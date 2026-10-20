@@ -7,7 +7,7 @@
 //! policy, so every kind gets it without any kind or node knowing: the
 //! language gives every trigger the settings
 //! ([`EntryLimits::node_inputs`]), the ctx reads them when the node
-//! registers its signal (`ExecutionContext::register_signal`), and the
+//! registers its signal (`RunContext::register_signal`), and the
 //! worker's door enforces them before any run starts, for every way work
 //! arrives (a caller, an event, a fire replayed): `weft_engine::door`.
 //!
@@ -47,6 +47,17 @@ pub struct ResolvedLimits {
     pub per_caller_per_minute: Option<u32>,
     pub per_minute: Option<u32>,
     pub at_once: Option<u32>,
+}
+
+impl ResolvedLimits {
+    /// What work released from its trigger's queue is admitted under: half
+    /// of the trigger's runs per minute and runs at once (at least one
+    /// each), so new arrivals still get through while it drains. A
+    /// caller's own limit stays as it is.
+    pub fn for_held(self) -> Self {
+        let half = |limit: Option<u32>| limit.map(|n| (n / 2).max(1));
+        Self { per_minute: half(self.per_minute), at_once: half(self.at_once), ..self }
+    }
 }
 
 impl EntryLimits {
@@ -114,7 +125,7 @@ impl EntryLimits {
         inputs.push(number(
             per_minute,
             "Runs started per minute",
-            "How many runs this trigger may start per minute, every caller and every event together. Unset, no limit. Set it when the run behind this trigger costs money (a paid model, an outside API), so a flood of calls or events cannot run up the bill. A call from outside past it is refused with 429 and a `Retry-After`; an event the trigger picked up itself (a schedule tick, a new message) past it is dropped, and `weft status` counts it.",
+            "How many runs this trigger may start per minute, every caller and every event together. Unset, no limit. Set it when the run behind this trigger costs money (a paid model, an outside API), so a flood of calls or events cannot run up the bill. A call from outside past it is refused with 429 and a `Retry-After`; an event the trigger picked up itself (a schedule tick, a new message) past it waits in the trigger's queue and starts once a later minute has room.",
         ));
         inputs.push(number(
             at_once,
@@ -230,6 +241,16 @@ impl Refused {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Released work gets half of the trigger's runs per minute and at
+    /// once, never less than one, and a caller's own limit as it is.
+    #[test]
+    fn held_work_is_admitted_under_half_the_limits() {
+        let limits = ResolvedLimits { per_caller_per_minute: Some(60), per_minute: Some(9), at_once: Some(1) };
+        assert_eq!(limits.for_held(), ResolvedLimits { per_caller_per_minute: Some(60), per_minute: Some(4), at_once: Some(1) });
+        let open = ResolvedLimits { per_caller_per_minute: None, per_minute: None, at_once: None };
+        assert_eq!(open.for_held(), open, "no limit stays no limit");
+    }
 
     #[test]
     fn unset_is_the_default_and_zero_is_no_limit() {

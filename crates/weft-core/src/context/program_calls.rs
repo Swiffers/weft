@@ -21,19 +21,19 @@ use serde_json::Value;
 
 use crate::activation::ActivationScope;
 use crate::error::{WeftError, WeftResult};
-use crate::instance::InstanceId;
+use crate::instance::{InstanceId, InstanceTarget};
 use crate::infra::{InfraNodeStatus, TerminateDisks};
 use crate::instance_door::ValuesChanged;
 use crate::program::{
-    CleanOutcome, ConnectionsForgotten, CostFilter, CostRecord, ExecutionPage, InfraCopy, InfraDownAnswer, InfraStartAnswer, InstanceHoldings,
-    MintedInstanceToken, PaidBy, ProgramCall, RunFilter, RunsCounted, TokensRevoked, MAX_RUNS_PAGE,
+    CleanOutcome, ConnectionsForgotten, CostFilter, CostRecord, RunPage, InfraCopy, InfraDownAnswer, InfraStartAnswer, InstanceHoldings,
+    MintedInstanceToken, NodeState, PaidBy, ProgramCall, RunFilter, RunsCounted, StillGoing, TokensRevoked, MAX_RUNS_PAGE,
 };
-use crate::running_policy::{DeactivateSpec, RunningPolicy};
 use crate::signal::timer::{Timer, TimerSpec};
 use crate::tag::StopSelf;
-use crate::ExecutionId;
+use crate::take_down::{ReleaseHeld, TakeDownChoice};
+use crate::RunId;
 
-use super::ExecutionContext;
+use super::RunContext;
 
 /// The name an instance token's mint is journaled under. Only the token's id
 /// is recorded (never its value): a replay revokes that one and mints a
@@ -43,7 +43,7 @@ const MINT_JOURNAL_NAME: &str = "weft.tokens.mint";
 /// How long a start waits between looks at a copy coming up.
 const START_LOOK_AGAIN: Timer = Timer { spec: TimerSpec::After { duration_ms: 3_000 } };
 
-impl ExecutionContext {
+impl RunContext {
     /// One infra node's copies: the shared one, or an instance's copy of
     /// a node marked `@per_instance` (`.instance(id)`). The node is named
     /// the way the program writes it (`bridge`, or `one.bridge` inside the
@@ -52,16 +52,18 @@ impl ExecutionContext {
         InfraCalls { ctx: self, node: node.into(), instance: None }
     }
 
-    /// One trigger's activation: the shared one, or an instance's
-    /// (`.instance(id)`) for a trigger that exists once per instance.
+    /// One trigger's activations: the shared one, or, for a trigger that
+    /// exists once per instance, the instances' named with `.instance(id)`
+    /// (repeatable) or every instance's with `.all_instances()`.
     pub fn trigger(&self, node: impl Into<String>) -> TriggerCalls<'_> {
-        TriggerCalls { ctx: self, triggers: vec![node.into()], instance: None }
+        TriggerCalls { ctx: self, triggers: vec![node.into()], instances: Vec::new(), all_instances: false }
     }
 
-    /// Every trigger of one owner: every shared trigger, or with
-    /// `.instance(id)` every per-instance trigger of that instance.
+    /// Every trigger of its owners: every shared trigger, or every
+    /// per-instance trigger of the instances named with `.instance(id)`,
+    /// or of every instance with `.all_instances()`.
     pub fn triggers(&self) -> TriggerCalls<'_> {
-        TriggerCalls { ctx: self, triggers: Vec::new(), instance: None }
+        TriggerCalls { ctx: self, triggers: Vec::new(), instances: Vec::new(), all_instances: false }
     }
 
     /// What an instance provides for the program's `@instance_filled`
@@ -93,6 +95,17 @@ impl ExecutionContext {
         RunQuery { ctx: self, instance: None, filter: RunFilter::default() }
     }
 
+    /// Where one node of a run of this project stands: pending, running,
+    /// waiting (with the raw last answer its wait saw), completed, failed
+    /// (with the error), skipped or cancelled, read from that run's
+    /// record. `node` is spelled the way `--from` takes it (`render`,
+    /// `one.render` inside the file the site `one` includes); a node
+    /// inside a loop fires once per iteration and is refused, while the
+    /// loop itself is read. Pass `self.run_id` for this run's own nodes.
+    pub async fn node_state(&self, run: RunId, node: impl Into<String>) -> WeftResult<NodeState> {
+        self.program_call(ProgramCall::NodeState { run, node: node.into() }, StopSelf::Keep).await
+    }
+
     /// Instance tokens: `mint_for_instance` hands a browser or extension
     /// a credential that acts inside one instance of this project.
     pub fn tokens(&self) -> TokenCalls<'_> {
@@ -109,13 +122,13 @@ impl ExecutionContext {
         let value = match replayed {
             Some(value) => value,
             None => {
-                let value = crate::storage::media::strip_links(&self.handle.program_call(call, stop_self, call_index).await?);
+                let value = self.handle.program_call(call, stop_self, call_index).await?;
                 self.handle.run_record(name, call_index, &value).await?;
                 value
             }
         };
         serde_json::from_value(value)
-            .map_err(|e| WeftError::NodeExecution(format!("{name}: the runtime answered a shape this node cannot read: {e}")))
+            .map_err(|e| WeftError::NodeFailed(format!("{name}: the runtime answered a shape this node cannot read: {e}")))
     }
 }
 
@@ -131,9 +144,9 @@ fn required_instance(raw: &str) -> WeftResult<InstanceId> {
     InstanceId::new(raw).map_err(|e| WeftError::Input(format!("instance id: {e}")))
 }
 
-/// One infra node's copies. See [`ExecutionContext::infra`].
+/// One infra node's copies. See [`RunContext::infra`].
 pub struct InfraCalls<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     node: String,
     instance: Option<String>,
 }
@@ -172,18 +185,18 @@ impl InfraCalls<'_> {
                 Some(InfraNodeStatus::Running) => return Ok(()),
                 Some(InfraNodeStatus::Failed) => {
                     let why = copy.and_then(|c| c.failure).unwrap_or_else(|| "no reason recorded".into());
-                    return Err(WeftError::NodeExecution(format!(
+                    return Err(WeftError::NodeFailed(format!(
                         "infra '{node}' failed to start: {why}; `weft infra status` shows the copy"
                     )));
                 }
                 None => {
-                    return Err(WeftError::NodeExecution(format!(
+                    return Err(WeftError::NodeFailed(format!(
                         "infra '{node}' did not come up: its start ended without a copy (the setup run failed \
-                         or was cancelled, or somebody terminated it); `weft executions` shows the setup run"
+                         or was cancelled, or somebody terminated it); `weft runs` shows the setup run"
                     )));
                 }
                 Some(stopped @ (InfraNodeStatus::Stopped | InfraNodeStatus::Stopping | InfraNodeStatus::Terminating)) => {
-                    return Err(WeftError::NodeExecution(format!(
+                    return Err(WeftError::NodeFailed(format!(
                         "infra '{node}' is {stopped}: somebody took it down while this start waited for it"
                     )));
                 }
@@ -221,32 +234,48 @@ impl InfraCalls<'_> {
         }
     }
 
-    /// Scale the copy down, keeping its disk. `spec` says what happens to
-    /// the triggers reading it and the runs using it; `stop_self` whether
-    /// this run goes too when it uses the copy. Answers whether there was
-    /// a copy to take down ([`InfraDownAnswer`]), so a program can tell an
-    /// instance with no copy (a mistyped id, one terminated before) apart.
-    pub async fn stop(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
-        let call = ProgramCall::InfraStop { node: self.node, instance: instance_id(&self.instance)?, spec };
+    /// Scale the copy down, keeping its disk. `take_down` says what
+    /// happens to the triggers whose cut contains it (they come back when
+    /// it runs again) and to the runs reaching it, each answer left out
+    /// being an infra command's default: the door holds, what is held is
+    /// kept, and the copy waits for its runs to end. `stop_self` decides
+    /// whether this run goes too when it reaches the copy. Answers whether
+    /// there was a copy to take down ([`InfraDownAnswer`]), so a program
+    /// can tell an instance with no copy (a mistyped id, one terminated
+    /// before) apart.
+    pub async fn stop(self, take_down: TakeDownChoice, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
+        let call = ProgramCall::InfraStop { node: self.node, instance: instance_id(&self.instance)?, take_down };
         self.ctx.program_call(call, stop_self).await
     }
 
     /// Delete the copy and its disks, keeping the ones its node lists in
     /// `keepOnTerminate` (a later start of the same copy finds them
-    /// again). Same `spec` and `stop_self` as [`Self::stop`].
-    pub async fn terminate(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
-        self.take_away(spec, stop_self, TerminateDisks::KeepListed).await
+    /// again). Same `take_down` and `stop_self` as [`Self::stop`].
+    pub async fn terminate(self, take_down: TakeDownChoice, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
+        self.take_away(take_down, stop_self, TerminateDisks::KeepListed).await
     }
 
     /// Delete the copy and every one of its disks, the ones listed in
     /// `keepOnTerminate` too: the copy's owner is going for good (a
-    /// instance being wiped). Same `spec` and `stop_self` as [`Self::stop`].
-    pub async fn wipe(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
-        self.take_away(spec, stop_self, TerminateDisks::DeleteAll).await
+    /// instance being wiped). Same `take_down` and `stop_self` as [`Self::stop`].
+    pub async fn wipe(self, take_down: TakeDownChoice, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
+        self.take_away(take_down, stop_self, TerminateDisks::DeleteAll).await
     }
 
-    async fn take_away(self, spec: DeactivateSpec, stop_self: StopSelf, disks: TerminateDisks) -> WeftResult<InfraDownAnswer> {
-        let call = ProgramCall::InfraTerminate { node: self.node, instance: instance_id(&self.instance)?, spec, disks };
+    /// Cycle the running copy onto the registered build's infra (a stop,
+    /// then a start; nothing is built), taking down the triggers whose cut
+    /// contains it as `take_down` says, the way [`Self::stop`] does; they
+    /// come back with it. Answers once the upgrade is under way, or at once
+    /// when the copy runs on the registered build already (nothing to
+    /// cycle); a copy that is not running is refused, since there is
+    /// nothing to cycle either.
+    pub async fn upgrade(self, take_down: TakeDownChoice, stop_self: StopSelf) -> WeftResult<()> {
+        let call = ProgramCall::InfraUpgrade { node: self.node, instance: instance_id(&self.instance)?, take_down };
+        self.ctx.program_call::<Value>(call, stop_self).await.map(drop)
+    }
+
+    async fn take_away(self, take_down: TakeDownChoice, stop_self: StopSelf, disks: TerminateDisks) -> WeftResult<InfraDownAnswer> {
+        let call = ProgramCall::InfraTerminate { node: self.node, instance: instance_id(&self.instance)?, take_down, disks };
         self.ctx.program_call(call, stop_self).await
     }
 
@@ -264,12 +293,13 @@ impl InfraCalls<'_> {
     }
 }
 
-/// Triggers' activations. See [`ExecutionContext::trigger`] and
-/// [`ExecutionContext::triggers`].
+/// Triggers' activations. See [`RunContext::trigger`] and
+/// [`RunContext::triggers`].
 pub struct TriggerCalls<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     triggers: Vec<String>,
-    instance: Option<String>,
+    instances: Vec<String>,
+    all_instances: bool,
 }
 
 impl TriggerCalls<'_> {
@@ -281,37 +311,49 @@ impl TriggerCalls<'_> {
         self
     }
 
-    /// That instance's activations, of triggers that exist once per
-    /// instance.
+    /// That instance's activations too, of triggers that exist once per
+    /// instance (call it again for another instance).
     pub fn instance(mut self, id: impl Into<String>) -> Self {
-        self.instance = Some(id.into());
+        self.instances.push(id.into());
+        self
+    }
+
+    /// Every instance's activations, of triggers that exist once per
+    /// instance.
+    pub fn all_instances(mut self) -> Self {
+        self.all_instances = true;
         self
     }
 
     fn scope(&self) -> WeftResult<ActivationScope> {
-        Ok(ActivationScope { triggers: self.triggers.clone(), instance: instance_id(&self.instance)? })
+        trigger_scope(&self.triggers, &self.instances, self.all_instances)
     }
 
-    /// Activate them. An instance's trigger reading that instance's infra copy
-    /// needs the copy running first. Activating what is active does
-    /// nothing.
-    pub async fn activate(self) -> WeftResult<()> {
-        let call = ProgramCall::TriggerActivate { scope: self.scope()? };
+    /// Turn on the ones that are off, leaving the ones on as they are
+    /// (with none off, this does nothing). What they held while down runs
+    /// (paced so new arrivals still get through) or is dropped, as `held`
+    /// says. An instance's trigger reading that instance's infra copy
+    /// needs the copy running first.
+    pub async fn activate(self, held: ReleaseHeld) -> WeftResult<()> {
+        let call = ProgramCall::TriggerActivate { scope: self.scope()?, held };
         self.ctx.program_call::<Value>(call, StopSelf::Keep).await.map(drop)
     }
 
-    /// Take them down under `spec` (wipe, hibernate or park; cancel or
-    /// wait for the runs they fired). `stop_self` decides this run's fate
-    /// when one of them fired it.
-    pub async fn deactivate(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<()> {
-        let call = ProgramCall::TriggerDeactivate { scope: self.scope()?, spec };
+    /// Take them down as `take_down` says, each answer left out being the
+    /// default: the door holds what arrives, what is held is kept, and the
+    /// runs going finish on their own version (`Running::Wait`; the call
+    /// answers once the triggers are down, never waiting on runs from
+    /// inside this one) or are cancelled (`Running::Cancel`). `stop_self`
+    /// decides this run's fate when one of them fired it.
+    pub async fn deactivate(self, take_down: TakeDownChoice, stop_self: StopSelf) -> WeftResult<()> {
+        let call = ProgramCall::TriggerDeactivate { scope: self.scope()?, take_down };
         self.ctx.program_call::<Value>(call, stop_self).await.map(drop)
     }
 }
 
-/// See [`ExecutionContext::connections`].
+/// See [`RunContext::connections`].
 pub struct ConnectionCalls<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
 }
 
 impl<'a> ConnectionCalls<'a> {
@@ -323,7 +365,7 @@ impl<'a> ConnectionCalls<'a> {
 
 /// One instance's connections.
 pub struct InstanceConnections<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     instance: String,
 }
 
@@ -343,9 +385,9 @@ impl InstanceConnections<'_> {
     }
 }
 
-/// See [`ExecutionContext::instances`].
+/// See [`RunContext::instances`].
 pub struct InstanceCalls<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
 }
 
 impl InstanceCalls<'_> {
@@ -359,9 +401,9 @@ impl InstanceCalls<'_> {
     }
 }
 
-/// See [`ExecutionContext::values`].
+/// See [`RunContext::values`].
 pub struct ValueCalls<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
 }
 
 impl<'a> ValueCalls<'a> {
@@ -375,25 +417,25 @@ impl<'a> ValueCalls<'a> {
 /// [`Self::set`] and [`Self::clear`] and make the change with
 /// [`Self::apply`].
 pub struct InstanceValueCalls<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     instance: String,
     set: Vec<crate::run_spec::InstanceValueInput>,
     clear: Vec<crate::run_spec::InstanceFieldRef>,
 }
 
 impl InstanceValueCalls<'_> {
-    /// What the instance gives, by step (named the way the program writes
+    /// What the instance gives, by node (named the way the program writes
     /// it) and field. A connection reads as its `{id, identity}` handle.
     pub async fn get(self) -> WeftResult<crate::instance::InstanceValues> {
         let call = ProgramCall::ValuesGet { instance: required_instance(&self.instance)? };
         self.ctx.program_call(call, StopSelf::Keep).await
     }
 
-    /// Give `value` for `field` of the step `step`, a field the program
+    /// Give `value` for `field` of the node `node`, a field the program
     /// writes `@instance_filled`. For a connection field the value is one
     /// of the instance's connections: `json!({ "id": <connection id> })`.
-    pub fn set(mut self, step: impl Into<String>, field: impl Into<String>, value: Value) -> Self {
-        self.set.push(crate::run_spec::InstanceValueInput { step: step.into(), field: field.into(), value });
+    pub fn set(mut self, node: impl Into<String>, field: impl Into<String>, value: Value) -> Self {
+        self.set.push(crate::run_spec::InstanceValueInput { node: node.into(), field: field.into(), value });
         self
     }
 
@@ -406,10 +448,10 @@ impl InstanceValueCalls<'_> {
         Ok(answer.rearmed)
     }
 
-    /// Forget the instance's value for `field` of `step`: the field then
+    /// Forget the instance's value for `field` of `node`: the field then
     /// falls back as if never given.
-    pub fn clear(mut self, step: impl Into<String>, field: impl Into<String>) -> Self {
-        self.clear.push(crate::run_spec::InstanceFieldRef { step: step.into(), field: field.into() });
+    pub fn clear(mut self, node: impl Into<String>, field: impl Into<String>) -> Self {
+        self.clear.push(crate::run_spec::InstanceFieldRef { node: node.into(), field: field.into() });
         self
     }
 
@@ -424,9 +466,9 @@ impl InstanceValueCalls<'_> {
     }
 }
 
-/// See [`ExecutionContext::costs`].
+/// See [`RunContext::costs`].
 pub struct CostQuery<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     instance: Option<String>,
     filter: CostFilter,
 }
@@ -457,9 +499,9 @@ impl CostQuery<'_> {
         self
     }
 
-    /// Costs of one run (`ctx.execution_id` for this one).
-    pub fn run(mut self, execution_id: ExecutionId) -> Self {
-        self.filter.run = Some(execution_id);
+    /// Costs of one run (`ctx.run_id` for this one).
+    pub fn run(mut self, run_id: RunId) -> Self {
+        self.filter.run = Some(run_id);
         self
     }
 
@@ -475,9 +517,9 @@ impl CostQuery<'_> {
     }
 }
 
-/// See [`ExecutionContext::runs`].
+/// See [`RunContext::runs`].
 pub struct RunQuery<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     instance: Option<String>,
     filter: RunFilter,
 }
@@ -509,7 +551,7 @@ impl RunQuery<'_> {
         self
     }
 
-    /// Runs carrying this tag (`ctx.tag_execution`), normalized the
+    /// Runs carrying this tag (`ctx.tag_run`), normalized the
     /// same way, so the value a run tagged itself with finds it. An
     /// empty tag is refused.
     pub fn tag(mut self, tag: &str) -> WeftResult<Self> {
@@ -525,10 +567,10 @@ impl RunQuery<'_> {
     }
 
     /// Delete them. A run still going is never deleted from under itself:
-    /// `running: Cancel` stops it (its rows go with the next clean),
-    /// `Wait` leaves it running. This run is never deleted; with
+    /// `StillGoing::Cancel` stops it (its rows go with the next clean),
+    /// `Leave` leaves it running. This run is never deleted; with
     /// `StopSelf::Include` and matching the filters, it is stopped.
-    pub async fn clean(mut self, running: RunningPolicy, stop_self: StopSelf) -> WeftResult<CleanOutcome> {
+    pub async fn clean(mut self, running: StillGoing, stop_self: StopSelf) -> WeftResult<CleanOutcome> {
         self.filter.instance = instance_id(&self.instance)?;
         self.ctx.program_call(ProgramCall::RunsClean { filter: self.filter, running }, stop_self).await
     }
@@ -536,7 +578,7 @@ impl RunQuery<'_> {
     /// The newest `limit` of them (1 to [`MAX_RUNS_PAGE`]), newest first,
     /// with how many match in all (`total`), so a listing that stopped
     /// short says so. A run parked on a wait reads `waiting_for_input`.
-    pub async fn list(mut self, limit: u32) -> WeftResult<ExecutionPage> {
+    pub async fn list(mut self, limit: u32) -> WeftResult<RunPage> {
         if !(1..=MAX_RUNS_PAGE).contains(&limit) {
             return Err(WeftError::Input(format!(
                 "runs list: a limit of {limit} is out of range; give 1 to {MAX_RUNS_PAGE}, and narrow the filters to reach older runs"
@@ -554,9 +596,9 @@ impl RunQuery<'_> {
     }
 }
 
-/// See [`ExecutionContext::tokens`].
+/// See [`RunContext::tokens`].
 pub struct TokenCalls<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
 }
 
 impl<'a> TokenCalls<'a> {
@@ -578,7 +620,7 @@ impl<'a> TokenCalls<'a> {
         // mint leaves no record of a token that never existed.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| WeftError::NodeExecution(format!("the clock is before 1970: {e}")))?
+            .map_err(|e| WeftError::NodeFailed(format!("the clock is before 1970: {e}")))?
             .as_secs();
         crate::signal_token::expiry_at(now, expires_in.as_secs()).map_err(WeftError::Input)?;
         let (call_index, replayed) = self.ctx.handle.run_step(MINT_JOURNAL_NAME).await?;
@@ -587,7 +629,7 @@ impl<'a> TokenCalls<'a> {
                 .get("id")
                 .and_then(Value::as_str)
                 .and_then(|id| id.parse::<uuid::Uuid>().ok())
-                .ok_or_else(|| WeftError::NodeExecution(format!("the journaled instance token mint is unreadable: {recorded}")))?,
+                .ok_or_else(|| WeftError::NodeFailed(format!("the journaled instance token mint is unreadable: {recorded}")))?,
             None => {
                 let id = uuid::Uuid::new_v4();
                 self.ctx.handle.run_record(MINT_JOURNAL_NAME, call_index, &serde_json::json!({ "id": id })).await?;
@@ -605,7 +647,7 @@ impl<'a> TokenCalls<'a> {
 
 /// One instance's tokens.
 pub struct InstanceTokens<'a> {
-    ctx: &'a ExecutionContext,
+    ctx: &'a RunContext,
     instance: String,
 }
 
@@ -616,5 +658,42 @@ impl InstanceTokens<'_> {
         let call = ProgramCall::TokensRevoke { instance: required_instance(&self.instance)?, id: None };
         let answer: TokensRevoked = self.ctx.program_call(call, StopSelf::Keep).await?;
         Ok(answer.revoked)
+    }
+}
+
+/// The activations a [`TriggerCalls`] names: `triggers` (every one when
+/// empty) of the program's own and of the instances `instances`, or of
+/// every instance with `all_instances`, which names none of its own.
+fn trigger_scope(triggers: &[String], instances: &[String], all_instances: bool) -> WeftResult<ActivationScope> {
+    let named = instances.iter().map(|id| required_instance(id)).collect::<WeftResult<Vec<InstanceId>>>()?;
+    let instances = match (all_instances, named.is_empty()) {
+        (true, false) => {
+            return Err(WeftError::Input(
+                "`.all_instances()` acts on every instance and `.instance(..)` names some; call one of the two".into(),
+            ))
+        }
+        (true, true) => InstanceTarget::EveryInstance,
+        (false, _) => InstanceTarget::named(named),
+    };
+    Ok(ActivationScope { triggers: triggers.to_vec(), instances })
+}
+
+#[cfg(test)]
+mod trigger_scope_tests {
+    use super::*;
+
+    /// No instance named is the program's own; named ones are those;
+    /// every instance is all of them, and naming some beside it is refused.
+    #[test]
+    fn a_trigger_call_names_its_activations() {
+        let feed = vec!["feed".to_string()];
+        let own = trigger_scope(&feed, &[], false).unwrap();
+        assert_eq!((own.triggers, own.instances), (feed.clone(), InstanceTarget::Shared));
+        let ada = trigger_scope(&[], &["ada".to_string()], false).unwrap();
+        assert_eq!(ada.instances, InstanceTarget::named(vec![InstanceId::new("ada").unwrap()]));
+        assert_eq!(trigger_scope(&feed, &[], true).unwrap().instances, InstanceTarget::EveryInstance);
+        let both = trigger_scope(&feed, &["ada".to_string()], true).unwrap_err();
+        assert!(both.to_string().contains("call one of the two"), "{both}");
+        assert!(trigger_scope(&feed, &["".to_string()], false).is_err(), "an instance must be named");
     }
 }

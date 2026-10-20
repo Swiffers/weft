@@ -44,18 +44,15 @@ sha2 = { workspace = true }
 # (signatures hash the exact bytes; the wrapper stays JSON).
 base64 = { workspace = true }
 hex = "0.4"
+# The files door decodes a link's path before it checks it as a storage key.
+percent-encoding = "2"
 # Materialize uploaded source rows to a temp dir for the compile + stage
 # (the dispatcher is a compile site for image builds).
 tempfile = { workspace = true }
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [features]
 test-helpers = []
-# Layer-3 tests that hit a REAL Postgres via `#[sqlx::test]` + $DATABASE_URL
-# (the dispatcher's own SQL: births, lifecycle writes, the ledger). OFF by
-# default so a plain `cargo test --workspace` needs no Postgres;
-# `scripts/run-db-tests.sh` runs them (CI's `db` job runs that same script
-# against a Postgres service).
-db-tests = ["weft-task-store/db-tests"]
 
 [dev-dependencies]
 weft-dispatcher = { path = ".", features = ["test-helpers"] }

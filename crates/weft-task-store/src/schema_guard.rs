@@ -307,13 +307,14 @@ fn edited_after_running(
         .collect()
 }
 
-/// Where the migration history starts. The history was restarted once, when
-/// weft moved off Kubernetes: every group's `origin.sql` was frozen again
-/// from the canonical DDL of that day and the migrations before it were
-/// deleted, so no database built earlier can be carried forward. Every
-/// database built since records this id (under [`HISTORY_GROUP`]) when its
-/// first group is built, and one without it is refused with the way out.
-const HISTORY_EPOCH: &str = "serverless";
+/// Where the migration history starts. The history has restarted twice,
+/// when weft moved off Kubernetes and when executions were renamed runs:
+/// each time every group's `origin.sql` was frozen again from the canonical
+/// DDL of that day and the migrations before it were deleted, so no
+/// database built earlier can be carried forward. Every database built
+/// since records this id (under [`HISTORY_GROUP`]) when its first group is
+/// built, and one without it is refused with the way out.
+const HISTORY_EPOCH: &str = "run";
 const HISTORY_GROUP: &str = "_history";
 
 /// Record the history's start on a new database, and refuse one that was
@@ -329,10 +330,11 @@ async fn refuse_a_database_from_before_the_history(tx: &mut sqlx::Transaction<'_
     .await?;
     anyhow::ensure!(
         !built || current,
-        "this database was built by a weft from before it moved off Kubernetes, and its \
-         tables cannot be carried forward. Wipe the old install with \
-         scripts/scrub-old-install.sh (this deletes its projects' run history and stored \
-         connections; your project folders are untouched), then run ./setup.sh."
+        "this database was built by an older weft (from before runs were renamed, or before \
+         it moved off Kubernetes), and its tables cannot be carried forward. Run ./setup.sh, \
+         which offers to wipe it (this deletes its projects' run history, versions and stored \
+         connections; your project folders are untouched), or wipe everything weft left on \
+         this machine with scripts/scrub-old-install.sh."
     );
     if !built {
         sqlx::query("INSERT INTO weft_migration (group_name, id, checksum) VALUES ($1, $2, '') ON CONFLICT DO NOTHING")
@@ -792,12 +794,10 @@ async fn record_migration(
 /// crate does. The build script EMBEDS everything in it (`MIGRATIONS`,
 /// `ORIGINS`), so the runtime never reads the disk; only the generator
 /// tooling below writes here.
-#[cfg(feature = "db-tests")]
 pub fn migrations_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations")
 }
 
-#[cfg(feature = "db-tests")]
 fn group_dir(group: &SchemaGroup) -> std::path::PathBuf {
     migrations_root().join(group.name)
 }
@@ -810,7 +810,6 @@ fn group_dir(group: &SchemaGroup) -> std::path::PathBuf {
 /// rewrite the past that every real database actually lived through.
 ///
 /// Run it after adding a new group. It reports what it wrote.
-#[cfg(feature = "db-tests")]
 pub fn write_missing_origins(groups: &[&SchemaGroup]) -> anyhow::Result<Vec<String>> {
     let mut written = Vec::new();
     for group in groups {
@@ -840,7 +839,6 @@ pub fn write_missing_origins(groups: &[&SchemaGroup]) -> anyhow::Result<Vec<Stri
 /// Ids are timestamps, so one global ordering across groups replays the
 /// changes in the order they were actually written, which is what an old
 /// database booting today does.
-#[cfg(feature = "db-tests")]
 pub async fn replay_from_origin(
     pool: &PgPool,
     groups: &[&SchemaGroup],
@@ -852,7 +850,6 @@ pub async fn replay_from_origin(
 
 /// Every group's frozen `origin.sql`: the database each group was on the
 /// day it shipped, before any migration ran.
-#[cfg(feature = "db-tests")]
 pub async fn replay_origins(pool: &PgPool, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     for group in groups {
         // Embedded at build time, like the migrations: the replay must
@@ -880,7 +877,6 @@ pub async fn replay_origins(pool: &PgPool, groups: &[&SchemaGroup]) -> anyhow::R
 /// `keep` picks. A test that stops the history at one release (to write
 /// rows the way an older build wrote them) and then plays the rest picks
 /// the two halves by id.
-#[cfg(feature = "db-tests")]
 pub async fn replay_migrations(
     pool: &PgPool,
     groups: &[&SchemaGroup],
@@ -923,7 +919,6 @@ impl std::fmt::Display for Thing {
 /// Everything the database currently holds, ready to compare against the same
 /// reading taken after the schema was built the other way. Generator
 /// tooling only; the boot's shape check reads through [`read_things`].
-#[cfg(feature = "db-tests")]
 pub async fn read_schema(pool: &PgPool) -> anyhow::Result<Vec<Thing>> {
     let mut conn = pool.acquire().await?;
     read_things(&mut conn, "public").await
@@ -1014,7 +1009,6 @@ const THING_QUERIES: &[&str] = &[
 
 /// Who a planned statement belongs to, so [`file_per_group`] can file it
 /// under the right group without scraping the SQL text.
-#[cfg(feature = "db-tests")]
 #[derive(Clone, PartialEq, Eq)]
 pub enum Owner {
     /// The table the statement touches; owned by the group whose
@@ -1026,13 +1020,11 @@ pub enum Owner {
 }
 
 /// One statement of a planned migration, with its owner.
-#[cfg(feature = "db-tests")]
 pub struct Planned {
     pub owner: Owner,
     pub stmt: String,
 }
 
-#[cfg(feature = "db-tests")]
 fn owner_of(thing: &Thing) -> Owner {
     // A trigger files under the group whose DDL DECLARES it, not the
     // group owning the table it fires on: a group may attach a trigger
@@ -1059,7 +1051,6 @@ fn owner_of(thing: &Thing) -> Owner {
 /// the order given, and the rest is diffed against the schema as it
 /// stands after them. A constraint or index whose definition then matches
 /// under another name is renamed rather than rebuilt.
-#[cfg(feature = "db-tests")]
 pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyhow::Result<Vec<Planned>> {
     let key = |t: &Thing| (t.kind.clone(), t.table.clone(), t.name.clone());
     let (old, mut plan) = apply_renames(old, renames)?;
@@ -1179,7 +1170,6 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyho
 
 /// One rename the person releasing a migration names, because no diff
 /// can tell a renamed column from a dropped one and an added one.
-#[cfg(feature = "db-tests")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rename {
     /// `--rename old_table=new_table`
@@ -1188,7 +1178,6 @@ pub enum Rename {
     Column { table: String, from: String, to: String },
 }
 
-#[cfg(feature = "db-tests")]
 impl std::str::FromStr for Rename {
     type Err = anyhow::Error;
     fn from_str(spec: &str) -> anyhow::Result<Self> {
@@ -1213,7 +1202,6 @@ impl std::str::FromStr for Rename {
 /// statements that get it there. A rename naming something `old` does
 /// not hold is refused: it is a typo, and running past it would plan the
 /// drop and add the rename was meant to prevent.
-#[cfg(feature = "db-tests")]
 fn apply_renames(old: &[Thing], renames: &[Rename]) -> anyhow::Result<(Vec<Thing>, Vec<Planned>)> {
     let mut things = old.to_vec();
     let mut plan = Vec::new();
@@ -1224,43 +1212,78 @@ fn apply_renames(old: &[Thing], renames: &[Rename]) -> anyhow::Result<(Vec<Thing
                     things.iter().any(|t| t.table == *from),
                     "--rename {from}={to}: there is no table '{from}' to rename"
                 );
+                // A serial column's sequence keeps its name when its
+                // table is renamed; a fresh database names it after the
+                // new table, so it is renamed along.
+                let sequences: Vec<(String, String)> = things
+                    .iter()
+                    .filter(|t| t.kind == "column" && t.table == *from)
+                    .filter_map(|t| owned_sequence_of(t, &format!("{from}_{}_seq", t.name)).map(|seq| (seq, format!("{to}_{}_seq", t.name))))
+                    .collect();
                 for thing in &mut things {
                     if thing.table == *from {
                         thing.table = to.clone();
                     }
                     thing.body = replace_ident(&thing.body, from, to);
+                    for (was, now) in &sequences {
+                        thing.body = replace_ident(&thing.body, was, now);
+                    }
                 }
                 plan.push(Planned {
                     owner: Owner::Table(to.clone()),
                     stmt: format!("ALTER TABLE {from} RENAME TO {to};"),
                 });
+                for (was, now) in sequences {
+                    plan.push(Planned { owner: Owner::Table(to.clone()), stmt: format!("ALTER SEQUENCE {was} RENAME TO {now};") });
+                }
             }
             Rename::Column { table, from, to } => {
                 anyhow::ensure!(
                     things.iter().any(|t| t.kind == "column" && t.table == *table && t.name == *from),
                     "--rename {table}.{from}={to}: table '{table}' has no column '{from}' to rename"
                 );
+                // The same for a serial column renamed: its sequence is
+                // named after the column on a fresh database.
+                let sequence = things
+                    .iter()
+                    .find(|t| t.kind == "column" && t.table == *table && t.name == *from)
+                    .and_then(|t| owned_sequence_of(t, &format!("{table}_{from}_seq")))
+                    .map(|seq| (seq, format!("{table}_{to}_seq")));
                 for thing in things.iter_mut().filter(|t| t.table == *table) {
                     if thing.kind == "column" && thing.name == *from {
                         thing.name = to.clone();
                     }
                     thing.body = replace_ident(&thing.body, from, to);
+                    if let Some((was, now)) = &sequence {
+                        thing.body = replace_ident(&thing.body, was, now);
+                    }
                 }
                 plan.push(Planned {
                     owner: Owner::Table(table.clone()),
                     stmt: format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to};"),
                 });
+                if let Some((was, now)) = sequence {
+                    plan.push(Planned { owner: Owner::Table(table.clone()), stmt: format!("ALTER SEQUENCE {was} RENAME TO {now};") });
+                }
             }
         }
     }
     Ok((things, plan))
 }
 
+/// `name` when `column` draws its default from the sequence of that
+/// name (a serial column's own sequence, as Postgres names it).
+fn owned_sequence_of(column: &Thing, name: &str) -> Option<String> {
+    column_parts(&column.body)
+        .default
+        .is_some_and(|d| d == format!("nextval('{name}'::regclass)"))
+        .then(|| name.to_string())
+}
+
 /// Columns and tables that leave while others arrive beside them: each
 /// could be a rename nobody named, which the plan would carry out as a
 /// drop (throwing the rows away) and an empty add. Empty when every such
 /// pair is accounted for.
-#[cfg(feature = "db-tests")]
 pub fn unnamed_renames(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyhow::Result<Vec<String>> {
     let (old, _) = apply_renames(old, renames)?;
     let tables = |things: &[Thing]| -> std::collections::BTreeSet<String> {
@@ -1289,7 +1312,6 @@ pub fn unnamed_renames(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyh
 
 /// `text` with the identifier `from` replaced by `to` wherever it stands
 /// as a whole word.
-#[cfg(feature = "db-tests")]
 fn replace_ident(text: &str, from: &str, to: &str) -> String {
     let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let mut out = String::with_capacity(text.len());
@@ -1313,7 +1335,6 @@ fn replace_ident(text: &str, from: &str, to: &str) -> String {
 
 /// What [`pair_renamed_objects`] found: the RENAME statements, and the
 /// old and new things they account for.
-#[cfg(feature = "db-tests")]
 struct Paired {
     plan: Vec<Planned>,
     old: std::collections::HashSet<(String, String, String)>,
@@ -1325,7 +1346,6 @@ struct Paired {
 /// renames have run): renamed, never rebuilt. They hold no rows, so
 /// pairing them is safe to do without being asked; a pair is made only
 /// when it is the one candidate on both sides.
-#[cfg(feature = "db-tests")]
 fn pair_renamed_objects(old: &[Thing], new: &[Thing]) -> Paired {
     fn unique_match<'a>(
         from: &Thing,
@@ -1376,7 +1396,6 @@ fn pair_renamed_objects(old: &[Thing], new: &[Thing]) -> Paired {
 
 /// The pieces of a column as Postgres reports them, parsed back out of
 /// the body format the column THING query builds.
-#[cfg(feature = "db-tests")]
 struct ColumnParts {
     ty: String,
     not_null: bool,
@@ -1387,7 +1406,6 @@ struct ColumnParts {
     generated: Option<String>,
 }
 
-#[cfg(feature = "db-tests")]
 fn column_parts(body: &str) -> ColumnParts {
     let ty = body.split(" null=").next().unwrap_or(body).to_string();
     let not_null = body.contains("null=NO");
@@ -1411,7 +1429,6 @@ fn column_parts(body: &str) -> ColumnParts {
 /// The column clause of a CREATE TABLE, rebuilt from what Postgres
 /// reports. Rendering of [`column_parts`], so there is one parser of
 /// the body format.
-#[cfg(feature = "db-tests")]
 fn describe_column(body: &str) -> String {
     let parts = column_parts(body);
     let mut out;
@@ -1439,7 +1456,6 @@ fn describe_column(body: &str) -> String {
 
 /// `bigserial`/`serial`/`smallserial` when the column is an integer
 /// whose default draws from a sequence; `None` for everything else.
-#[cfg(feature = "db-tests")]
 fn serial_form(parts: &ColumnParts) -> Option<&'static str> {
     if !parts.default.as_deref().is_some_and(|d| d.starts_with("nextval(")) {
         return None;
@@ -1452,7 +1468,6 @@ fn serial_form(parts: &ColumnParts) -> Option<&'static str> {
     }
 }
 
-#[cfg(feature = "db-tests")]
 fn added(thing: &Thing) -> String {
     match thing.kind.as_str() {
         "type" => format!(
@@ -1484,7 +1499,6 @@ fn added(thing: &Thing) -> String {
     }
 }
 
-#[cfg(feature = "db-tests")]
 fn changed(was: &Thing, now: &Thing) -> String {
     match now.kind.as_str() {
         // CREATE OR REPLACE cannot change what a function returns nor rename
@@ -1588,14 +1602,12 @@ fn changed(was: &Thing, now: &Thing) -> String {
 
 /// A function's head as `pg_get_functiondef` prints it: its first line
 /// (name and named parameters) and its `RETURNS` line.
-#[cfg(feature = "db-tests")]
 fn function_signature(definition: &str) -> (Option<&str>, Option<&str>) {
     let mut lines = definition.lines().map(str::trim);
     let head = lines.next();
     (head, lines.find(|line| line.starts_with("RETURNS ")))
 }
 
-#[cfg(feature = "db-tests")]
 fn removed(thing: &Thing) -> String {
     match thing.kind.as_str() {
         // IF EXISTS on an index or a constraint: one that names a column
@@ -1621,31 +1633,49 @@ fn removed(thing: &Thing) -> String {
     }
 }
 
-/// Whether `group`'s released history (its frozen origin, or a released
-/// migration) creates `table`: how a table the canonical DDL dropped is
-/// still known to be that group's.
-#[cfg(feature = "db-tests")]
-fn history_created(group: &str, table: &str) -> bool {
-    let creates = |sql: &str| {
+/// `group`'s released history: its frozen origin, then every released
+/// migration.
+fn released_history(group: &str) -> impl Iterator<Item = &'static str> + '_ {
+    embedded_origin(group)
+        .into_iter()
+        .chain(MIGRATIONS.iter().filter(move |m| m.group == group && !m.draft).map(|m| m.sql))
+}
+
+/// Every table `group`'s released history creates: how a table the
+/// canonical DDL dropped or renamed is still known to be that group's.
+fn history_tables(group: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for sql in released_history(group) {
         let lower = sql.to_ascii_lowercase();
-        [format!("create table if not exists {table} "), format!("create table {table} "),
-         format!("create table if not exists {table}("), format!("create table {table}(")]
-            .iter()
-            .any(|head| lower.contains(head.as_str()))
-    };
-    embedded_origin(group).is_some_and(creates)
-        || MIGRATIONS.iter().any(|m| m.group == group && !m.draft && creates(m.sql))
+        let mut rest = lower.as_str();
+        while let Some(at) = rest.find("create table ") {
+            rest = &rest[at + "create table ".len()..];
+            let name = rest.strip_prefix("if not exists ").unwrap_or(rest);
+            let name: String = name.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            if !name.is_empty() {
+                out.insert(name);
+            }
+        }
+    }
+    out
+}
+
+/// Whether `group`'s released history creates `table`.
+fn history_created(group: &str, table: &str) -> bool {
+    history_tables(group).contains(table)
+}
+
+/// Every function, type and trigger `group`'s released history declares:
+/// how an object the canonical DDL dropped is still known to be that
+/// group's.
+fn history_declared_names(group: &str) -> Vec<String> {
+    declared_in(released_history(group))
 }
 
 /// Whether `group`'s released history declares the function, type or
-/// trigger `name`: how an object the canonical DDL dropped is still known
-/// to be that group's.
-#[cfg(feature = "db-tests")]
+/// trigger `name`.
 fn history_declared(group: &str, name: &str) -> bool {
-    let history = embedded_origin(group)
-        .into_iter()
-        .chain(MIGRATIONS.iter().filter(|m| m.group == group && !m.draft).map(|m| m.sql));
-    declared_in(history).iter().any(|n| n == name)
+    history_declared_names(group).iter().any(|n| n == name)
 }
 
 /// Split a plan into one file per group, and say where each file goes.
@@ -1665,7 +1695,6 @@ fn history_declared(group: &str, name: &str) -> bool {
 /// break its recorded checksum with the original content gone.
 ///
 /// Returns the group, the path to write, and the file's contents.
-#[cfg(feature = "db-tests")]
 pub fn file_per_group(
     groups: &[&SchemaGroup],
     plan: &[Planned],
@@ -1726,15 +1755,28 @@ pub fn file_per_group(
 }
 
 /// How a database differs from `expected`, over the things these
-/// groups own; `None` when it holds exactly that shape. Read through
-/// `conn` so a caller mid-transaction sees its own uncommitted DDL.
-#[cfg(feature = "db-tests")]
+/// groups own now or once owned (a table a rename or a drop took away
+/// is still theirs to compare: the shape a release starts from holds it
+/// under its old name); `None` when it holds exactly that shape. Read
+/// through `conn` so a caller mid-transaction sees its own uncommitted
+/// DDL.
 async fn shape_diff(
     conn: &mut sqlx::PgConnection,
     groups: &[&SchemaGroup],
     expected: &[Thing],
 ) -> anyhow::Result<Option<String>> {
-    let ours = |t: &&Thing| groups.iter().any(|g| owned_by(g, t));
+    let once: Vec<(std::collections::HashSet<String>, Vec<String>)> =
+        groups.iter().map(|g| (history_tables(g.name), history_declared_names(g.name))).collect();
+    let ours = |t: &&Thing| {
+        groups.iter().zip(&once).any(|(g, (tables, declared))| {
+            owned_by(g, t)
+                || if t.table.is_empty() || t.kind == "trigger" {
+                    declared.iter().any(|n| n == bare_name(&t.name))
+                } else {
+                    tables.contains(&t.table)
+                }
+        })
+    };
     let live_all = read_things(conn, "public").await?;
     let live: Vec<Thing> = live_all.iter().filter(|t| ours(t)).cloned().collect();
     let expected: Vec<Thing> = expected.iter().filter(|t| ours(t)).cloned().collect();
@@ -1746,7 +1788,6 @@ async fn shape_diff(
 /// a group from its canonical DDL. A database from before the stamp
 /// table existed has built nothing this way, so every group is unborn
 /// to it and the boot builds them all.
-#[cfg(feature = "db-tests")]
 pub async fn unborn_groups(
     conn: &mut sqlx::PgConnection,
     groups: &[&SchemaGroup],
@@ -1766,7 +1807,6 @@ pub async fn unborn_groups(
 /// group, its id, its SQL, and whether the database still has to RUN
 /// it (it never saw the drafts) or only has it RECORDED (it ran them,
 /// so it already holds the result).
-#[cfg(feature = "db-tests")]
 pub struct Settling {
     pub group: String,
     pub id: String,
@@ -1783,7 +1823,6 @@ pub struct Settling {
 /// anywhere rolls all of it back, so the database is never recorded as
 /// holding a migration it does not, and a recorded migration only
 /// ever means "this database holds its result".
-#[cfg(feature = "db-tests")]
 pub async fn settle_release(
     pool: &PgPool,
     groups: &[&SchemaGroup],
@@ -1846,7 +1885,6 @@ pub async fn settle_release(
 
 /// Every draft file there is, so a release can delete them once it has
 /// collapsed them.
-#[cfg(feature = "db-tests")]
 pub fn draft_files(groups: &[&SchemaGroup]) -> Vec<std::path::PathBuf> {
     groups
         .iter()
@@ -1913,7 +1951,6 @@ pub fn diff_things(a: &[Thing], only_a: &str, b: &[Thing], only_b: &str) -> Opti
 /// and shipped DDL are still identical by construction. Freezing it any
 /// later would fold newer canonical changes into the "past" and lose
 /// their migration.
-#[cfg(feature = "db-tests")]
 pub async fn assert_schema_agrees(pool: &PgPool, groups: &[&SchemaGroup]) {
     let frozen = write_missing_origins(groups).expect("write missing origins");
     assert!(
@@ -1956,7 +1993,6 @@ pub async fn assert_schema_agrees(pool: &PgPool, groups: &[&SchemaGroup]) {
 /// `schema_agreement` test, so the first place a
 /// non-scratch-buildable statement (a hardcoded `public.`, a reference
 /// outside the group set) surfaces is CI, never a production boot.
-#[cfg(feature = "db-tests")]
 pub async fn assert_shape_check_restamps(pool: &PgPool, groups: &[&SchemaGroup]) {
     apply_groups(pool, groups).await.expect("build from canonical DDL");
     sqlx::query("UPDATE weft_schema_stamp SET fingerprint = 'moved'")
@@ -1983,7 +2019,6 @@ pub async fn assert_shape_check_restamps(pool: &PgPool, groups: &[&SchemaGroup])
 /// Its address is the `WEFT_DATABASE_URL` line `weft daemon start` writes
 /// into the install's `secrets.env`, the address its runtime reaches it
 /// at. Returns a description of the install for messages, and the address.
-#[cfg(feature = "db-tests")]
 fn live_database_url() -> anyhow::Result<(String, String)> {
     use weft_core::infra::{Install, WantedFrom, INSTALL_ENV};
     let cwd = std::env::current_dir()?;
@@ -2012,7 +2047,6 @@ fn live_database_url() -> anyhow::Result<(String, String)> {
 /// `--unrelated`. A release finds the database you have been working
 /// against itself ([`live_database_url`]): the one of the install the
 /// command acts on from where it runs.
-#[cfg(feature = "db-tests")]
 pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     use anyhow::Context;
     let name = std::env::args().nth(1).context(
@@ -2246,20 +2280,18 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
 
-    #[cfg(feature = "db-tests")]
     #[test]
     fn a_plan_drops_a_function_after_the_triggers_it_backs() {
         use super::{plan_migration, Thing};
         let thing = |kind: &str, table: &str, name: &str| Thing { kind: kind.into(), table: table.into(), name: name.into(), body: String::new() };
-        let kept = thing("column", "exec_event", "execution_id");
-        let old = vec![thing("function", "", "check"), kept.clone(), thing("trigger", "exec_event", "check_on_insert")];
+        let kept = thing("column", "run_event", "run_id");
+        let old = vec![thing("function", "", "check"), kept.clone(), thing("trigger", "run_event", "check_on_insert")];
         let plan: Vec<String> = plan_migration(&old, &[kept], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
-        assert_eq!(plan, ["DROP TRIGGER check_on_insert ON exec_event;", "DROP FUNCTION check CASCADE;"]);
+        assert_eq!(plan, ["DROP TRIGGER check_on_insert ON run_event;", "DROP FUNCTION check CASCADE;"]);
     }
     /// A function whose result changed is dropped before it is made again
     /// (CREATE OR REPLACE refuses that); one whose body alone changed is
     /// replaced in place.
-    #[cfg(feature = "db-tests")]
     #[test]
     fn a_plan_drops_a_function_whose_signature_changed() {
         use super::{plan_migration, Thing};
@@ -2277,7 +2309,6 @@ mod tests {
     }
     /// A trigger that fires on a column holds it: the trigger goes before the
     /// column, whatever order the old schema lists them in.
-    #[cfg(feature = "db-tests")]
     #[test]
     fn a_plan_drops_a_trigger_before_the_column_it_fires_on() {
         use super::{plan_migration, Thing};
@@ -2290,7 +2321,6 @@ mod tests {
         assert!(trigger < column, "{plan:?}");
     }
 
-    #[cfg(feature = "db-tests")]
     #[test]
     fn a_renamed_column_keeps_its_rows_and_its_constraint_and_index_follow() {
         use super::{plan_migration, Thing};
@@ -2318,7 +2348,6 @@ mod tests {
         ]);
     }
 
-    #[cfg(feature = "db-tests")]
     #[test]
     fn a_swap_named_in_order_keeps_both_columns() {
         use super::{plan_migration, unnamed_renames, Thing};
@@ -2334,7 +2363,6 @@ mod tests {
         ]);
     }
 
-    #[cfg(feature = "db-tests")]
     #[test]
     fn a_column_or_table_going_while_another_arrives_is_reported_until_named() {
         use super::{unnamed_renames, Thing};
@@ -2348,7 +2376,6 @@ mod tests {
         assert!(unnamed_renames(&[c("g", "a")], &[c("g", "a"), c("g", "b")], &[]).unwrap().is_empty());
     }
 
-    #[cfg(feature = "db-tests")]
     #[test]
     fn a_renamed_table_takes_its_indexes_along() {
         use super::{plan_migration, Thing};
@@ -2376,7 +2403,23 @@ mod tests {
         ]);
     }
 
-    #[cfg(feature = "db-tests")]
+    #[test]
+    fn a_renamed_table_or_column_takes_its_serial_sequence_along() {
+        use super::{plan_migration, Thing};
+        let t = |table: &str, kind: &str, name: &str, body: &str| Thing { kind: kind.into(), table: table.into(), name: name.into(), body: body.into() };
+        let old = [t("execution_tag", "column", "seq", "bigint null=NO default=nextval('execution_tag_seq_seq'::regclass)")];
+        let new = [t("run_tag", "column", "seq", "bigint null=NO default=nextval('run_tag_seq_seq'::regclass)")];
+        let plan: Vec<String> =
+            plan_migration(&old, &new, &["execution_tag=run_tag".parse().unwrap()]).unwrap().into_iter().map(|p| p.stmt).collect();
+        assert_eq!(plan, ["ALTER TABLE execution_tag RENAME TO run_tag;", "ALTER SEQUENCE execution_tag_seq_seq RENAME TO run_tag_seq_seq;"]);
+
+        let old = [t("tag", "column", "n", "bigint null=NO default=nextval('tag_n_seq'::regclass)")];
+        let new = [t("tag", "column", "seq", "bigint null=NO default=nextval('tag_seq_seq'::regclass)")];
+        let plan: Vec<String> =
+            plan_migration(&old, &new, &["tag.n=seq".parse().unwrap()]).unwrap().into_iter().map(|p| p.stmt).collect();
+        assert_eq!(plan, ["ALTER TABLE tag RENAME COLUMN n TO seq;", "ALTER SEQUENCE tag_n_seq RENAME TO tag_seq_seq;"]);
+    }
+
     #[test]
     fn a_rename_of_something_that_is_not_there_is_refused() {
         use super::{plan_migration, Thing};
@@ -2388,7 +2431,6 @@ mod tests {
         assert!(err.contains("has no column 'typo'"), "{err}");
     }
 
-    #[cfg(feature = "db-tests")]
     #[test]
     fn a_whole_identifier_is_replaced_never_part_of_one() {
         assert_eq!(super::replace_ident("old_member_id, member_id)", "member_id", "instance_id"), "old_member_id, instance_id)");
@@ -2503,12 +2545,11 @@ mod tests {
     /// its `origin.sql` or a released migration did (which is what lets a
     /// table the canonical DDL later drops still find its group), and a
     /// table no history created is nobody's.
-    #[cfg(feature = "db-tests")]
     #[test]
     fn a_table_is_owned_by_the_group_whose_history_created_it() {
         assert!(super::history_created("access_grant", "access_grant"));
-        assert!(super::history_created("access_grant", "member_value"));
-        assert!(!super::history_created("project", "member_value"));
-        assert!(!super::history_created("access_grant", "member"));
+        assert!(super::history_created("access_grant", "instance_value"));
+        assert!(!super::history_created("project", "instance_value"));
+        assert!(!super::history_created("access_grant", "instance"));
     }
 }

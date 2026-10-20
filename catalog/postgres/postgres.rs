@@ -20,11 +20,11 @@ use serde_json::{json, Map, Value};
 
 /// Fail the node now for a mistake in the program itself: the SQL it
 /// wrote, a setting, a value of the wrong shape. Such a failure is an
-/// input error, so it fails the run even when the node's `error`
+/// input error, so it fails the run even when the node's `_error`
 /// output is wired: the fix is editing the program, and nothing a
 /// program does at run time can route around it. A refusal that
 /// depends on the database's data or state stays `node_bail!`, which
-/// `error` catches.
+/// `_error` catches.
 macro_rules! mistake {
     ($($arg:tt)*) => {
         return Err(weft::WeftError::Input(format!($($arg)*)))
@@ -36,7 +36,7 @@ pub(crate) use mistake;
 /// server cannot even plan (SQLSTATE class 42: a syntax error, a
 /// table, column or function that does not exist, a parameter whose
 /// type it cannot infer) is a mistake in the program's SQL, so it is
-/// an input error that fails the run even with `error` wired. Anything
+/// an input error that fails the run even with `_error` wired. Anything
 /// else (a broken constraint, a `fail(..)` the SQL raised, a missing
 /// privilege, a dropped connection) is the database's answer to this
 /// run, which a program can handle.
@@ -55,7 +55,7 @@ use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Config, Row};
 
 use weft::access::OpenedConnection;
-use weft::{ExecutionContext, NodeErrExt, WeftError, WeftResult};
+use weft::{RunContext, NodeErrExt, WeftError, WeftResult};
 
 /// Where and how to dial, read off the connection. Pure, so the
 /// vocabulary and every refusal are testable without a database.
@@ -138,7 +138,7 @@ async fn dial_with(config: &Config) -> WeftResult<(tokio_postgres::Client, Conne
         } else {
             ""
         };
-        WeftError::NodeExecution(format!("postgres: connect: {}{hint}", pg_detail(&e)))
+        WeftError::NodeFailed(format!("postgres: connect: {}{hint}", pg_detail(&e)))
     })
 }
 
@@ -233,7 +233,7 @@ async fn clear_session(client: &tokio_postgres::Client) -> Result<(), tokio_post
 /// worker holds for it: an idle one, or a new one dialed when none is
 /// idle. The connection task of a new one lives as long as the client
 /// does.
-pub async fn connect(ctx: &ExecutionContext, access: &weft::access::Access) -> WeftResult<Pooled> {
+pub async fn connect(ctx: &RunContext, access: &weft::access::Access) -> WeftResult<Pooled> {
     let pool = ctx.shared(access, |opened| async move { Pool::new(&opened) }).with_limit(MOST_AT_ONCE).await?;
     loop {
         let idle = pool.idle.lock().expect("pool poisoned").pop();
@@ -262,7 +262,7 @@ pub async fn connect(ctx: &ExecutionContext, access: &weft::access::Access) -> W
 /// one for as long as it watches (it would hold a pooled one away from
 /// every other run). Its task ends when the client drops or the run is
 /// cancelled.
-pub async fn connect_alone(ctx: &ExecutionContext, conn: &OpenedConnection) -> WeftResult<tokio_postgres::Client> {
+pub async fn connect_alone(ctx: &RunContext, conn: &OpenedConnection) -> WeftResult<tokio_postgres::Client> {
     let (client, connection) = dial(conn).await?;
     let cancel = ctx.cancellation();
     tokio::spawn(async move {
@@ -296,7 +296,7 @@ pub enum ListenEvent {
 /// the client drops or the run is cancelled, and the stream ends with
 /// it.
 pub async fn connect_listening(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     conn: &OpenedConnection,
     channel: &str,
 ) -> WeftResult<(tokio_postgres::Client, tokio::sync::mpsc::UnboundedReceiver<ListenEvent>)> {
@@ -334,7 +334,7 @@ pub async fn connect_listening(
     client
         .batch_execute(&format!("LISTEN {}", quote_ident(channel)?))
         .await
-        .map_err(|e| WeftError::NodeExecution(format!("postgres: LISTEN {channel}: {}", pg_detail(&e))))?;
+        .map_err(|e| WeftError::NodeFailed(format!("postgres: LISTEN {channel}: {}", pg_detail(&e))))?;
     Ok((client, rx))
 }
 
@@ -659,79 +659,6 @@ pub fn rows_to_json(rows: &[Row]) -> WeftResult<Vec<Value>> {
         .collect()
 }
 
-/// Refuse a result whose columns collide with the ports the node
-/// answers itself, naming which and what to do.
-///
-/// These nodes hand a row's columns out as ports of the same name, and
-/// they also answer a few ports of their own (`rows`, and for a query
-/// `count`). Those live in ONE namespace, so a column called `count`
-/// asks for a port that is already spoken for, and the node's own
-/// value is what a reader gets. It reached production once: `select
-/// count(*) as count` over nine cards served `1`, the number of rows,
-/// with nothing anywhere saying so, and the types agreed on both sides.
-///
-/// So it refuses instead. The column is never lost (every column is in
-/// `rows` whatever happens here), and aliasing it in the SQL is the
-/// whole fix.
-pub fn refuse_shadowed_columns(first_row: &Value, own_ports: &[&str]) -> WeftResult<()> {
-    let Some(row) = first_row.as_object() else { return Ok(()) };
-    for port in own_ports {
-        if !row.contains_key(*port) {
-            continue;
-        }
-        mistake!(
-            "this query answers a column called '{port}', which is also one of this node's own \
-             output ports, so the column has nowhere to go: reading '{port}' gives you what the \
-             node puts there, not your column. Alias it in the SQL (`... as {port}_value`), or \
-             read it out of `rows`"
-        );
-    }
-    Ok(())
-}
-
-/// The mirror of [`refuse_shadowed_columns`]: a port the author
-/// declared that the query answers no column for.
-///
-/// These nodes fill a declared port from the first row's column of the
-/// same name, and a name that is not there is simply not filled, so the
-/// port closes and everything behind it skips. Nothing says why, and
-/// the mistake is a one-character typo or a column left out of the
-/// SELECT. It cost a real debugging cycle: `-> (card: JsonDict)` over
-/// `select id, name, note ...` closed `card`, both branches skipped,
-/// the caller got a 500, and the journal showed `rows` fully populated
-/// right beside `card closed`.
-///
-/// The node holds both halves at this instant, so it says so. Only
-/// when a row actually came back: a query that answered nothing closes
-/// every declared port, and that is the correct reading of no rows.
-pub fn refuse_unanswered_ports(
-    first_row: &Value,
-    declared: &std::collections::HashMap<String, weft::weft_type::WeftType>,
-    own_ports: &[&str],
-) -> WeftResult<()> {
-    let Some(row) = first_row.as_object() else { return Ok(()) };
-    let mut missing: Vec<&str> = declared
-        .keys()
-        .map(String::as_str)
-        .filter(|name| !own_ports.contains(name) && !row.contains_key(*name))
-        .collect();
-    if missing.is_empty() {
-        return Ok(());
-    }
-    missing.sort_unstable();
-    let answered: Vec<&str> = row.keys().map(String::as_str).collect();
-    mistake!(
-        "this node declares the output port{} {}, and the query answers no column of that \
-         name: the columns it answered are {}. A port filled from a column nobody selected \
-         closes, and everything behind it skips. Select the column (or alias one to that \
-         name, `... as {}`), or drop the port",
-        if missing.len() == 1 { "" } else { "s" },
-        missing.iter().map(|m| format!("'{m}'")).collect::<Vec<_>>().join(", "),
-        answered.iter().map(|a| format!("'{a}'")).collect::<Vec<_>>().join(", "),
-        missing[0]
-    );
-}
-
 /// A driver refusal said back in the author's own words.
 ///
 /// Postgres counts parameters and the author names them, so every
@@ -940,6 +867,12 @@ fn distinct_names(statements: &[Statement]) -> Vec<String> {
 /// names no port at all nothing is renumbered, so a `$1` there reaches
 /// the server as written: it is the author's own (a `PREPARE`) and it
 /// stays.
+///
+/// The compiler finds the same names before any run, with the regular
+/// expression in the nodes' `placeholdersAreInputs` (JSON holds no
+/// comment, so this is the only marker); a node test of
+/// PostgresExecuteQuery holds the two to each other.
+// SYNC: placeholders <-> catalog/postgres/execute_query/metadata.json placeholdersAreInputs.pattern, catalog/postgres/watch_query/metadata.json placeholdersAreInputs.pattern
 pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
     let chars: Vec<char> = sql.chars().collect();
     // The whole text with placeholders numbered per statement, which
@@ -1012,10 +945,13 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
             // escapes with a backslash) and quoted identifier.
             '\'' | '"' => {
                 let quote = c;
+                // The `e` has to start a token of its own: after a word
+                // character or a `$` (part of an identifier like `a$e`,
+                // or of a placeholder `$E`) it ends that token instead.
                 let escapes_with_backslash = quote == '\''
                     && i > 0
                     && matches!(chars[i - 1], 'e' | 'E')
-                    && (i < 2 || !ident_char(chars[i - 2]));
+                    && (i < 2 || !(ident_char(chars[i - 2]) || chars[i - 2] == '$'));
                 statement_has_text = true;
                 out.push(quote);
                 i += 1;
@@ -1149,7 +1085,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
             mistake!(
                 "the SQL uses `${tag}`, which is not a name this node can bind: parameters are \
                  the node's own input ports, read by name. Declare the port on the node, \
-                 `(user_id: String)`, and write `$user_id` where its value goes"
+                 `(userId: String)`, and write `$userId` where its value goes"
             );
         }
         if !bound.is_empty() {

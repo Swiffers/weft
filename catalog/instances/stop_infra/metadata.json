@@ -1,7 +1,7 @@
 {
   "type": "StopInfra",
   "label": "Stop infra",
-  "description": "Scale a copy of an infra node down, keeping its disk: the program's own copy, or with `instance` that instance's copy of a `@per_instance` node. The triggers reading the copy go down per `triggers`; the runs using it follow `running`.",
+  "description": "Scale a copy of an infra node down, keeping its disk: the program's own copy, or with `instance` that instance's copy of a `@per_instance` node. The triggers whose cut contains the copy go down first as `door` and `held` say, and come back once it runs again; `running` decides about the runs using it.",
   "tags": [
     "instances",
     "infra",
@@ -19,23 +19,47 @@
     {
       "name": "instance",
       "type": "String",
-      "requiredWhenWired": true,
-      "description": "Whose copy: an instance id your program gives it (`user-42`), for that instance's copy of a `@per_instance` node. Unwired: the program's own copy. Wired, and no id arrives (the step feeding it did not run): this node skips."
+      "description": "Whose copy: an instance id your program gives it (`user-42`), for that instance's copy of a `@per_instance` node. Unwired: the program's own copy. Wired, and no id arrives (the node feeding it did not run): this node skips."
     },
     {
-      "name": "triggers",
+      "name": "door",
       "type": "String",
       "widget": {
         "kind": "select",
         "options": [
-          "park",
-          "hibernate",
-          "wipe"
+          "take",
+          "hide",
+          "refuse"
         ]
       },
-      "default": "park",
-      "label": "Triggers",
-      "description": "The triggers reading the copy: park keeps everything that arrives (answers, events, the trigger's own fires) and runs it once the trigger is back, while a caller on a route is told to try again in a moment; hibernate does the same for `graceMinutes` with its questions hidden, then takes nothing more; wipe drops it all. Starting the copy again brings back the ones it took down."
+      "default": "take",
+      "label": "Door",
+      "description": "What happens to work arriving at the triggers whose cut contains the copy while they are down: take holds it for when they are back (a question stays listed for the people who answer it), hide holds it out of their sight, refuse takes nothing."
+    },
+    {
+      "name": "doorForMinutes",
+      "type": "Number",
+      "label": "Door for minutes",
+      "description": "With take or hide: the door refuses once this many minutes have passed. Unset: it holds until the triggers are back.",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      }
+    },
+    {
+      "name": "held",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "keep",
+          "drop"
+        ]
+      },
+      "default": "keep",
+      "label": "Held work",
+      "description": "The work already held on them (events held while they were down, runs they fired that are paused on a wait): keep it for when they are back, or drop it, cancelling the paused runs."
     },
     {
       "name": "running",
@@ -49,19 +73,7 @@
       },
       "default": "wait",
       "label": "Running work",
-      "description": "The runs still going that use the copy: wait lets them finish, cancel stops them. `wipe` needs cancel."
-    },
-    {
-      "name": "graceMinutes",
-      "type": "Number",
-      "default": 15,
-      "label": "Grace minutes",
-      "description": "Hibernate only: how long it keeps accepting.",
-      "widget": {
-        "kind": "number",
-        "min": 0,
-        "step": 1
-      }
+      "description": "The runs going right now that use the copy: wait keeps the copy up until they end, however long that takes, cancel stops them."
     },
     {
       "name": "includeSelf",
@@ -100,7 +112,7 @@
               "names": {
                 "node": {
                   "role": "infra",
-                  "per_instance": true
+                  "perInstance": true
                 }
               }
             }
@@ -133,7 +145,7 @@
               "names": {
                 "node": {
                   "role": "infra",
-                  "per_instance": false
+                  "perInstance": false
                 }
               }
             }
@@ -153,31 +165,20 @@
         "of": [
           {
             "kind": "config_equals",
-            "field": "triggers",
-            "equals": "wipe"
+            "field": "door",
+            "equals": "refuse"
           },
           {
-            "kind": "not",
-            "of": {
-              "kind": "config_equals",
-              "field": "running",
-              "equals": "cancel"
-            }
-          },
-          {
-            "kind": "not",
-            "of": {
-              "kind": "input_wired",
-              "port": "running"
-            }
+            "kind": "input_satisfied",
+            "port": "doorForMinutes"
           }
         ]
       },
       "then": {
-        "message": "StopInfra '{id}' wipes the triggers but lets running work finish. Wiping drops what the runs still need, so set `running` to cancel, or pick park or hibernate for `triggers`.",
+        "message": "StopInfra '{id}' refuses what arrives and sets `doorForMinutes`, which only counts down a door that takes or hides work. Pick take or hide for `door`, or leave `doorForMinutes` unset.",
         "level": "structural",
         "severity": "error",
-        "field": "running"
+        "field": "doorForMinutes"
       }
     }
   ]

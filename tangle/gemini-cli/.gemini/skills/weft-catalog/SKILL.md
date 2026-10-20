@@ -20,9 +20,13 @@ Three reads, in this order, all local and instant (they read `nodes/` on disk, n
 
    Every search starts here, including the ones where you think you already know the answer. You grep the capability's own words first, then the words a node would use (a picture is `Image`, a webhook is a trigger, a database is `postgres`); the tags sit on the same line, so they match too. When a few tries matched nothing, you read the listing whole: one sentence per node, a few kilobytes, and that is what it is for. Hidden types never appear, in any form of this command.
 
+   After the node rows, the listing ends with the files a program can include, under the heading `Files a program can @include("<path>"):`. Each line is one `.weft` file under `nodes/`: the path you put in `@include`, already starting with `__catalog/`, and beside it the file's first line when that line is a `#` comment, so the same grep finds them. If one already does the job, read its `Group(...) -> (...)` line for the ports it takes and gives, then pull it in as `<name> = @include("<that path>")` instead of rebuilding it by hand. For example, the computer package ships two: `__catalog/base_catalog/computer/agent.weft` is a whole agent that works a computer until its task is done, and `perform.weft` beside it runs one tool call the model asked for. If you write one to go with nodes of your own, put it in the package folder under `nodes/` that holds those nodes (never under `base_catalog/`), and make its first line a `#` comment saying what it does, because that line is all the listing shows. Until `src/main.weft` includes such a file, the validate run never checks it, so include it before you count on the validate run for it. A group that is just part of your program stays under `src/`, even when several modules use it.
+
+   If you want a shipped file but your case differs from it, you can adapt it. When it fits, include it as it is: it was written to be general. When something about your case is specific, copy it into the project's own `src/` and change the copy. Leave the original under `nodes/base_catalog/` alone, because `weft catalog update` replaces that folder and every edit in it. The copy works where it lands: the files it includes and reads are spelled with `__catalog/`, which means the project's `nodes/` folder from any file in the project. Your program then includes the copy by its own path, like any group under `src/`.
+
 2. **[the wiring view]**, `weft describe-nodes --node <Type> --compact`. One node's resolved ports, their types, what each accepts (a literal in the source, a wire from another node, or both), the widget kind, and the features that change how it wires. A few kilobytes per node, and it is the view that decides whether your wire compiles, so you read it for every node you are about to use, the familiar ones included. Three candidates is three calls, one per type. You never send a subagent to compare nodes: these calls are the comparison.
 
-3. **[the metadata file]**, `nodes/**/metadata.json`, when the question reaches past wiring: a service recipe, an infra node's images, the exact wording of a validation rule. `--compact` strips `service`, `images`, `label`, `tags`, `icon` and `display`, so those live only in the file. Node folders are snake_case and the `"type"` inside is PascalCase (`exec_python` holds `"type": "ExecPython"`): you glob and read the one whose `"type"` matches.
+3. **[the metadata file]**, `nodes/**/metadata.json`, when the question reaches past wiring: a service recipe, an infra node's images, the exact wording of a validation rule. `--compact` strips `service`, `images`, `label`, `tags`, `icon`, `color`, `display`, `claimsRoute` and `accessApps`, so those live only in the file. Node folders are snake_case and the `"type"` inside is PascalCase (`exec_python` holds `"type": "ExecPython"`): you glob and read the one whose `"type"` matches.
 
 Two reads you never run. `weft describe-nodes --compact` without `--node` prints every type's wiring as one JSON line, a quarter of a megabyte on the standard catalog, which grep cannot narrow; `weft describe-nodes` with no flags is the same thing with the authoring detail back in, the editor palette's read. And grepping the `nodes/` files to find a node matches only the words you guessed, so a node that does the job under another name stays invisible; those files are for authoring a node and for reading a service recipe once you have picked it. If you catch yourself grepping `nodes/` to find a node, or handing the search to a subagent, stop and write: "Wait. Ask the catalog." Then run [the listing].
 
@@ -41,9 +45,9 @@ A broken node or package never breaks the catalog: it is left out, and only a pr
 
 ## Reading a metadata file
 
-Top-level keys: `type`, `label`, `description`, `tags`, `icon`, `color`, `inputs`, `outputs`, `types`, `requires_infra`, `images`, `publishes`, `service`, `portsFromConfig`, `features`, `display`, `validate`.
+Top-level keys: `type`, `label`, `description`, `tags`, `icon`, `color`, `inputs`, `outputs`, `types`, `requiresInfra`, `images`, `publishes`, `service`, `portsFromConfig`, `features`, `display`, `validate`, `firesWith`, `claimsRoute`, `accessApps`. Every key weft defines is camelCase; a snake_case one (`requires_infra`) fails the node's load, and the error names the camelCase spelling. A value from one of weft's own fixed lists stays snake_case (a widget's `kind`, such as `text_list`). A select's `options` belong to the node and keep its spelling (`Africa/Abidjan`).
 
-An input entry: `name`, `type`, `required`, `requiredWhenWired` (optional unwired, required once wired), `accepts`, `widget`, `default`, `label`, `placeholder`, `description`, and for `Access`-typed inputs `requiresScopes` and `requiresValues`. An output entry: `name`, `type`, `description`, and on an [infra node] `baked` (what that means is under the infra node shape below).
+An input entry: `name`, `type`, `required`, `accepts`, `widget`, `default`, `label`, `placeholder`, `description`, and for `Access`-typed inputs `requiresScopes` and `requiresValues`. An input without `required` is optional: unwired, the node runs without it; wired, the node waits for it and skips if the wire closes. A program can change this where it uses the node (`x: T` requires the input, `x?: T` runs without it even when wired), but it can never make a `required` input optional; the `weft-language` skill has the table. An output entry: `name`, `type`, `description`, `narrowable` (the program may declare a narrower type on it, `-> (response: Verdict)`), and on an [infra node] `baked` (what that means is under the infra node shape below).
 
 `accepts` lists the drivers the port takes: `literal` (a value written in the source, in the braces or on its own line, `@file`/`@asset` included) and `wire` (a value another node produces). Absent means both; `["wire"]` means only a real node fills it (an LLM's `provider`, `params`, `historyFile`, `tools`; a consumer's `Access` handle). The list named in `portsFromConfig` is compiler-read: an inline typed value only, never a wire, never a marker. The access picker holds nothing in the source at all: its connection is picked on the install (`weft connect`). Exactly one driver per port.
 
@@ -54,11 +58,11 @@ An input entry: `name`, `type`, `required`, `requiredWhenWired` (optional unwire
 `remote_select`. Several carry their own settings inside that object, a
 select's `options` (the accepted literals) among them.
 
-`features`: `isTrigger` (starts executions from outside), `canAddInputPorts` / `canAddOutputPorts` (the source may add ports of its own, in that direction; a node carries either, both or neither, and this is where you read which), `optionalCustomInputs`, `customInputType`, `oneOfRequired` (skip the node when every port in a group arrives closed), `castPorts`, `liveEndpoint`, `showDebugPreview`.
+`features`: `isTrigger` (starts runs from outside), `canAddInputPorts` / `canAddOutputPorts` (the source may add ports of its own, in that direction; a node carries either, both or neither, and this is where you read which), `join` (a merge of branches in the manner of `FirstInOrder`: it runs with whichever of its added inputs arrived, all of them optional, with no `_should_flow` needed), `customInputType`, `oneOfRequired` (skip the node when every port in a group arrives closed), `castPorts`, `liveEndpoint`, `showDebugPreview`, `addedPortsAreDataKeys` (the ports you add are named after outside data, such as a query's parameters or the captures of a route's path, and keep that data's spelling: the compiler's `not-camel-case` warning skips them).
 
 `portsFromConfig`: ports generated at compile time from a config list. The metadata names the field and what an entry may be, so a node carrying the key tells you which of its ports you get by filling that list (a node that branches on cases derives one port per case this way).
 
-`service`: the connection recipe (acquisition, auth, test URL, identity, event delivery). A node that declares a `service` block is an [access node], and the compiler synthesizes its runtime "no connection picked" rule from that block: no author writes it by hand. `"connection_optional": true` inside the block is the one opt-out, for a node that genuinely runs with nothing picked, whatever the reason (`CustomProvider`, whose endpoint may need no credential at all, is one). The user picks the connection on the node in the editor or with `weft connect` in the terminal (the `weft-connections` skill); what flows on wires is a sealed `Access` handle, never a key.
+`service`: the connection recipe (acquisition, auth, test URL, identity, event delivery). A node that declares a `service` block is an [access node], and the compiler synthesizes its runtime "no connection picked" rule from that block: no author writes it by hand. `"connectionOptional": true` inside the block is the one opt-out, for a node that genuinely runs with nothing picked, whatever the reason (`CustomProvider`, whose endpoint may need no credential at all, is one). The user picks the connection on the node in the editor or with `weft connect` in the terminal (the `weft-connections` skill); what flows on wires is a sealed `Access` handle, never a key.
 
 ## What is on disk
 
@@ -73,13 +77,13 @@ from memory.
 
 ## Wiring patterns that recur
 
-**An [access node]**: you declare it (`telegram = TelegramAccess`) and wire its `.access` output into every consumer's `account` input. Consumers check at run time that the connection is picked and has the required scopes or values.
+**An [access node]**: you declare it (`telegram = TelegramAccess`) and wire its `.access` output into each consumer's `account` input (`access` on a model node and `LlmModerate`, and `auth` on a `Route` or `Socket` for an auth node such as `JwtAuth`). Consumers check at run time that the connection is picked and has the required scopes or values.
 
-**A provider node**: `provider: OpenRouterProvider { model: "z-ai/glm-5.3" }.provider` inline, or declared long and shared across several LLM nodes.
+**A provider node**: two nodes, an [access node] for the service and a model node that takes its `access`: `router = OpenRouterAccess`, then `provider: OpenRouterModel { access: router.access, model: "z-ai/glm-5.3" }.provider` inline, or the model declared long and shared across several LLM nodes. The connection is picked once, on the access node, however many models use it.
 
 **Shared sampling**: `params: LlmParams { systemPrompt: @file("assets/prompts/x.md"), temperature: 0.75 }.params` into any LLM node's `params`.
 
-**An [infra node]** (`requires_infra: true`): a node the runtime keeps a
+**An [infra node]** (`requiresInfra: true`): a node the runtime keeps a
 container running for, with a disk that survives restarts. It emits whatever
 its consumers need to reach it (a connection, an address), and you wire that
 out exactly like an [access node]'s. `weft infra start` / `stop` run them,
@@ -97,14 +101,18 @@ names that field and the kinds an entry may be; the compact view shows the
 ports a given list produced. A form is the case you meet most, each field of
 it an entry that becomes a port.
 
-**Ports you declare on the arrow** (`canAddOutputPorts` in its metadata): a
-node that answers with an opaque blob lets you name the pieces you want, and
-each arrives typed on a port of its own. Reach for this whenever the next
-node needs ONE field rather than the whole answer, because an opaque value
-has no keys to read: without a declared port you would be writing out a
-record type by hand just to pull one thing out of it. The node's metadata
-says what the names mean to it (a column of the answer, a key of a parsed
-reply), and the type you declare is what judges the value at run time.
+**Ports you declare on the arrow** (`canAddOutputPorts` in its metadata):
+three nodes take outputs you name yourself, `ExecPython` (a key its script
+returns), `ElevenLabsRunTemplate` (an output's id in the template) and
+`Route` (a capture of its path); each one's metadata says what the names
+mean. The type you declare is what judges the value at run time.
+
+**When the next node needs ONE field** of an opaque `JsonDict` answer, write
+the answer's shape as a record on that output (its metadata marks it
+`narrowable`) and read the field with dots: a query's `-> (row: Card)` read
+as `look.row.title`, an `LlmInferenceJson`'s `-> (response: Verdict)` read
+as `mark.response.label`. Until you name the shape, the value has no keys to
+read.
 
 ## When the catalog is missing something
 

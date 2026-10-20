@@ -27,7 +27,7 @@
 //!
 //! Nothing here is memoized with `ctx.run`, and it does not need to
 //! be: the body never waits, so it is never replayed, and every call
-//! it makes is safe to repeat when somebody runs the step again. Reading the password is a
+//! it makes is safe to repeat when somebody runs the node again. Reading the password is a
 //! read; publishing REPLACES one row keyed by this node; retiring is
 //! the same request with the same password, which the credential
 //! server answers the same way however many times it arrives.
@@ -41,7 +41,7 @@ use weft::infra::{
 };
 use weft::node::NodeOutput;
 use weft::{
-    EndpointMethod, ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag,
+    EndpointMethod, RunContext, InfraProvisionContext, Node, NodeManifest, ValueBag,
     WeftResult,
 };
 
@@ -254,10 +254,11 @@ impl Node for PostgresDatabaseNode {
                 },
             ],
             keep_on_terminate: Vec::new(),
+            health_rules: None,
         })
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let database: String = ctx.inputs.get("database")?;
         // Three asks that need nothing from each other, so they go out
         // together.
@@ -349,7 +350,7 @@ async fn confirm_stored(
         )
         .await?;
     let answer: Answer = serde_json::from_value(answer.clone()).map_err(|e| {
-        weft::WeftError::NodeExecution(format!(
+        weft::WeftError::NodeFailed(format!(
             "the database answered '{answer}' when asked to retire its password, which is \
              neither a yes nor a no: {e}"
         ))
@@ -366,7 +367,7 @@ async fn confirm_stored(
 /// means another run published the connection in the meantime, so
 /// this run reads that connection instead of asking again.
 async fn password_from_database(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     credential: &weft::EndpointHandle,
 ) -> WeftResult<String> {
     let answer = credential.call(EndpointMethod::Get, CREDENTIAL_PATH, None).await?;

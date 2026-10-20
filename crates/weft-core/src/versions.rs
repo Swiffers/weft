@@ -4,18 +4,18 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::exec::CancelCause;
 use crate::project::hash::Manifest;
 use crate::run_spec::RunSpec;
-use crate::ExecutionId;
+use crate::RunId;
 
 /// The project's head: where the next version parents and the next
 /// seed comes from, plus the versions the triggers are activated on.
 // SYNC: Head <-> extension-vscode/src/sidebar/version-tree.ts TreeJson.head
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Head {
     pub head_version: Option<String>,
-    pub head_run: Option<ExecutionId>,
+    pub head_run: Option<RunId>,
     /// Every version some activation's listeners run (one per trigger
     /// and owner at most, deduplicated, sorted). Empty while nothing
     /// listens.
@@ -52,6 +52,7 @@ pub fn manifest_diff(parent: &Manifest, child: &Manifest) -> ManifestDiff {
 
 // SYNC: VersionSummary <-> extension-vscode/src/sidebar/version-tree.ts VersionSummary
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VersionSummary {
     pub id: String,
     pub parent_id: Option<String>,
@@ -65,36 +66,31 @@ pub struct VersionSummary {
     #[serde(default)]
     pub trigger_runs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_trigger_run: Option<ExecutionId>,
+    pub last_trigger_run: Option<RunId>,
 }
 
-// SYNC: RunSummary <-> extension-vscode/src/sidebar/version-tree.ts RunSummary
+// SYNC: VersionRun <-> extension-vscode/src/sidebar/version-tree.ts VersionRun
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunSummary {
-    pub execution_id: ExecutionId,
+#[serde(rename_all = "camelCase")]
+pub struct VersionRun {
+    pub run_id: RunId,
     pub version_id: String,
     /// The program this run executed. `weft freeze` records it on the
     /// example so a later reader can tell which definition the frozen
     /// wires came from.
     pub definition_hash: String,
-    pub seed_execution_id: Option<ExecutionId>,
+    pub seed_run_id: Option<RunId>,
     pub stale: Vec<String>,
     pub spec: Option<RunSpec>,
     pub example: Option<String>,
-    /// The execution's status as the executions list reports it, or
-    /// `None` when its journal is gone.
-    // SYNC: RunSummary.status <-> extension-vscode/src/sidebar/version-tree.ts RunSummary.status
-    pub status: Option<crate::program::RunStatus>,
+    /// When it started, as the version tree recorded it: there whether
+    /// or not its record still is.
     pub started_at: u64,
-    pub completed_at: Option<u64>,
-    /// For a cancelled run, who or what stopped it.
-    #[serde(default)]
-    pub cancel_cause: Option<CancelCause>,
-    /// Node firings the run skipped because something upstream closed:
-    /// the number a person wants when a run says it completed and the
-    /// thing they were waiting for never happened.
-    #[serde(default)]
-    pub skipped_nodes: u64,
+    /// The run as the runs listing shows it (where it stands, when it
+    /// ended, who stopped it, what it skipped), or `None` when its record
+    /// is gone.
+    // SYNC: VersionRun.listing <-> extension-vscode/src/sidebar/version-tree.ts VersionRun.listing
+    pub listing: Option<crate::program::RunSummary>,
 }
 
 /// `GET /projects/{id}/versions/tree`.
@@ -103,7 +99,7 @@ pub struct RunSummary {
 pub struct VersionTree {
     pub head: Head,
     pub versions: Vec<VersionSummary>,
-    pub runs: Vec<RunSummary>,
+    pub runs: Vec<VersionRun>,
 }
 
 /// `GET /projects/{id}/versions/running`: the files of the program this
@@ -116,10 +112,11 @@ pub struct RunningSource {
 
 /// What a started run answers (`POST /projects/{id}/versions/run`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunStarted {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub version: String,
-    pub seed: Option<ExecutionId>,
+    pub seed: Option<RunId>,
     /// Nodes taken from the seed, sorted.
     pub inherited: Vec<String>,
     /// Nodes this run executes, sorted.
@@ -150,20 +147,23 @@ pub struct VersionUpsert {
 
 /// `POST /projects/{id}/versions/runs`: the run that records itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VersionRunRequest {
     pub manifest: Manifest,
     /// The definition the CLI just registered; the run refuses if the
     /// project's running definition moved since.
-    #[serde(rename = "definitionHash")]
     pub definition_hash: String,
-    #[serde(rename = "binaryHash")]
     pub binary_hash: String,
+    /// Seed from head's run (`weft run --seed`).
     #[serde(default)]
     pub seed: bool,
-    #[serde(default, rename = "seedUntil")]
+    /// Seed from this run instead (`weft run --seed=<run id>`): any
+    /// settled run of the project, whatever started it, of any version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_run: Option<RunId>,
+    #[serde(default)]
     pub seed_until: Vec<String>,
-    #[serde(default, rename = "seedBefore")]
+    #[serde(default)]
     pub seed_before: Vec<String>,
     #[serde(default)]
     pub root: bool,
@@ -183,7 +183,7 @@ pub struct HeadRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run: Option<ExecutionId>,
+    pub run: Option<RunId>,
 }
 
 /// Where head went, with that version's files so `weft branch` can
@@ -191,11 +191,11 @@ pub struct HeadRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeadResponse {
     pub version: String,
-    pub run: Option<ExecutionId>,
+    pub run: Option<RunId>,
     pub manifest: Manifest,
 }
 
-/// `PUT /projects/{id}/versions/runs/{execution_id}`: change what a
+/// `PUT /projects/{id}/versions/runs/{run_id}`: change what a
 /// recorded run remembers. A field left out is kept.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -223,7 +223,7 @@ where
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrunePlan {
     pub versions: Vec<String>,
-    pub runs: Vec<ExecutionId>,
+    pub runs: Vec<RunId>,
     /// `sha256` of every blob only the pruned versions held.
     pub blobs: Vec<String>,
 }
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn a_head_move_names_only_where_it_goes() {
-        let run = ExecutionId::nil();
+        let run = RunId::nil();
         let body = serde_json::to_value(HeadRequest { run: Some(run), version: None }).unwrap();
         assert_eq!(body, serde_json::json!({ "run": run }));
         let back: HeadRequest = serde_json::from_value(serde_json::json!({ "version": "v1" })).unwrap();
@@ -282,12 +282,33 @@ mod tests {
     }
 
     #[test]
+    fn a_started_run_and_the_head_name_their_fields_in_camel_case() {
+        let started = RunStarted {
+            run_id: RunId::nil(),
+            version: "v1".into(),
+            seed: None,
+            inherited: vec![],
+            ran: vec!["n".into()],
+            warnings: vec![],
+        };
+        let wire = serde_json::to_value(&started).unwrap();
+        assert_eq!(wire["runId"], "00000000-0000-0000-0000-000000000000");
+        assert!(wire.get("run_id").is_none(), "{wire}");
+        let head = Head { head_version: Some("v1".into()), head_run: Some(RunId::nil()), activated_versions: vec!["v1".into()] };
+        assert_eq!(
+            serde_json::to_value(&head).unwrap(),
+            serde_json::json!({ "headVersion": "v1", "headRun": "00000000-0000-0000-0000-000000000000", "activatedVersions": ["v1"] })
+        );
+    }
+
+    #[test]
     fn a_run_request_round_trips_its_camel_case_keys() {
         let body = VersionRunRequest {
             manifest: Manifest::new(),
             definition_hash: "d".into(),
             binary_hash: "b".into(),
             seed: true,
+            seed_run: Some(RunId::nil()),
             seed_until: vec!["n".into()],
             seed_before: Vec::new(),
             root: false,
@@ -295,7 +316,7 @@ mod tests {
             example: Some("e".into()),
         };
         let wire = serde_json::to_value(&body).unwrap();
-        for key in ["definitionHash", "binaryHash", "seedUntil", "seedBefore"] {
+        for key in ["definitionHash", "binaryHash", "seedRun", "seedUntil", "seedBefore"] {
             assert!(wire.get(key).is_some(), "{key} in {wire}");
         }
         let back: VersionRunRequest = serde_json::from_value(wire).unwrap();

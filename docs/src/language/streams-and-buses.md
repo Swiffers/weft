@@ -4,20 +4,34 @@ Most wires carry one value. Two things carry more than one, and they are for
 different jobs.
 
 A **stream** is one node handing items to one other node, in order, until it
-ends. A model writing its answer a word at a time.
+ends: the numbers `Range` counts out, or the messages a `Socket` hands on as
+its caller sends them.
 
-A **bus** is several nodes that are all running at once talking to each other.
-A transcriber, a translator and a display, each doing its part while the audio
-keeps arriving.
+A **bus** is several nodes that are all running at once talking to each other:
+a model writing its answer, a `Stream` passing the words to the caller, and
+a voice reading them aloud as they come.
 
 ## Streams
 
-Write the type on the port and you have one:
+A stream is a port typed `Generator[T]`. `Range` hands out numbers that way, and
+a loop over it takes one per iteration:
 
 ```weft
-rows = PostgresStreamQuery -> (rows: Generator[JsonDict]) { ... }
-grade = GradeEachRow { rows: rows.rows }
+numbers = Range { to: 1000 }
+double = Loop(n: Generator[Number]) -> (doubled: List[Number | Null]) {
+  over: ["n"]
+  times = ExecPython(n: Number) -> (out: Number) {
+    n: self.n
+    code: "return {'out': n * 2}"
+  }
+  self.doubled = times.out
+}
+double.n = numbers.values
 ```
+
+The `| Null` is required, because an iteration that sends nothing leaves a
+null in its place in the list. For the other kinds of loop port, go and read
+[the four kinds of port](loops.md#the-four-kinds-of-port).
 
 Items travel as ordinary pulses, each checked against the element type. The
 consumer starts when the first item arrives and pulls the rest as it goes, so
@@ -54,10 +68,24 @@ A bus is a channel any number of nodes join. One node makes it and emits a
 marker, and anything that gets the marker can join.
 
 ```weft
-mic = MicrophoneCapture -> (audio: Bus)
-transcribe = Transcribe { audio: mic.audio }
-translate = Translate { audio: mic.audio }
+ask = Route -> (body: { question: String }) { path: "ask", method: "POST" }
+answer = LlmStream {
+  prompt: ask.body.question
+  provider: model.provider
+}
+toCaller = Stream { bus: answer.stream }
+voice = ElevenLabsSpeak {
+  account: eleven.access
+  text: answer.stream
+  voice: "JBFqnCBsd6RMkjVDRZzb"
+}
 ```
+
+`LlmStream` makes the bus and sends the model's answer on it as it is
+written. `Stream` passes it to the caller, and at the same time
+`ElevenLabsSpeak` turns the same words into audio on its own `audio` bus (its
+`voice` is an ElevenLabs voice id). `model` and `eleven` are the model and
+the ElevenLabs connection, set up elsewhere in the program.
 
 The marker is an ordinary value. It crosses group boundaries, goes into loop
 bodies, sits inside records, and travels like anything else. Only the live
@@ -82,11 +110,47 @@ see everything.
 Ephemeral is for a firehose. Video frames should not stall because something
 downstream is slow, and they should not end up in permanent storage either.
 
+A node that streams lets you pick the mode with two settings:
+`journalEphemeral` (on keeps payloads out of the record, off by default) and
+`journalWindowMs` (a whole number from 100 to 60000, 1000 by default). Every
+message sent within one window lands in the same row of the record. A shorter
+window shows messages in the inspector sooner and gives a row per message on a
+slow stream. A longer one writes fewer rows for a fast stream (audio frames,
+tokens), and the inspector trails the live stream by up to that long. A row
+also closes early once it holds 2 MB. `Route` and `Socket` have both settings,
+and so do `LlmStream`, `ElevenLabsTranscribe` and `PostgresWatchQuery`. Other
+nodes have them only if their author turned them on.
+
 The window is 64 messages either way. What is always kept, in both modes, is
 who joined and who left, so nothing a reader needs can disappear into a gap.
 
 The record exists so you can read the conversation in the inspector afterwards.
 It is not what rebuilds a bus, because nothing rebuilds a bus.
+
+### How a bus ends
+
+Picture a reader at the end of a model's answer. Did the model finish, or did
+it stop halfway through a sentence? A bus says which. It ends when the node
+that made it is done, or when a node that joined it is, and it ends one of two
+ways:
+
+- **finished**, when that node's work completed, or when the node closed the
+  bus early on purpose;
+- **failed**, with the reason, when that node failed, was cancelled, or paused
+  on a wait before it was done. weft also ends a bus failed when the run got
+  stuck, or ended while the bus was still open.
+
+Each reader decides what a failed end means for it. `Stream` fails the answer
+to its caller ([what the caller
+sees](triggers-and-routes.md#when-a-run-ends-before-it-answers)), even on a
+route whose `whenChunkFails` is `drop_chunk`, because that setting skips one
+message and a failed bus has no next one to go on to. `Debug` logs
+a warning naming the reason, and the bus's panel in the inspector ends with
+`* the bus failed here: <reason>` instead of `* the bus closed here`.
+
+If a producer fails before its first piece, it may not have opened its bus
+yet. For what the program can do then, go and read [when a node
+fails](how-a-program-runs.md#when-a-node-fails).
 
 ### A bus lives exactly as long as its worker
 
@@ -115,7 +179,7 @@ but what is inside is between the nodes talking.
 | Several live nodes talking to each other | A bus |
 | To fan one thing out to several readers | A bus |
 | Ordering and type checking on every item | A stream |
-| To survive the worker restarting | Neither. Use storage, or a step that ends |
+| To survive the worker restarting | Neither. Use storage, or a node that ends |
 
 For the Rust on both sides, go and read
 [streams and buses in Rust](../nodes/streams-and-buses.md).

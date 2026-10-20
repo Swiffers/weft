@@ -366,7 +366,7 @@ fn set_config_compact_object_into_one_liner_bodies() {
 fn set_config_writes_a_multiline_object_value_everywhere() {
     // A MULTI-LINE `{`-object value is contained (its newlines live inside the
     // balanced brace-run) and the grammar parses it in EVERY value position
-    // (pinned by tests/parser_multiline_object.rs), so the editor accepts it:
+    // (pinned by tests/integration/parser_multiline_object.rs), so the editor accepts it:
     // bodyless node, one-liner body, and connection-origin field alike. This is
     // the form the webview emits for LARGE objects (a stored-file marker); the
     // historical failure mode was the gate refusing it and the FileDrop field
@@ -530,7 +530,7 @@ fn remove_edge_is_scope_disambiguated() {
 
 #[test]
 fn remove_edge_into_group_port() {
-    // An edge into a group's port is written `grp.inp = a.value`; removeEdge
+    // An edge into a group's port is written `grp.inp = a.value`; remove_edge
     // matches that connection by its as-written endpoints and drops it.
     let src = "a = Text { value: \"x\" }\ngrp = Group(inp: String) -> () {\n  t = Debug\n  t.data = self.inp\n}\ngrp.inp = a.value\n";
     let out = apply(src, vec![EditOp::RemoveEdge {
@@ -890,8 +890,8 @@ fn update_node_ports_drops_body_driver_on_removed_input() {
 
 #[test]
 fn update_node_ports_round_trips_an_unparseable_declared_type() {
-    // The parser keeps a typo'd type as recoverable (MustOverride + a
-    // squiggle), so a gesture on such a node round-trips the verbatim
+    // The parser keeps a typo'd type as recoverable (the port's own type
+    // variable + a squiggle), so a gesture on such a node round-trips the verbatim
     // spelling: refusing it would block the whole gesture, rewriting it
     // would erase the author's text and the diagnostic pointing at it.
     let src = "n = Debug(data?: Strng)\n";
@@ -908,21 +908,20 @@ fn update_node_ports_round_trips_an_unparseable_declared_type() {
 }
 
 #[test]
-fn update_node_ports_canonicalizes_a_bare_declared_port() {
-    // A declared port with no annotation (`(x)`) parses as the
-    // MustOverride placeholder; a header rewrite spells that out
-    // (`x?: MustOverride`), the deliberate canonicalization the
-    // `ParsedPort::type_text` doc pins: same parse, made explicit,
-    // never dropped as undeclared.
+fn update_node_ports_keeps_a_bare_declared_port_bare() {
+    // A declared port with no annotation (`(x)`) has the empty declared
+    // spelling; a header rewrite writes it back as the bare name, never
+    // dropped as undeclared and never given a type the author did not write.
     let src = "n = Text(x?)\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
-        inputs: vec![PortSig { name: "x".into(), required: false, port_type: ("MustOverride".into()) }],
+        inputs: vec![PortSig { name: "x".into(), required: false, port_type: ("".into()) }],
         outputs: vec![PortSig { name: "extra".into(), required: true, port_type: ("String".into()) }],
         removed_inputs: vec![],
         removed_outputs: vec![],
     }]);
-    assert!(out.contains("x?: MustOverride"), "bare port canonicalized, not dropped: {out}");
+    assert!(out.contains("Text(x?) ->"), "bare port written back bare, not dropped: {out}");
+    assert!(!out.contains("x?:"), "no type written for a port declared without one: {out}");
     parse_ok(&out);
 }
 
@@ -987,7 +986,7 @@ fn update_node_ports_wire_shape() {
     // lists are REQUIRED (a missing one is refused, never read as
     // "sweep nothing", which would strand a deleted port's wires).
     let op: EditOp = serde_json::from_str(
-        r#"{"op":"updateNodePorts","node":"n","inputs":[],"outputs":[],"removedInputs":["b"],"removedOutputs":[]}"#,
+        r#"{"op":"update_node_ports","node":"n","inputs":[],"outputs":[],"removedInputs":["b"],"removedOutputs":[]}"#,
     ).unwrap();
     let EditOp::UpdateNodePorts { removed_inputs, removed_outputs, .. } = &op else {
         panic!("wrong variant");
@@ -995,11 +994,11 @@ fn update_node_ports_wire_shape() {
     assert_eq!(removed_inputs, &vec!["b".to_string()]);
     assert!(removed_outputs.is_empty());
     let missing = serde_json::from_str::<EditOp>(
-        r#"{"op":"updateNodePorts","node":"n","inputs":[],"outputs":[],"removedInputs":["b"]}"#,
+        r#"{"op":"update_node_ports","node":"n","inputs":[],"outputs":[],"removedInputs":["b"]}"#,
     );
     assert!(missing.is_err(), "a missing removal list is refused, not defaulted");
     let no_required = serde_json::from_str::<EditOp>(
-        r#"{"op":"updateNodePorts","node":"n","inputs":[{"name":"a","portType":"String"}],"outputs":[],"removedInputs":[],"removedOutputs":[]}"#,
+        r#"{"op":"update_node_ports","node":"n","inputs":[{"name":"a","portType":"String"}],"outputs":[],"removedInputs":[],"removedOutputs":[]}"#,
     );
     assert!(no_required.is_err(), "a sig without `required` is refused, never read as required");
     let empty = EditOp::UpdateNodePorts {
@@ -1187,7 +1186,7 @@ fn update_node_ports_drops_inline_expr_wire_on_removed_input() {
 
 #[test]
 fn add_edge_inside_loop_body_replaces_existing_driver() {
-    // addEdge in a Loop body must REMOVE the existing driver of the target port
+    // add_edge in a Loop body must REMOVE the existing driver of the target port
     // (one driver per input), exactly as in a Group body. A Group-only scope
     // resolver in find_connection silently failed the removal and appended a
     // SECOND driver line (two drivers on one port).
@@ -1205,7 +1204,7 @@ fn add_edge_inside_loop_body_replaces_existing_driver() {
 
 #[test]
 fn remove_edge_inside_loop_body_finds_the_wire() {
-    // removeEdge in a Loop body must resolve its scope as a Loop, not error out
+    // remove_edge in a Loop body must resolve its scope as a Loop, not error out
     // on a Group kind-mismatch (which would surface ConnectionNotFound).
     let src = "l = Loop(items: List[String]) -> (acc: String) {\n  over: [\n  \"items\"\n]\n  a = Text() -> (value: String)\n  x = Text(v: String) -> (value: String)\n  x.v = a.value\n  self.acc = x.value\n}\n";
     let out = apply(src, vec![EditOp::RemoveEdge {
@@ -1569,7 +1568,7 @@ fn rename_group_to_empty_fails_loud() {
 
 #[test]
 fn set_label_on_group_fails_loud() {
-    // A setLabel targeting a container would write a `_label` field into
+    // A set_label targeting a container would write a `_label` field into
     // the group body, which the lowering rejects as a compile error.
     // The edit must fail at edit time with a kind mismatch instead.
     let src = "grp = Group() -> () {\n  t = Text { value: \"x\" }\n}\n";
@@ -1795,7 +1794,7 @@ fn opaque_token_that_would_swallow_the_file_is_refused() {
         .unwrap_err();
         assert!(matches!(err, EditError::InvalidArgument(_)), "port type {harmful:?}: {err:?}");
     }
-    for ok in ["String | Null", "List[Number]", "Dict[String, Number]", "MustOverride"] {
+    for ok in ["String | Null", "List[Number]", "Dict[String, Number]"] {
         assert!(
             apply_edits(
                 two,
@@ -1833,7 +1832,7 @@ fn keyword_shaped_names_are_refused() {
     }
     // As a node type: reserved type keywords are refused (they must not be
     // authored as a plain node through this door).
-    for kw in ["Group", "Loop", "LoopIn", "LoopOut", "Passthrough"] {
+    for kw in ["Group", "Loop", "LoopIn", "LoopOut"] {
         let err = apply_edits(
             src,
             "Untitled",
@@ -1850,7 +1849,7 @@ fn keyword_shaped_names_are_refused() {
 #[test]
 fn ops_refuse_a_reserved_local_id() {
     let src = "a = Text {}\n";
-    for bad in ["self", "Group", "Loop", "LoopIn", "Passthrough", "a__b"] {
+    for bad in ["self", "Group", "Loop", "LoopIn", "LoopOut", "a__b"] {
         let err = apply_edits(
             src,
             "Untitled",
@@ -2055,8 +2054,8 @@ fn edit_soak_never_corrupts() {
                 18 => EditOp::MoveLoopScope { loop_id: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
                 19 => EditOp::MoveLoopScope { loop_id: pick(next(), &targets), target_group: None },
                 20 => EditOp::UpdateLoopPorts { loop_id: pick(next(), &targets), inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[String]".into()) }], outputs: vec![PortSig { name: "results".into(), required: true, port_type: ("List[String | Null]".into()) }] },
-                21 => EditOp::SetLoopConfig { loop_id: pick(next(), &targets), key: "max_iters".into(), value: format!("{}", next() % 100) },
-                _ => EditOp::RemoveLoopConfig { loop_id: pick(next(), &targets), key: "max_iters".into() },
+                21 => EditOp::SetLoopConfig { loop_id: pick(next(), &targets), key: "maxIters".into(), value: format!("{}", next() % 100) },
+                _ => EditOp::RemoveLoopConfig { loop_id: pick(next(), &targets), key: "maxIters".into() },
             };
             // Ops that legitimately error (bad target, collision, ...) are skipped;
             // every SUCCESSFUL edit must satisfy the full structural invariants.
@@ -2077,32 +2076,32 @@ fn editop_wire_shape_round_trips() {
     use serde_json::json;
     // (json the TS side emits, expected variant predicate)
     let cases: Vec<serde_json::Value> = vec![
-        json!({"op":"setConfig","node":"n","key":"k","value":"\"v\""}),
-        json!({"op":"removeConfig","node":"n","key":"k"}),
-        json!({"op":"setLabel","node":"n","label":"L"}),
-        json!({"op":"setLabel","node":"n","label":null}),
-        json!({"op":"addNode","id":"n","nodeType":"Debug","parentGroup":null}),
-        json!({"op":"removeNode","node":"n"}),
-        json!({"op":"addEdge","source":"a","sourcePort":"value","target":"b","targetPort":"data","scopeGroup":null}),
-        json!({"op":"removeEdge","source":"a","sourcePort":"value","target":"b","targetPort":"data","scopeGroup":"g"}),
-        json!({"op":"addGroup","label":"g","parentGroup":null}),
-        json!({"op":"removeGroup","group":"g"}),
-        json!({"op":"renameGroup","group":"a","newLabel":"b"}),
-        json!({"op":"moveNodeScope","node":"n","targetGroup":"g"}),
-        json!({"op":"moveGroupScope","group":"g","targetGroup":null}),
-        json!({"op":"updateNodePorts","node":"n","inputs":[{"name":"i","required":true,"portType":"String"}],"outputs":[],"removedInputs":[],"removedOutputs":[]}),
-        json!({"op":"updateGroupPorts","group":"g","inputs":[],"outputs":[]}),
-        json!({"op":"setGroupDescription","group":"g","description":"d"}),
+        json!({"op":"set_config","node":"n","key":"k","value":"\"v\""}),
+        json!({"op":"remove_config","node":"n","key":"k"}),
+        json!({"op":"set_label","node":"n","label":"L"}),
+        json!({"op":"set_label","node":"n","label":null}),
+        json!({"op":"add_node","id":"n","nodeType":"Debug","parentGroup":null}),
+        json!({"op":"remove_node","node":"n"}),
+        json!({"op":"add_edge","source":"a","sourcePort":"value","target":"b","targetPort":"data","scopeGroup":null}),
+        json!({"op":"remove_edge","source":"a","sourcePort":"value","target":"b","targetPort":"data","scopeGroup":"g"}),
+        json!({"op":"add_group","label":"g","parentGroup":null}),
+        json!({"op":"remove_group","group":"g"}),
+        json!({"op":"rename_group","group":"a","newLabel":"b"}),
+        json!({"op":"move_node_scope","node":"n","targetGroup":"g"}),
+        json!({"op":"move_group_scope","group":"g","targetGroup":null}),
+        json!({"op":"update_node_ports","node":"n","inputs":[{"name":"i","required":true,"portType":"String"}],"outputs":[],"removedInputs":[],"removedOutputs":[]}),
+        json!({"op":"update_group_ports","group":"g","inputs":[],"outputs":[]}),
+        json!({"op":"set_group_description","group":"g","description":"d"}),
         // Loop ops: same wire-contract guarantee as the Group/Node
         // ops above. A serde rename here breaks the webview silently.
-        json!({"op":"addLoop","label":"l","parentGroup":null}),
-        json!({"op":"removeLoop","loopId":"l"}),
-        json!({"op":"renameLoop","loopId":"a","newLabel":"b"}),
-        json!({"op":"moveLoopScope","loopId":"l","targetGroup":"g"}),
-        json!({"op":"moveLoopScope","loopId":"l","targetGroup":null}),
-        json!({"op":"updateLoopPorts","loopId":"l","inputs":[{"name":"i","required":true,"portType":"List[String]"}],"outputs":[{"name":"o","required":true,"portType":"List[String | Null]"}]}),
-        json!({"op":"setLoopConfig","loopId":"l","key":"parallel","value":"true"}),
-        json!({"op":"removeLoopConfig","loopId":"l","key":"max_iters"}),
+        json!({"op":"add_loop","label":"l","parentGroup":null}),
+        json!({"op":"remove_loop","loopId":"l"}),
+        json!({"op":"rename_loop","loopId":"a","newLabel":"b"}),
+        json!({"op":"move_loop_scope","loopId":"l","targetGroup":"g"}),
+        json!({"op":"move_loop_scope","loopId":"l","targetGroup":null}),
+        json!({"op":"update_loop_ports","loopId":"l","inputs":[{"name":"i","required":true,"portType":"List[String]"}],"outputs":[{"name":"o","required":true,"portType":"List[String | Null]"}]}),
+        json!({"op":"set_loop_config","loopId":"l","key":"parallel","value":"true"}),
+        json!({"op":"remove_loop_config","loopId":"l","key":"maxIters"}),
     ];
     for c in cases {
         let op: EditOp = serde_json::from_value(c.clone()).unwrap_or_else(|e| panic!("deserialize {c}: {e}"));
@@ -2549,33 +2548,33 @@ fn set_loop_config_inserts_field() {
     let src = "my = Loop() -> () {\n  parallel: true\n}\n";
     let out = apply(src, vec![EditOp::SetLoopConfig {
         loop_id: "my".into(),
-        key: "max_iters".into(),
+        key: "maxIters".into(),
         value: "100".into(),
     }]);
     parse_ok(&out);
-    assert!(out.contains("max_iters: 100"), "max_iters inserted: {out}");
+    assert!(out.contains("maxIters: 100"), "maxIters inserted: {out}");
     assert!(out.contains("parallel: true"), "existing config kept: {out}");
 }
 
 #[test]
 fn set_loop_config_replaces_field_in_place() {
-    let src = "my = Loop() -> () {\n  parallel: true\n  max_iters: 10\n}\n";
+    let src = "my = Loop() -> () {\n  parallel: true\n  maxIters: 10\n}\n";
     let out = apply(src, vec![EditOp::SetLoopConfig {
         loop_id: "my".into(),
-        key: "max_iters".into(),
+        key: "maxIters".into(),
         value: "999".into(),
     }]);
     parse_ok(&out);
-    assert!(out.contains("max_iters: 999"), "value replaced: {out}");
-    assert!(!out.contains("max_iters: 10"), "old value gone: {out}");
+    assert!(out.contains("maxIters: 999"), "value replaced: {out}");
+    assert!(!out.contains("maxIters: 10"), "old value gone: {out}");
 }
 
 #[test]
 fn remove_loop_config_field() {
-    let src = "my = Loop() -> () {\n  parallel: true\n  max_iters: 10\n}\n";
-    let out = apply(src, vec![EditOp::RemoveLoopConfig { loop_id: "my".into(), key: "max_iters".into() }]);
+    let src = "my = Loop() -> () {\n  parallel: true\n  maxIters: 10\n}\n";
+    let out = apply(src, vec![EditOp::RemoveLoopConfig { loop_id: "my".into(), key: "maxIters".into() }]);
     parse_ok(&out);
-    assert!(!out.contains("max_iters"), "field removed: {out}");
+    assert!(!out.contains("maxIters"), "field removed: {out}");
     assert!(out.contains("parallel: true"), "siblings kept: {out}");
 }
 
@@ -2667,7 +2666,7 @@ fn move_loop_scope_rejects_group_target() {
 
 #[test]
 fn set_config_multiline_array_replaces_in_place() {
-    let src = "my = Loop(test?: MustOverride) {\n  parallel: true\n  over: []\n  carry: []\n}\n";
+    let src = "my = Loop(test?) {\n  parallel: true\n  over: []\n  carry: []\n}\n";
     let out = apply(src, vec![EditOp::SetLoopConfig {
         loop_id: "my".into(),
         key: "carry".into(),
@@ -2689,7 +2688,7 @@ fn set_config_multiline_array_replaces_in_place() {
 fn set_config_batched_multiple_keys_replace_in_place() {
     // Simulate what the webview does: one click sends an update containing
     // ALL keys in data.config (because the optimistic update is `{...data.config, [key]: value}`).
-    // createNodeUpdateHandler emits one setConfig per key. None should duplicate.
+    // createNodeUpdateHandler emits one set_config per key. None should duplicate.
     let src = "my = Loop() -> () {\n  parallel: true\n}\n";
     let out = apply(src, vec![
         EditOp::SetLoopConfig { loop_id: "my".into(), key: "parallel".into(), value: "true".into() },
@@ -2723,7 +2722,7 @@ fn set_config_collapses_existing_duplicates() {
 
 #[test]
 fn set_config_same_key_twice_in_batch() {
-    // Two setConfig ops for the same key in one batch (two clicks within
+    // Two set_config ops for the same key in one batch (two clicks within
     // debounce). The second must REPLACE the value the first set, not
     // append a second field.
     let src = "my = Loop() -> () {\n  parallel: true\n}\n";
@@ -2749,8 +2748,8 @@ fn set_config_node_same_key_twice_in_batch() {
 #[test]
 fn end_to_end_recover_broken_loop_file() {
     // The broken file Quentin saw: duplicate over/carry from a pre-fix
-    // race. A single setConfig per key collapses its duplicates.
-    let src = "MyLoop = Loop(test?: MustOverride) {\n  parallel: true\n  over: []\n  over: []\n  carry: []\n  carry: [\n  \"test\"\n]\n  carry: [\n  \"test\"\n]\n}\n";
+    // race. A single set_config per key collapses its duplicates.
+    let src = "MyLoop = Loop(test?) {\n  parallel: true\n  over: []\n  over: []\n  carry: []\n  carry: [\n  \"test\"\n]\n  carry: [\n  \"test\"\n]\n}\n";
     let out = apply(src, vec![
         EditOp::SetLoopConfig { loop_id: "MyLoop".into(), key: "carry".into(), value: "[\n  \"test\"\n]".into() },
     ]);
@@ -2767,7 +2766,7 @@ fn end_to_end_recover_broken_loop_file() {
 
 #[test]
 fn set_config_does_not_accumulate_blank_lines() {
-    // Each setConfig must layout the inserted field cleanly: one newline
+    // Each set_config must layout the inserted field cleanly: one newline
     // between the previous decl's last token and the new one, never more.
     // Without the explicit-layout helper, every iteration leaked an extra
     // blank line into the body (snippet trailing + body trailing).
@@ -2800,7 +2799,7 @@ fn update_ports_inside_loop_body_keeps_layout() {
         EditOp::UpdateNodePorts {
             node: "MyLoop.exec_python_1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "number".into(), required: false, port_type: ("MustOverride".into()) },
+                crate::edit::PortSig { name: "number".into(), required: false, port_type: ("".into()) },
             ],
             outputs: vec![],
             removed_inputs: vec![],
@@ -2808,7 +2807,7 @@ fn update_ports_inside_loop_body_keeps_layout() {
         },
     ]);
     parse_ok(&out);
-    assert!(out.contains("\n  exec_python_1 = ExecPython(number?: MustOverride) {}"), "2-space indent preserved: {out}");
+    assert!(out.contains("\n  exec_python_1 = ExecPython(number?) {}"), "2-space indent preserved: {out}");
     assert!(out.ends_with("MyLoop.numbers = range_1.values\n"), "trailing connection intact: {out}");
 }
 
@@ -2825,7 +2824,7 @@ fn update_ports_at_root_does_not_glue_onto_preceding_connection() {
         EditOp::UpdateNodePorts {
             node: "exec_python_1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "test".into(), required: false, port_type: ("MustOverride".into()) },
+                crate::edit::PortSig { name: "test".into(), required: false, port_type: ("".into()) },
             ],
             outputs: vec![],
             removed_inputs: vec![],
@@ -2847,7 +2846,7 @@ fn update_ports_does_not_double_indent() {
         EditOp::UpdateNodePorts {
             node: "MyLoop.exec_python_1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "test".into(), required: false, port_type: ("MustOverride".into()) },
+                crate::edit::PortSig { name: "test".into(), required: false, port_type: ("".into()) },
             ],
             outputs: vec![],
             removed_inputs: vec![],
@@ -2863,7 +2862,7 @@ fn update_ports_does_not_double_indent() {
         EditOp::UpdateNodePorts {
             node: "MyLoop.exec_python_1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "again".into(), required: false, port_type: ("MustOverride".into()) },
+                crate::edit::PortSig { name: "again".into(), required: false, port_type: ("".into()) },
             ],
             outputs: vec![],
             removed_inputs: vec![],
@@ -2912,12 +2911,12 @@ fn set_loop_config_preserves_nested_closing_brace_indent() {
     let src = "g = Group {\n  my = Loop() -> () {\n    parallel: true\n  }\n}\n";
     let out = apply(src, vec![EditOp::SetLoopConfig {
         loop_id: "g.my".into(),
-        key: "max_iters".into(),
+        key: "maxIters".into(),
         value: "5".into(),
     }]);
     parse_ok(&out);
     assert!(
-        out.contains("max_iters: 5\n  }"),
+        out.contains("maxIters: 5\n  }"),
         "the loop's closing brace keeps its 2-space indent: {out}"
     );
 }
@@ -3991,7 +3990,34 @@ fn set_per_instance_inside_a_group() {
 #[test]
 fn set_per_instance_refuses_what_cannot_carry_it() {
     let err = apply_err("g = Group() -> () {}\n", vec![set_per_instance("g", true)]);
-    assert!(err.contains("setPerInstance"), "{err}");
+    assert!(err.contains("set_per_instance"), "{err}");
     let err = apply_err("d = Debug {\n  data: Text { value: \"x\" }.value\n}\n", vec![set_per_instance("d__data", true)]);
     assert!(err.contains("its own line"), "{err}");
+}
+
+/// A port gesture on a group keeps the type parameters its ports still
+/// use and drops the ones nothing uses any more (the build refuses an
+/// unused one), along with the brackets when none is left.
+#[test]
+fn update_group_ports_keeps_used_type_params_and_drops_the_rest() {
+    let src = "g = Group[T: Image | Video | Audio, T2: List[T]](file: T) -> (out: T2) {\n  x = Debug\n}\n";
+    let sig = |name: &str, ty: &str| PortSig { name: name.into(), required: true, port_type: ty.into() };
+    let out = apply(src, vec![EditOp::UpdateGroupPorts {
+        group: "g".into(),
+        inputs: vec![sig("file", "Image")],
+        outputs: vec![sig("out", "T2")],
+    }]);
+    assert!(out.starts_with("g = Group[T: Image | Video | Audio, T2: List[T]](file: Image) -> (out: T2)"), "{out}");
+    let out = apply(src, vec![EditOp::UpdateGroupPorts {
+        group: "g".into(),
+        inputs: vec![sig("file", "T")],
+        outputs: vec![sig("out", "Image")],
+    }]);
+    assert!(out.starts_with("g = Group[T: Image | Video | Audio](file: T) -> (out: Image)"), "{out}");
+    let out = apply(src, vec![EditOp::UpdateGroupPorts {
+        group: "g".into(),
+        inputs: vec![sig("file", "Image")],
+        outputs: vec![sig("out", "Image")],
+    }]);
+    assert!(out.starts_with("g = Group(file: Image) -> (out: Image)"), "{out}");
 }

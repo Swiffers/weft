@@ -4,9 +4,9 @@
 //! way the CLI / web app does:
 //!   - list:     `GET /storage/files` -> `{ files: [meta...] }`
 //!   - download: `POST /storage/files/download { key }` -> `{ url }`,
-//!               then GET the bytes from that (box-public) URL.
+//!               then GET the bytes from that link, straight from the store.
 //!
-//! File keys are scoped: `exec/<execution_id>/<id>` (execution scratch, swept on
+//! File keys are scoped: `run/<run_id>/<id>` (run scratch, swept on
 //! terminate unless kept), `project/<project_id>/<id>`, `shared/<name>/<id>`.
 
 use std::time::Duration;
@@ -23,7 +23,7 @@ pub async fn list(disp: &Dispatcher) -> Result<Vec<StoredFileMeta>> {
     Ok(listing.files)
 }
 
-/// Find files under a SCOPE key prefix (e.g. `exec/<execution_id>/` for one run's
+/// Find files under a SCOPE key prefix (e.g. `run/<run_id>/` for one run's
 /// scratch). Wire keys are tenant-anchored (`<tenant>/<scope>/<owner>/<id>`),
 /// but tests think in the scope portion, so match the key with its leading
 /// `<tenant>/` segment stripped. Tenant-agnostic, so it works for any

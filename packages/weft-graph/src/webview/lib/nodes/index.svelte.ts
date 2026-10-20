@@ -11,7 +11,7 @@
  * `$derived` reads on first render see a populated registry.
  */
 
-import type { NodeTemplate, PortDefinition } from '../types';
+import type { NodeTemplate, PortDefinition, TemplateOutputPort } from '../types';
 import type { CatalogEntry, InputSpec, OutputSpec } from '../../../protocol';
 import { BUILTIN_NODE_ICONS, resolveIcon } from './icons';
 
@@ -37,9 +37,10 @@ function toInputPort({ type, required, ...rest }: InputSpec): PortDefinition {
 }
 
 /// Wire output (`{ name, type, ... }`) -> render port. Same generic
-/// spread discipline as `toInputPort`. An output carries no optionality:
-/// `required` is the constant the render port expects for one.
-function toOutputPort({ type, ...rest }: OutputSpec): PortDefinition {
+/// spread discipline as `toInputPort` (`narrowable` rides through). An
+/// output carries no optionality: `required` is the constant the render
+/// port expects for one.
+function toOutputPort({ type, ...rest }: OutputSpec): TemplateOutputPort {
 	return { ...rest, portType: type, required: true };
 }
 
@@ -53,14 +54,19 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		// Empty-array default keeps the command palette's
 		// `tags.some(...)` call safe for nodes that declare no tags.
 		tags: entry.tags ?? [],
-		// Mirror the catalog metadata's `requires_infra` flag onto
+		// Mirror the catalog X onto
 		// the template. The webview's infra-subgraph extractor +
 		// node-role helpers read this to decide which nodes are
 		// infra-backed. Without it the subgraph "eye" finds no
 		// seeds and shows an empty subgraph.
-		requiresInfra: entry.requires_infra ?? false,
+		requiresInfra: entry.requiresInfra ?? false,
 		defaultInputs: (entry.inputs ?? []).map(toInputPort),
 		defaultOutputs: (entry.outputs ?? []).map(toOutputPort),
+		// The catalog keys bounds by variable; the template carries them
+		// in the instance's wire shape, so one check reads either.
+		...(entry.typeParams
+			? { typeParams: Object.entries(entry.typeParams).map(([name, bound]) => ({ name, bound })) }
+			: {}),
 		features: entry.features,
 		display: entry.display,
 		// `weft describe-nodes` ships the entry-kind vocabulary inline
@@ -166,7 +172,7 @@ function registerBuiltins(): void {
 			color: '#8b5cf6',
 			tags: ['loop', 'iterate', 'container', 'scope'],
 			requiresInfra: false,
-			// The loop-config knobs (parallel / max_iters / trim_on_mismatch)
+			// The loop-config knobs (parallel / maxIters / trimOnMismatch)
 			// are editor-only UI owned by GroupNode.svelte, not template data.
 			defaultInputs: [],
 			defaultOutputs: [],

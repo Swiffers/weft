@@ -538,15 +538,23 @@ The shape, unless the user asks for another:
   `/signal-token/`, `http://127.0.0.1:14111` on a local install) goes in the
   server's environment and nowhere a page can read it. The pass-through
   forwards only `/instance/`, `/signal/`, `/signal-token/`, the program's
-  own routes (`/connect/<tenant>/<project id>/<path>`) and the picture links in their answers
-  (`/public/files/<token>`), carries the caller's token and body, and keeps the
-  site's cookies and the `Weft-Instance` header back. A page fetches
+  own routes (`/connect/<tenant>/<project id>/<path>`) and the file links in
+  their answers and a slot's uploads (`/files/...`), carries the caller's token and body, and keeps the
+  site's cookies and the `Weft-Instance` and `Weft-Run-Id` headers back (a
+  failed call answers only `Something went wrong` with its `runId`, so log or
+  show that id beside the failure; its owner opens the run to read why). A page fetches
   `/weft/signal-token/displays` with the instance token as bearer, calls a
   program route as `/weft/connect/<tenant>/<project id>/<path>` with the instance token in
   `Weft-Instance-Token`, and `new InstanceDoor(instanceToken)` already calls
-  `/weft/instance/...`. A route called through the pass-through builds the
-  picture links in its answer on the site's own address, so those pictures
-  load through the same pass-through, and you write no proxy route for them.
+  `/weft/instance/...`. On a local install, for the pictures in a route's
+  answers to load through the same pass-through, give the frontend the site's
+  `/weft` address as its visitor address: `weft frontend add <name>
+  --visitor-address https://<site>/weft`, or `weft frontend visitor-address
+  <name> https://<site>/weft` for one that already exists. Every file link the
+  project hands out then goes through the site, and you write no proxy route
+  for them. Without it, the links go through weft's tunnel when it is open,
+  else to the install's own address, which only this machine opens. On a cloud
+  install, file links go straight to the cloud store either way.
   If you catch yourself putting the dispatcher's
   address in a page, stop and write: "Wait. The browser talks to its own
   site." Then call `/weft/...`. If the site sends everyone not signed in to
@@ -560,14 +568,14 @@ The shape, unless the user asks for another:
   weft editor shows, restyled to the site, and never the author's shared key.
   A save that changes a value one of their live triggers reads re-arms it
   before it answers, and the page says so; nothing else to call. The page
-  titles each step with the program's own label and each field with the
+  titles each node with the program's own label and each field with the
   node's own name for it ("Value"), both written for the program's author,
   so you name every field a person sees in your own words:
   `<InstanceSettings {door} labels={{ 'greet': 'Your greeting', 'greet.value': 'How the bot greets you' }} />`,
-  a step's id for its title and `step.field` for a field (`door.fields()`
+  a node's name for its title and `node.field` for a field (`door.fields()`
   lists both). If the page
   must look different, build it from `door.fields()`, `door.setValues(..)` and
-  `ResourceSelect` over `door.resources(step, field)` instead. The library is not a package you install: you run
+  `ResourceSelect` over `door.resources(node, field)` instead. The library is not a package you install: you run
   `weft connect-lib` from the project root, which copies it into
   `front/src/lib/weft-connect` (`--into <dir>` for another folder), then
   import it from `$lib/weft-connect` and `$lib/weft-connect/svelte` (and
@@ -610,9 +618,23 @@ carry the header.
   on the address the route was called on, so a page calls routes through the
   pass-through (`/weft/connect/...`), never from its own server code straight
   to the dispatcher: called that way, the links point at an address the
-  browser may not reach. A picture the page
-  sends goes in the JSON body as a `data:` URL on the key the route declares
-  as `Image`; never as multipart, never as a separate upload.
+  browser may not reach. weft serves that file exactly as stored: the link
+  answers range requests, so a `<video>` seeks and a broken download picks
+  up where it stopped, and the same file asked for again within the link's
+  lifetime gets the same link, so a page that fetches its answer again keeps
+  its video playing. The page writes no range handling and keeps no file
+  cache of its own. Every such link is a download: opened in a tab it saves
+  the file under its name, while an `<img>`, `<video>` or `<audio>` shows or
+  plays it.
+- A picture the page sends goes in the JSON body as a `data:` URL on the key
+  the route declares as `Image`, never as multipart. A file too big for
+  that (a video, a long recording) goes through an upload slot the program
+  hands the page: `uploadFile(slot, file, (done, total) => ...)` from
+  `$lib/weft-connect` sends it in parts straight to storage, through the
+  `/weft` pass-through, resuming after a dropped connection, and answers the
+  slot string, which the page then sends to the route in the field it
+  declares as a file. A refusal (a file too big, a type the slot does not
+  take) comes back as an error whose message is a sentence ready to show.
 - If a page shows a conversation read from a conversation file (the AI
   nodes' `historyFile`), it skips the messages whose `role` is `system`: the
   file can open with the system prompt as its first message. It finds
@@ -622,8 +644,14 @@ carry the header.
 - An infra node's card (what `weft infra show` prints) is for the program's
   author. A page never parses its text for state and never shows its labels
   to people as they are: it asks the program, and chooses its own words.
-- Plain: shadcn-svelte components, little custom CSS, no design system the
-  request did not ask for.
+- The look is the `designer`'s, a specialist Tangle starts in the same turn
+  as the `frontend-builder` (a Gemini subagent cannot start another one). It
+  builds the tokens, the components and the motion in `design-lab/`, a
+  standalone app beside `front/` on the same stack, with every page mocked on
+  realistic data, and the real pages are built on what it hands over
+  (`design-lab/src/lib/design/` and its components, moved under
+  `front/src/lib/`). `design-lab/` is the design's source, kept in the
+  project; weft reads nothing in it.
 
 ## Proving the frontend is proving the frontend
 

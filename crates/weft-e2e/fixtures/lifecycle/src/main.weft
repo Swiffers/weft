@@ -1,7 +1,7 @@
 # The transition-coverage fixture. The committed graph is the simplest
 # HoldGate chain: a Text kick arms a HoldGate that polls the rig's release
 # URL until the rig flips it, then a Debug receives "released". The gate is
-# the rig's lever for a REAL running execution it can hold open and release
+# the rig's lever for a REAL running run it can hold open and release
 # on cue, which is what every drain / transitional-state test needs.
 #
 # Tests rewrite this file mid-test (via Project::set_main) to evolve the

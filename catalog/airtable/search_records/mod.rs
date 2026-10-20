@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use weft::access::client::get_json;
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::airtable::{checked_id, API};
 
@@ -24,7 +24,7 @@ impl Node for AirtableSearchRecordsNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let base: String = ctx.inputs.get("base")?;
         let table: String = ctx.inputs.get("table")?;

@@ -188,7 +188,7 @@ pub fn current_claim() -> Option<TaskClaim> {
 impl TaskClaim {
     /// Rest the claim on `run` (`crate::tasks::rest_claim`): no more
     /// renewals until [`Self::resume`].
-    pub async fn rest_on(&self, run: weft_core::ExecutionId) -> Result<()> {
+    pub async fn rest_on(&self, run: weft_core::RunId) -> Result<()> {
         self.resting.store(true, std::sync::atomic::Ordering::Release);
         if !crate::tasks::rest_claim(&self.pool, self.task_id, &self.replica, run).await? {
             self.lease.lost(LeaseLoss::Stolen);
@@ -289,7 +289,7 @@ where
             tracing::warn!(
                 target: "weft_task_store::executor",
                 id = %task_id, kind = %kind, cause = ?why,
-                "lease lost mid-execution; abandoning the executor future"
+                "lease lost mid-run; abandoning the executor future"
             );
             ExecOutcome::LeaseLost(why)
         }
@@ -422,7 +422,7 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 ///   - heartbeat errors past `claim_duration_secs() / interval` ticks:
 ///     the lease has lapsed at this point regardless of what the DB
 ///     says; a sibling process can re-claim, so we must stop or risk
-///     parallel execution of the same row. `LeaseLoss::Unrenewable`,
+///     parallel run of the same row. `LeaseLoss::Unrenewable`,
 ///     the finalizer requeues the row.
 /// A stalled executor is NOT an exit: the heartbeat keeps renewing,
 /// the executor keeps running, no leak. A claim resting on a run

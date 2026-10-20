@@ -11,14 +11,14 @@ use async_trait::async_trait;
 
 use weft::node::NodeOutput;
 use weft::storage::StorageScope;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct FileSizeNode;
 
 #[async_trait]
 impl Node for FileSizeNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // The file value the resolved `@asset` config produced arrives on the
         // `file` port exactly like a wired media value; `get_bytes` reads the
         // bytes behind its handle (bucket key or URL) via the storage handle.

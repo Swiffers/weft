@@ -40,7 +40,7 @@ error rather than a trigger that quietly never fires.
 
 | Field | Type | What it is |
 |---|---|---|
-| `execution_id` | `ExecutionId` (a UUID) | This run's id |
+| `run_id` | `RunId` (a UUID) | This run's id |
 | `project_id` | `Uuid` | The project it belongs to |
 | `node_id` | `String` | This node's id in the graph |
 | `node_type` | `String` | Its catalog type, such as `ExecPython` |
@@ -70,7 +70,7 @@ event payload, and only on the trigger that actually fired. Both are a
 | `declared()` | Only the type's own declared settings | never |
 | `in_order()` | Every input that arrived, in source order | On a wake or nested bag |
 | `declares("name")` | Whether the node declares this input at all | never |
-| `for_holes(holes, what, spell, declare)` | Values matched to named holes in a text, such as `$user_id` in SQL | A hole names no port, or a wired port the text never reads |
+| `for_holes(holes, what, spell, declare)` | Values matched to named holes in a text, such as `$userId` in SQL | A hole names no port, or a wired port the text never reads |
 
 Never write `get(...).unwrap_or(...)`. It turns a real type error into your
 default and you will not find out. `get_or` is the same shape and fails
@@ -80,13 +80,13 @@ honestly.
 
 | Call | What it does | It fails when |
 |---|---|---|
-| `pulse_downstream(output).await` | Sends values on | A port is mentioned twice, is not declared, gets a value its type does not allow, or is `error` on a node with `catchErrors` |
+| `pulse_downstream(output).await` | Sends values on | A port is mentioned twice, is not declared, gets a value its type does not allow or one over 100 KB, or is `_error` |
 | `yield_downstream(output).await` | The same, but waits until the value was taken | Same, plus a delivery that can never happen, and an empty output |
-| `close_port("port").await` | Closes one output. On a stream port this is the end of the stream | The port was already mentioned this firing, or is `error` on a node with `catchErrors` |
+| `close_port("port").await` | Closes one output. On a stream port this is the end of the stream | The port was already mentioned this firing, or is `_error` |
 | `set_max_buffered_items("port", n)` | Raises the un-taken cap on a stream port above 4096 | The port is not a stream output, or `n` is 0 |
-| `fan_declared(&value)` | Builds an output by matching an object's keys to your declared ports, skipping the rest. On a node with `catchErrors` it never fills `error`: a key called `error` in the data is data | never |
-| `data_outputs()` | Your declared ports, minus `error` on a node with `catchErrors`: the ones a node fills from data (a row's columns, a response's fields) | never |
-| `output_type("port")?` | The resolved type of one output | The node does not declare that output: a type error, so it fails the run even with `error` wired |
+| `fan_declared(&value)` | Builds an output by matching an object's keys to your declared ports, skipping the rest. It never fills `_error`: a key called `_error` in the data is data | never |
+| `data_outputs()` | Your declared ports minus `_error`: the ones a node fills from data (a row's columns, a response's fields) | never |
+| `output_type("port")?` | The resolved type of one output | The node does not declare that output: a type error, so it fails the run even with `_error` wired |
 | `declared_outputs()` / `declared_inputs()` | Every port this node declares in the program, with its type | never |
 | `is_output_wired("port")` | Whether anything downstream reads that output in this run | never |
 
@@ -113,13 +113,18 @@ you like until you close it.
 | Call | What it does | It fails when |
 |---|---|---|
 | `await_signal(kind).await` | Parks this firing until the signal fires, releasing the worker. Returns the payload | The body already yielded on or closed a stream output, or the node has a stream input, or the body's call order changed between replays |
+| `await_signal_with_cancel(kind, call).await` | The same, and if the run is cancelled while it waits, weft sends `call` once: a `CancelCall`, usually to the provider's cancel address for the job | Same, plus a `call` whose address is empty or not `http` or `https` |
 | `register_signal(kind).await` | Sets up a trigger that starts a new run on every fire. Called during setup | Called twice for one node in one setup |
 | `run("name", closure).await` | Runs the closure and writes down its result, or gives back what was written down last time | The closure itself fails |
 
 `ctx.run` is how you stop a replay from doing an expensive thing twice. A body
 replays only after a wait. If the worker dies while the body is running, the
-step is not replayed: a durable run fails it, and a fast run ends cancelled
+node is not replayed: a durable run fails it, and a fast run ends cancelled
 (go and read [surviving a restart](durable-execution.md)).
+
+If your node waits on a job a provider runs, go and read [waiting on a job a
+service runs](durable-execution.md#waiting-on-a-job-a-service-runs), which
+also covers the cancel call.
 
 ## Connections
 
@@ -214,20 +219,16 @@ are running and stop.
 ## Storage
 
 `ctx.storage(scope)` gives you a handle. The scope decides where new files go
-and what `list` sees; `get`, `delete`, `keep` and `presign` act on whatever
+and what `list` sees; `get`, `delete`, `keep` and the links act on whatever
 scope the key itself belongs to, so a later node can read a file without
 knowing where it came from.
 
-| Scope | Where it lives, and how long |
-|---|---|
-| `Execution` (the default) | This run only, swept after it ends unless you keep it |
-| `Project` | Outlives runs, gone on `weft clean` or `weft rm`, or when a lifetime you gave it runs out |
-| `Shared { name }` | Shared across projects that name the same space, until removed or its lifetime runs out |
-| `Asset` | The project's published assets. Readable, and the worker refuses writes |
+For every scope, go and read [Storage](storage.md).
 
 | Call | What it does |
 |---|---|
 | `identified(id)` | Names what the next put is a copy of, so storing it twice stores it once |
+| `link_lifetime(duration)` | Makes every link to the files this handle stores live that long instead of 15 minutes (at most seven days). The value carries it as `linkSecs` |
 | `put(bytes, mime, filename, keep)` | Stores bytes and gives back the stored-file value |
 | `put_stream(stream, mime, filename, keep)` | The same without holding the file in memory |
 | `put_response(resp, what, mime, filename, keep)` | Streams an HTTP response you already made into storage |
@@ -241,9 +242,11 @@ knowing where it came from.
 | `delete(&file)` | Deletes it. Stored files only, not URL-backed ones |
 | `list()` | Everything under this scope |
 | `keep(&file, ttl)` | Sets how long the file lives from now on, and saves a run-scoped one from the sweep (that part cannot be undone) |
-| `presign(&file, ttl)` | A temporary link. `None` means the default, about 15 minutes |
-| `public_link(&file, ttl)` | A link the open internet can fetch, or `None` if this install serves none |
-| `caller_link(&file, ttl)` | A link the caller of this run can fetch, on the address its request came in on |
+| `internal_link(&file)` | A `FileLink { url, public }` for code inside the install (a script your node runs), straight to storage |
+| `external_link(&file)` | A `FileLink { url, public }` for anything outside the install. `public: false` means only this machine (or its network) opens it, so an internet service needs the bytes instead |
+| `external_file(&file)` | The external link when it is public, else a `data:` URL of the bytes, with the file's mime type and filename |
+| `upload_slot(max_bytes, accepts, minutes, keep)` | A `weft-upload:...` string a page's visitor uploads one file through, with `uploadFile` from `@weft/connect` |
+| `claim_upload(slot, &ty)`, `claim_uploads(&[(slot, &ty)])` | The file uploaded through each slot, received once into a place of type `ty`. Several slots are received together or not at all, which is what a Route does for the file fields of one call |
 | `externalize(&value, &ty, policy)` | Turns every file inside a typed value into a link or inline bytes, for handing out |
 | `internalize(&value, &ty, keep)` | The reverse: pulls URLs and inline data into stored files |
 
@@ -258,11 +261,16 @@ links expire. Hand it to whoever asked and do not store it.
 
 | Call | What it does | It fails when |
 |---|---|---|
-| `create_bus(opts)` | Makes a bus and gives you a handle and a marker to emit | The options do not make sense |
+| `journal_policy()` | What your node's users set on `journalEphemeral` and `journalWindowMs`, as the `journal` option of a bus. Only a node with `features.journalSettings` (or a live-connection trigger) has them; for any other node it is the default | A setting is out of range or the wrong shape |
+| `create_bus(opts)` | Makes a bus and gives you a handle and a marker to emit. The bus ends when your body does | The options do not make sense, or `opts.journal` has a window outside 100 to 60000 ms |
 | `bus(&marker)` | Turns a marker value back into a live handle | The bus is gone, or that is not a marker |
-| `open_bus("port", opts, "name").await` | The whole producer move: make it, emit the marker, register your name. Closes on drop | Emitting or registering fails |
-| `join_bus("port", "name")` | The consumer twin, also closing on drop | The input is not a live bus |
-| `bus_from_input("port")` | A handle that does **not** close the bus. For an observer | Same |
+| `open_bus("port", opts, "name").await` | The whole producer move: make it, emit the marker, register your name. The bus ends when your body does | Emitting or registering fails |
+| `pending_bus("port", opts, "name")` | A bus that opens only on your first `open().await`, so the work that can fail runs first and its failure can still reach `_error` | never; `open()` fails as `open_bus` does |
+| `join_bus("port", "name")` | The consumer twin: registers your name, and the bus ends when your body does | The input is not a live bus |
+| `bus_from_input("port")` | A handle whose bus does **not** end with your body. For an observer | Same |
+
+For how a bus ends and what a reader does about it, go and read [streams and
+buses in Rust](streams-and-buses.md#how-a-bus-ends).
 
 Read a stream input like any other value: `ctx.inputs.get::<Generator<Row>>("rows")?`.
 
@@ -290,7 +298,7 @@ Read a stream input like any other value: `ctx.inputs.get::<Generator<Row>>("row
 | Call | What it does | It fails when |
 |---|---|---|
 | `log(level, message).await` | Writes a line into the run's log. `Trace`, `Debug`, `Info`, `Warn`, `Error` | The write fails |
-| `tag_execution(["user_7"]).await` | Tags this run. Additive and safe to repeat. Any string works: one that is not already a tag is turned into one (see below) | The list is empty, or a tag is empty |
+| `tag_run(["user_7"]).await` | Tags this run. Additive and safe to repeat. Any string works: one that is not already a tag is turned into one (see below) | The list is empty, or a tag is empty |
 | `stop_tagged("user_7", StopSelf::Keep).await` | Queues a stop for every live run of this project carrying that tag, turned into a tag the same way | The tag is empty |
 | `is_cancelled()` | Whether this run was cancelled. Cheap enough to poll | never |
 | `cancellation()` | The flag itself, to `select!` against your own work | never |
@@ -310,28 +318,32 @@ instance's copy instead of the shared one; `values()`, `connections()` and
 | Call | What it does |
 |---|---|
 | `infra("bridge").start().await` | Brings the shared copy up. Returns once it runs, parking the run between looks; fails with the reason if it does not come up, or if somebody stops it while this waits |
-| `infra("bridge").stop(spec, stop_self).await` | Scales the copy down, keeping its disk |
-| `infra("bridge").terminate(spec, stop_self).await` | Deletes the copy and its disks, except the ones listed in `keepOnTerminate` |
-| `infra("bridge").instance(id).wipe(spec, stop_self).await` | Deletes the instance's copy and every one of its disks, the kept ones too, even if the copy was already terminated |
+| `infra("bridge").request_start().await` | Asks for the copy to come up and returns once weft has accepted, without waiting for it to run. If a route should answer its caller at once (a 202), call this and let a later `status()` say whether the copy came up; until then it reads `provisioning` |
+| `infra("bridge").stop(take_down, stop_self).await` | Stops the copy, keeping its disks (a unit whose `onStop` keeps it running stays up until terminate). It returns once the stop is under way, and `status()` reads `stopping` until the copy is down. Answers an `InfraDownAnswer`: `TakenDown`; `AlreadyDown` when the copy was already stopped or stopping; or `NoCopy` (a copy never started, a mistyped instance id, or a copy terminated earlier) |
+| `infra("bridge").terminate(take_down, stop_self).await` | Deletes the copy and its disks, except the ones the node lists in `keep_on_terminate`. Answers as `stop` does, except that `AlreadyDown` means it was already being terminated |
+| `infra("bridge").instance(id).wipe(take_down, stop_self).await` | Deletes the instance's copy and every one of its disks, the kept ones too, even if the copy was already terminated. Always answers `TakenDown` |
+| `infra("bridge").upgrade(take_down, stop_self).await` | Moves a running copy onto the last build weft made (a stop, then a start; nothing is built). A copy already on that build is left alone, and a copy that is not running is refused. It returns once the upgrade is under way, not once the copy runs again; if you need it running, follow with `start()`, which waits |
 | `infra("bridge").status().await` | The copy's state, `None` when there is none. A start or stop on its way reads `provisioning` or `stopping` at once, the same answer `weft status` gives |
 | `infra("bridge").copies().await` | Every copy: the shared one and each instance's |
-| `trigger("receive").activate().await` | Turns one trigger on |
-| `triggers().deactivate(spec, stop_self).await` | Turns off every trigger of the program (or of one instance, with `.instance(id)`); if you want only some, name them with `.only([..])` |
-| `values().instance(id).get().await` | The instance's values for the program's `@instance_filled` fields, by step and field |
-| `values().instance(id).set(step, field, value).clear(step, field).apply().await` | Gives and clears values in one change, each checked against its node's rules; the instance's live triggers reading one are set up again, and their names come back |
+| `trigger("receive").activate(held).await` | Turns one trigger on if it is off. While it was down it may have held work that arrived: `ReleaseHeld::Run` runs that work, at half the trigger's own limits so new arrivals still get through, and `ReleaseHeld::Drop` deletes it and cancels the runs paused on it |
+| `triggers().deactivate(take_down, stop_self).await` | Turns off every shared trigger of the program, or an instance's triggers with `.instance(id)` (chain it again for each further instance), or every instance's with `.all_instances()`, which you cannot combine with `.instance(..)`. If you want only some triggers, name them with `.only([..])`. It returns once they are down, without waiting for the runs they started, even with `Running::Wait` |
+| `values().instance(id).get().await` | The instance's values for the program's `@instance_filled` fields, by node and field |
+| `values().instance(id).set(node, field, value).clear(node, field).apply().await` | Sets and clears values in one change, all or none, each checked against its field and its node's rules first. Any live trigger of the instance that reads one is set up again, and `apply` returns those triggers' names |
 | `values().instance(id).forget().await` | Forgets every value the instance was given |
 | `connections().instance(id).list() / forget()` | Lists an instance's connections, or forgets all of them (the values naming them go too) |
 | `instances().list().await` | Every instance weft holds anything for, one entry each: how many values, connections and live tokens, its infra copies, and its triggers, each with the events waiting on a field not yet filled and why |
 | `costs().instance(id).service(s).since(t).list().await` | The cost records, each saying whose credential paid, narrowed by instance, node, service, run, `paid_by` or `since` (unix seconds) |
 | `runs().instance(id).status(s).older_than(d).clean(running, stop_self).await` | Deletes runs; runs still going follow `running` |
 | `runs()...list(limit).await` / `.count().await` | The newest `limit` matching runs (1 to 200) with how many match in all, or just the count; same filters as `clean` |
+| `node_state(run, node).await` | Where one node of a run stands: `pending`, `running`, `waiting` (with the last answer its wait got), `completed`, `failed` (with the error), `skipped` or `cancelled`. Name the node the way `weft run --from` takes it: `render`, `work.render` inside a group, `one.render` inside the file the site `one` includes. A node inside a loop is refused (name the loop). Pass `ctx.run_id` for this run's own nodes |
 | `tokens().mint_for_instance(id, expires_in).await` | An instance token, value shown once |
 | `tokens().instance(id).revoke().await` | Revokes an instance's tokens |
 
-For what `spec` and `stop_self` decide, go and read
-[taking something down from a run](../running/instances.md#taking-something-down-from-a-run).
+`take_down` is a `TakeDownChoice` and `stop_self` a `StopSelf`. For what each
+one can say, with an example, go and read [taking something down from a
+run](../running/instances.md#taking-something-down-from-a-run).
 
 ## What is not here
 
 `ContextHandle`, the trait underneath, is the seam the runtime implements. Your
-node only ever sees the `ExecutionContext` wrappers on this page.
+node only ever sees the `RunContext` wrappers on this page.

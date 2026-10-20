@@ -31,18 +31,31 @@ cd hello
 weft run
 ```
 
-It prints the project's id, then the run's id, then a timestamped line for
-every step as it starts and finishes, then a tick:
+`weft run` says it is building, then prints the project's name and id, then
+the run's id and how many nodes it runs, then a line for every node as it
+starts and finishes, then a tick:
 
 ```text
+building hello
 registered hello (3f2a1c4e-9b81-4d0a-8e55-7c2f1a6b30de)
-started execution 9b81d0a2-4e17-4a33-bc90-51d8e2f4a7c1 on version a1b2c3d
-→ started execution=9b81d0a2 entry=greeting
+started run 9b81d0a2-4e17-4a33-bc90-51d8e2f4a7c1 on version a1b2c3d4
+2 nodes
+→ started run=9b81d0a2 entry=greeting
   …
-✓ completed execution=9b81d0a2
+✓ completed run=9b81d0a2
 ```
 
-That long id after `started execution` is the run's execution id, and it is how you
+The first run of a new project may also print two lines for each image it
+builds, indented under the rest:
+
+```text
+  building <image> as <build>; its log: <url>
+  built <image> in about <time>
+```
+
+The `; its log: <url>` part shows only when the build has a log to point at.
+
+That long id after `started run` is the run's id, and it is how you
 point at this one run later. Everything that reads a run takes it, and the
 first eight characters are enough as long as they name only one.
 
@@ -68,13 +81,13 @@ greeting = Text { value: "Hello, World!" }
 out = Debug { data: greeting.value }
 ```
 
-Two boxes and an arrow. A box is one step, which weft calls a **node**. The
+Two boxes and an arrow. A box is a **node**. The
 dots down its left edge are what it takes in, the dots down its right edge are
 what it sends out, and each dot is coloured by the kind of value it carries, so
 two dots of the same colour fit together.
 
 The arrow is `greeting.value` sitting where `out`'s `data` input goes. Writing
-a source and a port where a value belongs is how you connect two steps, and it
+a source and a port where a value belongs is how you connect two nodes, and it
 is the only wiring syntax there is.
 
 While a run is going, each box glows: amber while it works, cyan while it waits
@@ -92,8 +105,8 @@ For adding a box and drawing an arrow yourself, go and read
 |---|---|
 | `src/main.weft` | The program |
 | `weft.toml` | Its name and its permanent id |
-| `nodes/base_catalog/` | Every step weft ships, copied in so the build never reaches outside your project. `weft catalog update` replaces this folder wholesale after you update weft, so keep nothing of your own in here |
-| `nodes/` (anywhere else) | Steps you write yourself |
+| `nodes/base_catalog/` | Every node weft ships, copied in so the build never reaches outside your project. `weft catalog update` replaces this folder wholesale after you update weft, so keep nothing of your own in here |
+| `nodes/` (anywhere else) | Nodes you write yourself. A node can also sit under `src/`, next to the module that uses it |
 | `CLAUDE.md`, `.claude/` | Tangle, for whichever assistant you picked |
 | `.weft/` | Build state, generated |
 

@@ -10,7 +10,7 @@
  *   const editor = createFieldEditor(2000);
  *   // In template: value={editor.display(key, storeValue)}
  *   //              onfocus={() => editor.focus(key, storeValue)}
- *   //              oninput={(e) => editor.input(e.currentTarget.value)}
+ *   //              oninput={(e) => editor.input(e.currentTarget.value, key, saveFn)}
  *   //              onblur={() => editor.blur(key, saveFn)}
  */
 
@@ -28,7 +28,7 @@ export interface FieldEditor {
 	input: (value: string, key: string, saveFn: (value: string) => void) => void;
 	/** Call on blur: flushes local value to store immediately. */
 	blur: (key: string, saveFn: (value: string) => void) => void;
-	/** Flush any pending debounced save immediately. Call before actions like Run Project. */
+	/** Flush any pending debounced save immediately. Call before an action that reads the saved source, like a run. */
 	flush: () => void;
 	/** The current editing key (reactive, for use in templates). */
 	readonly activeKey: string | null;

@@ -105,11 +105,11 @@ pub fn held_check_route(state: Arc<BrokerState>) -> Router {
 /// Every call the broker answers, as a request and on a line alike.
 fn api(state: Arc<BrokerState>) -> Router {
     Router::new()
-        // Execution steering (`ctx.tag_execution` / `ctx.stop_tagged`)
-        .route("/v1/execution/tag", post(handlers::execution_tag))
+        // Run steering (`ctx.tag_run` / `ctx.stop_tagged`)
+        .route("/v1/run/tag", post(handlers::run_tag))
         .route(
-            "/v1/execution/stop_tagged",
-            post(handlers::execution_stop_tagged),
+            "/v1/run/stop_tagged",
+            post(handlers::run_stop_tagged),
         )
         // Tasks
         .route("/v1/task/enqueue_dedup", post(handlers::task_enqueue_dedup))
@@ -171,8 +171,8 @@ fn api(state: Arc<BrokerState>) -> Router {
             post(handlers::supervisor_infra_nodes),
         )
         .route(
-            "/v1/supervisor/health_protocols",
-            post(handlers::supervisor_health_protocols),
+            "/v1/supervisor/health_state",
+            post(handlers::supervisor_health_state),
         )
         .route(
             "/v1/supervisor/claim_command",
@@ -202,10 +202,6 @@ fn api(state: Arc<BrokerState>) -> Router {
         .route(
             "/v1/supervisor/infra_command_in_flight",
             post(handlers::supervisor_infra_command_in_flight),
-        )
-        .route(
-            "/v1/supervisor/trigger_deps",
-            post(handlers::supervisor_trigger_deps),
         )
         .route(
             "/v1/supervisor/set_applied",

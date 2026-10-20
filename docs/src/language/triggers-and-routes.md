@@ -15,12 +15,8 @@ Nothing listens until you run `weft activate`. Go and read
 ## What a run started by a trigger covers
 
 Everything downstream of the trigger that fired, plus whatever that work needs
-upstream, stopping the walk when it reaches another trigger.
-
-Only the trigger that actually fired gets the event. Any others in the project
-close their outputs, so paths that needed them skip.
-
-Two triggers can share the steps in the middle without their runs becoming one.
+upstream. Any other trigger in the project closes its outputs, so paths that
+needed it skip.
 
 ## A trigger's inputs are frozen
 
@@ -28,7 +24,7 @@ Whatever fed a trigger's ports when you activated is what it uses on every
 firing. The nodes upstream do not run again per event.
 
 Everything upstream of every trigger runs at activation as one program, so two
-steps that do not depend on each other run at the same time. Setup that several
+nodes that do not depend on each other run at the same time. Setup that several
 triggers share, like the schema all their tables live in, is written once and
 wired to each of them; two copies of `create extension if not exists` racing
 each other is how one of them fails on a duplicate key.
@@ -47,21 +43,49 @@ does it and listens
 `Route` claims an address and starts a run when somebody calls it.
 
 ```weft
-post = Route -> (body: JsonDict, photo: File) {
+type Card = { title: String, color?: String }
+
+post = Route -> (body: Card) {
   path: "cards"
   method: "POST"
 }
 
-reply = Reply {
-  body: { "id": saved.id }
+answer = JsonObject {
+  title: post.body.title
+  status: "saved"
 }
+
+reply = Reply { body: answer.object }
 ```
 
 The caller is held open while your program works, and `Reply` is what answers
 them. For streaming an answer as it is produced, and for the Rust side, go and
 read [talking to a live caller](../nodes/live-callers.md).
 
-A path can capture: `cards/{id}` puts `id` where your node can read it.
+The request's body comes out whole on `body`. Left undeclared, it is a
+`JsonDict`. If you declare a type on it, as `Card` above, a call whose body
+does not fit is answered `400` naming what is wrong, and no node after `post`
+runs. A body carrying a key that `Card` does not declare is answered `400`
+too. If callers may
+send more than you read, end the type with `..`; for what that does, go and
+read [what fits into what](types.md#what-fits-into-what). A request with no body, like a `GET`, closes `body`.
+
+If you want part of the path as a value, capture it with `{name}` and declare
+an output of the same name:
+
+```weft
+card = Route -> (id: String) {
+  path: "cards/{id}"
+  method: "GET"
+}
+```
+
+A call to `cards/42` puts `"42"` on `card.id`. Every other output you add to a
+`Route` has to be a capture of its path, typed `String`, or the build stops
+with `route-output-not-a-capture`. A capture can't share a name with one of
+`Route`'s own outputs (`body`, `method`, `path`, `query`, `headers`, `caller`,
+`fired`), so `cards/{body}` is the `route-capture-shadows-output` error,
+asking you to rename the capture.
 
 **Two routes that one call could reach, where neither is more specific, is an
 error.** `cards/count` beside `cards/{id}` is fine, because the first is more
@@ -91,11 +115,14 @@ activates. If another program or another of your projects holds that port,
 `weft activate` prints the address, and `weft status` shows it later or says
 why it is unavailable. Your routes keep answering under `/connect/local/<project id>/` as well.
 
-If a call arrives while the route's trigger is parked, hibernating within its
-grace window, or still being set up, it is answered `503` with a `Retry-After`
-at once, so a client that retries gets through once the trigger is on. Once
-the project is switched off (wiped), its own port is closed and
-`/connect/local/<project id>/<path>` answers `404`.
+If a call arrives while the route's trigger is down or still being set up, it
+does not wait for the trigger: it is answered `503` at once, with a `Retry-After` of 5 seconds,
+so a client that retries gets through once the trigger is back on. The
+exception is a trigger taken down with `weft deactivate --door refuse --held
+drop`, which takes its route away with it, so a call is answered `404`,
+the same as a call to a path no route serves. For what a take-down does with
+other work, like a webhook or a form, go and read [starting and stopping
+things](../running/lifecycles.md).
 
 ## How a run is kept
 
@@ -122,43 +149,45 @@ pay = Route -> (body: JsonDict) {
 | `recorded` | on | a page asks a route for something every few seconds (turn it off) |
 | `outlivesCaller` | off | a run answers its caller early and keeps working (only on a trigger that holds a caller on the line, like `Route` and `Socket`) |
 | `keepRunsFor` | the project's, else a week | you want its runs kept longer or shorter once they end (`12h`, `30d`, `forever`). For the project-wide default, go and read [how long a run is kept](../running/the-journal.md#how-long-a-run-is-kept) |
+| `journalEphemeral` | off | what streams through the route should not be written to the run's record, only counted. For what that keeps, go and read [two modes](streams-and-buses.md#two-modes) |
+| `journalWindowMs` | 1000 | you want the record's rows to cover less or more time, from 100 to 60000 ms. Same page |
 | `holdSecs` | 60 | a run that cannot pause should wait longer for an answer (up to 30 days), or not at all (`0`). See [when a run cannot pause](#when-a-run-cannot-pause) |
 
 **By default (`durable` off), a run is fast: it only waits for the database
 when it has to.** That is when it pauses (a timer, a form), and in a few
 other places (for the full list, go and read [when a run waits for
 its writes](../running/the-journal.md#when-a-run-waits-for-its-writes)). The
-rest of the time its steps live in the worker's memory, and its record (the
-journal that `weft events` and the editor read) is written a moment after
-each step. If its worker dies, the run ends
+rest of the time its work lives in the worker's memory, and its record (the
+journal that `weft events` and the editor read) is written a moment behind
+it, as it goes. If its worker dies, the run ends
 cancelled and is not run again. For why, and for what happens when the
 platform shuts a worker down on purpose, go and read [what happens when
 something dies](../running/architecture.md#what-happens-when-something-dies).
 
 **If a run must not end when its worker dies (it moves money, say), turn
-`durable` on.** Before each step starts, everything the run did so far is
+`durable` on.** Before each node starts, everything the run did so far is
 written to the database, and a route's answer is written before it is sent.
-The exception is a step of a [pure](../nodes/metadata.md#features) node
+The exception is a [pure](../nodes/metadata.md#features) node
 (`Text`, `JsonObject`, `Switch`, `Reply`), which does nothing outside the run
 but answer its caller and handle the run's own files, and starts without
 waiting.
 
 If the worker dies mid-run, another worker picks the run up where it stopped:
-every finished step stays finished, and a step that was in the middle of its
+every finished node stays finished, and a node that was in the middle of its
 work is failed with a message saying it may have partly happened, so you know
-which step to check. The exception is a step of a pure node that takes no
+which node to check. The exception is a pure node that takes no
 stream and had not passed anything on yet: it simply runs again. If a caller
 started the run, its connection was on the old worker and is gone: the run
-carries on in the new worker with nobody on the line, so a step that answers
+carries on in the new worker with nobody on the line, so a node that answers
 the caller fails, saying no live caller is attached. If the platform stops the
-worker instead, a run that can pause gets 5 seconds for the steps already
-running to finish, and only a step still running after that is failed. A run
+worker instead, a run that can pause gets 5 seconds for the nodes already
+running to finish, and only a node still running after that is failed. A run
 that cannot pause ([below](#when-a-run-cannot-pause)) keeps running on the
 stopping worker for as long as the platform lets it, and if the worker goes
 before the run ends, that is the same as the worker dying. If you want to know
-what `catchErrors` does with that failure, or what happens to a step that was
+what a wired `_error` does with that failure, or what happens to a node that was
 waiting on an answer or reading a stream, go and read [surviving a
-restart](../nodes/durable-execution.md#when-the-worker-dies-mid-step).
+restart](../nodes/durable-execution.md#when-the-worker-dies-mid-run).
 
 Even with `durable` off, a run waiting on a timer or a form, with nothing else
 of it running, survives its worker, because its whole record is written before
@@ -174,12 +203,14 @@ bus between its nodes open (a bus lives in its worker's memory alone).
 **When such a run reaches a timer or a form, the wait holds in the node's call
 instead.** The wait is registered as usual, the run stays on its worker, and
 the answer carries it on right there. The hold clock only runs while the run
-is quiet, meaning every step still running is waiting, on an answer or on a
-bus. Anything that moves (a bus message, a step finishing) starts it over. If
+is quiet, meaning every node still running is waiting, on an answer or on a
+bus. Anything that moves (a bus message, a node finishing) starts it over. If
 the run stays quiet for `holdSecs` (60 seconds unless the trigger says
 otherwise), the call that was waiting fails, saying it gave up, and the wait is
-withdrawn, so a form is no longer offered. The node can handle that error like
-any other, or send it to `error` with `catchErrors`. With `holdSecs: 0`, such a
+withdrawn, so a form is no longer offered. The node's code can handle that
+error like any other, and if it does not, the program can: it comes out on the
+node's `_error` when that is wired ([when a node
+fails](how-a-program-runs.md#when-a-node-fails)). With `holdSecs: 0`, such a
 wait fails at once.
 
 If the run becomes able to pause while a wait holds (the last bus between its
@@ -188,9 +219,9 @@ start. A run whose caller leaves while `outlivesCaller` is off is cancelled,
 as always. And a fast run holding a wait still ends with its worker.
 
 **If a page asks a route for a status every few seconds, turn `recorded`
-off**, or `weft executions` fills with hundreds of runs. weft keeps no history
-of such a run, not even in its worker's memory. If it fails, `weft executions`
-lists it with the step that failed and why, and nothing of what ran before. If
+off**, or `weft runs` fills with hundreds of runs. weft keeps no history
+of such a run, not even in its worker's memory. If it fails, `weft runs`
+lists it with the node that failed and why, and nothing of what ran before. If
 it reports a cost, or asks weft for something on its behalf that its worker
 does not already hold (a stored file, a new connection or infrastructure
 address, a task such as starting or stopping its infra, a stop through
@@ -202,14 +233,15 @@ failed.
 
 An unrecorded run cannot pause, so a timer or a form in it holds
 ([when a run cannot pause](#when-a-run-cannot-pause)). If a node tags it with
-`ctx.tag_execution` (a label you later find or stop runs by), the node fails:
+`ctx.tag_run` (a label you later find or stop runs by), the node fails:
 an unrecorded run has no record a tag could point at. The compiler also
 refuses `durable: true` with `recorded: false`.
 
 **On a cloud install, one stretch of a run lasts an hour at most.** Cloud Run
 cuts a request at 60 minutes, so a run stops itself 59 minutes after it
 started on its worker. It ends cancelled with a message saying so, instead
-of being cut off mid-step with no ending written. A run that pauses whole (every branch
+of being cut off while a node is still running, with no ending written. A run
+that pauses whole (every branch
 waiting on a timer or a form) starts a fresh hour when it picks back up; one
 branch waiting while another runs does not. So if a job can take longer than
 an hour, split it with a pause. On your machine no run is cut.
@@ -218,14 +250,23 @@ A run that answers a caller lives on the worker the caller reached. While the
 caller is on the line, the run stops at 59 minutes too, with a message telling
 you to have the client reconnect. Once the caller has gone, a route with
 `outlivesCaller` on keeps its run going, and on a cloud install the run moves:
-it starts no new step on that worker, and once the steps it was running end, it
+it starts no new node on that worker, and once the nodes it was running end, it
 carries on under a call weft holds open for it, with a fresh hour. Moving works
 from the run's record, so the compiler refuses `outlivesCaller: true` with
 `recorded: false`. A run with a bus open cannot move, since a bus lives in its worker's memory
 alone, so it keeps running on that worker for as long as the worker stays up.
 
+### When a run ends before it answers
+
+Every answer a route's run gives, good or bad, carries a `Weft-Run-Id` header
+holding the run's id.
+
 If a run ends before it has finished answering its caller, the caller gets
-one of these statuses instead, with the reason in the body:
+one of these statuses instead, and this JSON body:
+
+```json
+{"error": "Something went wrong", "runId": "9b81d0a2-..."}
+```
 
 | Status | When |
 |---|---|
@@ -241,13 +282,33 @@ may last, when it runs out while every run on that worker only waits (for
 why, go and read
 [the broker](../running/architecture.md#the-broker-and-who-may-talk-to-what)).
 
+The caller never sees why the run ended: the reason can name your nodes, your
+files and a provider's words, and those are yours to read. The whole reason
+stays on the run's record, and you open it with `weft logs <run id>` or in the
+graph. The id is safe to hand out, because opening a run takes your own
+credential. If you want a caller to get a message of your own instead, wire
+`_error` on the nodes that may fail and gate a `Reply` of yours on it; the run
+then no longer fails ([when a node
+fails](how-a-program-runs.md#when-a-node-fails)).
+
 A `503` here carries no `Retry-After`, because calling again would start a
 second run beside the one that may still be going. If the answer had already
 started, its status was already sent, so the error comes at the end of the
-body instead: a JSON-lines answer ends with `{"error": "...", "status": 504}`,
-a server-sent-events answer with an `error` event, and any other answer with
-a line `[error] ...`. A socket closes with `1011` where a call would get `500`
-or `504`, and with `1013` where it would get `503`.
+body instead, in the answer's own format:
+
+| The answer is | It ends with |
+|---|---|
+| JSON lines | one more line, `{"error": "Something went wrong", "runId": "...", "status": 504}`, where `status` is the one the call would have got |
+| Server-sent events | an `error` event whose data is `{"error": "Something went wrong", "runId": "..."}` |
+| Anything else | a line `[error] Something went wrong (run <id>)` |
+
+A socket closes with `1011` where a call would get `500` or `504`, and with
+`1013` where it would get `503`, and the close reason is that same
+`Something went wrong (run <id>)`.
+
+A `Stream` answers this way too when the bus it reads ended failed: a `500` if
+nothing was sent yet, the marker above if it was, `1011` on a socket. Its
+`done` output then stays absent.
 
 ## Answering on a socket
 
@@ -291,6 +352,58 @@ and that ends only its connection), or, when the page passes credentials,
 the route refuses them. A browser is told nothing about a socket refused at
 its opening (it sees only that it closed), so a socket opened without
 credentials keeps trying, at most every 15 seconds.
+
+## Slow callers and messages that cannot be made
+
+Picture a live price page streaming from a `Route`, and a phone on a bad
+connection reading it. Your program writes faster than the phone reads, so
+messages pile up for it. Up to 256 wait; past that, the route's
+`whenCallerIsSlow` decides what gives:
+
+| `whenCallerIsSlow` | What happens when 256 are waiting | Set it when |
+|---|---|---|
+| `block` (the default) | Your program's next send waits for room, so a slow caller slows the program down and gets every message | The caller has to read the whole thing: a model's answer, a conversation |
+| `drop_oldest` | The oldest waiting message is thrown away to make room, so the caller always gets the latest | Only the newest value matters: live video, a price feed |
+| `drop_newest` | The new message is thrown away, and what was already waiting goes out in order | The messages already waiting matter more than the ones arriving while the caller is behind |
+
+```weft
+db = PostgresDatabase { database: "shop" }
+
+prices = Route -> (symbol: String) {
+  path: "prices/{symbol}"
+  method: "GET"
+  whenCallerIsSlow: "drop_oldest"
+}
+latest = PostgresWatchQuery(symbol: String) {
+  account: db.access
+  symbol: prices.symbol
+  query: "SELECT price FROM quote WHERE symbol = $symbol"
+  channel: "quote_changed"
+}
+feed = Stream { format: "ndjson", bus: latest.row }
+```
+
+The other setting, `whenChunkFails`, is for a message your program cannot turn
+into the route's `dataType` at all: a value that is not a `String` on a `text`
+route, a file that cannot be read.
+
+| `whenChunkFails` | What happens | Set it when |
+|---|---|---|
+| `surface` (the default) | The node sending it fails and the caller is told, the way [a run that ends before it answers](#when-a-run-ends-before-it-answers) tells them | Every message counts |
+| `drop_chunk` | That message is skipped, the skip goes on the run's record, and the answer goes on | One missing message is fine, like a frame of a live feed |
+
+A `Socket` has both settings and they mean the same, for every message a
+`Reply` or a `Stream` sends on it; under `surface` the socket closes with
+`1011`. A run that fails, or a bus that ends failed, is told to the caller
+whatever `whenChunkFails` says.
+
+If a caller says part of a stream never arrived, the run's record shows
+which. The inspector strikes each lost message through and says why, and
+`weft events` prints them on the caller's rows as `dropped=<offsets> (<why>)`,
+an offset being the message's place in the conversation. The messages still
+waiting when the caller left are named the same way, whatever
+`whenCallerIsSlow` says. A message skipped under `drop_chunk` shows as
+an error row saying `a chunk was dropped and the exchange went on`, then why.
 
 ## Which triggers need a public address
 
@@ -336,7 +449,7 @@ ways: a missing field is refused, and so is one you invented.
 
 A run you fire this way follows the trigger's `durable` and `keepRunsFor`, and
 it is always recorded, even when the trigger has `recorded` off, so you can
-find it in `weft executions`. For the flags that change how one run is kept, go and read [the `weft
+find it in `weft runs`. For the flags that change how one run is kept, go and read [the `weft
 run` flags](../running/cli.md#run-something).
 
 For writing a trigger of your own, go and read

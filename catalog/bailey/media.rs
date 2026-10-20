@@ -8,7 +8,7 @@
 use serde_json::Value;
 
 use weft::storage::StorageScope;
-use weft::{EndpointHandle, EndpointMethod, ExecutionContext, WeftResult};
+use weft::{EndpointHandle, EndpointMethod, RunContext, WeftResult};
 
 /// Pull a message's media bytes out of the bridge (`/media/<messageId>`)
 /// into PROJECT storage, under the message's identity on its ACCOUNT
@@ -28,7 +28,7 @@ use weft::{EndpointHandle, EndpointMethod, ExecutionContext, WeftResult};
 /// bounded memory, and takes the name the bridge puts in its
 /// `Content-Disposition` (WhatsApp's own filename, extension and all).
 pub async fn fetch_media(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     bridge: &EndpointHandle,
     message_id: &str,
 ) -> WeftResult<Value> {

@@ -1,7 +1,7 @@
 {
   "type": "InstanceCosts",
   "label": "Instance costs",
-  "description": "Read what one instance's runs cost, per priced call with whose credential paid, plus the total; narrow by service, node, payer, or start time. Weft only reports; billing is up to the program.",
+  "description": "Read what one instance's runs cost, per priced call with whose credential paid, plus the total and how many calls had no measurable price; narrow by run, service, node, payer, or start time. Weft only reports; billing is up to the program.",
   "tags": [
     "instances",
     "costs",
@@ -15,6 +15,11 @@
       "type": "String",
       "required": true,
       "description": "The instance id your program gives it (`user-42`)."
+    },
+    {
+      "name": "run",
+      "type": "String",
+      "description": "Only this run's costs, by the id GetRunId gave it."
     },
     {
       "name": "service",
@@ -49,13 +54,18 @@
   "outputs": [
     {
       "name": "records",
-      "type": "List[JsonDict]",
-      "description": "One entry per priced call: `{ run, instance, node, service, model?, amount_usd, paid_by, at_unix }`. `amount_usd` is null when the service's price could not be measured."
+      "type": "List[{ run: String, instance?: String, node: String, service: String, model?: String, amountUsd: Number | Null, paidBy: String, atUnix: Number }]",
+      "description": "One entry per priced call: `{ run, instance, node, service, model?, amountUsd, paidBy, atUnix }`. `amountUsd` is null when the service's price could not be measured."
     },
     {
       "name": "totalUsd",
       "type": "Number",
-      "description": "Sum of every non-null `amount_usd`."
+      "description": "Sum of every non-null `amountUsd`. Short of the real cost when `unpricedCalls` is above 0."
+    },
+    {
+      "name": "unpricedCalls",
+      "type": "Number",
+      "description": "How many of `records` have a null `amountUsd`, so are missing from `totalUsd`. 0 means the total is complete."
     }
   ],
   "validate": [

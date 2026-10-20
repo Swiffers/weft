@@ -1,6 +1,6 @@
 //! Outbound event source (1 of 3): a long-lived Server-Sent Events
 //! subscription. The listener opens a `GET` with `Accept: text/event-stream`,
-//! parses SSE blocks, and fires a fresh execution per event whose `event:`
+//! parses SSE blocks, and fires a fresh run per event whose `event:`
 //! name matches `event_name` (or every event if `event_name` is empty).
 //!
 //! Receive-only: the listener never writes back up the connection. For a
@@ -23,7 +23,7 @@ pub struct SseSubscribe {
     /// The pre-fire filter, over the event's parsed `data:` object.
     /// Lifted onto the spec by [`super::to_spec`] (hence `skip`); the
     /// shared fire plumbing evaluates it, so a filtered-out event
-    /// costs no execution. Empty = fire on every matching event.
+    /// costs no run. Empty = fire on every matching event.
     #[serde(skip)]
     pub filters: Vec<crate::signal::predicate::Predicate>,
 }

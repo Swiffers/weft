@@ -71,7 +71,7 @@ optional, like fetching a link that is usually public.
 |---|---|
 | `client()` | The HTTP client, authenticated and metered |
 | `credential()` | The single credential, for a service that has one |
-| `value(name)` | One stored value, like `imap_host` |
+| `value(name)` | One stored value, like `imapHost` |
 | `identity()` | Who it is, for a log line |
 | `owner()` | Whether it is theirs or the runtime's |
 
@@ -85,7 +85,7 @@ part, and they are per consuming node.
 
 ```json
 { "name": "account", "type": "Access", "requiresScopes": ["channels:history"],
-  "requiresValues": ["imap_host"] }
+  "requiresValues": ["teamId"] }
 ```
 
 Those get stamped onto the value as it reaches you, and checked when you open
@@ -154,12 +154,20 @@ boot is asked for it exactly once.
 ## In a test
 
 ```rust
-let access = rig.access("slack");
-rig.connection_value("slack", "team_id", "T123");
-rig.connection_permissions("slack", ["chat:write"]);
+rig.connection_permissions("slack", &["chat:write"]);
+rig.respond("POST", "/api/chat.postMessage", json!({ "ok": true, "ts": "111.222", "channel": "C42" }));
+rig.respond("GET", "/api/chat.getPermalink", json!({ "ok": true, "permalink": "https://acme.slack.com/archives/C42/p111222" }));
 
-let outcome = rig.run(&SendNode, json!({ "account": access, "text": "hi" })).await.ok()?;
+let inputs = json!({ "account": rig.access("slack"), "channel": "C42", "text": "hi" });
+rig.run(&SlackSendMessageNode, inputs).await.ok()?;
 rig.assert_sent("POST", "/api/chat.postMessage");
 ```
 
-No real credential, no real call, no cost.
+`rig.access("slack")` makes a connection marker to put on the access input.
+`rig.connection_permissions` says what that connection was granted, so opening
+it checks the node's `requiresScopes`; leave it out and the permission check is
+skipped. `rig.connection_value("slack", "teamId", "T123")` gives the connection
+a stored value, for a node that reads one. `rig.respond` sets up a canned answer
+for a route, so no request leaves the test.
+
+The test uses no real credential and makes no real call, so it costs nothing.

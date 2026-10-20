@@ -69,8 +69,8 @@ export async function changeInstallPick(
 ): Promise<string[]> {
 	const body: ChangePicks =
 		connection == null
-			? { clear: [{ step: place, field }] }
-			: { set: [{ step: place, field, connection, service }] };
+			? { clear: [{ node: place, field }] }
+			: { set: [{ node: place, field, connection, service }] };
 	const changed = await picksCall<{ rearmed?: string[] }>('PUT', body);
 	reads.wrote();
 	invalidateGrants(service);

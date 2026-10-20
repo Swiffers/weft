@@ -2,8 +2,12 @@
 //! address, straight, with nothing of weft's in between
 //! (`weft_platform_traits::Runner::front`).
 //!
-//! The front is the program the project runs (`project.running_binary_hash`,
-//! moved by every activation). It is put in place when the project is
+//! The front is the binary the project's triggers that are on fire: one
+//! binary answers a project's routes, which every verb that turns
+//! triggers on keeps true (`crate::api::project::on_another_binary`), so a
+//! build registered meanwhile never takes the routes from the triggers
+//! still on the one before; with none on, the registered build's. It is put
+//! in place when the project is
 //! activated or resynced, when its worker settings change, and, on a machine,
 //! again by the reaper whenever it went down; it is let go once nothing of
 //! the project takes work any more. What callers and the listener reach it
@@ -67,11 +71,11 @@ async fn put_in_place(state: &DispatcherState, project: uuid::Uuid, port: Option
     if !takes_work(state, project).await? {
         return Ok(None);
     }
-    let Some(program) = state.projects.running_program_identity(project).await? else {
+    let Some(binary) = routes_binary(state, project).await? else {
         return Ok(None);
     };
     let tenant = state.projects.tenant_for(project).await?.ok_or_else(|| anyhow::anyhow!("project {project} is not registered"))?;
-    let target = crate::delivery::worker_target(state, &tenant, project, &program.binary_hash).await?;
+    let target = crate::delivery::worker_target(state, &tenant, project, &binary).await?;
     let Some(ports) = &state.project_ports else {
         anyhow::ensure!(port.is_none(), "this install gives projects no port: a project's own address is the platform's");
         return Ok(Some(state.runner.front(&target, None).await?));
@@ -99,6 +103,30 @@ async fn put_in_place(state: &DispatcherState, project: uuid::Uuid, port: Option
         }
     }
     anyhow::bail!("every free port tried for project {project} was taken by another program before its front could open it")
+}
+
+/// The binary that answers `project`'s routes: the one its triggers that
+/// are on fire, else the registered build's; `None` when it runs no
+/// program yet.
+async fn routes_binary(state: &DispatcherState, project: uuid::Uuid) -> anyhow::Result<Option<String>> {
+    let on: std::collections::BTreeSet<String> = state
+        .activations
+        .list(project)
+        .await?
+        .into_iter()
+        .filter(|a| a.lifecycle.status == crate::activation_store::ProjectStatus::Active)
+        .filter_map(|a| a.program.map(|program| program.binary_hash))
+        .collect();
+    match on.len() {
+        0 => state.projects.running_binary_hash(project).await,
+        1 => Ok(on.into_iter().next()),
+        _ => anyhow::bail!(
+            "project {project}'s triggers that are on fire {} binaries ({}), and one binary answers a project's routes; \
+             `weft resync --all` brings every one onto the registered build",
+            on.len(),
+            on.into_iter().collect::<Vec<_>>().join(", ")
+        ),
+    }
 }
 
 /// [`serve`], logged instead of raised: for an activation, whose own work

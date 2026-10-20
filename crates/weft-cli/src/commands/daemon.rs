@@ -215,16 +215,6 @@ fn env_port(name: &str, default: u16) -> Result<u16> {
     }
 }
 
-/// `N` free ports, all different: each is held until every one is picked,
-/// since a port let go at once may be handed out again by the next ask
-/// (two of an install's ports once came back the same, and its runtime
-/// could not bind the second).
-fn free_ports<const N: usize>() -> Result<[u16; N]> {
-    let held = (0..N).map(|_| std::net::TcpListener::bind("127.0.0.1:0")).collect::<std::io::Result<Vec<_>>>()?;
-    let ports = held.iter().map(|listener| listener.local_addr().map(|addr| addr.port())).collect::<std::io::Result<Vec<_>>>()?;
-    Ok(ports.try_into().expect("one port per listener"))
-}
-
 /// One port the install is about to listen on, and what to tell the
 /// person when something else already holds it.
 struct PortUse {
@@ -269,8 +259,10 @@ async fn refuse_taken_ports(uses: &[PortUse]) -> Result<()> {
         }
         if on_wsl() && windows_excludes(port).await {
             anyhow::bail!(
-                "weft needs port {port} for {}, and Windows has reserved it: it falls in a range Windows keeps off limits (`netsh int ipv4 show excludedportrange protocol=tcp` lists them). Either, in an administrator terminal, reset Windows' dynamic range with `netsh int ipv4 set dynamic tcp start=49152 num=16384` and reboot; or reserve weft's ports for weft with `net stop winnat`, then `netsh int ipv4 add excludedportrange protocol=tcp startport=14111 numberofports=8`, then `net start winnat`. Or give weft another port: {}",
+                "weft needs port {port} for {}, and Windows has reserved it: it falls in a range Windows keeps off limits (`netsh int ipv4 show excludedportrange protocol=tcp` lists them). Either, in an administrator terminal, reset Windows' dynamic range with `netsh int ipv4 set dynamic tcp start=49152 num=16384` and reboot; or reserve weft's ports for weft with `net stop winnat`, then `netsh int ipv4 add excludedportrange protocol=tcp startport={} numberofports={}`, then `net start winnat`. Or give weft another port: {}",
                 u.what,
+                ports::BLOCK.start(),
+                ports::BLOCK.len(),
                 u.move_it
             );
         }
@@ -341,27 +333,34 @@ async fn port_holder(port: u16) -> Option<String> {
 /// The ports this start runs the install on, saved in its `ports.json`
 /// so every later command (and the next start) finds the same address.
 /// A first start seeds them: the block's ports for the default install,
-/// free ports for a named one (it sits beside the default install, so the
-/// block is taken). On the default install a `WEFT_*_PORT` set on this
-/// start moves that port for good; a named install ignores them, because
-/// a variable exported for the default install would otherwise land every
-/// test cell on the same port. A named install's ports move by editing
-/// its file.
+/// free ports for a named one ([`ports::PortsTurn::free_ports`]: it sits
+/// beside the default install, so the block is taken), picked and saved
+/// while this start holds the machine's turn to pick ports. On the default
+/// install a `WEFT_*_PORT` set on this start moves that port for good; a
+/// named install ignores them, because a variable exported for the
+/// default install would otherwise land every test cell on the same port.
+/// A named install's ports move by editing its file. A file an older weft
+/// wrote gets its quick tunnel's metrics port here, and only here
+/// ([`ports::SavedPorts::to_start_on`]): every other command reads the
+/// file as it is.
 fn ports(install: &Install) -> Result<Ports> {
-    let saved = Ports::load(&install.dir).map_err(anyhow::Error::msg)?;
+    // Held until the ports are saved: another start picking at the same
+    // moment reads them there.
+    let turn = ports::PortsTurn::take().map_err(anyhow::Error::msg)?;
+    let saved = ports::SavedPorts::read(&install.dir).map_err(anyhow::Error::msg)?;
     let seeded = match (saved, install.id.name()) {
-        (Some(saved), _) => saved,
+        (Some(saved), _) => saved.to_start_on(&install.id, &turn).map_err(anyhow::Error::msg)?,
         (None, None) => Ports::DEFAULT,
         (None, Some(_)) => {
-            let [public, internal, outside, postgres] = free_ports()?;
-            Ports { public, internal, outside, postgres }
+            let [public, internal, outside, postgres, tunnel_metrics] = turn.free_ports(&[]).map_err(anyhow::Error::msg)?;
+            Ports { public, internal, outside, postgres, tunnel_metrics }
         }
     };
     let chosen = match install.id.name() {
         Some(_) => seeded,
         None => moved_by_env(seeded, |name| std::env::var(name).ok())?,
     };
-    if saved != Some(chosen) {
+    if !saved.is_some_and(|saved| saved.says(&chosen)) {
         chosen.save(&install.dir).with_context(|| format!("save {}", Ports::path(&install.dir).display()))?;
     }
     Ok(chosen)
@@ -380,6 +379,7 @@ fn moved_by_env(ports: Ports, var: impl Fn(&str) -> Option<String>) -> Result<Po
         internal: port("WEFT_INTERNAL_PORT", ports.internal)?,
         outside: port("WEFT_OUTSIDE_PORT", ports.outside)?,
         postgres: port("WEFT_POSTGRES_PORT", ports.postgres)?,
+        tunnel_metrics: port("WEFT_TUNNEL_METRICS_PORT", ports.tunnel_metrics)?,
     })
 }
 
@@ -961,7 +961,8 @@ fn edge_config(kept: Option<KeptEdge>) -> Result<EdgeConfig> {
 }
 
 /// The levers a person sets in `config.json`, as the last start left
-/// them: the worker defaults, the edge, how long idle workers stay up.
+/// them: the worker defaults, the edge, how long idle workers stay up,
+/// the network address.
 /// Only these are read from the file, each where it sits: the rest of it
 /// is weft's own and written afresh every start, so a shape a newer weft
 /// writes differently never stops the start that rewrites it.
@@ -970,6 +971,10 @@ struct Levers {
     worker_idle_stop_seconds: Option<u64>,
     workers: Option<weft_platform_traits::WorkerOverrides>,
     edge: Option<KeptEdge>,
+    /// The network address, as the network url the last start wrote
+    /// (`http://<address>:<outside port>`): the outside port may have
+    /// moved since, so only the address is kept from it.
+    network_url: Option<String>,
 }
 
 /// The edge settings a person may change, as kept from the last start's
@@ -1003,8 +1008,102 @@ impl Levers {
             worker_idle_stop_seconds: lever(&file, path, "/platform/workerIdleStopSeconds")?,
             workers: lever(&file, path, "/workers")?,
             edge: lever(&file, path, "/edge")?,
+            network_url: lever(&file, path, "/platform/networkUrl")?,
         })
     }
+}
+
+/// The setting that opens the outside doors to this machine's network.
+const NETWORK_ADDRESS_ENV: &str = "WEFT_NETWORK_ADDRESS";
+
+/// The address devices on this machine's network reach it at, an IP:
+/// `WEFT_NETWORK_ADDRESS` when this start sets it (`off` clears it), else
+/// the one the last start kept in `kept_url`, its network url. Either way
+/// it is checked to be an address another device can reach
+/// ([`reachable_network_address`]).
+fn network_address(set: Option<&str>, kept_url: Option<&str>) -> Result<Option<std::net::IpAddr>> {
+    let (address, named) = match set.map(str::trim).filter(|v| !v.is_empty()) {
+        Some("off") => return Ok(None),
+        Some(v) => (check_network_address(v)?, format!("{NETWORK_ADDRESS_ENV}='{v}'")),
+        None => match kept_url {
+            Some(url) => (address_of_network_url(url)?, format!("the network address in config.json (networkUrl '{url}')")),
+            None => return Ok(None),
+        },
+    };
+    reachable_network_address(address, &named).map(Some)
+}
+
+/// `raw` as a network address: the IP of this machine that devices on its
+/// network reach (the outside doors listen on it). A scheme, a port or a
+/// path belongs to weft, which adds them itself.
+fn check_network_address(raw: &str) -> Result<std::net::IpAddr> {
+    raw.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "{NETWORK_ADDRESS_ENV}='{raw}' is not a network address: it is the IP of this machine that devices on its \
+             network reach, with no scheme, port or path (like 192.168.1.20); weft adds the outside port itself. \
+             `{NETWORK_ADDRESS_ENV}=off` turns it off"
+        )
+    })
+}
+
+/// `address`, refused when no other device could reach the doors on it:
+/// a loopback address answers only this machine (the outside doors are
+/// on loopback already), an unspecified one (`0.0.0.0`, `::`) would put
+/// them on every interface this machine has, and a link-local IPv6 one
+/// (`fe80::`) needs a zone a link cannot carry. An IPv4 address written
+/// as IPv6 (`::ffff:127.0.0.1`) is read as the IPv4 one it is, so it is
+/// checked and opened as that. `named` says where the address came from.
+fn reachable_network_address(address: std::net::IpAddr, named: &str) -> Result<std::net::IpAddr> {
+    let address = address.to_canonical();
+    let why = match address {
+        a if a.is_loopback() => Some("a loopback address, which only this machine reaches (the outside doors are there already)"),
+        a if a.is_unspecified() => Some("every address of this machine at once, which would open the outside doors on all of them"),
+        std::net::IpAddr::V6(a) if a.is_unicast_link_local() => Some("a link-local address, which a link cannot name without the interface"),
+        _ => None,
+    };
+    match why {
+        Some(why) => anyhow::bail!(
+            "{named} is {why}: give the IP of this machine that devices on its network reach (like 192.168.1.20), \
+             or `{NETWORK_ADDRESS_ENV}=off` to turn it off"
+        ),
+        None => Ok(address),
+    }
+}
+
+/// Refuse a network address this machine does not have: binding a port
+/// on it fails at once here, where the runtime would otherwise fail to
+/// open its listener minutes later. Any port does (0 lets the system pick
+/// one), so another program on the outside port is left to
+/// [`refuse_taken_ports`], which names it.
+fn refuse_a_missing_network_address(address: std::net::IpAddr) -> Result<()> {
+    match std::net::TcpListener::bind((address, 0)) {
+        Ok(_) => Ok(()),
+        Err(e) => anyhow::bail!(
+            "this machine has no network address {address} ({e}): set {NETWORK_ADDRESS_ENV} to one of its IPs \
+             (`ip -brief address` lists them), or `{NETWORK_ADDRESS_ENV}=off` to turn it off"
+        ),
+    }
+}
+
+/// The address a network url names (`http://<address>:<port>`).
+fn address_of_network_url(url: &str) -> Result<std::net::IpAddr> {
+    let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("networkUrl '{url}' in config.json is not a URL: {e}"))?;
+    match parsed.host() {
+        Some(url::Host::Ipv6(ip)) => Ok(ip.into()),
+        Some(url::Host::Ipv4(ip)) => Ok(ip.into()),
+        _ => anyhow::bail!("networkUrl '{url}' in config.json names no IP; `{NETWORK_ADDRESS_ENV}=<IP>` sets one"),
+    }
+}
+
+/// Where the outside doors are reached from this machine's network: the
+/// address and the outside port.
+fn network_listen(address: std::net::IpAddr, outside: u16) -> std::net::SocketAddr {
+    (address, outside).into()
+}
+
+/// The network listener as a link is built on.
+fn network_url(listen: std::net::SocketAddr) -> String {
+    format!("http://{listen}")
 }
 
 /// The install's config. Everything that follows from this machine is
@@ -1015,7 +1114,7 @@ fn install_config(
     ports: Ports,
     runtime_image: String,
     builder_base: String,
-    internet_url: Option<String>,
+    tunnel: Option<&Tunnel>,
     previous: Levers,
 ) -> Result<InstallConfig> {
     // Only what a person set is written: a lever left out follows weft's
@@ -1027,6 +1126,7 @@ fn install_config(
     };
     let workers = previous.workers.unwrap_or_default();
     let edge = edge_config(previous.edge)?;
+    let network = network_address(std::env::var(NETWORK_ADDRESS_ENV).ok().as_deref(), previous.network_url.as_deref())?;
     let config = InstallConfig {
         install: install.id.clone(),
         platform: PlatformConfig::Local(Box::new(LocalPlatform {
@@ -1037,20 +1137,27 @@ fn install_config(
             listen: Listen {
                 public: ([127, 0, 0, 1], ports.public).into(),
                 internal: internal_listen(ports),
-                // Served whether or not a tunnel carries it: on loopback it
-                // answers a subset of what the public port does, and a
-                // tunnel opened later finds it already there.
+                // Served whether or not a tunnel carries it: it answers a
+                // subset of what the public port does, and a tunnel opened
+                // later finds it already there.
                 outside: Some(([127, 0, 0, 1], ports.outside).into()),
+                // The same doors again on the machine's network address,
+                // a listener of its own: its callers connect straight to
+                // it, so it trusts no forwarded address, where the
+                // tunnel's port trusts the one cloudflared adds.
+                network: network.map(|address| network_listen(address, ports.outside)),
             },
             project_ports: install.id.name().is_none().then_some(weft_platform_traits::config::PortRange {
                 first: weft_core::ports::PROJECTS.0,
                 last: weft_core::ports::PROJECTS.1,
             }),
             internal_url: format!("http://127.0.0.1:{}", ports.internal),
+            network_url: network.map(|address| network_url(network_listen(address, ports.outside))),
+            quick_tunnel_metrics: tunnel.and_then(|t| t.metrics.clone()),
         })),
         auth: AuthMode::Local,
         public_url: format!("http://127.0.0.1:{}", ports.public),
-        internet_url,
+        internet_url: tunnel.map(|t| t.url.clone()),
         roles: Default::default(),
         role_urls: Default::default(),
         workers,
@@ -1077,20 +1184,38 @@ fn install_config(
     Ok(config)
 }
 
-/// The ports a local install's one process serves.
-fn listen_of(config: &InstallConfig) -> &Listen {
+/// The local half of a config the daemon wrote.
+fn local_of(config: &InstallConfig) -> &LocalPlatform {
     match &config.platform {
-        PlatformConfig::Local(local) => &local.listen,
+        PlatformConfig::Local(local) => local,
         PlatformConfig::Gcp(_) => unreachable!("the daemon only ever writes a local install's config"),
     }
 }
 
+/// The ports a local install's one process serves.
+fn listen_of(config: &InstallConfig) -> &Listen {
+    &local_of(config).listen
+}
+
 // ----- the tunnel --------------------------------------------------------
 
+/// The install's open tunnel, as a start found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Tunnel {
+    /// The address it answers at now.
+    url: String,
+    /// Whether it is a named tunnel, whose address is fixed.
+    named: bool,
+    /// For a quick tunnel, where its metrics server answers
+    /// (`http://127.0.0.1:<port>`), which says its address as it is now:
+    /// a quick tunnel's moves whenever it reconnects.
+    metrics: Option<String>,
+}
+
 /// Bring the tunnel up (or down) to match the persisted choice, and
-/// answer its address when it is up. The tunnel carries only the outside
-/// port: the doors outside callers use, never the management API.
-async fn reconcile_tunnel(install: &Install, ports: Ports) -> Result<Option<(String, bool)>> {
+/// answer it when it is up. The tunnel carries only the outside port: the
+/// doors outside callers use, never the management API.
+async fn reconcile_tunnel(install: &Install, ports: Ports) -> Result<Option<Tunnel>> {
     let name = install.tunnel_container();
     if !public_url_marker(install).exists() {
         remove_container(&name).await?;
@@ -1126,20 +1251,61 @@ async fn reconcile_tunnel(install: &Install, ports: Ports) -> Result<Option<(Str
         // would claim this install still runs it.
         None => remove_if_present(&env_file)?,
     }
+    let metrics = QuickTunnelMetrics::on(ports.tunnel_metrics, cfg!(target_os = "linux"));
+    if named.is_none() {
+        args.extend(metrics.docker_args.iter().cloned());
+    }
     // The origin goes to a named tunnel too: one made with `cloudflared
     // tunnel create` (how a branch's install gets its own address) has no
     // routing stored at Cloudflare and forwards to `--url`, while one set
     // up in the dashboard gets its routing from there, which replaces it.
-    args.extend([TUNNEL_IMAGE.to_string(), "tunnel".into(), "--no-autoupdate".into(), "--url".into(), origin]);
+    args.extend([TUNNEL_IMAGE.to_string(), "tunnel".into(), "--no-autoupdate".into()]);
+    if named.is_none() {
+        args.extend(["--metrics".into(), metrics.bind.clone()]);
+    }
+    args.extend(["--url".into(), origin]);
     if named.is_some() {
         args.push("run".into());
     }
-    ensure_container(&name, &args, &install.dir, None).await?;
-    let url = match named {
-        Some((_, hostname)) => (hostname, true),
-        None => (quick_tunnel_url(&name).await?, false),
+    // A quick tunnel's metrics port is taken on loopback either way: on
+    // the host's network by cloudflared itself, elsewhere by Docker.
+    let published = named.is_none().then(|| {
+        PortUse::of(install, ([127, 0, 0, 1], ports.tunnel_metrics).into(), "the quick tunnel's address", "WEFT_TUNNEL_METRICS_PORT")
+    });
+    ensure_container(&name, &args, &install.dir, published).await?;
+    let tunnel = match named {
+        Some((_, hostname)) => Tunnel { url: hostname, named: true, metrics: None },
+        None => Tunnel { url: quick_tunnel_url(&name, &metrics.url).await?, named: false, metrics: Some(metrics.url) },
     };
-    Ok(Some(url))
+    Ok(Some(tunnel))
+}
+
+/// How a quick tunnel's metrics server is run so the install reaches it on
+/// loopback, where it says the tunnel's address as it is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuickTunnelMetrics {
+    /// What the tunnel container is run with besides: the published port,
+    /// when it runs on Docker's bridge network.
+    docker_args: Vec<String>,
+    /// Where cloudflared listens, inside the container (`--metrics`).
+    bind: String,
+    /// Where the install asks it, from the machine.
+    url: String,
+}
+
+impl QuickTunnelMetrics {
+    /// On Linux the tunnel runs on the host's network ([`tunnel_origin`]),
+    /// so it listens on loopback itself. Elsewhere it runs on Docker's
+    /// bridge network: it listens on every interface inside its container,
+    /// and Docker publishes the port to the machine's loopback only.
+    fn on(port: u16, host_network: bool) -> Self {
+        let url = format!("http://127.0.0.1:{port}");
+        if host_network {
+            Self { docker_args: Vec::new(), bind: format!("127.0.0.1:{port}"), url }
+        } else {
+            Self { docker_args: vec!["-p".into(), format!("127.0.0.1:{port}:{port}")], bind: format!("0.0.0.0:{port}"), url }
+        }
+    }
 }
 
 /// The Docker network the tunnel runs on, and the address it reaches the
@@ -1152,26 +1318,39 @@ fn tunnel_origin(ports: Ports) -> (String, String) {
     }
 }
 
-/// The quick tunnel's minted address, from its log (the newest one: a
-/// quick tunnel mints a new address when it reconnects).
-async fn quick_tunnel_url(container: &str) -> Result<String> {
+/// The quick tunnel's address, as its metrics server at `metrics` says it
+/// now (`/quicktunnel`, the same question the install asks each time it
+/// builds a link on it).
+async fn quick_tunnel_url(container: &str, metrics: &str) -> Result<String> {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     loop {
-        let out = images::docker().args(["logs", "--tail", "200", container]).output().await?;
-        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        if let Some(url) = text.split_whitespace().rfind(|w| w.starts_with("https://") && w.contains(".trycloudflare.com")) {
-            return Ok(url.trim_end_matches('/').to_string());
+        // Not answering yet, or answering with no hostname: the tunnel is
+        // still connecting.
+        if let Ok(answer) = client.get(format!("{metrics}/quicktunnel")).send().await {
+            if let Ok(QuickTunnelAnswer { hostname }) = answer.json().await {
+                if !hostname.is_empty() {
+                    return Ok(format!("https://{hostname}"));
+                }
+            }
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "the tunnel reported no public address; its log: docker logs {container}"
+            "the tunnel reported no public address at {metrics}/quicktunnel; its log: docker logs {container}"
         );
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
+/// What a quick tunnel's `/quicktunnel` answers.
+#[derive(serde::Deserialize)]
+struct QuickTunnelAnswer {
+    hostname: String,
+}
+
 /// Prove the address reaches the outside doors, then record it.
-async fn announce_tunnel(install: &Install, url: &str, named: bool, ports: Ports) -> Result<()> {
+async fn announce_tunnel(install: &Install, Tunnel { url, named, .. }: &Tunnel, ports: Ports) -> Result<()> {
+    let named = *named;
     let container = install.tunnel_container();
     let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
@@ -1200,7 +1379,7 @@ async fn announce_tunnel(install: &Install, url: &str, named: bool, ports: Ports
     std::fs::create_dir_all(&install.dir)?;
     std::fs::write(public_url_file(install), url)?;
     println!("public address: {url}");
-    println!("  it carries only the doors outside callers use: /events/... (provider event pushes), /signal/... (fire links), /signal-token/..., /public/files/... (shared file links), /connect/... (live routes), /infra/... (public infra endpoints) and the OAuth callback. Rerun with --no-public-url to close it.");
+    println!("  it carries only the doors outside callers use: /events/... (provider event pushes), /signal/... (fire links), /signal-token/..., /files/... (links to stored files, and visitors' uploads), /connect/... (live routes), /infra/... (public infra endpoints) and the OAuth callback. Rerun with --no-public-url to close it.");
     if !named {
         println!(
             "  NOTE: this free-tunnel address changes whenever the tunnel reconnects, and everything registered against it \
@@ -1478,6 +1657,15 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
     let repo_root = weft_compiler::build::resolve_weft_root().map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     std::fs::create_dir_all(&install.dir)?;
     refuse_an_older_install(install).await?;
+    // The levers the last start left, read once: a network address that is
+    // no good (set now or kept) is refused before anything starts.
+    let previous = match install.config_path().exists() {
+        true => Levers::read(&install.config_path())?,
+        false => Levers::default(),
+    };
+    if let Some(address) = network_address(std::env::var(NETWORK_ADDRESS_ENV).ok().as_deref(), previous.network_url.as_deref())? {
+        refuse_a_missing_network_address(address)?;
+    }
     let ports = ports(install)?;
 
     // This install runs and builds on these from now on, so they are
@@ -1499,11 +1687,7 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
     ensure_object_store(object_store_port()?).await?;
     let tunnel = reconcile_tunnel(install, ports).await?;
 
-    let previous = match install.config_path().exists() {
-        true => Levers::read(&install.config_path())?,
-        false => Levers::default(),
-    };
-    let config = install_config(install, ports, shared.runtime, shared.builder_base, tunnel.as_ref().map(|(u, _)| u.clone()), previous)?;
+    let config = install_config(install, ports, shared.runtime, shared.builder_base, tunnel.as_ref(), previous)?;
     std::fs::write(install.config_path(), serde_json::to_vec_pretty(&config)?)?;
     let env = secrets(install, ports, &repo_root)?;
     // SYNC: secrets.env lines <-> crates/weft-core/src/infra/install.rs (SECRETS_FILE,
@@ -1523,6 +1707,9 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
     if let Some(outside) = listen.outside {
         uses.push(PortUse::of(install, outside, "the doors outside callers use (the tunnel's target)", "WEFT_OUTSIDE_PORT"));
     }
+    if let Some(network) = listen.network {
+        uses.push(PortUse::of(install, network, "the doors devices on this machine's network use", "WEFT_OUTSIDE_PORT"));
+    }
     refuse_taken_ports(&uses).await?;
     start_runtime(install).await?;
     wait_for_runtime(install, ports.public).await?;
@@ -1530,8 +1717,11 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
     super::catalog::preload_standard_library(&local)
         .await
         .context("store the standard library in this install's assets")?;
-    if let Some((url, named)) = tunnel {
-        announce_tunnel(install, &url, named, ports).await?;
+    if let Some(tunnel) = &tunnel {
+        announce_tunnel(install, tunnel, ports).await?;
+    }
+    if let Some(url) = local_of(&config).network_url.as_deref() {
+        println!("network address: {url} (the doors outside callers use, for devices on this machine's network; a start with {NETWORK_ADDRESS_ENV}=off closes it)");
     }
     println!("weft is running at http://127.0.0.1:{} (install '{}')", ports.public, install.id.label_value());
     Ok(())
@@ -1581,6 +1771,12 @@ async fn remove(install: &Install) -> Result<()> {
         docker_ok(&["volume", "rm", "-f", v.trim()], "docker volume rm").await?;
     }
     delete_bucket(&install.bucket()).await?;
+    // The caches its images compiled weft's crates in, which no other
+    // install builds in (`weft_compiler::build::install_cache_key`).
+    crate::images::drop_install_build_caches(&install.id, None).await?;
+    // The images it holds under its own names, now that nothing of it
+    // runs them (`Install::local_image_ref`).
+    crate::images::remove_install_images(&install.id).await?;
     // Postgres owned its files as its own user.
     if install.postgres_dir().exists() {
         let out = run_in_alpine(&install.dir, "/d", "rm -rf /d/postgres-data").await?;
@@ -1747,13 +1943,20 @@ mod tests {
 
     #[test]
     fn the_config_a_start_writes_is_valid_and_keeps_the_management_api_off_the_tunnel() {
-        let ports = Ports { public: 14111, internal: 14113, outside: 14112, postgres: 14114 };
+        let ports = Ports { public: 14111, internal: 14113, outside: 14112, postgres: 14114, tunnel_metrics: 14117 };
         let closed = install_config(&install(None), ports, "weft-runtime:x".into(), "b".into(), None, Levers::default()).unwrap();
+        assert_eq!(local_of(&closed).network_url, None, "no network address unless a person sets one");
         assert_eq!(listen_of(&closed).outside, Some(([127, 0, 0, 1], 14112).into()), "the outside port is served without a tunnel too");
         assert_eq!(closed.public_url, "http://127.0.0.1:14111");
         let ObjectStoreSettings::S3(store) = &closed.object_store else { panic!("a local install's store is S3-compatible") };
         assert_eq!(store.worker_endpoint.as_deref(), Some("http://weft-object-store:8333"));
-        let open = install_config(&install(None), ports, "weft-runtime:x".into(), "b".into(), Some("https://a.trycloudflare.com".into()), Levers::default()).unwrap();
+        let quick = Tunnel { url: "https://a.trycloudflare.com".into(), named: false, metrics: Some("http://127.0.0.1:14117".into()) };
+        let open = install_config(&install(None), ports, "weft-runtime:x".into(), "b".into(), Some(&quick), Levers::default()).unwrap();
+        assert_eq!(open.internet_url.as_deref(), Some("https://a.trycloudflare.com"));
+        assert_eq!(local_of(&open).quick_tunnel_metrics.as_deref(), Some("http://127.0.0.1:14117"), "a quick tunnel's address is asked each time");
+        let named = Tunnel { url: "https://weft.example.com".into(), named: true, metrics: None };
+        let fixed = install_config(&install(None), ports, "weft-runtime:x".into(), "b".into(), Some(&named), Levers::default()).unwrap();
+        assert_eq!(local_of(&fixed).quick_tunnel_metrics, None, "a named tunnel's address is fixed");
         assert_eq!(listen_of(&open).outside, Some(([127, 0, 0, 1], 14112).into()));
         assert_eq!(listen_of(&open).public.ip(), std::net::IpAddr::from([127, 0, 0, 1]), "the management API stays on loopback");
         let v = serde_json::to_value(&open).unwrap();
@@ -1916,6 +2119,96 @@ mod tests {
         assert_eq!((label(c.running), labels(c.stale)), (None, vec!["old".to_string()]), "a file whose container is gone blocks nothing");
         assert_eq!(tunnel_token_holders("tok", &others), TokenHolders { running: None, stale: vec![] });
         assert_eq!(tunnel_token_holders("tok-a", &[]), TokenHolders { running: None, stale: vec![] });
+    }
+
+    /// The network address is an IP of the machine: set, it wins and
+    /// is checked; `off` clears it; unset, the last start's is kept, read
+    /// back off the network url it wrote, and checked the same way.
+    #[test]
+    fn a_network_address_is_an_ip_kept_across_starts() {
+        for good in ["192.168.1.20", "fd00::1"] {
+            assert_eq!(check_network_address(good).unwrap(), good.parse::<std::net::IpAddr>().unwrap());
+        }
+        for bad in ["http://192.168.1.20", "192.168.1.20:14112", "box/weft", "my-laptop.local", ""] {
+            let e = check_network_address(bad).unwrap_err().to_string();
+            assert!(e.contains("WEFT_NETWORK_ADDRESS"), "{bad}: {e}");
+        }
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let kept = Some("http://192.168.1.20:14112");
+        assert_eq!(network_address(None, kept).unwrap(), Some(ip("192.168.1.20")));
+        assert_eq!(network_address(Some(" "), kept).unwrap(), Some(ip("192.168.1.20")), "empty is unset");
+        assert_eq!(network_address(Some("off"), kept).unwrap(), None);
+        assert_eq!(network_address(Some("10.0.0.2"), kept).unwrap(), Some(ip("10.0.0.2")));
+        assert!(network_address(Some("box:1"), kept).is_err());
+        assert_eq!(network_address(None, None).unwrap(), None);
+        let v6 = network_url(network_listen(ip("fd00::1"), 14112));
+        assert_eq!(v6, "http://[fd00::1]:14112");
+        assert_eq!(network_address(None, Some(&v6)).unwrap(), Some(ip("fd00::1")));
+        assert_eq!(network_address(Some("::ffff:192.168.1.20"), None).unwrap(), Some(ip("192.168.1.20")), "read as the IPv4 it is");
+        // No other device reaches these: refused, naming where they came from.
+        for unreachable in ["127.0.0.1", "::1", "0.0.0.0", "::", "fe80::1", "::ffff:127.0.0.1", "::ffff:0.0.0.0"] {
+            let e = network_address(Some(unreachable), None).unwrap_err().to_string();
+            assert!(e.contains(&format!("WEFT_NETWORK_ADDRESS='{unreachable}'")), "{unreachable}: {e}");
+        }
+        let e = network_address(None, Some("http://127.0.0.1:14112")).unwrap_err().to_string();
+        assert!(e.contains("config.json"), "a kept one too: {e}");
+        assert!(network_address(None, Some("not a url")).is_err(), "an unparsable kept one too");
+    }
+
+    /// An address this machine has passes the probe; one it does not
+    /// (TEST-NET-3, never assigned) is refused before anything starts.
+    #[test]
+    fn a_network_address_this_machine_lacks_is_refused() {
+        refuse_a_missing_network_address("127.0.0.1".parse().unwrap()).unwrap();
+        let e = refuse_a_missing_network_address("203.0.113.7".parse().unwrap()).unwrap_err().to_string();
+        assert!(e.contains("has no network address 203.0.113.7") && e.contains("WEFT_NETWORK_ADDRESS"), "{e}");
+    }
+
+    /// Only the outside doors go on the network, on a listener of their
+    /// own: the tunnel's port stays on loopback, and so does the public
+    /// port, which carries the management API.
+    #[test]
+    fn a_network_address_opens_only_the_outside_doors() {
+        let ports = Ports { public: 14111, internal: 14113, outside: 14112, postgres: 14114, tunnel_metrics: 14117 };
+        let previous = Levers { network_url: Some("http://192.168.1.20:1".into()), ..Levers::default() };
+        let config = install_config(&install(None), ports, "weft-runtime:x".into(), "b".into(), None, previous).unwrap();
+        assert_eq!(listen_of(&config).outside, Some(([127, 0, 0, 1], 14112).into()));
+        assert_eq!(listen_of(&config).network, Some(([192, 168, 1, 20], 14112).into()));
+        assert_eq!(listen_of(&config).public, ([127, 0, 0, 1], 14111).into());
+        assert_eq!(local_of(&config).network_url.as_deref(), Some("http://192.168.1.20:14112"), "on the outside port as it is now");
+        assert_eq!(config.own_base_url(), "http://192.168.1.20:14112");
+        let none = install_config(&install(None), ports, "weft-runtime:x".into(), "b".into(), None, Levers::default()).unwrap();
+        assert_eq!(listen_of(&none).network, None);
+    }
+
+    /// The machine asks a quick tunnel's metrics on loopback: on the
+    /// host's network cloudflared listens there itself; on Docker's bridge
+    /// it listens inside its container and Docker publishes the port to
+    /// loopback only.
+    #[test]
+    fn the_quick_tunnel_metrics_answer_on_loopback() {
+        let host = QuickTunnelMetrics::on(14117, true);
+        assert_eq!((host.docker_args.is_empty(), host.bind.as_str(), host.url.as_str()), (true, "127.0.0.1:14117", "http://127.0.0.1:14117"));
+        let bridge = QuickTunnelMetrics::on(14117, false);
+        assert_eq!(bridge.docker_args, vec!["-p".to_string(), "127.0.0.1:14117:14117".to_string()]);
+        assert_eq!((bridge.bind.as_str(), bridge.url.as_str()), ("0.0.0.0:14117", "http://127.0.0.1:14117"));
+    }
+
+    /// A ports.json an older weft wrote has no metrics port: a named
+    /// install gets a free port of its own, saved and kept by the next
+    /// start, and the default install's moves with its variable.
+    #[test]
+    fn an_older_ports_file_gets_a_tunnel_metrics_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = r#"{"public":15000,"internal":15001,"outside":15002,"postgres":15003}"#;
+        std::fs::write(Ports::path(dir.path()), old).unwrap();
+        let named = Install { id: install(Some("cell3")).id, dir: dir.path().to_path_buf() };
+        let picked = ports(&named).unwrap();
+        assert!(![15000, 15001, 15002, 15003].contains(&picked.tunnel_metrics));
+        assert!(ports::SavedPorts::read(dir.path()).unwrap().unwrap().says(&picked), "saved for the next start");
+        assert_eq!(ports(&named).unwrap(), picked, "and kept by it");
+        let moved = moved_by_env(Ports::DEFAULT, |n| (n == "WEFT_TUNNEL_METRICS_PORT").then(|| "15117".to_string())).unwrap();
+        assert_eq!(moved.tunnel_metrics, 15117);
     }
 
     #[test]

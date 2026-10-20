@@ -10,7 +10,7 @@ use serde_json::{json, Map, Value};
 
 use weft::access::client::{get_json, post_json};
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 use super::elevenlabs::{merge_json, API};
 use super::flows::set_some;
@@ -33,7 +33,7 @@ impl Node for ElevenLabsAgentCallNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let agent: String = ctx.inputs.get("agent")?;
         let phone_number: String = ctx.inputs.get("phoneNumber")?;
@@ -55,7 +55,7 @@ impl Node for ElevenLabsAgentCallNode {
         // The number is the program's own choice, so a number this node
         // cannot dial, or a Twilio setting on a number that is not
         // Twilio's, is the program's mistake: an input error, which
-        // `error` never catches.
+        // `_error` never catches.
         let Some(&(_, route, a_provider)) = PROVIDERS.iter().find(|(name, _, _)| *name == provider) else {
             return Err(WeftError::Input(format!(
                 "phone number {phone_number} has provider '{provider}', which this node does not know how to \
@@ -108,7 +108,7 @@ fn has_keys(value: &Value) -> bool {
 
 /// `conversation_initiation_client_data`: `clientData` with the typed
 /// inputs merged on top, holding only what was set.
-fn client_data(ctx: &ExecutionContext) -> WeftResult<Value> {
+fn client_data(ctx: &RunContext) -> WeftResult<Value> {
     let mut agent = json!({});
     set_some(&mut agent, "first_message", ctx.inputs.opt::<String>("firstMessage")?);
     set_some(&mut agent, "language", ctx.inputs.opt::<String>("language")?);
@@ -148,7 +148,7 @@ struct Telephony {
 }
 
 impl Telephony {
-    fn read(ctx: &ExecutionContext) -> WeftResult<Self> {
+    fn read(ctx: &RunContext) -> WeftResult<Self> {
         Ok(Self {
             ringing_timeout_secs: ctx.inputs.opt("ringingTimeoutSecs")?,
             record: ctx.inputs.get("recordCall")?,

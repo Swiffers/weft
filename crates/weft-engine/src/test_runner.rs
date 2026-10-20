@@ -138,7 +138,7 @@ fn refuse_misdeclared_live(catalog: &'static dyn NodeCatalog) -> Result<(), Stri
                  tier (the live rig only drives a plain run body); declare it as a fake \
                  test instead",
                 t.name,
-                if manifest.features.is_trigger { "trigger" } else { "requires_infra" },
+                if manifest.features.is_trigger { "trigger" } else { "requiresInfra" },
             ));
         }
     }
@@ -243,7 +243,7 @@ async fn run(catalog: &'static dyn NodeCatalog, args: Args) -> ExitCode {
                                 tokio::task::spawn_blocking(move || declared.run_basic())
                                     .await
                                     .unwrap_or_else(|e| {
-                                        Err(weft_core::error::WeftError::NodeExecution(format!(
+                                        Err(weft_core::error::WeftError::NodeFailed(format!(
                                             "basic test task failed: {e}"
                                         )))
                                     })
@@ -289,7 +289,7 @@ fn report_of(
     test: &str,
     tier: TestTier,
     result: weft_core::error::WeftResult<()>,
-    execution_ids: Vec<String>,
+    run_ids: Vec<String>,
 ) -> TestReport {
     let error = result.err().map(|e| e.to_string());
     TestReport {
@@ -298,7 +298,7 @@ fn report_of(
         tier,
         passed: error.is_none(),
         error,
-        execution_ids,
+        run_ids,
     }
 }
 
@@ -321,7 +321,7 @@ pub struct LiveRequest {
     pub connection: String,
     /// The run the test is: this process bears it, and its cost
     /// attributes to it.
-    pub execution_id: uuid::Uuid,
+    pub run_id: uuid::Uuid,
     /// The replica id this process names itself with on the broker: the
     /// run's driver.
     pub replica: String,
@@ -380,7 +380,7 @@ async fn run_one(catalog: &'static dyn NodeCatalog, request: TestRequest, live_e
                 live.replica,
                 env.tenant_id.clone(),
                 env.project_id,
-                live.execution_id,
+                live.run_id,
                 format!("node-test:{node}::{}", declared.name),
                 env.run_cap,
             )
@@ -390,8 +390,8 @@ async fn run_one(catalog: &'static dyn NodeCatalog, request: TestRequest, live_e
             // Release leased connections + wait out in-flight cost records
             // BEFORE reporting: money first.
             let leaked = runner.settle().await;
-            let execution_ids = vec![runner.execution_id().to_string()];
-            let mut report = report_of(&node, declared.name, declared.tier, result, execution_ids);
+            let run_ids = vec![runner.run_id().to_string()];
+            let mut report = report_of(&node, declared.name, declared.tier, result, run_ids);
             if !leaked.is_empty() {
                 // A leaked lease fails the test even when the body passed;
                 // the body's own error stays primary, the leak is appended

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use weft::infra::InfraHandle;
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, StorageScope};
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BaileySendMediaNode;
@@ -23,14 +23,14 @@ impl Node for BaileySendMediaNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let to: String = ctx.inputs.get("to")?;
         let file: FileHandle = ctx.inputs.get("file")?;
         let caption: Option<String> = ctx.inputs.opt("caption")?;
         let voice_note: bool = ctx.inputs.get("voiceNote")?;
 
-        let media = ctx.storage(StorageScope::Execution).external_file(&file).await?;
+        let media = ctx.storage(StorageScope::Run).external_file(&file).await?;
         // A voice note is an audio message and nothing else. The bridge
         // picks the media kind from the mime and would quietly drop the
         // flag on anything else, so a file that is not audio is refused

@@ -5,13 +5,14 @@
 //! canAddInputPorts/canAddOutputPorts, and validate that every
 //! referenced node type exists.
 //!
-//! Three node-types are built-in (not catalog): `Passthrough` (group
-//! boundary), `LoopIn` / `LoopOut` (loop boundary). Their port shapes
-//! are written by the compiler's lowering (`flatten_group` in
-//! `weft_compiler.rs`); enrich does not consult the catalog for them
-//! (it `continue`s past these node types).
+//! Two node-types are built-in (not catalog): `LoopIn` / `LoopOut`, a
+//! loop's boundaries. Their port shapes are written by the compiler's
+//! lowering (`push_loop_boundaries` in `weft_compiler.rs`); enrich does
+//! not consult the catalog for them (it `continue`s past these node
+//! types). A group is no node: what enrich does for its ports (cast the
+//! literals written on them) it does on the group itself.
 
-use weft_core::exec::skip::{SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT};
+use weft_core::run::skip::{SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT};
 use weft_core::node::{derive_config_ports, materialize_auto_type_vars, MetadataCatalog, Widget, AUTO_TYPE_VAR};
 use weft_core::project::{InputDefinition, PortDefinition, ProjectDefinition, Span};
 use weft_core::node::Accepts;
@@ -31,6 +32,20 @@ pub struct EnrichError {
     /// came from a full-mode `@include` (same rule as
     /// `NodeDefinition::source_file`). None = the compiled source.
     pub file: Option<String>,
+    /// The nodes and groups the error is about, by id
+    /// (`Diagnostic::subjects`): the node being enriched, or both ends of
+    /// a wire; empty only for a fault of the catalog itself, which no cut
+    /// can step around.
+    pub subjects: Vec<String>,
+}
+
+impl EnrichError {
+    /// The finding this error is, for a caller that reports diagnostics.
+    pub fn diagnostic(&self) -> crate::Diagnostic {
+        crate::Diagnostic::at(self.span, crate::Severity::Error, "enrich", self.message.clone())
+            .in_file(self.file.as_deref())
+            .about(self.subjects.iter().cloned())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +55,13 @@ enum PortDirection {
 }
 
 impl PortDirection {
+    fn side(self) -> weft_core::weft_type::PortSide {
+        match self {
+            PortDirection::Input => weft_core::weft_type::PortSide::Input,
+            PortDirection::Output => weft_core::weft_type::PortSide::Output,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Input => "input",
@@ -81,25 +103,42 @@ fn normalize_port_literals(node: &mut weft_core::project::NodeDefinition) {
 /// hold one [`PortDefinition`], and the source-vs-catalog merge is one
 /// rule over that struct's fields; this hands the merge that struct so
 /// a new port field never needs a second accessor list.
+/// The program's `?` rides along: on an input it is `optional`, on an
+/// output it means nothing.
 trait AsPort: Clone {
     fn port(&self) -> &PortDefinition;
     fn port_mut(&mut self) -> &mut PortDefinition;
+    fn optional(&self) -> bool;
+    fn set_optional(&mut self, optional: bool);
 }
 
 impl AsPort for InputDefinition {
     fn port(&self) -> &PortDefinition { &self.port }
     fn port_mut(&mut self) -> &mut PortDefinition { &mut self.port }
+    fn optional(&self) -> bool { self.optional }
+    fn set_optional(&mut self, optional: bool) { self.optional = optional; }
 }
 
 impl AsPort for PortDefinition {
     fn port(&self) -> &PortDefinition { self }
     fn port_mut(&mut self) -> &mut PortDefinition { self }
+    fn optional(&self) -> bool { false }
+    fn set_optional(&mut self, _: bool) {}
 }
 
+/// Whether a type the source declares on a catalog port may replace the
+/// catalog's: `Err` says why not. An input narrows to anything that fits
+/// in the catalog's type; an output is the node's contract, so it takes
+/// another type only where the node lets the program say what it holds
+/// (a narrowable output, within its bound) or a type variable is pinned.
+type DeclarationFits<'a> = &'a dyn Fn(&PortDefinition, &WeftType) -> Result<(), String>;
+
+#[allow(clippy::too_many_arguments)]
 fn merge_ports<T: AsPort>(
     catalog_ports: &[T],
     weft_ports: &[T],
     can_add: bool,
+    fits: DeclarationFits<'_>,
     node_id: &str,
     span: Span,
     file: Option<&str>,
@@ -122,24 +161,27 @@ fn merge_ports<T: AsPort>(
             let (cp_port, wp_port) = (cp.port(), wp.port());
             let mut merged = cp.clone();
             merged.port_mut().required = wp_port.required;
+            merged.set_optional(wp.optional());
             // The catalog clone has no declared stamp; the header DOES
             // declare this port, so the editor's round-trip needs the
             // authored spelling carried onto the merged result.
             merged.port_mut().declared_type = wp_port.declared_type.clone();
-            if !wp_port.port_type.is_must_override() {
-                if cp_port.port_type.is_must_override()
-                    || WeftType::is_compatible(&wp_port.port_type, &cp_port.port_type)
-                {
-                    merged.port_mut().port_type = wp_port.port_type.clone();
-                } else {
-                    errors.push(EnrichError { span, file: file.map(str::to_string), message: format!(
-                        "node '{}': {} port '{}' declared type {} incompatible with catalog type {}",
-                        node_id,
-                        direction.as_str(),
-                        cp_port.name,
-                        wp_port.port_type,
-                        cp_port.port_type,
-                    )});
+            // A port the header names with no type keeps the catalog's.
+            if !wp_port.is_untyped(direction.side()) {
+                match fits(cp_port, &wp_port.port_type) {
+                    Ok(()) => merged.port_mut().port_type = wp_port.port_type.clone(),
+                    Err(why) => errors.push(EnrichError {
+                        span,
+                        file: file.map(str::to_string),
+                        subjects: vec![node_id.to_string()],
+                        message: format!(
+                            "node '{}': {} port '{}' is declared {}, {why}",
+                            node_id,
+                            direction.as_str(),
+                            cp_port.name,
+                            wp_port.port_type,
+                        ),
+                    }),
                 }
             }
             merged
@@ -159,7 +201,7 @@ fn merge_ports<T: AsPort>(
             // Not gated by EnrichPolicy: that only forgives unknown node
             // TYPES; a known type rejecting an authored port is a hard
             // authoring error in every mode.
-            errors.push(EnrichError { span, file: file.map(str::to_string), message: format!(
+            errors.push(EnrichError { span, file: file.map(str::to_string), subjects: vec![node_id.to_string()], message: format!(
                 "node '{}': declares custom {} port '{}' but node type does not support custom {} ports",
                 node_id,
                 direction.as_str(),
@@ -167,20 +209,6 @@ fn merge_ports<T: AsPort>(
                 direction.as_str(),
             )});
             continue;
-        }
-        // A user-added port with the placeholder `MustOverride` type is the
-        // graph editor's default for "I added a port but haven't set the
-        // type yet". Keep the port in the materialized list so the UI shows
-        // it (the user just added it), and surface the missing-type as an
-        // error diagnostic instead. Without this, the round-trip silently
-        // ate the port and it vanished from the canvas.
-        if wp.port().port_type.is_must_override() {
-            errors.push(EnrichError { span, file: file.map(str::to_string), message: format!(
-                "node '{}': custom {} port '{}' needs a concrete type",
-                node_id,
-                direction.as_str(),
-                wp.port().name,
-            )});
         }
         result.push(wp.clone());
     }
@@ -194,10 +222,9 @@ pub enum EnrichPolicy {
     Lenient,
 }
 
-/// Node-types written by the compiler's lowering passes (Passthrough by
-/// group-flatten, LoopIn/LoopOut by loop-lowering). They have no catalog
-/// entry by design: enrich fills their ports itself, and diagnostics must
-/// not flag them as unknown types.
+/// Node-types written by the compiler's lowering (a loop's LoopIn and
+/// LoopOut). They have no catalog entry by design: enrich fills their
+/// ports itself, and diagnostics must not flag them as unknown types.
 pub fn is_lowering_builtin(node_type: &str) -> bool {
     weft_core::project::boundary_types::is_boundary(node_type)
 }
@@ -255,7 +282,7 @@ fn gate_inputs() -> [InputDefinition; 2] {
                 // Its OWN type variable, never the node's `T`: a join whose
                 // branches carry Strings must not also force its permission
                 // to be a String.
-                port_type: WeftType::type_var("T__should_flow"),
+                port_type: WeftType::port_var(weft_core::weft_type::PortSide::Input, SHOULD_FLOW_PORT),
                 // Optional: unwired and unset, the node runs. The skip rule
                 // reads this port itself, so a closure on it does not need
                 // the required-input rule to bite.
@@ -271,7 +298,9 @@ fn gate_inputs() -> [InputDefinition; 2] {
             // Both, and never switchable: `_should_flow` is the
             // language's gate, and validate types its constant itself.
             accepts: Accepts::both(),
-            required_when_wired: false,
+            // The skip rules read the gate themselves (rule 0); a closure
+            // on it is never the required-input rule's to act on.
+            optional: true,
             widget: None,
             default: None,
             label: None,
@@ -283,7 +312,7 @@ fn gate_inputs() -> [InputDefinition; 2] {
         InputDefinition {
             port: PortDefinition {
                 name: SHOULD_NOT_FLOW_PORT.to_string(),
-                port_type: WeftType::type_var("T__should_not_flow"),
+                port_type: WeftType::port_var(weft_core::weft_type::PortSide::Input, SHOULD_NOT_FLOW_PORT),
                 required: false,
                 description: Some(
                     "Whether this node runs, read the other way round. A value here skips \
@@ -294,7 +323,7 @@ fn gate_inputs() -> [InputDefinition; 2] {
                 declared_type: None,
             },
             accepts: Accepts::both(),
-            required_when_wired: false,
+            optional: true,
             widget: None,
             default: None,
             label: None,
@@ -317,8 +346,8 @@ pub fn enrich_collecting(
 ) -> Vec<EnrichError> {
     let mut errors: Vec<EnrichError> = Vec::new();
     // One [reserved-node-type] error per offending TYPE, not per node:
-    // boundary types appear on two nodes per group, and a project full
-    // of groups would otherwise report the same corrupt catalog entry
+    // boundary types appear on two nodes per loop, and a project full
+    // of loops would otherwise report the same corrupt catalog entry
     // 2xN times.
     let mut reported_reserved: std::collections::HashSet<String> =
         std::collections::HashSet::new();
@@ -334,7 +363,7 @@ pub fn enrich_collecting(
         // catalog. Without it the editor reads an include as an empty box
         // and hides the Activate button on a project whose only trigger
         // is inside one. The include node itself gets neither
-        // `requires_infra` nor `is_trigger`: those drive real per-node
+        // `requiresInfra` nor `is_trigger`: those drive real per-node
         // work (a provisioned infra slot, a trigger's mount URL) and the
         // alias is not the node that does it.
         if let Some(contents) = &mut node.include_contents {
@@ -356,23 +385,22 @@ pub fn enrich_collecting(
             // gets the one home every port constant has, so the editor
             // shows and edits it like any node's. The build, which
             // inlines the file, lands the same line on the call site's
-            // boundary.
+            // port.
             normalize_port_literals(node);
             continue;
         }
 
         // Built-in boundary node-types. Their ports are written by the
-        // compiler's lowering pass (Passthrough by group-flatten, LoopIn
-        // / LoopOut by loop-lowering); enrich does not consult the
-        // catalog for them. A catalog entry that masquerades as one of
-        // these built-in names is rejected loud as a corrupt catalog:
-        // letting a catalog impl shadow the runtime built-in would
-        // silently break group / loop boundaries.
+        // compiler's loop lowering (LoopIn / LoopOut); enrich does not
+        // consult the catalog for them. A catalog entry that masquerades
+        // as one of these built-in names is rejected loud as a corrupt
+        // catalog: letting a catalog impl shadow the runtime built-in
+        // would silently break loop boundaries.
         if is_lowering_builtin(&node.node_type) {
             if catalog.lookup(&node.node_type).is_some()
                 && reported_reserved.insert(node.node_type.clone())
             {
-                errors.push(EnrichError { span: node.header_span_or_default(), file: node.source_file.clone(), message: format!(
+                errors.push(EnrichError { span: node.header_span_or_default(), file: node.source_file.clone(), subjects: Vec::new(), message: format!(
                     "[reserved-node-type] catalog declares '{}' but that name is a built-in language type; rename the catalog node",
                     node.node_type,
                 )});
@@ -388,7 +416,7 @@ pub fn enrich_collecting(
             if catalog.lookup(&node.node_type).is_some()
                 && reported_reserved.insert(node.node_type.clone())
             {
-                errors.push(EnrichError { span: node.header_span_or_default(), file: node.source_file.clone(), message: format!(
+                errors.push(EnrichError { span: node.header_span_or_default(), file: node.source_file.clone(), subjects: Vec::new(), message: format!(
                     "[reserved-node-type] catalog declares '{}' but that name is a reserved language keyword",
                     node.node_type,
                 )});
@@ -397,10 +425,15 @@ pub fn enrich_collecting(
         }
 
         let Some(meta) = catalog.lookup(&node.node_type) else {
-            if policy == EnrichPolicy::Strict {
+            // A node with an include path that reaches here is the
+            // placeholder an included file that does not compile leaves
+            // behind (`broken_include`): that file's own errors say what is
+            // wrong, and its type was never a catalog name.
+            if policy == EnrichPolicy::Strict && node.include_path.is_none() {
                 errors.push(EnrichError {
                     span: node.header_span_or_default(),
                     file: node.source_file.clone(),
+                    subjects: vec![node.id.clone()],
                     message: unknown_type_message(catalog, &node.node_type),
                 });
             }
@@ -425,7 +458,9 @@ pub fn enrich_collecting(
                     declared_type: None,
                 },
                 accepts: spec.effective_accepts(meta.is_compiler_read(&spec.name)),
-                required_when_wired: spec.required_when_wired,
+                // Optional in the metadata is required once wired, until
+                // the program writes otherwise.
+                optional: false,
                 // The DECLARED widget only; the type-derived default is
                 // stamped after TypeVar resolution (see the final pass),
                 // so a `T` input resolved to Image gets a file picker.
@@ -492,7 +527,7 @@ pub fn enrich_collecting(
         // in ONE namespace, so this is the whole collision rule.
         for wp in &weft_inputs {
             if catalog_inputs.iter().any(|cp| cp.name == wp.name) && meta.is_compiler_read(&wp.name) {
-                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
+                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
                     "node '{}': input '{}' of node type {} is read by the compiler to build \
                      the node; it takes an inline value only and cannot be declared as a \
                      port. Write it in the config braces instead",
@@ -525,7 +560,7 @@ pub fn enrich_collecting(
         // so it is refused where it cannot apply.
         for key in &node.optional_ports {
             if !weft_inputs.iter().any(|p| p.name == *key) {
-                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
+                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
                     "node '{}': '{}?' marks a port optional, but '{}' is not a port this node \
                      creates. Declare optionality on the port itself (`{}?: Type`) instead",
                     node.id, key, key, key,
@@ -533,54 +568,62 @@ pub fn enrich_collecting(
             }
         }
 
-        // An input required only once wired has its requiredness decided
-        // by its wiring, so a header line making it required always would
-        // quietly turn "unwired: the node runs without it" into a compile
-        // error. Declaring it optional (`name?: Type`) says nothing new and
-        // stays legal.
+        // A program may make an input its node calls optional required
+        // (`x: T`) or optional even when wired (`x?: T`), but never make a
+        // required one optional: the node's code is written to need it.
         for wp in &weft_inputs {
-            if wp.required && catalog_inputs.iter().any(|cp| cp.name == wp.name && cp.required_when_wired) {
-                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
-                    "node '{}': input '{}' of node type {} is required only when wired, so its \
-                     wiring decides whether it is required; declare it `{}?` or drop it from \
-                     the node's inputs",
-                    node.id, wp.name, node.node_type, wp.name,
+            if !wp.required && catalog_inputs.iter().any(|cp| cp.name == wp.name && cp.required) {
+                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
+                    "node '{}': input '{}' of node type {} is required, and its code needs it: \
+                     declare it `{}: {}` without `?`, or drop it from the node's inputs",
+                    node.id, wp.name, node.node_type, wp.name, wp.port_type,
                 )});
             }
         }
 
+        // SYNC: input_fits <-> packages/weft-graph/src/webview/lib/projection/header-ports.ts declarationRule
+        let input_fits = |catalog: &PortDefinition, declared: &WeftType| {
+            if WeftType::is_compatible(declared, &catalog.port_type) {
+                Ok(())
+            } else {
+                Err(format!("which does not fit in its type {}", catalog.port_type))
+            }
+        };
         let inputs = merge_ports(
             &catalog_inputs,
             &weft_inputs,
             meta.features.can_add_input_ports,
+            &input_fits,
             &node.id,
             node_span,
             node.source_file.as_deref(),
             PortDirection::Input,
             &mut errors,
         );
-        // A node that catches its failures has an `error` output the
-        // language gave it and the runtime fills; a source port of that
-        // name would read as the author's own value on it. The declared
-        // port is dropped before the merge so this is the one error it
-        // earns, not this plus a type mismatch against the catalog's.
+        // Every node has an `_error` output the language gave it and
+        // the runtime fills; a source port of that name would read as
+        // the author's own value on it. The declared port is dropped
+        // before the merge so this is the one error it earns, not this
+        // plus a type mismatch against the catalog's.
         let mut weft_outputs = weft_outputs;
-        if meta.features.catch_errors {
-            let port = weft_core::node::ERROR_PORT;
-            if weft_outputs.iter().any(|p| p.name == port) {
-                weft_outputs.retain(|p| p.name != port);
-                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
-                    "node '{}': '{port}' is the output this node type already has for its \
-                     failures (wire it to handle them); remove '{port}' from the node's \
-                     outputs, or give your own port another name",
-                    node.id,
-                )});
-            }
+        let port = weft_core::node::ERROR_PORT;
+        if weft_outputs.iter().any(|p| p.name == port) {
+            weft_outputs.retain(|p| p.name != port);
+            errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
+                "node '{}': '{port}' is the output every node already has for its failures \
+                 (wire it to handle them); remove '{port}' from the node's outputs, or give \
+                 your own port another name",
+                node.id,
+            )});
         }
+        let output_fits = |catalog: &PortDefinition, declared: &WeftType| {
+            meta.output_declaration_fits(&catalog.name, &catalog.port_type, declared)
+        };
         let outputs = merge_ports(
             &catalog_outputs,
             &weft_outputs,
             meta.features.can_add_output_ports,
+            &output_fits,
             &node.id,
             node_span,
             node.source_file.as_deref(),
@@ -590,6 +633,25 @@ pub fn enrich_collecting(
 
         node.inputs = inputs;
         node.outputs = outputs;
+        // The node's bounds: its type's, then the ones the program wrote
+        // after the type name (`KeepFile[T: Image]`), which hold on top.
+        // A written one must bound a variable the node's ports use, which
+        // only now, with the type's own ports in, can be asked.
+        let written_params = std::mem::take(&mut node.type_params);
+        let mut used = std::collections::BTreeSet::new();
+        for ty in node.inputs.iter().map(|p| &p.port_type).chain(node.outputs.iter().map(|p| &p.port_type)) {
+            ty.collect_type_vars(&mut used);
+        }
+        if let Err(why) = weft_core::weft_type::TypeParam::check_used(&written_params, &used) {
+            errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!("node '{}': {why}", node.id) });
+        }
+        node.type_params = meta.type_param_list();
+        node.type_params.extend(written_params);
+        // Each list is acyclic on its own; together they may not be
+        // (the type bounds `T` by `T2`, the program `T2` by `T`).
+        if let Err(why) = weft_core::weft_type::TypeParam::check_cycles(&node.type_params) {
+            errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!("node '{}': {why}", node.id) });
+        }
         // A declared port that narrows a catalog typevar narrows it
         // EVERYWHERE on this node: `Wait(value: String)` pins the `T`
         // that `value` carries in and out, so the pass-through output
@@ -618,7 +680,7 @@ pub fn enrich_collecting(
         for (var, concrete) in narrowings {
             match settled.iter().find(|(v, _)| *v == var) {
                 Some((_, first)) if *first != concrete => {
-                    errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
+                    errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message: format!(
                         "node '{}': the declared ports pin type '{var}' to two different types \
                          ({first} and {concrete}); every port that carries '{var}' on one node \
                          has to name the same type",
@@ -648,6 +710,14 @@ pub fn enrich_collecting(
                 node.features.one_of_required.push(group);
             }
         }
+        // A member of a one-of group is decided by its group: the node
+        // skips when every member closed, not when one wired member did.
+        // A member the program wrote required stays required.
+        for input in node.inputs.iter_mut() {
+            if !input.required && node.features.one_of_required.iter().any(|g| g.contains(&input.name)) {
+                input.optional = true;
+            }
+        }
         node.requires_infra = meta.requires_infra;
         node.images = meta.images.clone();
         node.fires_with = meta.fires_with.clone();
@@ -665,11 +735,12 @@ pub fn enrich_collecting(
                 // it belongs on the author's screen at build time.
                 Some(spec) => match weft_core::access::spec::publishable_fields(spec) {
                     Ok(_) => node.published_service = Some(spec.clone()),
-                    Err(message) => errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message }),
+                    Err(message) => errors.push(EnrichError { span: node_span, file: node.source_file.clone(), subjects: vec![node.id.clone()], message }),
                 },
                 None => errors.push(EnrichError {
                     span: node_span,
                     file: node.source_file.clone(),
+                    subjects: vec![node.id.clone()],
                     message: format!(
                         "node '{}' publishes a '{service}' connection, but no node in the \
                          catalog declares that service",
@@ -702,6 +773,7 @@ pub fn enrich_collecting(
                     errors.push(EnrichError {
                         span,
                         file: node.source_file.clone(),
+                        subjects: vec![node.id.clone()],
                         message: format!(
                             "'{id}.{field}' falls back to a connection written in the source. That was the \
                              old way: a connection lives in one install, so its id means nothing on any \
@@ -718,6 +790,7 @@ pub fn enrich_collecting(
                     errors.push(EnrichError {
                         span,
                         file: node.source_file.clone(),
+                        subjects: vec![node.id.clone()],
                         message: format!(
                             "'{id}.{field}' holds a connection written in the source. That was the old way \
                              of connecting a node: a connection lives in one install, so its id means \
@@ -761,6 +834,10 @@ pub fn enrich_collecting(
 
     // Effective-widget stamping, AFTER TypeVar resolution so a `T` input
     // resolved to Image gets the file picker its concrete type implies.
+    // A node whose places resolve apart (`place_types`) is stamped from
+    // its own types: the widget is what the editor draws, and the editor
+    // never sees an included file's places; a widget derived from a type
+    // adds no rule the run checks (only a declared one does).
     // Declared widgets are already in place from the catalog mapping;
     // everything still blank (type-derived inputs, user-added ports,
     // form-derived inputs) fills from the RESOLVED instance type. Runs
@@ -774,6 +851,20 @@ pub fn enrich_collecting(
         }
         cast_literals(node);
     }
+    // A literal on a group's own port is cast the same way, against the
+    // type the group declares there: the group sends it to every member
+    // that reads the port (`weft_core::run::scope`). A loop's sit on its
+    // `LoopIn`, cast above.
+    for group in project.groups.iter_mut().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+        for input in &group.in_ports {
+            if input.port_type.is_unresolved() { continue; }
+            let Some(value) = group.port_literals.get(&input.name).cloned() else { continue };
+            if WeftType::is_compatible(&crate::file_ref::literal_type(&value), &input.port_type) { continue; }
+            if let Ok(cast) = input.port_type.cast_value(&value) {
+                group.port_literals.insert(input.name.clone(), cast);
+            }
+        }
+    }
     mark_per_instance_slice(project);
     errors
 }
@@ -784,13 +875,17 @@ pub fn enrich_collecting(
 /// node, `@instance_filled` on a field); whatever sits downstream of one along the
 /// wires reads that instance's value, so it exists per instance as well: a
 /// trigger reading an instance's bridge address is armed once per instance,
-/// and a step reading an instance's connection runs in that instance's runs.
-/// Group, loop and include boundaries are ordinary nodes after
-/// flattening, so the walk crosses them without knowing they exist. A
-/// node an include's body shares between call sites is one node, so one
-/// per-instance site makes it per-instance for every site: the conservative
-/// answer, and the one that never lets an instance's value reach a shared
-/// run unnoticed.
+/// and a node reading an instance's connection runs in that instance's runs.
+/// A wire runs straight from a node to the node that reads it, through any
+/// group's port, so the walk follows wires and nothing else, with one more
+/// step: a wire landing on a group's gate decides whether the group runs,
+/// so everything inside a group whose gate reads a per-instance value runs
+/// per instance too. A loop's boundaries are ordinary nodes the wires
+/// cross, and its `LoopIn` (where its gate lands) launches every
+/// iteration, so reaching it reaches the loop's inside. A node an include's body
+/// shares between call sites is one node, so one per-instance site makes
+/// it per-instance for every site: the conservative answer, and the one
+/// that never lets an instance's value reach a shared run unnoticed.
 ///
 /// Derived and filled marks are recomputed from scratch each time, so a
 /// stale one can never outlive what it came from.
@@ -800,31 +895,58 @@ pub fn mark_per_instance_slice(project: &mut ProjectDefinition) {
         if matches!(node.per_instance, Some(PerInstance::Derived | PerInstance::Filled)) {
             node.per_instance = None;
         }
-    }
-    let mut downstream: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    for edge in &project.edges {
-        downstream.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
-    }
-    let mut reached: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    // The second starting point: a node with a field each instance fills.
-    for node in project.nodes.iter_mut() {
+        // The second starting point: a node with a field each instance fills.
         if node.per_instance.is_none() && weft_core::instance::instance_filled_fields(node).next().is_some() {
             node.per_instance = Some(PerInstance::Filled);
         }
     }
+    let mut downstream: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for edge in project.edges.iter().filter(|edge| !edge.to_group_port()) {
+        downstream.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
+    }
+    // A group reached through its gate reaches everything inside it, and
+    // a call site the body it calls.
+    let mut inside: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for node in &project.nodes {
+        for group in &node.scope {
+            inside.entry(group.as_str()).or_default().push(node.id.as_str());
+        }
+    }
+    for group in &project.groups {
+        if let weft_core::project::GroupKind::Call { body, .. } = &group.kind {
+            inside.entry(group.id.as_str()).or_default().push(body.as_str());
+        }
+    }
+    let mut reached: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut frontier: Vec<&str> = project
         .nodes
         .iter()
         .filter(|n| matches!(n.per_instance, Some(PerInstance::Marked | PerInstance::Filled)))
         .map(|n| n.id.as_str())
         .collect();
+    let groups: std::collections::HashSet<&str> = project.groups.iter().map(|g| g.id.as_str()).collect();
+    // A loop's gate lands on its `LoopIn`, which launches every iteration:
+    // reaching it reaches the loop's inside, the members no wire feeds
+    // among them.
+    let loop_of: std::collections::HashMap<&str, &str> = project.nodes.iter()
+        .filter_map(|n| n.group_boundary.as_ref()
+            .filter(|b| b.role == weft_core::project::GroupBoundaryRole::In)
+            .map(|b| (n.id.as_str(), b.group_id.as_str())))
+        .collect();
     while let Some(id) = frontier.pop() {
-        for &next in downstream.get(id).map(Vec::as_slice).unwrap_or_default() {
+        let opens = if groups.contains(id) { Some(id) } else { loop_of.get(id).copied() };
+        let next = downstream.get(id).map(Vec::as_slice).unwrap_or_default().iter()
+            // A gate reached: the group's inside. A group's own port (a
+            // wire from it) is reached only through its gate, never on
+            // its own: a literal is no instance's value.
+            .chain(opens.and_then(|group| inside.get(group)).into_iter().flatten());
+        for &next in next {
             if reached.insert(next.to_string()) {
                 frontier.push(next);
             }
         }
     }
+    let reached: std::collections::BTreeSet<String> = reached;
     for node in project.nodes.iter_mut() {
         if node.per_instance.is_none() && reached.contains(&node.id) {
             node.per_instance = Some(PerInstance::Derived);
@@ -842,8 +964,8 @@ pub fn mark_per_instance_slice(project: &mut ProjectDefinition) {
 /// (`config-type-mismatch`). Every constant is a candidate, whatever
 /// spelling wrote it; a marker's type is the type it declares (see
 /// `file_ref::literal_type`), so a file marker never looks like a
-/// String to cast. A port whose type is still open (`MustOverride`, an
-/// unbound variable) has nothing to cast toward yet.
+/// String to cast. A port whose type is still open (an unbound
+/// variable) has nothing to cast toward yet.
 fn cast_literals(node: &mut weft_core::project::NodeDefinition) {
     for input in &node.inputs {
         if input.port_type.is_unresolved() {
@@ -871,61 +993,258 @@ fn cast_literals(node: &mut weft_core::project::NodeDefinition) {
     }
 }
 
+/// Whether `Empty` (the item type of an empty list or object) sits
+/// anywhere in `ty`: a type read off such a constant says nothing about
+/// what that place holds.
+fn holds_empty(ty: &WeftType) -> bool {
+    match ty {
+        WeftType::Primitive(weft_core::weft_type::WeftPrimitive::Empty) => true,
+        WeftType::List(inner) | WeftType::Dict(inner) | WeftType::Generator(inner) => holds_empty(inner),
+        WeftType::Union(members) => members.iter().any(holds_empty),
+        WeftType::Record { fields, .. } => fields.iter().any(|f| holds_empty(&f.ty)),
+        WeftType::Named { body, .. } => holds_empty(body),
+        _ => false,
+    }
+}
+
+/// Work out every type variable from what is connected, at every place
+/// a node or a group runs. A node inside an included file runs once per
+/// site that includes it (however deep), and each place resolves its
+/// variables on its own: `blur` included once for an Image and once for
+/// a Video holds `T = Image` at one place and `T = Video` at the other.
+/// The node stays one node; where its places disagree, it carries each
+/// place's types ([`weft_core::project::NodeDefinition::place_types`]).
+/// A group's ports are typed the same way, place by place (a group inside
+/// an included file, the file's own body among them, is one group run at
+/// every place a site reaches it): a wire through group ports is a chain
+/// of stretches, from its source through each group port it passes to its
+/// target, and each stretch binds its two ends against each other, so a
+/// port that declares a concrete type is what both sides of it agree to
+/// and a port typed by a variable takes what reaches it and hands it on.
 fn resolve_type_vars(project: &mut ProjectDefinition) {
+    use weft_core::frames::Located;
+    use weft_core::project::graph::GraphView;
+    let graph = weft_core::project::graph::ProjectGraph::new(project);
+    let position: std::collections::HashMap<String, usize> =
+        project.nodes.iter().enumerate().map(|(at, n)| (n.id.clone(), at)).collect();
+    // Each place's own copy of what resolution changes: the port types and
+    // the type parameters, nothing else of the node or the group. A loop's
+    // ports are its two boundaries', which are nodes.
+    let mut typed: std::collections::BTreeMap<Located, PlacePorts> = weft_core::project::places::every_place(project)
+        .into_iter()
+        .filter_map(|at| {
+            let node = &project.nodes[*position.get(&at.id)?];
+            Some((at, PlacePorts::of(node)))
+        })
+        .collect();
+    for at in weft_core::project::places::every_group_place(project) {
+        let Some(group) = graph.group(&at.id) else { continue };
+        if matches!(group.kind, weft_core::project::GroupKind::Loop { .. }) { continue; }
+        typed.insert(at, PlacePorts::of_group(group));
+    }
+    // Each wire at every place it runs, as its stretches: the port each
+    // starts at, the keys it reads on the way, the port it lands at.
+    let mut stretches: Vec<(Slot, Vec<String>, Slot)> = Vec::new();
+    // A wire that stops at a group port nobody reads still types the
+    // ports it passes.
+    for (edge, source, target) in weft_core::project::places::wires_at_places(project) {
+        let places = weft_core::project::places::crossing_places(&graph, edge, &source);
+        let mut from: Option<Slot> = (!edge.from_group_port())
+            .then(|| (source.clone(), weft_core::project::CrossingSide::Out, edge.source_port().to_string()));
+        let mut keys: Vec<String> = Vec::new();
+        for (crossing, at) in edge.via.iter().zip(places) {
+            keys.extend(crossing.path.iter().cloned());
+            if !typed.contains_key(&at) { continue; }
+            let here: Slot = (at, crossing.side, crossing.port.clone());
+            if let Some(start) = from.take() {
+                stretches.push((start, std::mem::take(&mut keys), here.clone()));
+            }
+            keys.clear();
+            from = Some(here);
+        }
+        let (Some(start), Some(target)) = (from, target) else { continue };
+        let keys = match edge.via.len() {
+            0 => edge.path.clone(),
+            n => { let mut rest = keys; rest.extend(edge.path_after(n - 1)); rest }
+        };
+        stretches.push((start, keys, (target, weft_core::project::CrossingSide::In, edge.target_port().to_string())));
+    }
+    // The other half of a loop's boundary, at the same place: the two
+    // share the loop's variables.
+    let sibling = |at: &Located| -> Option<Located> {
+        let boundary = project.nodes[*position.get(&at.id)?].group_boundary.as_ref()?;
+        let id = match boundary.role {
+            weft_core::project::GroupBoundaryRole::In => weft_core::project::loop_out_id(&boundary.group_id),
+            weft_core::project::GroupBoundaryRole::Out => weft_core::project::loop_in_id(&boundary.group_id),
+        };
+        Some(Located::new(id, at.path.clone()))
+    };
+    let substitute = |typed: &mut std::collections::BTreeMap<Located, PlacePorts>, at: &Located, var: &str, concrete: &WeftType| {
+        let mut changed = typed.get_mut(at).is_some_and(|ports| ports.substitute(var, concrete));
+        if let Some(ports) = sibling(at).and_then(|other| typed.get_mut(&other)) {
+            changed |= ports.substitute(var, concrete);
+        }
+        changed
+    };
+
+    // A constant written on a port pins the variables of its type the
+    // way a wire would (`KeepFile { file: @asset("cat.png", Image) }`
+    // makes `T` an Image, so the `T` it hands out is one too): the
+    // constant IS what arrives. A value each instance or install fills
+    // later says nothing yet, and neither does an empty list or object
+    // about its items (`[]` pins no `T` in `List[T]`; a wire may still).
+    let mut literal_bindings: Vec<(Located, String, WeftType)> = Vec::new();
+    for (at, ports) in &typed {
+        let literals = match position.get(&at.id) {
+            Some(&node) => &project.nodes[node].port_literals,
+            None => match graph.group(&at.id) {
+                Some(group) => &group.port_literals,
+                None => continue,
+            },
+        };
+        for (name, port_type) in &ports.inputs {
+            if !port_type.contains_unresolved_leaf() {
+                continue;
+            }
+            let Some(value) = literals.get(name) else { continue };
+            if weft_core::picks::fills_later(value) {
+                continue;
+            }
+            let literal = crate::file_ref::literal_type(value);
+            if !literal.contains_unresolved_leaf() {
+                let mut bindings = Vec::new();
+                collect_type_var_bindings(port_type, &literal, &mut bindings);
+                literal_bindings.extend(
+                    bindings
+                        .into_iter()
+                        .filter(|(_, ty)| !holds_empty(ty))
+                        .map(|(name, ty)| (at.clone(), name, ty)),
+                );
+            }
+        }
+    }
+    for (at, name, concrete) in &literal_bindings {
+        substitute(&mut typed, at, name, concrete);
+    }
     loop {
         let mut changed = false;
-
-        let snapshot: Vec<(String, String, WeftType, String, String, WeftType)> = project
-            .edges
-            .iter()
-            .filter_map(|edge| {
-                let src_port = edge.source_handle.as_deref()?;
-                let tgt_port = edge.target_handle.as_deref()?;
-                // What the wire DELIVERS: the source port's type with
-                // the edge's path read off it. A path that does not fit
-                // binds nothing; validate names the problem.
-                let src_type = weft_core::deref::wire_source_type(project, edge)?.ok()?;
-                let tgt_type = project
-                    .nodes
-                    .iter()
-                    .find(|n| n.id == edge.target)
-                    .and_then(|n| n.inputs.iter().find(|p| p.name == tgt_port))
-                    .map(|p| p.port_type.clone())?;
-                Some((
-                    edge.source.clone(),
-                    src_port.to_string(),
-                    src_type,
-                    edge.target.clone(),
-                    tgt_port.to_string(),
-                    tgt_type,
-                ))
-            })
-            .collect();
-
-        for (src_node, _src_port, src_type, tgt_node, _tgt_port, tgt_type) in snapshot {
+        for ((from, from_side, from_port), keys, (to, to_side, to_port)) in &stretches {
+            let Some(from_type) = typed.get(from).and_then(|ports| ports.on(*from_side, from_port)).cloned() else { continue };
+            let Some(to_type) = typed.get(to).and_then(|ports| ports.on(*to_side, to_port)).cloned() else { continue };
+            // What the stretch DELIVERS: its start's type with the keys
+            // read on the way. A path that does not fit binds nothing;
+            // validate names the problem.
+            let Ok(delivered) = weft_core::deref::walk_path(&from_type, keys) else { continue };
             // Bind typevars at ANY depth (a `List[T]` port wired to a
             // `List[Number]` binds `T = Number`), matching what the
             // validator counts as unresolved; a bare-`T`-only binder
             // would leave nested vars unresolved forever.
             let mut bindings = Vec::new();
-            collect_type_var_bindings(&tgt_type, &src_type, &mut bindings);
+            collect_type_var_bindings(&to_type, &delivered, &mut bindings);
             for (name, concrete) in &bindings {
-                if substitute_type_var(project, &tgt_node, name, concrete) {
-                    changed = true;
-                }
+                changed |= substitute(&mut typed, to, name, concrete);
             }
             let mut bindings = Vec::new();
-            collect_type_var_bindings(&src_type, &tgt_type, &mut bindings);
+            collect_type_var_bindings(&delivered, &to_type, &mut bindings);
             for (name, concrete) in &bindings {
-                if substitute_type_var(project, &src_node, name, concrete) {
-                    changed = true;
-                }
+                changed |= substitute(&mut typed, from, name, concrete);
             }
         }
-
         if !changed {
             break;
         }
+    }
+
+    // Back onto the nodes and the groups: one set of types where every
+    // place agrees, and each place's where they do not.
+    let mut by_owner: std::collections::HashMap<String, Vec<(Located, PlacePorts)>> = std::collections::HashMap::new();
+    for (at, ports) in typed {
+        by_owner.entry(at.id.clone()).or_default().push((at, ports));
+    }
+    let per_place = |places: Vec<(Located, PlacePorts)>| -> Vec<weft_core::project::PlaceTypes> {
+        let first = &places[0].1;
+        if places.iter().all(|(_, ports)| ports == first) {
+            return Vec::new();
+        }
+        places
+            .into_iter()
+            .map(|(at, ports)| weft_core::project::PlaceTypes {
+                place: at.path,
+                inputs: ports.inputs.into_iter().collect(),
+                outputs: ports.outputs.into_iter().collect(),
+                type_params: ports.type_params,
+            })
+            .collect()
+    };
+    for node in project.nodes.iter_mut() {
+        let Some(places) = by_owner.remove(&node.id) else { continue };
+        let first = places[0].1.clone();
+        for (input, (_, resolved)) in node.inputs.iter_mut().zip(&first.inputs) {
+            input.port_type = resolved.clone();
+        }
+        for (output, (_, resolved)) in node.outputs.iter_mut().zip(&first.outputs) {
+            output.port_type = resolved.clone();
+        }
+        node.type_params = first.type_params;
+        node.place_types = per_place(places);
+    }
+    for group in project.groups.iter_mut() {
+        let Some(places) = by_owner.remove(&group.id) else { continue };
+        let first = places[0].1.clone();
+        for (port, (_, resolved)) in group.in_ports.iter_mut().zip(&first.inputs) {
+            port.port_type = resolved.clone();
+        }
+        for (port, (_, resolved)) in group.out_ports.iter_mut().zip(&first.outputs) {
+            port.port_type = resolved.clone();
+        }
+        group.type_params = first.type_params;
+        group.place_types = per_place(places);
+    }
+}
+
+/// One end of a stretch of wire in type resolution: the place (a node's
+/// or a group's), which side of it, and the port.
+type Slot = (weft_core::frames::Located, weft_core::project::CrossingSide, String);
+
+/// One place's copy of what type resolution works out: a node's port
+/// types, in the node's port order, and its type parameters.
+#[derive(Clone, PartialEq)]
+struct PlacePorts {
+    inputs: Vec<(String, WeftType)>,
+    outputs: Vec<(String, WeftType)>,
+    type_params: Vec<weft_core::weft_type::TypeParam>,
+}
+
+impl PlacePorts {
+    fn of(node: &weft_core::project::NodeDefinition) -> Self {
+        Self {
+            inputs: node.inputs.iter().map(|p| (p.name.clone(), p.port_type.clone())).collect(),
+            outputs: node.outputs.iter().map(|p| (p.name.clone(), p.port_type.clone())).collect(),
+            type_params: node.type_params.clone(),
+        }
+    }
+
+    fn of_group(group: &weft_core::project::GroupDefinition) -> Self {
+        Self {
+            inputs: group.in_ports.iter().map(|p| (p.name.clone(), p.port_type.clone())).collect(),
+            outputs: group.out_ports.iter().map(|p| (p.name.clone(), p.port_type.clone())).collect(),
+            type_params: group.type_params.clone(),
+        }
+    }
+
+    /// The type of `port` on one side: a node's input or a group's in
+    /// port (`In`), a node's output or a group's out port (`Out`).
+    fn on(&self, side: weft_core::project::CrossingSide, port: &str) -> Option<&WeftType> {
+        let ports = match side {
+            weft_core::project::CrossingSide::In => &self.inputs,
+            weft_core::project::CrossingSide::Out => &self.outputs,
+        };
+        ports.iter().find(|(name, _)| name == port).map(|(_, ty)| ty)
+    }
+
+    fn substitute(&mut self, var_name: &str, concrete: &WeftType) -> bool {
+        let types = self.inputs.iter_mut().chain(self.outputs.iter_mut()).map(|(_, ty)| ty);
+        substitute_in(types, &mut self.type_params, var_name, concrete)
     }
 }
 
@@ -938,6 +1257,8 @@ fn resolve_type_vars(project: &mut ProjectDefinition) {
 /// to descend one, because a declared body is concrete by
 /// construction (the registry and the wire parser both refuse a type
 /// variable inside one).
+// SYNC: collect_type_var_bindings <-> packages/weft-graph/src/webview/lib/types/index.ts collectTypeVarBindings,
+// packages/weft-graph/src/webview/lib/projection/header-ports.ts pinnedBoundProblem
 fn collect_type_var_bindings(
     port: &WeftType,
     other: &WeftType,
@@ -970,11 +1291,8 @@ fn collect_type_var_bindings(
         (WeftType::Generator(a), WeftType::Generator(b)) => {
             collect_type_var_bindings(a, b, out)
         }
-        (WeftType::Dict(ak, av), WeftType::Dict(bk, bv)) => {
-            collect_type_var_bindings(ak, bk, out);
-            collect_type_var_bindings(av, bv, out);
-        }
-        (WeftType::Record(af), WeftType::Record(bf)) => {
+        (WeftType::Dict(a), WeftType::Dict(b)) => collect_type_var_bindings(a, b, out),
+        (WeftType::Record { fields: af, .. }, WeftType::Record { fields: bf, .. }) => {
             for fa in af {
                 if let Some(fb) = bf.iter().find(|f| f.name == fa.name) {
                     collect_type_var_bindings(&fa.ty, &fb.ty, out);
@@ -985,82 +1303,51 @@ fn collect_type_var_bindings(
     }
 }
 
-fn substitute_type_var(
-    project: &mut ProjectDefinition,
-    node_id: &str,
-    var_name: &str,
-    concrete: &WeftType,
-) -> bool {
-    let Some(node) = project.nodes.iter_mut().find(|n| n.id == node_id) else {
-        return false;
-    };
-    substitute_type_var_on(node, var_name, concrete)
-}
-
 /// Replace every occurrence of `var_name` on ONE node's ports, at any
 /// depth, and say whether anything moved. The single substitution
 /// step: the edge-driven fixed point above and the declared-narrowing
-/// pass in `enrich_collecting` both go through it.
+/// pass in `enrich_collecting` both go through it. A bound on the
+/// variable records what it resolved to, and every bound naming it
+/// gets it substituted, so validate holds each bound to its variable
+/// with the others already in.
 fn substitute_type_var_on(
     node: &mut weft_core::project::NodeDefinition,
     var_name: &str,
     concrete: &WeftType,
 ) -> bool {
-    let mut changed = false;
-    for input in node.inputs.iter_mut() {
-        changed |= replace_in_type(&mut input.port_type, var_name, concrete);
-    }
-    for output in node.outputs.iter_mut() {
-        changed |= replace_in_type(&mut output.port_type, var_name, concrete);
-    }
-    changed
+    let types = node.inputs.iter_mut().map(|p| &mut p.port.port_type).chain(node.outputs.iter_mut().map(|p| &mut p.port_type));
+    substitute_in(types, &mut node.type_params, var_name, concrete)
 }
 
-fn replace_in_type(ty: &mut WeftType, var_name: &str, concrete: &WeftType) -> bool {
-    match ty {
-        WeftType::TypeVar(n) if n == var_name => {
-            *ty = concrete.clone();
-            true
-        }
-        WeftType::List(inner) | WeftType::Generator(inner) => {
-            replace_in_type(inner, var_name, concrete)
-        }
-        WeftType::Dict(key, val) => {
-            let a = replace_in_type(key, var_name, concrete);
-            let b = replace_in_type(val, var_name, concrete);
-            a || b
-        }
-        WeftType::Union(members) => {
-            let mut any = false;
-            for m in members.iter_mut() {
-                any |= replace_in_type(m, var_name, concrete);
-            }
-            any
-        }
-        // Substitution rewrites every shape a typevar can OCCUR in,
-        // a superset of the shapes collection binds through: collection
-        // never descends a union, but a union member's `T` is the same
-        // node-scoped variable a sibling port binds, so it must be
-        // rewritten here or the port stays half-resolved and validate
-        // reports unresolved-typevar on an edge that already
-        // determined the type. No `Named` arm: the registry refuses a
-        // declared body carrying a type variable, so an alias body
-        // never holds one.
-        WeftType::Record(fields) => {
-            let mut any = false;
-            for f in fields.iter_mut() {
-                any |= replace_in_type(&mut f.ty, var_name, concrete);
-            }
-            any
-        }
-        _ => false,
+/// The substitution step over a set of port types and the type
+/// parameters beside them.
+fn substitute_in<'a>(
+    types: impl Iterator<Item = &'a mut WeftType>,
+    type_params: &mut [weft_core::weft_type::TypeParam],
+    var_name: &str,
+    concrete: &WeftType,
+) -> bool {
+    let mut changed = false;
+    for ty in types {
+        changed |= ty.substitute_var(var_name, concrete);
     }
+    for param in type_params.iter_mut() {
+        if param.name == var_name && param.resolved.is_none() {
+            param.resolved = Some(concrete.clone());
+        }
+        param.bound.substitute_var(var_name, concrete);
+    }
+    changed
 }
 
 /// One wire arriving at a node: which of its ports it feeds, and where
 /// the line that wrote it is. Enough to create the port the wire lands
 /// on when that port does not exist yet.
 struct IncomingWire {
+    /// The part the wire comes from (`validate::part_by_id`: a loop's
+    /// boundary reads as its loop), so an error about the wire names both
+    /// of its ends.
+    source: String,
     target_port: String,
     span: Span,
     /// The file the span is a position IN. The wire's own, not the
@@ -1081,6 +1368,7 @@ fn incoming_wires_by_node(
     for edge in &project.edges {
         let Some(target_port) = &edge.target_handle else { continue };
         by_node.entry(edge.target.clone()).or_default().push(IncomingWire {
+            source: crate::validate::part_by_id(project, &edge.source).to_string(),
             target_port: target_port.clone(),
             span: edge.span.unwrap_or_default(),
             source_file: edge.source_file.clone(),
@@ -1150,6 +1438,7 @@ fn created_input_ports(
             errors.push(EnrichError {
                 span: wire.span,
                 file: wire.source_file.clone(),
+                subjects: vec![wire.source.clone(), node.id.clone()],
                 message: output_takes_no_value(&wire.target_port),
             });
             continue;
@@ -1173,11 +1462,11 @@ fn created_input_ports(
                 None => (Span::default(), node.source_file.clone()),
             };
             if is_output(key) {
-                errors.push(EnrichError { span, file, message: output_takes_no_value(key) });
+                errors.push(EnrichError { span, file, subjects: vec![node.id.clone()], message: output_takes_no_value(key) });
                 continue;
             }
             if value.is_null() {
-                errors.push(EnrichError { span, file, message: format!(
+                errors.push(EnrichError { span, file, subjects: vec![node.id.clone()], message: format!(
                     "node '{}': config key '{}' creates a port, and `null` says nothing about \
                      its type. Declare it (`{}: Type` in the signature) or give it a value",
                     node.id, key, key,
@@ -1203,7 +1492,7 @@ fn created_input_ports(
             // Required unless the node type says its created inputs are
             // optional by nature, or this key carries the `?` marker.
             let required =
-                !features.optional_custom_inputs && !node.optional_ports.contains(&name);
+                !features.join && !node.optional_ports.contains(&name);
             InputDefinition::from_wire_port(PortDefinition {
                 name,
                 port_type,
@@ -1214,6 +1503,9 @@ fn created_input_ports(
                 // round-trip into the signature.
                 declared_type: None,
             })
+            // A key's `?` (or a join's branch) runs without it even when
+            // its wire closed.
+            .with_optional(!required)
         })
         .collect()
 }
@@ -1263,44 +1555,5 @@ mod binding_tests {
         let mut out = Vec::new();
         collect_type_var_bindings(&parse("T"), &feed, &mut out);
         assert!(out.is_empty(), "a whole stream never instantiates a typevar: {out:?}");
-    }
-}
-
-#[cfg(test)]
-mod substitution_tests {
-    use super::*;
-
-    fn parse(s: &str) -> WeftType {
-        weft_core::weft_type::WeftType::parse(s).expect("type parses")
-    }
-
-    /// Layer-1 invariant: substitution rewrites every shape a typevar
-    /// can occur in, so a collected binding never leaves a port
-    /// half-resolved. (No Named case: the registry refuses a declared
-    /// body carrying a type variable, so an alias body never holds
-    /// one.)
-    #[test]
-    fn substitution_rewrites_every_shape_a_typevar_can_occur_in() {
-        // A record field carrying the var.
-        let mut rec = parse("{a: T, b: String}");
-        assert!(replace_in_type(&mut rec, "T", &parse("Number")));
-        assert_eq!(rec, parse("{a: Number, b: String}"));
-
-        // A generator element carrying the var.
-        let mut gen = parse("Generator[T]");
-        assert!(replace_in_type(&mut gen, "T", &parse("Number")));
-        assert_eq!(gen, parse("Generator[Number]"));
-
-        // A union member carrying the var: collection never binds
-        // THROUGH a union, but the var is node-scoped, so a sibling
-        // port's binding must resolve it here too.
-        let mut union = parse("T | Null");
-        assert!(replace_in_type(&mut union, "T", &parse("Number")));
-        assert_eq!(union, parse("Number | Null"));
-
-        // A dict value carrying the var.
-        let mut dict = parse("Dict[String, T]");
-        assert!(replace_in_type(&mut dict, "T", &parse("Number")));
-        assert_eq!(dict, parse("Dict[String, Number]"));
     }
 }

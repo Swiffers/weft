@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::docs::append_text;
 
@@ -23,7 +23,7 @@ impl Node for GoogleDocsCreateNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let title: String = ctx.inputs.get("title")?;
         let text: Option<String> = ctx.inputs.opt("text")?;

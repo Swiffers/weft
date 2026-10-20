@@ -4,7 +4,7 @@
 //! a node." Each kind (timer, form, sse_subscribe, route, socket, ...) is
 //! a plain data struct in this module. Node code constructs one and passes
 //! it directly to `ctx.register_signal(...)` (entry trigger) or
-//! `ctx.await_signal(...)` (mid-execution resume). The framework
+//! `ctx.await_signal(...)` (mid-run resume). The framework
 //! projects the typed kind onto the internal `SignalSpec` wire
 //! shape via the `Signal` trait.
 //!
@@ -34,6 +34,10 @@ pub use predicate::{Predicate, PredicateOp};
 // Wire-pure like `predicate`: `SignalSpec` carries it.
 pub mod limits;
 pub use limits::{EntryLimits, Limited, ResolvedLimits};
+
+// Wire-pure like `predicate`: `SignalSpec` carries it.
+pub mod cancel_call;
+pub use cancel_call::{CancelCall, CancelMethod};
 
 // The dispatcher <-> listener wire, also wire-pure, so the dispatcher
 // speaks it without linking the listener.
@@ -76,7 +80,7 @@ pub use socket_listen::{SocketFrame, SocketListen};
 pub use stream_listen::{Framing, LengthCounts, ScriptStep, StreamListen, StreamReply};
 #[cfg(feature = "runtime")]
 pub use live_connection::{
-    Backpressure, DataType, ErrorMode, JournalMode, LiveConnectionConfig,
+    Backpressure, DataType, ErrorMode, LiveConnectionConfig,
     Protocol, Route, Socket, DEFAULT_CALLER_SILENCE_SECS,
 };
 
@@ -99,7 +103,7 @@ use crate::primitive::{AccessRef, SignalSpec};
 ///
 /// `is_resume` is NOT on the trait. Whether a registration is a
 /// fresh entry or a paused-firing resume is decided by which
-/// `ExecutionContext` method the author called.
+/// `RunContext` method the author called.
 #[cfg(feature = "runtime")]
 pub trait Signal: Serialize + DeserializeOwned + Sized {
     /// Kind tag stored on the wire (`"timer"`, `"route"`, ...).
@@ -194,6 +198,7 @@ pub fn to_spec<K: Signal>(kind: K) -> SignalSpec {
         consumer_kind,
         limits: crate::signal::EntryLimits::default(),
         settings: crate::run_settings::RunSettings::default(),
+        on_cancel: None,
     }
 }
 
@@ -277,6 +282,9 @@ pub fn validate_spec(spec: &SignalSpec) -> Result<(), String> {
     // refused where someone is watching; per event it would be a
     // silent never-fires.
     predicate::validate(&spec.match_predicates)?;
+    if let Some(call) = &spec.on_cancel {
+        call.validate()?;
+    }
     if entry.requires_access && spec.access.is_none() {
         return Err(format!(
             "signal kind '{}' acts as a connection, but none was set; build the kind with \

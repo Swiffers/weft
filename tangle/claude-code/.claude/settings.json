@@ -18,6 +18,29 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/specialist_commands.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/refuse_specialist_prompts.py\"",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   },
   "permissions": {
@@ -27,11 +50,11 @@
       "Bash(weft build)",
       "Bash(weft run:*)",
       "Bash(weft describe-nodes:*)",
-      "Bash(weft executions:*)",
+      "Bash(weft runs:*)",
       "Bash(weft events:*)",
       "Bash(weft logs:*)",
-      "Bash(weft status)",
-      "Bash(weft ps)",
+      "Bash(weft status:*)",
+      "Bash(weft ps:*)",
       "Bash(weft follow:*)",
       "Bash(weft daemon status)",
       "Bash(weft daemon logs:*)",
@@ -39,13 +62,13 @@
       "Bash(weft activate:*)",
       "Bash(weft cancel-activate:*)",
       "Bash(weft cancel-build:*)",
-      "Bash(weft cancel-running:*)",
       "Bash(weft stop:*)",
+      "Bash(weft wait:*)",
+      "Bash(weft node-state:*)",
+      "Bash(weft instances:*)",
       "Bash(weft infra start:*)",
       "Bash(weft infra stop:*)",
       "Bash(weft infra upgrade:*)",
-      "Bash(weft infra status)",
-      "Bash(weft infra node-stop:*)",
       "Bash(weft infra show:*)",
       "Bash(weft infra press:*)",
       "Bash(weft infra env:*)",
@@ -54,12 +77,12 @@
       "Bash(weft infra logs:*)",
       "Bash(weft infra list-doors:*)",
       "Bash(weft infra status:*)",
+      "Bash(weft infra look:*)",
       "Bash(cd:*)",
       "Bash(weft test-node:*)",
       "Bash(weft node-test-hash:*)",
       "Bash(weft files ls:*)",
       "Bash(weft files inspect:*)",
-      "Bash(weft listener:*)",
       "Bash(weft connect:*)",
       "Bash(weft token:*)",
       "Bash(weft checkpoint:*)",
@@ -75,7 +98,9 @@
       "Bash(weft rm:*)",
       "Bash(weft clean:*)",
       "Bash(weft prune:*)",
-      "Bash(weft options:*)"
+      "Bash(weft options:*)",
+      "Bash(weft instance-values:*)",
+      "Bash(sleep 1200)"
     ]
   }
 }

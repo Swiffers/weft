@@ -19,12 +19,14 @@ resource "google_storage_bucket" "files" {
     }
   }
 
-  # Download links are signed for the browser, which fetches them from
-  # whatever origin the frontend is served on.
+  # Links are signed for the browser, which fetches them from whatever
+  # origin the frontend is served on: a player asking a range of a video
+  # (Range, answered with Content-Range), a download naming its file, and
+  # a page's upload sending parts and reading each one's ETag.
   cors {
     origin          = ["*"]
     method          = ["GET", "HEAD", "PUT"]
-    response_header = ["Content-Type", "Content-Length", "ETag"]
+    response_header = ["Content-Type", "Content-Length", "ETag", "Range", "Content-Range", "Accept-Ranges", "Content-Disposition"]
     max_age_seconds = 3600
   }
 }

@@ -1,7 +1,7 @@
 {
   "type": "GmailGet",
   "label": "Gmail: Get Message",
-  "description": "Fetches one Gmail message by id: subject/from/to/date, text body, labels, and every attachment pulled into storage.",
+  "description": "Fetches one Gmail message by id: subject/from/to/date, text body, labels, and every attachment pulled into storage. The body is cut at `maxBodyChars` (50,000 by default), and shorter if it would still weigh more than the 100 KB a wire carries; `bodyTruncated` says when.",
   "tags": [
     "google",
     "gmail",
@@ -29,6 +29,18 @@
       "type": "Boolean",
       "default": true,
       "label": "Download attachments"
+    },
+    {
+      "name": "maxBodyChars",
+      "type": "Number",
+      "default": 50000,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
+      "label": "Max body characters",
+      "description": "The most characters of the body to keep; the rest is cut off and `bodyTruncated` is true. Whatever you set, the body is also cut to fit the 100 KB a wire carries."
     }
   ],
   "outputs": [
@@ -58,6 +70,11 @@
       "type": "Boolean"
     },
     {
+      "name": "bodyTruncated",
+      "type": "Boolean",
+      "description": "True when the body was longer than `maxBodyChars` or than a wire carries, so `body` holds only its start (an HTML body cut there is no longer whole HTML)."
+    },
+    {
       "name": "threadId",
       "type": "String"
     },
@@ -71,10 +88,8 @@
     },
     {
       "name": "attachments",
-      "type": "List[File]"
+      "type": "List[File]",
+      "narrowable": true
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

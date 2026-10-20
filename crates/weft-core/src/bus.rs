@@ -1,5 +1,5 @@
 //! In-process message bus: a channel between co-alive nodes in the same
-//! execution (the same worker process).
+//! run (the same worker process).
 //!
 //! One node creates a bus (`ctx.create_bus(opts)`) and emits the marker on
 //! an output port; downstream nodes resolve the marker via `ctx.bus`
@@ -33,17 +33,20 @@
 //! (`ctx.await_signal`) DO coexist: a bus-held worker resolves the
 //! suspension in process (the driver's idle loop polls the journal for
 //! the `SuspensionResolved` row while a bus keeps the worker alive). The
-//! one real restriction is unrelated to the bus: a node may not
-//! `await_signal` AFTER it has emitted on an output port (replay would
-//! re-emit), enforced in the engine, not here.
+//! restriction on waiting is unrelated to the bus, and enforced in the
+//! engine, not here: a node may `await_signal` after sending on an
+//! ordinary output port (on resume the body replays and that send is
+//! a no-op, its value already recorded), but not after yielding on or
+//! closing a stream output, nor while it reads a stream input, since
+//! those items went out or were consumed live and cannot be replayed.
 //!
 //! ## Windowed journaling (the inspector trail)
 //!
 //! Journaling exists for the INSPECTOR, not for resume. Every append
-//! signals a per-execution `journal_pump_notify`; the engine's
+//! signals a per-run `journal_pump_notify`; the engine's
 //! bus-journal-pump task drains every live bus's unjournaled tail. The
 //! pump buffers each bus's `Message` entries and flushes ONE
-//! `BusWindow` journal row per bus per `journal_window` (a journaled
+//! `BusWindow` journal row per bus per journal window (a journaled
 //! bus's row carries every message in the window; an ephemeral bus's
 //! row carries only the per-sender/kind totals). Membership entries
 //! (`Joined` / `Left` / `Closed`) are journaled as individual rows, and
@@ -52,15 +55,16 @@
 //! the bus only AFTER a write succeeds, and owns the per-bus
 //! `journaled_through` cursor.
 //!
-//! ## `BusOptions` (all five knobs)
+//! ## `BusOptions` (all four knobs)
 //!
-//! - **`ephemeral`**: picks the payload-retention mode (see below).
+//! - **`journal`**: what the journal keeps, the same
+//!   [`crate::stream_journal::JournalPolicy`] every channel takes: the
+//!   payload-retention mode (see below) and the journal aggregation
+//!   window (default 1s, one `BusWindow` row per bus per window).
 //! - **`window`**: the in-RAM bound, in `Message` entries, for BOTH
 //!   modes (default 64).
 //! - **`payload`**: what messages carry, `Json` or `Bytes`, frozen at
 //!   creation.
-//! - **`journal_window`**: the journal aggregation window (default 1s):
-//!   one `BusWindow` row per bus per window.
 //! - **`meta`**: creator-declared stream metadata readable off the
 //!   handle by every consumer.
 //!
@@ -115,8 +119,19 @@
 //! The bus does NOT try to decide for itself whether a name will ever
 //! appear. That question depends on dispatch state, terminations, and
 //! topology, all of which live in the engine. The engine watches the
-//! execution and, when it concludes a wait can never be satisfied,
+//! run and, when it concludes a wait can never be satisfied,
 //! closes the bus. Every waiting cursor wakes; `next()` returns `None`.
+//!
+//! ## How a bus ends
+//!
+//! The close carries an end ([`StreamEnd`]): `Finished`, or `Failed`
+//! with an error. Every bus a firing creates or joins is held by that
+//! firing ([`FiringBuses`]) and ended by weft when the body does, with
+//! how the body returned: a reader of a producer that failed halfway
+//! learns the stream is incomplete instead of reading a short one as
+//! whole. A body may end a bus early with [`BusHandle::close`], which
+//! only ever says finished. The engine's own closes (a stuck run, the
+//! run's end) say failed, naming why.
 //!
 //! ## "wait" vs "park" vocabulary
 //!
@@ -128,7 +143,7 @@
 //! write.
 //!
 //! The only reason the engine needs to know about the bus's await at
-//! all is the stuck-detector: it tracks, per NODE EXECUTION, whether
+//! all is the stuck-detector: it tracks, per FIRING, whether
 //! that node is parked inside a bus wait with nothing to read, so when
 //! every participant node is parked it can declare deadlock and close
 //! every bus. Hence `WaitLiveness` and the `wait_on` protocol (which
@@ -149,33 +164,6 @@ use uuid::Uuid;
 use crate::liveness::{no_liveness, wait_on, FiringLocation, WaitLiveness, WaitSource};
 
 // ----- Public types ----------------------------------------------------
-
-/// Bus payload-retention mode. Encoded as a string in the marker
-/// (`"journaled"` or `"ephemeral"`) so consumers can read it without
-/// touching the bus inner; centralised here so the two wire spellings
-/// have a single source of truth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BusMode {
-    Journaled,
-    Ephemeral,
-}
-
-impl BusMode {
-    pub fn as_wire_str(self) -> &'static str {
-        match self {
-            BusMode::Journaled => "journaled",
-            BusMode::Ephemeral => "ephemeral",
-        }
-    }
-
-    pub fn from_wire_str(s: &str) -> Option<Self> {
-        match s {
-            "journaled" => Some(BusMode::Journaled),
-            "ephemeral" => Some(BusMode::Ephemeral),
-            _ => None,
-        }
-    }
-}
 
 /// What a bus's messages carry, declared at creation and frozen: JSON
 /// values (chat-shaped traffic) or raw bytes (media frames; no base64
@@ -312,8 +300,9 @@ impl WirePayload {
 
 /// One observable record on a bus, in append-only order. The cursor
 /// returns these directly to consumers; the engine's journal pump
-/// projects them to `ExecEvent::Bus*` rows for replay.
+/// projects them to `RunEvent::Bus*` rows for replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BusEntry {
     /// Monotonic per-bus position. The Nth append has offset N (0-based).
     /// Cursors use this as their resume cursor; the journal pump uses
@@ -329,10 +318,11 @@ pub struct BusEntry {
 
 /// One of the four shapes a bus entry takes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all_fields = "camelCase")]
 pub enum BusEntryKind {
     /// A handle registered `name`.
     Joined { name: String },
-    /// A registered handle dropped, or the bus closed for it.
+    /// A registered handle dropped while the bus was open.
     Left { name: String },
     /// A successful `send` landed. `from` is the sender's registered
     /// name (the bus stamps it). For journaled buses, `payload` is
@@ -347,19 +337,29 @@ pub enum BusEntryKind {
         payload: Option<WirePayload>,
         payload_byte_size: u64,
     },
-    /// Appended once at `close()`. Cursors never surface it as a
-    /// regular `Some(entry)`; `next()` returns `None` when it reaches
-    /// this marker. Journaled so the inspector renders "* the bus
-    /// closed here" instead of the panel just ending.
-    Closed,
+    /// Appended once at the close, saying how the bus ended. Cursors
+    /// never surface it as a regular `Some(entry)`; `next()` returns
+    /// `None` when it reaches this marker, and a reader asks the handle
+    /// how it ended ([`BusHandle::end`]). Journaled so the inspector
+    /// renders where the bus closed, or failed, instead of the panel
+    /// just ending.
+    Closed { end: StreamEnd },
 }
+
+/// How a bus ended: the same vocabulary a generator's stream ends with.
+/// `Finished` when the body of the firing that held it returned
+/// normally (or the bus was closed on purpose), `Failed` with the
+/// firing's error otherwise. Weft writes it ([`FiringBuses::end`]); a
+/// node can only end a bus as finished ([`BusHandle::close`]).
+pub use crate::primitive::StreamEnd;
 
 /// One message inside a journal window row: who sent it, when, and
 /// what it said as far as the journal keeps it. Only the ROW
 /// granularity is windowed; every message of a journaled bus gets its
 /// own line here.
-// SYNC: WindowedBusMessage <-> packages/weft-graph/src/protocol.ts BusInspectorEvent 'message', extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window' messages
+// SYNC: WindowedBusMessage <-> packages/weft-graph/src/protocol.ts BusInspectorEvent 'message', extension-vscode/src/runFollower.ts DispatcherEvent 'bus_window' messages
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WindowedBusMessage {
     pub offset: u64,
     pub from: String,
@@ -384,8 +384,9 @@ pub struct WindowedBusMessage {
 /// messages and how many bytes passed. The whole story an ephemeral
 /// bus journals; the summary line a journaled one carries besides its
 /// messages.
-// SYNC: BusWindowTotal <-> packages/weft-graph/src/protocol.ts BusInspectorEvent 'window' totals, extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window' totals
+// SYNC: BusWindowTotal <-> packages/weft-graph/src/protocol.ts BusInspectorEvent 'window' totals, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_window' totals
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BusWindowTotal {
     pub from: String,
     pub msg_kind: String,
@@ -443,7 +444,7 @@ pub fn aggregate_window(
                 bytes: *payload_byte_size,
             }),
         }
-        if !policy.ephemeral {
+        if !policy.is_ephemeral() {
             // What the journal keeps of a message is decided in one
             // place for every channel in the language, so a bus message
             // too big to write down is cut exactly as a caller's is,
@@ -475,15 +476,15 @@ pub fn aggregate_window(
 /// Configuration the producer passes to `ctx.create_bus(opts)`.
 #[derive(Debug, Clone, Default)]
 pub struct BusOptions {
-    /// `true` switches the bus to ephemeral mode (metadata-only in the
-    /// journal, slow consumers silently skip to the oldest retained
-    /// entry). `false` (default)
-    /// is the journaled mode (full payload persisted to the journal/DB for
-    /// durability). NOTE: in EITHER mode the in-RAM log is a bounded
-    /// window (cursors only ever read RAM, never the DB); the mode only
-    /// decides whether the payload is also persisted for replay-after-
-    /// worker-death, not whether RAM is bounded.
-    pub ephemeral: bool,
+    /// What the journal keeps of this bus: whether payloads are written
+    /// down (journaled, the default) or only counted (ephemeral, where
+    /// slow consumers also silently skip to the oldest retained entry),
+    /// and the window one journal row gathers. NOTE: in EITHER mode the
+    /// in-RAM log is a bounded window (cursors only ever read RAM, never
+    /// the DB); the mode only decides whether the payload is also
+    /// persisted, not whether RAM is bounded. A node whose users tune it
+    /// passes `ctx.journal_policy()?` here.
+    pub journal: crate::stream_journal::JournalPolicy,
     /// Per-bus in-RAM window size. `None` falls back to
     /// `DEFAULT_BUS_WINDOW`. Bounds RAM in BOTH modes: a journaled bus
     /// trims log entries that are already persisted to the DB once the
@@ -496,14 +497,6 @@ pub struct BusOptions {
     /// (media frames). Frozen at creation; a `send` of the other shape
     /// is refused loudly. Consumers read it off the handle/marker.
     pub payload: BusPayloadKind,
-    /// The journal aggregation window: the pump ships ONE journal row
-    /// per bus per window (the window's messages for a journaled bus,
-    /// the rollup for an ephemeral one) instead of a row per message.
-    /// `None` falls back to [`DEFAULT_JOURNAL_WINDOW`] (1s). A quiet
-    /// bus degenerates to per-message rows (a window holds one
-    /// message); a fast stream collapses to one row per window. Only
-    /// the JOURNAL granularity: what travels the bus is untouched.
-    pub journal_window: Option<std::time::Duration>,
     /// Creator-declared stream metadata, frozen at creation and
     /// readable by every consumer (off the handle or the marker):
     /// what a per-message header would otherwise repeat (an audio
@@ -511,11 +504,6 @@ pub struct BusOptions {
     /// Keep it small; it rides the marker. `Null` = none.
     pub meta: Value,
 }
-
-/// Default journal aggregation window. Every channel in the language
-/// starts from the same one, so it lives with the rest of the recording
-/// rules rather than here.
-pub use crate::stream_journal::DEFAULT_JOURNAL_WINDOW;
 
 /// Default in-RAM window for a bus (both modes). 64 entries fits the
 /// common consumer-lags-a-few-messages case without growing RAM
@@ -700,7 +688,7 @@ impl EphemeralStore {
 /// coordinator drop naturally; a wait/pump-notify observed after
 /// coordinator drop is a no-op.
 ///
-/// Public so the engine's per-execution bus-journal-pump task can
+/// Public so the engine's per-run bus-journal-pump task can
 /// hold `Weak<BusInner>` and call the engine-facing `pub fn`s in this
 /// file's impl block. Handle-level state, options, and the log
 /// itself stay private to this module.
@@ -709,8 +697,9 @@ pub struct BusInner {
     /// `BusRegistry::lookup` resolves a marker back to `Arc<BusInner>`
     /// via this id.
     id: Uuid,
-    /// Whether this bus runs in ephemeral mode. Frozen at creation.
-    ephemeral: bool,
+    /// What the journal keeps of this bus (its mode and window).
+    /// Frozen at creation.
+    journal: crate::stream_journal::JournalPolicy,
     /// The entry log, ordered by offset. ALL state-changes (Joined,
     /// Left, Message, Closed) go through here. Cursors read by
     /// offset; the journal pump drains the unjournaled tail.
@@ -739,6 +728,8 @@ pub struct BusInner {
     /// Set once when the bus is closed. Cursors return `None` after
     /// reaching the `Closed` entry; further sends error.
     closed: AtomicBool,
+    /// How the bus ended, set under the log lock just before `closed`.
+    end: std::sync::OnceLock<StreamEnd>,
     /// Set once when the journal pump has failed to write this bus's
     /// tail. Cleared by the pump's next successful batch
     /// (`acknowledge_journaled_through`). The next `send` while this
@@ -757,7 +748,7 @@ pub struct BusInner {
     /// log entry.
     present_names: Mutex<HashSet<String>>,
     /// Engine node-liveness hook. `Weak::new()` outside an engine-driven
-    /// execution; set once at bus creation via
+    /// run; set once at bus creation via
     /// `BusHandle::create_with_engine`. Fired at every cursor wait via
     /// the shared `wait_on` protocol and at every append via
     /// `push_entry`.
@@ -770,16 +761,15 @@ pub struct BusInner {
     /// send path beyond the one `fetch_add`; all comparison cost lives
     /// on the engine's stuck-check.
     append_gen: AtomicU64,
-    /// Per-execution journal pump wake. The bus ping it after every
+    /// Per-run journal pump wake. The bus ping it after every
     /// append; the pump wakes, walks every live bus, drains tails.
-    /// `Weak::new()` outside an engine-driven execution.
+    /// `Weak::new()` outside an engine-driven run.
     journal_pump_notify: Weak<Notify>,
-    /// Optional ephemeral payload store. `Some` iff `ephemeral`.
+    /// Optional ephemeral payload store. `Some` iff the journal mode is
+    /// ephemeral.
     ephemeral_store: Option<EphemeralStore>,
     /// What the messages carry (JSON vs raw bytes). Frozen at creation.
     payload_kind: BusPayloadKind,
-    /// The journal aggregation window (see [`BusOptions::journal_window`]).
-    journal_window: std::time::Duration,
     /// Creator-declared stream metadata (see [`BusOptions::meta`]).
     meta: Value,
     /// In-RAM retained-window size, in Message entries, for BOTH modes.
@@ -801,7 +791,7 @@ impl BusInner {
     /// every other participant (including `BusHandle::drop`, which
     /// runs DURING the panicking task's unwind) would panic on the
     /// lock, and a panic-during-unwind aborts the whole worker
-    /// process, killing every execution on the process.
+    /// process, killing every run on the process.
     fn lock_log(&self) -> std::sync::MutexGuard<'_, Vec<BusEntry>> {
         self.log
             .lock()
@@ -924,17 +914,27 @@ impl BusInner {
         });
     }
 
-    /// Close this bus. Appends a `Closed` entry (idempotent), sets the
-    /// closed flag, wakes every cursor waiting on the log and the
-    /// engine's liveness hook. Public so the engine's `BusCoordinator` can
-    /// fire stuck-detection close via a raw `Arc<BusInner>` it pins
-    /// for the pump's lifetime.
-    pub fn close(&self) {
+    /// Close this bus as `end`. Appends a `Closed` entry carrying it
+    /// (idempotent: the first close's end stands), sets the closed
+    /// flag, wakes every cursor waiting on the log and the engine's
+    /// liveness hook. Public so the engine can end a firing's buses
+    /// with how its body returned, and fire the stuck-detection close
+    /// via a raw `Arc<BusInner>` it pins for the pump's lifetime.
+    pub fn close(&self, end: StreamEnd) {
         let mut log = self.lock_log();
-        if self.closed.swap(true, Ordering::AcqRel) {
+        if self.closed.load(Ordering::Acquire) {
             return;
         }
-        self.push_entry(&mut log, BusEntryKind::Closed);
+        // Under the log lock, before the flag: whoever reads `closed`
+        // also reads the end.
+        let _ = self.end.set(end.clone());
+        self.closed.store(true, Ordering::Release);
+        self.push_entry(&mut log, BusEntryKind::Closed { end });
+    }
+
+    /// How the bus ended, `None` while it is open.
+    pub fn end(&self) -> Option<StreamEnd> {
+        self.end.get().cloned()
     }
 
     /// Read whether the journal pump previously failed for this bus.
@@ -970,7 +970,7 @@ impl BusInner {
     /// successful write supersedes the previous failure.
     pub fn acknowledge_journaled_through(&self, through_offset: u64) {
         // `fetch_max` makes the documented monotonicity true BY
-        // CONSTRUCTION rather than relying on a single-pump-per-execution
+        // CONSTRUCTION rather than relying on a single-pump-per-run
         // topology assumption stated nowhere: a load-then-store max would
         // regress the cursor if two acks ever interleaved (5 then 3),
         // after which the pump re-drains and double-ships journal rows.
@@ -998,19 +998,16 @@ impl BusInner {
         self.id
     }
 
-    pub fn ephemeral(&self) -> bool {
-        self.ephemeral
+    /// What the journal keeps of this bus. The pump's decision to close
+    /// a window and the fold's decision on what to keep both read it, so
+    /// they cannot come from two different policies.
+    pub fn journal(&self) -> crate::stream_journal::JournalPolicy {
+        self.journal
     }
 
     /// What the messages carry (JSON vs raw bytes).
     pub fn payload_kind(&self) -> BusPayloadKind {
         self.payload_kind
-    }
-
-    /// The journal aggregation window: how often the pump ships one
-    /// aggregate row for this bus.
-    pub fn journal_window(&self) -> std::time::Duration {
-        self.journal_window
     }
 
     /// Creator-declared stream metadata (`Null` when none was set).
@@ -1069,11 +1066,11 @@ pub struct BusHandle {
     /// handshake is race-free (see `cursor`). `None` until
     /// registration.
     registration: Option<(String, u64)>,
-    /// The node EXECUTION that minted this handle (`(node_id, frames)`),
+    /// The FIRING that minted this handle (`(node_id, frames)`),
     /// or `None` for a bus created outside an engine-driven node (unit
     /// tests, `BusHandle::create`). Used to key the node's bus liveness:
     /// every wait this handle enters, and the participant membership it
-    /// registers, are attributed to this node execution. Forked handles
+    /// registers, are attributed to this firing. Forked handles
     /// (`new_handle`) inherit it, because a forked handle is still the
     /// SAME node grabbing a second grip on the bus.
     node: Option<FiringLocation>,
@@ -1104,15 +1101,15 @@ impl BusHandle {
 
 impl BusHandle {
     /// Create a fresh bus with default options and no engine hooks.
-    /// Used in unit tests and code outside an engine-driven execution.
+    /// Used in unit tests and code outside an engine-driven run.
     pub fn create() -> Self {
         Self::create_with_options(BusOptions::default())
             .expect("default BusOptions cannot fail")
     }
 
     /// Create with explicit options, no engine hooks. Errors on an
-    /// invalid `window`.
-    pub fn create_with_options(opts: BusOptions) -> Result<Self, &'static str> {
+    /// invalid `window` or journal window.
+    pub fn create_with_options(opts: BusOptions) -> Result<Self, String> {
         Self::create_with_engine(opts, no_liveness(), Weak::<Notify>::new(), None)
     }
 
@@ -1120,31 +1117,35 @@ impl BusHandle {
     /// whenever this node's cursor enters/leaves a wait and on every
     /// append; the pump notify fires after every append to signal the
     /// engine's bus-journal-pump task. `node` is the minting node
-    /// execution (`None` outside an engine-driven node). Errors on an
-    /// invalid `window` (must be >= 1 when `ephemeral=true`).
+    /// run (`None` outside an engine-driven node). Errors on an
+    /// invalid `window` (must be >= 1) or a journal window out of range
+    /// ([`crate::stream_journal::JournalPolicy::check`]).
     pub fn create_with_engine(
         opts: BusOptions,
         liveness: Weak<dyn WaitLiveness>,
         journal_pump_notify: Weak<Notify>,
         node: Option<FiringLocation>,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, String> {
         let window = opts.window.unwrap_or(DEFAULT_BUS_WINDOW);
         if window == 0 {
             return Err("bus window must be >= 1; 0 would evict every entry before any \
-                        cursor could read it");
+                        cursor could read it"
+                .into());
         }
-        let ephemeral_store = if opts.ephemeral {
+        opts.journal.check().map_err(|why| format!("bus: {why}"))?;
+        let ephemeral_store = if opts.journal.is_ephemeral() {
             Some(EphemeralStore::new(window)?)
         } else {
             None
         };
         let inner = Arc::new(BusInner {
             id: Uuid::new_v4(),
-            ephemeral: opts.ephemeral,
+            journal: opts.journal,
             log: Mutex::new(Vec::new()),
             ever_joined: Mutex::new(HashSet::new()),
             journaled_through: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            end: std::sync::OnceLock::new(),
             journal_degraded: AtomicBool::new(false),
             degraded_reason: Mutex::new(String::new()),
             log_notify: Notify::new(),
@@ -1154,7 +1155,6 @@ impl BusHandle {
             journal_pump_notify,
             ephemeral_store,
             payload_kind: opts.payload,
-            journal_window: opts.journal_window.unwrap_or(DEFAULT_JOURNAL_WINDOW),
             meta: opts.meta,
             window,
         });
@@ -1166,7 +1166,7 @@ impl BusHandle {
     }
 
     /// Build a handle from an existing inner, attributed to the node
-    /// execution `node` that is resolving the marker. Used by
+    /// run `node` that is resolving the marker. Used by
     /// `BusRegistry::lookup` to hand a consumer a fresh handle on a bus
     /// the producer already created; the consumer's own node identity
     /// (not the producer's) keys its liveness.
@@ -1185,7 +1185,13 @@ impl BusHandle {
 
     /// Whether this bus runs in ephemeral mode.
     pub fn is_ephemeral(&self) -> bool {
-        self.inner.ephemeral
+        self.inner.journal.is_ephemeral()
+    }
+
+    /// What the journal keeps of this bus: its mode and window, as it
+    /// was opened with them.
+    pub fn journal(&self) -> crate::stream_journal::JournalPolicy {
+        self.inner.journal
     }
 
     /// What this bus's messages carry (JSON vs raw bytes).
@@ -1301,7 +1307,7 @@ impl BusHandle {
         // mode hides it from the log (the inspector renders the size +
         // hash prefix instead) and parks the bytes in the per-bus
         // sliding-window store for live cursors to pick up.
-        let entry_payload = if self.inner.ephemeral { None } else { Some(payload.clone()) };
+        let entry_payload = if self.inner.journal.is_ephemeral() { None } else { Some(payload.clone()) };
         let mut log = self.inner.lock_log();
         // Check Closed BEFORE JournalDegraded: a closed bus is the more
         // fundamental failure (no further sends will ever succeed),
@@ -1311,7 +1317,7 @@ impl BusHandle {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(SendError::Closed);
         }
-        if !self.inner.ephemeral && self.inner.is_journal_degraded() {
+        if !self.inner.journal.is_ephemeral() && self.inner.is_journal_degraded() {
             let reason = self
                 .inner
                 .degraded_reason
@@ -1501,56 +1507,94 @@ impl BusHandle {
 
     // ----- lifecycle ---------------------------------------------
 
+    /// End the bus now, as finished: "no more messages". A failed end is
+    /// never a node's to write; weft writes it from how the body of the
+    /// firing holding the bus returned ([`FiringBuses`]).
     pub fn close(&self) {
-        self.inner.close();
+        self.inner.close(StreamEnd::Finished);
     }
 
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::Acquire)
     }
 
+    /// How the bus ended, `None` while it is open. What a reader asks
+    /// once its cursor has run out: a `Failed` end is a stream that did
+    /// not complete, and the reader says so in its own protocol.
+    pub fn end(&self) -> Option<StreamEnd> {
+        self.inner.end()
+    }
+
     /// JSON marker for THIS bus. The marker is what a producer puts
     /// on an output port; consumers resolve it back via `ctx.bus`.
     pub fn marker(&self) -> Value {
-        let mode = if self.inner.ephemeral { BusMode::Ephemeral } else { BusMode::Journaled };
-        crate::weft_type::WeftType::bus_marker(&self.inner.id.to_string(), mode)
+        crate::weft_type::WeftType::bus_marker(&self.inner.id.to_string(), self.inner.journal.mode)
     }
 }
 
-/// A bus handle that CLOSES the bus when dropped: the shape every
-/// producer (and every consumer whose exit must not leave peers parked)
-/// wants, made unforgettable. Every exit path of the owning node body
-/// (success, error, panic-unwind) runs the close; peers' cursors read
-/// the `Closed` entry and end instead of parking forever. Derefs to
-/// [`BusHandle`], so the whole surface is available. Produced by
-/// `ctx.open_bus` / `ctx.join_bus`; a deliberate non-closing observer
-/// uses `ctx.bus_from_input` instead.
-pub struct ClosingBus {
-    handle: BusHandle,
+/// The buses one firing ends when its body does: every bus it created
+/// (`ctx.create_bus`, `ctx.open_bus`) and every bus it joined
+/// (`ctx.join_bus`). Weft ends them with how the body returned
+/// ([`Self::end`]): finished when it returned normally, failed with its
+/// error otherwise, so a reader learns whether the stream it read is
+/// complete and no node writes that itself. A bus the body closed
+/// earlier keeps the end it was closed with. One per firing, held by
+/// its ctx handle.
+#[derive(Default)]
+pub struct FiringBuses {
+    held: Mutex<HeldBuses>,
 }
 
-impl ClosingBus {
-    pub fn new(handle: BusHandle) -> Self {
-        Self { handle }
+#[derive(Default)]
+struct HeldBuses {
+    buses: Vec<Weak<BusInner>>,
+    /// The body's end, once it came: a bus taken after it (by a task
+    /// the body left running) ends at once the same way.
+    ended: Option<StreamEnd>,
+}
+
+/// How a body's return ends the buses it holds (it created them, or
+/// joined them as a party to the conversation): `Finished` only when it
+/// returned, `Failed` otherwise. A body that paused on a wait has left the
+/// conversation too: a bus lives in this process, and the body that
+/// resumes opens or joins one afresh, so a reader of this one must not
+/// take what it read as whole.
+pub fn body_end(result: &crate::error::WeftResult<()>) -> StreamEnd {
+    use crate::error::WeftError;
+    match result {
+        Ok(()) => StreamEnd::Finished,
+        Err(WeftError::Suspended { .. }) => {
+            StreamEnd::Failed { error: "the node holding this bus paused on a wait".into() }
+        }
+        Err(error) => StreamEnd::Failed { error: error.to_string() },
     }
 }
 
-impl std::ops::Deref for ClosingBus {
-    type Target = BusHandle;
-    fn deref(&self) -> &BusHandle {
-        &self.handle
+impl FiringBuses {
+    /// Hold `bus` until the body ends.
+    pub fn hold(&self, bus: &BusHandle) {
+        let mut held = self.held.lock().expect("firing buses poisoned");
+        match &held.ended {
+            Some(end) => bus.inner.close(end.clone()),
+            None => held.buses.push(Arc::downgrade(&bus.inner)),
+        }
     }
-}
 
-impl std::ops::DerefMut for ClosingBus {
-    fn deref_mut(&mut self) -> &mut BusHandle {
-        &mut self.handle
-    }
-}
-
-impl Drop for ClosingBus {
-    fn drop(&mut self) {
-        self.handle.close();
+    /// End every bus still open as `end`. The first end stands: a
+    /// later call (the engine's failure path after the body's own end)
+    /// changes nothing.
+    pub fn end(&self, end: StreamEnd) {
+        let buses = {
+            let mut held = self.held.lock().expect("firing buses poisoned");
+            if held.ended.is_some() {
+                return;
+            }
+            held.ended = Some(end.clone());
+            std::mem::take(&mut held.buses)
+        };
+        for bus in buses.iter().filter_map(Weak::upgrade) {
+            bus.close(end.clone());
+        }
     }
 }
 
@@ -1600,7 +1644,7 @@ pub struct BusCursor {
     inner: Weak<BusInner>,
     next_offset: u64,
     filter: Option<CursorFilter>,
-    /// The node execution that owns this cursor (inherited from the
+    /// The firing that owns this cursor (inherited from the
     /// handle that minted it), or `None` outside an engine-driven node.
     /// Keys this cursor's waits in the engine's liveness map, so a node
     /// parked in `next()` is correctly attributed.
@@ -1742,7 +1786,7 @@ impl BusCursor {
             let len = log.len();
             while idx < len {
                 let entry = &log[idx];
-                if matches!(entry.kind, BusEntryKind::Closed) {
+                if matches!(entry.kind, BusEntryKind::Closed { .. }) {
                     *next_offset = entry.offset;
                     return Some(None);
                 }
@@ -1822,15 +1866,15 @@ pub enum BusLookupError {
     NotABusMarker,
     #[error("bus marker uuid is malformed: {0}")]
     InvalidUuid(String),
-    #[error("no bus with id {0} is live in this execution")]
+    #[error("no bus with id {0} is live in this run")]
     UnknownBus(Uuid),
 }
 
-/// Per-execution registry mapping a bus's id to its live state. The
+/// Per-run registry mapping a bus's id to its live state. The
 /// engine's `BusCoordinator` owns one. A node creating a bus inserts;
 /// a node receiving a marker looks up. Single source of truth for
-/// "every bus this execution minted": holds the strong `Arc<BusInner>`
-/// so the bus stays pinned for the lifetime of the execution and the
+/// "every bus this run minted": holds the strong `Arc<BusInner>`
+/// so the bus stays pinned for the lifetime of the run and the
 /// pump's `Weak` refs always upgrade. Released by `shutdown()`'s
 /// `clear()` after the final drain.
 pub struct BusRegistry {
@@ -1861,7 +1905,7 @@ impl BusRegistry {
     }
 
     /// Resolve a marker JSON value to a fresh consumer handle attributed
-    /// to the resolving node execution `node` (whose identity keys its
+    /// to the resolving firing `node` (whose identity keys its
     /// own bus liveness). Errors loud on every failure mode.
     pub fn lookup(
         &self,
@@ -1914,7 +1958,7 @@ impl std::fmt::Debug for BusHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BusHandle")
             .field("id", &self.inner.id)
-            .field("ephemeral", &self.inner.ephemeral)
+            .field("journal", &self.inner.journal)
             .field("name", &self.name())
             .field("closed", &self.is_closed())
             .finish()
@@ -1951,9 +1995,11 @@ mod tests {
     #[tokio::test]
     async fn a_bytes_bus_carries_frames_and_declares_its_parameters() {
         let bus = BusHandle::create_with_options(BusOptions {
-            ephemeral: true,
+            journal: crate::stream_journal::JournalPolicy {
+                window: std::time::Duration::from_millis(250),
+                ..crate::stream_journal::JournalPolicy::ephemeral()
+            },
             payload: BusPayloadKind::Bytes,
-            journal_window: Some(std::time::Duration::from_millis(250)),
             meta: serde_json::json!({ "sample_rate": 16000 }),
             ..Default::default()
         })
@@ -2003,7 +2049,7 @@ mod tests {
 
         let kept = crate::stream_journal::JournalPolicy::default();
         let metadata_only =
-            crate::stream_journal::JournalPolicy { ephemeral: true, ..Default::default() };
+            crate::stream_journal::JournalPolicy::ephemeral();
 
         let journaled = aggregate_window(&entries, &kept).unwrap();
         assert_eq!((journaled.first_offset, journaled.last_offset), (3, 6));
@@ -2098,19 +2144,61 @@ mod tests {
         );
     }
 
-    /// The close-on-drop guard: dropping a `ClosingBus` (any exit path
-    /// of the owning body) closes the bus, so a parked reader ends
-    /// instead of waiting forever.
+    /// A firing's buses end with its body: a reader drains what was sent,
+    /// then reads how the bus ended. Dropping the handle ends nothing
+    /// on its own; the body's end does.
     #[tokio::test]
-    async fn the_closing_guard_ends_readers_on_drop() {
+    async fn a_firings_buses_end_with_its_body() {
+        let firing = FiringBuses::default();
         let bus = BusHandle::create();
         let mut cursor = bus.cursor();
-        let guard = ClosingBus::new(registered(&bus, "host"));
-        guard.send("hi", json!(1)).unwrap();
-        drop(guard);
+        let host = registered(&bus, "host");
+        firing.hold(&host);
+        host.send("hi", json!(1)).unwrap();
+        drop(host);
+        assert!(!bus.is_closed(), "a dropped handle leaves the bus to the body's end");
+        firing.end(StreamEnd::Failed { error: "the model went away".into() });
         assert!(matches!(cursor.next_json("hi").await, Ok(Some((_, v))) if v == json!(1)));
-        assert!(cursor.next_json("hi").await.unwrap().is_none(), "closed on drop");
-        assert!(bus.is_closed());
+        assert!(cursor.next_json("hi").await.unwrap().is_none(), "ended by the body");
+        assert_eq!(bus.end(), Some(StreamEnd::Failed { error: "the model went away".into() }));
+    }
+
+    /// The first end stands: a bus closed on purpose stays finished when
+    /// the body then fails, a second end changes nothing, and a bus taken
+    /// after the body ended ends at once the same way.
+    #[test]
+    fn the_first_end_stands() {
+        let firing = FiringBuses::default();
+        let done_early = BusHandle::create();
+        let open = BusHandle::create();
+        firing.hold(&done_early);
+        firing.hold(&open);
+        done_early.close();
+        firing.end(StreamEnd::Failed { error: "boom".into() });
+        firing.end(StreamEnd::Finished);
+        assert_eq!(done_early.end(), Some(StreamEnd::Finished));
+        assert_eq!(open.end(), Some(StreamEnd::Failed { error: "boom".into() }));
+        let late = BusHandle::create();
+        firing.hold(&late);
+        assert_eq!(late.end(), Some(StreamEnd::Failed { error: "boom".into() }));
+        assert_eq!(BusHandle::create().end(), None, "an open bus has no end yet");
+    }
+
+    /// Only a body that returned ends its buses finished; a pause, a
+    /// skip or any failure ends them failed.
+    #[test]
+    fn a_body_end_follows_how_it_returned() {
+        use crate::error::WeftError;
+        assert_eq!(body_end(&Ok(())), StreamEnd::Finished);
+        assert!(
+            matches!(body_end(&Err(WeftError::Suspended { token: "t".into() })), StreamEnd::Failed { error } if error.contains("paused")),
+        );
+        assert!(matches!(body_end(&Err(WeftError::WaitSkipped("w".into()))), StreamEnd::Failed { .. }));
+        assert_eq!(
+            body_end(&Err(WeftError::NodeFailed("the model went away".into()))),
+            StreamEnd::Failed { error: WeftError::NodeFailed("the model went away".into()).to_string() }
+        );
+        assert!(matches!(body_end(&Err(WeftError::Cancelled)), StreamEnd::Failed { .. }));
     }
 
     /// Drive `cursor` until its next Message entry; skips Joined/Left.
@@ -2361,7 +2449,7 @@ mod tests {
     #[tokio::test]
     async fn ephemeral_send_does_not_journal_payload_in_log_entry() {
         let bus =
-            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(8), ..Default::default() }).expect("valid options");
+            BusHandle::create_with_options(BusOptions { journal: crate::stream_journal::JournalPolicy::ephemeral(), window: Some(8), ..Default::default() }).expect("valid options");
         let p = registered(&bus, "p");
         p.send("frame", json!({ "bytes": "AAAA" })).unwrap();
         // Read entries directly out of the log to confirm payload=None.
@@ -2382,7 +2470,7 @@ mod tests {
     #[tokio::test]
     async fn ephemeral_cursor_returns_payload_when_window_still_has_it() {
         let bus =
-            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(8), ..Default::default() }).expect("valid options");
+            BusHandle::create_with_options(BusOptions { journal: crate::stream_journal::JournalPolicy::ephemeral(), window: Some(8), ..Default::default() }).expect("valid options");
         let p = registered(&bus, "p");
         p.send("frame", json!({ "n": 1 })).unwrap();
         let mut c = bus.cursor_from_start();
@@ -2403,7 +2491,7 @@ mod tests {
     #[tokio::test]
     async fn ephemeral_slow_consumer_silently_resumes_at_retained_floor() {
         let bus =
-            BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(2), ..Default::default() }).expect("valid options");
+            BusHandle::create_with_options(BusOptions { journal: crate::stream_journal::JournalPolicy::ephemeral(), window: Some(2), ..Default::default() }).expect("valid options");
         let p = registered(&bus, "p");
         // Create the cursor BEFORE sends so it starts at the joined-only
         // tail; the test exercises a consumer reading slowly enough that
@@ -2429,7 +2517,7 @@ mod tests {
     /// Joined "a" (0), msg (1, evicted), Joined "b" (2), msg (3, live).
     fn sparse_membership_bus() -> BusHandle {
         let bus = BusHandle::create_with_options(BusOptions {
-            ephemeral: true,
+            journal: crate::stream_journal::JournalPolicy::ephemeral(),
             window: Some(1),
             ..Default::default()
         })
@@ -2473,7 +2561,7 @@ mod tests {
     async fn resume_is_forward_to_next_retained_never_backward() {
         // window=1 so each new message evicts the previous one's payload;
         // Join entries are never evicted.
-        let bus = BusHandle::create_with_options(BusOptions { ephemeral: true, window: Some(1), ..Default::default() })
+        let bus = BusHandle::create_with_options(BusOptions { journal: crate::stream_journal::JournalPolicy::ephemeral(), window: Some(1), ..Default::default() })
             .expect("opts");
         let a = registered(&bus, "a");        // Joined @0
         a.send("A", json!(0)).unwrap();        // @1 msg
@@ -2535,14 +2623,14 @@ mod tests {
         );
         assert_eq!(
             crate::weft_type::WeftType::bus_marker_mode(&m),
-            Some(BusMode::Journaled)
+            Some(crate::stream_journal::JournalMode::Journaled)
         );
-        let eph = BusHandle::create_with_options(BusOptions { ephemeral: true, window: None, ..Default::default() })
+        let eph = BusHandle::create_with_options(BusOptions { journal: crate::stream_journal::JournalPolicy::ephemeral(), window: None, ..Default::default() })
             .expect("valid options");
         let me = eph.marker();
         assert_eq!(
             crate::weft_type::WeftType::bus_marker_mode(&me),
-            Some(BusMode::Ephemeral)
+            Some(crate::stream_journal::JournalMode::Ephemeral)
         );
     }
 
@@ -2553,7 +2641,7 @@ mod tests {
         // window applies to both modes, so a zero is rejected regardless of
         // `ephemeral`.
         let err = BusHandle::create_with_options(BusOptions {
-            ephemeral: true,
+            journal: crate::stream_journal::JournalPolicy::ephemeral(),
             window: Some(0),
             ..Default::default()
         })
@@ -2750,7 +2838,7 @@ mod tests {
     /// over the RAM bound. The full history is still readable from RAM.
     #[tokio::test]
     async fn journaled_keeps_unshipped_entries_past_window() {
-        let bus = BusHandle::create_with_options(BusOptions { ephemeral: false, window: Some(2), ..Default::default() })
+        let bus = BusHandle::create_with_options(BusOptions { window: Some(2), ..Default::default() })
             .expect("opts");
         let tx = registered(&bus, "tx");
         let rx = registered(&bus, "rx");
@@ -2775,7 +2863,7 @@ mod tests {
     /// has the data but a cursor never reads it).
     #[tokio::test]
     async fn journaled_trims_shipped_entries_past_window() {
-        let bus = BusHandle::create_with_options(BusOptions { ephemeral: false, window: Some(2), ..Default::default() })
+        let bus = BusHandle::create_with_options(BusOptions { window: Some(2), ..Default::default() })
             .expect("opts");
         let tx = registered(&bus, "tx");
         for i in 0..5 {

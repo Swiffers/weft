@@ -24,6 +24,7 @@ sha2 = { workspace = true }
 # `from_url` resource-source patterns are validated at metadata load, so
 # a typo'd extractor fails the node's metadata parse, not a later paste.
 regex = { workspace = true }
+fancy-regex = { workspace = true }
 # Runtime-only deps, gated behind the `runtime` feature (default on). The
 # language TYPE layer (project/node/weft_type/...) that the compiler's
 # parse+validate path needs does NOT use any of these, so a parse-only consumer
@@ -74,10 +75,13 @@ http = { version = "1", optional = true }
 # engine, node code handing a connected stream to a protocol library).
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
+# The workspace-wide feature union (`.config/hakari.toml`), under `runtime`
+# so the parse-only shape stays free of tokio and the rest.
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack", optional = true }
 
 [features]
 default = ["runtime"]
-# The runtime layer: the execution context, buses, storage streaming, caller
+# The runtime layer: the run context, buses, storage streaming, caller
 # connections, cancellation, timer signals, and signed routing tokens. Pulls
 # tokio/futures/bytes (no wasm32 support). Default on; the WASM parse build is
 # the only consumer that turns it off (it needs only the pure type layer).
@@ -100,6 +104,7 @@ runtime = [
     "dep:tokio-rustls",
     "dep:rustls-native-certs",
     "dep:lru",
+    "dep:weft-workspace-hack",
 ]
 # Ships the hand-rolled fakes colocated with their traits (currently
 # `caller::FakeCallerConnection`) so downstream crates can wire them into

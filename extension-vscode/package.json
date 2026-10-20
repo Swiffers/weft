@@ -1,8 +1,8 @@
 {
   "name": "weft-vscode",
   "displayName": "Weft",
-  "description": "Write Weft programs and watch them run: a live, editable graph of every .weft file, with diagnostics, runs and executions in the editor.",
-  "version": "0.2.269",
+  "description": "Write Weft programs and watch them run: a live, editable graph of every .weft file, with diagnostics and runs in the editor.",
+  "version": "0.2.270",
   "publisher": "weavemind",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -139,25 +139,25 @@
         "icon": "$(go-to-file)"
       },
       {
-        "command": "weft.viewExecution",
+        "command": "weft.viewRun",
         "title": "View in Graph",
         "category": "Weft",
         "icon": "$(eye)"
       },
       {
-        "command": "weft.deleteExecution",
+        "command": "weft.deleteRun",
         "title": "Delete",
         "category": "Weft",
         "icon": "$(trash)"
       },
       {
-        "command": "weft.clearExecutions",
-        "title": "Clear All Executions",
+        "command": "weft.clearRuns",
+        "title": "Clear All Runs",
         "category": "Weft",
         "icon": "$(clear-all)"
       },
       {
-        "command": "weft.loadMoreExecutions",
+        "command": "weft.loadMoreRuns",
         "title": "Load more",
         "category": "Weft",
         "icon": "$(ellipsis)"
@@ -169,13 +169,13 @@
         "icon": "$(refresh)"
       },
       {
-        "command": "weft.refreshExecutions",
-        "title": "Refresh Executions",
+        "command": "weft.refreshRuns",
+        "title": "Refresh Runs",
         "category": "Weft",
         "icon": "$(refresh)"
       },
       {
-        "command": "weft.toggleExecutionsMode",
+        "command": "weft.toggleRunsMode",
         "title": "Flat list / by version",
         "category": "Weft",
         "icon": "$(list-tree)"
@@ -236,8 +236,8 @@
           "name": "Projects"
         },
         {
-          "id": "weft.executions",
-          "name": "Executions"
+          "id": "weft.runs",
+          "name": "Runs"
         }
       ]
     },
@@ -275,7 +275,7 @@
       ],
       "commandPalette": [
         {
-          "command": "weft.loadMoreExecutions",
+          "command": "weft.loadMoreRuns",
           "when": "false"
         }
       ],
@@ -286,33 +286,33 @@
           "group": "navigation"
         },
         {
-          "command": "weft.refreshExecutions",
-          "when": "view == weft.executions",
+          "command": "weft.refreshRuns",
+          "when": "view == weft.runs",
           "group": "navigation@1"
         },
         {
-          "command": "weft.clearExecutions",
-          "when": "view == weft.executions",
+          "command": "weft.clearRuns",
+          "when": "view == weft.runs",
           "group": "navigation@2"
         },
         {
-          "command": "weft.toggleExecutionsMode",
-          "when": "view == weft.executions",
+          "command": "weft.toggleRunsMode",
+          "when": "view == weft.runs",
           "group": "navigation@3"
         },
         {
           "command": "weft.searchRuns",
-          "when": "view == weft.executions",
+          "when": "view == weft.runs",
           "group": "navigation@3"
         },
         {
           "command": "weft.showRunsOn",
-          "when": "view == weft.executions",
+          "when": "view == weft.runs",
           "group": "navigation@3"
         },
         {
           "command": "weft.checkpointLabel",
-          "when": "view == weft.executions",
+          "when": "view == weft.runs",
           "group": "navigation@4"
         }
       ],
@@ -328,53 +328,53 @@
           "group": "inline@2"
         },
         {
-          "command": "weft.viewExecution",
-          "when": "view == weft.executions && viewItem =~ /^weftExecution-/",
+          "command": "weft.viewRun",
+          "when": "view == weft.runs && viewItem =~ /^weftRun-/",
           "group": "inline@1"
         },
         {
-          "command": "weft.deleteExecution",
-          "when": "view == weft.executions && viewItem =~ /^weftExecution-/",
+          "command": "weft.deleteRun",
+          "when": "view == weft.runs && viewItem =~ /^weftRun-/",
           "group": "inline@2"
         },
         {
           "command": "weft.branchHere",
-          "when": "view == weft.executions && viewItem == weftVersion",
+          "when": "view == weft.runs && viewItem == weftVersion",
           "group": "inline@1"
         },
         {
           "command": "weft.pruneVersion",
-          "when": "view == weft.executions && viewItem == weftVersion",
+          "when": "view == weft.runs && viewItem == weftVersion",
           "group": "inline@2"
         },
         {
-          "command": "weft.viewExecution",
-          "when": "view == weft.executions && viewItem =~ /^weftRun-/",
+          "command": "weft.viewRun",
+          "when": "view == weft.runs && viewItem =~ /^weftVersionRun-/",
           "group": "inline@1"
         },
         {
           "command": "weft.diffWithHead",
-          "when": "view == weft.executions && viewItem =~ /^weftRun-/",
+          "when": "view == weft.runs && viewItem =~ /^weftVersionRun-/",
           "group": "1_run@1"
         },
         {
           "command": "weft.freezeRun",
-          "when": "view == weft.executions && viewItem =~ /^weftRun-/",
+          "when": "view == weft.runs && viewItem =~ /^weftVersionRun-/",
           "group": "1_run@2"
         },
         {
           "command": "weft.branchHere",
-          "when": "view == weft.executions && viewItem =~ /^weftRun-/",
+          "when": "view == weft.runs && viewItem =~ /^weftVersionRun-/",
           "group": "1_run@3"
         },
         {
-          "command": "weft.deleteExecution",
-          "when": "view == weft.executions && viewItem =~ /^weftRun-/",
+          "command": "weft.deleteRun",
+          "when": "view == weft.runs && viewItem =~ /^weftVersionRun-/",
           "group": "inline@2"
         },
         {
           "command": "weft.clearRunSearch",
-          "when": "view == weft.executions && viewItem == weftRunSearch",
+          "when": "view == weft.runs && viewItem == weftRunSearch",
           "group": "inline"
         }
       ]

@@ -50,7 +50,7 @@
       "description": "veo-3.1-fast-generate-001 (Veo 3.1 Fast) is the quick one, for previews and iteration; veo-3.1-generate-001 is the high-quality one. Seedance 2.5 makes the longest videos, up to 30 seconds; the fast and mini Seedance 2.0 models stop at 720p. The Seedance (ByteDance) models are refused with `model_access_denied` until ElevenLabs approves your workspace (ask ElevenLabs support for access), and are not offered in the United States.",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "veo-3.1-fast-generate-001",
           "veo-3.1-generate-001",
@@ -80,7 +80,7 @@
       "description": "Leave empty for 16:9. Veo takes only 16:9 and 9:16. `auto` (Seedance only) lets the model match your frames, and Seedance 2.5 always uses `auto` when you give it a frame.",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "auto",
           "16:9",
@@ -99,7 +99,7 @@
       "description": "Leave empty for 720p. Veo takes 720p, 1080p and 4K; Seedance 2.0 takes 480p, 720p, 1080p and 4K, but its fast and mini models only 480p and 720p; Seedance 2.5 takes 480p, 720p and 1080p. 4K and 4k both work.",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "480p",
           "720p",
@@ -147,9 +147,6 @@
       "description": "The generated video, kept for 30 days after it was last read."
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "validate": [
     {
       "when": {

@@ -9,7 +9,7 @@ You build one stage against a real input, run it, and read the result
 before growing the next stage. You judge a result by what the program is meant to do:
 completion alone says nothing. If you catch yourself calling a run good
 because it completed, stop and write: "Wait. Read the result." Then
-inspect `weft events <execution-id> --node <id>` and `weft logs <execution-id>`.
+inspect `weft events <run-id> --node <id>` and `weft logs <run-id>`.
 
 The terms below:
 
@@ -18,20 +18,21 @@ The terms below:
 - A [cut] is where a run stops: `--target` includes that endpoint,
   `--before` excludes it and everything beyond.
 - A [backup] is a value you supply on a [start]. The runtime waits for
-  real execution input first and uses the [backup] only after the real
+  the run's real input first and uses the [backup] only after the real
   source closes without a value or no source participates. A real value
   wins, including null; a running source is never overwritten; errors and
   invalid real values stay errors, a [backup] does not hide them.
 - An [example] is a set of running parameters saved by `--save name` in
-  `examples/name.json`. A [frozen example] is an [example] that `freeze`
+  `examples/name.json`, whose field names are camelCase (`keepFor`,
+  `holdSecs`), like every JSON file weft writes. A [frozen example] is an [example] that `freeze`
   has given accepted output evidence, stored as `expected`.
 - [head] is the version the project is on; `weft branch` moves it.
 
 ## Carve the work you want to exercise
 
-`weft run` builds the current code and starts one execution. You pass
-`--detach`, then read `weft executions --json`,
-`weft events <execution-id> --node <id>` and `weft logs <execution-id>`: failures and
+`weft run` builds the current code and starts one run. You pass
+`--detach`, then read `weft runs --json`,
+`weft events <run-id> --node <id>` and `weft logs <run-id>`: failures and
 waiting states as well as outputs. You keep the user's graph intact while
 trying a stage:
 
@@ -59,7 +60,7 @@ weft run --from triage='{"text":"the invoice is wrong"}' --before publish --deta
   `--node triage` shows them; there is no `triage__in` to name.
 - Whatever cut you choose, an input left with nothing is checked before the
   run starts: its wire's source is outside the run and you handed no value.
-  If a step would skip without it (a required input, or the last member of
+  If a node would skip without it (a required input, or the last member of
   a `@require_one_of` set that could get a value; the node's own, or one
   inside the group it enters, followed through every group, loop and
   included file), the run is refused, naming the input, its source, and
@@ -67,7 +68,17 @@ weft run --from triage='{"text":"the invoice is wrong"}' --before publish --deta
   at your start, or start further up so the source runs. A start is where
   the walk upstream stops, so neither `--group` nor `--from` runs what feeds
   the start's own ports: only what feeds the nodes AFTER it. On a `--seed`
-  run a saved result can feed it instead.
+  run a saved result can feed it instead. When the source is a trigger the
+  run does not fire, the refusal says so: `reply.chatId gets nothing in this
+  run: it only comes from the trigger ask, which this run does not fire, and
+  reply cannot run without it. Fire it (--fire ask='<event>'), or hand the
+  value at a start (...)`. `--emit` standing in for the trigger works
+  too.
+- `--check`, with the same `--from`, `--group`, `--target`, `--before`,
+  `--emit` and `--fire` (never with `--seed`,
+  `--save` or `--detach`), only says whether that run could start
+  (`the run can start`, or the refusal and exit `1`), building and running
+  nothing.
 - `--feed start` runs what feeds a start: for each of its inputs you did
   not hand, the node that feeds it (through every group or include door on
   the way, however deep), and nothing above that node. A loop feeding it
@@ -134,10 +145,8 @@ weft run --emit incoming='{"message":"the emitted output value"}' --detach
 ```
 
 If the program carries infrastructure, bring it up first with `weft infra
-start`. A RUN refuses outright while a node's container is not up, naming
-the node. A bake does not refuse; it brings the infrastructure up itself,
-which is right but takes as long as starting it would, so a bake that seems
-to hang on a program with infrastructure is usually provisioning.
+start`. A run refuses while a node's container is not up, naming the node,
+and so does a bake whose trigger setup reads one; neither starts it.
 
 This is also how you test an infra node: live tests do not cover infra
 nodes for now, so you prove one inside a real program. Start its infra, then
@@ -156,30 +165,29 @@ Changed code or configuration needs a matching new bake. Closed group
 gates can leave a trigger unprepared; you inspect the bake instead of
 forcing it. `weft activate` prepares and arms real listeners.
 `weft bake <project-id>` uses that project's registered build. If you
-deliberately use `--referenced`, you pass it to both bake and run. Off a
-terminal `deactivate` and `resync` use `wipe` unless you say otherwise
-(`infra stop`, `infra terminate` and `infra upgrade` stop and name `--mode`
-when a trigger reads the infra), so a change to the program never leaves a run waiting on
-something nobody will answer. Say `--mode park` or `--mode hibernate`
-when the work in flight has to survive, and say it deliberately.
+deliberately use `--referenced`, you pass it to both bake and run.
 
 ## Reuse completed work while developing
 
 `weft run --seed --detach` takes eligible results from [head]'s run. If
 [head] is a version without a run, it finds a finished run on that
-version or its nearest ancestor. To choose an older run, you run
-`weft branch <execution-id>` first; that also restores its code, so you
-checkpoint edits you want to keep.
+version or its nearest ancestor. `--seed=<run-id>` takes them from any run
+of the project instead, one a trigger started or one that failed included,
+which is how a run that failed or broke off is picked up again after a fix
+(the `=` is required, since a bare word after `--seed` is an example name).
+`--root` starts a new tree with nothing to reuse, so it is refused beside a
+seed. If you also want that run's code back, `weft branch <run-id>` first;
+that restores the files, so you checkpoint edits you want to keep.
 
 - `--seed --seed-before classify` reuses earlier compatible work and runs
   `classify` and what follows.
 - `--seed --seed-until classify` also permits reusing `classify`.
 
 These flags limit reuse within the requested run; the [cut] limits
-execution itself. A step whose saved output names a stored file that has
-been edited since, or is gone, cannot be reused: the run is refused before
-it starts, naming the step, the port and the file, and you either hand the
-file in with `--emit` or run the step again with `--seed-before` it. Changed implementations, inputs, dependencies, failed
+what runs. A node whose saved output names a stored file that has
+been edited since, or is gone, cannot be reused by a node that runs again: the run is refused before
+it starts, naming the node, the port and the file, and you either hand the
+file in with `--emit` or run the node again with `--seed-before` it. Changed implementations, inputs, dependencies, failed
 work, and live handles can prevent reuse. A loop is reused whole. An
 entirely reused run is valid and does no new node work. This applies
 inside a saved or carved run too: `--from` chooses its boundary, not a
@@ -207,13 +215,13 @@ omit it when reviewing how the current program answers the saved use case.
 
 ```bash
 weft run invoice --detach
-weft events <execution-id> --full
-weft freeze invoice <execution-id> --expect reply
+weft events <run-id> --full
+weft freeze invoice <run-id> --expect reply
 # After editing the program:
 weft run invoice --detach
-weft diff example:invoice <new-execution-id>
+weft diff example:invoice <new-run-id>
 # After inspecting and accepting the new result:
-weft freeze invoice <new-execution-id> --expect reply
+weft freeze invoice <new-run-id> --expect reply
 ```
 
 `freeze` preserves that completed run's starting parameters and accepted
@@ -226,7 +234,7 @@ code; interior reused results do not become hidden fixed inputs.
 and closures. A closure a failure left reads `"closed": true` with
 `"failure": {"node": "query", "error": "..."}`, the node that broke and its
 message. You repeat `--expect node` to focus review on particular
-node outputs; focus changes comparison, not execution, and a focused
+node outputs; focus changes comparison, not what runs, and a focused
 output that disappeared remains visible as a difference. Stored media
 compares by its content hash.
 
@@ -243,7 +251,7 @@ Removed input ports are ignored with a warning. Missing [start]s or [cut]
 endpoints are errors: you move the [cut] explicitly before running.
 
 ```bash
-weft run invoice --clear from --from new_classifier='{"text":"the invoice is wrong"}' --target reply --detach
+weft run invoice --clear from --from newClassifier='{"text":"the invoice is wrong"}' --target reply --detach
 weft run invoice --clear group --from triage='{"text":"the invoice is wrong"}' --before publish --detach
 ```
 
@@ -252,8 +260,8 @@ the corresponding saved settings. Repeated new from flags build the
 replacement starting map. Emit flags replace the named supplied ports and
 keep the other saved emit entries. `--clear <field>` clears a saved field
 before those edits: `from`, `emit`, `target`, `before`, `group`, `feed`,
-`fire`, `instance`, `keeping` (what `--durable` or `--fast` saved) or
-`keep_for`; repeat the flag for several fields.
+`fire`, `instance`, `keeping` (what `--durable` or `--fast` saved),
+`keep_for` or `hold_secs`; repeat the flag for several fields.
 Duplicate newly supplied ports are errors. Values are never guessed for
 renamed nodes.
 
@@ -274,9 +282,9 @@ inspecting that same run. Each entry holds exactly one of these:
   with it.
 - `"skipped": true`: the person skipped the question. Skip it the same way,
   `POST /signal/{token}/skip`.
-- `gave_up`: nobody answered. The run could not pause, held the wait in its
+- `gaveUp`: nobody answered. The run could not pause, held the wait in its
   worker until nothing had moved for its hold time, and gave the wait up;
-  the text is the error the waiting step failed with. Leave the current
+  the text is the error the waiting node failed with. Leave the current
   one unanswered, so the new run gives up the same way when its own hold
   runs out.
 
@@ -288,15 +296,15 @@ would cut a real wait short.
 For live connections, you send the recorded messages through a new
 connection and review the new responses.
 
-`weft wake <execution-id> <node>` resolves a pure time wait. A wait requiring a
+`weft wake <run-id> <node>` resolves a pure time wait. A wait requiring a
 value must receive that value instead. Logs and inherited markers identify
 which earlier run supplied reused history; historical costs are not new
 charges.
 
 ## Keep a reviewable trail
 
-`weft checkpoint [label]` saves a source version without executing.
-`weft tree` shows versions and runs; `weft branch <version|label|execution-id>`
+`weft checkpoint [label]` saves a source version without running anything.
+`weft tree` shows versions and runs; `weft branch <version|label|run-id>`
 restores a point in that tree. [head] is shared per project. A dirty
 branch refusal names the files: you checkpoint them before switching.
 Discarding edits and pruning history require the user's authority.
@@ -309,4 +317,4 @@ pruned versions go too.
 
 After an edit, you run the relevant saved use cases, inspect their diffs,
 and report what actually ran, what changed, why a result is acceptable or
-still wrong, and the execution ids.
+still wrong, and the run ids.

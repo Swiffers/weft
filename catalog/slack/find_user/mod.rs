@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::api;
 
@@ -23,7 +23,7 @@ impl Node for SlackFindUserNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let email: Option<String> = ctx.inputs.opt("email")?;
         let id: Option<String> = ctx.inputs.opt("id")?;

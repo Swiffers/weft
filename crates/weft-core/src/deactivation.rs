@@ -1,61 +1,141 @@
 //! What `POST /projects/{id}/deactivate` and `/resync` read and answer,
-//! and how a person reads whose triggers a lifecycle verb touched. ONE
+//! and what every command that takes triggers down says it did. ONE
 //! definition for the dispatcher and the CLI.
 
 use serde::{Deserialize, Serialize};
 
-use crate::instance::{InstanceId, Owner};
-use crate::activation::ActivationScope;
+use crate::activation::{ActivationScope, ActivationUrl, OwnerTriggers};
 use crate::builds::BuildHashes;
-use crate::running_policy::DeactivateSpec;
+use crate::instance::{InstanceId, Owner};
+use crate::take_down::{Held, Running, TakeDown, TakeDownChoice};
 
-/// Whose triggers a deactivate took down, in order, and which instances
-/// still have a trigger on afterwards, so a plain deactivate (the
-/// program's own triggers) can say that instances' are still listening
-/// and how to take them down too.
+/// What a take-down did, as every command that takes triggers down
+/// answers it and prints it: the answers it acted on, the triggers it
+/// took down, what is held on them, and what became of the runs going.
+// SYNC: TakeDownReport <-> packages/weft-graph/src/protocol.ts TakeDownReport
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeactivateResponse {
-    pub deactivated: Vec<Owner>,
-    pub instances_still_on: Vec<InstanceId>,
+#[serde(rename_all = "camelCase")]
+pub struct TakeDownReport {
+    pub take_down: TakeDown,
+    /// The triggers it took down, by owner. Empty when none it named was
+    /// on.
+    pub triggers: Vec<OwnerTriggers>,
+    /// The work held on them: kept for when they are back, or (with
+    /// `held: drop`) what was dropped.
+    pub held: crate::projects::HeldWork,
+    /// Runs going right now that it reached: cancelled (`running:
+    /// cancel`), or left to finish on their own version, the command going
+    /// on once they have (`wait`).
+    pub runs: u64,
 }
 
-/// `POST /projects/{id}/deactivate`: the take-down choice (mode,
-/// running policy and drain cap) and which activations: every shared
-/// trigger by default, or the ones named, for the instance named; or,
-/// with `all_instances`, for every instance whose triggers are on.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl TakeDownReport {
+    /// One line a person reads: "took down 'door', 'feed': the door holds
+    /// what arrives; 3 arrivals held, 1 paused run kept; 2 runs waited
+    /// for, finishing on their own version".
+    pub fn describe(&self) -> String {
+        if self.triggers.is_empty() {
+            return "no trigger it names was on, so nothing was taken down".into();
+        }
+        let held = match (self.take_down.held, self.held.is_empty()) {
+            (_, true) => "nothing held".to_string(),
+            (Held::Keep, false) => format!("{} kept", self.held.describe()),
+            (Held::Drop, false) => format!("{} dropped", self.held.describe()),
+        };
+        let runs = match (self.runs, self.take_down.running) {
+            (0, _) => "no run going".to_string(),
+            (n, Running::Wait) => format!("{} waited for, finishing on their own version", runs_counted(n)),
+            (n, Running::Cancel) => format!("{} cancelled", runs_counted(n)),
+        };
+        format!("took down {}: {}; {held}; {runs}", OwnerTriggers::list_words(&self.triggers), self.take_down.door_words())
+    }
+}
+
+/// "1 run" / "3 runs".
+fn runs_counted(n: u64) -> String {
+    if n == 1 { "1 run".into() } else { format!("{n} runs") }
+}
+
+/// What `POST /projects/{id}/deactivate` answers: what it did, and which
+/// instances still have a trigger on afterwards, so a deactivate of the
+/// shared triggers can say that instances' are still listening and how to
+/// take them down too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeactivateResponse {
+    pub report: TakeDownReport,
+    pub instances_still_on: Vec<InstanceId>,
+    /// Under `running: wait`, with runs left going: the wait for them,
+    /// followed in short looks (`GET /projects/{id}/follow/{task}`,
+    /// [`Following`]) until they have ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<uuid::Uuid>,
+}
+
+/// What `POST /projects/{id}/resync` (and `/resync/resume`) answers: done
+/// at once (nothing behind), or under way, followed in short looks
+/// (`GET /projects/{id}/follow/{task}`) until it ends, so no request has to
+/// stay open for as long as it waits on the old version's runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ResyncAnswer {
+    Done(ResyncResponse),
+    UnderWay { task: uuid::Uuid },
+}
+
+/// What one look at a task a person follows answers
+/// (`GET /projects/{id}/follow/{task}?waitSecs=<n>`): still going after
+/// waiting at most that long, or what it ended with. One that failed is
+/// answered as the refusal it ended with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Following {
+    Going,
+    Done(serde_json::Value),
+}
+
+/// `POST /projects/{id}/deactivate`: the take-down's answers and which
+/// activations: the named triggers (every one when none is) of the
+/// owners named (the shared ones when none is).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeactivateRequest {
     #[serde(flatten)]
-    pub spec: DeactivateSpec,
+    pub choice: TakeDownChoice,
     #[serde(default)]
     pub scope: ActivationScope,
-    /// Every instance with a trigger on, each taken down with the same
-    /// spec and the scope's triggers (all of that instance's when none are
-    /// named). The program's own triggers are left as they are: a plain
-    /// deactivate is for those. Refused beside `scope.instance`, which names
-    /// one instance instead.
-    #[serde(default, rename = "allInstances", skip_serializing_if = "std::ops::Not::not")]
-    pub all_instances: bool,
 }
 
-/// `POST /projects/{id}/resync`: the build it brings live (the hashes
-/// the caller built), the trigger-deactivation answer, required because
-/// a resync only acts on triggers that are on (428 without it), and which
-/// activations. The running-work answer is the picker's, so the body
-/// carries no `runningPolicy` of its own: one answer governs the trigger
-/// drain and the worker replacement alike. No reactivate choice either:
-/// what the take-down kept is carried over (the default
-/// `ReactivateChoice`).
+/// `POST /projects/{id}/resync`: the build it brings live (the hashes the
+/// caller built), how the triggers it refreshes go down for the swap, and
+/// which: the named triggers (every one when none is) of the owners named
+/// (the shared ones when none is), of which only those on and behind the
+/// build are refreshed. They come back at once on the new build.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResyncRequest {
     #[serde(flatten)]
     pub build: BuildHashes,
-    #[serde(default, rename = "triggerDeactivation", skip_serializing_if = "Option::is_none")]
-    pub trigger_deactivation: Option<DeactivateSpec>,
-    /// Which activations. Left out (no trigger, no instance): every
-    /// owner with a trigger on, the program's and each instance's.
+    #[serde(flatten)]
+    pub choice: TakeDownChoice,
     #[serde(default)]
     pub scope: ActivationScope,
+}
+
+/// What a resync answers: what its take-down did, the addresses its
+/// triggers answer on again, whose it refreshed in order, and the
+/// triggers of the new build that are off, which a resync never turns on
+/// (`weft activate --trigger` does).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResyncResponse {
+    pub report: TakeDownReport,
+    pub urls: Vec<ActivationUrl>,
+    pub resynced: Vec<Owner>,
+    /// Paused runs of the refreshed triggers moved onto the new build:
+    /// they resume on it.
+    pub moved_runs: u64,
+    /// Triggers of the new build that are off, by owner.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub off: Vec<OwnerTriggers>,
 }
 
 /// How a person reads one owner's triggers: "the program's triggers" or
@@ -70,34 +150,55 @@ pub fn whose_triggers(owner: &Owner) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::instance::InstanceTarget;
+    use crate::take_down::Door;
 
     #[test]
-    fn a_deactivate_names_all_instances_only_when_asked() {
-        let spec: DeactivateSpec =
-            serde_json::from_value(serde_json::json!({ "mode": "wipe", "runningPolicy": "cancel" })).unwrap();
-        let plain = DeactivateRequest { spec: spec.clone(), scope: ActivationScope::default(), all_instances: false };
-        let wire = serde_json::to_value(&plain).unwrap();
-        assert!(wire.get("allInstances").is_none(), "{wire}");
-        assert_eq!(wire["mode"], "wipe");
-        let every = serde_json::to_value(DeactivateRequest { all_instances: true, ..plain }).unwrap();
-        assert_eq!(every["allInstances"], true);
-        assert!(serde_json::from_value::<DeactivateRequest>(every).unwrap().all_instances);
+    fn a_deactivate_flattens_its_answers_beside_its_scope() {
+        let body: DeactivateRequest = serde_json::from_value(serde_json::json!({
+            "door": "hide", "running": "cancel", "scope": { "instances": "all_instances" }
+        }))
+        .unwrap();
+        assert_eq!(body.choice.door, Some(Door::Hide));
+        assert_eq!(body.choice.held, None, "left to the command's default");
+        assert_eq!(body.scope.instances, InstanceTarget::EveryInstance);
+        let wire = serde_json::to_value(&body).unwrap();
+        assert_eq!(wire, serde_json::json!({ "door": "hide", "running": "cancel", "scope": { "instances": "all_instances" } }));
     }
 
     #[test]
-    fn a_resync_names_its_build_and_carries_no_reactivate_choice() {
+    fn a_resync_names_its_build_and_its_answers() {
         let body = ResyncRequest {
             build: BuildHashes { binary_hash: Some("b".into()), ..Default::default() },
-            trigger_deactivation: None,
+            choice: TakeDownChoice { held: Some(Held::Drop), ..Default::default() },
             scope: ActivationScope::default(),
         };
         let wire = serde_json::to_value(&body).unwrap();
         assert_eq!(wire["binaryHash"], "b");
-        assert!(wire.get("reactivateChoice").is_none(), "{wire}");
-        let mut sent = wire.clone();
-        sent["reactivateChoice"] = "wipe_all".into();
-        let back: ResyncRequest = serde_json::from_value(sent).unwrap();
-        assert_eq!(serde_json::to_value(&back).unwrap(), wire, "a choice sent anyway is not read");
+        assert_eq!(wire["held"], "drop");
+        let back: ResyncRequest = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.choice.resolve().unwrap().held, Held::Drop);
+    }
+
+    #[test]
+    fn a_report_reads_as_what_was_done() {
+        let ada = Owner::Instance(InstanceId::new("ada").unwrap());
+        let report = TakeDownReport {
+            take_down: TakeDown::DEFAULT,
+            triggers: vec![
+                OwnerTriggers { owner: Owner::Shared, triggers: vec!["door".into(), "feed".into()] },
+                OwnerTriggers { owner: ada, triggers: vec!["inbox".into()] },
+            ],
+            held: crate::projects::HeldWork { arrivals: 3, paused: 1 },
+            runs: 2,
+        };
+        assert_eq!(
+            report.describe(),
+            "took down 'door', 'feed'; 'inbox' of instance 'ada': the door holds what arrives; \
+             3 arrivals and 1 paused run kept; 2 runs waited for, finishing on their own version"
+        );
+        let nothing = TakeDownReport { triggers: Vec::new(), ..report };
+        assert!(nothing.describe().contains("nothing was taken down"));
     }
 
     #[test]

@@ -13,7 +13,7 @@ entry). An [api token] lets a [consumer] list the [signal]s it may see. A
 is one, for the form kind; anything that can send HTTP is another, for that
 kind or any kind that renders a consumer payload. A frontend under `front/`
 (the `weft-frontend` skill) is one more [consumer] of exactly these
-[door]s, for the human steps the program parks; the program's own `Route`
+[door]s, for the questions the program parks for people; the program's own `Route`
 nodes serve its ordinary data calls (the `weft-api` skill).
 
 ## The token
@@ -65,14 +65,14 @@ any kind: they list, fire, skip, cancel and link the same way whatever the
 |---|---|
 | `GET /signal-token/signals` | the [signal]s this [api token] may see and that render a consumer payload, one [entry] each (shape below) |
 | `POST /signal/{signal token}` | fire one [signal] with a JSON body: answer a question, start a trigger's run, deliver a webhook's payload. No bearer: the [signal token] is the credential |
-| `POST /signal/{signal token}/skip` | decline a question a waiting run asked: the step that asked ends skipped, its outputs close and what reads them skips. Refused (409) on a trigger's [signal], which asks nothing. No bearer, same rule as firing |
+| `POST /signal/{signal token}/skip` | decline a question a waiting run asked: the node that asked ends skipped, its outputs close and what reads them skips. Refused (409) on a trigger's [signal], which asks nothing. No bearer, same rule as firing |
 | `GET /signal-token/signals/{signal token}/files/{field}` | a fresh link for a stored file a [signal]'s field shows, good for an hour. You ask every time you render and never store the link |
 
 Two more, for a [consumer] that manages [signal]s:
 `DELETE /signal/{signal token}` cancels the run behind a [signal] (answers
 204), and
 `DELETE /signal-token/signals` cancels every run the [api token] sees and
-drops its triggers (answers `{ execution_ids_cancelled, entry_signals_dropped }`).
+drops its triggers (answers `{ runIdsCancelled, entrySignalsDropped }`).
 Both need an [api token] with **no tag scope** and full project view; a
 narrowed token gets 403, because a cancel reaches sibling questions of the
 same run that the token may not see. `GET /signal-token/health` answers
@@ -85,7 +85,7 @@ A [display] is what one node shows about itself while it runs. Three more
 
 | [door] | What it does |
 |---|---|
-| `GET /signal-token/displays` | the displays this token may watch: `{ project_id, project_name, node, node_type, kind, label?, status? }` each, `kind` being `infra` or `trigger`. An `infra` entry's `status` is where the copy behind it stands: `none` (never started), `provisioning` (starting), `running`, `flaky`, `stopping`, `stopped`, `terminating` or `failed`. `node` is spelled the way a person writes it, and it is what `{node}` takes in the two doors below |
+| `GET /signal-token/displays` | the displays this token may watch: `{ projectId, projectName, node, nodeType, kind, label?, status? }` each, `kind` being `infra` or `trigger`. An `infra` entry's `status` is where the copy behind it stands: `none` (never started), `provisioning` (starting), `running`, `flaky`, `stopping`, `stopped`, `terminating` or `failed`. `node` is spelled the way a person writes it, and it is what `{node}` takes in the two doors below |
 | `GET /signal-token/displays/{project}/{node}` | what that node is showing right now |
 | `POST /signal-token/displays/{project}/{node}/action` | press a button one of its items carried: `{ "kind": "<actionKind>", "payload": ... }`. Only an `infra` node has buttons; a `trigger`'s [display] is read-only and answers 400 |
 
@@ -158,8 +158,8 @@ is nothing behind the display yet the door answers 404 as well, so read the
 listing's `status` to say which: `provisioning` is "starting" (a copy can take
 minutes, so show that it is on its way, and read the feed again once it says
 `running`), `none` or `stopped` is "not started" with the button that starts
-it, and `failed` is the error. A trigger's display 404s until the project is
-activated.
+it, and `failed` is the error. A trigger's display 404s until the trigger is
+turned on.
 
 ## What a listed signal looks like
 
@@ -181,9 +181,12 @@ An [entry] is one object of the listing:
 `token`, `nodeId`, `kind`, `isResume` and `title` are on every [entry]; the
 rest is the kind's own payload, and `kind` says how to read it. `isResume`
 splits the list: a parked question disappears once answered (a second
-answer gets 404 once it is gone, 409 while the project is parked and the
-first answer waits in its queue); a trigger stays listed while the project
-is active and fires again and again, each fire a new run.
+answer gets 409, or 404 once it is gone); a trigger stays listed while it is
+on and fires again and again, each fire a new run. Every field name
+weft writes in these answers is camelCase, and the value of a fixed-set
+field (`kind`, `consumerKind`, a display's `status`) is snake_case, so a
+client reads `entry.nodeId`, and checks
+`entry.consumerKind === "human_in_the_loop"`.
 
 **Which kinds appear.** A kind reaches the listing when its listener
 handler renders a consumer payload. Today the form kind is the only one that
@@ -229,13 +232,14 @@ The answer body is one JSON object, every answerable field present:
 `{ "ok": true, "reason": "looks fine", "tone": ["formal"] }`. A field left
 out lands as null on its port, which a typed port refuses: the port closes
 with a warning in the journal and whatever reads it skips, so you send every
-field. The dispatcher answers 200 on a live project, and also 200 when the
-project is parked (the answer is queued and played when it wakes); 404 for
-an unknown or already-answered [signal token]; 409 for a second answer
-while the first waits in a parked project's queue (you show it as "someone
-else answered"); 410 when the project no longer accepts anything (you show
-it as "the project is gone"); 429 when a trigger's queue is full while
-parked. On any other failure you show the message text.
+field. The dispatcher answers 200 when the answer reached its run, and also
+200 while the run's trigger is down and set to hold what arrives (the
+answer is kept and handed over once the trigger is back on); 404 for an
+unknown [signal token]; 409 for a second answer to the same question (you
+show it as "someone else answered"); 410 when the run it answers has ended,
+or its trigger takes nothing any more (you show it as "this is closed");
+429, with a `Retry-After`, when a trigger is firing more often than its
+limits allow. On any other failure you show the message text.
 
 ## A file in a form
 

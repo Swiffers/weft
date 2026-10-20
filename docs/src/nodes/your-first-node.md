@@ -1,7 +1,7 @@
 # Your first node
 
-Here is the smallest node in the catalog, whole. `Text` takes a string you
-typed and sends it on.
+Here is `Text`, one of the smallest nodes in the catalog, with the lines that
+hook up its tests left out. `Text` takes a string you typed and sends it on.
 
 `catalog/basic/text/metadata.json`:
 
@@ -9,7 +9,7 @@ typed and sends it on.
 {
   "type": "Text",
   "label": "Text",
-  "description": "Emit a literal string. Useful for prompts, labels, and config values.",
+  "description": "Emit a literal string (a prompt, a label, a config value).",
   "tags": ["literal", "string"],
   "icon": "Type",
   "color": "#64748b",
@@ -18,7 +18,7 @@ typed and sends it on.
       "required": true, "label": "Value" }
   ],
   "outputs": [ { "name": "value", "type": "String" } ],
-  "requires_infra": false
+  "features": { "pure": true }
 }
 ```
 
@@ -29,7 +29,7 @@ typed and sends it on.
 
 use async_trait::async_trait;
 
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
@@ -37,7 +37,7 @@ pub struct TextNode;
 
 #[async_trait]
 impl Node for TextNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let value: String = ctx.inputs.get("value")?;
         ctx.pulse_downstream(NodeOutput::new().set("value", value)).await
     }
@@ -48,8 +48,9 @@ Read an input, send an output. That is the shape of every node.
 
 ## Write one
 
-Make a folder under your project's `nodes/`, anywhere except
-`nodes/base_catalog/`. That folder holds the standard library, and it is a
+Make a folder anywhere under your project's `nodes/` (except
+`nodes/base_catalog/`), or anywhere under `src/`, for example next to the
+`.weft` file that uses it. `nodes/base_catalog/` holds the standard library, and it is a
 folder of nodes like any other: weft loads and builds it the same way, and
 you can delete it if you do not use it. The one thing particular to it is
 that `weft catalog update` replaces it with the installed weft's copy, so
@@ -86,7 +87,7 @@ nodes/word_count/
 
 use async_trait::async_trait;
 
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
@@ -94,7 +95,7 @@ pub struct WordCountNode;
 
 #[async_trait]
 impl Node for WordCountNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let text: String = ctx.inputs.get("text")?;
 
         let words: Vec<&str> = text.split_whitespace().collect();
@@ -136,7 +137,8 @@ downstream to stop waiting.
 
 **Keep values small.** A value over 100 KB fails the emit, naming the port.
 Bytes go in [storage](storage.md), and what travels the wire is the marker
-saying where they are.
+saying where they are. If a big answer is not a file, go and read
+[emitting](values-and-emission.md#emitting) for how to send less of it.
 
 ## Failing well
 
@@ -155,8 +157,12 @@ weft::node_bail!("pick a destination: a channel or a user");
 `node_bail!` is for something your own code worked out. Write the message as an
 instruction, because it is going in front of whoever is building the program.
 
-Your node never names a weft error type. Those two, plus `?` on anything the
-ctx hands back, cover it.
+Those two, plus `?` on anything the ctx hands back, cover almost every
+failure. The exception is a mistake in the program that your code spots, like
+SQL that does not parse: return `Err(WeftError::Input(..))` for that. For why,
+and for which failures a program can catch on `_error` (an output weft gives
+every node), go and read [which failures a program can
+handle](values-and-emission.md#which-failures-a-program-can-handle).
 
 ## Then a test
 

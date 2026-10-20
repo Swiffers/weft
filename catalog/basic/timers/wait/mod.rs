@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use weft::signal::{Timer, TimerSpec};
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::timers::output_after;
 
@@ -42,7 +42,7 @@ impl Node for WaitNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let seconds: f64 = ctx.inputs.get("seconds")?;
         let value: Option<Value> = ctx.inputs.raw("value").cloned();
         let wake = ctx.await_signal(timer_for(seconds)?).await?;

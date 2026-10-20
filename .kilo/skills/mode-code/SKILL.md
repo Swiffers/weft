@@ -77,11 +77,18 @@ Rules when adding code:
 edited plus each crate that depends on what you changed. Rust tests run
 under `cargo nextest run`, never `cargo test`: nextest runs every test of
 every test binary side by side, `cargo test` runs the binaries one after
-another. While iterating, one test by name (`cargo nextest run -p <crate>
-<name>`), then the crates, in ONE command (`cargo nextest run -p a -p b`)
-so cargo builds them together. Clippy runs once, when the change is done,
-on the same `-p` list, never `--workspace`. Runners take the same
-narrowing: `scripts/run-node-tests.sh <package>`, `scripts/run-db-tests.sh
+another. Always BUILD the whole workspace and narrow only what RUNS:
+`cargo nextest run --workspace -E 'rdeps(a) | rdeps(b)'` (`rdeps(a)` is
+crate `a` plus every crate that depends on it, which is the test scope),
+and while iterating one test by name (`-E 'rdeps(a) & test(name)'`).
+Never `-p`: a build of some crates alone turns on different features of
+the crates under them (a `test-helpers` only some crates' tests ask for),
+so cargo compiles a second copy of most of the workspace beside the
+first; `target/` once reached 84 GB that way. Once the workspace is built,
+a workspace build compiles only what changed and what depends on it.
+Clippy runs once, when the change is done, as `cargo clippy --workspace
+--all-targets`, which checks again only what changed. Runners take the
+same narrowing: `scripts/run-node-tests.sh <package>`, `scripts/run-db-tests.sh
 <crate> [name] [file]` (nextest too, every database suite at once),
 `scripts/run-e2e.sh <name>`. Built, the layer 1 to 3 tests of the whole
 workspace run in about 20 seconds and the database ones in about 15: a run

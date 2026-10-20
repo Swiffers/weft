@@ -86,7 +86,7 @@ async fn wrong_kind(rig: FakeRig) -> WeftResult<()> {
         )
         .await;
     let err = outcome.result.expect_err("openai kind must refuse").to_string();
-    assert!(err.contains("OpenRouterProvider"), "{err}");
+    assert!(err.contains("OpenRouterModel"), "{err}");
     Ok(())
 }
 

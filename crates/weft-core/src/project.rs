@@ -15,19 +15,22 @@ use crate::weft_type::WeftType;
 /// The canonical form of a program and the digests over it.
 pub mod hash;
 pub mod graph;
-pub mod selection;
+pub mod scopes;
+pub mod places;
+pub mod cut;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDefinition {
     pub id: Uuid,
     pub nodes: Vec<NodeDefinition>,
     pub edges: Vec<Edge>,
-    /// Group structure preserved by the parser. The flattened node
-    /// list in `nodes` contains the In/Out boundary Passthroughs +
-    /// child nodes for each group; this field carries the pre-
-    /// flatten tree so tooling (the VS Code graph view, AI editors)
-    /// can render groups as structured units without re-deriving
-    /// them from the flat layout.
+    /// The groups, loops, call sites and included bodies, as scopes. A
+    /// group is no node: its members sit in `nodes` with the group in
+    /// their `scope`, the wires run straight from producers to the
+    /// members that read them (each naming the group ports it passes,
+    /// [`Edge::via`]), and the engine drives the group as a scope
+    /// (`crate::run::scope`). A loop keeps its two boundary nodes, the
+    /// machinery its iterations run through.
     #[serde(default)]
     pub groups: Vec<GroupDefinition>,
     #[serde(rename = "createdAt", default = "Utc::now")]
@@ -38,6 +41,172 @@ pub struct ProjectDefinition {
     /// does not say otherwise (`[runs]`, `[triggers]`).
     #[serde(default, skip_serializing_if = "ProjectDefaults::is_default")]
     pub defaults: ProjectDefaults,
+    /// Where a run of this cut is given what it does not compute: the
+    /// input ports handed a value per place, and the places whose node
+    /// stands in for itself instead of running (an `--emit`, a seed's saved
+    /// result, an infra node's baked values). Only WHERE: the values are
+    /// the run's ([`Given`], on its birth), so two runs that differ only by
+    /// their values run one cut. Empty in a program as written; only
+    /// [`cut::cut`] fills it. Keyed by place, because a body is shared: a
+    /// node of an included file can be handed a value under one call and
+    /// run as written under another.
+    #[serde(default, skip_serializing_if = "GivenPlaces::is_empty")]
+    pub given: GivenPlaces,
+    /// The parts of the program that do not compile: an included file that
+    /// does not parse, a node whose type did not load, a wire between two
+    /// ports that cannot meet. The program around them still compiles, and
+    /// everything that does not need them runs; a cut that keeps one is
+    /// refused ([`cut::cut`]), naming what is wrong. Empty in a program
+    /// that compiles whole, and in every cut.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broken: Vec<Broken>,
+}
+
+impl ProjectDefinition {
+    /// Whether a broken part may hide nodes ([`Broken::hides`]), so a
+    /// trigger or an infra copy this program does not declare is not
+    /// proven gone: every decision that takes something down for being
+    /// absent from the program (an orphan's reap, an orphan entry row,
+    /// a gone copy's disks) asks this first, and leaves it alone.
+    pub fn hides_nodes(&self) -> bool {
+        self.broken.iter().any(|part| part.hides)
+    }
+}
+
+/// One part of a program that does not compile
+/// ([`ProjectDefinition::broken`]).
+// SYNC: Broken <-> packages/weft-graph/src/protocol.ts Broken
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Broken {
+    /// The nodes and groups the problem is about, by id. A cut that keeps
+    /// every one of them needs the broken part: one id for a node or a
+    /// group, the two ends for a wire (a cut that keeps only one end does
+    /// not carry the wire).
+    pub parts: Vec<String>,
+    /// What is wrong, as the compiler says it, with the file and line.
+    pub why: String,
+    /// The part may stand for nodes the program cannot see: an included
+    /// file that does not compile (its placeholder holds none of its
+    /// nodes), a node whose type did not load (nothing says whether it is
+    /// a trigger or infra). While a program has one, what is missing from
+    /// it may only be hidden ([`ProjectDefinition::hides_nodes`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hides: bool,
+}
+
+impl Broken {
+    /// Whether a cut whose nodes and groups are `kept` needs this part.
+    pub fn needed_by(&self, kept: &std::collections::BTreeSet<&str>) -> bool {
+        !self.parts.is_empty() && self.parts.iter().all(|part| kept.contains(part.as_str()))
+    }
+}
+
+/// See [`ProjectDefinition::given`].
+// SYNC: GivenPlaces <-> packages/weft-graph/src/protocol.ts GivenPlaces
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GivenPlaces {
+    /// Per place, the input ports handed a value. The wire into such a
+    /// port (if any) carries nothing at that place: the handed value is
+    /// the port's.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub inputs: std::collections::BTreeMap<Located, std::collections::BTreeSet<String>>,
+    /// The places whose node sends what the run gives it instead of
+    /// running.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub outputs: std::collections::BTreeSet<Located>,
+}
+
+impl GivenPlaces {
+    pub fn is_empty(&self) -> bool {
+        self.inputs.is_empty() && self.outputs.is_empty()
+    }
+}
+
+/// What a run is given: the values handed to its starts' inputs, and what
+/// each stand-in sends, at the places its program says
+/// ([`ProjectDefinition::given`]). Carried by the run itself (its birth),
+/// never by the program it runs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Given {
+    /// Per place and input port, the value handed to it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub inputs: std::collections::BTreeMap<Located, std::collections::BTreeMap<String, Value>>,
+    /// Per place, what the node there sends instead of running.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub outputs: std::collections::BTreeMap<Located, StandIn>,
+}
+
+impl Given {
+    pub fn is_empty(&self) -> bool {
+        self.inputs.is_empty() && self.outputs.is_empty()
+    }
+
+    /// Where these values go: the places a program running them must
+    /// say it is given ([`ProjectDefinition::given`]).
+    pub fn places(&self) -> GivenPlaces {
+        GivenPlaces {
+            inputs: self.inputs.iter().map(|(place, ports)| (place.clone(), ports.keys().cloned().collect())).collect(),
+            outputs: self.outputs.keys().cloned().collect(),
+        }
+    }
+
+    /// These values, held to `program`: they go exactly where it says a run
+    /// of it is given something. `Err` naming the first place that differs,
+    /// which only a corrupt record or a program and values that were never
+    /// resolved together produce.
+    pub fn check_against(&self, program: &ProjectDefinition) -> Result<(), String> {
+        let places = self.places();
+        if places == program.given {
+            return Ok(());
+        }
+        let missing_input = program.given.inputs.iter().find(|(place, ports)| places.inputs.get(*place) != Some(*ports));
+        let extra_input = places.inputs.keys().find(|place| !program.given.inputs.contains_key(*place));
+        let missing_output = program.given.outputs.iter().find(|place| !places.outputs.contains(*place));
+        let extra_output = places.outputs.iter().find(|place| !program.given.outputs.contains(*place));
+        Err(match (missing_input, extra_input, missing_output, extra_output) {
+            (Some((place, _)), _, _, _) | (_, Some(place), _, _) => format!("the values handed to '{place}' are not the ports its program is handed"),
+            (_, _, Some(place), _) => format!("'{place}' stands in for itself in its program, and the run gives it nothing to send"),
+            (_, _, _, Some(place)) => format!("the run gives '{place}' something to send, and its program runs it"),
+            (None, None, None, None) => "the run's given values do not match its program".to_string(),
+        })
+    }
+}
+
+/// A node that does not run: what it sends, port by port, once the scope
+/// around it opens (`crate::run::scope`), and where that came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StandIn {
+    pub ports: std::collections::BTreeMap<String, GivenPort>,
+    pub origin: GivenOrigin,
+}
+
+/// One output of a [`StandIn`]: a value (a stream's items as a list), or
+/// a closure, which keeps the failure it carried when its node broke.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GivenPort {
+    Value { value: Value },
+    Closed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<crate::pulse::Failure>,
+    },
+}
+
+/// Where a [`StandIn`]'s outputs came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GivenOrigin {
+    /// Handed in by a person (`--emit`).
+    Emitted,
+    /// An infra node's saved values: it was applied, and a run only reads
+    /// what it saved.
+    Baked,
+    /// The result the run named here left (`--seed`).
+    Inherited { run: crate::RunId },
 }
 
 /// What a project says once, in `weft.toml`, for all its runs and
@@ -68,12 +237,12 @@ impl ProjectDefaults {
     }
 }
 
-/// What kind of grouping construct this is. The visual editor uses
-/// this to pick a renderer; the runtime / flatten step uses the
-/// underlying boundary node type (Passthrough vs LoopIn/LoopOut).
+/// What kind of grouping construct this is: the editor picks a renderer
+/// from it, and the engine drives each kind as a scope (a loop through
+/// its LoopIn / LoopOut nodes, every other kind with no node at all).
 ///
-/// The loop's config (parallel / over / carry / max_iters /
-/// trim_on_mismatch) rides INSIDE the `Loop` variant, so "kind ==
+/// The loop's config (parallel / over / carry / maxIters /
+/// trimOnMismatch) rides INSIDE the `Loop` variant, so "kind ==
 /// Loop" and "has a loop config" cannot drift apart (the invalid
 /// states "Loop without config" / "Group with config" are
 /// unrepresentable). The enum is internally tagged on `kind` and
@@ -89,66 +258,64 @@ pub enum GroupKind {
         loop_config: serde_json::Value,
     },
     /// One use of an included file: `alias = @include("x.weft")`. The
-    /// site has no members of its own; its two boundaries hand the
-    /// caller's values to the shared `body` under a call frame and
-    /// take the body's results back out.
-    Call { body: String },
+    /// site has no members of its own: the shared `body` runs under the
+    /// caller's frames plus the site's call frame, which the wires
+    /// crossing the site push and pop ([`Crossing`]).
+    Call {
+        body: String,
+        /// The places under this site the program runs, each relative to
+        /// the site (the node, and the sites below this one on its path);
+        /// every place when absent. Only a cut sets it, and only on a site
+        /// at the top of the call tree: a body is shared, so two sites
+        /// running different parts of it is said here, not by its nodes.
+        // SYNC: GroupKind::Call.runs <-> packages/weft-graph/src/protocol.ts GroupDefinition.runs
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runs: Option<std::collections::BTreeSet<Located>>,
+    },
     /// An included file, compiled once and shared by every site that
     /// calls it. Its members fire under the caller's frames plus the
     /// site's call frame, so ten uses are one body and ten frames.
     Body,
 }
 
-/// The boundary node types the compiler mints. A group's two halves
-/// are `Passthrough`; a loop's are `LoopIn` / `LoopOut`; a call site's
-/// are `CallIn` / `CallOut`; a shared body's are `IncludeIn` /
-/// `IncludeOut`. One place for the names, so the engine, the journal
-/// fold and the compiler cannot drift on them.
+/// The node types of a loop's two boundaries, the only boundaries the
+/// compiler mints: a loop's iterations run through them. One place for
+/// the names, so the engine, the journal fold and the compiler cannot
+/// drift on them.
 pub mod boundary_types {
-    pub const PASSTHROUGH: &str = "Passthrough";
     pub const LOOP_IN: &str = "LoopIn";
     pub const LOOP_OUT: &str = "LoopOut";
-    pub const CALL_IN: &str = "CallIn";
-    pub const CALL_OUT: &str = "CallOut";
-    pub const INCLUDE_IN: &str = "IncludeIn";
-    pub const INCLUDE_OUT: &str = "IncludeOut";
-
-    /// A boundary that forwards its ports one for one and fires in the
-    /// boundary pass (never dispatched as a node): every kind but a
-    /// loop's, whose halves the engine drives itself.
-    pub fn is_forwarding(node_type: &str) -> bool {
-        matches!(node_type, PASSTHROUGH | CALL_IN | CALL_OUT | INCLUDE_IN | INCLUDE_OUT)
-    }
-
-    /// A boundary whose ports are selected one by one when a run is
-    /// cut (`RunSelection`): a group's, a call site's and a body's. A
-    /// loop is indivisible and goes in whole.
-    ///
-    /// The same set as [`is_forwarding`], and that is not a
-    /// coincidence: a boundary forwards its ports one for one exactly
-    /// when its ports can be taken one at a time. Written as one list
-    /// because two lists of one closed set drift the first time a
-    /// boundary kind is added and only one is edited. The two names
-    /// stay because the callers are asking different questions.
-    pub fn is_port_selected(node_type: &str) -> bool {
-        is_forwarding(node_type)
-    }
-
-    /// An In boundary that opens a new frame for its scope: a loop's
-    /// (an iteration frame per launch) and a body's (the call frame
-    /// its site pushed). The scope's members fire one frame deeper
-    /// than the boundary's caller.
-    pub fn opens_frame(node_type: &str) -> bool {
-        matches!(node_type, LOOP_IN | INCLUDE_IN)
-    }
 
     /// Every boundary type the engine ships, for whatever has to name
     /// them all (the worker's implementation map).
-    pub const ALL: &[&str] = &[PASSTHROUGH, LOOP_IN, LOOP_OUT, CALL_IN, CALL_OUT, INCLUDE_IN, INCLUDE_OUT];
+    pub const ALL: &[&str] = &[LOOP_IN, LOOP_OUT];
 
     /// Any boundary type at all.
     pub fn is_boundary(node_type: &str) -> bool {
-        is_forwarding(node_type) || matches!(node_type, LOOP_IN | LOOP_OUT)
+        matches!(node_type, LOOP_IN | LOOP_OUT)
+    }
+}
+
+/// The node type of an `@include` the compiler does not open up: the
+/// editor's opaque block, and in a build the placeholder an included file
+/// that does not compile leaves at its site ([`own_types`]).
+// SYNC: INCLUDED_GROUP_TYPE <-> packages/weft-graph/src/webview/lib/types/index.ts INCLUDE_NODE_TYPE
+pub const INCLUDED_GROUP_TYPE: &str = "IncludedGroup";
+
+/// The type names weft gives its own nodes and scopes: the language's
+/// `Group` and `Loop`, a loop's two boundaries, and the opaque include.
+/// No catalog may declare one (`weft_catalog` refuses it, naming the
+/// file), so nothing a project wrote is ever mistaken for the
+/// compiler's.
+pub mod own_types {
+    pub const GROUP: &str = "Group";
+    pub const LOOP: &str = "Loop";
+
+    /// Every one of them.
+    pub const ALL: &[&str] = &[GROUP, LOOP, super::boundary_types::LOOP_IN, super::boundary_types::LOOP_OUT, super::INCLUDED_GROUP_TYPE];
+
+    pub fn is_own(node_type: &str) -> bool {
+        ALL.contains(&node_type)
     }
 }
 
@@ -178,13 +345,14 @@ pub struct GroupDefinition {
     #[serde(rename = "childGroupIds", default)]
     pub child_group_ids: Vec<String>,
     /// Ids of member nodes (only direct children, not grandchildren).
-    /// Does NOT include the In/Out boundary nodes (`Passthrough` for
-    /// groups, `LoopIn`/`LoopOut` for loops).
+    /// A loop's own `LoopIn`/`LoopOut` are not among them: they sit in
+    /// the scope around the loop.
     #[serde(rename = "nodeIds", default)]
     pub node_ids: Vec<String>,
     /// True for the anonymous top-level group of an included `.weft` file
-    /// (no `name =`). The editor labels it from the filename and validates it
-    /// as a component (no project-level output requirement).
+    /// (no `name =`). The editor labels it from the filename, validates it
+    /// as a component (no project-level output requirement), and draws it
+    /// open until a person closes it.
     #[serde(default)]
     pub anonymous: bool,
     #[serde(default)]
@@ -201,16 +369,52 @@ pub struct GroupDefinition {
     pub description: Option<String>,
     /// Literals written on this container's interface ports: `g.x = "hi"`
     /// from outside, or `_should_flow: false` in the braces. A wired value
-    /// is an ordinary edge and never appears here.
+    /// is an ordinary edge and never appears here. What a member reads off
+    /// a filled port reaches it over the wire whose source is the group
+    /// itself ([`Edge::via`]), sent when the group opens. A loop's sit on
+    /// its `LoopIn` instead, which delivers them like any node.
     // SYNC: port_literals <-> packages/weft-graph/src/protocol.ts GroupDefinition.portLiterals
     #[serde(default, rename = "portLiterals")]
     pub port_literals: std::collections::BTreeMap<String, Value>,
+    /// File-backed `port_literals` entries, keyed by port: the same
+    /// record a node keeps for a `@file` / `@asset` field
+    /// ([`NodeDefinition::file_refs`]).
+    // SYNC: file_refs <-> packages/weft-graph/src/protocol.ts GroupDefinition.fileRefs
+    #[serde(default, rename = "fileRefs", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub file_refs: std::collections::BTreeMap<String, FileRef>,
     /// Where each `port_literals` entry was written, and in which form
     /// (a braces field or a `g.x = ...` statement), so an edit rewrites
     /// the value where it already lives.
     // SYNC: port_literal_spans <-> packages/weft-graph/src/protocol.ts GroupDefinition.portLiteralSpans
     #[serde(default, rename = "portLiteralSpans")]
     pub port_literal_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
+    /// `[T: Media]` written after `Group`: bounds on the type variables
+    /// its ports use, each with what it resolved to once enrich has run
+    /// (a loop's sit on its `LoopIn` and `LoopOut` instead).
+    // SYNC: GroupDefinition.type_params <-> packages/weft-graph/src/protocol.ts GroupDefinition.typeParams
+    #[serde(default, rename = "typeParams", skip_serializing_if = "Vec::is_empty")]
+    pub type_params: Vec<crate::weft_type::TypeParam>,
+    /// The port types this group has at each place it runs, when they
+    /// differ from one place to another: a group inside an included file
+    /// (the file's own body among them) whose type variables a site
+    /// resolves its own way. The same record a node keeps
+    /// ([`NodeDefinition::place_types`]), its inputs being the group's
+    /// in ports and its outputs its out ports; [`Self::types_at`] is the
+    /// one reading.
+    // SYNC: GroupDefinition.place_types <-> packages/weft-graph/src/protocol.ts GroupDefinition.placeTypes
+    #[serde(default, rename = "placeTypes", skip_serializing_if = "Vec::is_empty")]
+    pub place_types: Vec<PlaceTypes>,
+}
+
+impl GroupDefinition {
+    /// The group's port types at the place `path` reaches (the call path
+    /// its members run under; a site's own, the path above it).
+    pub fn types_at<S: AsRef<str>>(&self, path: &[S]) -> TypesAt<'_> {
+        let place = self.place_types.iter().find(|p| {
+            p.place.len() == path.len() && p.place.iter().zip(path).all(|(a, b)| a == b.as_ref())
+        });
+        TypesAt { own: Own::Group(self), place }
+    }
 }
 
 /// Graph-level instance of a node.
@@ -267,9 +471,9 @@ pub struct ConfigFieldSpan {
     /// The file the span's coordinates live in, when a full-mode
     /// `@include` spliced it out of another file. None = the compiled
     /// source. Carried on the SPAN (not derived from the owning node)
-    /// because a boundary node holds spans from two files at once: its
-    /// loop knobs from the included file, its interface-port fills from
-    /// the file that wrote `alias.port = value`.
+    /// because a group holds spans from two files at once: a loop's
+    /// knobs from the included file, its interface-port fills from the
+    /// file that wrote `alias.port = value`.
     #[serde(default, rename = "sourceFile", skip_serializing_if = "Option::is_none")]
     pub source_file: Option<String>,
 }
@@ -307,8 +511,7 @@ pub struct NodeDefinition {
     /// Group nesting, outermost first. Empty for top-level.
     #[serde(default)]
     pub scope: Vec<String>,
-    /// If this is a Passthrough at a group boundary, which group and
-    /// side.
+    /// For a loop's `LoopIn` / `LoopOut`, which loop and which side.
     #[serde(default, rename = "groupBoundary")]
     pub group_boundary: Option<GroupBoundary>,
     /// The file this node was written in, when it is NOT the compiled
@@ -328,6 +531,23 @@ pub struct NodeDefinition {
     /// need a registry lookup per node.
     #[serde(default)]
     pub features: crate::node::NodeFeatures,
+    /// The bounds on this node's type variables: its node type's
+    /// `typeParams` and the ones the program wrote on it
+    /// (`ExecPython[T: Media](...)`, or on the group a boundary halves,
+    /// which both its boundaries carry). Each carries what its variable
+    /// resolved to once enrich has run; validate holds the two together.
+    // SYNC: type_params <-> packages/weft-graph/src/protocol.ts NodeDefinition.typeParams
+    #[serde(default, rename = "typeParams", skip_serializing_if = "Vec::is_empty")]
+    pub type_params: Vec<crate::weft_type::TypeParam>,
+    /// The port types this node has at each place it runs, when they
+    /// differ from one place to another: a node inside an included file
+    /// whose type variables a site resolves its own way (`blur` included
+    /// once for an Image, once for a Video). One entry per place; empty
+    /// when every place agrees, the node's own port types being the types
+    /// at all of them. [`Self::types_at`] is the one reading.
+    // SYNC: NodeDefinition.place_types <-> packages/weft-graph/src/protocol.ts NodeDefinition.placeTypes
+    #[serde(default, rename = "placeTypes", skip_serializing_if = "Vec::is_empty")]
+    pub place_types: Vec<PlaceTypes>,
     /// `true` if this node implements `Node::provision_infra` and the
     /// dispatcher must run InfraSetup before activate. Mirrored from
     /// NodeMetadata.requires_infra at enrich time.
@@ -417,7 +637,6 @@ pub struct NodeDefinition {
     /// no longer skips the node. Only meaningful on a node type that
     /// accepts created ports; enrich rejects the marker anywhere else,
     /// where it would silently mean nothing.
-    // SYNC: optional_ports <-> packages/weft-graph/src/protocol.ts NodeDefinition.optionalPorts
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty", rename = "optionalPorts")]
     pub optional_ports: std::collections::BTreeSet<String>,
     /// Source ranges + written form for `port_literals` entries, keyed
@@ -545,6 +764,28 @@ fn default_config() -> Value {
 }
 
 impl NodeDefinition {
+    /// The part of the program this node is, as a finding about it names
+    /// it ([`Broken::parts`]): its own id, or for a loop's boundary node its
+    /// loop's, since a cut keeps a loop whole or not at all and the
+    /// boundary is the loop's own business.
+    pub fn part(&self) -> &str {
+        self.group_boundary.as_ref().map(|b| b.group_id.as_str()).unwrap_or(&self.id)
+    }
+
+    /// This node's port types at the place `path` reaches (an include
+    /// call path, outermost site first; empty at the top).
+    pub fn types_at<S: AsRef<str>>(&self, path: &[S]) -> TypesAt<'_> {
+        TypesAt { own: Own::Node(self), place: self.place_of(path).map(|index| &self.place_types[index]) }
+    }
+
+    /// Which [`Self::place_types`] entry is the place `path` reaches,
+    /// `None` when the node's own types are the types there.
+    pub fn place_of<S: AsRef<str>>(&self, path: &[S]) -> Option<usize> {
+        self.place_types.iter().position(|p| {
+            p.place.len() == path.len() && p.place.iter().zip(path).all(|(a, b)| a == b.as_ref())
+        })
+    }
+
     /// The node's header span, or a default (zero) span when it has none
     /// (synthetic nodes carry no header). The single home for "point a
     /// diagnostic at this node's header line", so every diagnostic site uses
@@ -590,26 +831,31 @@ pub enum GroupBoundaryRole {
     Out,
 }
 
-/// THE derivation of a group's IN-boundary node id. The compiler
-/// mints exactly this shape when it flattens a group (or a loop);
-/// the engine and the journal fold re-derive it. One definition so
-/// the convention cannot drift.
-// SYNC: boundary_in_id, boundary_out_id <-> packages/weft-graph/src/webview/host-bridge.ts BOUNDARY_IN, BOUNDARY_OUT
-pub fn boundary_in_id(group_id: &str) -> String {
-    format!("{group_id}{BOUNDARY_IN_SUFFIX}")
+/// THE derivation of a loop's `LoopIn` node id. The compiler mints
+/// exactly this shape; the engine and the journal fold re-derive it.
+/// One definition so the convention cannot drift.
+// SYNC: loop_in_id, loop_out_id <-> packages/weft-graph/src/webview/host-bridge.ts LOOP_IN, LOOP_OUT
+pub fn loop_in_id(loop_id: &str) -> String {
+    format!("{loop_id}{LOOP_IN_SUFFIX}")
 }
 
-/// What [`boundary_in_id`] puts after a group's id.
-const BOUNDARY_IN_SUFFIX: &str = "__in";
+/// What [`loop_in_id`] puts after a loop's id.
+const LOOP_IN_SUFFIX: &str = "__in";
 
-/// THE derivation of a group's OUT-boundary node id; see
-/// [`boundary_in_id`].
-pub fn boundary_out_id(group_id: &str) -> String {
-    format!("{group_id}{BOUNDARY_OUT_SUFFIX}")
+/// THE derivation of a loop's `LoopOut` node id; see [`loop_in_id`].
+pub fn loop_out_id(loop_id: &str) -> String {
+    format!("{loop_id}{LOOP_OUT_SUFFIX}")
 }
 
-/// What [`boundary_out_id`] puts after a group's id.
-const BOUNDARY_OUT_SUFFIX: &str = "__out";
+/// What [`loop_out_id`] puts after a loop's id.
+const LOOP_OUT_SUFFIX: &str = "__out";
+
+/// The loop a boundary's id or spelling names (`each__in`, `each__out`
+/// gives `each`), when it has a boundary's shape: whether a loop of that
+/// name exists is the caller's to check against what it holds.
+pub fn boundary_loop(spelled: &str) -> Option<&str> {
+    spelled.strip_suffix(LOOP_IN_SUFFIX).or_else(|| spelled.strip_suffix(LOOP_OUT_SUFFIX))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupBoundary {
@@ -637,12 +883,17 @@ pub struct InputDefinition {
     // SYNC: InputDefinition.accepts <-> packages/weft-graph/src/protocol.ts InputDefinition.accepts, packages/weft-connect/src/core/wire.ts InputDefinition.accepts
     #[serde(default = "Accepts::both")]
     pub accepts: Accepts,
-    /// Optional while unwired, required once wired (mirrored from the
-    /// metadata's `requiredWhenWired`): a wire into it that arrives
-    /// closed skips the node. [`Self::is_required`] is the one reading.
-    // SYNC: InputDefinition.required_when_wired <-> packages/weft-connect/src/core/wire.ts InputDefinition.requiredWhenWired
-    #[serde(default, rename = "requiredWhenWired", skip_serializing_if = "std::ops::Not::not")]
-    pub required_when_wired: bool,
+    /// The node runs without this input even when it is wired and the
+    /// wire closed (nothing arrived, or its source failed): the program
+    /// wrote `x?: T` (or a key creating the port, `x?:`), or the compiler
+    /// made the port to pass an absence on (a group boundary, a gate).
+    /// An input that is neither `required` nor `optional` is the default
+    /// for one the node's metadata calls optional: unwired the node runs
+    /// without it, wired it is required. [`Self::is_required`] is the one
+    /// reading.
+    // SYNC: InputDefinition.optional <-> packages/weft-graph/src/protocol.ts InputDefinition.optional, packages/weft-connect/src/core/wire.ts InputDefinition.optional
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
     /// The input's effective editor widget (declared, else derived from
     /// the RESOLVED instance type after TypeVar substitution). Always
     /// present after enrich.
@@ -694,10 +945,72 @@ pub struct InputDefinition {
     pub requires_values: Option<Vec<String>>,
 }
 
+/// A node's port types at one place it runs ([`NodeDefinition::place_types`]):
+/// the call path that reaches it (each include site's id, outermost
+/// first), and every port's type there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaceTypes {
+    pub place: Vec<String>,
+    pub inputs: std::collections::BTreeMap<String, WeftType>,
+    pub outputs: std::collections::BTreeMap<String, WeftType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_params: Vec<crate::weft_type::TypeParam>,
+}
+
+/// One node's port types at one place: the node's own, or its
+/// [`PlaceTypes`] entry for that place.
+pub struct TypesAt<'a> {
+    own: Own<'a>,
+    place: Option<&'a PlaceTypes>,
+}
+
+/// Whose own types a [`TypesAt`] falls back on.
+enum Own<'a> {
+    Node(&'a NodeDefinition),
+    Group(&'a GroupDefinition),
+}
+
+impl<'a> TypesAt<'a> {
+    /// The type of input `port` here.
+    pub fn input(&self, port: &str) -> Option<&'a WeftType> {
+        match (self.place, &self.own) {
+            (Some(place), _) => place.inputs.get(port),
+            (None, Own::Node(node)) => node.inputs.iter().find(|p| p.name == port).map(|p| &p.port_type),
+            (None, Own::Group(group)) => group.in_ports.iter().find(|p| p.name == port).map(|p| &p.port_type),
+        }
+    }
+
+    /// The type of output `port` here.
+    pub fn output(&self, port: &str) -> Option<&'a WeftType> {
+        match (self.place, &self.own) {
+            (Some(place), _) => place.outputs.get(port),
+            (None, Own::Node(node)) => node.outputs.iter().find(|p| p.name == port).map(|p| &p.port_type),
+            (None, Own::Group(group)) => group.out_ports.iter().find(|p| p.name == port).map(|p| &p.port_type),
+        }
+    }
+
+    /// The type parameters here, each with what it resolved to.
+    pub fn type_params(&self) -> &'a [crate::weft_type::TypeParam] {
+        match (self.place, &self.own) {
+            (Some(place), _) => &place.type_params,
+            (None, Own::Node(node)) => &node.type_params,
+            (None, Own::Group(group)) => &group.type_params,
+        }
+    }
+}
+
 impl PortDefinition {
+    /// Whether the header that declares this port, on `side`, wrote no
+    /// type for it (`(x)`), or one that did not parse: its type is then
+    /// its own variable ([`WeftType::port_var`]), taken from what is wired.
+    pub fn is_untyped(&self, side: crate::weft_type::PortSide) -> bool {
+        self.port_type == WeftType::port_var(side, &self.name)
+    }
+
     /// Whether this port carries a stream (`Generator[T]`). THE one
     /// reading of a port's type for that question; the node-level
-    /// readers in `exec::ready` are built on it.
+    /// readers in `run::ready` are built on it.
     pub fn is_generator(&self) -> bool {
         self.port_type.as_generator().is_some()
     }
@@ -706,19 +1019,21 @@ impl PortDefinition {
 impl InputDefinition {
     /// Whether a closed value on this input skips the node, given
     /// whether a wire feeds it where the node fires: always for a
-    /// required input, and for a `requiredWhenWired` one only when wired.
+    /// required input, never for an `optional` one, and otherwise only
+    /// when wired.
     pub fn is_required(&self, wired: bool) -> bool {
-        self.required || (wired && self.required_when_wired)
+        self.required || (wired && !self.optional)
     }
 
-    /// An input for a pure WIRE port (a boundary passthrough side, a
+    /// An input for a pure WIRE port (a side of a loop's boundary, a
     /// source-declared custom port): drivers from the type, no editor
-    /// surface beyond what enrich later stamps.
+    /// surface beyond what enrich later stamps. Not `optional`: a port
+    /// that runs without a closed wire says so with [`Self::with_optional`].
     pub fn from_wire_port(port: PortDefinition) -> Self {
         Self {
             accepts: Accepts::for_type(&port.port_type),
             port,
-            required_when_wired: false,
+            optional: false,
             widget: None,
             default: None,
             label: None,
@@ -729,6 +1044,15 @@ impl InputDefinition {
         }
     }
 
+}
+
+impl InputDefinition {
+    /// This input, marked to run without a value even when wired and the
+    /// wire closed when `optional` (see [`Self::optional`]).
+    pub fn with_optional(mut self, optional: bool) -> Self {
+        self.optional = optional;
+        self
+    }
 }
 
 impl std::ops::Deref for InputDefinition {
@@ -784,6 +1108,20 @@ pub struct Position {
     pub y: f64,
 }
 
+/// One wire, end to end: from the node that produces a value to the node
+/// that reads it, however many group ports it passes on the way (each
+/// named in [`Self::via`]). Either end can also be a group itself:
+///
+/// - a wire whose TARGET is a group, on `_should_flow` or
+///   `_should_not_flow`, is that group's gate;
+/// - a wire whose SOURCE is a group starts at one of its ports
+///   (`via[0]` is that group's own crossing): the literal written on an
+///   input port, or nothing at all (an input nobody feeds, an output no
+///   member writes), sent when the group opens;
+/// - a wire whose TARGET is a group on any other port ends there (the
+///   last crossing is that group's): a port nobody on the other side
+///   reads. It carries nothing at run time; it is there because a
+///   person wrote it, so the editor draws it and the checks see it.
 // SYNC: Edge <-> packages/weft-graph/src/protocol.ts Edge
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Edge {
@@ -800,11 +1138,22 @@ pub struct Edge {
     /// the record type at that level (`deref::walk_path` checks it at
     /// compile time), and the projection happens right before delivery,
     /// once per wire (`deref::project_value`): five wires off one port
-    /// are five independent projections.
+    /// are five independent projections. On a wire through group ports
+    /// it is every leg's keys in order (each leg's own are on its
+    /// [`Crossing`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path: Vec<String>,
-    /// Source range of the connection line (`target.port = source.port`).
-    /// Used by tooling to remove or rewrite the edge.
+    /// The group ports the wire passes, from its source to its target.
+    /// Entering a call site pushes the site's call frame and leaving one
+    /// pops it (`ProgramIndex::frames_across`); a group's
+    /// ports change nothing on the way, and say which groups the value
+    /// enters (it can open them) and leaves (they close it when they do
+    /// not run). Empty for a wire between two nodes of one scope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via: Vec<Crossing>,
+    /// Source range of the last leg's connection line (`target.port =
+    /// source.port`, or `target.port = self.x`). Used by tooling to
+    /// remove or rewrite the edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<Span>,
     /// The file the span lives in when the edge came from a full-mode
@@ -813,30 +1162,149 @@ pub struct Edge {
     pub source_file: Option<String>,
 }
 
+/// One group port a wire passes: the group, the port, and which way. The
+/// leg of the wire that ENDS at this port (the line a person wrote,
+/// `g.x = a.out` for the leg into `g.x`) keeps its own key path and
+/// source range here, so the editor can draw and edit each leg.
+// SYNC: Crossing <-> packages/weft-graph/src/protocol.ts Crossing
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Crossing {
+    pub group: String,
+    pub port: String,
+    pub side: CrossingSide,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<Span>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+}
+
+/// Into a group through one of its inputs, or out of it through one of
+/// its outputs.
+// SYNC: CrossingSide <-> packages/weft-graph/src/protocol.ts CrossingSide
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossingSide {
+    In,
+    Out,
+}
+
+impl Edge {
+    /// The input port the wire lands on.
+    pub fn target_port(&self) -> &str {
+        self.target_handle.as_deref().unwrap_or("default")
+    }
+
+    /// The output port the wire leaves from.
+    pub fn source_port(&self) -> &str {
+        self.source_handle.as_deref().unwrap_or("default")
+    }
+
+    /// The keys the wire reads off the value after crossing `via[k]`: the
+    /// legs past that port.
+    pub fn path_after(&self, k: usize) -> Vec<String> {
+        let before: usize = self.via.iter().take(k + 1).map(|crossing| crossing.path.len()).sum();
+        self.path.get(before..).map(<[String]>::to_vec).unwrap_or_default()
+    }
+
+    /// Whether the wire starts at a group's port rather than at a node:
+    /// its first crossing is its source's own.
+    pub fn from_group_port(&self) -> bool {
+        self.via.first().is_some_and(|crossing| crossing.group == self.source)
+    }
+
+    /// Whether the wire stops at a group's port rather than at a node:
+    /// its last crossing is its target's own.
+    pub fn to_group_port(&self) -> bool {
+        self.via.last().is_some_and(|crossing| crossing.group == self.target)
+    }
+
+    /// Whether the wire is a group's gate: it lands on a group's
+    /// `_should_flow` or `_should_not_flow`.
+    pub fn is_group_gate(&self, project: &ProjectDefinition) -> bool {
+        crate::run::skip::is_gate_port(self.target_port()) && !self.to_group_port()
+            && project.groups.iter().any(|group| group.id == self.target)
+    }
+
+    /// The call sites the wire crosses, in the order it crosses them:
+    /// entering one pushes its call frame onto what the value carries,
+    /// leaving one pops it.
+    pub fn site_crossings<'a>(&'a self, g: &'a impl graph::GraphView) -> impl DoubleEndedIterator<Item = (CrossingSide, &'a str)> + 'a {
+        self.via.iter()
+            .filter(move |crossing| g.is_site(&crossing.group))
+            .map(|crossing| (crossing.side, crossing.group.as_str()))
+    }
+
+    /// Carry the call stack `stack` across `crossings` (this wire's
+    /// [`Self::site_crossings`]), walking the wire `direction`: downstream
+    /// an entered site pushes and a left one pops, upstream the other way
+    /// round, each in the order the walk meets them. A pop takes only the
+    /// site on top (`site_of` reads a stack entry's site, `None` for one
+    /// that is no call); `false` when another is there: the wire is
+    /// another call's. A wire that enters a site and leaves it again
+    /// (through a body that only passes a value on) leaves the stack as it
+    /// found it.
+    pub fn carry_calls<'s, T>(
+        crossings: impl DoubleEndedIterator<Item = (CrossingSide, &'s str)>,
+        direction: places::Direction,
+        stack: &mut Vec<T>,
+        site_of: impl Fn(&T) -> Option<&str>,
+        frame: impl Fn(&str) -> T,
+    ) -> bool {
+        let steps: Vec<(CrossingSide, &str)> = match direction {
+            places::Direction::Downstream => crossings.collect(),
+            places::Direction::Upstream => crossings.rev().map(|(side, site)| (match side {
+                CrossingSide::In => CrossingSide::Out,
+                CrossingSide::Out => CrossingSide::In,
+            }, site)).collect(),
+        };
+        for (side, site) in steps {
+            match side {
+                CrossingSide::In => stack.push(frame(site)),
+                CrossingSide::Out => {
+                    if stack.last().and_then(&site_of) != Some(site) { return false; }
+                    stack.pop();
+                }
+            }
+        }
+        true
+    }
+}
+
 /// What a run reads of its program on every turn, worked out once per
-/// compiled project: its wires by node, each node by id, the inputs each
-/// node reads as a stream, the In boundary of each scope, and the shape
-/// each trigger fires with. Under a run selection the wire lookups
-/// answer for a PLACE (a node under the call frames it fires at): a
-/// wire between two nodes of an included file is in the run under one
-/// call and not under another, so the frames pick which wires exist.
+/// program: its wires by node, each node by id, the inputs each node
+/// reads as a stream, its scopes ([`scopes::ScopeIndex`]), the call
+/// frames each wire pushes and pops, and the shape each trigger fires
+/// with. Wires answer for a PLACE (a node under the call frames it fires
+/// at): a body's member is wired once per site that calls it, and the
+/// frames pick which of those wires is there.
 #[derive(Clone)]
 pub struct ProgramIndex {
+    /// The wires that carry something, by source and by target: a wire
+    /// that stops at a group port nobody reads carries nothing.
     outgoing: std::collections::HashMap<String, Vec<usize>>,
     incoming: std::collections::HashMap<String, Vec<usize>>,
-    selection: Option<selection::RunSelection>,
+    /// Per wire that crosses a call site, by wire id: the sites it
+    /// crosses, in order ([`Edge::site_crossings`]).
+    calls: std::collections::HashMap<String, Vec<(CrossingSide, String)>>,
     /// Each node's position in `project.nodes`, by id.
     nodes: std::collections::HashMap<String, usize>,
     /// Per node, by position: the inputs it reads as a stream
-    /// ([`crate::exec::ready::generator_inputs`]).
+    /// ([`crate::run::ready::generator_inputs`]).
     stream_inputs: Vec<Vec<String>>,
     /// The positions of the nodes that read a stream.
     stream_consumers: Vec<usize>,
-    /// The positions of the passthroughs: the boundaries that forward
-    /// what reaches them ([`crate::exec::boundary::is_passthrough`]).
-    passthroughs: Vec<usize>,
-    /// Each scope's In boundary ([`boundary_in_id`]), by scope id.
-    scope_in: std::collections::HashMap<String, usize>,
+    scopes: scopes::ScopeIndex,
+    /// The places a cut runs under each site at the top of the call tree
+    /// that runs only some of its body ([`GroupKind::Call`]'s `runs`).
+    runs: std::collections::HashMap<String, std::collections::BTreeSet<Located>>,
+    /// The places that stand in for their node, and the input ports
+    /// handed a value per place ([`ProjectDefinition::given`]): no wire
+    /// lands on either.
+    stand_ins: std::collections::HashSet<Located>,
+    handed: std::collections::HashMap<Located, std::collections::BTreeSet<String>>,
     /// Per node, by position: the shape its `firesWith` declares
     /// ([`crate::node::fire_payload_type`]), or why it is no shape.
     fire_payload: Vec<Result<Option<crate::weft_type::WeftType>, String>>,
@@ -846,53 +1314,82 @@ impl ProgramIndex {
     pub fn build(project: &ProjectDefinition) -> Self {
         let mut outgoing: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
         let mut incoming: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+        let mut calls = std::collections::HashMap::new();
         for (i, edge) in project.edges.iter().enumerate() {
+            if edge.to_group_port() {
+                continue;
+            }
             outgoing.entry(edge.source.clone()).or_default().push(i);
             incoming.entry(edge.target.clone()).or_default().push(i);
+            let steps: Vec<(CrossingSide, String)> = edge.site_crossings(project).map(|(side, site)| (side, site.to_string())).collect();
+            if !steps.is_empty() {
+                calls.insert(edge.id.clone(), steps);
+            }
         }
         let nodes = project.nodes.iter().enumerate().map(|(at, node)| (node.id.clone(), at)).collect();
         let stream_inputs: Vec<Vec<String>> = project
             .nodes
             .iter()
-            .map(|node| crate::exec::ready::generator_inputs(node).into_iter().map(str::to_string).collect())
+            .map(|node| crate::run::ready::generator_inputs(node).into_iter().map(str::to_string).collect())
             .collect();
         let stream_consumers = stream_inputs.iter().enumerate().filter(|(_, ports)| !ports.is_empty()).map(|(at, _)| at).collect();
-        let scope_in = project
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| node.group_boundary.as_ref().is_some_and(|boundary| boundary.role == GroupBoundaryRole::In))
-            .filter_map(|(at, node)| node.id.strip_suffix(BOUNDARY_IN_SUFFIX).map(|scope| (scope.to_string(), at)))
-            .collect();
-        let passthroughs =
-            project.nodes.iter().enumerate().filter(|(_, node)| crate::exec::boundary::is_passthrough(node)).map(|(at, _)| at).collect();
+        let runs = project.groups.iter().filter_map(|group| match &group.kind {
+            GroupKind::Call { runs: Some(runs), .. } => Some((group.id.clone(), runs.clone())),
+            _ => None,
+        }).collect();
         let fire_payload = project.nodes.iter().map(|node| crate::node::fire_payload_type(&node.fires_with)).collect();
-        Self { outgoing, incoming, selection: None, nodes, stream_inputs, stream_consumers, passthroughs, scope_in, fire_payload }
+        let stand_ins = project.given.outputs.iter().cloned().collect();
+        let handed = project.given.inputs.iter().map(|(place, ports)| (place.clone(), ports.clone())).collect();
+        Self {
+            outgoing, incoming, calls, nodes, stream_inputs, stream_consumers,
+            scopes: scopes::ScopeIndex::build(project), runs, stand_ins, handed, fire_payload,
+        }
     }
 
-    pub fn selected(project: &ProjectDefinition, selection: selection::RunSelection) -> Self {
-        let mut index = Self::build(project);
-        index.selection = Some(selection);
-        index
+    /// The program's scopes.
+    pub fn scopes(&self) -> &scopes::ScopeIndex {
+        &self.scopes
     }
 
-    /// This index under `selection` instead of its own.
-    pub fn reselected(&self, selection: selection::RunSelection) -> Self {
-        Self { selection: Some(selection), ..self.clone() }
-    }
-
-    pub fn selection(&self) -> Option<&selection::RunSelection> {
-        self.selection.as_ref()
-    }
-
-    pub fn includes_port(&self, node: &NodeDefinition, frames: &LoopFrames, port: &str) -> bool {
-        self.selection.as_ref().is_none_or(|selection| selection.includes_port(&Located::at(&node.id, frames), node, port))
-    }
-
-    /// Whether the node at `frames` is in the run (every node is, in a
-    /// whole run).
+    /// Whether the node `node_id` exists at `frames`: every node does,
+    /// except under a site a cut runs only part of the body of
+    /// ([`GroupKind::Call`]'s `runs`), where only the places it lists do.
     pub fn admits(&self, node_id: &str, frames: &LoopFrames) -> bool {
-        self.selection.as_ref().is_none_or(|selection| selection.nodes.contains(&Located::at(node_id, frames)))
+        let path = crate::frames::call_path(frames);
+        let Some((site, below)) = path.split_first() else { return true };
+        self.runs.get(*site).is_none_or(|runs| {
+            runs.contains(&Located::new(node_id, below.iter().map(|s| s.to_string()).collect()))
+        })
+    }
+
+    /// Whether the node at `frames` stands in for itself rather than run
+    /// ([`ProjectDefinition::given`]).
+    pub fn stands_in(&self, node_id: &str, frames: &LoopFrames) -> bool {
+        !self.stand_ins.is_empty() && self.stand_ins.contains(&Located::at(node_id, frames))
+    }
+
+    /// The input ports of the node at `frames` handed a value.
+    pub fn handed_ports(&self, node_id: &str, frames: &LoopFrames) -> Option<&std::collections::BTreeSet<String>> {
+        if self.handed.is_empty() {
+            return None;
+        }
+        self.handed.get(&Located::at(node_id, frames))
+    }
+
+    /// Whether `port` of the node at `frames` was handed a value.
+    pub fn is_handed(&self, node_id: &str, frames: &LoopFrames, port: &str) -> bool {
+        !self.handed.is_empty() && self.handed.get(&Located::at(node_id, frames)).is_some_and(|ports| ports.contains(port))
+    }
+
+    /// Whether a wire landing on `port` of `target` at `frames` delivers:
+    /// the program runs that place (no wire lands on a node that stands in
+    /// for itself, nor on a port handed a value). A group's gate always
+    /// takes its wire.
+    fn lands(&self, target: &str, port: &str, frames: &LoopFrames) -> bool {
+        if !self.nodes.contains_key(target) {
+            return true;
+        }
+        self.admits(target, frames) && !self.stands_in(target, frames) && !self.is_handed(target, frames, port)
     }
 
     /// The position of the node `id` in `project.nodes`.
@@ -916,21 +1413,6 @@ impl ProgramIndex {
         self.stream_consumers.iter().map(move |&at| (&project.nodes[at], self.stream_inputs[at].as_slice()))
     }
 
-    /// The passthroughs, in the program's order.
-    pub fn passthroughs<'a>(&'a self, project: &'a ProjectDefinition) -> impl Iterator<Item = &'a NodeDefinition> + Clone {
-        self.passthroughs.iter().map(move |&at| &project.nodes[at])
-    }
-
-    /// The node `id` when it is a passthrough.
-    pub fn passthrough<'a>(&self, project: &'a ProjectDefinition, id: &str) -> Option<&'a NodeDefinition> {
-        self.node(project, id).filter(|node| crate::exec::boundary::is_passthrough(node))
-    }
-
-    /// The In boundary of the scope `scope`.
-    pub fn scope_in<'a>(&self, project: &'a ProjectDefinition, scope: &str) -> Option<&'a NodeDefinition> {
-        self.scope_in.get(scope).map(|&at| &project.nodes[at])
-    }
-
     /// The shape the trigger `id` fires with: `None` when it declares
     /// none (or the program has no such node), `Err` naming why its
     /// declaration is no shape.
@@ -942,22 +1424,68 @@ impl ProgramIndex {
         }
     }
 
-    /// The wires out of `node_id` that exist at `frames`.
-    pub fn get_outgoing<'a>(&self, project: &'a ProjectDefinition, node_id: &str, frames: &LoopFrames) -> Vec<&'a Edge> {
-        let at = Located::at(node_id, frames);
-        self.outgoing.get(node_id)
+    /// The frames a value carries across `edge`, given the frames its
+    /// source sent it at, or `None` when the wire is not taken from
+    /// there. Every wire carries the source's frames unchanged, except
+    /// one that crosses a call site: leaving a site pops its call frame,
+    /// and only the site the top frame names takes the wire (a body's
+    /// member is wired out to every site that calls it; the frame says
+    /// whose result this is); entering one pushes it (the shared body
+    /// fires one frame deeper). A wire whose far end the program does not
+    /// run at the frames it lands at is not taken either. THE one place
+    /// frames change on a wire, shared by values and closures, so the
+    /// live engine and the journal fold agree. A wire is not taken onto a
+    /// place that stands in for its node, nor onto a port handed a value
+    /// there ([`ProjectDefinition::given`]).
+    pub fn frames_across(&self, edge: &Edge, frames: &LoopFrames) -> Option<LoopFrames> {
+        let out = self.carry_frames(edge, frames, places::Direction::Downstream)?;
+        self.lands(&edge.target, edge.target_port(), &out).then_some(out)
+    }
+
+    /// `frames` carried across the call sites `edge` crosses, walking it
+    /// `direction` ([`Edge::carry_calls`]); `None` when the wire is
+    /// another call's.
+    fn carry_frames(&self, edge: &Edge, frames: &LoopFrames, direction: places::Direction) -> Option<LoopFrames> {
+        let mut out = frames.clone();
+        let Some(steps) = self.calls.get(&edge.id) else { return Some(out) };
+        Edge::carry_calls(
+            steps.iter().map(|(side, site)| (*side, site.as_str())),
+            direction,
+            &mut out,
+            |frame| match frame { crate::frames::Frame::Call { site } => Some(site.as_str()), _ => None },
+            |site| crate::frames::Frame::Call { site: site.to_string() },
+        ).then_some(out)
+    }
+
+    /// The wires out of `source` (a node, or a group sending from one of
+    /// its ports) taken from `frames`.
+    pub fn get_outgoing<'a>(&self, project: &'a ProjectDefinition, source: &str, frames: &LoopFrames) -> Vec<&'a Edge> {
+        self.outgoing.get(source)
             .map(|indices| indices.iter().map(|&i| &project.edges[i])
-                .filter(|edge| self.selection.as_ref().is_none_or(|s| s.has_edge(project, &at, edge, true))).collect())
+                .filter(|edge| self.frames_across(edge, frames).is_some()).collect())
             .unwrap_or_default()
     }
 
-    /// The wires into `node_id` that exist at `frames`.
-    pub fn get_incoming<'a>(&self, project: &'a ProjectDefinition, node_id: &str, frames: &LoopFrames) -> Vec<&'a Edge> {
-        let at = Located::at(node_id, frames);
-        self.incoming.get(node_id)
+    /// The wires into `target` (a node, or a group's gate) that land at
+    /// `frames`: a wire entering call sites lands only under those calls,
+    /// and comes from a source the program runs.
+    pub fn get_incoming<'a>(&self, project: &'a ProjectDefinition, target: &str, frames: &LoopFrames) -> Vec<&'a Edge> {
+        self.incoming.get(target)
             .map(|indices| indices.iter().map(|&i| &project.edges[i])
-                .filter(|edge| self.selection.as_ref().is_none_or(|s| s.has_edge(project, &at, edge, false))).collect())
+                .filter(|edge| self.source_frames(edge, frames).is_some()).collect())
             .unwrap_or_default()
+    }
+
+    /// The frames the source of `edge` sends at, for the wire to land at
+    /// `frames`; `None` when it cannot land there. The inverse of
+    /// [`Self::frames_across`].
+    pub fn source_frames(&self, edge: &Edge, frames: &LoopFrames) -> Option<LoopFrames> {
+        if !self.lands(&edge.target, edge.target_port(), frames) {
+            return None;
+        }
+        let out = self.carry_frames(edge, frames, places::Direction::Upstream)?;
+        let sends = self.nodes.contains_key(&edge.source);
+        (!sends || self.admits(&edge.source, &out)).then_some(out)
     }
 }
 
@@ -968,59 +1496,6 @@ impl ProgramIndex {
 /// on what "has infra" means.
 pub fn has_infra(project: &ProjectDefinition) -> bool {
     project.nodes.iter().any(|n| n.requires_infra)
-}
-
-/// What an ARMED trigger keeps depending on: for every infra PLACE,
-/// every trigger place whose data path runs through it. Returns
-/// `(infra, trigger)` pairs, each spelled the way a person writes the
-/// place (`svc`, or `one.svc` inside the file the site `one` includes),
-/// sorted by `(infra, trigger)`.
-///
-/// Per place, because that is what runs: a file included twice holds
-/// two infra placements and two registered triggers, and the trigger
-/// under `one` reads its address off the placement under `one` alone.
-/// The spelling is the key every infra row and signal row is stored
-/// under, so a reader compares this against those directly.
-///
-/// This is the STAY-RUNNING question, and it is not the same as
-/// [`infra_triggers_depend_on`], which answers the BEFORE-ARMING one.
-/// A registered trigger holds an address it read off the node feeding
-/// it, so stopping that node breaks a signal that is live right now.
-/// Infra that only fed the GATE deciding whether the trigger's group
-/// flows was read once, during activation, and the armed registration
-/// does not touch it again: stopping it later breaks nothing, and
-/// refusing that stop would trap the user into deactivating first.
-/// Hence the plain data walk here (`selection::upstream_by_wires`),
-/// and the run-shaped one there.
-///
-/// Read by:
-///   - the dispatcher's per-node infra stop/terminate guard;
-///   - the broker's `supervisor_trigger_deps` endpoint, so the
-///     supervisor decides the same way when infra goes flaky.
-///
-/// Pure walk over `ProjectDefinition`; no I/O.
-pub fn compute_trigger_deps(project: &ProjectDefinition) -> Vec<(String, String)> {
-    let is_infra = |place: &Located| project.nodes.iter().any(|n| n.id == place.id && n.requires_infra);
-    let graph = graph::ProjectGraph::new(project);
-    let mut out: Vec<(String, String)> = Vec::new();
-    for trigger in trigger_places(project) {
-        let spelled_trigger = address_of(project, &trigger.id, &trigger.path);
-        for place in selection::upstream_by_wires(&graph, std::slice::from_ref(&trigger)) {
-            if is_infra(&place) {
-                out.push((address_of(project, &place.id, &place.path), spelled_trigger.clone()));
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-/// The scope (group or loop) `node` lives directly in, or `None` at
-/// the top level. A boundary node lives in the scope that holds its
-/// container (its `scope` is the container's parent chain), so a
-/// nested group's In boundary is a member of the enclosing body.
-pub fn direct_scope_of(node: &NodeDefinition) -> Option<&str> {
-    node.scope.last().map(String::as_str)
 }
 
 #[cfg(test)]
@@ -1041,6 +1516,8 @@ mod address_tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             defaults: Default::default(),
+            given: Default::default(),
+            broken: Vec::new(),
         };
         let (node, path) = resolve_address(&project, "");
         assert_eq!(node, "");
@@ -1069,6 +1546,7 @@ mod address_tests {
                 {"id": "Auth", "kind": "body", "nodeIds": ["Auth.check"]},
                 {"id": "Auth.billing", "kind": "group", "nodeIds": [], "parentGroupId": "Auth"},
                 {"id": "Auth.billing.inner", "kind": "call", "body": "Inner", "nodeIds": [], "parentGroupId": "Auth.billing"},
+                {"id": "Auth.each", "kind": "loop", "loopConfig": {}, "nodeIds": [], "parentGroupId": "Auth"},
                 {"id": "Inner", "kind": "body", "nodeIds": ["Inner.deep"]}
             ]
         })).unwrap()
@@ -1098,15 +1576,12 @@ mod address_tests {
         );
         // A body's own id addresses every call of it.
         assert_eq!(resolve_address(&p, "Auth.check"), ("Auth.check".into(), vec![]));
-        // A boundary reads as its group; a body's boundary as its site.
-        assert_eq!(address_of(&p, "Auth__in", &["auth".into()]), "auth");
-        assert_eq!(address_of(&p, "Auth__out", &["auth".into()]), "auth");
-        assert_eq!(address_of(&p, "Auth.billing__in", &["auth".into()]), "auth.billing");
-        assert_eq!(address_of(&p, "Inner__out", &["auth".into(), "Auth.billing.inner".into()]), "auth.billing.inner");
+        // A loop's boundary reads as its loop; a body as its site.
+        assert_eq!(address_of(&p, "Auth.each__in", &["auth".into()]), "auth.each");
+        assert_eq!(address_of(&p, "Auth.each__out", &["auth".into()]), "auth.each");
         assert_eq!(group_address(&p, "Auth", &["auth".into()]), "auth");
         assert_eq!(group_address(&p, "Auth.billing", &["auth".into()]), "auth.billing");
-        // The internal spelling still resolves, for the machinery.
-        assert_eq!(resolve_address(&p, "auth.__in"), ("Auth__in".into(), vec!["auth".into()]));
+        assert_eq!(group_address(&p, "Inner", &["auth".into(), "Auth.billing.inner".into()]), "auth.billing.inner");
         // And back again.
         for spelled in ["plain", "auth.check", "auth.billing.inner.deep", "auth.billing.inner"] {
             let (id, path) = resolve_address(&p, spelled);
@@ -1120,7 +1595,7 @@ mod address_tests {
 /// `one` includes), any other group its own address.
 pub fn group_address(project: &ProjectDefinition, group_id: &str, call_path: &[String]) -> String {
     match call_path.split_last() {
-        Some((site, above)) if selection::is_body(project, group_id) => address_of(project, site, above),
+        Some((site, above)) if places::is_body(project, group_id) => address_of(project, site, above),
         _ => address_of(project, group_id, call_path),
     }
 }
@@ -1151,29 +1626,28 @@ pub fn plain_id(id: &str) -> String {
 /// id, are scoped under the body they sit in, so that body's prefix
 /// comes off each. With no call path the id is its own address.
 ///
-/// A group's In and Out boundaries are the compiler's, nobody wrote
-/// them, so they read as the group itself (`gate`, `one.counting`); a
-/// body's boundaries read as the site that called it (`one`). What
-/// happened at the boundary (entered, left, skipped) is the record's
-/// kind, not its name.
+/// A loop's `LoopIn` and `LoopOut` are the compiler's, nobody wrote
+/// them, so they read as the loop itself (`each`, `one.counting`). What
+/// happened at the boundary (launched, gathered, skipped) is the
+/// record's kind, not its name. A body reads as the site that called it
+/// (`one`, through [`group_address`]).
 ///
 /// The editor spells the same thing for the nodes and groups it shows
 /// (a trigger's display poll is keyed by this spelling), so the two
-/// are kept the same function; the boundary arms exist only here,
-/// because the editor never addresses a boundary.
+/// are kept the same function; the loop arm exists only here, because
+/// the editor never addresses a loop's boundary.
 // SYNC: address_of <-> packages/weft-graph/src/run-spec.ts addressOf
 pub fn address_of(project: &ProjectDefinition, id: &str, call_path: &[String]) -> String {
-    // A group's boundary, read off its id rather than spelled for every
-    // group: every firing asks this.
-    let boundary_of = id.strip_suffix(BOUNDARY_IN_SUFFIX).or_else(|| id.strip_suffix(BOUNDARY_OUT_SUFFIX));
-    if let Some(group) = boundary_of.and_then(|group| project.groups.iter().find(|g| g.id == group)) {
+    // A loop's boundary, read off its id rather than spelled for every
+    // loop: every firing asks this.
+    if let Some(group) = boundary_loop(id).and_then(|group| project.groups.iter().find(|g| g.id == group)) {
         return group_address(project, &group.id, call_path);
     }
     let Some((first, rest)) = call_path.split_first() else { return id.to_string() };
     // The body a site or node sits in is the prefix its scope chain
     // starts with, which is the id's first segment; what is left is its
-    // local name. A boundary never gets here (the arm above spells it
-    // as its group), so every id has a segment to strip or is bare.
+    // local name. A loop's boundary never gets here (the arm above spells
+    // it as its loop), so every id has a segment to strip or is bare.
     let local = |scoped: &str| -> String {
         match scoped.split_once('.') {
             Some((_, local)) => local.to_string(),
@@ -1213,7 +1687,7 @@ pub fn resolve_address(project: &ProjectDefinition, spelled: &str) -> (String, V
         for k in 1..=(segments.len() - pos) {
             let candidate = format!("{scope_prefix}{}", segments[pos..pos + k].join("."));
             let body = project.groups.iter().find(|g| g.id == candidate).and_then(|g| match &g.kind {
-                GroupKind::Call { body } => Some(body.clone()),
+                GroupKind::Call { body, .. } => Some(body.clone()),
                 _ => None,
             });
             if let Some(body) = body {
@@ -1228,7 +1702,7 @@ pub fn resolve_address(project: &ProjectDefinition, spelled: &str) -> (String, V
     let rest = segments[pos..].join(".");
     if rest.is_empty() {
         // The spelling ends on a site: the address is the site itself,
-        // which fires in its caller's frames, under the calls above it.
+        // which runs in its caller's frames, under the calls above it.
         // Nothing left and no site matched cannot happen: an empty
         // spelling was refused above as an empty segment.
         let Some(site) = call_path.pop() else {
@@ -1236,55 +1710,8 @@ pub fn resolve_address(project: &ProjectDefinition, spelled: &str) -> (String, V
         };
         return (site, call_path);
     }
-    if rest.starts_with("__") {
-        // A body's own boundary: `one.__in` is the body's In under `one`.
-        return (format!("{}{rest}", scope_prefix.trim_end_matches('.')), call_path);
-    }
     (format!("{scope_prefix}{rest}"), call_path)
 }
-
-/// Every node inside scope `group_id`, however deep: its direct members
-/// (nested containers' boundaries among them) and everything inside
-/// those. What a gated scope takes down with it.
-pub fn scope_members<'a>(project: &'a ProjectDefinition, group_id: &str) -> Vec<&'a NodeDefinition> {
-    project
-        .nodes
-        .iter()
-        .filter(|n| n.scope.iter().any(|g| g == group_id))
-        .collect()
-}
-
-/// The nodes a scope launcher kicks when scope `group_id` starts: its
-/// DIRECT members that no wire feeds (a nested container's In boundary
-/// counts as a member; its Out boundary too, so a body that wires
-/// nothing to `self.out` still closes its outputs). Triggers are never
-/// among them: a trigger is kicked by its fire, or payload-less by a
-/// manual run, never by the START of the scope it sits in (the REFUSAL
-/// of that scope does reach it: see `tear_down_scope`, which skips
-/// every member). Everything else inside the scope is reached by pulses
-/// once these run. The ONE definition of "what starts with a scope",
-/// read by the group launcher and the loop launcher alike.
-pub fn scope_body_roots(
-    project: &ProjectDefinition,
-    edge_idx: &ProgramIndex,
-    group_id: &str,
-    frames: &LoopFrames,
-) -> Vec<String> {
-    project
-        .nodes
-        .iter()
-        .filter(|n| direct_scope_of(n) == Some(group_id))
-        .filter(|n| edge_idx.admits(&n.id, frames))
-        .filter(|n| !n.features.is_trigger)
-        .filter(|n| {
-            let at = Located::at(&n.id, frames);
-            !edge_idx.get_incoming(project, &n.id, frames).iter().any(|edge|
-                edge_idx.selection().is_none_or(|s| s.fed_by(project, &at, edge)))
-        })
-        .map(|n| n.id.clone())
-        .collect()
-}
-
 
 /// The ids of the project's trigger nodes (`features.is_trigger`).
 pub fn trigger_ids(project: &ProjectDefinition) -> Vec<String> {
@@ -1300,13 +1727,25 @@ pub fn infra_ids(project: &ProjectDefinition) -> Vec<String> {
 /// one per site that reaches it.
 pub fn trigger_places(project: &ProjectDefinition) -> Vec<Located> {
     let ids = trigger_ids(project);
-    selection::every_place(project).into_iter().filter(|place| ids.contains(&place.id)).collect()
+    places::every_place(project).into_iter().filter(|place| ids.contains(&place.id)).collect()
 }
 
 /// Every place an infra node is at (see `trigger_places`).
 pub fn infra_places(project: &ProjectDefinition) -> Vec<Located> {
     let ids = infra_ids(project);
-    selection::every_place(project).into_iter().filter(|place| ids.contains(&place.id)).collect()
+    places::every_place(project).into_iter().filter(|place| ids.contains(&place.id)).collect()
+}
+
+/// The infra places a program runs, spelled (`db`, `one.db`): its infra
+/// places, less the ones it is given instead of running (a stand-in: an
+/// infra node read only through its baked outputs, a seed's saved result).
+/// For a run's cut, the infra the run reaches.
+pub fn infra_reached(program: &ProjectDefinition) -> std::collections::BTreeSet<String> {
+    infra_places(program)
+        .into_iter()
+        .filter(|place| !program.given.outputs.contains(place))
+        .map(|place| address_of(program, &place.id, &place.path))
+        .collect()
 }
 
 /// Whether the node `id` exists once per instance (`@per_instance`): every
@@ -1325,7 +1764,7 @@ pub struct InstanceRules {
     /// run for an instance is a run, so runtime-level rules hold too.
     pub rules: Vec<crate::node::ValidationRule>,
     /// The output ports the source added beyond the type's own, which
-    /// `custom_outputs_declared` and `{custom_outputs}` read.
+    /// `custom_outputs_declared` and `{customOutputs}` read.
     #[serde(default, rename = "customOutputs", skip_serializing_if = "Vec::is_empty")]
     pub custom_outputs: Vec<String>,
 }
@@ -1335,7 +1774,7 @@ pub struct InstanceRules {
 /// keyed by. A node inside a file included twice is at two places, and an
 /// instance fills each on its own.
 pub fn instance_filled_places(project: &ProjectDefinition) -> Vec<(String, &NodeDefinition)> {
-    selection::every_place(project)
+    places::every_place(project)
         .into_iter()
         .filter_map(|place| {
             let node = project.nodes.iter().find(|n| n.id == place.id)?;
@@ -1368,6 +1807,10 @@ pub fn infra_place_spellings(project: &ProjectDefinition) -> std::collections::B
 pub struct DeclaredInfra {
     /// Place -> whether it is per instance.
     places: std::collections::BTreeMap<String, bool>,
+    /// The program hides nodes behind a part that does not compile
+    /// ([`ProjectDefinition::hides_nodes`]), so a copy it does not
+    /// declare may only be hidden.
+    hides: bool,
 }
 
 impl DeclaredInfra {
@@ -1380,25 +1823,35 @@ impl DeclaredInfra {
                 (spelled, per_instance)
             })
             .collect();
-        Self { places }
+        Self { places, hides: project.hides_nodes() }
     }
 
-    /// Whether the program has a copy of `spelled` of this kind: a
-    /// an instance's (`instance_copy`) or the shared one.
+    /// Whether the program has a copy of `spelled` of this kind: an
+    /// instance's (`instance_copy`) or the shared one.
     pub fn declares(&self, spelled: &str, instance_copy: bool) -> bool {
         self.places.get(spelled) == Some(&instance_copy)
     }
 
-    /// Whether the program still declares the copy a host names.
-    pub fn declares_copy(&self, copy: &crate::infra::NodeRef) -> bool {
-        self.declares(&copy.node, copy.is_instance_copy())
+    /// Whether the copy `spelled` of this kind is gone from the program
+    /// for good, so its units and disks may go: it does not declare it,
+    /// and no part that does not compile could be hiding it.
+    pub fn gone(&self, spelled: &str, instance_copy: bool) -> bool {
+        !self.hides && !self.declares(spelled, instance_copy)
+    }
+
+    /// [`Self::gone`] for the copy a host names.
+    pub fn gone_copy(&self, copy: &crate::infra::NodeRef) -> bool {
+        self.gone(&copy.node, copy.is_instance_copy())
     }
 }
 
-/// Every node `seeds` depend on by following wires backward, seeds
-/// included, over the whole program (no run selection, so the frames
-/// are the root's). The scope of a setup phase (everything the
-/// triggers, or the infra nodes, need) and of an untargeted manual run.
+/// Everything `seeds` depend on, by following wires backward, seeds
+/// included, over the whole program by id (no places, so a body's member
+/// is one id however many sites call it): each wire into a node, and every
+/// group around a node (its id is in the answer: the group decides whether
+/// the node runs), with the wires onto that group's gate, for a loop its
+/// `LoopIn`, and for an included body every call site of it. A group a wire starts from (a
+/// literal on its port) is in the answer the same way.
 pub fn upstream_closure(g: &impl graph::GraphView, seeds: &[String]) -> std::collections::HashSet<String> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut frontier: Vec<String> = seeds.to_vec();
@@ -1406,63 +1859,30 @@ pub fn upstream_closure(g: &impl graph::GraphView, seeds: &[String]) -> std::col
         if !seen.insert(id.clone()) {
             continue;
         }
-        for edge in g.edges_into(&id) {
-            if !seen.contains(&edge.source) {
-                frontier.push(edge.source.clone());
+        for edge in g.edges_into(&id).filter(|edge| !edge.to_group_port()) {
+            frontier.push(edge.source.clone());
+        }
+        match g.node(&id) {
+            Some(node) => frontier.extend(node.scope.iter().cloned()),
+            None => {
+                let group = g.group(&id);
+                frontier.extend(group.and_then(|group| group.parent_group_id.clone()));
+                // A loop runs its members once per iteration its `LoopIn`
+                // starts: what feeds that (the list, the gate) decides them.
+                if group.is_some_and(|group| matches!(group.kind, GroupKind::Loop { .. })) {
+                    frontier.push(loop_in_id(&id));
+                }
+                frontier.extend(g.project().groups.iter()
+                    .filter(|site| matches!(&site.kind, GroupKind::Call { body, .. } if *body == id))
+                    .map(|site| site.id.clone()));
             }
         }
     }
     seen
 }
 
-/// The infra a trigger DEPENDS ON, each PLACE named once, spelled the
-/// way a person writes it (`svc`, `one.svc`): the key its infra row is
-/// stored under, so a reader compares this against the rows directly.
-///
-/// Infra and triggers are independent lifetimes, joined by one rule: a
-/// trigger needs the infra feeding it to be RUNNING. A WhatsApp receive
-/// node takes the bridge's address off the bridge node feeding it, so
-/// arming it before the bridge is up would register a signal against an
-/// address that does not answer. Infra DOWNSTREAM of a trigger belongs
-/// to the run a fire starts and is gated there instead, so the project
-/// arms either way. Nothing here ever starts infra: that is the user's
-/// own verb.
-///
-/// What must be RUNNING before this project's triggers can be armed.
-///
-/// Arming them is a run: the TriggerSetup pass evaluates everything the
-/// registration needs, including the gate deciding whether a trigger's
-/// group flows at all. So this walks the way that run walks
-/// (`RunSelection::dependencies`, which is `RunSelection::setup` minus
-/// its validations), and the answer covers every infra node that run
-/// touches: the bridge whose address a trigger reads, and the node
-/// feeding a gate the setup has to evaluate.
-///
-/// Reading ports and call frames is what keeps it honest in the other
-/// direction: infra wired into a group port no trigger consumes is not
-/// in it, and does not hold an activation back.
-///
-/// The STAY-RUNNING question is [`compute_trigger_deps`], and it is a
-/// different set on purpose: once a trigger is armed, the gate's infra
-/// has already done its job. Changing one of these two to match the
-/// other is how the system starts contradicting itself; they answer
-/// different questions about different moments.
-///
-/// Empty when the project has no trigger.
-pub fn infra_triggers_depend_on(
-    project: &ProjectDefinition,
-) -> std::collections::BTreeSet<String> {
-    let reached = selection::RunSelection::dependencies(project, &trigger_places(project));
-    reached
-        .nodes
-        .iter()
-        .filter(|place| project.nodes.iter().any(|n| n.id == place.id && n.requires_infra))
-        .map(|place| address_of(project, &place.id, &place.path))
-        .collect()
-}
-
 #[cfg(test)]
-mod infra_triggers_depend_on_tests {
+mod trigger_dependency_tests {
     use super::*;
     use crate::NodeFeatures;
 
@@ -1470,6 +1890,8 @@ mod infra_triggers_depend_on_tests {
         NodeDefinition {
             id: id.into(),
             node_type: "Any".into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: Value::Object(Default::default()),
             position: Position { x: 0.0, y: 0.0 },
@@ -1506,6 +1928,7 @@ mod infra_triggers_depend_on_tests {
             source_handle: None,
             target_handle: None,
             path: Vec::new(),
+            via: Vec::new(),
             span: None,
             source_file: None,
         }
@@ -1520,11 +1943,23 @@ mod infra_triggers_depend_on_tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             defaults: Default::default(),
+            given: Default::default(),
+            broken: Vec::new(),
         }
     }
 
-    fn ids(set: std::collections::BTreeSet<String>) -> Vec<String> {
-        set.into_iter().collect()
+    /// A wire through the group ports `via`, each `(group, port, side)`.
+    fn through(source: &str, sp: &str, via: &[(&str, &str, &str)], target: &str, tp: &str) -> Value {
+        serde_json::json!({
+            "id": format!("{source}.{sp}->{target}.{tp}"), "source": source, "target": target,
+            "sourceHandle": sp, "targetHandle": tp,
+            "via": via.iter().map(|(group, port, side)| serde_json::json!({ "group": group, "port": port, "side": side })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// What the trigger at `trigger` depends on (`crate::run_spec::trigger_cut`).
+    fn deps(p: &ProjectDefinition, trigger: &str) -> Vec<String> {
+        crate::run_spec::trigger_cut(p, trigger).expect("its cut walks").depends_on
     }
 
     #[test]
@@ -1538,7 +1973,7 @@ mod infra_triggers_depend_on_tests {
             ],
             vec![wire("bridge", "receive"), wire("receive", "reply")],
         );
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string()]);
+        assert_eq!(deps(&p, "receive"), vec!["bridge".to_string()]);
     }
 
     #[test]
@@ -1553,18 +1988,18 @@ mod infra_triggers_depend_on_tests {
             ],
             vec![wire("bridge", "conf"), wire("conf", "receive")],
         );
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string()]);
+        assert_eq!(deps(&p, "receive"), vec!["bridge".to_string()]);
     }
 
+    /// The database a fire writes to is in its cut: taking it down takes
+    /// the trigger down with it, since its fires cannot run without it.
     #[test]
-    fn an_infra_node_downstream_of_a_trigger_stays_out() {
-        // The database the fired run writes to belongs to the run, not
-        // to arming the trigger; the run is what waits on it.
+    fn an_infra_node_downstream_of_a_trigger_counts() {
         let p = project(
             vec![node("receive", true, false), node("db", false, true)],
             vec![wire("receive", "db")],
         );
-        assert!(infra_triggers_depend_on(&p).is_empty());
+        assert_eq!(deps(&p, "receive"), vec!["db".to_string()]);
     }
 
     #[test]
@@ -1578,90 +2013,69 @@ mod infra_triggers_depend_on_tests {
             ],
             vec![wire("receive", "reply"), wire("svc", "svc_out")],
         );
-        assert!(infra_triggers_depend_on(&p).is_empty());
+        assert!(deps(&p, "receive").is_empty());
     }
 
     #[test]
-    fn a_project_with_no_trigger_reaches_nothing() {
+    fn a_project_with_no_trigger_has_no_cut() {
         let p = project(vec![node("svc", false, true)], vec![]);
-        assert!(infra_triggers_depend_on(&p).is_empty());
+        assert!(crate::run_spec::trigger_cuts(&p).is_empty());
     }
 
-    /// A group boundary is where the walk's port-precision earns its
-    /// keep: the trigger sits inside the group and reads the In's `x`,
-    /// so infra feeding the In's `y` never reaches it and must not hold
-    /// the activation back. A cruder walk (every wire into the
-    /// boundary) would name `svc` here and grey out Activate over infra
-    /// the triggers never touch.
+    /// A group's port is where the walk's port-precision earns its
+    /// keep: the trigger sits inside the group and reads the group's `x`,
+    /// so infra feeding the group's `y` never reaches it, and stopping it
+    /// leaves the trigger alone.
     #[test]
     fn infra_feeding_a_group_port_the_trigger_does_not_read_stays_out() {
-        let node = |id: &str, scope: &[&str], boundary: Value, infra: bool| serde_json::json!({
+        let node = |id: &str, scope: &[&str], infra: bool| serde_json::json!({
             "id": id, "nodeType": "T", "label": null, "config": {},
             "position": { "x": 0, "y": 0 }, "inputs": [], "outputs": [],
             "features": { "isTrigger": id == "receive" }, "scope": scope,
-            "groupBoundary": boundary, "requiresInfra": infra
-        });
-        let edge = |source: &str, sp: &str, target: &str, tp: &str| serde_json::json!({
-            "id": format!("{source}.{sp}->{target}.{tp}"), "source": source, "target": target,
-            "sourceHandle": sp, "targetHandle": tp
+            "groupBoundary": null, "requiresInfra": infra
         });
         let p: ProjectDefinition = serde_json::from_value(serde_json::json!({
             "id": "00000000-0000-0000-0000-000000000000",
             "nodes": [
-                node("bridge", &[], Value::Null, true),
-                node("svc", &[], Value::Null, true),
-                node("g__in", &[], serde_json::json!({ "groupId": "g", "role": "In" }), false),
-                node("receive", &["g"], Value::Null, false),
-                node("other", &["g"], Value::Null, false)
+                node("bridge", &[], true),
+                node("svc", &[], true),
+                node("receive", &["g"], false),
+                node("other", &["g"], false)
             ],
             "edges": [
-                edge("bridge", "out", "g__in", "x"),
-                edge("svc", "out", "g__in", "y"),
-                edge("g__in", "x", "receive", "in"),
-                edge("g__in", "y", "other", "in")
+                through("bridge", "out", &[("g", "x", "in")], "receive", "in"),
+                through("svc", "out", &[("g", "y", "in")], "other", "in")
             ],
             "groups": [{ "id": "g", "kind": "group", "nodeIds": ["receive", "other"] }]
         })).expect("the fixture deserializes");
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string()]);
-        // The stay-running walk is port-precise at the boundary too.
-        assert_eq!(compute_trigger_deps(&p), vec![("bridge".to_string(), "receive".to_string())]);
+        assert_eq!(deps(&p, "receive"), vec!["bridge".to_string()]);
     }
 
-    /// The two questions part company at the GATE: infra deciding
-    /// whether the trigger's group flows is evaluated by the arming run
-    /// and holds the activation back, but the armed trigger never reads
-    /// it again, so stopping it later breaks nothing and the stay-running
-    /// walk leaves it out.
+    /// Infra deciding whether the trigger's group flows is read by the
+    /// arming run once, and the armed trigger never reads it again, so
+    /// stopping it later breaks nothing: it is no dependency.
     #[test]
-    fn gate_infra_holds_the_activation_back_and_nothing_after() {
-        let node = |id: &str, scope: &[&str], boundary: Value, infra: bool| serde_json::json!({
+    fn gate_infra_is_no_dependency() {
+        let node = |id: &str, scope: &[&str], infra: bool| serde_json::json!({
             "id": id, "nodeType": "T", "label": null, "config": {},
             "position": { "x": 0, "y": 0 }, "inputs": [], "outputs": [],
             "features": { "isTrigger": id == "receive" }, "scope": scope,
-            "groupBoundary": boundary, "requiresInfra": infra
-        });
-        let edge = |source: &str, sp: &str, target: &str, tp: &str| serde_json::json!({
-            "id": format!("{source}.{sp}->{target}.{tp}"), "source": source, "target": target,
-            "sourceHandle": sp, "targetHandle": tp
+            "groupBoundary": null, "requiresInfra": infra
         });
         let p: ProjectDefinition = serde_json::from_value(serde_json::json!({
             "id": "00000000-0000-0000-0000-000000000000",
             "nodes": [
-                node("bridge", &[], Value::Null, true),
-                node("gate", &[], Value::Null, true),
-                node("g__in", &[], serde_json::json!({ "groupId": "g", "role": "In" }), false),
-                node("receive", &["g"], Value::Null, false),
-                node("g__out", &[], serde_json::json!({ "groupId": "g", "role": "Out" }), false)
+                node("bridge", &[], true),
+                node("gate", &[], true),
+                node("receive", &["g"], false)
             ],
             "edges": [
-                edge("bridge", "out", "g__in", "x"),
-                edge("gate", "out", "g__in", "_should_flow"),
-                edge("g__in", "x", "receive", "in")
+                through("bridge", "out", &[("g", "x", "in")], "receive", "in"),
+                through("gate", "out", &[], "g", "_should_flow")
             ],
             "groups": [{ "id": "g", "kind": "group", "nodeIds": ["receive"] }]
         })).expect("the fixture deserializes");
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["bridge".to_string(), "gate".to_string()]);
-        assert_eq!(compute_trigger_deps(&p), vec![("bridge".to_string(), "receive".to_string())]);
+        assert_eq!(deps(&p, "receive"), vec!["bridge".to_string()]);
     }
 
 
@@ -1675,43 +2089,32 @@ mod infra_triggers_depend_on_tests {
             ],
             vec![wire("db", "loopy"), wire("loopy", "db"), wire("db", "receive")],
         );
-        assert_eq!(ids(infra_triggers_depend_on(&p)), vec!["db".to_string()]);
+        assert_eq!(deps(&p, "receive"), vec!["db".to_string()]);
     }
 
     /// The shape an include compiles to: one body (`Bridge`) holding an
     /// infra node feeding a trigger, called from the sites `one` and
-    /// `two`; a top-level infra node wired into `one`'s door alone.
+    /// `two`; a top-level infra node wired into `one`'s port alone, and
+    /// `two`'s port fed by nobody (it sends its closure when it opens).
     fn program_with_two_sites() -> ProjectDefinition {
-        let node = |id: &str, scope: &[&str], boundary: Value, is_trigger: bool, requires_infra: bool| {
+        let node = |id: &str, scope: &[&str], is_trigger: bool, requires_infra: bool| {
             serde_json::json!({
                 "id": id, "nodeType": "T", "label": null, "config": {}, "position": {"x": 0, "y": 0},
                 "inputs": [], "outputs": [], "features": {"isTrigger": is_trigger},
-                "scope": scope, "groupBoundary": boundary, "requiresInfra": requires_infra
+                "scope": scope, "groupBoundary": null, "requiresInfra": requires_infra
             })
         };
-        let edge = |source: &str, sp: &str, target: &str, tp: &str| serde_json::json!({
-            "id": format!("{source}.{sp}->{target}.{tp}"), "source": source, "target": target,
-            "sourceHandle": sp, "targetHandle": tp
-        });
         serde_json::from_value(serde_json::json!({
             "id": "00000000-0000-0000-0000-000000000000",
             "nodes": [
-                node("top_db", &[], Value::Null, false, true),
-                node("one__in", &[], serde_json::json!({"groupId": "one", "role": "In"}), false, false),
-                node("one__out", &[], serde_json::json!({"groupId": "one", "role": "Out"}), false, false),
-                node("two__in", &[], serde_json::json!({"groupId": "two", "role": "In"}), false, false),
-                node("two__out", &[], serde_json::json!({"groupId": "two", "role": "Out"}), false, false),
-                node("Bridge__in", &[], serde_json::json!({"groupId": "Bridge", "role": "In"}), false, false),
-                node("Bridge.svc", &["Bridge"], Value::Null, false, true),
-                node("Bridge.door", &["Bridge"], Value::Null, true, false),
-                node("Bridge__out", &[], serde_json::json!({"groupId": "Bridge", "role": "Out"}), false, false),
+                node("top_db", &[], false, true),
+                node("Bridge.svc", &["Bridge"], false, true),
+                node("Bridge.door", &["Bridge"], true, false),
             ],
             "edges": [
-                edge("top_db", "out", "one__in", "seed"),
-                edge("one__in", "seed", "Bridge__in", "seed"),
-                edge("two__in", "seed", "Bridge__in", "seed"),
-                edge("Bridge__in", "seed", "Bridge.door", "seed"),
-                edge("Bridge.svc", "out", "Bridge.door", "address"),
+                through("top_db", "out", &[("one", "seed", "in"), ("Bridge", "seed", "in")], "Bridge.door", "seed"),
+                through("two", "seed", &[("two", "seed", "in"), ("Bridge", "seed", "in")], "Bridge.door", "seed"),
+                through("Bridge.svc", "out", &[], "Bridge.door", "address"),
             ],
             "groups": [
                 {"id": "one", "kind": "call", "body": "Bridge", "nodeIds": []},
@@ -1721,26 +2124,15 @@ mod infra_triggers_depend_on_tests {
         })).expect("the fixture deserializes")
     }
 
-    /// Both questions are answered per PLACE, spelled: the trigger under
-    /// `one` depends on the placement under `one` and on the top-level
-    /// node wired into `one`'s door; the trigger under `two` depends on
-    /// its own placement alone, because the top-level node feeds only
-    /// `one`.
+    /// Answered per PLACE, spelled: the trigger under `one` depends on
+    /// the placement under `one` and on the top-level node wired into
+    /// `one`'s door; the trigger under `two` depends on its own placement
+    /// alone, because the top-level node feeds only `one`.
     #[test]
     fn a_file_included_twice_depends_per_call() {
         let p = program_with_two_sites();
-        assert_eq!(
-            compute_trigger_deps(&p),
-            vec![
-                ("one.svc".to_string(), "one.door".to_string()),
-                ("top_db".to_string(), "one.door".to_string()),
-                ("two.svc".to_string(), "two.door".to_string()),
-            ]
-        );
-        assert_eq!(
-            ids(infra_triggers_depend_on(&p)),
-            vec!["one.svc".to_string(), "top_db".to_string(), "two.svc".to_string()]
-        );
+        assert_eq!(deps(&p, "one.door"), vec!["one.svc".to_string(), "top_db".to_string()]);
+        assert_eq!(deps(&p, "two.door"), vec!["two.svc".to_string()]);
     }
 }
 
@@ -1763,6 +2155,8 @@ mod project_wire_tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             defaults: Default::default(),
+            given: Default::default(),
+            broken: Vec::new(),
         };
         let v = serde_json::to_value(&p).unwrap();
         assert!(v.get("name").is_none(), "name must not serialize: {v}");
@@ -1794,7 +2188,7 @@ mod project_wire_tests {
                 declared_type: None,
             },
             accepts: Accepts::wire_only(),
-            required_when_wired: false,
+            optional: false,
             widget: None,
             default: None,
             label: None,
@@ -1806,6 +2200,8 @@ mod project_wire_tests {
         let node = NodeDefinition {
             id: "g.n".into(),
             node_type: "Llm".into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: default_config(),
             position: Position { x: 0.0, y: 0.0 },
@@ -1846,15 +2242,19 @@ mod project_wire_tests {
             source_file: None,
             description: None,
             port_literals: [("_should_flow".to_string(), Value::Bool(false))].into(),
+            file_refs: Default::default(),
             port_literal_spans: Default::default(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
         };
         let edge = Edge {
             id: "e1".into(),
             source: "g.n".into(),
             source_handle: Some("out".into()),
-            target: "g.m".into(),
+            target: "m".into(),
             target_handle: Some("in".into()),
             path: Vec::new(),
+            via: vec![Crossing { group: "g".into(), port: "y".into(), side: CrossingSide::Out, path: vec!["k".into()], span: None, source_file: None }],
             span: None,
             source_file: None,
         };
@@ -1866,6 +2266,8 @@ mod project_wire_tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             defaults: Default::default(),
+            given: Default::default(),
+            broken: Vec::new(),
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["groups"][0]["portLiterals"]["_should_flow"], false, "portLiterals key: {v}");
@@ -1886,6 +2288,10 @@ mod project_wire_tests {
         assert!(v["groups"][0].get("inPorts").is_some(), "inPorts key: {v}");
         assert!(v["groups"][0].get("nodeIds").is_some(), "nodeIds key: {v}");
         assert!(v.get("createdAt").is_some(), "createdAt key: {v}");
+        // A wire's crossings: camelCase, each side spelled, an empty
+        // `given` left off.
+        assert_eq!(v["edges"][0]["via"], serde_json::json!([{ "group": "g", "port": "y", "side": "out", "path": ["k"] }]), "via: {v}");
+        assert!(v.get("given").is_none(), "an empty given is left off: {v}");
         // headerSpan: the editor reads it to underline a node's header line. Both
         // the key (`headerSpan`) and the nested `Span` fields are camelCase, the
         // one wire convention this whole module follows; pin them so neither
@@ -1906,6 +2312,8 @@ mod project_wire_tests {
         NodeDefinition {
             id: id.into(),
             node_type: "Any".into(),
+            type_params: Vec::new(),
+            place_types: Vec::new(),
             label: None,
             config: default_config(),
             position: Position { x: 0.0, y: 0.0 },
@@ -1943,6 +2351,8 @@ mod project_wire_tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             defaults: Default::default(),
+            given: Default::default(),
+            broken: Vec::new(),
         }
     }
 
@@ -1983,146 +2393,145 @@ mod project_wire_tests {
             node: node.into(),
             copy_id: crate::infra::NodeRef::copy_id(project.id, node, of),
         };
-        assert!(declared.declares_copy(&copy("db", None)));
-        assert!(!declared.declares_copy(&copy("db", Some(&alice))));
-        assert!(declared.declares_copy(&copy("mine", Some(&alice))));
-        assert!(!declared.declares_copy(&copy("mine", None)));
+        assert!(!declared.gone_copy(&copy("db", None)));
+        assert!(declared.gone_copy(&copy("db", Some(&alice))));
+        assert!(!declared.gone_copy(&copy("mine", Some(&alice))));
+        assert!(declared.gone_copy(&copy("mine", None)));
+        assert!(declared.gone("gone", false));
+    }
+
+    /// A program with a part that may hide nodes proves nothing gone: a
+    /// copy it does not declare may sit inside the included file that
+    /// does not compile. A broken part that hides nothing proves as much
+    /// as a whole program.
+    #[test]
+    fn a_program_hiding_nodes_proves_no_copy_gone() {
+        let mut project = project_with_nodes(vec![node_with_infra("db", true)]);
+        project.broken = vec![Broken { parts: vec!["db".into()], why: "a wire".into(), hides: false }];
+        assert!(DeclaredInfra::of(&project).gone("other", false), "a wire hides no node");
+        project.broken.push(Broken { parts: vec!["lib".into()], why: "lib.weft does not parse".into(), hides: true });
+        let declared = DeclaredInfra::of(&project);
+        assert!(project.hides_nodes());
+        assert!(!declared.gone("other", false), "it may be inside lib.weft");
+        assert!(declared.declares("db", false), "what it declares, it still declares");
     }
 }
 
 #[cfg(test)]
-mod selection_setup_tests {
+mod setup_cut_tests {
     use super::*;
-    use super::selection::{RunSelection, SelectionBounds};
+    use crate::run_spec::{compute_trigger_fire, setup_cut, KickPlan};
 
-    /// (id, is_trigger, requires_infra, scope chain) plus the wires. A
-    /// `{g}__in` / `{g}__out` id is a boundary of scope `g`, the way
-    /// the compiler flattens one.
-    fn project(nodes: &[(&str, bool, bool, &[&str])], edges: &[(&str, &str)]) -> ProjectDefinition {
+    /// A wire: its source, the group ports it passes as `(group, side)`,
+    /// its target.
+    type Wire<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+
+    /// A program from its nodes (id, is_trigger, requires_infra, scope
+    /// chain), its groups (each with its parent), and its wires. Every
+    /// port is `v`: these tests are about scopes and wires, not about which
+    /// port feeds which.
+    fn project(nodes: &[(&str, bool, bool, &[&str])], groups: &[(&str, Option<&str>)], edges: &[Wire]) -> ProjectDefinition {
         let n_json: Vec<serde_json::Value> = nodes
             .iter()
-            .map(|(id, is_trigger, requires_infra, scope)| {
-                let boundary = id.rsplit_once("__").map(|(group, role)| {
-                    serde_json::json!({ "groupId": group, "role": if role == "in" { "In" } else { "Out" } })
-                });
-                serde_json::json!({
-                    "id": id,
-                    "nodeType": if boundary.is_some() { "Passthrough" } else { "T" },
-                    "label": null,
-                    "config": {},
-                    "position": { "x": 0, "y": 0 },
-                    "scope": scope,
-                    "groupBoundary": boundary,
-                    "features": { "isTrigger": is_trigger },
-                    "requiresInfra": requires_infra,
-                })
-            })
+            .map(|(id, is_trigger, requires_infra, scope)| serde_json::json!({
+                "id": id, "nodeType": "T", "label": null, "config": {},
+                "position": { "x": 0, "y": 0 }, "scope": scope, "groupBoundary": null,
+                "inputs": [{ "name": "v", "portType": "String", "required": false }],
+                "outputs": [{ "name": "v", "portType": "String", "required": false }],
+                "features": { "isTrigger": is_trigger }, "requiresInfra": requires_infra,
+            }))
             .collect();
         let e_json: Vec<serde_json::Value> = edges
             .iter()
-            // `sourceHandle` / `targetHandle` are the names `Edge`
-            // reads; the older `sourcePort` spelling was dropped
-            // silently (no `deny_unknown_fields`) and left every wire
-            // default -> default. One port name on both ends, because a
-            // boundary's port keeps its name across it (a group's `v`
-            // enters `g__in.v` and leaves `g__in.v`), and these tests are
-            // about scopes and wires, not about which port feeds which.
-            .map(|(s, t)| serde_json::json!({
+            .map(|(s, via, t)| serde_json::json!({
                 "id": format!("e_{s}_{t}"), "source": s, "sourceHandle": "v", "target": t, "targetHandle": "v",
+                "via": via.iter().map(|(group, side)| serde_json::json!({ "group": group, "port": "v", "side": side })).collect::<Vec<_>>(),
             }))
             .collect();
-        let groups: Vec<_> = nodes.iter().filter_map(|(id, _, _, _)| id.strip_suffix("__in"))
-            .map(|id| serde_json::json!({"id": id, "kind":"group"})).collect();
+        let g_json: Vec<serde_json::Value> = groups
+            .iter()
+            .map(|(id, parent)| serde_json::json!({
+                "id": id, "kind": "group", "parentGroupId": parent,
+                "inPorts": [{ "name": "v", "portType": "String", "required": false }],
+                "outPorts": [{ "name": "v", "portType": "String", "required": false }],
+                "nodeIds": nodes.iter().filter(|(_, _, _, scope)| scope.last() == Some(id)).map(|(n, ..)| *n).collect::<Vec<_>>(),
+            }))
+            .collect();
         serde_json::from_value(serde_json::json!({
-            "id": Uuid::nil(), "nodes": n_json, "edges": e_json, "groups": groups
+            "id": Uuid::nil(), "nodes": n_json, "edges": e_json, "groups": g_json
         }))
         .expect("valid test project")
     }
 
-    fn sorted(set: impl IntoIterator<Item = Located>) -> Vec<String> {
-        let mut v: Vec<String> = set.into_iter().map(|place| place.to_string()).collect();
-        v.sort();
-        v
+    fn runs(program: &ProjectDefinition) -> Vec<String> {
+        places::running_places(program).into_iter().map(|place| place.to_string()).collect()
     }
 
-    fn strs(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+    fn kicked(kicks: &[KickPlan]) -> Vec<(String, bool)> {
+        kicks.iter().map(|kick| (kick.node.clone(), kick.firing)).collect()
     }
 
     fn places(v: &[&str]) -> Vec<Located> {
         v.iter().map(|s| Located::top(*s)).collect()
     }
 
+    /// cfg ──► g.a, and g.seed has no input. Setting up the seed runs the
+    /// seed alone: what feeds the group's other members is no input of
+    /// it. The group stays in the cut (the seed starts when it opens) and,
+    /// nothing reaching it in the cut, it opens as the run starts: no root
+    /// is kicked from the outside.
     #[test]
-    fn an_unwired_group_member_needs_its_gate_but_not_other_input_branches() {
-        // cfg ──► g__in ──► g.a ──► g__out
-        //         g.seed (unwired body root)
-        // Aiming at the unwired seed brings the scope, and the scope's
-        // In boundary is fed by `cfg`, which has to run first.
+    fn an_unwired_group_member_needs_its_scope_but_not_the_other_input_branches() {
         let p = project(
-            &[
-                ("cfg", false, false, &[]),
-                ("g__in", false, false, &[]),
-                ("g.a", false, false, &["g"]),
-                ("g.seed", false, false, &["g"]),
-                ("g__out", false, false, &[]),
-                ("other", false, false, &[]),
-            ],
-            &[("cfg", "g__in"), ("g__in", "g.a"), ("g.a", "g__out")],
+            &[("cfg", false, false, &[]), ("g.a", false, false, &["g"]), ("g.seed", false, false, &["g"]), ("other", false, false, &[])],
+            &[("g", None)],
+            &[("cfg", &[("g", "in")], "g.a")],
         );
-        let selection = RunSelection::setup(&p, &places(&["g.seed"])).unwrap();
-        assert_eq!(sorted(selection.nodes.clone()), strs(&["g.seed", "g__in"]));
-        assert_eq!(sorted(selection.roots(&p)), strs(&["g.seed", "g__in"]));
+        let (cut, kicks) = setup_cut(&p, &places(&["g.seed"])).unwrap();
+        assert_eq!(runs(&cut), vec!["g.seed".to_string()]);
+        assert!(cut.groups.iter().any(|group| group.id == "g"), "the scope the seed starts in stays");
+        assert!(cut.edges.is_empty(), "{:?}", cut.edges);
+        assert!(kicks.is_empty(), "the group kicks its seed when it opens: {kicks:?}");
     }
 
+    /// root ──► h.x ──► g.a: aiming at g.a walks the wire back out of g,
+    /// out of h and up to root, which is the one root.
     #[test]
-    fn the_walk_alternates_wires_and_scopes_until_nothing_new_arrives() {
-        // h.x (in scope h) ──► g__in ──► g.a ; aiming at g.a brings g,
-        // then g's input source h.x, then h whole, then h's own input.
+    fn the_walk_follows_wires_through_scopes() {
         let p = project(
-            &[
-                ("root", false, false, &[]),
-                ("h__in", false, false, &[]),
-                ("h.x", false, false, &["h"]),
-                ("h__out", false, false, &[]),
-                ("g__in", false, false, &[]),
-                ("g.a", false, false, &["g"]),
-                ("g__out", false, false, &[]),
-            ],
-            &[("root", "h__in"), ("h__in", "h.x"), ("h.x", "h__out"), ("h__out", "g__in"), ("g__in", "g.a"), ("g.a", "g__out")],
+            &[("root", false, false, &[]), ("h.x", false, false, &["h"]), ("g.a", false, false, &["g"])],
+            &[("h", None), ("g", None)],
+            &[("root", &[("h", "in")], "h.x"), ("h.x", &[("h", "out"), ("g", "in")], "g.a")],
         );
-        let selection = RunSelection::setup(&p, &places(&["g.a"])).unwrap();
-        assert_eq!(sorted(selection.nodes.clone()), strs(&["g.a", "g__in", "h.x", "h__in", "h__out", "root"]));
-        assert_eq!(sorted(selection.roots(&p)), strs(&["root"]));
+        let (cut, kicks) = setup_cut(&p, &places(&["g.a"])).unwrap();
+        assert_eq!(runs(&cut), vec!["g.a".to_string(), "h.x".to_string(), "root".to_string()]);
+        assert_eq!(kicked(&kicks), vec![("root".to_string(), false)]);
     }
 
+    /// A fire runs the trigger and what it reaches, and never what feeds
+    /// the trigger: its ports replay what its setup captured.
     #[test]
-    fn a_trigger_is_included_and_not_walked_through() {
+    fn a_fired_trigger_runs_and_what_feeds_it_does_not() {
         let p = project(
             &[("setup", false, false, &[]), ("trig", true, false, &[]), ("out", false, false, &[])],
-            &[("setup", "trig"), ("trig", "out")],
+            &[],
+            &[("setup", &[], "trig"), ("trig", &[], "out")],
         );
-        let selection = RunSelection::carve(&p, &SelectionBounds { fire: Some("trig".into()), ..Default::default() }).unwrap();
-        assert_eq!(sorted(selection.nodes.clone()), strs(&["out", "trig"]));
-        assert_eq!(sorted(selection.roots(&p)), strs(&["trig"]));
+        let fire = compute_trigger_fire(&p, "trig", &serde_json::Value::Null, None, &Default::default()).unwrap();
+        assert_eq!(runs(&fire.program), vec!["out".to_string(), "trig".to_string()]);
+        assert_eq!(kicked(&fire.kicks), vec![("trig".to_string(), true)]);
+        assert!(fire.program.edges.iter().all(|edge| edge.target != "trig"), "no wire into the fired trigger");
     }
 
+    /// An infra node with no input inside a group is set up through its
+    /// group: the group opens as the run starts and kicks it.
     #[test]
-    fn an_unwired_infra_node_inside_a_group_is_reached_through_its_scope() {
-        // The setup phase seeds every infra node; one that sits unwired
-        // inside a group is started by the group, so the kick is the
-        // group's In boundary, not nothing.
-        let p = project(
-            &[
-                ("g__in", false, false, &[]),
-                ("g.db", false, true, &["g"]),
-                ("g__out", false, false, &[]),
-            ],
-            &[],
-        );
-        let selection = RunSelection::setup(&p, &infra_places(&p)).unwrap();
-        assert_eq!(sorted(selection.nodes.clone()), strs(&["g.db", "g__in"]));
-        assert_eq!(sorted(selection.roots(&p)), strs(&["g.db", "g__in"]));
+    fn an_unwired_infra_node_inside_a_group_is_started_by_its_scope() {
+        let p = project(&[("g.db", false, true, &["g"])], &[("g", None)], &[]);
+        let (cut, kicks) = setup_cut(&p, &infra_places(&p)).unwrap();
+        assert_eq!(runs(&cut), vec!["g.db".to_string()]);
+        assert!(cut.groups.iter().any(|group| group.id == "g"));
+        assert!(kicks.is_empty(), "{kicks:?}");
     }
 
     #[test]
@@ -2139,23 +2548,67 @@ mod selection_setup_tests {
                 ("cfg", false, false, &[]),
                 ("infra_b", false, true, &[]),
             ],
-            &[("text", "compute"), ("compute", "infra"), ("infra", "trigger"), ("trigger", "reply"), ("cfg", "infra_b")],
+            &[],
+            &[("text", &[], "compute"), ("compute", &[], "infra"), ("infra", &[], "trigger"), ("trigger", &[], "reply"), ("cfg", &[], "infra_b")],
         );
-        let infra = RunSelection::setup(&p, &infra_places(&p)).unwrap();
-        assert_eq!(sorted(infra.nodes), strs(&["cfg", "compute", "infra", "infra_b", "text"]));
-        let triggers = RunSelection::setup(&p, &trigger_places(&p)).unwrap();
-        assert_eq!(sorted(triggers.nodes), strs(&["compute", "infra", "text", "trigger"]));
-        let none = project(&[("a", false, false, &[]), ("b", false, false, &[])], &[("a", "b")]);
-        assert!(RunSelection::setup(&none, &infra_places(&none)).unwrap().nodes.is_empty());
+        let (infra, _) = setup_cut(&p, &infra_places(&p)).unwrap();
+        assert_eq!(runs(&infra), ["cfg", "compute", "infra", "infra_b", "text"].map(String::from));
+        let (triggers, kicks) = setup_cut(&p, &trigger_places(&p)).unwrap();
+        assert_eq!(runs(&triggers), ["compute", "infra", "text", "trigger"].map(String::from));
+        // A trigger's setup reads its inputs: the wire into it stays, and
+        // it fires on what reaches it rather than being kicked.
+        assert!(triggers.edges.iter().any(|edge| edge.target == "trigger"));
+        assert_eq!(kicked(&kicks), vec![("text".to_string(), false)]);
+        let none = project(&[("a", false, false, &[]), ("b", false, false, &[])], &[], &[("a", &[], "b")]);
+        assert!(setup_cut(&none, &infra_places(&none)).is_err(), "nothing to set up is never the whole program");
     }
 
+    /// A broken part stops only the cuts that need it: a node every one
+    /// of whose places the cut drops, and a wire whose other end it drops,
+    /// are not its business. The refusal names every part it needs.
     #[test]
-    fn a_forced_root_is_kicked_wherever_it_sits() {
-        let p = project(
-            &[("g__in", false, false, &[]), ("g.trig", true, false, &["g"]), ("g__out", false, false, &[])],
-            &[],
+    fn a_cut_is_refused_only_when_it_needs_a_broken_part() {
+        // a ──► b      g.c (inside g)      trig ──► out
+        let mut p = project(
+            &[("a", false, false, &[]), ("b", false, false, &[]), ("g.c", false, false, &["g"]), ("trig", true, false, &[]), ("out", false, false, &[])],
+            &[("g", None)],
+            &[("a", &[], "b"), ("trig", &[], "out")],
         );
-        let selection = RunSelection::carve(&p, &SelectionBounds { fire: Some("g.trig".into()), ..Default::default() }).unwrap();
-        assert_eq!(sorted(selection.roots(&p)), strs(&["g.trig", "g__in"]));
+        p.broken = vec![
+            Broken { parts: vec!["a".into(), "b".into()], why: "src/main.weft:3:1 a.v cannot feed b.v".into(), hides: false },
+            Broken { parts: vec!["g".into()], why: "src/main.weft:5:1 the group g is broken\nsecond line".into(), hides: false },
+        ];
+        assert!(setup_cut(&p, &places(&["a"])).is_ok(), "a alone does not carry the wire");
+        let refused = setup_cut(&p, &places(&["b"])).unwrap_err();
+        assert!(refused.contains("a.v cannot feed b.v"), "{refused}");
+        assert!(!refused.contains("the group g"), "{refused}");
+        let refused = setup_cut(&p, &places(&["g.c"])).unwrap_err();
+        assert!(refused.contains("the group g is broken\n    second line"), "a reason keeps its lines under it: {refused}");
+        // Fed from outside, g.c needs nothing of g as a scope, so the cut
+        // dissolves g; its member and the wire through its port still run,
+        // and so g's broken part is still needed.
+        let mut fed = project(
+            &[("f", false, false, &[]), ("g.c", false, false, &["g"])],
+            &[("g", None)],
+            &[("f", &[("g", "in")], "g.c")],
+        );
+        let (dissolved, _) = setup_cut(&fed, &places(&["g.c"])).unwrap();
+        assert!(dissolved.groups.is_empty(), "the cut keeps no scope for g: {:?}", dissolved.groups);
+        fed.broken = vec![Broken { parts: vec!["g".into()], why: "a stream through g's port".into(), hides: false }];
+        assert!(setup_cut(&fed, &places(&["g.c"])).unwrap_err().contains("a stream through g's port"));
+        let fire = compute_trigger_fire(&p, "trig", &serde_json::Value::Null, None, &Default::default()).unwrap();
+        assert!(fire.program.broken.is_empty(), "a cut carries nothing broken");
+        p.broken.push(Broken { parts: vec!["out".into()], why: "out did not load".into(), hides: true });
+        let refused = compute_trigger_fire(&p, "trig", &serde_json::Value::Null, None, &Default::default()).unwrap_err();
+        assert!(refused.starts_with("a fire of 'trig' cannot run") && refused.contains("out did not load"), "{refused}");
+    }
+
+    /// A trigger is kicked at the top wherever it sits; the copies around
+    /// it decide when its kick goes.
+    #[test]
+    fn a_fired_trigger_inside_a_group_is_kicked_from_the_top() {
+        let p = project(&[("g.trig", true, false, &["g"])], &[("g", None)], &[]);
+        let fire = compute_trigger_fire(&p, "g.trig", &serde_json::Value::Null, None, &Default::default()).unwrap();
+        assert_eq!(kicked(&fire.kicks), vec![("g.trig".to_string(), true)]);
     }
 }

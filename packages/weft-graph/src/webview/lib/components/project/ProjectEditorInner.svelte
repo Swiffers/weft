@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { SvelteFlow, Controls, Background, useSvelteFlow, useUpdateNodeInternals, type Node, type Edge, type Connection, SelectionMode, ConnectionLineType, MarkerType } from "@xyflow/svelte";
+	import { SvelteFlow, Controls, Background, useSvelteFlow, useUpdateNodeInternals, type Node, type Edge, type Connection, type Viewport, type Rect, type XYPosition, type Dimensions, SelectionMode, ConnectionLineType, MarkerType } from "@xyflow/svelte";
 	import { untrack, tick, onDestroy } from "svelte";
 	import "@xyflow/svelte/dist/style.css";
 	import { browser } from "$app/environment";
@@ -9,27 +9,32 @@
 	import CommandPalette from "./CommandPalette.svelte";
 	import CustomEdge from "./CustomEdge.svelte";
 	import ActionBar from "./ActionBar.svelte";
+	import ContextBar from "./ContextBar.svelte";
 	import NodeTagsEditor from "./NodeTagsEditor.svelte";
 	import { nodeTags, TAGS_CONFIG_KEY } from "../../node-tags";
-	import { pruneTargets, runTargetFacts } from "../../run-targets";
+	import { runCheckKey, runProgress, runTargetsOf, whyNothingToRun } from "../../run-targets";
+	import { infraBadge, runUnavailable, triggerBadge, type SelectedNode } from "../../lifecycle";
+	import { isVerbOffered, type VerbInputs } from "../../verb-gates";
+	import { emptyActionAvailability } from "../../../../status";
 	import { containerStatus } from "../../utils/container-status";
+	import { clampZoom, isOnScreen, zoomAfterCollapse, zoomAfterExpand, zoomAround, zoomFrame, MAX_ZOOM, MIN_ZOOM, ZOOM_ANIMATION_MS } from "../../utils/group-zoom";
 	import { derefKeys, derefType } from '../../utils/deref-menu';
-	import { boundaryInId, boundaryOutId } from "../../../host-bridge";
+	import { loopInId, loopOutId } from "../../../host-bridge";
+	import { scopeFirings, copyFrames, withinFrames, credentialOwner, type ScopeBox } from "../../utils/scope-firings";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
-	import { hasUnpickedAccess, inputsOf, outputsOf } from "../../utils/input-field";
+	import { hasUnpickedAccess, inputsOf, outputRows, outputsOf } from "../../utils/input-field";
 	import { effectiveAccessValue, installPicksVersion, loadInstallPicks } from "./install-picks.svelte";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
 	import { locatedKey, type Frame } from "../../../../protocol";
-	import { isContainerNodeType, isLoopNodeType, isIncludeNodeType, isBoundaryBoxNodeType, INCLUDE_NODE_TYPE, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible, portValueFirstForm } from "../../types";
+	import { isContainerNodeType, isLoopNodeType, isIncludeNodeType, isScopeBoxNodeType, INCLUDE_NODE_TYPE, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible, typeVarBoundRefuses, portValueFirstForm } from "../../types";
 	import { rowsByCallPath, type RowsByCallPath } from "../../utils/call-path-rows";
-	import RunSpecDialog from './RunSpecDialog.svelte';
 	import InstallSwitch from './InstallSwitch.svelte';
-	import { addressOf, groupOfCallPath, orderSpecsForMenu, specForAction, type ResolveSpecResponse, type RunSpec } from '../../../../run-spec';
-	import type { CredentialOwnerKind, EditOp, SourceLocation, TextEdit } from "../../../../protocol";
-	import { LOCAL_INSTALL, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT } from "../../../../protocol";
+	import { addressOf } from '../../../../run-spec';
+	import type { EditOp, RunCheck, SourceLocation, TextEdit, TypeParamWire } from "../../../../protocol";
+	import { LOCAL_INSTALL, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, portVar } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
-	import { updateLayoutEntry, removeLayoutEntryEveryView, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors, parseViewMode, setViewMode, LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB, type ViewMode, type LayoutVerb } from "../../layout";
+	import { updateLayoutEntry, removeLayoutEntryEveryView, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors, expandedOf, expandedToWrite, parseViewMode, setViewMode, LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB, type ViewMode, type LayoutVerb } from "../../layout";
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_SQUARE_PX, SIMPLIFIED_CARD_MAX_W_PX } from "../../constants/simplified-view";
 	import { Boxes } from "@lucide/svelte";
 	import { formatConfigValue } from "../../value-format";
@@ -43,7 +48,7 @@
 	import { provideFieldEditorRegistry } from "./field-editor-registry";
 	import { extractInfraSubgraph } from "../../utils/infra-subgraph";
 	import { extractTriggerSubgraph } from "../../utils/trigger-subgraph";
-	import { canBePerInstance, nodeHasDisplay, nodeIsTrigger, nodeRequiresInfra } from "../../utils/node-roles";
+	import { bodyFeedOf, canBePerInstance, nodeIsTrigger, nodeRequiresInfra } from "../../utils/node-roles";
 	import { toast } from "svelte-sonner";
 
 	let {
@@ -54,38 +59,21 @@
 		onApplyTextEdit,
 		onResyncSource,
 		onRun,
-		specs = [],
-		resolveSpec,
-		onRunSpec,
-		onSaveSpec,
-		onRunSpecFile,
-		onListSpecs,
 		onBranchTo,
 		onStop,
 		onDismissError,
 		onOpenLocation,
-		onActivate,
 		onCancelActivate,
 		onCancelBuild,
 		onCancelInfra,
-		onDeactivate,
-		onReactivate,
-		onCancelRunning,
-		onResumeActive,
-		onResync,
 		onResumeResync,
-		onStartInfra,
-		onStopInfra,
-		onTerminateInfra,
-		onInfraNodeStop,
-		onInfraNodeTerminate,
-		onUpgradeInfra,
+		onLifecycle,
+		checkRun,
 		actionBarState,
-		drift,
-		infraNodes,
+		status,
 		hasInfraInGraph = false,
 		hasTriggersInGraph = false,
-		executionState,
+		runState,
 		autoOrganizeOnMount = false,
 		displayByNode,
 		onOpenInclude = () => {},
@@ -124,7 +112,7 @@
 		// file, or a file walked into from it). A file opened on its own
 		// is no place: a node in it may run under several calls, so no
 		// action bar is drawn, no run can be started or aimed from here,
-		// and the host hands in an empty `executionState` and polls no
+		// and the host hands in an empty `runState` and polls no
 		// trigger display. The graph itself stays editable.
 		interactive?: boolean;
 		// Resolved content of @file targets, keyed by the marker's relative
@@ -135,65 +123,45 @@
 		// (the switch, top right). Absent when the project names no target.
 		installView?: import('../../../../protocol').InstallView;
 		onSwitchInstall?: (install: string) => void;
-		// Action-bar verb callbacks. The webview emits these; the
-		// host translates each into a CLI shell-out.
-		/// Targets are the nodes the user aimed the run at, empty for the
-		/// ordinary run.
-		onRun?: (targets: string[]) => void;
-		specs?: RunSpec[];
-		resolveSpec?: (spec: RunSpec, seeded: boolean) => Promise<ResolveSpecResponse>;
-		onRunSpec?: (spec: RunSpec, seeded?: boolean) => void;
-		onSaveSpec?: (spec: RunSpec) => void;
-		onRunSpecFile?: (name: string) => void;
-		onListSpecs?: () => void;
+		// Verb callbacks. The webview emits these; the host translates
+		// each into a CLI shell-out.
+		/// Run the selected nodes, each by its place. Never empty: the
+		/// graph has no gesture that runs the whole program.
+		onRun?: (targets: [string, ...string[]]) => void;
 		onBranchTo?: (reference: string) => void;
 		onStop?: () => void;
 		onDismissError?: () => void;
 		onOpenLocation: (location: SourceLocation) => void;
-		onActivate?: () => void;
 		onCancelActivate?: () => void;
 		onCancelBuild?: () => void;
 		onCancelInfra?: () => void;
-		onDeactivate?: () => void;
-		onReactivate?: () => void;
-		onCancelRunning?: () => void;
-		onResumeActive?: () => void;
-		onResync?: () => void;
 		onResumeResync?: () => void;
-		onStartInfra?: () => void;
-		onStopInfra?: () => void;
-		onTerminateInfra?: () => void;
-		/// Per-node infra lifecycle. The graph's node context-menu
-		/// emits these when the user right-clicks an infra node, with
-		/// the node's PLACEMENT (`addressOf(callPath, id)`, so `one.db`
-		/// for the `db` of the call this view walked into). Routed
-		/// through the host's CLI verb path so the action bar's
-		/// `cli_running` overlay covers them.
-		onInfraNodeStop?: (node: string) => void;
-		onInfraNodeTerminate?: (node: string) => void;
-		onUpgradeInfra?: () => void;
-		// Action-bar state machine (host-owned single source of
-		// truth) and drift snapshot. Passed straight through to
-		// the ActionBar component; nothing in this file decides.
+		/// A lifecycle verb from the contextual bar, on the selected
+		/// triggers or infra.
+		onLifecycle?: (action: import('../../../../protocol').LifecycleAction) => void;
+		/// The walk's refusal for a run of these targets, or `null` when
+		/// it resolves (`weft run --check`).
+		checkRun?: (targets: [string, ...string[]]) => Promise<RunCheck>;
+		// Action-bar state machine (host-owned single source of truth).
+		// Passed straight through to the ActionBar; nothing here decides.
 		actionBarState: import('../../../../protocol').ActionBarState;
-		drift: import('../../../../protocol').ActionAvailability | undefined;
-		// Per-instance infra status, keyed by PLACE (`node` is the spelling
-		// `addressOf(callPath, id)` gives the node on screen): a file
-		// included twice provisions twice, and this view shows the
-		// instance of the call it walked into. Used by the graph node
-		// decorations (badge under each infra node); independent of the
-		// action bar's infra rollup.
-		infraNodes?: import('../../../../protocol').InfraPlacementStatus[];
+		// The latest status answer: every trigger's, infra copy's and
+		// instance's state, as the dispatcher computed it. The node
+		// badges and the contextual bar only draw it. An infra or trigger
+		// entry is keyed by PLACE (`addressOf(callPath, id)` spells the
+		// node on screen): a file included twice provisions twice, and
+		// this view shows the copy of the call it walked into.
+		status: import('../../../../protocol').ActionAvailability | undefined;
 		// Source-derived flags from the parsed project: does this
 		// graph DECLARE infra / trigger nodes. Drives bar-section
 		// visibility (don't show Infra section on a project with
 		// no infra nodes).
 		hasInfraInGraph?: boolean;
 		hasTriggersInGraph?: boolean;
-		// Per-execution state for graph decorations: which edges
+		// Per-run state for graph decorations: which edges
 		// are pulsing right now, last-observed node outputs, etc.
 		// Independent of action-bar state.
-		executionState?: import('../../types').ExecutionState;
+		runState?: import('../../types').RunState;
 		autoOrganizeOnMount?: boolean;
 		/// What each node is showing, keyed by node id. Read for the
 		/// nodes that have a display (an infra node serving `/live`, a
@@ -204,7 +172,7 @@
 	// VS Code embedding: dashboard chrome (right sidebar, code
 	// panel, mobile notice, export dialog) is removed. The text
 	// editor is the .weft tab in column 2; node inspection is the
-	// magnifier on each node card, which opens ExecutionInspector.
+	// magnifier on each node card, which opens FiringInspector.
 
 	// ── The projection engine ──────────────────────────────────────────────
 	// The visible graph is a pure function of (truth, pendingOps, layoutCode),
@@ -325,7 +293,7 @@
 		return (layout) => updateLayoutEntry(layout, key,
 			node.position.x, node.position.y,
 			w, h,
-			cfg?.expanded as boolean | undefined ?? undefined,
+			expandedToWrite(cfg?.expanded as boolean | undefined, node.data as { anonymous?: boolean }),
 			cfg?.configOpen as boolean | undefined ?? undefined,
 			verb);
 	}
@@ -361,9 +329,9 @@
 		// their kind in data.nodeType, so the dispatch is total.
 		const op: EditOp = isContainer
 			? (containerKindOf(node.data?.nodeType) === 'Loop'
-				? { op: 'moveLoopScope', loopId: node.id, targetGroup: targetGroupId ?? null }
-				: { op: 'moveGroupScope', group: node.id, targetGroup: targetGroupId ?? null })
-			: { op: 'moveNodeScope', node: node.id, targetGroup: targetGroupId ?? null };
+				? { op: 'move_loop_scope', loopId: node.id, targetGroup: targetGroupId ?? null }
+				: { op: 'move_group_scope', group: node.id, targetGroup: targetGroupId ?? null })
+			: { op: 'move_node_scope', node: node.id, targetGroup: targetGroupId ?? null };
 		const localId = node.id.split('.').pop()!;
 		const newKey = scopedLayoutKey(localId, targetGroupId);
 		recordEdit([op], (layout) => {
@@ -477,9 +445,66 @@
 		// NOTE: Do NOT set markerEnd here - it overrides individual edge settings
 	});
 
-	// Get the SvelteFlow instance for screenToFlowPosition and fitView
-	const { screenToFlowPosition, fitView, getViewport, setViewport, zoomIn, zoomOut } = useSvelteFlow();
+	// Get the SvelteFlow instance for screenToFlowPosition and the viewport
+	const { screenToFlowPosition, getViewport, setViewport } = useSvelteFlow();
 	const updateNodeInternals = useUpdateNodeInternals();
+
+	// The canvas: every viewport computation measures it, and a viewport's
+	// x/y are relative to its top-left corner.
+	let canvasEl = $state<HTMLDivElement>();
+	function canvasSize(): Dimensions | null {
+		const rect = canvasEl?.getBoundingClientRect();
+		return rect && rect.width > 0 && rect.height > 0 ? { width: rect.width, height: rect.height } : null;
+	}
+
+	// The zoom a group toggle plays, while it plays. Anything else that moves
+	// the view (the person's wheel or pointer, a fit) stops it first.
+	let groupZoomFrame: number | null = null;
+	function stopGroupZoom(): void {
+		if (groupZoomFrame !== null) {
+			cancelAnimationFrame(groupZoomFrame);
+			groupZoomFrame = null;
+		}
+	}
+	/// Spring the view from `from` to `target`'s zoom around `anchor`, one
+	/// frame at a time, so the point under the pointer stays under it all the
+	/// way (`zoomFrame`); the last frame lands on `target`.
+	function playGroupZoom(from: Viewport, anchor: XYPosition, target: Viewport): void {
+		stopGroupZoom();
+		const start = performance.now();
+		const step = (now: number) => {
+			const t = Math.min(1, (now - start) / ZOOM_ANIMATION_MS);
+			setViewport(zoomFrame(from, anchor, target.zoom, t), { duration: 0 });
+			groupZoomFrame = t < 1 ? requestAnimationFrame(step) : null;
+		};
+		groupZoomFrame = requestAnimationFrame(step);
+	}
+	/// Once a group has opened or closed and the layout has made room, zoom
+	/// so what is on screen reads (`zoomAfterExpand` / `zoomAfterCollapse`),
+	/// centered on the pointer. `viewport` is the view the layout left.
+	/// Nothing moves while the person holds the pointer, and with the pointer
+	/// outside the window there is nothing to center on.
+	function zoomForToggledGroup(group: Node, viewport: Viewport): void {
+		const canvas = canvasEl?.getBoundingClientRect();
+		const screen = canvasSize();
+		if (!canvas || !screen || !lastPointer || pointerHeld) return;
+		const mouse = { x: lastPointer.clientX - canvas.left, y: lastPointer.clientY - canvas.top };
+		const rectOf = (n: Node): Rect => ({ ...getAbsolutePosition(n), ...getNodeRect(n) });
+		// What there is to read: every drawn node, never an open box.
+		const readable = nodes.filter(n => !n.hidden && n.type !== 'group');
+		const target = group.type === 'group'
+			? zoomAfterExpand(
+				viewport, screen, rectOf(group),
+				readable.filter(n => isDescendantOf(n.id, group.id)).map(rectOf),
+				mouse,
+			)
+			: zoomAfterCollapse(
+				viewport, screen,
+				readable.map(rectOf).filter(r => isOnScreen(r, viewport, screen)),
+				mouse,
+			);
+		if (target.zoom !== viewport.zoom) playGroupZoom(viewport, mouse, target);
+	}
 
 	// Track whether Ctrl is actually pressed on the keyboard (vs synthetic from pinch)
 	let realCtrlDown = false;
@@ -496,6 +521,9 @@
 	function handleWheel(e: WheelEvent) {
 		// Skip events we redispatched ourselves (see delta-mode normalization below).
 		if ((e as WheelEvent & { __weftNormalized?: boolean }).__weftNormalized) return;
+		// The person's own zoom or scroll wins over a group toggle's zoom,
+		// whose frames would otherwise undo the pan as it goes.
+		stopGroupZoom();
 		if (e.ctrlKey || e.metaKey) {
 			e.preventDefault();
 			e.stopPropagation();
@@ -503,14 +531,10 @@
 			// Pinch: amplify aggressively. Mouse wheel: gentle.
 			const multiplier = realCtrlDown ? 0.002 : 0.03;
 			const zoomDelta = -e.deltaY * multiplier;
-			let newZoom = viewport.zoom * (1 + zoomDelta);
-			newZoom = Math.max(0.05, Math.min(2, newZoom));
+			const newZoom = clampZoom(viewport.zoom * (1 + zoomDelta));
 			const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-			const mouseX = e.clientX - rect.left;
-			const mouseY = e.clientY - rect.top;
-			const newX = mouseX - (mouseX - viewport.x) * (newZoom / viewport.zoom);
-			const newY = mouseY - (mouseY - viewport.y) * (newZoom / viewport.zoom);
-			setViewport({ x: newX, y: newY, zoom: newZoom }, { duration: 0 });
+			const mouse = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+			setViewport(zoomAround(viewport, mouse, newZoom), { duration: 0 });
 			return;
 		}
 		// Normalize line/page delta modes to pixels. After a page reload or when
@@ -580,38 +604,25 @@
 
 	/** Navigate into an `@include`d file: the host opens that file's graph in
 	 *  this panel and pushes the current view onto the back-stack. `alias` is
-	 *  the include node id, accumulated into the execution-id prefix. */
+	 *  the include node id, accumulated into the run-id prefix. */
 	function openInclude(path: string, alias: string) {
 		onOpenInclude(path, alias);
 	}
 
-	/** A node's execution-journal key: its id, in every view. An included
+	/** A node's run-journal key: its id, in every view. An included
 	 *  file's nodes are journaled under the file's own id (`C.strip`), which
 	 *  is the id this view gives them, so no prefix is added; which CALL a
 	 *  row belongs to is its call frames, split in `readOverlayCtx`
 	 *  (`rowsByCallPath`). */
-	function execKey(localId: string): string {
+	function firingKey(localId: string): string {
 		return localId;
-	}
-
-	/** Whose key a group's members spent, folded for the group's synthetic
-	 *  execution row: one distinct origin passes through, disagreeing
-	 *  members read 'mixed', no cost records means no origin. */
-	function groupCredentialOwner(
-		members: { credentialOwner?: CredentialOwnerKind | 'mixed' }[],
-	): CredentialOwnerKind | 'mixed' | undefined {
-		const origins = new Set(
-			members.map((e) => e.credentialOwner).filter((o) => o !== undefined),
-		);
-		if (origins.size === 0) return undefined;
-		return origins.size === 1 ? [...origins][0] : 'mixed';
 	}
 
 	/// Flip a node's gate between `_should_flow` and `_should_not_flow`.
 	///
 	/// Both spellings are ordinary ports, so the flip is the ops that
-	/// already exist: a wire moves with removeEdge + addEdge, a written
-	/// value with removeConfig + setConfig. Nothing new on the wire and
+	/// already exist: a wire moves with remove_edge + add_edge, a written
+	/// value with remove_config + set_config. Nothing new on the wire and
 	/// nothing new in Rust, which is also why it undoes like any other
 	/// edit.
 	///
@@ -637,7 +648,7 @@
 			if (wire) {
 				const scopeGroup = (wire as { data?: { scopeGroup?: string | null } }).data?.scopeGroup ?? null;
 				ops.push({
-					op: 'removeEdge',
+					op: 'remove_edge',
 					source: wire.source,
 					sourcePort: wire.sourceHandle ?? 'default',
 					target: nodeId,
@@ -645,7 +656,7 @@
 					scopeGroup,
 				});
 				ops.push({
-					op: 'addEdge',
+					op: 'add_edge',
 					source: wire.source,
 					sourcePort: wire.sourceHandle ?? 'default',
 					target: nodeId,
@@ -802,8 +813,11 @@
 			}
 
 			// Expand/collapse: run ELK, then adjust viewport so the toggled node's
-			// top-right corner stays at the same screen position (no node shifting).
+			// top-right corner stays at the same screen position (no node shifting),
+			// then, for a group, zoom so what is on screen reads.
 			if (isExpandToggle) {
+				// A zoom still playing from the last toggle would fight the pin.
+				stopGroupZoom();
 				const pinnedNodeId = nodeId;
 				// Capture the top-right corner in flow coordinates before toggle
 				const currentNode = nodes.find(n => n.id === nodeId);
@@ -831,10 +845,15 @@
 									const newAbsTopRight = { x: postAbs.x + postRect.width, y: postAbs.y };
 									// Adjust viewport so the top-right stays at the same screen position
 									const currentVp = getViewport();
-									const newVpX = oldScreenX - newAbsTopRight.x * currentVp.zoom;
-									const newVpY = oldScreenY - newAbsTopRight.y * currentVp.zoom;
-									if (Math.abs(newVpX - currentVp.x) > 1 || Math.abs(newVpY - currentVp.y) > 1) {
-										setViewport({ x: newVpX, y: newVpY, zoom: currentVp.zoom });
+									const pinned = {
+										x: oldScreenX - newAbsTopRight.x * currentVp.zoom,
+										y: oldScreenY - newAbsTopRight.y * currentVp.zoom,
+										zoom: currentVp.zoom,
+									};
+									const moves = Math.abs(pinned.x - currentVp.x) > 1 || Math.abs(pinned.y - currentVp.y) > 1;
+									if (moves) setViewport(pinned);
+									if (isContainerNodeType(postNode.data.nodeType)) {
+										zoomForToggledGroup(postNode, moves ? pinned : currentVp);
 									}
 								}
 
@@ -884,8 +903,8 @@
 					// push.
 					const kind = containerKindOf(node?.data?.nodeType);
 					ops.push(kind === 'Loop'
-						? { op: 'renameLoop', loopId: nodeId, newLabel: updates.label as string }
-						: { op: 'renameGroup', group: nodeId, newLabel: updates.label as string });
+						? { op: 'rename_loop', loopId: nodeId, newLabel: updates.label as string }
+						: { op: 'rename_group', group: nodeId, newLabel: updates.label as string });
 					// Re-key the group's layout subtree (its own entry + descendants) from
 					// the old scoped address to the new one. Same exact, non-compounding
 					// re-key a move uses; a rename only changes the last path segment.
@@ -895,7 +914,7 @@
 					mutateLayout = (layout) => renameLayoutSubtree(layout, nodeId, newPrefix);
 					hasLayout = true;
 				} else {
-					ops.push({ op: 'setLabel', node: nodeId, label: (updates.label as string | null) ?? null });
+					ops.push({ op: 'set_label', node: nodeId, label: (updates.label as string | null) ?? null });
 				}
 			}
 			if ('config' in updates) {
@@ -914,11 +933,15 @@
 				// miss the entry (read undefined -> every dim looks "changed" -> a spurious
 				// layout write + history churn on a keystroke).
 				const layoutEntry = liveNode ? parseLayoutCode(layoutCode, layoutVerb)[getLayoutKey(liveNode)] : undefined;
+				// `expanded` compares against what the node draws with, the
+				// default included: an included file's group is open with no
+				// entry written, and an edit re-sending that `expanded: true`
+				// has not changed it.
 				const persistedDim = (key: string): unknown =>
 					key === 'width' ? layoutEntry?.w
 						: key === 'height' ? layoutEntry?.h
 						: key === 'configOpen' ? layoutEntry?.configOpen
-						: layoutEntry?.expanded;
+						: expandedOf(layoutEntry?.expanded, (liveNode?.data ?? {}) as { anonymous?: boolean });
 				let needsLayout = false;
 				for (const [key, value] of Object.entries(cfg)) {
 					if (['width', 'height', 'expanded', 'configOpen'].includes(key)) {
@@ -971,7 +994,7 @@
 			}
 			if ('portValueForm' in updates && updates.portValueForm) {
 				const { key, form } = updates.portValueForm;
-				ops.push({ op: 'setValueForm', node: nodeId, key, form });
+				ops.push({ op: 'set_value_form', node: nodeId, key, form });
 			}
 			if ('inputs' in updates || 'outputs' in updates) {
 				// Everything the emit READS comes from the PROJECTION (the
@@ -1004,9 +1027,9 @@
 						const inputs = toPortSigs(nextInputs, 'input');
 						const outputs = toPortSigs(nextOutputs, 'output');
 						if (kind === 'Loop') {
-							ops.push({ op: 'updateLoopPorts', loopId: nodeId, inputs, outputs });
+							ops.push({ op: 'update_loop_ports', loopId: nodeId, inputs, outputs });
 						} else {
-							ops.push({ op: 'updateGroupPorts', group: nodeId, inputs, outputs });
+							ops.push({ op: 'update_group_ports', group: nodeId, inputs, outputs });
 						}
 					} else {
 						// A NODE's header declares only the custom/overridden
@@ -1041,8 +1064,14 @@
 						// and wrong for a derived one (a hand-authored shadow line
 						// restating the derived shape is the author's only record
 						// of the declaration, and must round-trip).
-						const ins = headerPortSigs(prevInputs, nextInputs, defaults?.defaultInputs);
-						const outs = headerPortSigs(prevOutputs, nextOutputs, defaults?.defaultOutputs);
+						// The inputs a wire feeds: an optional catalog port the
+						// program never wrote is spelled by its wiring, so the
+						// line keeps meaning what the port means now.
+						const wiredInputs = new Set(fold.project.edges
+							.filter((e) => e.target === nodeId && e.targetHandle)
+							.map((e) => e.targetHandle as string));
+						const ins = headerPortSigs(prevInputs, nextInputs, defaults?.defaultInputs, wiredInputs);
+						const outs = headerPortSigs(prevOutputs, nextOutputs, defaults?.defaultOutputs, new Set());
 						// A derived port must not be WRITTEN into the header
 						// unless the source already declares it (a hand-authored
 						// shadow line, which merges cleanly at enrich and must
@@ -1081,12 +1110,12 @@
 						const spans = foldPorts.portLiteralSpans;
 						for (const name of remIns.removed) {
 							if (literals && name in literals) {
-								ops.push({ op: 'removeConfig', node: nodeId, key: name, form: spans?.[name]?.origin });
+								ops.push({ op: 'remove_config', node: nodeId, key: name, form: spans?.[name]?.origin });
 							}
 						}
 						const revertedInputs = [...gateRevertedIns, ...remIns.reverted];
 						const revertedOutputs = [...gateRevertedOuts, ...remOuts.reverted];
-						// An op that carries nothing is not sent: `updateNodePorts`
+						// An op that carries nothing is not sent: `update_node_ports`
 						// de-inlines an inline node and rewrites its header before
 						// it looks at the payload, so an empty op is not a no-op
 						// on the Rust side (a config-list tweak on an inline
@@ -1095,7 +1124,7 @@
 							|| remIns.removed.length || remOuts.removed.length
 							|| revertedInputs.length || revertedOutputs.length) {
 							ops.push({
-								op: 'updateNodePorts',
+								op: 'update_node_ports',
 								node: nodeId,
 								inputs: sigInputs,
 								outputs: sigOutputs,
@@ -1168,7 +1197,7 @@
 		const font = nodeLabelFont(10);
 
 		const inputNames = (inputs || []).map(p => p.name + (p.required ? '*' : ''));
-		const outputNames = (outputs || []).map(p => p.name);
+		const outputNames = outputRows(outputs || []).map(p => p.name);
 
 		let maxRowWidth = 0;
 		const rowCount = Math.max(inputNames.length, outputNames.length);
@@ -1225,19 +1254,21 @@
 		// this view-state) plus the layout file produce one merged node list. The
 		// rest of buildNodes (visibility walk, sizing, the returned config) reads the
 		// merged config, and the ancestor-collapse walk sees merged `expanded` too.
+		// `expanded` is the entry's flag else the node's default (`expandedOf`),
+		// so a node with no entry yet (an included file opened for the first
+		// time) still draws in its default state.
 		// Position is applied per-node below (also from the layout entry).
-		if (layoutMap) {
-			projectNodes = projectNodes.map(n => {
-				const e = layoutMap[n.id];
-				if (!e) return n;
-				const cfg = { ...(n.config as Record<string, unknown>) };
-				if (e.w !== undefined) cfg.width = e.w;
-				if (e.h !== undefined) cfg.height = e.h;
-				if (e.expanded !== undefined) cfg.expanded = e.expanded;
-				if (e.configOpen !== undefined) cfg.configOpen = e.configOpen;
-				return { ...n, config: cfg };
-			}) as typeof projectNodes;
-		}
+		projectNodes = projectNodes.map(n => {
+			const e = layoutMap?.[n.id];
+			const expanded = expandedOf(e?.expanded, n);
+			if (!e && expanded === undefined) return n;
+			const cfg = { ...(n.config as Record<string, unknown>) };
+			if (e?.w !== undefined) cfg.width = e.w;
+			if (e?.h !== undefined) cfg.height = e.h;
+			if (expanded !== undefined) cfg.expanded = expanded;
+			if (e?.configOpen !== undefined) cfg.configOpen = e.configOpen;
+			return { ...n, config: cfg };
+		}) as typeof projectNodes;
 		// An access node with no connection picked is pinned open: the
 		// Connect button lives in the expanded body. The pin is VIEW
 		// state only, computed here and carried on node DATA, never in
@@ -1492,7 +1523,7 @@
 				zIndex: sizing.zIndex,
 				...(sizing.width !== undefined ? { width: sizing.width } : {}),
 				...(sizing.height !== undefined ? { height: sizing.height } : {}),
-				// Dynamic per-node data (fileContents, infra badges, execution
+				// Dynamic per-node data (fileContents, infra badges, run
 				// state, body feeds) is painted by `decorate`, the ONE decoration
 				// pass; buildNodes carries only the structural fields.
 				data: {
@@ -1515,6 +1546,9 @@
 					portLiterals: (n as typeof n & { portLiterals?: Record<string, unknown> }).portLiterals,
 					portLiteralSpans: n.portLiteralSpans,
 					features: n.features,
+					// The bounds on the node's type variables, which the wire
+					// gate holds a source to (isValidConnection).
+					typeParams: n.typeParams,
 					// What the compiler said about this node, so the role
 					// predicates read the instance before the catalog, the
 					// way the host does before it starts a poller.
@@ -1527,6 +1561,9 @@
 					pinnedOpen: pinnedIds.has(n.id),
 					placeOf,
 					includePath: (n as typeof n & { includePath?: string }).includePath,
+					// An included file's own group: what `expandedOf` reads for
+					// its default, here and when an update is checked against it.
+					anonymous: n.anonymous,
 					sourceLine: (n as typeof n & { sourceLine?: number }).sourceLine,
 					onUpdate: createNodeUpdateHandler(n.id),
 					onToggleGate: createGateToggleHandler(n.id),
@@ -1700,7 +1737,7 @@
 					// self-guard on `simplified` as defense. (Svelte Flow has no
 					// per-edge `reconnectable` field, unlike React Flow, so the anchor
 					// is the real lever.) Without this, dragging a merged edge's end
-					// would record a removeEdge against the SYNTHETIC `__simp_*` handle.
+					// would record a remove_edge against the SYNTHETIC `__simp_*` handle.
 					selectable: false,
 					deletable: false,
 					data: { simplified: true },
@@ -1756,26 +1793,13 @@
 	// `busParticipantsByBus` is replaced by reference only when a new
 	// participant lands (see App.svelte's bus_participant handler), so
 	// reference equality with the prior tick means the inversion is
-	// unchanged. Without this, every nodeOutputs/nodeExecutions tick
+	// unchanged. Without this, every nodeOutputs/nodeFirings tick
 	// (which happens on every SSE event) re-inverts and re-allocates
-	// the whole nodes array, quadratic with execution age.
+	// the whole nodes array, quadratic with run age.
 	let busesByNodeCache: { ref: unknown; value: Record<string, string[]> } = {
 		ref: undefined,
 		value: {},
 	};
-
-	/// Output nodes the user aimed the run at, by node id. Empty is the
-	/// ordinary run: the dispatcher starts from every output node. This is
-	/// deliberately not surfaced anywhere except the right-click menu and the
-	/// glow on a targeted node, so it stays out of the way of somebody who
-	/// never wants it.
-	let runTargets = $state<Set<string>>(new Set());
-
-	function toggleRunTarget(nodeId: string): void {
-		const next = new Set(runTargets);
-		if (!next.delete(nodeId)) next.add(nodeId);
-		runTargets = next;
-	}
 
 	// Everything dynamic painted onto the projected graph, gathered in one
 	// place so there is ONE decoration pass (no per-source effects mutating
@@ -1786,38 +1810,36 @@
 		/// The followed run's rows around this view's call path: `here` by
 		/// node id for the rows at this level, `inside` by include site for
 		/// everything that ran under one (see `rowsByCallPath`).
-		rows: RowsByCallPath<import('../../types').NodeExecution>;
+		rows: RowsByCallPath<import('../../types').NodeFiring>;
 		busLogByBus: Record<string, import('../../../../protocol').BusInspectorEvent[]>;
 		busesByNode: Record<string, string[]>;
 		busMetaByBus: Record<string, import('../../../../protocol').BusMeta>;
 		loopEventsByGroup: Record<string, import('../../../../protocol').LoopInspectorEvent[]>;
+		/// Every copy of a scope the run decided, by scope id.
+		scopeDecisions: Record<string, import('../../../../protocol').ScopeDecidedEvent[]>;
 		journalCorruptions: Array<{ site: import('../../../../protocol').CorruptionSite; reason: string }>;
-		/// The run's own tags (`ctx.tag_execution`), painted onto every
+		/// The run's own tags (`ctx.tag_run`), painted onto every
 		/// node so any node's inspector can show them.
-		executionTags: string[];
+		runTags: string[];
 		/// How the run ended (state plus, for a cancel, why), painted
 		/// onto every node so a node card or inspector can name who
 		/// stopped the run.
-		runTerminal: import('../../types').ExecutionTerminal | undefined;
-		infraNodes: typeof infraNodes;
+		runTerminal: import('../../types').RunTerminal | undefined;
+		status: typeof status;
 		fileContents: typeof fileContents;
 		displayByNode: typeof displayByNode;
 		showInfraSubgraph: boolean;
 		showTriggerSubgraph: boolean;
-		/// Output nodes the run is aimed at. Read here rather than straight
-		/// from the state so setting a target repaints immediately: `decorate`
-		/// runs untracked, so a source it reads on its own never registers as
-		/// a dependency of the overlay effect.
-		runTargets: ReadonlySet<string>;
 		/// The followed run's node set (`null` = whole graph, `undefined`
 		/// = no run or its birth has not arrived).
 		runScope: ReadonlySet<string> | null | undefined;
 		callPath: string[];
 		projectNodes: import('../../types').NodeInstance[];
+		projectEdges: import('../../types').Edge[];
 	};
 
 	function readOverlayCtx(): OverlayCtx {
-		const state = executionState;
+		const state = runState;
 		const busParticipantsByBus = state?.busParticipantsByBus || {};
 		let busesByNode: Record<string, string[]>;
 		if (busesByNodeCache.ref === busParticipantsByBus) {
@@ -1837,23 +1859,23 @@
 		}
 		return {
 			nodeOutputs: state?.nodeOutputs || {},
-			rows: rowsByCallPath(state?.nodeExecutions || {}, callPath),
+			rows: rowsByCallPath(state?.nodeFirings || {}, callPath),
 			busLogByBus: state?.busLogByBus || {},
 			busesByNode,
 			busMetaByBus: state?.busMetaByBus ?? {},
 			loopEventsByGroup: state?.loopEventsByGroup ?? {},
+			scopeDecisions: state?.scopeDecisions ?? {},
 			journalCorruptions: state?.journalCorruptions ?? [],
-			executionTags: state?.tags ?? [],
+			runTags: state?.tags ?? [],
 			runTerminal: state?.terminal,
-			infraNodes,
+			status,
 			fileContents,
 			displayByNode,
 			showInfraSubgraph,
 			showTriggerSubgraph,
-			runTargets,
-			runScope: executionState?.scope === undefined ? undefined
-				: executionState.scope === null ? null
-				: new Set(executionState.scope),
+			runScope: runState?.scope === undefined ? undefined
+				: runState.scope === null ? null
+				: new Set(runState.scope),
 			// Read in the tracked region so a navigation that only changes the
 			// call path re-decorates (the rows above are filtered by it).
 			// Untrack the projection: the STRUCTURAL effect already owns
@@ -1862,27 +1884,82 @@
 			// decorate pass on the hottest path).
 			callPath,
 			projectNodes: untrack(() => fold.project.nodes),
+			projectEdges: untrack(() => fold.project.edges),
 		};
 	}
 
-	/** Paint every dynamic decoration (execution state, infra badges, file
+	/// What a group or include box at this level is painted from (see
+	/// `scopeFirings`): the copies its scope was decided in, every row that
+	/// ran inside it with the copy it ran in, and the wires on its faces.
+	function scopeBox(id: string, nodeType: string, ctx: OverlayCtx): ScopeBox {
+		const box = ctx.projectNodes.find((p) => p.id === id);
+		const loopIds = new Set(ctx.projectNodes.filter((p) => isLoopNodeType(p.nodeType)).map((p) => p.id));
+		// Each row with the number of loops between the box and the node it
+		// belongs to, which is how many iterations its frames carry past
+		// the box's copy.
+		const inside: Array<{ row: import('../../types').NodeFiring; loops: number }> = [];
+		const loopsBelow = (scope: readonly string[] | undefined) => {
+			const chain = scope ?? [];
+			return chain.slice(chain.indexOf(id) + 1).filter((s) => loopIds.has(s)).length;
+		};
+		if (isIncludeNodeType(nodeType)) {
+			for (const row of ctx.rows.inside[id] ?? []) inside.push({ row, loops: 0 });
+		}
+		for (const projNode of ctx.projectNodes) {
+			if (!projNode.scope?.includes(id)) continue;
+			const loops = loopsBelow(projNode.scope);
+			for (const row of ctx.rows.here[firingKey(projNode.id)] ?? []) inside.push({ row, loops });
+			for (const row of ctx.rows.inside[projNode.id] ?? []) inside.push({ row, loops });
+		}
+		const loopsOf = new Map(inside.map(({ row, loops }) => [row, loops]));
+		// A wire end on a loop box is one of its boundary nodes: what lands
+		// on the loop reaches its LoopIn, what leaves it is its LoopOut's.
+		const rowsOf = (nodeId: string, side: 'source' | 'target') => {
+			const place = !loopIds.has(nodeId) ? nodeId : side === 'target' ? loopInId(nodeId) : loopOutId(nodeId);
+			return ctx.rows.here[firingKey(place)] ?? [];
+		};
+		return {
+			id,
+			callPath: ctx.callPath,
+			decisions: ctx.scopeDecisions[id] ?? [],
+			inside: inside.map(({ row }) => row),
+			copyOf: (row) => copyFrames(row.frames, ctx.callPath.length, loopsOf.get(row) ?? 0),
+			legs: ctx.projectEdges,
+			rowsOf,
+			inPorts: (box?.inputs ?? []).map((p) => p.name),
+			outPorts: (box?.outputs ?? []).map((p) => p.name),
+			terminal: ctx.runTerminal,
+		};
+	}
+
+	/// Whether the box `id` stands for something the followed run runs at
+	/// this call path. A node is a place; a loop is its LoopIn; a group is
+	/// in the run when one of its members is, and an include when a place
+	/// under its call is.
+	function boxInRun(id: string, nodeType: string, runScope: ReadonlySet<string>, ctx: OverlayCtx): boolean {
+		if (isLoopNodeType(nodeType)) return runScope.has(locatedKey(loopInId(id), ctx.callPath));
+		if (isIncludeNodeType(nodeType)) {
+			const under = `${locatedKey(id, ctx.callPath)}/`;
+			for (const place of runScope) if (place.startsWith(under)) return true;
+			return false;
+		}
+		if (isContainerNodeType(nodeType)) {
+			return ctx.projectNodes.some((p) => p.parentId === id && boxInRun(p.id, p.nodeType, runScope, ctx));
+		}
+		return runScope.has(locatedKey(id, ctx.callPath));
+	}
+
+	/** Paint every dynamic decoration (run state, infra badges, file
 	 *  contents, body feeds, subgraph highlight) onto a node/edge array.
 	 *  Pure: spreads each node, never reorders or repositions. Used by BOTH
 	 *  the structural rebuild and the overlay-tick refresh, so the two render
 	 *  paths cannot drift. */
-	/// Is a row at `frames` inside the iteration at `iteration`: the same
-	/// frame stack, or one that extends it (a nested loop's own frames).
-	function withinFrames(frames: Frame[], iteration: Frame[]): boolean {
-		return frames.length >= iteration.length
-			&& iteration.every((f, i) => JSON.stringify(frames[i]) === JSON.stringify(f));
-	}
-
 	function decorate(ns: Node[], es: Edge[], ctx: OverlayCtx): { nodes: Node[]; edges: Edge[] } {
 		const {
 			nodeOutputs, busLogByBus, busesByNode, busMetaByBus,
-			loopEventsByGroup, journalCorruptions, executionTags, runTerminal,
+			loopEventsByGroup, journalCorruptions, runTags, runTerminal,
 		} = ctx;
-		const nodeExecutions = ctx.rows.here;
+		const nodeFirings = ctx.rows.here;
 		// Subgraph highlight classes are computed over the CURRENT arrays so
 		// highlighted/dimmed always reflects what is on screen.
 		let subgraphNodeIds: Set<string> | null = null;
@@ -1922,137 +1999,137 @@
 					// Debug-style preview: show the node's output if
 					// it has one; otherwise (Debug, any future sink)
 					// show what flowed IN, since that's what makes
-					// the preview meaningful. Read the latest exec
+					// the preview meaningful. Read the latest firing
 					// row's input payload when no outputs exist on
 					// the node type.
 					let debugData: unknown = undefined;
 					if (nodeTypeConfig?.features?.showDebugPreview) {
-						const hasOutputs = (nodeTypeConfig.defaultOutputs?.length ?? 0) > 0;
+						// `_error` is on every catalog node, so it says
+						// nothing about whether the node has a value to show.
+						const hasOutputs = outputRows(nodeTypeConfig.defaultOutputs ?? []).length > 0;
 						if (hasOutputs) {
-							debugData = nodeOutputs[execKey(n.id)];
+							debugData = nodeOutputs[firingKey(n.id)];
 						} else {
-							const rows = nodeExecutions[execKey(n.id)];
+							const rows = nodeFirings[firingKey(n.id)];
 							const latest = rows?.[rows.length - 1];
 							debugData = latest?.input;
 						}
 					}
 
-					let executions: import('../../types').NodeExecution[];
+					let firings: import('../../types').NodeFiring[];
 
-					if (isBoundaryBoxNodeType(nodeType)) {
-						const groupId = n.id;
+					if (isLoopNodeType(nodeType)) {
+						const loopId = n.id;
 
-						// The boundary pair that stands for this box at this level
-						// (one id derivation: host-bridge). A container's halves fire
-						// here around its members; an include's are its call site's
-						// halves, which fire here in the caller's frames, while the
-						// body runs one call frame deeper.
-						const inExecs = nodeExecutions[execKey(boundaryInId(groupId))] || [];
-						const outExecs = nodeExecutions[execKey(boundaryOutId(groupId))] || [];
+						// A loop runs through its two boundary nodes, which fire
+						// here around each iteration (one id derivation:
+						// host-bridge).
+						const inFirings = nodeFirings[firingKey(loopInId(loopId))] || [];
+						const outFirings = nodeFirings[firingKey(loopOutId(loopId))] || [];
 
-						// Everything that ran inside the box: its members at this level
-						// (via scope, against the CURRENT projected nodes, not the stale
-						// initial prop), and every row that ran under a call site that is
-						// the box itself or one of its members, however deep the calls
-						// below go (`ctx.rows.inside` is keyed by the site at this level).
-						const internalExecs: import('../../types').NodeExecution[] = [];
-						if (isIncludeNodeType(nodeType)) {
-							internalExecs.push(...(ctx.rows.inside[groupId] ?? []));
-						}
+						// Everything that ran inside the loop: its members at this
+						// level (via scope, against the CURRENT projected nodes, not
+						// the stale initial prop), and every row that ran under a
+						// call site among them, however deep the calls below go
+						// (`ctx.rows.inside` is keyed by the site at this level).
+						const internalFirings: import('../../types').NodeFiring[] = [];
 						for (const projNode of ctx.projectNodes) {
-							if (!projNode.scope?.includes(groupId)) continue;
-							internalExecs.push(...(nodeExecutions[execKey(projNode.id)] ?? []));
-							internalExecs.push(...(ctx.rows.inside[projNode.id] ?? []));
+							if (!projNode.scope?.includes(loopId)) continue;
+							internalFirings.push(...(nodeFirings[firingKey(projNode.id)] ?? []));
+							internalFirings.push(...(ctx.rows.inside[projNode.id] ?? []));
 						}
 
-						// Pair the __out boundary execution to its __in by
+						// Pair the __out boundary run to its __in by
 						// FRAME STACK, not array index. A parallel loop fires
 						// many iterations whose __in / __out events interleave
 						// and arrive out of order, so the i-th __in is not the
 						// i-th __out; matching by framesKey ties each iteration's
-						// in to its own out. (Sequential loops and plain groups
-						// happen to line up by index, but framesKey is correct
-						// for all of them.)
-						const outByFrames = new Map(outExecs.map((e) => [e.framesKey, e]));
+						// in to its own out.
+						const outByFrames = new Map(outFirings.map((e) => [e.framesKey, e]));
 
-						// Build synthetic execution: one per __in execution
-						executions = inExecs.map((inExec) => {
-							const outExec = outByFrames.get(inExec.framesKey);
+						// Build synthetic run: one per __in run
+						firings = inFirings.map((inFiring) => {
+							const outFiring = outByFrames.get(inFiring.framesKey);
 							// Derive status and cost from THIS iteration's rows only:
 							// the boundary pair at its frames and every internal
 							// row at those frames or deeper (a nested loop's
 							// iterations). A parallel loop's other iterations are
 							// sibling cards, not this one's children.
-							const allRelated = [...internalExecs, ...inExecs, ...outExecs]
-								.filter((e) => withinFrames(e.frames, inExec.frames));
-							const status = containerStatus(inExec.status, allRelated);
+							const allRelated = [...internalFirings, ...inFirings, ...outFirings]
+								.filter((e) => withinFrames(e.frames, inFiring.frames));
+							const status = containerStatus(inFiring.status, allRelated);
 
 							return {
 								// Frame-stack-keyed id so an iteration's card keeps
 								// a stable identity across ticks even as sibling
 								// iterations' events interleave (index would shuffle).
-								id: `${groupId}-synth-${inExec.framesKey}`,
-								nodeId: groupId,
+								id: `${loopId}-synth-${inFiring.framesKey}`,
+								nodeId: loopId,
 								status,
-								pulseId: inExec.pulseId,
-								error: outExec?.error ?? inExec.error,
-								startedAt: inExec.startedAt,
-								completedAt: outExec?.completedAt ?? inExec.completedAt,
-								input: inExec.output, // __in output = what flows into the group
-								output: outExec?.output, // __out output = what the group produces
+								pulseId: inFiring.pulseId,
+								error: outFiring?.error ?? inFiring.error,
+								startedAt: inFiring.startedAt,
+								completedAt: outFiring?.completedAt ?? inFiring.completedAt,
+								input: inFiring.output, // __in output = what flows into the loop
+								output: outFiring?.output, // __out output = what the loop produces
 								// Closed input ports surface from the `__in` boundary
-								// (its own `closedPorts` is the set of group-level
+								// (its own `closedPorts` is the set of loop-level
 								// inputs that arrived as closures). Without this, a
-								// group inspector with closed inputs renders a
+								// loop inspector with closed inputs renders a
 								// blank Input panel where the per-node inspector
 								// shows `port: (closed)` rows.
-								closedPorts: inExec.closedPorts,
+								closedPorts: inFiring.closedPorts,
+								skipReason: inFiring.skipReason,
 								// A reused input boundary alone does not mean its body was reused.
-								inheritedFrom: allRelated.every((e) => e.inheritedFrom === inExec.inheritedFrom)
-									? inExec.inheritedFrom : undefined,
-								providedPorts: inExec.providedPorts,
-								backupPorts: inExec.backupPorts,
-								inheritedPorts: inExec.inheritedPorts,
+								inheritedFrom: allRelated.every((e) => e.inheritedFrom === inFiring.inheritedFrom)
+									? inFiring.inheritedFrom : undefined,
+								providedPorts: inFiring.providedPorts,
+								inheritedPorts: inFiring.inheritedPorts,
 								costUsd: allRelated.reduce((sum, e) => sum + (e.costUsd || 0), 0),
 								inheritedCostUsd: allRelated.reduce((sum, e) => sum + (e.inheritedFrom ? e.costUsd : 0), 0),
 								inheritedCostUnknown: allRelated.some((e) => e.inheritedFrom && e.costUnknown),
-								// An unknown member cost keeps the group honest too: the
+								// An unknown member cost keeps the loop honest too: the
 								// summed figure alone would read as the full price.
 								costUnknown: allRelated.some((e) => e.costUnknown),
-								credentialOwner: groupCredentialOwner(allRelated),
+								credentialOwner: credentialOwner(allRelated),
 								logs: [],
-								executionId: inExec.executionId,
-								frames: inExec.frames,
-								framesKey: inExec.framesKey,
+								runId: inFiring.runId,
+								frames: inFiring.frames,
+								framesKey: inFiring.framesKey,
 							};
 						});
+					} else if (isScopeBoxNodeType(nodeType)) {
+						// A group or an include is a scope, no node: its box is
+						// painted from the copies the run decided and from what
+						// ran inside each.
+						firings = scopeFirings(scopeBox(n.id, nodeType, ctx));
 					} else {
-						executions = nodeExecutions[execKey(n.id)] || [];
+						firings = nodeFirings[firingKey(n.id)] || [];
 					}
 
-					// Derive SvelteFlow wrapper class from the latest execution status
-					const latestExec = executions[executions.length - 1];
-					const execStatus = latestExec?.status;
+					// Derive SvelteFlow wrapper class from the latest run status
+					const latestFiring = firings[firings.length - 1];
+					const firingStatus = latestFiring?.status;
 					// A node outside the followed run's scope is "not in this run":
 					// dimmed, no status class, never skipped or empty. One more
 					// case of the dimming the subgraph highlight already paints.
 					// A scope names places, which are compiled nodes: a box (a
-					// container, an include) is never one, its In boundary is.
-					const placeId = isBoundaryBoxNodeType(nodeType) ? boundaryInId(n.id) : n.id;
+					// container, an include) is never one, so it is in the run
+					// when something inside it is.
 					const notInRun = ctx.runScope !== undefined && ctx.runScope !== null
-						&& !ctx.runScope.has(locatedKey(placeId, ctx.callPath)) && executions.length === 0;
+						&& !boxInRun(n.id, nodeType, ctx.runScope, ctx) && firings.length === 0;
 					// Inheritance is NOT one of these: it is orthogonal to
 					// status, and the node components paint it themselves
-					// (`node-inherited-glow`, from `latestExecution.inheritedFrom`).
+					// (`node-inherited-glow`, from `latestFiring.inheritedFrom`).
 					// Branching on it here cost an inherited node its status
 					// class, so an inherited group lost `node-completed`, which
 					// is what `GroupNode`'s own styling keys off, and the class
 					// it gained instead (`node-inherited`) is defined nowhere.
 					const nodeClass = notInRun ? 'run-dimmed'
-						: execStatus === 'running' ? 'node-running'
-						: execStatus === 'waiting_for_input' ? 'node-waiting'
-						: execStatus === 'failed' ? 'node-failed'
-						: execStatus === 'completed' || execStatus === 'skipped' ? 'node-completed'
+						: firingStatus === 'running' ? 'node-running'
+						: firingStatus === 'waiting_for_input' ? 'node-waiting'
+						: firingStatus === 'failed' ? 'node-failed'
+						: firingStatus === 'completed' || firingStatus === 'skipped' ? 'node-completed'
 						: '';
 
 					// Bus panels: for an ordinary node, the buses this node
@@ -2060,11 +2137,11 @@
 					// every internal node's bus participation (so the
 					// group's modal shows the conversations its members
 					// had with each other or with the outside).
-					const busIdsForNode = new Set<string>(busesByNode[execKey(n.id)] ?? []);
+					const busIdsForNode = new Set<string>(busesByNode[firingKey(n.id)] ?? []);
 					if (isContainerNodeType(n.data?.nodeType)) {
 						for (const projNode of ctx.projectNodes) {
 							if (projNode.scope?.includes(n.id)) {
-								for (const busId of busesByNode[execKey(projNode.id)] ?? []) {
+								for (const busId of busesByNode[firingKey(projNode.id)] ?? []) {
 									busIdsForNode.add(busId);
 								}
 							}
@@ -2081,28 +2158,29 @@
 					}));
 
 					const loopEvents = isLoopNodeType(n.data?.nodeType)
-						? (loopEventsByGroup[execKey(n.id)] ?? [])
+						? (loopEventsByGroup[firingKey(n.id)] ?? [])
 						: [];
 
-					// Per-node infra badge (status snapshot from the host): the
-					// instance at this view's place, through the one lookup.
-					const backendNode = infraStatusOf(n.id);
+					// The trigger's or infra node's badge, from the status the
+					// dispatcher computed: the entry at this view's place.
+					const lifecycleBadge = lifecycleBadgeOf(n.id, ctx.status);
 
 					// What this node is showing, if it shows anything. Own-property
 					// read: node ids come off the wire, and a node literally named
 					// 'constructor' would otherwise resolve a prototype function
 					// as its display.
-					const bodyFeed = nodeHasDisplay({
-						nodeType,
-						requiresInfra: n.data.requiresInfra as boolean | undefined,
-						features: n.data.features as
-							{ isTrigger?: boolean; liveEndpoint?: string } | undefined,
-					})
-						? ownValue(ctx.displayByNode, n.id)
-						: undefined;
+					const bodyFeed = bodyFeedOf(
+						{
+							nodeType,
+							requiresInfra: n.data.requiresInfra as boolean | undefined,
+							features: n.data.features as
+								{ isTrigger?: boolean; liveEndpoint?: string } | undefined,
+						},
+						ownValue(ctx.displayByNode, n.id),
+					);
 
 					// Subgraph highlight wins the class slot while active; the
-					// execution-status class paints otherwise.
+					// run-status class paints otherwise.
 					const cls = subgraphNodeIds
 						? (subgraphNodeIds.has(n.id) ? highlightedClass : dimmedClass)
 						: nodeClass;
@@ -2111,21 +2189,16 @@
 						...n,
 						data: {
 							...n.data,
-							runTarget: ctx.runTargets.has(n.id),
 							debugData,
-							executions,
+							firings,
 							busLogs,
 							loopEvents,
 							journalCorruptions,
-							executionTags,
+							runTags,
 							runTerminal,
 							fileContents: ctx.fileContents,
 							bodyFeed,
-							infraNodeStatus: backendNode?.status,
-							infraInstanceCopies: backendNode?.instanceCopyCount,
-							infraFailureStage: backendNode?.failureStage,
-							infraFailureMessage: backendNode?.failureMessage,
-							infraProgress: backendNode?.progress,
+							lifecycleBadge,
 						},
 						class: cls,
 					};
@@ -2185,7 +2258,7 @@
 		});
 	});
 
-	// OVERLAY refresh: when any dynamic source ticks (execution SSE, infra
+	// OVERLAY refresh: when any dynamic source ticks (run SSE, infra
 	// badges, file contents, body feeds, subgraph toggles), re-decorate the
 	// CURRENT arrays in place (positions, selection, mid-gesture state are
 	// preserved because decorate only spreads).
@@ -2231,7 +2304,19 @@
 	// a check that lands waits for the release.
 	let pointerHeld = false;
 	let resizeCheckAfterRelease = false;
-	const holdPointer = () => { pointerHeld = true; };
+	// Where the pointer last was, in window coordinates: what a group toggle's
+	// zoom is centered on. Null while the pointer is outside the window (or
+	// before it first came in), so a zoom never centers on where it left.
+	let lastPointer: { clientX: number; clientY: number } | null = null;
+	const trackPointer = (e: PointerEvent) => { lastPointer = { clientX: e.clientX, clientY: e.clientY }; };
+	// `pointerout` with nothing it moved into is the pointer leaving the window.
+	const forgetPointer = (e: PointerEvent) => { if (!e.relatedTarget) lastPointer = null; };
+	const holdPointer = (e: PointerEvent) => {
+		pointerHeld = true;
+		trackPointer(e);
+		// The person took hold of the canvas: a group toggle's zoom stops where it is.
+		stopGroupZoom();
+	};
 	const releasePointer = () => {
 		pointerHeld = false;
 		if (resizeCheckAfterRelease) { resizeCheckAfterRelease = false; scheduleResizeCheck(); }
@@ -2239,10 +2324,14 @@
 	// Capture phase, so a node that stops the event from bubbling still counts.
 	$effect(() => {
 		window.addEventListener('pointerdown', holdPointer, true);
+		window.addEventListener('pointermove', trackPointer, true);
+		window.addEventListener('pointerout', forgetPointer, true);
 		window.addEventListener('pointerup', releasePointer, true);
 		window.addEventListener('pointercancel', releasePointer, true);
 		return () => {
 			window.removeEventListener('pointerdown', holdPointer, true);
+			window.removeEventListener('pointermove', trackPointer, true);
+			window.removeEventListener('pointerout', forgetPointer, true);
 			window.removeEventListener('pointerup', releasePointer, true);
 			window.removeEventListener('pointercancel', releasePointer, true);
 		};
@@ -2250,6 +2339,7 @@
 	onDestroy(() => {
 		destroyed = true;
 		if (resizeCheckTimer) { clearTimeout(resizeCheckTimer); resizeCheckTimer = null; }
+		stopGroupZoom();
 	});
 	/// Debounced so a burst of streaming updates (and the frames a resize takes to
 	/// settle) triggers one check, not dozens.
@@ -2273,7 +2363,7 @@
 		// differ from, and a removed one leaves nothing to overlap.
 		const resized = base !== undefined && [...now].some(([id, size]) => base.has(id) && base.get(id) !== size);
 		if (!resized) { laidOutFor.set(layoutVerb, now); return; }
-		// No fitView (don't yank the camera mid-execution); non-undoable (an
+		// No fitView (don't yank the camera mid-run); non-undoable (an
 		// automatic re-flow is not a user action, must not pollute the undo stack).
 		void runAutoOrganize(false, false);
 	}
@@ -2289,103 +2379,149 @@
 
 	let contextMenu = $state<{ x: number; y: number; flowX: number; flowY: number; nodeId: string | null } | null>(null);
 
-	/// Targets the graph still holds. A targeted node the user then deleted
-	/// is dropped here rather than sent to a dispatcher that would refuse it.
-	const liveRunTargets = $derived([...pruneTargets(runTargets, nodes)]);
-	// And the STATE prunes itself too (the derived view above covers the
-	// same render tick): without this, deleting a targeted node and later
-	// re-creating one with the same id would bring it back already
-	// targeted, showing "Unset target" on a node the user never aimed at.
-	$effect(() => {
-		const pruned = pruneTargets(runTargets, nodes);
-		if (pruned.size !== runTargets.size) runTargets = new Set(pruned);
-	});
+	/// The latest status answer, or the empty one before any arrived.
+	const statusNow = $derived(status ?? emptyActionAvailability());
 
-	/// What the aimed run executes, read off the graph: whether its joined
-	/// subgraph touches any trigger (if not, the action bar offers Run
-	/// beside the trigger lifecycle), and which infra nodes it holds.
-	// Read off the PROJECTION, not the rendered graph: a collapsed
-	// ancestor re-parents (or hides) what it holds for drawing, and the
-	// facts of a run are about the program, not the picture.
-	const runTargetFactsLive = $derived(
-		runTargetFacts(
-			liveRunTargets,
-			fold.project.nodes.map((n) => ({
-				id: n.id,
-				isTrigger: nodeIsTrigger(n),
-				isInfra: nodeRequiresInfra(n),
-				parentId: n.parentId,
-			})),
-			fold.project.edges,
-		),
-	);
-
-	/// The aimed run is ready infra-wise when every infra node in ITS
-	/// subgraph reports running. Infra elsewhere in the project has no
-	/// say: a targeted run never touches it.
-	const runTargetsInfraReady = $derived(
-		runTargetFactsLive.infraIds.every((id) => infraStatusOf(id)?.status === 'running'),
-	);
-
-	/// The infra placement behind a node on screen: the one at THIS view's
-	/// place (`addressOf(callPath, id)`), never another call's. A view
-	/// that is no place names no placement, whatever the status holds.
-	function infraStatusOf(nodeId: string) {
+	/// The status entries behind a node on screen: the ones at THIS
+	/// view's place (`addressOf(callPath, id)`), never another call's. A
+	/// view that is no place names no entry, whatever the status holds.
+	function infraStatusOf(nodeId: string, from: typeof status = status) {
 		if (!interactive) return undefined;
 		const place = addressOf(callPath, nodeId);
-		return infraNodes?.find((inf) => inf.node === place);
+		return from?.infraNodes.find((inf) => inf.node === place);
+	}
+	function triggerStatusOf(nodeId: string, from: typeof status) {
+		if (!interactive) return undefined;
+		const place = addressOf(callPath, nodeId);
+		return from?.triggers.find((t) => t.node === place);
 	}
 
-	/// The one funnel every "run" gesture goes through (the action bar's
-	/// button, Ctrl+Enter), so the place check lives here and not on
-	/// each gesture: a view that is no place in the program cannot start
-	/// a run, and says so rather than starting one silently.
-	function runWithTargets(): void {
-		if (!interactive) {
-			toast.error('This file was opened on its own, so there is nothing to run here. Open src/main.weft and run from there.');
+	/// The badge a trigger or infra node wears, when the status names it.
+	function lifecycleBadgeOf(nodeId: string, from: typeof status) {
+		const infra = infraStatusOf(nodeId, from);
+		if (infra) return infraBadge(infra, from?.instanceInfra ?? [], Date.now() / 1000);
+		const trigger = triggerStatusOf(nodeId, from);
+		return trigger ? triggerBadge(trigger) : undefined;
+	}
+
+	// ── The contextual bar ────────────────────────────────────────────────
+	/// The nodes selected right now (annotations are notes, never acted
+	/// on), in the order the canvas holds them.
+	const selectedIds = $derived(nodes.filter((n) => n.selected && n.type !== 'annotation').map((n) => n.id));
+	/// The same nodes as the contextual bar reads them, each by its place.
+	const selectedForBar = $derived<Array<SelectedNode & { id: string }>>(
+		selectedIds.flatMap((id) => {
+			const node = fold.project.nodes.find((n) => n.id === id);
+			return node
+				? [{ id, place: addressOf(callPath, id), isTrigger: nodeIsTrigger(node), isInfra: nodeRequiresInfra(node), perInstance: !!node.perInstance }]
+				: [];
+		}),
+	);
+	/// The selected nodes Run runs: all but the triggers and the infra.
+	const runnable = $derived(runTargetsOf(selectedForBar));
+
+	/// What stops a run of the selection whatever weft says.
+	const runBlocked = $derived(
+		!interactive
+			? 'This file was opened on its own, so there is nothing to run here. Open src/main.weft and run from there.'
+			: null,
+	);
+
+	const verbInputs = $derived<VerbInputs>({
+		removing: actionBarState.backend.removing,
+		available: actionBarState.backend.available,
+		hasInfra: hasInfraInGraph,
+		hasTriggers: hasTriggersInGraph,
+		infraRollup: actionBarState.backend.infraRollup,
+		status: actionBarState.backend.status,
+		transition: actionBarState.backend.transition,
+		infraBusy: actionBarState.backend.infraBusy,
+	});
+	/// A verb or a build in flight: the contextual bar waits for it.
+	const verbsBlocked = $derived(
+		actionBarState.overlay.kind === 'cli_running'
+			|| actionBarState.overlay.kind === 'pending'
+			|| actionBarState.backend.transition === 'building'
+			|| actionBarState.backend.transition === 'cancelling_build',
+	);
+
+	/// The selection as a run names it: each node by its place.
+	const runTargets = $derived(runnable.map((n) => n.place));
+	/// What the walk's answer depends on, by value: the targets and the
+	/// source the engine holds now. Every change of the program advances
+	/// that source (the text tab or an outside writer through
+	/// `applyExternalSource`, a canvas edit once the host confirms it),
+	/// while the `project` prop only changes on a fresh mount. A `nodes`
+	/// array replaced around an unchanged selection and source (a run
+	/// event, a status refresh) keeps the key, so the walk is not asked.
+	const runKey = $derived(runCheckKey(runTargets, engine.truth.weftCode));
+	/// weft's answer for the selection on screen (`weft run --check`):
+	/// its refusal, or the infra the run reads; `undefined` while it is
+	/// asked.
+	let runCheck = $state<RunCheck | undefined>(undefined);
+	$effect(() => {
+		void runKey;
+		const asked = untrack(() => runTargets);
+		runCheck = undefined;
+		if (!checkRun || runBlocked || asked.length === 0) return;
+		let current = true;
+		// A selection dragged across the canvas changes on every node it
+		// passes: ask once it settles.
+		const timer = setTimeout(() => {
+			checkRun(asked as [string, ...string[]]).then(
+				(answer) => { if (current) runCheck = answer; },
+				(err) => { if (current) runCheck = { ok: false, refusal: err instanceof Error ? err.message : String(err) }; },
+			);
+		}, 300);
+		return () => {
+			current = false;
+			clearTimeout(timer);
+		};
+	});
+	/// Whether Run may go, and why not: the one rule the bar's Run
+	/// button and every run gesture read, or `undefined` when it may.
+	const runWhy = $derived(
+		runUnavailable({ blocked: verbsBlocked, offered: isVerbOffered('run', verbInputs), runBlocked, check: runCheck, status: statusNow }),
+	);
+
+	/// The one funnel every "run" gesture goes through (the contextual
+	/// bar's Run, Ctrl+Enter): the selected nodes, each by its place.
+	function runSelection(): void {
+		// An editor given no way to run, or to check one, has no Run.
+		if (!onRun || !checkRun) return;
+		const [first, ...rest] = runTargets;
+		if (first === undefined) {
+			toast.info(whyNothingToRun(selectedForBar));
 			return;
 		}
-		onRun?.(liveRunTargets);
+		if (runWhy) {
+			toast.error(runWhy);
+			return;
+		}
+		onRun([first, ...rest]);
 	}
 
-	/// The run spec dialog: `null` closed, else the spec it opened with.
-	let specDialogInitial = $state<RunSpec | null>(null);
-	let specDialogOpen = $state(false);
-	/// The group the user stands in (an include's alias chain), so the
-	/// dialog and the Run menu put it first.
-	const focusedGroup = $derived(groupOfCallPath(callPath));
-	const menuSpecs = $derived(orderSpecsForMenu(specs, focusedGroup));
-	function openSpecDialog(initial: RunSpec): void {
-		specDialogInitial = initial;
-		specDialogOpen = true;
-	}
-	$effect(() => {
-		if (!specDialogOpen) specDialogInitial = null;
-	});
-	// The dialog runs a spec spelled for the view it opened in. A view
-	// that stops being a place (another file picked in the explorer
-	// while it is open) has no run to start, and the spec's addresses
-	// belong to the file that is gone, so the dialog closes with it.
-	$effect(() => {
-		if (!interactive) specDialogOpen = false;
-	});
+	/// How far the followed run got, for the bottom bar.
+	const followedProgress = $derived(
+		actionBarState.overlay.kind === 'run_running' && runState
+			? runProgress(runState.nodeFirings, runState.scope)
+			: undefined,
+	);
+
 	/// The followed run's version differs from the files on disk.
 	const versionMismatch = $derived.by(() => {
-		const v = executionState?.version;
+		const v = runState?.version;
 		if (!v || !v.version) return null;
 		return v.version !== v.diskVersion ? v.version : null;
 	});
 	// An OPEN node menu closes itself when its target can no longer fill it:
 	// the node vanished from the graph (deleted from the text tab in another
-	// column while the menu was open), or, in simplified view, its only menu
-	// content (infra lifecycle actions) disappeared mid-execution. Same
-	// predicates that gate rendering the items, so open-time and stay-open
-	// agree and an empty popover shell can never linger. The empty-area menu
-	// (no nodeId) always has Undo/Redo, never empties.
+	// column while the menu was open). The empty-area menu (no nodeId)
+	// always has Undo/Redo, never empties.
 	$effect(() => {
 		if (!contextMenu?.nodeId) return;
 		const target = nodes.find(n => n.id === contextMenu!.nodeId);
-		if (!target || (simplified && !nodeInfraActions(contextMenu.nodeId).has)) {
+		if (!target || !nodeMenuHasItems()) {
 			contextMenu = null;
 		}
 	});
@@ -2397,7 +2533,7 @@
 	let tagEditor = $state<{ nodeId: string; x: number; y: number } | null>(null);
 
 	// Apply a `_tags` change to a node through the SAME edit path config edits
-	// use (createNodeUpdateHandler diffs it into a setConfig op + autosave).
+	// use (createNodeUpdateHandler diffs it into a set_config op + autosave).
 	function setNodeTags(nodeId: string, next: string[]) {
 		// Read the CURRENT config from projection truth (`fold`), NOT the render
 		// `nodes` array. `_tags` is a source key, so it only repaints into `nodes`
@@ -2409,7 +2545,7 @@
 		if (!node) return;
 		// An empty tag list means "no tags", i.e. REMOVE the key, not `_tags: []`
 		// (which would leave a `_tags = []` cruft line in source). diffConfigOps
-		// emits a removeConfig only for a key that is PRESENT-but-undefined in the
+		// emits a remove_config only for a key that is PRESENT-but-undefined in the
 		// update (a key merely absent is never visited), so pass `undefined` for the
 		// empty case rather than omitting or writing `[]`.
 		const config = {
@@ -2523,7 +2659,9 @@
 	}
 
 	/// The drawn expanded state: the unconnected-access pin wins, then
-	/// config, else collapsed (containers too: every group and loop starts closed). THE one rule for every sizing
+	/// config, which `buildNodes` filled from the layout entry or the node's
+	/// default (`expandedOf`: closed, except an included file's own group),
+	/// else collapsed. THE one rule for every sizing
 	/// and containment reader, so no path can draw a pinned node
 	/// collapsed under its open body (ProjectNode's render derived is
 	/// the same expression over `data.pinnedOpen`).
@@ -2562,35 +2700,18 @@
 
 
 	function doFitView(padding = 0.2) {
-		const flowContainer = document.querySelector('.svelte-flow');
-		if (!flowContainer) return;
-		const rect = flowContainer.getBoundingClientRect();
-		const containerW = rect.width;
-		const containerH = rect.height;
-		if (containerW === 0 || containerH === 0) return;
+		const screen = canvasSize();
+		if (!screen) return;
+		const containerW = screen.width;
+		const containerH = screen.height;
 
 		// Compute bounding box of visible, measured nodes (using absolute positions)
 		const visibleNodes = nodes.filter(n => !n.hidden && n.measured?.width && n.measured?.height);
 		if (visibleNodes.length === 0) return;
 
-		// For child nodes, compute absolute position by walking up parentId chain
-		function getAbsPos(node: Node): { x: number; y: number } {
-			let x = node.position.x;
-			let y = node.position.y;
-			if (node.parentId) {
-				const parent = nodes.find(n => n.id === node.parentId);
-				if (parent) {
-					const parentAbs = getAbsPos(parent);
-					x += parentAbs.x;
-					y += parentAbs.y;
-				}
-			}
-			return { x, y };
-		}
-
 		let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
 		for (const n of visibleNodes) {
-			const abs = getAbsPos(n);
+			const abs = getAbsolutePosition(n);
 			minX = Math.min(minX, abs.x);
 			minY = Math.min(minY, abs.y);
 			maxX = Math.max(maxX, abs.x + (n.measured!.width ?? 0));
@@ -2603,17 +2724,16 @@
 
 		const padW = containerW * padding;
 		const padH = containerH * padding;
-		const zoom = Math.min(
+		const clampedZoom = clampZoom(Math.min(
 			(containerW - padW) / contentW,
 			(containerH - padH) / contentH,
-			2  // maxZoom
-		);
-		const clampedZoom = Math.max(0.05, Math.min(zoom, 2));
+		));
 		const centerX = (minX + maxX) / 2;
 		const centerY = (minY + maxY) / 2;
 		const x = containerW / 2 - centerX * clampedZoom;
 		const y = containerH / 2 - centerY * clampedZoom;
 
+		stopGroupZoom();
 		setViewport({ x, y, zoom: clampedZoom });
 	}
 
@@ -2666,7 +2786,7 @@
 	// `undoable`: a user-initiated organize (palette button, collapse/expand,
 	// first-show) records an undo entry; an AUTOMATIC re-flow (a node resized
 	// because live-display content arrived) persists without one, so a streaming
-	// execution can't bury the user's real edits under reflow frames.
+	// run can't bury the user's real edits under reflow frames.
 	// Outcome of an organize: it APPLIED, or it bailed because the active view
 	// CHANGED mid-run (the new view's own rebuild organizes it if it needs
 	// it), or because the component was DESTROYED, or ELK FAILED (nothing
@@ -2933,7 +3053,7 @@
 				saveProject();
 				break;
 			case 'run':
-				runWithTargets();
+				runSelection();
 				break;
 			case 'undo':
 				undo();
@@ -2944,6 +3064,13 @@
 			case 'selectAll':
 				nodes = nodes.map(n => ({ ...n, selected: true }));
 				break;
+			case 'selectTriggers': {
+				// Acting on every trigger is selecting every trigger: the
+				// contextual bar then offers each action once, counted.
+				const triggers = new Set(fold.project.nodes.filter((n) => nodeIsTrigger(n)).map((n) => n.id));
+				nodes = nodes.map(n => (!!n.selected === triggers.has(n.id) ? n : { ...n, selected: triggers.has(n.id) }));
+				break;
+			}
 			case 'fitView':
 				doFitView();
 				break;
@@ -2973,7 +3100,7 @@
 					.filter(e => !doomed.has(e.source) && !doomed.has(e.target))
 					.map(e => {
 						const ref = toWeftEdgeRef(e.source, e.sourceHandle || 'value', e.target, e.targetHandle || 'value');
-						return { op: 'removeEdge' as const, source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
+						return { op: 'remove_edge' as const, source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
 					});
 				contextMenu = null;
 				transaction(() => {
@@ -3065,8 +3192,27 @@
 			if (walked.kind === 'unparsed') return true;
 			sourceType = walked.type;
 		}
+		return wireTypesFit(sourceType, targetType, nodeTypeParams(connection.target!));
+	}
+
+	/** The bounds on a node's type variables: the parse's, or, for a node
+	 *  added here and not parsed yet, its node type's. */
+	function nodeTypeParams(nodeId: string): TypeParamWire[] | undefined {
+		const node = nodes.find(n => n.id === nodeId);
+		if (!node) return undefined;
+		return (node.data.typeParams as TypeParamWire[] | undefined)
+			?? NODE_TYPE_CONFIG[node.data.nodeType as string]?.typeParams;
+	}
+
+	/** May a wire carrying `sourceType` land on a port typed `targetType`
+	 *  of a node bounding its type variables with `targetParams`? The
+	 *  frontend mirror of the compiler's rules; a type this side cannot
+	 *  parse passes (the compiler is the authority on those). */
+	function wireTypesFit(sourceType: string | null, targetType: string | null, targetParams: readonly TypeParamWire[] | undefined): boolean {
+		if (sourceType === null || targetType === null) return true;
 		if (parseWeftType(sourceType) === null || parseWeftType(targetType) === null) return true;
-		return isWeftTypeCompatible(sourceType, targetType);
+		return isWeftTypeCompatible(sourceType, targetType)
+			&& !typeVarBoundRefuses(sourceType, targetType, targetParams);
 	}
 
 	// Track current connection line color based on source handle
@@ -3125,8 +3271,8 @@
 		const oldRef = toWeftEdgeRef(oldEdge.source, oldEdge.sourceHandle || 'value', oldEdge.target, oldEdge.targetHandle || 'value');
 		const newRef = toWeftEdgeRef(newConnection.source, newConnection.sourceHandle || 'value', newConnection.target, newConnection.targetHandle || 'value');
 		recordEdit([
-			{ op: 'removeEdge', source: oldRef.srcRef, sourcePort: oldRef.srcPort, target: oldRef.tgtRef, targetPort: oldRef.tgtPort, scopeGroup: oldRef.scopeGroupLabel ?? null },
-			{ op: 'addEdge', source: newRef.srcRef, sourcePort: newRef.srcPort, target: newRef.tgtRef, targetPort: newRef.tgtPort, scopeGroup: newRef.scopeGroupLabel ?? null, ...(path.length > 0 ? { path } : {}) },
+			{ op: 'remove_edge', source: oldRef.srcRef, sourcePort: oldRef.srcPort, target: oldRef.tgtRef, targetPort: oldRef.tgtPort, scopeGroup: oldRef.scopeGroupLabel ?? null },
+			{ op: 'add_edge', source: newRef.srcRef, sourcePort: newRef.srcPort, target: newRef.tgtRef, targetPort: newRef.tgtPort, scopeGroup: newRef.scopeGroupLabel ?? null, ...(path.length > 0 ? { path } : {}) },
 		]);
 	}
 
@@ -3135,10 +3281,10 @@
 		reconnectingPath = [];
 		if (simplified) return; // no wiring edits in simplified view
 		// Reconnect dropped on empty space = remove the edge (the gesture's
-		// meaning, expressed as the same removeEdge op a delete uses).
+		// meaning, expressed as the same remove_edge op a delete uses).
 		if (!reconnectSuccessful) {
 			const ref = toWeftEdgeRef(edge.source, edge.sourceHandle || 'value', edge.target, edge.targetHandle || 'value');
-			recordEdit([{ op: 'removeEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null }]);
+			recordEdit([{ op: 'remove_edge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null }]);
 		}
 		reconnectSuccessful = false;
 	}
@@ -3214,14 +3360,13 @@
 		// through the one rollback path. Returning null tells xyflow not to add
 		// its own optimistic edge (the projection's re-derive paints it).
 		const ref = toWeftEdgeRef(connection.source!, connection.sourceHandle || 'value', connection.target!, connection.targetHandle || 'value');
-		recordEdit([{ op: 'addEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null }]);
+		recordEdit([{ op: 'add_edge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null }]);
 		return null;
 	}
 
 	function getViewportCenter(): { x: number; y: number } {
-		const flowContainer = document.querySelector('.svelte-flow');
-		if (flowContainer) {
-			const rect = flowContainer.getBoundingClientRect();
+		if (canvasEl) {
+			const rect = canvasEl.getBoundingClientRect();
 			return screenToFlowPosition({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
 		}
 		return { x: 250, y: 150 };
@@ -3255,10 +3400,10 @@
 		nodes = nodes.map(n => (n.selected ? { ...n, selected: false } : n));
 		selectedNodeId = id;
 		const op: EditOp = isLoop
-			? { op: 'addLoop', label: containerLabel!, parentGroup: null }
+			? { op: 'add_loop', label: containerLabel!, parentGroup: null }
 			: isGroup
-				? { op: 'addGroup', label: containerLabel!, parentGroup: null }
-				: { op: 'addNode', id, nodeType: type, parentGroup: null };
+				? { op: 'add_group', label: containerLabel!, parentGroup: null }
+				: { op: 'add_node', id, nodeType: type, parentGroup: null };
 		// A connection drag dropped on empty canvas opened this menu: finish
 		// the gesture by wiring the picked node to the drag's origin in the
 		// SAME batch (one gesture, one undo unit). The wire lands on the first
@@ -3276,26 +3421,26 @@
 				&& !(origin.data.config as Record<string, string>)?.parentId
 				&& !(wire.handle ?? '').endsWith('__inner');
 			if (originTopLevel) {
-				const compatible = (from: string | null, to: string | null): boolean =>
-					from === null || to === null
-					|| parseWeftType(from) === null || parseWeftType(to) === null
-					|| isWeftTypeCompatible(from, to);
 				const template = NODE_TYPE_CONFIG[type];
 				const originType = handlePortType(wire.nodeId, wire.handle, wire.side);
 				if (wire.side === 'source') {
 					const input = (template?.defaultInputs ?? []).find(
-						p => acceptsWire(p) && compatible(originType, p.portType),
+						p => acceptsWire(p) && wireTypesFit(originType, p.portType, template?.typeParams),
 					);
 					if (input) {
 						const ref = toWeftEdgeRef(wire.nodeId, wire.handle || 'value', id, input.name);
-						edgeOp = { op: 'addEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
+						edgeOp = { op: 'add_edge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
 					}
 				} else if (!vetoLiteralDrivenTarget(wire.nodeId, wire.handle)) {
 					// Dragged backwards from an input: the new node drives it.
-					const output = (template?.defaultOutputs ?? []).find(p => compatible(p.portType, originType));
+					// Never `_error`: a failure is not what a dragged
+					// input asks to be driven by.
+					const output = outputRows(template?.defaultOutputs ?? []).find(
+						p => wireTypesFit(p.portType, originType, nodeTypeParams(wire.nodeId)),
+					);
 					if (output) {
 						const ref = toWeftEdgeRef(id, output.name, wire.nodeId, wire.handle || 'value');
-						edgeOp = { op: 'addEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
+						edgeOp = { op: 'add_edge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
 					}
 				}
 			}
@@ -3318,9 +3463,9 @@
 	function deleteNodes(nodeIds: string[]) {
 		if (nodeIds.length === 0) return;
 
-		// Classify each id: containers route by kind (`removeLoop` vs
-		// `removeGroup`; the Rust side rejects a mismatch loudly), everything
-		// else is `removeNode`. Projection-built containers always carry their
+		// Classify each id: containers route by kind (`remove_loop` vs
+		// `remove_group`; the Rust side rejects a mismatch loudly), everything
+		// else is `remove_node`. Projection-built containers always carry their
 		// kind in data.nodeType. The visual removal (and a removed group's
 		// children climbing into the parent scope) comes from the projection.
 		const containers = new Map<string, 'Group' | 'Loop'>();
@@ -3342,14 +3487,14 @@
 		const layoutKeysToDrop: string[] = [];
 		for (const nodeId of nodeIds) {
 			if (!containers.has(nodeId)) {
-				ops.push({ op: 'removeNode', node: nodeId });
+				ops.push({ op: 'remove_node', node: nodeId });
 				layoutKeysToDrop.push(nodeId);
 			}
 		}
 		// Container removals DEEPEST-FIRST: ungrouping a container re-keys its
 		// children (a nested `outer.inner` becomes `inner` when `outer`
 		// dissolves), so removing the parent first would leave a later
-		// `removeGroup outer.inner` unresolvable ("node not found"). Removing the
+		// `remove_group outer.inner` unresolvable ("node not found"). Removing the
 		// deepest container first never touches a shallower one's id (children
 		// climb INTO the shallower container, whose id is unchanged), so every op
 		// resolves and the final ids match computeUngroupLayoutMoves' mapping.
@@ -3357,7 +3502,7 @@
 			(a, b) => b[0].split('.').length - a[0].split('.').length,
 		);
 		for (const [nodeId, kind] of containersDeepFirst) {
-			ops.push(kind === 'Loop' ? { op: 'removeLoop', loopId: nodeId } : { op: 'removeGroup', group: nodeId });
+			ops.push(kind === 'Loop' ? { op: 'remove_loop', loopId: nodeId } : { op: 'remove_group', group: nodeId });
 			layoutKeysToDrop.push(nodeId);
 		}
 		// A removed container UNGROUPS: every node under it climbs out, its
@@ -3523,7 +3668,7 @@
 	// Right-click on a wire: read a key off the value it carries. The menu
 	// lists the fields one level below the wire's current path (a record
 	// type on the source port), and picking one rewrites the wire as
-	// removeEdge + addEdge with the longer path.
+	// remove_edge + add_edge with the longer path.
 	let edgeMenu = $state<{ x: number; y: number; edgeId: string } | null>(null);
 
 	function onEdgeContextMenu({ edge, event }: { edge: Edge; event: MouseEvent | TouchEvent }) {
@@ -3553,11 +3698,11 @@
 
 	function rewireWithPath(edge: import('../../types').Edge, path: string[]) {
 		const ref = toWeftEdgeRef(edge.source, edge.sourceHandle || 'value', edge.target, edge.targetHandle || 'value');
-		// One op: addEdge replaces the port's driver in place, so the wire
+		// One op: add_edge replaces the port's driver in place, so the wire
 		// keeps the spelling it was written in (braces or statement).
-		// A removeEdge first would erase that spelling before the add saw it.
+		// A remove_edge first would erase that spelling before the add saw it.
 		recordEdit([
-			{ op: 'addEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null, ...(path.length > 0 ? { path } : {}) },
+			{ op: 'add_edge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null, ...(path.length > 0 ? { path } : {}) },
 		]);
 		edgeMenu = null;
 	}
@@ -3803,17 +3948,11 @@
 		}
 	}
 
-	/** Whether a node's context menu has any INFRA lifecycle action (stop/terminate).
-	 *  The one source of truth for "infra actions present", used both to decide
-	 *  whether to open the menu in simplified view and to render the infra section. */
-	function nodeInfraActions(nodeId: string | null): { stop: boolean; terminate: boolean; has: boolean } {
-		const infra = nodeId ? infraStatusOf(nodeId) : undefined;
-		// A place with no shared copy (never started, or one per instance)
-		// has nothing to stop or terminate here.
-		const hasCopy = !!infra && infra.status !== 'not_started' && infra.status !== 'per_instance';
-		const stop = hasCopy && (infra.status === 'running' || infra.status === 'flaky');
-		const terminate = hasCopy && infra.status !== 'terminating';
-		return { stop, terminate, has: stop || terminate };
+	/** Whether a node's context menu has anything to show: every item in
+	 *  it is a structural edit, which simplified view hides. The one
+	 *  predicate for opening the menu, keeping it open, and rendering it. */
+	function nodeMenuHasItems(): boolean {
+		return !simplified;
 	}
 
 	function onContextMenu(event: MouseEvent) {
@@ -3822,11 +3961,9 @@
 		const flowPos = screenToFlowPosition({ x: event.clientX, y: event.clientY });
 		const clickedNodeId = findNodeAtPosition(event.clientX, event.clientY);
 
-		// Simplified view hides the structural node-menu items (Duplicate/Delete),
-		// leaving only infra lifecycle actions. A node with no infra actions would
-		// open an empty popover, so don't open the menu at all in that case. (The
-		// empty-area menu still has Undo/Redo, so it's never empty.)
-		if (simplified && clickedNodeId && !nodeInfraActions(clickedNodeId).has) {
+		// A node menu with nothing in it would open an empty popover, so it
+		// does not open at all. (The empty-area menu still has Undo/Redo.)
+		if (clickedNodeId && !nodeMenuHasItems()) {
 			contextMenu = null;
 			return;
 		}
@@ -3925,8 +4062,8 @@
 				// null (unset = key absent), and formatConfigValue throws
 				// loudly if that invariant ever breaks.
 				ops.push(isLoop
-					? { op: 'setLoopConfig', loopId: scopedId, key, value: formatConfigValue(value) }
-					: { op: 'setConfig', node: scopedId, key, value: formatConfigValue(value) });
+					? { op: 'set_loop_config', loopId: scopedId, key, value: formatConfigValue(value) }
+					: { op: 'set_config', node: scopedId, key, value: formatConfigValue(value) });
 			}
 		};
 		// Copy a decl's written PORT values onto its copy, each in the form
@@ -3967,8 +4104,8 @@
 					newIds.push(scopedId);
 					const cfg = config as Record<string, number> | undefined;
 					ops.push(isLoop
-						? { op: 'addLoop', label, parentGroup: parentId ?? null }
-						: { op: 'addGroup', label, parentGroup: parentId ?? null });
+						? { op: 'add_loop', label, parentGroup: parentId ?? null }
+						: { op: 'add_group', label, parentGroup: parentId ?? null });
 					// Copy the container's boundary SIGNATURE: it is part of the decl,
 					// and a Loop's `over`/`carry` config references its ports, so the
 					// shell must declare them or the next build hard-errors
@@ -3980,8 +4117,8 @@
 					const sigOutputs = toPortSigs(outputsOf(orig.data.outputs), 'output');
 					if (sigInputs.length > 0 || sigOutputs.length > 0) {
 						ops.push(isLoop
-							? { op: 'updateLoopPorts', loopId: scopedId, inputs: sigInputs, outputs: sigOutputs }
-							: { op: 'updateGroupPorts', group: scopedId, inputs: sigInputs, outputs: sigOutputs });
+							? { op: 'update_loop_ports', loopId: scopedId, inputs: sigInputs, outputs: sigOutputs }
+							: { op: 'update_group_ports', group: scopedId, inputs: sigInputs, outputs: sigOutputs });
 					}
 					if (isLoop) {
 						copyConfig(config, scopedId, true);
@@ -3989,14 +4126,14 @@
 						// A group's description rides its `config` on the node
 						// data (host-bridge puts it there for the card) and has
 						// its own op; a loop's travels with its settings above.
-						ops.push({ op: 'setGroupDescription', group: scopedId, description: config.description });
+						ops.push({ op: 'set_group_description', group: scopedId, description: config.description });
 					}
 					copyPortLiterals(orig, scopedId, nodeType);
 					layoutWrites.push((layout) => updateLayoutEntry(layout, scopedId, newPos.x, newPos.y, cfg?.width, cfg?.height));
 				} else {
 					const { localId, scopedId } = freshScopedNodeId(nodeType, parentId, taken);
 					newIds.push(scopedId);
-					ops.push({ op: 'addNode', id: localId, nodeType, parentGroup: parentId ?? null });
+					ops.push({ op: 'add_node', id: localId, nodeType, parentGroup: parentId ?? null });
 					// Copy the DECLARED port surface (custom ports, type
 					// overrides): the config copy below carries the
 					// config-created ports, but header-declared ones live
@@ -4012,7 +4149,7 @@
 					const declOutputs = copiedPortSigs(renderedOut, nodeDefaults?.defaultOutputs);
 					if (declInputs.length > 0 || declOutputs.length > 0) {
 						ops.push({
-							op: 'updateNodePorts',
+							op: 'update_node_ports',
 							node: scopedId,
 							inputs: declInputs,
 							outputs: declOutputs,
@@ -4026,7 +4163,7 @@
 					copyConfig(config, scopedId, false);
 					copyPortLiterals(orig, scopedId, nodeType);
 					if (orig.data.label) {
-						ops.push({ op: 'setLabel', node: scopedId, label: orig.data.label as string });
+						ops.push({ op: 'set_label', node: scopedId, label: orig.data.label as string });
 					}
 				}
 			}
@@ -4078,6 +4215,10 @@
 	// narrower local type once dropped it silently). toPortSigs writes a
 	// CONTAINER signature, which is its whole surface: the rendered type
 	// IS the spelling there, and declaredType deliberately plays no part.
+	// The one rendered type with a shorter spelling is the port's own
+	// variable (`portVar`), which is what a port written with no type
+	// holds: it goes back as the bare name. `rendered` rides along so the
+	// projection keeps showing the type until the reparse.
 	function toPortSigs(ports: HeaderPortLike[], side: 'input' | 'output'): import('../../../../protocol').EditPortSig[] {
 		// portRequired: the ONE missing-value polarity (Rust's serde
 		// default: not required); rendered ports always carry the flag,
@@ -4088,7 +4229,8 @@
 		return (ports ?? []).map(p => ({
 			name: p.name,
 			required: side === 'output' || portRequired(p),
-			portType: p.portType,
+			portType: p.portType === portVar(side, p.name) ? '' : p.portType,
+			rendered: p.portType,
 		}));
 	}
 
@@ -4182,7 +4324,7 @@
 				</button>
 			</div>
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
-			<div class="svelte-flow-wrapper" style="width: 100%; height: 100%;" onwheelcapture={handleWheel}>
+			<div class="svelte-flow-wrapper" style="width: 100%; height: 100%;" bind:this={canvasEl} onwheelcapture={handleWheel}>
 			<!-- The `...Key={UNBOUND_KEY}` props below DISABLE xyflow's built-in
 			     key bindings (delete is ours via the KEYMAP in handleKeyDown;
 			     zoom/pan need no modifier). See UNBOUND_KEY for why we don't
@@ -4211,8 +4353,8 @@
 				onedgeclick={onEdgeClick}
 				onedgecontextmenu={onEdgeContextMenu}
 				bind:viewport={currentViewport}
-				minZoom={0.05}
-				maxZoom={2}
+				minZoom={MIN_ZOOM}
+				maxZoom={MAX_ZOOM}
 				deleteKey={UNBOUND_KEY}
 				selectionKey="Shift"
 				multiSelectionKey="Shift"
@@ -4277,90 +4419,55 @@
 		     the program (a run, the project's lifecycle): a file opened on
 		     its own has none, so none of it is drawn (see `interactive`). -->
 		{#if interactive}
-		<!-- Drift banner. A redundant surfacing of the action-bar
-		     affordance, in case the user misses the button. The verb
-		     it names must match whichever button is actually showing:
-		     if infra is running + drifted the button is Upgrade; if
-		     it's stopped + drifted the button is Start (Start re-applies
-		     the changed spec and reaps orphans on the way up). Keyed on
-		     `available_actions` so banner text and button agree. -->
-		{#if drift?.infraDrift && (drift?.availableActions ?? []).includes('infra_upgrade')}
-			<div class="absolute bottom-20 left-1/2 -translate-x-1/2 flex flex-col gap-1.5 items-center z-10">
-				<div class="flex items-center gap-2 px-4 py-2 bg-amber-500/90 text-white rounded-lg shadow-lg text-xs font-medium backdrop-blur-sm">
-					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-					Infrastructure has changed. Click Upgrade to apply.
+		<!-- The bar at the bottom: what is going on right now, and in the
+		     same bar what the selected nodes offer (only with a selection).
+		     Its state comes from the host's ActionBarStore and the status
+		     answer; nothing here decides a state, only which nodes are
+		     selected. -->
+		<div class="absolute bottom-6 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1 z-20">
+			{#if versionMismatch && runState?.seed !== undefined}
+				<div class="flex items-center gap-3 px-3 py-1.5 text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-lg">
+					<span>This run is from version {versionMismatch.slice(0, 8)}; your code differs.</span>
+					{#if onBranchTo}
+						<button class="px-2 py-0.5 rounded border border-amber-300 hover:bg-amber-100" onclick={() => onBranchTo?.(versionMismatch)}>Branch here</button>
+					{/if}
 				</div>
-			</div>
-		{:else if drift?.infraDrift && (drift?.availableActions ?? []).includes('infra_start')}
-			<div class="absolute bottom-20 left-1/2 -translate-x-1/2 flex flex-col gap-1.5 items-center z-10">
-				<div class="flex items-center gap-2 px-4 py-2 bg-amber-500/90 text-white rounded-lg shadow-lg text-xs font-medium backdrop-blur-sm">
-					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-					Infrastructure has changed. Click Start to apply.
-				</div>
-			</div>
-		{/if}
-
-		<!-- Floating action bar. State + drift come from the host's
-		     ActionBarStore (single source of truth). The bar reads
-		     `state.backend` for at-rest facts and `state.overlay`
-		     for the in-flight user-action; `drift` lights
-		     Resync/Upgrade indicators. -->
-		{#if versionMismatch && executionState?.seed !== undefined}
-			<div class="flex items-center gap-3 px-3 py-1.5 text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-lg mb-1">
-				<span>This run is from version {versionMismatch.slice(0, 8)}; your code differs.</span>
-				{#if onBranchTo}
-					<button class="px-2 py-0.5 rounded border border-amber-300 hover:bg-amber-100" onclick={() => onBranchTo?.(versionMismatch)}>Branch here</button>
-				{/if}
-			</div>
-		{/if}
-		<ActionBar
-			state={actionBarState}
-			{drift}
-			onRun={runWithTargets}
-			runTargetCount={liveRunTargets.length}
-			specs={menuSpecs}
-			{focusedGroup}
-			onRunSpec={onRunSpecFile}
-			onOpenSpecDialog={(initial) => openSpecDialog(initial ?? { name: 'one-off' })}
-			onOpenSpecMenu={onListSpecs}
-			{onStop}
-			{onDismissError}
-			{onOpenLocation}
-			{onActivate}
-			{onCancelActivate}
-			{onCancelBuild}
-			{onCancelInfra}
-			{onDeactivate}
-			{onReactivate}
-			{onCancelRunning}
-			{onResumeActive}
-			{onResync}
-			{onResumeResync}
-			{onStartInfra}
-			{onStopInfra}
-			{onTerminateInfra}
-			{onUpgradeInfra}
-			hasInfra={hasInfraInGraph}
-			hasTriggers={hasTriggersInGraph}
-			runTargetsAvoidTriggers={runTargetFactsLive.avoidsTriggers}
-			{runTargetsInfraReady}
-			onToggleInfraSubgraph={() => { showInfraSubgraph = !showInfraSubgraph; if (showInfraSubgraph) showTriggerSubgraph = false; }}
-			{showInfraSubgraph}
-			onToggleTriggerSubgraph={() => { showTriggerSubgraph = !showTriggerSubgraph; if (showTriggerSubgraph) showInfraSubgraph = false; }}
-			{showTriggerSubgraph}
-			nodeCount={nodes.length}
-		/>
+			{/if}
+			{#snippet contextBar()}
+				<ContextBar
+					selected={selectedForBar}
+					{runTargets}
+					status={statusNow}
+					project={project.id}
+					blocked={verbsBlocked}
+					offered={(verb) => isVerbOffered(verb, verbInputs)}
+					{runWhy}
+					onRun={runSelection}
+					onLifecycle={(action) => onLifecycle?.(action)}
+				/>
+			{/snippet}
+			<ActionBar
+				state={actionBarState}
+				{status}
+				runProgress={followedProgress}
+				selection={selectedForBar.length > 0 && onRun && onLifecycle && checkRun ? contextBar : undefined}
+				{onStop}
+				{onDismissError}
+				{onOpenLocation}
+				{onCancelActivate}
+				{onCancelBuild}
+				{onCancelInfra}
+				{onResumeResync}
+				hasInfra={hasInfraInGraph}
+				hasTriggers={hasTriggersInGraph}
+				onToggleInfraSubgraph={() => { showInfraSubgraph = !showInfraSubgraph; if (showInfraSubgraph) showTriggerSubgraph = false; }}
+				{showInfraSubgraph}
+				onToggleTriggerSubgraph={() => { showTriggerSubgraph = !showTriggerSubgraph; if (showTriggerSubgraph) showInfraSubgraph = false; }}
+				{showTriggerSubgraph}
+			/>
+		</div>
 		{/if}
 	</div>
-	{#if specDialogInitial && resolveSpec && onRunSpec}
-		<RunSpecDialog
-			bind:open={specDialogOpen}
-			initial={specDialogInitial}
-			{resolveSpec}
-			onRun={(spec, seeded) => onRunSpec?.(spec, seeded)}
-			onSave={(spec) => onSaveSpec?.(spec)}
-		/>
-	{/if}
 
 	<!-- Wire menu: read a key off the value a wire carries -->
 	{#if edgeMenu}
@@ -4420,115 +4527,54 @@
 			onclick={(e) => e.stopPropagation()}
 		>
 			{#if contextMenu.nodeId}
+				<!-- These consts are derived from `contextMenu`, so they are read
+				     again on use: a handler reads what it needs from them BEFORE
+				     it sets `contextMenu = null`, or the read throws on null. -->
 				{@const targetNodeId = contextMenu.nodeId}
 				{@const nodeToEdit = nodes.find(n => n.id === targetNodeId)}
 				{@const nodeConfig = nodeToEdit ? NODE_TYPE_CONFIG[nodeToEdit.data.nodeType as NodeType] : null}
-				{@const infraInfo = infraStatusOf(targetNodeId)}
-				{@const infraActions = nodeInfraActions(targetNodeId)}
-				{@const canNodeStop = infraActions.stop}
-				{@const canNodeTerminate = infraActions.terminate}
-				{@const hasInfraActions = infraActions.has}
-				<!-- In simplified view the only node-menu items are infra lifecycle actions
-				     (structural Duplicate/Delete are hidden), so render the menu only when
-				     there's something to show, never an empty popover. -->
-				{#if nodeToEdit && nodeConfig && (!simplified || hasInfraActions)}
+				<!-- Every item here is a STRUCTURAL edit, hidden in simplified view
+				     (read-only for structure), the same gate STRUCTURAL_ACTIONS applies
+				     to the palette and the keyboard; there the menu does not open. -->
+				{#if nodeToEdit && nodeConfig && nodeMenuHasItems()}
 					<div class="px-1">
-						<!-- Duplicate/Delete are STRUCTURAL edits: hidden in simplified view
-						     (read-only for structure). Infra Stop/Terminate below are runtime
-						     lifecycle actions (not source edits), so they stay available. This
-						     is the same gate STRUCTURAL_ACTIONS applies to the palette/keyboard;
-						     the context menu is the other entry point and must gate too. -->
-						{#if !simplified}
-							<button
-								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-								onclick={() => duplicateNode(contextMenu!.nodeId!)}
-							>
-								<span class="text-muted-foreground text-xs">Ctrl+D</span>
-								<span>Duplicate</span>
-							</button>
-							<button
-								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-destructive/10 text-sm text-left transition-colors text-destructive"
-								onclick={() => deleteNode(contextMenu!.nodeId!)}
-							>
-								<span class="text-xs">Del</span>
-								<span>Delete</span>
-							</button>
-							<button
-								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-								onclick={() => { const id = contextMenu!.nodeId!; const x = contextMenu!.x; const y = contextMenu!.y; contextMenu = null; tagEditor = { nodeId: id, x, y }; }}
-							>
-								<span class="text-muted-foreground text-xs">#</span>
-								<span>Tags…</span>
-							</button>
-							<!-- `@per_instance`: only on a node that owns something per
-							     instance (an infra container, a connection). A node the
-							     compiler reached from a marked one follows it and has
-							     nothing of its own to toggle. -->
-							{#if canBePerInstance({ nodeType: nodeToEdit.data.nodeType as string, requiresInfra: nodeToEdit.data.requiresInfra as boolean | undefined })}
-								{@const marked = nodeToEdit.data.perInstance === 'marked'}
-								<button
-									class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-									title={marked
-										? 'Make this node one shared node again: every instance uses the same one.'
-										: 'Give every instance of the program its own copy of this node (its container, or the connection it uses).'}
-									onclick={() => { const id = contextMenu!.nodeId!; contextMenu = null; recordEdit([{ op: 'setPerInstance', node: id, perInstance: !marked }]); }}
-								>
-									<span class="text-muted-foreground text-xs">@</span>
-									<span>{marked ? 'Share across instances' : 'One per instance'}</span>
-								</button>
-							{/if}
-						{/if}
-						<!-- Aiming a run names a PLACE (`addressOf` spells the node
-						     under this view's calls), so a view that is no place
-						     offers none of it. -->
-						{#if interactive}
 						<button
 							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-							onclick={() => { toggleRunTarget(targetNodeId); contextMenu = null; }}
+							onclick={() => duplicateNode(contextMenu!.nodeId!)}
 						>
-							<span class="text-muted-foreground text-xs">◎</span>
-							<span>{runTargets.has(targetNodeId) ? 'Unset target' : 'Set as target'}</span>
+							<span class="text-muted-foreground text-xs">Ctrl+D</span>
+							<span>Duplicate</span>
+						</button>
+						<button
+							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-destructive/10 text-sm text-left transition-colors text-destructive"
+							onclick={() => deleteNode(contextMenu!.nodeId!)}
+						>
+							<span class="text-xs">Del</span>
+							<span>Delete</span>
 						</button>
 						<button
 							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-							onclick={() => { contextMenu = null; openSpecDialog(specForAction('from', addressOf(callPath, targetNodeId))); }}
+							onclick={() => { const id = contextMenu!.nodeId!; const x = contextMenu!.x; const y = contextMenu!.y; contextMenu = null; tagEditor = { nodeId: id, x, y }; }}
 						>
-							<span class="text-muted-foreground text-xs">▶</span>
-							<span>Run from here…</span>
+							<span class="text-muted-foreground text-xs">#</span>
+							<span>Tags…</span>
 						</button>
-						{#if isContainerNodeType(nodeToEdit.data.nodeType) || nodeToEdit.data.includePath}
+						<!-- `@per_instance`: only on a node that owns something per
+						     instance (an infra container, a connection). A node the
+						     compiler reached from a marked one follows it and has
+						     nothing of its own to toggle. -->
+						{#if canBePerInstance({ nodeType: nodeToEdit.data.nodeType as string, requiresInfra: nodeToEdit.data.requiresInfra as boolean | undefined })}
+							{@const marked = nodeToEdit.data.perInstance === 'marked'}
 							<button
 								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-								onclick={() => { contextMenu = null; openSpecDialog(specForAction('group', addressOf(callPath, targetNodeId))); }}
+								title={marked
+									? 'Make this node one shared node again: every instance uses the same one.'
+									: 'Give every instance of the program its own copy of this node (its container, or the connection it uses).'}
+								onclick={() => { const id = contextMenu!.nodeId!; const perInstance = !marked; contextMenu = null; recordEdit([{ op: 'set_per_instance', node: id, perInstance }]); }}
 							>
-								<span class="text-muted-foreground text-xs">▶</span>
-								<span>Run this group…</span>
+								<span class="text-muted-foreground text-xs">@</span>
+								<span>{marked ? 'Share across instances' : 'One per instance'}</span>
 							</button>
-						{/if}
-						{/if}
-						{#if hasInfraActions}
-							{#if !simplified}<div class="my-1 mx-2 border-t"></div>{/if}
-							<div class="px-3 py-1 text-xs text-muted-foreground uppercase tracking-wide">
-								Infra ({infraInfo!.status})
-							</div>
-							{#if canNodeStop && onInfraNodeStop}
-								<button
-									class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-									onclick={() => { const place = addressOf(callPath, contextMenu!.nodeId!); contextMenu = null; onInfraNodeStop?.(place); }}
-								>
-									<span class="text-muted-foreground text-xs">⏸</span>
-									<span>Stop this node</span>
-								</button>
-							{/if}
-							{#if canNodeTerminate && onInfraNodeTerminate}
-								<button
-									class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-destructive/10 text-sm text-left transition-colors text-destructive"
-									onclick={() => { const place = addressOf(callPath, contextMenu!.nodeId!); contextMenu = null; onInfraNodeTerminate?.(place); }}
-								>
-									<span class="text-xs">✕</span>
-									<span>Terminate this node</span>
-								</button>
-							{/if}
 						{/if}
 					</div>
 				{/if}

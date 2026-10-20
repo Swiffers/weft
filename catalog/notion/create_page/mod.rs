@@ -6,7 +6,7 @@ use serde_json::json;
 
 use weft::access::client::post_json;
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::notion::{children_of, API};
 
@@ -23,7 +23,7 @@ impl Node for NotionCreatePageNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let parent: String = ctx.inputs.get("parentPage")?;
         let title: String = ctx.inputs.get("title")?;

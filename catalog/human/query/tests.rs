@@ -21,8 +21,8 @@ pub fn tests() -> Vec<NodeTest> {
 /// consumer, and the files door mints the link when the form is shown.
 async fn image_parked(rig: FakeRig) -> WeftResult<()> {
     let image = rig.store_file("cat.png", "image/png", b"PNGDATA".to_vec());
-    rig.output_type("ok_approved", WeftType::parse("Boolean").expect("Boolean parses"));
-    rig.output_type("ok_rejected", WeftType::parse("Boolean").expect("Boolean parses"));
+    rig.output_type("okApproved", WeftType::parse("Boolean").expect("Boolean parses"));
+    rig.output_type("okRejected", WeftType::parse("Boolean").expect("Boolean parses"));
     rig.signal(json!({ "ok": true }));
     rig.run(
         &HumanQueryNode,
@@ -78,12 +78,12 @@ async fn label_and_placeholder(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// A person skipping the form: the wait ends skipped, which ends the step
+/// A person skipping the form: the wait ends skipped, which ends the firing
 /// skipped with every output closed, whatever its fields are (an
 /// approve/reject one included).
 async fn skipped_form(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("decision_approved", WeftType::parse("Boolean").expect("Boolean parses"));
-    rig.output_type("decision_rejected", WeftType::parse("Boolean").expect("Boolean parses"));
+    rig.output_type("decisionApproved", WeftType::parse("Boolean").expect("Boolean parses"));
+    rig.output_type("decisionRejected", WeftType::parse("Boolean").expect("Boolean parses"));
     rig.signal_skipped();
     let outcome = rig
         .run(
@@ -100,8 +100,8 @@ async fn skipped_form(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn submission_maps(rig: FakeRig) -> WeftResult<()> {
-    rig.output_type("decision_approved", WeftType::parse("Boolean").expect("Boolean parses"));
-    rig.output_type("decision_rejected", WeftType::parse("Boolean").expect("Boolean parses"));
+    rig.output_type("decisionApproved", WeftType::parse("Boolean").expect("Boolean parses"));
+    rig.output_type("decisionRejected", WeftType::parse("Boolean").expect("Boolean parses"));
     // The canned form submission that resumes the park.
     rig.signal(json!({ "decision": false }));
     let outcome = rig
@@ -114,7 +114,7 @@ async fn submission_maps(rig: FakeRig) -> WeftResult<()> {
         )
         .await
         .ok()?;
-    assert_eq!(outcome.outputs["decision_rejected"], json!(true));
-    assert!(!outcome.outputs.contains_key("decision_approved"));
+    assert_eq!(outcome.outputs["decisionRejected"], json!(true));
+    assert!(!outcome.outputs.contains_key("decisionApproved"));
     Ok(())
 }

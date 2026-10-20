@@ -50,10 +50,17 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             token_id UUID,
             pending_token_ids UUID[] NOT NULL DEFAULT '{}',
             added_unix BIGINT NOT NULL,
+            -- Where its server passes the install's doors on to its
+            -- visitors (`https://shop.example/weft`), when it does: the
+            -- broker builds a link to the project's stored files on it.
+            visitor_address TEXT,
             PRIMARY KEY (project_id, name),
             CHECK ((host = 'cloud_run') = (repo IS NOT NULL)),
             CHECK ((repo IS NULL) = (repo_id IS NULL))
-        )"#],
+        )"#,
+        // One visitor address per project: a link has one way to go.
+        r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_project_frontend_visitor_address
+            ON project_frontend(project_id) WHERE visitor_address IS NOT NULL"#],
     seed: &[],
 };
 
@@ -68,6 +75,7 @@ struct Row {
     url: Option<String>,
     token_id: Option<uuid::Uuid>,
     pending_token_ids: Vec<uuid::Uuid>,
+    visitor_address: Option<String>,
 }
 
 impl Row {
@@ -88,11 +96,12 @@ impl Row {
             url: self.url,
             token_id: self.token_id,
             pending_token_ids: self.pending_token_ids,
+            visitor_address: self.visitor_address,
         })
     }
 }
 
-const COLUMNS: &str = "project_id, name, host, repo, repo_id, service, url, token_id, pending_token_ids";
+const COLUMNS: &str = "project_id, name, host, repo, repo_id, service, url, token_id, pending_token_ids, visitor_address";
 
 /// Every frontend of `project`, by name.
 pub async fn list(pool: &PgPool, project: uuid::Uuid) -> anyhow::Result<Vec<Frontend>> {
@@ -136,8 +145,8 @@ pub async fn repo_still_used<'e>(
 /// Store `frontend`; `false` when the project has one of that name.
 pub async fn record<'e>(executor: impl sqlx::PgExecutor<'e>, frontend: &Frontend, now_unix: i64) -> anyhow::Result<bool> {
     Ok(sqlx::query(
-        "INSERT INTO project_frontend (project_id, name, host, repo, repo_id, service, url, token_id, added_unix) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (project_id, name) DO NOTHING",
+        "INSERT INTO project_frontend (project_id, name, host, repo, repo_id, service, url, token_id, added_unix, visitor_address) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (project_id, name) DO NOTHING",
     )
     .bind(frontend.project)
     .bind(&frontend.name)
@@ -148,6 +157,7 @@ pub async fn record<'e>(executor: impl sqlx::PgExecutor<'e>, frontend: &Frontend
     .bind(&frontend.url)
     .bind(frontend.token_id)
     .bind(now_unix)
+    .bind(&frontend.visitor_address)
     .execute(executor)
     .await?
     .rows_affected()
@@ -254,6 +264,7 @@ pub async fn add(
         url: None,
         token_id: minted.as_ref().map(|minted| minted.id),
         pending_token_ids: Vec::new(),
+        visitor_address: req.visitor_address.as_deref().map(|a| a.trim_end_matches('/').to_string()),
     };
     let site = site(&frontend);
     // Whether this add asked the cloud for the site: only then is there
@@ -281,6 +292,7 @@ pub async fn add(
     let failure = match made {
         Ok(true) => return Ok(Json(AddedFrontend { frontend, token: minted.map(|minted| minted.token) })),
         Ok(false) => taken(),
+        Err(e) if visitor_address_taken(&e) => another_visitor_address(&state, project).await,
         Err(e) => (StatusCode::BAD_GATEWAY, format!("add frontend '{}': {e:#}", req.name)),
     };
     let (status, mut msg) = failure;
@@ -299,6 +311,66 @@ pub async fn add(
         }
     }
     Err((status, msg))
+}
+
+/// Whether `e` is the project's one visitor address being taken already.
+fn visitor_address_taken(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|cause| cause.downcast_ref::<sqlx::Error>())
+        .filter_map(|e| e.as_database_error())
+        .any(|e| e.constraint() == Some("idx_project_frontend_visitor_address"))
+}
+
+/// The refusal of a second visitor address, naming the frontend that has
+/// the project's one.
+async fn another_visitor_address(state: &DispatcherState, project: uuid::Uuid) -> (StatusCode, String) {
+    let holder = list(&state.pg_pool, project)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().find(|f| f.visitor_address.is_some()))
+        .map(|f| format!("frontend '{}' ({})", f.name, f.visitor_address.unwrap_or_default()))
+        .unwrap_or_else(|| "another frontend".to_string());
+    (
+        StatusCode::CONFLICT,
+        format!(
+            "{holder} already carries this project's visitor address, and a link to a stored file has one way to go; \
+             `weft frontend visitor-address <name> off` clears it"
+        ),
+    )
+}
+
+/// `PUT /projects/{id}/frontends/{name}/visitor-address`: set where the
+/// frontend's server passes the install's doors on to its visitors, or
+/// clear it.
+pub async fn set_visitor_address(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path((project, name)): Path<(uuid::Uuid, String)>,
+    Json(req): Json<weft_core::frontend::VisitorAddressRequest>,
+) -> Result<Json<Frontend>, (StatusCode, String)> {
+    authorize_project(&state, &caller.0, project).await?;
+    if let Some(address) = &req.visitor_address {
+        weft_core::frontend::check_visitor_address(address).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+    }
+    let address = req.visitor_address.as_deref().map(|a| a.trim_end_matches('/'));
+    let set = sqlx::query("UPDATE project_frontend SET visitor_address = $3 WHERE project_id = $1 AND name = $2")
+        .bind(project)
+        .bind(&name)
+        .bind(address)
+        .execute(&state.pg_pool)
+        .await;
+    match set {
+        Ok(done) if done.rows_affected() == 0 => return Err(not_found(&name)),
+        Ok(_) => {}
+        Err(e) => {
+            let e = anyhow::Error::from(e);
+            if visitor_address_taken(&e) {
+                return Err(another_visitor_address(&state, project).await);
+            }
+            return Err(internal(format!("{e:#}")));
+        }
+    }
+    get(&state.pg_pool, project, &name).await.map_err(internal)?.map(Json).ok_or_else(|| not_found(&name))
 }
 
 /// Undo a failed `open` of `site`: the service, and the repository's access

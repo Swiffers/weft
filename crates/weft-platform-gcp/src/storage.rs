@@ -20,8 +20,9 @@ use base64::Engine as _;
 use bytes::Bytes;
 use reqwest::{Method, StatusCode};
 use sha2::{Digest, Sha256};
-use weft_platform_traits::object_store::MAX_PRESIGN_TTL_SECS;
-use weft_platform_traits::{ObjectEntry, ObjectStore, PresignAudience};
+use weft_core::access::spec::percent_encode;
+use weft_platform_traits::object_store::{encode_key, CopyProgress, MAX_PRESIGN_TTL_SECS};
+use weft_platform_traits::{GetLink, ObjectEntry, ObjectStore, PresignAudience};
 
 use crate::api::{is_status, Google};
 
@@ -44,11 +45,20 @@ pub struct GcsObjectStore {
 impl GcsObjectStore {
     /// The store on `bucket`, as the account the metadata server names.
     /// Fails at boot, naming the cause, when the bucket cannot be reached.
+    /// A refusal is asked again for a few minutes first
+    /// ([`GRANT_APPLIES_AT_BOOT`](crate::accounts::GRANT_APPLIES_AT_BOOT)):
+    /// on a fresh install the grant on the bucket exists, but Google may
+    /// still be applying it. Those tries are this one boot's, nothing
+    /// outlives it.
     pub async fn new(google: Google, bucket: String) -> Result<Self> {
         let account = google.tokens().account_email().await?;
         let store = Self { google, bucket, account, signed: AtomicBool::new(false) };
-        let probe = store.request(Method::GET, &format!("https://{HOST}/storage/v1/b/{}", store.bucket), &[]).await;
-        if let Err(e) = Self::ok("reach the object-store bucket", probe?).await {
+        let url = format!("https://{HOST}/storage/v1/b/{}", store.bucket);
+        let reached = crate::accounts::until_settled_within(&crate::accounts::GRANT_APPLIES_AT_BOOT, |e| is_status(e, 403), || async {
+            Self::ok("reach the object-store bucket", store.request(Method::GET, &url, &[]).await?).await
+        })
+        .await;
+        if let Err(e) = reached {
             let advice = if is_status(&e, 403) {
                 format!(
                     ": grant {} roles/storage.objectAdmin and roles/storage.legacyBucketReader on it",
@@ -97,9 +107,17 @@ impl GcsObjectStore {
         Ok(Some(size))
     }
 
-    /// A link to `method` on `key` with `query`, signed for this account,
-    /// the body's exact length signed in when there is one.
-    async fn sign(&self, method: &str, key: &str, query: &[(&str, String)], length: Option<u64>, ttl_secs: u64) -> Result<String> {
+    /// A link to `method` on `key` with `query`, signed for this account at
+    /// `at`, the body's exact length signed in when there is one.
+    async fn sign(
+        &self,
+        method: &str,
+        key: &str,
+        query: &[(&str, String)],
+        length: Option<u64>,
+        at: SystemTime,
+        ttl_secs: u64,
+    ) -> Result<String> {
         if ttl_secs == 0 || ttl_secs > MAX_PRESIGN_TTL_SECS {
             bail!("a link to {key} lives 1 to {MAX_PRESIGN_TTL_SECS} seconds (7 days), not {ttl_secs}");
         }
@@ -109,7 +127,7 @@ impl GcsObjectStore {
             query: query.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
             length,
             account: &self.account,
-            at: SystemTime::now(),
+            at,
             ttl_secs,
         };
         let (to_sign, query) = link.string_to_sign();
@@ -216,18 +234,62 @@ impl ObjectStore for GcsObjectStore {
 
     // Every caller reaches Cloud Storage at the same address, so the
     // audience changes nothing.
-    async fn presign_get(&self, key: &str, _audience: PresignAudience, ttl_secs: u64) -> Result<String> {
-        self.sign("GET", key, &[], None, ttl_secs).await
+    async fn presign_get(&self, key: &str, link: &GetLink) -> Result<String> {
+        let mut query = Vec::new();
+        if let Some(content_type) = &link.content_type {
+            query.push(("response-content-type", content_type.clone()));
+        }
+        if let Some(disposition) = &link.disposition {
+            query.push(("response-content-disposition", disposition.clone()));
+        }
+        self.sign("GET", key, &query, None, link.signed_at, link.ttl_secs).await
     }
 
-    async fn presign_put(&self, key: &str, content_length: u64, _audience: PresignAudience, ttl_secs: u64) -> Result<String> {
-        self.sign("PUT", key, &[], Some(content_length), ttl_secs).await
-    }
-
-    async fn create_multipart(&self, key: &str) -> Result<String> {
-        let resp = self.write(self.google.http().post(format!("{}?uploads", self.object_url(key))), Bytes::new()).await?;
+    async fn create_multipart(&self, key: &str, content_type: &str) -> Result<String> {
+        let req = self
+            .google
+            .http()
+            .post(format!("{}?uploads", self.object_url(key)))
+            .header(reqwest::header::CONTENT_TYPE, content_type);
+        let resp = self.write(req, Bytes::new()).await?;
         let body = Self::ok(&format!("start an upload of {key}"), resp).await?.text().await?;
         xml_text(&body, "UploadId").with_context(|| format!("Cloud Storage started an upload of {key} with no id: {body}"))
+    }
+
+    /// Cloud Storage's rewrite, asked again with its token until it says
+    /// it is done: inside one bucket and storage class it is done at once,
+    /// whatever the object weighs. Each step is a piece `progress` hears of.
+    async fn copy(&self, from: &str, to: &str, progress: &dyn CopyProgress) -> Result<u64> {
+        #[derive(serde::Deserialize)]
+        struct Rewrite {
+            done: bool,
+            #[serde(default, rename = "rewriteToken")]
+            token: Option<String>,
+            #[serde(default, rename = "objectSize")]
+            size: Option<String>,
+        }
+        let url = format!(
+            "https://{HOST}/storage/v1/b/{bucket}/o/{}/rewriteTo/b/{bucket}/o/{}",
+            percent_encode(from),
+            percent_encode(to),
+            bucket = self.bucket
+        );
+        let mut token: Option<String> = None;
+        loop {
+            let query: Vec<(&str, String)> = token.iter().map(|t| ("rewriteToken", t.clone())).collect();
+            let req = self.google.http().post(&url).query(&query).header(reqwest::header::CONTENT_TYPE, "application/json");
+            let resp = Self::ok(&format!("copy {from} to {to}"), self.write(req, Bytes::from_static(b"{}")).await?).await?;
+            let step: Rewrite = resp.json().await.with_context(|| format!("read the copy of {from} to {to}"))?;
+            progress.copied_piece().await?;
+            if step.done {
+                return step
+                    .size
+                    .with_context(|| format!("Cloud Storage copied {from} to {to} and named no size"))?
+                    .parse()
+                    .with_context(|| format!("the size of the copy of {from} is not a number"));
+            }
+            token = Some(step.token.with_context(|| format!("Cloud Storage is still copying {from} and named no way to go on"))?);
+        }
     }
 
     async fn presign_part(
@@ -236,11 +298,11 @@ impl ObjectStore for GcsObjectStore {
         upload_id: &str,
         part_number: i32,
         part_size: u64,
-        _audience: PresignAudience,
+        _audience: &PresignAudience,
         ttl_secs: u64,
     ) -> Result<String> {
         let query = [("partNumber", part_number.to_string()), ("uploadId", upload_id.to_string())];
-        self.sign("PUT", key, &query, Some(part_size), ttl_secs).await
+        self.sign("PUT", key, &query, Some(part_size), SystemTime::now(), ttl_secs).await
     }
 
     async fn upload_part(&self, key: &str, upload_id: &str, part_number: i32, bytes: Bytes) -> Result<String> {
@@ -289,21 +351,7 @@ impl ObjectStore for GcsObjectStore {
 
 /// `/<bucket>/<key>`, each segment of the key percent-encoded.
 fn object_path(bucket: &str, key: &str) -> String {
-    let key: Vec<String> = key.split('/').map(encode).collect();
-    format!("/{bucket}/{}", key.join("/"))
-}
-
-/// RFC 3986 encoding: everything but the unreserved characters.
-fn encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
+    format!("/{bucket}/{}", encode_key(key))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -363,7 +411,7 @@ impl LinkToSign<'_> {
             ("X-Goog-Expires".to_string(), self.ttl_secs.to_string()),
             ("X-Goog-SignedHeaders".to_string(), signed_headers.clone()),
         ]);
-        let mut encoded: Vec<(String, String)> = query.iter().map(|(k, v)| (encode(k), encode(v))).collect();
+        let mut encoded: Vec<(String, String)> = query.iter().map(|(k, v)| (percent_encode(k), percent_encode(v))).collect();
         encoded.sort();
         let query = encoded.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
         let canonical_headers: String = headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
@@ -407,6 +455,16 @@ mod tests {
              &X-Goog-Date=20231114T221320Z&X-Goog-Expires=900&X-Goog-SignedHeaders=content-length%3Bhost\
              &partNumber=3&uploadId=u%2F1"
         );
+    }
+
+    /// How the bucket answers a download rides in the link, signed with
+    /// the rest of its query.
+    #[test]
+    fn a_download_signs_how_it_is_answered() {
+        let mut download = link(None, vec![("response-content-disposition".into(), "attachment; filename=\"a b.mp4\"".into())]);
+        download.method = "GET";
+        let (_, query) = download.string_to_sign();
+        assert!(query.ends_with("&response-content-disposition=attachment%3B%20filename%3D%22a%20b.mp4%22"), "{query}");
     }
 
     #[test]

@@ -4,20 +4,22 @@
 # A routine answer goes straight back to the customer; a sensitive one
 # waits for a person to approve it.
 
+type Draft = { answer: String, sensitivity: String, .. }
+
 whatsapp = BaileyBridge
+openrouter = OpenRouterAccess
 
 ask = BaileyReceive { bridge: whatsapp.bridge }
 
-draft = LlmInference -> (answer: String, sensitivity: String) {
-  parseJson: true
+draft = LlmInferenceJson -> (response: Draft) {
   prompt: ask.content
-  provider: OpenRouterProvider { model: "z-ai/glm-5.3" }.provider
+  provider: OpenRouterModel { access: openrouter.access, model: "z-ai/glm-5.3" }.provider
   params: LlmParams { systemPrompt: @file("assets/prompts/support.md"), temperature: 0.75 }.params
 }
 
 # Exactly one of these two says yes, the other stays quiet
 route = Switch {
-  value: draft.sensitivity
+  value: draft.response.sensitivity
   cases: [
     { "kind": "equals", "value": "high", "port": "needsAPerson" },
     { "kind": "otherwise", "port": "goAhead" }
@@ -35,11 +37,11 @@ review = HumanQuery {
   ]
   from: ask.pushName
   question: ask.content
-  answer: draft.answer
+  answer: draft.response.answer
 }
 
 allowed = FirstInOrder {
-  approved: review.send_approved
+  approved: review.sendApproved
   automatic: route.goAhead
 }
 
@@ -47,5 +49,5 @@ reply = BaileySend {
   _should_flow: allowed.value
   bridge: whatsapp.bridge
   to: ask.chatId
-  message: draft.answer
+  message: draft.response.answer
 }

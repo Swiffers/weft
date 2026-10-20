@@ -5,14 +5,14 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct ShoutNode;
 
 #[async_trait]
 impl Node for ShoutNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let text: String = ctx.inputs.get("text")?;
         ctx.pulse_downstream(NodeOutput::new().set("loud", text.to_uppercase())).await
     }

@@ -16,7 +16,9 @@
 //! exists only at this provider-protocol boundary), and relays every
 //! COMMITTED transcript segment onto the `segments` output Bus as it
 //! lands, followed by what ElevenLabs annotates it with (its words and
-//! language, its entities, its rewrite). When the audio bus closes, the
+//! language, its entities, its rewrite); the bus opens with the first
+//! segment, so a session refused before it hears anything is a failure
+//! `_error` can catch. When the audio bus closes, the
 //! remaining audio is flushed with a final commit, the session is
 //! closed, and the full transcript is stored as the JSON file emitted on
 //! `transcript` (its text, and the entities and the rewritten transcript
@@ -36,12 +38,12 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use weft::access::socket::SocketMessage;
-use weft::bus::{BusHandle, BusOptions};
-use weft::context::LogLevel;
+use weft::bus::BusOptions;
+use weft::context::{LogLevel, PendingBus};
 use weft::node::NodeOutput;
-use weft::{node_error, Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{node_error, Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
-use super::elevenlabs::{detected_entity, store_json, text_input, WS_API};
+use super::elevenlabs::{detected_entity, refuse_broken_input, store_json, text_input, WS_API};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsTranscribeNode;
@@ -82,7 +84,7 @@ struct Session {
 }
 
 impl Session {
-    fn read(ctx: &ExecutionContext) -> WeftResult<Self> {
+    fn read(ctx: &RunContext) -> WeftResult<Self> {
         Ok(Self {
             model: ctx.inputs.get("model")?,
             commit_strategy: ctx.inputs.get("commitStrategy")?,
@@ -423,15 +425,15 @@ impl Transcript {
 /// or fail on a refusal. True when the session said nothing was left to
 /// transcribe.
 async fn relay(
-    ctx: &ExecutionContext,
-    bus: &BusHandle,
+    ctx: &RunContext,
+    bus: &mut PendingBus<'_>,
     transcript: &mut Transcript,
     word: ServerWord,
 ) -> WeftResult<bool> {
     match word {
         ServerWord::Committed(text) => {
             if transcript.commit(&text) {
-                bus.send("text", json!({ "text": text })).node_err("relay a segment")?;
+                bus.open().await?.send("text", json!({ "text": text })).node_err("relay a segment")?;
             }
         }
         ServerWord::Words { text, words, language } => {
@@ -440,7 +442,7 @@ async fn relay(
                 message["language"] = json!(language);
                 transcript.language = Some(language);
             }
-            bus.send("words", message).node_err("relay a segment's words")?;
+            bus.open().await?.send("words", message).node_err("relay a segment's words")?;
         }
         ServerWord::Language(language) => transcript.language = Some(language),
         ServerWord::Entities { text, entities } => {
@@ -451,7 +453,7 @@ async fn relay(
                 )
                 .await?;
             }
-            bus.send("entities", json!({ "text": text, "entities": entities })).node_err("relay a segment's entities")?;
+            bus.open().await?.send("entities", json!({ "text": text, "entities": entities })).node_err("relay a segment's entities")?;
         }
         ServerWord::Edited { text, edited } => {
             if !transcript.add_edit(&text, &edited) && !text.is_empty() {
@@ -461,7 +463,7 @@ async fn relay(
                 )
                 .await?;
             }
-            bus.send("edited", json!({ "text": text, "editedText": edited })).node_err("relay a segment's rewrite")?;
+            bus.open().await?.send("edited", json!({ "text": text, "editedText": edited })).node_err("relay a segment's rewrite")?;
         }
         ServerWord::Ignore => {}
         ServerWord::NothingLeft => return Ok(true),
@@ -483,7 +485,7 @@ impl Node for ElevenLabsTranscribeNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let session = Session::read(&ctx)?;
         if let Some(refusal) = session.refusal() {
@@ -500,10 +502,10 @@ impl Node for ElevenLabsTranscribeNode {
         let url = format!("{WS_API}/speech-to-text/realtime?{}", session.query(&format));
         let mut socket = conn.socket(&url).await?;
 
-        // The live segments bus: marker emitted before any
-        // transcription (a downstream consumer reads while segments
-        // land), closed on EVERY exit by the guard.
-        let segments_bus = ctx.open_bus("segments", BusOptions::default(), "transcriber").await?;
+        // The live segments bus, opened with the first segment (a
+        // downstream consumer reads while segments land) and ended the
+        // way the body ends.
+        let mut segments_bus = ctx.pending_bus("segments", BusOptions { journal: ctx.journal_policy()?, ..BusOptions::default() }, "transcriber");
 
         let mut transcript = Transcript::default();
         // The context rides the first chunk only, whichever that is.
@@ -527,7 +529,7 @@ impl Node for ElevenLabsTranscribeNode {
                     // Mid-stream, "nothing left" only means a quiet
                     // stretch: the audio goes on.
                     Some(msg) => {
-                        relay(&ctx, &segments_bus, &mut transcript, classify_server_frame(&msg.into_text()?)).await?;
+                        relay(&ctx, &mut segments_bus, &mut transcript, classify_server_frame(&msg.into_text()?)).await?;
                     }
                     None => return Err(node_error("the session closed before the audio ended")),
                 },
@@ -535,6 +537,8 @@ impl Node for ElevenLabsTranscribeNode {
             }
         }
 
+        // Audio that broke off is not a recording to transcribe whole.
+        refuse_broken_input("audio", audio.end())?;
         // The audio ended: commit whatever the session still holds, then
         // drain it alone. The drain relays EVERY committed segment (the
         // flush may commit several) and what ElevenLabs annotates them
@@ -553,7 +557,7 @@ impl Node for ElevenLabsTranscribeNode {
                 frame = socket.recv() => match frame? {
                     Some(msg) => {
                         let word = classify_server_frame(&msg.into_text()?);
-                        if relay(&ctx, &segments_bus, &mut transcript, word).await? {
+                        if relay(&ctx, &mut segments_bus, &mut transcript, word).await? {
                             break;
                         }
                     }
@@ -564,7 +568,10 @@ impl Node for ElevenLabsTranscribeNode {
         }
 
         socket.close().await?;
-        drop(segments_bus);
+        // Every segment is out: readers end now, not after the file is
+        // stored. A session that heard no speech opens the bus here, so
+        // its readers read an empty stream rather than none at all.
+        segments_bus.open().await?.close();
 
         let unedited = transcript.unedited();
         if session.transcript_edit.is_some() && unedited > 0 {

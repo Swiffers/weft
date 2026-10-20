@@ -74,7 +74,7 @@ impl PrepareError {
 
 /// Mint one cycle's socket address from a [`MintedSocket`]: run the
 /// connect call with the resolved values and read the capture named
-/// by `url_from`. Shared by every kind that dials a minted address;
+/// by `urlFrom`. Shared by every kind that dials a minted address;
 /// these addresses are single-use, so callers run this per cycle.
 pub async fn mint_socket_url(
     minted: &MintedSocket,

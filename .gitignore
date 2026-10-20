@@ -93,3 +93,5 @@ tangle/old
 .agents/skills/good-writter/
 .agents/skills/prompt-engineer/
 .codex/agents/ruthless-reviewer.toml
+
+test/

@@ -22,7 +22,7 @@ use serde_json::Value;
 
 use weft::caller::{CallerHandle, CloseReason};
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::wire;
 
@@ -39,7 +39,7 @@ impl Node for CloseNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let code: Option<u16> = ctx.inputs.opt("code")?;
         let status: Option<u16> = ctx.inputs.opt("status")?;
         let reason: Option<String> = ctx.inputs.opt("reason")?;

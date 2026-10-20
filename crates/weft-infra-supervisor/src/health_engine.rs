@@ -1,5 +1,5 @@
 //! Pure state machine driving the supervisor's flaky/recovered
-//! detection and HealthProtocol matching.
+//! detection and which health rules fire.
 //!
 //! Split off from `health.rs` so the windowed transitions can be
 //! tested deterministically without spinning a real supervisor +
@@ -11,25 +11,20 @@
 //!   unit ready or not      ──> evaluate_node_health  ──> NodeDecision
 //!   now (unix seconds)
 //!
-//!   prior in_flight flag   +
-//!   prior fired scopes     +
-//!   seen units             ──> evaluate_protocols    ──> Option<ProtocolMatch>
-//!   protocol list
+//!   rules fired so far     +
+//!   each seen copy's units
+//!   and its node's rules   ──> next_fire             ──> Option<Fire>
 //!
 //! Tests poke values straight into these functions, no fakes
 //! required. The I/O glue in `health.rs` is then a thin caller that
 //! asks the host how each unit is doing, calls these, dispatches the
 //! resulting events.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::time::Duration;
 
-use weft_broker_client::protocol::InfraCopy;
-
-use crate::protocol::{
-    broken_copies, evaluate_condition, names_infra, still_broken_copies, ConditionContext, HealthProtocol, HealthProtocols,
-    ProtocolAction, UnitView,
-};
+use weft_broker_client::protocol::{InfraCopy, LifecycleSpec, RestoreReaders, TakeDownReaders};
+use weft_core::infra::health::{CopyReading, HealthAction, HealthRule, UnitReading};
 
 /// Default windows. Public so callers can override per-test or
 /// per-instance without forking the engine.
@@ -189,185 +184,164 @@ fn secs(d: Duration) -> i64 {
     i64::try_from(d.as_secs()).unwrap_or(i64::MAX)
 }
 
-/// What the protocols are evaluated on: every seen unit of every copy
-/// expected to run now, and the project's listening.
+/// One copy as this look saw it: whose copy, the rules its node runs
+/// (`weft_core::infra::health::rules_of`), and its units the host
+/// reported that are expected to run now.
 #[derive(Debug, Clone)]
-pub struct ProtocolEvalInputs {
-    pub units: Vec<UnitView>,
-    pub project_status: weft_broker_client::protocol::ProjectStatus,
-    /// Is something the health loop took down still down? Gates
-    /// `HealthCondition::HealthParked` (auto-recover).
-    pub health_parked: bool,
+pub struct CopyView {
+    pub copy: InfraCopy,
+    pub rules: Vec<HealthRule>,
+    pub units: Vec<UnitReading>,
 }
 
-impl ProtocolEvalInputs {
-    fn context(&self) -> ConditionContext<'_> {
-        ConditionContext { units: &self.units, project_status: self.project_status, health_parked: self.health_parked }
-    }
-}
-
-/// What `evaluate_protocols` decided. None = no protocol fires this
-/// tick. Some = the named protocol matched and the caller should
-/// dispatch its action.
+/// What the rules are evaluated on: every copy with a unit the host
+/// reported (a copy it has not reported is neither broken nor healthy,
+/// so no rule reads it), and the project's listening.
 #[derive(Debug, Clone)]
-pub struct ProtocolMatch<'a> {
-    pub protocol: &'a HealthProtocol,
-    /// Where the action lands, see [`protocol_scope`]: the copies it
-    /// acts on, the copies still broken for an auto-recover, empty for a
-    /// notification or a take-down of the whole project.
-    pub scope: BTreeSet<InfraCopy>,
+pub struct RuleInputs {
+    pub copies: Vec<CopyView>,
+    /// The project's listening reads `active`.
+    pub listening: bool,
+    /// Something the health check took down is still down.
+    pub taken_down_by_health: bool,
 }
 
-/// Pure: where `proto` holds this look. `None` when it does not hold
-/// at all.
-///
-/// - An action on broken copies: the copies its condition finds broken
-///   ([`broken_copies`], `None` rather than an empty set: such an action
-///   with no copy has nothing to aim at); when the condition names no
-///   infra, [`ProtocolAction::unowned_scope`] (the named node's shared
-///   copy for a restart, the empty set, the whole project, for
-///   a take-down).
-/// - An auto-recover: the copies still broken ([`still_broken_copies`]),
-///   when the condition holds with those set aside. Empty when nothing
-///   is, and every reader the loop took comes back.
-/// - A notification: the empty set.
-pub fn protocol_scope(proto: &HealthProtocol, ctx: &ConditionContext<'_>) -> Option<BTreeSet<InfraCopy>> {
-    if matches!(proto.action, ProtocolAction::AutoRecover) {
-        let broken = still_broken_copies(&proto.when, ctx);
-        let rest: Vec<UnitView> = ctx.units.iter().filter(|u| !broken.contains(&u.copy())).cloned().collect();
-        return evaluate_condition(&proto.when, &ConditionContext { units: &rest, ..ctx.clone() }).then_some(broken);
+impl RuleInputs {
+    fn reading<'a>(&self, copy: &'a CopyView) -> CopyReading<'a> {
+        CopyReading { units: &copy.units, listening: self.listening, taken_down_by_health: self.taken_down_by_health }
     }
-    if !evaluate_condition(&proto.when, ctx) {
-        return None;
-    }
-    if !proto.action.aims_at_broken_copies() {
-        return Some(BTreeSet::new());
-    }
-    if !names_infra(&proto.when) {
-        return Some(proto.action.unowned_scope());
-    }
-    let broken = broken_copies(&proto.when, ctx);
-    (!broken.is_empty()).then_some(broken)
-}
 
-/// Pure: what a protocol that already fired (`acted`, see
-/// [`record_fire`]) still has to do where it holds now (`scope`), or
-/// `None` when it has done it all.
-///
-/// - An auto-recover fires again once a copy that was broken when it
-///   last fired, or broke since ([`rearm`]), is broken no longer, with
-///   the copies still broken now.
-/// - An action on copies acts only on the copies it has not acted on:
-///   a second copy breaking after the first is restarted or taken
-///   down alone, never the first one again.
-/// - An action on no copy (a notification, a take-down of the whole
-///   project) fired once for the episode.
-fn still_to_do(proto: &HealthProtocol, acted: &BTreeSet<InfraCopy>, scope: BTreeSet<InfraCopy>) -> Option<BTreeSet<InfraCopy>> {
-    if matches!(proto.action, ProtocolAction::AutoRecover) {
-        return (!acted.is_subset(&scope)).then_some(scope);
+    /// The units this look saw of `copy`: none when it saw none.
+    pub fn units_of(&self, copy: &InfraCopy) -> &[UnitReading] {
+        self.copies.iter().find(|c| c.copy == *copy).map(|c| c.units.as_slice()).unwrap_or_default()
     }
-    let fresh: BTreeSet<InfraCopy> = scope.difference(acted).cloned().collect();
-    (!fresh.is_empty()).then_some(fresh)
-}
 
-/// Pure: given the protocol list, what each already-fired protocol
-/// acted on and still holds for (`fired`: name to the copies its action
-/// aimed at, see [`rearm`]), the in-flight flag, and the inputs computed
-/// from this tick, return the FIRST protocol that has something to do,
-/// aimed at only that ([`still_to_do`]).
-///
-/// Skips:
-///   - if the project has any protocol in-flight (returns None);
-///   - protocols that do not hold ([`protocol_scope`]);
-///   - a protocol already fired with nothing left to do.
-pub fn evaluate_protocols<'a>(
-    protocols: &'a HealthProtocols,
-    fired: &HashMap<String, BTreeSet<InfraCopy>>,
-    in_flight: bool,
-    inputs: &ProtocolEvalInputs,
-) -> Option<ProtocolMatch<'a>> {
-    if in_flight {
-        return None;
+    /// The rule `on` names, as its copy's node runs it, and whether it
+    /// holds for the copy now. `None` when this look did not see the copy,
+    /// or its node no longer runs a rule of that name.
+    pub fn rule_on(&self, on: &RuleOn) -> Option<(&HealthRule, bool)> {
+        let copy = self.copies.iter().find(|c| c.copy == on.copy)?;
+        let rule = copy.rules.iter().find(|r| r.name == on.rule)?;
+        Some((rule, rule.when.holds(&self.reading(copy))))
     }
-    let ctx = inputs.context();
-    for proto in &protocols.protocols {
-        let Some(scope) = protocol_scope(proto, &ctx) else {
-            continue;
-        };
-        let scope = match fired.get(&proto.name) {
-            None => scope,
-            Some(acted) => match still_to_do(proto, acted, scope) {
-                Some(scope) => scope,
-                None => continue,
-            },
-        };
-        return Some(ProtocolMatch { protocol: proto, scope });
-    }
-    None
-}
 
-/// Pure: note that `proto` fired on `scope`. An action on copies adds
-/// them to what it acted on; an auto-recover remembers the copies still
-/// broken when it fired, so it fires again when one of them heals.
-pub fn record_fire(fired: &mut HashMap<String, BTreeSet<InfraCopy>>, proto: &HealthProtocol, scope: &BTreeSet<InfraCopy>) {
-    let acted = fired.entry(proto.name.clone()).or_default();
-    if matches!(proto.action, ProtocolAction::AutoRecover) {
-        *acted = scope.clone();
-    } else {
-        acted.extend(scope.iter().cloned());
+    /// Whether a bring-back rule of `copy`'s node holds for it now: its
+    /// node's own word that the copy came back.
+    pub fn brought_back(&self, copy: &InfraCopy) -> bool {
+        self.copies.iter().find(|c| c.copy == *copy).is_some_and(|c| {
+            let reading = self.reading(c);
+            c.rules.iter().any(|rule| rule.action == HealthAction::BringBack && rule.when.holds(&reading))
+        })
     }
 }
 
-/// Pure: is every seen unit of the project healthy now: fully ready,
-/// and none declared flaky?
-pub fn all_units_healthy(units: &[UnitView]) -> bool {
-    units.iter().all(|u| u.ready && !u.flaky)
+/// One rule on one copy: what its state is kept by. Two nodes' rules of
+/// the same name, or one rule on two copies, are two of these.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RuleOn {
+    pub copy: InfraCopy,
+    pub rule: String,
 }
 
-/// Pure: re-arm what the protocols fired, copy by copy.
-///
-/// - An action on copies keeps, of those, only the ones it still holds
-///   for ([`protocol_scope`]): a copy that healed is armed again, so its
-///   next episode fires, while every other copy stays as it was.
-/// - An auto-recover is forgotten once it no longer holds (nothing the
-///   loop took is still down), and otherwise also counts every copy
-///   broken now, so a copy that breaks after it fired is restored when
-///   it heals.
-/// - A notification re-arms once every seen unit of the project is
-///   healthy; a take-down of the whole project once it no longer holds.
-/// - A protocol no longer configured is forgotten.
-pub fn rearm(fired: &mut HashMap<String, BTreeSet<InfraCopy>>, protocols: &HealthProtocols, inputs: &ProtocolEvalInputs) {
-    let ctx = inputs.context();
-    let healthy = all_units_healthy(&inputs.units);
-    fired.retain(|name, acted| {
-        let Some(proto) = protocols.protocols.iter().find(|p| p.name == *name) else {
-            return false;
-        };
-        let holds = protocol_scope(proto, &ctx);
-        match &proto.action {
-            ProtocolAction::AutoRecover => match holds {
-                Some(broken) => {
-                    acted.extend(broken);
-                    true
-                }
-                None => false,
-            },
-            ProtocolAction::Notify { .. } => !healthy,
-            _ if acted.is_empty() => holds.is_some(),
-            _ => {
-                let holds = holds.unwrap_or_default();
-                acted.retain(|copy| holds.contains(copy));
-                !acted.is_empty()
+/// Pure: each copy's first rule, in its node's order, that holds for it
+/// and has not fired for it (`fired`). A copy none holds for has none.
+fn picks<'a>(inputs: &'a RuleInputs, fired: &BTreeSet<RuleOn>) -> Vec<(RuleOn, &'a HealthRule)> {
+    inputs
+        .copies
+        .iter()
+        .filter_map(|copy| {
+            let reading = inputs.reading(copy);
+            copy.rules
+                .iter()
+                .filter(|rule| rule.when.holds(&reading))
+                .map(|rule| (RuleOn { copy: copy.copy.clone(), rule: rule.name.clone() }, rule))
+                .find(|(on, _)| !fired.contains(on))
+        })
+        .collect()
+}
+
+/// What one look does: one action, for the rules (each on its copy) that
+/// asked for it.
+#[derive(Debug, Clone)]
+pub struct Fire<'a> {
+    pub action: HealthAction,
+    pub rules: Vec<(RuleOn, &'a HealthRule)>,
+}
+
+impl Fire<'_> {
+    /// How long queueing the action may take: the longest of its rules'
+    /// timeouts.
+    pub fn timeout(&self) -> Duration {
+        let secs = self.rules.iter().map(|(_, rule)| rule.timeout_seconds.get()).max().unwrap_or_default();
+        Duration::from_secs(u64::from(secs))
+    }
+
+    /// The lifecycle command the action enqueues for the dispatcher (the
+    /// supervisor has no trigger rows of its own):
+    ///
+    /// - a take-down aims at exactly the copies whose rule fired: the
+    ///   dispatcher takes down the live triggers whose cut contains one;
+    /// - a bring-back names the copies still broken ([`still_broken`],
+    ///   `took_down` being the copies whose take-down took something down
+    ///   or is queued): the dispatcher brings back what the health check
+    ///   took down whose cut contains none of them.
+    pub fn plan(&self, inputs: &RuleInputs, took_down: &BTreeSet<InfraCopy>) -> LifecycleSpec {
+        match self.action {
+            HealthAction::TakeDownTriggers => {
+                let broken: BTreeSet<InfraCopy> = self.rules.iter().map(|(on, _)| on.copy.clone()).collect();
+                LifecycleSpec::Deactivate(TakeDownReaders { broken: broken.into_iter().collect() })
             }
+            HealthAction::BringBack => LifecycleSpec::Reactivate(RestoreReaders {
+                still_broken: still_broken(inputs, took_down).into_iter().collect(),
+            }),
         }
-    });
+    }
+}
+
+/// Pure: the action this look fires, or `None`. Every copy's pick
+/// ([`picks`]) whose rule is not `waiting` (backing off after a failure,
+/// or given up) joins it: the take-downs first, as one action over every
+/// copy whose take-down holds; else the bring-backs, as one.
+pub fn next_fire<'a>(inputs: &'a RuleInputs, fired: &BTreeSet<RuleOn>, waiting: impl Fn(&RuleOn) -> bool) -> Option<Fire<'a>> {
+    let picks: Vec<(RuleOn, &HealthRule)> = picks(inputs, fired).into_iter().filter(|(on, _)| !waiting(on)).collect();
+    [HealthAction::TakeDownTriggers, HealthAction::BringBack].into_iter().find_map(|action| {
+        let rules: Vec<(RuleOn, &HealthRule)> = picks.iter().filter(|(_, rule)| rule.action == action).cloned().collect();
+        (!rules.is_empty()).then_some(Fire { action, rules })
+    })
+}
+
+/// Pure: the seen copies a bring-back keeps the readers of down: those
+/// no bring-back rule of their node holds for, when either their node
+/// runs one (its own rules say the copy has not come back) or the copy is
+/// in `took_down` (a take-down of it took something down, or is queued,
+/// and nothing brought the copy back since). So a copy whose node runs no
+/// bring-back rule keeps down what its own take-down took down, until a
+/// person brings it back, and never holds back a trigger another copy's
+/// rule took down: however it is doing, nothing asked it to.
+pub fn still_broken(inputs: &RuleInputs, took_down: &BTreeSet<InfraCopy>) -> BTreeSet<InfraCopy> {
+    inputs
+        .copies
+        .iter()
+        .filter(|copy| {
+            let has_bring_back = copy.rules.iter().any(|rule| rule.action == HealthAction::BringBack);
+            (has_bring_back || took_down.contains(&copy.copy)) && !inputs.brought_back(&copy.copy)
+        })
+        .map(|copy| copy.copy.clone())
+        .collect()
+}
+
+/// Pure: forget every fired rule that no longer holds for its copy (its
+/// copy unseen, or the rule gone from its node, included), so the copy's
+/// next episode fires it again.
+pub fn rearm(fired: &mut BTreeSet<RuleOn>, inputs: &RuleInputs) {
+    fired.retain(|on| inputs.rule_on(on).is_some_and(|(_, holds)| holds));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{HealthCondition, ProtocolAction};
     use weft_broker_client::protocol::InfraNodeStatus as Status;
+    use weft_core::infra::health::{built_in_rules, HealthCondition, DEFAULT_RULE_TIMEOUT_SECONDS};
 
     const T: i64 = 1_000_000;
 
@@ -528,302 +502,206 @@ mod tests {
         assert_eq!(still.desired_status, Status::Flaky);
     }
 
-    // ---------- evaluate_protocols ----------
+    // ---------- the rules ----------
 
-    fn proto(name: &str, when: HealthCondition, action: ProtocolAction) -> HealthProtocol {
-        HealthProtocol {
-            name: name.to_string(),
-            when,
-            action,
-            timeout_seconds: 1800,
-        }
+    const TAKE_DOWN: &str = "take-down-while-flaky";
+    const BRING_BACK: &str = "bring-back-once-healthy";
+
+    fn shared(node: &str) -> InfraCopy {
+        InfraCopy { node_id: node.into(), instance: None }
     }
 
-    fn flaky_when() -> HealthCondition {
-        HealthCondition::NodeNotReady { node_id: "*".into(), unit: "*".into() }
+    fn of(node: &str, instance: &str) -> InfraCopy {
+        InfraCopy { node_id: node.into(), instance: Some(weft_core::instance::InstanceId::new(instance).unwrap()) }
     }
 
-    fn view(node: &str, instance: Option<&str>, ready: bool, flaky: bool) -> UnitView {
-        UnitView {
-            node_id: node.into(),
-            instance: instance.map(|m| weft_core::instance::InstanceId::new(m).unwrap()),
-            unit: node.into(),
-            ready,
-            flaky,
-        }
+    fn unit(name: &str, ready: bool, flaky: bool) -> UnitReading {
+        UnitReading { unit: name.into(), ready, flaky }
     }
 
-    fn inputs(units: Vec<UnitView>) -> ProtocolEvalInputs {
-        ProtocolEvalInputs {
-            units,
-            project_status: weft_broker_client::protocol::ProjectStatus::Active,
-            health_parked: false,
-        }
+    /// A copy running the built-in rules, its one unit named after its
+    /// node.
+    fn copy(copy: InfraCopy, ready: bool, flaky: bool) -> CopyView {
+        let units = vec![unit(&copy.node_id, ready, flaky)];
+        CopyView { copy, rules: built_in_rules(), units }
     }
 
-    fn inputs_with_ready(node: &str, ready: bool) -> ProtocolEvalInputs {
-        inputs(vec![view(node, None, ready, false)])
+    fn inputs(copies: Vec<CopyView>) -> RuleInputs {
+        RuleInputs { copies, listening: true, taken_down_by_health: false }
     }
 
-    fn fired(name: &str, scope: BTreeSet<InfraCopy>) -> HashMap<String, BTreeSet<InfraCopy>> {
-        HashMap::from([(name.to_string(), scope)])
+    fn on(copy: &InfraCopy, rule: &str) -> RuleOn {
+        RuleOn { copy: copy.clone(), rule: rule.into() }
     }
 
+    fn fire(inputs: &RuleInputs, fired: &BTreeSet<RuleOn>) -> Option<(HealthAction, Vec<RuleOn>)> {
+        next_fire(inputs, fired, |_| false).map(|f| (f.action, f.rules.into_iter().map(|(on, _)| on).collect()))
+    }
+
+    fn rule(name: &str, when: HealthCondition, action: HealthAction) -> HealthRule {
+        HealthRule { name: name.into(), when, action, timeout_seconds: DEFAULT_RULE_TIMEOUT_SECONDS }
+    }
+
+    /// The built-in take-down fires on a unit's latch, never on one
+    /// reading, and aims at exactly the copy it holds for: ada's broken
+    /// copy of `svc`, never bob's healthy one or the shared `db`.
     #[test]
-    fn protocols_match_first_in_list_order() {
-        let p = HealthProtocols {
-            protocols: vec![
-                proto("first", flaky_when(), ProtocolAction::AutoRecover),
-                proto(
-                    "second",
-                    flaky_when(),
-                    ProtocolAction::Notify {
-                        channel: "ops".into(),
-                    },
-                ),
-            ],
+    fn a_take_down_waits_for_the_latch_and_aims_at_its_copy() {
+        let ada_svc = of("svc", "ada");
+        let one_bad_reading = inputs(vec![copy(ada_svc.clone(), false, false), copy(of("svc", "bob"), true, false), copy(shared("db"), true, false)]);
+        assert!(fire(&one_bad_reading, &BTreeSet::new()).is_none());
+        let latched = inputs(vec![copy(ada_svc.clone(), false, true), copy(of("svc", "bob"), true, false), copy(shared("db"), true, false)]);
+        let f = next_fire(&latched, &BTreeSet::new(), |_| false).expect("take down");
+        assert_eq!(f.action, HealthAction::TakeDownTriggers);
+        assert_eq!(f.plan(&latched, &BTreeSet::new()), LifecycleSpec::Deactivate(TakeDownReaders { broken: vec![ada_svc] }));
+        let quiet = RuleInputs { listening: false, ..latched };
+        assert!(fire(&quiet, &BTreeSet::new()).is_none(), "nothing listens: nothing to take down");
+    }
+
+    /// Copies that break in the same look go down in one action; a copy
+    /// already taken down is not again, and a second copy breaking later
+    /// is taken down alone.
+    #[test]
+    fn a_take_down_acts_once_per_copy() {
+        let (ada, bob) = (of("svc", "ada"), of("svc", "bob"));
+        let both = inputs(vec![copy(ada.clone(), false, true), copy(bob.clone(), false, true)]);
+        assert_eq!(fire(&both, &BTreeSet::new()), Some((HealthAction::TakeDownTriggers, vec![on(&ada, TAKE_DOWN), on(&bob, TAKE_DOWN)])));
+        let fired = BTreeSet::from([on(&ada, TAKE_DOWN)]);
+        assert_eq!(fire(&both, &fired), Some((HealthAction::TakeDownTriggers, vec![on(&bob, TAKE_DOWN)])));
+        let all = BTreeSet::from([on(&ada, TAKE_DOWN), on(&bob, TAKE_DOWN)]);
+        assert!(fire(&both, &all).is_none());
+    }
+
+    /// Each copy runs its own node's rules over its own units: a node
+    /// whose rule reads only its `primary` unit is not taken down for a
+    /// flaky `sidecar`, while a node on the built-in rules is taken down
+    /// for any of its units; two nodes' rules of one name are two states.
+    #[test]
+    fn each_copy_runs_its_own_nodes_rules() {
+        let primary_only = vec![rule(
+            TAKE_DOWN,
+            HealthCondition::UnitFlaky { unit: Some("primary".into()) },
+            HealthAction::TakeDownTriggers,
+        )];
+        let picky = CopyView { copy: shared("picky"), rules: primary_only, units: vec![unit("primary", true, false), unit("sidecar", false, true)] };
+        let plain = CopyView { copy: shared("plain"), rules: built_in_rules(), units: vec![unit("primary", true, false), unit("sidecar", false, true)] };
+        let look = inputs(vec![picky, plain]);
+        assert_eq!(fire(&look, &BTreeSet::new()), Some((HealthAction::TakeDownTriggers, vec![on(&shared("plain"), TAKE_DOWN)])));
+        let fired = BTreeSet::from([on(&shared("plain"), TAKE_DOWN)]);
+        assert!(fire(&look, &fired).is_none(), "the other node's rule of that name is its own");
+    }
+
+    /// A node that runs no rules is never acted on, however broken.
+    #[test]
+    fn a_node_with_no_rules_is_left_alone() {
+        let look = inputs(vec![CopyView { copy: shared("db"), rules: Vec::new(), units: vec![unit("db", false, true)] }]);
+        assert!(fire(&look, &BTreeSet::new()).is_none());
+    }
+
+    /// The built-in bring-back fires only while the health check took
+    /// something down, for every healthy copy at once, and names the
+    /// copies still broken: here ada's, so her readers stay down.
+    #[test]
+    fn a_bring_back_names_the_copies_still_broken() {
+        let (ada, bob) = (of("svc", "ada"), of("svc", "bob"));
+        let nothing_down = inputs(vec![copy(ada.clone(), true, false), copy(bob.clone(), true, false)]);
+        assert!(fire(&nothing_down, &BTreeSet::new()).is_none(), "nothing the health check took is down");
+
+        let look = RuleInputs { taken_down_by_health: true, listening: false, ..inputs(vec![copy(ada.clone(), false, true), copy(bob.clone(), true, false), copy(shared("db"), true, false)]) };
+        let f = next_fire(&look, &BTreeSet::new(), |_| false).expect("bring back");
+        assert_eq!(f.action, HealthAction::BringBack);
+        assert_eq!(f.rules.iter().map(|(on, _)| on.clone()).collect::<Vec<_>>(), vec![on(&bob, BRING_BACK), on(&shared("db"), BRING_BACK)]);
+        assert_eq!(f.plan(&look, &BTreeSet::new()), LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![ada.clone()] }));
+
+        // Fired for bob and db: it fires again once ada heals, for her.
+        let fired = BTreeSet::from([on(&shared("db"), BRING_BACK), on(&bob, BRING_BACK)]);
+        assert!(fire(&look, &fired).is_none());
+        let healed = RuleInputs { copies: vec![copy(ada.clone(), true, false), copy(bob, true, false), copy(shared("db"), true, false)], ..look };
+        assert_eq!(fire(&healed, &fired), Some((HealthAction::BringBack, vec![on(&ada, BRING_BACK)])));
+        assert!(still_broken(&healed, &BTreeSet::new()).is_empty());
+    }
+
+    /// A take-down goes before a bring-back in the same look: the
+    /// bring-back then still names the newly broken copy.
+    #[test]
+    fn a_take_down_goes_first() {
+        let look = RuleInputs { taken_down_by_health: true, ..inputs(vec![copy(shared("db"), false, true), copy(shared("svc"), true, false)]) };
+        assert_eq!(fire(&look, &BTreeSet::new()).map(|(action, _)| action), Some(HealthAction::TakeDownTriggers));
+    }
+
+    /// A copy whose node runs no bring-back rule holds down only what its
+    /// own take-down took down (`took_down`): healthy or not, it never
+    /// holds back a trigger another copy's rule took down. Here `db`
+    /// (the built-in rules) recovered, `cache` runs no rules at all and
+    /// `keep` only a take-down: neither holds anything down until a
+    /// take-down of it took something down, and then only a person
+    /// brings that back.
+    #[test]
+    fn a_copy_with_no_bring_back_holds_down_only_what_it_took_down() {
+        let no_rules = CopyView { copy: shared("cache"), rules: Vec::new(), units: vec![unit("cache", false, true)] };
+        let keep_down = CopyView {
+            copy: shared("keep"),
+            rules: vec![rule(TAKE_DOWN, HealthCondition::UnitFlaky { unit: None }, HealthAction::TakeDownTriggers)],
+            units: vec![unit("keep", true, false)],
         };
-        let inputs = inputs_with_ready("n1", false);
-        let m = evaluate_protocols(&p, &HashMap::new(), false, &inputs);
-        assert_eq!(m.expect("match").protocol.name, "first");
+        let look = RuleInputs { taken_down_by_health: true, ..inputs(vec![copy(shared("db"), true, false), no_rules, keep_down]) };
+        let f = next_fire(&look, &BTreeSet::new(), |_| false).expect("db brings back");
+        assert_eq!(f.rules.iter().map(|(on, _)| on.clone()).collect::<Vec<_>>(), vec![on(&shared("db"), BRING_BACK)]);
+        assert_eq!(f.plan(&look, &BTreeSet::new()), LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![] }));
+        let took_down = BTreeSet::from([shared("keep"), shared("db")]);
+        assert_eq!(
+            f.plan(&look, &took_down),
+            LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![shared("keep")] }),
+            "db came back by its own rule; keep has no way back but a person"
+        );
     }
 
+    /// A rule backing off or given up on a copy keeps that copy out of the
+    /// action (and does not fall through to its next rule); the others
+    /// still act.
     #[test]
-    fn protocols_skip_already_fired() {
-        let p = HealthProtocols {
-            protocols: vec![
-                proto("first", flaky_when(), ProtocolAction::ParkTriggers),
-                proto(
-                    "second",
-                    flaky_when(),
-                    ProtocolAction::Notify {
-                        channel: "ops".into(),
-                    },
-                ),
-            ],
-        };
-        let inputs = inputs_with_ready("n1", false);
-        let n1 = BTreeSet::from([InfraCopy { node_id: "n1".into(), instance: None }]);
-        let m = evaluate_protocols(&p, &fired("first", n1), false, &inputs);
-        assert_eq!(m.expect("match").protocol.name, "second");
+    fn a_waiting_rule_holds_back_only_its_copy() {
+        let (ada, bob) = (of("svc", "ada"), of("svc", "bob"));
+        let both = inputs(vec![copy(ada.clone(), false, true), copy(bob.clone(), false, true)]);
+        let f = next_fire(&both, &BTreeSet::new(), |o| *o == on(&ada, TAKE_DOWN)).expect("bob's goes on");
+        assert_eq!(f.rules.into_iter().map(|(on, _)| on).collect::<Vec<_>>(), vec![on(&bob, TAKE_DOWN)]);
+        assert!(next_fire(&both, &BTreeSet::new(), |_| true).is_none());
     }
 
+    /// The action's timeout is the longest of its rules'.
     #[test]
-    fn protocols_no_match_when_in_flight() {
-        let p = HealthProtocols {
-            protocols: vec![proto("first", flaky_when(), ProtocolAction::AutoRecover)],
-        };
-        let inputs = inputs_with_ready("n1", false);
-        let m = evaluate_protocols(&p, &HashMap::new(), true, &inputs);
-        assert!(m.is_none());
-    }
-
-    #[test]
-    fn protocols_no_match_when_condition_false() {
-        let p = HealthProtocols {
-            protocols: vec![proto("first", flaky_when(), ProtocolAction::AutoRecover)],
-        };
-        // Ready: `node_not_ready` is false.
-        let inputs = inputs_with_ready("n1", true);
-        let m = evaluate_protocols(&p, &HashMap::new(), false, &inputs);
-        assert!(m.is_none());
-    }
-
-    #[test]
-    fn protocols_empty_list_no_match() {
-        let p = HealthProtocols {
-            protocols: vec![],
-        };
-        let m = evaluate_protocols(&p, &HashMap::new(), false, &inputs(Vec::new()));
-        assert!(m.is_none());
-    }
-
-    /// The default park fires on a unit's latch, never on one reading:
-    /// a copy not ready that is not declared flaky parks nothing; a
-    /// declared-flaky one parks, aimed at exactly its copy.
-    #[test]
-    fn the_default_park_waits_for_the_latch_and_aims_at_the_broken_copy() {
-        let p = crate::protocol::default_protocols();
-        let one_bad_reading = inputs(vec![view("svc", Some("ada"), false, false), view("db", None, true, false)]);
-        assert!(evaluate_protocols(&p, &HashMap::new(), false, &one_bad_reading).is_none());
-
-        let latched = inputs(vec![view("svc", Some("ada"), false, true), view("db", None, true, false)]);
-        let m = evaluate_protocols(&p, &HashMap::new(), false, &latched).expect("park");
-        assert_eq!(m.protocol.name, "park-while-infra-broken");
-        let ada_svc = InfraCopy { node_id: "svc".into(), instance: Some(weft_core::instance::InstanceId::new("ada").unwrap()) };
-        assert_eq!(m.scope, BTreeSet::from([ada_svc.clone()]));
-
-        // Fired on ada's copy: the same breakage does not fire again, a
-        // second copy breaking does, aimed at that copy alone.
-        let acted = fired("park-while-infra-broken", BTreeSet::from([ada_svc.clone()]));
-        assert!(evaluate_protocols(&p, &acted, false, &latched).is_none());
-        let both = inputs(vec![view("svc", Some("ada"), false, true), view("db", None, false, true)]);
-        let m = evaluate_protocols(&p, &acted, false, &both).expect("the new breakage parks");
-        assert_eq!(m.scope, BTreeSet::from([InfraCopy { node_id: "db".into(), instance: None }]));
-    }
-
-    /// A restart fires once per copy: ada's broken copy is restarted, and
-    /// when bob's breaks after it, only bob's is.
-    #[test]
-    fn a_protocol_acts_once_per_copy() {
-        let p = HealthProtocols {
-            protocols: vec![proto(
-                "restart",
-                HealthCondition::NodeFlaky { node_id: "svc".into(), unit: "*".into() },
-                ProtocolAction::RestartUnit { node_id: "svc".into(), unit: "svc".into() },
-            )],
-        };
-        let ada = InfraCopy { node_id: "svc".into(), instance: Some(weft_core::instance::InstanceId::new("ada").unwrap()) };
-        let bob = InfraCopy { node_id: "svc".into(), instance: Some(weft_core::instance::InstanceId::new("bob").unwrap()) };
-        let mut acted = HashMap::new();
-        let first = inputs(vec![view("svc", Some("ada"), false, true), view("svc", Some("bob"), true, false)]);
-        let m = evaluate_protocols(&p, &acted, false, &first).expect("ada's copy breaks");
-        assert_eq!(m.scope, BTreeSet::from([ada.clone()]));
-        record_fire(&mut acted, m.protocol, &m.scope);
-        let then = inputs(vec![view("svc", Some("ada"), false, true), view("svc", Some("bob"), false, true)]);
-        rearm(&mut acted, &p, &then);
-        let m = evaluate_protocols(&p, &acted, false, &then).expect("bob's copy breaks after");
-        assert_eq!(m.scope, BTreeSet::from([bob]), "ada's copy is not restarted again");
-        record_fire(&mut acted, m.protocol, &m.scope);
-        assert!(evaluate_protocols(&p, &acted, false, &then).is_none());
-    }
-
-    /// A restart on a broken shared copy aims at that shared copy.
-    #[test]
-    fn a_restart_on_a_broken_shared_copy_aims_at_it() {
-        let p = HealthProtocols {
-            protocols: vec![proto(
-                "restart",
-                flaky_when(),
-                ProtocolAction::RestartUnit { node_id: "svc".into(), unit: "svc".into() },
-            )],
-        };
-        let m = evaluate_protocols(&p, &HashMap::new(), false, &inputs(vec![view("svc", None, false, false)]))
-            .expect("the shared copy is not ready");
-        assert_eq!(m.scope, BTreeSet::from([InfraCopy { node_id: "svc".into(), instance: None }]));
-    }
-
-    /// A protocol whose condition names no infra acts where it did
-    /// before copies had owners: a restart of the named node's shared
-    /// copy, a take-down on the whole project, each once while it
-    /// holds, and again after it stopped holding.
-    #[test]
-    fn a_protocol_with_no_unit_condition_acts_as_before() {
-        use weft_broker_client::protocol::ProjectStatus;
-        let active = HealthCondition::ProjectStatusEq { status: ProjectStatus::Active };
-        let restart = HealthProtocols {
-            protocols: vec![proto(
-                "restart",
-                active.clone(),
-                ProtocolAction::RestartUnit { node_id: "svc".into(), unit: "svc".into() },
-            )],
-        };
-        let m = evaluate_protocols(&restart, &HashMap::new(), false, &inputs(Vec::new())).expect("fires");
-        assert_eq!(m.scope, BTreeSet::from([InfraCopy { node_id: "svc".into(), instance: None }]));
-
-        let park = HealthProtocols { protocols: vec![proto("park", active, ProtocolAction::ParkTriggers)] };
-        let mut acted = HashMap::new();
-        let m = evaluate_protocols(&park, &acted, false, &inputs(Vec::new())).expect("fires on the whole project");
-        assert!(m.scope.is_empty());
-        record_fire(&mut acted, m.protocol, &m.scope);
-        rearm(&mut acted, &park, &inputs(Vec::new()));
-        assert!(evaluate_protocols(&park, &acted, false, &inputs(Vec::new())).is_none(), "once while it holds");
-        let inactive = ProtocolEvalInputs { project_status: ProjectStatus::Inactive, ..inputs(Vec::new()) };
-        rearm(&mut acted, &park, &inactive);
-        assert!(acted.is_empty(), "re-armed once it stopped holding");
-    }
-
-    /// Auto-recover reads each copy on its own and names the copies
-    /// still broken: while ada's copy is flaky it fires with that copy
-    /// (everything else comes back), and only when the health loop parked
-    /// something.
-    #[test]
-    fn the_default_recover_names_the_copies_still_broken() {
-        let p = crate::protocol::default_protocols();
-        let ada_svc = InfraCopy { node_id: "svc".into(), instance: Some(weft_core::instance::InstanceId::new("ada").unwrap()) };
-        let healthy_parked = ProtocolEvalInputs { health_parked: true, ..inputs(vec![view("svc", None, true, false)]) };
-        let m = evaluate_protocols(&p, &HashMap::new(), false, &healthy_parked).expect("recover");
-        assert_eq!(m.protocol.name, "auto-recover-when-infra-healthy");
-        assert!(m.scope.is_empty(), "nothing is still broken");
-
-        let parked_svc = fired("park-while-infra-broken", BTreeSet::from([ada_svc.clone()]));
-        let one_still_flaky = ProtocolEvalInputs {
-            health_parked: true,
-            ..inputs(vec![view("svc", None, true, false), view("svc", Some("ada"), false, true)])
-        };
-        let m = evaluate_protocols(&p, &parked_svc, false, &one_still_flaky).expect("the rest recovers");
-        assert_eq!(m.protocol.name, "auto-recover-when-infra-healthy");
-        assert_eq!(m.scope, BTreeSet::from([ada_svc]));
-
-        let nothing_parked = inputs(vec![view("svc", None, true, false)]);
-        assert!(evaluate_protocols(&p, &HashMap::new(), false, &nothing_parked).is_none());
-    }
-
-    /// A shared-only project whose triggers read only copies the loop
-    /// cannot see: nothing is known broken, so a recovery fires with an
-    /// empty still-broken set and every reader the loop took comes back.
-    #[test]
-    fn a_recovery_with_no_seen_copy_restores_everything() {
-        let p = crate::protocol::default_protocols();
-        let parked = ProtocolEvalInputs { health_parked: true, ..inputs(Vec::new()) };
-        let m = evaluate_protocols(&p, &HashMap::new(), false, &parked).expect("recover");
-        assert_eq!(m.protocol.name, "auto-recover-when-infra-healthy");
-        assert!(m.scope.is_empty());
-    }
-
-    /// Re-arming is per copy: a take-down forgets a copy once it healed
-    /// and keeps the one still broken; a recovery fires again when a copy
-    /// broken at its fire, or broken since, heals, and is forgotten once
-    /// nothing it took is down; a notification waits for the whole
-    /// project.
-    #[test]
-    fn rearm_is_copy_by_copy() {
-        let p = crate::protocol::default_protocols();
-        let ada = InfraCopy { node_id: "svc".into(), instance: Some(weft_core::instance::InstanceId::new("ada").unwrap()) };
-        let bob = InfraCopy { node_id: "svc".into(), instance: Some(weft_core::instance::InstanceId::new("bob").unwrap()) };
-        let recover = &p.protocols[1];
-        let mut acted = HashMap::from([
-            ("park-while-infra-broken".to_string(), BTreeSet::from([ada.clone(), bob.clone()])),
-            ("gone-from-the-config".to_string(), BTreeSet::new()),
+    fn an_action_takes_as_long_as_its_slowest_rule() {
+        let quick = rule("quick", HealthCondition::UnitFlaky { unit: None }, HealthAction::TakeDownTriggers);
+        let slow = HealthRule { timeout_seconds: std::num::NonZeroU32::new(4000).unwrap(), ..quick.clone() };
+        let look = inputs(vec![
+            CopyView { copy: shared("a"), rules: vec![quick], units: vec![unit("a", false, true)] },
+            CopyView { copy: shared("b"), rules: vec![slow], units: vec![unit("b", false, true)] },
         ]);
-        // The recovery fired while ada's copy was still broken.
-        record_fire(&mut acted, recover, &BTreeSet::from([ada.clone()]));
-        // Ada healed, bob is still flaky, and something is still parked.
-        let now = ProtocolEvalInputs {
-            health_parked: true,
-            ..inputs(vec![view("svc", Some("ada"), true, false), view("svc", Some("bob"), false, true)])
-        };
-        rearm(&mut acted, &p, &now);
-        assert_eq!(acted.get("park-while-infra-broken"), Some(&BTreeSet::from([bob.clone()])));
-        assert!(!acted.contains_key("gone-from-the-config"));
-        // Bob broke after the recovery fired: counted, so his healing fires it.
-        assert_eq!(acted.get("auto-recover-when-infra-healthy"), Some(&BTreeSet::from([ada.clone(), bob.clone()])));
-        let m = evaluate_protocols(&p, &acted, false, &now).expect("ada healed since it fired");
-        assert_eq!(m.scope, BTreeSet::from([bob.clone()]));
-        record_fire(&mut acted, m.protocol, &m.scope);
-        assert!(evaluate_protocols(&p, &acted, false, &now).is_none(), "nothing healed since");
-
-        // Nothing is parked any more: the recovery is forgotten.
-        let done = inputs(vec![view("svc", Some("ada"), true, false), view("svc", Some("bob"), true, false)]);
-        rearm(&mut acted, &p, &done);
-        assert!(!acted.contains_key("auto-recover-when-infra-healthy"));
-
-        let notify = HealthProtocols { protocols: vec![proto("tell", flaky_when(), ProtocolAction::Notify { channel: "ops".into() })] };
-        let mut told = fired("tell", BTreeSet::new());
-        rearm(&mut told, &notify, &inputs(vec![view("svc", None, false, false)]));
-        assert!(told.contains_key("tell"), "not healthy yet");
-        rearm(&mut told, &notify, &inputs(vec![view("svc", None, true, false)]));
-        assert!(told.is_empty());
+        assert_eq!(next_fire(&look, &BTreeSet::new(), |_| false).unwrap().timeout(), Duration::from_secs(4000));
     }
 
-    // ---------- all_units_healthy ----------
-
+    /// Re-arming is per rule per copy: a take-down whose copy healed is
+    /// forgotten (its next breakage fires), one still broken is kept; a
+    /// bring-back is forgotten once nothing is down; an unseen copy's, or
+    /// a rule its node no longer runs, is forgotten.
     #[test]
-    fn healthy_means_every_unit_ready_and_none_flaky() {
-        assert!(all_units_healthy(&[view("a", None, true, false), view("b", None, true, false)]));
-        assert!(!all_units_healthy(&[view("a", None, true, false), view("b", None, false, false)]));
-        assert!(!all_units_healthy(&[view("a", None, true, true)]), "ready inside the recovery window is not healthy");
-        // No expected-running unit keeps nothing armed.
-        assert!(all_units_healthy(&[]));
+    fn rearm_forgets_what_no_longer_holds() {
+        let (ada, bob) = (of("svc", "ada"), of("svc", "bob"));
+        let mut fired = BTreeSet::from([
+            on(&ada, TAKE_DOWN),
+            on(&bob, TAKE_DOWN),
+            on(&shared("db"), BRING_BACK),
+            on(&shared("gone"), TAKE_DOWN),
+            on(&bob, "renamed-since"),
+        ]);
+        let now = RuleInputs {
+            taken_down_by_health: true,
+            ..inputs(vec![copy(ada.clone(), true, false), copy(bob.clone(), false, true), copy(shared("db"), true, false)])
+        };
+        rearm(&mut fired, &now);
+        assert_eq!(fired, BTreeSet::from([on(&bob, TAKE_DOWN), on(&shared("db"), BRING_BACK)]));
+        let nothing_down = RuleInputs { taken_down_by_health: false, ..now };
+        rearm(&mut fired, &nothing_down);
+        assert_eq!(fired, BTreeSet::from([on(&bob, TAKE_DOWN)]));
     }
 }

@@ -3,15 +3,16 @@
 //!
 //! Two layers, both kept by the worker ([`Plans`]):
 //!
-//! - [`ProgramTables`], per program definition and selection: what a drive
-//!   reads on every turn (the wires of the part of the program the run may
-//!   dispatch, the nodes by id, their ports, which are group boundaries and
-//!   which read a stream, the infra the program declares). Every run reads
-//!   them, born here or carried on from its record.
+//! - [`ProgramTables`], per program definition: what a drive reads on
+//!   every turn (the wires, the nodes by id, their ports, which are a
+//!   loop's boundaries and which read a stream, the infra the program
+//!   declares). Every run reads them, born here or carried on from its
+//!   record.
 //! - [`RunPlan`], per trigger, per instance its runs are for, and per
 //!   version of what its runs read (the trigger as armed, the run facts):
 //!   the run a fire of the trigger starts
-//!   (its selection, the roots it kicks, what infra it reads baked), whether
+//!   (its cut of the program, the roots it kicks, what infra it reads
+//!   baked), whether
 //!   what it reads lets it start (its infra up, what its instance provides,
 //!   the install's picks), its birth, its caller's connection settings and
 //!   its limits. A run born from a plan starts from the plan's roots: no
@@ -27,14 +28,14 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 use weft_broker_client::protocol::ArmedEntry;
-use weft_core::frames::{FiringLocation, Located};
-use weft_core::project::selection::RecordedSelection;
+use weft_core::frames::FiringLocation;
 use weft_core::project::{DeclaredInfra, ProgramIndex, NodeDefinition};
 use weft_core::pulse::PulseTable;
 use weft_core::run_spec::KickPlan;
 use weft_core::weft_type::WeftType;
-use weft_core::{ExecutionId, ProjectDefinition};
-use weft_journal::ExecEvent;
+use weft_core::{RunId, ProjectDefinition};
+use weft_journal::record::RunsProgram;
+use weft_journal::RunEvent;
 
 use crate::door::{DoorBroker, HeldTrigger};
 
@@ -44,38 +45,61 @@ pub(crate) struct NodePorts {
     pub(crate) outputs: Arc<HashMap<String, WeftType>>,
 }
 
+/// A node's ports at every place it runs: its own, and those of each
+/// place whose types differ (a node inside an included file a site
+/// resolved its own way, `NodeDefinition::place_types`).
+struct PlacedPorts {
+    own: NodePorts,
+    places: Vec<(Vec<String>, NodePorts)>,
+}
+
 /// See the module doc.
 pub(crate) struct ProgramTables {
     pub(crate) project: Arc<ProjectDefinition>,
-    /// The part of the program the run may dispatch, `None` for the whole.
-    pub(crate) selection: Option<RecordedSelection>,
     pub(crate) index: ProgramIndex,
-    pub(crate) dispatchable: Option<HashSet<Located>>,
-    ports: Vec<NodePorts>,
-    /// The group boundaries (a group's In and Out, a loop's): runtime
+    ports: Vec<PlacedPorts>,
+    /// A loop's boundaries (its `LoopIn` and `LoopOut`): runtime
     /// machinery whose whole state is on record.
     pub(crate) boundaries: HashSet<String>,
     pub(crate) declared_infra: Arc<DeclaredInfra>,
 }
 
 impl ProgramTables {
-    pub(crate) fn new(project: Arc<ProjectDefinition>, selection: Option<RecordedSelection>) -> Self {
-        let index = match &selection {
-            Some(selection) => ProgramIndex::selected(&project, selection.selection().as_ref().clone()),
-            None => ProgramIndex::build(&project),
-        };
-        let dispatchable = selection.as_ref().map(|selection| selection.selection().dispatchable_nodes());
+    pub(crate) fn new(project: Arc<ProjectDefinition>) -> Self {
+        let index = ProgramIndex::build(&project);
         let ports = project
             .nodes
             .iter()
-            .map(|node| NodePorts {
-                inputs: Arc::new(node.inputs.iter().map(|p| (p.name.clone(), p.port_type.clone())).collect()),
-                outputs: Arc::new(node.outputs.iter().map(|p| (p.name.clone(), p.port_type.clone())).collect()),
+            .map(|node| {
+                // The node's own inputs: the gates are the language's
+                // (the bag drops them too), so a node asking what it
+                // declares (a List with no items, a script binding its
+                // ports by name) never sees them.
+                let ports_at = |types: weft_core::project::TypesAt<'_>| NodePorts {
+                    inputs: Arc::new(
+                        node.inputs
+                            .iter()
+                            .filter(|p| !weft_core::run::skip::is_gate_port(&p.name))
+                            .filter_map(|p| Some((p.name.clone(), types.input(&p.name)?.clone())))
+                            .collect(),
+                    ),
+                    outputs: Arc::new(
+                        node.outputs.iter().filter_map(|p| Some((p.name.clone(), types.output(&p.name)?.clone()))).collect(),
+                    ),
+                };
+                PlacedPorts {
+                    own: ports_at(node.types_at::<&str>(&[])),
+                    places: node
+                        .place_types
+                        .iter()
+                        .map(|place| (place.place.clone(), ports_at(node.types_at(&place.place))))
+                        .collect(),
+                }
             })
             .collect::<Vec<_>>();
         let boundaries = project.nodes.iter().filter(|n| n.group_boundary.is_some()).map(|n| n.id.clone()).collect();
         let declared_infra = Arc::new(DeclaredInfra::of(&project));
-        Self { project, selection, index, dispatchable, ports, boundaries, declared_infra }
+        Self { project, index, ports, boundaries, declared_infra }
     }
 
     /// The node whose id is `id`.
@@ -83,28 +107,34 @@ impl ProgramTables {
         self.index.node(&self.project, id)
     }
 
-    /// The ports of the node whose id is `id`.
-    pub(crate) fn ports(&self, id: &str) -> Option<&NodePorts> {
-        self.index.position(id).map(|at| &self.ports[at])
+    /// The ports of the node whose id is `id`, as they are where it
+    /// fires at `frames` (the include call path on them picks the place).
+    pub(crate) fn ports(&self, id: &str, frames: &weft_core::frames::LoopFrames) -> Option<&NodePorts> {
+        let at = self.index.position(id)?;
+        let placed = &self.ports[at];
+        // The same reading `NodeDefinition::types_at` makes: the entry of
+        // the place this firing runs at, else the node's own.
+        let place = self.project.nodes[at].place_of(&weft_core::frames::call_path(frames));
+        Some(place.map_or(&placed.own, |index| &placed.places[index].1))
     }
 
     /// The nodes ready to fire on `pulses`, in the program's order: what
-    /// `weft_core::exec::find_ready_nodes` answers, asking only the nodes
+    /// `weft_core::run::find_ready_nodes` answers, asking only the nodes
     /// some pending pulse waits at (a node with none is never ready)
     /// instead of every node of the program.
-    pub(crate) fn ready(&self, pulses: &PulseTable) -> Vec<(String, weft_core::exec::ReadyGroup)> {
+    pub(crate) fn ready(&self, pulses: &PulseTable, given: &weft_core::project::Given) -> Vec<(String, weft_core::run::ReadyGroup)> {
         let mut waited_at: Vec<usize> = pulses
             .iter()
             .filter(|(_, bucket)| bucket.iter().any(|pulse| pulse.status.is_pending()))
             .filter_map(|(id, _)| self.index.position(id))
             .collect();
         waited_at.sort_unstable();
-        weft_core::exec::ready::find_ready_among(
+        weft_core::run::ready::find_ready_among(
             &self.project,
             waited_at.into_iter().map(|at| &self.project.nodes[at]),
             pulses,
             &self.index,
-            self.dispatchable.as_ref(),
+            given,
         )
         .into_iter()
         .map(|(node, group)| (node.id.clone(), group))
@@ -158,25 +188,27 @@ pub(crate) struct RunPlan {
 
 /// The run a plan starts.
 pub(crate) struct Startable {
+    /// Its cut of the program (`weft_core::run_spec::compute_trigger_fire`).
     pub(crate) program: Arc<ProgramTables>,
+    /// The cut as its runs' births name it and the record keeps it: a
+    /// run's first write carries the cut ([`RunsProgram::kept`]) unless its
+    /// lane already put it on record (`crate::journal_writer`).
+    pub(crate) runs: RunsProgram,
     /// The roots its run kicks, the firing one's payload left for the call.
     kicks: Vec<KickPlan>,
+    /// What its runs are given at the places its cut says: the saved
+    /// values of the infra places it reads only baked, standing in.
+    pub(crate) given: Arc<weft_core::project::Given>,
     /// The infra places it reads only baked outputs of, with their saved
-    /// values: they do not run, and the run is born with their values.
+    /// values: they do not run, and each run's record says why.
     baked: weft_core::infra::bake::Saved,
     /// What it starts with besides its call.
     pub(crate) ready: Ready,
 }
 
-/// A run's first state, as a plan starts it.
-pub(crate) struct Opening {
-    pub(crate) kicked: HashMap<FiringLocation, weft_core::primitive::KickedNode>,
-    pub(crate) pulses: PulseTable,
-}
-
 impl RunPlan {
     fn build(
-        program_of: impl FnOnce(RecordedSelection) -> Arc<ProgramTables>,
+        program_of: impl FnOnce(ProjectDefinition, &str) -> Arc<ProgramTables>,
         project: &Arc<ProjectDefinition>,
         trigger: &Arc<HeldTrigger>,
         entry: &Arc<ArmedEntry>,
@@ -184,15 +216,23 @@ impl RunPlan {
         facts: &weft_broker_client::protocol::DoorRunFacts,
     ) -> Self {
         let saved = weft_core::infra::bake::saved_for_run(project, &facts.infra, instance);
-        // The firing kick's payload is the call's: the carve does not read it.
+        // The firing kick's payload is the call's: the cut does not read it.
         let start = weft_core::run_spec::compute_trigger_fire(project, &trigger.node_id, &Value::Null, entry.port_snapshot.as_ref(), &saved)
             .map_err(Unready::Refused)
             .and_then(|fire| {
-                let selection = RecordedSelection::new(fire.subgraph);
-                weft_core::run_spec::refuse_instanceless(project, selection.selection(), instance)
+                weft_core::run_spec::refuse_instanceless(&fire.program, instance)
                     .map_err(|refusal| Unready::Refused(refusal.to_string()))?;
-                let ready = run_facts_gate(project, selection.selection(), instance, facts).map_err(Unready::Waits)?;
-                Ok(Startable { program: program_of(selection), kicks: fire.kicks, baked: fire.baked, ready })
+                let ready = run_facts_gate(&fire.program, instance, facts).map_err(Unready::Waits)?;
+                let runs = RunsProgram::of(&entry.definition_hash, project.id, &fire.program)
+                    .map_err(|e| Unready::Refused(format!("the cut a fire of '{}' runs does not serialize: {e:#}", trigger.node_id)))?;
+                Ok(Startable {
+                    program: program_of(fire.program, runs.definition_hash()),
+                    runs,
+                    kicks: fire.kicks,
+                    given: Arc::new(fire.given),
+                    baked: fire.baked,
+                    ready,
+                })
             });
         Self {
             trigger: trigger.clone(),
@@ -213,22 +253,22 @@ impl Startable {
             .collect()
     }
 
-    /// The birth of run `execution_id` of `plan`, whose call brought
-    /// `payload`: its `ExecutionStarted`, its kicks and the values it reads
+    /// The birth of run `run_id` of `plan`, whose call brought
+    /// `payload`: its `RunStarted`, its kicks and the values it reads
     /// baked, in the order its record keeps them.
-    pub(crate) fn birth(&self, plan: &RunPlan, execution_id: ExecutionId, payload: &Value, at_unix: u64) -> Vec<ExecEvent> {
+    pub(crate) fn birth(&self, plan: &RunPlan, run_id: RunId, payload: &Value, at_unix: u64) -> Vec<RunEvent> {
         let program = &self.program;
         let ready = &self.ready;
         let kicks = self.kicks_with(payload);
         let (start, kicks) = weft_journal::birth::birth_events(weft_journal::birth::Birth {
-            execution_id,
+            run_id,
             project_id: program.project.id,
             phase: weft_core::context::Phase::Fire,
             entry_node: &plan.trigger.node_id,
             kicks: &kicks,
-            definition_hash: &plan.entry.definition_hash,
+            program: &self.runs,
+            given: &self.given,
             binary_hash: &plan.entry.binary_hash,
-            selection: program.selection.as_ref(),
             seed: None,
             source_version: Some(&plan.entry.source_version),
             instance: plan.instance.as_ref().map(|instance| weft_journal::birth::RunFor { instance, values: &ready.instance_values }),
@@ -238,17 +278,18 @@ impl Startable {
             settings: plan.entry.spec.settings,
             at_unix,
         });
-        let baked = weft_journal::birth::baked_rows(&program.project, execution_id, &self.baked, at_unix);
+        let baked = weft_journal::birth::baked_rows(run_id, &self.baked, at_unix);
         std::iter::once(start).chain(kicks).chain(baked).collect()
     }
 
-    /// The first state of run `execution_id`, whose call brought `payload`:
-    /// its roots kicked, and the values it reads baked already on their
-    /// wires. Built from the plan, never from a fold of its birth. A baked
-    /// value that does not fit its wires is the program's shape broken.
-    pub(crate) fn opening(&self, execution_id: ExecutionId, payload: &Value) -> Result<Opening, String> {
-        let kicked = self
-            .kicks_with(payload)
+    /// The first state of a run whose call brought `payload`: its roots
+    /// kicked, and nothing on its wires. Built from the plan, never from a
+    /// fold of its birth; what its cut gives (the baked values its
+    /// stand-ins send) and what its scopes decide at once go out on the
+    /// drive's first pass over its scopes (`weft_core::run::scope::settle_table`),
+    /// as a fold of its birth sends and decides them.
+    pub(crate) fn opening(&self, payload: &Value) -> HashMap<FiringLocation, weft_core::primitive::KickedNode> {
+        self.kicks_with(payload)
             .into_iter()
             .map(|kick| {
                 (
@@ -262,42 +303,33 @@ impl Startable {
                     },
                 )
             })
-            .collect();
-        let mut pulses = PulseTable::new();
-        if !self.baked.is_empty() {
-            let program = &self.program;
-            let rows = weft_journal::birth::baked_rows(&program.project, execution_id, &self.baked, 0);
-            weft_journal::fold::provided_pulses(&program.project, &program.index, execution_id, &rows, &mut pulses)?;
-        }
-        Ok(Opening { kicked, pulses })
+            .collect()
     }
 }
 
-/// The run gate over `facts`: what a run of `selection` reads is up, what
-/// its instance provides fits it, and the install's picks fit it. Answers
-/// the values and picks it is born with.
+/// The run gate over `facts`: what a run of `program` (its cut) reads is
+/// up, what its instance provides fits it, and the install's picks fit
+/// it. Answers the values and picks it is born with.
 fn run_facts_gate(
-    project: &ProjectDefinition,
-    selection: &weft_core::project::selection::RunSelection,
+    program: &ProjectDefinition,
     instance: Option<&weft_core::instance::InstanceId>,
     facts: &weft_broker_client::protocol::DoorRunFacts,
 ) -> Result<Ready, RunGate> {
-    let within: HashSet<String> = selection.nodes.iter().map(|place| weft_core::project::address_of(project, &place.id, &place.path)).collect();
-    let wanted = weft_core::infra::run_gate::copies_read(project, Some(&within), instance);
+    let wanted = weft_core::infra::run_gate::copies_read(program, None, instance);
     let missing = weft_core::infra::run_gate::missing_copies(&wanted, &facts.infra);
     if !missing.is_empty() {
         return Err(RunGate::InfraDown(missing));
     }
     let instance_values = match (instance, &facts.instance_values) {
         (Some(instance), Some(stored)) => {
-            weft_core::run_spec::instance_run_values(project, selection, instance, stored).map_err(RunGate::InstanceValues)?
+            weft_core::run_spec::instance_run_values(program, instance, stored).map_err(RunGate::InstanceValues)?
         }
         _ => Default::default(),
     };
-    let picks = if weft_core::picks::picked_places(project).is_empty() {
+    let picks = if weft_core::picks::picked_places(program).is_empty() {
         Default::default()
     } else {
-        weft_core::picks::run_picks(project, selection, &facts.picks).map_err(RunGate::Picks)?
+        weft_core::picks::run_picks(program, &facts.picks).map_err(RunGate::Picks)?
     };
     Ok(Ready { instance_values, picks })
 }
@@ -333,9 +365,8 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> Bounded<K, V> {
     }
 }
 
-/// Which program a table set is for: its definition, and its selection's
-/// digest (`None` for the whole program).
-type ProgramKey = (String, Option<String>);
+/// Which program a table set is for: its definition hash.
+type ProgramKey = String;
 
 /// Which plan: the trigger's token, and the versions of the held triggers
 /// and run facts it was made from.
@@ -344,15 +375,20 @@ type PlanKey = (String, Option<weft_core::instance::InstanceId>, u64, u64);
 /// What a worker keeps of its programs and plans (see the module doc).
 pub(crate) struct Plans {
     project_id: uuid::Uuid,
+    /// What this worker's build left out because it did not compile
+    /// (`weft_core::NodeCatalog::left_out`): a fire whose cut uses one of
+    /// those node types is refused before it starts.
+    left_out: &'static weft_core::builds::LeftOut,
     projects: Mutex<Bounded<String, Arc<ProjectDefinition>>>,
     programs: Mutex<Bounded<ProgramKey, Arc<ProgramTables>>>,
     plans: Mutex<Bounded<PlanKey, Arc<RunPlan>>>,
 }
 
 impl Plans {
-    pub(crate) fn new(project_id: uuid::Uuid) -> Self {
+    pub(crate) fn new(project_id: uuid::Uuid, left_out: &'static weft_core::builds::LeftOut) -> Self {
         Self {
             project_id,
+            left_out,
             projects: Mutex::new(Bounded::new(8)),
             programs: Mutex::new(Bounded::new(64)),
             plans: Mutex::new(Bounded::new(256)),
@@ -378,16 +414,39 @@ impl Plans {
         Ok(project)
     }
 
-    /// The tables of `project` (whose definition hash is `definition_hash`)
-    /// for `selection`.
-    pub(crate) fn program(&self, project: &Arc<ProjectDefinition>, definition_hash: &str, selection: Option<RecordedSelection>) -> Arc<ProgramTables> {
-        let key = (definition_hash.to_string(), selection.as_ref().map(|s| s.digest().to_string()));
+    /// `project` as this worker can run it: what its build left out added
+    /// to the program's broken parts (`weft_core::builds::LeftOut`), so the
+    /// fire's cut refuses a node it has no code for, naming the package.
+    fn runnable(&self, project: Arc<ProjectDefinition>) -> Arc<ProjectDefinition> {
+        if self.left_out.is_empty() {
+            return project;
+        }
+        let mut runnable = (*project).clone();
+        runnable.broken.extend(weft_core::builds::LeftOut::broken_parts(&self.left_out.packages, &project, None));
+        Arc::new(runnable)
+    }
+
+    /// The tables of `project`, whose definition hash is `definition_hash`.
+    pub(crate) fn program(&self, project: &Arc<ProjectDefinition>, definition_hash: &str) -> Arc<ProgramTables> {
+        let key = definition_hash.to_string();
         if let Some(tables) = self.programs.lock().expect("program cache").get(&key) {
             return tables;
         }
-        let tables = Arc::new(ProgramTables::new(project.clone(), selection));
+        let tables = Arc::new(ProgramTables::new(project.clone()));
         self.programs.lock().expect("program cache").insert(key, tables.clone());
         tables
+    }
+
+    /// The tables of `cut` (whose definition hash is `definition_hash`),
+    /// kept like a program fetched by its hash: a run born on it and one
+    /// carried on from its record share them.
+    fn cut(&self, cut: ProjectDefinition, definition_hash: &str) -> Arc<ProgramTables> {
+        if let Some(tables) = self.programs.lock().expect("program cache").get(&definition_hash.to_string()) {
+            return tables;
+        }
+        let cut = Arc::new(cut);
+        self.projects.lock().expect("project cache").insert(definition_hash.to_string(), cut.clone());
+        self.program(&cut, definition_hash)
     }
 
     /// The plan of `trigger` (armed as `entry`, from the held triggers of
@@ -425,9 +484,9 @@ impl Plans {
         if let Some(plan) = self.plans.lock().expect("plan cache").get(&key) {
             return Ok(plan);
         }
-        let project = self.project(clients, &entry.definition_hash).await?;
+        let project = self.runnable(self.project(clients, &entry.definition_hash).await?);
         let plan = Arc::new(RunPlan::build(
-            |selection| self.program(&project, &entry.definition_hash, Some(selection)),
+            |cut, definition_hash| self.cut(cut, definition_hash),
             &project,
             trigger,
             entry,
@@ -474,7 +533,7 @@ pub(crate) mod tests {
             instance: None,
         });
         let held = Arc::new(HeldTrigger::new("t1".into(), trigger.into(), crate::door::HeldEntry::Armed(entry.clone()), None));
-        RunPlan::build(|selection| Arc::new(ProgramTables::new(project.clone(), Some(selection))), project, &held, &entry, instance, facts)
+        RunPlan::build(|cut, _| Arc::new(ProgramTables::new(Arc::new(cut))), project, &held, &entry, instance, facts)
     }
 
     /// A trigger feeding two nodes, one behind the other.
@@ -486,10 +545,10 @@ pub(crate) mod tests {
                     { "id": "trig", "nodeType": "Trig", "position": { "x": 0.0, "y": 0.0 },
                       "outputs": [{ "name": "value", "portType": "String", "required": false }],
                       "features": { "isTrigger": true } },
-                    { "id": "a", "nodeType": "Step", "position": { "x": 1.0, "y": 0.0 },
+                    { "id": "a", "nodeType": "Pass", "position": { "x": 1.0, "y": 0.0 },
                       "inputs": [{ "name": "value", "portType": "String", "required": true }],
                       "outputs": [{ "name": "value", "portType": "String", "required": false }] },
-                    { "id": "b", "nodeType": "Step", "position": { "x": 2.0, "y": 0.0 },
+                    { "id": "b", "nodeType": "Pass", "position": { "x": 2.0, "y": 0.0 },
                       "inputs": [{ "name": "value", "portType": "String", "required": true }],
                       "outputs": [{ "name": "value", "portType": "String", "required": false }] }
                 ],
@@ -502,19 +561,74 @@ pub(crate) mod tests {
         )
     }
 
-    /// A run started from a plan holds exactly what the fold of its own
-    /// birth holds: the roots kicked (the firing one with the call's
-    /// payload), the wires as they stand, the same part of the program.
+    /// A trigger feeding `a` inside group `g` (through its input `x`), an
+    /// infra node `db` whose baked `url` feeds `a` too (through `g.u`), and
+    /// `b` past the group reading `a` (through `g.y`), and a literal on
+    /// `g`'s input `k` that `a` reads (so the cut keeps `g`: it sends `k` as
+    /// it opens). `g` has no gate: it opens on the first value that reaches
+    /// it from outside.
+    fn baked_group() -> Arc<ProjectDefinition> {
+        let string = |name: &str, required: bool| json!({ "name": name, "portType": "String", "required": required });
+        Arc::new(
+            serde_json::from_value(json!({
+                "id": uuid::Uuid::from_u128(11),
+                "nodes": [
+                    { "id": "trig", "nodeType": "Trig", "position": { "x": 0.0, "y": 0.0 },
+                      "outputs": [string("value", false)], "features": { "isTrigger": true } },
+                    { "id": "db", "nodeType": "Db", "position": { "x": 0.0, "y": 1.0 },
+                      "outputs": [string("url", false)], "requiresInfra": true, "bakedOutputs": ["url"] },
+                    { "id": "a", "nodeType": "Pass", "position": { "x": 1.0, "y": 0.0 }, "scope": ["g"],
+                      "inputs": [string("value", true), string("url", true), string("k", true)], "outputs": [string("value", false)] },
+                    { "id": "b", "nodeType": "Pass", "position": { "x": 2.0, "y": 0.0 },
+                      "inputs": [string("value", true)], "outputs": [string("value", false)] }
+                ],
+                "edges": [
+                    { "id": "e1", "source": "trig", "target": "a", "sourceHandle": "value", "targetHandle": "value",
+                      "via": [{ "group": "g", "port": "x", "side": "in" }] },
+                    { "id": "e2", "source": "db", "target": "a", "sourceHandle": "url", "targetHandle": "url",
+                      "via": [{ "group": "g", "port": "u", "side": "in" }] },
+                    { "id": "e3", "source": "a", "target": "b", "sourceHandle": "value", "targetHandle": "value",
+                      "via": [{ "group": "g", "port": "y", "side": "out" }] },
+                    { "id": "e4", "source": "g", "target": "a", "sourceHandle": "k", "targetHandle": "k",
+                      "via": [{ "group": "g", "port": "k", "side": "in" }] }
+                ],
+                "groups": [{ "id": "g", "kind": "group", "nodeIds": ["a"], "portLiterals": { "k": "lit" },
+                             "inPorts": [string("x", false), string("u", false), string("k", false)], "outPorts": [string("y", false)] }]
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// A run started from a plan, once its drive's first pass over its
+    /// scopes ran, holds exactly what the fold of its own birth holds: the
+    /// roots kicked (the firing one with the call's payload), the baked
+    /// value its stand-in sent, the group that value opened, the same
+    /// part of the program.
     #[test]
     fn a_run_from_a_plan_starts_where_the_fold_of_its_birth_does() {
-        let project = chain();
-        let plan = plan_of(&project, "trig", &Default::default());
+        let project = baked_group();
+        let facts = weft_broker_client::protocol::DoorRunFacts {
+            infra: vec![weft_core::infra::run_gate::InfraCopyUp {
+                node_id: "db".into(),
+                instance: None,
+                running: true,
+                baked: [("url".to_string(), json!("postgres://db"))].into(),
+            }],
+            ..Default::default()
+        };
+        let plan = plan_of(&project, "trig", &facts);
         let startable = plan.start.as_ref().map_err(|_| "unready").expect("a plan that starts");
-        let execution_id = ExecutionId::from_u128(4);
+        let program = &startable.program;
+        let run_id = RunId::from_u128(4);
         let payload = json!({ "tick": 1 });
-        let opening = startable.opening(execution_id, &payload).unwrap();
-        let birth = startable.birth(&plan, execution_id, &payload, 7);
-        let folded = weft_journal::fold_to_snapshot(execution_id, project.clone(), &birth);
+        let birth = startable.birth(&plan, run_id, &payload, 7);
+        let mut kicked = startable.opening(&payload);
+        let mut pulses = PulseTable::new();
+        let mut scopes = weft_core::run::scope::ScopeTable::default();
+        weft_core::run::scope::settle_table(
+            &program.project, &program.index, &startable.given, weft_core::context::Phase::Fire, run_id, 7, &mut pulses, &mut scopes, &mut kicked,
+        );
+        let folded = weft_journal::fold_to_snapshot(run_id, program.project.clone(), &birth);
         assert!(folded.corruptions.is_empty(), "{:?}", folded.corruptions);
         let kicks = |kicked: &HashMap<FiringLocation, weft_core::primitive::KickedNode>| {
             let mut kicks: Vec<(String, String)> =
@@ -522,12 +636,27 @@ pub(crate) mod tests {
             kicks.sort();
             kicks
         };
-        assert_eq!(kicks(&opening.kicked), kicks(&folded.kicked));
-        let pending = |pulses: &PulseTable| -> Vec<(String, String)> {
-            pulses.values().flatten().filter(|p| p.status.is_pending()).map(|p| (p.target_node.clone(), p.target_port.clone())).collect()
+        assert_eq!(kicks(&kicked), kicks(&folded.kicked));
+        let wires = |pulses: &PulseTable| -> Vec<String> {
+            let mut wires: Vec<String> = pulses.values().flatten().map(|pulse| format!("{pulse:?}")).collect();
+            wires.sort();
+            wires
         };
-        assert_eq!(pending(&opening.pulses), pending(&folded.pulses));
-        assert_eq!(folded.selection.as_ref(), startable.program.selection.as_ref().map(|s| s.selection().as_ref()));
+        assert_eq!(wires(&pulses), wires(&folded.pulses));
+        let decided = |scopes: &weft_core::run::scope::ScopeTable| -> Vec<String> {
+            scopes.iter().map(|(copy, record)| format!("{copy:?} {:?}", record.state)).collect()
+        };
+        assert_eq!(decided(&scopes), decided(&folded.scopes));
+        // What the two agree on is the run's real start: the baked url is
+        // on its way to `a`, and it opened `g`.
+        let url = pulses.get("a").into_iter().flatten().find(|pulse| pulse.target_port == "url").expect("the baked url reached a");
+        assert_eq!(*url.value, json!("postgres://db"));
+        assert_eq!(
+            scopes.get(&weft_core::project::scopes::ScopeCopy::new("g", vec![])).map(|record| record.state.clone()),
+            Some(weft_core::run::scope::ScopeState::Open),
+        );
+        let k = pulses.get("a").into_iter().flatten().find(|pulse| pulse.target_port == "k").expect("g sent its literal as it opened");
+        assert_eq!(*k.value, json!("lit"));
     }
 
     /// The ready nodes asked only where a pending pulse waits are the ones
@@ -559,8 +688,8 @@ pub(crate) mod tests {
             }))
             .unwrap(),
         );
-        let program = ProgramTables::new(project.clone(), None);
-        let execution_id = ExecutionId::from_u128(5);
+        let program = ProgramTables::new(project.clone());
+        let run_id = RunId::from_u128(5);
         let targets = [("join", "a"), ("join", "b"), ("tail", "a")];
         // A small linear congruential generator: the same tables every run.
         let mut seed: u64 = 0x5eed;
@@ -574,22 +703,100 @@ pub(crate) mod tests {
                 let (node, port) = targets[next(targets.len() as u64) as usize];
                 let id = uuid::Uuid::from_u128(u128::from(next(u64::MAX)));
                 let mut pulse = if next(4) == 0 {
-                    weft_core::pulse::Pulse::closure(id, execution_id, Vec::new(), node, port)
+                    weft_core::pulse::Pulse::closure(id, run_id, Vec::new(), node, port)
                 } else {
-                    weft_core::pulse::Pulse::new(id, execution_id, Vec::new(), node, port, Arc::new(json!("x")))
+                    weft_core::pulse::Pulse::new(id, run_id, Vec::new(), node, port, Arc::new(json!("x")))
                 };
                 if next(3) == 0 {
                     pulse.absorb();
                 }
                 pulses.entry(node.to_string()).or_default().push(pulse);
             }
-            let asked: Vec<(String, Vec<uuid::Uuid>)> = program.ready(&pulses).into_iter().map(|(id, group)| (id, group.pulse_ids)).collect();
-            let scanned: Vec<(String, Vec<uuid::Uuid>)> = weft_core::exec::find_ready_nodes(&project, &pulses, &program.index, None)
+            let asked: Vec<(String, Vec<uuid::Uuid>)> = program.ready(&pulses, &Default::default()).into_iter().map(|(id, group)| (id, group.pulse_ids)).collect();
+            let scanned: Vec<(String, Vec<uuid::Uuid>)> = weft_core::run::find_ready_nodes(&project, &pulses, &program.index, &Default::default())
                 .into_iter()
                 .map(|(id, group)| (id, group.pulse_ids))
                 .collect();
             assert_eq!(asked, scanned);
         }
+    }
+
+    /// The inputs a firing is told its node declares are the node's own:
+    /// the gates are the language's, so a List with no item ports sees
+    /// none, as it does in the node-test rig.
+    #[test]
+    fn a_nodes_declared_inputs_leave_out_the_gates() {
+        let project: Arc<ProjectDefinition> = Arc::new(
+            serde_json::from_value(json!({
+                "id": uuid::Uuid::from_u128(11),
+                "nodes": [
+                    { "id": "n", "nodeType": "N", "position": { "x": 0.0, "y": 0.0 },
+                      "inputs": [
+                        { "name": "item", "portType": "String", "required": true },
+                        { "name": weft_core::run::skip::SHOULD_FLOW_PORT, "portType": "T__should_flow", "required": false },
+                        { "name": weft_core::run::skip::SHOULD_NOT_FLOW_PORT, "portType": "T__should_not_flow", "required": false }
+                      ] }
+                ],
+                "edges": []
+            }))
+            .unwrap(),
+        );
+        let program = ProgramTables::new(project);
+        let ports = program.ports("n", &Vec::new()).expect("the node's ports");
+        assert_eq!(ports.inputs.keys().collect::<Vec<_>>(), vec!["item"]);
+    }
+
+    /// A node an included file shares between sites hands each firing
+    /// the types of the place its frames name, and its own elsewhere.
+    #[test]
+    fn a_firing_gets_the_ports_of_its_place() {
+        let project: Arc<ProjectDefinition> = Arc::new(
+            serde_json::from_value(json!({
+                "id": uuid::Uuid::from_u128(12),
+                "nodes": [
+                    { "id": "n", "nodeType": "N", "position": { "x": 0.0, "y": 0.0 },
+                      "inputs": [{ "name": "file", "portType": "Image", "required": true }],
+                      "outputs": [{ "name": "file", "portType": "Image", "required": true }],
+                      "placeTypes": [
+                        { "place": ["img"], "inputs": { "file": "Image" }, "outputs": { "file": "Image" } },
+                        { "place": ["vid"], "inputs": { "file": "Video" }, "outputs": { "file": "Video" } }
+                      ] }
+                ],
+                "edges": []
+            }))
+            .unwrap(),
+        );
+        let program = ProgramTables::new(project);
+        let at = |site: &str| {
+            let frames = vec![weft_core::frames::Frame::Call { site: site.into() }];
+            program.ports("n", &frames).expect("the node's ports").outputs["file"].clone()
+        };
+        assert_eq!(at("img"), WeftType::parse("Image").unwrap());
+        assert_eq!(at("vid"), WeftType::parse("Video").unwrap());
+        assert_eq!(program.ports("n", &Vec::new()).unwrap().outputs["file"], WeftType::parse("Image").unwrap());
+    }
+
+    /// A worker whose build left a package out refuses, before it starts,
+    /// a fire whose cut uses one of its node types, naming the package and
+    /// its first error; a worker built whole plans the same fire.
+    #[test]
+    fn a_fire_reaching_a_left_out_package_is_refused_up_front() {
+        let left_out: &'static weft_core::builds::LeftOut = Box::leak(Box::new(weft_core::builds::LeftOut {
+            packages: vec![weft_core::builds::LeftOutPackage {
+                package: "relay".into(),
+                node_types: vec!["Pass".into()],
+                error: "error[E0425]: cannot find value `x`".into(),
+            }],
+        }));
+        let whole = Plans::new(uuid::Uuid::from_u128(9), Box::leak(Box::default()));
+        assert!(!matches!(plan_of(&whole.runnable(chain()), "trig", &Default::default()).start, Err(Unready::Refused(_))));
+        let missing = Plans::new(uuid::Uuid::from_u128(9), left_out);
+        let refused = plan_of(&missing.runnable(chain()), "trig", &Default::default());
+        assert!(
+            matches!(&refused.start, Err(Unready::Refused(why)) if why.contains("package 'relay' didn't compile: error[E0425]")),
+            "{:?}",
+            refused.start.as_ref().err()
+        );
     }
 
     /// A plan of a node that is no trigger never starts a run, and says why.
@@ -599,8 +806,8 @@ pub(crate) mod tests {
         assert!(matches!(plan.start, Err(Unready::Refused(_))));
     }
 
-    /// A run that reaches a step per instance is planned for the instance
-    /// its call names: with none it is refused, naming the step, and with
+    /// A run that reaches a node per instance is planned for the instance
+    /// its call names: with none it is refused, naming the node, and with
     /// one its plan (and the birth of its runs) is for that instance.
     #[test]
     fn a_plan_is_for_the_instance_its_call_names() {

@@ -17,26 +17,26 @@ use crate::event::Replay;
 use crate::run::SettledRun;
 
 impl SettledRun {
-    /// Assert the execution completed successfully. On failure, surfaces the
+    /// Assert the run completed successfully. On failure, surfaces the
     /// terminal event's error/reason so the cause is visible.
     pub fn completed(&self) -> Result<&Self> {
         match self.status.as_str() {
             "completed" => Ok(self),
             "failed" => bail!(
-                "execution {} FAILED: {}",
-                self.execution_id,
+                "run {} FAILED: {}",
+                self.run_id,
                 self.failure_message().unwrap_or_else(|| "<no error text>".into())
             ),
             "cancelled" => bail!(
-                "execution {} was CANCELLED: {}",
-                self.execution_id,
+                "run {} was CANCELLED: {}",
+                self.run_id,
                 self.cancel_reason().unwrap_or_else(|| "<no reason>".into())
             ),
-            other => bail!("execution {} has unexpected status {other}", self.execution_id),
+            other => bail!("run {} has unexpected status {other}", self.run_id),
         }
     }
 
-    /// Assert the execution failed AND its error text contains `needle`. Used by
+    /// Assert the run failed AND its error text contains `needle`. Used by
     /// negative tests (a node that must fail loud). `needle` must be non-empty: a
     /// negative test has to name a DISCRIMINATING fragment of the expected error,
     /// since `contains("")` is always true and would assert nothing.
@@ -48,42 +48,42 @@ impl SettledRun {
         );
         if self.status != "failed" {
             bail!(
-                "expected execution {} to FAIL, but status is {}",
-                self.execution_id,
+                "expected run {} to FAIL, but status is {}",
+                self.run_id,
                 self.status
             );
         }
         let msg = self.failure_message().unwrap_or_default();
         if !msg.contains(needle) {
             bail!(
-                "execution {} failed but error did not contain '{needle}': {msg}",
-                self.execution_id
+                "run {} failed but error did not contain '{needle}': {msg}",
+                self.run_id
             );
         }
         Ok(self)
     }
 
-    /// The execution-level outputs (`execution_completed.outputs`), or null if
+    /// The run-level outputs (`run_completed.outputs`), or null if
     /// the run did not complete.
     pub fn completed_outputs(&self) -> Value {
         self.replay
-            .first_kind("execution_completed")
+            .first_kind("run_completed")
             .and_then(|e| e.field("outputs").cloned())
             .unwrap_or(Value::Null)
     }
 
-    /// The `error` text of `execution_failed`, if the run failed.
+    /// The `error` text of `run_failed`, if the run failed.
     pub fn failure_message(&self) -> Option<String> {
         self.replay
-            .first_kind("execution_failed")
+            .first_kind("run_failed")
             .and_then(|e| e.str_field("error"))
             .map(str::to_string)
     }
 
-    /// The `reason` of `execution_cancelled`, if the run was cancelled.
+    /// The `reason` of `run_cancelled`, if the run was cancelled.
     pub fn cancel_reason(&self) -> Option<String> {
         self.replay
-            .first_kind("execution_cancelled")
+            .first_kind("run_cancelled")
             .and_then(|e| e.str_field("reason"))
             .map(str::to_string)
     }
@@ -202,13 +202,25 @@ fn wire_value(payload: &Value) -> Value {
     /// A message the journal did not keep (an ephemeral exchange, raw
     /// bytes) still has a row, carrying only its size. It has no
     /// payload, so it is not returned here; a test that wants to see
-    /// those reads the rows itself.
+    /// those reads the rows itself. Nor is a message of the program's
+    /// that a window (the caller read too slowly) or the row saying the
+    /// caller left (it was still waiting to go out) names in `dropped`:
+    /// the caller never received it.
     fn caller_messages(&self, direction: &str) -> Vec<(Value, bool)> {
+        let dropped: std::collections::HashSet<u64> = self
+            .replay
+            .by_kind("caller_window")
+            .chain(self.replay.by_kind("caller_disconnected"))
+            .filter_map(|e| e.field("dropped").and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_u64)
+            .collect();
         self.replay
             .by_kind("caller_window")
             .filter_map(|e| e.field("messages").and_then(Value::as_array))
             .flatten()
             .filter(|m| m.get("direction").and_then(Value::as_str) == Some(direction))
+            .filter(|m| m.get("offset").and_then(Value::as_u64).is_none_or(|offset| !dropped.contains(&offset)))
             .filter_map(|m| {
                 let payload = m.get("payload").map(Self::wire_value)?;
                 let terminal = m.get("terminal").and_then(Value::as_bool).unwrap_or(false);
@@ -382,7 +394,7 @@ fn wire_value(payload: &Value) -> Value {
     pub fn loop_iterations(&self, group_id: &str) -> usize {
         self.replay
             .by_kind("loop_iteration_launched")
-            .filter(|e| e.str_field("group_id") == Some(group_id))
+            .filter(|e| e.str_field("groupId") == Some(group_id))
             .count()
     }
 
@@ -395,15 +407,15 @@ fn wire_value(payload: &Value) -> Value {
                  loop_instantiated: {:?}",
                 self.replay
                     .by_kind("loop_instantiated")
-                    .map(|e| e.field("iter_cap").cloned().unwrap_or(Value::Null))
+                    .map(|e| e.field("iterCap").cloned().unwrap_or(Value::Null))
                     .collect::<Vec<_>>()
             );
         }
         Ok(self)
     }
 
-    /// Every cost the execution recorded, as `(service, amount_usd)` in order.
-    /// Each is a provider meter's measurement of a real call; the execution's
+    /// Every cost the run recorded, as `(service, amount_usd)` in order.
+    /// Each is a provider meter's measurement of a real call; the run's
     /// money trail. A record whose amount is `null` (the meter could not
     /// resolve the figure, an honest unknown) is skipped here.
     /// Every resolved cost record: `(service, origin, amount_usd)`. Origin is
@@ -417,13 +429,13 @@ fn wire_value(payload: &Value) -> Value {
                 Some((
                     e.str_field("service")?.to_string(),
                     e.str_field("origin")?.to_string(),
-                    e.0.get("amount_usd").and_then(Value::as_f64)?,
+                    e.0.get("amountUsd").and_then(Value::as_f64)?,
                 ))
             })
             .collect()
     }
 
-    /// Assert the execution recorded `count` spends for `service` that
+    /// Assert the run recorded `count` spends for `service` that
     /// carry NO figure.
     ///
     /// The counterpart of [`Self::assert_measured`]: money went out and
@@ -446,7 +458,7 @@ fn wire_value(payload: &Value) -> Value {
             replay
                 .by_kind("cost_reported")
                 .filter(|e| e.str_field("service") == Some(service))
-                .filter(|e| e.0.get("amount_usd").is_none_or(Value::is_null))
+                .filter(|e| e.0.get("amountUsd").is_none_or(Value::is_null))
                 .count()
         };
         self.refresh_replay_until(
@@ -462,14 +474,14 @@ fn wire_value(payload: &Value) -> Value {
                  every cost record: {:?}",
                 self.replay
                     .by_kind("cost_reported")
-                    .map(|e| (e.str_field("service").unwrap_or("?").to_string(), e.0.get("amount_usd").cloned()))
+                    .map(|e| (e.str_field("service").unwrap_or("?").to_string(), e.0.get("amountUsd").cloned()))
                     .collect::<Vec<_>>()
             );
         }
         Ok(self)
     }
 
-    /// Assert the execution recorded exactly one cost for `service`, resolved
+    /// Assert the run recorded exactly one cost for `service`, resolved
     /// to a real positive amount AND spent on the expected key (`origin` is
     /// `"author"` or `"platform"`): the call was made, it rode the
     /// key the test set up (no silent fall-through to the other one), and the

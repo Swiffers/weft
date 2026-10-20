@@ -47,12 +47,12 @@ describe('gesture to confirmation', () => {
 		const afterDelete = project(withText.nodes.filter(n => n.id !== 'a'));
 		host.editScript.push(ok(withText, 'v1'), ok(afterDelete, 'v2'));
 		engine.recordEdit([setConfigOp('a', '"hi"')], (l) => l, 'cfg:a');
-		engine.recordEdit([{ op: 'removeNode', node: 'a' }]);
+		engine.recordEdit([{ op: 'remove_node', node: 'a' }]);
 		await engine.settled();
 		const editCalls = host.calls.filter(c => c.kind === 'applyEdits');
 		expect(editCalls).toHaveLength(2);
-		expect((editCalls[0].payload as EditOp[])[0]).toMatchObject({ op: 'setConfig', node: 'a' });
-		expect((editCalls[1].payload as EditOp[])[0]).toMatchObject({ op: 'removeNode', node: 'a' });
+		expect((editCalls[0].payload as EditOp[])[0]).toMatchObject({ op: 'set_config', node: 'a' });
+		expect((editCalls[1].payload as EditOp[])[0]).toMatchObject({ op: 'remove_node', node: 'a' });
 		expect(engine.pendingOps).toHaveLength(0);
 		expect(host.notifications).toHaveLength(0);
 	});
@@ -91,7 +91,7 @@ describe('gesture to confirmation', () => {
 		host.resyncScript.push({ project: baseProject(), weftCode: 'v0' });
 
 		// Op 1 will be rejected; op 2 is independent and must survive.
-		engine.recordEdit([{ op: 'removeConfig', node: 'a', key: 'text' }]);
+		engine.recordEdit([{ op: 'remove_config', node: 'a', key: 'text' }]);
 		engine.recordEdit([addNodeOp('text_2')]);
 		await engine.settled();
 
@@ -125,7 +125,7 @@ describe('gesture to confirmation', () => {
 		host.editScript.push(ok(afterX, 'vX', true)); // held
 		// Op X targets node `a`; the external truth will remove `a`, so X can
 		// no longer apply and drops.
-		engine.recordEdit([{ op: 'removeConfig', node: 'a', key: 'text' }], () => 'a @layout 5 5');
+		engine.recordEdit([{ op: 'remove_config', node: 'a', key: 'text' }], () => 'a @layout 5 5');
 		// Wait for the send task to reach the held await.
 		for (let i = 0; i < 50 && host.held.length === 0; i++) await Promise.resolve();
 		expect(host.held).toHaveLength(1);
@@ -144,7 +144,7 @@ describe('gesture to confirmation', () => {
 
 	it('an external truth advance mid-flight, then a held REJECT reply, is idempotent', async () => {
 		host.editScript.push({ kind: 'reject', reason: 'node not found: ghost', hold: true });
-		engine.recordEdit([{ op: 'removeConfig', node: 'a', key: 'text' }], () => 'a @layout 5 5');
+		engine.recordEdit([{ op: 'remove_config', node: 'a', key: 'text' }], () => 'a @layout 5 5');
 		for (let i = 0; i < 50 && host.held.length === 0; i++) await Promise.resolve();
 		const without = project(baseProject().nodes.filter(n => n.id !== 'a'));
 		engine.applyExternalSource(without, 'vEXT', '');
@@ -623,8 +623,8 @@ describe('config typing', () => {
 		engine.recordEdit([addNodeOp('text_2')]);
 		await engine.settled();
 		const editCalls = host.calls.filter(c => c.kind === 'applyEdits');
-		expect((editCalls[0].payload as EditOp[])[0]).toMatchObject({ op: 'setConfig', node: 'a' });
-		expect((editCalls[1].payload as EditOp[])[0]).toMatchObject({ op: 'addNode', id: 'text_2' });
+		expect((editCalls[0].payload as EditOp[])[0]).toMatchObject({ op: 'set_config', node: 'a' });
+		expect((editCalls[1].payload as EditOp[])[0]).toMatchObject({ op: 'add_node', id: 'text_2' });
 		expect(engine.pendingOps).toHaveLength(0);
 		expect(engine.visibleProject().nodes.find(n => n.id === 'a')!.config.text).toBe('hel');
 		expect(engine.truth.weftCode).toBe('v2');
@@ -649,7 +649,7 @@ describe('layout fold (base + log)', () => {
 		// LATER drag must win, not be clobbered by an absolute inverse.
 		host.editScript.push({ kind: 'reject', reason: 'server says no', hold: true });
 		host.resyncScript.push({ project: baseProject(), weftCode: 'v0' });
-		engine.recordEdit([{ op: 'removeConfig', node: 'a', key: 'text' }], () => 'a @layout 5 5');
+		engine.recordEdit([{ op: 'remove_config', node: 'a', key: 'text' }], () => 'a @layout 5 5');
 		for (let i = 0; i < 50 && host.held.length === 0; i++) await Promise.resolve();
 		expect(posOf(engine.layoutCode, 'a')).toBe('a @layout 5 5');
 		// Layout-only drag of the same key to (9,9), AFTER the pending op.
@@ -687,7 +687,7 @@ describe('layout fold (base + log)', () => {
 		// only when it rebases (confirm). A rejected op must never have written.
 		host.editScript.push({ kind: 'reject', reason: 'no', hold: true });
 		host.resyncScript.push({ project: baseProject(), weftCode: 'v0' });
-		engine.recordEdit([{ op: 'removeConfig', node: 'a', key: 'text' }], () => 'a @layout 5 5');
+		engine.recordEdit([{ op: 'remove_config', node: 'a', key: 'text' }], () => 'a @layout 5 5');
 		for (let i = 0; i < 50 && host.held.length === 0; i++) await Promise.resolve();
 		// While pending+held: the optimistic position is visible but NOT on disk.
 		expect(posOf(engine.layoutCode, 'a')).toBe('a @layout 5 5');
@@ -780,7 +780,7 @@ describe('layout fold (base + log)', () => {
 		await engine.settled();
 		host.editScript.push({ kind: 'reject', reason: 'server says no', hold: true });
 		host.resyncScript.push({ project: baseProject(), weftCode: 'v0' });
-		engine.recordEdit([{ op: 'removeNode', node: 'a' }]);
+		engine.recordEdit([{ op: 'remove_node', node: 'a' }]);
 		for (let i = 0; i < 50 && host.held.length === 0; i++) await Promise.resolve();
 		// A reflow while the delete is in flight: 'a' is not visible, so the
 		// reflow's output has no line for it (a removeEntry in the diff).
@@ -857,7 +857,7 @@ describe('layout fold (base + log)', () => {
 		// erasing it from the saved file with no way back.
 		host.editScript.push({ kind: 'reject', reason: 'server says no', hold: true }); // op-1
 		host.resyncScript.push({ project: baseProject(), weftCode: 'v0' });
-		engine.recordEdit([{ op: 'removeNode', node: 'a' }]);
+		engine.recordEdit([{ op: 'remove_node', node: 'a' }]);
 		for (let i = 0; i < 50 && host.held.length === 0; i++) await Promise.resolve();
 		engine.recordEdit([addNodeOp('a')]); // op-2, queued behind op-1
 		expect(engine.visibleProject().nodes.some(n => n.id === 'a')).toBe(true);

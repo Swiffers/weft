@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use weft::infra::InfraHandle;
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BaileyListChatsNode;
@@ -21,7 +21,7 @@ impl Node for BaileyListChatsNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let result = ctx.endpoint_of(&bridge).await?.action("getChats", serde_json::json!({})).await?;
         let chats = result["chats"]

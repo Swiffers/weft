@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Wipe what an older weft left on this machine, so ./setup.sh starts clean.
 #
-# Weft used to run on a local Kubernetes cluster (kind). The version that
-# replaced it runs as one process beside Docker, and its database starts a
-# new schema history: a database from before cannot be carried forward, and
-# the new runtime refuses to boot on one. This script removes all of it:
+# Weft's database has started a new schema history twice: when weft moved
+# off a local Kubernetes cluster (kind) to one process beside Docker, and
+# when executions were renamed runs. A database from before the current
+# history cannot be carried forward, and the runtime refuses to boot on one.
+# This script removes all of it, whichever weft left it:
 #
 #   - weft's runtime for every install, stopped and taken off the service
 #     manager (or, when a detached start left it running, stopped by its

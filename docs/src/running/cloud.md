@@ -189,8 +189,8 @@ While nobody is using the install and no trigger keeps a connection open,
 none of weft runs. Your database wakes only when something happens: a run
 doing work, a timer or schedule coming due, a poll that finds something new,
 something arriving from outside (a call to a route, a webhook, an event on a
-connection a trigger holds), something weft itself has due (a hibernation
-ending, a subscription to renew), or an editor or `weft follow` watching the
+connection a trigger holds), something weft itself has due (a door you gave a `--door-for` time limit
+starting to refuse, a subscription to renew), or an editor or `weft follow` watching the
 install (more on the editor below). A poll that finds nothing new wakes weft's
 listener and leaves the database asleep. A program's infrastructure that
 runs fine keeps nothing awake: each machine says so itself when its state
@@ -219,7 +219,7 @@ retry reaches a fresh one.
 | Your database | everything weft keeps, at the address you gave it |
 | Cloud Build | builds your programs' images when you deploy |
 | Pub/Sub | three topics, which let weft's parts tell each other things without going through your database: `weft-machine-events` carries Compute Engine's record of an infrastructure machine stopping or failing to the supervisor, `weft-news` is where weft announces that a run a worker drives got an answer or was cancelled, and `weft-holders` tells the holders that the triggers they should hold changed, or that one of your connections was reconnected, rotated or removed, so they drop the credentials they kept for it (a token refresh is not announced here) |
-| Cloud Tasks | two queues. `weft-wakes` delivers every timer, schedule and poll your programs set, each subscription renewal, and each holder's check; if the install does not answer one, it keeps retrying, at most five minutes apart. For a trigger's wake, the listener gives the trigger up after `wake_attempts` failed deliveries it answered (20, about an hour; a delivery that never reached it uses none) and says why on its node. `weft resync` brings it back. `weft-ticks` delivers the wakes weft sets for itself (a background job's next look) and gives one up after ten minutes |
+| Cloud Tasks | two queues. `weft-wakes` delivers every timer, schedule and poll your programs set, each subscription renewal, and each holder's check; if the install does not answer one, it keeps retrying, at most five minutes apart. For a trigger's wake, the listener gives the trigger up after `wake_attempts` failed deliveries it answered (20, about an hour; a delivery that never reached it uses none) and says why on its node. For how to bring it back, go and read [the listener](architecture.md#the-listener). `weft-ticks` delivers the wakes weft sets for itself (a background job's next look) and gives one up after ten minutes |
 | Compute Engine | one machine per infrastructure unit your programs start (a database, a GPU model) |
 | A storage bucket | weft's files, reached as weft's own service account: no key is made for it, so an organization that forbids service-account keys runs weft as is |
 | Artifact Registry | two image repositories: one for the runtime, workers and infra nodes, which only the install writes, and one for frontends |
@@ -371,7 +371,7 @@ the keys you have handed out, run `weft token ls --on prod`, and to cancel
 one right away, `weft token revoke <id> --on prod`.
 
 Every command takes `--on` the same way: `weft status --on prod`,
-`weft executions --on prod`, `weft logs <execution-id> --on prod`. Without it, a
+`weft runs --on prod`, `weft logs <run-id> --on prod`. Without it, a
 command acts on your own machine; nothing makes prod the default.
 
 ### What `activate --on prod` does
@@ -384,20 +384,24 @@ and activates.
 
 ### Deploy a change
 
-Once the program is on, `weft activate` refuses (`these triggers are already
-on`). If you want a change to go live, resync instead: it takes the triggers
-down and brings them back up on the new version.
+If you want a change to go live on a program that is already on, run these
+(`weft activate` would only turn on what is off):
 
 ```bash
-weft resync --on prod --mode park
+weft infra upgrade --on prod --all
+weft resync --on prod --all
 ```
 
-On prod, pick `park` or `hibernate`, because the events arriving while the
-triggers are down can be real people's: `park` keeps them and runs them on
-the new version once the triggers are back, `hibernate` does the same for a
-grace window (`--grace`, in minutes). A caller on a route is not kept: it is
-answered `503` with a `Retry-After`, and its client tries again. `wipe` drops them and cancels the work waiting on the triggers,
-which is fine on a dev install.
+The upgrade puts the new build on the infrastructure that is running (with
+none, it does nothing), and the resync brings onto it every trigger that is
+on and behind. `--all` includes
+every instance's (for those, go and read [programs with
+instances](instances.md)). By default nothing that arrives meanwhile is lost:
+the triggers' door holds what arrives and runs it on the new version once
+they are back, a caller on a route is answered `503` with a `Retry-After` and
+its client tries again, and the runs going finish on the old version first.
+For the other answers (`--door`, `--held`, `--running`), go and read [taking
+triggers down](lifecycles.md#taking-triggers-down-three-questions).
 
 Only the change is uploaded, and only the image it touches is rebuilt. If
 nothing changed, nothing is built.
@@ -410,28 +414,30 @@ to go back, find the version in `weft tree --on prod`, then let
 
 ```bash
 weft branch <version> --on prod
-weft resync --on prod --mode park   # or `weft activate --on prod` if it is off
+weft infra upgrade --on prod --all
+weft resync --on prod --all          # and `weft activate --on prod` for what is off
 ```
 
 `weft branch` stops if your folder holds changes no version records yet;
-`--discard` throws those away. That version's images still exist from its
-first deploy, so nothing is rebuilt.
+`--discard` throws those away. Unless `weft clean --images` removed them
+since, that version's images are still there from its first deploy, so
+nothing is rebuilt.
 
 ### Connections
 
 Each install keeps its own connections and its own picks of them: which
-connection a step uses is picked on the install, never written in your
+connection a node uses is picked on the install, never written in your
 files ([picked on each install](../build/connections.md#picked-on-each-install)).
-A step you connected on your machine has no pick on prod until you make one
+A node you connected on your machine has no pick on prod until you make one
 there, with the same walkthrough:
 
 ```bash
 weft connect --on prod
 ```
 
-If a run on prod reaches a step with nothing picked there, it is refused
-before it starts, and the message names the step and
-`weft connect --node <step>`; add `--on prod`. An instance's own connection (a
+If a run on prod reaches a node with nothing picked there, it is refused
+before it starts, and the message names the node and
+`weft connect --node <node>`; add `--on prod`. An instance's own connection (a
 field written `@instance_filled`) lives in the install it was made on, so
 your customers connect through your frontend on prod, the same way they do
 locally.
@@ -442,12 +448,12 @@ If your project names a target, the graph has a switch in its top right
 corner: **local**, then each target. If you want to see what prod is
 running, click **prod**. The graph then shows the program as it was last
 deployed there, along with prod's runs, status and connections. From then
-on, **Run**, **Activate**, the Executions list and the version tree all go
+on, **Run**, **Activate**, the Runs list and the version tree all go
 to prod, as if you had typed `--on prod` on each command.
 
 You cannot edit the program there, because it is a copy of what prod runs.
 You can change its connections, though: **Connect** and **Disconnect** on a
-step change which connection prod uses, and prod sets up again any trigger
+node change which connection prod uses, and prod sets up again any trigger
 that relies on it. If the files in your folder are a different version from
 prod's, a banner at the top says so. **Activate** deploys the files in your
 folder, exactly like `weft activate --on prod`, not the copy you see on
@@ -495,13 +501,28 @@ Put those in the frontend's environment.
 hand from the Actions tab. It takes the weft CLI the release built from the
 source your install runs (waiting for it while that release is still
 building, or building it when the release has none), deploys
-the program (`weft activate --on prod` when it is off,
-`weft resync --on prod --mode park` when it is on: edit the mode in the file
-if `hibernate` or `wipe` suits the program better), then
-builds `front/` with Docker and deploys it to the repository's service. If you run
-`weft ci add` again, it replaces the file only if you have not edited it;
-otherwise it stops and leaves your edits alone. If you are starting a new
-project, `weft new <name> --ci gcp` writes the workflow for you.
+the program with `weft infra upgrade --all` then `weft resync --all`, then
+builds `front/` with Docker and deploys it to the repository's service. If
+you run `weft ci add` again, it replaces the file only if you have not edited
+it; otherwise it stops and leaves your edits alone.
+
+The workflow never turns anything on: the upgrade replaces only the
+infrastructure that is running, and the resync moves only the triggers that
+are on, so anything somebody took down stays down. Before the first deploy,
+run `weft infra start --on prod` and `weft activate --on prod` once by hand.
+
+The runs going when the deploy replaces what they run on finish first, and
+the deploy waits for them however long that takes. If you would rather they
+stop at once, set `RUNNING: cancel` in the workflow's `env:` block, where it
+says `RUNNING: wait` (that counts as an edit). If GitHub cuts the job off,
+the upgrade or resync it had started carries on by itself on the install. If
+it was cut off before the resync began, wait until `weft infra status --on
+prod` shows the upgrade done, then run `weft resync --on prod --all` by hand.
+If the resync had already begun, it finishes on its own, and `weft status --on
+prod` shows how far it is.
+
+If you are starting a new project, `weft new <name> --ci gcp` writes the
+workflow for you.
 
 `weft target export prod --github` uses the GitHub CLI (`gh`) to set the
 variables and secrets the workflow reads, so run it with `gh` logged in. It
@@ -605,8 +626,8 @@ waiting for it to start.
   weft tells the holders the trigger is there; otherwise weft is starting
   one. If it stays that way, the holders' logs say why.
 - **A run on prod is refused with "has no ... connection picked on this
-  install"**: the step was connected on your machine, not on prod. Run the
-  `weft connect --node <step>` it names, with `--on prod`.
+  install"**: the node was connected on your machine, not on prod. Run the
+  `weft connect --node <node>` it names, with `--on prod`.
 - **An image build fails**: the error quotes the builder's log, with the
   `cargo` or `apt` line that failed. Fix what it names and deploy again;
   only what changed rebuilds.

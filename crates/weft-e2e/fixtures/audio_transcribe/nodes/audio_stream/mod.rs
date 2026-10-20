@@ -14,9 +14,9 @@
 //! { "sample_rate": 16000, "encoding": "pcm_s16le" }
 //! ```
 //!
-//! The bus closes when the file ends (or on any error: the handle from
-//! `ctx.open_bus` closes on every exit), and that close IS the
-//! end-of-stream signal a reader waits on.
+//! The bus closes when the file ends (or on any error: a bus from
+//! `ctx.open_bus` ends with the body, failed then), and that close IS
+//! the end-of-stream signal a reader waits on.
 
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ use serde_json::json;
 use weft::bus::{BusOptions, BusPayloadKind};
 use weft::node::NodeOutput;
 use weft::storage::StorageScope;
-use weft::{node_error, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{node_error, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct AudioStreamNode;
@@ -129,7 +129,7 @@ fn chunk_bytes(rate: u32) -> usize {
 
 #[async_trait]
 impl Node for AudioStreamNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let file = ctx.inputs.get("audio")?;
         let (_meta, bytes) = ctx.storage(StorageScope::Project).get_bytes(&file).await?;
         let (rate, pcm) = parse_wav(&bytes).map_err(node_error)?;
@@ -138,7 +138,7 @@ impl Node for AudioStreamNode {
             .open_bus(
                 "stream",
                 BusOptions {
-                    ephemeral: true,
+                    journal: weft::stream_journal::JournalPolicy::ephemeral(),
                     window: Some(WINDOW_CHUNKS),
                     payload: BusPayloadKind::Bytes,
                     meta: json!({ "sample_rate": rate, "encoding": "pcm_s16le" }),
@@ -155,7 +155,7 @@ impl Node for AudioStreamNode {
             pace.tick().await;
             bus.send_bytes("audio", chunk.to_vec()).node_err("stream an audio frame")?;
         }
-        drop(bus); // the close IS the end-of-stream signal
+        bus.close(); // the close IS the end-of-stream signal
 
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await?;
         Ok(())

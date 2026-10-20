@@ -1,11 +1,11 @@
 //! Shared by `TagRun` and `StopTagged`: how a steering node reads the
 //! tags it was handed. One reader, so the two nodes can never disagree
-//! on what counts as a tag. Any string works: `ctx.tag_execution` and
+//! on what counts as a tag. Any string works: `ctx.tag_run` and
 //! `ctx.stop_tagged` normalise each value the same way
 //! (`weft::tag::normalize_tag`), so the same value always lands on the
 //! same tag from either side.
 
-use weft::{node_bail, ExecutionContext, WeftResult};
+use weft::{node_bail, RunContext, WeftResult};
 
 /// The tags a steering node was handed: every created input (one tag
 /// each, typed `String` by both manifests) plus the optional `tags`
@@ -13,7 +13,7 @@ use weft::{node_bail, ExecutionContext, WeftResult};
 /// node with nothing to tag or stop is a wiring mistake, never a silent
 /// no-op. An empty value is refused here, before anything is tagged or
 /// stopped, so the node never acts on half its tags.
-pub fn tags_from_inputs(ctx: &ExecutionContext) -> WeftResult<Vec<String>> {
+pub fn tags_from_inputs(ctx: &RunContext) -> WeftResult<Vec<String>> {
     let mut tags: Vec<String> = Vec::new();
     // `custom()` is the created ports only; the declared `tags` list
     // is read below.

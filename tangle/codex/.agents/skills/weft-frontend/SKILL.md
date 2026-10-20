@@ -36,7 +36,7 @@ a time, each with a timeout of at most 60 seconds:
 ```bash
 pnpm dlx sv@0.17.0 create front --template minimal --types ts --no-add-ons --no-install
 pnpm dlx sv@0.17.0 add tailwindcss="plugins:none" --no-install --cwd front --no-git-check --no-download-check
-cd front && pnpm add clsx tailwind-merge && pnpm add -D tw-animate-css shadcn-svelte@1.6.1 && pnpm install
+pnpm --dir front add clsx tailwind-merge && pnpm --dir front add -D tw-animate-css shadcn-svelte@1.6.1 && pnpm --dir front install
 ```
 
 The Tailwind add-on writes `src/routes/layout.css`. `shadcn-svelte init`
@@ -206,12 +206,19 @@ block a destructive button renders with no colour at all:
 }
 ```
 
-Then, still in `front/`:
+Then, still from the project root (`--dir front` runs pnpm as if it started
+in `front/`; `pnpm dlx` does not take it, so shadcn-svelte gets its own
+`--cwd front`):
 
 ```bash
-pnpm dlx shadcn-svelte@1.6.1 add button card input --yes --overwrite --no-deps-install && pnpm install
-pnpm run build
+pnpm dlx shadcn-svelte@1.6.1 add button card input --yes --overwrite --no-deps-install --cwd front && pnpm --dir front install
+pnpm --dir front run build
 ```
+
+Every command here starts at the project root and names `front/` with a
+flag, never a `cd front && ...`: the project's command rules
+(`.codex/rules/tangle.rules`) do not allow `cd`, so a line that starts with
+one runs in the sandbox, where the network is closed and pnpm cannot fetch.
 
 If any command asks a question anyway, you kill it and report what it asked;
 you never answer it. A build takes seconds: you give it 30, and if it
@@ -268,10 +275,16 @@ values with `weft infra env`. The button's warning (`weft infra show` prints it)
 cuts off; if something already uses the old one, cutting it off is the user's
 call, so you ask the orchestrator before pressing.
 
-If the environment's permission checker refuses one of these commands, you
-stop that part and hand the user the exact command to run, then go on with the
-rest. You never go round it by reading the secret yourself or copying it onto
-a command line.
+Run each of these as one plain command from the project folder, exactly as
+written above: no pipe, no redirection, nothing joined to it but another
+allowed command, and `--into front/.env` for the path. The project's command
+rules (`.codex/rules/tangle.rules`) let `weft infra ...` run without asking
+only when every command on the line is one they allow. If one asks anyway,
+you are a subagent and the approval is refused: put the exact command in your
+report and go on with the rest, and the orchestrator runs it and tells you
+when the file is written. Nobody goes round a refusal by reading the secret
+or copying it onto a command line; if the orchestrator is refused too, it
+hands the user the exact command.
 
 **If you need a door that is not listed, you report it and stop on that part.**
 Whether a piece of infrastructure is reachable is part of what [the program]
@@ -306,11 +319,11 @@ without them it logs "Database schema mismatch ... Missing tables" and every
 call to it fails. You never write that SQL or startup code yourself, because
 BetterAuth's own CLI (the `auth` package; the older `@better-auth/cli` is
 deprecated) creates them. Once the database's values are in the server env
-file, from `front/`:
+file, from the project root:
 
 ```bash
-pnpm add better-auth@1.7.6 pg && pnpm add -D auth@1.7.6 @types/pg
-pnpm exec auth migrate --yes
+pnpm --dir front add better-auth@1.7.6 pg && pnpm --dir front add -D auth@1.7.6 @types/pg
+pnpm --dir front exec auth migrate --yes
 ```
 
 `migrate` finds the config at `src/lib/server/auth.ts`, reads `front/.env` the
@@ -538,15 +551,23 @@ The shape, unless the user asks for another:
   `/signal-token/`, `http://127.0.0.1:14111` on a local install) goes in the
   server's environment and nowhere a page can read it. The pass-through
   forwards only `/instance/`, `/signal/`, `/signal-token/`, the program's
-  own routes (`/connect/<tenant>/<project id>/<path>`) and the picture links in their answers
-  (`/public/files/<token>`), carries the caller's token and body, and keeps the
-  site's cookies and the `Weft-Instance` header back. A page fetches
+  own routes (`/connect/<tenant>/<project id>/<path>`) and the file links in
+  their answers and a slot's uploads (`/files/...`), carries the caller's token and body, and keeps the
+  site's cookies and the `Weft-Instance` header back. It does pass a route's
+`Weft-Run-Id` header back, so if you want the site to log or show which run
+failed, read it there. A page fetches
   `/weft/signal-token/displays` with the instance token as bearer, calls a
   program route as `/weft/connect/<tenant>/<project id>/<path>` with the instance token in
   `Weft-Instance-Token`, and `new InstanceDoor(instanceToken)` already calls
-  `/weft/instance/...`. A route called through the pass-through builds the
-  picture links in its answer on the site's own address, so those pictures
-  load through the same pass-through, and you write no proxy route for them.
+  `/weft/instance/...`. On a local install, for the pictures in a route's
+  answers to load through the same pass-through, give the frontend the site's
+  `/weft` address as its visitor address: `weft frontend add <name>
+  --visitor-address https://<site>/weft`, or `weft frontend visitor-address
+  <name> https://<site>/weft` for one that already exists. Every file link the
+  project hands out then goes through the site, and you write no proxy route
+  for them. Without it, the links go through weft's tunnel when it is open,
+  else to the install's own address, which only this machine opens. On a cloud
+  install, file links go straight to the cloud store either way.
   If you catch yourself putting the dispatcher's
   address in a page, stop and write: "Wait. The browser talks to its own
   site." Then call `/weft/...`. If the site sends everyone not signed in to
@@ -560,14 +581,14 @@ The shape, unless the user asks for another:
   weft editor shows, restyled to the site, and never the author's shared key.
   A save that changes a value one of their live triggers reads re-arms it
   before it answers, and the page says so; nothing else to call. The page
-  titles each step with the program's own label and each field with the
+  titles each node with the program's own label and each field with the
   node's own name for it ("Value"), both written for the program's author,
   so you name every field a person sees in your own words:
   `<InstanceSettings {door} labels={{ 'greet': 'Your greeting', 'greet.value': 'How the bot greets you' }} />`,
-  a step's id for its title and `step.field` for a field (`door.fields()`
+  a node's name for its title and `node.field` for a field (`door.fields()`
   lists both). If the page
   must look different, build it from `door.fields()`, `door.setValues(..)` and
-  `ResourceSelect` over `door.resources(step, field)` instead. The library is not a package you install: you run
+  `ResourceSelect` over `door.resources(node, field)` instead. The library is not a package you install: you run
   `weft connect-lib` from the project root, which copies it into
   `front/src/lib/weft-connect` (`--into <dir>` for another folder), then
   import it from `$lib/weft-connect` and `$lib/weft-connect/svelte` (and
@@ -594,10 +615,12 @@ carry the header.
   `node_modules`, its build output. You never put frontend files in the weft
   source tree, and never point a weft `@file` marker into `front/`.
 - The build is `pnpm install` then `pnpm run build`; the dev server is
-  `pnpm run dev`. You hand the user those exact commands in the report.
+  `pnpm run dev`. You run them from the project root as `pnpm --dir front
+  install` and so on, and hand the user the plain forms, to run in `front/`,
+  in the report.
 - `front/Dockerfile` builds the frontend into a server that listens on
   `$PORT`: that is what the deploy workflow runs on the cloud. For SvelteKit
-  that means `pnpm add -D @sveltejs/adapter-node`, then, in
+  that means `pnpm --dir front add -D @sveltejs/adapter-node`, then, in
   `front/vite.config.ts`, importing `adapter` from `@sveltejs/adapter-node`
   where the scaffold imports it from `@sveltejs/adapter-auto` (the scaffold
   writes no `svelte.config.js`: the adapter is set inside `sveltekit({ ... })`
@@ -610,9 +633,23 @@ carry the header.
   on the address the route was called on, so a page calls routes through the
   pass-through (`/weft/connect/...`), never from its own server code straight
   to the dispatcher: called that way, the links point at an address the
-  browser may not reach. A picture the page
-  sends goes in the JSON body as a `data:` URL on the key the route declares
-  as `Image`; never as multipart, never as a separate upload.
+  browser may not reach. weft serves that file exactly as stored: the link
+  answers range requests, so a `<video>` seeks and a broken download picks
+  up where it stopped, and the same file asked for again within the link's
+  lifetime gets the same link, so a page that fetches its answer again keeps
+  its video playing. The page writes no range handling and keeps no file
+  cache of its own. Every such link is a download: opened in a tab it saves
+  the file under its name, while an `<img>`, `<video>` or `<audio>` shows or
+  plays it.
+- A picture the page sends goes in the JSON body as a `data:` URL on the key
+  the route declares as `Image`, never as multipart. A file too big for
+  that (a video, a long recording) goes through an upload slot the program
+  hands the page: `uploadFile(slot, file, (done, total) => ...)` from
+  `$lib/weft-connect` sends it in parts straight to storage, through the
+  `/weft` pass-through, resuming after a dropped connection, and answers the
+  slot string, which the page then sends to the route in the field it
+  declares as a file. A refusal (a file too big, a type the slot does not
+  take) comes back as an error whose message is a sentence ready to show.
 - If a page shows a conversation read from a conversation file (the AI
   nodes' `historyFile`), it skips the messages whose `role` is `system`: the
   file can open with the system prompt as its first message. It finds
@@ -622,8 +659,14 @@ carry the header.
 - An infra node's card (what `weft infra show` prints) is for the program's
   author. A page never parses its text for state and never shows its labels
   to people as they are: it asks the program, and chooses its own words.
-- Plain: shadcn-svelte components, little custom CSS, no design system the
-  request did not ask for.
+- The look is the `designer`'s, a specialist the `frontend-builder` starts
+  before anything else (on an older model that gives a specialist no tool to
+  start one, Tangle starts it instead, in the same breath). It builds the tokens, the components and the motion in `design-lab/`, a
+  standalone app beside `front/` on the same stack, with every page mocked on
+  realistic data, and the real pages are built on what it hands over
+  (`design-lab/src/lib/design/` and its components, moved under
+  `front/src/lib/`). `design-lab/` is the design's source, kept in the
+  project; weft reads nothing in it.
 
 ## Proving the frontend is proving the frontend
 

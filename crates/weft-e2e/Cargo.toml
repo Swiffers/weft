@@ -51,7 +51,7 @@ weft-compiler = { workspace = true }
 # JSON in tests), and runs the compile-time validation chain in-process
 # (the same code path `weft validate` runs).
 weft-catalog = { workspace = true }
-# The drift-backstop / refresh e2es (tests/accesses.rs) additionally seed
+# The drift-backstop / refresh e2es (tests/e2e/accesses.rs) additionally seed
 # grant rows directly in the store's Postgres (WEFT_E2E_DATABASE_URL):
 # there is deliberately no HTTP door that writes arbitrary grants. Rides
 # the platform layer's sqlx (below) with json/uuid/chrono row types.
@@ -82,13 +82,14 @@ axum = { workspace = true }
 
 # Optional: only compiled under the `e2e` feature (see [features]). The platform
 # layer (src/platform.rs) connects to the install's Postgres to observe
-# which worker owns an execution and what a run stored.
+# which worker owns a run and what a run stored.
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono"], optional = true }
 
 # Optional: only under `e2e`. Loads the repo root's `.env.local` and `.env`
 # (the files the CLI reads too) so a test that spends on a real key finds it
 # without the operator re-exporting it into the test shell.
 dotenvy = { version = "0.15", optional = true }
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [lints]
 workspace = true

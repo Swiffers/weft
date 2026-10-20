@@ -1,12 +1,12 @@
-//! `stop_tagged` task: one execution stopping its siblings by tag
+//! `stop_tagged` task: one run stopping its siblings by tag
 //! (`ctx.stop_tagged`). The broker enqueued it when the worker asked,
 //! with the ordering anchor (`before_seq`) resolved THEN; here a
-//! dispatcher reads the live executions carrying the tag, applies
+//! dispatcher reads the live runs carrying the tag, applies
 //! the pure stop rule, and cancels each match through the ONE cancel
-//! path (`cancel_execution_id`), so a tag stop reaches a parked run exactly the
+//! path (`cancel_run_id`), so a tag stop reaches a parked run exactly the
 //! way `weft stop` does: its wake signals are stripped first, its
 //! owning worker (if any) gets the flag with the cause, and the journal
-//! reaches `ExecutionCancelled` naming who asked and which tag matched.
+//! reaches `RunCancelled` naming who asked and which tag matched.
 //!
 //! Idempotent under retry: a second pass finds the first pass's targets
 //! already terminal (the live read excludes them) and stops nothing new.
@@ -14,13 +14,13 @@
 //! is never reached, however late this runs. Every selected target is
 //! attempted before the task reports: one failing cancel must not strand
 //! the runs after it, and it must not vanish either, so any failure fails
-//! the task with every failed execution and its error in the task row.
+//! the task with every failed run and its error in the task row.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft_core::exec::CancelCause;
+use weft_core::run::CancelCause;
 use weft_task_store::executor::TaskExecutor;
 use weft_task_store::tasks::Task;
 use weft_task_store::StopTaggedPayload;
@@ -41,19 +41,19 @@ impl TaskExecutor<DispatcherState> for StopTaggedExecutor {
     }
 }
 
-/// Stop every live execution of `project_id` the rule selects, and
-/// return the executions stopped. The SELECTION is
+/// Stop every live run of `project_id` the rule selects, and
+/// return the runs stopped. The SELECTION is
 /// `weft_journal::tags::select_stop_targets`, the CANCEL is
-/// `cancel_execution_ids`, nothing here is a third path.
+/// `cancel_run_ids`, nothing here is a third path.
 pub async fn stop_tagged(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     tag: &str,
-    by: weft_core::ExecutionId,
+    by: weft_core::RunId,
     before_seq: Option<i64>,
     stop_self: weft_core::StopSelf,
-) -> Result<Vec<weft_core::ExecutionId>> {
-    let live = state.journal.live_tagged_executions(project_id, tag).await?;
+) -> Result<Vec<weft_core::RunId>> {
+    let live = state.journal.live_tagged_runs(project_id, tag).await?;
     let targets = weft_journal::tags::select_stop_targets(&live, by, before_seq, stop_self);
     tracing::info!(
         target: "weft_dispatcher::stop_tagged",
@@ -66,7 +66,7 @@ pub async fn stop_tagged(
         stopping = targets.len(),
         "stop_tagged"
     );
-    let cause = CancelCause::Execution { by, tag: tag.to_string() };
-    let targets: Vec<(weft_core::ExecutionId, &CancelCause)> = targets.iter().map(|c| (*c, &cause)).collect();
-    crate::api::execution::cancel_execution_ids(state, &targets).await
+    let cause = CancelCause::Run { by, tag: Some(tag.to_string()) };
+    let targets: Vec<(weft_core::RunId, &CancelCause)> = targets.iter().map(|c| (*c, &cause)).collect();
+    crate::api::run::cancel_run_ids(state, &targets).await
 }

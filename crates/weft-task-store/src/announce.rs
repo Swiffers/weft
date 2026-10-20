@@ -50,7 +50,7 @@
 //! what happened to a run a worker drives (an answer handed to it, a cancel
 //! asked of it), which the broker copy holding that worker's line must hear
 //! while the database may sleep. The write leaves it in [`NEWS_TABLE`]
-//! (`weft_tell(project, execution, kind)`), committing with it, and its
+//! (`weft_tell(project, run, kind)`), committing with it, and its
 //! writer then says so ([`news_written`]: only a cancel or an answer
 //! reaching a run pays a look at the news, never the run path's writes).
 //! Beside the flushing, once the process gave it its news
@@ -123,7 +123,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         r#"CREATE TABLE IF NOT EXISTS weft_news (
             seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             project_id UUID NOT NULL,
-            execution_id UUID NOT NULL,
+            run_id UUID NOT NULL,
             kind TEXT NOT NULL CHECK (kind IN ('answer', 'cancel')),
             refused_at TIMESTAMPTZ
         )"#,
@@ -151,21 +151,21 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         // none.
         // SYNC: the lock 'weft:news-refused' <-> weft_news_refuse
         r#"CREATE OR REPLACE FUNCTION weft_news_refused(p_limit BIGINT, p_skip BIGINT[], p_callee TEXT)
-            RETURNS TABLE (seq BIGINT, project_id UUID, execution_id UUID, kind TEXT) AS $$
+            RETURNS TABLE (seq BIGINT, project_id UUID, run_id UUID, kind TEXT) AS $$
             BEGIN
                 PERFORM pg_advisory_xact_lock(hashtextextended('weft:news-refused', 0));
                 IF NOT EXISTS (SELECT 1 FROM weft_news n WHERE n.refused_at IS NOT NULL) THEN
                     DELETE FROM unanswered_call u WHERE u.callee = p_callee;
                     RETURN;
                 END IF;
-                RETURN QUERY SELECT n.seq, n.project_id, n.execution_id, n.kind FROM weft_news n
+                RETURN QUERY SELECT n.seq, n.project_id, n.run_id, n.kind FROM weft_news n
                     WHERE n.refused_at IS NOT NULL AND n.seq <> ALL(p_skip)
                     ORDER BY n.refused_at, n.seq LIMIT p_limit;
             END;
             $$ LANGUAGE plpgsql"#,
         // What a write calls to make news, in the write's transaction.
-        r#"CREATE OR REPLACE FUNCTION weft_tell(p_project UUID, p_execution UUID, p_kind TEXT) RETURNS VOID AS $$
-            INSERT INTO weft_news (project_id, execution_id, kind) VALUES (p_project, p_execution, p_kind)
+        r#"CREATE OR REPLACE FUNCTION weft_tell(p_project UUID, p_run UUID, p_kind TEXT) RETURNS VOID AS $$
+            INSERT INTO weft_news (project_id, run_id, kind) VALUES (p_project, p_run, p_kind)
             $$ LANGUAGE sql"#,
         // What a trigger on a run's path calls instead of `pg_notify`.
         r#"CREATE OR REPLACE FUNCTION weft_announce(p_channel TEXT, p_payload TEXT) RETURNS VOID AS $$
@@ -569,10 +569,10 @@ type NewNewsRow = (bool, Option<i64>, Option<uuid::Uuid>, Option<uuid::Uuid>, Op
 /// twice.
 async fn new_news(pool: &PgPool, read_past: i64) -> Result<NewNews, sqlx::Error> {
     let rows: Vec<NewNewsRow> = sqlx::query_as(
-        "SELECT f.refusals, n.seq, n.project_id, n.execution_id, n.kind \
+        "SELECT f.refusals, n.seq, n.project_id, n.run_id, n.kind \
          FROM (SELECT EXISTS (SELECT 1 FROM weft_news r WHERE r.refused_at IS NOT NULL) \
                    OR EXISTS (SELECT 1 FROM unanswered_call u WHERE u.callee = $3) AS refusals) f \
-         LEFT JOIN LATERAL (SELECT seq, project_id, execution_id, kind FROM weft_news \
+         LEFT JOIN LATERAL (SELECT seq, project_id, run_id, kind FROM weft_news \
              WHERE refused_at IS NULL AND seq > $2 ORDER BY seq LIMIT $1) n ON TRUE \
          ORDER BY n.seq",
     )
@@ -584,7 +584,7 @@ async fn new_news(pool: &PgPool, read_past: i64) -> Result<NewNews, sqlx::Error>
     let refusals = rows.first().is_some_and(|row| row.0);
     let rows = rows
         .into_iter()
-        .filter_map(|(_, seq, project, execution, kind)| Some((seq?, project?, execution?, kind?)))
+        .filter_map(|(_, seq, project, run, kind)| Some((seq?, project?, run?, kind?)))
         .collect();
     Ok(NewNews { pieces: pieces(rows), refusals })
 }
@@ -593,7 +593,7 @@ async fn new_news(pool: &PgPool, read_past: i64) -> Result<NewNews, sqlx::Error>
 /// longest refused first ([`pieces`]); none, with the refusal written down
 /// cleared, when no refused row is left (`weft_news_refused`).
 async fn refused_news(pool: &PgPool, skip: &[i64]) -> Result<Vec<(i64, Option<RunNews>)>, sqlx::Error> {
-    let rows: Vec<NewsRow> = sqlx::query_as("SELECT seq, project_id, execution_id, kind FROM weft_news_refused($1, $2, $3)")
+    let rows: Vec<NewsRow> = sqlx::query_as("SELECT seq, project_id, run_id, kind FROM weft_news_refused($1, $2, $3)")
         .bind(NEWS_BATCH)
         .bind(skip)
         .bind(Callee::News.key())
@@ -606,8 +606,8 @@ async fn refused_news(pool: &PgPool, skip: &[i64]) -> Result<Vec<(i64, Option<Ru
 /// which goes out of the table unsaid, loudly).
 fn pieces(rows: Vec<NewsRow>) -> Vec<(i64, Option<RunNews>)> {
     rows.into_iter()
-        .map(|(seq, project, execution, kind)| {
-            let news = kind_named(&kind).map(|kind| RunNews { project, execution, kind });
+        .map(|(seq, project, run, kind)| {
+            let news = kind_named(&kind).map(|kind| RunNews { project, run, kind });
             if news.is_none() {
                 tracing::error!(target: "weft_task_store::announce", seq, %kind, "news of a kind nobody tells; dropped");
             }
@@ -617,7 +617,7 @@ fn pieces(rows: Vec<NewsRow>) -> Vec<(i64, Option<RunNews>)> {
 }
 
 /// The kind a row of [`NEWS_TABLE`] names.
-// SYNC: kind_named <-> the kinds in weft_news (GROUP), crates/weft-task-store/src/parked_fires.rs (parked_fire_notify), crates/weft-dispatcher/src/journal/postgres.rs (cancel_execution)
+// SYNC: kind_named <-> the kinds in weft_news (GROUP), crates/weft-task-store/src/parked_fires.rs (parked_fire_notify), crates/weft-dispatcher/src/journal/postgres.rs (cancel_run)
 fn kind_named(kind: &str) -> Option<NewsKind> {
     match kind {
         "answer" => Some(NewsKind::Answer),
@@ -657,7 +657,7 @@ mod tests {
 
     fn batch() -> Vec<RunNews> {
         (1..=3)
-            .map(|n| RunNews { project: uuid::Uuid::from_u128(1), execution: uuid::Uuid::from_u128(n), kind: NewsKind::Answer })
+            .map(|n| RunNews { project: uuid::Uuid::from_u128(1), run: uuid::Uuid::from_u128(n), kind: NewsKind::Answer })
             .collect()
     }
 

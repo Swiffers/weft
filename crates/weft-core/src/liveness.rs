@@ -9,7 +9,7 @@
 //! resolve loudly) from "one task waits while another still computes"
 //! (still working). This module is the shared vocabulary for that:
 //!
-//! - [`FiringLocation`] identifies the node EXECUTION doing the waiting.
+//! - [`FiringLocation`] identifies the FIRING doing the waiting.
 //! - [`WaitSource`] is the thing being waited on (a bus, a stream, an
 //!   emission's delivery), reduced to the one fact the stuck-check
 //!   needs: a monotone generation of its state changes.
@@ -27,9 +27,9 @@
 
 use std::sync::{Arc, Weak};
 
-/// Identity of one node EXECUTION: the node id plus its loop-frame
+/// Identity of one FIRING: the node id plus its loop-frame
 /// stack. A loop running the same node body N times in parallel is N
-/// distinct executions, one per frame, each with its own wait liveness.
+/// distinct runs, one per frame, each with its own wait liveness.
 /// This is the key the engine's stuck-check uses to tell "this lane is
 /// waiting forever" from "this lane is still computing".
 /// Defined in `frames` (a pure identity persisted on `NodeRunState`,
@@ -39,7 +39,7 @@ use std::sync::{Arc, Weak};
 pub use crate::frames::FiringLocation;
 
 /// A single wait's identity within the engine's liveness map. One node
-/// execution can hold SEVERAL concurrent waits at once (a body that
+/// run can hold SEVERAL concurrent waits at once (a body that
 /// `tokio::select!`s or `join!`s over two cursors, or two `wait_for`s),
 /// each its own guard; the id keeps their parked/observed state
 /// separate under the one node entry. Minted by `enter_wait`;
@@ -84,7 +84,7 @@ pub trait WaitSource: Send + Sync {
 /// resolves without ever registering a wait with the engine.
 ///
 /// `node` is the waiting FIRING's identity. Every wait that belongs to
-/// an in-flight node execution MUST carry it. Today every
+/// an in-flight firing MUST carry it. Today every
 /// engine-attached source does; `None` is only ever paired with
 /// [`no_liveness`] (standalone rigs and tests). A live `liveness` with
 /// `node: None` would make the wait invisible to the stuck-check, so
@@ -116,7 +116,7 @@ pub async fn wait_on<T>(
 /// "every waiting node is parked forever" (real deadlock) from "one
 /// node waits while another still computes" (still working).
 ///
-/// Liveness is attached to the NODE EXECUTION (`(node_id, frames)`),
+/// Liveness is attached to the FIRING (`(node_id, frames)`),
 /// not to each wait: the unit that is "computing" or "waiting" is the
 /// async task, and a node holding several waits is still one task. A
 /// task CAN be inside several waits at once (select!/join! over two
@@ -218,7 +218,7 @@ pub fn no_liveness() -> Weak<dyn WaitLiveness> {
 /// `exit_wait`. Drop fires whether the awaiting future returns
 /// normally OR is cancelled mid-await (e.g. the loop aborts a stuck
 /// task), so the engine's liveness map stays consistent. Carries the
-/// node-execution identity so every hook keys on the right firing. A
+/// node-run identity so every hook keys on the right firing. A
 /// guard with no node identity (a source not minted by an
 /// engine-driven node) is a no-op.
 struct WaitGuard {

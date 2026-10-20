@@ -25,7 +25,7 @@ use crate::cst::parse;
 /// A structured edit intent. `serde` tag `op` matches the parse-server wire.
 // SYNC: EditOp <-> packages/weft-graph/src/protocol.ts EditOp
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(tag = "op", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum EditOp {
     /// Set (or insert) a config field. `value` is the already-formatted source
     /// token (`"hi"`, `42`, a `@file(...)` marker, multi-line JSON), produced
@@ -71,7 +71,7 @@ pub enum EditOp {
     MoveGroupScope { group: String, target_group: Option<String> },
     /// Rewrite a node's declared port surface. `inputs`/`outputs` are the
     /// header's ports ONLY: custom additions, plus a catalog port whose type
-    /// or requiredness the author overrides (filling a MustOverride output).
+    /// or requiredness the author overrides (narrowing a narrowable output).
     /// The catalog provides the node type's own ports at enrich, so restating
     /// them here would freeze the whole signature into source. A port the
     /// gesture DELETED is named in `removed_inputs`/`removed_outputs`, and
@@ -83,7 +83,7 @@ pub enum EditOp {
     /// source silently. The editor's op additionally carries
     /// projection-only `revertedInputs`/`revertedOutputs` members, which
     /// serde ignores here by design.
-    // SYNC: UpdateNodePorts <-> packages/weft-graph/src/protocol.ts EditOp updateNodePorts
+    // SYNC: UpdateNodePorts <-> packages/weft-graph/src/protocol.ts EditOp update_node_ports
     UpdateNodePorts {
         node: String,
         inputs: Vec<PortSig>,
@@ -121,7 +121,7 @@ pub enum EditOp {
     /// form-toggle marker on a port-driven field sends this.
     SetValueForm { node: String, key: String, form: ValueForm },
     /// Set a single loop config field (`parallel`, `over`, `carry`,
-    /// `max_iters`, `trim_on_mismatch`). The value is a pre-formatted
+    /// `maxIters`, `trimOnMismatch`). The value is a pre-formatted
     /// source token: `true`, `["a","b"]`, `100`, etc. Inserts the field
     /// if missing, replaces it if present.
     SetLoopConfig { loop_id: String, key: String, value: String },
@@ -131,9 +131,9 @@ pub enum EditOp {
 
 /// The written form of a body-set port value; mirrors
 /// `ConfigOrigin` (`Inline` = braces field, `Connection` = statement).
-// SYNC: ValueForm <-> packages/weft-graph/src/protocol.ts EditOp setValueForm.form, packages/weft-graph/src/webview/lib/types/index.ts portValueForm.form
+// SYNC: ValueForm <-> packages/weft-graph/src/protocol.ts EditOp set_value_form.form, packages/weft-graph/src/webview/lib/types/index.ts portValueForm.form
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum ValueForm {
     Inline,
     Connection,
@@ -153,8 +153,8 @@ pub struct PortSig {
     /// would rewrite an author's `name?: Type` as `name: Type`.
     pub required: bool,
     /// Required on the wire for the same reason: a default here would
-    /// write the `MustOverride` placeholder over the author's declared
-    /// type. Where a placeholder is meant, the editor spells it out.
+    /// write some type over the author's declared one. The empty string
+    /// is a port written with no type, written back as the bare name.
     pub port_type: String,
 }
 

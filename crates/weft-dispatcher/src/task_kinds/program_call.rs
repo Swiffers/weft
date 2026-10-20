@@ -29,12 +29,12 @@ use weft_core::program::{
     ConnectionsForgotten, CostFilter, CostRecord, InfraCopy, InfraStartAnswer, InstanceHoldings, InstanceTrigger, ProgramCall,
     ProgramCallOutcome, ProgramCallPayload, RunsCounted, TokensRevoked,
 };
-use weft_core::running_policy::DeactivateSpec;
-use weft_core::{ExecutionId, StopSelf};
+use weft_core::take_down::TakeDownChoice;
+use weft_core::{RunId, StopSelf};
 use weft_task_store::executor::TaskExecutor;
 use weft_task_store::tasks::Task;
 
-use crate::infra_lifecycle_command::TakeDown;
+use crate::infra_lifecycle_command::Teardown;
 use crate::state::DispatcherState;
 
 pub struct ProgramCallExecutor;
@@ -74,13 +74,16 @@ pub(crate) async fn run_call(
             let started = infra_start(state, project_id, node, instance.as_ref()).await?;
             answered(serde_json::to_value(started).map_err(internal("answer"))?)
         }
-        ProgramCall::InfraStop { node, instance, spec } => {
-            let stop = TakeDown::Stop { force: false };
-            infra_down(state, project_id, node, instance.as_ref(), stop, spec, asker, payload.stop_self).await
+        ProgramCall::InfraStop { node, instance, take_down } => {
+            let stop = Teardown::Stop { force: false };
+            infra_down(state, project_id, node, instance.as_ref(), stop, take_down, asker, payload.stop_self).await
         }
-        ProgramCall::InfraTerminate { node, instance, spec, disks } => {
-            let terminate = TakeDown::Terminate { disks: *disks };
-            infra_down(state, project_id, node, instance.as_ref(), terminate, spec, asker, payload.stop_self).await
+        ProgramCall::InfraTerminate { node, instance, take_down, disks } => {
+            let terminate = Teardown::Terminate { disks: *disks };
+            infra_down(state, project_id, node, instance.as_ref(), terminate, take_down, asker, payload.stop_self).await
+        }
+        ProgramCall::InfraUpgrade { node, instance, take_down } => {
+            infra_upgrade(state, project_id, node, instance.as_ref(), take_down, asker, payload.stop_self).await
         }
         ProgramCall::InfraStatus { node, instance } => {
             let copy = observed_copies(state, project_id)
@@ -98,9 +101,9 @@ pub(crate) async fn run_call(
             let tenant = owner().await?;
             answered(serde_json::to_value(instances(state, &tenant, project_id).await?).map_err(internal("answer"))?)
         }
-        ProgramCall::TriggerActivate { scope } => answered(triggers_activate(state, project_id, scope).await?),
-        ProgramCall::TriggerDeactivate { scope, spec } => {
-            triggers_deactivate(state, project_id, scope, spec, asker, payload.stop_self).await
+        ProgramCall::TriggerActivate { scope, held } => answered(triggers_activate(state, project_id, scope, *held).await?),
+        ProgramCall::TriggerDeactivate { scope, take_down } => {
+            triggers_deactivate(state, project_id, scope, take_down, asker, payload.stop_self).await
         }
         ProgramCall::ConnectionsList { instance } => {
             let tenant = owner().await?;
@@ -129,7 +132,7 @@ pub(crate) async fn run_call(
             answered(serde_json::to_value(values).map_err(internal("answer"))?)
         }
         ProgramCall::ValuesChange { instance, set, clear } => {
-            let clear: Vec<(String, String)> = clear.iter().map(|f| (f.step.clone(), f.field.clone())).collect();
+            let clear: Vec<(String, String)> = clear.iter().map(|f| (f.node.clone(), f.field.clone())).collect();
             let changed = crate::instance_values::change(state, owner().await?.as_str(), project_id, instance, set, &clear).await?;
             answered(serde_json::to_value(changed).map_err(internal("answer"))?)
         }
@@ -144,20 +147,24 @@ pub(crate) async fn run_call(
             let tenant = owner().await?;
             let asker_matches = asker_matches_filter(state, project_id, filter, asker).await?;
             let outcome =
-                crate::api::execution::clean_runs(state, &tenant, Some(project_id), filter, *running, Some(asker)).await?;
+                crate::api::run::clean_runs(state, &tenant, Some(project_id), filter, *running, Some(asker)).await?;
             let stops_asker = payload.stop_self == StopSelf::Include && asker_matches;
             stop_asker(state, asker, stops_asker).await?;
             Ok(ProgramCallOutcome { value: serde_json::to_value(outcome).map_err(internal("answer"))?, stops_asker })
         }
         ProgramCall::RunsList { filter, limit } => {
             let tenant = owner().await?;
-            let page = crate::api::execution::list_runs(state, &tenant, project_id, filter, *limit).await?;
+            let page = crate::api::run::list_project_runs(state, &tenant, project_id, filter, *limit).await?;
             answered(serde_json::to_value(page).map_err(internal("answer"))?)
         }
         ProgramCall::RunsCount { filter } => {
             let tenant = owner().await?;
-            let total = crate::api::execution::count_runs(state, &tenant, project_id, filter).await?;
+            let total = crate::api::run::count_runs(state, &tenant, project_id, filter).await?;
             answered(serde_json::to_value(RunsCounted { total }).map_err(internal("answer"))?)
+        }
+        ProgramCall::NodeState { run, node } => {
+            let read = crate::node_state::read(state, project_id, *run, node).await?;
+            answered(serde_json::to_value(read).map_err(internal("answer"))?)
         }
         ProgramCall::TokensRevoke { instance, id } => {
             let tenant = owner().await?;
@@ -174,9 +181,9 @@ pub(crate) async fn run_call(
 /// here on); the copy comes up on its own and `ctx.infra(..).status()`
 /// says when. A copy already running, or already starting, answers
 /// without starting anything. A refusal for a passing reason (a build in
-/// progress, a trigger reading the copy mid-activation or mid-drain)
-/// answers `waiting` with that reason, and `ctx.infra(..).start()` asks
-/// again at its next look; any other refusal fails the call.
+/// progress, a trigger whose cut contains the copy mid-activation) answers
+/// `waiting` with that reason, and `ctx.infra(..).start()` asks again at
+/// its next look; any other refusal fails the call.
 async fn infra_start(
     state: &DispatcherState,
     project_id: uuid::Uuid,
@@ -198,22 +205,14 @@ async fn infra_start(
         _ => {}
     }
     // Up to the setup run being journaled, here; the rest of the sync runs
-    // on after the answer. A first copy coming up can move the project's
-    // workers next to their infra, and the asking run is on one of them:
-    // waiting here for that move would wait on the asker itself. A start
-    // never takes a run down, so the old workers drain instead of
-    // cancelling.
-    let body = weft_core::infra::wire::SyncRequest {
-        instance: instance.cloned(),
-        nodes: vec![node.to_string()],
-        running: weft_core::running_policy::RunningChoice {
-            running_policy: Some(weft_core::running_policy::RunningPolicy::Wait),
-            drain_timeout_secs: None,
-        },
-        ..Default::default()
-    };
-    let begun = match crate::api::infra::begin_sync(state, project_id, &body).await.map_err(|refused| refused.into_parts()) {
-        Ok(begun) => begun,
+    // on after the answer. A start never takes a run down.
+    let begun = match crate::api::infra::begin_sync(state, project_id, &Default::default(), instance, &[node.to_string()], instance.is_none())
+        .await
+        .map_err(|refused| refused.into_parts())
+    {
+        Ok(Some(begun)) => begun,
+        // Running or starting by the time the gates passed.
+        Ok(None) => return Ok(InfraStartAnswer::AlreadyStarting),
         Err((StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED, reason)) => {
             return Ok(InfraStartAnswer::Waiting { reason });
         }
@@ -225,7 +224,7 @@ async fn infra_start(
     let busy = state.signals.busy().await;
     tokio::spawn(async move {
         let _busy = busy;
-        if let Err(not_landed) = crate::api::infra::finish_sync(&state, project_id, begun).await {
+        if let Err(not_landed) = crate::api::infra::finish_sync(&state, begun).await {
             let (status, message) = <(StatusCode, String)>::from(not_landed);
             tracing::error!(
                 target: "weft_dispatcher::program_call",
@@ -237,22 +236,23 @@ async fn infra_start(
     Ok(InfraStartAnswer::Started)
 }
 
-/// Take one copy of an infra node down: the triggers reading it with it
-/// (by `spec`), the runs using it by `spec`'s running policy, then the
-/// supervisor's command. Never the run that asked, unless it said
-/// `StopSelf::Include` and it uses the copy.
+/// Take one copy of an infra node down: the triggers whose cut contains it
+/// with it, and the runs reaching it, as `take_down` says (an infra
+/// command's defaults for what it leaves out), then the supervisor's
+/// command. Never the run that asked, unless it said `StopSelf::Include`
+/// and it reaches the copy.
 #[allow(clippy::too_many_arguments)]
 async fn infra_down(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     node: &str,
     instance: Option<&InstanceId>,
-    take_down: TakeDown,
-    spec: &DeactivateSpec,
-    asker: ExecutionId,
+    teardown: Teardown,
+    take_down: &TakeDownChoice,
+    asker: RunId,
     stop_self: StopSelf,
 ) -> Result<ProgramCallOutcome, CallError> {
-    spec.validate().map_err(|m| (StatusCode::BAD_REQUEST, m.to_string()))?;
+    let take_down = take_down.resolve().map_err(|why| (StatusCode::BAD_REQUEST, why))?;
     let project = load_project(state, project_id).await?;
     let (copies_now, pending) =
         crate::infra_node::observe_with(&state.pg_pool, project_id, &project).await.map_err(internal("infra copies"))?;
@@ -261,7 +261,7 @@ async fn infra_down(
     // is the later intent, so the start ends here.
     let cancelled_start = !pending.setups_starting(node, instance).is_empty();
     for setup in pending.setups_starting(node, instance) {
-        crate::api::execution::cancel_execution_id(state, setup, &weft_core::exec::CancelCause::User)
+        crate::api::run::cancel_run_id(state, setup, &weft_core::run::CancelCause::User)
             .await
             .map_err(internal("cancel the copy's start"))?;
     }
@@ -275,127 +275,154 @@ async fn infra_down(
     let answered = |answer: InfraDownAnswer| -> Result<ProgramCallOutcome, CallError> {
         Ok(ProgramCallOutcome { value: serde_json::to_value(answer).map_err(internal("answer"))?, stops_asker: false })
     };
-    match (row, take_down) {
-        (_, TakeDown::Terminate { disks: weft_core::infra::TerminateDisks::DeleteAll }) => {}
+    match (row, teardown) {
+        (_, Teardown::Terminate { disks: weft_core::infra::TerminateDisks::DeleteAll }) => {}
         // A start of it still in its setup run was the copy, and is gone.
         (None, _) if cancelled_start => return answered(InfraDownAnswer::TakenDown),
         (None, _) => return answered(InfraDownAnswer::NoCopy),
-        (Some(InfraNodeStatus::Stopped | InfraNodeStatus::Stopping), TakeDown::Stop { .. })
-        | (Some(InfraNodeStatus::Terminating), TakeDown::Terminate { .. }) => return answered(InfraDownAnswer::AlreadyDown),
+        (Some(InfraNodeStatus::Stopped | InfraNodeStatus::Stopping), Teardown::Stop { .. })
+        | (Some(InfraNodeStatus::Terminating), Teardown::Terminate { .. }) => return answered(InfraDownAnswer::AlreadyDown),
         (Some(_), _) => {}
     }
-    let copies = Copies::of(instance.cloned());
-    let nodes = std::collections::BTreeSet::from([node.to_string()]);
-    let live_readers: Vec<weft_core::activation::ActivationKey> =
-        crate::api::infra::activations_reading(state, project_id, &project, &nodes, &copies)
-            .await?
-            .into_iter()
-            .filter(|a| a.lifecycle.status == crate::activation_store::ProjectStatus::Active)
-            .map(|a| a.key)
-            .collect();
-    let deactivated = !live_readers.is_empty();
-    if deactivated {
-        crate::take_down::take_down(
-            state,
-            project_id,
-            &crate::take_down::TakeDownTarget::Activations(live_readers),
-            spec,
-            // Down with the copy: the copy's start brings it back. A wipe
-            // takes the copy away for good (its owner is going), so nothing
-            // is left to bring them back.
-            match take_down {
-                TakeDown::Terminate { disks: weft_core::infra::TerminateDisks::DeleteAll } => None,
-                TakeDown::Stop { .. } | TakeDown::Terminate { .. } => Some(crate::take_down::DownWith::Infra),
-            },
-            crate::take_down::TakeDownAsker::Run(asker),
-        )
-        .await?;
-    }
-    let runs = crate::take_down::live_runs(state, project_id).await.map_err(internal("live runs"))?;
-    let asker_uses_it = crate::take_down::runs_using_copies(&copies, &runs, None).iter().any(|r| r.execution_id == asker);
-    crate::api::infra::settle_running_before_infra_op(
+    let reach = crate::infra_reach::InfraReach { places: std::collections::BTreeSet::from([node.to_string()]), copies: Copies::of(instance.cloned()) };
+    let asker_reaches_it = crate::infra_reach::runs_reached(state, project_id, &reach, None)
+        .await
+        .map_err(internal("the runs reaching the copy"))?
+        .iter()
+        .any(|run| run.run_id == asker);
+    let taken = crate::api::infra::take_copies_down(
         state,
         project_id,
-        &copies,
-        spec.running_policy,
-        false,
-        Some(asker),
+        &project,
+        instance,
+        &[node.to_string()],
+        teardown,
+        &take_down,
+        crate::take_down::TakeDownAsker::Run(asker),
     )
     .await?;
-    let drain = spec.drain_timeout_secs.unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
-    let command_id = crate::api::infra::issue_lifecycle_for(
-        state,
-        project_id,
-        Some(node),
-        &copies,
-        take_down,
-        crate::api::infra::drain_first(spec.running_policy, drain, Some(asker)),
-    )
-    .await?;
-    let stops_asker = stop_self == StopSelf::Include && asker_uses_it;
+    let stops_asker = stop_self == StopSelf::Include && asker_reaches_it;
     stop_asker(state, asker, stops_asker).await?;
-    tracing::info!(target: "weft_dispatcher::program_call", %project_id, node, command = %command_id, "a program took an infra copy down");
+    tracing::info!(target: "weft_dispatcher::program_call", %project_id, node, commands = ?taken.commands, "a program took an infra copy down");
     Ok(ProgramCallOutcome { value: serde_json::to_value(InfraDownAnswer::TakenDown).map_err(internal("answer"))?, stops_asker })
 }
 
-/// Activate the activations `scope` names. Those already active answer
-/// without being set up again. The asking run may sit on a worker built
-/// from an older image, so that worker is retired, never waited on.
-async fn triggers_activate(state: &DispatcherState, project_id: uuid::Uuid, scope: &ActivationScope) -> Result<Value, CallError> {
-    let project = state
-        .projects
-        .project(project_id)
-        .await
-        .map_err(internal("project"))?
-        .ok_or((StatusCode::NOT_FOUND, "project not found".to_string()))?;
-    let keys = scope.resolve(&project).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let existing = state.activations.list(project_id).await.map_err(internal("activations"))?;
-    let active = |key: &weft_core::activation::ActivationKey| {
-        existing.iter().any(|a| &a.key == key && a.lifecycle.status == crate::activation_store::ProjectStatus::Active)
-    };
-    if keys.iter().all(active) {
-        return Ok(serde_json::json!({ "activated": false, "already": "active" }));
+/// Cycle one running copy of an infra node onto the registered build, the
+/// way `weft infra upgrade --infra <node>` does: the triggers whose cut
+/// contains it taken down, and the runs reaching it, as `take_down` says;
+/// then an upgrade command, which a dispatcher carries out. Answers once
+/// the command is issued. A copy that is not running is refused: there is
+/// nothing to cycle (`ctx.infra(..).start()` starts one).
+async fn infra_upgrade(
+    state: &DispatcherState,
+    project_id: uuid::Uuid,
+    node: &str,
+    instance: Option<&InstanceId>,
+    take_down: &TakeDownChoice,
+    asker: RunId,
+    stop_self: StopSelf,
+) -> Result<ProgramCallOutcome, CallError> {
+    let take_down = take_down.resolve().map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+    let project = load_project(state, project_id).await?;
+    crate::api::infra::resolve_infra_nodes(&project, &[node.to_string()], instance)?;
+    let copies = crate::infra_node::observe(&state.pg_pool, project_id, &project).await.map_err(internal("infra copies"))?;
+    if copies.status_of(node, instance) != Some(crate::infra_node::InfraNodeStatus::Running) {
+        return Err((
+            StatusCode::PRECONDITION_FAILED,
+            format!("infra '{node}' is not running, so there is nothing to upgrade; `ctx.infra(..).start()` starts it on the registered build"),
+        ));
     }
-    let request = weft_core::activation::ActivateRequest { scope: scope.clone(), ..Default::default() };
-    let answer =
-        crate::api::project::activate_with(state, project_id, request, crate::api::project::ActivateAsker::Run)
-            .await
-            .map_err(<(StatusCode, String)>::from)?;
+    // Running on the registered build already: nothing to cycle, the way
+    // `weft infra upgrade` answers it.
+    let binary_hash = state.projects.running_binary_hash(project_id).await.map_err(internal("running hashes"))?;
+    let definition_hash = state.projects.running_definition_hash(project_id).await.map_err(internal("running hashes"))?;
+    let desired = crate::api::project::Desired::registered(state, project_id, &project, binary_hash.as_deref(), definition_hash.as_deref()).await?;
+    if !crate::api::infra::upgrades(&copies, &desired, node, instance) {
+        return Ok(ProgramCallOutcome { value: serde_json::json!({ "upgrading": false }), stops_asker: false });
+    }
+    let reach = crate::infra_reach::InfraReach { places: std::collections::BTreeSet::from([node.to_string()]), copies: Copies::of(instance.cloned()) };
+    let asker_reaches_it = crate::infra_reach::runs_reached(state, project_id, &reach, None)
+        .await
+        .map_err(internal("the runs reaching the copy"))?
+        .iter()
+        .any(|run| run.run_id == asker);
+    if let Some(command_id) = crate::infra_lifecycle_command::upgrade_in_flight(&state.pg_pool, project_id, instance.map(|m| m.as_str()))
+        .await
+        .map_err(internal("upgrades in flight"))?
+    {
+        return Err(crate::infra_lifecycle_command::upgrade_in_flight_refusal(command_id));
+    }
+    let live = crate::api::infra::triggers_reached(state, project_id, &project, &reach).await?;
+    let tenant = state.tenant_router.tenant_for_project(project_id).await.map_err(internal("tenant"))?;
+    let commands = crate::infra_lifecycle_command::TakeDownCommands {
+        tenant_id: tenant.as_str().to_string(),
+        issued_by_replica: state.replica.as_str().to_string(),
+        work: crate::infra_lifecycle_command::TakeDownWork::Upgrade {
+            instance: instance.cloned(),
+            work: crate::infra_lifecycle_command::UpgradeWork {
+                nodes: vec![node.to_string()],
+                running: vec![node.to_string()],
+                take_down,
+                binary_hash: None,
+                definition_hash: None,
+                infra_hash: None,
+                waits_on_tokens: Vec::new(),
+                stopped: false,
+            },
+        },
+    };
+    crate::api::infra::take_down_reached(state, project_id, &reach, live, &take_down, crate::take_down::TakeDownAsker::Run(asker), &commands).await?;
+    let stops_asker = stop_self == StopSelf::Include && asker_reaches_it;
+    stop_asker(state, asker, stops_asker).await?;
+    Ok(ProgramCallOutcome { value: serde_json::json!({ "upgrading": true }), stops_asker })
+}
+
+/// Turn on the activations `scope` names that are off, releasing or
+/// dropping what they held as `held` says. Those already on answer without
+/// being set up again.
+async fn triggers_activate(
+    state: &DispatcherState,
+    project_id: uuid::Uuid,
+    scope: &ActivationScope,
+    held: weft_core::take_down::ReleaseHeld,
+) -> Result<Value, CallError> {
+    let request = weft_core::activation::ActivateRequest { scope: scope.clone(), held, ..Default::default() };
+    let answer = crate::api::project::activate_with(state, project_id, request, crate::api::project::ActivateAsker::Outside)
+        .await
+        .map_err(<(StatusCode, String)>::from)?;
     serde_json::to_value(answer.0).map_err(internal("answer"))
 }
 
-/// Take the activations `scope` names down under `spec`, never touching
-/// the run that asked unless it said `StopSelf::Include` and one of them
-/// fired it.
+/// Take the activations `scope` names down as `take_down` says, never
+/// touching the run that asked unless it said `StopSelf::Include` and one
+/// of them fired it.
 async fn triggers_deactivate(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     scope: &ActivationScope,
-    spec: &DeactivateSpec,
-    asker: ExecutionId,
+    take_down: &TakeDownChoice,
+    asker: RunId,
     stop_self: StopSelf,
 ) -> Result<ProgramCallOutcome, CallError> {
-    let project = state
-        .projects
-        .project(project_id)
-        .await
-        .map_err(internal("project"))?
-        .ok_or((StatusCode::NOT_FOUND, "project not found".to_string()))?;
-    let keys = scope.resolve(&project).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let target = crate::take_down::TakeDownTarget::Activations(keys);
+    let take_down = take_down.resolve().map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+    let Some(taken) =
+        crate::api::project::deactivate_scope(state, project_id, scope, &take_down, crate::take_down::TakeDownAsker::Run(asker)).await?
+    else {
+        return Err((StatusCode::NOT_FOUND, "the project is gone".to_string()));
+    };
+    let target = crate::take_down::TakeDownTarget::Activations(taken.keys.clone());
     let runs = crate::take_down::live_runs(state, project_id).await.map_err(internal("live runs"))?;
-    let asker_fired = crate::take_down::affected_runs(&target, &runs, None).iter().any(|r| r.execution_id == asker);
-    crate::take_down::take_down(state, project_id, &target, spec, None, crate::take_down::TakeDownAsker::Run(asker)).await?;
+    let asker_fired = crate::take_down::affected_runs(&target, &runs, None).iter().any(|r| r.run_id == asker);
     let stops_asker = stop_self == StopSelf::Include && asker_fired;
     stop_asker(state, asker, stops_asker).await?;
-    Ok(ProgramCallOutcome { value: serde_json::json!({ "deactivated": true }), stops_asker })
+    Ok(ProgramCallOutcome { value: serde_json::to_value(taken.report(take_down)).map_err(internal("answer"))?, stops_asker })
 }
 
 /// Cancel the asking run when its own call reaches it and it asked to be
 /// stopped with the rest. Its worker is waiting for exactly this.
-async fn stop_asker(state: &DispatcherState, asker: ExecutionId, stops: bool) -> Result<(), CallError> {
+async fn stop_asker(state: &DispatcherState, asker: RunId, stops: bool) -> Result<(), CallError> {
     if stops {
-        crate::api::execution::cancel_execution_id(state, asker, &weft_core::exec::CancelCause::User)
+        crate::api::run::cancel_run_id(state, asker, &weft_core::run::CancelCause::User)
             .await
             .map_err(internal("cancel the asking run"))?;
     }
@@ -408,9 +435,9 @@ async fn asker_matches_filter(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     filter: &weft_core::program::RunFilter,
-    asker: ExecutionId,
+    asker: RunId,
 ) -> Result<bool, CallError> {
-    let Some(run) = state.journal.execution_summary(asker).await.map_err(internal("the asking run"))? else {
+    let Some(run) = state.journal.run_summary(asker).await.map_err(internal("the asking run"))? else {
         return Ok(false);
     };
     let now = crate::lease::now_unix() as u64;
@@ -431,13 +458,13 @@ async fn asker_matches_filter(
 /// instance, and the runs still going or ended since its `since`). The
 /// run's instance is its run row's, born with the run and never changed.
 async fn costs(state: &DispatcherState, project_id: uuid::Uuid, filter: &CostFilter) -> Result<Vec<CostRecord>, CallError> {
-    let runs: Vec<(ExecutionId, Option<String>)> = sqlx::query_as(
-        "SELECT execution_id, instance_id FROM run \
+    let runs: Vec<(RunId, Option<String>)> = sqlx::query_as(
+        "SELECT run_id, instance_id FROM run \
          WHERE project_id = $1 \
            AND ($2::text IS NULL OR instance_id = $2) \
-           AND ($3::uuid IS NULL OR execution_id = $3) \
+           AND ($3::uuid IS NULL OR run_id = $3) \
            AND ($4::bigint IS NULL OR ended_at IS NULL OR ended_at >= $4) \
-         ORDER BY started_at, execution_id",
+         ORDER BY started_at, run_id",
     )
     .bind(project_id)
     .bind(filter.instance.as_ref().map(|m| m.as_str()))
@@ -449,16 +476,16 @@ async fn costs(state: &DispatcherState, project_id: uuid::Uuid, filter: &CostFil
     let project = state.projects.project(project_id).await.map_err(internal("project"))?;
     let mut out = Vec::new();
     let mut reported = Vec::new();
-    for (execution_id, instance) in runs {
+    for (run_id, instance) in runs {
         let record = {
             let mut conn = state.pg_pool.acquire().await.map_err(internal("costs"))?;
-            weft_journal::record::read_record(&mut conn, execution_id, None).await.map_err(internal("cost record"))?
+            weft_journal::record::read_record(&mut conn, run_id, None).await.map_err(internal("cost record"))?
         };
-        let events = record.events(execution_id).map_err(internal("cost record"))?;
-        reported.push(events.into_iter().map(move |event| (execution_id, event, instance.clone())));
+        let events = record.events(run_id).map_err(internal("cost record"))?;
+        reported.push(events.into_iter().map(move |event| (run_id, event, instance.clone())));
     }
-    for (execution_id, event, instance) in reported.into_iter().flatten() {
-        let weft_journal::ExecEvent::CostReported { node_id, frames, service, model, amount_usd, origin, at_unix, .. } = event else {
+    for (run_id, event, instance) in reported.into_iter().flatten() {
+        let weft_journal::RunEvent::CostReported { node_id, frames, service, model, amount_usd, origin, at_unix, .. } = event else {
             continue;
         };
         if filter.since_unix.is_some_and(|since| at_unix < since) {
@@ -478,7 +505,7 @@ async fn costs(state: &DispatcherState, project_id: uuid::Uuid, filter: &CostFil
             continue;
         }
         out.push(CostRecord {
-            run: execution_id,
+            run: run_id,
             instance: instance.map(InstanceId::new).transpose().map_err(internal("cost row instance"))?,
             node,
             service,
@@ -527,8 +554,10 @@ async fn observed_copies(state: &DispatcherState, project_id: uuid::Uuid) -> Res
 }
 
 /// Every instance weft holds anything for in the project, with what it
-/// holds (`InstanceHoldings::merge` over each store's counts).
-async fn instances(
+/// holds (`InstanceHoldings::merge` over each store's counts): what
+/// `ctx.instances().list()`, `weft instances` and the project's status
+/// answer.
+pub(crate) async fn instances(
     state: &DispatcherState,
     tenant: &crate::tenant::TenantId,
     project_id: uuid::Uuid,
@@ -567,7 +596,19 @@ async fn instances(
             ))
         })
         .collect();
-    Ok(InstanceHoldings::merge(values, connections, tokens, copies, triggers))
+    let last_runs: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT instance_id, MAX(started_at) FROM run WHERE project_id = $1 AND instance_id IS NOT NULL GROUP BY instance_id",
+    )
+    .bind(project_id)
+    .fetch_all(&state.pg_pool)
+    .await
+    .map_err(internal("instance runs"))?;
+    let last_runs = last_runs
+        .into_iter()
+        .map(|(instance, at)| InstanceId::new(instance).map(|instance| (instance, at)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("a run holds a broken instance: {e}")))?;
+    Ok(InstanceHoldings::merge(values, connections, tokens, copies, triggers, last_runs))
 }
 
 fn internal<E: std::fmt::Display>(what: &'static str) -> impl Fn(E) -> CallError {

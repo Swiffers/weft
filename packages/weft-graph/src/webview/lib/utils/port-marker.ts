@@ -1,4 +1,5 @@
 import type { PortDefinition } from '../types';
+import { inputIsRequired } from '../../../protocol';
 
 /** Visual state of a port marker.
  *  - 'full': required + not satisfied from code (fully filled)
@@ -11,11 +12,16 @@ import type { PortDefinition } from '../types';
  */
 export type PortMarkerState = 'full' | 'empty' | 'half' | 'empty-dotted';
 
-/** Whether an input draws as required: a required input always, and one
- *  required only once wired (`requiredWhenWired`) exactly while a wire
- *  feeds it, so its look follows connect and disconnect. */
-export function portLooksRequired(port: PortDefinition, isWired: boolean): boolean {
-	return port.required || (isWired && !!port.requiredWhenWired);
+/** What an input's requiredness means right now, in words, for its
+ *  hover text: null for a required input (its full marker says it), and
+ *  for the other two states what a missing value does. An input with
+ *  neither flag changes with its wiring, so its text names both halves. */
+export function requirednessNote(port: PortDefinition, isWired: boolean): string | null {
+	if (port.required) return null;
+	if (port.optional) return `${port.name}: optional, even when wired (if its wire delivers nothing, this node runs without it)`;
+	return isWired
+		? `${port.name}: required while wired (if its wire delivers nothing, this node skips); optional once unwired`
+		: `${port.name}: optional while unwired; once wired, required (if its wire delivers nothing, this node skips)`;
 }
 
 /** Pick the marker state for an input port.
@@ -49,7 +55,9 @@ export function inputMarkerState(
  *  - color: the port's type color
  *  - side: 'input' (honors state) or 'output' (always full)
  *  - extraClass: optional extra Tailwind utilities
- *  - isWired: whether a wire feeds this input (see `portLooksRequired`)
+ *  - isWired: whether a wire feeds this input: an input with neither
+ *    `required` nor `optional` draws required exactly while wired
+ *    (`inputIsRequired`), so its look follows connect and disconnect
  */
 export function portMarkerStyle(
 	port: PortDefinition,
@@ -62,7 +70,7 @@ export function portMarkerStyle(
 ): { style: string; class: string } {
 	// Outputs are always `full`, regardless of the port's `required` flag.
 	const state: PortMarkerState = side === 'input'
-		? inputMarkerState(portLooksRequired(port, isWired), oneOfRequiredPorts.has(port.name), literalFilledPorts.has(port.name))
+		? inputMarkerState(inputIsRequired(port, isWired), oneOfRequiredPorts.has(port.name), literalFilledPorts.has(port.name))
 		: 'full';
 
 	if (state === 'full') return filledMarkerStyle(color, 'port', extraClass);

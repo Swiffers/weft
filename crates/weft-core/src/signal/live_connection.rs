@@ -53,36 +53,74 @@ impl Protocol {
     }
 }
 
-/// How outbound talk behaves when the connection is congested (a slow
-/// caller). A multiplexing process must never OOM on one slow caller.
+/// How outbound talk behaves when the caller reads slower than the
+/// program writes, so the bounded outbound buffer fills. A multiplexing
+/// process must never OOM on one slow caller, so every mode keeps the
+/// buffer bounded; they differ in what gives. Spelled as the trigger's
+/// `whenCallerIsSlow` setting takes it ([`Self::parse_field`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Backpressure {
-    /// `write`/`send` awaits when the bounded outbound buffer is full, so
-    /// a slow caller slows the producer rather than growing RAM.
+    /// `write`/`send` waits for room, so a slow caller slows the
+    /// producer and every chunk arrives.
     #[default]
     Block,
-    /// Shed the oldest buffered chunk to make room (video-style: stale
-    /// frames are worthless).
+    /// Make room by shedding the oldest chunk still waiting, so the
+    /// caller always gets the latest (live video, a price feed: a stale
+    /// frame is worthless).
     DropOldest,
-    /// Shed the incoming chunk when the buffer is full (keep what is
-    /// already queued).
+    /// Shed the chunk being written, so what was already waiting goes
+    /// out in order and the gap is at the end.
     DropNewest,
 }
 
-/// What happens to the caller when a node errors mid-exchange.
+impl Backpressure {
+    /// The trigger setting's spelling (`block`, `drop_oldest`,
+    /// `drop_newest`), the same words the signal's config carries.
+    pub fn parse_field(raw: &str) -> Result<Self, String> {
+        match raw {
+            "block" => Ok(Self::Block),
+            "drop_oldest" => Ok(Self::DropOldest),
+            "drop_newest" => Ok(Self::DropNewest),
+            other => Err(format!("whenCallerIsSlow must be block, drop_oldest or drop_newest, got '{other}'")),
+        }
+    }
+}
+
+/// What a node writing to the caller does with one chunk (an HTTP
+/// stream's piece, a socket message) it could not make: a value that
+/// does not fit the caller's data type, a file it could not read.
+/// Read through `HttpCaller::drop_or_fail` / `WsCaller::drop_or_fail`.
+///
+/// It governs that one chunk only. An exchange that cannot go on (the
+/// run failed or was stopped, the stream's source broke off) is told to
+/// the caller in every mode: there is nothing left to continue, and
+/// ending it cleanly would tell the caller a cut stream was whole.
+/// Spelled as the trigger's `whenChunkFails` setting takes it
+/// ([`Self::parse_field`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorMode {
-    /// Surface the error to the caller. HTTP before any bytes = a real
-    /// error status + body; HTTP after streaming started = in-band error
-    /// chunk then close; WebSocket = close frame with code + reason.
+    /// The node fails, and the caller is told: before any bytes, a real
+    /// error status; after an HTTP stream started, an in-band error,
+    /// then the end; on a socket, a `1011` close.
     #[default]
     Surface,
-    /// Drop the failed chunk and continue, for streams where a dropped
-    /// frame is tolerable. Never a SILENT truncation: this mode is the
-    /// explicit opt-in to tolerate it.
+    /// The chunk is skipped and the exchange goes on with the next one.
+    /// The skip is on the exchange's record, so it is never silent.
     DropChunk,
+}
+
+impl ErrorMode {
+    /// The trigger setting's spelling (`surface`, `drop_chunk`), the
+    /// same words the signal's config carries.
+    pub fn parse_field(raw: &str) -> Result<Self, String> {
+        match raw {
+            "surface" => Ok(Self::Surface),
+            "drop_chunk" => Ok(Self::DropChunk),
+            other => Err(format!("whenChunkFails must be surface or drop_chunk, got '{other}'")),
+        }
+    }
 }
 
 /// The shape of the bytes flowing in/out. The node works in a general
@@ -122,25 +160,6 @@ impl DataType {
             Self::Bytes => "bytes",
         }
     }
-}
-
-/// Whether the caller exchange is PERSISTED to the journal/DB for replay.
-/// This is ONLY about durability; it does NOT control the in-RAM window
-/// (that is the separate `window` field, which bounds RAM in both modes,
-/// cursors only ever read RAM). The same distinction a bus draws, and
-/// the same code decides what it means for both
-/// ([`crate::stream_journal`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum JournalMode {
-    /// Full payload persisted to the journal/DB (replay survives a worker
-    /// dying). The in-RAM window still bounds what a live cursor can reach.
-    #[default]
-    Journaled,
-    /// Metadata-only in the journal (how many messages went each way
-    /// and how many bytes); payloads are never persisted, so they live
-    /// only in the in-RAM window.
-    Ephemeral,
 }
 
 /// Default heartbeat interval. Clears the ~30s cellular-NAT floor and
@@ -248,22 +267,15 @@ pub struct LiveConnectionConfig {
     #[serde(default)]
     pub error_mode: ErrorMode,
 
-    /// How the caller exchange is journaled for replay.
-    #[serde(default)]
-    pub journal_mode: JournalMode,
-
-    /// How long the journal accumulates before one row goes out, in
-    /// seconds. `None` falls back to the window every channel in the
-    /// language starts from
-    /// ([`crate::stream_journal::DEFAULT_JOURNAL_WINDOW`], one second).
-    /// A quiet conversation degenerates to one message per window, so a
-    /// request and its answer read exactly as they did; a chatty socket
-    /// collapses instead of writing a row per frame.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub journal_window_secs: Option<u64>,
+    /// What the journal keeps of the exchange: whether content is
+    /// written down, and how long one row gathers messages. The same
+    /// policy a bus takes, stored flat (`journal_mode`,
+    /// `journal_window_ms`).
+    #[serde(flatten)]
+    pub journal: crate::stream_journal::JournalPolicy,
 
     /// In-RAM inbound window size (how many recent messages a WebSocket
-    /// retains for cursors). Bounds RAM regardless of `journal_mode`
+    /// retains for cursors). Bounds RAM regardless of the journal mode
     /// (cursors only read this window, never the DB; journaled just also
     /// persists each message for durability). `None` falls back to
     /// `weft_core::caller::DEFAULT_INBOUND_WINDOW`.
@@ -272,25 +284,12 @@ pub struct LiveConnectionConfig {
 }
 
 impl LiveConnectionConfig {
-    /// What the journal keeps of this conversation, in the shape every
-    /// channel in the language answers with. The bus builds the same
-    /// thing from its own options, which is what stops the two drifting
-    /// on where content is trimmed or on what ephemeral means.
-    pub fn journal_policy(&self) -> crate::stream_journal::JournalPolicy {
-        crate::stream_journal::JournalPolicy {
-            window: self
-                .journal_window_secs
-                .map(std::time::Duration::from_secs)
-                .unwrap_or(crate::stream_journal::DEFAULT_JOURNAL_WINDOW),
-            ephemeral: matches!(self.journal_mode, JournalMode::Ephemeral),
-            ..Default::default()
-        }
-    }
-
     /// Build the shared body from a catalog node's config field map (the
     /// common authoring fields both live-caller nodes expose: `path`,
     /// `method`, `dataType`, `auth`, `outlivesCaller`, `maxSessionSecs`,
-    /// `callerSilenceSecs`, `maxInboundMb`).
+    /// `callerSilenceSecs`, `maxInboundMb`, `whenChunkFails`,
+    /// `whenCallerIsSlow`, and the journal settings the language gives a
+    /// live-connection trigger, `journalEphemeral` and `journalWindowMs`).
     /// Centralized here so the two nodes (`Route`, `Socket`) do NOT each
     /// re-implement field parsing; every non-exposed knob keeps its
     /// default. `fields` is the node's `ctx.inputs.object()` map.
@@ -306,12 +305,23 @@ impl LiveConnectionConfig {
             Some(serde_json::Value::String(s)) => vec![crate::route::normalize_method(s)?],
             Some(other) => return Err(format!("method must be a string, got {other}")),
         };
-        let data_type = match fields.get("dataType") {
-            None | Some(serde_json::Value::Null) => DataType::default(),
-            Some(serde_json::Value::String(s)) if s.trim().is_empty() => DataType::default(),
-            Some(serde_json::Value::String(s)) => DataType::parse_field(s)?,
-            Some(other) => return Err(format!("dataType must be a string, got {other}")),
-        };
+        // A choice from a fixed set: absent or empty is the default, a
+        // word outside the set a refusal naming the set.
+        fn choice<T: Default>(
+            fields: &serde_json::Map<String, serde_json::Value>,
+            name: &str,
+            parse: fn(&str) -> Result<T, String>,
+        ) -> Result<T, String> {
+            match fields.get(name) {
+                None | Some(serde_json::Value::Null) => Ok(T::default()),
+                Some(serde_json::Value::String(s)) if s.trim().is_empty() => Ok(T::default()),
+                Some(serde_json::Value::String(s)) => parse(s),
+                Some(other) => Err(format!("{name} must be a string, got {other}")),
+            }
+        }
+        let data_type = choice(fields, "dataType", DataType::parse_field)?;
+        let error_mode = choice(fields, "whenChunkFails", ErrorMode::parse_field)?;
+        let backpressure = choice(fields, "whenCallerIsSlow", Backpressure::parse_field)?;
         // The `auth` input carries an `Access` marker (an auth access
         // node's output); the routing keeps only what the gate needs to
         // find the connection again.
@@ -364,21 +374,9 @@ impl LiveConnectionConfig {
                 _ => return Err(format!("maxInboundMb must be a whole number of megabytes, 1 or more, got {v}")),
             },
         };
-        // What the journal keeps of the exchange. A node that wants to
-        // hand that choice to its author surfaces a `journalEphemeral`
-        // boolean; one that does not never sets it and gets the same
-        // default every channel in the language starts from. Refused
-        // rather than read as false when it is neither, because
-        // "written down" and "not written down" is not a difference to
-        // guess at.
-        let journal_mode = match fields.get("journalEphemeral") {
-            None | Some(serde_json::Value::Null) => JournalMode::default(),
-            Some(serde_json::Value::Bool(true)) => JournalMode::Ephemeral,
-            Some(serde_json::Value::Bool(false)) => JournalMode::Journaled,
-            Some(v) => {
-                return Err(format!("journalEphemeral must be true or false, got {v}"));
-            }
-        };
+        // What the journal keeps of the exchange, read the way every
+        // channel's settings are read.
+        let journal = crate::stream_journal::JournalPolicy::from_node_fields(fields)?;
         Ok(Self {
             path,
             methods,
@@ -389,10 +387,9 @@ impl LiveConnectionConfig {
             max_inbound_bytes,
             max_session_secs,
             data_type,
-            backpressure: Backpressure::default(),
-            error_mode: ErrorMode::default(),
-            journal_mode,
-            journal_window_secs: None,
+            backpressure,
+            error_mode,
+            journal,
             window: None,
         })
     }
@@ -421,6 +418,7 @@ impl LiveConnectionConfig {
                  request; disable the cap is not a goal, set it generously"
             ));
         }
+        self.journal.check().map_err(|why| format!("{kind_tag}: {why}"))?;
         if let Some(w) = self.window {
             if w == 0 {
                 return Err(format!(
@@ -505,7 +503,7 @@ mod tests {
         assert_eq!(c.data_type, DataType::Json);
         assert_eq!(c.backpressure, Backpressure::Block);
         assert_eq!(c.error_mode, ErrorMode::Surface);
-        assert_eq!(c.journal_mode, JournalMode::Journaled);
+        assert_eq!(c.journal, crate::stream_journal::JournalPolicy::default());
         assert_eq!(c.window, None);
     }
 
@@ -550,8 +548,10 @@ mod tests {
                 data_type: DataType::Bytes,
                 backpressure: Backpressure::DropOldest,
                 error_mode: ErrorMode::DropChunk,
-                journal_mode: JournalMode::Ephemeral,
-                journal_window_secs: Some(5),
+                journal: crate::stream_journal::JournalPolicy {
+                    mode: crate::stream_journal::JournalMode::Ephemeral,
+                    window: std::time::Duration::from_secs(5),
+                },
                 window: Some(128),
             },
         };
@@ -569,58 +569,45 @@ mod tests {
         assert_eq!(back.common.data_type, DataType::Bytes);
         assert_eq!(back.common.backpressure, Backpressure::DropOldest);
         assert_eq!(back.common.error_mode, ErrorMode::DropChunk);
-        assert_eq!(back.common.journal_mode, JournalMode::Ephemeral);
-        assert_eq!(back.common.journal_window_secs, Some(5));
+        assert!(back.common.journal.is_ephemeral());
+        assert_eq!(back.common.journal.window, std::time::Duration::from_secs(5));
         assert_eq!(back.common.window, Some(128));
     }
 
-    /// A caller conversation and a bus answer the same question the
-    /// same way. A route that says nothing about journaling gets the
-    /// window and the size limit every channel in the language starts
-    /// from; the two knobs a node can surface move exactly one thing
-    /// each.
+    /// The journal settings a node hands its author reach the
+    /// conversation through the one reader every channel shares; a node
+    /// that sets neither gets the policy every channel starts from, and a
+    /// refusal names the setting.
     #[test]
-    fn a_conversation_journals_on_the_language_default() {
-        let policy = bare().journal_policy();
-        assert_eq!(policy, crate::stream_journal::JournalPolicy::default());
-        assert_eq!(policy.window, crate::stream_journal::DEFAULT_JOURNAL_WINDOW);
-        assert_eq!(policy.trim_bytes, crate::stream_journal::JOURNAL_TRIM_BYTES);
-        assert!(!policy.ephemeral, "a conversation is written down unless it says otherwise");
-
-        let quiet = LiveConnectionConfig { journal_mode: JournalMode::Ephemeral, ..bare() };
-        assert!(quiet.journal_policy().ephemeral);
-        assert_eq!(quiet.journal_policy().window, crate::stream_journal::DEFAULT_JOURNAL_WINDOW);
-
-        let slow = LiveConnectionConfig { journal_window_secs: Some(5), ..bare() };
-        assert_eq!(slow.journal_policy().window, std::time::Duration::from_secs(5));
-        assert!(!slow.journal_policy().ephemeral, "the window says nothing about content");
-    }
-
-    /// `journalEphemeral` is the knob a node hands its author. It is
-    /// read as a boolean or refused: whether a conversation is written
-    /// down is not a thing to guess at from a stray value.
-    #[test]
-    fn a_node_can_hand_its_author_the_journaling_choice() {
-        let with = |value: serde_json::Value| {
+    fn a_node_can_hand_its_author_the_journal_settings() {
+        let with = |extra: serde_json::Value| {
             let mut fields = serde_json::Map::new();
             fields.insert("path".to_string(), serde_json::json!("chat"));
-            fields.insert("journalEphemeral".to_string(), value);
+            fields.extend(extra.as_object().unwrap().clone());
             LiveConnectionConfig::from_node_fields(&fields)
         };
-        assert_eq!(with(serde_json::json!(true)).unwrap().journal_mode, JournalMode::Ephemeral);
-        assert_eq!(with(serde_json::json!(false)).unwrap().journal_mode, JournalMode::Journaled);
-        assert_eq!(with(serde_json::Value::Null).unwrap().journal_mode, JournalMode::default());
+        let set = with(serde_json::json!({ "journalEphemeral": true, "journalWindowMs": 250 })).unwrap();
+        assert!(set.journal.is_ephemeral());
+        assert_eq!(set.journal.window, std::time::Duration::from_millis(250));
+        assert_eq!(with(serde_json::json!({})).unwrap().journal, crate::stream_journal::JournalPolicy::default());
 
-        let refusal = with(serde_json::json!("yes")).expect_err("a string is not an answer");
-        assert!(refusal.contains("journalEphemeral must be true or false"), "{refusal}");
+        let refusal = with(serde_json::json!({ "journalEphemeral": "yes" })).expect_err("a string is not an answer");
+        assert!(refusal.contains("journalEphemeral"), "{refusal}");
+        let refusal = with(serde_json::json!({ "journalWindowMs": 50 })).expect_err("under the floor");
+        assert!(refusal.contains("journalWindowMs") && refusal.contains("between 100 and 60000 ms"), "{refusal}");
+    }
 
-        // A node that never surfaces it gets the default, not a refusal.
-        let mut bare_fields = serde_json::Map::new();
-        bare_fields.insert("path".to_string(), serde_json::json!("chat"));
-        assert_eq!(
-            LiveConnectionConfig::from_node_fields(&bare_fields).unwrap().journal_mode,
-            JournalMode::default()
-        );
+    /// A stored config whose window is out of range (written by hand, or
+    /// by an older weft) is refused when the kind is validated, naming
+    /// the kind.
+    #[test]
+    fn a_journal_window_out_of_range_is_refused() {
+        let journal = crate::stream_journal::JournalPolicy {
+            window: std::time::Duration::from_secs(61),
+            ..Default::default()
+        };
+        let err = Route { common: LiveConnectionConfig { journal, ..bare() } }.validate().unwrap_err();
+        assert!(err.starts_with("route:") && err.contains("between 100 and 60000 ms"), "{err}");
     }
 
     #[test]
@@ -677,6 +664,8 @@ mod tests {
         let cfg = LiveConnectionConfig::from_node_fields(empty.as_object().unwrap()).expect("builds");
         assert!(cfg.methods.is_empty(), "an empty method is any method");
         assert_eq!(cfg.data_type, DataType::Json);
+        assert_eq!(cfg.error_mode, ErrorMode::Surface, "a route that says nothing tells its caller");
+        assert_eq!(cfg.backpressure, Backpressure::Block, "a route that says nothing waits for a slow caller");
         assert!(matches!(cfg.auth, PublicEntryAuth::None));
         assert_eq!(cfg.max_session_secs, 0, "no ceiling unless one was asked for");
         assert_eq!(cfg.max_inbound_bytes, DEFAULT_MAX_INBOUND_BYTES, "a route that says nothing gets 16 MB");
@@ -696,6 +685,10 @@ mod tests {
             ("maxInboundMb", serde_json::json!(0)),
             ("maxInboundMb", serde_json::json!(1.5)),
             ("maxInboundMb", serde_json::json!("big")),
+            ("whenChunkFails", serde_json::json!("ignore")),
+            ("whenChunkFails", serde_json::json!(true)),
+            ("whenCallerIsSlow", serde_json::json!("drop")),
+            ("whenCallerIsSlow", serde_json::json!(2)),
         ] {
             let bad = serde_json::json!({ "path": "x", field: value });
             assert!(
@@ -703,6 +696,41 @@ mod tests {
                 "{field} must be refused"
             );
         }
+    }
+
+    /// The two settings that say what gives on a live exchange reach the
+    /// config under the words the trigger's select offers, each value to
+    /// its own mode, and empty is the default like every other choice.
+    #[test]
+    fn node_fields_pick_what_gives_on_a_live_exchange() {
+        let with = |field: &str, value: &str| {
+            let fields = serde_json::json!({ "path": "feed", field: value });
+            LiveConnectionConfig::from_node_fields(fields.as_object().unwrap()).expect("builds")
+        };
+        assert_eq!(with("whenChunkFails", "surface").error_mode, ErrorMode::Surface);
+        assert_eq!(with("whenChunkFails", "drop_chunk").error_mode, ErrorMode::DropChunk);
+        assert_eq!(with("whenChunkFails", "").error_mode, ErrorMode::Surface);
+        assert_eq!(with("whenCallerIsSlow", "block").backpressure, Backpressure::Block);
+        assert_eq!(with("whenCallerIsSlow", "drop_oldest").backpressure, Backpressure::DropOldest);
+        assert_eq!(with("whenCallerIsSlow", "drop_newest").backpressure, Backpressure::DropNewest);
+        assert_eq!(with("whenCallerIsSlow", "").backpressure, Backpressure::Block);
+
+        // The setting's words are the config's own: what the trigger reads
+        // is what the signal carries to the worker.
+        for mode in [Backpressure::Block, Backpressure::DropOldest, Backpressure::DropNewest] {
+            let word = serde_json::to_value(mode).unwrap();
+            assert_eq!(Backpressure::parse_field(word.as_str().unwrap()), Ok(mode));
+        }
+        for mode in [ErrorMode::Surface, ErrorMode::DropChunk] {
+            let word = serde_json::to_value(mode).unwrap();
+            assert_eq!(ErrorMode::parse_field(word.as_str().unwrap()), Ok(mode));
+        }
+
+        let refusal = LiveConnectionConfig::from_node_fields(
+            serde_json::json!({ "path": "feed", "whenCallerIsSlow": "skip" }).as_object().unwrap(),
+        )
+        .expect_err("not one of the modes");
+        assert!(refusal.contains("block, drop_oldest or drop_newest"), "{refusal}");
     }
 
     #[test]
@@ -742,8 +770,7 @@ mod tests {
             data_type: DataType::Json,
             backpressure: Backpressure::Block,
             error_mode: ErrorMode::Surface,
-            journal_mode: JournalMode::Journaled,
-            journal_window_secs: None,
+            journal: crate::stream_journal::JournalPolicy::default(),
             window: None,
         }
     }

@@ -1,9 +1,8 @@
 //! Prepare and save trigger settings without arming listeners. The
-//! setup runs on a worker, so a worker built from an older image is
-//! replaced on the way, and `--running-policy` says what happens to
-//! its running executions, exactly as on `weft activate`.
+//! setup runs on a worker of the registered build; nothing running is
+//! touched.
 
-use super::ensure::{parse_running_choice, running_choice};
+use anyhow::Context;
 use super::Ctx;
 use crate::progress::ActionVerb;
 
@@ -11,16 +10,10 @@ pub async fn run(
     ctx: Ctx,
     project: Option<String>,
     node_set: weft_core::builds::NodeSet,
-    running_policy: Option<String>,
-    drain_timeout: Option<u64>,
     scope: weft_core::activation::ActivationScope,
 ) -> anyhow::Result<()> {
     let inner = ctx.clone();
     ctx.with_progress(ActionVerb::Bake, |progress| async move {
-        // Parsed before anything is built: a misspelt policy, or a cap
-        // with nothing to bound, is refused here, not after a build.
-        let (running_policy, drain_timeout) =
-            parse_running_choice(running_policy.as_deref(), drain_timeout)?;
         let (client, id) = match project {
             Some(id) => (inner.client()?, id),
             None => {
@@ -29,11 +22,17 @@ pub async fn run(
             }
         };
         let path = format!("/projects/{id}/bake");
-        let body = weft_core::activation::BakeRequest { running: running_choice(running_policy, drain_timeout), scope };
-        progress.drain_wait(running_policy, drain_timeout);
+        let body = weft_core::activation::BakeRequest { scope };
         progress.dispatcher_call_start(&path);
         let result: serde_json::Value = client.post_json(&path, &serde_json::to_value(&body)?).await?;
-        progress.dispatcher_call_done(serde_json::json!({"project_id": id}));
+        progress.dispatcher_call_done(serde_json::json!({"projectId": id}));
+        // The install's own reading of the version it baked, whichever way
+        // it was named.
+        let broken: Vec<weft_core::project::Broken> = match result.get("broken") {
+            Some(broken) => serde_json::from_value(broken.clone()).context("read the parts of the bake that do not compile")?,
+            None => Vec::new(),
+        };
+        super::ensure::warn_broken(&progress, &broken);
         progress.complete_with("trigger settings saved", result);
         Ok(())
     }).await

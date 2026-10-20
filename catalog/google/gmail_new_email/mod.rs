@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use weft::signal::{DeltaMode, PollDelta, PollEndpoint};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::gmail::{read_message, API};
 
@@ -26,7 +26,7 @@ impl Node for GmailNewEmailNode {
         tests::tests()
     }
 
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let query: String = ctx.inputs.get_or("query", String::new())?;
         let interval: f64 = ctx.inputs.get("intervalSecs")?;
@@ -54,9 +54,10 @@ impl Node for GmailNewEmailNode {
         .await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let include_attachments: bool = ctx.inputs.get("includeAttachments")?;
+        let max_body_chars = ctx.inputs.get::<f64>("maxBodyChars")? as usize;
 
         let wake = ctx.wake.record()?;
         let id = wake
@@ -66,7 +67,7 @@ impl Node for GmailNewEmailNode {
             .to_string();
 
         let http = ctx.client(&account).await?;
-        let read = read_message(&ctx, &http, &id, include_attachments).await?;
+        let read = read_message(&ctx, &http, &id, include_attachments, max_body_chars).await?;
         ctx.pulse_downstream(read.into_output().set("id", id)).await
     }
 }

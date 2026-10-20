@@ -28,15 +28,21 @@ const NOTHING: &[WakeOn] = &[];
 pub(crate) static ON_PARKED_FIRE: &[WakeOn] = &[WakeOn::any(weft_task_store::parked_fires::PARKED_FIRE_CHANNEL)];
 pub(crate) static ON_STORAGE_SWEEP: &[WakeOn] = &[WakeOn::any(STORAGE_SWEEP_CHANNEL)];
 /// A trigger's activation changing status, whether it takes work, or until
-/// when: a hibernation starting has a grace window to end.
-pub(crate) static ON_HIBERNATION: &[WakeOn] = &[WakeOn::any(crate::holders::HELD_SIGNALS_CHANNEL)];
-/// An infra copy coming, going or changing status: one running again
-/// brings back the triggers that went down with it, and the events that
-/// waited on it. An activation changing status or a held signal going: a
+/// when: a trigger taken down with `doorForMinutes` has a window to end.
+pub(crate) static ON_DOOR_WINDOW: &[WakeOn] = &[WakeOn::any(crate::holders::HELD_SIGNALS_CHANNEL)];
+/// An infra copy coming, going or changing status, or an infra command
+/// ending: a copy running again (or a take-down called off) brings back the
+/// triggers that went down with it, and the events that waited on it. An
+/// activation changing status or a held signal going: a
 /// trigger refused because another claim held it comes back once that
 /// claim ends.
-pub(crate) static ON_INFRA_RETURNS: &[WakeOn] =
-    &[WakeOn::any(crate::held::INFRA_STATUS_CHANNEL), WakeOn::any(crate::holders::HELD_SIGNALS_CHANNEL)];
+pub(crate) static ON_INFRA_RETURNS: &[WakeOn] = &[
+    WakeOn::any(crate::held::INFRA_STATUS_CHANNEL),
+    WakeOn::any(crate::holders::HELD_SIGNALS_CHANNEL),
+    // A take-down command ending (a cancel, a failure) with its copies
+    // still up brings back what went down with them.
+    WakeOn::any(weft_broker_client::lifecycle_command::INFRA_COMMAND_CHANNEL),
+];
 
 /// Safety tick of the reapers that are woken by a write: 60 seconds in
 /// real time, at this install's pace (`weft_core::time_scale`).
@@ -54,16 +60,16 @@ pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
         woken(state, ON_PARKED_FIRE, crate::parked_drain::PARKED_FIRES, "hand queued trigger events to their runs", |s| async move {
             crate::parked_drain::drain_due(&s).await
         }),
-        // Storage plane: the durable terminate sweep (un-kept exec files of
-        // a terminated execution). The queue deletes an execution's row only after
+        // Storage plane: the durable terminate sweep (un-kept run files of
+        // a terminated run). The queue deletes a run's row only after
         // the broker confirms the sweep; a broker that keeps failing fails
         // the pass, and the next run ending queued for a sweep tries every
         // row again. The kept-file expiry sweep is the broker's own loop
         // (it owns the bucket + metadata).
         woken(state, ON_STORAGE_SWEEP, "storage_sweep", "clear the files of ended runs", crate::storage::process_sweep_queue),
-        // A hibernation's grace window ending: its triggers stop listening
-        // and taking work. Sleeps until the next one ends.
-        woken(state, ON_HIBERNATION, HIBERNATIONS, HIBERNATIONS_LABEL, end_hibernations),
+        // A door's window ending: its triggers stop listening and taking
+        // work. Sleeps until the next one ends.
+        woken(state, ON_DOOR_WINDOW, DOOR_WINDOWS, DOOR_WINDOWS_LABEL, close_door_windows),
         // An infra copy running again: the triggers its stop took down
         // with it come back, and the events that waited on it go.
         woken(state, ON_INFRA_RETURNS, "infra_returns", "bring back triggers whose infra returned", crate::api::infra::bring_back_triggers_whose_infra_returned),
@@ -77,34 +83,34 @@ pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
     loops
 }
 
-/// The hibernations loop, by name.
-const HIBERNATIONS: &str = "hibernations";
+/// The door-windows loop, by name.
+pub(crate) const DOOR_WINDOWS: &str = "door_windows";
 
-/// End every hibernation whose grace window has passed
-/// ([`end_grace_windows_over`], the listener letting go of its signals
-/// through `crate::listener::let_go_of_stopped`); a project left with
-/// nothing taking work lets go of its front. Then sleep until the next
-/// window ends, or until an activation changes.
-async fn end_hibernations(state: DispatcherState) -> anyhow::Result<DrainStep> {
+/// Close every door whose window has passed ([`close_door_windows_over`],
+/// the listener letting go of its signals through
+/// `crate::listener::let_go_of_stopped`); a project left with nothing
+/// taking work lets go of its front. Then sleep until the next window
+/// ends, or until an activation changes.
+async fn close_door_windows(state: DispatcherState) -> anyhow::Result<DrainStep> {
     let let_go = |signals: Vec<crate::journal::SignalRegistration>| {
         let state = state.clone();
         async move { crate::listener::let_go_of_stopped(&state.pg_pool, &state.listener, &signals).await }
     };
-    for project_id in end_grace_windows_over(&state.pg_pool, let_go).await? {
+    for project_id in close_door_windows_over(&state.pg_pool, let_go).await? {
         // Nothing of the project may take work any more: its front goes.
         crate::front::let_go_if_idle(&state, project_id).await?;
     }
     let now = crate::lease::now_unix();
-    Ok(match crate::activation_store::next_grace_end(&state.pg_pool).await? {
+    Ok(match crate::activation_store::next_door_window_end(&state.pg_pool).await? {
         None => DrainStep::Done,
         Some(deadline) => DrainStep::RetryIn(Duration::from_secs((deadline + 1 - now).max(1) as u64)),
     })
 }
 
-/// End every hibernation whose grace window has passed: `let_go` has the
-/// listener let go of its signals and answers the ones it kept (with why),
-/// then its activation stops taking work
-/// (`crate::activation_store::end_grace_windows`), whatever the listener
+/// Close every door whose window has passed: `let_go` has the listener
+/// let go of its signals and answers the ones it kept (with why), then its
+/// activation stops taking work
+/// (`crate::activation_store::close_door_windows`), whatever the listener
 /// answered: a fire that still arrives is refused by the activation, and a
 /// holder hears it stop taking work (`crate::holders::HELD_SIGNALS_CHANNEL`).
 /// A signal the listener kept is marked on its own row
@@ -112,7 +118,7 @@ async fn end_hibernations(state: DispatcherState) -> anyhow::Result<DrainStep> {
 /// pass until it lets go (or its trigger takes work again); while any is
 /// marked, its project's `weft status` names it (`Callee::LetGo`). Answers the
 /// projects whose windows ended.
-pub async fn end_grace_windows_over<F, Fut>(pool: &sqlx::PgPool, let_go: F) -> anyhow::Result<Vec<uuid::Uuid>>
+pub async fn close_door_windows_over<F, Fut>(pool: &sqlx::PgPool, let_go: F) -> anyhow::Result<Vec<uuid::Uuid>>
 where
     F: Fn(Vec<crate::journal::SignalRegistration>) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<Vec<(String, String)>>>,
@@ -123,7 +129,7 @@ where
         crate::listener::note_let_go(pool, &again, &kept).await?;
     }
     let mut by_project: std::collections::BTreeMap<uuid::Uuid, Vec<weft_core::activation::ActivationKey>> = Default::default();
-    for (project_id, key) in crate::activation_store::grace_windows_over(pool).await? {
+    for (project_id, key) in crate::activation_store::door_windows_over(pool).await? {
         by_project.entry(project_id).or_default().push(key);
     }
     let mut ended_in = Vec::new();
@@ -131,12 +137,12 @@ where
         let signals = crate::journal::postgres::activation_signals(pool, project_id, &keys).await?;
         let kept = let_go(signals.clone()).await?;
         crate::listener::note_let_go(pool, &signals, &kept).await?;
-        let ended = crate::activation_store::end_grace_windows(pool, project_id, &keys).await?;
+        let ended = crate::activation_store::close_door_windows(pool, project_id, &keys).await?;
         if ended > 0 {
             tracing::info!(
                 target: "weft_dispatcher::reaper",
                 %project_id, triggers = ended,
-                "a hibernation's grace window ended: its triggers stopped listening and take no more work"
+                "a door's window ended: its triggers stopped listening and take no more work"
             );
             ended_in.push(project_id);
         }
@@ -155,7 +161,7 @@ where
         tracing::error!(
             target: "weft_dispatcher::reaper",
             %project, signals = ?named,
-            "the listener kept serving signals whose hibernation ended; their activations take no work, so what they pick up \
+            "the listener kept serving signals whose door closed; their activations take no work, so what they pick up \
              is refused"
         );
         weft_task_store::unanswered::failed(pool, weft_task_store::unanswered::Callee::LetGo(project), None, &named.join("; ")).await?.log();
@@ -163,8 +169,8 @@ where
     Ok(ended_in)
 }
 
-/// What the hibernations loop does, in a person's words.
-const HIBERNATIONS_LABEL: &str = "end hibernations whose grace window passed";
+/// What the door-windows loop does, in a person's words.
+const DOOR_WINDOWS_LABEL: &str = "close the doors whose window passed";
 
 /// A sweep that runs on its interval alone (a machine's only). `interval`
 /// is given in real time and runs at this install's pace

@@ -22,7 +22,7 @@ scripts/run-e2e.sh --clean                  # only remove what failed runs kept
 The runner tests the install of the checkout you run it from: the default
 install on `main`, the branch's own install anywhere else (what `weft daemon
 which` names). It brings that install to current code once (`setup.sh --cli
---daemon`), builds every test binary once, then runs every TEST on its own,
+--daemon`), builds the one test binary once, then runs every TEST on its own,
 side by side, longest first (by how long each took last time). Everything a
 run keeps lives in the install's own folder, under `e2e/` (for the default
 install, `~/.local/share/weft/e2e/`): each test's output lands in
@@ -37,7 +37,7 @@ building beside you.
 
 If you want to know where a slow test spends its time, read its log: every
 `weft` command it ran and every wait it sat through is a line of its own
-(`[e2e] 38.3s: weft infra start`, `[e2e] waited 4.0s for: execution ... to
+(`[e2e] 38.3s: weft infra start`, `[e2e] waited 4.0s for: run ... to
 reach a terminal status`).
 
 If you want to know what happens when something fails: the test keeps what it
@@ -109,7 +109,7 @@ work: check the output for what skipped before you trust it.
 
 This is a different mechanism from the node self-tests, which read
 `WEFT_NODE_TEST_*` and can also use a connection you signed into in the editor.
-Theirs is documented in [Testing a node](https://weavemindai.github.io/weft/nodes/testing.html#giving-the-live-tier-what-it-needs).
+Theirs is documented in [Testing a node](https://weavemindai.github.io/weft/nodes/testing.html#live-tests).
 
 ## When the install looks wrong, fix the source
 
@@ -127,7 +127,7 @@ machine and CI end up with the same working system you have.
 ```
 
 `--uninstall --purge` exists for a genuine clean slate and takes every project,
-execution and stored credential on the machine with it. It is not the way to
+run and stored credential on the machine with it. It is not the way to
 apply a change.
 
 If a test needs a capability the toolkit lacks, see "Add a test". Never patch
@@ -135,7 +135,10 @@ a test to tolerate the wrong state.
 
 ## Add a test
 
-Add `tests/<area>.rs` (the runner discovers it; no list to update). Shape:
+Add `tests/e2e/<area>.rs` and a `mod <area>;` line in `tests/e2e/main.rs`
+(every e2e test is one binary, each file a module of it; the runner asks the
+binary for its tests, so there is no other list to update). Its tests are
+named `<area>::<test>`. Shape:
 
 ```rust
 #![cfg(feature = "e2e")]
@@ -188,8 +191,7 @@ test may only touch and count what it made itself. In practice:
 
 - Assert on your own project, your own run, your own workers. A query over a whole
   table ("how many links exist", "how many workers run") counts your
-  neighbours too; scope it to your execution id or your project, the way
-  `Platform::public_file_link_count_for` does.
+  neighbours too; scope it to your run id or your project.
 - Never delete anything you did not create, and never clean up at the start of
   a test. A failed test's leftovers are evidence, and the next run removes them.
 - End a passing test with `project.finish()` (and `cell.finish()` if it made a
@@ -252,7 +254,7 @@ install-wide stays on the install under test.
 | `ensure` | Reach the install under test (the runner brought it up); wait for health; read a credential or skip. |
 | `cell::Cell` | A whole install of a test's own, with its own pace; see above. |
 | `project::Project` | Fixture -> isolated project: `prepare`, `build`, `activate`, `weft(args)`, `substitute_in_main`, `finish`. |
-| `run` | `run_and_settle`, `start`, `wait_for_triggered_execution`, `SettledRun::observe`. |
+| `run` | `run_and_settle`, `start`, `wait_for_triggered_run`, `SettledRun::observe`. |
 | `assert` (`SettledRun`) | `completed`, `failed_with`, `assert_input/output/skipped`, `assert_loop_iterations`. |
 | `signal` | Discover + fire signals: `SignalScope`, `fire_token`. |
 | `live` | Live caller: `open_ws`, `http_post`, `http_request`, `browser_post_json`. |
@@ -266,13 +268,13 @@ Driving each trigger kind: **plain** `run::run_and_settle`; **HTTP**
 `activate` + `live::http_post`; **WebSocket** `activate` + `live::open_ws`;
 **human form** `human::wait_for_form_by_node` + `answer_form`; **dial-out
 (SSE/poll)** a `fakes::*` + `substitute_in_main` +
-`wait_for_triggered_execution`; **infra** `infra::start_and_wait_running` +
+`wait_for_triggered_run`; **infra** `infra::start_and_wait_running` +
 `terminate_and_wait_gone`.
 
 ## Platform layer
 
 The toolkit above tests the PROGRAM (what a `.weft` does, via the public API).
-`platform` tests the SYSTEM underneath (which worker served an execution, crash
+`platform` tests the SYSTEM underneath (which worker served a run, crash
 recovery) by reaching behind the API the way an operator would: it reads the
 install's Postgres, removes worker containers with Docker (`kill_workers`), and
 reads the runtime's log (`wait_for_runtime_log`). **None of it ships**: `platform` + its `sqlx` dep compile only

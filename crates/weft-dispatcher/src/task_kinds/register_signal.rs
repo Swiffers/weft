@@ -7,7 +7,7 @@
 //! nothing), write it, then have the listener bring the signal up
 //! (`start`), so whatever the signal starts always finds its row.
 //!
-//! Idempotency: dedup keyed on `(execution, node_id, frames, is_resume,
+//! Idempotency: dedup keyed on `(run, node_id, frames, is_resume,
 //! call_index)` so a process-crash retry converges on the same task. The
 //! task's body is itself idempotent: entry rows reuse a stable token
 //! per `(project_id, node_id)`, resume rows mint per-suspension.
@@ -29,13 +29,13 @@ use crate::state::DispatcherState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterSignalPayload {
-    pub execution_id: weft_core::ExecutionId,
+    pub run_id: weft_core::RunId,
     pub node_id: String,
     pub frames: LoopFrames,
     pub spec: SignalSpec,
     pub is_resume: bool,
     /// 0-based ordinal of the `await_signal` call within this
-    /// (execution, node_id, frames). Set by the worker, which stamps it on
+    /// (run, node_id, frames). Set by the worker, which stamps it on
     /// the `SuspensionRegistered` it records, so replay can rebuild the
     /// per-(node, frames) sequence in order. Must not vary across replays
     /// of the same body, so the dedup key and the resume token include it. Required: a missing field would silently default
@@ -233,13 +233,13 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
         let payload: RegisterSignalPayload = serde_json::from_value(task.payload.clone())?;
         if !payload.is_resume {
             core_signal::validate_spec(&payload.spec).map_err(anyhow::Error::msg)?;
-            let execution_id = payload.execution_id;
-            let owner = state.journal.execution_owner(execution_id).await?.context("entry capture has no run")?;
+            let run_id = payload.run_id;
+            let owner = state.journal.run_owner(run_id).await?.context("entry capture has no run")?;
             anyhow::ensure!(
                 owner.phase == weft_core::context::Phase::TriggerSetup && owner.binary_hash.is_some(),
                 "entry capture requires a trigger-setup run with a pinned program"
             );
-            let found = crate::projection::program_of_owner(state, execution_id, &owner).await?;
+            let found = crate::projection::program_of_owner(state, run_id, &owner).await?;
             let project = found.program().context("entry capture has no original program")?;
             let node_id = captured_trigger_address(&project, &payload.node_id, &payload.frames, payload.call_index)?;
             let ports = payload.port_snapshot.as_ref().context("entry capture requires its input port snapshot")?;
@@ -258,7 +258,7 @@ impl RegisterSignalExecutor {
     /// The answer says what the arm did to the row, so a caller whose
     /// later step fails can take it back ([`disarm`]).
     pub(crate) async fn arm(state: &DispatcherState, mut payload: RegisterSignalPayload) -> Result<Armed> {
-        let execution_id = payload.execution_id;
+        let run_id = payload.run_id;
 
         // Per-kind validation: each `Signal` impl owns its rules
         // (cron parses, path well-formed, url is http(s), etc).
@@ -272,11 +272,11 @@ impl RegisterSignalExecutor {
         // Resolve tenant + project_id. Token reuse for entry rows keeps the
         // registration stable across reactivates; resume rows always mint
         // fresh.
-        let Some(owner) = state.journal.execution_owner(execution_id).await? else {
-            anyhow::bail!("no run row for execution {execution_id}")
+        let Some(owner) = state.journal.run_owner(run_id).await? else {
+            anyhow::bail!("no run row for run {run_id}")
         };
         let project_id = owner.project_id;
-        // The tenant stamped on the execution, not one re-derived from
+        // The tenant stamped on the run, not one re-derived from
         // the project store: same answer while the project lives, and
         // still an answer once it does not.
         let tenant = owner.tenant.clone();
@@ -290,7 +290,7 @@ impl RegisterSignalExecutor {
         // node was compiled into, so the spelling is the one that
         // program's source reads. Tags drive the signal-token enumeration
         // filter; charset already validated at parse time.
-        let found = crate::projection::program_of_owner(state, execution_id, &owner).await?;
+        let found = crate::projection::program_of_owner(state, run_id, &owner).await?;
         let Filed { place, tags, entry_defaults } = filed_under(&found, &payload.node_id, &payload.frames, payload.is_resume)
             .with_context(|| format!("register_signal: project_id={project_id}"))?;
         // An entry takes its project's defaults where its trigger's own
@@ -302,13 +302,13 @@ impl RegisterSignalExecutor {
         }
 
         // Resume tokens derive from the suspension identity so a retry of
-        // this task converges on the same token. The identity (execution,
+        // this task converges on the same token. The identity (run,
         // node_id, frames, call_index) is what the engine's fold uses to
         // match resumes. Entry tokens are reused across reactivates and
         // read off the existing row below.
         let resume_token = payload.is_resume.then(|| {
             let mut hasher = Sha256::new();
-            hasher.update(execution_id.to_string().as_bytes());
+            hasher.update(run_id.to_string().as_bytes());
             hasher.update(b":");
             hasher.update(payload.node_id.as_bytes());
             hasher.update(b":");
@@ -324,16 +324,16 @@ impl RegisterSignalExecutor {
             uuid::Uuid::from_bytes(buf).to_string()
         });
 
-        let resume_execution_id = payload.is_resume.then_some(execution_id);
+        let resume_run_id = payload.is_resume.then_some(run_id);
         let spec_json = serde_json::to_string(&payload.spec)?;
 
-        let program = match (&owner.definition_hash, &owner.binary_hash) {
+        let program = match (owner.registered_hash(), &owner.binary_hash) {
             (Some(definition_hash), Some(binary_hash)) => Some(
                 state
                     .projects
                     .program_identity(project_id, definition_hash, binary_hash)
                     .await?
-                    .ok_or_else(|| anyhow::anyhow!("run {execution_id} ran on worker {binary_hash}, which its project no longer records"))?,
+                    .ok_or_else(|| anyhow::anyhow!("run {run_id} ran on worker {binary_hash}, which its project no longer records"))?,
             ),
             _ => None,
         };
@@ -373,7 +373,7 @@ impl RegisterSignalExecutor {
                         spec: payload.spec.clone(),
                         node_id: place.clone(),
                         is_resume: payload.is_resume,
-                        execution_id: resume_execution_id,
+                        run_id: resume_run_id,
                         source: weft_core::signal::listener_protocol::PrepareSource {
                             prior_kind_state,
                             asked_at_unix_ms: payload.asked_at_unix_ms,
@@ -394,13 +394,13 @@ impl RegisterSignalExecutor {
                         // activation's of the trigger that fired its run (none
                         // for a run started by hand).
                         activation_trigger: if payload.is_resume { fired_by.clone() } else { Some(place.clone()) },
-                        setup_execution_id: (!payload.is_resume).then_some(execution_id),
+                        setup_run_id: (!payload.is_resume).then_some(run_id),
                         source_version: source_version.clone(),
                         program: program.clone(),
                         token: token.clone(),
                         tenant_id: tenant.to_string(),
                         project_id,
-                        execution_id: if payload.is_resume { Some(execution_id) } else { None },
+                        run_id: if payload.is_resume { Some(run_id) } else { None },
                         node_id: place.clone(),
                         is_resume: payload.is_resume,
                         spec_json: spec_json.clone(),

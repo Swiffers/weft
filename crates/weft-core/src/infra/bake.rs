@@ -4,7 +4,7 @@
 //! The node's metadata marks which of its outputs are baked
 //! (`OutputSpec::baked`, carried as `NodeDefinition::baked_outputs`). The
 //! run that applies its infra (the infra setup) runs its body and saves
-//! what went out on those outputs (`weft_engine`'s execution driver); the
+//! what went out on those outputs (`weft_engine`'s run driver); the
 //! infra itself can change a saved value later with no node running
 //! ([`PushedValues`]).
 //!
@@ -54,10 +54,7 @@ pub fn saved_for_run(
             continue;
         };
         let fits = |port: &str, value: &Value| {
-            node.outputs
-                .iter()
-                .find(|output| output.name == port)
-                .is_some_and(|output| output.port_type.accepts_runtime_value(value))
+            node.types_at(&place.path).output(port).is_some_and(|ty| ty.accepts_runtime_value(value))
         };
         let values: BTreeMap<String, Value> = row
             .baked
@@ -84,7 +81,7 @@ pub fn covered(project: &ProjectDefinition, saved: &Saved, runs: &BTreeSet<Locat
             if named.contains(&place.id) || !runs.contains(*place) {
                 return false;
             }
-            let read = crate::project::selection::ports_read_by(project, place, runs);
+            let read = crate::project::places::ports_read_by(project, place, runs);
             !read.is_empty() && read.iter().all(|port| values.contains_key(port))
         })
         .map(|(place, values)| (place.clone(), values.clone()))
@@ -184,18 +181,21 @@ mod covered_tests {
     }
 
     /// A run that reaches a baked place without starting anywhere (a
-    /// `--target`) skips the place and what only fed it.
+    /// `--target`) skips the place and what only fed it: the place stands
+    /// in for itself in the cut, sending what it saved.
     #[test]
     fn a_skipped_place_takes_what_only_fed_it_out_of_the_run() {
         let project = program();
         let saved = saved_for_run(&project, &[copy(true, &[("access", json!("a1"))])], None);
-        let bounds = crate::project::selection::SelectionBounds { target: vec!["query".into()], ..Default::default() };
-        let (selection, baked) = crate::run_spec::carve_reading_baked(&project, bounds, &saved, &BTreeSet::new()).unwrap();
-        assert!(baked.contains_key(&Located::top("db")), "db is skipped");
-        assert!(selection.suppliers.contains(&Located::top("db")));
-        assert!(!selection.nodes.contains(&Located::top("db")));
-        assert!(!selection.nodes.contains(&Located::top("cfg")), "cfg only fed db: {:?}", selection.nodes);
-        assert!(selection.nodes.contains(&Located::top("query")) && selection.nodes.contains(&Located::top("trig")));
+        let spec = crate::run_spec::RunSpec { target: vec!["query".into()], ..crate::run_spec::RunSpec::whole("baked") };
+        let resolved = crate::run_spec::resolve_spec(&spec, &project, &saved).unwrap();
+        assert!(resolved.baked.contains_key(&Located::top("db")), "db is skipped");
+        let stand_in = &resolved.given.outputs[&Located::top("db")];
+        assert_eq!(stand_in.ports["access"], crate::project::GivenPort::Value { value: json!("a1") });
+        assert_eq!(stand_in.origin, crate::project::GivenOrigin::Baked);
+        assert!(!resolved.runs.contains(&Located::top("db")));
+        assert!(!resolved.program.nodes.iter().any(|node| node.id == "cfg"), "cfg only fed db");
+        assert!(resolved.runs.contains(&Located::top("query")) && resolved.runs.contains(&Located::top("trig")));
     }
 
     #[test]

@@ -12,7 +12,7 @@
 //!   (cancelled, never run again); it waits for its record only where
 //!   something else acts on it (a pause, a call to weft that names the
 //!   run), and lets go once its ending is handed to the writer. A
-//!   `Durable` run has what it did on record before each step of a node
+//!   `Durable` run has what it did on record before each firing of a node
 //!   that is not pure starts, and lets anything leave the system (an
 //!   answer) only once it is written.
 //! - **Whether it is recorded**: off, the run keeps no history. It leaves
@@ -42,7 +42,7 @@ pub enum Keeping {
     /// ending is queued, and its record trails behind it. The default.
     #[default]
     Fast,
-    /// What the run did is on record before each step of a node that is
+    /// What the run did is on record before each firing of a node that is
     /// not pure starts, and an answer before it leaves.
     Durable,
 }
@@ -77,7 +77,6 @@ fn yes() -> bool {
 pub const DEFAULT_HOLD_SECS: u32 = 60;
 
 /// The longest hold a run may ask for: a hold is never unbounded.
-// SYNC: MAX_HOLD_SECS <-> packages/weft-graph/src/run-spec.ts MAX_HOLD_SECS
 pub const MAX_HOLD_SECS: u32 = 30 * 24 * 3600;
 
 fn is_default_hold(secs: &u32) -> bool {
@@ -217,9 +216,9 @@ impl<'de> Deserialize<'de> for KeepFor {
 /// A run started by hand is always recorded, whatever its trigger's
 /// `recorded` says: it starts as a queued row, and a row must end, so its
 /// record is written whole however it ends.
-// SYNC: SettingsChoice <-> packages/weft-graph/src/run-spec.ts (RunSettings, its validator, and the flags it maps to)
+// SYNC: SettingsChoice <-> packages/weft-graph/src/run-spec.ts RunSettings
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SettingsChoice {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keeping: Option<Keeping>,
@@ -291,7 +290,7 @@ impl RunSettings {
         if keeping.is_durable() && !recorded {
             return Err(format!(
                 "a run cannot be both `{DURABLE_FIELD}` and not `{RECORDED_FIELD}`: a durable run writes \
-                 down what it did before its steps start, which is a record. Turn `{RECORDED_FIELD}` \
+                 down what it did before its nodes start, which is a record. Turn `{RECORDED_FIELD}` \
                  back on, or `{DURABLE_FIELD}` off"
             ));
         }
@@ -326,7 +325,7 @@ impl RunSettings {
     /// How long, in seconds, the run holds its worker when it cannot pause
     /// (its caller is on the line and its route does not outlive it, it is
     /// unrecorded, or a bus between its nodes is open) and its waits are
-    /// all that is left: the clock runs only while nothing moves (no step
+    /// all that is left: the clock runs only while nothing moves (no node
     /// working, nothing said on a bus) and starts again when something
     /// does. When it runs out, every `ctx.await_signal` still waiting fails
     /// at the call. `0` fails such a wait at once.
@@ -428,9 +427,9 @@ impl RunSettings {
                 false,
                 "Durable runs",
                 "Turn on if a run must carry on when its worker dies: another worker picks it up where it \
-                 was, and a step that was running at that moment is failed rather than run twice (a pure \
-                 node's step that had not passed a value on is run again instead). To make that possible, \
-                 what the run did is written down before each step, except a pure node's, and an answer \
+                 was, and a node that was running at that moment is failed rather than run twice (a pure \
+                 node that had not passed a value on is run again instead). To make that possible, \
+                 what the run did is written down before each node runs, except a pure one, and an answer \
                  before it leaves. \
                  Off (default): the run waits for its record only when it pauses or asks weft for \
                  something on its behalf, and if its worker dies mid-run the run ends cancelled and is not run again.",
@@ -440,8 +439,8 @@ impl RunSettings {
                 true,
                 "Record each run",
                 "Turn off for a route called every few seconds (a status a page polls). Off: no history of \
-                 a run is kept. One that fails is listed in `weft executions` with its failure (which \
-                 step, and why); one that reported a cost or asked weft for something its worker does not already hold \
+                 a run is kept. One that fails is listed in `weft runs` with its failure (which \
+                 node, and why); one that reported a cost or asked weft for something its worker does not already hold \
                  (a stored file, a new connection or infrastructure address, a task such as starting or \
                  stopping its infra, a stop through `ctx.stop_tagged`) is listed with its costs and how it ended; any other leaves only a count in `weft status`. \
                  A run started by hand is always recorded. An unrecorded run cannot wait (timer, form), \
@@ -466,7 +465,7 @@ impl RunSettings {
                 "description": "How long, in seconds, a wait (a form, a timer) holds the run's worker when \
                  the run cannot pause: its caller is on the line and it does not outlive it, it is not \
                  recorded, or a bus between its nodes is open. The clock runs only while nothing moves in \
-                 the run (no step working, nothing said on a bus), and starts over when something does. \
+                 the run (no node working, nothing said on a bus), and starts over when something does. \
                  When it runs out, the waiting node fails, saying it gave up, and the node may handle that \
                  itself. `0` fails such a wait at once; at most 30 days.",
             }))

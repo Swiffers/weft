@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { weftPassThrough } from './passthrough';
+import { LARGEST_PART_BYTES, RUN_ID_HEADER, weftPassThrough, type PlainFailure } from './passthrough';
 
 /** A dispatcher that records what reached it and echoes the body back. */
 function fakeDispatcher(answer: (req: Request) => Response | Promise<Response> = () => new Response('ok')) {
@@ -116,6 +116,24 @@ describe('the pass-through', () => {
 		expect(new Headers(init?.headers).get('weft-instance-token')).toBe('wft-m');
 	});
 
+	it("hands back which run answered, on a failure and on a success", async () => {
+		const runId = '7f3c0d2e-0000-4000-8000-000000000001';
+		const failure: PlainFailure = { error: 'Something went wrong', runId };
+		for (const [status, body] of [
+			[500, JSON.stringify(failure)],
+			[200, '{"reply":"hi"}'],
+		] as const) {
+			const { fetcher } = fakeDispatcher(
+				() => new Response(body, { status, headers: { 'content-type': 'application/json', [RUN_ID_HEADER]: runId } }),
+			);
+			const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
+			const res = await pass(new Request(`${site}/connect/local/p/bot/ask`, { method: 'POST', body: '{}' }), 'connect/local/p/bot/ask');
+			expect(res.status).toBe(status);
+			expect(res.headers.get(RUN_ID_HEADER)).toBe(runId);
+			expect(await res.text()).toBe(body);
+		}
+	});
+
 	it('reaches the display doors, keeping each segment one segment', async () => {
 		const { fetcher, seen } = fakeDispatcher();
 		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
@@ -123,17 +141,183 @@ describe('the pass-through', () => {
 		expect(seen[0].url).toBe('http://d/signal-token/displays/p/test.whatsapp');
 	});
 
-	it("passes a stored file's link, so a picture a route answered with loads through the site", async () => {
+	it("passes a stored file's link byte for byte, so its signature still matches", async () => {
 		const { fetcher, seen } = fakeDispatcher();
 		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
-		await pass(new Request(`${site}/public/files/tok123`), 'public/files/tok123');
-		expect(seen[0].url).toBe('http://d/public/files/tok123');
+		// A weft key is segments of [A-Za-z0-9._-] joined by '/', which
+		// re-encoding each segment leaves as it was; the query carries the
+		// signature with its escapes, and must reach the store unchanged.
+		const key = 'runtime/local/project/0b6e8c1a-2f3d-4c5e-9a7b-1c2d3e4f5a6b/7f3e2a10-1b2c-4d5e-8f9a-0b1c2d3e4f5a';
+		const query =
+			'?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=weft%2F20261019%2Fus-east-1%2Fs3%2Faws4_request' +
+			'&X-Amz-Date=20261019T101500Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host' +
+			'&X-Amz-Signature=3f1c%2B0a&response-content-disposition=inline%3B%20filename%3D%22a%20b.png%22&x-id=GetObject';
+		for (const name of ['a.B_c-9', 'with.many.dots', '_', '-']) {
+			const path = `files/${key}/${name}`;
+			await pass(new Request(`${site}/${path}${query}`), path);
+		}
+		expect(seen.map((r) => r.url)).toEqual(
+			['a.B_c-9', 'with.many.dots', '_', '-'].map((name) => `http://d/files/${key}/${name}${query}`),
+		);
+	});
+
+	it("asks the store for what a file read needs, and hands back what it answered", async () => {
+		const answered = {
+			'content-range': 'bytes 0-99/1000',
+			'accept-ranges': 'bytes',
+			etag: '"abc"',
+			'last-modified': 'Mon, 19 Oct 2026 10:15:00 GMT',
+			'x-content-type-options': 'nosniff',
+		};
+		const { fetcher, seen } = fakeDispatcher(() => new Response('x'.repeat(100), { status: 206, headers: answered }));
+		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
+		const asked = {
+			range: 'bytes=0-99',
+			'if-range': '"abc"',
+			'if-none-match': '"old"',
+			'if-modified-since': 'Sun, 18 Oct 2026 10:15:00 GMT',
+		};
+		const res = await pass(new Request(`${site}/files/runtime/t/f?sig=1`, { headers: asked }), 'files/runtime/t/f');
+		expect(res.status).toBe(206);
+		for (const [name, value] of Object.entries(asked)) expect(seen[0].headers.get(name)).toBe(value);
+		for (const [name, value] of Object.entries(answered)) expect(res.headers.get(name)).toBe(value);
+	});
+
+	it("sends a part of an upload with its exact length, never chunked", async () => {
+		let init: RequestInit | undefined;
+		const fetcher = (async (_url: string, given: RequestInit) => {
+			init = given;
+			return new Response(null, { status: 200, headers: { etag: '"part-1"' } });
+		}) as unknown as typeof fetch;
+		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
+		const part = new Uint8Array(1234).fill(7);
+		const res = await pass(
+			new Request(`${site}/files/runtime/t/upload?partNumber=1&sig=1`, {
+				method: 'PUT',
+				headers: { 'content-length': '1234' },
+				body: new ReadableStream({
+					start(c) {
+						c.enqueue(part.subarray(0, 1000));
+						c.enqueue(part.subarray(1000));
+						c.close();
+					},
+				}),
+				duplex: 'half',
+			} as RequestInit),
+			'files/runtime/t/upload',
+		);
+		expect(res.headers.get('etag')).toBe('"part-1"');
+		// A whole body (not a stream), so fetch sends `Content-Length: 1234`.
+		expect(init?.body).toBeInstanceOf(ArrayBuffer);
+		expect((init?.body as ArrayBuffer).byteLength).toBe(1234);
+		expect((init as { duplex?: string }).duplex).toBeUndefined();
+	});
+
+	it('refuses a part with no length, or a length past the largest part, before reading it', async () => {
+		const { fetcher, seen } = fakeDispatcher();
+		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
+		let pulled = false;
+		const untouched = () =>
+			// No high-water mark: the stream is pulled only when read.
+			new ReadableStream(
+				{
+					pull() {
+						pulled = true;
+					},
+				},
+				{ highWaterMark: 0 },
+			);
+		const put = (headers: Record<string, string>) =>
+			pass(
+				new Request(`${site}/files/runtime/t/upload?partNumber=1`, { method: 'PUT', headers, body: untouched(), duplex: 'half' } as RequestInit),
+				'files/runtime/t/upload',
+			);
+		expect((await put({})).status).toBe(411);
+		const tooBig = await put({ 'content-length': String(LARGEST_PART_BYTES + 1) });
+		expect(tooBig.status).toBe(413);
+		expect(await tooBig.text()).toContain(`at most ${LARGEST_PART_BYTES} bytes`);
+		expect(pulled).toBe(false);
+		expect(seen).toHaveLength(0);
+	});
+
+	it('stops reading a part that carries more than it said', async () => {
+		const { fetcher, seen } = fakeDispatcher();
+		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
+		let sent = 0;
+		const res = await pass(
+			new Request(`${site}/files/runtime/t/upload?partNumber=1`, {
+				method: 'PUT',
+				headers: { 'content-length': '10' },
+				// Endless: only stopping reading ends this test.
+				body: new ReadableStream({
+					pull(c) {
+						sent++;
+						c.enqueue(new Uint8Array(4));
+					},
+				}),
+				duplex: 'half',
+			} as RequestInit),
+			'files/runtime/t/upload',
+		);
+		expect(res.status).toBe(413);
+		expect(sent).toBeLessThan(5);
+		expect(seen).toHaveLength(0);
+	});
+
+	it("passes a write's version check on to the store", async () => {
+		const { fetcher, seen } = fakeDispatcher();
+		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
+		await pass(
+			new Request(`${site}/files/runtime/t/f?sig=1`, { method: 'PUT', headers: { 'content-length': '1', 'if-match': '"v1"' }, body: 'x' }),
+			'files/runtime/t/f',
+		);
+		expect(seen[0].headers.get('if-match')).toBe('"v1"');
+	});
+
+	it('writes a key the way its link was signed, whatever it holds', async () => {
+		const { fetcher, seen } = fakeDispatcher();
+		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
+		// What the signer wrote (RFC 3986), and the decoded path a site's
+		// router hands over for it.
+		const signed = 'files/runtime/t/a%20b%2Bc%25d%C3%A9%E2%82%AC%28x%29%21%2A%27';
+		const decoded = "files/runtime/t/a b+c%dé€(x)!*'";
+		await pass(new Request(`${site}/${signed}?X-Amz-Signature=ab%2F`), decoded);
+		expect(seen[0].url).toBe(`http://d/${signed}?X-Amz-Signature=ab%2F`);
+	});
+
+	it("passes an upload's steps, and nothing else under files", async () => {
+		const { fetcher, seen } = fakeDispatcher(
+			() => new Response('being completed', { status: 409, headers: { 'x-weft-completing': '1' } }),
+		);
+		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
+		const res = await pass(
+			new Request(`${site}/files/upload/begin`, { method: 'POST', body: '{"slot":"weft-upload:t"}', headers: { 'content-type': 'application/json' } }),
+			'files/upload/begin',
+		);
+		// The "being completed, ask again" mark comes back with the answer.
+		expect(res.headers.get('x-weft-completing')).toBe('1');
+		expect(seen.map((r) => r.url)).toEqual(['http://d/files/upload/begin']);
+		expect(await seen[0].text()).toBe('{"slot":"weft-upload:t"}');
+		for (const [method, path] of [
+			['GET', 'files/other'],
+			['GET', 'files/upload/begin'],
+			['POST', 'files/upload'],
+			['POST', 'files/upload/begin/x'],
+			['POST', 'files/runtime/t/f'],
+			['DELETE', 'files/runtime/t/f'],
+			['GET', 'files/runtime'],
+		]) {
+			const refused = await pass(new Request(`${site}/${path}`, { method, ...(method === 'POST' ? { body: '{}' } : {}) }), path);
+			expect(refused.status, `${method} ${path}`).toBe(404);
+			expect(await refused.text()).toContain('under /files/ only');
+		}
+		expect(seen).toHaveLength(1);
 	});
 
 	it('refuses anything outside the weft doors without calling the dispatcher', async () => {
 		const { fetcher, seen } = fakeDispatcher();
 		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
-		for (const path of ['projects/1/activate', '', 'instance/../projects', 'signal/./x', 'public', 'public/logo.png', 'public/files']) {
+		for (const path of ['projects/1/activate', '', 'instance/../projects', 'signal/./x', 'public/files/tok', 'files', 'files/runtime/../chunks/x']) {
 			expect((await pass(new Request(`${site}/${path}`), path)).status).toBe(404);
 		}
 		expect(seen).toHaveLength(0);

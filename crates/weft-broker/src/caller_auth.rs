@@ -135,7 +135,7 @@ fn names(payload: &str, key: &VerifierKey) -> bool {
 /// `verifiers` until they change), resolve the scheme's templates against
 /// the values, run it. Answers the identity the scheme established, and
 /// the headers it read the credential from.
-/// Separate from the route so the db-tests exercise it directly.
+/// Separate from the route so the database tests exercise it directly.
 pub async fn verify_caller(
     verifiers: &HeldVerifiers,
     pool: &PgPool,

@@ -1,6 +1,6 @@
 ---
 name: weft-editor
-description: "Read when telling the user where to click or what they are looking at in VS Code: the toolbar, the action bar, the palette, context menus, editing gestures, groups and loops in the graph, run and replay, the inspector, the connect flow, the problems panel. Labels are verbatim from the extension, except an infra node's live card, whose buttons the running container names."
+description: "Read when telling the user where to click or what they are looking at in VS Code: the toolbar, running and turning triggers and infra on or off from a selection, the state pill on each trigger and infra node, the action bar, the palette, context menus, editing gestures, groups and loops in the graph, run and replay, the inspector, the connect flow, the problems panel. Labels are verbatim from the extension, except an infra node's live card, whose buttons the running container names."
 ---
 
 # The editor surface
@@ -22,10 +22,10 @@ to the dispatcher at `http://127.0.0.1:14111` (setting `weft.dispatcherUrl`).
   - **Projects**: one row per `.weft` file in the workspace (label = folder
     name). Click to pin and open its graph; inline buttons "Open in Editor"
     and "Run Project"; title-bar "Refresh".
-  - **Executions**: runs of the pinned project, newest first (paged, "Load
+  - **Runs**: runs of the pinned project, newest first (paged, "Load
     more (N more)" at the bottom). Row = status icon, entry node, time;
-    tooltip = the execution id. Inline "View in Graph" and "Delete"; title-bar
-    "Refresh Executions" and "Clear All Executions".
+    tooltip = the run id. Inline "View in Graph" and "Delete"; title-bar
+    "Refresh Runs" and "Clear All Runs".
 - **The graph panel**, titled "Weft Graph: <project folder name>".
 - **The Problems panel** carries the compiler's live diagnostics.
 
@@ -36,8 +36,8 @@ to the dispatcher at `http://127.0.0.1:14111` (setting `weft.dispatcherUrl`).
   cancelled, ⊘ skipped) and the type name, body with the label and its
   ports. Left rail: input ports. Right rail: output ports. Each port is a
   dot colored by its type (String gray, Number blue, Boolean rose, files
-  gold/purple/green/brown, List teal, Dict purple, Access teal, Bus amber,
-  MustOverride red); a required input carries a `*`.
+  gold/purple/green/brown, List teal, Dict purple, Access teal, Bus amber);
+  a required input carries a `*`.
 - **The small amber arrow top-left of every box** is `_should_flow`, the
   port that decides whether it runs: filled when something answers it,
   hollow when nothing does.
@@ -76,13 +76,13 @@ or off; click to show the newest and follow again), and **"Source"**
 
 The [follow toggle] has three parts, each explained on hover; only the
 active one shows its word:
-- **"Following · <execution-id>"** (eye icon): every run that starts takes over
+- **"Following · <run-id>"** (eye icon): every run that starts takes over
   the graph. The default.
-- **"Locked · <execution-id>"** (lock icon): the graph stays on this run; runs
+- **"Locked · <run-id>"** (lock icon): the graph stays on this run; runs
   that start are counted, not shown. Greyed while no run is on screen.
 - **"Off"** (crossed eye): no run on the graph, just the program.
 
-Clicking Run, Activate, or Infra Start in the editor switches to
+Run, Turn on, or Start in the editor switches to
 Following. A run started from the terminal (including every `weft run`
 you issue) never changes the mode: if the user left the graph Locked or
 Off, your run lands in the "N new run(s)" count, not on their screen, so
@@ -93,40 +93,64 @@ Top-right: **"Simplified view"** toggle. On: square, read-only nodes (toast
 "Switch to the builder view to edit the graph"), one dot per side, for
 reading and showing. Builder and simplified keep separate saved positions.
 
-Bottom-center action bar, contextual slots. [the pre-flight] runs before
-Run, Activate, or Resync is sent: a runtime validation through the warm
-parse-server, where an unpicked connection and cousins land on the bar's
-error banner (the complete list, each entry clickable to its file and
-line) and the verb is not sent, so a build that cannot run never starts.
+**Everything you act on starts with a selection.** Select nodes (Ctrl+A
+selects all; the palette's "Select All Triggers" takes just the triggers)
+and a bar appears at the bottom center showing only what that selection
+allows, in big buttons: "RUN 1 TARGET" or "RUN N TARGETS", then under
+Triggers "Turn off", "Turn on", "Resync", then under Infra "Start", "Stop",
+"Terminate", "Upgrade", and "Options". A count, "(N)", follows a label only
+when that button covers more than one selected node. [the pre-flight] runs
+before a run or a lifecycle verb is sent: a runtime validation through the
+warm parse-server, where an unpicked connection and cousins land on the
+bar's error banner (the complete list, each entry clickable to its file and
+line) and the verb is not sent.
 
-- **Infra slot** (when the project has infra): "Start Infra" / "Stop
-  Infra" / "Upgrade Infra" (amber, when source changed since start) /
-  terminate (trash). An eye toggle "Show infrastructure subgraph" dims
-  everything except the infra closure.
-- **Run slot**: "Run Project" (or "Run 1 target" / "Run N targets" once
-  targets are set). While working the button becomes its own cancel:
-  "Building...", "Cached, loading...", "Provisioning infra...",
-  "Running...". While following a live run it is "Stop Execution".
-- **Trigger slot** (when the source declares triggers): "Activate" /
-  "Deactivate" / "Resync" (amber "Out of sync" when the project changed
-  since activation). An eye toggle "Show trigger subgraph". A resync
-  that stopped with triggers down shows a red "Resync stopped" with two
-  buttons: "Resync" takes it up again where it stopped, "Give up" ends it
-  and leaves the triggers it took down off. When some
-  triggers are off while the others run (an infra stop took down the ones
-  reading it), a second button beside "Deactivate" turns them back on and
-  names them: "Activate gmail.watch", or "Reactivate ..." when runs wait on
-  them, two by name and then "and N more". Deactivating
-  opens the picker "Deactivate: how should triggers come down?": **Park**
-  (nothing dropped: everything that arrives waits and runs once the
-  triggers are back), **Hibernate** (the same for a grace window, questions
-  hidden, then refuse), **Wipe** (drop everything, cancels suspended runs), plus what to
-  do with running executions. Reactivating offers "Run what was kept, keep
-  the waiting runs", "Drop the kept events, keep the waiting runs", "Wipe all".
+- **RUN N TARGETS** runs the selected nodes as targets (`weft run
+  --target`) with what they need. A selected trigger or infra node offers no Run, only its
+  own buttons; in a mixed selection Run runs the other nodes. Greyed,
+  its tooltip gives weft's reason: the refusal `weft run --check`
+  gives, or the infra the run reads that is not running (start it first); with
+  several nodes selected it names each blocked node and its reason. Ctrl+Enter with nothing selected says "Select the nodes to run
+  first: the run takes them and what they need."; with triggers or infra alone it
+  says Run leaves them out. The sidebar's "Run Project" runs every root
+  of the program. The editor has no gesture for `--from`, `--group`,
+  `--fire` or a saved example: those are CLI.
+- **"Options"** ("How triggers go down and come back") holds the same
+  three questions as the CLI, prefilled with the defaults: "What arrives
+  while it is down" (**Hold it**, **Hold it, hidden**, **Refuse it**, then
+  refuse after some minutes), "What already waits" (**Keep it**, **Drop
+  it**) and "The runs going now" (**Wait for them**, **Cancel them**), plus,
+  for turning on, "What they held while they were down" (**Run it**,
+  **Drop it**). Stopping infra lists what "Goes down with it".
+- **The instance picker** ("instance: shared") says whose copies the bar
+  acts on: "shared (the program's own)", "all instances (N)", an instance
+  id, or a new one typed in. Acting on a per-instance node needs an
+  instance chosen here.
+- Terminate asks first, in a VS Code dialog: "Terminate <infra>? Every
+  resource is deleted, stored data included unless the node keeps it."
 
-Banners above the bar: red for a failed verb (click for full diagnostics),
-amber for infra drift ("Infrastructure has changed. Click Upgrade to
-apply."), indigo "Graph locked while ..." while a verb owns the graph.
+**Each trigger and infra node shows its state** in a pill. A trigger reads
+`on`, `off`, `behind` (on, firing an older version: Resync brings it up to
+date), `turning on...`, `held N` (it holds that much for when it is back) or
+`held back`; a per-instance one reads `2 of 5 on`. An infra node reads
+`running`, `starting...`, `stopping...`, `stopped`, `behind`, `flaky` or
+`failed` (`N of M running` for a per-instance one). Hovering the pill says
+why: "Taken down with its infra: it comes back once that infra runs
+again.", "Taken down by the health check: ...", "Held back: <reason>", and
+for infra what taking it down takes with it.
+
+The bottom-center bar is the status bar and the selection bar in one. With
+nothing selected it shows only what is happening now (and the eye toggles,
+which show only the trigger or the infrastructure subgraph): the run you
+are following with its "Stop" button and node count, or the verb at work
+("Building...", "Resyncing...", "Turning triggers on...", "Waiting for the
+runs still going..."), with "(Cancel)" when it can be called off. A resync
+that stopped with triggers down shows "Resync stopped" with "Resync" (take
+it up again where it stopped) and "Give up" (leave the triggers it took
+down off). Select nodes and their buttons join it, after a divider.
+
+A verb that failed leaves a red banner above the bar; clicking it opens the
+full diagnostics.
 
 ## The in-graph palette (Ctrl+P or Cmd+P)
 
@@ -172,10 +196,11 @@ read-only (you can still move, expand, and collapse).".
   required", "Type: <type>" (editable), "Remove port". On loop ports the
   right-click also shows and changes the role (broadcast, iter, gather,
   carry).
-- **Nodes**: right-click for "Duplicate (Ctrl+D)", "Delete (Del)", "Tags...",
-  and "Set as target" / "Unset target" (any node). On an infra node:
-  "Stop this node" (scales to zero, keeps disks) and "Terminate this node"
-  (destroys them), both behind a confirmation.
+- **Nodes**: right-click for "Duplicate (Ctrl+D)", "Delete (Del)" and
+  "Tags…". On a node each instance can
+  have its own copy of (an infra node's container, an access node's
+  connection), "One per instance" or "Share across instances". Stopping or
+  terminating infra is done by selecting the node (above).
 - **An infra node's card**: while its container runs, the node's body shows
   readouts of its live state and a button for each way out of a state it can
   sit in. Those come from the RUNNING container, not from this file, so their
@@ -194,9 +219,10 @@ bottom-left controls carry zoom, fit, and lock.
 
 ## Running and watching
 
-The Run button runs the pinned project's ordinary roots, or the selected
-work when a cut is set. Triggers need an explicit fire or supplied outputs.
-The run lands in the Executions list. Clicking any node opens [the inspector]: status,
+Run in the graph runs the selected nodes and what they need; the
+sidebar's "Run Project" runs the pinned project's ordinary roots. Triggers
+need an explicit fire or supplied outputs.
+The run lands in the Runs list. Clicking any node opens [the inspector]: status,
 duration, cost ("$0.0123 (own key)"), the exact inputs and outputs of that
 firing as one card per port (a long value expands, copies, and selects
 whole on a double-click), closed ports greyed out, skip reasons in plain
@@ -205,10 +231,10 @@ words ("its `_should_flow` said no", "the required input 'x' closed",
 panels, and a firing navigator ("‹ 2/5 iter 5/2 ›") for nodes that fired
 several times. The Copy button exports the whole inspection.
 
-Past runs: in the Executions view, "View in Graph" replays the run in the
+Past runs: in the Runs view, "View in Graph" replays the run in the
 graph with every value in place and locks the [follow toggle] onto it;
 "N new run(s) · Follow" jumps to the newest. From the terminal the same
-facts are `weft executions`, `weft events <execution-id>`, `weft logs` (the
+facts are `weft runs`, `weft events <run-id>`, `weft logs` (the
 `weft-debugging` skill).
 
 ## Diagnostics and AI edits
@@ -222,6 +248,11 @@ A diagnostic may name another file than the one being edited (a node
 spliced in by `@include` keeps its own file's coordinates). The graph
 keeps showing the last good render with a problems pill ("N problems")
 until the source compiles again (hint on the pill: stale node copies cause
-most catalog errors, run `weft catalog update`). An AI chat extension can
+most catalog errors, run `weft catalog update`). If a node's
+`metadata.json` spells a name in the wrong casing, the pill lists it as "node
+catalog warning" (a weft key written in snake_case is different: that node fails to
+load, and a program that uses it fails to compile, saying the node failed to
+load and why). A name in the source that is not camelCase is a `not-camel-case`
+warning in the Problems panel, and the program still runs. An AI chat extension can
 stream SEARCH/REPLACE edits into the open file and the graph updates as
 each block lands (setting `weft.ai.streamingEditsEnabled`).

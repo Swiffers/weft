@@ -1,7 +1,7 @@
 <script lang="ts">
-	/// One execution payload, drawn as one card per port.
+	/// One run payload, drawn as one card per port.
 	///
-	/// The execution inspector and the Debug-style node preview show the
+	/// The run inspector and the Debug-style node preview show the
 	/// SAME values, so they share this component: a dict of ports becomes
 	/// a card per key, a file value becomes a `FileCard`, anything else
 	/// becomes a `ValueCard` (plain text for a string, coloured JSON for
@@ -20,7 +20,7 @@
 		/// saying so, after the ports that did carry one.
 		closedPorts?: string[];
 		/// Where a port's value came from when it did not travel a wire
-		/// in this run (a backup, a supplied output, the seed run).
+		/// in this run (a value given to the run, the seed run).
 		noteFor?: (port: string) => string | undefined;
 		/// What to say when the payload carries nothing at all.
 		empty?: string;

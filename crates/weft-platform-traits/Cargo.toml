@@ -29,6 +29,8 @@ uuid = { workspace = true }
 reqwest = { workspace = true }
 # Stable wake names (`alarm::Wake::name`).
 sha2 = { workspace = true }
+# The forwarded link's base and the signed link it is moved under.
+url = { workspace = true }
 # S3-compatible object-store client (the production `ObjectStore` impl).
 # Works against any S3 endpoint (GCS, SeaweedFS, AWS, a client's bucket)
 # via an endpoint-URL override, which is exactly the deploy-time slot.
@@ -42,6 +44,7 @@ aws-smithy-types = { workspace = true }
 # warns on but doesn't prevent). Behind the feature so production
 # builds don't pull it.
 parking_lot = { workspace = true, optional = true }
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [lints]
 workspace = true

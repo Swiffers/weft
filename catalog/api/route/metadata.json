@@ -1,7 +1,7 @@
 {
   "type": "Route",
   "label": "Route",
-  "description": "An HTTP endpoint: each call to its path (and method) starts a fresh run carrying the request. The fixed ports carry method, path, captures, query and headers; the body arrives on the ports you declare on the arrow (`-> (user_id: String)`), one per top-level key, with no port for the whole body. A declared port named like a path capture reads the capture; one declared as a file kind (`photo: Image`) takes a `data:` URL or base64 and receives the stored file. Answer with Reply, Stream or Close downstream.",
+  "description": "An HTTP endpoint: each call to its path (and method) starts a fresh run carrying the request. The fixed ports carry method, path, query and headers, and the body comes out whole on `body`. Declare the body's type to have it checked before the run starts (`-> (body: Signup)` with `type Signup = { email: String, age?: Number }`, `..` before the closing brace to drop keys it does not name): a body that does not fit is answered 400 naming the field, and nothing downstream runs. A field declared as a file kind (`photo: Image`) takes a `data:` URL or base64 and receives the stored file. A port you add on the arrow reads the path capture of its name (`-> (id: String)` on `cards/{id}`). Answer with Reply, Stream or Close downstream.",
   "tags": [
     "api",
     "http",
@@ -50,7 +50,7 @@
       },
       "default": "json",
       "label": "Body shape",
-      "description": "Body shape. `json`: top-level keys land on declared ports; a non-object body is refused. `text`: the whole body is a String on the one declared port. `bytes`: the body is stored and its stored-file value lands on the one declared port (declare `File`, or `Image`, which is checked against the bytes). Capture-named ports never count as that one port. Reply and Stream answer in this shape unless their `answerAs` says otherwise."
+      "description": "Body shape. `json`: the body is one JSON object on `body` (a record type or `JsonDict`); anything else is answered 400. `text`: the whole body is a String on `body` (declare `-> (body: String)`). `bytes`: the body is stored and its stored-file value lands on `body` (declare `File`, or `Image`, which is checked against the bytes). Reply and Stream answer in this shape unless their `answerAs` says otherwise."
     },
     {
       "name": "auth",
@@ -96,10 +96,33 @@
       "description": "Largest request body in MB; bigger is answered 413. A `data:` URL inflates its bytes by about a third, so the default 16 fits roughly 12 MB of picture."
     },
     {
-      "name": "journalEphemeral",
-      "type": "Boolean",
-      "label": "Keep the exchange out of the journal",
-      "description": "On: the journal keeps only sizes and counts, never the request or answer content (also hidden from you when debugging). Off (default): both are recorded, trimmed above 100 KB; raw bytes are never recorded."
+      "name": "whenChunkFails",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "surface",
+          "drop_chunk"
+        ]
+      },
+      "default": "surface",
+      "label": "When a message cannot be sent",
+      "description": "What happens when a Stream cannot turn one message into the route's `dataType` (a value that is not a String on a `text` route, a file it cannot read). `surface` (default): the Stream fails and the caller is told, with an error status if nothing was sent yet, the format's error marker after. `drop_chunk`: that message is skipped, noted on the run's record, and the stream goes on; pick it when one missing message is fine, like a frame of a live feed. A run that fails, or a bus that ends failed, is told to the caller either way."
+    },
+    {
+      "name": "whenCallerIsSlow",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "block",
+          "drop_oldest",
+          "drop_newest"
+        ]
+      },
+      "default": "block",
+      "label": "When the caller reads slower than you send",
+      "description": "What gives when a streamed answer is written faster than the caller reads it and the 256 chunks waiting for it fill up. `block` (default): the next write waits for room, so a slow caller slows the program and gets every chunk. `drop_oldest`: the oldest waiting chunk is thrown away, so the caller always gets the latest; pick it for live video or a price feed. `drop_newest`: the new chunk is thrown away and what was already waiting goes out in order. A dropped chunk never reaches the caller, so keep `block` for anything the caller must read whole."
     }
   ],
   "outputs": [
@@ -119,11 +142,6 @@
       "description": "Path as called, no leading slash (`users/42`)."
     },
     {
-      "name": "params",
-      "type": "Dict[String, String]",
-      "description": "The path's `{name}` captures."
-    },
-    {
       "name": "query",
       "type": "Dict[String, String]",
       "description": "Query string parameters."
@@ -136,12 +154,20 @@
     {
       "name": "caller",
       "type": "JsonDict | Null",
+      "narrowable": true,
       "description": "What the auth gate established: JWT claims, `{\"key\": <index>}` for an API key, `{}` for HMAC. Null with no `auth`."
+    },
+    {
+      "name": "body",
+      "type": "JsonDict",
+      "narrowable": "JsonDict | String | File",
+      "description": "The request body, held to the type declared here: a record or `JsonDict` for `json`, `String` for `text`, a file kind for `bytes`. A body that does not fit is answered 400 naming the field. Closed when the request carries no body (a GET)."
     }
   ],
   "claimsRoute": {
     "pathField": "path",
-    "methodField": "method"
+    "methodField": "method",
+    "capturesAreOutputs": true
   },
   "firesWith": {
     "method": "String",
@@ -150,16 +176,62 @@
     "query?": "Dict[String, String]",
     "headers?": "List[List[String]]",
     "caller?": "JsonDict",
-    "base_url?": "String",
+    "baseUrl?": "String",
     "body?": "JsonDict | String"
   },
   "features": {
     "pure": true,
     "isTrigger": true,
     "liveConnection": "http",
-    "canAddOutputPorts": true
+    "canAddOutputPorts": true,
+    "addedPortsAreDataKeys": true
   },
   "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "not", "of": { "kind": "config_in_set", "field": "dataType", "values": ["text", "bytes"] } },
+          { "kind": "not", "of": { "kind": "output_type_fits", "port": "body", "within": "JsonDict" } }
+        ]
+      },
+      "then": {
+        "message": "Route '{id}' takes a json body, which is one JSON object: declare `body` as a record type or `JsonDict`, or set `dataType` to the shape the body has.",
+        "level": "structural",
+        "severity": "error",
+        "field": "dataType"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "dataType", "equals": "text" },
+          { "kind": "not", "of": { "kind": "output_type_fits", "port": "body", "within": "String" } }
+        ]
+      },
+      "then": {
+        "message": "Route '{id}' takes a text body, which arrives as one String: declare `-> (body: String)`.",
+        "level": "structural",
+        "severity": "error",
+        "field": "dataType"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "dataType", "equals": "bytes" },
+          { "kind": "not", "of": { "kind": "output_type_fits", "port": "body", "within": "File" } }
+        ]
+      },
+      "then": {
+        "message": "Route '{id}' takes a bytes body, which is stored as a file: declare `-> (body: File)`, or the kind it has to be (`Image`), which is checked against the bytes.",
+        "level": "structural",
+        "severity": "error",
+        "field": "dataType"
+      }
+    },
     {
       "when": {
         "kind": "config_matches",
@@ -195,7 +267,7 @@
         "kind": "per_instance"
       },
       "then": {
-        "message": "Route '{id}' would exist once per instance, because {per_instance_reason}, but its public address is one for every instance. Keep the route shared and pick the instance per call: the `Weft-Instance` header on a route gated by a connection, or an instance token.",
+        "message": "Route '{id}' would exist once per instance, because {perInstanceReason}, but its public address is one for every instance. Keep the route shared and pick the instance per call: the `Weft-Instance` header on a route gated by a connection, or an instance token.",
         "level": "structural",
         "severity": "error"
       }

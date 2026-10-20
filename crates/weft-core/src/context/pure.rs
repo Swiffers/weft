@@ -2,7 +2,7 @@
 //! [`crate::node::NodeFeatures::pure`]). A pure body does nothing outside
 //! its run that weft does not put on record first, which is what lets a
 //! durable run start it without first putting what came before on record,
-//! and run it again when its worker died mid-step. So every call that
+//! and run it again when its worker died while it ran. So every call that
 //! reaches outside on its own (the network, a connection, a wait,
 //! `ctx.run`, the broker's steering, storage beyond this run) fails here,
 //! naming the flag: a node marked pure by mistake fails loudly at its
@@ -14,8 +14,8 @@
 //! does. And the run's own caller and files: answering the caller (a
 //! durable run's answer leaves only once its record is written, and after
 //! a crash no caller is left to answer twice), reading stored files,
-//! storing files for this run alone, and handing the caller links to
-//! them.
+//! storing files for this run alone, receiving the file its caller
+//! uploaded, and handing the caller links to them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -129,7 +129,7 @@ impl ContextHandle for PureHandle {
         self.inner.log(level, message).await
     }
 
-    async fn tag_execution(&self, _tags: Vec<String>) -> WeftResult<()> {
+    async fn tag_run(&self, _tags: Vec<String>) -> WeftResult<()> {
         self.refused("tag its run")
     }
 
@@ -167,8 +167,8 @@ impl ContextHandle for PureHandle {
         self.inner.wired_output_ports()
     }
 
-    fn catches_errors(&self) -> bool {
-        self.inner.catches_errors()
+    fn firing_buses(&self) -> &crate::bus::FiringBuses {
+        self.inner.firing_buses()
     }
 
     async fn pulse_downstream(&self, output: crate::node::NodeOutput, wait_delivered: bool) -> WeftResult<()> {
@@ -204,7 +204,7 @@ impl ContextHandle for PureHandle {
         declared_size: Option<u64>,
     ) -> WeftResult<Value> {
         match (scope, keep) {
-            (crate::storage::StorageScope::Execution, None) => {
+            (crate::storage::StorageScope::Run, None) => {
                 self.inner.storage_put(scope, identity, data, mime_type, filename, keep, declared_size).await
             }
             _ => self.refused("store a file beyond this run"),
@@ -267,17 +267,45 @@ impl ContextHandle for PureHandle {
         self.refused("keep a stored file")
     }
 
-    async fn storage_presign(&self, _key: &str, _ttl_secs: Option<u64>) -> WeftResult<String> {
-        self.refused("link a stored file")
+    /// The link its caller fetches, which a pure node answering its
+    /// caller (Reply) needs. Making it twice is harmless: within a window
+    /// it is the same link, and the file's life it extends only ever
+    /// grows to cover a link handed out. One for node code would be
+    /// fetched by something beside the body, outside the run.
+    async fn storage_link(
+        &self,
+        key: &str,
+        ttl_secs: Option<u64>,
+        reach: crate::storage::LinkReach,
+    ) -> WeftResult<crate::storage::LinkAnswer> {
+        match reach {
+            crate::storage::LinkReach::External => self.inner.storage_link(key, ttl_secs, reach).await,
+            crate::storage::LinkReach::Internal => self.refused("link a stored file for node code"),
+        }
     }
 
-    /// A link for the run's own caller to fetch; one for anybody else
-    /// leaves the run.
-    async fn storage_public_link(&self, key: &str, ttl_secs: Option<u64>, reach: crate::storage::LinkReach) -> WeftResult<Option<String>> {
-        match reach {
-            crate::storage::LinkReach::Caller { .. } => self.inner.storage_public_link(key, ttl_secs, reach).await,
-            _ => self.refused("link a stored file for anybody but its caller"),
+    /// A copy for this run alone, as a put is.
+    async fn storage_copy(
+        &self,
+        scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
+        key: &str,
+        keep: Option<crate::storage::KeepTtl>,
+    ) -> WeftResult<Value> {
+        match (scope, keep) {
+            (crate::storage::StorageScope::Run, None) => self.inner.storage_copy(scope, identity, key, keep).await,
+            _ => self.refused("store a file beyond this run"),
         }
+    }
+
+    async fn storage_upload_slot(&self, _request: &crate::storage::slot::UploadSlotRequest) -> WeftResult<String> {
+        self.refused("let a visitor upload a file")
+    }
+
+    /// The files its caller uploaded, arriving with the call: received
+    /// again by the same run (a body run twice), they are the same files.
+    async fn storage_claim_uploads(&self, claims: &[(&str, &crate::weft_type::WeftType)]) -> WeftResult<Vec<Value>> {
+        self.inner.storage_claim_uploads(claims).await
     }
 
     fn wake_payload(&self) -> Option<&Value> {

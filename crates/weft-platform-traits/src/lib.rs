@@ -56,11 +56,11 @@ pub use images::{BuildHandle, BuildRequest, BuildStatus, ImageBuilder, ImageDele
 pub use infra_host::{EndpointAt, InfraHost, UnitObservation, UnitRunState};
 pub use news::{Listening, MayMiss, News, NewsHeard, NewsKind, RunNews};
 pub use object_store::{
-    object_store_for, ObjectEntry, ObjectStore, ObjectStoreConfig, PresignAudience,
-    S3ObjectStore, SharedObjectStore,
+    object_store_for, CopyProgress, GetLink, ObjectEntry, ObjectStore, ObjectStoreConfig, PresignAudience,
+    S3ObjectStore, SharedObjectStore, Unfollowed,
 };
 pub use roles::{CoreRole, Placement, RoleAddresses, RolePlacement, Vantage};
-pub use runner::{worker_auth_key, worker_auth_value, Patience, PortTaken, Runner, WorkerCall, WorkerEndpoint, WorkerOverrides, WorkerSettings, WorkerStarting, WorkerTarget, WorkersResponse, MAX_QUEUE_WAIT_ENV, MAX_RUNS_AT_ONCE_ENV, SHARED_IDLE_ENV, WORKER_ANSWER_HEADER, WORKER_AUTH_HEADER};
+pub use runner::{worker_auth_key, worker_auth_value, Patience, PortTaken, Runner, WorkerCall, WorkerEndpoint, WorkerOverrides, WorkerSettings, WorkerStarting, WorkerTarget, WorkerWontStart, WorkersResponse, MAX_QUEUE_WAIT_ENV, MAX_RUNS_AT_ONCE_ENV, SHARED_IDLE_ENV, WORKER_ANSWER_HEADER, WORKER_AUTH_HEADER};
 
 /// The `tracing` target of the line weft logs, once, when its own work is
 /// stuck (`weft_task_store::unanswered`): the platform turns it into an

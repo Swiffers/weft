@@ -22,7 +22,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use weft_broker_client::protocol::{
-    HealthProtocolState, ProjectTrouble, SupervisorClaim, SupervisorCommandRow, SupervisorHealthProtocolsResponse, SupervisorInfraNode,
+    HealthRuleState, ProjectTrouble, SupervisorClaim, SupervisorCommandRow, SupervisorInfraNode,
     SupervisorProject, SupervisorSetHealthStateRequest, SupervisorSetHealthStateResponse, SupervisorSyncOwnershipRequest,
     SupervisorSyncOwnershipResponse,
 };
@@ -68,12 +68,12 @@ pub enum BrokerCall {
     InfraNodes {
         project_id: uuid::Uuid,
     },
-    HealthProtocols {
+    HealthState {
         project_id: uuid::Uuid,
     },
     SetHealthState {
         project_id: uuid::Uuid,
-        protocols: Vec<HealthProtocolState>,
+        rules: Vec<HealthRuleState>,
     },
     ClaimCommand {
         claimer: String,
@@ -174,13 +174,17 @@ struct Inner {
     /// Infra nodes keyed by (project_id, node_id, instance): one per copy.
     infra_nodes: HashMap<CopyKey, SupervisorInfraNode>,
 
-    /// Health protocols JSON per project. `None` entries return
-    /// `Ok(None)` (caller falls back to `default_protocols`).
-    health_protocols: HashMap<uuid::Uuid, Option<serde_json::Value>>,
-
-    /// What each project's health protocols did, as `set_health_state`
+    /// Where each project's health rules stand, as `set_health_state`
     /// last wrote it.
-    health_state: HashMap<uuid::Uuid, Vec<HealthProtocolState>>,
+    health_state: HashMap<uuid::Uuid, Vec<HealthRuleState>>,
+
+    /// How each health command `enqueue_lifecycle` queued ended: every one
+    /// succeeds as it is queued, unless `health_commands_run_on`.
+    health_endings: HashMap<i64, weft_broker_client::protocol::HealthCommandEnding>,
+
+    /// The health commands `enqueue_lifecycle` queues keep running until a
+    /// test ends them (`end_health_command`).
+    health_commands_run_on: bool,
 
     /// Every issued lifecycle command, oldest first; tests push via
     /// `enqueue_command`. A command stays here after it is claimed, as
@@ -213,6 +217,10 @@ struct Inner {
     /// How many of the next `owned_projects` calls fail, as a broker
     /// whose read errors does.
     owned_reads_failing: usize,
+
+    /// Every `enqueue_lifecycle` records its call and then never
+    /// answers, as a broker that hangs would.
+    hang_enqueues: bool,
 
     /// project_id of each claimed command, so `command_complete` (which
     /// carries only a command_id) can apply the same per-project
@@ -356,7 +364,7 @@ impl FakeBroker {
                 project_id,
                 tenant_id,
                 status,
-                health_parked: false,
+                health_down: false,
             },
         );
     }
@@ -377,13 +385,13 @@ impl FakeBroker {
         self.inner.lock().displaced_on_judgment.insert(project_id);
     }
 
-    /// Flip `health_parked` on a seeded project. Lets a test
+    /// Flip `health_down` on a seeded project. Lets a test
     /// distinguish "the health loop parked something still down" (true)
     /// from "a person deactivated" (false) when exercising the
     /// auto-recover gate.
-    pub fn set_health_parked(&self, project_id: uuid::Uuid, parked: bool) {
+    pub fn set_health_down(&self, project_id: uuid::Uuid, parked: bool) {
         if let Some(p) = self.inner.lock().projects.get_mut(&project_id) {
-            p.health_parked = parked;
+            p.health_down = parked;
         }
     }
 
@@ -465,6 +473,7 @@ impl FakeBroker {
                 keep_disks: Vec::new(),
                 units,
                 instance: None,
+                health_rules: None,
             },
         );
     }
@@ -493,6 +502,7 @@ impl FakeBroker {
                 keep_disks: Vec::new(),
                 units,
                 instance: Some(instance.clone()),
+                health_rules: None,
             },
         );
     }
@@ -521,11 +531,21 @@ impl FakeBroker {
         node.keep_disks = keep_disks;
     }
 
-    pub fn set_health_protocols(&self, project_id: uuid::Uuid, protocols: serde_json::Value) {
-        self.inner
-            .lock()
-            .health_protocols
-            .insert(project_id, Some(protocols));
+    /// The health rules a seeded copy's last apply stamped (what its node
+    /// wrote: `None` for none, so it runs the built-in ones).
+    pub fn set_health_rules(
+        &self,
+        project_id: uuid::Uuid,
+        node_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        rules: Option<Vec<weft_core::infra::health::HealthRule>>,
+    ) {
+        let mut inner = self.inner.lock();
+        let node = inner
+            .infra_nodes
+            .get_mut(&copy_key(project_id, node_id, instance))
+            .expect("set_health_rules on a seeded row");
+        node.health_rules = rules;
     }
 
     /// Issue a command: it waits until `command_complete` records it,
@@ -695,14 +715,32 @@ impl FakeBroker {
         self.inner.lock().owned_reads_failing = count;
     }
 
+    /// Make every `enqueue_lifecycle` record its call and then never
+    /// return, so a test can hold a health rule's action mid-flight.
+    pub fn hang_lifecycle_enqueues(&self) {
+        self.inner.lock().hang_enqueues = true;
+    }
+
+    /// Keep every health command queued from now on running, until
+    /// `end_health_command` ends it.
+    pub fn keep_health_commands_running(&self) {
+        self.inner.lock().health_commands_run_on = true;
+    }
+
+    /// End health command `command` with `outcome` (and its `message`).
+    pub fn end_health_command(&self, command: i64, outcome: weft_broker_client::protocol::LifecycleOutcome, message: Option<&str>) {
+        let ending = weft_broker_client::protocol::HealthCommandEnding { command, outcome, message: message.map(str::to_string) };
+        self.inner.lock().health_endings.insert(command, ending);
+    }
+
     /// What `set_health_state` last wrote for the project.
-    pub fn health_state(&self, project_id: uuid::Uuid) -> Vec<HealthProtocolState> {
+    pub fn health_state_rows(&self, project_id: uuid::Uuid) -> Vec<HealthRuleState> {
         self.inner.lock().health_state.get(&project_id).cloned().unwrap_or_default()
     }
 
-    /// Seed what the project's health protocols did.
-    pub fn set_health_state_rows(&self, project_id: uuid::Uuid, protocols: Vec<HealthProtocolState>) {
-        self.inner.lock().health_state.insert(project_id, protocols);
+    /// Seed where the project's health rules stand.
+    pub fn set_health_state_rows(&self, project_id: uuid::Uuid, rules: Vec<HealthRuleState>) {
+        self.inner.lock().health_state.insert(project_id, rules);
     }
 
     /// The projects syncs reported failed (tried again), in order, one
@@ -711,7 +749,7 @@ impl FakeBroker {
         self.troubles(|failed, _| failed)
     }
 
-    /// The projects syncs reported a health protocol gave up on, in
+    /// The projects syncs reported a health rule gave up on, in
     /// order, one entry per sync that reported it.
     pub fn gave_up(&self) -> Vec<uuid::Uuid> {
         self.troubles(|_, gave_up| gave_up)
@@ -869,13 +907,17 @@ impl BrokerSupervisorOps for FakeBroker {
             .collect())
     }
 
-    async fn health_protocols(&self, project_id: uuid::Uuid) -> Result<SupervisorHealthProtocolsResponse> {
+    async fn health_state(&self, project_id: uuid::Uuid) -> Result<weft_broker_client::protocol::SupervisorHealthStateResponse> {
         let mut inner = self.inner.lock();
-        inner.calls.push(BrokerCall::HealthProtocols { project_id });
-        Ok(SupervisorHealthProtocolsResponse {
-            protocols: inner.health_protocols.get(&project_id).cloned().unwrap_or(None),
-            state: inner.health_state.get(&project_id).cloned().unwrap_or_default(),
-        })
+        inner.calls.push(BrokerCall::HealthState { project_id });
+        let rules = inner.health_state.get(&project_id).cloned().unwrap_or_default();
+        let mut ended: Vec<weft_broker_client::protocol::HealthCommandEnding> = rules
+            .iter()
+            .filter_map(|r| r.queued.and_then(|q| inner.health_endings.get(&q.command).cloned()))
+            .collect();
+        ended.sort_by_key(|e| e.command);
+        ended.dedup();
+        Ok(weft_broker_client::protocol::SupervisorHealthStateResponse { rules, ended })
     }
 
     async fn set_health_state(
@@ -883,11 +925,11 @@ impl BrokerSupervisorOps for FakeBroker {
         req: &SupervisorSetHealthStateRequest,
     ) -> Result<weft_broker_client::WriteOutcome<SupervisorSetHealthStateResponse>> {
         let mut inner = self.inner.lock();
-        inner.calls.push(BrokerCall::SetHealthState { project_id: req.project_id, protocols: req.protocols.clone() });
+        inner.calls.push(BrokerCall::SetHealthState { project_id: req.project_id, rules: req.rules.clone() });
         if !inner.owns(req.project_id) {
             return Ok(weft_broker_client::WriteOutcome::Displaced);
         }
-        inner.health_state.insert(req.project_id, req.protocols.clone());
+        inner.health_state.insert(req.project_id, req.rules.clone());
         Ok(weft_broker_client::WriteOutcome::Applied(SupervisorSetHealthStateResponse {}))
     }
 
@@ -1188,6 +1230,7 @@ impl BrokerSupervisorOps for FakeBroker {
         instance: Option<&weft_core::instance::InstanceId>,
         copy_id: &str,
         keep_disks: Vec<String>,
+        health_rules: Option<Vec<weft_core::infra::health::HealthRule>>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetProvisioningResponse>> {
         let mut inner = self.inner.lock();
@@ -1222,6 +1265,7 @@ impl BrokerSupervisorOps for FakeBroker {
                 keep_disks,
                 units,
                 instance: instance.cloned(),
+                health_rules,
             },
         );
         Ok(weft_broker_client::WriteOutcome::Applied(
@@ -1240,6 +1284,7 @@ impl BrokerSupervisorOps for FakeBroker {
         applied_spec_hash: &str,
         addresses: weft_broker_client::protocol::AppliedEndpoints,
         keep_disks: Vec<String>,
+        health_rules: Option<Vec<weft_core::infra::health::HealthRule>>,
         notes: Vec<String>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetAppliedResponse>> {
@@ -1280,6 +1325,7 @@ impl BrokerSupervisorOps for FakeBroker {
                 keep_disks,
                 units,
                 instance: instance.cloned(),
+                health_rules,
             },
         );
         Ok(weft_broker_client::WriteOutcome::Applied(
@@ -1308,12 +1354,26 @@ impl BrokerSupervisorOps for FakeBroker {
         project_id: uuid::Uuid,
         spec: weft_broker_client::protocol::LifecycleSpec,
     ) -> Result<i64> {
-        let mut inner = self.inner.lock();
-        let id = inner.calls.len() as i64 + 1;
-        inner.calls.push(BrokerCall::EnqueueLifecycle {
-            project_id,
-            spec,
-        });
+        let (id, hang) = {
+            let mut inner = self.inner.lock();
+            let id = inner.calls.len() as i64 + 1;
+            inner.calls.push(BrokerCall::EnqueueLifecycle {
+                project_id,
+                spec,
+            });
+            if !inner.health_commands_run_on {
+                let ending = weft_broker_client::protocol::HealthCommandEnding {
+                    command: id,
+                    outcome: weft_broker_client::protocol::LifecycleOutcome::Succeeded,
+                    message: None,
+                };
+                inner.health_endings.insert(id, ending);
+            }
+            (id, inner.hang_enqueues)
+        };
+        if hang {
+            std::future::pending::<()>().await;
+        }
         Ok(id)
     }
 }

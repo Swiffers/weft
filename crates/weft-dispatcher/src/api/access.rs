@@ -61,7 +61,18 @@ pub(crate) async fn redirect_uri(state: &DispatcherState, spec: &weft_core::Acce
             .map(|d| format!("https://{}", d.name)),
         _ => None,
     };
-    let base = callback_base(&state.public_base_url, state.internet_url.as_deref(), install_domain.as_deref(), spec.callback)
+    // The internet address is asked for only when nothing stable
+    // qualifies: a quick tunnel's is read live, and a provider the stable
+    // base suits never waits on it.
+    let stable = callback_base(&state.public_base_url, None, install_domain.as_deref(), spec.callback).map(str::to_string);
+    let base = match stable {
+        Some(base) => Some(base),
+        None => {
+            let internet = state.internet_url().await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+            callback_base(&state.public_base_url, internet.as_deref(), install_domain.as_deref(), spec.callback).map(str::to_string)
+        }
+    };
+    let base = base
         .ok_or_else(|| {
             let why = match spec.callback {
                 CallbackAddress::Domain => format!(
@@ -392,7 +403,7 @@ pub async fn picker_begin(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The author's door (see `lookup`).
     req.for_instance = None;
-    let base = crate::storage::LinkBase::for_request(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let base = crate::api::request_base(&headers)?;
     let picker_state = weft_access_store::begin_picker(&state.pg_pool, &caller.0 .0, req)
         .await
         .map_err(access_err)?;
@@ -403,10 +414,7 @@ pub async fn picker_begin(
     // at once (the operator's loopback, a tunnel name, an ingress host),
     // and a configured constant is wrong for every caller arriving at
     // one of the others, invisibly until the page will not load.
-    let url = format!(
-        "{}/access/picker/{picker_state}",
-        base.as_str()
-    );
+    let url = format!("{base}/access/picker/{picker_state}");
     Ok(Json(serde_json::json!({ "state": picker_state, "url": url })))
 }
 
@@ -456,7 +464,7 @@ pub async fn picker_page(
     // the fetcher are the same client: the request's own host again.
     let result_url = format!(
         "{}/access/picker/{picker_state}/result",
-        crate::storage::LinkBase::for_request(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?.as_str()
+        crate::api::request_base(&headers)?
     );
     // The page runs NODE-declared script on purpose, un-sandboxed:
     // provider choosers (Google's included) need their own cookies for

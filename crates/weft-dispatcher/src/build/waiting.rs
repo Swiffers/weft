@@ -405,7 +405,12 @@ pub async fn register_version(
         Registrar::Request { hold } => (Some(hold), None),
         Registrar::Loop { version: waiting } => (None, Some(waiting)),
     };
-    let mut registered = registered_in_store(projects, project, tenant, version, settles_by).await;
+    // What its worker left out, from the image's own record: a worker
+    // reused from an earlier build refuses the same runs it did.
+    let mut registered = match super::ledger::left_out(pool, &version.program.worker_image).await {
+        Ok(left_out) => registered_in_store(projects, project, tenant, version, settles_by, left_out).await,
+        Err(e) => Err(e),
+    };
     // Let go only now: a prune deciding about one of these images under
     // its lock sees either this claim or the committed reference
     // (`ledger::begin_reclaim`), never neither.
@@ -451,6 +456,7 @@ async fn registered_in_store(
     tenant: &str,
     version: &super::Version,
     waiting: Option<uuid::Uuid>,
+    left_out: (weft_core::builds::LeftOut, Option<String>),
 ) -> Result<Option<(StoredProjectSummary, BuiltProgram)>> {
     let before = projects
         .running_infra_image_tags(project)
@@ -459,6 +465,12 @@ async fn registered_in_store(
         .unwrap_or_default();
     let mut answer = version.program.clone();
     answer.replaced_infra_images = super::replaced_infra_images(&before, &answer.infra_images);
+    (answer.left_out, answer.worker_log) = (left_out.0.packages, left_out.1);
+    let code = crate::project_store::ProgramCode {
+        implementations: answer.implementations.clone(),
+        left_out: answer.left_out.clone(),
+        worker_log: answer.worker_log.clone(),
+    };
     let infra_images: crate::project_store::InfraImageTags = answer
         .infra_images
         .iter()
@@ -478,9 +490,10 @@ async fn registered_in_store(
             Some(&answer.definition_hash),
             Some(&answer.infra_hash),
             Some(&infra_images),
-            Some(&answer.implementations),
+            Some(&code),
             Some(&version.manifest),
             Some(&settles),
+            Some(&answer.infra_places),
         )
         .await
         .context("register the build")?;

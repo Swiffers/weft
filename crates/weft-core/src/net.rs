@@ -9,9 +9,12 @@
 //! of assembling its own TLS stack.
 //!
 //! INBOUND: [`request_base_url`], the address a request arrived at. One
-//! install answers at several addresses at once, so a link the caller
-//! will fetch is built from that caller's own request rather than from
-//! anything configured.
+//! install answers at several addresses at once, so what has to point
+//! back at the address this caller used is built from its own request:
+//! the address of a chooser page the caller opens, the socket address a
+//! caller's ticket opens, and the host a request through the files door
+//! shows storage, which the link's signature must match. A file link
+//! itself never is: the broker picks its address.
 //!
 //! OUTBOUND HTTP: [`EmptyBody`], for a call that sends nothing.
 

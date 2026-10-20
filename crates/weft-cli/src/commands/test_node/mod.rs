@@ -336,11 +336,12 @@ fn resolve_targets(catalog: &FsCatalog, target: Option<&str>) -> Result<Vec<Targ
             // declare tests (the catalog's own predicate, shared with
             // every other consumer): building a test binary for a
             // test-less package would be wasted compilation.
-            let mut names: Vec<String> = catalog
-                .packages()
-                .filter(|p| catalog.package_declares_tests(p))
-                .map(|p| p.name.clone())
-                .collect();
+            let mut names: Vec<String> = Vec::new();
+            for package in catalog.packages() {
+                if catalog.package_declares_tests(package)? {
+                    names.push(package.name.clone());
+                }
+            }
             names.sort();
             Ok(names
                 .into_iter()
@@ -550,10 +551,10 @@ fn render(ctx: &Ctx, reports: &[TestReport]) -> Result<()> {
                 r.tier.as_str(),
                 r.error.as_deref().unwrap_or("no error message").replace('\n', "\n  ")
             );
-            if !r.execution_ids.is_empty() {
+            if !r.run_ids.is_empty() {
                 println!(
-                    "  live run cost is recorded under execution(s): {}",
-                    r.execution_ids.join(", ")
+                    "  live run cost is recorded under run(s): {}",
+                    r.run_ids.join(", ")
                 );
             }
         }
@@ -975,7 +976,7 @@ fn prepare_ephemeral_key(catalog: &FsCatalog, service: &str) -> Result<PreparedK
             format!("no node in this project declares the '{service}' service recipe")
         })?;
 
-    // The paste surface: a consent service's own_page.paste fields, or
+    // The paste surface: a consent service's ownPage.paste fields, or
     // a static (key-paste) service's own declared fields.
     let (fields, paste_flag) = match spec.paste_variant() {
         Some(variant) => (
@@ -1096,7 +1097,7 @@ async fn run_live_tests(
         );
     }
 
-    // Each run is its own call with its own execution identity, so runs
+    // Each run is its own call with its own run identity, so runs
     // interleave freely; the index restores declaration order in the
     // report. A run that itself breaks (not a failing test) surfaces
     // after the in-flight batch settles.
@@ -1293,7 +1294,7 @@ async fn ensure_test_image(
             &tag,
             &artifact.build_context.join("Dockerfile"),
             &artifact.build_context,
-            // SYNC: weft.dev/project <-> crates/weft-cli/src/commands/executions.rs (dangling_prune)
+            // SYNC: weft.dev/project <-> crates/weft-cli/src/commands/runs.rs (dangling_prune)
             &[
                 format!("weft.dev/project={}", project.id()),
                 format!("weft.dev/node-test-package={package}"),

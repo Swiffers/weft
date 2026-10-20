@@ -1,5 +1,5 @@
 //! SlackAwaitAction: the approval pattern. Post a message with
-//! buttons, park the execution, resume when someone clicks, say which
+//! buttons, park the run, resume when someone clicks, say which
 //! button and who.
 //!
 //! Flow:
@@ -11,7 +11,7 @@
 //!      interaction payload, which is where the `interactions` topic's
 //!      `callbackId` field reads it back out.
 //!   3. `await_signal` on the connection's `interactions` topic,
-//!      predicated on that exact id: the execution parks (the worker
+//!      predicated on that exact id: the run parks (the worker
 //!      is released) until the click arrives through the service's
 //!      interactivity delivery (webhook or the app's Socket Mode).
 //!   4. On resume, replace the original message through `chat.update`
@@ -25,7 +25,7 @@ use serde_json::json;
 
 use weft::access::client::required_str;
 use weft::signal::{Predicate, ProviderEvents};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::api;
 
@@ -50,7 +50,7 @@ impl Node for SlackAwaitActionNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let channel: String = ctx.inputs.get("channel")?;
         let text: String = ctx.inputs.get("text")?;
@@ -215,7 +215,7 @@ impl Node for SlackAwaitActionNode {
 }
 
 /// A button list the program wrote wrong: an input error, which
-/// `error` never catches (the fix is editing the program).
+/// `_error` never catches (the fix is editing the program).
 fn bad_buttons(what: &str) -> weft::WeftError {
     weft::WeftError::Input(what.to_string())
 }

@@ -45,17 +45,17 @@ pub struct PrepareRequest {
     /// task's node; a fire never echoes it (the dispatcher reads the
     /// row by token).
     pub node_id: String,
-    /// True iff this signal is a mid-execution resume (HumanQuery
+    /// True iff this signal is a mid-run resume (HumanQuery
     /// awaiting form submission, etc) rather than an entry trigger.
     /// The listener uses this to decide which `ProcessTarget`
     /// discriminant to return at fire time. Without it, dual-use
     /// kinds like Form can't tell resume from entry.
     #[serde(default)]
     pub is_resume: bool,
-    /// Execution of the suspended execution to resume, present iff
+    /// Run of the suspended run to resume, present iff
     /// `is_resume`. Echoed back into `ProcessTarget::Resume`.
     #[serde(default)]
-    pub execution_id: Option<crate::ExecutionId>,
+    pub run_id: Option<crate::RunId>,
     /// Where the registration's kind_state starts from (see
     /// [`PrepareSource`]).
     pub source: PrepareSource,
@@ -211,6 +211,43 @@ pub struct LiveRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveResponse {
     pub live: crate::live::LiveFeed,
+    /// For a run's wait: the last answer it saw from outside (a poll of a
+    /// job's status), for a reader that parses it (`GetNodeState`'s
+    /// `live`). `None` before the first one, and for a kind with no answer
+    /// to keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<LastAnswer>,
+}
+
+/// What a run's wait keeps of the last answer it saw from outside: the
+/// answer as it came, unparsed, or only its size when it is past what a
+/// wait keeps, so a reader is told it is missing rather than handed part
+/// of it or nothing. A program reads it through `crate::program::NodeState`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LastAnswer {
+    Kept(String),
+    /// Its size in bytes.
+    TooLarge(u64),
+}
+
+/// Body for `POST /cancel_call` on the listener: send the last call of a
+/// wait whose run was cancelled (`crate::signal::cancel_call`). The wait's
+/// row is gone by now (the cancel took it down), so everything the call
+/// needs rides here: the spec carries the call and the connection it is
+/// sent as.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelCallRequest {
+    /// The token the wait was registered under. The broker answers where
+    /// an infra address in the call is reached for it while the call is
+    /// queued.
+    pub token: String,
+    pub tenant_id: String,
+    /// Whose run waited, when it was an instance's: its connection is
+    /// read through that instance's alone, as the wait's polls were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_instance: Option<crate::instance::InstanceScope>,
+    pub spec: SignalSpec,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,8 +373,8 @@ pub enum ProcessTarget {
     /// Answer the wait of a run: the install hands the value to its run
     /// (`weft_dispatcher::api::signal::answer_run`). The wait is found by
     /// its token; only the run is echoed here.
-    Resume { execution_id: crate::ExecutionId },
-    /// Start a fresh execution as an entry trigger: the event goes to
+    Resume { run_id: crate::RunId },
+    /// Start a fresh run as an entry trigger: the event goes to
     /// the worker's door of the trigger's program (`weft_core::door_fire`),
     /// which reads the trigger by token.
     Entry,
@@ -369,7 +406,7 @@ mod tests {
             spec: spec(),
             node_id: "node-1".into(),
             is_resume: false,
-            execution_id: Some(uuid::Uuid::nil()),
+            run_id: Some(uuid::Uuid::nil()),
             source: PrepareSource {
                 prior_kind_state: Some(serde_json::json!({"cursor": 42})),
                 asked_at_unix_ms: 1_700_000_000_123,
@@ -414,13 +451,28 @@ mod tests {
         assert_eq!(back.mode, StartMode::Restore);
     }
 
+    /// A cancel call carries the wait's whole spec across: the call
+    /// itself and the connection it is sent as, since the row is gone.
+    #[test]
+    fn a_cancel_call_request_carries_the_call_and_its_connection() {
+        let mut spec = SignalSpec::of_kind("poll_endpoint", serde_json::json!({ "url": "https://x/status" }));
+        spec.access = Some(crate::primitive::AccessRef { id: "a1".into(), service: "fal".into(), required_values: Vec::new() });
+        spec.on_cancel = Some(crate::signal::CancelCall::put("https://x/cancel"));
+        let req = CancelCallRequest { token: "t".into(), tenant_id: "acme".into(), for_instance: None, spec };
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(wire["spec"]["onCancel"], serde_json::json!({ "url": "https://x/cancel", "method": "put" }));
+        let back: CancelCallRequest = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.spec.on_cancel, Some(crate::signal::CancelCall::put("https://x/cancel")));
+        assert_eq!(back.spec.access.map(|a| a.id), Some("a1".to_string()));
+    }
+
     /// `ProcessTarget` is serialized over the fire path; every variant
     /// must keep its tag spelling (the dispatcher matches on them).
     #[test]
     fn process_target_round_trips() {
         for target in [
             ProcessTarget::Entry,
-            ProcessTarget::Resume { execution_id: uuid::Uuid::nil() },
+            ProcessTarget::Resume { run_id: uuid::Uuid::nil() },
             ProcessTarget::Drop { reason: Some("dup".into()) },
         ] {
             let json = serde_json::to_string(&target).unwrap();

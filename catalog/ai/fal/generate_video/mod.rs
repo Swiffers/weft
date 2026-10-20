@@ -8,7 +8,7 @@ use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::fal::{merge_params, run_queued, video_url};
 
@@ -25,7 +25,7 @@ impl Node for FalGenerateVideoNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let model: String = ctx.inputs.get("model")?;
         let prompt: String = ctx.inputs.get("prompt")?;
@@ -42,7 +42,7 @@ impl Node for FalGenerateVideoNode {
         let url = video_url(&answer).node_err("fal answered no video for this generation")?;
         let ty = ctx.output_type("video")?;
         let stored = ctx
-            .storage(StorageScope::Execution)
+            .storage(StorageScope::Run)
             // The generated video is the run's product: keep it past the
             // run (default 30-day access-bumped TTL).
             .internalize(&Value::String(url.to_string()), &ty, Some(KeepTtl::Default))

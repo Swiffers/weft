@@ -15,7 +15,7 @@
       "type": "String"
     }
   ],
-  "requires_infra": true,
+  "requiresInfra": true,
   "images": [
     "images/job_service"
   ],

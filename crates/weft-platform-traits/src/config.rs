@@ -112,6 +112,69 @@ pub struct LocalPlatform {
     /// reaches it at `container_internal_url`.
     #[serde(rename = "internalUrl")]
     pub internal_url: String,
+    /// Where devices on this machine's network reach the outside doors
+    /// (`http://192.168.1.20:<outside port>`), when the person set a
+    /// network address (`WEFT_NETWORK_ADDRESS`): the outside doors then
+    /// listen a second time, on that address alone (`Listen::network`),
+    /// and a link to a stored file for a project with no visitor address
+    /// and no tunnel is built on it, so a phone on the same network
+    /// opens it.
+    #[serde(default, rename = "networkUrl", skip_serializing_if = "Option::is_none")]
+    pub network_url: Option<String>,
+    /// Where the install's quick tunnel says its address, when its tunnel
+    /// is a quick one (`http://127.0.0.1:<port>`, cloudflared's metrics
+    /// server). A quick tunnel's address changes whenever it reconnects,
+    /// so the address is asked here each time a link is built on it,
+    /// never kept from the start.
+    #[serde(default, rename = "quickTunnelMetrics", skip_serializing_if = "Option::is_none")]
+    pub quick_tunnel_metrics: Option<String>,
+}
+
+/// The address the open internet reaches an install at, as it is right
+/// now ([`InstallConfig::internet_address`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InternetAddress {
+    /// The open internet does not reach the install.
+    None,
+    /// A stable address: a named tunnel's, a domain's.
+    Fixed(String),
+    /// A quick tunnel, whose address is asked of cloudflared's metrics
+    /// server at `metrics` each time.
+    QuickTunnel { metrics: String },
+}
+
+impl InternetAddress {
+    /// The address, as it is now. A quick tunnel that does not answer is
+    /// an error naming it: a link through a tunnel that is down would
+    /// work for nobody.
+    pub async fn current(&self, http: &reqwest::Client) -> anyhow::Result<Option<String>> {
+        match self {
+            Self::None => Ok(None),
+            Self::Fixed(url) => Ok(Some(url.trim_end_matches('/').to_string())),
+            Self::QuickTunnel { metrics } => {
+                #[derive(Deserialize)]
+                struct Said {
+                    hostname: String,
+                }
+                let asked = format!("{}/quicktunnel", metrics.trim_end_matches('/'));
+                let said: Said = async {
+                    let resp = http.get(&asked).timeout(std::time::Duration::from_secs(5)).send().await?;
+                    resp.error_for_status()?.json().await
+                }
+                .await
+                .map_err(|e: reqwest::Error| {
+                    anyhow::anyhow!(
+                        "weft's quick tunnel does not say its address at {asked} ({e}); `weft daemon start` opens it again"
+                    )
+                })?;
+                anyhow::ensure!(
+                    !said.hostname.trim().is_empty(),
+                    "weft's quick tunnel has no address yet ({asked}); it is still connecting"
+                );
+                Ok(Some(format!("https://{}", said.hostname.trim())))
+            }
+        }
+    }
 }
 
 /// How long a local worker with nothing to do stays up, unless the install
@@ -250,6 +313,12 @@ pub struct Listen {
     /// public port).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outside: Option<SocketAddr>,
+    /// The outside doors again, on the address devices on this machine's
+    /// network reach it at, when a network address is set
+    /// (`LocalPlatform::network_url`). Its callers connect straight to it,
+    /// so it trusts no forwarded address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<SocketAddr>,
 }
 
 /// A block of ports, both ends included.
@@ -571,11 +640,30 @@ impl InstallConfig {
         audiences
     }
 
-    /// The base for URLs handed to OUTSIDE callers (webhook targets, the
-    /// address a provider posts to): the internet address when there is
-    /// one, the public one otherwise.
-    pub fn external_base_url(&self) -> &str {
-        self.internet_url.as_deref().unwrap_or(&self.public_url)
+    /// The address the open internet reaches the install at: a quick
+    /// tunnel's (asked each time), else the stable internet address, else
+    /// the public address when it is not a loopback one.
+    pub fn internet_address(&self) -> InternetAddress {
+        let quick = match &self.platform {
+            PlatformConfig::Local(local) => local.quick_tunnel_metrics.clone(),
+            PlatformConfig::Gcp(_) => None,
+        };
+        match (quick, &self.internet_url) {
+            (Some(metrics), _) => InternetAddress::QuickTunnel { metrics },
+            (None, Some(url)) => InternetAddress::Fixed(url.clone()),
+            (None, None) if !weft_core::net::is_loopback_url(&self.public_url) => InternetAddress::Fixed(self.public_url.clone()),
+            (None, None) => InternetAddress::None,
+        }
+    }
+
+    /// The install's own address for a link outside callers open when
+    /// neither a site nor the internet carries it: the network address
+    /// when one is set, else the public one.
+    pub fn own_base_url(&self) -> &str {
+        match &self.platform {
+            PlatformConfig::Local(local) => local.network_url.as_deref().unwrap_or(&self.public_url),
+            PlatformConfig::Gcp(_) => &self.public_url,
+        }
     }
 }
 
@@ -591,9 +679,11 @@ pub(crate) mod tests {
                 container_internal_url: "http://host.docker.internal:14113".into(),
                 runtime_image: "weft-runtime:dev".into(),
                 worker_idle_stop_seconds: None,
-                listen: Listen { public: "127.0.0.1:14111".parse().unwrap(), internal: "127.0.0.1:14113".parse().unwrap(), outside: None },
+                listen: Listen { public: "127.0.0.1:14111".parse().unwrap(), internal: "127.0.0.1:14113".parse().unwrap(), outside: None, network: None },
                 project_ports: Some(PortRange { first: 14200, last: 14999 }),
                 internal_url: "http://127.0.0.1:14113".into(),
+                network_url: None,
+                quick_tunnel_metrics: None,
             })),
             auth: AuthMode::Local,
             public_url: "http://127.0.0.1:14111".into(),
@@ -672,6 +762,26 @@ pub(crate) mod tests {
         let mut unset = serde_json::to_value(local()).unwrap();
         unset.as_object_mut().unwrap().remove("alertAfterMinutes");
         assert_eq!(serde_json::from_value::<InstallConfig>(unset).unwrap().alert_after_minutes, DEFAULT_ALERT_AFTER_MINUTES);
+    }
+
+    /// What reaches an install from the internet, and its own address for
+    /// everything else: a quick tunnel is asked, a stable address is kept,
+    /// a loopback public address reaches nobody outside, and a network
+    /// address stands for the machine.
+    #[test]
+    fn the_internet_reaches_the_tunnel_and_the_network_reaches_its_address() {
+        let mut c = local();
+        assert_eq!(c.internet_address(), InternetAddress::None);
+        assert_eq!(c.own_base_url(), "http://127.0.0.1:14111");
+        c.internet_url = Some("https://weft.example".into());
+        assert_eq!(c.internet_address(), InternetAddress::Fixed("https://weft.example".into()));
+        if let PlatformConfig::Local(local) = &mut c.platform {
+            local.quick_tunnel_metrics = Some("http://127.0.0.1:14120".into());
+            local.network_url = Some("http://192.168.1.20:14112".into());
+        }
+        assert_eq!(c.internet_address(), InternetAddress::QuickTunnel { metrics: "http://127.0.0.1:14120".into() });
+        assert_eq!(c.own_base_url(), "http://192.168.1.20:14112");
+        assert_eq!(gcp().internet_address(), InternetAddress::Fixed(gcp().public_url));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 	import { untrack } from "svelte";
 	import { Handle, Position, useEdges, useNodes, NodeResizer, type ResizeParams } from "@xyflow/svelte";
 	import { NODE_TYPE_CONFIG, specForService, type NodeType } from "../../nodes";
-	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeExecution, LiveDataItem, NodeExecutionStatus } from "../../types";
+	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeFiring, LiveDataItem, NodeFiringStatus } from "../../types";
 	import { declaredHomeValue, acceptsWire, ownValue, storedValueOf, portValueFirstForm, isIncludeNodeType } from "../../types";
 	import { getPortTypeColor } from "../../constants/colors";
 	import type { Edge } from "@xyflow/svelte";
@@ -11,30 +11,32 @@
 	import CopyButton from "../ui/CopyButton.svelte";
 	import { buildSpecMap, deriveInputsFromEntries, deriveOutputsFromEntries, entryForSource, entryPortCollisions, entryPortName, hasValue, isEmptyChoiceSet, isFilledIn, isValidFieldKey, type PortEntryDef, type PortSpec } from '../../utils/port-specs';
 	import { getStatusBadgeColor, getStatusIcon } from "../../utils/status";
-	import { describeProgress } from "../../../../status";
-	import type { ChangeProgress, ConfigFieldSpan, FileContent, BusInspectorEvent, BusMeta, CorruptionSite, NodeFeedState } from "../../../../protocol";
+	import type { ConfigFieldSpan, FileContent, BusInspectorEvent, BusMeta, CorruptionSite, NodeFeedState } from "../../../../protocol";
 	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2, FileSymlink, Pencil } from '@lucide/svelte';
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
 	import { emptyToUnset, isFileRefValue, type WeftFileRefValue } from '../../value-format';
 	import { openPortMenu, buildPortMenuItems, instanceFilledMenuItem, type InstanceFilledToggle } from "../../utils/port-context-menu";
-	import { portMarkerStyle } from "../../utils/port-marker";
+	import { portMarkerStyle, requirednessNote } from "../../utils/port-marker";
+	import { isScopeKey } from "../../utils/storage-key";
 	import { nodeIsTrigger } from "../../utils/node-roles";
-	import { portDeleteAction } from "../../projection/header-ports";
-	import { fieldForInput, fieldForSpecField, gateField, inputRendersField, inputsOf, nextPortLiterals, outputsOf } from "../../utils/input-field";
-	import ExecutionInspector from './ExecutionInspector.svelte';
+	import { declarationRule, nodeInputRequiredness, portDeleteAction } from "../../projection/header-ports";
+	import { errorMarker, fieldForInput, fieldForSpecField, gateField, inputRendersField, inputsOf, nextPortLiterals, outputRows, outputsOf } from "../../utils/input-field";
+	import FiringInspector from './FiringInspector.svelte';
 	import PayloadCards from './PayloadCards.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, SIMPLIFIED_CARD_MAX_W_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import FieldStrip from './FieldStrip.svelte';
 	import FileDropField from './FileDropField.svelte';
 	import AccessField from './AccessField.svelte';
 	import { changeInstallPick, effectiveAccessValue } from './install-picks.svelte';
+	import { accessFeedingEdge } from '../../utils/access-trace';
 	import RemoteSelectField from './RemoteSelectField.svelte';
 	import { grantsForService, grantsGeneration } from './grants-cache.svelte';
 	import FilePreview from './FilePreview.svelte';
 	import FlowDock from './FlowDock.svelte';
+	import ErrorDock from './ErrorDock.svelte';
 	import type { FileValueWire } from "../../../../protocol";
-	import { parseFileValue, typeReferencesFile, isGatePort, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, instanceFilled, instanceFilledValue, installPicked } from "../../../../protocol";
+	import { parseFileValue, typeReferencesFile, isGatePort, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT, instanceFilled, instanceFilledValue, installPicked, portVar } from "../../../../protocol";
 
 	const edgesState = useEdges();
 	const nodesState = useNodes();
@@ -44,13 +46,9 @@
 			label: string | null;
 			nodeType: NodeType;
 			/// Simplified view: render as a fixed square (icon + type label,
-			/// one in/out dot), no ports/config/body. Execution overlays
+			/// one in/out dot), no ports/config/body. Run overlays
 			/// (status glyph, inspector, glow) are kept.
 			simplified?: boolean;
-			/// The user aimed the run at this output node (right-click, "Set as
-			/// target"). Renders as a breathing ring in the node's own colour,
-			/// which is the only place the feature shows on the canvas.
-			runTarget?: boolean;
 			config: Record<string, unknown>;
 			/// Body-set PORT values + their written forms, the two-home
 			/// twin of `config` (see NodeInstance.portLiterals).
@@ -59,6 +57,9 @@
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
 			features?: NodeFeatures;
+			/// The bounds on the node's type variables, each with what it
+			/// resolved to; absent on a node not parsed yet.
+			typeParams?: import('../../../../protocol').TypeParamWire[];
 			/// The unconnected-access pin (view state from buildNodes,
 			/// never a config key): drawn open, collapse disabled.
 			pinnedOpen?: boolean;
@@ -86,45 +87,42 @@
 			onToggleGate?: () => void;
 			onSaveFileRef?: (path: string, content: string) => void;
 			onOpenInclude?: (path: string, alias: string) => void;
-			infraNodeStatus?: string;
-			/// For a `per_instance` place: how many instances have a copy.
-			infraInstanceCopies?: number;
-			infraFailureStage?: string;
-			infraFailureMessage?: string;
-			/// While a start is under way: since when, and what it waits on.
-			infraProgress?: ChangeProgress;
+			/// A trigger's or an infra node's badge (`on`, `behind`,
+			/// `3 of 5 running`...), from the state the dispatcher computed;
+			/// its detail shows on hover.
+			lifecycleBadge?: import('../../lifecycle').LifecycleBadge;
 			debugData?: unknown;
-			executions?: NodeExecution[];
+			firings?: NodeFiring[];
 			/// One IRC-style scrollable log per bus this node took part
 			/// in (live + replay, identical shape). Empty `[]` for
 			/// nodes that never touched a bus. Populated by ProjectEditorInner
-			/// from `executionState.busLogByBus` filtered by participant set.
+			/// from `runState.busLogByBus` filtered by participant set.
 			busLogs?: Array<{
 				busId: string;
 				events: BusInspectorEvent[];
 				meta?: BusMeta;
 			}>;
-			/// Execution-wide journal corruptions. Empty in the normal
+			/// Run-wide journal corruptions. Empty in the normal
 			/// case. The inspector renders a muted collapsed
 			/// disclosure at the bottom when non-empty; not alarming.
 			journalCorruptions?: Array<{
 				site: CorruptionSite;
 				reason: string;
 			}>;
-			/// The run's own tags (`ctx.tag_execution`), the same on
+			/// The run's own tags (`ctx.tag_run`), the same on
 			/// every node; the inspector footer shows them.
-			executionTags?: string[];
+			runTags?: string[];
 			/// How the run ended, the same on every node; the inspector
 			/// footer names a cancel's cause from it, and the cancel card
 			/// falls back to it when the node's own row carries no reason.
-			runTerminal?: import('../../types').ExecutionTerminal;
+			runTerminal?: import('../../types').RunTerminal;
 			/// What this node is showing: its display, set ONLY for the
 			/// two kinds that have one (an infra node whose container
 			/// serves `/live`, and a trigger, whose signal kind serves
 			/// one). Other nodes get undefined and render no body panel
 			/// here. Distinct from `debugData`, which is the value
 			/// preview Debug-style nodes show under the body, drawn as
-			/// the same cards as the execution inspector.
+			/// the same cards as the run inspector.
 			bodyFeed?: NodeFeedState;
 		};
 		id: string;
@@ -171,14 +169,14 @@
 	// catalog entry and no name a person wrote), the type's label otherwise.
 	const typeName = $derived(isInclude ? includeName : typeConfig.label);
 
-	const executions = $derived(data.executions ?? []);
-	const latestExecution = $derived(executions[executions.length - 1]);
-	// `undefined` means idle (no execution yet), NOT a status value.
+	const firings = $derived(data.firings ?? []);
+	const latestFiring = $derived(firings[firings.length - 1]);
+	// `undefined` means idle (no run yet), NOT a status value.
 	// The status helpers are exhaustive over the real statuses only;
 	// the idle case is handled explicitly at each use site (no glyph,
 	// the node's own type color) instead of a `''` sentinel that fell
 	// through every switch and silently returned undefined.
-	const displayedStatus = $derived<NodeExecutionStatus | undefined>(latestExecution?.status);
+	const displayedStatus = $derived<NodeFiringStatus | undefined>(latestFiring?.status);
 	/// The ONE ring this node shows, picked here rather than left to the
 	/// stylesheet. An inherited firing is also a completed (or failed)
 	/// one, so both classes used to land on the node and which ring the
@@ -192,7 +190,7 @@
 				? 'node-waiting-glow'
 				: displayedStatus === 'failed'
 					? 'node-failed-glow'
-					: latestExecution?.inheritedFrom
+					: latestFiring?.inheritedFrom
 						? 'node-inherited-glow'
 						: displayedStatus === 'completed'
 							? 'node-completed-glow'
@@ -202,7 +200,7 @@
 	// that never touched a bus.
 	const busLogs = $derived(data.busLogs ?? []);
 	const journalCorruptions = $derived(data.journalCorruptions ?? []);
-	const executionTags = $derived(data.executionTags ?? []);
+	const runTags = $derived(data.runTags ?? []);
 	const runTerminal = $derived(data.runTerminal);
 
 	const entryKinds: PortSpec[] = $derived(typeConfig.portsFromConfig?.specs ?? []);
@@ -273,7 +271,7 @@
 
 
 	/// Is there a latest value to preview? The preview itself is drawn
-	/// by `PayloadCards`, the same component the execution inspector
+	/// by `PayloadCards`, the same component the run inspector
 	/// uses, so a port reads the same in both places.
 	const hasDebugData = $derived(data.debugData !== undefined && data.debugData !== null);
 
@@ -288,7 +286,7 @@
 		if (!spec) return null;
 		// The declaration names the port WITH its side, so a node with
 		// a same-named input and output stays unambiguous.
-		const side = spec.output !== undefined ? latestExecution?.output : latestExecution?.input;
+		const side = spec.output !== undefined ? latestFiring?.output : latestFiring?.input;
 		const port = spec.output ?? spec.input;
 		if (typeof side !== 'object' || side === null || port === undefined) return null;
 		return parseFileValue(ownValue(side as Record<string, unknown>, port));
@@ -323,6 +321,26 @@
 	const isTriggerNode = $derived(
 		nodeIsTrigger({ nodeType: data.nodeType, features: data.features }),
 	);
+
+	/// A lifecycle badge's colours, per tone.
+	const BADGE_PILL: Record<import('../../lifecycle').BadgeTone, string> = {
+		on: 'bg-green-100 text-green-700',
+		off: 'bg-zinc-100 text-zinc-600',
+		busy: 'bg-sky-100 text-sky-700',
+		behind: 'bg-amber-100 text-amber-800',
+		held: 'bg-violet-100 text-violet-700',
+		failed: 'bg-rose-100 text-rose-700',
+		warn: 'bg-amber-100 text-amber-700',
+	};
+	const BADGE_DOT: Record<import('../../lifecycle').BadgeTone, string> = {
+		on: 'bg-green-500',
+		off: 'bg-zinc-400',
+		busy: 'bg-sky-500 animate-pulse',
+		behind: 'bg-amber-500',
+		held: 'bg-violet-500',
+		failed: 'bg-rose-500',
+		warn: 'bg-amber-500',
+	};
 	const showDebugDisplay = $derived(!!typeConfig.features?.showDebugPreview && hasDebugData);
 	const showFileDisplay = $derived(!!(typeConfig.display && displayedFileValue));
 	// Simplified view: a node with anything to show (its display, a
@@ -391,11 +409,14 @@
 	}
 
 	// Inputs only: requiredness has no runtime meaning on an output, and
-	// the menu offers the row on inputs alone.
+	// the menu offers the row on inputs alone. Either way the port ends up
+	// WRITTEN: `x:` (required) or `x?:` (optional, even when wired).
 	function setInputPortRequired(portName: string, required: boolean) {
-		const newInputs = inputs.map((p: PortDefinition) =>
-			p.name === portName ? { ...p, required } : { ...p }
-		);
+		const newInputs = inputs.map((p: PortDefinition) => {
+			if (p.name !== portName) return { ...p };
+			const { optional: _was, ...rest } = p;
+			return required ? { ...rest, required } : { ...rest, required, optional: true };
+		});
 		data.onUpdate?.({ inputs: newInputs });
 	}
 	
@@ -419,7 +440,11 @@
 			return buildPortMenuItems({
 				port,
 				...(side === 'input'
-					? { side, onSetRequired: (required: boolean) => setInputPortRequired(portName, required) }
+					? {
+						side,
+						requiredness: nodeInputRequiredness(port, typeConfig.defaultInputs.find((d) => d.name === port.name)),
+						onSetRequired: (required: boolean) => setInputPortRequired(portName, required),
+					}
 					: { side }),
 				deleteAction: portDeleteAction(port, provided, canAddPorts),
 				// Derived-ness is per PORT (only the ports the config list
@@ -429,6 +454,7 @@
 				configDerived: derivedNames.some((d) => d.name === port.name)
 					&& port.declaredType === undefined,
 				onSetType: (newType) => setPortType(portName, side, newType),
+				typeRule: declarationRule(side, provided.find((d) => d.name === port.name), data.typeParams ?? typeConfig.typeParams),
 				instanceFilled: side === 'input' ? instanceFilledToggle(portName) ?? undefined : undefined,
 				onRemove: () => { if (side === 'input') removeInputPort(portName); else removeOutputPort(portName); },
 			});
@@ -479,12 +505,17 @@
 		(p: PortDefinition) => acceptsWire(p) && !isGatePort(p.name)
 	));
 	const outputs = $derived(outputsOf(data.outputs));
+	/** Outputs that render a ROW: all but `_error`, which docks on the
+	 *  right edge as a marker (`errorDock`). `outputs` stays the
+	 *  COMPLETE list (edits round-trip the full set). */
+	const rowOutputs = $derived(outputRows(outputs));
+	const errorDockState = $derived(errorMarker(id, outputs, edgesState.current));
 
 	// Dynamic min resize height: header + ports + fixed buffer for at least one config line
 	// Accent bar (2) + header row (32) + content padding (16) + label (24) + ports gap (8) + port rows + buffer (100)
 	const PORT_ROW_HEIGHT = 25;
 	const minResizeHeight = $derived(
-		2 + 32 + 16 + 24 + 8 + Math.max(wireableInputs.length, outputs.length) * PORT_ROW_HEIGHT + 80
+		2 + 32 + 16 + 24 + 8 + Math.max(wireableInputs.length, rowOutputs.length) * PORT_ROW_HEIGHT + 80
 	);
 	
 	// Check if node allows adding ports based on its features
@@ -590,7 +621,7 @@
 	function remoteTextSource(key: string): string | null {
 		const ref = fileRefOf(key);
 		if (!ref || ref.marker !== 'asset') return null;
-		const remote = /^https?:\/\//.test(ref.path) || /^(exec|project|shared|asset)\/[^/]+\/[^/]+$/.test(ref.path);
+		const remote = /^https?:\/\//.test(ref.path) || isScopeKey(ref.path);
 		return remote ? ref.path : null;
 	}
 
@@ -942,9 +973,7 @@
 				handle && typeof handle === 'object' ? (handle as { id?: unknown }).id : undefined;
 			return typeof grantId === 'string' ? { accessId: grantId, service } : null;
 		}
-		const edge = edgesState.current.find(
-			(e: Edge) => e.target === id && e.targetHandle === accessInput,
-		);
+		const edge = accessFeedingEdge(edgesState.current as Edge[], id, accessInput);
 		if (!edge) return null;
 		const src = nodesState.current.find((n) => n.id === edge.source);
 		if (!src) return null;
@@ -1050,11 +1079,11 @@
 					if (grant)
 						next[name] = {
 							scopes: grant.scopes,
-							verified: grant.permissions_verified,
-							valueNames: grant.value_names ?? [],
+							verified: grant.permissionsVerified,
+							valueNames: grant.valueNames ?? [],
 							owner: grant.owner,
 							service: ref.service,
-							hasCredential: grant.has_credential,
+							hasCredential: grant.hasCredential,
 						};
 				} catch (e) {
 					failure = e instanceof Error ? e.message : String(e);
@@ -1107,7 +1136,7 @@
 			if (!grant || grant.owner !== 'platform') continue;
 			const catalogue = specForService(grant.service)?.permissions ?? [];
 			for (const p of catalogue) {
-				if (p.own_only && required.includes(p.id)) {
+				if (p.ownOnly && required.includes(p.id)) {
 					out.push({
 						text: `'${p.label}' only works on your own ${grant.service} account (the shared credential's account would hold the result); connect your own on the access node.`,
 						link: p.guide?.link,
@@ -1358,10 +1387,14 @@
 			toast.error(`"${name}" is already an input of this node`);
 			return;
 		}
+		// No type chosen yet: the header names the port alone (`name?`), and
+		// the port holds its own variable until something is wired to it.
 		const newPort: PortDefinition = {
 			name,
-			portType: 'MustOverride',
+			portType: portVar('input', name),
+			declaredType: '',
 			required: false,
+			optional: true,
 		};
 		const newInputs = [...inputs, newPort];
 		if (data.onUpdate) {
@@ -1380,7 +1413,8 @@
 		}
 		const newPort: PortDefinition = {
 			name,
-			portType: 'MustOverride',
+			portType: portVar('output', name),
+			declaredType: '',
 			required: true,
 		};
 		const newOutputs = [...outputs, newPort];
@@ -1543,7 +1577,7 @@
 {/snippet}
 
 <!-- The Debug-style preview: the node's latest payload, one card per
-     port, drawn by the same component as the execution inspector. The
+     port, drawn by the same component as the run inspector. The
      box scrolls and resizes; the flow classes keep a drag, a pan or a
      wheel inside it from moving the canvas instead. -->
 {#snippet debugDisplay()}
@@ -1566,9 +1600,9 @@
 			     error box (nothing is broken, nothing is running). -->
 			<div class="text-[10px] text-muted-foreground bg-zinc-50 border border-zinc-200 rounded px-2 py-1.5">
 				{#if isTriggerNode}
-					Nothing is listening for this trigger. Activate the project from the action bar.
+					Nothing is listening for this trigger. Select it and turn it on.
 				{:else}
-					Not running. Start it from the action bar.
+					Not running. Select it and start it.
 				{/if}
 			</div>
 		{:else if data.bodyFeed.items.length > 0}
@@ -1658,11 +1692,20 @@
 	/>
 {/snippet}
 
+<!-- Error dock: `_error` carries why this node failed, so it sits apart
+     from the node's own outputs, as a "!" circle on the right edge level
+     with the flow dock. Filled means a wire handles the failure. -->
+{#snippet errorDock()}
+	{#if errorDockState}
+		<ErrorDock top={18} wired={errorDockState.wired} />
+	{/if}
+{/snippet}
+
 {#if data.simplified}
 	<!-- Simplified view. A bare node is a square: icon, type, editable label, one
 	     in/out dot. A node with LIVE DISPLAY content (infra feed, debug preview,
 	     image) grows into a card that shows that display under the header instead
-	     of staying square. Execution overlays (status glyph, inspector, glow) are
+	     of staying square. Run overlays (status glyph, inspector, glow) are
 	     kept; ports/config are not shown; structure is not editable, but the
 	     LABEL can still be renamed by double-click. -->
 	{@const Icon = typeConfig.icon}
@@ -1682,7 +1725,7 @@
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div
 		bind:this={nodeElement}
-		class="project-node simplified-node rounded-lg select-none transition-all duration-200 {glowClass} {selected ? 'node-selected' : ''} {data.runTarget ? 'node-run-target' : ''}"
+		class="project-node simplified-node rounded-lg select-none transition-all duration-200 {glowClass} {selected ? 'node-selected' : ''}"
 		style="
 			width: 100%;
 			height: 100%;
@@ -1697,7 +1740,6 @@
 			border: 1px solid {selected ? typeConfig.color : 'rgba(0, 0, 0, 0.08)'};
 			box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05){selected ? `, 0 0 0 1px ${typeConfig.color}20` : ''};
 			backdrop-filter: blur(8px);
-			--run-target-color: {typeConfig.color};
 		"
 	>
 		<!-- Status glyph (top-right) + inspector (magnifier), same as full view -->
@@ -1705,7 +1747,7 @@
 			{#if displayedStatus}
 				<span class="text-xs leading-none {displayedStatus === 'running' ? 'animate-pulse' : ''}" style="color: {getStatusBadgeColor(displayedStatus) ?? typeConfig.color};">{getStatusIcon(displayedStatus)}</span>
 			{/if}
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} label={data.label || typeName} />
+			<FiringInspector {firings} {busLogs} {journalCorruptions} {runTags} {runTerminal} label={data.label || typeName} />
 		</div>
 		<!-- Bare node: the content column is fixed to the square's inner width (the
 		     square side minus the 8px padding each side) so the node measures as a
@@ -1772,9 +1814,8 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
 	bind:this={nodeElement}
-	class="project-node rounded min-w-[200px] select-none transition-all duration-200 {glowClass} {selected ? 'node-selected' : ''} {data.runTarget ? 'node-run-target' : ''}"
+	class="project-node rounded min-w-[200px] select-none transition-all duration-200 {glowClass} {selected ? 'node-selected' : ''}"
 	style="
-		--run-target-color: {typeConfig.color};
 		width: 100%;
 		height: 100%;
 		display: flex;
@@ -1806,39 +1847,19 @@
 			{:else}
 				<span class="text-[11px] font-semibold tracking-wide uppercase" style="color: {typeConfig.color};">{typeConfig.label}</span>
 			{/if}
-			{#if data.infraNodeStatus}
+			{#if data.lifecycleBadge}
+				{@const badge = data.lifecycleBadge}
 				<span
-					class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-medium leading-none
-					{data.infraNodeStatus === 'running' ? 'bg-green-100 text-green-700' : ''}
-					{data.infraNodeStatus === 'flaky' ? 'bg-amber-100 text-amber-700' : ''}
-					{data.infraNodeStatus === 'failed' ? 'bg-rose-100 text-rose-700' : ''}
-					{data.infraNodeStatus === 'stopped' || data.infraNodeStatus === 'not_started' || data.infraNodeStatus === 'per_instance' ? 'bg-zinc-100 text-zinc-600' : ''}
-					{data.infraNodeStatus === 'provisioning' || data.infraNodeStatus === 'stopping' || data.infraNodeStatus === 'terminating' ? 'bg-sky-100 text-sky-700' : ''}
-					"
-					title={data.infraFailureMessage
-						? `${data.infraFailureStage ? data.infraFailureStage + ': ' : ''}${data.infraFailureMessage}`
-						: data.infraProgress
-							? `${data.infraNodeStatus} ${describeProgress(data.infraProgress, Date.now() / 1000)}`
-							: undefined}
+					class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-medium leading-none whitespace-nowrap {BADGE_PILL[badge.tone]}"
+					title={badge.detail}
 				>
-					<span class="w-1.5 h-1.5 rounded-full
-						{data.infraNodeStatus === 'running' ? 'bg-green-500' : ''}
-						{data.infraNodeStatus === 'flaky' ? 'bg-amber-500' : ''}
-						{data.infraNodeStatus === 'failed' ? 'bg-rose-500' : ''}
-						{data.infraNodeStatus === 'stopped' || data.infraNodeStatus === 'not_started' || data.infraNodeStatus === 'per_instance' ? 'bg-zinc-400' : ''}
-						{data.infraNodeStatus === 'provisioning' || data.infraNodeStatus === 'stopping' || data.infraNodeStatus === 'terminating' ? 'bg-sky-500 animate-pulse' : ''}
-					"></span>
-					<!-- A per-instance place has no copy of its own: the node's
-					     "per instance" badge already says so, so this says how
-					     many instances have one. -->
-					{data.infraNodeStatus === 'per_instance'
-						? `${data.infraInstanceCopies ?? 0} ${data.infraInstanceCopies === 1 ? 'copy' : 'copies'}`
-						: data.infraNodeStatus.replace('_', ' ')}
+					<span class="w-1.5 h-1.5 rounded-full {BADGE_DOT[badge.tone]}"></span>
+					{badge.label}
 				</span>
 			{/if}
 		</div>
 		<div class="flex items-center gap-0.5">
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} label={data.label || typeName} />
+			<FiringInspector {firings} {busLogs} {journalCorruptions} {runTags} {runTerminal} label={data.label || typeName} />
 		{#if isInclude}
 			<button
 				class="px-1.5 h-5 flex items-center gap-1 rounded hover:bg-violet-100 cursor-pointer transition-colors text-violet-600 text-[10px] font-medium nodrag nopan"
@@ -1923,9 +1944,9 @@
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
 						class="relative flex items-center gap-1 group pl-3"
-						title={input.requiredWhenWired
-							? `${input.name}: required when wired (if its wire delivers nothing, this node skips); optional while unwired`
-							: !input.required && oneOfRequiredPorts.has(input.name) ? `At least one required: ${oneOfRequiredGroups.filter(g => g.includes(input.name)).map(g => g.join(' or ')).join('; ')}` : input.name}
+						title={!input.required && oneOfRequiredPorts.has(input.name)
+							? `At least one required: ${oneOfRequiredGroups.filter(g => g.includes(input.name)).map(g => g.join(' or ')).join('; ')}`
+							: requirednessNote(input, wiredInputPorts.has(input.name)) ?? input.name}
 						oncontextmenu={(e) => {
 							e.preventDefault();
 							e.stopPropagation();
@@ -1977,7 +1998,7 @@
 			
 			<!-- Output Ports -->
 			<div class="space-y-1 text-right flex flex-col items-end min-w-0 flex-1">
-				{#each outputs as output}
+				{#each rowOutputs as output}
 				{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, literalFilledPorts, getPortColor(output.portType), 'output')}
 				{@const outputDeleteAction = portDeleteAction(output, providedOutputs, canAddOutputPorts)}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -2374,18 +2395,18 @@
 				{:else if displayedStatus === 'completed'}
 					<div class="debug-placeholder completed">
 						<span>✓</span>
-						<span>Execution complete</span>
+						<span>Run complete</span>
 					</div>
 				{:else if displayedStatus === 'failed'}
 					<div class="debug-placeholder completed" style="color: var(--color-red-500);">
 						<span>✗</span>
-						<span>Execution failed{latestExecution?.error ? `: ${latestExecution.error}` : ''}</span>
+						<span>Run failed{latestFiring?.error ? `: ${latestFiring.error}` : ''}</span>
 					</div>
 				{:else if displayedStatus === 'cancelled'}
 					<div class="debug-placeholder completed" style="color: #71717a;">
 						<span>■</span>
 						<span>
-							{latestExecution?.error
+							{latestFiring?.error
 								|| (runTerminal?.state === 'cancelled' ? runTerminal.reason : undefined)
 								|| 'Cancelled'}
 						</span>
@@ -2406,8 +2427,8 @@
 			<!-- The declared file display (`features.display`): inline
 			     media (MediaDisplay, the generators) or a download-link
 			     card (DownloadLink), showing the declared port of the
-			     latest firing. Key-backed files fetch through the
-			     authenticated download handshake; url-backed ones
+			     latest firing. Key-backed files load from the presigned
+			     store link the dispatcher answers; url-backed ones
 			     render/link their URL directly. -->
 			{#if typeConfig.display}
 				{#if displayedFileValue}
@@ -2438,6 +2459,7 @@
 </div>
 
 {@render flowDock()}
+{@render errorDock()}
 
 {/if}
 
@@ -2497,42 +2519,6 @@
 		border-top-color: #f59e0b;
 		border-radius: 50%;
 		animation: debug-spin 0.8s linear infinite;
-	}
-
-	/* An output node the user aimed the run at. A ring in the node's own
-	   colour that breathes, so a targeted node is obvious on a busy canvas
-	   without adding anything permanent to every output node. `!important`
-	   because the inline box-shadow on the card would otherwise win. */
-	:global(.node-run-target) {
-		box-shadow:
-			0 1px 3px rgba(0, 0, 0, 0.08),
-			0 4px 12px rgba(0, 0, 0, 0.05),
-			0 0 0 3px var(--run-target-color) !important;
-		animation: run-target-breathe 2.4s ease-in-out infinite;
-	}
-
-	@keyframes run-target-breathe {
-		0%, 100% {
-			box-shadow:
-				0 1px 3px rgba(0, 0, 0, 0.08),
-				0 4px 12px rgba(0, 0, 0, 0.05),
-				0 0 0 3px var(--run-target-color),
-				0 0 6px 1px var(--run-target-color);
-		}
-		50% {
-			box-shadow:
-				0 1px 3px rgba(0, 0, 0, 0.08),
-				0 4px 12px rgba(0, 0, 0, 0.05),
-				0 0 0 3px var(--run-target-color),
-				0 0 18px 5px var(--run-target-color);
-		}
-	}
-
-	/* Somebody who set reduce-motion still gets the ring, without the pulse. */
-	@media (prefers-reduced-motion: reduce) {
-		:global(.node-run-target) {
-			animation: none;
-		}
 	}
 
 	@keyframes debug-spin {

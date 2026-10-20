@@ -36,7 +36,7 @@
       "description": "eleven_v4 is ElevenLabs's most expressive model. If you prefer how a voice sounded on eleven_v3, the model before it, pick that; both cost the same per character.",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "eleven_v4",
           "eleven_v3"
@@ -183,7 +183,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -215,7 +215,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -248,7 +248,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -412,9 +412,6 @@
       }
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "display": {
     "kind": "media",
     "output": "file"

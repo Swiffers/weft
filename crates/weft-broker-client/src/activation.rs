@@ -8,38 +8,35 @@
 use crate::protocol::ProjectStatus;
 
 /// One activation's lifecycle: status plus the three axes the fire gate,
-/// the consumer enumeration and the reaper read.
+/// the consumer enumeration and the door's window read.
 ///
-///   accepting_fires:            the gate passes or parks a fire when
-///                               true, refuses it when false.
+///   accepting_fires:            the gate holds a fire while the trigger
+///                               is down when true, refuses it when false.
 ///   fires_visible_to_consumers: a token's enumeration shows the
 ///                               signals when true, hides them when false.
 ///   fires_deadline_unix:        accepting only until then.
 ///
-/// The user-facing modes map onto them: wipe = refusing and hidden (the
-/// signals are gone too), hibernate = parking until a deadline and hidden,
-/// park = parking and visible, active = live and visible.
+/// A trigger taken down sets them from its door
+/// (`weft_core::take_down::Door`, [`Self::down`]): take = accepting and
+/// visible, hide = accepting and hidden, refuse = neither; a door's
+/// minutes are the deadline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationLifecycle {
     pub status: ProjectStatus,
     pub accepting_fires: bool,
     pub fires_visible_to_consumers: bool,
     pub fires_deadline_unix: Option<i64>,
-    /// While `status = Deactivating` with `runningPolicy = wait`: the unix
-    /// second past which the drain gives up, cancels what is still running,
-    /// and lands Inactive (enforced by the stuck-transition reaper).
-    pub drain_deadline_unix: Option<i64>,
-    /// Why the CURRENT deactivation happened, when it was the infra the
-    /// trigger reads going down rather than a person: the health loop
-    /// parking it because a copy broke, or an infra verb (stop, terminate,
-    /// upgrade) taking it down with its copies. The copy coming back
-    /// brings it back (the health loop's auto-recover, an infra start);
-    /// one a person took down stays down until they switch it on.
+    /// Why the CURRENT take-down happened, when it was the infra in the
+    /// trigger's cut going down rather than a person: the health loop
+    /// taking it down because a copy broke, or an infra verb (stop,
+    /// terminate, upgrade) taking it down with its copies. The copy coming
+    /// back brings it back (the health loop's auto-recover, an infra
+    /// start); one a person took down stays down until they switch it on.
     pub went_down: Option<WentDown>,
     /// The trigger-setup run of the activation in flight, reserved before
     /// setup is queued; every write the activation makes is guarded by it.
     /// `None` outside Activating.
-    pub activating_execution_id: Option<uuid::Uuid>,
+    pub activating_run_id: Option<uuid::Uuid>,
 }
 
 impl ActivationLifecycle {
@@ -64,122 +61,96 @@ impl ActivationLifecycle {
             accepting_fires: true,
             fires_visible_to_consumers: true,
             fires_deadline_unix: None,
-            drain_deadline_unix: None,
             went_down: None,
-            activating_execution_id: None,
+            activating_run_id: None,
         }
     }
 
-    /// While setup runs: fires park (the listener may not have every
-    /// signal yet) and consumers see nothing; the drain at the end of the
-    /// activation replays what parked.
-    pub fn activating(execution_id: uuid::Uuid) -> Self {
+    /// While setup runs: fires are held (the listener may not have every
+    /// signal yet) and consumers see nothing; the activation's end hands
+    /// over what was held.
+    pub fn activating(run_id: uuid::Uuid) -> Self {
         Self {
             status: ProjectStatus::Activating,
             fires_visible_to_consumers: false,
-            activating_execution_id: Some(execution_id),
+            activating_run_id: Some(run_id),
             ..Self::active()
         }
     }
 
-    /// Wipe: every signal and run is gone, the gate refuses.
-    pub fn wiped() -> Self {
+    /// Taken down with `take_down`'s door at `now_unix`. What took it down,
+    /// when not a person, is the write's to mark (`went_down`): an infra
+    /// take-down's mark names the command it issues in that write.
+    pub fn down(take_down: &weft_core::take_down::TakeDown, now_unix: i64) -> Self {
+        use weft_core::take_down::Door;
+        let (accepting_fires, fires_visible_to_consumers) = match take_down.door {
+            Door::Take => (true, true),
+            Door::Hide => (true, false),
+            Door::Refuse => (false, false),
+        };
         Self {
             status: ProjectStatus::Inactive,
-            accepting_fires: false,
-            fires_visible_to_consumers: false,
-            ..Self::active()
+            accepting_fires,
+            fires_visible_to_consumers,
+            fires_deadline_unix: take_down.door_for_minutes.map(|minutes| now_unix + i64::from(minutes) * 60),
+            went_down: None,
+            activating_run_id: None,
         }
     }
 
-    /// Hibernate: parking until the deadline, then refusing (the dispatcher
-    /// clears `accepting_fires` once it passes); hidden the whole time.
-    pub fn hibernating(deadline_unix: i64) -> Self {
-        Self {
-            status: ProjectStatus::Inactive,
-            fires_visible_to_consumers: false,
-            fires_deadline_unix: Some(deadline_unix),
-            ..Self::active()
-        }
+    /// Down, its door refusing, with nothing kept: what an activation
+    /// nobody finished and that kept no work lands at.
+    pub fn refused() -> Self {
+        Self::down(&weft_core::take_down::TakeDown::REMOVE, 0)
     }
 
-    /// Park: parking forever, visible so consumers can browse and submit.
-    pub fn parked() -> Self {
-        Self { status: ProjectStatus::Inactive, ..Self::active() }
-    }
-
-    /// While running work drains: the gate already behaves like the target
-    /// from the first write; only `status` waits for the drain.
-    pub fn deactivating_to(target: ActivationLifecycle, drain_deadline_unix: i64) -> Self {
-        Self {
-            status: ProjectStatus::Deactivating,
-            drain_deadline_unix: Some(drain_deadline_unix),
-            activating_execution_id: None,
-            ..target
-        }
-    }
-
-    /// Whether this is a wipe: inactive, refusing work, with no grace
-    /// window (a hibernation whose window ended refuses work too, and keeps
-    /// its deadline).
-    // SYNC: is_wiped <-> WIPE_FORGETS_SQL (crates/weft-dispatcher/src/activation_store.rs)
-    pub fn is_wiped(&self) -> bool {
-        self.status == ProjectStatus::Inactive && !self.accepting_fires && self.fires_deadline_unix.is_none()
+    /// Down, its door taking what arrives: what an activation nobody
+    /// finished lands at when its triggers kept work, so that work waits
+    /// for their next activation.
+    pub fn holding() -> Self {
+        Self::down(&weft_core::take_down::TakeDown::DEFAULT, 0)
     }
 
     /// Whether the health loop took this down and it is still down: what
     /// its auto-recover brings back.
-    pub fn parked_by_health(&self) -> bool {
-        self.went_down.is_some_and(|w| w.with == DownWith::Health) && self.status == ProjectStatus::Inactive
+    pub fn down_by_health(&self) -> bool {
+        self.went_down == Some(WentDown::Health) && self.status == ProjectStatus::Inactive
+    }
+
+    /// The door of an activation that is down, as its axes read it.
+    pub fn door(&self) -> weft_core::take_down::Door {
+        use weft_core::take_down::Door;
+        match (self.accepting_fires, self.fires_visible_to_consumers) {
+            (false, _) => Door::Refuse,
+            (true, true) => Door::Take,
+            (true, false) => Door::Hide,
+        }
     }
 
     /// Where the activation stands, as a person reads it: `registered`,
-    /// `activating`, `active`, `deactivating`, or for an inactive
-    /// activation how it went down: `wipe`, `hibernate`, `park`.
+    /// `activating`, `active`, or for one down what its door does: `take`,
+    /// `hide`, `refuse`.
     pub fn mode(&self) -> weft_core::activation::ActivationMode {
         use weft_core::activation::ActivationMode;
-        use weft_core::DeactivationMode;
         match self.status {
             ProjectStatus::Registered => ActivationMode::Registered,
             ProjectStatus::Activating => ActivationMode::Activating,
             ProjectStatus::Active => ActivationMode::Active,
-            ProjectStatus::Deactivating => ActivationMode::Deactivating,
-            ProjectStatus::Inactive => ActivationMode::Down(if self.is_wiped() {
-                DeactivationMode::Wipe
-            } else if !self.fires_visible_to_consumers {
-                DeactivationMode::Hibernate
-            } else {
-                DeactivationMode::Park
-            }),
+            ProjectStatus::Inactive => ActivationMode::Down(self.door()),
         }
     }
 }
 
 /// Several activations as one lifecycle: what a project shows for its
-/// shared triggers, and what a verb aimed at several triggers is checked
-/// against. Transitional states win (a person sees the verb working and
-/// is offered its cancel): activating, then deactivating. Then anything
-/// listening makes it active. All-inactive keeps the most that survived
-/// (accepting if any accepts, visible if any is, the latest deadline), so
-/// a project with anything parked is offered the reactivate choice. None
-/// at all is registered.
+/// shared triggers. Activating wins (a person sees the verb working and
+/// is offered its cancel); then anything listening makes it active.
+/// All-down keeps the most that survived (accepting if any accepts,
+/// visible if any is, the latest deadline). None at all is registered.
 pub fn aggregate<'a>(lifecycles: impl IntoIterator<Item = &'a ActivationLifecycle>) -> ActivationLifecycle {
     let all: Vec<&ActivationLifecycle> = lifecycles.into_iter().collect();
     let with = |status: ProjectStatus| all.iter().copied().filter(move |l| l.status == status);
     if let Some(first) = with(ProjectStatus::Activating).next() {
         return first.clone();
-    }
-    if with(ProjectStatus::Deactivating).next().is_some() {
-        let draining: Vec<&ActivationLifecycle> = with(ProjectStatus::Deactivating).collect();
-        return ActivationLifecycle {
-            status: ProjectStatus::Deactivating,
-            accepting_fires: draining.iter().any(|l| l.accepting_fires),
-            fires_visible_to_consumers: draining.iter().any(|l| l.fires_visible_to_consumers),
-            fires_deadline_unix: draining.iter().filter_map(|l| l.fires_deadline_unix).max(),
-            drain_deadline_unix: draining.iter().filter_map(|l| l.drain_deadline_unix).max(),
-            went_down: same_cause(&draining),
-            activating_execution_id: None,
-        };
     }
     if with(ProjectStatus::Active).next().is_some() {
         return ActivationLifecycle::active();
@@ -193,60 +164,76 @@ pub fn aggregate<'a>(lifecycles: impl IntoIterator<Item = &'a ActivationLifecycl
         accepting_fires: inactive.iter().any(|l| l.accepting_fires),
         fires_visible_to_consumers: inactive.iter().any(|l| l.fires_visible_to_consumers),
         fires_deadline_unix: inactive.iter().filter_map(|l| l.fires_deadline_unix).max(),
-        drain_deadline_unix: None,
         went_down: same_cause(&inactive),
-        activating_execution_id: None,
+        activating_run_id: None,
     }
 }
 
 /// The cause every one of `lifecycles` went down with, when they all went
-/// down with the same one, at the latest of their moments.
+/// down the same way; of infra commands, the earliest.
 fn same_cause(lifecycles: &[&ActivationLifecycle]) -> Option<WentDown> {
-    let with = lifecycles.first()?.went_down?.with;
-    let mut at_unix = i64::MIN;
+    let mut went = lifecycles.first()?.went_down?;
     for lifecycle in lifecycles {
-        let went = lifecycle.went_down.filter(|w| w.with == with)?;
-        at_unix = at_unix.max(went.at_unix);
+        went = match (went, lifecycle.went_down?) {
+            (WentDown::Health, WentDown::Health) => WentDown::Health,
+            (WentDown::Infra { first_command: a }, WentDown::Infra { first_command: b }) => WentDown::Infra { first_command: a.min(b) },
+            _ => return None,
+        };
     }
-    Some(WentDown { with, at_unix })
+    Some(went)
 }
 
-/// What took a trigger down when it was not a person, and when (see
-/// [`ActivationLifecycle::went_down`]). The moment is what tells a copy
-/// that came back up since from one still going down: only the first
-/// brings the trigger back.
+/// What took a trigger down when it was not a person (see
+/// [`ActivationLifecycle::went_down`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WentDown {
-    pub with: DownWith,
-    pub at_unix: i64,
-}
-
-/// What took a trigger down when it was not a person ([`WentDown`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DownWith {
+pub enum WentDown {
     /// The health loop parked it: a copy it reads broke.
     Health,
-    /// An infra verb took it down with the copies it reads.
-    Infra,
+    /// An infra verb took it down with the copies it reads, in the same
+    /// transaction that issued its commands, the first of which is
+    /// `first_command`: what ended or came back after that command is
+    /// what brings it back, so nothing older can.
+    Infra { first_command: i64 },
 }
 
-impl DownWith {
-    // SYNC: the spellings <-> trigger_activation.went_down_with (crates/weft-dispatcher/src/activation_store.rs)
-    pub fn as_str(self) -> &'static str {
+impl WentDown {
+    pub fn with(self) -> DownWith {
         match self {
-            DownWith::Health => "health",
-            DownWith::Infra => "infra",
+            WentDown::Health => DownWith::Health,
+            WentDown::Infra { .. } => DownWith::Infra,
         }
     }
 
-    pub fn parse(s: &str) -> Option<Self> {
-        [DownWith::Health, DownWith::Infra].into_iter().find(|cause| cause.as_str() == s)
+    /// The command its mark names, for an infra take-down.
+    pub fn first_command(self) -> Option<i64> {
+        match self {
+            WentDown::Health => None,
+            WentDown::Infra { first_command } => Some(first_command),
+        }
+    }
+
+    /// From its row's `went_down_with` and `went_down_by_command`.
+    pub fn of_columns(with: Option<&str>, first_command: Option<i64>) -> Result<Option<Self>, String> {
+        match (with.map(|w| (w, DownWith::parse(w))), first_command) {
+            (None, None) => Ok(None),
+            (Some((_, Some(DownWith::Health))), None) => Ok(Some(WentDown::Health)),
+            (Some((_, Some(DownWith::Infra))), Some(first_command)) => Ok(Some(WentDown::Infra { first_command })),
+            (Some((spelling, None)), _) => Err(format!("unknown trigger_activation.went_down_with '{spelling}'")),
+            (with, command) => Err(format!(
+                "trigger_activation.went_down_with={:?} and went_down_by_command={command:?} disagree: an infra take-down names its command, nothing else does",
+                with.map(|w| w.0)
+            )),
+        }
     }
 }
+
+/// The kind of [`WentDown`], as the row spells it and `weft status` says it.
+pub use weft_core::projects::DownWith;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weft_core::take_down::{Door, Held, Running, TakeDown};
 
     #[test]
     fn nothing_activated_is_registered() {
@@ -254,33 +241,75 @@ mod tests {
     }
 
     #[test]
-    fn a_transition_wins_the_aggregate() {
-        let execution_id = uuid::Uuid::new_v4();
-        let all = [ActivationLifecycle::active(), ActivationLifecycle::activating(execution_id), ActivationLifecycle::parked()];
-        assert_eq!(aggregate(&all).activating_execution_id, Some(execution_id));
-        let draining = ActivationLifecycle::deactivating_to(ActivationLifecycle::parked(), 50);
-        let all = [ActivationLifecycle::active(), draining.clone()];
-        let agg = aggregate(&all);
-        assert_eq!(agg.status, ProjectStatus::Deactivating);
-        assert_eq!(agg.drain_deadline_unix, Some(50));
+    fn activating_wins_the_aggregate() {
+        let run_id = uuid::Uuid::new_v4();
+        let all = [ActivationLifecycle::active(), ActivationLifecycle::activating(run_id), ActivationLifecycle::holding()];
+        assert_eq!(aggregate(&all).activating_run_id, Some(run_id));
     }
 
     #[test]
     fn anything_listening_is_active() {
-        let all = [ActivationLifecycle::wiped(), ActivationLifecycle::active()];
+        let all = [ActivationLifecycle::refused(), ActivationLifecycle::active()];
         assert_eq!(aggregate(&all).mode().as_str(), "active");
+    }
+
+    /// The door sets the three axes, and reads back as itself.
+    #[test]
+    fn a_door_sets_the_axes_and_reads_back() {
+        let at = |door, minutes| TakeDown { door, door_for_minutes: minutes, held: Held::Keep, running: Running::Wait };
+        let take = ActivationLifecycle::down(&at(Door::Take, None), 100);
+        assert!(take.accepting_fires && take.fires_visible_to_consumers && take.fires_deadline_unix.is_none());
+        let hide = ActivationLifecycle::down(&at(Door::Hide, Some(10)), 100);
+        assert!(hide.accepting_fires && !hide.fires_visible_to_consumers);
+        assert_eq!(hide.fires_deadline_unix, Some(100 + 600));
+        let refuse = ActivationLifecycle::down(&at(Door::Refuse, None), 100);
+        assert!(!refuse.accepting_fires && !refuse.fires_visible_to_consumers);
+        for (lifecycle, door) in [(take, Door::Take), (hide, Door::Hide), (refuse, Door::Refuse)] {
+            assert_eq!(lifecycle.mode(), weft_core::activation::ActivationMode::Down(door));
+        }
+        assert!(ActivationLifecycle { went_down: Some(WentDown::Health), ..ActivationLifecycle::down(&TakeDown::HEALTH, 100) }.down_by_health());
+        assert_eq!(ActivationLifecycle::holding().door(), TakeDown::DEFAULT.door);
     }
 
     #[test]
     fn all_down_keeps_the_most_that_survived() {
-        let all = [ActivationLifecycle::wiped(), ActivationLifecycle::hibernating(10), ActivationLifecycle::parked()];
-        assert_eq!(aggregate(&all).mode().as_str(), "park");
-        let all = [ActivationLifecycle::wiped(), ActivationLifecycle::hibernating(10)];
-        let agg = aggregate(&all);
-        assert_eq!(agg.mode().as_str(), "hibernate");
-        assert_eq!(agg.fires_deadline_unix, Some(10));
-        assert_eq!(aggregate(&[ActivationLifecycle::wiped()]).mode().as_str(), "wipe");
+        let hidden = ActivationLifecycle::down(
+            &TakeDown { door: Door::Hide, door_for_minutes: Some(1), held: Held::Keep, running: Running::Wait },
+            0,
+        );
+        let all = [ActivationLifecycle::refused(), hidden.clone(), ActivationLifecycle::holding()];
+        assert_eq!(aggregate(&all).mode().as_str(), "take");
+        let agg = aggregate(&[ActivationLifecycle::refused(), hidden]);
+        assert_eq!(agg.mode().as_str(), "hide");
+        assert_eq!(agg.fires_deadline_unix, Some(60));
+        assert_eq!(aggregate(&[ActivationLifecycle::refused()]).mode().as_str(), "refuse");
     }
 
+    /// A row's mark reads back as what took it down, and a mark whose two
+    /// columns disagree is refused rather than guessed at.
+    #[test]
+    fn a_mark_reads_back_from_its_columns() {
+        assert_eq!(WentDown::of_columns(None, None), Ok(None));
+        assert_eq!(WentDown::of_columns(Some("health"), None), Ok(Some(WentDown::Health)));
+        assert_eq!(WentDown::of_columns(Some("infra"), Some(7)), Ok(Some(WentDown::Infra { first_command: 7 })));
+        for (with, command) in [(Some("infra"), None), (Some("health"), Some(7)), (None, Some(7)), (Some("flood"), None)] {
+            assert!(WentDown::of_columns(with, command).is_err(), "{with:?} {command:?}");
+        }
+        for went in [WentDown::Health, WentDown::Infra { first_command: 3 }] {
+            assert_eq!(DownWith::parse(went.with().as_str()), Some(went.with()));
+        }
+    }
 
+    /// Down the same way, several read as one, an infra mark as its
+    /// earliest command; down different ways, or one by a person, they
+    /// carry no mark.
+    #[test]
+    fn the_aggregate_marks_only_a_shared_cause() {
+        let marked = |went_down| ActivationLifecycle { went_down, ..ActivationLifecycle::holding() };
+        let infra = |first_command| marked(Some(WentDown::Infra { first_command }));
+        assert_eq!(aggregate(&[infra(9), infra(4)]).went_down, Some(WentDown::Infra { first_command: 4 }));
+        assert_eq!(aggregate(&[marked(Some(WentDown::Health)), marked(Some(WentDown::Health))]).went_down, Some(WentDown::Health));
+        assert_eq!(aggregate(&[infra(4), marked(Some(WentDown::Health))]).went_down, None);
+        assert_eq!(aggregate(&[infra(4), marked(None)]).went_down, None);
+    }
 }

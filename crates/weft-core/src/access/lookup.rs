@@ -14,6 +14,7 @@ use crate::node::Lookup;
 /// One page of lookup options, as the editor renders them.
 // SYNC: LookupPage <-> packages/weft-connect/src/core/wire.ts LookupPage
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LookupPage {
     pub items: Vec<LookupItem>,
     pub next_cursor: Option<String>,
@@ -30,6 +31,7 @@ pub struct LookupItem {
 /// One `remote_select` lookup request.
 // SYNC: LookupRequest <-> packages/weft-graph/src/webview/lib/components/project/editor-connect.ts list
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LookupRequest {
     /// The connection to sign with; `None` for a `public` lookup (no
     /// connection is involved at all, and no `service` either).
@@ -48,7 +50,7 @@ pub struct LookupRequest {
     pub lookup: Lookup,
     #[serde(default)]
     pub query: String,
-    /// Picked parent values for drill-down (`depends_on`).
+    /// Picked parent values for drill-down (`dependsOn`).
     #[serde(default)]
     pub parents: BTreeMap<String, String>,
     #[serde(default)]
@@ -59,6 +61,7 @@ pub struct LookupRequest {
 /// stored capture's id/label pairs to read.
 // SYNC: GrantedQuery <-> packages/weft-graph/src/webview/lib/components/project/editor-connect.ts granted
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GrantedQuery {
     pub access_id: uuid::Uuid,
     pub service: String,

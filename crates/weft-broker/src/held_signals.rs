@@ -18,9 +18,10 @@ use weft_broker_client::protocol::{
 
 /// The signal rows a booting or rehydrating listener must hold: every row
 /// whose governing activation listens ([`ACTIVATION_LISTENS`], or that
-/// none governs). A wiped activation's rows are gone; a hibernation past
-/// its grace window keeps its rows (a reactivate restores them from here)
-/// but no longer listens, so they never come out of this query. Mixed
+/// none governs). A trigger taken down refusing with nothing kept has no
+/// rows left; one whose door refuses with work kept, or whose window is
+/// over, keeps its rows (its next activation starts from them) but no
+/// longer listens, so they never come out of this query. Mixed
 /// tenants: each row carries its own. `project` narrows it to one
 /// project's rows.
 pub async fn signals_held(pool: &PgPool, project: Option<uuid::Uuid>) -> anyhow::Result<Vec<SignalRowWire>> {
@@ -57,6 +58,23 @@ pub async fn signal_held_project(pool: &PgPool, token: &str) -> anyhow::Result<O
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(p,)| p))
+}
+
+/// The project of the wait `token` whose run was cancelled and whose last
+/// call is out now (`weft_task_store::TaskKind::CancelCall`, claimed by
+/// the dispatcher sending it through the listener), or `None`: the wait's
+/// row is gone, so the call's task is what scopes the listener's question
+/// about an address in it to that wait's own project, for as long as the
+/// call is being sent and no longer.
+// SYNC: cancel_call_project <-> weft_task_store::kinds::cancel_call_key
+pub async fn cancel_call_project(pool: &PgPool, token: &str) -> anyhow::Result<Option<uuid::Uuid>> {
+    Ok(sqlx::query_scalar(
+        "SELECT project_id FROM task WHERE kind = $1 AND dedup_key = $2 AND status = 'claimed' AND project_id IS NOT NULL LIMIT 1",
+    )
+    .bind(weft_task_store::TaskKind::CancelCall.as_str())
+    .bind(weft_task_store::kinds::cancel_call_key(token))
+    .fetch_optional(pool)
+    .await?)
 }
 
 /// Claim a signal kind's moment: write its durable state at version
@@ -268,7 +286,7 @@ fn activation_held(row: &str) -> String {
 /// holder claims it: a freed claim's last word is not the truth.
 fn held_select() -> String {
     format!(
-        "SELECT s.token, s.tenant_id, s.node_id, s.spec_json, s.is_resume, s.execution_id, \
+        "SELECT s.token, s.tenant_id, s.node_id, s.spec_json, s.is_resume, s.run_id, \
                 s.surface_kind, s.mount_path, s.mount_methods, s.auth_kind, s.auth_config, \
                 s.kind_state, s.kind_state_seq, s.project_id, s.instance_id, s.holds, \
                 s.generation, s.held_failed, \
@@ -296,7 +314,7 @@ fn decode(r: sqlx::postgres::PgRow) -> anyhow::Result<SignalRowWire> {
         node_id: r.try_get("node_id")?,
         spec_json: r.try_get("spec_json")?,
         is_resume: r.try_get("is_resume")?,
-        execution_id: r.try_get("execution_id")?,
+        run_id: r.try_get("run_id")?,
         surface_kind,
         mount_path: r.try_get("mount_path")?,
         mount_methods: r.try_get("mount_methods")?,

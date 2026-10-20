@@ -419,8 +419,8 @@ async fn resolve_and_decide(
 /// settled decides it here. An unservable decision is TERMINAL: retrying
 /// would re-derive the same facts. The signal is given up on, and comes
 /// back, deciding again, when the account is reconnected (which lifts
-/// the give-up of every held signal acting as it) or the project is
-/// resynced (`weft resync`).
+/// the give-up of every held signal acting as it) or the trigger is set
+/// up again (turned off and on, or a resync moving it onto a new build).
 fn serve_subscription(
     cfg: ProviderEvents,
     access: AccessRef,
@@ -452,8 +452,8 @@ fn serve_subscription(
             // until aborted at unregister.
             Transport::Socket => serve_socket(&cfg, &access, decided.provider_account, &ctx).await,
             Transport::Webhook => serve_webhook(&cfg, &access, &decided.topic, &ctx).await,
-            // Given up on; a reconnect of the account or a resync brings
-            // it back, and the decision runs again.
+            // Given up on; a reconnect of the account or the trigger set
+            // up again brings it back, and the decision runs again.
             Transport::Unservable(reason) => ctx.fire.give_up(&format!("the subscription cannot be served: {reason}")).await,
         }
     })
@@ -468,7 +468,7 @@ static SOCKETS: LazyLock<DashMap<String, SocketShare>> = LazyLock::new(DashMap::
 
 /// One subscription on a shared socket: its fire plumbing plus what
 /// it may hear. On a multi-install socket (the recipe declares
-/// `multi_account`) an account-scoped subscriber only hears frames
+/// `multiAccount`) an account-scoped subscriber only hears frames
 /// proven to be its own account's; an app-wide one hears everything.
 #[derive(Clone)]
 struct Subscriber {
@@ -622,8 +622,9 @@ fn spawn_shared_engine(
             // A cycle that can never serve: every subscription on it is
             // given up on. A connection refused, gone or needing a
             // reconnect comes back with a reconnect of the account; a
-            // recipe that cannot serve, once it is fixed, with a resync
-            // of the project (`weft resync`).
+            // recipe that cannot serve, once it is fixed, with the resync
+            // that moves the trigger onto the build with the fix
+            // (`weft resync`).
             if let Err(PrepareError::Fatal(e)) = &plan {
                 let fires: Vec<FireContext> = subscribers.iter().map(|s| s.fire.clone()).collect();
                 for fire in fires {
@@ -912,13 +913,13 @@ mod tests {
                     "url": "https://slack.com/api/apps.connections.open",
                     "method": "POST",
                     "auth": [{ "kind": "header", "name": "Authorization",
-                               "value": "Bearer {app_token}" }],
+                               "value": "Bearer {appToken}" }],
                     "captures": [{ "name": "url", "path": "url" }]
                 }
             },
             "webhook": { "verify": { "kind": "hmac",
-                                     "signature_header": "X-Slack-Signature",
-                                     "timestamp_header": "X-Slack-Request-Timestamp",
+                                     "signatureHeader": "X-Slack-Signature",
+                                     "timestampHeader": "X-Slack-Request-Timestamp",
                                      "concat": "v0:{timestamp}:{body}",
                                      "prefix": "v0=" } }
         }))
@@ -931,7 +932,7 @@ mod tests {
     fn the_transport_follows_the_connection() {
         let both = slack_topic();
         let with_token =
-            BTreeMap::from([("app_token".to_string(), "xapp-1".to_string())]);
+            BTreeMap::from([("appToken".to_string(), "xapp-1".to_string())]);
         assert_eq!(
             decide_transport(&both, EventScope::Account, &with_token, false),
             Transport::Socket
@@ -950,7 +951,7 @@ mod tests {
         match decide_transport(&both, EventScope::App, &BTreeMap::new(), false) {
             Transport::Unservable(reason) => {
                 assert!(reason.contains("app-wide"), "{reason}");
-                assert!(reason.contains("app_token"), "{reason}");
+                assert!(reason.contains("appToken"), "{reason}");
             }
             other => panic!("expected unservable, got {other:?}"),
         }
@@ -962,14 +963,14 @@ mod tests {
                 "connect": {
                     "url": "https://x/open", "method": "POST",
                     "auth": [{ "kind": "header", "name": "Authorization",
-                               "value": "Bearer {app_token}" }],
+                               "value": "Bearer {appToken}" }],
                     "captures": [{ "name": "url", "path": "url" }]
                 }
             }
         }));
         match decide_transport(&socket_only, EventScope::Account, &BTreeMap::new(), false) {
             Transport::Unservable(reason) => {
-                assert!(reason.contains("app_token"), "{reason}")
+                assert!(reason.contains("appToken"), "{reason}")
             }
             other => panic!("expected unservable, got {other:?}"),
         }
@@ -982,7 +983,7 @@ mod tests {
     #[test]
     fn an_install_that_prefers_the_push_takes_it() {
         let both = slack_topic();
-        let with_token = BTreeMap::from([("app_token".to_string(), "xapp-1".to_string())]);
+        let with_token = BTreeMap::from([("appToken".to_string(), "xapp-1".to_string())]);
         assert_eq!(decide_transport(&both, EventScope::Account, &with_token, true), Transport::Webhook);
         assert_eq!(decide_transport(&both, EventScope::App, &with_token, true), Transport::Socket);
     }

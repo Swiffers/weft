@@ -1,7 +1,7 @@
 {
   "type": "Socket",
   "label": "Socket",
-  "description": "A WebSocket endpoint: each connection opened at its path starts one run, and every message the caller sends is one item of `inbound`, so a Loop over it runs once per message. The opening request comes out on the fixed ports. Answer with Reply per message and Close at the end.",
+  "description": "A WebSocket endpoint: each connection opened at its path starts one run, and every message the caller sends is one item of `inbound`, so a Loop over it runs once per message. The opening request comes out on the fixed ports. Declare the item type to have each message checked (`-> (inbound: Generator[Move])`): a message that does not fit is refused back to the caller naming the field, and the session goes on. Answer with Reply per message and Close at the end.",
   "tags": [
     "api",
     "websocket",
@@ -31,7 +31,7 @@
       },
       "default": "json",
       "label": "Message shape",
-      "description": "What each message is, both ways: `json` (`inbound: Generator[JsonDict]`, or `Generator[Image]` to store a `data:` URL or base64 message), `text` (`Generator[String]`), `bytes` (each binary frame stored, `Generator[File]`)."
+      "description": "What each message is, both ways: `json` (`inbound: Generator[JsonDict]` or a record type, or `Generator[Image]` to store a `data:` URL or base64 message), `text` (`Generator[String]`), `bytes` (each binary frame stored, `Generator[File]`)."
     },
     {
       "name": "auth",
@@ -77,10 +77,33 @@
       "description": "Largest single message in MB; a bigger one ends the session with an error."
     },
     {
-      "name": "journalEphemeral",
-      "type": "Boolean",
-      "label": "Keep the conversation out of the journal",
-      "description": "On: the journal keeps only sizes and counts, never message content. Off (default): every message both ways is recorded (batched per second, trimmed above 100 KB; raw bytes never recorded)."
+      "name": "whenChunkFails",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "surface",
+          "drop_chunk"
+        ]
+      },
+      "default": "surface",
+      "label": "When a message cannot be sent",
+      "description": "What happens when a Reply or a Stream cannot turn one message into the socket's `dataType` (a value that is not a String on a `text` socket, a file it cannot read). `surface` (default): that node fails and the socket closes with 1011. `drop_chunk`: that message is skipped, noted on the run's record, and the session goes on; pick it when one missing message is fine, like a frame of a live feed. A run that fails, or a bus that ends failed, closes the socket with 1011 either way."
+    },
+    {
+      "name": "whenCallerIsSlow",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "block",
+          "drop_oldest",
+          "drop_newest"
+        ]
+      },
+      "default": "block",
+      "label": "When the caller reads slower than you send",
+      "description": "What gives when messages are sent faster than the caller reads them and the 256 messages waiting for it fill up. `block` (default): the next send waits for room, so a slow caller slows the program and gets every message. `drop_oldest`: the oldest waiting message is thrown away, so the caller always gets the latest; pick it for live video or a price feed. `drop_newest`: the new message is thrown away and what was already waiting goes out in order. A dropped message never reaches the caller, so keep `block` for a conversation the caller must read whole."
     }
   ],
   "outputs": [
@@ -112,12 +135,14 @@
     {
       "name": "caller",
       "type": "JsonDict | Null",
+      "narrowable": true,
       "description": "What the auth gate established: JWT claims, `{\"key\": <index>}` for an API key, `{}` for HMAC. Null with no `auth`."
     },
     {
       "name": "inbound",
-      "type": "Generator[MustOverride]",
-      "description": "One item per caller message, in order; ends when the caller disconnects. Declare the item type to match `dataType`. A second reader needs a custom node using the ctx (inbound is broadcast there)."
+      "type": "Generator[JsonDict]",
+      "narrowable": "Generator[JsonDict | String | File]",
+      "description": "One item per caller message, in order; ends when the caller disconnects. Each message is held to the item type declared here (matching `dataType`). A second reader needs a custom node using the ctx (inbound is broadcast there)."
     }
   ],
   "claimsRoute": {
@@ -130,14 +155,58 @@
     "query?": "Dict[String, String]",
     "headers?": "List[List[String]]",
     "caller?": "JsonDict",
-    "base_url?": "String"
+    "baseUrl?": "String"
   },
   "features": {
     "isTrigger": true,
-    "liveConnection": "websocket",
-    "canAddOutputPorts": true
+    "liveConnection": "websocket"
   },
   "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "not", "of": { "kind": "config_in_set", "field": "dataType", "values": ["text", "bytes"] } },
+          { "kind": "not", "of": { "kind": "output_type_fits", "port": "inbound", "within": "Generator[JsonDict | File]" } }
+        ]
+      },
+      "then": {
+        "message": "Socket '{id}' takes json messages, each one JSON object (or a picture as a `data:` URL or base64): declare `inbound` as `Generator[<a record type or JsonDict>]` or `Generator[Image]`, or set `dataType` to the shape the messages have.",
+        "level": "structural",
+        "severity": "error",
+        "field": "dataType"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "dataType", "equals": "text" },
+          { "kind": "not", "of": { "kind": "output_type_fits", "port": "inbound", "within": "Generator[String]" } }
+        ]
+      },
+      "then": {
+        "message": "Socket '{id}' takes text messages, each one String: declare `-> (inbound: Generator[String])`.",
+        "level": "structural",
+        "severity": "error",
+        "field": "dataType"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_equals", "field": "dataType", "equals": "bytes" },
+          { "kind": "not", "of": { "kind": "output_type_fits", "port": "inbound", "within": "Generator[File]" } }
+        ]
+      },
+      "then": {
+        "message": "Socket '{id}' takes byte messages, each stored as a file: declare `-> (inbound: Generator[File])`, or the kind they have to be (`Generator[Image]`), which is checked against the bytes.",
+        "level": "structural",
+        "severity": "error",
+        "field": "dataType"
+      }
+    },
     {
       "when": {
         "kind": "config_matches",
@@ -173,7 +242,7 @@
         "kind": "per_instance"
       },
       "then": {
-        "message": "Socket '{id}' would exist once per instance, because {per_instance_reason}, but its public address is one for every instance. Keep the socket shared and pick the instance per call: the `Weft-Instance` header on a socket gated by a connection, or an instance token.",
+        "message": "Socket '{id}' would exist once per instance, because {perInstanceReason}, but its public address is one for every instance. Keep the socket shared and pick the instance per call: the `Weft-Instance` header on a socket gated by a connection, or an instance token.",
         "level": "structural",
         "severity": "error"
       }

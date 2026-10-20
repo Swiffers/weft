@@ -45,7 +45,7 @@
       "default": "scribe_v2",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "scribe_v2",
           "scribe_v2_medical"
@@ -269,7 +269,6 @@
     }
   ],
   "features": {
-    "catchErrors": true,
     "oneOfRequired": [
       [
         "audio",

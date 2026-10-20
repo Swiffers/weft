@@ -1,4 +1,4 @@
-# Executions steering each other by tag, built from the two catalog nodes
+# Runs steering each other by tag, built from the two catalog nodes
 # and no Rust. Three programs share one fake SSE feed, one event name
 # each, so the rig picks the program by the event it pushes.
 #
@@ -55,7 +55,7 @@ review = HumanQuery {
 review.sender = start.value
 
 out = Debug
-out.data = review.decision_approved
+out.data = review.decisionApproved
 
 purge = TestSseTrigger -> (value: String) {
   url: "__E2E_FAKE_URL__"
@@ -77,7 +77,7 @@ purge_confirm = HumanQuery {
 }
 
 purge_out = Debug
-purge_out.data = purge_confirm.ack_approved
+purge_out.data = purge_confirm.ackApproved
 
 abort = TestSseTrigger -> (value: String) {
   url: "__E2E_FAKE_URL__"
@@ -103,4 +103,4 @@ abort_confirm = HumanQuery {
 }
 
 abort_out = Debug
-abort_out.data = abort_confirm.ack_approved
+abort_out.data = abort_confirm.ackApproved

@@ -24,7 +24,7 @@
           "secret": false
         },
         {
-          "name": "jwks_url",
+          "name": "jwksUrl",
           "label": "JWKS URL",
           "placeholder": "https://auth.example.com/.well-known/jwks.json",
           "secret": false
@@ -42,7 +42,7 @@
     "verify": {
       "kind": "oidc",
       "issuers": ["{issuer}"],
-      "jwks_url": "{jwks_url}"
+      "jwksUrl": "{jwksUrl}"
     }
   },
   "inputs": [

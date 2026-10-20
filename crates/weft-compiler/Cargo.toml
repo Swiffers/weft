@@ -45,6 +45,9 @@ filetime = { workspace = true, optional = true }
 # upload, seed the catalog, read the self-contained folder back). Gated behind
 # `build`.
 tempfile = { workspace = true, optional = true }
+# The workspace-wide feature union (`.config/hakari.toml`), under `build` so
+# the parse-only shape stays free of it.
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack", optional = true }
 
 [features]
 default = ["build"]
@@ -52,7 +55,7 @@ default = ["build"]
 # the docker build invocation. Pulls weft-core's runtime layer (codegen names
 # the runtime `Node`/`NodeCatalog`) + filetime (native). The browser WASM parse
 # build turns this off; it needs only parse + enrich + validate.
-build = ["weft-core/runtime", "dep:filetime", "dep:weft-catalog", "dep:tempfile"]
+build = ["weft-core/runtime", "dep:filetime", "dep:weft-catalog", "dep:tempfile", "dep:weft-workspace-hack"]
 
 [dev-dependencies]
 uuid = { workspace = true }

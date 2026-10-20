@@ -1,8 +1,8 @@
 //! `weft describe-nodes`: print the project's node catalog as JSON
-//! (every node under `nodes/`), for the editor's node palette, and
-//! (`--compact`) as the token-cheap wiring view an AI reads instead of
-//! whole `metadata.json` files. Runs locally because the catalog lives
-//! in the project's `nodes/`.
+//! (every node under `nodes/` and beside the code under `src/`), for the
+//! editor's node palette, and (`--compact`) as the token-cheap wiring
+//! view an AI reads instead of whole `metadata.json` files. Runs locally
+//! because the catalog lives in the project's folders.
 
 use std::collections::BTreeMap;
 
@@ -19,11 +19,12 @@ struct NodesResponse<T> {
     // (form-field specs included) is a metadata key. Under `--compact`
     // the values are the filtered wiring view instead, same envelope.
     catalog: BTreeMap<String, T>,
-    /// Soft errors from scanning `nodes/` (malformed metadata.json,
-    /// duplicate types). Surfaced, not silent: a node mid-rename has a
-    /// transient parse error the editor should see but not crash on.
+    /// Soft errors from scanning the node roots (malformed metadata.json,
+    /// duplicate types), and names a loaded node spells off the weft way.
+    /// Surfaced, not silent: a node mid-rename has a transient parse
+    /// error the editor should see but not crash on.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    warnings: Vec<String>,
+    warnings: Vec<weft_catalog::CatalogWarning>,
 }
 
 /// One row of `--list`: what a reader scanning for a node needs to
@@ -36,6 +37,42 @@ struct ListRow<'a> {
     node_type: &'a str,
     tags: &'a [String],
     description: &'a str,
+}
+
+/// `--list --json`: the node rows, and apart from them the `.weft` files
+/// shipped under `nodes/` that a program can `@include`, so a file is
+/// never read as a node type.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Listing<'a> {
+    nodes: Vec<ListRow<'a>>,
+    include_files: Vec<IncludeRow>,
+}
+
+/// One shipped `.weft` file: the path a program writes in `@include`
+/// (`__catalog/base_catalog/computer/agent.weft`), and its first-line
+/// comment when it has one.
+#[derive(Serialize)]
+struct IncludeRow {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+/// Every `.weft` file under `root` as an [`IncludeRow`], its path spelled
+/// the way a program reaches it: `__catalog/` then `under`, the folder
+/// `root` is inside `nodes/` (none for the project's `nodes/` itself,
+/// `base_catalog` for the bundled stdlib, which a project holds there).
+fn include_rows(root: &std::path::Path, under: Option<&str>) -> Result<Vec<IncludeRow>> {
+    let files = weft_catalog::include_files(root).map_err(|e| anyhow::anyhow!("list the .weft files under {}: {e}", root.display()))?;
+    let prefix = match under {
+        Some(under) => format!("{}/{under}/", weft_compiler::project::CATALOG_PREFIX),
+        None => format!("{}/", weft_compiler::project::CATALOG_PREFIX),
+    };
+    Ok(files
+        .into_iter()
+        .map(|file| IncludeRow { path: format!("{prefix}{}", file.path), description: file.description })
+        .collect())
 }
 
 /// The first sentence of a description: up to and including the first
@@ -113,13 +150,22 @@ pub async fn run(
                 description: first_sentence(&metadata.description),
             })
             .collect();
-        // The scan warnings go out either way: a node mid-rename that
-        // dropped out of the listing has to say so, JSON or not.
+        // The scan warnings go out either way, JSON or not: a node
+        // mid-rename that dropped out of the listing has to say so, and so
+        // does a name a listed node spells off the weft way.
         for warning in cat.warnings() {
             eprintln!("warning: {warning}");
         }
+        // Only `nodes/` is reachable through `__catalog/`, so a `.weft`
+        // beside the code under `src/` is not listed.
+        let include_files = if stdlib {
+            include_rows(&roots[0], Some(weft_compiler::project::BASE_CATALOG_DIR))?
+        } else {
+            include_rows(&ctx.project()?.nodes_dir(), None)?
+        };
         if ctx.json() {
-            println!("{}", serde_json::to_string(&rows).context("serialize node listing")?);
+            let listing = Listing { nodes: rows, include_files };
+            println!("{}", serde_json::to_string(&listing).context("serialize node listing")?);
             return Ok(());
         }
         let width = rows.iter().map(|r| r.node_type.len()).max().unwrap_or(0);
@@ -130,6 +176,19 @@ pub async fn run(
                 format!("[{}] ", row.tags.join(","))
             };
             println!("{:<width$}  {tags}{}", row.node_type, row.description);
+        }
+        // The files after the types, under their own heading: each line
+        // starts with the path a program writes, so a grep for a word
+        // still lands on a line that says what to do with it.
+        if !include_files.is_empty() {
+            println!("\nFiles a program can @include(\"<path>\"):");
+            let width = include_files.iter().map(|f| f.path.len()).max().unwrap_or(0);
+            for file in &include_files {
+                match &file.description {
+                    Some(description) => println!("{:<width$}  {description}", file.path),
+                    None => println!("{}", file.path),
+                }
+            }
         }
         return Ok(());
     }
@@ -186,8 +245,8 @@ fn language_construct(name: &str) -> Option<String> {
         "Group" => ("a group, written `name = Group(...) { ... }`", "docs/src/language/groups.md"),
         "Loop" => ("a loop, written `name = Loop(...) { ... }`", "docs/src/language/loops.md"),
         "Include" => ("an include, written `name = @include(\"file.weft\")`", "docs/src/language/files-and-reuse.md"),
-        weft_core::project::boundary_types::PASSTHROUGH | weft_core::project::boundary_types::LOOP_IN | weft_core::project::boundary_types::LOOP_OUT => (
-            "a step the compiler makes out of a group or a loop; you never write it",
+        weft_core::project::boundary_types::LOOP_IN | weft_core::project::boundary_types::LOOP_OUT => (
+            "a node the compiler makes out of a loop; you never write it",
             "docs/src/language/how-a-program-runs.md",
         ),
         _ => return None,

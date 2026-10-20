@@ -80,7 +80,7 @@ attaches, a signal nobody answers.
 | Canned HTTP | `rig.respond(method, path, body)`, `rig.respond_status(...)`, `rig.respond_raw(...)`, `rig.respond_with_headers(...)` for an answer that lives partly in a header (a created id, an ETag) |
 | A server it cannot reach at all | `rig.fail_connection(method, path)`: the call errors with no status and no body |
 | Check what it sent | `rig.requests()`, `rig.assert_sent(method, path)` |
-| What `ctx.run` recorded | `rig.recorded_steps(&node)`. Run the node twice on one rig and the second run replays the first's steps and the signals it was answered with, like a resumed execution, so a publish that must happen once is something you can prove: two runs, one request. Each node keeps its own, so two nodes on one rig never replay each other's |
+| What `ctx.run` recorded | `rig.recorded_steps(&node)`. Run the node twice on one rig and the second run replays the first's steps and the signals it was answered with, like a resumed run, so a publish that must happen once is something you can prove: two runs, one request. Each node keeps its own, so two nodes on one rig never replay each other's |
 | A connection | `rig.access("slack")`, `rig.connection_value(...)`, `rig.connection_permissions(...)` |
 | A trigger's event | `rig.wake(payload)`, `rig.signal(payload)` |
 | A live caller | `rig.attach_caller(conn)` |
@@ -88,14 +88,15 @@ attaches, a signal nobody answers.
 | A bus it emitted | `rig.bus(&outcome.outputs["channel"])` |
 | A stored file | `rig.store_file(filename, mime, bytes)` going in; `rig.stored_bytes(key)`, `rig.stored_meta(key)` and `rig.stored_files(scope)` for what the node stored; `rig.file_edits()` for every in-place change, with the file, the versions and the diff |
 | An infra endpoint | `rig.declare_endpoint(name, url)`, `rig.answer_endpoint(...)`, `rig.refuse_endpoint(...)` |
-| What it asked for | `rig.registered_signals()`, `rig.awaited_signals()`, `rig.logs()`, `rig.execution_tags()`, `rig.stops()` |
+| What it asked for | `rig.registered_signals()`, `rig.awaited_signals()`, `rig.logs()`, `rig.run_tags()`, `rig.stops()` |
 | A port's type, for a node that takes added ports | `rig.output_type(port, ty)`, `rig.input_type(port, ty)` |
-| An output something downstream reads | `rig.wire_output(port)`. Nothing is wired unless you say so. On a node with `catchErrors`, `rig.wire_output("error")` makes a failure come out on `error`, as it would in a run |
+| An output something downstream reads | `rig.wire_output(port)`. Nothing is wired unless you say so. `rig.wire_output("_error")` makes a failure come out on `_error`, as it would in a run, and `outcome.output("_error")` reads it |
 | A server that is there and will not talk, for a node that opens its own socket | `rig.hang_up_server()`, a local port that hangs up on every connection. It is for raw socket clients (a database driver, a mail client): web calls in a fake test never reach the network, so for those use `rig.fail_connection`. If you want a refused connection, use this rather than a closed port: on some machines a closed port hangs until a timeout |
 
 The outcome gives you `.ok()` for the happy path, `.failure()` for the error
 string, `.output(port)` for one port, `.infra_spec()` for an infra run, and
-`.outputs` for the map.
+`.outputs` for the map. The rig refuses a value over 100 KB with the same error
+a run gives, so a test catches an output no wire would carry.
 
 Note the last group: in a fake test nothing is really stopped and nothing is
 really tagged. The rig records what your node **asked for**, and that is what
@@ -127,7 +128,7 @@ Setting the run up:
 | `connection_value(&self, service: &str, name: &str, value: &str)` | A value the opened connection answers (`conn.value(name)`) |
 | `connection_permissions(&self, service: &str, granted: &[&str])` | What the connection has granted, checked against what the input requires |
 | `published_connection(&self, service: &str, values: &[(&str, &str)])` | Says the node already published this connection on an earlier run |
-| `output_type(&self, port: &str, ty: WeftType)` | The type the compiler would give a port declared `MustOverride` |
+| `output_type(&self, port: &str, ty: WeftType)` | Declares the type of an output, the way a program does on a narrowable output (`-> (response: Verdict)`) or on one it adds. If the compiler would refuse that type (an output that is not narrowable takes only its own), the run fails with `the case declares output ...` |
 | `input_type(&self, port: &str, ty: WeftType)` | Declares an added input port and its type |
 | `wire_output(&self, port: &str)` | Wires an output downstream. Nothing is wired unless you say so |
 | `hang_up_server(&self) -> u16` | A local port that hangs up on every connection, for raw socket clients |
@@ -143,9 +144,9 @@ Running it:
 
 | Signature | What it does |
 |---|---|
-| `run(&self, node: &dyn Node, inputs: Value) -> RunOutcome` | Runs the node's body with `inputs` (a JSON object of input name to value) |
-| `run_setup_trigger(&self, node: &dyn Node, inputs: Value) -> RunOutcome` | Runs a trigger's setup |
-| `run_provision_infra(&self, node: &dyn Node, inputs: Value) -> RunOutcome` | Runs an infra node's `provision_infra` |
+| `run(&self, node: &dyn Node, inputs: Value) -> RigOutcome` (async) | Runs the node's body with `inputs` (a JSON object of input name to value) |
+| `run_setup_trigger(&self, node: &dyn Node, inputs: Value) -> RigOutcome` (async) | Runs a trigger's setup |
+| `run_provision_infra(&self, node: &dyn Node, inputs: Value) -> RigOutcome` (async) | Runs an infra node's `provision_infra` |
 
 Looking at what happened:
 
@@ -163,7 +164,7 @@ Looking at what happened:
 | `awaited_signals(&self) -> Vec<SignalSpec>` | Every signal the node parked on |
 | `recorded_steps(&self, node: &dyn Node) -> Vec<AwaitedEntry>` | Every `ctx.run` step and signal the node's run recorded |
 | `logs(&self) -> Vec<(LogLevel, String)>` | Every `ctx.log` line |
-| `execution_tags(&self) -> Vec<Vec<String>>` | The tags, one list per `ctx.tag_execution` |
+| `run_tags(&self) -> Vec<Vec<String>>` | The tags, one list per `ctx.tag_run` |
 | `stops(&self) -> Vec<(String, StopSelf)>` | Every `ctx.stop_tagged` asked for |
 | `program_calls(&self) -> Vec<(ProgramCall, StopSelf)>` | Every program call made |
 | `minted_tokens(&self) -> Vec<MintedToken>` | Every instance token minted: `instance`, `expires_in_secs`, `id` |
@@ -175,18 +176,18 @@ Looking at what happened:
 | Signature | What it does |
 |---|---|
 | `access(&self, service: &str) -> Value` | The test's connection marker. The service must be the one the test declared |
-| `fixture(&self, name: &str) -> WeftResult<String>` | A `--fixture` value, or a failure naming the variable to set |
+| `fixture(&self, name: &str) -> WeftResult<String>` | The value of `WEFT_NODE_TEST_<name>`, or a failure naming the variable to set |
 | `store_file(&self, filename: &str, mime_type: &str, bytes: impl Into<Vec<u8>>) -> WeftResult<Value>` (async) | Stores a real file and gives its value |
 | `connect(&self) -> WeftResult<OpenedConnection>` (async) | Opens the test's connection, for setup and cleanup calls of your own around the node |
 | `bus(&self, opts: BusOptions) -> WeftResult<(BusHandle, Value)>` | A real bus you write into, and its marker |
 | `wire_output(&self, port: &str)` | Wires an output downstream |
-| `run(&self, node: &dyn Node, inputs: Value) -> RunOutcome` (async) | Runs the node against the real runtime |
+| `run(&self, node: &dyn Node, inputs: Value) -> RigOutcome` (async) | Runs the node against the real runtime |
 
 `LiveRig::new(..)` is built by the runner, never by a test.
 
 ### What comes back
 
-`RunOutcome`, from every `run`:
+`RigOutcome`, from every `run`:
 
 | Field or method | What it is |
 |---|---|
@@ -239,9 +240,13 @@ afterwards.
 Every prompt happens before any credential exists and before any signal handler
 is armed, so Ctrl+C at a prompt leaks nothing.
 
-`--fixture` values, declared with `.with_fixture(...)` on a live test, are how
-a test names the real thing it needs: a channel it may post in, an account it
-may read. Read them with `rig.fixture("NAME")`.
+If a live test needs a real thing to act on (a chat it may post in, an
+account it may read), declare it as a fixture:
+`.with_fixture(fixture_spec("CHAT_ID", "Chat", "a chat the bot may post in"))`,
+which is a name, a label and a description. Set `WEFT_NODE_TEST_CHAT_ID` in
+the shell you run `weft test-node` from, and the test reads it with
+`rig.fixture("CHAT_ID")`. If any fixture is missing, the runner lists every
+variable to set, with its label, before it runs anything.
 
 If your node waits on a signal (`ctx.await_signal`), a live test waits for the
 real answer, held in the node's call the way it is in

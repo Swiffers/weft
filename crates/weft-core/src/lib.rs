@@ -1,7 +1,7 @@
 // First, so every module below can use the macros it exports.
 mod wire_enum;
 
-// Runtime modules: the execution context, buses, storage streaming, caller
+// Runtime modules: the run context, buses, storage streaming, caller
 // connections, cancellation, timer signals, and signed routing tokens. Pull
 // tokio/futures/bytes (no wasm32 support), so they are gated behind the
 // `runtime` feature (default on). The browser WASM parse build turns `runtime`
@@ -20,6 +20,7 @@ pub mod builds;
 #[cfg(feature = "runtime")]
 pub mod caller_token;
 pub mod door_fire;
+pub mod casing;
 pub mod comma_list;
 #[cfg(feature = "runtime")]
 pub mod cancellation;
@@ -30,7 +31,6 @@ pub mod context;
 pub mod deactivation;
 pub mod deref;
 pub mod error;
-pub mod exec;
 #[cfg(feature = "runtime")]
 pub mod file_lock;
 pub mod frames;
@@ -66,9 +66,9 @@ pub mod projects;
 pub mod pulse;
 pub mod route;
 pub mod rules;
+pub mod run;
 pub mod run_settings;
 pub mod run_spec;
-pub mod running_policy;
 #[cfg(feature = "runtime")]
 pub mod seeding;
 // The predicate submodule is wire-pure and always available (the
@@ -86,11 +86,13 @@ pub mod signed_token;
 // aliases are runtime-gated, inside the module.
 pub mod storage;
 // What every channel's messages look like once written down: the one
-// trim rule and the one meaning of "ephemeral" a bus and a live caller
-// conversation both answer to. Runtime-only: it records bus payloads.
-#[cfg(feature = "runtime")]
+// recording policy (mode and window), the one trim rule, and the one
+// meaning of "ephemeral" a bus and a live caller conversation both answer
+// to. The policy is pure (the language gives nodes its settings); what
+// records a payload is runtime-gated inside the module.
 pub mod stream_journal;
 pub mod tag;
+pub mod take_down;
 pub mod task;
 pub mod time_scale;
 pub mod versions;
@@ -142,6 +144,23 @@ pub fn is_rust_identifier(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// True if `s` can name a Rust module as written: a plain identifier
+/// ([`is_rust_identifier`]) that is neither a keyword (strict, reserved,
+/// or one a later edition takes) nor `_`. Codegen writes a module per
+/// node (its type in snake_case: `Loop` is `loop`) and per shared file
+/// of a package, so the catalog refuses a package holding a name that
+/// fails this.
+pub fn is_rust_module_name(s: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for", "if", "impl",
+        "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "static", "struct",
+        "super", "Self", "trait", "true", "type", "unsafe", "use", "where", "while", "async", "await", "dyn", "abstract",
+        "become", "box", "do", "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
+        "gen",
+    ];
+    is_rust_identifier(s) && s != "_" && !KEYWORDS.contains(&s)
+}
+
 // Re-export `inventory` so the `register_signal_kind!` macro
 // expanded in third-party crates (or other workspace crates) can
 // reach the same crate version without adding a direct dep.
@@ -169,7 +188,7 @@ pub use reqwest;
 
 #[cfg(feature = "runtime")]
 pub use bus::{
-    BusCursor, BusEntry, BusEntryKind, BusHandle, BusInner, BusLookupError, BusMode, BusOptions,
+    BusCursor, BusEntry, BusEntryKind, BusHandle, BusInner, BusLookupError, BusOptions,
     BusRegistry, CursorError, RegisterError, SendError, WaitError,
 };
 #[cfg(feature = "runtime")]
@@ -182,7 +201,7 @@ pub use generator::{Generator, StreamEnd, TryNext};
 pub use cancellation::CancellationFlag;
 #[cfg(feature = "runtime")]
 pub use context::{
-    ContextHandle, EndpointHandle, EndpointMethod, ExecutionContext, Phase, ValueBag,
+    ContextHandle, EndpointHandle, EndpointMethod, RunContext, Phase, ValueBag,
     StorageHandle,
 };
 pub use access::spec::{AccessSpec, AppRegistration};
@@ -212,10 +231,10 @@ pub use node::{Node, NodeCatalog};
 #[cfg(feature = "runtime")]
 pub use node_test::{
     fixture_spec, fixture_spec_like, with_cleanup, EndpointCall, FakeRig, LiveRig, NodeTest,
-    NodeTestInfo, RunOutcome, SentRequest, TestTier,
+    NodeTestInfo, RigOutcome, SentRequest, TestTier,
 };
 #[cfg(feature = "runtime")]
-pub use primitive::ExecutionSnapshot;
+pub use primitive::RunSnapshot;
 pub use primitive::{
     AwaitedEntry, AwaitedEntryKind, KickedNode, SignalAuth, SignalRouting, SignalSpec,
     SignalSurface, SuspensionInfo,
@@ -225,33 +244,30 @@ pub use project::{
     InputDefinition, NodeDefinition, PortDefinition, Position, ProjectDefinition,
 };
 pub use pulse::Pulse;
-pub use running_policy::{
-    default_drain_timeout_secs, trigger_choice_required, DeactivateSpec, DeactivationMode, RunningChoice,
-    RunningPolicy, DEFAULT_DRAIN_TIMEOUT_SECS, DEFAULT_GRACE_MINUTES, TRIGGER_CHOICE_REQUIRED_HEADER,
-};
-pub use exec::CancelCause;
+pub use take_down::{Door, Held, ReleaseHeld, Running, TakeDown, TakeDownChoice};
+pub use run::CancelCause;
 pub use tag::StopSelf;
 #[cfg(feature = "runtime")]
 pub use storage::{ByteRange, ByteStream, KeepTtl, StorageScope, StoredFileMeta, StoredFile};
 pub use weft_type::{WeftPrimitive, WeftType};
 
-/// The identity of ONE execution. An execution IS an execution: every
-/// execution is minted exactly one execution at `ExecutionStarted`, every
+/// The identity of ONE run. A run IS a run: every
+/// run is minted exactly one run at `RunStarted`, every
 /// journal event / pulse / node firing carries it, and when the
-/// execution terminates the execution is spent forever (a re-run is a new
-/// execution with a NEW execution). So "per execution" always means "per
-/// execution", never "per project" or "per anything reused across
-/// runs". At most one worker drives a given execution at a time (the
-/// one-worker-per-execution invariant keeps that execution's journal a single
-/// coherent stream); there is nothing to retry "across executions".
-pub type ExecutionId = uuid::Uuid;
+/// run terminates the run is spent forever (a re-run is a new
+/// run with a NEW run). So "per run" always means "per
+/// run", never "per project" or "per anything reused across
+/// runs". At most one worker drives a given run at a time (the
+/// one-worker-per-run invariant keeps that run's journal a single
+/// coherent stream); there is nothing to retry "across runs".
+pub type RunId = uuid::Uuid;
 
 /// A new run's id. Time-ordered (UUIDv7), so a run born now lands at the
 /// right edge of every index keyed by it instead of on a random page; every
 /// birth of a new run mints it here. A fire's run is the exception: its id
 /// comes from the fire's (`door_fire::run_of_fire`), so an event sent twice
 /// is born once.
-pub fn new_execution_id() -> ExecutionId {
+pub fn new_run_id() -> RunId {
     uuid::Uuid::now_v7()
 }
 
@@ -266,6 +282,16 @@ mod helper_tests {
         }
         for bad in ["", "1abc", "my-node", "my.node", "with space", "émoji", "a\"b"] {
             assert!(!is_rust_identifier(bad), "{bad} should fail");
+        }
+    }
+
+    #[test]
+    fn rust_module_name_check() {
+        for ok in ["text", "run_command", "_hidden", "looped", "types"] {
+            assert!(is_rust_module_name(ok), "{ok} should pass");
+        }
+        for bad in ["loop", "type", "self", "Self", "match", "gen", "_", "my-node", ""] {
+            assert!(!is_rust_module_name(bad), "{bad} should fail");
         }
     }
 

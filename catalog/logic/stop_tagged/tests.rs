@@ -26,7 +26,7 @@ async fn keep_by_default(rig: FakeRig) -> WeftResult<()> {
         vec![("user_7".to_string(), StopSelf::Keep), ("batch_a".to_string(), StopSelf::Keep)]
     );
     assert_eq!(outcome.outputs["done"], json!(true));
-    assert!(rig.execution_tags().is_empty(), "stopping does not tag");
+    assert!(rig.run_tags().is_empty(), "stopping does not tag");
     Ok(())
 }
 

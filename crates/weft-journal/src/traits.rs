@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 
-use crate::events::ExecEvent;
+use crate::events::RunEvent;
 
 /// One event of a run's record, decoded: the row it was written in (one
 /// write is one row, `crate::record::RunLogRow`) and its place inside it.
@@ -14,7 +14,7 @@ use crate::events::ExecEvent;
 pub struct JournalRow {
     pub seq: i32,
     pub index: u32,
-    pub event: ExecEvent,
+    pub event: RunEvent,
 }
 
 /// An event's place in its run's record, in the order the events were
@@ -38,10 +38,10 @@ impl JournalRow {
 #[async_trait]
 pub trait JournalClient: Send + Sync {
     /// Hand one event to the run's record.
-    async fn record_event(&self, event: &ExecEvent, replica: Option<&str>) -> anyhow::Result<()>;
+    async fn record_event(&self, event: &RunEvent, replica: Option<&str>) -> anyhow::Result<()>;
 
     /// Hand `events`, all of one run, in order.
-    async fn record_events(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
+    async fn record_events(&self, events: &[RunEvent], replica: Option<&str>) -> anyhow::Result<()> {
         for event in events {
             self.record_event(event, replica).await?;
         }
@@ -51,7 +51,7 @@ pub trait JournalClient: Send + Sync {
     /// Every event of a run on record, in order: a seed ancestor's (which
     /// ended), or the run's own once what it handed is on record. A row that
     /// does not decode fails the read.
-    async fn events_for_execution_id(&self, execution_id: weft_core::ExecutionId) -> anyhow::Result<Vec<ExecEvent>>;
+    async fn events_for_run_id(&self, run_id: weft_core::RunId) -> anyhow::Result<Vec<RunEvent>>;
 }
 
 /// Where a worker's writer lanes send their batches, and where a run's
@@ -65,14 +65,14 @@ pub trait RecordClient: Send + Sync {
     async fn record_batch(&self, batch: Vec<u8>) -> Result<crate::frame::BatchAnswer, BatchError>;
 
     /// The whole record of a run of this worker's project, raw.
-    async fn record_of(&self, execution_id: weft_core::ExecutionId) -> anyhow::Result<crate::record::RawRecord>;
+    async fn record_of(&self, run_id: weft_core::RunId) -> anyhow::Result<crate::record::RawRecord>;
 
-    /// End `execution_id`, a run this worker drives but whose record it can
+    /// End `run_id`, a run this worker drives but whose record it can
     /// no longer write: the record writes its ending, failed with `why`,
     /// after the last row that landed, and the run is no longer this
     /// worker's (`crate::record::give_up_in`). `Refused` when this worker
     /// does not drive it.
-    async fn give_up(&self, execution_id: weft_core::ExecutionId, why: String) -> Result<(), BatchError>;
+    async fn give_up(&self, run_id: weft_core::RunId, why: String) -> Result<(), BatchError>;
 }
 
 /// Why a batch got no answer.
@@ -96,11 +96,11 @@ pub struct NoopJournal;
 
 #[async_trait]
 impl JournalClient for NoopJournal {
-    async fn record_event(&self, _event: &ExecEvent, _replica: Option<&str>) -> anyhow::Result<()> {
+    async fn record_event(&self, _event: &RunEvent, _replica: Option<&str>) -> anyhow::Result<()> {
         Ok(())
     }
 
-    async fn events_for_execution_id(&self, _execution_id: weft_core::ExecutionId) -> anyhow::Result<Vec<ExecEvent>> {
+    async fn events_for_run_id(&self, _run_id: weft_core::RunId) -> anyhow::Result<Vec<RunEvent>> {
         Ok(Vec::new())
     }
 }

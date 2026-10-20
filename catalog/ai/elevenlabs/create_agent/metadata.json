@@ -52,7 +52,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -83,7 +83,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -122,7 +122,7 @@
       "label": "Reasoning effort",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "none",
           "minimal",
@@ -195,7 +195,7 @@
       "label": "Voice model",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "eleven_v4_turbo",
           "eleven_v4",
@@ -246,7 +246,7 @@
       "label": "Output audio format",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "pcm_8000",
           "pcm_16000",
@@ -392,9 +392,6 @@
       "description": "The new agent's id: what Agent: Place Call takes."
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "validate": [
     {
       "when": {

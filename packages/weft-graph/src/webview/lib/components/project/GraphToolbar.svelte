@@ -5,7 +5,7 @@
 
   let {
     mode,
-    executionId,
+    runId,
     pendingCount,
     notPainted = undefined,
     onSetMode,
@@ -18,7 +18,7 @@
     below,
   }: {
     mode: FollowMode;
-    executionId: string | undefined;
+    runId: string | undefined;
     pendingCount: number;
     /// Set when the run on screen cannot be painted from its journal,
     /// with the reason. Shown as its own pill: the canvas is empty or
@@ -58,7 +58,7 @@
     below?: Snippet;
   } = $props();
 
-  const shortExecutionId = $derived(executionId ? executionId.slice(0, 8) : '');
+  const shortRunId = $derived(runId ? runId.slice(0, 8) : '');
 
   /// The three choices of the follow toggle, in the order drawn. Only
   /// the active one shows its word; the others show their icon, and
@@ -75,10 +75,10 @@
       mode: 'locked' as const,
       icon: Lock,
       label: 'Locked',
-      hint: executionId || mode === 'locked'
+      hint: runId || mode === 'locked'
         ? 'Locked: the graph stays on this run. Runs that start are counted, not shown.'
         : 'Locked: keeps the graph on one run. There is no run on the graph to lock onto yet.',
-      disabled: !executionId && mode !== 'locked',
+      disabled: !runId && mode !== 'locked',
     },
     {
       mode: 'off' as const,
@@ -151,7 +151,7 @@
              tooltip, and the hover text is what says why Locked is greyed. -->
         <choice.icon class="w-3 h-3" />
         {#if active}
-          {choice.label}{choice.mode !== 'off' && shortExecutionId ? ` · ${shortExecutionId}` : ''}
+          {choice.label}{choice.mode !== 'off' && shortRunId ? ` · ${shortRunId}` : ''}
         {/if}
       </button>
     {/each}

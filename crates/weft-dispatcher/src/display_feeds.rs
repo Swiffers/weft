@@ -42,7 +42,7 @@ pub const LOOK_NOW_CHANNEL: &str = "weft_display_look_now";
 pub const LOOK_EVERY: Duration = Duration::from_secs(3);
 
 /// Where a node's display is served from.
-// SYNC: DisplaySource <-> extension-vscode/src/graphView.ts (DisplayRoute.source)
+// SYNC: DisplaySource <-> extension-vscode/src/displayRoutes.ts (DisplayRoute.source)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DisplaySource {
@@ -50,6 +50,10 @@ pub enum DisplaySource {
     Infra,
     /// The listener kind holding a trigger's signal.
     Signal,
+    /// The listener kind holding a node's wait in one run
+    /// ([`run_waits`]): a node waiting on an outside job shows what the
+    /// job last answered.
+    Wait,
 }
 
 /// One node's display: a project, where it is served from, and the node
@@ -292,7 +296,125 @@ fn worth_sending(current: &mut Option<NodeFeed>, fresh: NodeFeed) -> bool {
     true
 }
 
-/// The production reader: the same reads the editor's `/live` doors
+/// One wait of a run, where [`run_waits`] asks what it shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitAt {
+    /// The node waiting, spelled as its place (`one.render`).
+    pub node: String,
+    /// Where the listener holds it, and the address a caller reaches it
+    /// at, when it has one (`crate::api::signal::SignalLiveAt`).
+    pub at: crate::api::signal::SignalLiveAt,
+}
+
+/// What [`run_waits`] reads: one run's waits, and what each shows.
+#[async_trait]
+pub trait WaitReader: Send + Sync + 'static {
+    /// The waits `run` has now, in registration order: reads the database.
+    async fn waits(&self, run: weft_core::RunId) -> Result<Vec<WaitAt>, String>;
+    /// What the wait at `at` shows: asks the listener.
+    async fn read(&self, at: &crate::api::signal::SignalLiveAt) -> NodeFeed;
+}
+
+/// What the waits of `run` show, one message per node whenever it changes,
+/// and `Absent` once a node's wait is over: looked at at once, then every
+/// [`LOOK_EVERY`], for as long as the caller holds the stream (the editor
+/// holds it while it follows the run). A node waiting several times at
+/// once (inside a loop) shows each of its waits, each line named with
+/// which one it is. A failed read of the run's waits shows on every node
+/// shown so far.
+///
+/// One loop per stream rather than a shared [`Feed`]: a feed is one node's
+/// display, under a key known up front, while a run's waits are a set
+/// that grows and shrinks as its nodes wait, and the loop ends with the
+/// stream that holds it.
+pub fn run_waits(reader: Arc<dyn WaitReader>, run: weft_core::RunId) -> impl futures::Stream<Item = NodeDisplay> {
+    struct Looking {
+        reader: Arc<dyn WaitReader>,
+        shown: std::collections::BTreeMap<String, NodeFeed>,
+        queued: std::collections::VecDeque<NodeDisplay>,
+        first: bool,
+    }
+    let start = Looking { reader, shown: Default::default(), queued: Default::default(), first: true };
+    futures::stream::unfold(start, move |mut looking| async move {
+        loop {
+            if let Some(next) = looking.queued.pop_front() {
+                return Some((next, looking));
+            }
+            if !std::mem::take(&mut looking.first) {
+                tokio::time::sleep(LOOK_EVERY).await;
+            }
+            let now = look_at_waits(looking.reader.as_ref(), run, &looking.shown).await;
+            for (node, feed) in now {
+                let changed = match &feed {
+                    NodeFeed::Absent => looking.shown.remove(&node).is_some(),
+                    _ => looking.shown.insert(node.clone(), feed.clone()).as_ref() != Some(&feed),
+                };
+                if changed {
+                    looking.queued.push_back(NodeDisplay { source: DisplaySource::Wait, node, feed });
+                }
+            }
+        }
+    })
+}
+
+/// One look at the waits of `run`: what each node with a wait shows now,
+/// and `Absent` for each node in `shown` whose wait is over.
+async fn look_at_waits(
+    reader: &dyn WaitReader,
+    run: weft_core::RunId,
+    shown: &std::collections::BTreeMap<String, NodeFeed>,
+) -> Vec<(String, NodeFeed)> {
+    let waits = match reader.waits(run).await {
+        Ok(waits) => waits,
+        Err(error) => return shown.keys().map(|node| (node.clone(), NodeFeed::Error { error: error.clone() })).collect(),
+    };
+    let mut by_node: std::collections::BTreeMap<String, Vec<crate::api::signal::SignalLiveAt>> = std::collections::BTreeMap::new();
+    for wait in waits {
+        by_node.entry(wait.node).or_default().push(wait.at);
+    }
+    let mut now = Vec::new();
+    for (node, waits) in &by_node {
+        let mut feeds = Vec::new();
+        for at in waits {
+            feeds.push(reader.read(at).await);
+        }
+        now.push((node.clone(), several(feeds)));
+    }
+    now.extend(shown.keys().filter(|node| !by_node.contains_key(*node)).map(|node| (node.clone(), NodeFeed::Absent)));
+    now
+}
+
+/// One node's display from what each of its waits shows: the one itself,
+/// or, for several, every line of each named `(k of n)`. A wait gone
+/// between the read of the waits and its own read shows nothing; one that
+/// failed fails the whole.
+fn several(feeds: Vec<NodeFeed>) -> NodeFeed {
+    let shown: Vec<NodeFeed> = feeds.into_iter().filter(|feed| *feed != NodeFeed::Absent).collect();
+    if let Some(error) = shown.iter().find(|feed| matches!(feed, NodeFeed::Error { .. })) {
+        return error.clone();
+    }
+    match shown.len() {
+        0 => NodeFeed::Absent,
+        1 => shown.into_iter().next().expect("one"),
+        n => NodeFeed::Ok {
+            items: shown
+                .into_iter()
+                .enumerate()
+                .flat_map(|(k, feed)| match feed {
+                    NodeFeed::Ok { items } => items,
+                    NodeFeed::Absent | NodeFeed::Error { .. } => Vec::new(),
+                }
+                .into_iter()
+                .map(move |mut item| {
+                    item.label = format!("{} ({} of {n})", item.label, k + 1);
+                    item
+                }))
+                .collect(),
+        },
+    }
+}
+
+/// The production readers: the same reads the editor's `/live` doors
 /// answer from.
 pub struct StateReader(pub crate::state::DispatcherState);
 
@@ -305,6 +427,9 @@ impl DisplayReader for StateReader {
                 .await
                 .map(|endpoint_url| DisplayAt::Container { endpoint_url }),
             DisplaySource::Signal => crate::api::signal::signal_live_at(state, key.project, &key.node, instance).await.map(DisplayAt::Listener),
+            // A wait belongs to one run, and its run's stream reads it
+            // (`run_waits`); a node's own feed never names one.
+            DisplaySource::Wait => return Err(format!("the wait at '{}' is shown with its run, never as a feed of its own", key.node)),
         };
         match found {
             Ok(at) => Ok(at),
@@ -323,6 +448,34 @@ impl DisplayReader for StateReader {
             Ok(feed) => NodeFeed::Ok { items: feed.items },
             Err((axum::http::StatusCode::NOT_FOUND, _)) => NodeFeed::Absent,
             Err((_, error)) => NodeFeed::Error { error },
+        }
+    }
+}
+
+#[async_trait]
+impl WaitReader for StateReader {
+    async fn waits(&self, run: weft_core::RunId) -> Result<Vec<WaitAt>, String> {
+        let signals = self.0.journal.signal_list_for_run_id(run).await.map_err(|e| format!("the run's waits: {e:#}"))?;
+        // The configured base, as for a trigger's display: the address is
+        // handed on to whoever answers the wait. Read only once a wait has
+        // an outside address.
+        let base = self.0.external_base();
+        let mut waits = Vec::new();
+        for s in signals.into_iter().filter(|s| s.is_resume && s.run_id == Some(run)) {
+            let address = match s.public_path() {
+                Some(path) => Some(base.url(&path).await.map_err(|e| format!("the run's waits: {e:#}"))?),
+                None => None,
+            };
+            waits.push(WaitAt { node: s.node_id, at: crate::api::signal::SignalLiveAt { token: s.token, address } });
+        }
+        Ok(waits)
+    }
+
+    async fn read(&self, at: &crate::api::signal::SignalLiveAt) -> NodeFeed {
+        match self.0.listener.live(&at.token, at.address.as_deref()).await {
+            Ok(Some(answer)) => NodeFeed::Ok { items: answer.live.items },
+            Ok(None) => NodeFeed::Absent,
+            Err(e) => NodeFeed::Error { error: format!("the wait's display: {e:#}") },
         }
     }
 }
@@ -489,5 +642,81 @@ mod tests {
         assert_eq!(*shown.borrow_and_update(), Some(NodeFeed::Ok { items: vec![] }));
         tokio::time::sleep(LOOK_EVERY * 5).await;
         assert!(!shown.has_changed().unwrap(), "the same look again is not news");
+    }
+
+    /// One run's waits, as a test sets them, and what each token shows.
+    struct Waits {
+        waits: std::sync::Mutex<Result<Vec<WaitAt>, String>>,
+        shows: std::sync::Mutex<HashMap<String, NodeFeed>>,
+    }
+
+    impl Default for Waits {
+        fn default() -> Self {
+            Self { waits: std::sync::Mutex::new(Ok(Vec::new())), shows: Default::default() }
+        }
+    }
+
+    impl Waits {
+        fn set(&self, waits: &[(&str, &str)]) {
+            let at = |token: &str| crate::api::signal::SignalLiveAt { token: token.into(), address: None };
+            *self.waits.lock().unwrap() = Ok(waits.iter().map(|(n, t)| WaitAt { node: n.to_string(), at: at(t) }).collect());
+        }
+        fn show(&self, token: &str, text: &str) {
+            let items = vec![weft_core::live::LiveItem::text("Last answer", text)];
+            self.shows.lock().unwrap().insert(token.into(), NodeFeed::Ok { items });
+        }
+    }
+
+    #[async_trait]
+    impl WaitReader for Waits {
+        async fn waits(&self, _run: weft_core::RunId) -> Result<Vec<WaitAt>, String> {
+            self.waits.lock().unwrap().clone()
+        }
+        async fn read(&self, at: &crate::api::signal::SignalLiveAt) -> NodeFeed {
+            self.shows.lock().unwrap().get(&at.token).cloned().unwrap_or(NodeFeed::Absent)
+        }
+    }
+
+    fn answer(display: &NodeDisplay) -> Vec<(String, String)> {
+        match &display.feed {
+            NodeFeed::Ok { items } => items.iter().map(|i| (i.label.clone(), i.data.as_str().unwrap().to_string())).collect(),
+            other => panic!("not shown: {other:?}"),
+        }
+    }
+
+    /// A run's waits show at once, then only when what they show changes;
+    /// a node whose wait is over says so once, and a node waiting twice at
+    /// once shows both waits, each line named with which one it is.
+    #[tokio::test(start_paused = true)]
+    async fn a_runs_waits_show_what_changes_and_go_when_they_end() {
+        use futures::StreamExt;
+        let reader = Arc::new(Waits::default());
+        reader.set(&[("render", "t1")]);
+        reader.show("t1", "IN_QUEUE");
+        let mut shown = Box::pin(run_waits(reader.clone(), weft_core::RunId::from_u128(1)));
+
+        let first = shown.next().await.unwrap();
+        assert_eq!((first.source, first.node.as_str()), (DisplaySource::Wait, "render"));
+        assert_eq!(answer(&first), vec![("Last answer".to_string(), "IN_QUEUE".to_string())]);
+
+        reader.show("t1", "IN_PROGRESS");
+        let next = tokio::time::timeout(LOOK_EVERY * 2, shown.next()).await.expect("a change is sent at the next look").unwrap();
+        assert_eq!(answer(&next), vec![("Last answer".to_string(), "IN_PROGRESS".to_string())]);
+        assert!(tokio::time::timeout(LOOK_EVERY * 3, shown.next()).await.is_err(), "the same look again is not news");
+
+        reader.set(&[("each", "a"), ("each", "b")]);
+        reader.show("a", "one");
+        reader.show("b", "two");
+        let mut seen = [
+            tokio::time::timeout(LOOK_EVERY * 2, shown.next()).await.unwrap().unwrap(),
+            tokio::time::timeout(LOOK_EVERY * 2, shown.next()).await.unwrap().unwrap(),
+        ];
+        seen.sort_by(|x, y| x.node.cmp(&y.node));
+        assert_eq!(answer(&seen[0]), vec![("Last answer (1 of 2)".to_string(), "one".to_string()), ("Last answer (2 of 2)".to_string(), "two".to_string())]);
+        assert_eq!((seen[1].node.as_str(), &seen[1].feed), ("render", &NodeFeed::Absent), "its wait is over");
+
+        *reader.waits.lock().unwrap() = Err("the database is down".into());
+        let failed = tokio::time::timeout(LOOK_EVERY * 2, shown.next()).await.unwrap().unwrap();
+        assert_eq!((failed.node.as_str(), &failed.feed), ("each", &NodeFeed::Error { error: "the database is down".into() }));
     }
 }

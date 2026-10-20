@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::provider;
 
@@ -24,7 +24,10 @@ impl Node for CustomProviderNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        provider::emit(&ctx, "custom").await
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+        // The recipe's `connectionOptional` makes an unpicked connection
+        // `None` here, and the object then carries no `account`.
+        let account = ctx.inputs.access(provider::CONNECTION_INPUT)?;
+        provider::emit(&ctx, "custom", account).await
     }
 }

@@ -10,7 +10,7 @@ use uuid::Uuid;
 // beside the other connect wire types; the store's read-back query
 // answers the same struct, so publish and read-back cannot drift.
 use weft_core::access::wire::PublishedConnection;
-use weft_core::ExecutionId;
+use weft_core::RunId;
 use weft_task_store::tasks::{NewTask, TaskOutcome, TaskStatus};
 
 // The wire-enum helper is weft-core's (`weft_core::wire_enum!`), so an
@@ -42,16 +42,6 @@ wire_enum! {
         Upgrade = "upgrade",
     }
 }
-
-/// The running-work vocabulary (`RunningPolicy`, `RunningChoice`,
-/// `DeactivationMode`, `DeactivateSpec`, the default drain cap) is
-/// defined once in weft-core, where the CLI reaches it too; re-exported
-/// here so the existing `weft_broker_client::protocol::*` paths keep
-/// working.
-pub use weft_core::{
-    default_drain_timeout_secs, DeactivateSpec, DeactivationMode, RunningChoice, RunningPolicy,
-    DEFAULT_DRAIN_TIMEOUT_SECS,
-};
 
 /// The lifecycle state of an infra node copy lives in weft-core, where a
 /// program's `ctx.infra(..).status()` decodes it too; re-exported here so
@@ -154,7 +144,7 @@ pub const JOURNAL_RECORD_BODY_LIMIT: usize = 64 * weft_core::storage::MAX_WIRE_V
 /// ancestor).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordOfRequest {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,7 +159,7 @@ pub struct RecordOfResponse {
 /// reads its record in the same trip. `None` when it is not queued.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunClaimRequest {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,7 +175,7 @@ pub struct RunClaimResponse {
 /// when one is handed to it (`crate::line::PARKED_FIRE_CHANNEL`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunAnswersRequest {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     /// The waits whose answers the worker already took. An answer stays
     /// waiting until the run's record holds it, which an unrecorded run's
     /// never does, so these are left out rather than handed again.
@@ -219,10 +209,10 @@ pub struct RunRecheckedResponse {
     pub answers: Vec<RunAnswerOf>,
 }
 
-/// An answer handed to the run `execution_id`.
+/// An answer handed to the run `run_id`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunAnswerOf {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub token: String,
     pub answer: weft_core::primitive::WaitAnswer,
 }
@@ -232,7 +222,7 @@ pub struct RunAnswerOf {
 /// Answered 409 when the worker does not drive it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunGiveUpRequest {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     /// Why, as the run's failure says it.
     pub error: String,
 }
@@ -246,45 +236,45 @@ pub struct RunGiveUpResponse {
 /// One cancel waiting for a run, and why.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunCancel {
-    pub execution_id: ExecutionId,
-    pub cause: weft_core::exec::CancelCause,
+    pub run_id: RunId,
+    pub cause: weft_core::run::CancelCause,
 }
 
-// ---------- Execution steering (`ctx.tag_execution` / `ctx.stop_tagged`) ----------
+// ---------- Run steering (`ctx.tag_run` / `ctx.stop_tagged`) ----------
 
-/// `POST /v1/execution/tag`: the worker tags the execution it is
-/// driving, its `ExecutionTagged` already on record. Worker-only: the
-/// broker writes the `execution_tag` rows synchronously, so by the time
+/// `POST /v1/run/tag`: the worker tags the run it is
+/// driving, its `RunTagged` already on record. Worker-only: the
+/// broker writes the `run_tag` rows synchronously, so by the time
 /// the node's call returns its tag row exists and a following
 /// `stop_tagged` can anchor on it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionTagRequest {
-    pub execution_id: ExecutionId,
+pub struct RunTagRequest {
+    pub run_id: RunId,
     /// Already validated by the ctx (`weft_core::tag`); the broker
     /// validates again, because it trusts no process.
     pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionTagResponse {}
+pub struct RunTagResponse {}
 
-/// `POST /v1/execution/stop_tagged`: the worker asks that every live
-/// execution of ITS project carrying `tag` be stopped. The broker
+/// `POST /v1/run/stop_tagged`: the worker asks that every live
+/// run of ITS project carrying `tag` be stopped. The broker
 /// resolves the ordering anchor at this moment (the asker's own tag
 /// seq, or one past the newest row) and enqueues the dispatcher's
 /// `stop_tagged` task with it, so a stop that runs late can never reach
 /// a sibling that tagged itself after the ask. The project is the
 /// run's, read from its row; the request never names one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionStopTaggedRequest {
-    /// The asking execution.
-    pub execution_id: ExecutionId,
+pub struct RunStopTaggedRequest {
+    /// The asking run.
+    pub run_id: RunId,
     pub tag: String,
     pub stop_self: weft_core::StopSelf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionStopTaggedResponse {
+pub struct RunStopTaggedResponse {
     /// The stop reaches the asking run itself (`StopSelf::Include` and
     /// the run carries the tag). The asker then waits for its own
     /// cancel instead of going on: the dispatcher carries the stop out
@@ -356,7 +346,7 @@ pub struct InfraEndpointUrlRequest {
     /// The asking run. The broker resolves its project from it, so a
     /// handle never reaches outside the run's project, and checks the
     /// handle's instance against the run's.
-    pub execution_id: weft_core::ExecutionId,
+    pub run_id: weft_core::RunId,
     /// The endpoint asked for: an infra node's place (see
     /// `InfraEnqueueApplyRequest`), the endpoint's name, and the instance
     /// whose copy it is (absent for a shared copy).
@@ -367,7 +357,7 @@ pub struct InfraEndpointUrlRequest {
 /// outputs, for the run that runs the node (`InfraReader::baked_outputs`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraBakedRequest {
-    pub execution_id: weft_core::ExecutionId,
+    pub run_id: weft_core::RunId,
     /// The node's place, spelled.
     pub place: String,
     /// Whose copy: absent for the shared one.
@@ -386,7 +376,7 @@ pub struct InfraBakedResponse {
 /// run saves, and only for a copy it may read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraBakeRequest {
-    pub execution_id: weft_core::ExecutionId,
+    pub run_id: weft_core::RunId,
     /// The node's place, spelled.
     pub place: String,
     /// Whose copy: absent for the shared one.
@@ -409,17 +399,17 @@ pub struct InfraEndpointUrlResponse {
 /// connection `connection_id`. The store refreshes lazily
 /// (single-flight) before answering; for a connection whose credential
 /// the runtime supplies, the runtime's credential source answers
-/// instead. The caller's execution scope anchors the tenant, and the
+/// instead. The caller's run scope anchors the tenant, and the
 /// row's tenant must match (the tenant wall at run time). The firing's
 /// identity travels on EVERY resolve, because any connection can be
 /// billable and every cost record must be attributable to a firing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolveConnectionRequest {
-    /// The requesting execution. The broker resolves the owning tenant
+    /// The requesting run. The broker resolves the owning tenant
     /// AND project from it and enforces both, so neither is taken from
     /// this request: a credential policy that decides per project must
     /// not be deciding on a name the worker chose.
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub node_id: String,
     /// The opening firing's loop-frame coordinate, so anything the
     /// runtime later books against this connection (a measured cost)
@@ -456,9 +446,9 @@ pub struct ResolveConnectionRequest {
 /// person would have pasted; the store refuses anything else.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishAccessRequest {
-    /// The publishing execution. The broker resolves the owning tenant
+    /// The publishing run. The broker resolves the owning tenant
     /// AND project from it, so neither is taken from this request.
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     /// The publishing node's PLACE, spelled the way a person writes it
     /// (`db`, or `one.db` inside the file the site `one` includes). Its
     /// connection: publishing again updates that one row, and
@@ -487,7 +477,7 @@ pub struct PublishAccessResponse {
 /// "Which connection did this node publish for this service, if any?"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishedAccessRequest {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub node_id: String,
     pub service: String,
     /// As on [`PublishAccessRequest::per_instance`].
@@ -504,7 +494,7 @@ pub struct ProgramMintInstanceTokenRequest {
     /// that token (a new value, the old one dead) instead of leaving a
     /// second one behind.
     pub id: uuid::Uuid,
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub instance: weft_core::instance::InstanceId,
     /// How long it works, in seconds; required, a year at most.
     pub expires_in_secs: u64,
@@ -579,7 +569,7 @@ pub struct ResolveConnectionResponse {
 /// theirs and never travel back. Nothing node-facing makes this call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseConnectionRequest {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     /// The resolved values being given back; the runtime's credential
     /// source retires the ones it recognizes.
     pub values: std::collections::BTreeMap<String, String>,
@@ -591,7 +581,7 @@ pub struct ReleaseConnectionResponse {}
 // ---------- Project (worker fetches its own definition) ----------
 
 /// Worker call to fetch the project's runtime `ProjectDefinition`
-/// at execution claim time. Keyed by `(project_id, expected_hash)`:
+/// at run claim time. Keyed by `(project_id, expected_hash)`:
 /// the hash makes the lookup content-addressed against the
 /// append-only `project_definition` history table.
 ///
@@ -685,7 +675,7 @@ pub struct SupervisorSyncOwnershipRequest {
     /// once a sync's listing (`held_projects`) holds none of them.
     #[serde(default)]
     pub failed: Vec<ProjectTrouble>,
-    /// Projects a health protocol of this replica gave up on: written down
+    /// Projects a health rule of this replica gave up on: written down
     /// for `weft status` until a pass reports them settled, and tried again
     /// only when something real happens (a machine's word, a person's
     /// command or look), never on a clock. Only a project whose lease this
@@ -717,7 +707,7 @@ pub struct ProjectTrouble {
 }
 
 /// How many tries in a row the supervisor makes at one thing before it
-/// gives up until something real happens: a health protocol's action, a
+/// gives up until something real happens: a health rule's action, a
 /// pass over a project ([`SupervisorSyncOwnershipRequest::failed`]), and
 /// the runs of one infra command that never ended (its `runs`, counted by
 /// the broker's claim).
@@ -742,19 +732,18 @@ pub struct SupervisorProject {
     /// The project's listening as one status: the aggregate over all
     /// its trigger activations, every owner's
     /// (`weft_broker_client::activation::aggregate`). The supervisor's
-    /// health protocol engine consumes this so a
-    /// `HealthCondition::ProjectStatusEq` can fire based on lifecycle
-    /// (e.g. "auto-recover only when the project is currently
-    /// parked"). No `serde(default)`: broker and supervisor deploy
-    /// together, a missing field is schema drift and should fail loud
-    /// on deserialize.
+    /// health rules read it (`HealthCondition::Listening` of
+    /// `weft_core::infra::health` holds while it is `active`). No
+    /// `serde(default)`: broker and supervisor deploy together, a missing
+    /// field is schema drift and should fail loud on deserialize.
     pub status: ProjectStatus,
     /// True iff some activation the health loop took down (it parks
     /// only what reads a broken infra copy) is still down. A person's
-    /// deactivate clears the mark on what it takes down, so the default
-    /// auto-recover protocol, gated on this, reactivates only what the
+    /// deactivate clears the mark on what it takes down, so the built-in
+    /// bring-back rule, gated on this
+    /// (`HealthCondition::TakenDownByHealth`), reactivates only what the
     /// health loop took and never overrides a person's stop.
-    pub health_parked: bool,
+    pub health_down: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -769,7 +758,7 @@ pub struct SupervisorSyncOwnershipResponse {
     pub claimed: Vec<Uuid>,
     /// When a supervisor next has something to look at that nothing
     /// announces (unix seconds, database clock): a unit's health window
-    /// ending, a health protocol's retry, a command waiting on a project no
+    /// ending, a health rule's retry, a command waiting on a project no
     /// lease covers, a lease another replica holds lapsing. The broker
     /// books the supervisor's next pass then; `None` when there is none.
     pub next_due_unix: Option<i64>,
@@ -851,6 +840,11 @@ pub struct SupervisorInfraNode {
     /// stop_behavior, keyed by unit name. The authoritative unit
     /// roster + per-unit truth the health/stop loops operate on.
     pub units: std::collections::BTreeMap<String, UnitRuntime>,
+    /// The health rules its node wrote (`InfraSpec::health_rules`), as
+    /// its last apply stamped them: what the health loop runs on this
+    /// copy. `None`: the node wrote none (or no apply stamped them yet),
+    /// so it runs `weft_core::infra::health::built_in_rules`.
+    pub health_rules: Option<Vec<weft_core::infra::health::HealthRule>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -858,47 +852,88 @@ pub struct SupervisorInfraNodesResponse {
     pub nodes: Vec<SupervisorInfraNode>,
 }
 
+/// Read where each health rule of a project's copies stands, kept across
+/// the supervisor's processes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorHealthProtocolsRequest {
+pub struct SupervisorHealthStateRequest {
     pub project_id: Uuid,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorHealthProtocolsResponse {
-    pub protocols: Option<serde_json::Value>,
-    /// What each of the project's health protocols did, kept across the
-    /// supervisor's processes.
-    #[serde(default)]
-    pub state: Vec<HealthProtocolState>,
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorHealthStateResponse {
+    pub rules: Vec<HealthRuleState>,
+    /// How each command a rule queued ([`HealthRuleState::queued`]) ended,
+    /// for the ones that did: read with the state, never written back. A
+    /// command not listed is still running (or gone, which its deadline
+    /// settles).
+    pub ended: Vec<HealthCommandEnding>,
 }
 
-/// What one health protocol of a project did, kept across the
-/// supervisor's processes (an `infra_health_protocol` row).
+/// How a command a health rule queued ended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HealthProtocolState {
-    pub protocol: String,
-    /// The copies its action acted on since it was last armed (empty for
-    /// an action on no copy); `None`: it has not fired.
-    pub acted: Option<std::collections::BTreeSet<InfraCopy>>,
+pub struct HealthCommandEnding {
+    pub command: i64,
+    pub outcome: LifecycleOutcome,
+    /// The error of a failed one, the reason of a cancelled one.
+    pub message: Option<String>,
+}
+
+/// The take-down or bring-back command a health rule's action queued for
+/// the dispatcher, until a look sees it end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedHealthCommand {
+    /// Its `infra_lifecycle_command` id.
+    pub command: i64,
+    /// Not ended by then (unix seconds: when it was queued plus the
+    /// rule's `timeoutSeconds`), it counts as failed. The broker books a
+    /// look at it.
+    pub deadline_unix: i64,
+}
+
+/// Where one health rule stands on one copy, kept across the supervisor's
+/// processes (an `infra_health_rule` row). Keyed by the copy and the
+/// rule's name, so two nodes' rules of the same name, or one rule on two
+/// copies, never share a state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthRuleState {
+    /// The copy the rule reads.
+    pub copy: InfraCopy,
+    /// The rule's name, unique among its node's rules.
+    pub rule: String,
+    /// Its action was queued for the copy and has not failed, and the
+    /// rule has held for it ever since: it runs again only once the rule
+    /// stopped holding.
+    pub fired: bool,
+    /// The command its action queued that no look has seen end yet. A
+    /// look that finds it failed, or past its deadline, counts a failure
+    /// of the rule and tries again like any failed action; while it runs,
+    /// the rule fires nothing else on the copy.
+    pub queued: Option<QueuedHealthCommand>,
+    /// A take-down rule's: its take-down was queued for the copy and did
+    /// not fail, and the copy has not come back since (no bring-back rule
+    /// of its node holds for it, and something the health check took down
+    /// is still down). What lets a copy whose node runs no bring-back rule
+    /// keep down what it took down, and only that.
+    pub took_down: bool,
     /// Failed attempts in a row since its last success.
     pub consecutive_failures: u32,
     /// Not before (unix seconds) does it try again after a failure.
     pub next_retry_at_unix: Option<i64>,
-    /// When it gave up (unix seconds): it tries again once the units it
-    /// saw then (`gave_up_seen`) change, a person's infra command touches
-    /// the project, or every unit is healthy.
+    /// When it gave up (unix seconds): it tries again once the copy's
+    /// units it saw then (`gave_up_seen`) change, a person's infra command
+    /// touches the project, or the rule stops holding for the copy.
     pub gave_up_at_unix: Option<i64>,
     pub gave_up_seen: Option<serde_json::Value>,
     pub last_error: Option<String>,
 }
 
-/// Replace a project's [`HealthProtocolState`]s (a protocol not listed
+/// Replace a project's [`HealthRuleState`]s (a rule on a copy not listed
 /// has none left), for the supervisor holding its lease (410 otherwise).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetHealthStateRequest {
     pub replica: String,
     pub project_id: Uuid,
-    pub protocols: Vec<HealthProtocolState>,
+    pub rules: Vec<HealthRuleState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1044,8 +1079,6 @@ wire_enum! {
         Stopped = "stopped",
         Terminated = "terminated",
         Started = "started",
-        Notify = "notify",
-        ProtocolConfigError = "protocol_config_error",
     }
 }
 
@@ -1067,8 +1100,6 @@ pub enum InfraEvent {
     Stopped,
     Terminated,
     Started(StartedPayload),
-    Notify(NotifyPayload),
-    ProtocolConfigError(ProtocolConfigErrorPayload),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1101,19 +1132,6 @@ pub struct FailedPayload {
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NotifyPayload {
-    pub protocol: String,
-    pub channel: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProtocolConfigErrorPayload {
-    /// The serde error message from the failed `health_protocols_json`
-    /// deserialize, verbatim.
-    pub error: String,
-}
-
 impl InfraEvent {
     /// Wire-shape pair for a `supervisor_event_record` call.
     /// The kind string is the canonical column value; the payload
@@ -1131,17 +1149,11 @@ impl InfraEvent {
             Self::Stopped => InfraEventKind::Stopped,
             Self::Terminated => InfraEventKind::Terminated,
             Self::Started(_) => InfraEventKind::Started,
-            Self::Notify(_) => InfraEventKind::Notify,
-            Self::ProtocolConfigError(_) => InfraEventKind::ProtocolConfigError,
         };
         let payload = match self {
             Self::Flaky(p) => serde_json::to_value(p).expect("FlakyPayload serializes"),
             Self::Failed(p) => serde_json::to_value(p).expect("FailedPayload serializes"),
             Self::Started(p) => serde_json::to_value(p).expect("StartedPayload serializes"),
-            Self::Notify(p) => serde_json::to_value(p).expect("NotifyPayload serializes"),
-            Self::ProtocolConfigError(p) => {
-                serde_json::to_value(p).expect("ProtocolConfigErrorPayload serializes")
-            }
             Self::Recovered | Self::Stopped | Self::Terminated => Value::Null,
         };
         (kind, payload)
@@ -1162,10 +1174,6 @@ impl InfraEvent {
             InfraEventKind::Stopped => Self::Stopped,
             InfraEventKind::Terminated => Self::Terminated,
             InfraEventKind::Started => Self::Started(serde_json::from_value(payload.clone())?),
-            InfraEventKind::Notify => Self::Notify(serde_json::from_value(payload.clone())?),
-            InfraEventKind::ProtocolConfigError => {
-                Self::ProtocolConfigError(serde_json::from_value(payload.clone())?)
-            }
         })
     }
 }
@@ -1275,6 +1283,9 @@ pub struct SupervisorSetAppliedRequest {
     /// = all units up). The health loop then maintains per-unit
     /// status from this baseline.
     pub units: std::collections::BTreeMap<String, UnitRuntime>,
+    /// `InfraSpec::health_rules`, stamped on the row for the health loop
+    /// (see [`SupervisorInfraNode::health_rules`]).
+    pub health_rules: Option<Vec<weft_core::infra::health::HealthRule>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1326,6 +1337,9 @@ pub struct SupervisorSetProvisioningRequest {
     /// `Provisioning` for every unit at this point. Locked in before
     /// any platform call so a partial-apply failure leaves the roster visible.
     pub units: std::collections::BTreeMap<String, UnitRuntime>,
+    /// `InfraSpec::health_rules`, stamped with the roster (see
+    /// [`SupervisorInfraNode::health_rules`]).
+    pub health_rules: Option<Vec<weft_core::infra::health::HealthRule>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1354,7 +1368,8 @@ pub struct SupervisorEnqueueLifecycleRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "verb", rename_all = "snake_case")]
 pub enum LifecycleSpec {
-    /// Take down what a health protocol reaches, under `spec`.
+    /// Take down the triggers that read the infra copies a health rule
+    /// found broken (`weft_core::take_down::TakeDown::HEALTH`).
     Deactivate(TakeDownReaders),
     /// Bring back what the health loop took down: each activation it
     /// took carries the mark (`went_down_with`: health) the take-down
@@ -1374,33 +1389,22 @@ pub struct RestoreReaders {
     pub still_broken: Vec<InfraCopy>,
 }
 
-/// The health loop's take-down: `spec`, over the activations `reach`
-/// names.
+/// The health loop's take-down: the live activations whose trigger's cut
+/// contains one of the `broken` copies, and nothing else. A shared copy
+/// is read by every owner's triggers that read the node; an instance's
+/// copy only by that instance's. Its answers are fixed
+/// (`weft_core::take_down::TakeDown::HEALTH`): the door holds what
+/// arrives, what is held is kept, and the runs going are stopped, since
+/// they cannot go on on infra that is down.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TakeDownReaders {
-    pub spec: DeactivateSpec,
-    pub reach: TakeDownReach,
-}
-
-/// Which live activations a health take-down reaches.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TakeDownReach {
-    /// Every live activation of the project: the protocol's condition
-    /// names no infra, so nothing says which copies are broken.
-    Project,
-    /// The activations whose triggers read one of the `broken` copies,
-    /// and nothing else. A shared copy is read by every owner's triggers
-    /// that read the node; an instance's copy only by that instance's. Never
-    /// empty: a take-down aimed at no copy is refused.
-    ReadersOf { broken: Vec<InfraCopy> },
+    pub broken: Vec<InfraCopy>,
 }
 
 impl TakeDownReaders {
-    /// The spec's own rule, and a reach that names something.
+    /// Never empty: a take-down aimed at no copy is refused.
     pub fn validate(&self) -> Result<(), &'static str> {
-        self.spec.validate()?;
-        if matches!(&self.reach, TakeDownReach::ReadersOf { broken } if broken.is_empty()) {
+        if self.broken.is_empty() {
             return Err("a health take-down aimed at broken infra copies must name them");
         }
         Ok(())
@@ -1430,9 +1434,10 @@ impl LifecycleSpec {
     }
 
     /// Project the typed spec onto the (verb, spec_json) columns the
-    /// `infra_lifecycle_command` schema stores: Deactivate carries its
-    /// running policy inside `spec_json` (single source of truth);
-    /// Reactivate carries its still-broken copies there.
+    /// `infra_lifecycle_command` schema stores: Deactivate carries the
+    /// copies whose triggers go down (`broken`) inside `spec_json`, the way
+    /// they go down being the fixed `TakeDown::HEALTH`; Reactivate carries
+    /// its still-broken copies there.
     pub fn into_row_columns(self) -> (InfraLifecycleVerb, Option<Value>) {
         match self {
             Self::Deactivate(take_down) => {
@@ -1519,6 +1524,10 @@ pub struct InfraEnqueueApplyRequest {
     #[serde(default)]
     pub instance: Option<weft_core::instance::InstanceId>,
     pub spec_json: serde_json::Value,
+    /// The infra setup run applying it: the build it runs says which
+    /// version of the place's infra the copy will be, stamped on the copy
+    /// when the apply succeeds.
+    pub run_id: weft_core::RunId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1697,22 +1706,6 @@ pub struct SupervisorCommandCompleteRequest {
 pub struct SupervisorCommandCompleteResponse {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorTriggerDepsRequest {
-    pub project_id: Uuid,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorTriggerDep {
-    pub infra_node_id: String,
-    pub trigger_node_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorTriggerDepsResponse {
-    pub deps: Vec<SupervisorTriggerDep>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorInfraCommandInFlightRequest {
     pub project_id: Uuid,
 }
@@ -1749,16 +1742,15 @@ impl InFlightCommand {
 /// entry, the trigger's that fired its run for a wait; read through
 /// [`SIGNAL_ACTIVATION_JOIN`]) has its listeners listen: being activated
 /// (the rehydrate at the end of activate runs before the flip to active),
-/// live, or off in a way that takes work while it is off (parked, or
-/// hibernating within its grace window), since what a parked trigger hears
-/// waits for it to be back on (`weft_dispatcher::arrival`). A signal no
-/// activation governs listens. A wiped activation's rows are gone, and a
-/// hibernation past its grace window stops listening. What a starting
-/// listener rehydrates, what holders claim, and how many holders run all
-/// read this.
-// SYNC: ACTIVATION_LISTENS <-> weft_core::arrival::Standing::arrival, crates/weft-dispatcher/src/activation_store.rs (IN_GRACE_WINDOW_SQL)
+/// live, or down with a door that holds what arrives (within its window,
+/// when it has one), since what such a trigger hears waits for it to be
+/// back on (`weft_core::arrival`). A signal no activation governs listens.
+/// A door that refuses, or whose window ended, stops listening, its rows
+/// kept for when the trigger is back. What a starting listener rehydrates,
+/// what holders claim, and how many holders run all read this.
+// SYNC: ACTIVATION_LISTENS <-> weft_core::arrival::Standing::arrival, crates/weft-dispatcher/src/activation_store.rs (DOOR_WINDOW_OPEN_SQL)
 pub const ACTIVATION_LISTENS: &str = "(a.status IS NULL OR a.status IN ('activating', 'active') \
-    OR (a.status IN ('deactivating', 'inactive') AND a.accepting_fires \
+    OR (a.status = 'inactive' AND a.accepting_fires \
         AND (a.fires_deadline_unix IS NULL OR a.fires_deadline_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT)))";
 
 /// The join every "is this signal held" read goes through: the
@@ -1929,7 +1921,7 @@ pub struct SignalRowWire {
     pub node_id: String,
     pub spec_json: String,
     pub is_resume: bool,
-    pub execution_id: Option<ExecutionId>,
+    pub run_id: Option<RunId>,
     pub surface_kind: SignalSurfaceKind,
     pub mount_path: Option<String>,
     /// The HTTP methods a `PublicEntry` serves, uppercase; empty = any
@@ -2086,8 +2078,9 @@ pub struct ListenerResolveRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListenerInfraAddressRequest {
     /// The signal the listener is connecting for. The broker reads its
-    /// project off the held row, so the answer looks at that project's
-    /// infra alone, and a token that is not held is refused.
+    /// project off the held row (or, for a cancelled wait whose last call
+    /// is being sent, off that call's task), so the answer looks at that
+    /// project's infra alone, and any other token is refused.
     pub signal_token: String,
     /// `host:port`, as the trigger's URL or address names it.
     pub authority: String,
@@ -2234,7 +2227,7 @@ pub enum DoorParked {
     QueueFull,
     /// The signal is gone.
     Gone,
-    /// The trigger takes no work (wiped, past its hibernation): the fire
+    /// The trigger takes no work (its door refuses, or its window ended): the fire
     /// is not kept.
     TakesNoWork,
     /// The holder it was picked up under no longer holds the signal: it is
@@ -2367,7 +2360,7 @@ pub struct DoorInstanceToken {
 /// next.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoorLetGoRequest {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub why: LetGo,
 }
 
@@ -2517,14 +2510,14 @@ mod supervisor_protocol_tests {
     #[test]
     fn publish_access_round_trip() {
         // The request carries no project: the broker resolves that
-        // from the execution, so a worker cannot name someone else's.
+        // from the run, so a worker cannot name someone else's.
         let spec: weft_core::AccessSpec = serde_json::from_value(json!({
             "service": "postgres",
             "acquisition": { "kind": "static", "fields": [{ "name": "host" }] },
         }))
         .unwrap();
         let req = PublishAccessRequest {
-            execution_id: uuid::Uuid::from_u128(0xc1),
+            run_id: uuid::Uuid::from_u128(0xc1),
             node_id: "db".into(),
             service: "postgres".into(),
             spec,
@@ -2534,7 +2527,7 @@ mod supervisor_protocol_tests {
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["per_instance"], true, "whose copy published it rides as a flag; the instance is the run's");
-        assert_eq!(v["execution_id"], json!(uuid::Uuid::from_u128(0xc1)));
+        assert_eq!(v["run_id"], json!(uuid::Uuid::from_u128(0xc1)));
         assert_eq!(v["node_id"], "db");
         assert_eq!(v["values"]["host"], "db.svc");
         assert!(v.get("project_id").is_none(), "the project is never on the wire");
@@ -2542,7 +2535,7 @@ mod supervisor_protocol_tests {
         // Both verbs answer the SAME shape, so a connection read back
         // is the same value as the one published.
         let published: PublishAccessResponse = serde_json::from_value(json!({
-            "connection": { "connection_id": "id-1", "identity": "weft@db/app" },
+            "connection": { "connectionId": "id-1", "identity": "weft@db/app" },
         }))
         .unwrap();
         assert_eq!(published.connection.connection_id, "id-1");
@@ -2560,7 +2553,7 @@ mod supervisor_protocol_tests {
         );
         let some: PublishedAccessResponse = serde_json::from_value(json!({
             "state": "published",
-            "connection": { "connection_id": "id-1", "identity": null },
+            "connection": { "connectionId": "id-1", "identity": null },
         }))
         .unwrap();
         assert_eq!(some.connection().expect("a connection").connection_id, "id-1");
@@ -2634,7 +2627,7 @@ mod supervisor_protocol_tests {
                     "project_id": "00000000-0000-0000-0000-0000000000a1",
                     "tenant_id": "alice",
                     "status": "active",
-                    "health_parked": false,
+                    "health_down": false,
                 }
             ],
             "claimed": ["00000000-0000-0000-0000-0000000000a1"],
@@ -2696,7 +2689,7 @@ mod supervisor_protocol_tests {
                     "project_id": "00000000-0000-0000-0000-0000000000a1",
                     "tenant_id": "alice",
                     "status": "active",
-                    "health_parked": false,
+                    "health_down": false,
                 }
             ]
         }))
@@ -2722,7 +2715,7 @@ mod supervisor_protocol_tests {
         );
     }
 
-    /// `SupervisorProject::health_parked` also has NO `serde(default)`:
+    /// `SupervisorProject::health_down` also has NO `serde(default)`:
     /// a missing field is schema drift and must fail loud (the broker +
     /// supervisor deploy together). Pin it so a future `serde(default)`
     /// slipping in would break CI rather than silently defaulting the
@@ -2736,7 +2729,7 @@ mod supervisor_protocol_tests {
         }));
         assert!(
             res.is_err(),
-            "missing health_parked should fail deserialize; got {:?}",
+            "missing health_down should fail deserialize; got {:?}",
             res
         );
     }
@@ -2760,11 +2753,17 @@ mod supervisor_protocol_tests {
                         "stop_behavior": { "kind": "stop" },
                         "flaky_after_seconds": 30,
                         "recovery_after_seconds": 30
-                    }}
+                    }},
+                    "health_rules": [{
+                        "name": "back",
+                        "when": { "kind": "unit_flaky", "unit": "main" },
+                        "action": { "kind": "bring_back" }
+                    }]
                 }
             ]
         });
         let resp: SupervisorInfraNodesResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.nodes[0].health_rules.as_ref().unwrap()[0].when.units_named(), vec!["main"]);
         assert_eq!(resp.nodes[0].addresses.urls.get("api").unwrap(), "http://x.svc:8080");
         assert_eq!(resp.nodes[0].addresses.install_urls.get("api").unwrap(), "http://127.0.0.1:41234");
         assert_eq!(resp.nodes[0].addresses.public_paths.get("api").unwrap(), "/infra/p/wn-abc-tgi-12/hooks");
@@ -2814,6 +2813,7 @@ mod supervisor_protocol_tests {
             keep_disks: vec!["data".into()],
             notes: vec!["unit 'main' of 'tgi' asked for 1 x l4".into()],
             units: std::collections::BTreeMap::new(),
+            health_rules: Some(weft_core::infra::health::built_in_rules()),
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["notes"][0], "unit 'main' of 'tgi' asked for 1 x l4");
@@ -2827,19 +2827,20 @@ mod supervisor_protocol_tests {
         assert_eq!(back.command_id, 7);
         assert_eq!(back.keep_disks, vec!["data".to_string()]);
         assert_eq!(back.copy_id, "wn-abc-tgi-12");
+        assert_eq!(back.health_rules, req.health_rules);
     }
 
     #[test]
     fn resolve_connection_request_round_trip() {
         let req = ResolveConnectionRequest {
-            execution_id: uuid::Uuid::from_u128(0xc1),
+            run_id: uuid::Uuid::from_u128(0xc1),
             node_id: "ask".into(),
             frames: vec![weft_core::frames::Frame::Loop { index: 3 }],
             node_type: "openrouter.inference".into(),
             connection_id: "11111111-2222-3333-4444-555555555555".into(),
             service: "openrouter".into(),
             required_permissions: vec!["drive.readonly".into()],
-            required_values: vec!["imap_host".into()],
+            required_values: vec!["imapHost".into()],
             expected_duration_secs: 120,
         };
         // The full literal object pins the FIELD NAMES on the wire: a
@@ -2849,14 +2850,14 @@ mod supervisor_protocol_tests {
         assert_eq!(
             v,
             json!({
-                // No project: the broker resolves it from the execution,
+                // No project: the broker resolves it from the run,
                 // so a worker never names one.
-                "execution_id": uuid::Uuid::from_u128(0xc1), "node_id": "ask",
+                "run_id": uuid::Uuid::from_u128(0xc1), "node_id": "ask",
                 "frames": [{"index": 3}], "node_type": "openrouter.inference",
                 "connection_id": "11111111-2222-3333-4444-555555555555",
                 "service": "openrouter",
                 "required_permissions": ["drive.readonly"],
-                "required_values": ["imap_host"],
+                "required_values": ["imapHost"],
                 "expected_duration_secs": 120
             })
         );
@@ -2906,14 +2907,14 @@ mod supervisor_protocol_tests {
     #[test]
     fn release_connection_request_round_trip() {
         let req = ReleaseConnectionRequest {
-            execution_id: uuid::Uuid::from_u128(0xc1),
+            run_id: uuid::Uuid::from_u128(0xc1),
             values: [("token".to_string(), "cred".to_string())].into_iter().collect(),
         };
         let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v, json!({ "execution_id": uuid::Uuid::from_u128(0xc1), "values": { "token": "cred" } }));
+        assert_eq!(v, json!({ "run_id": uuid::Uuid::from_u128(0xc1), "values": { "token": "cred" } }));
         let back: ReleaseConnectionRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back.values["token"], "cred");
-        assert_eq!(back.execution_id, uuid::Uuid::from_u128(0xc1));
+        assert_eq!(back.run_id, uuid::Uuid::from_u128(0xc1));
     }
 
     #[test]
@@ -2940,6 +2941,7 @@ mod supervisor_protocol_tests {
             copy_id: "wn-abc-tgi-12".into(),
             keep_disks: vec!["data".into()],
             units: std::collections::BTreeMap::new(),
+            health_rules: None,
         };
         let v = serde_json::to_value(&req).unwrap();
         let back: SupervisorSetProvisioningRequest = serde_json::from_value(v).unwrap();
@@ -2969,30 +2971,8 @@ mod supervisor_protocol_tests {
         assert_eq!(row.node_id, None);
     }
 
-    #[test]
-    fn deactivate_spec_round_trip() {
-        let s = DeactivateSpec {
-            mode: DeactivationMode::Hibernate,
-            grace_minutes: 5,
-            running_policy: RunningPolicy::Wait,
-            drain_timeout_secs: Some(120),
-        };
-        let v = serde_json::to_value(&s).unwrap();
-        assert_eq!(v["drainTimeoutSecs"], 120);
-        let back: DeactivateSpec = serde_json::from_value(v).unwrap();
-        assert_eq!(s, back);
-    }
-
     fn take_down(broken: Vec<InfraCopy>) -> TakeDownReaders {
-        TakeDownReaders {
-            spec: DeactivateSpec {
-                mode: DeactivationMode::Park,
-                grace_minutes: 0,
-                running_policy: RunningPolicy::Cancel,
-                drain_timeout_secs: None,
-            },
-            reach: TakeDownReach::ReadersOf { broken },
-        }
+        TakeDownReaders { broken }
     }
 
     fn ada_svc() -> InfraCopy {
@@ -3007,15 +2987,9 @@ mod supervisor_protocol_tests {
         ]));
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["verb"], "deactivate");
-        assert_eq!(v["reach"]["kind"], "readers_of");
-        assert_eq!(v["reach"]["broken"], json!([{ "node_id": "svc", "instance": "ada" }, { "node_id": "db" }]));
+        assert_eq!(v["broken"], json!([{ "node_id": "svc", "instance": "ada" }, { "node_id": "db" }]));
         let back: LifecycleSpec = serde_json::from_value(v).unwrap();
         assert_eq!(d, back);
-
-        let whole = LifecycleSpec::Deactivate(TakeDownReaders { reach: TakeDownReach::Project, ..take_down(vec![]) });
-        let v = serde_json::to_value(&whole).unwrap();
-        assert_eq!(v["reach"], json!({ "kind": "project" }));
-        assert_eq!(serde_json::from_value::<LifecycleSpec>(v).unwrap(), whole);
 
         let r = LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![ada_svc()] });
         let v = serde_json::to_value(&r).unwrap();
@@ -3043,13 +3017,6 @@ mod supervisor_protocol_tests {
             InfraEvent::Started(StartedPayload {
                 copy_id: "inst1".into(),
                 mode: StartMode::Fresh,
-            }),
-            InfraEvent::Notify(NotifyPayload {
-                protocol: "p".into(),
-                channel: "ops".into(),
-            }),
-            InfraEvent::ProtocolConfigError(ProtocolConfigErrorPayload {
-                error: "bad json".into(),
             }),
         ];
         for ev in cases {
@@ -3119,20 +3086,13 @@ mod supervisor_protocol_tests {
         ));
     }
 
-    /// A take-down aimed at broken copies names at least one, and one
-    /// aimed at the whole project names none; a spec the running-work
-    /// rule refuses is refused either way. A recovery has no rule: an
-    /// empty still-broken set restores everything the loop took.
+    /// A take-down names at least one broken copy. A recovery has no
+    /// rule: an empty still-broken set restores everything the loop took.
     #[test]
     fn a_take_down_names_its_broken_copies() {
         assert!(take_down(vec![ada_svc()]).validate().is_ok());
         assert!(take_down(vec![]).validate().is_err());
-        assert!(TakeDownReaders { reach: TakeDownReach::Project, ..take_down(vec![]) }.validate().is_ok());
         assert!(LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![] }).validate().is_ok());
-        let mut wipe_wait = take_down(vec![ada_svc()]);
-        wipe_wait.spec.mode = DeactivationMode::Wipe;
-        wipe_wait.spec.running_policy = RunningPolicy::Wait;
-        assert!(wipe_wait.validate().is_err());
     }
 
     #[test]
@@ -3201,7 +3161,7 @@ mod supervisor_protocol_tests {
 
     #[test]
     fn endpoint_url_response_carries_the_public_url() {
-        let v = json!({ "address": { "url": "http://a.ns.svc:80", "public_url": "http://door/infra/ns/a/hooks" } });
+        let v = json!({ "address": { "url": "http://a.ns.svc:80", "publicUrl": "http://door/infra/ns/a/hooks" } });
         let r: InfraEndpointUrlResponse = serde_json::from_value(v).unwrap();
         let address = r.address.unwrap();
         assert_eq!(address.url, "http://a.ns.svc:80");
@@ -3211,7 +3171,7 @@ mod supervisor_protocol_tests {
     #[test]
     fn endpoint_url_request_carries_the_handle() {
         let v = json!({
-            "execution_id": "00000000-0000-0000-0000-0000000000a1",
+            "run_id": "00000000-0000-0000-0000-0000000000a1",
             "infra": { "__weft_infra__": { "place": "n", "endpoint": "api", "instance": "ada" } }
         });
         let r: InfraEndpointUrlRequest = serde_json::from_value(v).unwrap();
@@ -3233,7 +3193,7 @@ mod supervisor_protocol_tests {
             kind_state_seq: 0,
             spec_json: "{}".into(),
             is_resume: false,
-            execution_id: None,
+            run_id: None,
             surface_kind,
             mount_path: mount_path.map(|s| s.to_string()),
             mount_methods: Vec::new(),
@@ -3360,7 +3320,7 @@ mod supervisor_protocol_tests {
             }),
             access_id: "11111111-2222-3333-4444-555555555555".into(),
             service: "slack".into(),
-            required_values: vec!["imap_host".into()],
+            required_values: vec!["imapHost".into()],
         };
         // The full literal pins the FIELD NAMES on the wire: a
         // symmetric rename round-trips fine but breaks the peer.
@@ -3370,12 +3330,12 @@ mod supervisor_protocol_tests {
             json!({
                 "tenant": "tenant-a",
                 "for_instance": {
-                    "project_id": "00000000-0000-0000-0000-0000000000a1",
+                    "projectId": "00000000-0000-0000-0000-0000000000a1",
                     "instance": "alice"
                 },
                 "access_id": "11111111-2222-3333-4444-555555555555",
                 "service": "slack",
-                "required_values": ["imap_host"]
+                "required_values": ["imapHost"]
             })
         );
         let back: ListenerResolveRequest = serde_json::from_value(v).unwrap();
@@ -3407,7 +3367,7 @@ mod supervisor_protocol_tests {
                 }
             }))
             .unwrap(),
-            recipe_values: [("app_token".to_string(), "xapp-1".to_string())]
+            recipe_values: [("appToken".to_string(), "xapp-1".to_string())]
                 .into_iter()
                 .collect(),
             provider_account: Some("T1".into()),
@@ -3419,7 +3379,7 @@ mod supervisor_protocol_tests {
             v["auth"],
             json!([{ "kind": "header", "name": "Authorization", "value": "Bearer {token}" }])
         );
-        assert_eq!(v["recipe_values"], json!({ "app_token": "xapp-1" }));
+        assert_eq!(v["recipe_values"], json!({ "appToken": "xapp-1" }));
         assert_eq!(v["provider_account"], "T1");
         assert_eq!(v["events"]["messages"]["account"]["value"], "team");
         let back: ResolvedEventSource = serde_json::from_value(v).unwrap();

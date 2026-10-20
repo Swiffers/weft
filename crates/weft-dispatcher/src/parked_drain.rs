@@ -72,7 +72,7 @@ pub(crate) async fn drain_activations(
         .into_iter()
         .map(|signal| signal.token)
         .collect();
-    let queued: Vec<String> = sqlx::query_scalar("SELECT DISTINCT token FROM parked_fire WHERE token = ANY($1) AND execution_id IS NULL")
+    let queued: Vec<String> = sqlx::query_scalar("SELECT DISTINCT token FROM parked_fire WHERE token = ANY($1) AND run_id IS NULL")
         .bind(&tokens)
         .fetch_all(&state.pg_pool)
         .await?;
@@ -231,6 +231,7 @@ pub(crate) async fn drain_token(state: &DispatcherState, token: &str, due: Due) 
             caller: head.waiting.caller.clone(),
             held_by: None,
             attempts: head.waiting.attempts,
+            released: true,
         };
         let landed = crate::api::signal::fire_entry(state, &routing, fire).await;
         let now = crate::lease::now_unix();

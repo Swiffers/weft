@@ -8,7 +8,7 @@ use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::fal::{merge_params, run_queued};
 
@@ -25,7 +25,7 @@ impl Node for FalGenerateImageNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let model: String = ctx.inputs.get("model")?;
         let prompt: String = ctx.inputs.get("prompt")?;
@@ -61,10 +61,10 @@ impl Node for FalGenerateImageNode {
         }
         let ty = ctx.output_type("images")?;
         let stored = ctx
-            .storage(StorageScope::Execution)
+            .storage(StorageScope::Run)
             // A generated image is the run's product: keep it past the
             // run (default 30-day access-bumped TTL) so the reference
-            // stays readable after the execution ends.
+            // stays readable after the run ends.
             .internalize(&json!(urls), &ty, Some(KeepTtl::Default))
             .await?;
         let first = stored.as_array().and_then(|a| a.first()).cloned().expect("checked non-empty");

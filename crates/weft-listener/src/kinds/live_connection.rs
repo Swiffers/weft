@@ -105,8 +105,7 @@ mod tests {
                 data_type: Default::default(),
                 backpressure: Default::default(),
                 error_mode: Default::default(),
-                journal_mode: Default::default(),
-                journal_window_secs: None,
+                journal: Default::default(),
                 window: None,
             },
         })
@@ -153,7 +152,7 @@ mod tests {
             node_id: "n".into(),
             tenant_id: "t".into(),
             is_resume: false,
-            execution_id: None,
+            run_id: None,
             task: None,
             kind_state: None,
             routing: SignalRouting {

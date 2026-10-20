@@ -185,7 +185,7 @@ async fn no_line(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     for (extra, says) in [
         (json!({ "voice": " " }), "`voice` is empty"),
         (json!({ "description": "Low" }), "`description` is 3 characters"),
@@ -194,7 +194,7 @@ async fn refused(rig: FakeRig) -> WeftResult<()> {
         (json!({ "text": "x".repeat(1001) }), "`text` is 1001 characters"),
     ] {
         let err = rig.run(&ElevenLabsRemixVoiceNode, inputs(&rig, extra.clone())).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `error` wired: {extra}: {err}");
+        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {extra}: {err}");
         assert!(err.contains(says), "{extra}: {err}");
     }
     assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");

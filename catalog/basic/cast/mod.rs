@@ -1,8 +1,10 @@
 //! Cast: convert a value into the type declared on the output.
 //!
-//! The target type is whatever the weft source declared on the `value`
-//! output (the metadata ships it as `MustOverride`, so the compiler
-//! demands a concrete declaration). The conversion itself is
+//! The target type is the `value` output's: a type variable of its own
+//! that the program pins, by declaring it (`-> (value: Signup)`) or by
+//! wiring the output into a port of a concrete type, which the
+//! compiler works it out from (a `value` it cannot pin is its
+//! `unresolved-typevar`). The conversion itself is
 //! `WeftType::cast_value`: the same rules the compiler's literal
 //! lenience applies, so text parses into scalars and JSON structures,
 //! scalars stringify, and an object claiming a declared
@@ -13,7 +15,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{node_bail, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{node_bail, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct CastNode;
@@ -28,10 +30,10 @@ impl Node for CastNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let value: serde_json::Value = ctx.inputs.get("value")?;
-        // The metadata ships MustOverride and the compiler refuses an
-        // un-overridden one, so the type is always resolved here.
+        // The compiler refuses a connected output whose variable nothing
+        // pinned, so the type is resolved here.
         let target = ctx.output_type("value")?;
         match target.cast_value(&value) {
             Ok(cast) => ctx.pulse_downstream(NodeOutput::new().set("value", cast)).await,

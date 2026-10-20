@@ -6,15 +6,17 @@ description: "Read when a program calls a language model and you need it to beha
 # Models: reasoning, budgets, and caching
 
 Three things decide how a model call runs, and they sit in different
-places. The provider node says WHICH model. The LLM node itself says
+places. The model node (`OpenRouterModel`, say, wired to its access node)
+says WHICH model. The LLM node itself says
 what it is given and what comes back. And [params], the node wired into
 an LLM node's `params` input, says how it thinks: everything below that
 is not about the prompt is a setting on it.
 
-If you need a real model id for the provider node, run `weft options <step>
-model --search <text>` from the project, with the provider node's name as
-`<step>`. It prints one `id  label` line per matching model, the same list
-the editor's search shows, read through the connection picked on that node,
+If you need a real model id for the model node, run `weft options <node>
+model --search <text>` from the project, with the model node's name as
+`<node>`. It prints one `id  label` line per matching model, the same list
+the editor's search shows, read through the connection picked on the access
+node wired into it,
 and the id is what you write in `model`. Never guess an id, and never ask the
 provider's API yourself.
 
@@ -22,26 +24,26 @@ Everything here is about the model's behaviour, which no metadata file
 can tell you: what a setting DOES to an answer, what it costs, and how
 the pieces interact across a chain of calls.
 
-## Reasoning is off unless you turn it on
+## Reasoning: unset, off or on
 
-`reasoning` on [params] has two positions: off (unset, or `false`),
-or on with the `reasoningEffort` you picked, `low` (the fast, cheap
-effort) when you picked none.
+`reasoning` on [params] has three states. Unset sends nothing, so the
+model runs at its provider's default, which for many models is to reason
+and bill for it. `false` asks for no reasoning. `true` reasons at the
+`reasoningEffort` you picked, sent as written, and at the provider's
+lowest effort (the fast, cheap one) when you picked none.
 
-- **Off** sends no reasoning request; a plain model runs as it always
-  does. A model that cannot switch reasoning off refuses on the providers
-  that spell the off position, and the failure reads ``This model always
-  reasons; set `reasoning: true` on its params (low effort unless you pick
-  one)``. On the OpenAI and Anthropic wires nothing is sent for off, so
-  such a model reasons at its own default and bills you for it: the call
-  that takes four seconds takes forty-five.
+- **Off** asks the provider for no reasoning, on every provider; a plain
+  model runs as it always does. A model that cannot switch reasoning off
+  refuses the call, and the failure reads ``This model always reasons;
+  set `reasoning: true` on its params (the provider's lowest effort
+  unless you pick one)``.
 - **On** sends the effort. A model that has no reasoning fails with its
   provider's own raw error, or ignores the setting; when the model says it
   cannot reason, you set `false`.
 
 There is no retry behind either failure: the fix is one edit on [params].
 Most modern models reason, so on a model you do not know you start with
-`true` and raise the effort only for the one step that needs
+`true` and raise the effort only for the one node that needs
 it.
 
 A prompt that asks the model for its thinking inside the answer (a
@@ -77,11 +79,11 @@ Rough magnitudes for choosing, never for billing:
 - A large model answers in several seconds and costs ten to fifty times
   more per token. You use it where the answer is the product.
 - A reasoning model at high effort takes tens of seconds to minutes and
-  bills every reasoning token. You use it for one hard step. If you catch
+  bills every reasoning token. You use it for one hard node. If you catch
   yourself wiring it into every turn of a conversation, stop and write:
-  "Wait. One hard step." Then give that one step its own [params] node.
+  "Wait. One hard node." Then give that one node its own [params] node.
 
-Two nodes wired to one [params] share every setting; a step that
+Two nodes wired to one [params] share every setting; a node that
 needs a different model or effort gets its own [params] node, with a
 comment saying why.
 

@@ -39,8 +39,8 @@
             "label": "name",
             "value": "id",
             "page": {
-              "cursor_param": "cursor",
-              "cursor_path": "response_metadata.next_cursor"
+              "cursorParam": "cursor",
+              "cursorPath": "response_metadata.next_cursor"
             }
           },
           {
@@ -62,6 +62,7 @@
     {
       "name": "messages",
       "type": "List[JsonDict]",
+      "narrowable": true,
       "description": "As Slack returns them: text, user, ts, reactions, ..."
     },
     {
@@ -69,8 +70,5 @@
       "type": "Number",
       "description": "Messages in the thread, parent included."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

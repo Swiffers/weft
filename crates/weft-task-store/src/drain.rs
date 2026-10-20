@@ -1,7 +1,7 @@
 //! The wake-and-drain loop every role's background work runs.
 //!
 //! The loops that use it (the dispatcher's task picker, its delivery of
-//! executions, the lifecycle claimer, the reapers; the broker's expiry of
+//! runs, the lifecycle claimer, the reapers; the broker's expiry of
 //! stored files) all have the same shape: sleep until a write they care
 //! about is announced on the process's [`PgSignalWatch`] (see
 //! [`crate::pg_signal`]), then run their drain body until it reports the
@@ -35,8 +35,17 @@
 //! times ([`RETRY_PAUSES`]); past the last it books nothing, keeps no look
 //! already past (which would run it again on every pass of its role), and
 //! is written down with its error (`crate::unanswered`, for `weft
-//! status`): it runs again when a write that concerns it rings it, and its
-//! next drain that goes through clears what was written. A next look whose
+//! status`): it runs again when a write that concerns it rings it, or once
+//! as a process of its role starts ([`Pass::Start`]), and its next drain
+//! that goes through clears what was written. A process starts only when
+//! something real woke the role, so that try keeps no database awake; it
+//! is what brings back a loop that failed on a fresh cloud install while
+//! Google was still applying the install's permissions. The try keeps the
+//! loop's count of failures: a loop that spent its retries books none when
+//! it fails again, and is written down as before, while one written down
+//! only for a wake that could not be set has spent none, and fails into
+//! them like any loop, each failing retry writing its error over the one
+//! shown. A next look whose
 //! wake cannot be set is tried a few times in the pass, then written down
 //! the same way, the booking left as it was. Either way the pass answers
 //! its tick as done. Only a pass that could not write this down for some
@@ -458,7 +467,8 @@ impl Booking {
     /// last it books nothing and drops a look already past. A failed drain
     /// past its retries, or a wake that could not be set, is written down
     /// with its error in the same transaction; the loop's next drain that
-    /// goes through clears what was written. An error only when the
+    /// goes through clears what was written, and a retry that fails before
+    /// then writes its own error over it. An error only when the
     /// database could not be written: nothing was written down then.
     async fn rebook(&self, name: &str, label: Option<&str>, step: Step, rule: Rule) -> Result<()> {
         let role = self.role.as_str();
@@ -534,6 +544,10 @@ impl Booking {
             alerts = unanswered::gave_up(&mut *tx, callee, label, error).await?;
         } else if cleared {
             unanswered::answered(&mut *tx, callee).await?;
+        } else if let (Step::Failed { error, .. }, true) = (&step, failure_written) {
+            // Retrying, with a failure written down before (a wake that
+            // could not be set): what `weft status` shows is what fails now.
+            alerts = unanswered::failed(&mut *tx, callee, label, error).await?;
         }
         sqlx::query(&format!(
             "UPDATE role_loop_due SET due_ms = $3, seq = $4, set_again = $5, failures = $6, failure_written = $7, written_ms = {DB_NOW_MS} \
@@ -644,6 +658,20 @@ async fn set_with_tries(alarm: &dyn Alarm, wake: Wake) -> Result<()> {
     }
 }
 
+/// Which pass of its process a pass of a role that scales to zero is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pass {
+    /// The one its process runs as it starts, for what came due while no
+    /// process of the role was up: it also gives each loop that gave up
+    /// ([`Booked::gave_up`]) one more try. Only this pass does, once per
+    /// process, and the try keeps the loop's count of failures, so a loop
+    /// past its retries whose try fails is not tried again before the
+    /// next start or the next write that rings it.
+    Start,
+    /// A tick's: the loops its call names, and the ones due.
+    Tick,
+}
+
 /// What a pass does with one loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Plan {
@@ -658,14 +686,19 @@ enum Plan {
 struct Booked {
     due_ms: Option<i64>,
     seq: i64,
+    /// Written down with no look booked: past its last retry, or with a
+    /// look its wake could not be set for and none kept. Nothing but a
+    /// write that rings it, or a process of its role starting
+    /// ([`Pass::Start`]), runs it again.
+    gave_up: bool,
 }
 
-/// What a pass that read the due times at `now` does with a loop booked
+/// What `pass`, which read the due times at `now`, does with a loop booked
 /// as `booked` (`None` with no row). A woken loop always runs, and so does
 /// the loop whose current booking this pass's wake was set for
-/// (`current_seq`); one with no row is due now, one due by now runs, and
-/// every other one is left.
-fn plan(woken: bool, current_seq: Option<i64>, now: i64, booked: Option<Booked>) -> Plan {
+/// (`current_seq`); one with no row is due now, one due by now runs, one
+/// that gave up runs on a process's start, and every other one is left.
+fn plan(woken: bool, current_seq: Option<i64>, now: i64, booked: Option<Booked>, pass: Pass) -> Plan {
     if woken {
         return Plan::Run;
     }
@@ -673,6 +706,7 @@ fn plan(woken: bool, current_seq: Option<i64>, now: i64, booked: Option<Booked>)
         None => Plan::Run,
         Some(b) if current_seq == Some(b.seq) && b.due_ms.is_some() => Plan::Run,
         Some(Booked { due_ms: Some(at), .. }) if at <= now => Plan::Run,
+        Some(Booked { gave_up: true, .. }) if pass == Pass::Start => Plan::Run,
         Some(_) => Plan::Leave,
     }
 }
@@ -686,13 +720,14 @@ struct ReadDue {
 }
 
 /// One row of [`read_due`]'s query: the clock, then a loop's name, when
-/// it is due, its seq, and whether nobody has booked it for
-/// [`FORGET_AFTER`] (all four `None` when the role has no row).
-type DueRow = (i64, Option<String>, Option<i64>, Option<i64>, Option<bool>);
+/// it is due, its seq, whether nobody has booked it for [`FORGET_AFTER`],
+/// and whether it gave up ([`Booked::gave_up`]); all five `None` when the
+/// role has no row.
+type DueRow = (i64, Option<String>, Option<i64>, Option<i64>, Option<bool>, Option<bool>);
 
 async fn read_due(pool: &PgPool, role: &str) -> Result<ReadDue> {
     let rows: Vec<DueRow> = sqlx::query_as(&format!(
-        "SELECT c.now_ms, d.loop_name, d.due_ms, d.seq, d.written_ms < c.now_ms - $2 \
+        "SELECT c.now_ms, d.loop_name, d.due_ms, d.seq, d.written_ms < c.now_ms - $2, d.failure_written AND d.due_ms IS NULL \
          FROM (SELECT {DB_NOW_MS} AS now_ms) c \
          LEFT JOIN role_loop_due d ON d.role = $1"
     ))
@@ -703,12 +738,12 @@ async fn read_due(pool: &PgPool, role: &str) -> Result<ReadDue> {
     let now = rows.first().map(|r| r.0).context("the clock query returned no row")?;
     let mut booked = HashMap::new();
     let mut unbooked = Vec::new();
-    for (_, name, due_ms, seq, stale) in rows {
+    for (_, name, due_ms, seq, stale, gave_up) in rows {
         let (Some(name), Some(seq)) = (name, seq) else { continue };
         if stale == Some(true) {
             unbooked.push(name.clone());
         }
-        booked.insert(name, Booked { due_ms, seq });
+        booked.insert(name, Booked { due_ms, seq, gave_up: gave_up == Some(true) });
     }
     Ok(ReadDue { now, booked, unbooked })
 }
@@ -719,7 +754,8 @@ async fn read_due(pool: &PgPool, role: &str) -> Result<ReadDue> {
 /// look again later, or spent its share of `slice`), and book each one's
 /// next look. The others stay as they are, each with its own wake, so a
 /// pass run because a journal event was written does not also run every
-/// other loop.
+/// other loop. A process's first pass ([`Pass::Start`]) also runs each
+/// loop that gave up, once.
 ///
 /// `slice` is how long the pass keeps draining, shared out evenly between
 /// the loops it runs: a loop with more left once its share is spent books
@@ -744,6 +780,7 @@ pub async fn drain_due(
     booking: &Booking,
     loops: &[DrainLoop],
     call: &TickBody,
+    pass: Pass,
     slice: Duration,
     listen: Option<&PgSignalWatch>,
 ) -> std::result::Result<(), PassFailed> {
@@ -764,7 +801,12 @@ pub async fn drain_due(
         .iter()
         .map(|l| {
             let woken = call.loops.iter().any(|w| w == l.name);
-            plan(woken, call.booking_of(l.name), read.now, read.booked.get(l.name).copied())
+            let booked = read.booked.get(l.name).copied();
+            let plan = plan(woken, call.booking_of(l.name), read.now, booked, pass);
+            if plan == Plan::Run && pass == Pass::Start && booked.is_some_and(|b| b.gave_up) {
+                tracing::info!(target: "weft_task_store::drain", role, subsystem = l.name, "a loop that gave up gets one more try as its role's process starts");
+            }
+            plan
         })
         .collect();
     let running = plans.iter().filter(|p| **p == Plan::Run).count();
@@ -1107,25 +1149,31 @@ mod plan_tests {
     use super::*;
 
     fn due(at: i64, seq: i64) -> Option<Booked> {
-        Some(Booked { due_ms: Some(at), seq })
+        Some(Booked { due_ms: Some(at), seq, gave_up: false })
     }
 
     fn asleep(seq: i64) -> Option<Booked> {
-        Some(Booked { due_ms: None, seq })
+        Some(Booked { due_ms: None, seq, gave_up: false })
+    }
+
+    fn gave_up(seq: i64) -> Option<Booked> {
+        Some(Booked { due_ms: None, seq, gave_up: true })
     }
 
     #[test]
     fn a_woken_loop_always_runs() {
-        assert_eq!(plan(true, None, 100, due(1_000, 1)), Plan::Run);
-        assert_eq!(plan(true, None, 100, asleep(1)), Plan::Run);
+        assert_eq!(plan(true, None, 100, due(1_000, 1), Pass::Tick), Plan::Run);
+        assert_eq!(plan(true, None, 100, asleep(1), Pass::Tick), Plan::Run);
+        assert_eq!(plan(true, None, 100, gave_up(1), Pass::Tick), Plan::Run, "a ring runs a loop that gave up");
     }
 
     #[test]
     fn a_loop_with_no_row_or_a_row_due_runs_and_one_booked_later_is_left() {
-        assert_eq!(plan(false, None, 100, None), Plan::Run, "no row: due now");
-        assert_eq!(plan(false, None, 100, due(100, 1)), Plan::Run);
-        assert_eq!(plan(false, None, 100, due(50, 1)), Plan::Run);
-        assert_eq!(plan(false, None, 100, due(101, 1)), Plan::Leave, "its own wake comes then");
+        assert_eq!(plan(false, None, 100, None, Pass::Tick), Plan::Run, "no row: due now");
+        assert_eq!(plan(false, None, 100, due(100, 1), Pass::Tick), Plan::Run);
+        assert_eq!(plan(false, None, 100, due(50, 1), Pass::Tick), Plan::Run);
+        assert_eq!(plan(false, None, 100, due(101, 1), Pass::Tick), Plan::Leave, "its own wake comes then");
+        assert_eq!(plan(false, None, 100, due(101, 1), Pass::Start), Plan::Leave, "a start runs nothing booked later");
     }
 
     /// The wake of the current booking runs its loop even when the
@@ -1133,16 +1181,27 @@ mod plan_tests {
     /// moved since) runs nothing.
     #[test]
     fn the_current_bookings_wake_runs_its_loop_and_a_stale_one_does_not() {
-        assert_eq!(plan(false, Some(4), 100, due(150, 4)), Plan::Run);
-        assert_eq!(plan(false, Some(3), 100, due(150, 4)), Plan::Leave);
-        assert_eq!(plan(false, Some(4), 100, asleep(4)), Plan::Leave, "the booking was cleared since");
+        assert_eq!(plan(false, Some(4), 100, due(150, 4), Pass::Tick), Plan::Run);
+        assert_eq!(plan(false, Some(3), 100, due(150, 4), Pass::Tick), Plan::Leave);
+        assert_eq!(plan(false, Some(4), 100, asleep(4), Pass::Tick), Plan::Leave, "the booking was cleared since");
     }
 
     /// A loop with nothing left waits for a write however long ago it was
-    /// booked: nothing runs "just in case".
+    /// booked, a process's start included: nothing runs "just in case".
     #[test]
     fn an_asleep_loop_waits_for_a_write() {
-        assert_eq!(plan(false, None, 1_000_000, asleep(0)), Plan::Leave);
+        assert_eq!(plan(false, None, 1_000_000, asleep(0), Pass::Tick), Plan::Leave);
+        assert_eq!(plan(false, None, 1_000_000, asleep(0), Pass::Start), Plan::Leave, "it never gave up");
+    }
+
+    /// A loop that gave up gets its one more try from the pass its process
+    /// starts with, and from no other: a tick, the start's try that failed
+    /// included, leaves it for a write to ring.
+    #[test]
+    fn a_loop_that_gave_up_runs_on_a_start_and_on_no_tick() {
+        assert_eq!(plan(false, None, 100, gave_up(3), Pass::Start), Plan::Run);
+        assert_eq!(plan(false, None, 100, gave_up(3), Pass::Tick), Plan::Leave);
+        assert_eq!(plan(false, Some(3), 100, gave_up(3), Pass::Tick), Plan::Leave, "nor does a wake of the booking it gave up on");
     }
 
     #[test]
@@ -1163,8 +1222,11 @@ mod plan_tests {
     }
 }
 
-#[cfg(all(test, feature = "db-tests"))]
-mod drain_due_tests {
+// These tests need a real Postgres. A module named `db_tests` is how
+// `.config/nextest.toml` finds database tests inside a library: the
+// default profile leaves them out, the `db` profile runs them.
+#[cfg(test)]
+mod db_tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
@@ -1195,7 +1257,12 @@ mod drain_due_tests {
 
     /// A tick's pass, with a minute to drain and no watch.
     async fn pass(booking: &Booking, loops: &[DrainLoop], call: &TickBody) -> std::result::Result<(), PassFailed> {
-        drain_due(booking, loops, call, Duration::from_secs(60), None).await
+        drain_due(booking, loops, call, Pass::Tick, Duration::from_secs(60), None).await
+    }
+
+    /// The pass a process of the role starts with.
+    async fn start(booking: &Booking, loops: &[DrainLoop]) -> std::result::Result<(), PassFailed> {
+        drain_due(booking, loops, &TickBody::default(), Pass::Start, Duration::from_secs(60), None).await
     }
 
     async fn written(pool: &PgPool) -> Vec<(String, Option<String>, String)> {
@@ -1368,6 +1435,86 @@ mod drain_due_tests {
         assert!(written(&pool).await.is_empty(), "its success clears it");
     }
 
+    /// A loop that gave up gets one more try from the pass a process of
+    /// its role starts with: failing, it books no retry (its count of
+    /// failures kept) and is written down again, and no tick tries it
+    /// after; the next start tries it again, and going through, it clears
+    /// what was written. A loop that never gave up is left by a start.
+    #[sqlx::test]
+    async fn a_loop_that_gave_up_is_tried_once_per_start(pool: PgPool) {
+        schema(&pool).await;
+        let (booking, alarm) = booking(&pool);
+        let error: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(Some("Permission 'cloudtasks.tasks.create' denied")));
+        let failing = error.clone();
+        let runs = Arc::new(AtomicU32::new(0));
+        let counter = runs.clone();
+        let l = DrainLoop::new("expiry", "expire stored files", WRITES, Duration::from_secs(30), move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let error = *failing.lock().unwrap();
+            async move {
+                match error {
+                    Some(error) => anyhow::bail!(error),
+                    None => Ok(DrainStep::Done),
+                }
+            }
+        });
+        let (asleep, asleep_runs) = counting("asleep", DrainStep::Done);
+        let loops = [l, asleep];
+        // Fails through its retries and gives up; `asleep` drains once and
+        // sleeps until a write wakes it.
+        let mut call = named(&["expiry", "asleep"]);
+        for _ in 0..=RETRY_PAUSES.len() {
+            pass(&booking, &loops, &call).await.unwrap();
+            call = booked("expiry", row(&pool, "expiry").await.1);
+        }
+        let gave_up = (None, RETRY_PAUSES.len() as i64, RETRY_PAUSES.len() as i32 + 1);
+        assert_eq!(row(&pool, "expiry").await, gave_up);
+        assert_eq!(written(&pool).await.len(), 1);
+        let (ran, wakes) = (runs.load(Ordering::SeqCst), alarm.wakes().len());
+
+        *error.lock().unwrap() = Some("Permission 'cloudtasks.tasks.create' still denied");
+        start(&booking, &loops).await.unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), ran + 1, "a start tries it once");
+        assert_eq!(asleep_runs.load(Ordering::SeqCst), 1, "and leaves a loop that never gave up");
+        let (due, seq, failures) = row(&pool, "expiry").await;
+        assert_eq!((due, seq, failures), (None, gave_up.1, gave_up.2 + 1), "failing, it books no retry and keeps counting");
+        assert_eq!(alarm.wakes().len(), wakes, "no wake set for it");
+        let again: Vec<String> = written(&pool).await.into_iter().map(|w| w.2).collect();
+        assert_eq!(again, vec!["Permission 'cloudtasks.tasks.create' still denied".to_string()], "written down again, with the start's error");
+        pass(&booking, &loops, &TickBody::default()).await.unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), ran + 1, "no tick tries it after");
+
+        *error.lock().unwrap() = None;
+        start(&booking, &loops).await.unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), ran + 2, "the next start tries it again");
+        assert_eq!(row(&pool, "expiry").await, (None, gave_up.1, 0), "going through, it is back to normal");
+        assert!(written(&pool).await.is_empty(), "and what was written is cleared");
+        start(&booking, &loops).await.unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), ran + 2, "a loop back to normal is left by a start");
+    }
+
+    /// A loop written down only because its wake could not be set has
+    /// spent no retry: the start's try that fails books its first, and
+    /// what `weft status` shows is the error that try failed with.
+    #[sqlx::test]
+    async fn a_start_try_of_a_loop_whose_wake_failed_retries_showing_its_error(pool: PgPool) {
+        schema(&pool).await;
+        let (booking, alarm) = booking(&pool);
+        alarm.fail_sets(true);
+        let (x, _) = counting("x", DrainStep::RetryIn(Duration::from_secs(5)));
+        pass(&booking, &[x], &TickBody::default()).await.expect("written down");
+        assert_eq!(row(&pool, "x").await, (None, 0, 0), "nothing booked, no failure counted");
+        assert!(written(&pool).await[0].2.contains("could not be set"));
+        alarm.fail_sets(false);
+        let failing = DrainLoop::new("x", "count", WRITES, Duration::from_secs(30), || async { anyhow::bail!("still denied") });
+        let before = db_now(&pool).await;
+        start(&booking, &[failing]).await.unwrap();
+        let (due, seq, failures) = row(&pool, "x").await;
+        assert!(due.is_some_and(|due| due >= before + millis(RETRY_PAUSES[0])), "its first retry is booked: {due:?}");
+        assert_eq!((seq, failures), (1, 1));
+        assert_eq!(written(&pool).await.into_iter().map(|w| w.2).collect::<Vec<_>>(), vec!["still denied".to_string()]);
+    }
+
     /// A booking whose wake cannot be set leaves the booking as it was and
     /// is written down, and the call goes through: a later booking sets the
     /// wake, and the loop's next drain clears what was written.
@@ -1488,9 +1635,9 @@ mod drain_due_tests {
         let now = db_now(&pool).await;
         booking.book("x", Some(now + 600_000)).await.unwrap();
         let stale = TickBody { booked: Some(BookedLook { loop_name: "x".into(), seq: 0, set_again: 0 }), ..TickBody::default() };
-        drain_due(&booking, &loops, &stale, Duration::from_secs(60), Some(&watch)).await.unwrap();
+        drain_due(&booking, &loops, &stale, Pass::Tick, Duration::from_secs(60), Some(&watch)).await.unwrap();
         assert!(held.lock().unwrap().is_empty() && !watch.holds(), "nothing ran, nothing held");
-        drain_due(&booking, &loops, &named(&["x"]), Duration::from_secs(60), Some(&watch)).await.unwrap();
+        drain_due(&booking, &loops, &named(&["x"]), Pass::Tick, Duration::from_secs(60), Some(&watch)).await.unwrap();
         assert_eq!(*held.lock().unwrap(), vec![true]);
         assert!(!watch.holds(), "let go once the pass ended");
     }

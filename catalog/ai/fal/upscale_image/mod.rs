@@ -7,7 +7,7 @@ use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, KeepTtl, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::fal::{merge_params, run_queued};
 
@@ -24,7 +24,7 @@ impl Node for FalUpscaleImageNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let model: String = ctx.inputs.get("model")?;
         let image: FileHandle = ctx.inputs.get("image")?;
@@ -32,7 +32,7 @@ impl Node for FalUpscaleImageNode {
         let params = ctx.inputs.opt::<Map<String, Value>>("params")?;
 
         let mut payload = json!({
-            "image_url": ctx.storage(StorageScope::Execution).external_url(&image).await?,
+            "image_url": ctx.storage(StorageScope::Run).external_file(&image).await?.url,
             "scale": scale,
         });
         merge_params(&mut payload, params.as_ref());
@@ -49,7 +49,7 @@ impl Node for FalUpscaleImageNode {
             .node_err("fal answered no image for this upscale")?;
         let ty = ctx.output_type("image")?;
         let stored = ctx
-            .storage(StorageScope::Execution)
+            .storage(StorageScope::Run)
             // The upscaled image is the run's product: keep it past the
             // run (default 30-day access-bumped TTL).
             .internalize(&Value::String(url.to_string()), &ty, Some(KeepTtl::Default))

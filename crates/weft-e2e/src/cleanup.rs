@@ -23,9 +23,10 @@
 //!     install references (yours included, once nothing runs them), and
 //!     the builder bases, node-test images, runtime images, standard
 //!     workers and worker compile caches that no install on the machine
-//!     records using. While some install has no record yet, it removes
-//!     nothing of that kind, and it never removes a cache a build is using
-//!     right now.
+//!     records using, and every image and compile cache of an install no
+//!     longer on the machine. While some install has no record yet, it
+//!     removes nothing of the recorded kinds, and it never removes a cache
+//!     a build is using right now.
 
 use anyhow::{Context, Result};
 

@@ -65,8 +65,7 @@ pub fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
 /// The two older spellings (`ours`, `their-own`) still read, as
 /// `Platform` and `Author`: journal rows written before instances existed
 /// carry them. The rename of member to instance rewrote stored rows once
-/// (`{"member": id}` became `{"instance": id}`, in the
-/// `*_rename_member_keys_in_json.sql` migrations), so no alias reads the
+/// (`{"member": id}` became `{"instance": id}`), so no alias reads the
 /// old spelling.
 // SYNC: CredentialOwner <-> packages/weft-connect/src/core/wire.ts CredentialOwner, crates/weft-core/src/program.rs PaidBy
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -158,7 +157,7 @@ impl OpenedConnection {
     /// the service, or through the runtime's relay when the resolved
     /// credential carries one), and, when a meter is registered for
     /// the service, measures what each call cost and records the
-    /// figure on the execution's cost trail. The one rule for calls on
+    /// figure on the run's cost trail. The one rule for calls on
     /// a connection: never construct your own HTTP client for them; a
     /// call on a hand-rolled client is invisible to the cost trail.
     pub fn client(&self) -> &reqwest_middleware::ClientWithMiddleware {
@@ -169,7 +168,7 @@ impl OpenedConnection {
     /// rules as [`Self::client`]: the runtime signs the handshake (the
     /// credential rides the handshake only, never a frame), routes the
     /// session, and, when the service's meter prices sessions, measures
-    /// what it cost and records the figure on the execution's cost
+    /// what it cost and records the figure on the run's cost
     /// trail. Never construct your own socket client for a provider; a
     /// hand-rolled session is invisible to the cost trail.
     pub async fn socket(&self, url: &str) -> crate::error::WeftResult<socket::ProviderSocket> {
@@ -251,7 +250,7 @@ impl std::fmt::Debug for OpenedConnection {
 /// its `access` widget, never by name). The connection is ALWAYS
 /// required here: this body's whole output is the connection, so an
 /// "optional" one would only starve everything downstream silently. A
-/// recipe wanting `connection_optional` writes its own body saying
+/// recipe wanting `connectionOptional` writes its own body saying
 /// what unconnected means (see the custom LLM provider).
 #[macro_export]
 macro_rules! access_node {
@@ -261,10 +260,10 @@ macro_rules! access_node {
 
         #[$crate::async_trait::async_trait]
         impl $crate::Node for $name {
-            async fn run(&self, ctx: $crate::ExecutionContext) -> $crate::WeftResult<()> {
+            async fn run(&self, ctx: $crate::RunContext) -> $crate::WeftResult<()> {
                 let access = ctx.inputs.access("account")?.ok_or_else(|| {
                     $crate::WeftError::Input(
-                        "this access node's recipe declares connection_optional, but its \
+                        "this access node's recipe declares connectionOptional, but its \
                          pass-through body has no meaning without a connection; pick one \
                          on the node, or give the node type its own body"
                             .into(),
@@ -308,10 +307,10 @@ mod tests {
     /// connection does not hold refuses loudly naming both sides.
     #[test]
     fn a_stored_value_is_read_by_name() {
-        let conn = opened(vec![], &[("imap_host", "imap.acme.com"), ("user", "q")]);
-        assert_eq!(conn.value("imap_host").unwrap(), "imap.acme.com");
-        let err = conn.value("smtp_host").unwrap_err().to_string();
-        assert!(err.contains("svc") && err.contains("smtp_host"), "{err}");
+        let conn = opened(vec![], &[("imapHost", "imap.acme.com"), ("user", "q")]);
+        assert_eq!(conn.value("imapHost").unwrap(), "imap.acme.com");
+        let err = conn.value("smtpHost").unwrap_err().to_string();
+        assert!(err.contains("svc") && err.contains("smtpHost"), "{err}");
     }
 
     /// `credential()` is DERIVED: one step interpolating one stored
@@ -361,11 +360,11 @@ mod tests {
                 with: SignKind::SigV4 {
                     service: "s3".into(),
                     region: Template::new("{region}"),
-                    access_key_id: Template::new("{access_key_id}"),
-                    secret_access_key: Template::new("{secret_access_key}"),
+                    access_key_id: Template::new("{accessKeyId}"),
+                    secret_access_key: Template::new("{secretAccessKey}"),
                 },
             }],
-            &[("region", "r"), ("access_key_id", "i"), ("secret_access_key", "s")],
+            &[("region", "r"), ("accessKeyId", "i"), ("secretAccessKey", "s")],
         );
         assert!(signed.credential().is_err());
 

@@ -6,15 +6,16 @@
 //!
 //! A BUS input is followed live: each message is logged as it lands (so
 //! the inspector shows the stream as a stream), the payloads are
-//! accumulated, and the accumulated log is printed once the bus closes.
-//! Anything else is logged once, as before.
+//! accumulated, and the accumulated log is printed once the bus closes,
+//! as a warning naming why when the bus ended failed. Anything else is
+//! logged once, as before.
 
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft::bus::BusEntryKind;
+use weft::bus::{BusEntryKind, StreamEnd};
 use weft::context::LogLevel;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult, WeftType};
+use weft::{RunContext, Node, NodeManifest, WeftResult, WeftType};
 
 #[derive(NodeManifest)]
 pub struct DebugNode;
@@ -29,7 +30,7 @@ impl Node for DebugNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let data = ctx.inputs.raw("data").cloned().unwrap_or(Value::Null);
         let label = ctx.node_label.as_deref().unwrap_or(&ctx.node_id).to_string();
 
@@ -63,15 +64,17 @@ impl Node for DebugNode {
                     seen.push(shown);
                 }
             }
-            ctx.log(
-                LogLevel::Info,
-                format!(
-                    "[{label}] bus closed after {} message(s): {}",
-                    seen.len(),
-                    Value::Array(seen)
-                ),
-            )
-            .await?;
+            let count = seen.len();
+            let seen = Value::Array(seen);
+            match bus.end() {
+                Some(StreamEnd::Failed { error }) => {
+                    ctx.log(LogLevel::Warn, format!("[{label}] bus failed after {count} message(s) ({error}): {seen}"))
+                        .await?
+                }
+                Some(StreamEnd::Finished) | None => {
+                    ctx.log(LogLevel::Info, format!("[{label}] bus closed after {count} message(s): {seen}")).await?
+                }
+            }
             return Ok(());
         }
 

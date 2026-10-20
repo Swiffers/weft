@@ -101,8 +101,8 @@ pub async fn fire_signal(
 }
 
 /// `POST /signal/{token}/skip`. A person declines what a waiting run
-/// asked: the waiting step ends skipped, every output of it closed, and
-/// what reads them skips in turn. Sibling firings of the same execution
+/// asked: the waiting node ends skipped, every output of it closed, and
+/// what reads them skips in turn. Sibling firings of the same run
 /// keep going. Only a waiting run's question can be skipped; an entry
 /// has nothing to decline. The answer is weft's own
 /// (`WaitAnswer::Skipped`), never a value the signal's kind processes,
@@ -263,6 +263,7 @@ pub(crate) async fn take_event(
                 // (`/v1/door/park_fire`), and none other names one.
                 held_by: None,
                 attempts: 0,
+                released: false,
             };
             match fire_entry(state, routing, fire)
                 .await
@@ -501,15 +502,16 @@ pub(crate) async fn delete_signals(
     Ok(())
 }
 
-/// `DELETE /signal/{token}`. Hard-cancel the underlying execution
-/// for a resume signal: every signal attached to the same execution
+/// `DELETE /signal/{token}`. Hard-cancel the underlying run
+/// for a resume signal: every signal attached to the same run
 /// goes down (so canceling one HumanQuery in a 5-parallel set
 /// drops the other 4 too), the worker receives Cancel, and
-/// NodeCancelled + ExecutionFailed get journaled. The journal
+/// each node still going gets `NodeCancelled` and the run ends
+/// `RunCancelled` (cause user). The journal
 /// preserves everything for log-review.
 ///
 /// For an entry-trigger signal (is_resume=false, e.g. a webhook),
-/// there's no execution to cancel: the signal row gets dropped
+/// there's no run to cancel: the signal row gets dropped
 /// and the listener registration unregistered.
 ///
 /// Auth: requires `Authorization: Bearer <signal_token>` AND the
@@ -548,14 +550,14 @@ pub async fn cancel_signal(
         ));
     }
 
-    if let Some(execution_id) = row.execution_id {
+    if let Some(run_id) = row.run_id {
         // The one cancel strips the run's wake signals and ends it, or asks
-        // the worker driving it to (`cancel_execution_id`).
-        crate::api::execution::cancel_execution_id(&state, execution_id, &weft_core::exec::CancelCause::User)
+        // the worker driving it to (`cancel_run_id`).
+        crate::api::run::cancel_run_id(&state, run_id, &weft_core::run::CancelCause::User)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel: {e}")))?;
     } else {
-        // Entry-trigger signal: no execution to cancel. Single
+        // Entry-trigger signal: no run to cancel. Single
         // signal deletion via the shared helper that owns the
         // DB-first-listener-second ordering.
         delete_signals(&state, std::slice::from_ref(&row)).await?;
@@ -580,7 +582,7 @@ pub async fn cancel_signal(
 /// tags, project visibility), the field is one the signal's kind names a
 /// file for (`Signal::stored_file`, asked through the kind inventory so
 /// this door knows no kind), and the file must belong to the signal (its
-/// project, its execution, or the tenant's shared space). Anything else
+/// project, its run, or the tenant's shared space). Anything else
 /// is 404, so a token learns nothing about signals or files it cannot see.
 pub async fn signal_file_for_token(
     State(state): State<DispatcherState>,
@@ -616,11 +618,11 @@ pub async fn signal_file_for_token(
     // The store's own message names the storage key, and this door
     // exists so a consumer never sees one. Say what happened in the
     // consumer's terms and keep the store's text for the operator log.
-    // The consumer holding this token is the one who will fetch the
-    // bytes (the browser extension showing a form), so the link comes
-    // back on the address they reached us at.
-    let base = crate::storage::LinkBase::for_request(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    let link = crate::storage::download_link(&state, &base, &file.key, Some(SIGNAL_FILE_LINK_TTL_SECS))
+    // The consumer holding this token (the browser extension showing a
+    // form) reaches the install as the signal's project's callers do, so
+    // the link goes the way the project's outside links go.
+    let reader = weft_core::storage::LinkReader::Outside { project: sig.project_id.to_string() };
+    let link = crate::storage::download_link(&state, &file.key, Some(SIGNAL_FILE_LINK_TTL_SECS), reader)
         .await
         .map_err(|e| {
             tracing::warn!(
@@ -652,22 +654,27 @@ pub async fn signal_file_for_token(
     // The facts come from the signal's own value, not from the link:
     // they describe the file the form is showing, and the mime (which
     // the store's answer does not carry) has to come from there anyway,
-    // so taking all four from one source keeps them consistent.
+    // so taking all four from one source keeps them consistent. Only
+    // whether the link opens from the open internet is the link's own.
     Ok(Json(SignalFileLink {
         url: link.url,
+        public: link.public,
         mime_type: file.mime_type,
         size_bytes: file.size_bytes,
         filename: file.filename,
     }))
 }
 
-/// What the files door answers: a link that lives an hour, plus the
-/// facts a consumer needs to render the file without fetching it.
-// SYNC: SignalFileLink <-> extension-browser/src/lib/api.ts TaskFileLink, crates/weft-core/src/signal/form.rs consumer_file_value (the URL-backed arm publishes the same four keys)
+/// What the files door answers: a link that lives an hour, whether the
+/// open internet opens it (else only a device that reaches the install's
+/// own address does), plus the facts a consumer needs to render the file
+/// without fetching it.
+// SYNC: SignalFileLink <-> extension-browser/src/lib/api.ts TaskFileLink, crates/weft-core/src/signal/form.rs consumer_file_value (the URL-backed arm publishes the same keys)
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignalFileLink {
     pub url: String,
+    pub public: bool,
     pub mime_type: String,
     pub size_bytes: u64,
     pub filename: String,
@@ -680,7 +687,7 @@ const SIGNAL_FILE_LINK_TTL_SECS: u64 = 3600;
 
 /// May a signal's consumer be handed this file: the file sits in the
 /// signal's own tenant, and in the signal's project (a project file),
-/// its execution (a file the run made), the tenant's shared space, or the
+/// its run (a file the run made), the tenant's shared space, or the
 /// tenant's assets. A file of another project or run is not the form's to show.
 fn file_belongs_to_signal(
     parsed: &weft_core::storage::key::ParsedKey,
@@ -699,7 +706,7 @@ fn file_belongs_to_signal(
         KeyScope::Instance { project_id, instance } => {
             *project_id == sig.project_id.to_string() && sig.instance.as_ref().is_some_and(|m| m.as_str() == instance)
         }
-        KeyScope::Exec { execution_id } => sig.execution_id.is_some_and(|c| c.to_string() == *execution_id),
+        KeyScope::Run { run_id } => sig.run_id.is_some_and(|c| c.to_string() == *run_id),
         KeyScope::Shared { .. } => true,
     }
 }
@@ -707,8 +714,9 @@ fn file_belongs_to_signal(
 /// Scoped enumeration. Filters by
 /// the signal token's allowed_projects, allowed_tags AND
 /// by project visibility (`fires_visible_to_consumers = TRUE`):
-/// active and parked projects show up; hibernate-mode projects do
-/// not. Wiped projects have no rows. The dispatcher never asks the
+/// triggers on and triggers down with their door taking show up; one
+/// whose door hides does not. One taken down with nothing kept has no
+/// rows. The dispatcher never asks the
 /// listener for the signal token: the SQL pre-filter is the only
 /// scope check.
 ///
@@ -733,7 +741,7 @@ pub async fn list_signals_for_token(
             // Stamp `isResume` onto the enumerated payload so the consumer can
             // split the list into TRIGGERS (entry signals, always shown while
             // registered, fireable repeatedly to start a run) and RESUME tasks
-            // (one-shot replies to a paused execution). It's a signal-row
+            // (one-shot replies to a paused run). It's a signal-row
             // property, not part of the listener's render, so it is added here
             // where the row and its rendered payload meet.
             // SYNC: consumer payload keys <->
@@ -760,16 +768,16 @@ pub async fn signal_token_health(
 
 /// `DELETE /signal-token/signals` (signal token in `Authorization: Bearer`).
 /// Bulk clear-all: cancel
-/// every execution this token has visibility over. Distinct executions
-/// cancel once each (cancel_execution_id drops every sibling signal of
-/// the same execution), so a 5-parallel HumanQuery set under one
-/// execution costs one cancel call.
+/// every run this token has visibility over. Distinct runs
+/// cancel once each (cancel_run_id drops every sibling signal of
+/// the same run), so a 5-parallel HumanQuery set under one
+/// run costs one cancel call.
 ///
 /// Auth: token's scope must be ≥ project (kinds + tags empty).
 /// Tag-scoped or kind-scoped tokens get 403: clear-all reaches
 /// into sibling signals they can't see; same rationale as cancel.
 ///
-/// Returns counts: { execution_ids_cancelled, entry_signals_dropped }.
+/// Returns counts: { runIdsCancelled, entrySignalsDropped }.
 pub async fn clear_all_signals(
     State(state): State<DispatcherState>,
     headers: HeaderMap,
@@ -794,45 +802,45 @@ pub async fn clear_all_signals(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
 
-    // Distinct executions only. cancel_execution_id drops every sibling
-    // signal of the same execution, so cancelling once per execution is
+    // Distinct runs only. cancel_run_id drops every sibling
+    // signal of the same run, so cancelling once per run is
     // both correct AND avoids duplicate work on parallel HumanQueries.
-    let mut execution_ids: std::collections::BTreeSet<weft_core::ExecutionId> = Default::default();
+    let mut run_ids: std::collections::BTreeSet<weft_core::RunId> = Default::default();
     let mut entry_signals: Vec<crate::journal::SignalRegistration> = Vec::new();
     for s in visible {
-        match s.execution_id {
+        match s.run_id {
             Some(c) => {
-                execution_ids.insert(c);
+                run_ids.insert(c);
             }
             None => entry_signals.push(s),
         }
     }
 
-    for execution_id in &execution_ids {
-        cancel_execution_id_logged(&state, *execution_id).await;
+    for run_id in &run_ids {
+        cancel_run_id_logged(&state, *run_id).await;
     }
-    // Entry-trigger signals have no execution to cancel; delete via the
+    // Entry-trigger signals have no run to cancel; delete via the
     // shared helper (DB-first-listener-second ordering).
     delete_signals(&state, &entry_signals).await?;
 
     Ok(Json(serde_json::json!({
-        "execution_ids_cancelled": execution_ids.len(),
-        "entry_signals_dropped": entry_signals.len(),
+        "runIdsCancelled": run_ids.len(),
+        "entrySignalsDropped": entry_signals.len(),
     })))
 }
 
-/// Best-effort `cancel_execution_id` wrapper for the admin sweep path:
-/// failures are logged and skipped so one bad execution doesn't block
+/// Best-effort `cancel_run_id` wrapper for the admin sweep path:
+/// failures are logged and skipped so one bad run doesn't block
 /// the whole clear-all. (The handler exists for the admin "drop
 /// everything" verb where best-effort is the contract.)
-async fn cancel_execution_id_logged(state: &DispatcherState, execution_id: weft_core::ExecutionId) {
+async fn cancel_run_id_logged(state: &DispatcherState, run_id: weft_core::RunId) {
     if let Err(e) =
-        crate::api::execution::cancel_execution_id(state, execution_id, &weft_core::exec::CancelCause::User).await
+        crate::api::run::cancel_run_id(state, run_id, &weft_core::run::CancelCause::User).await
     {
         tracing::warn!(
             target: "weft_dispatcher::signal",
-            %execution_id, error = %e,
-            "clear_all_signals: cancel_execution_id failed; skipping"
+            %run_id, error = %e,
+            "clear_all_signals: cancel_run_id failed; skipping"
         );
     }
 }
@@ -903,7 +911,7 @@ impl TokenScope {
 
     /// True if the token may CANCEL this signal, GIVEN it is already known to be
     /// same-tenant (call `same_tenant` first). Cancel reaches into sibling
-    /// signals of the same execution (different tags), so the token must have full
+    /// signals of the same run (different tags), so the token must have full
     /// project-level view, not a sub-project slice.
     ///
     /// Rule (within the tenant): covered project AND no tag restriction. Empty
@@ -1339,7 +1347,7 @@ pub(crate) async fn signal_live_at(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal row: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, format!("no signal for node '{node}'")))?;
     // Where a caller reaches this signal. The row is the authority (it
-    // holds the tenant-namespaced mount path) and `public_url` is the
+    // holds the tenant-namespaced mount path) and `public_path` is the
     // one place that knows a held-connection kind is served under
     // `/connect/`; the listener holds only the route pattern its kind
     // computed, so the finished address is sent to it rather than
@@ -1349,7 +1357,15 @@ pub(crate) async fn signal_live_at(
     // address is handed on to a third party (whoever will call the
     // trigger), and the reader's host says nothing about what that
     // party reaches.
-    let address = entry.public_url(state.external_base_url());
+    //
+    // A signal with no outside address reads no base, so its display
+    // answers while the tunnel is down or still connecting.
+    let address = match entry.public_path() {
+        Some(path) => Some(
+            state.external_base().url(&path).await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?,
+        ),
+        None => None,
+    };
     Ok(SignalLiveAt { token: entry.token, address })
 }
 
@@ -1369,6 +1385,7 @@ pub(crate) async fn fetch_signal_live(state: &DispatcherState, node: &str, at: &
         .live(&at.token, at.address.as_deref())
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("the trigger's display: {e}")))?
+        .map(|answer| answer.live)
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -1452,7 +1469,7 @@ mod route_lookup_tests {
 }
 
 #[cfg(test)]
-mod public_url_tests {
+mod public_path_tests {
     use crate::journal::SignalRegistration;
 
     fn fresh(surface: &str, mount: Option<&str>) -> SignalRegistration {
@@ -1460,12 +1477,12 @@ mod public_url_tests {
             instance: None,
             activation_trigger: None,
             source_version: None,
-            setup_execution_id: None,
+            setup_run_id: None,
             program: None,
             token: "tok-1".into(),
             tenant_id: "t".into(),
             project_id: uuid::Uuid::from_u128(0x100),
-            execution_id: None,
+            run_id: None,
             node_id: "n".into(),
             is_resume: false,
             // A real row always names its kind, and the address depends
@@ -1493,10 +1510,7 @@ mod public_url_tests {
     #[test]
     fn public_entry_root_normalizes() {
         let s = fresh("public_entry", Some("/"));
-        assert_eq!(
-            s.public_url("http://127.0.0.1:14111"),
-            Some("http://127.0.0.1:14111/".into())
-        );
+        assert_eq!(s.public_path(), Some("/".into()));
     }
 
     /// A row whose spec cannot be read gets NO address rather than the
@@ -1507,16 +1521,13 @@ mod public_url_tests {
     fn an_unreadable_spec_yields_no_address_rather_than_a_guess() {
         let mut s = fresh("public_entry", Some("/chat"));
         s.spec_json = "{".into();
-        assert_eq!(s.public_url("http://127.0.0.1:14111"), None);
+        assert_eq!(s.public_path(), None);
     }
 
     #[test]
     fn public_entry_with_path() {
         let s = fresh("public_entry", Some("/webhooks/stripe"));
-        assert_eq!(
-            s.public_url("http://127.0.0.1:14111"),
-            Some("http://127.0.0.1:14111/webhooks/stripe".into())
-        );
+        assert_eq!(s.public_path(), Some("/webhooks/stripe".into()));
     }
 
     #[test]
@@ -1526,41 +1537,26 @@ mod public_url_tests {
         // plain public fire.
         let mut s = fresh("public_entry", Some("/alice/chat"));
         s.spec_json = r#"{"kind":"route","config":{},"consumer_kind":null}"#.into();
-        assert_eq!(
-            s.public_url("http://127.0.0.1:14111"),
-            Some("http://127.0.0.1:14111/connect/alice/chat".into())
-        );
-    }
-
-    #[test]
-    fn public_entry_strips_trailing_slash_on_base() {
-        let s = fresh("public_entry", Some("/foo"));
-        assert_eq!(
-            s.public_url("http://127.0.0.1:14111/"),
-            Some("http://127.0.0.1:14111/foo".into())
-        );
+        assert_eq!(s.public_path(), Some("/connect/alice/chat".into()));
     }
 
     #[test]
     fn task_callback_uses_token() {
         let s = fresh("task_callback", None);
-        assert_eq!(
-            s.public_url("http://127.0.0.1:14111"),
-            Some("http://127.0.0.1:14111/signal/tok-1".into())
-        );
+        assert_eq!(s.public_path(), Some("/signal/tok-1".into()));
     }
 
     #[test]
     fn unknown_surface_returns_none() {
         let s = fresh("future_kind", None);
-        assert!(s.public_url("http://127.0.0.1:14111").is_none());
+        assert!(s.public_path().is_none());
     }
 }
 
 
 
 /// Layer-1 tests for the `can_cancel` authorization gate (the C1 cross-tenant
-/// fix). The cancel path reaches sibling signals of the same execution, so the gate
+/// fix). The cancel path reaches sibling signals of the same run, so the gate
 /// must enforce: SAME TENANT (the outer wall, always) + covered project + no tag
 /// restriction. A pure function over `(SignalToken, SignalRegistration)`, so no
 /// DB is needed. Without these, the tenant predicate could be reverted and the
@@ -1595,12 +1591,12 @@ mod can_cancel_tests {
             instance: None,
             activation_trigger: None,
             source_version: None,
-            setup_execution_id: None,
+            setup_run_id: None,
             program: None,
             token: "s".into(),
             tenant_id: tenant.into(),
             project_id: project,
-            execution_id: None,
+            run_id: None,
             node_id: "n".into(),
             is_resume: false,
             spec_json: "{}".into(),
@@ -1690,7 +1686,7 @@ mod can_cancel_tests {
     #[test]
     fn tag_scoped_token_can_never_cancel() {
         // A tag restriction means the token sees a sub-project SLICE, so it must not
-        // cancel (cancel reaches sibling signals of other tags in the same execution).
+        // cancel (cancel reaches sibling signals of other tags in the same run).
         let a = token("tenant-a", vec![], vec!["support".into()]);
         let sig = signal("tenant-a", uuid::Uuid::from_u128(1));
         assert!(a.same_tenant(&sig));
@@ -1707,19 +1703,19 @@ mod signal_file_scope_tests {
     use crate::journal::SignalRegistration;
     use weft_core::storage::key::parse_key;
 
-    fn signal(execution_id: Option<&str>) -> SignalRegistration {
+    fn signal(run_id: Option<&str>) -> SignalRegistration {
         SignalRegistration {
             instance: None,
             activation_trigger: None,
             source_version: None,
-            setup_execution_id: None,
+            setup_run_id: None,
             program: None,
             token: "tok-1".into(),
             tenant_id: "t".into(),
             project_id: uuid::Uuid::from_u128(0x100),
-            execution_id: execution_id.map(|c| c.parse().expect("a uuid")),
+            run_id: run_id.map(|c| c.parse().expect("a uuid")),
             node_id: "n".into(),
-            is_resume: execution_id.is_some(),
+            is_resume: run_id.is_some(),
             spec_json: "{}".into(),
             access_id: None,
             consumer_kind: None,
@@ -1743,20 +1739,20 @@ mod signal_file_scope_tests {
     /// project or run.
     #[test]
     fn a_file_is_the_forms_to_show_only_inside_its_own_walls() {
-        let execution_id = "11111111-1111-1111-1111-111111111111";
-        let sig = signal(Some(execution_id));
+        let run_id = "11111111-1111-1111-1111-111111111111";
+        let sig = signal(Some(run_id));
         let p = sig.project_id;
         let ok = |key: &str| file_belongs_to_signal(&parse_key(key).expect(key), &sig);
         assert!(ok(&format!("t/project/{p}/cat")));
         assert!(ok("t/asset/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
         assert!(!ok("other/asset/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"), "another tenant's asset");
-        assert!(ok(&format!("t/exec/{execution_id}/cat")));
+        assert!(ok(&format!("t/run/{run_id}/cat")));
         assert!(ok("t/shared/pool/cat"));
         assert!(!ok(&format!("other/project/{p}/cat")), "another tenant");
         assert!(!ok("t/project/q/cat"), "another project");
-        assert!(!ok("t/exec/22222222-2222-2222-2222-222222222222/cat"), "another run");
+        assert!(!ok("t/run/22222222-2222-2222-2222-222222222222/cat"), "another run");
         let entry = signal(None);
-        assert!(!file_belongs_to_signal(&parse_key(&format!("t/exec/{execution_id}/cat")).unwrap(), &entry), "an entry signal has no run");
+        assert!(!file_belongs_to_signal(&parse_key(&format!("t/run/{run_id}/cat")).unwrap(), &entry), "an entry signal has no run");
     }
 }
 

@@ -3,7 +3,7 @@
 # permission inline, so the whole branch lives in one file.
 #
 # The rig asserts: `blocked` was skipped (it was told not to run) and so
-# was `out` behind it, while the execution itself completed. This is the
+# was `out` behind it, while the run itself completed. This is the
 # core "one branch turns the other off" behavior of the language.
 
 source = ExecPython() -> (value: String, allowed: Boolean, missing: String) {

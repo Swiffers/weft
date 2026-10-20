@@ -23,7 +23,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "from_url",
@@ -40,7 +40,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "depends_on": [
+        "dependsOn": [
           "database"
         ],
         "sources": [
@@ -73,8 +73,5 @@
       "type": "String",
       "description": "The new row's link."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

@@ -50,6 +50,7 @@ tracing = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 # The alert line, written as Cloud Logging reads it (`alert_line`).
 tracing-subscriber = { workspace = true, optional = true }
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [lints]
 workspace = true

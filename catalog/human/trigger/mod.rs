@@ -1,4 +1,4 @@
-//! HumanTrigger: starts an execution when a human submits a form.
+//! HumanTrigger: starts a run when a human submits a form.
 //!
 //!   - `setup_trigger`: build a Form signal from the node's config and
 //!     register it.
@@ -10,7 +10,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::form_helpers::{build_form, form_specs, map_response_to_ports, parse_form_fields};
 
@@ -27,7 +27,7 @@ impl Node for HumanTriggerNode {
         tests::tests()
     }
 
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let specs = form_specs(self.manifest())?;
         // Triggers have no upstream input ports at setup time; an
         // empty prefill means no value is projected into prefilled /
@@ -37,7 +37,7 @@ impl Node for HumanTriggerNode {
         ctx.register_signal(form).await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // The wake record is the form submission, keyed by field key.
         // `object()` fails loud on a broken delivery: an empty substitute
         // would silently fire a fake "all fields empty" submission (for

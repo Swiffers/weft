@@ -112,6 +112,16 @@ pub async fn read_cells(http: &ClientWithMiddleware,
         .collect())
 }
 
+/// The refusal of a row no page can hold: `row` alone weighs more than
+/// one wire carries. `sheet_row` is its 1-based row in the sheet.
+pub fn heavy_row(row: &Value, sheet_row: impl std::fmt::Display) -> weft::WeftError {
+    weft::node_error(format!(
+        "row {sheet_row} of the tab weighs {} on its own, so no page can hold it; trim that row's \
+         cells in the sheet",
+        weft::storage::wire_weight_said(weft::storage::wire_weight(row))
+    ))
+}
+
 /// One values-API row (an array of cells) to strings.
 pub fn row_to_strings(row: &Value) -> Vec<String> {
     row.as_array()

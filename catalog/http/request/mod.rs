@@ -10,7 +10,7 @@ use reqwest::Method;
 use serde_json::Value;
 
 use weft::storage::{self, diff::is_text_mime, KeepTtl, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, StorageHandle, WeftError, WeftResult};
 use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
@@ -26,7 +26,7 @@ impl Node for HttpRequestNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // A failure is no answer at all or an unreadable body. An answer
         // with any status is a success: `status` and `ok` say it.
         let url: String = ctx.inputs.get("url")?;
@@ -76,7 +76,7 @@ impl Node for HttpRequestNode {
             .and_then(|v| v.to_str().ok())
             .and_then(storage::filename_from_disposition)
             .unwrap_or_else(|| storage::filename_from_url(&url));
-        let files = ctx.storage(StorageScope::Execution);
+        let files = ctx.storage(StorageScope::Run);
         let out = match content_type {
             // A body that says it is not text is bytes, and decoding it
             // as text would corrupt it: it is stored whole, as a file.
@@ -87,13 +87,17 @@ impl Node for HttpRequestNode {
                     .await?;
                 out.set("file", file)
             }
-            Some(_) => out.set("body", text_body(resp.text().await.node_err("http body read")?)),
+            Some(ct) => {
+                let text = resp.text().await.node_err("http body read")?;
+                let mime = storage::normalize_content_type(Some(&ct));
+                text_out(&ctx, &files, out, text, &mime, &filename).await?
+            }
             // A body that names no type is text when it reads as text,
             // and a file otherwise, typed by its first bytes.
             None => {
                 let bytes = resp.bytes().await.node_err("http body read")?;
                 match std::str::from_utf8(&bytes) {
-                    Ok(text) => out.set("body", text_body(text.to_string())),
+                    Ok(text) => text_out(&ctx, &files, out, text.to_string(), "text/plain", &filename).await?,
                     Err(_) => {
                         let mime = storage::sniff_mime(&bytes).unwrap_or("application/octet-stream");
                         out.set("file", files.put(bytes, mime, &filename, Some(KeepTtl::Default)).await?)
@@ -105,12 +109,43 @@ impl Node for HttpRequestNode {
     }
 }
 
+/// A text response onto the output: on `body` when it fits a wire,
+/// else stored whole in `files` and sent on `file` as `mime`, the way a
+/// response that is not text always goes. Cutting
+/// it would hand on half a JSON document as if it were the answer.
+/// When `file` is not wired, a `body` that is wired has to be told why
+/// nothing came, and with neither wired nobody reads the text at all.
+async fn text_out(
+    ctx: &RunContext,
+    files: &StorageHandle,
+    out: NodeOutput,
+    raw: String,
+    mime: &str,
+    filename: &str,
+) -> WeftResult<NodeOutput> {
+    let body = text_body(&raw);
+    let Some(weight) = storage::over_wire(&body) else {
+        return Ok(out.set("body", body));
+    };
+    if !ctx.is_output_wired("file") {
+        if ctx.is_output_wired("body") {
+            weft::node_bail!(
+                "the response body weighs {weight}, so `body` cannot carry it. Wire `file`: a body \
+                 that big comes out there whole, as a stored file"
+            );
+        }
+        return Ok(out);
+    }
+    let file = files.put(raw.into_bytes(), mime, filename, Some(KeepTtl::Default)).await?;
+    Ok(out.set("file", file))
+}
+
 /// A text body as the `body` output, declared `JsonDict | String`: a
 /// JSON OBJECT stays a dict; anything else (an array, a scalar, text
 /// that is not JSON) is the verbatim string.
-fn text_body(raw: String) -> Value {
-    match serde_json::from_str::<Value>(&raw) {
+fn text_body(raw: &str) -> Value {
+    match serde_json::from_str::<Value>(raw) {
         Ok(v @ Value::Object(_)) => v,
-        _ => Value::String(raw),
+        _ => Value::String(raw.to_string()),
     }
 }

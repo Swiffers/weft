@@ -1,7 +1,7 @@
 # Showing something in the graph
 
-Every value on every wire is already in the inspector. You never hand-deliver
-information to whoever is watching.
+Every value on every wire is already in the inspector, so your node never
+has to send anything just so a person can see it.
 
 Two things go further, and they share a word, so keep them apart.
 

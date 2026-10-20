@@ -68,7 +68,7 @@ async fn live_send(rig: LiveRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// Telegram refusing the send, the failure both `error` tests read.
+/// Telegram refusing the send, the failure both `_error` tests read.
 fn refuse_the_send(rig: &FakeRig) {
     rig.respond(
         "POST",
@@ -90,9 +90,9 @@ async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
 
 async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     refuse_the_send(&rig);
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig.run(&TelegramSendMessageNode, send_inputs(&rig)).await.ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("bot was blocked"), "{error}");
     assert!(!outcome.outputs.contains_key("messageId"), "a caught failure emits no messageId");
     Ok(())

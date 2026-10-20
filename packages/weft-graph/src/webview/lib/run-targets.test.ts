@@ -1,106 +1,78 @@
 import { describe, it, expect } from 'vitest';
-import { runLabel, pruneTargets, runTargetFacts } from './run-targets';
+import { runProgress, runCheckKey, runTargetsOf, whyNothingToRun } from './run-targets';
 
-describe('runLabel', () => {
-  it('stays plain until the user aims the run', () => {
-    expect(runLabel(0)).toBe('Run Project');
+describe('runTargetsOf', () => {
+  const door = { place: 'door', isTrigger: true, isInfra: false };
+  const clean = { place: 'clean', isTrigger: false, isInfra: false };
+  const sub = { place: 'c.door', isTrigger: true, isInfra: false };
+  const pg = { place: 'pg', isTrigger: false, isInfra: true };
+  const included = { place: 's.db', isTrigger: false, isInfra: true };
+
+  it('offers no Run for triggers alone: a trigger runs when it fires', () => {
+    expect(runTargetsOf([door])).toEqual([]);
+    expect(runTargetsOf([door, sub])).toEqual([]);
   });
 
-  it('counts what it will run', () => {
-    expect(runLabel(1)).toBe('Run 1 target');
-    expect(runLabel(3)).toBe('Run 3 targets');
+  it('offers no Run for infra alone: infra is started, never run', () => {
+    expect(runTargetsOf([pg])).toEqual([]);
+    expect(runTargetsOf([pg, included, door])).toEqual([]);
+  });
+
+  it('runs the rest of a mixed selection, in the order selected', () => {
+    expect(runTargetsOf([door, clean, sub])).toEqual([clean]);
+    expect(runTargetsOf([pg, clean, included])).toEqual([clean]);
   });
 });
 
-describe('pruneTargets', () => {
-  const nodes = [{ id: 'out' }, { id: 'mid' }];
+describe('whyNothingToRun', () => {
+  const trigger = { isTrigger: true, isInfra: false };
+  const infra = { isTrigger: false, isInfra: true };
 
-  it('keeps any node the graph still holds', () => {
-    expect(pruneTargets(['out', 'mid'], nodes)).toEqual(new Set(['out', 'mid']));
+  it('says what to select when nothing is', () => {
+    expect(whyNothingToRun([])).toMatch(/^Select the nodes to run first/);
   });
 
-  it('drops a node that was deleted', () => {
-    expect(pruneTargets(['out', 'gone'], nodes)).toEqual(new Set(['out']));
+  it('says why each kind is left out', () => {
+    expect(whyNothingToRun([trigger])).toMatch(/^A trigger runs when it fires/);
+    expect(whyNothingToRun([infra])).toMatch(/^Infra is started, not run/);
+    expect(whyNothingToRun([trigger, infra])).toMatch(/^Run leaves out triggers and infra/);
   });
 });
 
-describe('runTargetFacts', () => {
-  // trigger -> mid -> out ; bridge(infra) -> door ; side -> door
-  const nodes = [
-    { id: 'trigger', isTrigger: true, isInfra: false },
-    { id: 'mid', isTrigger: false, isInfra: false },
-    { id: 'out', isTrigger: false, isInfra: false },
-    { id: 'bridge', isTrigger: false, isInfra: true },
-    { id: 'side', isTrigger: false, isInfra: false },
-    { id: 'door', isTrigger: false, isInfra: false },
-  ];
-  const edges = [
-    { source: 'trigger', target: 'mid' },
-    { source: 'mid', target: 'out' },
-    { source: 'bridge', target: 'door' },
-    { source: 'side', target: 'door' },
-  ];
-
-  it('a target fed only by non-triggers avoids them', () => {
-    expect(runTargetFacts(['door'], nodes, edges).avoidsTriggers).toBe(true);
+describe('runProgress', () => {
+  it('counts the places whose latest firing ended, out of the run\'s places', () => {
+    const firings = {
+      a: [{ status: 'completed' as const }],
+      b: [{ status: 'completed' as const }, { status: 'running' as const }],
+      c: [{ status: 'skipped' as const }],
+      d: [{ status: 'waiting_for_input' as const }],
+    };
+    expect(runProgress(firings, ['a', 'b', 'c', 'd', 'e'])).toEqual({ done: 2, total: 5 });
   });
 
-  it('a target downstream of a trigger does not', () => {
-    expect(runTargetFacts(['out'], nodes, edges).avoidsTriggers).toBe(false);
+  it('has no total when the run\'s program could not be read', () => {
+    expect(runProgress({}, null)).toEqual({ done: 0, total: null });
+  });
+});
+
+describe('runCheckKey', () => {
+  const src = 'a = Text\n';
+  it('gives the same key for the same selection in a new array', () => {
+    const selection = ['b', 'a.x'];
+    expect(runCheckKey([...selection], src)).toBe(runCheckKey(selection, src));
+    expect(runCheckKey(['a.x', 'b'], src)).toBe(runCheckKey(['b', 'a.x'], src));
   });
 
-  it('one triggered target poisons the joined set', () => {
-    expect(runTargetFacts(['door', 'out'], nodes, edges).avoidsTriggers).toBe(false);
+  it('gives another key when the selection changes', () => {
+    expect(runCheckKey(['a', 'b'], src)).not.toBe(runCheckKey(['a'], src));
+    expect(runCheckKey(['a', 'b'], src)).not.toBe(runCheckKey(['a', 'c'], src));
   });
 
-  it('no targets means no bypass', () => {
-    expect(runTargetFacts([], nodes, edges).avoidsTriggers).toBe(false);
+  it('gives another key when the program changes under the same selection', () => {
+    expect(runCheckKey(['a'], src)).not.toBe(runCheckKey(['a'], 'a = Text\nb = Text\n'));
   });
 
-  it('reports the infra inside the joined subgraph and nothing else', () => {
-    expect(runTargetFacts(['door'], nodes, edges).infraIds).toEqual(['bridge']);
-    expect(runTargetFacts(['out'], nodes, edges).infraIds).toEqual([]);
-  });
-
-  it('does not walk through a trigger to infra above it', () => {
-    const edges2 = [...edges, { source: 'bridge', target: 'trigger' }];
-    expect(runTargetFacts(['out'], nodes, edges2).infraIds).toEqual([]);
-  });
-
-  it('a target inside a group brings the group, its inputs, and its siblings', () => {
-    // feed -> grp ; grp contains inner (the target) and db (infra) ; trigger -> feed
-    const scoped = [
-      { id: 'trigger', isTrigger: true, isInfra: false },
-      { id: 'feed', isTrigger: false, isInfra: false },
-      { id: 'grp', isTrigger: false, isInfra: false },
-      { id: 'inner', isTrigger: false, isInfra: false, parentId: 'grp' },
-      { id: 'db', isTrigger: false, isInfra: true, parentId: 'grp' },
-    ];
-    const scopedEdges = [
-      { source: 'trigger', target: 'feed' },
-      { source: 'feed', target: 'grp' },
-    ];
-    const facts = runTargetFacts(['inner'], scoped, scopedEdges);
-    expect(facts.infraIds).toEqual(['db']);
-    expect(facts.avoidsTriggers).toBe(false);
-  });
-
-  it('reaches infra nested two containers deep', () => {
-    // grp contains inner (the target) and sub ; sub contains db (infra)
-    const scoped = [
-      { id: 'grp', isTrigger: false, isInfra: false },
-      { id: 'inner', isTrigger: false, isInfra: false, parentId: 'grp' },
-      { id: 'sub', isTrigger: false, isInfra: false, parentId: 'grp' },
-      { id: 'db', isTrigger: false, isInfra: true, parentId: 'sub' },
-    ];
-    expect(runTargetFacts(['inner'], scoped, []).infraIds).toEqual(['db']);
-  });
-
-  it('a container target brings what is inside it', () => {
-    const scoped = [
-      { id: 'grp', isTrigger: false, isInfra: false },
-      { id: 'db', isTrigger: false, isInfra: true, parentId: 'grp' },
-    ];
-    expect(runTargetFacts(['grp'], scoped, []).infraIds).toEqual(['db']);
+  it('cannot confuse two places with one whose name holds the separator', () => {
+    expect(runCheckKey(['a,b'], src)).not.toBe(runCheckKey(['a', 'b'], src));
   });
 });

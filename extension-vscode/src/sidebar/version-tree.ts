@@ -1,58 +1,54 @@
-// The version tree as the Executions view shows it in "by version"
+// The version tree as the Runs view shows it in "by version"
 // mode: what `weft tree --json` answers, folded into nested version
 // nodes with their runs beneath. Pure, so the shape is tested without
 // an editor process; the provider only draws it.
 
 import { specScopedTo, type RunSpec } from '../../../packages/weft-graph/src/run-spec';
-import type { CancelCause } from '../../../packages/weft-graph/src/protocol';
-import type { RunStatus } from './executions';
+import type { RunSummary } from './runs';
 import { describeOutcome } from './outcome';
 
-// SYNC: TreeJson, VersionSummary, RunSummary <-> crates/weft-core/src/versions.rs VersionTree, Head, VersionSummary, RunSummary (the shape `weft tree --json` prints, with `disk_version` added by crates/weft-cli/src/commands/tree.rs)
+// SYNC: TreeJson, VersionSummary, VersionRun <-> crates/weft-core/src/versions.rs VersionTree, Head, VersionSummary, VersionRun (the shape `weft tree --json` prints, with `diskVersion` added by crates/weft-cli/src/commands/tree.rs)
 export interface TreeJson {
-  head: { head_version: string | null; head_run: string | null; activated_versions: string[] };
+  head: { headVersion: string | null; headRun: string | null; activatedVersions: string[] };
   versions: VersionSummary[];
-  runs: RunSummary[];
+  runs: VersionRun[];
   /** The version the files on disk are, when it is one the tree holds. */
-  disk_version?: string | null;
+  diskVersion?: string | null;
 }
 
 export interface VersionSummary {
   id: string;
-  parent_id: string | null;
+  parentId: string | null;
   label: string | null;
-  created_at: number;
+  createdAt: number;
   diff: { added: string[]; removed: string[]; changed: string[] };
   manifest: Record<string, string>;
   /** How many runs the project's triggers started on this version (too
    *  many to list one by one), and the newest. */
-  trigger_runs?: number;
-  last_trigger_run?: string | null;
+  triggerRuns?: number;
+  lastTriggerRun?: string | null;
 }
 
-export interface RunSummary {
-  execution_id: string;
-  version_id: string;
-  definition_hash: string;
-  seed_execution_id: string | null;
+export interface VersionRun {
+  runId: string;
+  versionId: string;
+  definitionHash: string;
+  seedRunId: string | null;
   stale: string[];
   spec: RunSpec | null;
   example: string | null;
-  /** The run's listing status, or null when its journal is gone. */
-  // SYNC: RunSummary.status <-> crates/weft-core/src/versions.rs RunSummary.status
-  status: RunStatus | null;
-  started_at: number;
-  completed_at: number | null;
-  /** For a cancelled run: who or what stopped it. */
-  cancel_cause?: CancelCause | null;
-  /** Node firings the run skipped. */
-  skipped_nodes?: number;
+  /** When it started, as the version tree recorded it. */
+  startedAt: number;
+  /** The run as the runs listing shows it, or null when its record is
+   *  gone. */
+  // SYNC: VersionRun.listing <-> crates/weft-core/src/versions.rs VersionRun.listing
+  listing: RunSummary | null;
 }
 
 /** One version in the drawn tree. */
 export interface VersionTreeNode {
   version: VersionSummary;
-  runs: RunSummary[];
+  runs: VersionRun[];
   children: VersionTreeNode[];
   /** Head's version. */
   isHead: boolean;
@@ -67,21 +63,21 @@ export interface VersionTreeNode {
  *  dispatcher recorded them (the order it lists them in). */
 export function buildVersionTree(tree: TreeJson): VersionTreeNode[] {
   const known = new Set(tree.versions.map((v) => v.id));
-  const runsOf = new Map<string, RunSummary[]>();
+  const runsOf = new Map<string, VersionRun[]>();
   for (const r of tree.runs) {
-    const list = runsOf.get(r.version_id) ?? [];
+    const list = runsOf.get(r.versionId) ?? [];
     list.push(r);
-    runsOf.set(r.version_id, list);
+    runsOf.set(r.versionId, list);
   }
   // Children indexed once, in order, instead of scanning every version
   // per version: a project records a version per run, so the history is
   // long and mostly linear, and the scan-per-node was quadratic in it.
   const childrenOf = new Map<string, VersionSummary[]>();
   for (const v of tree.versions) {
-    if (v.parent_id === null || !known.has(v.parent_id)) continue;
-    const list = childrenOf.get(v.parent_id) ?? [];
+    if (v.parentId === null || !known.has(v.parentId)) continue;
+    const list = childrenOf.get(v.parentId) ?? [];
     list.push(v);
-    childrenOf.set(v.parent_id, list);
+    childrenOf.set(v.parentId, list);
   }
   // `seen` is not decoration. A version's parent link carries no foreign
   // key, so two rows pointing at each other, or one reachable from two
@@ -100,9 +96,9 @@ export function buildVersionTree(tree: TreeJson): VersionTreeNode[] {
       version: v,
       runs: runsOf.get(v.id) ?? [],
       children: [],
-      isHead: tree.head.head_version === v.id,
-      isDisk: tree.disk_version === v.id,
-      isActivated: tree.head.activated_versions.includes(v.id),
+      isHead: tree.head.headVersion === v.id,
+      isDisk: tree.diskVersion === v.id,
+      isActivated: tree.head.activatedVersions.includes(v.id),
     };
     const pending: VersionTreeNode[] = [root];
     while (pending.length > 0) {
@@ -114,9 +110,9 @@ export function buildVersionTree(tree: TreeJson): VersionTreeNode[] {
           version: c,
           runs: runsOf.get(c.id) ?? [],
           children: [],
-          isHead: tree.head.head_version === c.id,
-          isDisk: tree.disk_version === c.id,
-          isActivated: tree.head.activated_versions.includes(c.id),
+          isHead: tree.head.headVersion === c.id,
+          isDisk: tree.diskVersion === c.id,
+          isActivated: tree.head.activatedVersions.includes(c.id),
         };
         parent.children.push(child);
         pending.push(child);
@@ -127,7 +123,7 @@ export function buildVersionTree(tree: TreeJson): VersionTreeNode[] {
   const out: VersionTreeNode[] = [];
   for (const v of tree.versions) {
     if (seen.has(v.id)) continue;
-    if (v.parent_id === null || !known.has(v.parent_id)) out.push(node(v));
+    if (v.parentId === null || !known.has(v.parentId)) out.push(node(v));
   }
   // Whatever is left no root reaches, which means a cycle: either a
   // version in one, or one hanging off a member of one. Shown rather than
@@ -139,10 +135,10 @@ export function buildVersionTree(tree: TreeJson): VersionTreeNode[] {
   // then appears further down with the child under it as well: the same
   // version drawn twice, or drawn at a place that is not where it sits.
   const inACycle = (start: VersionSummary): boolean => {
-    let at = start.parent_id;
+    let at = start.parentId;
     for (let step = 0; step < tree.versions.length && at !== null && at !== undefined; step += 1) {
       if (at === start.id) return true;
-      at = tree.versions.find((v) => v.id === at)?.parent_id ?? null;
+      at = tree.versions.find((v) => v.id === at)?.parentId ?? null;
     }
     return false;
   };
@@ -171,7 +167,7 @@ export function versionLabel(node: VersionTreeNode): string {
     ...d.added.map((p) => `+${p}`),
     ...d.removed.map((p) => `-${p}`),
   ];
-  if (node.version.parent_id === null) parts.push('root');
+  if (node.version.parentId === null) parts.push('root');
   else if (changed.length > 0) parts.push(changed.join(' '));
   return parts.join(' ');
 }
@@ -182,23 +178,24 @@ export function versionMarks(node: VersionTreeNode): string[] {
   if (node.isHead) marks.push('HEAD');
   if (node.isDisk) marks.push('on disk');
   if (node.isActivated) marks.push('activated');
-  const fired = node.version.trigger_runs ?? 0;
+  const fired = node.version.triggerRuns ?? 0;
   if (fired > 0) marks.push(`${fired} trigger run${fired === 1 ? '' : 's'}`);
   return marks;
 }
 
 /** A run's description: status, seed, scope, example. */
-export function runDescription(run: RunSummary, headRun: string | null): string {
-  const parts = [describeOutcome(run.status ?? 'unknown', run.cancel_cause, run.skipped_nodes)];
-  if (run.seed_execution_id) parts.push(`seed ${shortId(run.seed_execution_id)} (${run.stale.length} stale)`);
+export function runDescription(run: VersionRun, headRun: string | null): string {
+  const listing = run.listing;
+  const parts = [describeOutcome(listing?.status ?? 'unknown', listing?.cancelCause, listing?.skippedNodes)];
+  if (run.seedRunId) parts.push(`seed ${shortId(run.seedRunId)} (${run.stale.length} stale)`);
   if (run.spec) parts.push(`spec ${run.spec.name}`);
   if (run.example) parts.push(`example ${run.example}`);
-  if (headRun === run.execution_id) parts.push('HEAD run');
+  if (headRun === run.runId) parts.push('HEAD run');
   return parts.join('  ·  ');
 }
 
 /** Whether a run is scoped to `group` (or inside it): the runs the
  *  list marks when the editor is focused inside that group. */
-export function runScopedTo(run: RunSummary, group: string | null): boolean {
+export function runScopedTo(run: VersionRun, group: string | null): boolean {
   return !!run.spec && !!group && specScopedTo(run.spec, group);
 }

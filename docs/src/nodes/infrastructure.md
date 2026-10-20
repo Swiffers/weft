@@ -6,7 +6,7 @@ makes what runs match it: Docker containers on your machine, or a Compute
 Engine machine of its own on a cloud install.
 
 ```json
-"requires_infra": true,
+"requiresInfra": true,
 "images": ["images/credential"],
 "publishes": "postgres"
 ```
@@ -29,8 +29,8 @@ async fn provision_infra(&self, ctx: InfraProvisionContext, input: ValueBag)
 }
 ```
 
-Declaring `requires_infra: true` without writing `provision_infra` is an error
-naming your node, rather than a silent nothing.
+Declaring `requiresInfra: true` without writing `provision_infra` is an error
+naming your node when the infra is provisioned, rather than a silent nothing.
 
 ## The spec
 
@@ -39,7 +39,8 @@ naming your node, rather than a silent nothing.
 | `units` | What runs. Most nodes have exactly one |
 | `volumes` | Disks, kept across stop and upgrade by name, and scratch space emptied at each start |
 | `endpoints` | Named ports your node and the project's other nodes reach it on, and whether anything outside the project may |
-| `keepOnTerminate` | Disks to keep even through a terminate, for the next `weft infra start` to pick up |
+| `keep_on_terminate` | Disks to keep even through a terminate, for the next `weft infra start` to pick up |
+| `health_rules` | What weft does to the project's triggers when a unit of this node stops being ready, and when it undoes it. For the defaults and how to write your own, go and read [when a unit stops being ready](#when-a-unit-stops-being-ready) |
 
 A unit is a group of containers that run side by side, with optional init
 containers that run one after another before them. It also says what machine
@@ -267,18 +268,21 @@ opening the connection your node published, weft adds a line to that node's
 error naming `weft infra rebake <node>`.
 
 If you change what your `run` emits on a baked output, runs that skip your
-node keep handing out the old saved value until it bakes again. `weft infra
-upgrade` builds your current source, then stops the infrastructure and
-starts it again. If you would rather restart nothing, build first (`weft
-build`, or any `weft run`) and then run `weft infra rebake <node>`, which
-runs whatever weft built last.
+node keep handing out the old saved value until it bakes again. If you want
+the new value out, `weft infra upgrade` builds your current source and
+restarts each copy it reaches that still runs an older build, which bakes it
+again. The triggers that go through that copy are down until it is back. If you would rather
+restart nothing, build first
+(`weft build`, or any `weft run`) and then run `weft infra rebake <node>`,
+which runs whatever weft built last.
 
-Without `--instance`, the upgrade stops the program's shared infrastructure
-and starts it again. A `@per_instance` node's copies are left alone, so run
-it with `--instance <id>` for each instance whose copy should bake your new
-code. For what an upgrade does to running work and to triggers, go and read
-[choosing what happens to work in
-flight](../running/lifecycles.md#choosing-what-happens-to-work-in-flight).
+Without a flag, the upgrade touches the program's shared infrastructure only.
+If you want a `@per_instance` node's copies to bake your new code, add
+`--instance <id>` for some instances or `--all-instances` for every one;
+neither touches the shared copies. If you want both at once, use `--all`. For what an
+upgrade does to running work and to triggers, go and read [infra commands
+take down only what reads the
+infra](../running/lifecycles.md#infra-commands-take-down-only-what-reads-the-infra).
 
 ## Letting other nodes reach it
 
@@ -338,10 +342,13 @@ network. Before every check it asks for the same endpoint's address as weft's
 own roles reach it, looked up in this project's infra only, so the address you
 pass works as it is.
 
-If somebody stops the run while it waits, none of your code runs: the run ends
-cancelled and the checks stop, but the job in your container carries on. If it
-should stop too, have the container give up on a job whose status nobody has
-asked for in a few intervals; terminating the infra stops it as well.
+If somebody cancels the run while it waits, the job in your container carries
+on. If you want it to stop too, give your container a cancel route and pass it
+as the cancel call: `CancelCall::post(format!("{}/jobs/{id}/cancel",
+api.url()))`. The listener reaches it the way it reaches the status route. For
+what happens when your container refuses the call or does not answer, go and
+read [if the run is cancelled while the job
+runs](durable-execution.md#if-the-run-is-cancelled-while-the-job-runs).
 
 ## A live panel
 
@@ -361,14 +368,126 @@ It takes an exclusive lease on the project, applies your spec, and watches
 whether what it created is healthy. For what happens when a supervisor dies halfway through a change, go and
 read [the supervisor](../running/architecture.md#the-supervisor).
 
-A unit that was healthy and stays not ready past its flaky window
-(`health.flakyAfterSeconds`, 30 seconds by default) is marked flaky, and one
-that stays ready again past `health.recoveryAfterSeconds` (also 30) is marked
-running again. `weft infra status` shows which.
-
 There is no time limit on coming up, because a model server pulling weights can
 take a long time. Somebody waiting on yours reads `weft infra logs <node>` and
 cancels if it will never come.
+
+## When a unit stops being ready
+
+A unit that was ready and then stays not ready for its whole flaky window
+(the unit's `health.flaky_after_seconds` in Rust, `flakyAfterSeconds` in the
+spec's JSON; 30 seconds by default) is marked **flaky**. One that stays ready
+again for `health.recovery_after_seconds` (`recoveryAfterSeconds`; also 30)
+is marked running again. `weft infra status` shows which state each unit
+is in.
+
+What happens to the project while a unit is flaky is up to your node's
+`health_rules`. If you write none, your node gets these two:
+
+- **take-down-while-flaky**: while a unit of the copy is flaky and the
+  project's triggers are on, take down every trigger whose cut contains this
+  copy (the cut is the part of the program a trigger's runs go through). Work
+  that arrives for those triggers is held until they are back, work they were
+  already holding is kept, and the runs reaching the copy are cancelled, since
+  they cannot go on without it. A trigger whose cut does not contain the copy
+  keeps running.
+- **bring-back-once-healthy**: once no unit of the copy is flaky, bring back
+  what the health check took down, but never what a person or an infra
+  command took down.
+
+Each rule reads one copy at a time, and only that copy's own units, so one
+instance's broken copy never takes down another instance's triggers.
+
+If that is not what your node needs, write your own. Say your node runs a
+database unit `db` and a small admin panel `panel` beside it. With the two
+rules above, the panel going flaky would take down every trigger that uses
+the database. Name the unit and only `db` counts:
+
+```rust
+use weft::infra::health::{HealthAction, HealthCondition, HealthRule, DEFAULT_RULE_TIMEOUT_SECONDS};
+
+let db_flaky = HealthCondition::UnitFlaky { unit: Some("db".into()) };
+let health_rules = vec![
+    HealthRule {
+        name: "take-down-while-db-flaky".into(),
+        when: HealthCondition::All { conditions: vec![db_flaky.clone(), HealthCondition::Listening] },
+        action: HealthAction::TakeDownTriggers,
+        timeout_seconds: DEFAULT_RULE_TIMEOUT_SECONDS,
+    },
+    HealthRule {
+        name: "bring-back-once-db-healthy".into(),
+        when: HealthCondition::All {
+            conditions: vec![HealthCondition::Not { condition: Box::new(db_flaky) }, HealthCondition::TakenDownByHealth],
+        },
+        action: HealthAction::BringBack,
+        timeout_seconds: DEFAULT_RULE_TIMEOUT_SECONDS,
+    },
+];
+
+Ok(InfraSpec { units, health_rules: Some(health_rules), ..Default::default() })
+```
+
+A condition is one of these, nested as deep as you like:
+
+| Condition | Holds when |
+|---|---|
+| `UnitFlaky { unit }` | That unit of the copy is flaky (`unit: None`: any of its units). A unit not reported yet is not flaky |
+| `Listening` | Some trigger of the project is on, and none is being turned on |
+| `TakenDownByHealth` | Something the health check took down is still down. A person's stop or deactivate clears the mark, so a rule gated on this never undoes what a person did |
+| `All { conditions }` | Every one of them holds (an empty list holds) |
+| `Any { conditions }` | One of them holds (an empty list does not) |
+| `Not { condition }` | It does not hold |
+
+The action is `TakeDownTriggers` or `BringBack`. Give each rule a name no
+other rule of this node uses: weft keeps each rule's state under its name,
+and `weft status` names it if the rule gives up. A repeated name is refused
+when the spec is applied.
+
+Rules are read in the order you write them. A rule fires once for a copy when
+its condition starts to hold, and can fire again only after the condition
+stopped holding for that copy. When two hold at once for a copy, only the
+first fires. The second fires on a later check, once the first has fired or
+stopped holding; while the first is retrying or has given up, the second
+waits.
+
+Firing a rule means the supervisor asks weft to queue its action, and the
+rule counts as fired while that action runs. The action fails if the request
+to queue it fails, if weft cannot carry it out, or if it has not finished
+within `timeout_seconds` of being queued. Each time weft finishes a health
+action, the supervisor takes one more look, so a failure is noticed at once.
+A failed action is tried again 5 seconds later, then 10 seconds after that. On
+the third failure in a row weft gives up on the rule, and `weft status` names
+it with the last error. A rule that gave up tries again when any unit of the
+copy changes between ready, not ready and flaky, when the rule stops holding,
+when somebody starts, stops, upgrades or terminates the project's infra, or
+when somebody runs `weft infra look`.
+
+Set `timeout_seconds` to `DEFAULT_RULE_TIMEOUT_SECONDS` (30 minutes) unless
+you want another limit. It is a `NonZeroU32`, so for ten minutes write
+`NonZeroU32::new(600).unwrap()`.
+
+When a bring-back fires, a trigger stays down if its cut contains a running
+copy that is still broken: one whose node has a bring-back rule that does not
+hold right now, or one whose own take-down took down something that is still
+down. A healthy copy whose node writes no rules never holds anything down.
+
+If you want a flaky unit to take nothing down, set `health_rules:
+Some(vec![])`. A node with take-down rules but no bring-back rule keeps down
+what it took down itself until a person runs `weft activate`.
+
+A rule that names a unit the spec does not declare is refused when the spec
+is applied:
+
+```text
+infra node 'database': health rule 'take-down-while-db-flaky' reads unit 'dbb',
+which is not declared; name one of the node's units, or leave `unit` out to
+read any of them
+```
+
+For what the person running the project sees when the health check took a
+trigger down, and how to bring one back by hand, go and read [infra commands
+take down only what reads the
+infra](../running/lifecycles.md#infra-commands-take-down-only-what-reads-the-infra).
 
 ## Two things a user has to do themselves
 
@@ -378,10 +497,10 @@ money and weft will not spend it on a click that did not mention one.
 
 And `weft infra stop` keeps the disk while `weft infra terminate` deletes it.
 If your node has data worth keeping even through a terminate, name its disk in
-`keepOnTerminate`. The next `weft infra start` of the same node (the same
+`keep_on_terminate`. The next `weft infra start` of the same node (the same
 instance's copy, for a node marked `@per_instance`) finds that disk and mounts it
 again, data and all. If you want a kept disk gone, drop it from
-`keepOnTerminate`, start the node once so the copy knows about it, and
+`keep_on_terminate`, start the node once so the copy knows about it, and
 terminate.
 
 A kept disk is deleted for you once its copy can never come back: when you

@@ -85,8 +85,8 @@ pub async fn fields(State(state): State<DispatcherState>, headers: HeaderMap) ->
     let picks = crate::api::project::stored_picks(&state, caller.project).await?;
     let mut out = Vec::new();
     let rules = weft_core::rules::RuleContext::new(&project);
-    for (step, node) in weft_core::project::instance_filled_places(&project) {
-        let (id, path) = weft_core::project::resolve_address(&project, &step);
+    for (place, node) in weft_core::project::instance_filled_places(&project) {
+        let (id, path) = weft_core::project::resolve_address(&project, &place);
         let at = weft_core::frames::Located::new(id, path);
         for input in &node.inputs {
             let Some(filled) = node.port_literals.get(&input.name).and_then(weft_core::instance::as_instance_filled) else {
@@ -109,9 +109,9 @@ pub async fn fields(State(state): State<DispatcherState>, headers: HeaderMap) ->
                 needed: weft_core::instance::instance_field_needed(&rules, node, &input.name),
                 spec: if is_connection { node.instance_service.clone() } else { None },
                 connection,
-                value: values.get(&step).and_then(|fields| fields.get(&input.name)).cloned(),
+                value: values.get(&place).and_then(|fields| fields.get(&input.name)).cloned(),
                 input: input.clone(),
-                step: step.clone(),
+                node: place.clone(),
             });
         }
     }
@@ -257,7 +257,7 @@ pub async fn set_values(
     Json(req): Json<weft_core::instance_door::ValuesRequest>,
 ) -> Result<Json<ValuesChanged>, ApiError> {
     let caller = instance_caller(&state, &headers).await?;
-    let clear: Vec<(String, String)> = req.clear.into_iter().map(|f| (f.step, f.field)).collect();
+    let clear: Vec<(String, String)> = req.clear.into_iter().map(|f| (f.node, f.field)).collect();
     crate::instance_values::change(&state, &caller.tenant, caller.project, &caller.instance, &req.set, &clear)
         .await
         .map(Json)
@@ -267,7 +267,7 @@ pub async fn set_values(
 // SYNC: LookupRequest <-> packages/weft-connect/src/core/wire.ts InstanceLookupRequest
 #[derive(Debug, Deserialize)]
 pub struct LookupRequest {
-    pub step: String,
+    pub node: String,
     pub field: String,
     /// Which of the field widget's `sources`, by position: a `list` or a
     /// `granted` one.
@@ -293,10 +293,10 @@ pub async fn lookup(
     Json(req): Json<LookupRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let caller = instance_caller(&state, &headers).await?;
-    let (source, connection) = field_source(&state, &caller, &req.step, &req.field, req.source).await?;
+    let (source, connection) = field_source(&state, &caller, &req.node, &req.field, req.source).await?;
     match source {
         weft_core::node::ResourceSource::List { lookup, .. } => {
-            let access_id = if lookup.public { None } else { Some(signing(&connection, &req.step, &req.field)?.id) };
+            let access_id = if lookup.public { None } else { Some(signing(&connection, &req.node, &req.field)?.id) };
             let request = weft_access_store::LookupRequest {
                 for_instance: Some(caller.scope()),
                 access_id,
@@ -312,7 +312,7 @@ pub async fn lookup(
         }
         weft_core::node::ResourceSource::Granted { from, label, value } => {
             let weft_core::instance::WiredConnection { id: access_id, service, .. } =
-                own_signing(&connection, &req.step, &req.field)?;
+                own_signing(&connection, &req.node, &req.field)?;
             let request =
                 weft_access_store::GrantedQuery { for_instance: Some(caller.scope()), access_id, service, from, label, value };
             crate::broker_admin::forward_json(&state, "/v1/access/admin/granted", &Tenanted { tenant: caller.tenant, inner: request })
@@ -321,7 +321,7 @@ pub async fn lookup(
         }
         _ => Err((
             StatusCode::BAD_REQUEST,
-            format!("source {} of '{}.{}' is not a list to look up", req.source, req.step, req.field),
+            format!("source {} of '{}.{}' is not a list to look up", req.source, req.node, req.field),
         )),
     }
 }
@@ -330,7 +330,7 @@ pub async fn lookup(
 // SYNC: PickerRequest <-> packages/weft-connect/src/core/wire.ts InstancePickerRequest
 #[derive(Debug, Deserialize)]
 pub struct PickerRequest {
-    pub step: String,
+    pub node: String,
     pub field: String,
     /// Which of the field widget's `sources`: a `picker` one.
     pub source: usize,
@@ -346,15 +346,15 @@ pub async fn picker(
     Json(req): Json<PickerRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let caller = instance_caller(&state, &headers).await?;
-    let (source, connection) = field_source(&state, &caller, &req.step, &req.field, req.source).await?;
+    let (source, connection) = field_source(&state, &caller, &req.node, &req.field, req.source).await?;
     let weft_core::node::ResourceSource::Picker { script, code, grants, mime_types } = source else {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("source {} of '{}.{}' is not a picker", req.source, req.step, req.field),
+            format!("source {} of '{}.{}' is not a picker", req.source, req.node, req.field),
         ));
     };
-    let weft_core::instance::WiredConnection { id: access_id, service, .. } = own_signing(&connection, &req.step, &req.field)?;
-    let base = crate::storage::LinkBase::for_request(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let weft_core::instance::WiredConnection { id: access_id, service, .. } = own_signing(&connection, &req.node, &req.field)?;
+    let base = crate::api::request_base(&headers)?;
     let picker_state = weft_access_store::begin_picker(
         &state.pg_pool,
         &caller.tenant,
@@ -362,41 +362,41 @@ pub async fn picker(
     )
     .await
     .map_err(access_err)?;
-    let url = format!("{}/access/picker/{picker_state}", base.as_str());
+    let url = format!("{base}/access/picker/{picker_state}");
     Ok(Json(serde_json::json!({ "state": picker_state, "url": url })))
 }
 
-/// The source at position `index` of the widget of `field` at `step`, a
+/// The source at position `index` of the widget of `field` at `place`, a
 /// field the instance fills, and the connection the instance's run signs it
 /// with there.
 async fn field_source(
     state: &DispatcherState,
     caller: &InstanceCaller,
-    step: &str,
+    place: &str,
     field: &str,
     index: usize,
 ) -> Result<(weft_core::node::ResourceSource, Option<weft_core::instance::WiredConnection>), ApiError> {
     let project = caller_project(state, caller).await?;
-    let Some((_, node)) = weft_core::project::instance_filled_places(&project).into_iter().find(|(place, _)| place == step) else {
-        return Err((StatusCode::NOT_FOUND, format!("'{step}' is no step with a field you fill")));
+    let Some((_, node)) = weft_core::project::instance_filled_places(&project).into_iter().find(|(at, _)| at == place) else {
+        return Err((StatusCode::NOT_FOUND, format!("'{place}' is no node with a field you fill")));
     };
     if !weft_core::instance::instance_filled_fields(node).any(|(filled, _)| filled == field) {
-        return Err((StatusCode::NOT_FOUND, format!("'{step}.{field}' is no field you fill")));
+        return Err((StatusCode::NOT_FOUND, format!("'{place}.{field}' is no field you fill")));
     }
     let Some(weft_core::node::Widget::RemoteSelect { sources, .. }) =
         node.inputs.iter().find(|i| i.name == field).and_then(|i| i.widget.as_ref())
     else {
-        return Err((StatusCode::BAD_REQUEST, format!("'{step}.{field}' has no list to look up")));
+        return Err((StatusCode::BAD_REQUEST, format!("'{place}.{field}' has no list to look up")));
     };
     let source = sources
         .get(index)
         .cloned()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("'{step}.{field}' has no source {index}")))?;
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("'{place}.{field}' has no source {index}")))?;
     let values = weft_access_store::instance_values(&state.pg_pool, &caller.tenant, caller.project, &caller.instance)
         .await
         .map_err(access_err)?;
     let picks = crate::api::project::stored_picks(state, caller.project).await?;
-    let (id, path) = weft_core::project::resolve_address(&project, step);
+    let (id, path) = weft_core::project::resolve_address(&project, place);
     let connection = weft_core::instance::lookup_connection(&project, &weft_core::frames::Located::new(id, path), field, &values, &picks)
         .and_then(weft_core::instance::LookupConnection::signing)
         .map_err(|why| (StatusCode::CONFLICT, why))?;
@@ -406,11 +406,11 @@ async fn field_source(
 /// The connection a signed source needs, or why there is none.
 fn signing(
     connection: &Option<weft_core::instance::WiredConnection>,
-    step: &str,
+    node: &str,
     field: &str,
 ) -> Result<weft_core::instance::WiredConnection, ApiError> {
     connection.clone().ok_or_else(|| {
-        (StatusCode::CONFLICT, format!("'{step}.{field}' reads its list through a connection, and none is wired to it"))
+        (StatusCode::CONFLICT, format!("'{node}.{field}' reads its list through a connection, and none is wired to it"))
     })
 }
 
@@ -419,14 +419,14 @@ fn signing(
 /// shared one never signs them (see `FieldConnection`).
 fn own_signing(
     connection: &Option<weft_core::instance::WiredConnection>,
-    step: &str,
+    node: &str,
     field: &str,
 ) -> Result<weft_core::instance::WiredConnection, ApiError> {
-    let wired = signing(connection, step, field)?;
+    let wired = signing(connection, node, field)?;
     if wired.whose != weft_core::instance_door::FieldConnection::Own {
         return Err((
             StatusCode::FORBIDDEN,
-            format!("'{step}.{field}' reads through the program author's connection; this source only runs on your own"),
+            format!("'{node}.{field}' reads through the program author's connection; this source only runs on your own"),
         ));
     }
     Ok(wired)
@@ -440,14 +440,15 @@ pub struct RunsQuery {
 }
 
 /// `GET /instance/runs`: the instance's own runs in the token's project,
-/// newest first.
+/// newest first, each failed one with the plain failure in place of why
+/// it failed ([`plain_failures`]).
 pub async fn runs(
     State(state): State<DispatcherState>,
     headers: HeaderMap,
     Query(q): Query<RunsQuery>,
-) -> Result<Json<weft_core::program::ExecutionPage>, ApiError> {
+) -> Result<Json<weft_core::program::RunPage>, ApiError> {
     let caller = instance_caller(&state, &headers).await?;
-    let query = crate::journal::ExecutionQuery {
+    let query = crate::journal::RunListQuery {
         limit: q.limit.unwrap_or(50).clamp(1, 200),
         offset: q.offset.unwrap_or(0),
         project_id: Some(caller.project),
@@ -457,13 +458,61 @@ pub async fn runs(
     };
     state
         .journal
-        .list_executions(&caller.tenant, &query)
+        .list_runs(&caller.tenant, &query)
         .await
-        .map(Json)
+        .map(|page| Json(plain_failures(page)))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("runs: {e:#}")))
+}
+
+/// An instance token is a visitor of the program, never its owner: a
+/// failed run reads as the plain failure (`weft_core::caller::PLAIN_FAILURE`),
+/// its node paths and a provider's words left to the owner, who opens it
+/// by the run id the summary already carries.
+fn plain_failures(mut page: weft_core::program::RunPage) -> weft_core::program::RunPage {
+    for run in &mut page.runs {
+        if run.error.is_some() {
+            run.error = Some(weft_core::caller::PLAIN_FAILURE.to_string());
+        }
+    }
+    page
 }
 
 fn access_err(e: anyhow::Error) -> ApiError {
     let (status, message) = weft_access_store::client_error(e);
     (StatusCode::from_u16(status).expect("store status codes are valid"), message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plain_failures;
+    use weft_core::program::{RunPage, RunStatus, RunSummary};
+
+    fn run(status: RunStatus, error: Option<&str>) -> RunSummary {
+        RunSummary {
+            run_id: uuid::Uuid::new_v4(),
+            project_id: uuid::Uuid::nil(),
+            entry_node: "route".into(),
+            status,
+            phase: weft_core::primitive::Phase::Fire,
+            started_at: 1,
+            completed_at: Some(2),
+            tags: Vec::new(),
+            cancel_cause: None,
+            error: error.map(str::to_string),
+            skipped_nodes: 0,
+            instance: None,
+        }
+    }
+
+    /// A failed run reads as the plain failure, keeping its id; a run
+    /// that did not fail keeps no error.
+    #[test]
+    fn an_instance_reads_failures_plain() {
+        let failed = run(RunStatus::Failed, Some("route.work.ingest: ffprobe failed probing /data/src.mp4"));
+        let id = failed.run_id;
+        let page = plain_failures(RunPage { runs: vec![failed, run(RunStatus::Completed, None)], total: 2 });
+        assert_eq!(page.runs[0].error.as_deref(), Some("Something went wrong"));
+        assert_eq!(page.runs[0].run_id, id);
+        assert_eq!(page.runs[1].error, None);
+    }
 }

@@ -1,13 +1,22 @@
 //! One engine for every take-down.
 //!
-//! `weft deactivate` (the whole project's shared triggers, or the ones
-//! `--trigger` / `--instance` name), `weft resync`'s first half, the infra
-//! verbs that take triggers down with their containers, the health loop
-//! parking what reads a broken container, project removal, and a program's
-//! own `ctx.trigger(..).deactivate(..)` / `ctx.triggers().instance(..)`
-//! calls all send the same request: a TARGET, a [`DeactivateSpec`] (what
-//! happens to parked work: wipe, hibernate, park; and to running work:
-//! cancel, or wait up to a cap), and the run that asked, if one did.
+//! `weft deactivate` (the triggers `--trigger` / `--instance` /
+//! `--all-instances` name), `weft resync`'s first half, the infra verbs
+//! that take down the triggers whose cut contains their copies, the health
+//! loop taking down what reaches a broken copy, project removal, and a
+//! program's own `ctx.trigger(..).deactivate(..)` calls all send the same
+//! request: a TARGET, a [`TakeDown`] (the door, what is held, what is
+//! running: `weft_core::take_down`), and the run that asked, if one did.
+//!
+//! The three answers are carried out in their order, so nothing arriving
+//! slips between them: the door first (the lifecycle write, which also
+//! drops what is held when asked to, in its own transaction), then the
+//! paused runs a `held: drop` cancels, then the running runs a `running:
+//! cancel` stops. Under `wait` this leaves them going: the wait is the
+//! command's own, after this (`crate::drain`: an infra command's before its
+//! copies go, a resync's before its new version takes over, a
+//! deactivate's before it answers). The trigger is down at once either
+//! way.
 //!
 //! [`affected_runs`] decides, in one place, which runs a target reaches:
 //! the runs its triggers fired (for their instance), or every run for the
@@ -19,12 +28,14 @@
 use axum::http::StatusCode;
 
 use weft_core::activation::ActivationKey;
+use weft_core::deactivation::TakeDownReport;
 use weft_core::instance::InstanceId;
-use weft_core::running_policy::{DeactivateSpec, DeactivationMode, RunningPolicy};
-use weft_core::ExecutionId;
+use weft_core::projects::HeldWork;
+use weft_core::take_down::{Door, Held, Running, TakeDown};
+use weft_core::RunId;
 
-use crate::activation_store::{ActivationLifecycle, LifecycleWrite, ProjectStatus, SignalsGoing};
-pub use weft_broker_client::activation::{DownWith, WentDown};
+pub use crate::activation_store::DownCause;
+use crate::activation_store::{ActivationLifecycle, Forget, LifecycleWrite, ProjectStatus, SignalsGoing};
 use crate::events::DispatcherEvent;
 use crate::state::DispatcherState;
 
@@ -44,7 +55,7 @@ pub enum TakeDownAsker {
     /// A person, a lifecycle command or one of the dispatcher's loops.
     Outside,
     /// A program's run: never among the runs the take-down reaches.
-    Run(ExecutionId),
+    Run(RunId),
     /// A resync taking down the triggers it brings back, under its drive
     /// (`crate::task_kinds::resync::ResyncPlan::driver`): it goes through
     /// only while that drive holds the project.
@@ -53,7 +64,7 @@ pub enum TakeDownAsker {
 
 impl TakeDownAsker {
     /// The run that asked, if one did.
-    pub fn run(self) -> Option<ExecutionId> {
+    pub fn run(self) -> Option<RunId> {
         match self {
             TakeDownAsker::Run(run) => Some(run),
             TakeDownAsker::Outside | TakeDownAsker::Resync(_) => None,
@@ -70,9 +81,9 @@ impl TakeDownAsker {
 }
 
 /// How a take-down ended, when nothing refused it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TakenDown {
-    Done,
+    Done(Taken),
     /// The project does not exist.
     ProjectGone,
     /// It was a resync's ([`TakeDownAsker::Resync`]), and that drive no
@@ -80,15 +91,50 @@ pub enum TakenDown {
     ResyncGone,
 }
 
+/// What a take-down did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Taken {
+    /// The activations it took down (the ones among its target that had a
+    /// row).
+    pub keys: Vec<ActivationKey>,
+    /// What they held as they went down: kept, or dropped.
+    pub held: HeldWork,
+    /// Runs going right now that it reached: cancelled, or left going.
+    pub runs: u64,
+    /// The infra commands it issued with the triggers
+    /// ([`DownCause::Infra`]), first issued first.
+    pub commands: Vec<i64>,
+    /// The entry tokens of the activations it took down, as they stood
+    /// before: what a wait for their runs counts at the door
+    /// (`crate::drain::Reaching`).
+    pub tokens: Vec<String>,
+}
+
+impl Taken {
+    /// Add what another take-down did (another owner's, of one verb).
+    pub fn add(&mut self, other: Taken) {
+        self.keys.extend(other.keys);
+        self.held += other.held;
+        self.runs += other.runs;
+        self.commands.extend(other.commands);
+        self.tokens.extend(other.tokens);
+    }
+
+    /// What a person reads of it, for `take_down`.
+    pub fn report(&self, take_down: TakeDown) -> TakeDownReport {
+        TakeDownReport { take_down, triggers: weft_core::activation::by_owner(&self.keys), held: self.held, runs: self.runs }
+    }
+}
+
 /// What a take-down needs to know about one live run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunFacts {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     /// Who the run is for.
     pub instance: Option<InstanceId>,
     /// The trigger that fired it (`None` for a run started by hand).
     pub fired_by: Option<String>,
-    /// Parked on a wait (`state = 'parked'`), rather than working now.
+    /// Paused on a wait (`state = 'parked'`), rather than working now.
     pub suspended: bool,
 }
 
@@ -102,9 +148,9 @@ impl RunFacts {
 
 /// The live runs `target` reaches, never the run that asked (`asked_by`):
 /// that one's fate is its own `StopSelf`, carried out by the asker.
-pub fn affected_runs<'a>(target: &TakeDownTarget, runs: &'a [RunFacts], asked_by: Option<ExecutionId>) -> Vec<&'a RunFacts> {
+pub fn affected_runs<'a>(target: &TakeDownTarget, runs: &'a [RunFacts], asked_by: Option<RunId>) -> Vec<&'a RunFacts> {
     runs.iter()
-        .filter(|run| Some(run.execution_id) != asked_by)
+        .filter(|run| Some(run.run_id) != asked_by)
         .filter(|run| match target {
             TakeDownTarget::WholeProject => true,
             TakeDownTarget::Activations(keys) => keys.iter().any(|key| run.fired_by(key)),
@@ -112,178 +158,188 @@ pub fn affected_runs<'a>(target: &TakeDownTarget, runs: &'a [RunFacts], asked_by
         .collect()
 }
 
-/// The live runs an infra copy going reaches, never the run that asked.
-/// Which run uses which copy is not recorded, so a shared copy's going
-/// reaches every run, and an instance's copy going reaches that instance's runs
-/// (another instance's never touch it).
-pub fn runs_using_copies<'a>(
-    copies: &weft_core::instance::Copies,
-    runs: &'a [RunFacts],
-    asked_by: Option<ExecutionId>,
-) -> Vec<&'a RunFacts> {
-    runs.iter()
-        .filter(|run| Some(run.execution_id) != asked_by)
-        .filter(|run| match copies {
-            weft_core::instance::Copies::Instance(m) => run.instance.as_ref() == Some(m),
-            weft_core::instance::Copies::Shared | weft_core::instance::Copies::Every => true,
+/// Which of `affected` the take-down cancels: the paused ones when it
+/// drops what is held, the ones going when it cancels what runs.
+pub fn runs_to_cancel<'a>(take_down: &TakeDown, affected: &[&'a RunFacts]) -> Vec<&'a RunFacts> {
+    affected
+        .iter()
+        .copied()
+        .filter(|run| match run.suspended {
+            true => take_down.held == Held::Drop,
+            false => take_down.running == Running::Cancel,
         })
         .collect()
 }
 
-/// The lifecycle a spec lands its activations at, before any drain.
-pub fn landing_lifecycle(spec: &DeactivateSpec, now_unix: i64, went_down: Option<WentDown>) -> ActivationLifecycle {
-    let target = match spec.mode {
-        DeactivationMode::Wipe => ActivationLifecycle::wiped(),
-        DeactivationMode::Hibernate => ActivationLifecycle::hibernating(now_unix + (spec.grace_minutes as i64) * 60),
-        DeactivationMode::Park => ActivationLifecycle::parked(),
-    };
-    let target = ActivationLifecycle { went_down, ..target };
-    if spec.drains() {
-        let cap = spec.drain_timeout_secs.unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
-        ActivationLifecycle::deactivating_to(target, now_unix + cap as i64)
-    } else {
-        target
+/// What the lifecycle write deletes in its own transaction: every signal
+/// of the project when it is removed, every signal the activations govern
+/// when their door refuses with nothing kept, only what they hold when the
+/// door goes on taking but what is held is dropped, nothing otherwise.
+pub fn signals_going(target: &TakeDownTarget, take_down: &TakeDown, asked_by: Option<RunId>) -> SignalsGoing {
+    match (target, take_down.door, take_down.held) {
+        (TakeDownTarget::WholeProject, _, _) => SignalsGoing::Project { except: asked_by },
+        (TakeDownTarget::Activations(_), Door::Refuse, Held::Drop) => SignalsGoing::Activations,
+        (TakeDownTarget::Activations(_), _, Held::Drop) => SignalsGoing::HeldArrivals,
+        (TakeDownTarget::Activations(_), _, Held::Keep) => SignalsGoing::Kept,
     }
 }
 
 /// Every run of the project that has not ended, with what a take-down
 /// needs to know.
 pub(crate) async fn live_runs(state: &DispatcherState, project_id: uuid::Uuid) -> anyhow::Result<Vec<RunFacts>> {
-    let rows: Vec<(ExecutionId, Option<String>, Option<String>, bool)> = sqlx::query_as(
-        "SELECT execution_id, instance_id, fired_by, state = 'parked' FROM run \
-         WHERE project_id = $1 AND state <> 'ended' ORDER BY started_at, execution_id",
+    let rows: Vec<(RunId, Option<String>, Option<String>, bool)> = sqlx::query_as(
+        "SELECT run_id, instance_id, fired_by, state = 'parked' FROM run \
+         WHERE project_id = $1 AND state <> 'ended' ORDER BY started_at, run_id",
     )
     .bind(project_id)
     .fetch_all(&state.pg_pool)
     .await?;
     rows.into_iter()
-        .map(|(execution_id, instance, fired_by, suspended)| {
-            let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("run {execution_id} holds a broken instance: {e}"))?;
-            Ok(RunFacts { execution_id, instance, fired_by, suspended })
+        .map(|(run_id, instance, fired_by, suspended)| {
+            let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("run {run_id} holds a broken instance: {e}"))?;
+            Ok(RunFacts { run_id, instance, fired_by, suspended })
         })
         .collect()
 }
 
-/// Take `target` down under `spec`, as `asker` asked.
+/// Take `target` down as `take_down` says, as `asker` asked, marked by
+/// `cause` (an infra cause's commands are issued with it).
 ///
-/// In order, so the gate is right from the first moment and nothing is
-/// left half done: refuse a target that is mid-activation (cancel that
-/// first) or a project mid-build; then wipe drops what the target's
-/// activations had registered and cancels every run it reaches, while
-/// hibernate and park keep the rows and the listeners keep holding them
-/// (what they hear waits for the trigger: `weft_core::arrival`); `cancel` stops what is
-/// running now (a parked run survives hibernate and park), `wait` leaves
-/// it to finish and lands the activations once it has (the drains loop
-/// cancels what is left at the cap, `crate::drain`). The lifecycle write comes before any of
-/// that, guarded, so a refused write leaves nothing done.
+/// Refused for a target that is mid-activation (cancel that first) or a
+/// project mid-build. The lifecycle write comes first, guarded, so a
+/// refused write leaves nothing done: it sets the door, deletes what goes
+/// with it ([`signals_going`]), counts what was held and issues an infra
+/// cause's commands, in one transaction. Then the listeners let go of the
+/// signals that went, and the runs the answers reach are cancelled
+/// ([`runs_to_cancel`]). Activations of which none has a row take nothing
+/// down: only an infra cause's commands are issued.
 pub async fn take_down(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     target: &TakeDownTarget,
-    spec: &DeactivateSpec,
-    went_down_with: Option<DownWith>,
+    take_down: &TakeDown,
+    cause: DownCause<'_>,
     asker: TakeDownAsker,
 ) -> Result<TakenDown, (StatusCode, String)> {
-    spec.validate().map_err(|m| (StatusCode::BAD_REQUEST, m.to_string()))?;
     let internal = |what: &str, e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
     let asked_by = asker.run();
     let Some(transition) = state.projects.transition(project_id).await.map_err(|e| internal("transition", e))? else {
         return Ok(TakenDown::ProjectGone);
     };
-    if transition.is_building() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("cannot deactivate: project is {}; cancel the build first", transition.as_str()),
-        ));
-    }
     let existing = state.activations.list(project_id).await.map_err(|e| internal("activations", e))?;
     let keys: Vec<ActivationKey> = match target {
         TakeDownTarget::WholeProject => existing.iter().map(|a| a.key.clone()).collect(),
         TakeDownTarget::Activations(keys) => keys.iter().filter(|k| existing.iter().any(|a| &a.key == *k)).cloned().collect(),
     };
+    if keys.is_empty() && matches!(target, TakeDownTarget::Activations(_)) {
+        let commands = match cause {
+            DownCause::Person | DownCause::Health(_) => Vec::new(),
+            DownCause::Infra(commands) => match commands.issue(&state.pg_pool, project_id).await.map_err(|e| internal("issue the infra commands", e))? {
+                Some(crate::infra_lifecycle_command::Issued::Commands(ids)) => ids,
+                Some(crate::infra_lifecycle_command::Issued::UpgradeInFlight(command)) => {
+                    return Err(crate::infra_lifecycle_command::upgrade_in_flight_refusal(command))
+                }
+                None => return Ok(TakenDown::ProjectGone),
+            },
+        };
+        return Ok(TakenDown::Done(Taken { commands, ..Taken::default() }));
+    }
+    if transition.is_building() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("cannot take triggers down: project is {}; cancel the build first", transition.as_str()),
+        ));
+    }
     if let Some(busy) = existing.iter().find(|a| keys.contains(&a.key) && a.lifecycle.status == ProjectStatus::Activating) {
         return Err((
             StatusCode::CONFLICT,
-            format!("cannot deactivate: trigger {} is activating; cancel the activation first", busy.key),
+            format!("cannot take trigger {} down: it is activating; cancel the activation first", busy.key),
         ));
     }
-    // The guarded lifecycle write goes first: when it is refused (a
-    // trigger began activating, a build started) or the project is gone,
-    // nothing has been cancelled or unregistered yet. A wipe deletes the
-    // signals in that same transaction, so the activation rows (a
-    // instance's wiped row goes) and their signals leave together: a
-    // failure after it leaves nothing registered for a row that is gone,
-    // and the cancels below are safe to repeat. A park or a hibernate
-    // keeps the rows, and the listeners keep holding them: what they hear
-    // waits for the trigger to be back on (`weft_core::arrival`).
-    // When it went down is the database's moment, the clock an infra
-    // copy's apply is stamped with, which is what it is compared with
-    // (`crate::api::infra::bring_back_triggers_whose_infra_returned`).
-    let went_down = match went_down_with {
-        None => None,
-        Some(with) => {
-            let at_unix: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM NOW())::BIGINT")
-                .fetch_one(&state.pg_pool)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read the database's clock: {e}")))?;
-            Some(WentDown { with, at_unix })
-        }
-    };
-    let landing = landing_lifecycle(spec, crate::lease::now_unix(), went_down);
-    let signals = match (spec.mode, target) {
-        (DeactivationMode::Wipe, TakeDownTarget::WholeProject) => SignalsGoing::Project { except: asked_by },
-        (DeactivationMode::Wipe, TakeDownTarget::Activations(_)) => SignalsGoing::Activations,
-        _ => SignalsGoing::Kept,
-    };
-    let unlisten = match state
+    // 1. The door, and what goes with it, in one guarded write: when it is
+    // refused (a trigger began activating, a build started) or the project
+    // is gone, nothing has been cancelled, deleted or issued yet.
+    let landing = ActivationLifecycle::down(take_down, crate::lease::now_unix());
+    let signals = signals_going(target, take_down, asked_by);
+    let (keys, tokens, unlisten, held, commands) = match state
         .activations
-        .set_lifecycle_guarded(project_id, &keys, &landing, signals, asker.resync())
+        .set_lifecycle_guarded(project_id, &keys, &landing, signals, Forget::of(take_down, &cause), cause, asker.resync())
         .await
         .map_err(|e| internal("set lifecycle", e))?
     {
-        LifecycleWrite::Applied { unlisten } => unlisten,
+        LifecycleWrite::Applied { keys: taken, tokens, unlisten, held, commands } => (taken, tokens, unlisten, held, commands),
         LifecycleWrite::NotFound => return Ok(TakenDown::ProjectGone),
         LifecycleWrite::ResyncGone => return Ok(TakenDown::ResyncGone),
+        LifecycleWrite::UpgradeInFlight(command) => return Err(crate::infra_lifecycle_command::upgrade_in_flight_refusal(command)),
         LifecycleWrite::Rejected { blocker } => {
-            return Err((StatusCode::CONFLICT, format!("cannot deactivate: {blocker}; cancel it first")));
+            return Err((StatusCode::CONFLICT, format!("cannot take triggers down: {blocker}; cancel it first")));
         }
     };
-    // Take the listeners' copies of the wiped signals away. A retry finds
-    // the rows already gone and repeats nothing.
+    // Every one it was aimed at was down already (taken down since it was
+    // listed): nothing else of the project changed.
+    if keys.is_empty() && matches!(target, TakeDownTarget::Activations(_)) {
+        return Ok(TakenDown::Done(Taken { commands, ..Taken::default() }));
+    }
+    // The listeners' copies of the signals that went. A retry finds the
+    // rows already gone and repeats nothing.
     if !unlisten.is_empty() {
         state.listener.unregister_many(&unlisten).await;
     }
+    // A door that refuses with what it holds kept stops listening at once,
+    // its rows kept for when it is back: the listener lets go of them the
+    // way it does when a door's window ends (`crate::reaper`), and what it
+    // could not let go of is marked for the door-windows loop to tell it
+    // again.
+    if take_down.door == Door::Refuse && matches!(signals, SignalsGoing::Kept) && !keys.is_empty() {
+        let kept = crate::journal::postgres::activation_signals(&state.pg_pool, project_id, &keys)
+            .await
+            .map_err(|e| internal("the signals to let go of", e))?;
+        let refused = crate::listener::let_go_of_stopped(&state.pg_pool, &state.listener, &kept)
+            .await
+            .map_err(|e| internal("let go of the signals", e))?;
+        crate::listener::note_let_go(&state.pg_pool, &kept, &refused).await.map_err(|e| internal("note the let-go", e))?;
+    }
 
+    // 2 and 3. What is held that runs (the paused runs), and what is
+    // running now, as the answers say. Cancelling strips a run's own waits.
     let runs = live_runs(state, project_id).await.map_err(|e| internal("live runs", e))?;
     let affected = affected_runs(target, &runs, asked_by);
-
-    let user = weft_core::exec::CancelCause::User;
-    if spec.mode == DeactivationMode::Wipe {
-        // Every run the target reaches, parked ones too. Cancelling
-        // strips a run's own waits.
-        let targets: Vec<(ExecutionId, &weft_core::exec::CancelCause)> = affected.iter().map(|r| (r.execution_id, &user)).collect();
-        crate::api::execution::cancel_execution_ids(state, &targets).await.map_err(|e| internal("cancel", e))?;
-    } else if spec.running_policy == RunningPolicy::Cancel {
-        let targets: Vec<(ExecutionId, &weft_core::exec::CancelCause)> =
-            affected.iter().filter(|r| !r.suspended).map(|r| (r.execution_id, &user)).collect();
-        crate::api::execution::cancel_execution_ids(state, &targets).await.map_err(|e| internal("cancel", e))?;
-    }
+    let why = cancel_cause(&cause, asker);
+    let cancelled: Vec<(RunId, &weft_core::run::CancelCause)> =
+        runs_to_cancel(take_down, &affected).into_iter().map(|r| (r.run_id, &why)).collect();
+    crate::api::run::cancel_run_ids(state, &cancelled).await.map_err(|e| internal("cancel", e))?;
 
     // Nothing of the project takes work any more: its front goes.
     crate::front::let_go_if_idle(state, project_id).await.map_err(|e| internal("let the front go", e))?;
-
     state.events.publish(DispatcherEvent::ProjectDeactivated { project_id }).await;
-    if landing.status == ProjectStatus::Deactivating {
-        // Nothing to wait for lands at once, so nobody sees a
-        // Deactivating that is already over; the rest land from the
-        // drains loop (`crate::drain`).
-        for key in &keys {
-            crate::drain::land_if_drained(state, project_id, key)
-                .await
-                .map_err(|e| internal("finish drain", e))?;
+    let going = affected.iter().filter(|run| !run.suspended).count() as u64;
+    Ok(TakenDown::Done(Taken { keys, held, runs: going, commands, tokens }))
+}
+
+/// Why the runs a take-down cancels were cancelled, as their record says
+/// it: the health check names the copies it found broken, a program's run
+/// names itself, and anything else was a person's command.
+fn cancel_cause(cause: &DownCause<'_>, asker: TakeDownAsker) -> weft_core::run::CancelCause {
+    use weft_core::run::CancelCause;
+    match (cause, asker.run()) {
+        (DownCause::Health(broken), _) => {
+            let copies: Vec<String> = broken
+                .iter()
+                .map(|copy| match &copy.instance {
+                    Some(instance) => format!("'{}' of instance '{instance}'", copy.node_id),
+                    None => format!("'{}'", copy.node_id),
+                })
+                .collect();
+            CancelCause::Runtime {
+                detail: format!(
+                    "the infra health check found {} broken and took down the triggers that read it, stopping their runs",
+                    copies.join(", ")
+                ),
+            }
         }
+        (_, Some(by)) => CancelCause::Run { by, tag: None },
+        (_, None) => CancelCause::User,
     }
-    Ok(TakenDown::Done)
 }
 
 #[cfg(test)]
@@ -291,25 +347,17 @@ mod tests {
     use super::*;
     use weft_core::instance::Owner;
 
-    fn run(execution_id: u128, instance: Option<&str>, fired_by: Option<&str>) -> RunFacts {
+    fn run(run_id: u128, instance: Option<&str>, fired_by: Option<&str>) -> RunFacts {
         RunFacts {
-            execution_id: ExecutionId::from_u128(execution_id),
+            run_id: RunId::from_u128(run_id),
             instance: instance.map(|m| InstanceId::new(m).unwrap()),
             fired_by: fired_by.map(str::to_string),
             suspended: false,
         }
     }
 
-    #[test]
-    fn an_instances_copy_going_reaches_that_instances_runs_and_never_the_asker() {
-        let runs = [run(1, Some("a"), None), run(2, Some("b"), None), run(3, None, None), run(4, Some("a"), None)];
-        let a = weft_core::instance::Copies::Instance(InstanceId::new("a").unwrap());
-        assert_eq!(execution_ids(runs_using_copies(&a, &runs, Some(ExecutionId::from_u128(4)))), vec![1]);
-        assert_eq!(execution_ids(runs_using_copies(&weft_core::instance::Copies::Shared, &runs, None)), vec![1, 2, 3, 4]);
-    }
-
-    fn execution_ids(runs: Vec<&RunFacts>) -> Vec<u128> {
-        runs.into_iter().map(|r| r.execution_id.as_u128()).collect()
+    fn run_ids(runs: Vec<&RunFacts>) -> Vec<u128> {
+        runs.into_iter().map(|r| r.run_id.as_u128()).collect()
     }
 
     fn instance(id: &str) -> Owner {
@@ -329,9 +377,9 @@ mod tests {
             run(5, Some("a"), Some("cron")),
         ];
         let target = TakeDownTarget::Activations(vec![ActivationKey::new("receive", instance("a"))]);
-        assert_eq!(execution_ids(affected_runs(&target, &runs, None)), vec![1]);
+        assert_eq!(run_ids(affected_runs(&target, &runs, None)), vec![1]);
         let target = TakeDownTarget::Activations(vec![ActivationKey::new("receive", Owner::Shared)]);
-        assert_eq!(execution_ids(affected_runs(&target, &runs, None)), vec![3]);
+        assert_eq!(run_ids(affected_runs(&target, &runs, None)), vec![3]);
     }
 
     /// The whole project reaches every run, and the asker is never among
@@ -339,32 +387,80 @@ mod tests {
     #[test]
     fn the_asker_is_never_affected() {
         let runs = [run(1, Some("a"), Some("receive")), run(2, None, None)];
-        assert_eq!(execution_ids(affected_runs(&TakeDownTarget::WholeProject, &runs, None)), vec![1, 2]);
-        assert_eq!(execution_ids(affected_runs(&TakeDownTarget::WholeProject, &runs, Some(ExecutionId::from_u128(1)))), vec![2]);
+        assert_eq!(run_ids(affected_runs(&TakeDownTarget::WholeProject, &runs, None)), vec![1, 2]);
+        assert_eq!(run_ids(affected_runs(&TakeDownTarget::WholeProject, &runs, Some(RunId::from_u128(1)))), vec![2]);
         let target = TakeDownTarget::Activations(vec![ActivationKey::new("receive", instance("a"))]);
-        assert!(affected_runs(&target, &runs, Some(ExecutionId::from_u128(1))).is_empty());
+        assert!(affected_runs(&target, &runs, Some(RunId::from_u128(1))).is_empty());
+    }
+
+    /// `held` decides the paused runs, `running` the ones going: dropping
+    /// what is held cancels the paused ones and nothing else, cancelling
+    /// what runs the going ones and nothing else, and the defaults touch
+    /// neither.
+    #[test]
+    fn held_decides_the_paused_runs_and_running_the_ones_going() {
+        let going = run(1, None, Some("door"));
+        let paused = RunFacts { suspended: true, ..run(2, None, Some("door")) };
+        let affected = [&going, &paused];
+        let cancelled = |take_down: TakeDown| run_ids(runs_to_cancel(&take_down, &affected));
+        let defaults = TakeDown::DEFAULT;
+        assert!(cancelled(defaults).is_empty(), "nothing destructive unless typed: the wait is the command's own");
+        assert_eq!(cancelled(TakeDown { held: Held::Drop, ..defaults }), vec![2]);
+        assert_eq!(cancelled(TakeDown { running: Running::Cancel, ..defaults }), vec![1]);
+        assert_eq!(cancelled(TakeDown::REMOVE), vec![1, 2]);
+    }
+
+    /// The door that refuses with nothing kept takes the signals with it;
+    /// one that goes on taking keeps them and drops only what they hold.
+    #[test]
+    fn what_goes_with_the_door_follows_the_door_and_held() {
+        let keys = TakeDownTarget::Activations(vec![ActivationKey::new("door", Owner::Shared)]);
+        let defaults = TakeDown::DEFAULT;
+        assert!(matches!(signals_going(&keys, &defaults, None), SignalsGoing::Kept));
+        assert!(matches!(signals_going(&keys, &TakeDown { held: Held::Drop, ..defaults }, None), SignalsGoing::HeldArrivals));
+        assert!(matches!(signals_going(&keys, &TakeDown::REMOVE, None), SignalsGoing::Activations));
+        let refused_kept = TakeDown { door: Door::Refuse, ..defaults };
+        assert!(matches!(signals_going(&keys, &refused_kept, None), SignalsGoing::Kept), "a refusing door keeps what it held for later");
+        let asker = Some(RunId::from_u128(7));
+        assert!(matches!(
+            signals_going(&TakeDownTarget::WholeProject, &TakeDown::REMOVE, asker),
+            SignalsGoing::Project { except: Some(e) } if e == RunId::from_u128(7)
+        ));
     }
 
     #[test]
-    fn a_wait_lands_draining_with_its_cap() {
-        let spec = DeactivateSpec {
-            mode: DeactivationMode::Park,
-            grace_minutes: 15,
-            running_policy: RunningPolicy::Wait,
-            drain_timeout_secs: Some(30),
+    fn a_take_down_reports_its_triggers_by_owner() {
+        let taken = Taken {
+            keys: vec![ActivationKey::new("door", Owner::Shared), ActivationKey::new("inbox", instance("ada"))],
+            held: HeldWork { arrivals: 2, paused: 0 },
+            runs: 1,
+            commands: Vec::new(),
+            tokens: Vec::new(),
         };
-        let landing = landing_lifecycle(&spec, 100, None);
-        assert_eq!(landing.status, ProjectStatus::Deactivating);
-        assert_eq!(landing.drain_deadline_unix, Some(130));
-        assert_eq!(landing.mode().as_str(), "deactivating");
-        let spec = DeactivateSpec { running_policy: RunningPolicy::Cancel, ..spec };
-        let health = WentDown { with: DownWith::Health, at_unix: 90 };
-        assert_eq!(landing_lifecycle(&spec, 100, Some(health)).mode().as_str(), "park");
-        assert_eq!(
-            landing_lifecycle(&spec, 100, Some(WentDown { with: DownWith::Infra, at_unix: 90 })).went_down,
-            Some(WentDown { with: DownWith::Infra, at_unix: 90 })
-        );
-        let hibernate = DeactivateSpec { mode: DeactivationMode::Hibernate, ..spec };
-        assert_eq!(landing_lifecycle(&hibernate, 100, None).fires_deadline_unix, Some(100 + 15 * 60));
+        let report = taken.report(TakeDown::DEFAULT);
+        assert_eq!(report.triggers.len(), 2);
+        assert_eq!(report.held, HeldWork { arrivals: 2, paused: 0 });
+        assert_eq!(report.runs, 1);
+    }
+
+    /// A run the health check stops says the health check did, naming the
+    /// broken copies; one a program's run stops names that run; the rest
+    /// were a person's.
+    #[test]
+    fn the_cancelled_runs_say_what_took_their_triggers_down() {
+        use weft_broker_client::protocol::InfraCopy;
+        use weft_core::run::CancelCause;
+        let broken = [
+            InfraCopy { node_id: "db".into(), instance: None },
+            InfraCopy { node_id: "cache".into(), instance: Some(InstanceId::new("ada").unwrap()) },
+        ];
+        let CancelCause::Runtime { detail } = cancel_cause(&DownCause::Health(&broken), TakeDownAsker::Outside) else {
+            panic!("the health check is no person");
+        };
+        assert!(detail.contains("health check") && detail.contains("'db', 'cache' of instance 'ada'"), "{detail}");
+        let by = RunId::from_u128(7);
+        assert_eq!(cancel_cause(&DownCause::Person, TakeDownAsker::Run(by)), CancelCause::Run { by, tag: None });
+        assert_eq!(cancel_cause(&DownCause::Person, TakeDownAsker::Outside), CancelCause::User);
+        assert_eq!(cancel_cause(&DownCause::Person, TakeDownAsker::Resync(uuid::Uuid::nil())), CancelCause::User);
     }
 }

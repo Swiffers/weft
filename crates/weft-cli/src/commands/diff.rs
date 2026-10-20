@@ -1,5 +1,5 @@
 //! `weft diff <ref> <ref>`: what two runs put on their wires, compared.
-//! A ref is an execution (or the start of one) or `example:<name>` (a frozen
+//! A ref is a run (or the start of one) or `example:<name>` (a frozen
 //! spec's `expected`). Per node by default ("classify: 3 of 10000
 //! frames differ"), per wire with both values under `--full`; media
 //! compares by the stored bytes' content hash.
@@ -15,7 +15,7 @@ use super::Ctx;
 pub async fn wires_of(ctx: &Ctx, client: &crate::client::DispatcherClient, reference: &str) -> anyhow::Result<(String, Expected)> {
     let project = ctx.project()?;
     let project_id = project.id().to_string();
-    let mut resolved_execution_id = String::new();
+    let mut resolved_run_id = String::new();
     let wires = if let Some(name) = reference.strip_prefix("example:") {
         let spec = read_spec(project, name)?;
         let Some(expected) = spec.expected else {
@@ -25,13 +25,13 @@ pub async fn wires_of(ctx: &Ctx, client: &crate::client::DispatcherClient, refer
     } else {
         let tree = fetch_tree(client, &project_id).await?;
         let run = resolve_run(&tree, reference)?;
-        resolved_execution_id = run.execution_id.to_string();
-        super::versions::output_wires(client, &run.execution_id.to_string()).await?
+        resolved_run_id = run.run_id.to_string();
+        super::versions::output_wires(client, &run.run_id.to_string()).await?
     };
-    // Label with the RESOLVED execution, not the prefix the user typed, so
+    // Label with the RESOLVED run, not the prefix the user typed, so
     // `weft diff 3f a1b2c3d4` does not print one side as `3f` and the
     // other as `a1b2c3d`.
-    let label = if reference.starts_with("example:") { reference.to_string() } else { short(&resolved_execution_id).to_string() };
+    let label = if reference.starts_with("example:") { reference.to_string() } else { short(&resolved_run_id).to_string() };
     Ok((label, wires))
 }
 
@@ -45,7 +45,7 @@ pub async fn run(ctx: Ctx, left: String, right: String, full: bool) -> anyhow::R
     let missing_focus: Vec<_> = focus.iter().filter_map(|node| {
         let left_missing = !left_outputs.wires.iter().any(|w| &w.node == node);
         let right_missing = !right_outputs.wires.iter().any(|w| &w.node == node);
-        (left_missing || right_missing).then(|| serde_json::json!({"node": node, "left_missing": left_missing, "right_missing": right_missing}))
+        (left_missing || right_missing).then(|| serde_json::json!({"node": node, "leftMissing": left_missing, "rightMissing": right_missing}))
     }).collect();
     if !ctx.json_out(&serde_json::json!({
         "left": left_label,
@@ -54,7 +54,7 @@ pub async fn run(ctx: Ctx, left: String, right: String, full: bool) -> anyhow::R
         "compared": diff.compared,
         "differing": diff.differing,
         "focus": focus,
-        "missing_focus": missing_focus,
+        "missingFocus": missing_focus,
     }))? {
         if !focus.is_empty() {
             println!("Review focus: {}", focus.iter().cloned().collect::<Vec<_>>().join(", "));

@@ -7,17 +7,25 @@
 //! a Socket is refused loud, the format is ignored).
 //!
 //! The bus is read from the earliest message still buffered, so a
-//! producer that started before this node attached loses nothing. The
-//! framing is the package's pure `framing.rs`; a raw payload rides per
-//! the trigger's data type through `wire::chunk_for`.
+//! producer that started before this node attached loses nothing. A bus
+//! that ended failed (its producer broke off) is never ended as a whole
+//! answer: the exchange fails instead (`fail`), a real error status when
+//! nothing went out yet, the format's error marker after (an SSE `error`
+//! event, a last ndjson line, an `[error]` line), a `1011` close on a
+//! socket, and `done` stays absent. A message that cannot be made into
+//! a chunk (a value the trigger's data type does not carry) goes through
+//! `drop_or_fail`: it fails the answer, or is skipped when the trigger's
+//! `whenChunkFails` is `drop_chunk`. The framing is the package's pure
+//! `framing.rs`; a raw payload rides per the trigger's data type through
+//! `wire::chunk_for`.
 
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft::bus::{BusEntryKind, WirePayload};
+use weft::bus::{BusEntryKind, BusHandle, StreamEnd, WirePayload};
 use weft::caller::{CallerHandle, HttpCaller, OutboundChunk, ResponseHead};
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::framing::{ndjson_line, sse_event, Format};
 use super::wire;
@@ -35,13 +43,15 @@ impl Node for StreamNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let format: String = ctx.inputs.get("format")?;
         let format = Format::parse(&format).map_err(weft::node_error)?;
         let status: u16 = ctx.inputs.get("status")?;
         let headers: Option<Value> = ctx.inputs.opt("headers")?;
         let caller = ctx.live_caller().await?;
-        let data_type = wire::answer_type(&ctx)?;
+        let wire::Answer::Data(data_type) = wire::answer(&ctx)? else {
+            weft::node_bail!("answerAs is redirect, and a Stream sends messages; a redirect is one answer, so send it with a Reply");
+        };
         // An observer, not a participant: it reads what is retained from
         // the start (a producer that already finished, an LLM whose
         // reply came back fast, is still fully readable) and never
@@ -67,14 +77,21 @@ impl Node for StreamNode {
                 if let Some(filler) = format.keepalive() {
                     head = head.map(|h| h.with_keepalive(filler));
                 }
+                // A chunk that cannot be made fails the answer, or is
+                // skipped when the trigger says so (`whenChunkFails`).
                 if let Some(value) = &first {
-                    let chunk = framed(&ctx, format, data_type, WirePayload::Json(value.clone().into())).await?;
-                    write_chunk(&http, &mut head, chunk).await?;
+                    let made = framed(&ctx, format, data_type, WirePayload::Json(value.clone().into())).await;
+                    if let Some(chunk) = http.drop_or_fail(made)? {
+                        write_chunk(&http, &mut head, chunk).await?;
+                    }
                 }
                 while let Some(entry) = messages.next().await {
                     let BusEntryKind::Message { payload: Some(payload), .. } = entry.kind else { continue };
-                    let chunk = framed(&ctx, format, data_type, payload).await?;
+                    let Some(chunk) = http.drop_or_fail(framed(&ctx, format, data_type, payload).await)? else { continue };
                     write_chunk(&http, &mut head, chunk).await?;
+                }
+                if let Some(why) = broke_off(&bus) {
+                    return http.fail(&why).await;
                 }
                 // The bus closed: end the response. A stream that never
                 // carried a message still answers, with the head alone.
@@ -86,18 +103,32 @@ impl Node for StreamNode {
             CallerHandle::Websocket(ws) => {
                 wire::refuse_head_on_socket("Stream", status, headers.as_ref())?;
                 if let Some(value) = &first {
-                    let chunk = framed(&ctx, Format::Raw, data_type, WirePayload::Json(value.clone().into())).await?;
-                    ws.send(chunk).await?;
+                    let made = framed(&ctx, Format::Raw, data_type, WirePayload::Json(value.clone().into())).await;
+                    if let Some(chunk) = ws.drop_or_fail(made)? {
+                        ws.send(chunk).await?;
+                    }
                 }
                 while let Some(entry) = messages.next().await {
                     let BusEntryKind::Message { payload: Some(payload), .. } = entry.kind else { continue };
                     // A socket message is a frame: no HTTP framing.
-                    let chunk = framed(&ctx, Format::Raw, data_type, payload).await?;
+                    let Some(chunk) = ws.drop_or_fail(framed(&ctx, Format::Raw, data_type, payload).await)? else { continue };
                     ws.send(chunk).await?;
+                }
+                if let Some(why) = broke_off(&bus) {
+                    return ws.fail(&why).await;
                 }
             }
         }
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
+    }
+}
+
+/// Why the stream did not complete, when its bus ended failed: what the
+/// exchange's failure says on the run's record.
+fn broke_off(bus: &BusHandle) -> Option<String> {
+    match bus.end() {
+        Some(StreamEnd::Failed { error }) => Some(format!("the stream broke off: {error}")),
+        Some(StreamEnd::Finished) | None => None,
     }
 }
 
@@ -117,7 +148,7 @@ async fn write_chunk(
 /// `ndjson`, the payload itself per the data type for `raw` (a byte
 /// payload rides as bytes whatever the format, it has no text form).
 async fn framed(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     format: Format,
     data_type: weft::signal::DataType,
     payload: WirePayload,

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 
 use weft::node::NodeOutput;
 use weft::signal::{DeltaMode, PollDelta, PollEndpoint};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::airtable::{checked_id, API};
 
@@ -28,7 +28,7 @@ impl Node for AirtableNewRecordNode {
         tests::tests()
     }
 
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let base: String = ctx.inputs.get("base")?;
         let table: String = ctx.inputs.get("table")?;
@@ -58,7 +58,7 @@ impl Node for AirtableNewRecordNode {
         .await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let wake = ctx.wake.record()?;
         let record = wake["item"].clone();
         let id = record["id"]

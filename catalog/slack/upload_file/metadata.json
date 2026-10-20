@@ -41,8 +41,8 @@
             "label": "name",
             "value": "id",
             "page": {
-              "cursor_param": "cursor",
-              "cursor_path": "response_metadata.next_cursor"
+              "cursorParam": "cursor",
+              "cursorPath": "response_metadata.next_cursor"
             }
           },
           {
@@ -85,8 +85,5 @@
       "type": "String",
       "description": "A link to the shared file."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

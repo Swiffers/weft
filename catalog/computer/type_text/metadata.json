@@ -1,0 +1,32 @@
+{
+  "type": "TypeText",
+  "label": "Type text",
+  "description": "Type text on the computer's keyboard, into whatever has the focus: `args` is `{ text }`. A newline in the text presses Return.",
+  "tags": [
+    "computer",
+    "keyboard",
+    "type"
+  ],
+  "icon": "TextCursorInput",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "required": true,
+      "description": "The `computer` output of the Computer node to act on."
+    },
+    {
+      "name": "args",
+      "type": "TypeArgs",
+      "required": true,
+      "description": "The text, in the shape the node's description gives. RouteComputerCall's `type` port hands it over from a model's tool call; written by hand, it is a record literal."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "result",
+      "type": "String",
+      "description": "What happened, in a sentence a model can read back as the tool's result."
+    }
+  ]
+}

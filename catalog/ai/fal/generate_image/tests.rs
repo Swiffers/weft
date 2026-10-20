@@ -100,6 +100,12 @@ async fn generates(rig: FakeRig) -> WeftResult<()> {
             weft::signal::Predicate::neq("status", "IN_PROGRESS"),
         ]
     );
+    // Cancelling the run cancels the request on fal, at the app's route
+    // like the status.
+    assert_eq!(
+        awaited[0].on_cancel,
+        Some(weft::signal::CancelCall::put("https://queue.fal.run/fal-ai/flux/requests/req-1/cancel"))
+    );
     Ok(())
 }
 
@@ -172,9 +178,9 @@ async fn failed_generation(rig: FakeRig) -> WeftResult<()> {
 }
 
 /// A malformed model id is a mistake in the program, not fal's answer:
-/// a wired `error` must not swallow it.
+/// a wired `_error` must not swallow it.
 async fn bad_model(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig
         .run(
             &FalGenerateImageNode,
@@ -214,9 +220,9 @@ async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
 
 async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     let inputs = refuse_the_submit(&rig);
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig.run(&FalGenerateImageNode, inputs).await.ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("bad key"), "{error}");
     for port in ["images", "image"] {
         assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");

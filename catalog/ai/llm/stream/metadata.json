@@ -1,7 +1,7 @@
 {
   "type": "LlmStream",
   "label": "LLM Stream",
-  "description": "AI language model completion whose reply streams live onto a bus as each text delta is generated; pick it over the LLM node when a consumer should see the text as it is produced. The whole reply then pulses on the normal ports, wiring is the same as the LLM node, and a failure after the stream has opened fails the run, so a cut-off stream is never mistaken for a finished one.",
+  "description": "AI language model completion whose reply streams live onto a bus as each text delta is generated; pick it over the LLM node when a consumer should see the text as it is produced. The whole reply then pulses on the normal ports, wiring is the same as the LLM node, and the bus opens with the model's first chunk: a call refused before it is a failure `_error` can catch, and one that breaks off after it fails the run and ends the bus failed, so a cut-off stream is never mistaken for a finished one.",
   "tags": [
     "ai",
     "stream",
@@ -27,15 +27,15 @@
     },
     {
       "name": "media",
-      "type": "Media | List[Media]",
-      "description": "One stored image, audio clip, or video attached to this prompt, or a list of them."
+      "type": "Media | List[Media | Null]",
+      "description": "One stored image, audio clip, or video attached to this prompt, or a list of them (a null in the list is no media, so a loop's gathered list goes in as it comes)."
     },
     {
       "name": "provider",
       "type": "LlmProvider",
       "required": true,
       "accepts": ["wire"],
-      "description": "Which service, model, and credential: wire an OpenRouter, Anthropic, OpenAI, or Custom Provider node's output."
+      "description": "Which service, model, and credential: wire an OpenRouter Model, Anthropic Model, OpenAI Model, or Custom Provider node's output."
     },
     {
       "name": "params",
@@ -72,7 +72,7 @@
     {
       "name": "stream",
       "type": "Bus",
-      "description": "The live text: one 'delta' message per generated fragment, in order; the bus closing is the end of the reply. The bus metadata carries the serving model's name."
+      "description": "The live text: one 'delta' message per generated fragment, in order; the bus closing is the end of the reply, a failed end when it broke off. The bus metadata carries the serving model's name."
     },
     {
       "name": "response",
@@ -91,6 +91,7 @@
     }
   ],
   "features": {
-    "oneOfRequired": [["prompt", "historyFile", "media"]]
+    "oneOfRequired": [["prompt", "historyFile", "media"]],
+    "journalSettings": true
   }
 }

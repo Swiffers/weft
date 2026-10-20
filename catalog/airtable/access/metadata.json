@@ -20,11 +20,11 @@
       "kind": "oauth2",
       "grant": {
         "kind": "authorization_code",
-        "auth_url": "https://airtable.com/oauth2/v1/authorize",
+        "authUrl": "https://airtable.com/oauth2/v1/authorize",
         "pkce": true
       },
-      "token_url": "https://airtable.com/oauth2/v1/token",
-      "token_auth": "basic"
+      "tokenUrl": "https://airtable.com/oauth2/v1/token",
+      "tokenAuth": "basic"
     },
     "auth": [
       {
@@ -64,12 +64,12 @@
         "default": true
       }
     ],
-    "all_permissions_url": "https://airtable.com/developers/web/api/scopes",
+    "allPermissionsUrl": "https://airtable.com/developers/web/api/scopes",
     "verification": {
       "rung": "reports_permissions",
       "cost": "free"
     },
-    "own_page": {
+    "ownPage": {
       "paste": {
         "fields": [
           {

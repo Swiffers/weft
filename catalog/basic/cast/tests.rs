@@ -1,5 +1,5 @@
-//! Cast self-tests: the declared output type drives the conversion
-//! (the rig plays the compiler's MustOverride-resolution role via
+//! Cast self-tests: the output's type drives the conversion (the rig
+//! plays the program pinning the output's variable via
 //! `rig.output_type`).
 
 use serde_json::json;

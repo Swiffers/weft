@@ -2,7 +2,7 @@
 	import { SvelteFlowProvider } from "@xyflow/svelte";
 	import ProjectEditorInner from "./ProjectEditorInner.svelte";
 	import type { ProjectDefinition } from "../../types";
-	import type { SourceLocation } from "../../../../protocol";
+	import type { RunCheck, SourceLocation } from "../../../../protocol";
 
 	// The bound inner instance's public API this wrapper forwards. Typed (not
 	// `any`) so a signature drift between wrapper and inner is a compile error,
@@ -45,38 +45,21 @@
 		onApplyTextEdit,
 		onResyncSource,
 		onRun,
-		specs = [],
-		resolveSpec,
-		onRunSpec,
-		onSaveSpec,
-		onRunSpecFile,
-		onListSpecs,
 		onBranchTo,
 		onStop,
 		onDismissError,
 		onOpenLocation,
-		onActivate,
 		onCancelActivate,
 		onCancelBuild,
 		onCancelInfra,
-		onDeactivate,
-		onReactivate,
-		onCancelRunning,
-		onResumeActive,
-		onResync,
 		onResumeResync,
-		onStartInfra,
-		onStopInfra,
-		onTerminateInfra,
-		onInfraNodeStop,
-		onInfraNodeTerminate,
-		onUpgradeInfra,
+		onLifecycle,
+		checkRun,
 		actionBarState,
-		drift,
-		infraNodes,
+		status,
 		hasInfraInGraph = false,
 		hasTriggersInGraph = false,
-		executionState,
+		runState,
 		autoOrganizeOnMount = false,
 		displayByNode,
 		onOpenInclude = () => {},
@@ -98,42 +81,25 @@
 		fileContents?: Record<string, import('../../../../protocol').FileContent>;
 		installView?: import('../../../../protocol').InstallView;
 		onSwitchInstall?: (install: string) => void;
-		onRun?: (targets: string[]) => void;
-		specs?: import('../../../../run-spec').RunSpec[];
-		resolveSpec?: (spec: import('../../../../run-spec').RunSpec, seeded: boolean) => Promise<import('../../../../run-spec').ResolveSpecResponse>;
-		onRunSpec?: (spec: import('../../../../run-spec').RunSpec, seeded?: boolean) => void;
-		onSaveSpec?: (spec: import('../../../../run-spec').RunSpec) => void;
-		onRunSpecFile?: (name: string) => void;
-		onListSpecs?: () => void;
+		onRun?: (targets: [string, ...string[]]) => void;
 		onBranchTo?: (reference: string) => void;
 		onStop?: () => void;
 		onDismissError?: () => void;
 		onOpenLocation: (location: SourceLocation) => void;
-		onActivate?: () => void;
 		onCancelActivate?: () => void;
 		onCancelBuild?: () => void;
 		onCancelInfra?: () => void;
-		onDeactivate?: () => void;
-		onReactivate?: () => void;
-		onCancelRunning?: () => void;
-		onResumeActive?: () => void;
-		onResync?: () => void;
 		onResumeResync?: () => void;
-		onStartInfra?: () => void;
-		onStopInfra?: () => void;
-		onTerminateInfra?: () => void;
-		/// Per-node lifecycle, used by the graph's right-click menu
-		/// on a single infra node. The parent dispatches the HTTP
-		/// call through the extension host's CLI verb path.
-		onInfraNodeStop?: (node: string) => void;
-		onInfraNodeTerminate?: (node: string) => void;
-		onUpgradeInfra?: () => void;
+		/// A lifecycle verb from the contextual bar, on the selected
+		/// triggers or infra; the host runs it through the CLI.
+		onLifecycle?: (action: import('../../../../protocol').LifecycleAction) => void;
+		/// The walk's refusal for a run of these targets, or `null`.
+		checkRun?: (targets: [string, ...string[]]) => Promise<RunCheck>;
 		actionBarState: import('../../../../protocol').ActionBarState;
-		drift: import('../../../../protocol').ActionAvailability | undefined;
-		infraNodes?: import('../../../../protocol').InfraPlacementStatus[];
+		status: import('../../../../protocol').ActionAvailability | undefined;
 		hasInfraInGraph?: boolean;
 		hasTriggersInGraph?: boolean;
-		executionState?: import('../../types').ExecutionState;
+		runState?: import('../../types').RunState;
 		autoOrganizeOnMount?: boolean;
 		/// What each node is showing, keyed by node id. Consumed by the
 		/// nodes that have a display: an infra node serving `/live`, and
@@ -152,38 +118,21 @@
 		{onApplyTextEdit}
 		{onResyncSource}
 		{onRun}
-		{specs}
-		{resolveSpec}
-		{onRunSpec}
-		{onSaveSpec}
-		{onRunSpecFile}
-		{onListSpecs}
 		{onBranchTo}
 		{onStop}
 		{onDismissError}
 		{onOpenLocation}
-		{onActivate}
 		{onCancelActivate}
 		{onCancelBuild}
 		{onCancelInfra}
-		{onDeactivate}
-		{onReactivate}
-		{onCancelRunning}
-		{onResumeActive}
-		{onResync}
 		{onResumeResync}
-		{onStartInfra}
-		{onStopInfra}
-		{onTerminateInfra}
-		{onInfraNodeStop}
-		{onInfraNodeTerminate}
-		{onUpgradeInfra}
+		{onLifecycle}
+		{checkRun}
 		{actionBarState}
-		{drift}
-		{infraNodes}
+		{status}
 		{hasInfraInGraph}
 		{hasTriggersInGraph}
-		{executionState}
+		{runState}
 		{autoOrganizeOnMount}
 		{displayByNode}
 		{onOpenInclude}

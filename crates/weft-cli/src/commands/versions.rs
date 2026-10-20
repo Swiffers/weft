@@ -2,8 +2,8 @@
 //! the run spec on disk, the tree as the dispatcher answers it, and the
 //! pure comparison of two runs' wires. The verbs themselves are one
 //! file each (`checkpoint`, `branch`, `tree`, `diff`, `freeze`,
-//! `examples`, `prune`, `wake`); `run` and `activate` snapshot
-//! through here too.
+//! `examples`, `prune`, `wake`); what a command reads and publishes as a
+//! version is `snapshot::Snapshot`, over the files [`covers`] names.
 //!
 //! A snapshot covers the files that make the program: every `*.weft`
 //! (an `@include`d file is program text), `weft.toml`, `src/**` (the
@@ -14,7 +14,8 @@
 //! `assets/**`, and `examples/**` (a branch back restores the examples
 //! that existed then). NOT `layouts/`: a canvas drag is not a version,
 //! for the same reason the definition hash ignores it. The blobs go
-//! through `weft_assets::publish_files` into the tenant's assets, so a
+//! through `weft_assets::publish_hashed` into the tenant's assets
+//! (`snapshot::Snapshot::publish`), so a
 //! file identical to one any version of any of the tenant's projects held
 //! (or the standard library the install preloads) costs nothing.
 
@@ -24,7 +25,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use weft_compiler::project::Project;
-use weft_core::versions::{RunSummary, VersionSummary, VersionTree};
+use weft_core::versions::{VersionRun, VersionSummary, VersionTree};
 use weft_core::live_event::{DispatcherEvent, LiveEvent};
 use weft_core::run_spec::{Expected, ExpectedWire, PortValues, RunSpec};
 
@@ -127,12 +128,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
         if path.is_dir() && !is_symlink {
             // Prune whole trees the rule never covers, so a large
             // `.weft/target` is never walked.
-            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            // A `target/` directory is Cargo's output exactly when a
-            // `Cargo.toml` sits beside it. That is a fact about the
-            // disk, not about the path, which is why the pure `covers`
-            // rule cannot make this call and the walk does.
-            let cargo_output = name == "target" && dir.join("Cargo.toml").is_file();
+            let cargo_output = is_cargo_output(&path);
             // Pruning asks `covers` about the directory as a path, so
             // the two cannot disagree: spelled out again here, `.weft`
             // without its slash also pruned a folder called
@@ -174,6 +170,31 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// Whether the directory at `dir` is Cargo's build output: a `target/`
+/// with a `Cargo.toml` beside it. A fact about the disk, not the path,
+/// which is why the pure [`covers`] cannot make this call and the walk
+/// does.
+fn is_cargo_output(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|name| name == "target") && dir.parent().is_some_and(|parent| parent.join("Cargo.toml").is_file())
+}
+
+/// Whether the walk takes the file at `rel` (project-relative, forward
+/// slashes) into a version: [`covers`] says so, and no folder on its way
+/// is Cargo's build output. The one answer to "is this a version's file"
+/// for a path the walk did not list itself.
+pub fn walk_takes(root: &Path, rel: &str) -> bool {
+    if !covers(rel) {
+        return false;
+    }
+    let mut dir = root.to_path_buf();
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    parts.pop();
+    parts.into_iter().all(|part| {
+        dir.push(part);
+        !is_cargo_output(&dir)
+    })
+}
+
 /// Whether a DIRECTORY holds nothing a version covers, so the walk can
 /// skip it whole.
 ///
@@ -188,32 +209,33 @@ fn prunes_whole_tree(rel: &str) -> bool {
     !covers(&format!("{rel}/x.weft")) && !covers(&format!("{rel}/x"))
 }
 
-/// The manifest of the project as it is on disk, without publishing
-/// anything: what `branch` compares against head to see a dirty tree.
-pub fn local_manifest(project: &Project) -> Result<Manifest> {
-    let paths = covered_paths(&project.root)?;
-    let source = crate::commands::assets::DiskSource::new(project.root.clone());
+/// The manifest of the project at `root` as it is on disk, without
+/// publishing anything: what `branch` compares against head to see a dirty
+/// tree, and what a command's snapshot is compared against once it is done
+/// (`snapshot::Snapshot::changed_on_disk`).
+///
+/// A file deleted between the walk and its read is one the disk no
+/// longer has ([`open_covered`]), as it would be a moment later.
+pub fn local_manifest(root: &Path) -> Result<Manifest> {
     let mut manifest = Manifest::new();
-    for hashed in weft_assets::hash_files(&paths, &source)? {
-        manifest.insert(hashed.path, hashed.hash);
+    for rel in covered_paths(root)? {
+        let Some(file) = open_covered(root, &rel)? else { continue };
+        let (hash, _) = weft_assets::hash_reader(file).with_context(|| format!("read {}", root.join(&rel).display()))?;
+        manifest.insert(rel, hash);
     }
     Ok(manifest)
 }
 
-/// Snapshot the project: publish every covered file into the tenant's
-/// assets and answer the manifest a version records. `tell` says on
-/// stderr how far the uploads have got (never under `--json`, whose
-/// output is the program's).
-pub async fn snapshot(client: &DispatcherClient, project: &Project, tell: bool) -> Result<Manifest> {
-    let paths = covered_paths(&project.root)?;
-    let source = crate::commands::assets::DiskSource::new(project.root.clone());
-    let store = if tell {
-        crate::commands::assets::DispatcherStore::telling(client)
-    } else {
-        crate::commands::assets::DispatcherStore::new(client)
-    };
-    let published = weft_assets::publish_files(&paths, &source, &store).await.context("publish the version's files")?;
-    Ok(published.into_iter().map(|(path, p)| (path, p.hash)).collect())
+/// Open the covered file `rel` under `root` for one read, `None` when it
+/// was deleted since the walk named it ([`covered_paths`]): another person
+/// or agent removing a file mid-walk is the disk changing, not an error.
+pub fn open_covered(root: &Path, rel: &str) -> Result<Option<std::fs::File>> {
+    let path = root.join(rel);
+    match std::fs::File::open(&path) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
 }
 
 // ----- the tree as the dispatcher answers it -----------------------------
@@ -237,22 +259,22 @@ pub async fn fetch_tree_raw(client: &DispatcherClient, project_id: &str) -> Resu
     Ok((tree, value))
 }
 
-/// The first characters of a version id or an execution, for a line.
+/// The first characters of a version id or a run, for a line.
 pub fn short(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
-/// The run `ref` names: a whole execution, or the start of one among the
+/// The run `ref` names: a whole run, or the start of one among the
 /// tree's runs.
-pub fn resolve_run<'a>(tree: &'a VersionTree, reference: &str) -> Result<&'a RunSummary> {
-    let matches: Vec<&RunSummary> = tree.runs.iter().filter(|r| r.execution_id.to_string().starts_with(reference)).collect();
+pub fn resolve_run<'a>(tree: &'a VersionTree, reference: &str) -> Result<&'a VersionRun> {
+    let matches: Vec<&VersionRun> = tree.runs.iter().filter(|r| r.run_id.to_string().starts_with(reference)).collect();
     match matches.as_slice() {
         [one] => Ok(one),
         [] => bail!("no run starts with {reference} in this project's tree; `weft tree` lists them"),
         many => bail!(
             "{reference} names {} runs ({}); give more characters",
             many.len(),
-            some_ids(many.iter().map(|r| r.execution_id.to_string()))
+            some_ids(many.iter().map(|r| r.run_id.to_string()))
         ),
     }
 }
@@ -318,8 +340,14 @@ pub fn spec_path(project: &Project, name: &str) -> PathBuf {
 /// file itself for anything ending in `.json` (a path, relative to the
 /// project root or absolute).
 pub fn read_spec(project: &Project, name: &str) -> Result<RunSpec> {
+    read_spec_from(project, name, &|path| std::fs::read_to_string(path))
+}
+
+/// [`read_spec`] with the file read by `read` (a command's snapshot, then
+/// the disk: the example a run uses is the one its version holds).
+pub fn read_spec_from(project: &Project, name: &str, read: &dyn Fn(&Path) -> std::io::Result<String>) -> Result<RunSpec> {
     let path = spec_file_path(project, name);
-    read_spec_if_present(project, name)?
+    read_spec_if_present_from(project, name, read)?
         .with_context(|| format!("no spec at {}", path.display()))
 }
 
@@ -331,10 +359,10 @@ pub fn read_spec(project: &Project, name: &str) -> Result<RunSpec> {
 /// their own copy of the first half.
 pub async fn replay_rows(
     client: &crate::client::DispatcherClient,
-    execution_id: &str,
+    run_id: &str,
 ) -> Result<Vec<LiveEvent>> {
     let rows = client
-        .get_json(&format!("/executions/{execution_id}/replay"))
+        .get_json(&format!("/runs/{run_id}/replay"))
         .await
         .context("read the run")?;
     serde_json::from_value(rows)
@@ -345,9 +373,9 @@ pub async fn replay_rows(
 /// bytes so two runs' values compare as values.
 pub async fn output_wires(
     client: &crate::client::DispatcherClient,
-    execution_id: &str,
+    run_id: &str,
 ) -> Result<Expected> {
-    let mut expected: Expected = serde_json::from_value(client.get_json(&format!("/executions/{execution_id}/outputs")).await?)
+    let mut expected: Expected = serde_json::from_value(client.get_json(&format!("/runs/{run_id}/outputs")).await?)
         .context("decode complete output history")?;
     normalize_media(client, &mut expected.wires).await?;
     Ok(expected)
@@ -367,13 +395,22 @@ fn spec_file_path(project: &Project, name: &str) -> PathBuf {
 /// read or parse is an error: treating it as "nothing here" lets the
 /// caller write over a spec whose only problem was a typo in it.
 pub fn read_spec_if_present(project: &Project, name: &str) -> Result<Option<RunSpec>> {
+    read_spec_if_present_from(project, name, &|path| std::fs::read_to_string(path))
+}
+
+/// [`read_spec_if_present`] with the file read by `read` ([`read_spec_from`]).
+pub fn read_spec_if_present_from(
+    project: &Project,
+    name: &str,
+    read: &dyn Fn(&Path) -> std::io::Result<String>,
+) -> Result<Option<RunSpec>> {
     let path = spec_file_path(project, name);
-    let text = match std::fs::read_to_string(&path) {
+    let text = match read(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
-    let mut spec: RunSpec = serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    let mut spec = RunSpec::parse_file(&text).map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
     spec.name = path.file_stem().context("example filename")?.to_string_lossy().into_owned();
     Ok(Some(spec))
 }
@@ -385,7 +422,6 @@ pub fn read_spec_if_present(project: &Project, name: &str) -> Result<Option<RunS
 /// `examples/<name>.json`. Letting a path reach the writer produced
 /// `examples/examples/chain.json.json`, so the rule lives on the writer
 /// where both `weft freeze` and `weft run --save` pass through it.
-// SYNC: validate_example_name <-> packages/weft-graph/src/run-spec.ts exampleNameProblem
 pub fn validate_example_name(name: &str) -> Result<()> {
     // A leading dash is refused because the name is typed back as an
     // argument (`weft run <name>`, `weft freeze <name>`), where the
@@ -416,14 +452,17 @@ pub fn validate_example_name(name: &str) -> Result<()> {
     bail!("an example needs a name (a word, not a path or a directory): `weft freeze <name>`")
 }
 
-pub fn write_spec(project: &Project, spec: &RunSpec) -> Result<PathBuf> {
+/// Write `spec` as `examples/<name>.json`, answering where and the text
+/// written (a command that wrote it keeps it in its snapshot,
+/// `snapshot::Snapshot::record`).
+pub fn write_spec(project: &Project, spec: &RunSpec) -> Result<(PathBuf, String)> {
     validate_example_name(&spec.name)?;
     let path = spec_path(project, &spec.name);
     std::fs::create_dir_all(examples_dir(project))?;
     let mut text = serde_json::to_string_pretty(spec)?;
     text.push('\n');
-    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
-    Ok(path)
+    std::fs::write(&path, &text).with_context(|| format!("write {}", path.display()))?;
+    Ok((path, text))
 }
 
 /// Every spec in `examples/`, by name, sorted, plus the files in there
@@ -449,7 +488,7 @@ pub fn list_specs(project: &Project) -> Result<(Vec<RunSpec>, Vec<String>)> {
         // or one file with the wrong permissions, stopped `weft prune`
         // dead with a bare "Is a directory (os error 21)" and no path.
         match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|text| {
-            serde_json::from_str::<RunSpec>(&text).map_err(|e| format!("is not a spec ({e})"))
+            RunSpec::parse_file(&text).map_err(|e| format!("is not a spec ({e})"))
         }) {
             Ok(mut spec) => {
                 // The filename is the runnable name; an edited display name
@@ -478,7 +517,7 @@ pub struct RunFlags {
     /// Which instance the run is in (`--instance`).
     pub instance: Option<weft_core::instance::InstanceId>,
     pub clear: Vec<String>,
-    /// Write each step before the next (`--durable`).
+    /// Write what the run did down before each node starts (`--durable`).
     pub durable: bool,
     /// Never wait for the record except to pause (`--fast`), over a
     /// durable trigger.
@@ -616,6 +655,19 @@ pub struct OutsideFacts {
 
 pub fn outside_facts(rows: &[LiveEvent]) -> Result<OutsideFacts> {
     let mut facts = OutsideFacts::default();
+    // The program's messages the caller never received, and why: a
+    // window names those a caller reading too slowly lost (possibly ones
+    // an earlier window carried), the row saying the caller left names
+    // those still waiting then. All are known before any message is
+    // written down.
+    let dropped: BTreeMap<u64, &str> = rows
+        .iter()
+        .flat_map(|row| match &row.event {
+            DispatcherEvent::CallerWindow { dropped, .. } => dropped.iter().map(|o| (*o, "caller_too_slow")).collect(),
+            DispatcherEvent::CallerDisconnected { dropped, .. } => dropped.iter().map(|o| (*o, "exchange_ended")).collect(),
+            _ => Vec::new(),
+        })
+        .collect();
     // node -> frames key -> the firing input the person saw.
     let mut inputs: BTreeMap<(String, String), Value> = BTreeMap::new();
     for row in rows {
@@ -641,10 +693,16 @@ pub fn outside_facts(rows: &[LiveEvent]) -> Result<OutsideFacts> {
             // its own `direction`, which is what makes the answer
             // readable beside the request. Recording the window rows
             // whole instead would put the journal's batching into a
-            // file a person reads.
+            // file a person reads. A message the caller never received
+            // says so and why (`"dropped": "caller_too_slow"` or
+            // `"exchange_ended"`).
             DispatcherEvent::CallerWindow { messages, .. } => {
                 for message in messages {
-                    facts.caller.push(serde_json::to_value(message).context("write down a caller message")?);
+                    let mut written = serde_json::to_value(message).context("write down a caller message")?;
+                    if let Some(why) = dropped.get(&message.offset) {
+                        written["dropped"] = Value::String((*why).to_string());
+                    }
+                    facts.caller.push(written);
                 }
             }
             _ => {}
@@ -784,7 +842,7 @@ fn replace_stored(value: Value, hashes: &BTreeMap<String, String>) -> Value {
 /// The storage key a stored-file marker carries, if `value` is one.
 fn stored_key(value: &Value) -> Option<String> {
     if let Ok(weft_core::storage::media::MediaSlotContent::Stored {
-        handle: weft_core::storage::FileHandle::Key(key), ..
+        handle: weft_core::storage::FileHandle::Key { key, .. }, ..
     }) = weft_core::storage::media::classify_media_slot(value)
     {
         return Some(key);
@@ -824,6 +882,33 @@ mod tests {
         let (listed, errors) = list_specs(&project).unwrap();
         assert!(errors.is_empty());
         assert_eq!(listed, vec![spec]);
+    }
+
+    /// A spec an older weft saved, with keys spelled the old way, is
+    /// refused naming the file, each old key and its spelling now.
+    #[test]
+    fn a_spec_with_an_old_spelling_is_refused_naming_the_file_and_the_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("weft.toml"), "[package]\nname = 'test'\nid = '00000000-0000-0000-0000-000000000001'\n").unwrap();
+        let project = Project::load(dir.path()).unwrap();
+        std::fs::create_dir_all(examples_dir(&project)).unwrap();
+        let path = spec_path(&project, "old");
+        std::fs::write(
+            &path,
+            r#"{"name":"old","frozen_from":{"version":"v","execution_id":"00000000-0000-0000-0000-000000000002","definition_hash":"h"},"settings":{"keep_for":"1d"}}"#,
+        )
+        .unwrap();
+        let error = read_spec(&project, "old").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "parse {}: this spec was saved by an older weft, and these keys are spelled differently now: \
+                 `frozen_from` is `frozenFrom`, `frozen_from.execution_id` is `runId`, \
+                 `frozen_from.definition_hash` is `definitionHash`, `settings.keep_for` is `keepFor`. \
+                 The old spelling is no longer read; rename them",
+                path.display()
+            )
+        );
     }
 
     fn version(id: &str, label: Option<&str>) -> VersionSummary {
@@ -927,6 +1012,11 @@ mod tests {
             // The standard library is a folder of the project's nodes
             // like any other.
             "nodes/base_catalog/x/mod.rs",
+            // A program a package ships and the prompt it reads, which
+            // a build on the install compiles from the version through
+            // `__catalog/`.
+            "nodes/base_catalog/computer/agent.weft",
+            "nodes/base_catalog/computer/agent_prompt.md",
         ] {
             assert!(covers(yes), "{yes} is part of a version");
         }
@@ -1167,14 +1257,14 @@ mod tests {
         // the kind's.
         let row = |mut fields: Value| -> LiveEvent {
             let fields_of = fields.as_object_mut().unwrap();
-            fields_of.insert("event_id".into(), json!("journal:1:0"));
-            fields_of.insert("execution_id".into(), json!(uuid::Uuid::nil()));
-            fields_of.insert("project_id".into(), json!(uuid::Uuid::nil()));
-            fields_of.insert("at_unix".into(), json!(1));
+            fields_of.insert("eventId".into(), json!("journal:1:0"));
+            fields_of.insert("runId".into(), json!(uuid::Uuid::nil()));
+            fields_of.insert("projectId".into(), json!(uuid::Uuid::nil()));
+            fields_of.insert("atUnix".into(), json!(1));
             serde_json::from_value(fields).unwrap()
         };
         let rows = vec![
-            row(json!({ "kind": "node_started", "node": "review", "frames": [], "input": { "prompt": "ok?" }, "closed_ports": [] })),
+            row(json!({ "kind": "node_started", "node": "review", "frames": [], "input": { "prompt": "ok?" }, "closedPorts": [] })),
             row(json!({ "kind": "node_suspended", "node": "review", "frames": [], "token": "t" })),
             row(json!({ "kind": "wait_ended", "node": "review", "frames": [], "token": "t", "ended": { "type": "answered", "value": { "answer": "yes" } } })),
             row(json!({ "kind": "node_resumed", "node": "review", "frames": [], "token": "t" })),
@@ -1182,16 +1272,24 @@ mod tests {
             row(json!({ "kind": "wait_ended", "node": "skipped", "frames": [], "token": "t3", "ended": { "type": "skipped" } })),
             // A wait held in the worker that gave up: no suspend, no
             // resume, only its ending and the node failing with its error.
-            row(json!({ "kind": "node_started", "node": "held", "frames": [], "input": { "prompt": "still there?" }, "closed_ports": [] })),
+            row(json!({ "kind": "node_started", "node": "held", "frames": [], "input": { "prompt": "still there?" }, "closedPorts": [] })),
             row(json!({ "kind": "wait_ended", "node": "held", "frames": [], "token": "t2", "ended": { "type": "gave_up", "error": "node 'held' gave up its wait: quiet" } })),
             row(json!({ "kind": "node_failed", "node": "held", "frames": [], "error": "node 'held' gave up its wait: quiet" })),
             // One window row carrying the whole short conversation,
             // which is how the journal writes it: the messages come out
             // of the row, not one row each.
-            row(json!({ "kind": "caller_window", "first_offset": 0, "last_offset": 1, "messages": [
-                { "offset": 0, "direction": "inbound", "payload": { "kind": "json", "data": "hi" }, "payload_byte_size": 4, "at_unix": 1 },
-                { "offset": 1, "direction": "outbound", "payload": { "kind": "json", "data": "bye" }, "payload_byte_size": 5, "terminal": true, "at_unix": 1 },
+            row(json!({ "kind": "caller_window", "firstOffset": 0, "lastOffset": 1, "messages": [
+                { "offset": 0, "direction": "inbound", "payload": { "kind": "json", "data": "hi" }, "payloadByteSize": 4, "atUnix": 1 },
+                { "offset": 1, "direction": "outbound", "payload": { "kind": "json", "data": "bye" }, "payloadByteSize": 5, "terminal": true, "atUnix": 1 },
             ], "totals": [] })),
+            // A later window whose chunk pushed the first one out before
+            // the caller read it.
+            row(json!({ "kind": "caller_window", "firstOffset": 2, "lastOffset": 3, "messages": [
+                { "offset": 2, "direction": "outbound", "payload": { "kind": "json", "data": "late" }, "payloadByteSize": 6, "atUnix": 1 },
+                { "offset": 3, "direction": "outbound", "payload": { "kind": "json", "data": "later" }, "payloadByteSize": 7, "atUnix": 1 },
+            ], "totals": [], "dropped": [1] })),
+            // The caller left with the last one still waiting to go out.
+            row(json!({ "kind": "caller_disconnected", "offset": 4, "reason": "caller hung up", "dropped": [3] })),
         ];
         let facts = outside_facts(&rows).unwrap();
         assert_eq!(facts.answers.len(), 3, "one per wait that ended; a boundary re-fire is none");
@@ -1202,16 +1300,22 @@ mod tests {
         assert_eq!(facts.answers[2].node, "held");
         assert_eq!(facts.answers[2].ended, AwaitEnd::GaveUp { error: "node 'held' gave up its wait: quiet".into() });
         assert_eq!(facts.answers[2].question, Some(json!({ "prompt": "still there?" })), "a wait given up keeps the question it asked");
-        assert_eq!(facts.caller.len(), 2, "both halves of the exchange, request AND answer");
+        assert_eq!(facts.caller.len(), 4, "both halves of the exchange, request AND answer");
         let directions: Vec<&str> =
             facts.caller.iter().filter_map(|m| m["direction"].as_str()).collect();
-        assert_eq!(directions, vec!["inbound", "outbound"], "each message says which way it went");
+        assert_eq!(directions, vec!["inbound", "outbound", "outbound", "outbound"], "each message says which way it went");
+        let dropped: Vec<Option<&str>> = facts.caller.iter().map(|m| m.get("dropped").and_then(Value::as_str)).collect();
+        assert_eq!(
+            dropped,
+            vec![None, Some("caller_too_slow"), None, Some("exchange_ended")],
+            "a message the record names as never received says so, and why"
+        );
     }
 
     #[test]
     fn a_stored_media_marker_is_recognised_and_a_plain_value_is_not() {
-        let marker = json!({ "__weft_image__": { "key": "t/exec/c/pic", "mimeType": "image/png", "sizeBytes": 3, "filename": "pic.png" } });
-        assert_eq!(stored_key(&marker), Some("t/exec/c/pic".to_string()));
+        let marker = json!({ "__weft_image__": { "key": "t/run/c/pic", "mimeType": "image/png", "sizeBytes": 3, "filename": "pic.png" } });
+        assert_eq!(stored_key(&marker), Some("t/run/c/pic".to_string()));
         assert_eq!(stored_key(&json!({ "key": "x" })), None);
     }
 }

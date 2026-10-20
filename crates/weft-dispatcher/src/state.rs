@@ -95,13 +95,20 @@ pub struct DispatcherState {
     pub project_reclaimer: Arc<dyn crate::reclaim::ProjectReclaimer>,
     /// The STABLE base URL people and editors reach this install at.
     pub public_base_url: String,
-    /// An ADDITIONAL address the open internet reaches this install at (a
-    /// tunnel's), when one exists. Never a replacement for the base:
-    /// local surfaces (the OAuth callback shown to the operator, storage
-    /// links) stay on the stable base, and only internet-facing surfaces
-    /// (activation URLs, event pushes) prefer this one via
+    /// Where the open internet reaches this install (a tunnel's address,
+    /// a fixed one), read each time it is used
+    /// ([`weft_platform_traits::config::InternetAddress::current`]): a quick
+    /// tunnel opened again comes back under a new name, and an address
+    /// read once at boot would point at the old one from then on. Never a
+    /// replacement for the base: local surfaces (the OAuth callback shown
+    /// to the operator) stay on the stable base, and only internet-facing
+    /// surfaces (activation URLs, event pushes) prefer this one via
     /// [`DispatcherState::external_base_url`].
-    pub internet_url: Option<String>,
+    pub internet: weft_platform_traits::config::InternetAddress,
+    /// Where the files door passes requests on to (`crate::files_door`):
+    /// `None` on a store the open internet reaches itself, whose links
+    /// never go through the install.
+    pub files: Option<crate::files_door::FilesTarget>,
     /// What the install allows at its public edge (trusted proxy hops,
     /// the token-guessing bound); see `entry_limits`.
     pub edge: crate::entry_limits::EdgeConfig,
@@ -136,12 +143,47 @@ pub struct DispatcherState {
     pub booking: Option<weft_task_store::drain::Booking>,
 }
 
+/// The base for outside URLs of one answer
+/// ([`DispatcherState::external_base`]): read the first time a path is put
+/// on it, then kept for the rest of that answer only, so one answer hands
+/// out every address under the same base.
+pub struct ExternalBase<'a> {
+    state: &'a DispatcherState,
+    base: tokio::sync::OnceCell<String>,
+}
+
+impl ExternalBase<'_> {
+    /// `path` (an address's path on this install) as outside callers reach
+    /// it. The first call reads the base, and fails as
+    /// [`DispatcherState::external_base_url`] does.
+    pub async fn url(&self, path: &str) -> anyhow::Result<String> {
+        let base = self.base.get_or_try_init(|| self.state.external_base_url()).await?;
+        Ok(weft_core::infra::public_url(base, path))
+    }
+}
+
 impl DispatcherState {
+    /// The address the open internet reaches this install at right now,
+    /// `None` when it reaches none. A quick tunnel that does not say its
+    /// address is an error naming it.
+    pub async fn internet_url(&self) -> anyhow::Result<Option<String>> {
+        self.internet.current(&self.http).await
+    }
+
     /// The base for URLs handed to OUTSIDE callers (webhook activation
-    /// URLs, addresses a provider posts events to): the additional
-    /// internet address when one exists, the stable base otherwise.
-    pub fn external_base_url(&self) -> &str {
-        self.internet_url.as_deref().unwrap_or(&self.public_base_url)
+    /// URLs, addresses a provider posts events to): the internet address
+    /// as it is now when there is one, the stable base otherwise.
+    pub async fn external_base_url(&self) -> anyhow::Result<String> {
+        Ok(self.internet_url().await?.unwrap_or_else(|| self.public_base_url.clone()))
+    }
+
+    /// The base for outside URLs ([`DispatcherState::external_base_url`]),
+    /// read only when an answer first puts a path on it: an answer that
+    /// hands out no outside address (a cron-only activation, a run whose
+    /// waits have no resume link) never waits on a tunnel, and fails on
+    /// none that is down or still connecting.
+    pub fn external_base(&self) -> ExternalBase<'_> {
+        ExternalBase { state: self, base: tokio::sync::OnceCell::new() }
     }
 
     /// The program `project` recorded under `hash`, parsed; `None` when
@@ -164,28 +206,47 @@ impl DispatcherState {
         Ok(Some(program))
     }
 
-    /// The program identity of the run whose rows are `events`: read
-    /// from the project's stored code for the binary its birth names. A
-    /// run never copies the implementation fingerprints, so this is the
-    /// way back to them.
+    /// The program identity of the run whose rows are `events`
+    /// ([`Self::registered_identity`] of what its birth names).
     pub async fn run_program_identity(
         &self,
-        events: &[weft_journal::ExecEvent],
+        events: &[weft_journal::RunEvent],
     ) -> anyhow::Result<weft_core::project::hash::ProgramIdentity> {
-        let Some(weft_journal::ExecEvent::ExecutionStarted {
-            execution_id,
+        let Some(weft_journal::RunEvent::RunStarted {
+            run_id,
             project_id,
             definition_hash: Some(definition_hash),
+            cut_from,
             binary_hash: Some(binary_hash),
             ..
         }) = events.first()
         else {
             anyhow::bail!("the run's history does not start with a birth naming its program");
         };
+        self.registered_identity(*run_id, *project_id, definition_hash, cut_from.as_deref(), binary_hash).await
+    }
+
+    /// The identity of the registered program run `run_id` of `project_id`
+    /// ran against, its birth naming its program `definition_hash` (cut
+    /// from `cut_from`, for a run of a cut) on worker `binary_hash`: read
+    /// from the project's stored code for that binary. A run never copies
+    /// the implementation fingerprints, so this is the way back to them.
+    /// A run of a cut answers with the registered program it was cut
+    /// from: what its bakes are for and what a seed holds its results
+    /// against.
+    pub async fn registered_identity(
+        &self,
+        run_id: weft_core::RunId,
+        project_id: uuid::Uuid,
+        definition_hash: &str,
+        cut_from: Option<&str>,
+        binary_hash: &str,
+    ) -> anyhow::Result<weft_core::project::hash::ProgramIdentity> {
+        let registered = cut_from.unwrap_or(definition_hash);
         self.projects
-            .program_identity(*project_id, definition_hash, binary_hash)
+            .program_identity(project_id, registered, binary_hash)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("run {execution_id} ran on worker {binary_hash}, which its project no longer records"))
+            .ok_or_else(|| anyhow::anyhow!("run {run_id} ran on worker {binary_hash}, which its project no longer records"))
     }
 }
 

@@ -35,6 +35,26 @@ pub struct BuiltProgram {
     /// before.
     #[serde(rename = "replacedInfraImages", default)]
     pub replaced_infra_images: Vec<String>,
+    /// `place -> hash` of each infra place's own infra (its node, what
+    /// feeds it, their packages; the compiler's `compute_infra_place_hashes`):
+    /// a copy applied from this build carries its place's, and one whose
+    /// place hashes otherwise in the source now is behind it.
+    #[serde(rename = "infraPlaces", default)]
+    pub infra_places: BTreeMap<String, String>,
+    /// The worker image's ref, whose build record says which node
+    /// packages it left out ([`LeftOut`]). Empty in a version a release
+    /// before records wrote down, whose worker could leave nothing out.
+    #[serde(rename = "workerImage", default)]
+    pub worker_image: String,
+    /// The node packages the worker's build left out because they did not
+    /// compile ([`LeftOut`]): no run whose cut uses one of their node types
+    /// starts. Filled at registration, from the worker image's record.
+    #[serde(rename = "leftOut", default, skip_serializing_if = "Vec::is_empty")]
+    pub left_out: Vec<LeftOutPackage>,
+    /// Where the worker build's log is read, for every error of a package
+    /// it left out (the record keeps only the first line of each).
+    #[serde(rename = "workerLog", default, skip_serializing_if = "Option::is_none")]
+    pub worker_log: Option<String>,
 }
 
 impl BuiltProgram {
@@ -45,6 +65,89 @@ impl BuiltProgram {
             definition_hash: Some(self.definition_hash.clone()),
             infra_hash: Some(self.infra_hash.clone()),
         }
+    }
+}
+
+/// Where a worker image keeps the record of the node packages its build
+/// left out ([`LeftOut`]): the install reads it from the built image
+/// without running it, and never trusts a record from anywhere else.
+// SYNC: LEFT_OUT_RECORD_PATH <-> crates/weft-compiler/src/worker_image.rs (RUNTIME_STAGE_FRAGMENT, the record's COPY line)
+pub const LEFT_OUT_RECORD_PATH: &str = "/weft-left-out.json";
+
+/// The most bytes a record may take: what a Cloud Build step may hand back
+/// as its output. The build shortens each package's first error line to
+/// fit, and fails outright when even that does not fit (the full errors
+/// are in its log either way).
+// SYNC: LEFT_OUT_RECORD_LIMIT <-> crates/weft-compiler/src/worker_isolate.rs RECORD_LIMIT
+pub const LEFT_OUT_RECORD_LIMIT: usize = 4000;
+
+/// The node packages a worker image's build left out because they did
+/// not compile: the image is the worker without them, and their node types
+/// answer "package X didn't compile" if a run ever reaches one. Written by
+/// the build itself (`weft_compiler::worker_isolate`), stored on the
+/// install's ledger row for the image, and read back whenever the image is
+/// used, so a cached image refuses the same runs. Empty for an image that
+/// left nothing out.
+// SYNC: LeftOut <-> crates/weft-compiler/src/worker_isolate.rs Record
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LeftOut {
+    #[serde(default)]
+    pub packages: Vec<LeftOutPackage>,
+}
+
+/// One package a worker's build left out ([`LeftOut`]).
+// SYNC: LeftOutPackage <-> crates/weft-compiler/src/worker_isolate.rs LeftOutPackage
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LeftOutPackage {
+    /// The package's name, as its folder or `package.toml` says.
+    pub package: String,
+    /// Every node type the package holds that the worker would have
+    /// compiled in.
+    pub node_types: Vec<String>,
+    /// The first line of its first compile error, shortened to fit the
+    /// record; the build log has them all.
+    pub error: String,
+}
+
+impl LeftOut {
+    /// A record as a build wrote it. A record that does not read is the
+    /// build's failure, never an empty record.
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(bytes).map_err(|e| format!("the worker build's record of the packages it left out does not read: {e}"))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.packages.is_empty()
+    }
+
+    /// The broken parts these packages make of `definition`: one per node
+    /// of a left-out type (`crate::project::Broken`), so a cut that keeps
+    /// one is refused naming the package and its first error, and every
+    /// other cut runs. `log` is where the build's full errors are read.
+    pub fn broken_parts(packages: &[LeftOutPackage], definition: &crate::ProjectDefinition, log: Option<&str>) -> Vec<crate::project::Broken> {
+        let mut parts = Vec::new();
+        for node in &definition.nodes {
+            let Some(package) = packages.iter().find(|p| p.node_types.contains(&node.node_type)) else { continue };
+            parts.push(crate::project::Broken {
+                parts: vec![node.part().to_string()],
+                why: format!("{}: {}", crate::project::plain_id(&node.id), package.reason(log)),
+                hides: false,
+            });
+        }
+        parts
+    }
+}
+
+impl LeftOutPackage {
+    /// What a person is told about a run that reaches one of its nodes.
+    pub fn reason(&self, log: Option<&str>) -> String {
+        let log = match log {
+            Some(url) => format!("its full errors are in the build log: {url}"),
+            None => "its full errors are in the build log".to_string(),
+        };
+        format!("package '{}' didn't compile: {}; {log}", self.package, self.error)
     }
 }
 
@@ -204,12 +307,47 @@ mod tests {
             implementations: [("Llm".to_string(), "h".to_string())].into(),
             infra_images: [("one.db".to_string(), [("db".to_string(), "r/db:1".to_string())].into())].into(),
             replaced_infra_images: vec!["one.db".into()],
+            infra_places: [("one.db".to_string(), "p".to_string())].into(),
+            worker_image: "r/weft-worker:b".into(),
+            left_out: vec![LeftOutPackage { package: "media".into(), node_types: vec!["Resize".into()], error: "error[E0308]".into() }],
+            worker_log: Some("https://log/1".into()),
         };
         let wire = serde_json::to_value(&built).unwrap();
-        for key in ["binaryHash", "definitionHash", "infraHash", "infraImages", "replacedInfraImages"] {
+        for key in ["binaryHash", "definitionHash", "infraHash", "infraImages", "replacedInfraImages", "infraPlaces", "workerImage", "leftOut", "workerLog"] {
             assert!(wire.get(key).is_some(), "{key} missing from {wire}");
         }
         let back: BuiltProgram = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(&back).unwrap(), wire);
+    }
+
+    /// A record reads as the build wrote it, refuses anything else, and
+    /// breaks exactly the nodes of a left-out type, each refusal naming
+    /// the package, its first error and where the rest are.
+    #[test]
+    fn a_left_out_record_breaks_the_nodes_of_its_packages() {
+        let record = br#"{"packages":[{"package":"media","nodeTypes":["Resize","Crop"],"error":"error[E0308]: mismatched types"}]}"#;
+        let left_out = LeftOut::parse(record).unwrap();
+        assert_eq!(left_out.packages[0].node_types, ["Resize", "Crop"]);
+        assert!(LeftOut::parse(br#"{"packages":[],"extra":1}"#).is_err(), "a record weft did not write");
+        assert!(LeftOut::parse(b"not json").unwrap_err().contains("does not read"));
+        assert!(LeftOut::parse(b"{}").unwrap().is_empty());
+
+        let definition: crate::ProjectDefinition = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001",
+            "nodes": [
+                { "id": "shrink", "nodeType": "Resize", "inputs": [], "outputs": [], "position": { "x": 0, "y": 0 } },
+                { "id": "say", "nodeType": "Text", "inputs": [], "outputs": [], "position": { "x": 0, "y": 0 } }
+            ],
+            "edges": []
+        }))
+        .unwrap();
+        let parts = LeftOut::broken_parts(&left_out.packages, &definition, Some("https://log/1"));
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].parts, ["shrink"]);
+        assert_eq!(
+            parts[0].why,
+            "shrink: package 'media' didn't compile: error[E0308]: mismatched types; its full errors are in the build log: https://log/1"
+        );
+        assert!(left_out.packages[0].reason(None).ends_with("its full errors are in the build log"));
     }
 }

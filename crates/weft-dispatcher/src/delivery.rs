@@ -5,7 +5,7 @@
 //! back, its worker went away while it was durable) waits as a `queued`
 //! run row. This loop takes queued runs ([`take`], which also marks each
 //! delivered for a while so no sibling hands it out twice) and calls a
-//! worker for each: `POST /_weft/run/<execution_id>` on the project's
+//! worker for each: `POST /_weft/run/<run_id>` on the project's
 //! workers at the run's image. The worker claims the run (its row goes
 //! `running`, owned by that worker, its epoch raised) and drives it from
 //! its record. A worker that never claims leaves the delivery to run out,
@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use weft_core::net::EmptyBody;
-use weft_core::ExecutionId;
+use weft_core::RunId;
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn};
 
 use crate::state::DispatcherState;
@@ -92,7 +92,7 @@ fn safety() -> Duration {
 /// One queued run taken for delivery.
 #[derive(Debug, sqlx::FromRow)]
 pub struct Delivery {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub project_id: uuid::Uuid,
     pub tenant_id: String,
     /// The image it runs on; `None` for a run of no program, which no
@@ -140,14 +140,14 @@ pub async fn take(pool: &sqlx::PgPool, now: i64, limit: i64) -> anyhow::Result<V
         "UPDATE run SET delivered_until = $1 + $2, waits = FALSE, \
              unreached = CASE WHEN unreached >= $4 THEN 0 ELSE unreached END, \
              busy_since = CASE WHEN unreached >= $4 THEN NULL ELSE busy_since END \
-         WHERE execution_id IN ( \
-             SELECT r.execution_id FROM run r \
+         WHERE run_id IN ( \
+             SELECT r.run_id FROM run r \
              WHERE r.state = 'queued' \
                AND ((r.unreached < $4 AND (r.delivered_until IS NULL OR r.delivered_until < $1)) \
                     OR (r.unreached >= $4 AND EXISTS (SELECT 1 FROM worker_lease l \
                                                       WHERE l.project_id = r.project_id AND l.alive_since >= r.delivered_until))) \
              ORDER BY r.started_at LIMIT $3 FOR UPDATE SKIP LOCKED) \
-         RETURNING execution_id, project_id, tenant_id, binary_hash",
+         RETURNING run_id, project_id, tenant_id, binary_hash",
     )
     .bind(now)
     .bind(delivery_lease_secs())
@@ -184,9 +184,9 @@ pub fn busy_wait_cap_secs() -> i64 {
 /// out again once [`starting_wait_secs`] passed, joining the same
 /// bring-up, counting no try. Not announced: the loop looks again when
 /// the earliest such wait runs out.
-pub async fn wait_for_worker(pool: &sqlx::PgPool, execution_id: ExecutionId) -> anyhow::Result<()> {
-    sqlx::query("UPDATE run SET delivered_until = $2, waits = TRUE WHERE execution_id = $1 AND state = 'queued'")
-        .bind(execution_id)
+pub async fn wait_for_worker(pool: &sqlx::PgPool, run_id: RunId) -> anyhow::Result<()> {
+    sqlx::query("UPDATE run SET delivered_until = $2, waits = TRUE WHERE run_id = $1 AND state = 'queued'")
+        .bind(run_id)
         .bind(crate::lease::now_unix() + starting_wait_secs())
         .execute(pool)
         .await?;
@@ -200,13 +200,13 @@ pub async fn wait_for_worker(pool: &sqlx::PgPool, execution_id: ExecutionId) -> 
 /// [`busy_wait_cap_secs`], and for as long as the workers answer busy: it
 /// is real work waiting for room. Answers how long the stretch has lasted,
 /// in seconds, `None` when it is no longer queued.
-pub async fn busy(pool: &sqlx::PgPool, execution_id: ExecutionId) -> anyhow::Result<Option<i64>> {
+pub async fn busy(pool: &sqlx::PgPool, run_id: RunId) -> anyhow::Result<Option<i64>> {
     Ok(sqlx::query_scalar(
         "UPDATE run SET busy_since = COALESCE(busy_since, $2), waits = TRUE, waited_on_workers = TRUE, \
              delivered_until = $2 + LEAST(GREATEST($2 - COALESCE(busy_since, $2), $3), $4) \
-         WHERE execution_id = $1 AND state = 'queued' RETURNING $2 - busy_since",
+         WHERE run_id = $1 AND state = 'queued' RETURNING $2 - busy_since",
     )
-    .bind(execution_id)
+    .bind(run_id)
     .bind(crate::lease::now_unix())
     .bind(busy_wait_secs())
     .bind(busy_wait_cap_secs())
@@ -231,13 +231,13 @@ fn busy_for_words(secs: i64) -> String {
 /// to be tried again after the wait that refusal earns ([`RETRY_WAITS`]).
 /// Answers how many refusals it has now, `None` when it is no longer
 /// queued; the [`REFUSALS_TO_END`]th ends it ([`refused_cause`]).
-pub async fn refused(pool: &sqlx::PgPool, execution_id: ExecutionId) -> anyhow::Result<Option<i16>> {
+pub async fn refused(pool: &sqlx::PgPool, run_id: RunId) -> anyhow::Result<Option<i16>> {
     Ok(sqlx::query_scalar(
         "UPDATE run SET refusals = refusals + 1, waits = TRUE, waited_on_workers = TRUE, \
              delivered_until = $2 + (($3::bigint[])[LEAST(refusals + 1, array_length($3::bigint[], 1))]) \
-         WHERE execution_id = $1 AND state = 'queued' RETURNING refusals",
+         WHERE run_id = $1 AND state = 'queued' RETURNING refusals",
     )
-    .bind(execution_id)
+    .bind(run_id)
     .bind(crate::lease::now_unix())
     .bind(RETRY_WAITS.map(weft_core::time_scale::scaled_secs).to_vec())
     .fetch_optional(pool)
@@ -253,14 +253,14 @@ pub async fn refused(pool: &sqlx::PgPool, execution_id: ExecutionId) -> anyhow::
 /// [`retry_stopped`], `crate::project_store::ProjectStoreOps::set_worker_overrides`).
 /// Answers how many it has now, `None` when it is no longer queued (its
 /// worker claimed it before the call broke).
-pub async fn unreached(pool: &sqlx::PgPool, execution_id: ExecutionId) -> anyhow::Result<Option<i16>> {
+pub async fn unreached(pool: &sqlx::PgPool, run_id: RunId) -> anyhow::Result<Option<i16>> {
     Ok(sqlx::query_scalar(
         "UPDATE run SET unreached = unreached + 1, waits = TRUE, waited_on_workers = TRUE, \
              delivered_until = CASE WHEN unreached + 1 >= $3 THEN EXTRACT(EPOCH FROM NOW())::BIGINT \
                  ELSE $2 + (($4::bigint[])[unreached + 1]) END \
-         WHERE execution_id = $1 AND state = 'queued' RETURNING unreached",
+         WHERE run_id = $1 AND state = 'queued' RETURNING unreached",
     )
-    .bind(execution_id)
+    .bind(run_id)
     .bind(crate::lease::now_unix())
     .bind(UNREACHED_TO_STOP)
     .bind(RETRY_WAITS.map(weft_core::time_scale::scaled_secs).to_vec())
@@ -292,24 +292,37 @@ pub async fn retry_stopped(conn: &mut sqlx::PgConnection, project_id: uuid::Uuid
 /// What a run refused [`REFUSALS_TO_END`] times is ended for, naming who
 /// gave the last refusal (`by`) and what it said (`error`). It ends the
 /// way every run the dispatcher ends itself does
-/// ([`crate::api::execution::cancel_execution_id`]).
-pub fn refused_cause(by: RefusedBy, error: &str) -> weft_core::exec::CancelCause {
+/// ([`crate::api::run::cancel_run_id`]).
+pub fn refused_cause(by: RefusedBy, error: &str) -> weft_core::run::CancelCause {
     let who = match by {
         RefusedBy::Worker => "its worker refused it",
         RefusedBy::Platform => "the platform refused weft's calls for it",
         RefusedBy::Settings => "its project's worker settings kept it from any worker",
     };
-    weft_core::exec::CancelCause::Runtime { detail: format!("{who} {REFUSALS_TO_END} times: {error}") }
+    weft_core::run::CancelCause::Runtime { detail: format!("{who} {REFUSALS_TO_END} times: {error}") }
+}
+
+/// What a run whose build's worker cannot start (`why`) is ended for: at
+/// once, never handed out again, its record kept like any ended run's, so
+/// once the program runs again it can be picked up from what it did.
+pub fn wont_start_cause(run_id: RunId, why: &str) -> weft_core::run::CancelCause {
+    weft_core::run::CancelCause::Runtime {
+        detail: format!(
+            "{why}. Nothing will run on that build again: fix the program and build again (`weft resync` puts \
+             triggers that are on onto the new build), then `weft run --seed={run_id}` picks this run up from \
+             what it did"
+        ),
+    }
 }
 
 /// End a queued run no worker can ever claim (a run of no program): until
 /// its ending lands it shows going and its waiters hang. It ends the way
 /// every run the dispatcher ends itself does, a runtime cancel naming why
-/// ([`crate::api::execution::cancel_execution_id`]).
-async fn end_undeliverable(state: &DispatcherState, execution_id: ExecutionId, reason: &str) -> anyhow::Result<()> {
-    tracing::warn!(target: "weft_dispatcher::delivery", %execution_id, %reason, "a queued run no worker can claim: ending it");
-    let cause = weft_core::exec::CancelCause::Runtime { detail: format!("could not be handed to a worker: {reason}") };
-    crate::api::execution::cancel_execution_id(state, execution_id, &cause).await
+/// ([`crate::api::run::cancel_run_id`]).
+async fn end_undeliverable(state: &DispatcherState, run_id: RunId, reason: &str) -> anyhow::Result<()> {
+    tracing::warn!(target: "weft_dispatcher::delivery", %run_id, %reason, "a queued run no worker can claim: ending it");
+    let cause = weft_core::run::CancelCause::Runtime { detail: format!("could not be handed to a worker: {reason}") };
+    crate::api::run::cancel_run_id(state, run_id, &cause).await
 }
 
 /// The project a worker target was asked for does not exist (it was
@@ -367,13 +380,13 @@ fn worker_settings(
 }
 
 async fn deliver(state: &DispatcherState, delivery: Delivery) {
-    let execution_id = delivery.execution_id;
+    let run_id = delivery.run_id;
     // What this side reads and writes around the call is work: the
     // database is listened to for it, and only for it.
     let busy = state.signals.busy().await;
     let Some(binary_hash) = &delivery.binary_hash else {
-        if let Err(e) = end_undeliverable(state, execution_id, "it runs no program").await {
-            tracing::error!(target: "weft_dispatcher::delivery", %execution_id, error = %format!("{e:#}"), "could not end an undeliverable run; its delivery runs out and it is tried again");
+        if let Err(e) = end_undeliverable(state, run_id, "it runs no program").await {
+            tracing::error!(target: "weft_dispatcher::delivery", %run_id, error = %format!("{e:#}"), "could not end an undeliverable run; its delivery runs out and it is tried again");
         }
         return;
     };
@@ -381,22 +394,22 @@ async fn deliver(state: &DispatcherState, delivery: Delivery) {
     drop(busy);
     let outcome = match target {
         Err(e) if e.downcast_ref::<NotRegistered>().is_some() => {
-            if let Err(e) = end_undeliverable(state, execution_id, "its project was removed").await {
-                tracing::error!(target: "weft_dispatcher::delivery", %execution_id, error = %format!("{e:#}"), "could not end a run whose project was removed; its delivery runs out and it is tried again");
+            if let Err(e) = end_undeliverable(state, run_id, "its project was removed").await {
+                tracing::error!(target: "weft_dispatcher::delivery", %run_id, error = %format!("{e:#}"), "could not end a run whose project was removed; its delivery runs out and it is tried again");
             }
             return;
         }
         Err(e) => Err(e),
-        Ok(target) => run_on_worker(state, &target, execution_id).await,
+        Ok(target) => run_on_worker(state, &target, run_id).await,
     };
     match outcome {
         Ok(weft_core::door_fire::RunAnswer::Failed { error }) => tracing::warn!(
             target: "weft_dispatcher::delivery",
-            %execution_id,
+            %run_id,
             %error,
             "the worker's drive of the run failed"
         ),
-        Ok(answer) => tracing::debug!(target: "weft_dispatcher::delivery", %execution_id, ?answer, "worker answered"),
+        Ok(answer) => tracing::debug!(target: "weft_dispatcher::delivery", %run_id, ?answer, "worker answered"),
         Err(e) => {
             let _busy = state.signals.busy().await;
             // The worker may have claimed the run before the call broke:
@@ -404,7 +417,7 @@ async fn deliver(state: &DispatcherState, delivery: Delivery) {
             // notice, once the grace the claim gave it runs out.
             crate::lapses::book_after_or_log(state, crate::worker_door::lost_margin_secs() * 2).await;
             if let Err(e) = hand_back(state, &delivery, &e).await {
-                tracing::warn!(target: "weft_dispatcher::delivery", %execution_id, error = %format!("{e:#}"), "could not give the delivery back; it is made again once its lease runs out");
+                tracing::warn!(target: "weft_dispatcher::delivery", %run_id, error = %format!("{e:#}"), "could not give the delivery back; it is made again once its lease runs out");
             }
         }
     }
@@ -434,26 +447,26 @@ async fn deliver(state: &DispatcherState, delivery: Delivery) {
 /// waiting (`weft_task_store::unanswered::delivery_waits_ended`), or once
 /// a later run of the project reaches a worker with none waiting.
 async fn hand_back(state: &DispatcherState, delivery: &Delivery, e: &anyhow::Error) -> anyhow::Result<()> {
-    let execution_id = delivery.execution_id;
+    let run_id = delivery.run_id;
     let error = format!("{e:#}");
     let workers = weft_task_store::unanswered::Callee::Workers(delivery.project_id);
     match GiveBack::of(e) {
         GiveBack::WorkerStarting => {
             tracing::debug!(
                 target: "weft_dispatcher::delivery",
-                %execution_id,
+                %run_id,
                 project = %delivery.project_id,
                 reason = %error,
                 "the run waits for its worker to start"
             );
-            wait_for_worker(&state.pg_pool, execution_id).await
+            wait_for_worker(&state.pg_pool, run_id).await
         }
         GiveBack::WorkerBusy => {
-            let Some(busy_for) = busy(&state.pg_pool, execution_id).await? else { return Ok(()) };
+            let Some(busy_for) = busy(&state.pg_pool, run_id).await? else { return Ok(()) };
             if busy_for < state.alert_after_secs {
                 tracing::debug!(
                     target: "weft_dispatcher::delivery",
-                    %execution_id,
+                    %run_id,
                     project = %delivery.project_id,
                     reason = %error,
                     busy_for_secs = busy_for,
@@ -463,7 +476,7 @@ async fn hand_back(state: &DispatcherState, delivery: &Delivery, e: &anyhow::Err
             }
             tracing::warn!(
                 target: "weft_dispatcher::delivery",
-                %execution_id,
+                %run_id,
                 project = %delivery.project_id,
                 %error,
                 busy_for_secs = busy_for,
@@ -477,10 +490,10 @@ async fn hand_back(state: &DispatcherState, delivery: &Delivery, e: &anyhow::Err
             Ok(())
         }
         GiveBack::Refused(by) => {
-            let Some(refusals) = refused(&state.pg_pool, execution_id).await? else { return Ok(()) };
+            let Some(refusals) = refused(&state.pg_pool, run_id).await? else { return Ok(()) };
             tracing::warn!(
                 target: "weft_dispatcher::delivery",
-                %execution_id,
+                %run_id,
                 project = %delivery.project_id,
                 %error,
                 refusals,
@@ -492,13 +505,36 @@ async fn hand_back(state: &DispatcherState, delivery: &Delivery, e: &anyhow::Err
                 return Ok(());
             }
             weft_task_store::unanswered::gave_up(&state.pg_pool, workers, None, &error).await?.log();
-            crate::api::execution::cancel_execution_id(state, execution_id, &refused_cause(by, &error)).await
+            crate::api::run::cancel_run_id(state, run_id, &refused_cause(by, &error)).await
         }
-        GiveBack::NotDelivered => {
-            let Some(tries) = unreached(&state.pg_pool, execution_id).await? else { return Ok(()) };
+        GiveBack::WontStart => {
+            // Every run queued on that build ends with it: each would bring
+            // up the same worker and meet the same answer.
+            let queued: Vec<RunId> = sqlx::query_scalar(
+                "SELECT run_id FROM run WHERE project_id = $1 AND binary_hash IS NOT DISTINCT FROM $2 AND state = 'queued'",
+            )
+            .bind(delivery.project_id)
+            .bind(delivery.binary_hash.as_deref())
+            .fetch_all(&state.pg_pool)
+            .await?;
             tracing::warn!(
                 target: "weft_dispatcher::delivery",
-                %execution_id,
+                %run_id,
+                project = %delivery.project_id,
+                %error,
+                queued = queued.len(),
+                "the worker of the run's build cannot start: ending the runs queued on it"
+            );
+            let causes: Vec<(RunId, weft_core::run::CancelCause)> =
+                queued.into_iter().chain(std::iter::once(run_id)).map(|queued| (queued, wont_start_cause(queued, &error))).collect();
+            let targets: Vec<(RunId, &weft_core::run::CancelCause)> = causes.iter().map(|(queued, cause)| (*queued, cause)).collect();
+            crate::api::run::cancel_run_ids(state, &targets).await.map(drop)
+        }
+        GiveBack::NotDelivered => {
+            let Some(tries) = unreached(&state.pg_pool, run_id).await? else { return Ok(()) };
+            tracing::warn!(
+                target: "weft_dispatcher::delivery",
+                %run_id,
                 project = %delivery.project_id,
                 %error,
                 tries,
@@ -520,11 +556,15 @@ async fn hand_back(state: &DispatcherState, delivery: &Delivery, e: &anyhow::Err
 /// worker up and too busy to take it now ([`WorkerBusy`]), a definite no
 /// ([`Refusal`], or the platform refusing to bring the worker up:
 /// `weft_platform_traits::runner::PlatformRefused`), or no answer at all.
+/// Or why it never goes back: the worker of the run's build cannot start
+/// at all (`weft_platform_traits::WorkerWontStart`), which no retry
+/// changes, so the run ends at once ([`wont_start_cause`]).
 #[derive(Debug, PartialEq, Eq)]
 enum GiveBack {
     WorkerStarting,
     WorkerBusy,
     Refused(RefusedBy),
+    WontStart,
     NotDelivered,
 }
 
@@ -532,6 +572,8 @@ impl GiveBack {
     fn of(e: &anyhow::Error) -> Self {
         if weft_platform_traits::WorkerStarting::is(e) {
             GiveBack::WorkerStarting
+        } else if weft_platform_traits::WorkerWontStart::is(e) {
+            GiveBack::WontStart
         } else if e.downcast_ref::<WorkerBusy>().is_some() {
             GiveBack::WorkerBusy
         } else if let Some(refusal) = e.downcast_ref::<Refusal>() {
@@ -625,7 +667,7 @@ impl NotTaken {
 async fn run_on_worker(
     state: &DispatcherState,
     target: &weft_platform_traits::WorkerTarget,
-    execution_id: ExecutionId,
+    run_id: RunId,
 ) -> anyhow::Result<weft_core::door_fire::RunAnswer> {
     // The platform refusing to give an address (permission denied, a
     // quota, an invalid request) is a no, kept typed through the context;
@@ -639,7 +681,7 @@ async fn run_on_worker(
         .context("the platform gave no address for the project's workers")?;
     let resp = state
         .http
-        .post(format!("{}/_weft/run/{execution_id}", endpoint.base_url.trim_end_matches('/')))
+        .post(format!("{}/_weft/run/{run_id}", endpoint.base_url.trim_end_matches('/')))
         .header(weft_platform_traits::WORKER_AUTH_HEADER, endpoint.auth_value())
         .empty_body()
         .send()
@@ -679,12 +721,13 @@ async fn run_on_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::{GiveBack, NotTaken, RefusedBy};
+    use super::{wont_start_cause, GiveBack, NotTaken, RefusedBy};
     use weft_platform_traits::WorkerCall;
 
     /// A worker still starting, a worker too busy, a no from the worker or
-    /// the platform, and a hand-off that got no answer are told apart:
-    /// only the no counts as a refusal, naming who said it.
+    /// the platform, a build whose worker cannot start, and a hand-off that
+    /// got no answer are told apart: only the no counts as a refusal,
+    /// naming who said it.
     #[test]
     fn a_refusal_is_told_apart_from_a_worker_starting_and_from_no_answer() {
         let starting = anyhow::Error::new(weft_platform_traits::WorkerStarting { what: "w".into() }).context("endpoint");
@@ -696,8 +739,22 @@ mod tests {
         let platform = anyhow::Error::new(weft_platform_traits::runner::PlatformRefused { why: "Google answered 403".into() })
             .context("the platform gave no address for the project's workers");
         assert_eq!(GiveBack::of(&platform), GiveBack::Refused(RefusedBy::Platform), "the platform refusing to bring a worker up is its no");
+        let wont = anyhow::Error::new(weft_platform_traits::WorkerWontStart { why: "it exited".into() }).context("endpoint");
+        assert_eq!(GiveBack::of(&wont), GiveBack::WontStart, "a build whose worker cannot start, found through a context");
         assert_eq!(GiveBack::of(&anyhow::anyhow!("call the worker at http://w: timed out")), GiveBack::NotDelivered);
         assert_eq!(GiveBack::of(&anyhow::anyhow!("pool timed out")), GiveBack::NotDelivered, "this side's own read failing");
+    }
+
+    /// A run whose build's worker cannot start ends saying why, what fixes
+    /// it, and how to pick the run back up.
+    #[test]
+    fn a_run_whose_worker_cannot_start_says_how_to_pick_it_up() {
+        let run_id = uuid::Uuid::from_u128(9);
+        let weft_core::run::CancelCause::Runtime { detail } = wont_start_cause(run_id, "the worker of this build cannot start: it exited") else {
+            panic!("a runtime cause");
+        };
+        assert!(detail.starts_with("the worker of this build cannot start: it exited."), "{detail}");
+        assert!(detail.contains("weft resync") && detail.contains(&format!("weft run --seed={run_id}")), "{detail}");
     }
 
     /// A busy answer is never a refusal: the worker's own busy `503` waits
@@ -731,7 +788,7 @@ mod tests {
     #[test]
     fn a_refused_run_names_who_refused_it() {
         let detail = |by| match super::refused_cause(by, "no") {
-            weft_core::exec::CancelCause::Runtime { detail } => detail,
+            weft_core::run::CancelCause::Runtime { detail } => detail,
             other => panic!("{other:?}"),
         };
         assert_eq!(detail(RefusedBy::Worker), "its worker refused it 3 times: no");

@@ -1,4 +1,4 @@
-// THE one snake_case -> camelCase remap for the dispatcher's
+// THE one parse of the dispatcher's
 // `/projects/{id}/status` payload (identical whether it arrives via
 // `weft status --json` on the CLI or a direct HTTP fetch). Every host
 // (the VS Code extension, a browser-based editor) builds its
@@ -11,12 +11,16 @@ import type {
   ActionVerb,
   ChangeProgress,
   BackendSnapshot,
-  ExecutionPhase,
+  InstanceHoldings,
+  InstanceInfraEntry,
+  OwnerTriggers,
+  RunPhase,
   ProjectTransition,
+  TriggerEntry,
 } from './protocol';
-import { EXECUTION_PHASES } from './protocol';
+import { RUN_PHASES } from './protocol';
 
-/// The raw dispatcher status payload (snake_case wire shape). Only the
+/// The raw dispatcher status payload (the wire shape). Only the
 /// fields the frontends consume; extra fields are ignored.
 // SYNC: RawStatusPayload <-> crates/weft-core/src/projects.rs ProjectStatusResponse
 export interface RawStatusPayload {
@@ -24,38 +28,32 @@ export interface RawStatusPayload {
   removing?: boolean;
   status?: string;
   transition?: string;
-  mode?: string;
-  fires_deadline_unix?: number;
-  running_count?: number;
-  orphaned_infra?: boolean;
-  infra_rollup?: string;
-  infra_busy?: boolean;
+  orphanedInfra?: boolean;
+  infraRollup?: string;
+  infraBusy?: boolean;
   builds?: Array<{ image: string; build: string; startedAtUnix: number; logUrl?: string }>;
   infra?: Array<{
     node?: string;
-    node_type?: string;
+    nodeType?: string;
     status?: string;
     failureStage?: string;
     failureMessage?: string;
-    instance_copy_count?: number;
+    instanceCopyCount?: number;
     progress?: ChangeProgress;
+    behind?: boolean;
+    takesDown?: OwnerTriggers[];
   }>;
-  drift?: {
-    binary_drift?: boolean;
-    definition_drift?: boolean;
-    infra_drift?: boolean;
-    activation_drift?: boolean;
-  };
-  available_actions?: string[];
-  preservation?: { parked?: number; suspended?: number };
-  activations?: Array<{ trigger?: string; instance?: string; status?: string }>;
-  executions?: {
-    last_status?: string;
-    last_execution_id?: string;
-    /** Every execution running right now, oldest first, with what it
+  instanceInfra?: InstanceInfraEntry[];
+  triggers?: TriggerEntry[];
+  instances?: InstanceHoldings[];
+  availableActions?: string[];
+  runs?: {
+    lastStatus?: string;
+    lastRunId?: string;
+    /** Every run running right now, oldest first, with what it
      *  is for; the editor replaces its running set with this on each
      *  refresh. */
-    running?: RunningExecution[];
+    running?: GoingRun[];
   };
 }
 
@@ -64,7 +62,7 @@ export interface RawStatusPayload {
 // SYNC: PROJECT_BEING_REMOVED <-> crates/weft-core/src/projects.rs PROJECT_BEING_REMOVED
 export const PROJECT_BEING_REMOVED = 'the project is being removed; run `weft rm` again to finish removing it';
 
-// SYNC: infra_rollup values <-> crates/weft-core/src/projects.rs ProjectStatusResponse.infra_rollup
+// SYNC: infraRollup values <-> crates/weft-core/src/projects.rs ProjectStatusResponse.infra_rollup
 const VALID_ROLLUPS = [
   'none',
   'stopped',
@@ -77,11 +75,11 @@ const VALID_ROLLUPS = [
   'provisioning',
 ] as const;
 
+// SYNC: VALID_STATUSES <-> crates/weft-core/src/projects.rs ProjectStatus
 const VALID_STATUSES = [
   'registered',
   'activating',
   'active',
-  'deactivating',
   'inactive',
 ] as const;
 
@@ -104,102 +102,98 @@ export function emptyActionAvailability(): ActionAvailability {
   return {
     removing: false,
     availableActions: [],
-    binaryDrift: false,
-    definitionDrift: false,
-    infraDrift: false,
     projectStatus: 'unknown',
     transition: 'none',
     orphanedInfra: false,
-    mode: 'unknown',
-    runningCount: 0,
-    triggersOff: [],
     infraRollup: 'none',
     infraBusy: false,
     infraNodes: [],
-    preservation: { parked: 0, suspended: 0 },
+    instanceInfra: [],
+    triggers: [],
+    instances: [],
   };
 }
 
 /// Parse a raw status payload into the shared `ActionAvailability`.
-/// Unknown enum strings collapse to their resting value rather than
-/// crashing the bar (a version-skewed dispatcher shouldn't brick the
-/// UI); the raw string is still visible via a status refetch once the
-/// client updates.
+/// The project-wide words (status, transition, rollup) collapse to their
+/// resting value when unknown, rather than crashing the bar (a
+/// version-skewed dispatcher shouldn't brick the UI). A trigger state it
+/// does not know throws instead: drawn, it would be a badge on a node
+/// saying something untrue about it.
 export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
-  const drift = raw.drift ?? {};
   const statusStr = String(raw.status ?? 'unknown');
   const projectStatus = (VALID_STATUSES as readonly string[]).includes(statusStr)
     ? (statusStr as ActionAvailability['projectStatus'])
     : 'unknown';
   const transition = parseTransition(raw.transition);
-  const rollupStr = String(raw.infra_rollup ?? 'none');
+  const rollupStr = String(raw.infraRollup ?? 'none');
   const infraRollup = (VALID_ROLLUPS as readonly string[]).includes(rollupStr)
     ? (rollupStr as ActionAvailability['infraRollup'])
     : 'none';
-  const firesDeadlineUnix =
-    typeof raw.fires_deadline_unix === 'number' ? raw.fires_deadline_unix : undefined;
+  const localNowUnix = Date.now() / 1000;
   const infraNodes = (Array.isArray(raw.infra) ? raw.infra : []).map((n) => ({
     node: n.node ?? '',
-    nodeType: n.node_type ?? '',
+    nodeType: n.nodeType ?? '',
     status: n.status ?? 'unknown',
     ...(n.failureStage !== undefined ? { failureStage: n.failureStage } : {}),
     ...(n.failureMessage !== undefined ? { failureMessage: n.failureMessage } : {}),
-    ...(n.instance_copy_count !== undefined ? { instanceCopyCount: n.instance_copy_count } : {}),
-    ...(n.progress !== undefined ? { progress: progressOnLocalClock(n.progress, Date.now() / 1000) } : {}),
+    ...(n.instanceCopyCount !== undefined ? { instanceCopyCount: n.instanceCopyCount } : {}),
+    ...(n.progress !== undefined ? { progress: progressOnLocalClock(n.progress, localNowUnix) } : {}),
+    ...(n.behind ? { behind: true } : {}),
+    ...(n.takesDown?.length ? { takesDown: n.takesDown } : {}),
   }));
+  const instanceInfra = (raw.instanceInfra ?? []).map((copy) =>
+    copy.progress !== undefined ? { ...copy, progress: progressOnLocalClock(copy.progress, localNowUnix) } : copy,
+  );
   return {
     removing: !!raw.removing,
-    availableActions: (Array.isArray(raw.available_actions)
-      ? raw.available_actions
+    availableActions: (Array.isArray(raw.availableActions)
+      ? raw.availableActions
       : []) as ActionVerb[],
-    binaryDrift: !!drift.binary_drift,
-    definitionDrift: !!drift.definition_drift,
-    infraDrift: !!drift.infra_drift,
     projectStatus,
     transition,
-    orphanedInfra: !!raw.orphaned_infra,
-    mode: String(raw.mode ?? 'unknown'),
-    ...(firesDeadlineUnix !== undefined ? { firesDeadlineUnix } : {}),
-    runningCount: Number(raw.running_count ?? 0),
-    triggersOff: triggersOff(raw),
+    orphanedInfra: !!raw.orphanedInfra,
     infraRollup,
-    infraBusy: !!raw.infra_busy,
+    infraBusy: !!raw.infraBusy,
     infraNodes,
-    preservation: {
-      parked: Number(raw.preservation?.parked ?? 0),
-      suspended: Number(raw.preservation?.suspended ?? 0),
-    },
+    instanceInfra,
+    triggers: (raw.triggers ?? []).map(parseTriggerEntry),
+    instances: raw.instances ?? [],
   };
 }
 
-/// The program's own triggers that are off: registered and never
-/// switched on, or taken down. An instance's copies are its own and stay
-/// out of it, as the bar acts on the program's.
-// SYNC: triggersOff <-> crates/weft-dispatcher/src/api/project.rs is_down
-function triggersOff(raw: RawStatusPayload): string[] {
-  return (raw.activations ?? [])
-    .filter((a) => !a.instance && (a.status === 'registered' || a.status === 'inactive'))
-    .map((a) => a.trigger ?? '')
-    .filter((trigger) => trigger !== '');
+// SYNC: TRIGGER_STATES <-> crates/weft-core/src/projects.rs TriggerState
+const TRIGGER_STATES = ['off', 'turning_on', 'on', 'behind'] as const;
+
+/// One trigger entry, its every state checked: a state the editor does
+/// not know is a wire drift and throws, rather than being drawn as a
+/// state it may not be.
+function parseTriggerEntry(entry: TriggerEntry): TriggerEntry {
+  for (const copy of [...(entry.shared ? [entry.shared] : []), ...(entry.copies ?? [])]) {
+    if (!(TRIGGER_STATES as readonly string[]).includes(copy.state)) {
+      throw new Error(`status names a trigger state the editor cannot read: ${JSON.stringify(entry)}`);
+    }
+  }
+  return entry;
 }
 
-/// One execution running right now, and what it is for.
-// SYNC: RunningExecution <-> crates/weft-core/src/projects.rs RunningExecution
-export interface RunningExecution {
-  execution_id: string;
-  phase: ExecutionPhase;
+/// One run running right now, and what it is for.
+// SYNC: GoingRun <-> crates/weft-core/src/projects.rs GoingRun
+export interface GoingRun {
+  runId: string;
+  phase: RunPhase;
 }
 
-/// The running executions a status payload names, oldest first. An
+/// The running runs a status payload names, oldest first. An
 /// entry whose phase is not one the editor knows is a wire drift and
 /// throws, rather than being shown as a run it may not be.
-export function parseRunning(raw: RawStatusPayload): RunningExecution[] {
-  const running = raw.executions?.running ?? [];
+export function parseRunning(raw: RawStatusPayload): GoingRun[] {
+  const running = raw.runs?.running ?? [];
   return running.map((entry) => {
-    if (typeof entry?.execution_id !== 'string' || !EXECUTION_PHASES.includes(entry.phase)) {
-      throw new Error(`status names a running execution the editor cannot read: ${JSON.stringify(entry)}`);
+    if (typeof entry?.runId !== 'string' || !RUN_PHASES.includes(entry.phase)) {
+      throw new Error(`status names a running run the editor cannot read: ${JSON.stringify(entry)}`);
     }
-    return { execution_id: entry.execution_id, phase: entry.phase };
+    return { runId: entry.runId, phase: entry.phase };
   });
 }
 
@@ -222,14 +216,8 @@ export function backendFromSnapshot(snapshot: ActionAvailability): BackendSnapsh
     status: snapshot.projectStatus,
     transition: snapshot.transition,
     orphanedInfra: snapshot.orphanedInfra,
-    mode: snapshot.mode,
     infraRollup: snapshot.infraRollup,
     infraBusy: snapshot.infraBusy,
-    runningCount: snapshot.runningCount,
-    triggersOff: snapshot.triggersOff,
-    ...(snapshot.firesDeadlineUnix !== undefined
-      ? { firesDeadlineUnix: snapshot.firesDeadlineUnix }
-      : {}),
   };
 }
 

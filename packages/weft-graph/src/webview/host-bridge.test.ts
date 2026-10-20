@@ -86,6 +86,7 @@ describe('translateProject', () => {
       parentGroupId,
       childGroupIds: [],
       nodeIds: [],
+      anonymous: false,
     });
     const host = {
       id: 'p1',
@@ -113,6 +114,7 @@ describe('translateProject', () => {
       parentGroupId,
       childGroupIds: [],
       nodeIds: [],
+      anonymous: false,
     });
     const host = {
       id: 'p1',
@@ -127,6 +129,33 @@ describe('translateProject', () => {
     expect(labels.get('@src:cards:read_cards.rows')).toBe('rows');
   });
 
+  it("marks an included file's own group, and no other", () => {
+    // The file's top-level group is the one the editor opens by default
+    // (`expandedOf`), so the flag has to survive the translation.
+    const group = (id: string, parentGroupId: string | null, anonymous: boolean) => ({
+      id,
+      kind: 'group' as const,
+      label: null,
+      inPorts: [],
+      outPorts: [],
+      parentGroupId,
+      childGroupIds: [],
+      nodeIds: [],
+      anonymous,
+    });
+    const host = {
+      id: 'p1',
+      nodes: [],
+      edges: [],
+      groups: [group('@src:cards:read_cards', null, true), group('@src:cards:read_cards.rows', '@src:cards:read_cards', false)],
+    } as unknown as HostProject;
+
+    const v1 = translateProject(host, 'src', '');
+    const anonymous = new Map(v1.nodes.map((n) => [n.id, n.anonymous]));
+    expect(anonymous.get('@src:cards:read_cards')).toBe(true);
+    expect(anonymous.get('@src:cards:read_cards.rows')).toBeUndefined();
+  });
+
   it("carries a group's `_should_flow` literal across as a port literal", () => {
     const host = {
       id: 'p1',
@@ -136,13 +165,13 @@ describe('translateProject', () => {
         {
           id: 'off', kind: 'group' as const, label: null,
           inPorts: [], outPorts: [],
-          parentGroupId: null, childGroupIds: [], nodeIds: [],
+          parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
           portLiterals: { _should_flow: false },
         },
         {
           id: 'on', kind: 'group' as const, label: null,
           inPorts: [], outPorts: [],
-          parentGroupId: null, childGroupIds: [], nodeIds: [],
+          parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
         },
       ],
     } as unknown as HostProject;
@@ -151,5 +180,174 @@ describe('translateProject', () => {
     const byId = new Map(v1.nodes.map((n) => [n.id, n]));
     expect(byId.get('off')?.portLiterals).toEqual({ _should_flow: false });
     expect(byId.get('on')?.portLiterals).toBeUndefined();
+  });
+
+  it("puts a group's `@file` marker back in place of the resolved content, as for a node", () => {
+    const ref = { path: 'prompt.txt', type: 'String', marker: 'file' as const };
+    const marker = { __weftFileRef: ref };
+    const host = {
+      id: 'p1',
+      nodes: [
+        {
+          id: 'n', nodeType: 'Text', label: null, config: {},
+          position: { x: 0, y: 0 }, scope: [], groupBoundary: null,
+          inputs: [], outputs: [], features: {},
+          portLiterals: { text: 'resolved content' },
+          fileRefs: { text: ref },
+        },
+      ],
+      edges: [],
+      groups: [
+        {
+          id: 'g', kind: 'group' as const, label: null,
+          inPorts: [], outPorts: [],
+          parentGroupId: null, childGroupIds: [], nodeIds: [], anonymous: false,
+          portLiterals: { prompt: 'resolved content', other: 'plain' },
+          fileRefs: { prompt: ref },
+        },
+      ],
+    } as unknown as HostProject;
+
+    const v1 = translateProject(host, 'src', '');
+    const byId = new Map(v1.nodes.map((n) => [n.id, n]));
+    expect(byId.get('g')?.portLiterals).toEqual({ prompt: marker, other: 'plain' });
+    expect(byId.get('n')?.portLiterals).toEqual({ text: marker });
+  });
+});
+
+/** The compiled program has one wire per value, end to end, naming the
+ *  group ports it passes; the editor draws the legs a person wrote. */
+describe('legsOf: a compiled wire back into the legs a person wrote', () => {
+  const group = (id: string, parentGroupId: string | null = null, kind: 'group' | 'loop' = 'group') => ({
+    id, kind, label: null, inPorts: [], outPorts: [], parentGroupId,
+    childGroupIds: [], nodeIds: [], anonymous: false,
+    ...(kind === 'loop' ? { loopConfig: {} } : {}),
+  });
+  const node = (id: string, scope: string[] = [], groupBoundary: { groupId: string; role: 'In' | 'Out' } | null = null) => ({
+    id, nodeType: groupBoundary ? (groupBoundary.role === 'In' ? 'LoopIn' : 'LoopOut') : 'Text',
+    label: null, config: {}, position: { x: 0, y: 0 }, scope, groupBoundary,
+    inputs: [], outputs: [], features: {},
+  });
+  const legs = (host: unknown) =>
+    translateProject(host as HostProject, 'src', '').edges
+      .map((e) => `${e.source}.${e.sourceHandle} -> ${e.target}.${e.targetHandle}${e.path ? ` [${e.path.join('.')}]` : ''}`)
+      .sort();
+
+  it('draws the leg into a fanned-out group port once, with a stable id', () => {
+    const host = {
+      id: 'p', groups: [group('g')],
+      nodes: [node('a'), node('g.m1', ['g']), node('g.m2', ['g'])],
+      edges: [
+        { id: 'e-a-out-in:g:x-g.m1-in', source: 'a', sourceHandle: 'out', target: 'g.m1', targetHandle: 'in', via: [{ group: 'g', port: 'x', side: 'in' }] },
+        { id: 'e-a-out-in:g:x-g.m2-in', source: 'a', sourceHandle: 'out', target: 'g.m2', targetHandle: 'in', via: [{ group: 'g', port: 'x', side: 'in' }] },
+      ],
+    };
+    expect(legs(host)).toEqual([
+      'a.out -> g.x',
+      'g.x__inner -> g.m1.in',
+      'g.x__inner -> g.m2.in',
+    ]);
+    // The id is the leg's four ends, the same one the optimistic
+    // projection gives a leg it adds, so a reparse keeps the leg's identity.
+    const v1 = translateProject(host as unknown as HostProject, 'src', '');
+    expect(v1.edges.map((e) => e.id).sort()).toEqual([
+      'e-a-out-g-x',
+      'e-g-x__inner-g.m1-in',
+      'e-g-x__inner-g.m2-in',
+    ]);
+  });
+
+  it("draws a send from a group's own input as the inside leg alone", () => {
+    // `g.x = 5` outside: nothing leads to the port, the group sends the
+    // literal when it opens.
+    const host = {
+      id: 'p', groups: [group('g')],
+      nodes: [node('g.m', ['g'])],
+      edges: [
+        { id: 'e-g-x-in:g:x-g.m-in', source: 'g', sourceHandle: 'x', target: 'g.m', targetHandle: 'in', via: [{ group: 'g', port: 'x', side: 'in' }] },
+      ],
+    };
+    expect(legs(host)).toEqual(['g.x__inner -> g.m.in']);
+  });
+
+  it('draws a wire that stops at a port nobody reads as the leg up to it', () => {
+    const host = {
+      id: 'p', groups: [group('g')],
+      nodes: [node('a'), node('g.m', ['g'])],
+      edges: [
+        // Into an input no member reads.
+        { id: 'e-a-out-in:g:x-g-x', source: 'a', sourceHandle: 'out', target: 'g', targetHandle: 'x', via: [{ group: 'g', port: 'x', side: 'in' }] },
+        // Out of a member into an output nobody outside reads.
+        { id: 'e-g.m-out-out:g:y-g-y', source: 'g.m', sourceHandle: 'out', target: 'g', targetHandle: 'y', via: [{ group: 'g', port: 'y', side: 'out' }] },
+      ],
+    };
+    expect(legs(host)).toEqual([
+      'a.out -> g.x',
+      'g.m.out -> g.y__inner',
+    ]);
+  });
+
+  it("draws a gate wire as legs ending on the group's own gate", () => {
+    // `g._should_flow = h.done`, where `h.done` is written inside `h`.
+    const host = {
+      id: 'p', groups: [group('h'), group('g')],
+      nodes: [node('h.k', ['h']), node('g.m', ['g'])],
+      edges: [
+        { id: 'e-h.k-ok-out:h:done-g-_should_flow', source: 'h.k', sourceHandle: 'ok', target: 'g', targetHandle: '_should_flow', via: [{ group: 'h', port: 'done', side: 'out' }] },
+      ],
+    };
+    expect(legs(host)).toEqual([
+      'h.done -> g._should_flow',
+      'h.k.ok -> h.done__inner',
+    ]);
+  });
+
+  it('draws a wire across two nested groups as one leg per line, each with its own keys', () => {
+    // `outer.x = a.out.p`, `inner.y = self.x`, `m.in = self.y.q`.
+    const host = {
+      id: 'p', groups: [group('outer'), group('outer.inner', 'outer')],
+      nodes: [node('a'), node('outer.inner.m', ['outer', 'outer.inner'])],
+      edges: [
+        {
+          id: 'e-a-out-in:outer:x-in:outer.inner:y-outer.inner.m-in',
+          source: 'a', sourceHandle: 'out', target: 'outer.inner.m', targetHandle: 'in',
+          path: ['p', 'q'],
+          via: [
+            { group: 'outer', port: 'x', side: 'in', path: ['p'] },
+            { group: 'outer.inner', port: 'y', side: 'in' },
+          ],
+        },
+      ],
+    };
+    expect(legs(host)).toEqual([
+      'a.out -> outer.x [p]',
+      'outer.inner.y__inner -> outer.inner.m.in [q]',
+      'outer.x__inner -> outer.inner.y',
+    ]);
+  });
+
+  it("draws a loop's boundary nodes as the loop box's two faces", () => {
+    const host = {
+      id: 'p', groups: [group('l', null, 'loop')],
+      nodes: [
+        node('a'), node('b'), node('l.m', ['l']),
+        node('l__in', [], { groupId: 'l', role: 'In' }),
+        node('l__out', [], { groupId: 'l', role: 'Out' }),
+      ],
+      edges: [
+        { id: 'e-a-out-l__in-items', source: 'a', sourceHandle: 'out', target: 'l__in', targetHandle: 'items' },
+        { id: 'e-l__in-items-l.m-in', source: 'l__in', sourceHandle: 'items', target: 'l.m', targetHandle: 'in' },
+        { id: 'e-l.m-out-l__out-all', source: 'l.m', sourceHandle: 'out', target: 'l__out', targetHandle: 'all' },
+        { id: 'e-l__out-all-b-in', source: 'l__out', sourceHandle: 'all', target: 'b', targetHandle: 'in' },
+      ],
+    };
+    expect(legs(host)).toEqual([
+      'a.out -> l.items',
+      'l.all -> b.in',
+      'l.items__inner -> l.m.in',
+      'l.m.out -> l.all__inner',
+    ]);
+    const v1 = translateProject(host as unknown as HostProject, 'src', '');
+    expect(v1.nodes.map((n) => n.id).sort()).toEqual(['a', 'b', 'l', 'l.m']);
   });
 });

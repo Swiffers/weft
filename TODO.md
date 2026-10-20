@@ -130,7 +130,7 @@ which promised this primitive before it existed.
 how many run at once: a 10k-element list launches 10k concurrent
 iterations, and a stream-driven parallel loop launches a lane per
 arriving item the same way (the producer's buffer cap gives no
-backpressure, because items launch instead of buffering). `max_iters`
+backpressure, because items launch instead of buffering). `maxIters`
 caps the TOTAL, which is a different question from "how many in
 flight".
 
@@ -297,13 +297,13 @@ Not now: it is a real piece of infrastructure, not an afternoon.
 
 ## Type rules in metadata: an output typed from the node's other ports
 
-Two nodes want an output whose type the metadata cannot write down as a
-single type, and today each fakes it: `FirstInOrder` emits whichever
-branch survived, so its output is really the UNION of what its created
-inputs carry, and `LlmInference.response` is a `String` without
-`parseJson` and a record or `JsonDict` with it. Both are `MustOverride`
-or a type variable now, and the author restates the type in the
-signature every time.
+A node can want an output whose type the metadata cannot write down as
+a single type: `FirstInOrder` emits whichever branch survived, so its
+output is really the UNION of what its created inputs carry. It uses a
+type variable shared by every created input now, so two branches of
+different types need the type declared on the node. (`LlmInference`
+was the other case; it is two nodes now, `LlmInference` answering text
+and `LlmInferenceJson` with a narrowable `response`.)
 
 The feature is a small rule language in `metadata.json` (an output typed
 as "the union of these inputs", "this type when that input is true"),
@@ -502,7 +502,7 @@ million rows.
 
 **Direction.** Write stream items in windows, the way a bus already
 batches its appends. This belongs with the packed record format of the
-current performance work (one write per step for a durable run, one
+current performance work (one write per firing for a durable run, one
 compact row per run for a fast one), which cuts the rows per item for
 the same reason it cuts them per run.
 
@@ -541,7 +541,7 @@ async fn ping(request) {
 
 **Measured on 2026-10-08**, after the performance round (fast and durable
 runs, callers straight to the worker, one journal writer per worker, the
-program's facts worked out once per program, a step that ends at once run on
+program's facts worked out once per program, a firing that ends at once run on
 the drive's own task). The bench project (40 nodes, `bench/weft-project`),
 its unrecorded ping (`Route` to `JsonObject` to `Reply`):
 
@@ -552,7 +552,7 @@ its unrecorded ping (`Route` to `JsonObject` to `Reply`):
   CPU per call (axum in Docker: about 50 µs). A profile of that worker,
   taken before unrecorded runs stopped keeping their history, put about
   half of its CPU in the drive loop (readiness, settling boundaries,
-  building each step's input bag, applying emissions) and the rest around
+  building each firing's input bag, applying emissions) and the rest around
   it: serving the call, the door, the run's birth, the record.
 - Throughput: 23,181 unrecorded and 12,092 fast pings a second, against
   axum's 36,996 behind Docker's port relay; 0.6 ms and 0.7 ms at one caller
@@ -570,7 +570,7 @@ measure again (`bench/README.md` has the worker-side profile).
 1. **Keep the interpreter, precompile its plan.** Everything the loop
    works out at run time (who feeds whom, which inputs are required,
    which ports are wired) becomes plain numbers decided at compile time:
-   no name lookups, no scan of every node each step, and a straight
+   no name lookups, no scan of every node on every pass, and a straight
    chain runs in place instead of starting a task per node. Pausing and
    resuming do not change.
 2. **Compile the wiring fully**, as in the sketch: a wire costs what a
@@ -674,3 +674,53 @@ work around it.
 
 [Update Notice Warning] If we touch `catalog/basic/exec_python/mod.rs`'s
 process pool, revisit this entry.
+
+## On-demand infra: units that scale with requests, to zero
+
+**What.** Today every infra unit is a machine kept up while its infra is
+started (locally a container, on GCP a Compute Engine VM). Add a second
+way for a unit to run, chosen by the NODE'S AUTHOR in the infra
+description `provision_infra` returns (`Unit`,
+`crates/weft-core/src/infra/types.rs`): on demand, with a maximum number
+of copies and how many requests one copy takes. Copies start when
+requests arrive and stop when idle, down to zero. A node's users never
+see it unless the author exposes it as an ordinary input of the node.
+
+**Settled (2026-10-19):**
+- It is for any kind of infra, not a GPU feature, and it is the author's
+  call: no refusal for on-demand with a disk or a non-HTTP port. The
+  author is choosing Cloud Run-style running and its limits (no
+  persistent disk, HTTP only, a request capped at 60 minutes on GCP); the
+  node-authoring docs and the option's own description say so.
+- Sizing uses the machine choice that exists: the unit says the CPU,
+  memory and GPU it needs, and the platform picks what fits; `type` (or a
+  GPU name) names one exactly. A GPU is asked for by the GPU memory it
+  needs, or by name. A name the provider does not offer, or a GPU that
+  cannot be had (quota, permission, region), is a loud error: never
+  another card, never a fallback to CPU.
+- Per platform: GCP runs an on-demand unit as a Cloud Run service sized
+  from those numbers (raised to Cloud Run's minimums: an L4 needs 4 CPU
+  and 16 GiB); locally it stays one container; other providers map it to
+  their own scaling service later (Azure Container Apps has scale-to-zero
+  GPUs; AWS has no serverless GPU container today).
+- Big files a unit needs at start (model weights) come from weft's own
+  storage, which on a cloud is that cloud's object store in the same
+  region (Google's recommended fast path): `FetchToStorage` keeps the
+  file, the file goes to the infra node as a setting, the container
+  downloads it at start through a direct link. Nothing new in weft for
+  that; check the infra's start-up code can mint the link.
+
+**What the GCP side needs:** the supervisor managing Cloud Run services
+(create, update, delete; weft already does this for its own workers),
+`ctx.endpoint` handing out the service's address and its callers sending
+an identity token (or ingress limited to the project's network), a
+health reading where zero copies is healthy and stop means delete or cap
+at zero, sidecars for a unit's extra containers, in-memory volumes for
+scratch, an equivalent for init containers, `@per_instance` copies as one
+service each, and the Cloud Run rights in Terraform. Do it after the
+`lifecycle` branch lands (it edits the supervisor too).
+
+Facts from Google's docs (2026-10): Cloud Run GPUs are GA (L4 24 GB,
+RTX PRO 6000 96 GB, one per copy, a few regions), scale to zero, start in
+about 5 seconds plus model load, stay warm up to 10 minutes idle, and are
+billed per second of a copy's life with a 1 minute minimum.

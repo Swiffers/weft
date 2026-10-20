@@ -24,11 +24,8 @@ pub async fn mint_instance_token(
     if caller.role != Role::Worker {
         return Err((StatusCode::FORBIDDEN, "worker only".into()));
     }
-    let run = crate::scope::require_execution_id_scope(&state.scope_cache, &state.pool, &caller, req.execution_id).await?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_secs();
+    let run = crate::scope::require_run_id_scope(&state.scope_cache, &state.pool, &caller, req.run_id).await?;
+    let now = crate::handlers::unix_now_secs();
     let expires_at = weft_core::signal_token::expiry_at(now, req.expires_in_secs)
         .map_err(|why| (StatusCode::BAD_REQUEST, why))?;
     let token = weft_core::signal_token::generate_token();

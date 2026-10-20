@@ -4,8 +4,8 @@
 //! upgrade can wait on a drain for hours). The complementary
 //! supervisor-owned verbs (`apply` / `stop` / `terminate`) are
 //! claimed by the pooled supervisor process that owns the project, via the
-//! broker; a stop or terminate that first waits for the running work its
-//! copies reach (`drain_by_unix`) is claimed here for that wait
+//! broker; a stop or terminate that first waits for the runs reaching its
+//! copies to end (`drains`) is claimed here for that wait
 //! (`crate::drain`), and handed on to its supervisor once it is over.
 //!
 //! Why a separate loop rather than reusing the supervisor's claim
@@ -60,7 +60,7 @@ async fn earliest_claim_lapse(pool: &PgPool) -> Result<Option<i64>> {
     Ok(sqlx::query_scalar(&format!(
         "SELECT MIN(claimed_at_unix) + {ttl} FROM infra_lifecycle_command \
          WHERE claimed_by_replica IS NOT NULL AND completed_at_unix IS NULL \
-           AND (verb IN ({verbs}) OR drain_by_unix IS NOT NULL)",
+           AND (verb IN ({verbs}) OR drains)",
         ttl = weft_broker_client::lifecycle_command::CLAIM_LEASE_TTL.as_secs(),
         verbs = weft_broker_client::lifecycle_command::DISPATCHER_VERBS_SQL,
     ))
@@ -109,8 +109,8 @@ async fn claim_and_run_one(state: &DispatcherState) -> Result<bool> {
 /// for a whole lease and another process took the command over), the run
 /// stops here and the new holder answers for it.
 async fn run_and_complete(state: &DispatcherState, row: ClaimedCommand) {
-    if let Some(drain) = row.drain {
-        return drain_then_hand_over(state, &row, drain).await;
+    if row.waits {
+        return drain_then_hand_over(state, &row).await;
     }
     let replica = state.replica.as_str();
     let outcome = tokio::select! {
@@ -155,28 +155,42 @@ async fn run_and_complete(state: &DispatcherState, row: ClaimedCommand) {
 }
 
 /// The wait a stop or terminate does before its supervisor takes it: the
-/// running work its copies reach, through the one drain, cancelled at its
-/// deadline (sparing the run that asked). Once over, the command is handed
-/// on: its drain cleared and its claim let go, which announces it to the
-/// supervisors. A cancel of the command ends it here, cancelled. The drain
-/// keeps the claim alive at each look it takes ([`CommandClaim`]), so a
-/// wait on runs that only wait touches the database when it looks, not
-/// on a clock of its own. A database failure lets the claim go with the
-/// drain still to do, for the next pass.
-async fn drain_then_hand_over(state: &DispatcherState, row: &ClaimedCommand, drain: crate::infra_lifecycle_command::DrainFirst) {
+/// runs reaching its copies, through the one drain, for as long as they
+/// go (the run that asked is waited for too, never cancelled for it).
+/// Once over, the command is handed on: its wait cleared and its claim let
+/// go, which announces it to the supervisors. A cancel of the command ends
+/// it here, cancelled, and brings back the triggers it took down
+/// (`crate::api::infra::cancel`). The drain keeps the claim alive at each
+/// look it takes ([`CommandClaim`]), so a wait on runs that only wait
+/// touches the database when it looks, not on a clock of its own. A
+/// database failure lets the claim go with the wait still to do, for the
+/// next pass.
+async fn drain_then_hand_over(state: &DispatcherState, row: &ClaimedCommand) {
     let replica = state.replica.as_str();
-    let scope = crate::drain::DrainScope {
-        project_id: row.project_id,
-        reaching: crate::drain::Reaching::Copies(&row.copies),
-        except: drain.asked_by,
+    let project = match state.projects.project(row.project_id).await {
+        Ok(Some(project)) => project,
+        Ok(None) => {
+            let outcome = RunOutcome::Cancelled(format!("project {} no longer exists", row.project_id));
+            if let Err(e) = complete(&state.pg_pool, row.id, replica, &outcome).await {
+                tracing::error!(target: "weft_dispatcher::lifecycle_claimer", command_id = row.id, error = %format!("{e:#}"), "could not record a cancelled command; its claim lapses and the next pass looks again");
+            }
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(target: "weft_dispatcher::lifecycle_claimer", command_id = row.id, error = %format!("{e:#}"), "could not read the program this take-down waits on; it is looked at again once its claim lapses");
+            return;
+        }
     };
-    let left = u64::try_from(drain.by_unix - crate::lease::now_unix()).unwrap_or(0);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(left);
+    let reach = crate::infra_reach::InfraReach::of_command(&project, row.node_id.as_deref(), row.copies.clone());
+    let scope = crate::drain::DrainScope { project_id: row.project_id, reaching: crate::drain::Reaching::Infra { reach: &reach, tokens: &row.waits_on_tokens } };
     let claim = CommandClaim { id: row.id, replica };
     let ended = tokio::select! {
-        drained = crate::drain::drain(state, &scope, Some(deadline), crate::infra_lifecycle_command::RunningPolicy::Wait, Some(&claim)) => drained,
+        drained = crate::drain::drain(state, &scope, Some(&claim)) => drained,
         () = cancelled(state, row.id) => {
-            let outcome = RunOutcome::Cancelled("cancelled while waiting for the running work".into());
+            let outcome = RunOutcome::Cancelled("cancelled while waiting for the runs reaching it".into());
+            // The copies never went down: what went down with them comes
+            // back once this ending is heard
+            // (`crate::infra_lifecycle_command::SinceTakeDown`).
             if let Err(e) = complete(&state.pg_pool, row.id, replica, &outcome).await {
                 tracing::error!(target: "weft_dispatcher::lifecycle_claimer", command_id = row.id, error = %format!("{e:#}"), "could not record a cancelled command; its claim lapses and the next pass looks again");
             }
@@ -184,8 +198,8 @@ async fn drain_then_hand_over(state: &DispatcherState, row: &ClaimedCommand, dra
         }
     };
     let handed = match ended {
-        Ok(_) => sqlx::query(
-            "UPDATE infra_lifecycle_command SET drain_by_unix = NULL, claimed_by_replica = NULL, claimed_at_unix = NULL \
+        Ok(()) => sqlx::query(
+            "UPDATE infra_lifecycle_command SET drains = FALSE, claimed_by_replica = NULL, claimed_at_unix = NULL \
              WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL",
         )
         .bind(row.id)
@@ -329,10 +343,16 @@ pub struct ClaimedCommand {
     spec_json: Option<serde_json::Value>,
     /// Whose copies an upgrade cycles (`None`: the shared ones).
     instance: Option<weft_core::instance::InstanceId>,
+    /// The place a take-down acts on, `None` for every one of its copies'
+    /// kind.
+    node_id: Option<String>,
     /// The copies a take-down acts on.
     copies: weft_core::instance::Copies,
     /// A stop or terminate claimed for the wait it does first.
-    drain: Option<crate::infra_lifecycle_command::DrainFirst>,
+    waits: bool,
+    /// The entry tokens of the triggers taken down with it, as they stood
+    /// before (`infra_lifecycle_command.waits_on_tokens`).
+    waits_on_tokens: Vec<String>,
 }
 
 /// Atomic claim: UPDATE the row AND parse its typed columns in one
@@ -349,20 +369,20 @@ pub async fn claim_one(pool: &PgPool, claimer_replica: &str) -> Result<Option<Cl
     use sqlx::Row;
     // Claim predicate (shared with the broker's supervisor claim):
     // either no current claimer OR an expired lease. The lease lets
-    // a dispatcher that crashed mid-execution release the row
+    // a dispatcher that crashed mid-run release the row
     // automatically after `CLAIM_LEASE_TTL` instead of pinning it.
     //
     // A project's health verbs (`deactivate` / `reactivate`) run one at
     // a time, in issue order: each claimed command runs on its own task,
-    // so without this a park and the recovery right after it could run
-    // at once and the park land last, leaving the triggers down. An
+    // so without this a take-down and the recovery right after it could
+    // run at once and the take-down land last, leaving the triggers down. An
     // upgrade is not held behind them, nor holds them.
     let sql = format!(
         "UPDATE infra_lifecycle_command \
          SET claimed_by_replica = $1, claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
          WHERE id = ( \
             SELECT c.id FROM infra_lifecycle_command c \
-            WHERE (c.verb IN ({verbs}) OR c.drain_by_unix IS NOT NULL) \
+            WHERE (c.verb IN ({verbs}) OR c.drains) \
               AND {predicate} \
               AND NOT (c.verb IN ({health}) AND EXISTS ( \
                 SELECT 1 FROM infra_lifecycle_command o \
@@ -374,7 +394,7 @@ pub async fn claim_one(pool: &PgPool, claimer_replica: &str) -> Result<Option<Cl
             FOR UPDATE SKIP LOCKED \
             LIMIT 1 \
          ) \
-         RETURNING id, project_id, verb, spec_json, instance_id, every_copy, drain_by_unix, asked_by",
+         RETURNING id, project_id, node_id, verb, spec_json, instance_id, every_copy, drains, waits_on_tokens",
         verbs = weft_broker_client::lifecycle_command::DISPATCHER_VERBS_SQL,
         predicate = weft_broker_client::lifecycle_command::claimable_predicate(),
         health = format!(
@@ -426,18 +446,16 @@ fn decode_row(r: &sqlx::postgres::PgRow) -> Result<ClaimedCommand> {
         .map(weft_core::instance::InstanceId::new)
         .transpose()
         .map_err(|e| anyhow::anyhow!("corrupt instance_id on id={id}: {e}"))?;
-    let drain = r
-        .try_get::<Option<i64>, _>("drain_by_unix")?
-        .map(|by_unix| -> Result<_> { Ok(crate::infra_lifecycle_command::DrainFirst { by_unix, asked_by: r.try_get("asked_by")? }) })
-        .transpose()?;
     Ok(ClaimedCommand {
         id,
         project_id,
         verb,
         spec_json,
         instance,
+        node_id: r.try_get("node_id")?,
         copies,
-        drain,
+        waits: r.try_get("drains")?,
+        waits_on_tokens: r.try_get("waits_on_tokens")?,
     })
 }
 
@@ -482,32 +500,27 @@ async fn run_deactivate(
     take_down: weft_broker_client::protocol::TakeDownReaders,
 ) -> Result<RunOutcome> {
     // The take-down round-tripped through the DB (enqueued as JSON in
-    // infra_lifecycle_command, deserialized on claim), so it's
-    // untrusted input at this point. Validate at the consume boundary
-    // so an impossible combo (e.g. wipe+wait) or a take-down aimed at
-    // nothing fails loud here rather than taking the wrong branch
-    // downstream.
+    // infra_lifecycle_command, deserialized on claim), so it's untrusted
+    // input at this point. Validate at the consume boundary so a
+    // take-down aimed at nothing fails loud here rather than taking the
+    // wrong branch downstream.
     take_down.validate().map_err(|m| anyhow::anyhow!("invalid health take-down: {m}"))?;
     let Some(project) = state.projects.project(project_id).await? else {
         return Ok(RunOutcome::Cancelled(format!("project {project_id} no longer exists")));
     };
     let activations = state.activations.list(project_id).await?;
-    let targets = health_take_down_targets(
-        &crate::api::project::compute_trigger_deps(&project),
-        &activations,
-        &take_down.reach,
-    );
+    let targets = health_take_down_targets(&project, &activations, &take_down.broken);
     if targets.is_empty() {
-        // Nothing listening is reached: nothing to park.
+        // Nothing listening is reached: nothing to take down.
         return Ok(RunOutcome::Succeeded);
     }
     let taken = crate::take_down::take_down(
         state,
         project_id,
         &crate::take_down::TakeDownTarget::Activations(targets),
-        &take_down.spec,
-        // The health loop's own park: its auto-recover may bring it back.
-        Some(crate::take_down::DownWith::Health),
+        &weft_core::take_down::TakeDown::HEALTH,
+        // The health loop's own take-down: its auto-recover may bring it back.
+        crate::take_down::DownCause::Health(&take_down.broken),
         crate::take_down::TakeDownAsker::Outside,
     )
     .await
@@ -525,36 +538,30 @@ async fn run_deactivate(
     Ok(RunOutcome::Succeeded)
 }
 
-/// The live activations a health take-down reaches: every one for a
-/// take-down of the whole project; otherwise those whose triggers read
-/// one of the `broken` copies (the same readers an infra verb on that
-/// copy takes down), and nothing that reads only healthy infra. `deps`
-/// is the program's `(infra, trigger)` reads.
+/// The live activations a health take-down reaches: those whose
+/// trigger's cut contains one of the `broken` copies (the same triggers an
+/// infra verb on that copy takes down), and nothing whose cut has only
+/// healthy infra.
 fn health_take_down_targets(
-    deps: &[(String, String)],
+    project: &weft_core::ProjectDefinition,
     activations: &[crate::activation_store::Activation],
-    reach: &weft_broker_client::protocol::TakeDownReach,
+    broken: &[weft_broker_client::protocol::InfraCopy],
 ) -> Vec<weft_core::activation::ActivationKey> {
-    use weft_broker_client::protocol::TakeDownReach;
-    activations
+    let mut keys: Vec<weft_core::activation::ActivationKey> = broken
         .iter()
-        .filter(|a| a.lifecycle.status == crate::activation_store::ProjectStatus::Active)
-        .filter(|a| {
-            let broken = match reach {
-                TakeDownReach::Project => return true,
-                TakeDownReach::ReadersOf { broken } => broken,
-            };
-            broken.iter().any(|copy| {
-                crate::api::infra::reads(
-                    deps,
-                    &a.key,
-                    &std::collections::BTreeSet::from([copy.node_id.clone()]),
-                    &weft_core::instance::Copies::of(copy.instance.clone()),
-                )
-            })
-        })
-        .map(|a| a.key.clone())
-        .collect()
+        .flat_map(|copy| crate::infra_reach::live_triggers_reached(&copy_reach(copy), activations, project))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// The reach of one copy: its place, its owner's copy of it.
+fn copy_reach(copy: &weft_broker_client::protocol::InfraCopy) -> crate::infra_reach::InfraReach {
+    crate::infra_reach::InfraReach {
+        places: std::collections::BTreeSet::from([copy.node_id.clone()]),
+        copies: weft_core::instance::Copies::of(copy.instance.clone()),
+    }
 }
 
 async fn run_reactivate(
@@ -567,24 +574,38 @@ async fn run_reactivate(
     let Some(project) = state.projects.project(project_id).await? else {
         return Ok(RunOutcome::Cancelled(format!("project {project_id} no longer exists")));
     };
+    // The copies expected to run: one stopped by a person, being worked
+    // on by an infra command, or never applied is not up, whatever the
+    // health check saw of the rest.
+    let observed = crate::infra_node::observe(&state.pg_pool, project_id, &project).await?;
+    let up: std::collections::HashSet<weft_broker_client::protocol::InfraCopy> = observed
+        .rows
+        .iter()
+        .filter(|row| matches!(row.status, crate::infra_node::InfraNodeStatus::Running | crate::infra_node::InfraNodeStatus::Flaky))
+        .map(|row| weft_broker_client::protocol::InfraCopy { node_id: row.node_id.clone(), instance: row.instance.clone() })
+        .collect();
     let targets = health_restore_targets(
-        &crate::api::project::compute_trigger_deps(&project),
+        &project,
         |place| crate::api::infra::is_per_instance_place(&project, place),
         &state.activations.list(project_id).await?,
         &restore.still_broken,
+        |copy| up.contains(copy),
     );
     // Owner by owner (one activation per owner, since a setup run is
     // one owner's).
-    let mut parked: std::collections::BTreeMap<Option<weft_core::instance::InstanceId>, Vec<String>> = Default::default();
+    let mut down: std::collections::BTreeMap<weft_core::instance::Owner, Vec<String>> = Default::default();
     for key in targets {
-        parked.entry(key.instance().cloned()).or_default().push(key.trigger);
+        down.entry(key.owner.clone()).or_default().push(key.trigger);
     }
-    for (instance, triggers) in parked {
+    for (owner, triggers) in down {
         let request = weft_core::activation::ActivateRequest {
-            scope: weft_core::activation::ActivationScope { triggers, instance },
+            scope: weft_core::activation::ActivationScope::of_owner(triggers, &owner),
             ..Default::default()
         };
-        match crate::api::project::activate_inner(state, project_id, request).await {
+        let activated = crate::api::project::activate_with(state, project_id, request, crate::api::project::ActivateAsker::InfraBack)
+            .await
+            .map_err(<(axum::http::StatusCode, String)>::from);
+        match activated {
             Ok(_) => {}
             Err((axum::http::StatusCode::NOT_FOUND, _)) => {
                 return Ok(RunOutcome::Cancelled(format!("project {project_id} no longer exists")));
@@ -597,31 +618,31 @@ async fn run_reactivate(
 
 /// The activations a health recovery restores: those the health loop
 /// took down (they carry its mark, and a person's deactivate clears it)
-/// that are still down, and that read none of the `still_broken`
-/// copies. A trigger reading one copy still broken stays down; one
-/// instance's broken copy never holds back another's readers; a copy the
-/// loop cannot see (nothing says it is broken) holds back nobody.
-/// `deps` is the program's `(infra, trigger)` reads; a trigger reads
-/// the shared copy of a shared node and its owner's copy of a
-/// per-instance one.
+/// that are still down, whose cut contains none of the `still_broken`
+/// copies, and every copy of whose cut is up (`is_up`: running, not
+/// stopped by a person, worked on by an infra command or never applied,
+/// which the health check does not see). A trigger whose cut has one copy
+/// still broken or not up stays down; one instance's copy never holds
+/// back another's triggers. A trigger's cut holds the shared copy of a
+/// shared node and its owner's copy of a per-instance one.
 fn health_restore_targets(
-    deps: &[(String, String)],
+    project: &weft_core::ProjectDefinition,
     per_instance_of: impl Fn(&str) -> bool,
     activations: &[crate::activation_store::Activation],
     still_broken: &[weft_broker_client::protocol::InfraCopy],
+    is_up: impl Fn(&weft_broker_client::protocol::InfraCopy) -> bool,
 ) -> Vec<weft_core::activation::ActivationKey> {
     activations
         .iter()
-        .filter(|a| a.lifecycle.parked_by_health())
+        .filter(|a| a.lifecycle.down_by_health())
         .filter(|a| {
-            !deps
-                .iter()
-                .filter(|(_, trigger)| *trigger == a.key.trigger)
-                .map(|(infra, _)| weft_broker_client::protocol::InfraCopy {
-                    node_id: infra.clone(),
-                    instance: if per_instance_of(infra) { a.key.instance().cloned() } else { None },
+            crate::infra_reach::depends_on(a, project)
+                .into_iter()
+                .map(|infra| weft_broker_client::protocol::InfraCopy {
+                    instance: if per_instance_of(&infra) { a.key.instance().cloned() } else { None },
+                    node_id: infra,
                 })
-                .any(|copy| still_broken.contains(&copy))
+                .all(|copy| !still_broken.contains(&copy) && is_up(&copy))
         })
         .map(|a| a.key.clone())
         .collect()
@@ -630,27 +651,31 @@ fn health_restore_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weft_broker_client::protocol::{InfraCopy, LifecycleOutcome, TakeDownReach};
+    use weft_broker_client::protocol::{InfraCopy, LifecycleOutcome};
     use weft_core::activation::ActivationKey;
     use weft_core::instance::{InstanceId, Owner};
 
-    fn activation(trigger: &str, owner: Owner, status: crate::activation_store::ProjectStatus) -> crate::activation_store::Activation {
+    fn activation(trigger: &str, owner: Owner, status: crate::activation_store::ProjectStatus, depends_on: &[&str]) -> crate::activation_store::Activation {
         let lifecycle = match status {
             crate::activation_store::ProjectStatus::Active => weft_broker_client::activation::ActivationLifecycle::active(),
-            _ => weft_broker_client::activation::ActivationLifecycle::parked(),
+            _ => weft_broker_client::activation::ActivationLifecycle::holding(),
         };
         crate::activation_store::Activation {
             key: ActivationKey::new(trigger, owner),
             lifecycle,
             program: None,
             source_version: None,
+            cut: Some(crate::activation_store::RecordedCut {
+                fingerprint: "f".into(),
+                depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
+            }),
         }
     }
 
     /// An activation the health loop took down.
-    fn by_health(trigger: &str, owner: Owner) -> crate::activation_store::Activation {
-        let mut a = activation(trigger, owner, crate::activation_store::ProjectStatus::Inactive);
-        a.lifecycle.went_down = Some(weft_broker_client::activation::WentDown { with: crate::take_down::DownWith::Health, at_unix: 0 });
+    fn by_health(trigger: &str, owner: Owner, depends_on: &[&str]) -> crate::activation_store::Activation {
+        let mut a = activation(trigger, owner, crate::activation_store::ProjectStatus::Inactive, depends_on);
+        a.lifecycle.went_down = Some(weft_broker_client::activation::WentDown::Health);
         a
     }
 
@@ -658,89 +683,185 @@ mod tests {
         Owner::Instance(InstanceId::new("ada").unwrap())
     }
 
-    /// An instance's broken copy takes down only that instance's live
-    /// triggers that read the node: never a trigger that reads no infra
-    /// (the program's shared `mint`), never another instance's reader,
-    /// never one already down. A broken shared copy takes down every
-    /// owner's readers of it.
-    #[test]
-    fn a_health_take_down_reaches_only_the_readers_of_the_broken_copy() {
-        use crate::activation_store::ProjectStatus::{Active, Inactive};
-        let deps = vec![("svc".to_string(), "up".to_string()), ("db".to_string(), "look".to_string())];
-        let bob = Owner::Instance(InstanceId::new("bob").unwrap());
-        let activations = vec![
-            activation("mint", Owner::Shared, Active),
-            activation("up", ada(), Active),
-            activation("up", bob.clone(), Active),
-            activation("look", ada(), Active),
-            activation("look", Owner::Shared, Active),
-            activation("look", bob.clone(), Inactive),
-        ];
-        let of = |copy: InfraCopy| TakeDownReach::ReadersOf { broken: vec![copy] };
-        let ada_svc = InfraCopy { node_id: "svc".into(), instance: Some(InstanceId::new("ada").unwrap()) };
-        assert_eq!(
-            health_take_down_targets(&deps, &activations, &of(ada_svc)),
-            vec![ActivationKey::new("up", ada())]
-        );
-        let shared_db = InfraCopy { node_id: "db".into(), instance: None };
-        assert_eq!(
-            health_take_down_targets(&deps, &activations, &of(shared_db)),
-            vec![ActivationKey::new("look", ada()), ActivationKey::new("look", Owner::Shared)]
-        );
-        // A protocol whose condition names no infra reaches every live
-        // activation, as it did before copies had owners.
-        assert_eq!(health_take_down_targets(&deps, &activations, &TakeDownReach::Project).len(), 5);
+    fn empty() -> weft_core::ProjectDefinition {
+        serde_json::from_value(serde_json::json!({ "id": uuid::Uuid::nil(), "nodes": [], "edges": [] })).unwrap()
     }
 
-    /// A recovery restores what the health loop parked that reads none
-    /// of the copies still broken: ada's reader of her healed `svc` comes
-    /// back while bob's reader of his still-broken copy stays down, a
-    /// reader of the healthy shared `db` that also reads bob's broken
-    /// copy stays down, and a person's own deactivate (no mark) is never
-    /// overridden.
+    /// An instance's broken copy takes down only that instance's live
+    /// triggers whose cut contains the node: never a trigger whose cut has
+    /// no infra (the program's shared `mint`), never another instance's,
+    /// never one already down. A broken shared copy takes down every
+    /// owner's triggers whose cut contains it.
     #[test]
-    fn a_health_recovery_restores_what_reads_no_broken_copy() {
-        use crate::activation_store::ProjectStatus::Inactive;
-        let deps = vec![
-            ("svc".to_string(), "up".to_string()),
-            ("db".to_string(), "look".to_string()),
-            ("db".to_string(), "both".to_string()),
-            ("svc".to_string(), "both".to_string()),
-        ];
+    fn a_health_take_down_reaches_only_the_triggers_whose_cut_contains_the_broken_copy() {
+        use crate::activation_store::ProjectStatus::{Active, Inactive};
         let bob = Owner::Instance(InstanceId::new("bob").unwrap());
         let activations = vec![
-            by_health("up", ada()),
-            by_health("up", bob.clone()),
-            by_health("look", Owner::Shared),
-            by_health("both", bob.clone()),
-            activation("look", ada(), Inactive),
+            activation("mint", Owner::Shared, Active, &[]),
+            activation("up", ada(), Active, &["svc"]),
+            activation("up", bob.clone(), Active, &["svc"]),
+            activation("look", ada(), Active, &["db"]),
+            activation("look", Owner::Shared, Active, &["db"]),
+            activation("look", bob.clone(), Inactive, &["db"]),
+        ];
+        let ada_svc = InfraCopy { node_id: "svc".into(), instance: Some(InstanceId::new("ada").unwrap()) };
+        assert_eq!(health_take_down_targets(&empty(), &activations, &[ada_svc]), vec![ActivationKey::new("up", ada())]);
+        let shared_db = InfraCopy { node_id: "db".into(), instance: None };
+        assert_eq!(
+            health_take_down_targets(&empty(), &activations, &[shared_db]),
+            vec![ActivationKey::new("look", Owner::Shared), ActivationKey::new("look", ada())]
+        );
+    }
+
+    /// A recovery restores what the health loop took down whose cut
+    /// contains none of the copies still broken: ada's trigger on her
+    /// healed `svc` comes back while bob's on his still-broken copy stays
+    /// down, a trigger on the healthy shared `db` whose cut also holds
+    /// bob's broken copy stays down, and a person's own deactivate (no
+    /// mark) is never overridden.
+    #[test]
+    fn a_health_recovery_restores_what_has_no_broken_copy_in_its_cut() {
+        use crate::activation_store::ProjectStatus::Inactive;
+        let bob = Owner::Instance(InstanceId::new("bob").unwrap());
+        let activations = vec![
+            by_health("up", ada(), &["svc"]),
+            by_health("up", bob.clone(), &["svc"]),
+            by_health("look", Owner::Shared, &["db"]),
+            by_health("both", bob.clone(), &["db", "svc"]),
+            activation("look", ada(), Inactive, &["db"]),
         ];
         let still_broken = vec![InfraCopy { node_id: "svc".into(), instance: Some(InstanceId::new("bob").unwrap()) }];
         assert_eq!(
-            health_restore_targets(&deps, |place| place == "svc", &activations, &still_broken),
+            health_restore_targets(&empty(), |place| place == "svc", &activations, &still_broken, |_| true),
             vec![ActivationKey::new("up", ada()), ActivationKey::new("look", Owner::Shared)]
         );
     }
 
-    /// A shared-only project: a trigger parked for a broken `db` that
-    /// also reads `cache`, a copy the loop has never seen (its apply
-    /// failed), comes back once `db` heals. Nothing says `cache` is
-    /// broken, so it holds nothing back.
+    /// A trigger taken down for a broken `db` whose cut also holds
+    /// `cache`, a copy that is not up (a person stopped it meanwhile, an
+    /// infra command works on it, or its apply failed: the health check sees
+    /// none of these), stays down once `db` heals; it comes back once
+    /// `cache` runs too.
     #[test]
-    fn a_reader_of_an_unseen_copy_is_restored() {
-        let deps = vec![("db".to_string(), "look".to_string()), ("cache".to_string(), "look".to_string())];
-        let activations = vec![by_health("look", Owner::Shared)];
+    fn a_trigger_reading_a_copy_that_is_not_up_stays_down() {
+        let activations = vec![by_health("look", Owner::Shared, &["cache", "db"])];
+        let db = InfraCopy { node_id: "db".into(), instance: None };
+        assert!(health_restore_targets(&empty(), |_| false, &activations, &[], |copy| copy == &db).is_empty());
         assert_eq!(
-            health_restore_targets(&deps, |_| false, &activations, &[]),
+            health_restore_targets(&empty(), |_| false, &activations, &[], |_| true),
             vec![ActivationKey::new("look", Owner::Shared)]
         );
     }
 
+    /// A program with two triggers: `door` reaches the infra node `svc`
+    /// only further down its flow (`door -> parse -> svc`), and `tick`
+    /// reaches no infra (`tick -> log`).
+    fn door_and_tick() -> weft_core::ProjectDefinition {
+        let node = |id: &str, is_trigger: bool, requires_infra: bool| {
+            serde_json::json!({
+                "id": id, "nodeType": "T", "label": null, "config": {}, "position": { "x": 0, "y": 0 },
+                "features": { "isTrigger": is_trigger }, "requiresInfra": requires_infra,
+            })
+        };
+        let edge = |s: &str, t: &str| {
+            serde_json::json!({ "id": format!("e_{s}_{t}"), "source": s, "sourceHandle": "out", "target": t, "targetHandle": "in" })
+        };
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::nil(),
+            "nodes": [node("door", true, false), node("parse", false, false), node("svc", false, true), node("tick", true, false), node("log", false, false)],
+            "edges": [edge("door", "parse"), edge("parse", "svc"), edge("tick", "log")],
+            "groups": [],
+        }))
+        .unwrap()
+    }
+
+    /// `trigger` of `owner`, its cut recorded from `project` the way its
+    /// setup records it, with `lifecycle`.
+    fn set_up(
+        project: &weft_core::ProjectDefinition,
+        trigger: &str,
+        owner: Owner,
+        lifecycle: weft_broker_client::activation::ActivationLifecycle,
+    ) -> crate::activation_store::Activation {
+        crate::activation_store::Activation {
+            key: ActivationKey::new(trigger, owner),
+            lifecycle,
+            program: None,
+            source_version: None,
+            cut: Some(weft_core::run_spec::trigger_cut(project, trigger).unwrap().into()),
+        }
+    }
+
+    /// The health take-down of a broken copy reaches exactly the triggers
+    /// `weft infra stop` of that copy reaches (the same per-trigger
+    /// dependency list, `crate::infra_reach::activations_reached`), of
+    /// those the ones that are on: `door`, which reaches `svc` only two
+    /// nodes down its flow, and never `tick`, which reaches no infra. An
+    /// instance's broken copy reaches only that instance's `door`; the
+    /// shared copy, every owner's.
+    #[test]
+    fn a_health_take_down_reaches_what_weft_infra_stop_of_the_copy_reaches() {
+        use weft_broker_client::activation::ActivationLifecycle;
+        let project = door_and_tick();
+        assert_eq!(crate::infra_reach::depends_on(&set_up(&project, "door", Owner::Shared, ActivationLifecycle::active()), &project), vec!["svc"]);
+        let bob = Owner::Instance(InstanceId::new("bob").unwrap());
+        let activations = vec![
+            set_up(&project, "door", Owner::Shared, ActivationLifecycle::active()),
+            set_up(&project, "door", ada(), ActivationLifecycle::active()),
+            set_up(&project, "door", bob.clone(), ActivationLifecycle::active()),
+            set_up(&project, "door", Owner::Instance(InstanceId::new("carl").unwrap()), ActivationLifecycle::holding()),
+            set_up(&project, "tick", Owner::Shared, ActivationLifecycle::active()),
+            set_up(&project, "tick", ada(), ActivationLifecycle::active()),
+        ];
+        // What `weft infra stop` of the copy takes down
+        // (`crate::api::infra::triggers_reached`).
+        let infra_stop_reaches = |copy: &InfraCopy| -> Vec<ActivationKey> {
+            let mut keys = crate::infra_reach::live_triggers_reached(&copy_reach(copy), &activations, &project);
+            keys.sort();
+            keys
+        };
+        let ada_svc = InfraCopy { node_id: "svc".into(), instance: Some(InstanceId::new("ada").unwrap()) };
+        let shared_svc = InfraCopy { node_id: "svc".into(), instance: None };
+        assert_eq!(health_take_down_targets(&project, &activations, std::slice::from_ref(&ada_svc)), vec![ActivationKey::new("door", ada())]);
+        assert_eq!(health_take_down_targets(&project, &activations, std::slice::from_ref(&ada_svc)), infra_stop_reaches(&ada_svc));
+        let shared = health_take_down_targets(&project, &activations, std::slice::from_ref(&shared_svc));
+        assert_eq!(shared, vec![ActivationKey::new("door", Owner::Shared), ActivationKey::new("door", ada()), ActivationKey::new("door", bob)]);
+        assert_eq!(shared, infra_stop_reaches(&shared_svc));
+    }
+
+    /// A health recovery brings back only what the health check took
+    /// down: never a trigger a person took down, nor one an infra command
+    /// took down with the copies it reads (`weft infra stop`), even when
+    /// nothing is still broken; and of what the health check took, not
+    /// one whose cut contains a copy still broken.
+    #[test]
+    fn a_health_recovery_brings_back_only_what_the_health_check_took_down() {
+        use weft_broker_client::activation::{ActivationLifecycle, WentDown};
+        let project = door_and_tick();
+        let down = |went_down: Option<WentDown>| ActivationLifecycle { went_down, ..ActivationLifecycle::holding() };
+        let (bob, carl, dee) = (
+            Owner::Instance(InstanceId::new("bob").unwrap()),
+            Owner::Instance(InstanceId::new("carl").unwrap()),
+            Owner::Instance(InstanceId::new("dee").unwrap()),
+        );
+        let activations = vec![
+            set_up(&project, "door", ada(), down(Some(WentDown::Health))),
+            set_up(&project, "door", bob, down(None)),
+            set_up(&project, "door", carl, down(Some(WentDown::Infra { first_command: 4 }))),
+            set_up(&project, "door", dee.clone(), down(Some(WentDown::Health))),
+        ];
+        let per_instance = |place: &str| place == "svc";
+        assert_eq!(
+            health_restore_targets(&project, per_instance, &activations, &[], |_| true),
+            vec![ActivationKey::new("door", ada()), ActivationKey::new("door", dee.clone())]
+        );
+        let dee_svc = InfraCopy { node_id: "svc".into(), instance: Some(InstanceId::new("dee").unwrap()) };
+        assert_eq!(health_restore_targets(&project, per_instance, &activations, &[dee_svc], |_| true), vec![ActivationKey::new("door", ada())]);
+    }
+
     /// `RunOutcome::Cancelled` MUST project to `LifecycleOutcome::Cancelled`
-    /// + a reason in `outcome_message`. The previous shape wrote
-    /// Succeeded for "project no longer exists" cancellations,
-    /// hiding the distinction from `wait_for_command` consumers.
-    /// Pin the projection so a regression breaks CI.
+    /// + a reason in `outcome_message`, so `wait_for_command` consumers
+    /// tell "no longer applicable" from a failure.
     #[test]
     fn project_outcome_distinguishes_three_terminal_states() {
         let succeeded = RunOutcome::Succeeded;
@@ -759,4 +880,3 @@ mod tests {
         assert_eq!(msg, Some("gone"));
     }
 }
-

@@ -123,9 +123,9 @@ async fn labels(rig: FakeRig) -> WeftResult<()> {
 }
 
 /// No samples is a mistake in the program, not the service's answer:
-/// a wired `error` must not swallow it.
+/// a wired `_error` must not swallow it.
 async fn no_samples(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig
         .run(
             &ElevenLabsCloneVoiceNode,
@@ -164,9 +164,9 @@ async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
 
 async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     let inputs = refuse_the_clone(&rig);
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig.run(&ElevenLabsCloneVoiceNode, inputs).await.ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("bad key"), "{error}");
     assert!(!outcome.outputs.contains_key("voiceId"), "a caught failure emits no voiceId");
     Ok(())

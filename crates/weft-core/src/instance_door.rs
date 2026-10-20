@@ -8,11 +8,11 @@ use serde::{Deserialize, Serialize};
 // SYNC: InstanceField <-> packages/weft-connect/src/core/wire.ts InstanceField
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceField {
-    /// The step, spelled the way the program reads it: with `field`, the
+    /// The node, spelled the way the program reads it: with `field`, the
     /// key the instance's value is stored under.
-    pub step: String,
+    pub node: String,
     pub field: String,
-    /// The step's node type and label, for titling it on a page.
+    /// The node type and label, for titling it on a page.
     #[serde(rename = "nodeType")]
     pub node_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1,0 +1,68 @@
+{
+  "type": "OpenAIAccess",
+  "label": "OpenAI Access",
+  "description": "Connect OpenAI's API with your own API key, and wire `access` into every OpenAI Model node: one access for however many models.",
+  "tags": [
+    "ai",
+    "provider",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#6b6b99",
+  "service": {
+    "service": "openai",
+    "label": "OpenAI",
+    "doors": ["own"],
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "key",
+          "label": "API key",
+          "placeholder": "sk-..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {key}"
+      }
+    ],
+    "test": {
+      "url": "https://api.openai.com/v1/models"
+    },
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    },
+    "ownPage": {
+      "guide": {
+        "link": "https://platform.openai.com/api-keys",
+        "steps": [
+          "Open platform.openai.com, API keys, and create an API key.",
+          "Paste it below and name the connection."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "description": "Wire into OpenAI Model nodes' `access` input."
+    }
+  ]
+}

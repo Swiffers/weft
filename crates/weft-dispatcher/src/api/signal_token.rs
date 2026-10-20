@@ -143,12 +143,15 @@ pub(crate) async fn mint(
         expires_at,
     };
 
+    // The address is read before the token is stored, so a tunnel that
+    // does not answer leaves no token behind that nobody was handed.
+    let base = state.external_base_url().await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
     state
         .journal
         .mint_signal_token(&signal_token)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
-    let url = token_url(state.external_base_url(), &token);
+    let url = token_url(&base, &token);
     Ok(MintedToken {
         id: signal_token.id,
         kind: signal_token.kind,

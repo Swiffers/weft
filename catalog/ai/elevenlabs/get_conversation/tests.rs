@@ -180,7 +180,7 @@ async fn conversation_only_when_read(rig: FakeRig) -> WeftResult<()> {
         .ok()?;
     assert!(!outcome.outputs.contains_key("conversation"), "nothing reads the whole object");
     let stored: Vec<String> =
-        rig.stored_files(&StorageScope::Execution)?.into_iter().map(|f| f.filename).collect();
+        rig.stored_files(&StorageScope::Run)?.into_iter().map(|f| f.filename).collect();
     assert_eq!(stored, vec!["conversation_conv-6_transcript.json".to_string()], "only the transcript is stored");
     let (transcript, _) = json_file(&rig, &outcome.outputs, "transcript")?;
     assert_eq!(transcript, json!({ "text": "", "turns": [] }), "a call with no turns yet");

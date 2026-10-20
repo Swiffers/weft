@@ -12,3 +12,23 @@ CREATE TABLE IF NOT EXISTS install_domain (
             CHECK ((serves = 'install') = (project_id IS NULL)),
             CHECK ((serves = 'frontend') = (upstream IS NOT NULL))
         );
+CREATE OR REPLACE FUNCTION install_domain_notify() RETURNS trigger AS $$
+            BEGIN
+                PERFORM pg_notify('weft_install_domains', '');
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql;
+CREATE TABLE IF NOT EXISTS install_domain_door (
+            singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+            served TEXT[] NOT NULL,
+            -- When the door last accepted `served` (unix ms, the
+            -- database's clock).
+            served_at_ms BIGINT NOT NULL,
+            refused TEXT,
+            refusals INT NOT NULL
+        );
+DROP TRIGGER IF EXISTS install_domain_changed ON install_domain;
+CREATE TRIGGER install_domain_changed
+            AFTER INSERT OR DELETE ON install_domain
+            FOR EACH ROW
+            EXECUTE FUNCTION install_domain_notify();

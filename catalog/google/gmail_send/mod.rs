@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use weft::node::NodeOutput;
 use weft::access::client::{get_json, required_str};
 use weft::storage::{FileHandle, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use lettre::message::Mailbox;
 
@@ -33,7 +33,7 @@ impl Node for GmailSendNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let to = weft::comma_list(ctx.inputs.list::<String>("to")?);
         let cc = weft::comma_list(ctx.inputs.list::<String>("cc")?);
@@ -112,7 +112,7 @@ impl Node for GmailSendNode {
 
         // Attachments: one File or a list of Files, read from storage.
         let mut attachments = Vec::new();
-        let storage = ctx.storage(StorageScope::Execution);
+        let storage = ctx.storage(StorageScope::Run);
         for h in handles {
             let handle = FileHandle::from_value(&h)?;
             let (meta, bytes) = storage.get_bytes(&handle).await?;

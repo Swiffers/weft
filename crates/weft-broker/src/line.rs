@@ -112,7 +112,7 @@ fn follower(fanout: Arc<LineFanout>, principal: Principal) -> Follower {
 /// copy's change is its project's; a connection's is its project's, or its
 /// tenant's when it is shared across the tenant's projects
 /// (`tenant:<tenant>`); a cancel, and an answer handed to a run, are the
-/// run's project's (`<project> <execution>`; an event parked for a trigger
+/// run's project's (`<project> <run>`; an event parked for a trigger
 /// names its project alone, and is for nobody on a line); a trigger's
 /// change is its project's. Every other channel is for nobody on a line.
 // SYNC: the channels and payloads <-> weft_broker_client::line::LINE_CHANNELS, crates/weft-dispatcher/src/infra_node.rs (infra_node_status_notify), crates/weft-dispatcher/src/project_store.rs (project_declared_infra_notify), crates/weft-access-store/src/lib.rs (access_notify), crates/weft-task-store/src/tasks.rs (task_ready_notify), crates/weft-task-store/src/runs.rs (run_payload), crates/weft-broker/src/caller_auth.rs (names), crates/weft-dispatcher/src/held.rs (access_changed)

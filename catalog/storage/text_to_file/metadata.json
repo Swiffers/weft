@@ -36,19 +36,19 @@
     {
       "name": "scope",
       "type": "String",
-      "default": "execution",
+      "default": "run",
       "widget": {
         "kind": "select",
         "options": [
-          "execution",
+          "run",
           "project"
         ]
       },
       "label": "Store in",
-      "description": "`execution`: only this run can read it. `project`: every later run can."
+      "description": "`run`: only this run can read it. `project`: every later run can."
     },
     {
-      "name": "ttl_days",
+      "name": "ttlDays",
       "type": "Number",
       "widget": {
         "kind": "number",
@@ -56,13 +56,14 @@
         "step": 1
       },
       "label": "Keep for (days, 0 = forever)",
-      "description": "Lifetime since last access (any read, download or presign resets it); 0 never expires. Empty: an execution file is swept soon after its run, a project file lives until deleted."
+      "description": "Lifetime since last access (any read, download or link resets it); 0 never expires. Empty: a run file is swept soon after its run, a project file lives until deleted."
     }
   ],
   "outputs": [
     {
       "name": "file",
       "type": "File",
+      "narrowable": true,
       "description": "The stored file."
     },
     {

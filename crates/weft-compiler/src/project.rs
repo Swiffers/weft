@@ -176,7 +176,26 @@ impl Project {
         let manifest_path = root.join("weft.toml");
         let raw = std::fs::read_to_string(&manifest_path)
             .map_err(|e| CompileError::Project(format!("{}: {}", manifest_path.display(), e)))?;
-        let manifest: ProjectManifest = toml::from_str(&raw)
+        Self::from_manifest(root, &raw, &|path| path.exists())
+    }
+
+    /// [`Self::load`] from `tree` (the snapshot a command took of the
+    /// project, so the manifest it compiles with is the one in the
+    /// snapshot).
+    #[cfg(feature = "build")]
+    pub fn load_in(root: &Path, tree: &dyn weft_catalog::SourceTree) -> CompileResult<Self> {
+        let manifest_path = root.join("weft.toml");
+        let raw = tree
+            .read_to_string(&manifest_path)
+            .map_err(|e| CompileError::Project(format!("{}: {}", manifest_path.display(), e)))?;
+        Self::from_manifest(root, &raw, &|path| tree.entry_kind(path).is_ok())
+    }
+
+    /// The project at `root` whose `weft.toml` reads `raw`; `exists` says
+    /// whether a file is there, from wherever the manifest was read.
+    fn from_manifest(root: &Path, raw: &str, exists: &dyn Fn(&Path) -> bool) -> CompileResult<Self> {
+        let manifest_path = root.join("weft.toml");
+        let manifest: ProjectManifest = toml::from_str(raw)
             .map_err(|e| CompileError::Project(format!("weft.toml parse: {e}")))?;
         if manifest.dispatcher.is_some() {
             return Err(CompileError::Project(format!(
@@ -202,7 +221,7 @@ impl Project {
         // with the move spelled out, rather than failing later as a
         // missing file. Two valid places for the entry would be the
         // free-for-all the `src/` layout exists to end.
-        if !project.main_weft().exists() && root.join(ENTRY_FILE).exists() {
+        if !exists(&project.main_weft()) && exists(&root.join(ENTRY_FILE)) {
             return Err(CompileError::Project(format!(
                 "{} holds its program at the root; weft reads it from {}. \
                  Move it: `mkdir -p src && mv main.weft src/`, move any \
@@ -366,7 +385,7 @@ impl Project {
 /// `weft new` runs to seed it), replacing it from the installation.
 #[cfg(feature = "build")]
 pub fn base_catalog_dir(project_root: &Path) -> PathBuf {
-    project_root.join("nodes").join("base_catalog")
+    project_root.join(NODES_DIR).join(BASE_CATALOG_DIR)
 }
 
 /// (Re)seed `nodes/base_catalog/` from the weft installation's bundled
@@ -400,7 +419,17 @@ pub const SRC_DIR: &str = "src";
 pub const ENTRY_FILE: &str = "main.weft";
 /// The shared node tree: the standard library under `base_catalog/`
 /// and any node several parts of the program use.
+// SYNC: NODES_DIR <-> extension-vscode/src/includePath.ts NODES_DIR
 pub const NODES_DIR: &str = "nodes";
+/// The standard library's folder inside [`NODES_DIR`].
+pub const BASE_CATALOG_DIR: &str = "base_catalog";
+/// The first segment of a marker path read from [`NODES_DIR`] wherever
+/// it is written: `@include("__catalog/base_catalog/computer/agent.weft")`
+/// names the same file from `src/main.weft`, from a file deep in `src/`,
+/// and from a file under `nodes/` itself. The rule that applies it is
+/// `crate::file_reader::catalog_path`.
+// SYNC: CATALOG_PREFIX <-> extension-vscode/src/includePath.ts CATALOG_PREFIX
+pub const CATALOG_PREFIX: &str = "__catalog";
 
 /// Where a project's nodes are looked for: `nodes/`, and beside the
 /// code under `src/`. A node used by one module sits next to that

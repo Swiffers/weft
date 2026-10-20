@@ -107,11 +107,11 @@ pub fn parse_marker(raw: &str) -> Option<Result<FileRef, String>> {
                  Image, Video, Audio, Blob for a file, or a text type such as String"
             )));
         }
-        (Some(t), _) => match WeftType::parse(t.trim()) {
-            Some(ty) => ty,
-            None => return Some(Err(format!(
-                "{name}: invalid type {:?}; a file kind is Image, Video, Audio or Blob, a text kind \
-                 is String, Number, Boolean, JsonDict, JsonList or a JSON shape",
+        (Some(t), _) => match WeftType::try_parse(t.trim()) {
+            Ok(ty) => ty,
+            Err(why) => return Some(Err(format!(
+                "{name}: invalid type {:?} ({why}); a file kind is Image, Video, Audio or Blob, a \
+                 text kind is String, Number, Boolean, JsonDict, a List or a record shape",
                 t.trim()
             ))),
         },
@@ -156,6 +156,17 @@ fn split_path_and_type<'a>(inner: &'a str, name: &str) -> Result<(&'a str, Optio
 
 fn unquote(s: &str) -> Option<String> {
     serde_json::from_str(s).ok()
+}
+
+/// Whether a written field is ONE file marker, recorded as file-backed (a
+/// node's field or a group's port alike): a marker at the top
+/// (`systemPrompt: @file(...)`), or the fallback of an
+/// `@instance_filled(@file(...))`, which the editor puts back inside the
+/// marker. A list of markers resolves each one and is recorded as none:
+/// editing through a field is a thing you do to one file.
+fn is_one_marker(value: &serde_json::Value) -> bool {
+    value.as_str().is_some()
+        || weft_core::instance::as_instance_filled(value).and_then(|filled| filled.fallback).is_some_and(|f| f.is_string())
 }
 
 /// Freeze scoped type names into their portable wire spelling before leaving
@@ -261,6 +272,7 @@ impl MarkedValues for weft_core::project::ProjectDefinition {
             .flat_map(|node| {
                 node.config.as_object().map(|o| o.values()).into_iter().flatten().chain(node.port_literals.values())
             })
+            .chain(self.groups.iter().flat_map(|group| group.port_literals.values()))
             .collect()
     }
 
@@ -275,6 +287,7 @@ impl MarkedValues for weft_core::project::ProjectDefinition {
                     .flatten()
                     .chain(node.port_literals.values_mut())
             })
+            .chain(self.groups.iter_mut().flat_map(|group| group.port_literals.values_mut()))
             .collect()
     }
 }
@@ -474,7 +487,9 @@ fn resolve(file_ref: &FileRef, fs: &CompileFs) -> Result<Resolved, String> {
 /// resolution map) resolves against that one anchor and a ref only ever
 /// leaves the compiler in one spelling. It is normalized (`.` and a
 /// balancing `..` collapse); one that climbs above the root is refused,
-/// there being nothing above the root it could mean.
+/// there being nothing above the root it could mean. A path starting
+/// `__catalog/` names a file under the project's `nodes/` and is spelled
+/// as that (`nodes/...`), so no consumer has to know the prefix.
 ///
 /// A file outside the project is named where it sits, by an absolute
 /// path or one under `~` (expanded to the home directory here, so the
@@ -497,6 +512,10 @@ fn spell_from_root(mut file_ref: FileRef, home: Option<&std::path::Path>) -> Res
         home.join(under_home)
     } else if written.is_absolute() {
         written.to_path_buf()
+    } else if let Some(in_nodes) = crate::file_reader::catalog_path(written) {
+        // `__catalog/x` is `nodes/x`, spelled so here, before the
+        // normalization below could fold a `..` out of the prefix.
+        in_nodes.map_err(|why| format!("{}({:?}) {why}", file_ref.marker.directive(), file_ref.path))?
     } else {
         crate::file_reader::normalize_lexical(written).ok_or_else(|| {
             format!(
@@ -533,6 +552,7 @@ pub(crate) fn resolve_project_file_refs(
 ) {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     for node in &mut project.nodes {
+      let part = node.part().to_string();
       let config_spans = &node.config_spans;
       let literal_spans = &node.port_literal_spans;
       for (key, value, field) in node.config.as_object_mut().into_iter().flat_map(|map| map.iter_mut())
@@ -544,23 +564,39 @@ pub(crate) fn resolve_project_file_refs(
         // A present field span with no file names the main source, even
         // when its owner is a group that came from an included file.
         let source_file = field.map(|s| s.source_file.as_deref()).unwrap_or(node.source_file.as_deref());
-        // A marker sits at the top of a field (`systemPrompt: @file(...)`)
-        // or inside a list (`attachments: [@asset(...), @asset(...)]`), and
-        // every one of them resolves. Only a field that is ONE marker is
-        // recorded as file-backed: that record drives editing the file
-        // through the field, which is a thing you do to one file. A
-        // `@instance_filled(@file(...))` fallback is one marker too, so the
-        // editor can put it back inside the marker.
-        let single = value.as_str().is_some()
-            || weft_core::instance::as_instance_filled(value).and_then(|filled| filled.fallback).is_some_and(|f| f.is_string());
+        // Every marker resolves, at the top of a field or inside a list;
+        // only a field that is one marker is recorded ([`is_one_marker`]).
+        let single = is_one_marker(value);
         each_value_mut(value, &mut |leaf| match resolve_leaf(leaf, root_fs, home.as_deref(), single) {
             Ok(Some(file_ref)) if single => {
                 node.file_refs.insert(key.clone(), file_ref);
             }
             Ok(_) => {}
-            Err(msg) => errors.push(CompileError::at(span, msg).in_file(source_file)),
+            // A file that is not there breaks the node that reads it, and
+            // only that node.
+            Err(msg) => errors.push(CompileError::at(span, msg).in_file(source_file).about(&part)),
         });
       }
+    }
+    // A literal on a group's own port (`g.x = @file(...)`, or
+    // `alias.x = ...` on an include site) resolves the same way: the
+    // group sends it to the members that read the port. A loop's literals
+    // sit on its `LoopIn` too, resolved with the nodes above.
+    for group in project.groups.iter_mut().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+        let spans = &group.port_literal_spans;
+        for (key, value) in group.port_literals.iter_mut() {
+            let field = spans.get(key);
+            let span = field.map(|s| s.span).unwrap_or(group.header_span.or(group.span).unwrap_or_default());
+            let source_file = field.map(|s| s.source_file.as_deref()).unwrap_or(group.source_file.as_deref());
+            let single = is_one_marker(value);
+            each_value_mut(value, &mut |leaf| match resolve_leaf(leaf, root_fs, home.as_deref(), single) {
+                Ok(Some(file_ref)) if single => {
+                    group.file_refs.insert(key.clone(), file_ref);
+                }
+                Ok(_) => {}
+                Err(msg) => errors.push(CompileError::at(span, msg).in_file(source_file).about(&group.id)),
+            });
+        }
     }
 }
 

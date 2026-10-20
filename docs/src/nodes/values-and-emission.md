@@ -15,21 +15,37 @@ Three things can fill a port, in this order:
 | 2 | A value written into the node's body, if nothing arrived |
 | 3 | The `default` from the node's metadata, if the port is still empty |
 
-Four rules around that, each of which exists to stop a quiet wrong answer.
+Four rules sit around that.
 
-**A closure kills the default.** If a wire arrived closed, meaning upstream
-produced nothing, the default does **not** fill in. A closure means something
-did not happen, and substituting a default would hide that.
+**A closed wire kills the default.** If a wire closes without carrying a value
+(weft calls that a closure: upstream finished without sending on that port, or
+failed), the default does **not** fill in, because that would hide that
+something did not happen.
 
 **A delivered `null` is a value only where the type allows it.** On a port
-whose type admits `Null`, `null` is data. Anywhere else it reads as nothing
-arrived, and the default fills.
+whose type admits `Null`, `null` is data. Anywhere else, a `null` arriving on a
+wire fails the run, unless the program marked that input optional (`x?: T`
+where it uses your node): then it reads as nothing arrived, and the default
+fills.
 
-**A wrong type fails the firing**, required or not. It is never quietly dropped
-so the default can take over.
+**A wrong type fails the run**, required or not, and the program cannot catch
+it ([which failures a program can
+handle](#which-failures-a-program-can-handle)). It is never dropped so the
+default can take over.
 
-**A number outside its declared range fails too.** A poll interval of `0` on a
-port with a minimum never quietly becomes `30`.
+**A number outside its `number` widget's `min` and `max` fails the run too**
+([widget](metadata.md#widget)), and so does a fraction where the widget's
+`step` is whole: a poll interval of `0` on a port with `"min": 1` fails rather
+than becoming the port's default. So does a value that is not one of a
+`select` widget's `options`, unless the widget sets `freeText`.
+
+An input your metadata leaves optional can be empty when your body runs: nobody
+wired it and it has no default, or the program wrote `?` on it and its wire
+closed. Read such an
+input with `opt` or `get_or` ([reading inputs](ctx.md#reading-inputs)). Whether
+your node runs at all then is up to the program. For how a program decides, go
+and read [optional and required
+inputs](../language/syntax.md#optional-and-required-inputs).
 
 Two ports get special handling before your code sees them. A connection input
 arrives as a full `Access` value carrying the service, rather than the id the
@@ -82,10 +98,35 @@ node 'reply' tried to emit on undeclared output port 'txet'. Declare it in
 metadata.json's outputs list, or correct the port name in the node body.
 ```
 
-**A value over 100 KB fails the call**, naming the port. The check is on what
-you emit, so a node one hop later cannot trim it for you: bound it yourself (a
-cap input, a `LIMIT`), or put bytes in [storage](storage.md) and send the
-marker.
+**A value that does not fit its port's type fails the call**, naming the port,
+the type and what did not fit. The type is the one in your metadata, after the program filled in any type
+variable. If your metadata marks the output `narrowable`
+([outputs](metadata.md#outputs)), it is the type the program declared on it,
+like `-> (response: Verdict)`. If the type is an open record, extra keys are
+dropped instead of failing the call ([records that take extra
+keys](custom-types.md#records-that-take-extra-keys)). A refused call sends nothing and leaves the port open, so if your
+code handles the `Err` instead of returning it with `?`, it can emit on that
+port again with something else.
+
+**A value over 100 KB fails the call**, naming the port. The weight is the
+value written as JSON, checked on what you emit, so a node one hop later
+cannot trim it for you. There are two ways out, and the refusal names both:
+put the data in [storage](storage.md) and send the stored file, whose value
+weighs a few hundred bytes whatever the file holds, or send less. Sending less
+means sending one page of it along with where the next page starts, or cutting
+it short and saying so in another output.
+
+If you want to bound a value yourself, `weft::storage` measures it the way the
+wire does, against `MAX_WIRE_VALUE_BYTES`:
+
+| You want | Call |
+|---|---|
+| What a value weighs on a wire | `wire_weight(&value)` |
+| The longest start of a text that weighs at most `budget`, never splitting a character | `cut_to_weight(text, budget)` |
+| A text cut to `max_chars` characters, then to what one port carries, and whether anything was cut | `cap_text(text, max_chars)` |
+
+`FetchPage` uses `cap_text` this way: a `maxChars` input, and a `truncated`
+output that tells the program the page was cut.
 
 ## Waiting for the value to be taken
 
@@ -127,49 +168,48 @@ as: `file`, `filename`, `mimeType` and `sizeBytes`.
 
 Those, plus `?` on anything the ctx returns, cover every failure except a
 mistake in the program itself, which you return as `Err(WeftError::Input(..))`
-(see [Letting the program handle a failure](#letting-the-program-handle-a-failure)).
+(see [which failures a program can handle](#which-failures-a-program-can-handle)).
 
 Write the message as an instruction to whoever is building the program, because
 that is who reads it. "pick a destination: a channel or a user" beats "invalid
 configuration".
 
-## Letting the program handle a failure
+## Which failures a program can handle
 
-If your node reaches outside, it can fail for reasons the program might want
-to deal with: a model refusing a prompt, a host that does not answer, a
-database rejecting a row. If you want a
-program to be able to handle those, set this in the node's metadata:
+Every node has an `_error` output, which weft adds when it loads the node. If
+a program wires it, your node's failure comes out there and the node counts as
+done; if nobody wired it, the failure fails the run. For what that looks like
+from the program, go and read [when a node
+fails](../language/how-a-program-runs.md#when-a-node-fails). Your body writes
+no handling for it: it returns its errors with `?` as usual.
 
-```json
-"features": { "catchErrors": true }
-```
+`_error` is weft's, so a body that emits on it or closes it fails. `error`,
+without the underscore, is yours to use like any other name.
 
-weft then gives the node an `error` output, and your body just returns its
-errors with `?` as usual. If the program wires `error`, the failure's message comes out there,
-the step counts as done, and every output the body had not sent yet closes. If
-nobody wired it, the failure fails the run.
+What your node does decide is which kind of failure it returns. A failure of
+the work itself can be caught on `_error`: anything from `node_err` or
+`node_bail!`, a value your node emits that does not fit its port (like a
+model's answer in the wrong shape), and a wait that gave up (go and read [when
+the run cannot pause](durable-execution.md#when-the-run-cannot-pause)). A
+mistake in the program (a bad setting, or a value of the wrong type arriving
+on an input) always fails the run, even when the program wired `_error`, because the fix is
+in the program. If your node asks `ctx.output_type` about a port it does not declare,
+that fails the run too, and `_error` never sees it.
 
-In a durable run, a step that failed because its worker went away goes to `error`
-too (go and read [surviving a restart](durable-execution.md#when-the-worker-dies-mid-step)).
-
-weft owns `error`: your node cannot declare it, and a body that emits on it
-fails. If your node only shapes values (a cast, a switch, a template), leave
-the flag off: it has nothing outside to fail on.
-
-Only failures of the call itself are caught: what `node_err`, `node_bail!` and
-outside errors produce. A bad setting, a bad input or a bad type always fails
-the run, wired or not, because the fix for those is in the program. The ctx
-sorts its own refusals the same way: `ctx.output_type` on a port your node does
-not declare fails the run, so just use `?` on it. A cancel, or a step pausing to
-wait for an answer, never becomes an `error` value.
-
-So when your node spots a mistake in the program itself (SQL it cannot run, a
-value of the wrong shape, an empty field it needs), fail with
+So when your node spots a mistake in the program itself (SQL that does not parse or names a table that is not there, an
+input value of the wrong shape, an empty field it needs), fail with
 `Err(WeftError::Input(..))`. If a program could sensibly retry or route around
 the failure while it runs, use `node_bail!` instead. If your node talks to a
 server, decide the same way for each kind of refusal: the Postgres nodes fail
 the run on a syntax error or a missing table, and put a broken constraint on
-`error`.
+`_error`.
 
-In a test, `rig.wire_output("error")` wires `error` the way a program would.
-Without it the rig wires nothing, so the same node fails loudly.
+If your node produces a stream, its failure stops reaching `_error` once
+something went out on a `Bus` or `Generator` output. So do the work that can
+fail before you send the first piece. For a bus, `ctx.pending_bus` waits to
+open it until you have the first piece (go and read [streams and buses in
+Rust](streams-and-buses.md#hosting-a-bus)).
+
+In a test, `rig.wire_output("_error")` wires `_error` the way a program would,
+and `outcome.output("_error")` reads what came out. Without it the rig wires
+nothing, so the same node fails loudly.

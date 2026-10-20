@@ -31,7 +31,7 @@
 //!
 //!   NOT hashed: per-node config values, edges, node ids, positions.
 //!   Those live in the `ProjectDefinition` the worker fetches from
-//!   the broker at execution claim time; they no longer reach the
+//!   the broker at run claim time; they no longer reach the
 //!   binary via `include_str!`.
 //!
 //! - **`compute_definition_hash`**: hashes the runtime project
@@ -46,7 +46,7 @@
 //!
 //! - **`compute_infra_hash`**: hashes everything that affects the
 //!   running infrastructure. Drives the upgrade prompt. Scoped to
-//!   the infra closure (every `requires_infra` node + every node
+//!   the infra closure (every `requiresInfra` node + every node
 //!   upstream of one). Inputs:
 //!     - graph definition: the closure's slice of the canonical
 //!       `ProjectDefinition` (its nodes' configs + the edges among
@@ -132,6 +132,13 @@ mod fs_hashes {
     /// holding an image built by the old rule.
     pub const BUILDER_BASE_SPLIT_SCRIPT: &str = "deploy/docker/worker-builder-base-split.sh";
 
+    /// The compile-cache sweep (`worker_image::CACHE_GC_SCRIPT`, compiled
+    /// in from this file). Hashed with the split script for the same
+    /// reason: the builder base runs it before baking its cache, so it
+    /// decides what the image holds.
+    // SYNC: CACHE_GC_SCRIPT_PATH <-> the include_str! of worker_image::CACHE_GC_SCRIPT
+    pub const CACHE_GC_SCRIPT_PATH: &str = "crates/weft-compiler/src/weft-cache-gc.sh";
+
     /// Fold the worker build environment into `hasher`: the worker crate
     /// closure (`codegen::worker_workspace_crates`, the ONLY workspace
     /// crates a worker build links), the workspace manifests + toolchain
@@ -159,7 +166,7 @@ mod fs_hashes {
         for rel in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
             hash_path(hasher, rel, &weft_root.join(rel))?;
         }
-        for rel in [BUILDER_BASE_DOCKERFILE, BUILDER_BASE_SPLIT_SCRIPT] {
+        for rel in [BUILDER_BASE_DOCKERFILE, BUILDER_BASE_SPLIT_SCRIPT, CACHE_GC_SCRIPT_PATH] {
             hash_path(hasher, rel, &weft_root.join(rel))?;
         }
         Ok(())
@@ -197,7 +204,7 @@ mod fs_hashes {
     ///
     /// An unreferenced node can't change the worker binary, so it does
     /// not flip this hash. The same node walked through `weft_catalog`'s
-    /// `is_node_tree_excluded` policy that `stage_build_context` uses, so
+    /// `is_left_out_of_package_build` policy that `stage_build_context` uses, so
     /// what the binary sees and what we hash agree byte-for-byte.
     pub fn compute_binary_hash(
         definition: &ProjectDefinition,
@@ -208,7 +215,10 @@ mod fs_hashes {
     ) -> Result<SourceHash> {
         let project_root = project.root.as_path();
         let mut hasher = Sha256::new();
-        hasher.update(b"weft-binary-v2\n");
+        // v3: the image keeps the record of the node packages its build
+        // left out (`weft_core::builds::LEFT_OUT_RECORD_PATH`); an image
+        // from before has none to read.
+        hasher.update(b"weft-binary-v3\n");
         hash_image_recipe(&mut hasher, project)?;
 
         // SET of referenced node TYPES: the dispatch table in registry.rs
@@ -372,9 +382,17 @@ mod fs_hashes {
             hasher.update(b"package:");
             hasher.update(label.as_bytes());
             hasher.update(b"\n");
-            hash_path(hasher, &label, root)?;
+            hash_package_root(hasher, &label, root)?;
         }
         Ok(())
+    }
+
+    /// Hash one package root as the build stages it
+    /// (`build::stage_project_nodes`): every file but what
+    /// `weft_catalog::is_left_out_of_package_build` names, so a `.weft`
+    /// file a program includes from the package flips no package hash.
+    pub fn hash_package_root(hasher: &mut Sha256, label: &str, root: &Path) -> Result<()> {
+        hash_path_skipping(hasher, label, root, &|name, _| weft_catalog::is_left_out_of_package_build(name))
     }
 
     /// Content hash of everything that can change a package's node-test
@@ -432,7 +450,7 @@ mod fs_hashes {
     }
 
     /// Hash everything that affects the running infrastructure.
-    /// Scoped to the infra closure: every node where `requires_infra` is
+    /// Scoped to the infra closure: every node where `requiresInfra` is
     /// true plus every node upstream of one (the chain that produces the
     /// inputs the infra node consumes during InfraSetup).
     pub fn compute_infra_hash(
@@ -475,6 +493,43 @@ mod fs_hashes {
         hash_worker_build_env(&mut hasher, weft_root)?;
 
         Ok(hex(&hasher.finalize()))
+    }
+
+    /// Each infra place's own infra hash, by place (`db`, `one.db`): what
+    /// [`compute_infra_hash`] hashes, scoped to the place's own closure
+    /// (its node and everything upstream of it, their packages) and the
+    /// place's spelling. A copy applied from one build carries its place's
+    /// (`BuiltProgram::infra_places`); one whose place hashes otherwise in
+    /// the source now is behind it, and an edit to one infra node leaves
+    /// every other place where it was.
+    pub fn compute_infra_place_hashes(
+        project: &ProjectDefinition,
+        project_root: &Path,
+        weft_root: &Path,
+        catalog: &FsCatalog,
+    ) -> Result<std::collections::BTreeMap<String, SourceHash>> {
+        let graph = ProjectGraph::new(project);
+        let mut out = std::collections::BTreeMap::new();
+        for place in weft_core::project::infra_places(project) {
+            let spelled = weft_core::project::address_of(project, &place.id, &place.path);
+            let mut hasher = Sha256::new();
+            hasher.update(b"weft-infra-place-v1\n");
+            hasher.update(spelled.as_bytes());
+            hasher.update(b"\n");
+            let closure = upstream_closure(&graph, std::slice::from_ref(&place.id));
+            hash_definition_slice(&mut hasher, project, &closure)?;
+            hash_path(&mut hasher, "weft.toml", &project_root.join("weft.toml"))?;
+            let roots: Vec<PathBuf> = closure
+                .iter()
+                .filter_map(|id| project.nodes.iter().find(|n| n.id == *id))
+                .filter_map(|n| catalog.package_of(&n.node_type))
+                .map(|pkg| pkg.root.clone())
+                .collect();
+            hash_package_roots(&mut hasher, &roots, &[project_root, weft_root])?;
+            hash_worker_build_env(&mut hasher, weft_root)?;
+            out.insert(spelled, hex(&hasher.finalize()));
+        }
+        Ok(out)
     }
 
     /// Hash a single image's source: Dockerfile + every file in the
@@ -676,34 +731,49 @@ mod fs_hashes {
         Ok(())
     }
 
-    /// Load + enrich a project to a `ProjectDefinition` AND return the
-    /// catalog it was enriched against, without running cargo / docker.
-    /// Returns both because every caller (drift hashes, infra build) needs
-    /// the same catalog the definition was built from; returning it here is
-    /// one discovery per command instead of each caller re-walking `nodes/`.
-    pub fn load_enriched_project(project: &Project) -> Result<(ProjectDefinition, FsCatalog)> {
-        load_enriched_project_with_diagnostics(project).map_err(|e| anyhow::anyhow!("{e}"))
+    /// The project's program as every command compiles it
+    /// ([`crate::compile_program`]: what does not compile is left in as
+    /// broken parts) AND the catalog it was compiled against, read from
+    /// disk, without running cargo / docker. Returns both because every
+    /// caller (drift hashes, infra build) needs the same catalog the
+    /// definition was built from; returning it here is one discovery per
+    /// command instead of each caller re-walking the node roots.
+    pub fn load_program(project: &Project) -> Result<(ProjectDefinition, FsCatalog)> {
+        load_program_with_diagnostics(project).map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    /// Same as `load_enriched_project` but on compile failure the Err
-    /// carries the structured `Vec<Diagnostic>` so callers that surface
-    /// errors to the editor (the CLI's run path emitting structured
-    /// progress events) can render them one-per-line rather than as a
-    /// single flattened string.
-    pub fn load_enriched_project_with_diagnostics(
+    /// Same as `load_program` but on a failure of the program as a whole
+    /// the Err carries the structured `Vec<Diagnostic>` so callers that
+    /// surface errors to the editor (the CLI's run path emitting
+    /// structured progress events) can render them one-per-line rather
+    /// than as a single flattened string.
+    pub fn load_program_with_diagnostics(
         project: &Project,
     ) -> std::result::Result<(ProjectDefinition, FsCatalog), CompileLoadError> {
-        use crate::build::build_project_catalog;
-        use crate::compile_enriched_with_diagnostics;
-        let source = project
-            .read_main_weft()
-            .map_err(|e| CompileLoadError::Read(format!("read {}: {e}", project.main_weft().display())))?;
-        let catalog = build_project_catalog(&project.root)
+        load_program_in(project, std::sync::Arc::new(weft_catalog::DiskTree))
+    }
+
+    /// [`load_program_with_diagnostics`] with every file read from `tree`:
+    /// the entry file, the files it includes and reads, and both node
+    /// roots. A command reads its project once into a snapshot and
+    /// compiles from that, so nothing written to disk meanwhile reaches
+    /// it.
+    pub fn load_program_in(
+        project: &Project,
+        tree: std::sync::Arc<dyn weft_catalog::SourceTree>,
+    ) -> std::result::Result<(ProjectDefinition, FsCatalog), CompileLoadError> {
+        let main_weft = project.main_weft();
+        let source = tree
+            .read_to_string(&main_weft)
+            .map_err(|e| CompileLoadError::Read(format!("read {}: {e}", main_weft.display())))?;
+        let roots = crate::project::node_roots(&project.root);
+        let catalog = FsCatalog::discover_roots_in(tree.clone(), &roots.iter().map(|r| r.as_path()).collect::<Vec<_>>())
             .map_err(|e| CompileLoadError::Read(format!("catalog: {e}")))?;
         let src_dir = project.src_dir();
-        let fs = crate::CompileFs::disk(&project.root).anchored_at(Some(&src_dir));
-        let mut definition = compile_enriched_with_diagnostics(&source, project.id(), fs, &catalog)
-            .map_err(CompileLoadError::Diagnostics)?;
+        let reader = crate::file_reader::TreeFileReader::new(tree.as_ref());
+        let fs = crate::CompileFs::with_reader(&reader, Some(&project.root)).anchored_at(Some(&src_dir));
+        let mut definition =
+            crate::compile_program(&source, project.id(), fs, &catalog).map_err(CompileLoadError::Diagnostics)?;
         // What weft.toml says for every run and trigger rides in the
         // program, so a version reads the defaults it was built with.
         definition.defaults = project.manifest.defaults();
@@ -745,16 +815,16 @@ mod fs_hashes {
             let catalog = FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
             let empty: ProjectDefinition = serde_json::from_value(serde_json::json!({"id":project.id(),"nodes":[],"edges":[]})).unwrap();
-            let mut grouped = empty.clone();
-            grouped.nodes.push(serde_json::from_value(serde_json::json!({
-                "id":"g__in", "nodeType":"Passthrough", "inputs":[], "outputs":[], "position":{"x":0,"y":0},
-                "groupBoundary":{"groupId":"g","role":"In"}
+            let mut looped = empty.clone();
+            looped.nodes.push(serde_json::from_value(serde_json::json!({
+                "id":"l__in", "nodeType":"LoopIn", "inputs":[], "outputs":[], "position":{"x":0,"y":0},
+                "groupBoundary":{"groupId":"l","role":"In"}
             })).unwrap());
             for set in [weft_core::builds::NodeSet::Full, weft_core::builds::NodeSet::Referenced] {
                 let before = implementation_hashes(&empty, &project, root, &catalog, set).unwrap();
-                let after = implementation_hashes(&grouped, &project, root, &catalog, set).unwrap();
+                let after = implementation_hashes(&looped, &project, root, &catalog, set).unwrap();
                 assert_eq!(before, after, "adding a built-in boundary does not change the worker's implementation map");
-                assert!(before.contains_key("Passthrough") && before.contains_key("IncludeIn") && before.contains_key("CallOut"));
+                assert!(before.contains_key("LoopIn") && before.contains_key("LoopOut"));
                 if matches!(set, weft_core::builds::NodeSet::Full) { assert!(before.contains_key("Text")); }
             }
         }
@@ -786,7 +856,7 @@ mod fs_hashes {
             let initial = hash(&graph);
             assert_eq!(hash(&graph), initial);
             graph.nodes[0].config = serde_json::json!({"value":"after"});
-            assert_eq!(hash(&graph), initial, "config belongs to the execution definition");
+            assert_eq!(hash(&graph), initial, "config belongs to the run definition");
             graph.nodes[0].node_type = "Format".into();
             assert_eq!(hash(&graph), initial, "all catalog implementations were already compiled");
         }
@@ -864,6 +934,28 @@ mod fs_hashes {
             std::fs::write(a.join("target/output"), "build artifact").unwrap();
             assert_eq!(previous, hash(&a));
         }
+
+        /// A `.weft` file a program includes from a package is read into
+        /// the program, never compiled into the package: adding or editing
+        /// one moves no package hash, so no worker rebuilds and no node test
+        /// reruns. Any other file still does, a prompt included (node code
+        /// may `include_str!` it).
+        #[test]
+        fn a_weft_file_in_a_package_moves_no_package_hash() {
+            let temp = tempfile::tempdir().unwrap();
+            let pkg = temp.path().join("nodes/computer");
+            std::fs::create_dir_all(pkg.join("click")).unwrap();
+            std::fs::write(pkg.join("click/mod.rs"), "node body").unwrap();
+            let hash = || digest(std::slice::from_ref(&pkg), &[temp.path()]);
+            let before = hash();
+            std::fs::write(pkg.join("agent.weft"), "Group {}").unwrap();
+            std::fs::write(pkg.join("click/flow.weft"), "Group {}").unwrap();
+            assert_eq!(hash(), before);
+            std::fs::write(pkg.join("agent.weft"), "Group { edited }").unwrap();
+            assert_eq!(hash(), before);
+            std::fs::write(pkg.join("agent_prompt.md"), "Act carefully.").unwrap();
+            assert_ne!(hash(), before);
+        }
     }
 }
 
@@ -938,7 +1030,7 @@ mod tests {
     /// hashed them verbatim, every CLI invocation would produce a
     /// different hash for the same source, the resync drift signal
     /// would always light, and the worker's per-hash definition
-    /// cache would miss on every execution. The hash must depend
+    /// cache would miss on every run. The hash must depend
     /// only on the semantic shape.
     #[test]
     fn definition_hash_is_stable_across_timestamps() {

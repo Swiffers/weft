@@ -9,7 +9,7 @@
 //! spawns the run only when it has work left after answering. A streamed
 //! answer and a websocket keep one task that feeds the wire.
 //!
-//! Shape (one connection per execution):
+//! Shape (one connection per run):
 //!   - OUTBOUND: nodes call `send_chunk` / `terminate`; the connection
 //!     pushes onto a bounded single-consumer `OutboundQueue` the socket
 //!     task drains to the wire. The queue is a `VecDeque` the PRODUCER can
@@ -17,6 +17,9 @@
 //!     `block` awaits a slot, `drop_newest` sheds the incoming chunk,
 //!     `drop_oldest` pops the front and enqueues (so one slow caller
 //!     cannot grow a multiplexing process's RAM). Terminal items always land.
+//!     A drop is decided as the chunk arrives, before it is recorded
+//!     ([`Admission`]), so the record names every chunk the caller will
+//!     never receive in the row it writes anyway.
 //!   - INBOUND (WebSocket): the socket task publishes each decoded
 //!     message onto a bounded `InboundLog`; every node's `receive` holds
 //!     its own absolute-offset cursor over the same window, so inbound
@@ -52,10 +55,10 @@ use tokio::sync::mpsc;
 use weft_core::caller::{
     resolve_disconnect, try_send_head, try_terminate, CallerConnection, CallerError,
     CallerRuntimeConfig, CloseReason, DisconnectAction, HttpRequestParts, InboundMessage,
-    LiveRequest, OutboundChunk, ResponseHead,
+    LiveRequest, OutboundChunk, PlainFailure, ResponseHead,
 };
 use weft_core::signal::{Backpressure, DataType, Protocol};
-use weft_core::ExecutionId;
+use weft_core::RunId;
 
 /// Capacity of the outbound buffer (chunks queued toward the wire before
 /// backpressure kicks in). Bounded so a slow caller slows the producer
@@ -70,15 +73,19 @@ pub(crate) enum Outbound {
     /// connection refuses a second one (`HeadAlreadySent`), so the
     /// drainer sees it at most once, and only ahead of the first item.
     Head(ResponseHead),
-    /// A non-terminal chunk to write to the wire.
-    Chunk(OutboundChunk),
+    /// A non-terminal chunk to write to the wire, and the offset the
+    /// exchange's record holds it at, so pushing it out of the queue
+    /// can say which one it was.
+    Chunk { chunk: OutboundChunk, offset: u64 },
     /// The terminal: final optional body, then close the wire (with
     /// this close frame on a WebSocket; `None` = normal closure).
     Terminate(Option<OutboundChunk>, Option<CloseReason>),
-    /// An error to surface to the caller per the error mode (a real
-    /// error status before anything went out, an in-band chunk after,
-    /// a close frame on a socket), then close; `ending` says which.
-    Error { message: String, ending: Ending },
+    /// The run failed the exchange (a real error status before anything
+    /// went out, an in-band chunk after, a close frame on a socket), then
+    /// close; `ending` says which. The caller is told the plain failure
+    /// and the run's id ([`weft_core::caller::PlainFailure`]); why it
+    /// failed went on the run's record when this was queued.
+    Error { ending: Ending },
 }
 
 /// How an exchange ends when the program did not answer it, as its caller
@@ -117,11 +124,11 @@ impl Ending {
     }
 
     /// How a run cancelled for `cause` ends for its caller.
-    pub fn of_cancel(cause: &weft_core::exec::CancelCause) -> Self {
-        use weft_core::exec::CancelCause;
+    pub fn of_cancel(cause: &weft_core::run::CancelCause) -> Self {
+        use weft_core::run::CancelCause;
         match cause {
             CancelCause::Limit { .. } => Self::TimeLimit,
-            CancelCause::User | CancelCause::Execution { .. } | CancelCause::CallerGone | CancelCause::Runtime { .. } => Self::Stopped,
+            CancelCause::User | CancelCause::Run { .. } | CancelCause::CallerGone | CancelCause::Runtime { .. } => Self::Stopped,
         }
     }
 }
@@ -138,6 +145,17 @@ impl Ending {
 /// end). The `capacity` therefore bounds queued chunks, not the whole
 /// buffer, which can briefly hold `capacity + 1` when a terminal arrives
 /// behind a full queue.
+///
+/// A chunk enters in two steps under the connection's `sending` lock:
+/// [`Self::admit`] decides what the policy does with it and has it
+/// recorded, then [`Self::push_admitted`] (or [`Self::push_block`])
+/// queues it. Chunks enter only that way and the drainer only takes them
+/// out, so a slot `admit` found or made is still free at the push.
+///
+/// Recording happens under the queue's lock, and so does the end of the
+/// exchange ([`Self::end`]): a chunk is on the record either before the
+/// row saying the caller left, and then that row names it if it never
+/// went out, or not at all.
 pub(crate) struct OutboundQueue {
     inner: Mutex<OutboundInner>,
     /// Woken on every push (drainer) AND on every drain/close (a blocked
@@ -148,6 +166,13 @@ pub(crate) struct OutboundQueue {
 
 struct OutboundInner {
     items: std::collections::VecDeque<Outbound>,
+    /// How many of `items` are chunks: the count the capacity bounds,
+    /// kept as they come and go rather than counted on every push.
+    chunks: usize,
+    /// The chunk admitted and recorded but not queued yet (a durable run
+    /// waits for its record in between, `block` for a slot): if the
+    /// exchange ends first, it never reaches the caller either.
+    in_flight: Option<u64>,
     /// Set when the socket task ends: producers stop queueing (return a
     /// transport error) and the drainer drains the tail then returns `None`.
     closed: bool,
@@ -158,21 +183,13 @@ impl OutboundQueue {
         Arc::new(Self {
             inner: Mutex::new(OutboundInner {
                 items: std::collections::VecDeque::new(),
+                chunks: 0,
+                in_flight: None,
                 closed: false,
             }),
             notify: tokio::sync::Notify::new(),
             capacity: capacity.max(1),
         })
-    }
-
-    /// Count of queued non-terminal chunks (the capacity bound applies to
-    /// these; terminals always land). Caller holds the lock.
-    fn chunk_count(inner: &OutboundInner) -> usize {
-        inner
-            .items
-            .iter()
-            .filter(|o| matches!(o, Outbound::Chunk(_)))
-            .count()
     }
 
     /// `Block` mode: wait until a chunk slot frees, then enqueue. Errors
@@ -187,7 +204,9 @@ impl OutboundQueue {
                 if g.closed {
                     return Err(CallerError::Transport("outbound queue closed".into()));
                 }
-                if Self::chunk_count(&g) < self.capacity {
+                if g.chunks < self.capacity {
+                    g.chunks += 1;
+                    g.in_flight = None;
                     g.items.push_back(chunk);
                     drop(g);
                     self.notify.notify_waiters();
@@ -198,36 +217,51 @@ impl OutboundQueue {
         }
     }
 
-    /// `DropNewest`: enqueue if there is room, else shed the incoming chunk.
-    fn push_drop_newest(&self, chunk: Outbound) -> Result<(), CallerError> {
+    /// What `policy` does with a chunk arriving now, handed to `record`,
+    /// which writes the chunk down and returns its offset. `Block` decides
+    /// nothing up front: it waits for a slot as it pushes. The drop
+    /// policies decide at once, while the queue is full: `DropNewest`
+    /// refuses the arriving chunk, `DropOldest` evicts the OLDEST queued
+    /// chunk (never a terminal) to make room, which an `mpsc` cannot do.
+    /// Errors, recording nothing, if the exchange already ended.
+    fn admit(&self, policy: Backpressure, record: impl FnOnce(Admission) -> u64) -> Result<(Admission, u64), CallerError> {
         let mut g = self.inner.lock().expect("outbound queue poisoned");
         if g.closed {
             return Err(CallerError::Transport("outbound queue closed".into()));
         }
-        if Self::chunk_count(&g) < self.capacity {
-            g.items.push_back(chunk);
-            drop(g);
-            self.notify.notify_waiters();
+        let admission = match policy {
+            Backpressure::Block => Admission::Waits,
+            _ if g.chunks < self.capacity => Admission::Room,
+            Backpressure::DropNewest => Admission::Refused,
+            Backpressure::DropOldest => {
+                let pos = g.items.iter().position(|o| matches!(o, Outbound::Chunk { .. }))
+                    .expect("a full queue holds a chunk");
+                let Some(Outbound::Chunk { offset, .. }) = g.items.remove(pos) else {
+                    unreachable!("the position found a chunk")
+                };
+                g.chunks -= 1;
+                Admission::Evicted(offset)
+            }
+        };
+        let offset = record(admission);
+        if admission != Admission::Refused {
+            g.in_flight = Some(offset);
         }
-        Ok(())
+        Ok((admission, offset))
     }
 
-    /// `DropOldest`: if full, evict the OLDEST queued chunk (not a terminal)
-    /// to make room, then enqueue the incoming one. This is the behavior an
-    /// `mpsc` cannot provide.
-    fn push_drop_oldest(&self, chunk: Outbound) -> Result<(), CallerError> {
-        let mut g = self.inner.lock().expect("outbound queue poisoned");
-        if g.closed {
-            return Err(CallerError::Transport("outbound queue closed".into()));
-        }
-        if Self::chunk_count(&g) >= self.capacity {
-            // Drop the oldest CHUNK (skip terminals, which must survive).
-            if let Some(pos) = g.items.iter().position(|o| matches!(o, Outbound::Chunk(_))) {
-                g.items.remove(pos);
+    /// Queue a chunk [`Self::admit`] made room for. Errors only if the
+    /// exchange ended meanwhile, whose record then named it.
+    fn push_admitted(&self, chunk: Outbound) -> Result<(), CallerError> {
+        {
+            let mut g = self.inner.lock().expect("outbound queue poisoned");
+            if g.closed {
+                return Err(CallerError::Transport("outbound queue closed".into()));
             }
+            g.chunks += 1;
+            g.in_flight = None;
+            g.items.push_back(chunk);
         }
-        g.items.push_back(chunk);
-        drop(g);
         self.notify.notify_waiters();
         Ok(())
     }
@@ -259,6 +293,9 @@ impl OutboundQueue {
             {
                 let mut g = self.inner.lock().expect("outbound queue poisoned");
                 if let Some(item) = g.items.pop_front() {
+                    if matches!(item, Outbound::Chunk { .. }) {
+                        g.chunks -= 1;
+                    }
                     drop(g);
                     // Wake a Block-mode producer that may be waiting for the
                     // slot we just freed.
@@ -278,10 +315,52 @@ impl OutboundQueue {
         self.inner.lock().expect("outbound queue poisoned").closed = true;
         self.notify.notify_waiters();
     }
+
+    /// The exchange is over: close, take out every chunk still waiting
+    /// (and the one admitted but not queued yet), none of which will ever
+    /// reach the caller, and hand their offsets to `record`, under the
+    /// lock a chunk is recorded under ([`Self::admit`]). Terminals stay
+    /// for a drainer still running; chunks would only go to a caller who
+    /// is gone.
+    fn end(&self, record: impl FnOnce(Vec<u64>)) {
+        {
+            let mut g = self.inner.lock().expect("outbound queue poisoned");
+            g.closed = true;
+            let mut undelivered = Vec::with_capacity(g.chunks + 1);
+            g.items.retain(|item| match item {
+                Outbound::Chunk { offset, .. } => {
+                    undelivered.push(*offset);
+                    false
+                }
+                _ => true,
+            });
+            g.chunks = 0;
+            undelivered.extend(g.in_flight.take());
+            record(undelivered);
+        }
+        self.notify.notify_waiters();
+    }
+}
+
+/// What the queue toward the caller does with a chunk as it arrives, per
+/// the trigger's `whenCallerIsSlow` ([`OutboundQueue::admit`]). Decided
+/// BEFORE the chunk is recorded, so the row that records it also says
+/// which chunk the caller will never receive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// `block`: the chunk waits for a slot as it is pushed.
+    Waits,
+    /// There is a slot: the chunk joins the queue.
+    Room,
+    /// The queue was full: the oldest chunk waiting, the one the record
+    /// holds at this offset, was pushed out to make room (`drop_oldest`).
+    Evicted(u64),
+    /// The queue is full: this chunk is let go (`drop_newest`).
+    Refused,
 }
 
 /// Production live caller connection. Shared (`Arc`) across the
-/// concurrently-running nodes of one execution.
+/// concurrently-running nodes of one run.
 pub struct LiveCallerConnection {
     config: CallerRuntimeConfig,
     /// Outbound to the socket task. The producer side of the single-consumer
@@ -340,9 +419,9 @@ pub struct LiveCallerConnection {
 ///
 /// A reader waits through the shared wait protocol
 /// (`weft_core::liveness::wait_on`), the log being its source: its
-/// generation moves on each message and on the close, so a run whose steps
+/// generation moves on each message and on the close, so a run whose running nodes
 /// all wait on the caller reads as waiting on the outside, never stuck
-/// (`crate::execution_driver`).
+/// (`crate::run_driver`).
 pub(crate) struct InboundLog {
     inner: Mutex<InboundInner>,
     notify: tokio::sync::Notify,
@@ -493,7 +572,7 @@ impl ConnInner {
 }
 
 impl LiveCallerConnection {
-    /// Whether, with the caller still connected, a step of the run whose
+    /// Whether, with the caller still connected, a node of the run whose
     /// waits `waits` holds waits on the caller's next message: the outside
     /// can move the run, so it is not stuck.
     pub(crate) fn waited_on(&self, waits: &crate::wait_tracker::WaitTracker) -> bool {
@@ -540,10 +619,15 @@ impl LiveCallerConnection {
         let Some(answer) = held.take() else { return };
         match committed {
             Ok(()) => self.outbound.push_terminal(answer),
-            Err(why) => self.outbound.push_terminal(Outbound::Error {
-                message: format!("the answer is not on the run's record, so it was not sent: {why}"),
-                ending: Ending::Stopped,
-            }),
+            Err(why) => {
+                // The record is what failed, so this is said in the log.
+                tracing::error!(
+                    target: "weft_engine::caller_conn",
+                    error = %why,
+                    "the answer is not on the run's record, so it was not sent; the caller is told the run stopped"
+                );
+                self.outbound.push_terminal(Outbound::Error { ending: Ending::Stopped })
+            }
         }
     }
 
@@ -582,33 +666,37 @@ impl LiveCallerConnection {
     /// sink, so a flip first could close it before the row was handed over.
     /// Only the first call writes and flips: a second one returning at once
     /// leaves the flip to the first, so it never lands ahead of the row.
+    ///
+    /// The chunks still waiting to go out never will: the queue gives
+    /// them up, and the row names them as never received.
     pub(crate) fn mark_disconnected(&self, reason: &str) {
         if !self.disconnect_recorded.swap(true, Ordering::SeqCst) {
-            if self.arrival_recorded.load(Ordering::SeqCst) {
-                self.record.disconnected(reason);
-            }
+            self.outbound.end(|undelivered| {
+                if self.arrival_recorded.load(Ordering::SeqCst) {
+                    self.record.disconnected(reason, &undelivered);
+                }
+            });
             self.connected.send_replace(false);
         }
     }
 
-    /// Surface a node/run error to the caller per the error mode. Best
-    /// effort: records the `CallerErrored` event and pushes an `Error`
-    /// outbound (the socket task turns it into an in-band chunk for HTTP
-    /// after streaming started, or a WS close frame with the reason). Used
-    /// by the execute path when a live-connection run fails with the
-    /// caller still attached, so the caller learns why instead of seeing a
-    /// silently dropped socket. A program that already answered keeps its
-    /// answer: the error is recorded and never pushed after it, whether
-    /// that answer already left or still waits for the run's record.
-    /// `ending` is how the caller hears which kind of end it was.
+    /// Surface a run's error to the caller. Best effort: records the
+    /// `CallerErrored` event and pushes an `Error` outbound (a real status
+    /// before the first byte, an in-band chunk for HTTP after streaming
+    /// started, a WS close frame with the reason). Used by the execute
+    /// path when a live-connection run fails with the caller still
+    /// attached, so the caller learns why instead of seeing a silently
+    /// dropped socket. In every error mode: a run that ended has nothing
+    /// left to continue, so `drop_chunk` (which skips one chunk a node
+    /// could not make) has nothing to skip here. A program that already
+    /// answered keeps its answer: the error is recorded and never pushed
+    /// after it, whether that answer already left or still waits for the
+    /// run's record. `ending` is how the caller hears which kind of end
+    /// it was.
     pub async fn surface_error(&self, message: &str, ending: Ending) {
         self.record.errored(message);
-        // Tolerant streams: the chosen mode says swallow it.
-        if self.config.error_mode == weft_core::signal::ErrorMode::DropChunk {
-            return;
-        }
         if self.take_end(|_| ()).is_some() {
-            self.outbound.push_terminal(Outbound::Error { message: message.to_string(), ending });
+            self.outbound.push_terminal(Outbound::Error { ending });
         }
     }
 
@@ -628,7 +716,7 @@ impl LiveCallerConnection {
         if silent_http {
             let message = weft_core::caller::NO_ANSWER;
             self.record.errored(message);
-            self.outbound.push_terminal(Outbound::Error { message: message.to_string(), ending: Ending::ProgramFailed });
+            self.outbound.push_terminal(Outbound::Error { ending: Ending::ProgramFailed });
         } else {
             self.outbound.push_terminal(Outbound::Terminate(None, None));
         }
@@ -645,7 +733,7 @@ impl LiveCallerConnection {
             return;
         }
         self.record.errored(why);
-        self.outbound.push_terminal(Outbound::Error { message: why.to_string(), ending: Ending::Stopped });
+        self.outbound.push_terminal(Outbound::Error { ending: Ending::Stopped });
     }
 
     /// Claim the exchange's end once: `None` when it was already
@@ -667,7 +755,7 @@ impl LiveCallerConnection {
     fn disconnected_outcome(&self) -> Result<(), CallerError> {
         match resolve_disconnect(self.config.outlives_caller) {
             DisconnectAction::ContinueIntoVoid => Ok(()),
-            DisconnectAction::CancelExecution => Err(CallerError::Disconnected),
+            DisconnectAction::CancelRun => Err(CallerError::Disconnected),
         }
     }
 
@@ -763,20 +851,22 @@ impl CallerConnection for LiveCallerConnection {
             return Err(CallerError::JournalLost(why));
         }
         // An answer that streams is recorded whole, its caller's arrival
-        // first.
+        // first, and each chunk with what a slow caller's policy did to
+        // it or to the oldest chunk still waiting.
         self.caller_arrived();
-        self.record.outbound(&chunk, false);
+        let (admission, offset) = self.outbound.admit(self.config.backpressure, |admission| self.record.chunk(&chunk, admission))?;
+        if admission == Admission::Refused {
+            // Let go as it arrived, and on the record as such; nothing
+            // leaves, so nothing waits for the record.
+            return Ok(());
+        }
         // A durable run's answer leaves only once it is on record.
         self.record.sink.committed().await.map_err(CallerError::JournalLost)?;
-        let chunk = Outbound::Chunk(chunk);
-        match self.config.backpressure {
+        let chunk = Outbound::Chunk { chunk, offset };
+        match admission {
             // Await a free slot; only errors if the socket is gone.
-            Backpressure::Block => self.outbound.push_block(chunk).await,
-            // Shed the incoming chunk if the queue is full; keep what's queued.
-            Backpressure::DropNewest => self.outbound.push_drop_newest(chunk),
-            // Evict the oldest queued chunk to make room, then enqueue. Real
-            // drop-oldest: the producer owns the buffer (see `OutboundQueue`).
-            Backpressure::DropOldest => self.outbound.push_drop_oldest(chunk),
+            Admission::Waits => self.outbound.push_block(chunk).await,
+            _ => self.outbound.push_admitted(chunk),
         }
     }
 
@@ -815,7 +905,7 @@ impl CallerConnection for LiveCallerConnection {
             // is held rather than waited for here: the drive lets it go
             // once the record holds it, and when the answer is the run's
             // last act, the run's ending is in that same write
-            // (`execution_driver`, `Self::release_answer`).
+            // (`run_driver`, `Self::release_answer`).
             *self.held.lock().expect("caller conn poisoned") = Some(terminal);
             self.held_note.notify_one();
             return Ok(());
@@ -825,6 +915,33 @@ impl CallerConnection for LiveCallerConnection {
         // (the exchange is over anyway).
         self.outbound.push_terminal(terminal);
         Ok(())
+    }
+
+    /// In every error mode: a stream that broke off is never ended as if
+    /// it were whole, which is what a clean end would tell the caller.
+    async fn fail(&self, message: &str) -> Result<(), CallerError> {
+        let _sending = self.sending.lock().await;
+        {
+            let mut g = self.inner.lock().expect("caller conn poisoned");
+            try_terminate(g.terminated)?;
+            g.terminated = true;
+            g.wire_started = true;
+        }
+        self.record.errored(message);
+        let terminal = Outbound::Error { ending: Ending::ProgramFailed };
+        // A durable run's last word, held for its record like any
+        // terminal (see `terminate`).
+        if self.record.sink.waits_for_commit() {
+            *self.held.lock().expect("caller conn poisoned") = Some(terminal);
+            self.held_note.notify_one();
+            return Ok(());
+        }
+        self.outbound.push_terminal(terminal);
+        Ok(())
+    }
+
+    fn chunk_dropped(&self, why: &str) {
+        self.record.errored(&format!("{}: {why}", weft_core::caller::CHUNK_DROPPED));
     }
 
     async fn receive(
@@ -978,14 +1095,14 @@ impl QuietTimer {
 /// caller (a live connection, a fired run's stand-in) writes through
 /// one, so their rows number the same way.
 pub(crate) struct CallerRecord {
-    execution_id: ExecutionId,
+    run_id: RunId,
     sink: Arc<dyn CallerJournalSink>,
     next_offset: AtomicU64,
 }
 
 impl CallerRecord {
-    pub(crate) fn new(execution_id: ExecutionId, sink: Arc<dyn CallerJournalSink>) -> Self {
-        Self { execution_id, sink, next_offset: AtomicU64::new(0) }
+    pub(crate) fn new(run_id: RunId, sink: Arc<dyn CallerJournalSink>) -> Self {
+        Self { run_id, sink, next_offset: AtomicU64::new(0) }
     }
 
     pub(crate) fn sink(&self) -> Arc<dyn CallerJournalSink> {
@@ -997,23 +1114,42 @@ impl CallerRecord {
     }
 
     pub(crate) fn connected(&self, protocol: Protocol) {
-        self.sink.connected(self.execution_id, self.take_offset(), protocol);
+        self.sink.connected(self.run_id, self.take_offset(), protocol);
     }
 
     pub(crate) fn inbound(&self, msg: &InboundMessage) {
-        self.sink.inbound(self.execution_id, self.take_offset(), msg);
+        self.sink.inbound(self.run_id, self.take_offset(), msg);
     }
 
+    /// One of the program's messages that reaches the caller as it is
+    /// (an answer's last words, a fired run's answer).
     pub(crate) fn outbound(&self, chunk: &OutboundChunk, terminal: bool) {
-        self.sink.outbound(self.execution_id, self.take_offset(), chunk, terminal);
+        self.sink.outbound(self.run_id, self.take_offset(), chunk, terminal, None);
+    }
+
+    /// A streamed chunk, with what the queue toward the caller did as it
+    /// arrived ([`Admission`]): the chunk itself let go, or an older one
+    /// pushed out for it, is said in the same row. Returns the chunk's
+    /// offset.
+    pub(crate) fn chunk(&self, chunk: &OutboundChunk, admission: Admission) -> u64 {
+        let offset = self.take_offset();
+        let dropped = match admission {
+            Admission::Refused => Some(offset),
+            Admission::Evicted(oldest) => Some(oldest),
+            Admission::Waits | Admission::Room => None,
+        };
+        self.sink.outbound(self.run_id, offset, chunk, false, dropped);
+        offset
     }
 
     pub(crate) fn errored(&self, message: &str) {
-        self.sink.errored(self.execution_id, self.take_offset(), message);
+        self.sink.errored(self.run_id, self.take_offset(), message);
     }
 
-    pub(crate) fn disconnected(&self, reason: &str) {
-        self.sink.disconnected(self.execution_id, self.take_offset(), reason);
+    /// The exchange is over, for `reason`. `dropped` are the program's
+    /// messages still waiting to go out, which the caller never received.
+    pub(crate) fn disconnected(&self, reason: &str, dropped: &[u64]) {
+        self.sink.disconnected(self.run_id, self.take_offset(), reason, dropped);
     }
 }
 
@@ -1022,11 +1158,19 @@ impl CallerRecord {
 /// bus journal pump's projection (connect / inbound / outbound / error /
 /// disconnect, each with an offset).
 pub trait CallerJournalSink: Send + Sync {
-    fn connected(&self, execution_id: ExecutionId, offset: u64, protocol: Protocol);
-    fn inbound(&self, execution_id: ExecutionId, offset: u64, msg: &InboundMessage);
-    fn outbound(&self, execution_id: ExecutionId, offset: u64, chunk: &OutboundChunk, terminal: bool);
-    fn errored(&self, execution_id: ExecutionId, offset: u64, message: &str);
-    fn disconnected(&self, execution_id: ExecutionId, offset: u64, reason: &str);
+    fn connected(&self, run_id: RunId, offset: u64, protocol: Protocol);
+    fn inbound(&self, run_id: RunId, offset: u64, msg: &InboundMessage);
+    /// One of the program's messages at `offset`. `dropped` is the
+    /// offset of a message of the program's the caller will never receive,
+    /// decided as this one was sent: this one itself, or an older one
+    /// pushed out for it ([`Admission`]). It belongs in the same row as
+    /// this message.
+    fn outbound(&self, run_id: RunId, offset: u64, chunk: &OutboundChunk, terminal: bool, dropped: Option<u64>);
+    fn errored(&self, run_id: RunId, offset: u64, message: &str);
+    /// The exchange is over, for `reason`; `dropped` are the offsets of
+    /// the program's messages still waiting to go out, which the caller
+    /// never received.
+    fn disconnected(&self, run_id: RunId, offset: u64, reason: &str, dropped: &[u64]);
 
     /// Stop taking rows, and hand over what is held. A run closes its
     /// caller's sink once it is over, before it lets go of its record
@@ -1069,7 +1213,7 @@ pub trait CallerJournalSink: Send + Sync {
 #[allow(clippy::type_complexity)]
 pub(crate) fn new_connection(
     config: CallerRuntimeConfig,
-    execution_id: ExecutionId,
+    run_id: RunId,
     handshake: Arc<LiveRequest>,
     http_body: Option<InboundMessage>,
     journal: Arc<dyn CallerJournalSink>,
@@ -1097,7 +1241,7 @@ pub(crate) fn new_connection(
         session_ends,
         handshake,
         http_request,
-        record: CallerRecord::new(execution_id, journal.clone()),
+        record: CallerRecord::new(run_id, journal.clone()),
         inner: Mutex::new(ConnInner { terminated: false, wire_started: false }),
         connected: tokio::sync::watch::Sender::new(true),
         disconnect_recorded: AtomicBool::new(false),
@@ -1164,9 +1308,9 @@ pub struct ConnServerState {
     pub starter: Arc<dyn LiveStarter>,
     /// Worker clock (for the now()-based session deadline / heartbeat).
     pub clock: Arc<dyn weft_platform_traits::Clock>,
-    /// Fires the per-execution cancel flag (cancel-on-disconnect for a
-    /// caller-tied run). Looked up by execution.
-    pub canceller: Arc<dyn ExecutionCanceller>,
+    /// Fires the per-run cancel flag (cancel-on-disconnect for a
+    /// caller-tied run). Looked up by run.
+    pub canceller: Arc<dyn RunCanceller>,
 }
 
 /// Why an exchange ended. The one fact the drainers decide a cancel
@@ -1176,7 +1320,7 @@ pub struct ConnServerState {
 /// its last nodes: a `done` pulse, a Debug). Matching the words would
 /// have been the bug this replaces: for a while every "response
 /// complete" cancelled the run that had just answered, and the
-/// executions panel filled with cancelled rows.
+/// runs panel filled with cancelled rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExchangeEnd {
     /// The caller stopped reading (HTTP).
@@ -1241,8 +1385,8 @@ impl ExchangeEnd {
     /// is the time limit the caller was answered with, naming the cap
     /// ([`crate::worker::Limit::SessionCap`]).
     ///
-    /// [`CancelCause::CallerGone`]: weft_core::exec::CancelCause::CallerGone
-    fn cancels_tied_run(self, config: &CallerRuntimeConfig, execution_id: ExecutionId) -> Option<weft_core::exec::CancelCause> {
+    /// [`CancelCause::CallerGone`]: weft_core::run::CancelCause::CallerGone
+    fn cancels_tied_run(self, config: &CallerRuntimeConfig, run_id: RunId) -> Option<weft_core::run::CancelCause> {
         match self {
             Self::CallerHungUp
             | Self::CallerHungUpOnSend
@@ -1252,9 +1396,9 @@ impl ExchangeEnd {
             | Self::CallerMissedHeartbeat
             | Self::SocketNeverOpened
             | Self::InboundTooLarge
-            | Self::InboundDecodeFailed => Some(weft_core::exec::CancelCause::CallerGone),
+            | Self::InboundDecodeFailed => Some(weft_core::run::CancelCause::CallerGone),
             Self::SessionCapExceeded => Some(
-                crate::worker::Limit::SessionCap { cap: std::time::Duration::from_secs(config.max_session_secs) }.cause(execution_id),
+                crate::worker::Limit::SessionCap { cap: std::time::Duration::from_secs(config.max_session_secs) }.cause(run_id),
             ),
             Self::ResponseComplete
             | Self::ResponseErrored
@@ -1264,22 +1408,22 @@ impl ExchangeEnd {
         }
     }
 }
-/// Fires the per-execution cancel flag (cancel-on-disconnect). The worker
+/// Fires the per-run cancel flag (cancel-on-disconnect). The worker
 /// implements this over its cancel registry.
-pub trait ExecutionCanceller: Send + Sync {
-    fn cancel(&self, execution_id: ExecutionId, cause: weft_core::exec::CancelCause);
+pub trait RunCanceller: Send + Sync {
+    fn cancel(&self, run_id: RunId, cause: weft_core::run::CancelCause);
 }
 
 /// A run born for a caller: where its exchange is recorded, and its drive,
 /// which starts with the caller's connection in hand.
 pub struct Born {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     /// The sink the exchange is recorded through: the run's record.
     pub sink: Arc<dyn CallerJournalSink>,
     /// The run's drive, given its caller's exchange. Whoever holds the
     /// future drives the run: the call's own task for an HTTP call, a task
     /// of its own for a socket.
-    pub drive: Box<dyn FnOnce(crate::execution_driver::Exchange) -> futures::future::BoxFuture<'static, ()> + Send>,
+    pub drive: Box<dyn FnOnce(crate::run_driver::Exchange) -> futures::future::BoxFuture<'static, ()> + Send>,
 }
 
 /// Gives birth to the run of a caller the door let in.
@@ -1297,11 +1441,11 @@ pub trait LiveStarter: Send + Sync {
 /// reads as gone, so whatever wakes on the caller leaving
 /// (`weft_engine::worker`'s move off a worker no call holds open) finds the
 /// run already cancelled.
-fn exchange_ended(conn: &LiveCallerConnection, outbound: &OutboundQueue, canceller: &dyn ExecutionCanceller, execution_id: ExecutionId, end: ExchangeEnd) {
+fn exchange_ended(conn: &LiveCallerConnection, outbound: &OutboundQueue, canceller: &dyn RunCanceller, run_id: RunId, end: ExchangeEnd) {
     outbound.close();
-    if matches!(resolve_disconnect(conn.config.outlives_caller), DisconnectAction::CancelExecution) {
-        if let Some(cause) = end.cancels_tied_run(&conn.config, execution_id) {
-            canceller.cancel(execution_id, cause);
+    if matches!(resolve_disconnect(conn.config.outlives_caller), DisconnectAction::CancelRun) {
+        if let Some(cause) = end.cancels_tied_run(&conn.config, run_id) {
+            canceller.cancel(run_id, cause);
         }
     }
     conn.mark_disconnected(end.as_str());
@@ -1311,14 +1455,14 @@ fn exchange_ended(conn: &LiveCallerConnection, outbound: &OutboundQueue, cancell
 /// on to a task of its own once the answer leaves with work left
 /// ([`Self::carry_on`]); dropped with the call before that (the caller
 /// went away), it ends the exchange as the caller's and still goes on to
-/// its end on a task of its own, so a run never stops mid-step because
+/// its end on a task of its own, so a run never stops mid-firing because
 /// its caller left.
 struct RunHere {
     run: Option<futures::future::BoxFuture<'static, ()>>,
     conn: Arc<LiveCallerConnection>,
     outbound: Arc<OutboundQueue>,
-    canceller: Arc<dyn ExecutionCanceller>,
-    execution_id: ExecutionId,
+    canceller: Arc<dyn RunCanceller>,
+    run_id: RunId,
 }
 
 impl RunHere {
@@ -1336,7 +1480,7 @@ impl RunHere {
 impl Drop for RunHere {
     fn drop(&mut self) {
         if let Some(run) = self.run.take() {
-            exchange_ended(&self.conn, &self.outbound, self.canceller.as_ref(), self.execution_id, ExchangeEnd::CallerHungUp);
+            exchange_ended(&self.conn, &self.outbound, self.canceller.as_ref(), self.run_id, ExchangeEnd::CallerHungUp);
             tokio::spawn(run);
         }
     }
@@ -1349,8 +1493,8 @@ impl Drop for RunHere {
 struct Unopened {
     conn: Arc<LiveCallerConnection>,
     outbound: Arc<OutboundQueue>,
-    canceller: Arc<dyn ExecutionCanceller>,
-    execution_id: ExecutionId,
+    canceller: Arc<dyn RunCanceller>,
+    run_id: RunId,
     armed: bool,
 }
 
@@ -1364,7 +1508,7 @@ impl Unopened {
 impl Drop for Unopened {
     fn drop(&mut self) {
         if self.armed {
-            exchange_ended(&self.conn, &self.outbound, self.canceller.as_ref(), self.execution_id, ExchangeEnd::SocketNeverOpened);
+            exchange_ended(&self.conn, &self.outbound, self.canceller.as_ref(), self.run_id, ExchangeEnd::SocketNeverOpened);
         }
     }
 }
@@ -1670,21 +1814,21 @@ async fn handle_connect(
     if let Some(socket) = &socket {
         socket.bound_silence(config.caller_silence_secs);
     }
-    let execution_id = born.execution_id;
+    let run_id = born.run_id;
     let http_body = match &opening {
         Opening::Http(body) => Some(body.clone()),
         Opening::Socket(_) => None,
     };
-    let (conn, outbound, inbound) = new_connection(config.clone(), execution_id, handshake, http_body, born.sink);
-    let exchange = crate::execution_driver::Exchange { conn: conn.clone(), live: Some(conn.clone()), sink: conn.journal() };
+    let (conn, outbound, inbound) = new_connection(config.clone(), run_id, handshake, http_body, born.sink);
+    let exchange = crate::run_driver::Exchange { conn: conn.clone(), live: Some(conn.clone()), sink: conn.journal() };
     let run = (born.drive)(exchange);
-    match opening {
+    let mut answer = match opening {
         Opening::Http(_) => {
-            let here = RunHere { run: Some(run), conn, outbound, canceller: state.canceller.clone(), execution_id };
+            let here = RunHere { run: Some(run), conn, outbound, canceller: state.canceller.clone(), run_id };
             answer_http(here, heartbeat_secs, state.clock.clone()).await
         }
         Opening::Socket(upgrade) => {
-            let unopened = Unopened { conn: conn.clone(), outbound: outbound.clone(), canceller: state.canceller.clone(), execution_id, armed: true };
+            let unopened = Unopened { conn: conn.clone(), outbound: outbound.clone(), canceller: state.canceller.clone(), run_id, armed: true };
             // A socket's run has a task of its own; the socket's task feeds
             // the wire.
             tokio::spawn(run);
@@ -1698,10 +1842,23 @@ async fn handle_connect(
             let upgrade = upgrade.max_message_size(cap).max_frame_size(cap);
             // A socket that never completes its upgrade drops the closure,
             // and with it `unopened`, which ends the exchange.
-            let pump = SocketPump { conn, outbound, inbound, config, heartbeat_secs, clock: state.clock.clone(), canceller: state.canceller.clone(), execution_id };
+            let pump = SocketPump { conn, outbound, inbound, config, heartbeat_secs, clock: state.clock.clone(), canceller: state.canceller.clone(), run_id };
             upgrade.on_upgrade(move |socket| pump_ws(socket, pump, unopened))
         }
-    }
+    };
+    // Every answer of a run says which run it was, success or failure.
+    answer.headers_mut().insert(run_id_header(), run_id_value(run_id));
+    answer
+}
+
+/// The [`weft_core::caller::RUN_ID_HEADER`] header's name.
+fn run_id_header() -> axum::http::HeaderName {
+    axum::http::HeaderName::from_bytes(weft_core::caller::RUN_ID_HEADER.as_bytes()).expect("a valid header name")
+}
+
+/// A run id as a header value: a uuid is always one.
+fn run_id_value(run_id: RunId) -> axum::http::HeaderValue {
+    axum::http::HeaderValue::from_str(&run_id.to_string()).expect("a uuid is a valid header value")
 }
 
 /// What a call brings besides its opening request.
@@ -1731,7 +1888,9 @@ async fn read_body(config: &CallerRuntimeConfig, body: axum::body::Body) -> Resu
 /// ([`stream_body`]), and the run goes on on a task of its own. Nothing goes
 /// out before the program speaks, so a route can answer 404, set a header,
 /// or stream; a program that never replies holds the caller only as long as
-/// it runs, and its end answers a `500` saying so (`run_ended`).
+/// it runs, and its end answers a `500` saying so (`run_ended`). Every
+/// failure is answered as the plain failure and the run's id, whatever went
+/// wrong (`failure_response`).
 async fn answer_http(mut here: RunHere, heartbeat_secs: u64, clock: Arc<dyn weft_platform_traits::Clock>) -> Response {
     let outbound = here.outbound.clone();
     let mut explicit: Option<ResponseHead> = None;
@@ -1759,23 +1918,24 @@ async fn answer_http(mut here: RunHere, heartbeat_secs: u64, clock: Arc<dyn weft
             Waited::RunOver => here.run = None,
             Waited::SessionOver => {
                 let end = ExchangeEnd::SessionCapExceeded;
-                exchange_ended(&here.conn, &outbound, here.canceller.as_ref(), here.execution_id, end);
+                exchange_ended(&here.conn, &outbound, here.canceller.as_ref(), here.run_id, end);
+                let run_id = here.run_id;
                 here.carry_on();
-                return build_response(&error_head(Ending::TimeLimit), axum::body::Body::from(format!("no response from the program: {}", end.as_str())));
+                return failure_response(Ending::TimeLimit, run_id);
             }
             Waited::Item(Some(Outbound::Head(head))) => explicit = Some(head),
             Waited::Item(decisive) => break decisive,
         }
     };
-    let (conn, execution_id) = (here.conn.clone(), here.execution_id);
+    let (conn, run_id) = (here.conn.clone(), here.run_id);
     let response = match first {
-        Some(Outbound::Chunk(chunk)) => {
+        Some(Outbound::Chunk { chunk, .. }) => {
             let head = committed_head(explicit, Some(&chunk));
             let body = stream_body(StreamedAnswer {
                 conn: conn.clone(),
                 outbound: outbound.clone(),
                 canceller: here.canceller.clone(),
-                execution_id,
+                run_id,
                 head: head.clone(),
                 first: chunk,
                 heartbeat_secs,
@@ -1789,15 +1949,15 @@ async fn answer_http(mut here: RunHere, heartbeat_secs: u64, clock: Arc<dyn weft
             build_response(&head, axum::body::Body::from(last.as_ref().map(chunk_to_bytes).unwrap_or_default()))
         }
         // Before the first byte the status line is still ours to set: a
-        // real error status, the message as the body.
-        Some(Outbound::Error { message, ending }) => {
+        // real error status, the plain failure as the body.
+        Some(Outbound::Error { ending }) => {
             conn.mark_disconnected(ExchangeEnd::ResponseErrored.as_str());
-            build_response(&error_head(ending), axum::body::Body::from(message))
+            failure_response(ending, run_id)
         }
         Some(Outbound::Head(_)) => unreachable!("a head is held above, never decisive"),
         None => {
             conn.mark_disconnected(ExchangeEnd::OutboundQueueClosed.as_str());
-            build_response(&error_head(Ending::ProgramFailed), axum::body::Body::from(format!("no response from the program: {}", ExchangeEnd::OutboundQueueClosed.as_str())))
+            failure_response(Ending::ProgramFailed, run_id)
         }
     };
     here.carry_on();
@@ -1826,18 +1986,20 @@ fn committed_head(explicit: Option<ResponseHead>, first: Option<&OutboundChunk>)
     }
 }
 
-/// The head of an exchange that ends before its first byte without the
-/// program's answer: the status `ending` says, with a text body.
-fn error_head(ending: Ending) -> ResponseHead {
-    ResponseHead::new(ending.status()).with_content_type_for(&OutboundChunk::Text(String::new()))
+/// The answer of an exchange that ends before its first byte without the
+/// program's answer: the status `ending` says, the plain failure and the
+/// run's id as its JSON body.
+fn failure_response(ending: Ending, run_id: RunId) -> Response {
+    let head = ResponseHead::new(ending.status()).with_content_type_for(&OutboundChunk::Json(serde_json::Value::Null));
+    build_response(&head, axum::body::Body::from(PlainFailure::of(run_id).body()))
 }
 
 /// What feeds a streamed answer's body.
 struct StreamedAnswer {
     conn: Arc<LiveCallerConnection>,
     outbound: Arc<OutboundQueue>,
-    canceller: Arc<dyn ExecutionCanceller>,
-    execution_id: ExecutionId,
+    canceller: Arc<dyn RunCanceller>,
+    run_id: RunId,
     /// The head that went out: the body's framing (its keepalive filler,
     /// how an error is written in-band).
     head: ResponseHead,
@@ -1862,7 +2024,7 @@ struct StreamedAnswer {
 fn stream_body(answer: StreamedAnswer) -> axum::body::Body {
     let (tx, rx) = mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
     tokio::spawn(async move {
-        let StreamedAnswer { conn, outbound, canceller, execution_id, head, first, heartbeat_secs, mut session } = answer;
+        let StreamedAnswer { conn, outbound, canceller, run_id, head, first, heartbeat_secs, mut session } = answer;
         let mut heartbeat = QuietTimer::new(heartbeat_secs);
         let end = 'feed: {
             let sent = async { tx.send(Ok(chunk_to_bytes(&first))).await.is_ok() };
@@ -1879,9 +2041,9 @@ fn stream_body(answer: StreamedAnswer) -> axum::body::Body {
                         // and skipped.
                         Some(Outbound::Head(_)) => tracing::error!(
                             target: "weft_engine::caller_conn",
-                            %execution_id, "a response head reached a stream already under way"
+                            %run_id, "a response head reached a stream already under way"
                         ),
-                        Some(Outbound::Chunk(c)) => {
+                        Some(Outbound::Chunk { chunk: c, .. }) => {
                             let sent = async { tx.send(Ok(chunk_to_bytes(&c))).await.is_ok() };
                             match write_or_end(sent, tx.closed(), &mut session).await {
                                 Ok(true) => heartbeat.sent(),
@@ -1905,8 +2067,8 @@ fn stream_body(answer: StreamedAnswer) -> axum::body::Body {
                         }
                         // The status is committed, so the error goes
                         // in-band, then the stream closes.
-                        Some(Outbound::Error { message, ending }) => {
-                            let sent = async { tx.send(Ok(head.in_band_error(&message, ending.status()))).await.is_ok() };
+                        Some(Outbound::Error { ending }) => {
+                            let sent = async { tx.send(Ok(head.in_band_error(&PlainFailure::of(run_id), ending.status()))).await.is_ok() };
                             if let Err(end) = write_or_end(sent, tx.closed(), &mut session).await {
                                 break 'feed end;
                             }
@@ -1942,12 +2104,12 @@ fn stream_body(answer: StreamedAnswer) -> axum::body::Body {
         // limit. Only if the body has room: a full body is a caller that
         // has not read what came before it, and would never read this.
         if end == ExchangeEnd::SessionCapExceeded {
-            let _ = tx.try_send(Ok(head.in_band_error(end.as_str(), Ending::TimeLimit.status())));
+            let _ = tx.try_send(Ok(head.in_band_error(&PlainFailure::of(run_id), Ending::TimeLimit.status())));
         }
         // The exchange ended: stop producers (a blocked send now errors);
         // a tied run is cancelled when the caller ended it (or its session
         // cap did), and a run that answered finishes on its own.
-        exchange_ended(&conn, &outbound, canceller.as_ref(), execution_id, end);
+        exchange_ended(&conn, &outbound, canceller.as_ref(), run_id, end);
     });
     axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
@@ -1979,8 +2141,8 @@ struct SocketPump {
     config: CallerRuntimeConfig,
     heartbeat_secs: u64,
     clock: Arc<dyn weft_platform_traits::Clock>,
-    canceller: Arc<dyn ExecutionCanceller>,
-    execution_id: ExecutionId,
+    canceller: Arc<dyn RunCanceller>,
+    run_id: RunId,
 }
 
 /// WebSocket path: bridge the socket to the connection, on the socket's
@@ -1988,7 +2150,7 @@ struct SocketPump {
 /// write pump (drain outbound -> frames), and the heartbeat (ping on a
 /// timer).
 async fn pump_ws(mut socket: WebSocket, pump: SocketPump, unopened: Unopened) {
-    let SocketPump { conn, outbound, inbound, config, heartbeat_secs, clock, canceller, execution_id } = pump;
+    let SocketPump { conn, outbound, inbound, config, heartbeat_secs, clock, canceller, run_id } = pump;
     unopened.opened();
     conn.caller_arrived();
 
@@ -2040,7 +2202,7 @@ async fn pump_ws(mut socket: WebSocket, pump: SocketPump, unopened: Unopened) {
                 // one arriving here is a connection bug, loud and skipped.
                 Some(Outbound::Head(_)) => tracing::error!(
                     target: "weft_engine::caller_conn",
-                    execution_id = %execution_id, "a response head reached a websocket drainer"
+                    run_id = %run_id, "a response head reached a websocket drainer"
                 ),
                 // A socket reports a caller gone only through a failed
                 // write, so each write races the session cap alone. A
@@ -2049,7 +2211,7 @@ async fn pump_ws(mut socket: WebSocket, pump: SocketPump, unopened: Unopened) {
                 // (`bound_silence`, set before the protocol branch), so
                 // the machine aborts a connection whose data sits
                 // unacknowledged, or behind a closed window, that long.
-                Some(Outbound::Chunk(c)) => {
+                Some(Outbound::Chunk { chunk: c, .. }) => {
                     let sent = async { socket.send(chunk_to_ws(&c)).await.is_ok() };
                     match write_or_end(sent, std::future::pending(), &mut session).await {
                         Ok(true) => heartbeat.sent(),
@@ -2075,11 +2237,11 @@ async fn pump_ws(mut socket: WebSocket, pump: SocketPump, unopened: Unopened) {
                     }
                     break ExchangeEnd::SessionClosedByProgram;
                 }
-                Some(Outbound::Error { message, ending }) => {
+                Some(Outbound::Error { ending }) => {
                     let sent = async {
                         socket.send(Message::Close(Some(axum::extract::ws::CloseFrame {
                             code: ending.close_code(),
-                            reason: message.into(),
+                            reason: PlainFailure::of(run_id).line().into(),
                         }))).await.is_ok()
                     };
                     // The program ended it: a close the caller no longer
@@ -2112,14 +2274,14 @@ async fn pump_ws(mut socket: WebSocket, pump: SocketPump, unopened: Unopened) {
     // only when the CALLER ended the exchange, and a socket the program
     // closed leaves the run to finish.
     inbound.close();
-    exchange_ended(&conn, &outbound, canceller.as_ref(), execution_id, reason);
-    // The cap is told as a time limit. A caller that no longer reads holds
-    // this write only until the socket's caller-silence bound aborts the
-    // connection, and then has nobody left to tell.
+    exchange_ended(&conn, &outbound, canceller.as_ref(), run_id, reason);
+    // The cap is told as a time limit, in the plain words every failure is
+    // told in. A caller that no longer reads holds this write only until
+    // the socket's caller-silence bound aborts the connection, and then has
+    // nobody left to tell.
     if reason == ExchangeEnd::SessionCapExceeded {
-        let _ = socket
-            .send(Message::Close(Some(axum::extract::ws::CloseFrame { code: Ending::TimeLimit.close_code(), reason: reason.as_str().into() })))
-            .await;
+        let close = axum::extract::ws::CloseFrame { code: Ending::TimeLimit.close_code(), reason: PlainFailure::of(run_id).line().into() };
+        let _ = socket.send(Message::Close(Some(close))).await;
     }
 }
 
@@ -2139,10 +2301,12 @@ mod tests {
             Some(ResponseHead::new(200).with_header("content-type", "application/x-ndjson").with_keepalive("\n")),
             Some(&OutboundChunk::Text("{\"a\":1}\n".into())),
         );
-        assert_eq!(ndjson.in_band_error("boom", 500), b"\n{\"error\":\"boom\",\"status\":500}\n");
+        let failure = PlainFailure::of(uuid::Uuid::nil());
+        let line: serde_json::Value = serde_json::from_slice(&ndjson.in_band_error(&failure, 500)).unwrap();
+        assert_eq!(line["status"], 500);
         assert_eq!(ndjson.keepalive.as_deref(), Some("\n"), "the filler comes off the committed head");
         let text = committed_head(None, Some(&OutboundChunk::Text("partial".into())));
-        assert_eq!(text.in_band_error("boom", 500), b"\n[error] boom");
+        assert!(text.in_band_error(&failure, 500).starts_with(b"\n[error] "));
         assert_eq!(committed_head(None, None).status, 204, "no body and no head is a 204");
     }
 
@@ -2151,27 +2315,54 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         events: Mutex<Vec<String>>,
+        /// The program's messages as recorded: offset, payload, and the
+        /// message the caller will never receive said in the same row.
+        sent: Mutex<Vec<(u64, OutboundChunk, Option<u64>)>>,
+        /// The messages the row saying the caller left names as never
+        /// received.
+        left_behind: Mutex<Vec<u64>>,
     }
     impl RecordingSink {
         fn events(&self) -> Vec<String> {
             self.events.lock().unwrap().clone()
         }
+
+        /// What the record says reached the caller: every message of the
+        /// program's, in order, minus those a row says it never received.
+        fn received(&self) -> Vec<i64> {
+            let sent = self.sent.lock().unwrap();
+            let mut dropped: std::collections::HashSet<u64> = sent.iter().filter_map(|(_, _, d)| *d).collect();
+            dropped.extend(self.left_behind.lock().unwrap().iter().copied());
+            sent.iter()
+                .filter(|(offset, _, _)| !dropped.contains(offset))
+                .map(|(_, chunk, _)| match chunk {
+                    OutboundChunk::Json(v) => v.as_i64().unwrap(),
+                    other => panic!("expected a json chunk, got {other:?}"),
+                })
+                .collect()
+        }
+
+        fn dropped(&self) -> usize {
+            self.sent.lock().unwrap().iter().filter(|(_, _, d)| d.is_some()).count()
+        }
     }
     impl CallerJournalSink for RecordingSink {
-        fn connected(&self, _c: ExecutionId, off: u64, _p: Protocol) {
+        fn connected(&self, _c: RunId, off: u64, _p: Protocol) {
             self.events.lock().unwrap().push(format!("connected@{off}"));
         }
-        fn inbound(&self, _c: ExecutionId, off: u64, _m: &InboundMessage) {
+        fn inbound(&self, _c: RunId, off: u64, _m: &InboundMessage) {
             self.events.lock().unwrap().push(format!("inbound@{off}"));
         }
-        fn outbound(&self, _c: ExecutionId, off: u64, _ch: &OutboundChunk, terminal: bool) {
+        fn outbound(&self, _c: RunId, off: u64, ch: &OutboundChunk, terminal: bool, dropped: Option<u64>) {
             self.events.lock().unwrap().push(format!("outbound@{off}:term={terminal}"));
+            self.sent.lock().unwrap().push((off, ch.clone(), dropped));
         }
-        fn errored(&self, _c: ExecutionId, off: u64, _m: &str) {
-            self.events.lock().unwrap().push(format!("errored@{off}"));
+        fn errored(&self, _c: RunId, off: u64, message: &str) {
+            self.events.lock().unwrap().push(format!("errored@{off}:{message}"));
         }
-        fn disconnected(&self, _c: ExecutionId, off: u64, _r: &str) {
+        fn disconnected(&self, _c: RunId, off: u64, _r: &str, dropped: &[u64]) {
             self.events.lock().unwrap().push(format!("disconnected@{off}"));
+            self.left_behind.lock().unwrap().extend_from_slice(dropped);
         }
 
         fn close(&self) {
@@ -2198,7 +2389,7 @@ mod tests {
     #[tokio::test]
     async fn a_sockets_disconnect_is_recorded_once() {
         let journal = Arc::new(RecordingSink::default());
-        let (conn, _, _) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, journal.clone());
+        let (conn, _, _) = new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, journal.clone());
         conn.caller_arrived();
         conn.terminate(None, None, None).await.unwrap();
         conn.mark_disconnected("socket closed");
@@ -2210,7 +2401,7 @@ mod tests {
     async fn outbound_chunks_reach_the_socket_channel_and_journal() {
         let sink = Arc::new(RecordingSink::default());
         let (conn, out_rx, _inb) =
-            new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink.clone());
+            new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, sink.clone());
         conn.caller_arrived();
         let handle = CallerHandle::from_connection(conn.clone());
         let CallerHandle::Websocket(ws) = handle else { unreachable!() };
@@ -2218,7 +2409,7 @@ mod tests {
         ws.close().await.unwrap();
         // Socket task would drain these:
         let first = out_rx.recv().await.expect("chunk");
-        assert!(matches!(first, Outbound::Chunk(_)));
+        assert!(matches!(first, Outbound::Chunk { .. }));
         let term = out_rx.recv().await.expect("terminate");
         assert!(matches!(term, Outbound::Terminate(None, None)));
         // Journal saw connect and the outbound chunk. The disconnect is the
@@ -2235,7 +2426,7 @@ mod tests {
     async fn inbound_broadcasts_to_every_listener() {
         let sink = Arc::new(RecordingSink::default());
         let (conn, _out_rx, inbound) =
-            new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
+            new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         let h1 = CallerHandle::from_connection(conn.clone());
         let h2 = CallerHandle::from_connection(conn.clone());
@@ -2256,7 +2447,7 @@ mod tests {
     #[tokio::test]
     async fn builtin_cursor_pins_at_attach_no_subscribe_race() {
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, inbound) = new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         // A message arrives AFTER attach (offset 0) but BEFORE the node
         // builds its handle / first reads. The built-in cursor pins at the
@@ -2275,7 +2466,7 @@ mod tests {
     #[tokio::test]
     async fn cursor_from_start_reads_retained_history() {
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, inbound) = new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         inbound.push(InboundMessage::Json(serde_json::json!("a")));
         inbound.push(InboundMessage::Json(serde_json::json!("b")));
@@ -2292,7 +2483,7 @@ mod tests {
     async fn inbound_window_trims_and_below_floor_falls_behind() {
         // ws_cfg() sets inbound_window = 4. Push 6: the oldest 2 are evicted.
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, inbound) = new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         for i in 0..6 {
             inbound.push(InboundMessage::Json(serde_json::json!(i)));
@@ -2321,7 +2512,7 @@ mod tests {
     #[tokio::test]
     async fn cursor_including_last_seeds_most_recent() {
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, inbound) = new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         inbound.push(InboundMessage::Json(serde_json::json!("first")));
         inbound.push(InboundMessage::Json(serde_json::json!("latest")));
@@ -2336,7 +2527,7 @@ mod tests {
     #[tokio::test]
     async fn cursor_at_positions_at_absolute_offset() {
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, inbound) = new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         for i in 0..4 {
             inbound.push(InboundMessage::Json(serde_json::json!(i)));
@@ -2359,7 +2550,7 @@ mod tests {
     async fn now_offset_and_retained_floor_track_window() {
         // window=4: after 7 pushes, now=7, floor=3 (offsets 0,1,2 evicted).
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, inbound) = new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         for i in 0..7 {
             inbound.push(InboundMessage::Json(serde_json::json!(i)));
@@ -2374,7 +2565,7 @@ mod tests {
     #[tokio::test]
     async fn request_via_cursor_reads_next_reply() {
         let sink = Arc::new(RecordingSink::default());
-        let (conn, out_rx, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, out_rx, inbound) = new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         let CallerHandle::Websocket(ws) = CallerHandle::from_connection(conn.clone()) else {
             unreachable!()
@@ -2390,13 +2581,13 @@ mod tests {
         assert_eq!(reply, InboundMessage::Json(serde_json::json!("pong")));
         // The "ping" was actually queued to the socket.
         let sent = out_rx.recv().await.expect("ping queued");
-        assert!(matches!(sent, Outbound::Chunk(_)));
+        assert!(matches!(sent, Outbound::Chunk { .. }));
     }
 
     #[tokio::test]
     async fn terminate_once_locks_out_second() {
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, _inb) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, _inb) = new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, sink);
         conn.terminate(None, None, None).await.expect("first terminal");
         let err = conn.terminate(None, None, None).await.expect_err("second rejected");
         assert!(matches!(err, CallerError::AlreadyTerminated));
@@ -2410,7 +2601,7 @@ mod tests {
     #[tokio::test]
     async fn receive_delivers_a_late_message() {
         let sink = Arc::new(RecordingSink::default());
-        let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
+        let (conn, _out, inbound) = new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, sink);
         let inbound = inbound.expect("ws has inbound");
         let CallerHandle::Websocket(ws) = CallerHandle::from_connection(conn.clone()) else {
             unreachable!()
@@ -2442,13 +2633,44 @@ mod tests {
     // ----- OutboundQueue backpressure policies (the real DropOldest) --------
 
     fn chunk(n: i64) -> Outbound {
-        Outbound::Chunk(OutboundChunk::Json(serde_json::json!(n)))
+        Outbound::Chunk { chunk: OutboundChunk::Json(serde_json::json!(n)), offset: n as u64 }
     }
     fn chunk_n(o: &Outbound) -> i64 {
         match o {
-            Outbound::Chunk(OutboundChunk::Json(v)) => v.as_i64().unwrap(),
+            Outbound::Chunk { chunk: OutboundChunk::Json(v), .. } => v.as_i64().unwrap(),
             other => panic!("expected json chunk, got {other:?}"),
         }
+    }
+
+    /// A chunk through a drop policy, the way `send_chunk` does it:
+    /// admitted (and recorded, at offset `n`) first, queued unless
+    /// refused. Returns the admission.
+    fn offer(q: &OutboundQueue, policy: Backpressure, n: i64) -> Admission {
+        let (admission, _) = q.admit(policy, |_| n as u64).unwrap();
+        if admission != Admission::Refused {
+            q.push_admitted(chunk(n)).unwrap();
+        }
+        admission
+    }
+
+    /// The exchange ending gives up every chunk still waiting, and the one
+    /// admitted but not queued yet (a durable run waiting on its record),
+    /// whose push then fails; a terminal stays for the drainer.
+    #[tokio::test]
+    async fn an_ended_exchange_gives_up_what_still_waited() {
+        let q = OutboundQueue::new(4);
+        offer(&q, Backpressure::DropOldest, 1);
+        offer(&q, Backpressure::DropOldest, 2);
+        assert_eq!(chunk_n(&q.recv().await.unwrap()), 1, "1 went out");
+        let (_, offset) = q.admit(Backpressure::DropOldest, |_| 3).unwrap();
+        q.push_terminal(Outbound::Terminate(None, None));
+        let mut undelivered = Vec::new();
+        q.end(|offsets| undelivered = offsets);
+        assert_eq!(undelivered, vec![2, offset], "the waiting chunk and the one on its way in");
+        assert!(q.push_admitted(chunk(3)).is_err(), "the exchange is over");
+        assert!(matches!(q.recv().await, Some(Outbound::Terminate(None, None))), "the terminal stays");
+        assert!(q.recv().await.is_none());
+        assert!(q.admit(Backpressure::Block, |_| panic!("nothing is recorded once it ended")).is_err());
     }
 
     /// `DropNewest`: once full, the INCOMING chunk is shed; the queued ones
@@ -2456,9 +2678,9 @@ mod tests {
     #[tokio::test]
     async fn outbound_drop_newest_sheds_incoming() {
         let q = OutboundQueue::new(2);
-        q.push_drop_newest(chunk(1)).unwrap();
-        q.push_drop_newest(chunk(2)).unwrap();
-        q.push_drop_newest(chunk(3)).unwrap(); // full -> 3 is shed
+        assert_eq!(offer(&q, Backpressure::DropNewest, 1), Admission::Room);
+        assert_eq!(offer(&q, Backpressure::DropNewest, 2), Admission::Room);
+        assert_eq!(offer(&q, Backpressure::DropNewest, 3), Admission::Refused, "full: 3 is shed");
         assert_eq!(chunk_n(&q.recv().await.unwrap()), 1);
         assert_eq!(chunk_n(&q.recv().await.unwrap()), 2);
         // Nothing else queued.
@@ -2472,9 +2694,9 @@ mod tests {
     #[tokio::test]
     async fn outbound_drop_oldest_evicts_front() {
         let q = OutboundQueue::new(2);
-        q.push_drop_oldest(chunk(1)).unwrap();
-        q.push_drop_oldest(chunk(2)).unwrap();
-        q.push_drop_oldest(chunk(3)).unwrap(); // full -> evict 1, keep 2,3
+        offer(&q, Backpressure::DropOldest, 1);
+        offer(&q, Backpressure::DropOldest, 2);
+        assert_eq!(offer(&q, Backpressure::DropOldest, 3), Admission::Evicted(1), "full: 1 is evicted, by its offset");
         assert_eq!(chunk_n(&q.recv().await.unwrap()), 2);
         assert_eq!(chunk_n(&q.recv().await.unwrap()), 3);
         q.close();
@@ -2487,9 +2709,9 @@ mod tests {
     #[tokio::test]
     async fn outbound_terminal_always_lands_and_is_never_evicted() {
         let q = OutboundQueue::new(1);
-        q.push_drop_oldest(chunk(1)).unwrap();
+        offer(&q, Backpressure::DropOldest, 1);
         q.push_terminal(Outbound::Terminate(None, None)); // lands despite full chunks
-        q.push_drop_oldest(chunk(2)).unwrap(); // evicts chunk 1, NOT the terminal
+        assert_eq!(offer(&q, Backpressure::DropOldest, 2), Admission::Evicted(1), "chunk 1, NOT the terminal");
         // Assert the EXACT surviving sequence in FIFO order: the terminal
         // (queued 2nd) then chunk 2. This pins all three properties: chunk 1
         // was the one evicted, chunk 2 was enqueued, and the terminal kept its
@@ -2541,12 +2763,12 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingCanceller {
-        cancelled: Mutex<Vec<ExecutionId>>,
-        causes: Mutex<Vec<weft_core::exec::CancelCause>>,
+        cancelled: Mutex<Vec<RunId>>,
+        causes: Mutex<Vec<weft_core::run::CancelCause>>,
     }
-    impl ExecutionCanceller for RecordingCanceller {
-        fn cancel(&self, execution_id: ExecutionId, cause: weft_core::exec::CancelCause) {
-            self.cancelled.lock().unwrap().push(execution_id);
+    impl RunCanceller for RecordingCanceller {
+        fn cancel(&self, run_id: RunId, cause: weft_core::run::CancelCause) {
+            self.cancelled.lock().unwrap().push(run_id);
             self.causes.lock().unwrap().push(cause);
         }
     }
@@ -2554,7 +2776,7 @@ mod tests {
         /// The run was ended as the session cap, naming the cap.
         fn ended_at_the_session_cap(&self) {
             match self.causes.lock().unwrap().as_slice() {
-                [weft_core::exec::CancelCause::Limit { detail }] => assert!(detail.contains("maxSessionSecs"), "{detail}"),
+                [weft_core::run::CancelCause::Limit { detail }] => assert!(detail.contains("maxSessionSecs"), "{detail}"),
                 other => panic!("ended with {other:?}"),
             }
         }
@@ -2647,6 +2869,59 @@ mod tests {
         assert_eq!(*starter.started.lock().unwrap(), vec!["t1".to_string()]);
     }
 
+    /// Bears a run that answers its caller, or fails without answering.
+    struct AnsweringStarter {
+        run_id: RunId,
+        fails: bool,
+    }
+    #[async_trait]
+    impl LiveStarter for AnsweringStarter {
+        async fn bear(&self, _admitted: Box<crate::door::Admitted>) -> Result<Born, Response> {
+            let fails = self.fails;
+            Ok(Born {
+                run_id: self.run_id,
+                sink: Arc::new(RecordingSink::default()),
+                drive: Box::new(move |exchange| {
+                    Box::pin(async move {
+                        let crate::run_driver::Exchange { conn, live, .. } = exchange;
+                        match (fails, live) {
+                            (true, Some(live)) => live.surface_error("boom", Ending::ProgramFailed).await,
+                            _ => {
+                                let CallerHandle::Http(http) = CallerHandle::from_connection(conn) else { unreachable!() };
+                                http.respond(OutboundChunk::Json(serde_json::json!({ "ok": true }))).await.unwrap();
+                            }
+                        }
+                    })
+                }),
+            })
+        }
+    }
+
+    /// Every answer of a run names the run in `Weft-Run-Id`, an answer
+    /// and a failure alike, and the failure's body names the same run.
+    #[tokio::test]
+    async fn every_answer_of_a_run_names_the_run() {
+        use tower::ServiceExt as _;
+        for fails in [false, true] {
+            let (mut state, _) = server_state();
+            let run_id = RunId::new_v4();
+            state.starter = Arc::new(AnsweringStarter { run_id, fails });
+            let mut request = axum::http::Request::builder().method("POST").uri("/chat/room7").body(axum::body::Body::from("{}")).unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(CallerSocket { socket: None, peer: "10.0.0.1".parse().unwrap() }));
+            let response = connection_router(state).oneshot(request).await.unwrap();
+            let named = response.headers().get(weft_core::caller::RUN_ID_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string);
+            assert_eq!(named, Some(run_id.to_string()), "fails={fails}");
+            let status = response.status();
+            let body = String::from_utf8(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+            if fails {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(plain_failure_of(&body), run_id);
+            } else {
+                assert_eq!(status, StatusCode::OK, "{body}");
+            }
+        }
+    }
+
     /// What an HTTP call brings is read before its run is born: a body
     /// the run could not read is the caller's answer, and nothing starts.
     #[tokio::test]
@@ -2679,11 +2954,11 @@ mod tests {
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let (state, canceller) = server_state();
-        let execution_id = ExecutionId::new_v4();
+        let run_id = RunId::new_v4();
         let body = decode_inbound(cfg.data_type, body.as_bytes()).expect("the test's body decodes");
-        let (conn, outbound, _) = new_connection(cfg, execution_id, Arc::new(request), Some(body), Arc::new(RecordingSink::default()));
+        let (conn, outbound, _) = new_connection(cfg, run_id, Arc::new(request), Some(body), Arc::new(RecordingSink::default()));
         let run: futures::future::BoxFuture<'static, ()> = Box::pin(program(conn.clone()));
-        let here = RunHere { run: Some(run), conn, outbound, canceller: state.canceller.clone(), execution_id };
+        let here = RunHere { run: Some(run), conn, outbound, canceller: state.canceller.clone(), run_id };
         (here, state.clock, canceller)
     }
 
@@ -2698,14 +2973,14 @@ mod tests {
         body: &str,
         heartbeat_secs: u64,
         program: F,
-    ) -> (Response, ExecutionId, Arc<RecordingCanceller>)
+    ) -> (Response, RunId, Arc<RecordingCanceller>)
     where
         F: FnOnce(Arc<LiveCallerConnection>) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let (here, clock, canceller) = run_here(cfg, request, body, program);
-        let execution_id = here.execution_id;
-        (answer_http(here, heartbeat_secs, clock).await, execution_id, canceller)
+        let run_id = here.run_id;
+        (answer_http(here, heartbeat_secs, clock).await, run_id, canceller)
     }
 
     /// [`open_exchange`] for a `POST chat/room7` carrying `body`, read
@@ -2743,6 +3018,16 @@ mod tests {
         headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     }
 
+    /// The run a failure body names, asserting it is the plain failure
+    /// and nothing else: whatever went wrong, the caller reads only that
+    /// it failed and which run it was.
+    fn plain_failure_of(body: &str) -> RunId {
+        let told: serde_json::Value = serde_json::from_str(body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}"));
+        assert_eq!(told["error"], weft_core::caller::PLAIN_FAILURE, "{body}");
+        assert_eq!(told.as_object().map(|o| o.len()), Some(2), "the words and the run, nothing else: {body}");
+        told["runId"].as_str().and_then(|id| id.parse().ok()).unwrap_or_else(|| panic!("no run id: {body}"))
+    }
+
     #[tokio::test]
     async fn first_chunk_commits_a_200_with_its_content_type() {
         let (status, headers, body) = exchange("{}", |conn| async move {
@@ -2760,7 +3045,7 @@ mod tests {
     /// A streaming exchange: `GET feed`, its response handed back as soon
     /// as the program commits the head. `heartbeat_secs` as the worker
     /// would pass it.
-    async fn open_feed<F, Fut>(heartbeat_secs: u64, program: F) -> (Response, ExecutionId, Arc<RecordingCanceller>)
+    async fn open_feed<F, Fut>(heartbeat_secs: u64, program: F) -> (Response, RunId, Arc<RecordingCanceller>)
     where
         F: FnOnce(Arc<LiveCallerConnection>) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -2853,7 +3138,7 @@ mod tests {
     #[tokio::test]
     async fn a_caller_leaving_a_quiet_stream_cancels_the_run_without_a_write() {
         use tokio_stream::StreamExt as _;
-        let (response, execution_id, canceller) = open_feed(0, quiet_feed).await;
+        let (response, run_id, canceller) = open_feed(0, quiet_feed).await;
         let mut body = response.into_body().into_data_stream();
         let first = body.next().await.unwrap().unwrap();
         assert_eq!(&first[..], b"data: first\n\n");
@@ -2863,7 +3148,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the run was never cancelled after the caller left");
             tokio::task::yield_now().await;
         }
-        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[execution_id]);
+        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[run_id]);
     }
 
     /// A feed that has not said ANYTHING yet: the bus it watches was
@@ -2881,7 +3166,7 @@ mod tests {
             // Never writes: the watched table never changed.
             std::future::pending::<()>().await;
         });
-        let execution_id = here.execution_id;
+        let run_id = here.run_id;
         // Dropping the task is what hyper does to it when the connection
         // goes.
         let handler = tokio::spawn(answer_http(here, 1, clock));
@@ -2893,7 +3178,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "a caller who left before the first byte never ended the run");
             tokio::task::yield_now().await;
         }
-        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[execution_id]);
+        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[run_id]);
     }
 
     /// A run that answered ended the exchange itself: it is left to
@@ -2915,9 +3200,9 @@ mod tests {
     /// caller with, and the program's own ends cancel nothing.
     #[test]
     fn each_end_cancels_a_tied_run_with_its_own_cause() {
-        use weft_core::exec::CancelCause;
+        use weft_core::run::CancelCause;
         let cfg = CallerRuntimeConfig { max_session_secs: 900, ..http_cfg() };
-        let id = ExecutionId::nil();
+        let id = RunId::nil();
         for end in [
             ExchangeEnd::CallerHungUp,
             ExchangeEnd::CallerHungUpOnSend,
@@ -2957,15 +3242,35 @@ mod tests {
         assert!(body.is_empty());
     }
 
+    /// Before the first byte a failure is a real `500` whose body is the
+    /// plain failure naming the run: never the failure itself (node
+    /// paths, file names, a provider's words), which goes on the run's
+    /// record for its owner.
     #[tokio::test]
     async fn an_error_before_the_first_byte_is_a_real_500() {
-        let (status, headers, body) = exchange("{}", |conn| async move {
-            conn.surface_error("the node blew up", Ending::ProgramFailed).await;
-        })
-        .await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(header(&headers, "content-type"), Some("text/plain; charset=utf-8"));
-        assert_eq!(body, "the node blew up");
+        let (state, _) = server_state();
+        let run_id = RunId::new_v4();
+        let sink = Arc::new(RecordingSink::default());
+        let (conn, outbound, _) = new_connection(
+            http_cfg(),
+            run_id,
+            Arc::new(LiveRequest { method: "POST".into(), path: "chat/room7".into(), ..Default::default() }),
+            Some(InboundMessage::Json(serde_json::Value::Null)),
+            sink.clone(),
+        );
+        let failing = conn.clone();
+        let run: futures::future::BoxFuture<'static, ()> = Box::pin(async move {
+            failing.surface_error("run failed: ingest.work: ffprobe failed probing /data/src.mp4", Ending::ProgramFailed).await;
+        });
+        let here = RunHere { run: Some(run), conn, outbound, canceller: state.canceller.clone(), run_id };
+        let response = answer_http(here, 0, state.clock).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers().get("content-type").and_then(|v| v.to_str().ok()), Some("application/json"));
+        let body = String::from_utf8(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert!(!body.contains("ffprobe"), "{body}");
+        assert_eq!(plain_failure_of(&body), run_id);
+        let recorded = sink.events();
+        assert!(recorded.iter().any(|e| e.contains("ffprobe failed probing")), "the whole message is on the record: {recorded:?}");
     }
 
     /// Each kind of end is its own status before the first byte: a time
@@ -2980,7 +3285,7 @@ mod tests {
             .await;
             assert_eq!(status, expected, "{ending:?}");
             assert_eq!(header(&headers, "retry-after"), None, "{ending:?}");
-            assert_eq!(body, "ended");
+            plain_failure_of(&body);
         }
     }
 
@@ -2996,19 +3301,66 @@ mod tests {
         })
         .await;
         assert_eq!(status, StatusCode::OK, "the status line was out already");
-        let last: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
-        assert_eq!(last, serde_json::json!({ "error": "the run reached its cap", "status": 504 }));
+        let mut last: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert_eq!(last["status"], 504);
+        last.as_object_mut().unwrap().remove("status");
+        plain_failure_of(&last.to_string());
+    }
+
+    /// A node failing the exchange (a stream whose bus broke off) is the
+    /// same failure: in-band after the first byte, the plain failure under
+    /// a `500`; a second terminal is refused. A route that skips chunks it
+    /// cannot make says so too: a stream that broke off is not a chunk,
+    /// and ending it cleanly would tell the caller it was whole.
+    #[tokio::test]
+    async fn a_node_failing_the_exchange_says_so_in_band() {
+        let (status, _headers, body) = exchange("{}", |conn| async move {
+            let CallerHandle::Http(http) = CallerHandle::from_connection(conn.clone()) else { unreachable!() };
+            let head = ResponseHead::new(200).with_header("content-type", "application/x-ndjson");
+            http.write_with(head, OutboundChunk::Text("{\"a\":1}\n".into())).await.unwrap();
+            http.fail("the stream broke off: the model went away").await.unwrap();
+            assert!(http.close().await.is_err(), "the failure was the terminal");
+        })
+        .await;
+        assert_eq!(status, StatusCode::OK, "the status line was out already");
+        let mut last: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert_eq!(last["status"], 500);
+        last.as_object_mut().unwrap().remove("status");
+        plain_failure_of(&last.to_string());
+
+        let tolerant = CallerRuntimeConfig { error_mode: weft_core::signal::ErrorMode::DropChunk, ..http_cfg() };
+        let request = LiveRequest { method: "POST".into(), path: "chat/room7".into(), ..Default::default() };
+        let (response, run_id, _) = open_exchange(tolerant, request, "{}", 0, |conn| async move {
+            let CallerHandle::Http(http) = CallerHandle::from_connection(conn) else { unreachable!() };
+            http.write(OutboundChunk::Text("partial".into())).await.unwrap();
+            http.fail("the stream broke off").await.unwrap();
+        })
+        .await;
+        let body = String::from_utf8(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert_eq!(body, format!("partial\n[error] {}", PlainFailure::of(run_id).line()), "what went out stays, and the break is told");
+
+        // Before the first byte: the failure under a real status.
+        let tolerant = CallerRuntimeConfig { error_mode: weft_core::signal::ErrorMode::DropChunk, ..http_cfg() };
+        let request = LiveRequest { method: "POST".into(), path: "chat/room7".into(), ..Default::default() };
+        let (response, run_id, _) = open_exchange(tolerant, request, "{}", 0, |conn| async move {
+            let CallerHandle::Http(http) = CallerHandle::from_connection(conn) else { unreachable!() };
+            http.fail("the stream broke off").await.unwrap();
+        })
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = String::from_utf8(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert_eq!(plain_failure_of(&body), run_id);
     }
 
     /// How each cancel reaches a caller: a limit is a time limit, anything
     /// else a stop; and the close code a socket hears for each kind.
     #[test]
     fn a_cancel_ends_for_its_caller_by_its_cause() {
-        use weft_core::exec::CancelCause;
+        use weft_core::run::CancelCause;
         assert_eq!(Ending::of_cancel(&CancelCause::Limit { detail: "cap".into() }), Ending::TimeLimit);
         for cause in [
             CancelCause::User,
-            CancelCause::Execution { by: ExecutionId::nil(), tag: "t".into() },
+            CancelCause::Run { by: RunId::nil(), tag: Some("t".into()) },
             CancelCause::Runtime { detail: "the drain's deadline".into() },
             CancelCause::CallerGone,
         ] {
@@ -3027,8 +3379,8 @@ mod tests {
         })
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(header(&headers, "content-type"), Some("text/plain; charset=utf-8"));
-        assert_eq!(body, weft_core::caller::NO_ANSWER);
+        assert_eq!(header(&headers, "content-type"), Some("application/json"));
+        plain_failure_of(&body);
     }
 
     /// A run that parked has not ended: its caller hears that it
@@ -3043,7 +3395,7 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(header(&headers, "retry-after"), None, "a retry would start a second run");
-            assert_eq!(body, why);
+            plain_failure_of(&body);
         }
     }
 
@@ -3130,21 +3482,22 @@ mod tests {
     }
 
     /// A program that never answers holds its caller only up to the
-    /// session cap: the cap answers a `504` saying so, and the run, tied
-    /// to its caller, is cancelled as that time limit, naming the cap.
+    /// session cap: the cap answers a `504` with the plain failure, and
+    /// the run, tied to its caller, is cancelled as that time limit,
+    /// naming the cap on the run.
     #[tokio::test]
-    async fn a_silent_end_answers_504_with_the_reason() {
+    async fn a_silent_end_answers_504() {
         let cfg = CallerRuntimeConfig { max_session_secs: 1, ..http_cfg() };
         // Nobody talks; the session cap (1s on the fake clock, which
         // returns at once) ends the exchange with the head held.
-        let (response, execution_id, canceller) =
+        let (response, run_id, canceller) =
             open_exchange(cfg, LiveRequest::default(), "{}", 0, |_conn| std::future::pending::<()>()).await;
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-        assert!(body.contains("session cap exceeded"), "got: {body}");
-        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[execution_id]);
+        assert_eq!(plain_failure_of(&body), run_id);
+        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[run_id]);
         canceller.ended_at_the_session_cap();
     }
 
@@ -3160,29 +3513,29 @@ mod tests {
             http.write_with(head, OutboundChunk::Text("{\"a\":1}\n".into())).await.unwrap();
             std::future::pending::<()>().await;
         });
-        let execution_id = here.execution_id;
+        let run_id = here.run_id;
         let response = answer_http(here, 0, weft_platform_traits::SystemClock::new()).await;
         assert_eq!(response.status(), StatusCode::OK, "the status line was out already");
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         let last: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
-        assert_eq!(last, serde_json::json!({ "error": "session cap exceeded", "status": 504 }));
-        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[execution_id]);
+        assert_eq!(last, serde_json::json!({ "error": weft_core::caller::PLAIN_FAILURE, "runId": run_id, "status": 504 }));
+        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[run_id]);
         canceller.ended_at_the_session_cap();
     }
 
     /// A socket open when the session cap runs out is closed as a time
-    /// limit, saying why, and the run, tied to its caller, is cancelled as
-    /// that time limit, naming the cap.
+    /// limit with the plain failure, and the run, tied to its caller, is
+    /// cancelled as that time limit, naming the cap on the run.
     #[tokio::test]
     async fn the_session_cap_closes_a_socket_as_a_time_limit() {
         use futures::StreamExt as _;
         let cfg = CallerRuntimeConfig { max_session_secs: 1, ..ws_cfg() };
-        let execution_id = ExecutionId::new_v4();
+        let run_id = RunId::new_v4();
         let (conn, outbound, inbound) =
-            new_connection(cfg.clone(), execution_id, Arc::new(LiveRequest::default()), None, Arc::new(RecordingSink::default()));
+            new_connection(cfg.clone(), run_id, Arc::new(LiveRequest::default()), None, Arc::new(RecordingSink::default()));
         let canceller = Arc::new(RecordingCanceller::default());
-        let unopened = Unopened { conn: conn.clone(), outbound: outbound.clone(), canceller: canceller.clone(), execution_id, armed: true };
+        let unopened = Unopened { conn: conn.clone(), outbound: outbound.clone(), canceller: canceller.clone(), run_id, armed: true };
         let pump = SocketPump {
             conn,
             outbound,
@@ -3191,7 +3544,7 @@ mod tests {
             heartbeat_secs: 0,
             clock: weft_platform_traits::SystemClock::new(),
             canceller: canceller.clone(),
-            execution_id,
+            run_id,
         };
         let opened = Arc::new(Mutex::new(Some((pump, unopened))));
         let app = Router::new().route(
@@ -3211,8 +3564,8 @@ mod tests {
             }
         };
         assert_eq!(u16::from(close.code), Ending::TimeLimit.close_code());
-        assert_eq!(&*close.reason, "session cap exceeded");
-        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[execution_id]);
+        assert_eq!(&*close.reason, PlainFailure::of(run_id).line());
+        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[run_id]);
         canceller.ended_at_the_session_cap();
     }
 
@@ -3221,7 +3574,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let (conn, _out, _inb) = new_connection(
             http_cfg(),
-            ExecutionId::nil(),
+            RunId::nil(),
             Arc::new(LiveRequest::default()),
             Some(InboundMessage::Json(serde_json::Value::Null)),
             sink,
@@ -3243,12 +3596,12 @@ mod tests {
     async fn a_websocket_drops_heads_and_queues_its_close_reason() {
         let sink = Arc::new(RecordingSink::default());
         let (conn, out, _inb) =
-            new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
+            new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, sink);
         conn.send_chunk(Some(ResponseHead::new(201)), OutboundChunk::Text("a".into()))
             .await
             .unwrap();
         let first = out.recv().await.unwrap();
-        assert!(matches!(first, Outbound::Chunk(_)), "no Head item on a websocket: {first:?}");
+        assert!(matches!(first, Outbound::Chunk { .. }), "no Head item on a websocket: {first:?}");
         conn.terminate(None, None, Some(CloseReason { code: 4000, reason: "done".into() }))
             .await
             .unwrap();
@@ -3268,7 +3621,7 @@ mod tests {
     async fn a_websocket_run_that_ends_closes_the_socket_normally() {
         let sink = Arc::new(RecordingSink::default());
         let (conn, out, _inb) =
-            new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
+            new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, sink);
         conn.run_ended().await;
         assert!(
             matches!(out.recv().await.unwrap(), Outbound::Terminate(None, None)),
@@ -3297,7 +3650,7 @@ mod tests {
         worker_threads: 4,
         async fn body() {
             let sink = std::sync::Arc::new(RecordingSink::default());
-            let (conn, _out, inbound) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink);
+            let (conn, _out, inbound) = new_connection(ws_cfg(), RunId::nil(), Arc::new(LiveRequest::default()), None, sink);
             let inbound = inbound.expect("ws has inbound");
             let CallerHandle::Websocket(ws) = CallerHandle::from_connection(conn.clone()) else {
                 unreachable!()
@@ -3310,6 +3663,346 @@ mod tests {
             match recv.await.expect("task joins") {
                 Err(CallerError::Disconnected) => {}
                 other => panic!("expected Disconnected on close, got {other:?}"),
+            }
+        }
+    }
+
+    // ----- What gives on a live exchange: whenChunkFails, whenCallerIsSlow --
+
+    /// A chunk a node could not make, as the node hands it over.
+    fn unmade() -> weft_core::WeftResult<OutboundChunk> {
+        Err(weft_core::node_error("the frame does not fit the route's text"))
+    }
+
+    /// One HTTP exchange driven like `open_exchange`, with its record kept
+    /// so a test can read what the exchange wrote down.
+    async fn recorded_exchange<F, Fut>(cfg: CallerRuntimeConfig, program: F) -> (RunId, String, Vec<String>)
+    where
+        F: FnOnce(Arc<LiveCallerConnection>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (state, _) = server_state();
+        let run_id = RunId::new_v4();
+        let sink = Arc::new(RecordingSink::default());
+        let (conn, outbound, _) = new_connection(
+            cfg,
+            run_id,
+            Arc::new(LiveRequest { method: "POST".into(), path: "feed".into(), ..Default::default() }),
+            Some(InboundMessage::Json(serde_json::Value::Null)),
+            sink.clone(),
+        );
+        let run: futures::future::BoxFuture<'static, ()> = Box::pin(program(conn.clone()));
+        let here = RunHere { run: Some(run), conn, outbound, canceller: state.canceller.clone(), run_id };
+        let response = answer_http(here, 0, state.clock).await;
+        let body = String::from_utf8(axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        (run_id, body, sink.events())
+    }
+
+    /// `drop_chunk` on a stream: the chunk a node could not make is
+    /// skipped, the stream goes on with the next one and ends as the
+    /// program ends it, and the skip is on the exchange's record.
+    /// `surface`: the node gets the failure back, returns it, the run
+    /// fails, and the caller is told in-band after what already went out.
+    #[tokio::test]
+    async fn a_stream_skips_a_chunk_it_cannot_make_or_tells_the_caller() {
+        let tolerant = CallerRuntimeConfig { error_mode: weft_core::signal::ErrorMode::DropChunk, ..http_cfg() };
+        let (_, body, record) = recorded_exchange(tolerant, |conn| async move {
+            let CallerHandle::Http(http) = CallerHandle::from_connection(conn) else { unreachable!() };
+            http.write(OutboundChunk::Text("a\n".into())).await.unwrap();
+            assert!(http.drop_or_fail(unmade()).expect("skipped, not failed").is_none());
+            http.write(OutboundChunk::Text("c\n".into())).await.unwrap();
+            http.close().await.unwrap();
+        })
+        .await;
+        assert_eq!(body, "a\nc\n", "the stream went on past the chunk it skipped");
+        let skip = format!("{}: the frame does not fit the route's text", weft_core::caller::CHUNK_DROPPED);
+        assert!(record.iter().any(|e| e.ends_with(&skip)), "the skip is on the record: {record:?}");
+
+        let (run_id, body, _) = recorded_exchange(http_cfg(), |conn| async move {
+            let CallerHandle::Http(http) = CallerHandle::from_connection(conn.clone()) else { unreachable!() };
+            http.write(OutboundChunk::Text("a\n".into())).await.unwrap();
+            let failed = http.drop_or_fail(unmade()).expect_err("the route tells its caller");
+            // What the run does with a node that returned its failure.
+            conn.surface_error(&format!("run failed: {failed}"), Ending::ProgramFailed).await;
+            assert!(http.write(OutboundChunk::Text("c\n".into())).await.is_err(), "nothing follows the failure");
+        })
+        .await;
+        assert_eq!(body, format!("a\n\n[error] {}", PlainFailure::of(run_id).line()));
+    }
+
+    /// A run that fails is told to its caller in every mode: there is no
+    /// next chunk to go on with, so a route that skips chunks still ends
+    /// the stream as failed rather than as complete, with the status the
+    /// ending has.
+    #[tokio::test]
+    async fn a_failed_run_is_told_whatever_the_route_skips() {
+        let tolerant = CallerRuntimeConfig { error_mode: weft_core::signal::ErrorMode::DropChunk, ..http_cfg() };
+        let (run_id, body, _) = recorded_exchange(tolerant.clone(), |conn| async move {
+            let CallerHandle::Http(http) = CallerHandle::from_connection(conn.clone()) else { unreachable!() };
+            let head = ResponseHead::new(200).with_header("content-type", "application/x-ndjson");
+            http.write_with(head, OutboundChunk::Text("{\"a\":1}\n".into())).await.unwrap();
+            conn.surface_error("run failed: the model went away", Ending::ProgramFailed).await;
+        })
+        .await;
+        let last: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert_eq!(last, serde_json::json!({ "error": weft_core::caller::PLAIN_FAILURE, "runId": run_id, "status": 500 }));
+
+        for (ending, status) in [(Ending::TimeLimit, StatusCode::GATEWAY_TIMEOUT), (Ending::Stopped, StatusCode::SERVICE_UNAVAILABLE)] {
+            let (state, _) = server_state();
+            let (here, _, _) = run_here(tolerant.clone(), LiveRequest::default(), "{}", move |conn| async move {
+                conn.surface_error("ended", ending).await;
+            });
+            let response = answer_http(here, 0, state.clock).await;
+            assert_eq!(response.status(), status, "before the first byte, the ending's own status: {ending:?}");
+        }
+    }
+
+    /// A socket with its caller on a real WebSocket: `program` runs
+    /// against the connection once the socket is open, and the caller
+    /// reads every frame until the close. Hands back the messages, the
+    /// close frame, the run's id and the exchange's record.
+    async fn socket_exchange<F, Fut>(
+        cfg: CallerRuntimeConfig,
+        program: F,
+    ) -> (Vec<String>, Option<tokio_tungstenite::tungstenite::protocol::CloseFrame<'static>>, RunId, Vec<String>)
+    where
+        F: FnOnce(Arc<LiveCallerConnection>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        use futures::StreamExt as _;
+        use tokio_tungstenite::tungstenite::Message as Frame;
+        let run_id = RunId::new_v4();
+        let sink = Arc::new(RecordingSink::default());
+        let (conn, outbound, inbound) = new_connection(cfg.clone(), run_id, Arc::new(LiveRequest::default()), None, sink.clone());
+        let canceller = Arc::new(RecordingCanceller::default());
+        let unopened = Unopened { conn: conn.clone(), outbound: outbound.clone(), canceller: canceller.clone(), run_id, armed: true };
+        let pump = SocketPump {
+            conn: conn.clone(),
+            outbound,
+            inbound: inbound.expect("a websocket connection has an inbound log"),
+            config: cfg,
+            heartbeat_secs: 0,
+            clock: weft_platform_traits::SystemClock::new(),
+            canceller,
+            run_id,
+        };
+        let opened = Arc::new(Mutex::new(Some((pump, unopened))));
+        let app = Router::new().route(
+            "/",
+            axum::routing::get(move |ws: WebSocketUpgrade| async move {
+                let (pump, unopened) = opened.lock().unwrap().take().expect("one socket");
+                ws.on_upgrade(move |socket| pump_ws(socket, pump, unopened))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/")).await.unwrap();
+        tokio::spawn(program(conn));
+        let mut messages = Vec::new();
+        let close = loop {
+            match socket.next().await {
+                Some(Ok(Frame::Text(t))) => messages.push(t.as_str().to_owned()),
+                Some(Ok(Frame::Close(frame))) => break frame,
+                Some(Ok(_)) => {}
+                // The socket went without a close frame.
+                Some(Err(_)) | None => break None,
+            }
+        };
+        (messages, close, run_id, sink.events())
+    }
+
+    /// The same two modes on a socket: `drop_chunk` skips the message and
+    /// the session goes on to a normal close; `surface` closes it `1011`
+    /// after what already went out.
+    #[tokio::test]
+    async fn a_socket_skips_a_message_it_cannot_make_or_closes_failed() {
+        let tolerant = CallerRuntimeConfig { error_mode: weft_core::signal::ErrorMode::DropChunk, ..ws_cfg() };
+        let (messages, close, _, record) = socket_exchange(tolerant, |conn| async move {
+            let CallerHandle::Websocket(ws) = CallerHandle::from_connection(conn) else { unreachable!() };
+            ws.send(OutboundChunk::Text("a".into())).await.unwrap();
+            assert!(ws.drop_or_fail(unmade()).expect("skipped, not failed").is_none());
+            ws.send(OutboundChunk::Text("c".into())).await.unwrap();
+            ws.close().await.unwrap();
+        })
+        .await;
+        assert_eq!(messages, vec!["a", "c"], "the session went on past the message it skipped");
+        assert_eq!(close.map(|c| u16::from(c.code)), Some(1000), "a normal close");
+        assert!(record.iter().any(|e| e.contains(weft_core::caller::CHUNK_DROPPED)), "{record:?}");
+
+        let (messages, close, run_id, _) = socket_exchange(ws_cfg(), |conn| async move {
+            let CallerHandle::Websocket(ws) = CallerHandle::from_connection(conn.clone()) else { unreachable!() };
+            ws.send(OutboundChunk::Text("a".into())).await.unwrap();
+            let failed = ws.drop_or_fail(unmade()).expect_err("the socket tells its caller");
+            conn.surface_error(&format!("run failed: {failed}"), Ending::ProgramFailed).await;
+        })
+        .await;
+        assert_eq!(messages, vec!["a"]);
+        let close = close.expect("a close frame, never a dropped socket");
+        assert_eq!(u16::from(close.code), 1011);
+        assert_eq!(&*close.reason, PlainFailure::of(run_id).line());
+    }
+
+    /// A socket whose run fails is closed `1011` whatever it skips: before,
+    /// a route that skipped chunks swallowed the failure and the caller
+    /// saw its socket vanish with no close frame.
+    #[tokio::test]
+    async fn a_failed_run_closes_a_tolerant_socket_with_a_frame() {
+        let tolerant = CallerRuntimeConfig { error_mode: weft_core::signal::ErrorMode::DropChunk, ..ws_cfg() };
+        let (_, close, run_id, _) = socket_exchange(tolerant, |conn| async move {
+            conn.surface_error("run failed: boom", Ending::ProgramFailed).await;
+            conn.hang_up().await;
+        })
+        .await;
+        let close = close.expect("a close frame, never a dropped socket");
+        assert_eq!(u16::from(close.code), 1011);
+        assert_eq!(&*close.reason, PlainFailure::of(run_id).line());
+    }
+
+    /// `OUTBOUND_BUFFER + extra` numbered chunks sent through `cfg`'s
+    /// connection while nobody drains it (a caller that stopped reading),
+    /// then what the wire would carry, in order. Also checks the record
+    /// says exactly that, and names `extra` chunks as never received.
+    async fn sent_to_a_stalled_caller(cfg: CallerRuntimeConfig, extra: usize) -> Vec<i64> {
+        let http_body = (cfg.protocol == Protocol::Http).then_some(InboundMessage::Json(serde_json::Value::Null));
+        let record = Arc::new(RecordingSink::default());
+        let (conn, outbound, _) = new_connection(cfg, RunId::nil(), Arc::new(LiveRequest::default()), http_body, record.clone());
+        for n in 0..(OUTBOUND_BUFFER + extra) as i64 {
+            conn.send_chunk(None, OutboundChunk::Json(serde_json::json!(n))).await.expect("a drop mode never waits or fails");
+        }
+        conn.terminate(None, None, None).await.unwrap();
+        let mut carried = Vec::new();
+        while let Some(item) = outbound.recv().await {
+            match item {
+                Outbound::Terminate(..) => break,
+                chunk => carried.push(chunk_n(&chunk)),
+            }
+        }
+        assert_eq!(record.received(), carried, "the record says what the caller received");
+        assert_eq!(record.dropped(), extra, "and names every chunk it did not");
+        carried
+    }
+
+    /// `drop_oldest` keeps the newest: the caller that catches up reads
+    /// the last `OUTBOUND_BUFFER` chunks; `drop_newest` keeps the oldest:
+    /// it reads the first ones and the gap is at the end. Neither ever
+    /// makes the program wait, on either wire.
+    #[tokio::test]
+    async fn a_slow_caller_gets_the_newest_or_the_oldest_per_the_route() {
+        let extra = 10;
+        for protocol in [Protocol::Http, Protocol::Websocket] {
+            let oldest = CallerRuntimeConfig { protocol, backpressure: Backpressure::DropOldest, ..ws_cfg() };
+            let carried = sent_to_a_stalled_caller(oldest, extra).await;
+            let newest: Vec<i64> = (extra as i64..(OUTBOUND_BUFFER + extra) as i64).collect();
+            assert_eq!(carried, newest, "{protocol:?}: drop_oldest keeps the newest");
+
+            let newest_shed = CallerRuntimeConfig { protocol, backpressure: Backpressure::DropNewest, ..ws_cfg() };
+            let carried = sent_to_a_stalled_caller(newest_shed, extra).await;
+            let first: Vec<i64> = (0..OUTBOUND_BUFFER as i64).collect();
+            assert_eq!(carried, first, "{protocol:?}: drop_newest keeps the oldest");
+        }
+    }
+
+    /// A caller that leaves (or whose session cap ends the exchange) with
+    /// chunks still waiting: the row saying it left names each of them,
+    /// so the record says exactly what the caller received, under every
+    /// policy.
+    #[tokio::test]
+    async fn a_caller_that_leaves_never_received_what_still_waited() {
+        for backpressure in [Backpressure::Block, Backpressure::DropOldest, Backpressure::DropNewest] {
+            for end in [ExchangeEnd::CallerHungUp, ExchangeEnd::SessionCapExceeded] {
+                let cfg = CallerRuntimeConfig { protocol: Protocol::Http, backpressure, ..ws_cfg() };
+                let record = Arc::new(RecordingSink::default());
+                let (conn, outbound, _) = new_connection(
+                    cfg, RunId::nil(), Arc::new(LiveRequest::default()),
+                    Some(InboundMessage::Json(serde_json::Value::Null)), record.clone(),
+                );
+                for n in 0..10 {
+                    conn.send_chunk(None, OutboundChunk::Json(serde_json::json!(n))).await.unwrap();
+                }
+                let carried: Vec<i64> = vec![chunk_n(&outbound.recv().await.unwrap()), chunk_n(&outbound.recv().await.unwrap())];
+                exchange_ended(&conn, &outbound, &RecordingCanceller::default(), RunId::nil(), end);
+                assert!(outbound.recv().await.is_none(), "nothing left to write");
+                assert_eq!(record.received(), carried, "{backpressure:?} {end:?}: the record says what the caller received");
+                assert_eq!(record.left_behind.lock().unwrap().len(), 8, "{backpressure:?} {end:?}: and names the rest");
+                // A send after the caller left (refused, or swallowed for a
+                // run that outlives its caller) is never on the record as
+                // received.
+                let _ = conn.send_chunk(None, OutboundChunk::Json(serde_json::json!(99))).await;
+                assert_eq!(record.received(), carried, "{backpressure:?} {end:?}: a later send is not on the record");
+            }
+        }
+    }
+
+    // A caller reading slowly WHILE the program sends, under both drop
+    // policies and on both wires: whatever the race between a send and
+    // the read beside it, the record names exactly the chunks the caller
+    // did not receive (a caller that never reads at all is
+    // `sent_to_a_stalled_caller`). Stress-looped multi-thread, since the
+    // read racing the send is the point.
+    weft_core::stress_test! {
+        name: a_slow_callers_record_says_exactly_what_it_received,
+        runs: 32,
+        worker_threads: 4,
+        async fn body() {
+            for protocol in [Protocol::Http, Protocol::Websocket] {
+                for backpressure in [Backpressure::DropOldest, Backpressure::DropNewest] {
+                    let cfg = CallerRuntimeConfig { protocol, backpressure, ..ws_cfg() };
+                    let http_body = (protocol == Protocol::Http).then_some(InboundMessage::Json(serde_json::Value::Null));
+                    let record = Arc::new(RecordingSink::default());
+                    let (conn, outbound, _) = new_connection(cfg, RunId::nil(), Arc::new(LiveRequest::default()), http_body, record.clone());
+                    // The caller: reads one, then lets a few sends go by.
+                    let reader = tokio::spawn(async move {
+                        let mut carried = Vec::new();
+                        while let Some(item) = outbound.recv().await {
+                            match item {
+                                Outbound::Terminate(..) => break,
+                                chunk => carried.push(chunk_n(&chunk)),
+                            }
+                            for _ in 0..3 { tokio::task::yield_now().await; }
+                        }
+                        carried
+                    });
+                    for n in 0..(OUTBOUND_BUFFER * 3) as i64 {
+                        conn.send_chunk(None, OutboundChunk::Json(serde_json::json!(n))).await.expect("a drop mode never waits or fails");
+                    }
+                    conn.terminate(None, None, None).await.unwrap();
+                    let carried = reader.await.expect("joins");
+                    assert_eq!(record.received(), carried, "{protocol:?} {backpressure:?}: the record says what the caller received");
+                }
+            }
+        }
+    }
+
+    // `block`: with the buffer full the program's next send waits, and
+    // it goes out (last, in order) once the caller reads one. Stress-looped
+    // multi-thread: a lost wakeup between the drain and the waiting send
+    // would hang `waiting.await`, failing the iteration.
+    weft_core::stress_test! {
+        name: a_slow_caller_under_block_makes_the_program_wait,
+        runs: 32,
+        worker_threads: 4,
+        async fn body() {
+            for protocol in [Protocol::Http, Protocol::Websocket] {
+                let cfg = CallerRuntimeConfig { protocol, backpressure: Backpressure::Block, ..ws_cfg() };
+                let http_body = (protocol == Protocol::Http).then_some(InboundMessage::Json(serde_json::Value::Null));
+                let (conn, outbound, _) = new_connection(cfg, RunId::nil(), Arc::new(LiveRequest::default()), http_body, Arc::new(RecordingSink::default()));
+                for n in 0..OUTBOUND_BUFFER as i64 {
+                    conn.send_chunk(None, OutboundChunk::Json(serde_json::json!(n))).await.unwrap();
+                }
+                let sender = conn.clone();
+                let waiting = tokio::spawn(async move {
+                    sender.send_chunk(None, OutboundChunk::Json(serde_json::json!(OUTBOUND_BUFFER as i64))).await
+                });
+                for _ in 0..8 { tokio::task::yield_now().await; }
+                assert!(!waiting.is_finished(), "{protocol:?}: a full buffer makes the send wait");
+                assert_eq!(chunk_n(&outbound.recv().await.unwrap()), 0);
+                waiting.await.expect("joins").expect("it went once there was room");
+                let mut carried = Vec::new();
+                for _ in 0..OUTBOUND_BUFFER {
+                    carried.push(chunk_n(&outbound.recv().await.unwrap()));
+                }
+                assert_eq!(carried, (1..=OUTBOUND_BUFFER as i64).collect::<Vec<_>>(), "{protocol:?}: nothing shed, in order");
             }
         }
     }

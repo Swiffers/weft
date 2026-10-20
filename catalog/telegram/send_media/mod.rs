@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use weft::access::client::Multipart;
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::api;
 
@@ -36,7 +36,7 @@ impl Node for TelegramSendMediaNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let chat_id: String = ctx.inputs.get("chatId")?;
         let file: FileHandle = ctx.inputs.get("file")?;
@@ -50,7 +50,7 @@ impl Node for TelegramSendMediaNode {
                 "unknown media kind '{kind}' (photo, document, voice, video, audio)"
             )));
         };
-        let (meta, bytes) = ctx.storage(StorageScope::Execution).get_bytes(&file).await?;
+        let (meta, bytes) = ctx.storage(StorageScope::Run).get_bytes(&file).await?;
 
         let mut form = Multipart::form_data().text("chat_id", &chat_id);
         if let Some(c) = &caption {

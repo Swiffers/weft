@@ -8,9 +8,10 @@
 //! ([`weft_platform_traits::WORKER_AUTH_HEADER`]), so a caller's own
 //! `Authorization` reaches the upstream untouched. The door says who the
 //! caller is and which address it used, since the upstream sees the door
-//! as its peer and its own address as the host: that is what it builds
-//! links from (`weft_core::net::request_base_url`) and counts callers by
-//! (`weft_core::net::caller_address`). Any server is told the usual way
+//! as its peer and its own address as the host: that is where it reads
+//! the address the caller used (`weft_core::net::request_base_url`: a run
+//! is told it, and a live socket's ticket points back at it) and who the
+//! caller is (`weft_core::net::caller_address`). Any server is told the usual way
 //! (`X-Forwarded-For`, `-Host`, `-Proto`); a project's worker is told in
 //! weft's own hop headers, which it removes, so the run reads the request
 //! as its caller sent it ([`Forwarding`]).
@@ -306,11 +307,21 @@ async fn forward_socket(
         .and_then(|v| v.to_str().ok())
         .map(|p| vec![p.to_string()])
         .unwrap_or_default();
+    // And the run the socket opened, which the worker names on its answer.
+    let run_id = answer
+        .headers()
+        .get(weft_core::caller::RUN_ID_HEADER)
+        .and_then(|value| HeaderValue::from_bytes(value.as_bytes()).ok());
     let hold = upstream.hold;
-    upgrade.protocols(chosen).on_upgrade(move |caller| async move {
+    let mut opened = upgrade.protocols(chosen).on_upgrade(move |caller| async move {
         pump(caller, worker).await;
         drop(hold);
-    })
+    });
+    if let Some(run_id) = run_id {
+        let name = HeaderName::from_bytes(weft_core::caller::RUN_ID_HEADER.as_bytes()).expect("a valid header name");
+        opened.headers_mut().insert(name, run_id);
+    }
+    opened
 }
 
 /// Pass messages both ways until either side ends, then end the other.

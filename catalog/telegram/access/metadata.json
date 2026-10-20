@@ -32,12 +32,12 @@
       "url": "https://api.telegram.org/getMe",
       "captures": [
         {
-          "name": "bot_username",
+          "name": "botUsername",
           "path": "result.username"
         }
       ]
     },
-    "identity": "@{bot_username}"
+    "identity": "@{botUsername}"
   },
   "inputs": [
     {

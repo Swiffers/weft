@@ -12,7 +12,7 @@
 #
 # What a run does, once: brings this checkout's install to current code
 # (setup.sh, which on a branch is the branch's own install, never main's),
-# removes whatever earlier failed runs kept, builds every test binary, then
+# removes whatever earlier failed runs kept, builds the test binary, then
 # runs the tests one by one, as many at once as -j says, longest first (by
 # how long each took last time) so a slow one never starts last and holds
 # the run open. Each test's output goes to
@@ -67,7 +67,7 @@ trap cleanup EXIT
 usage() {
   echo "usage: scripts/run-e2e.sh [-j <n>] [--keep-going] [--failed | <file|file::test> ...] | --clean" >&2
   echo "  no args        every test" >&2
-  echo "  <file>         every test in crates/weft-e2e/tests/<file>.rs" >&2
+  echo "  <file>         every test in crates/weft-e2e/tests/e2e/<file>.rs" >&2
   echo "  <file>::<test> one test" >&2
   echo "  --failed       the tests that did not pass in the last run (failed or never started)" >&2
   echo "  -j <n>         how many tests run at once (default 4)" >&2
@@ -164,7 +164,7 @@ logged() { # log cmd...
 # done. Removed before anything new is made, so it never mixes with this
 # run's state.
 echo "removing what earlier failed runs kept"
-if ! with_build_slot logged "$E2E_DIR/clean.log" cargo build -q -p weft-e2e --features e2e --bin weft-e2e-clean \
+if ! with_build_slot logged "$E2E_DIR/clean.log" cargo build -q --workspace --features weft-e2e/e2e --bin weft-e2e-clean \
   || ! without_machine_locks "$REPO_ROOT/target/debug/weft-e2e-clean" >>"$E2E_DIR/clean.log" 2>&1; then
   echo "removing what earlier runs kept failed; its output is in $E2E_DIR/clean.log" >&2
   exit 1
@@ -248,34 +248,35 @@ if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ]; then
   export WEFT_E2E_S3_BUCKET="$BUCKET"
 fi
 
-# ---------- Build every test binary once ----------
-# Then each test runs its binary directly: dozens of `cargo test`s at once
-# would only queue on cargo's build lock.
-echo "building the e2e test binaries"
+# ---------- Build the test binary once ----------
+# Every e2e test is in one binary (tests/e2e/main.rs, one module per file).
+# Then each test runs the binary directly: dozens of `cargo test`s at once
+# would only queue on cargo's build lock. Built with the whole workspace
+# selected (both here and for the clean binary above): a build of
+# weft-e2e alone turns on different features of the crates under it, so
+# cargo would compile a second copy of the workspace instead of reusing
+# the one the unit tests built.
+echo "building the e2e test binary"
 BUILD_OUT="$E2E_DIR/build.log"
-if ! with_build_slot logged "$BUILD_OUT" cargo test -p weft-e2e --features e2e --no-run; then
+if ! with_build_slot logged "$BUILD_OUT" cargo test --workspace --features weft-e2e/e2e --test e2e --no-run; then
   echo "building the e2e tests failed:" >&2
   tail -60 "$BUILD_OUT" >&2
   exit 1
 fi
-# cargo names each binary relative to the workspace root.
-declare -A BINARY=()
-while read -r name path; do
-  case "$path" in /*) ;; *) path="$REPO_ROOT/$path" ;; esac
-  BINARY["$name"]="$path"
-done < <(
-  sed -n 's|^ *Executable tests/\([A-Za-z0-9_]*\)\.rs (\(.*\))$|\1 \2|p' "$BUILD_OUT"
-)
+# cargo names the binary relative to the workspace root.
+BINARY="$(sed -n 's|^ *Executable tests/e2e/main\.rs (\(.*\))$|\1|p' "$BUILD_OUT")"
+case "$BINARY" in
+  "") echo "the e2e build named no test binary; its output is in $BUILD_OUT" >&2; exit 1 ;;
+  /*) ;;
+  *) BINARY="$REPO_ROOT/$BINARY" ;;
+esac
 
 # ---------- Which tests ----------
-# Every test of every file, asked of the binaries themselves, so a new test
-# (or a new `tests/<name>.rs`) runs without anyone updating anything. A test
-# is named `<file>::<test>`.
+# Every test, asked of the binary itself, so a new test (or a new
+# `tests/e2e/<name>.rs` module) runs without anyone updating anything. A
+# test is named after its module path, `<file>::<test>`.
 mapfile -t ALL_TESTS < <(
-  for file in $(printf '%s\n' "${!BINARY[@]}" | sort); do
-    "${BINARY[$file]}" --list --format terse 2>/dev/null \
-      | sed -n "s/^\(.*\): test\$/$file::\1/p"
-  done
+  "$BINARY" --list --format terse 2>/dev/null | sed -n 's/^\(.*\): test$/\1/p' | sort
 )
 if [ "$FROM_FAILED" -eq 1 ]; then
   if [ ! -s "$FAILED_LIST" ]; then
@@ -295,7 +296,7 @@ else
     done
     if [ "$matched" -eq 0 ]; then
       echo "no test file or test named '$want'. Test files:" >&2
-      printf '  %s\n' "${!BINARY[@]}" | sort >&2
+      printf '%s\n' "${ALL_TESTS[@]}" | sed 's/::.*//' | sort -u | sed 's/^/  /' >&2
       exit 1
     fi
   done
@@ -480,11 +481,10 @@ for t in "${TESTS[@]}"; do
   [ "$STOPPING" -eq 1 ] && break
   while [ ${#RUNNING[@]} -ge "$JOBS" ]; do wait_one; done
   [ "$STOPPING" -eq 1 ] && break
-  bin="${BINARY[${t%%::*}]}"
   STARTED["$t"]=$(date +%s)
   # In its own process group (setsid), so an interrupt can stop the test
   # and everything it started (weft, docker) in one kill.
-  ( close_machine_locks_here; cd "$REPO_ROOT/crates/weft-e2e" && exec "${SETSID[@]}" "$bin" --exact "${t#*::}" --test-threads=1 --nocapture ) \
+  ( close_machine_locks_here; cd "$REPO_ROOT/crates/weft-e2e" && exec "${SETSID[@]}" "$BINARY" --exact "$t" --test-threads=1 --nocapture ) \
     >"$RUN_DIR/$t.log" 2>&1 &
   RUNNING[$!]="$t"
   pid=$!

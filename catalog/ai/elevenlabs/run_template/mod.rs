@@ -26,7 +26,7 @@ use weft::access::client::get_json;
 use weft::node::NodeOutput;
 use weft::storage::FileHandle;
 use weft::{
-    node_error, Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftPrimitive,
+    node_error, Access, RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftPrimitive,
     WeftResult, WeftType,
 };
 
@@ -62,7 +62,7 @@ impl Node for ElevenLabsRunTemplateNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let template = template_id(ctx.inputs.get("template")?)?;
         let version: Option<String> = ctx.inputs.opt("version")?;
@@ -77,7 +77,7 @@ impl Node for ElevenLabsRunTemplateNode {
                 Ok((name.clone(), ty.clone()))
             })
             .collect::<WeftResult<_>>()?;
-        let outputs: BTreeMap<String, WeftType> = ctx.data_outputs().into_iter().collect();
+        let outputs: BTreeMap<String, WeftType> = ctx.declared_outputs().into_iter().collect();
 
         let http = ctx.client(&account).await?;
         let refs = References::new(&ctx, &http);
@@ -362,7 +362,7 @@ fn whole(value: &Value) -> Option<Value> {
 /// The `inputs` a run sends: each template input's port value, the way
 /// its kind takes it. Every value is checked before the first file goes
 /// up, so a bad one leaves nothing behind in the workspace.
-async fn bind_inputs(ctx: &ExecutionContext, refs: &References<'_>, template: &[Value]) -> WeftResult<Value> {
+async fn bind_inputs(ctx: &RunContext, refs: &References<'_>, template: &[Value]) -> WeftResult<Value> {
     let mut values = Vec::with_capacity(template.len());
     for input in template {
         let id = port_id(input);
@@ -399,7 +399,7 @@ async fn bind_inputs(ctx: &ExecutionContext, refs: &References<'_>, template: &[
 /// What one output of a completed run emits on its port: an image, a
 /// video or an audio stored as a file, a text, number or boolean as its
 /// content.
-async fn output_value(ctx: &ExecutionContext, port: &str, output: &Value) -> WeftResult<Value> {
+async fn output_value(ctx: &RunContext, port: &str, output: &Value) -> WeftResult<Value> {
     match output["type"].as_str() {
         Some(kind @ ("image" | "video" | "audio")) => store_output(ctx, kind, output).await,
         Some("string" | "number" | "integer" | "boolean") if !output["content"].is_null() => {

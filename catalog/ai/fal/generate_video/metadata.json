@@ -33,7 +33,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -42,8 +42,8 @@
             "label": "endpoint_id",
             "value": "endpoint_id",
             "page": {
-              "cursor_param": "cursor",
-              "cursor_path": "next_cursor"
+              "cursorParam": "cursor",
+              "cursorPath": "next_cursor"
             },
             "public": true
           }
@@ -56,7 +56,7 @@
       "default": "16:9",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "16:9",
           "9:16",
@@ -78,9 +78,6 @@
       "description": "The generated video."
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "display": {
     "kind": "media",
     "output": "video"

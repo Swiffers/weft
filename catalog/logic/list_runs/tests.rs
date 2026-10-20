@@ -18,19 +18,19 @@ pub fn tests() -> Vec<NodeTest> {
 
 async fn lists_runs(rig: FakeRig) -> WeftResult<()> {
     let run = json!({
-        "execution_id": "00000000-0000-0000-0000-000000000001",
-        "project_id": "00000000-0000-0000-0000-0000000000aa",
-        "entry_node": "inbox",
+        "runId": "00000000-0000-0000-0000-000000000001",
+        "projectId": "00000000-0000-0000-0000-0000000000aa",
+        "entryNode": "inbox",
         "status": "waiting_for_input",
         "phase": "fire",
-        "started_at": 100,
-        "completed_at": null,
+        "startedAt": 100,
+        "completedAt": null,
         "tags": ["user_7"],
-        "cancel_cause": null,
-        "skipped_nodes": 0,
+        "cancelCause": null,
+        "skippedNodes": 0,
         "instance": "ada"
     });
-    rig.answer_program_call("weft.runs.list", json!({ "executions": [run], "total": 9 }));
+    rig.answer_program_call("weft.runs.list", json!({ "runs": [run], "total": 9 }));
     let outcome = rig.run(&ListRunsNode, json!({ "limit": 1, "tag": "user_7", "status": "running" })).await.ok()?;
     assert_eq!(outcome.outputs["total"], json!(9));
     assert_eq!(outcome.outputs["runs"][0]["status"], json!("waiting_for_input"));

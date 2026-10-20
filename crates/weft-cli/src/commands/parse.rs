@@ -1,11 +1,12 @@
 //! `weft parse` / `weft validate`: editor feedback surface.
 //!
 //! Both read weft source from stdin and run the compiler against the
-//! project's `nodes/` catalog (the same catalog the build uses), then
-//! print JSON to stdout. This is where the editor's live graph and
+//! project's node catalog (the same catalog the build uses), then print
+//! JSON to stdout. This is where the editor's live graph and
 //! Problems-panel feedback comes from. It runs locally, on the CLI,
-//! because the catalog lives in the project's `nodes/` folder: the
-//! dispatcher (a remote process) has no access to it.
+//! because the catalog lives in the project's folders (`nodes/`, and the
+//! nodes beside the code under `src/`): the dispatcher (a remote process)
+//! has no access to them.
 //!
 //! `parse` is lenient (unknown node types become placeholders so the
 //! graph keeps rendering mid-edit); `validate` is the full strict
@@ -41,13 +42,14 @@ struct ParseResponse {
 #[derive(Debug, Serialize)]
 struct ValidateResponse {
     diagnostics: Vec<Diagnostic>,
-    /// One line per catalog folder left out and why (a broken
-    /// `metadata.json`, a node with no code yet, an empty package), the
-    /// same lines `weft describe-nodes` warns with. Never a failure on
-    /// their own: a program naming a left-out node gets its own
+    /// The catalog's warnings, the same lines `weft describe-nodes` warns
+    /// with: one per folder left out and why (a broken `metadata.json`, a
+    /// node with no code yet, an empty package), and one per name a node
+    /// spells off the weft way (that node still loads). Never a failure
+    /// on their own: a program naming a left-out node gets its own
     /// diagnostic.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    warnings: Vec<String>,
+    warnings: Vec<weft_catalog::CatalogWarning>,
 }
 
 fn read_stdin() -> Result<String> {
@@ -111,15 +113,16 @@ fn do_parse(
 // A long-lived process the VS Code extension spawns once and keeps warm. It
 // reads one JSON request per line on stdin and writes one JSON response per
 // line on stdout. Holding the per-project node catalog in memory makes each
-// request ~parse-cost instead of paying catalog-discovery (a full `nodes/`
-// walk) on every keystroke as the one-shot `weft parse` would. This is the
+// request ~parse-cost instead of paying catalog-discovery (a full walk of
+// both node roots) on every keystroke as the one-shot `weft parse` would. This is the
 // editor's hot path; the one-shot commands stay for tests and other callers.
 
 /// One editor request. `kind` selects the pipeline; `source` is the buffer
 /// text (NOT read from disk, so an unsaved buffer parses); `file` gives the
 /// `@file`/`@include` base + the project to resolve. `reload_catalog` drops
 /// the warm catalog for this project first (the host sends it when its
-/// `nodes/` watcher fired, so the server never needs its own watcher).
+/// node watcher fired, over `nodes/` and `src/` alike, so the server never
+/// needs its own watcher).
 // SYNC: ServerRequest <-> extension-vscode/src/parseServer.ts ParseServerRequest
 #[derive(Debug, Deserialize)]
 struct ServerRequest {
@@ -134,7 +137,7 @@ struct ServerRequest {
     /// edited source is then parsed so the UI re-renders in one round-trip.
     #[serde(default)]
     ops: Vec<weft_compiler::edit::EditOp>,
-    /// A raw text edit to replay (only for `kind: "applyEdit"`, the undo/redo
+    /// A raw text edit to replay (only for `kind: "apply_edit"`, the undo/redo
     /// path). Applied to `source`, then parsed, like `edit`.
     #[serde(default, rename = "textEdit")]
     text_edit: Option<weft_compiler::edit::TextEdit>,
@@ -146,45 +149,19 @@ struct ServerRequest {
     /// meant.
     #[serde(default)]
     mode: Option<ValidationMode>,
-    /// The run spec to resolve against the parsed program (only for
-    /// `kind: "resolveSpec"`): the editor's spec dialog asks on every
-    /// change, so every missing input is a field before the run starts.
-    #[serde(default)]
-    spec: Option<weft_core::run_spec::RunSpec>,
-    #[serde(default)]
-    bakes: Vec<weft_core::run_spec::BakeSummary>,
-    /// Seed history is evaluated at execution preparation, not by the local parser.
-    #[serde(default)]
-    seeded: bool,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 enum ServerRequestKind {
     Parse,
     Validate,
     Edit,
     /// Replay a `TextEdit` (undo/redo): apply it to `source`, parse the result.
     ApplyEdit,
-    /// Resolve a run spec against the parsed program
-    /// (`weft_core::run_spec::resolve_spec`): the same resolver the
-    /// dispatcher runs at the run, so the editor refuses what the
-    /// dispatcher would refuse, with every missing input named.
-    ResolveSpec,
 }
 
-/// Response payload for a `resolveSpec` request: what the spec resolves
-/// to, or why it cannot run. One of the two is set.
-// SYNC: ResolveSpecResponse <-> packages/weft-graph/src/run-spec.ts ResolveSpecResponse
-#[derive(Debug, Serialize)]
-struct ResolveSpecResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resolved: Option<weft_core::run_spec::Resolved>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    refusal: Option<weft_core::run_spec::Refusal>,
-}
-
-/// Response payload for an `edit`/`applyEdit` request: the new source, the parse
+/// Response payload for an `edit`/`apply_edit` request: the new source, the parse
 /// of it, and the INVERSE text edit (apply it to `source` to restore the prior
 /// source). The frontend writes `source`, re-renders from `parse`, and stores
 /// `inverse` as the action's undo. One round-trip.
@@ -214,25 +191,21 @@ struct ServerResponse {
 /// deactivate). A malformed or failing request answers with an `error`
 /// envelope and the loop continues: one bad request must not take the server
 /// down and stop all editor feedback.
-pub async fn serve(ctx: Ctx) -> Result<()> {
+pub fn serve() -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     // Per-project-root warm catalog. The catalog is immutable during an
-    // editing session except when the user edits `nodes/`, which the host
+    // editing session except when the user edits a node, which the host
     // signals via `reload_catalog`.
     let mut catalogs: HashMap<PathBuf, FsCatalog> = HashMap::new();
 
-    // No client here: the server runs for the whole editor session, most
-    // requests never reach an install, and the one that does resolves its
-    // own (see `Ctx::fresh_client`), so an install that is down, unnamed
-    // or starts later never costs the editor its parsing.
     for line in stdin.lock().lines() {
         let line = line.context("read request line")?;
         if line.trim().is_empty() {
             continue;
         }
         let resp = match serde_json::from_str::<ServerRequest>(&line) {
-            Ok(req) => handle_request(req, &mut catalogs, &ctx).await,
+            Ok(req) => handle_request(req, &mut catalogs),
             // A request we can't parse into the typed shape may still be
             // valid JSON carrying an `id` (a stale editor talking to a
             // newer server): recover it so the host matches the reply to
@@ -259,7 +232,7 @@ pub async fn serve(ctx: Ctx) -> Result<()> {
 /// pipeline. Project discovery walks up from the file's directory (the server
 /// has no fixed cwd project, unlike the one-shot commands). Parse is lenient
 /// and works without a project (nil id, empty catalog); validate requires one.
-async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>, ctx: &Ctx) -> ServerResponse {
+fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>) -> ServerResponse {
     let id = req.id;
     // Three-way: no project (lenient), a project, or a BROKEN manifest. A broken
     // `weft.toml` must surface loudly on every kind, not silently degrade to the
@@ -280,49 +253,6 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
         ServerRequestKind::Parse => {
             match parse_source(&req.source, &project, &anchor, req.file.as_deref(), catalogs, req.reload_catalog) {
                 Ok(parse_resp) => envelope(id, &parse_resp),
-                Err(e) => ServerResponse { id, payload: None, error: Some(e) },
-            }
-        }
-        ServerRequestKind::ResolveSpec => {
-            let Some(spec) = req.spec else {
-                return ServerResponse { id, payload: None, error: Some("resolveSpec requires a spec".into()) };
-            };
-            match resolve_source(&req.source, project.as_ref(), req.file.as_deref(), catalogs, req.reload_catalog) {
-                Ok(mut definition) => {
-                    if spec.fire.is_some() {
-                        let root = &project.as_ref().expect("resolution requires a project").root;
-                        let verified = match ctx.fresh_client(project.as_ref()) {
-                            Ok(client) => super::assets::resolve_project_assets(&client, root, &mut definition, false).await,
-                            Err(error) => Err(error),
-                        };
-                        if let Err(error) = verified {
-                            return envelope(id, &ResolveSpecResponse {
-                                resolved: None, refusal: Some(weft_core::run_spec::Refusal::error(format!("cannot verify trigger assets: {error:#}"))),
-                            });
-                        }
-                    }
-                    let resolved = weft_core::run_spec::resolve_spec(&spec, &definition, &Default::default())
-                        .and_then(|mut resolved| {
-                            if let Some((node, _)) = &spec.fire {
-                                let program = preview_program(&definition, project.as_ref(), catalogs)
-                                    .map_err(weft_core::run_spec::Refusal::error)?;
-                                weft_core::run_spec::validate_fire_bake(node, &program, &req.bakes)?;
-                            }
-                            // A seeded start can feed a crossing from history, which
-                            // only the dispatcher reads, so the refusal waits for it.
-                            if req.seeded {
-                                resolved.warnings.push("This preview has not checked the saved run. When starting, compatible saved results may supply inputs at the cut; an input something needs that no saved result supplies refuses the run then.".into());
-                            } else {
-                                weft_core::run_spec::refuse_unrunnable(&definition, &resolved.selection, &spec)?;
-                            }
-                            Ok(resolved)
-                        });
-                    let answer = match resolved {
-                        Ok(resolved) => ResolveSpecResponse { resolved: Some(resolved), refusal: None },
-                        Err(refusal) => ResolveSpecResponse { resolved: None, refusal: Some(refusal) },
-                    };
-                    envelope(id, &answer)
-                }
                 Err(e) => ServerResponse { id, payload: None, error: Some(e) },
             }
         }
@@ -383,7 +313,7 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
             // `inverse` is the edit that undoes THIS replay (so undo<->redo
             // round-trips without recomputing).
             let Some(text_edit) = &req.text_edit else {
-                return ServerResponse { id, payload: None, error: Some("applyEdit requires a textEdit".into()) };
+                return ServerResponse { id, payload: None, error: Some("apply_edit requires a textEdit".into()) };
             };
             let new_source = match weft_compiler::edit::apply_text_edit(&req.source, text_edit) {
                 Ok(s) => s,
@@ -397,7 +327,7 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
 }
 
 /// Build the `{source, parse, inverse}` response shared by `edit` and
-/// `applyEdit`: parse the new source (lenient, like a normal parse), or surface
+/// `apply_edit`: parse the new source (lenient, like a normal parse), or surface
 /// a catalog error loudly.
 fn edit_envelope(
     id: u64,
@@ -412,64 +342,6 @@ fn edit_envelope(
         Ok(parse) => envelope(id, &EditResponse { source: new_source, parse, inverse }),
         Err(e) => ServerResponse { id, payload: None, error: Some(e) },
     }
-}
-
-/// The runtime graph uses full includes; the canvas's interface-only graph
-/// cannot decide cuts or claim that a bake matches compiled code.
-fn resolve_source(
-    source: &str,
-    project: Option<&Project>,
-    file: Option<&std::path::Path>,
-    catalogs: &mut HashMap<PathBuf, FsCatalog>,
-    reload: bool,
-) -> std::result::Result<weft_core::ProjectDefinition, String> {
-    let project = project.ok_or_else(|| "run preview requires a project".to_string())?;
-    let file = file.ok_or_else(|| "run preview requires the open file's path".to_string())?;
-    let reader = BufferFileReader { file: file.canonicalize().map_err(|error| error.to_string())?, source };
-    let main = project.main_weft().canonicalize().map_err(|error| error.to_string())?;
-    let source = if main == reader.file { source.to_string() }
-        else { project.read_main_weft().map_err(|error| error.to_string())? };
-    let catalog = warm_catalog(catalogs, &project.root, reload)?;
-    let src_dir = project.src_dir();
-    weft_compiler::compile_enriched_with_diagnostics(&source, project.id(),
-        weft_compiler::CompileFs::with_reader(&reader, Some(&project.root)).anchored_at(Some(&src_dir)), catalog)
-        .map_err(|diagnostics| weft_compiler::render_diagnostics(&diagnostics))
-}
-
-struct BufferFileReader<'a> {
-    file: PathBuf,
-    source: &'a str,
-}
-
-impl weft_compiler::FileReader for BufferFileReader<'_> {
-    fn resolve_and_read(&self, root: &std::path::Path, base: &std::path::Path, relative: &std::path::Path) -> std::result::Result<weft_compiler::ResolvedFile, String> {
-        let mut file = weft_compiler::DiskFileReader.resolve_and_read(root, base, relative)?;
-        if file.identity == self.file { file.content = self.source.to_string(); }
-        Ok(file)
-    }
-
-    fn identity(&self, path: &std::path::Path) -> std::result::Result<PathBuf, String> {
-        weft_compiler::DiskFileReader.identity(path)
-    }
-}
-
-/// Hash the actual runtime buffer using the same build inputs as `weft run`.
-fn preview_program(
-    definition: &weft_core::ProjectDefinition,
-    project: Option<&Project>,
-    catalogs: &mut HashMap<PathBuf, FsCatalog>,
-) -> std::result::Result<weft_core::project::hash::ProgramIdentity, String> {
-    let project = project.ok_or_else(|| "trigger preview requires a project".to_string())?;
-    let catalog = warm_catalog(catalogs, &project.root, false)?;
-    let facts = || -> anyhow::Result<weft_core::project::hash::ProgramIdentity> {
-        let root = weft_compiler::build::resolve_weft_root()?;
-        Ok(weft_core::project::hash::ProgramIdentity {
-            definition_hash: weft_compiler::hash::compute_definition_hash(definition)?,
-            binary_hash: weft_compiler::hash::compute_binary_hash(definition, project, &root, catalog, weft_core::builds::NodeSet::Full)?,
-            implementations: weft_compiler::hash::implementation_hashes(definition, project, &root, catalog, weft_core::builds::NodeSet::Full)?,
-        })
-    };
-    facts().map_err(|error| format!("cannot verify the buffer's trigger bake: {error:#}"))
 }
 
 /// Lenient canvas parsing keeps includes as navigable interfaces.
@@ -587,11 +459,12 @@ pub async fn validate(ctx: Ctx, file: Option<std::path::PathBuf>) -> Result<()> 
     // from the project we already resolved, not a second `ctx.project()` call.
     let anchor = anchor_for(file.as_deref(), Some(project.root.as_path()));
     // Runtime: the terminal command is the complete pre-flight check (graph
-    // shape plus runtime rules like missing credentials); callers that want
+    // shape plus runtime rules like a provider with no model named); callers that want
     // the structural tier go through the parse-server's mode field.
     let resp = do_validate(&source, project.id(), &anchor, &catalog, file.as_deref(), ValidationMode::Runtime);
-    // The catalog's left-out folders go to stderr either way, as
-    // `weft describe-nodes` does; the JSON on stdout carries them too.
+    // The catalog's warnings (left-out folders, misspelled names) go
+    // to stderr either way, as `weft describe-nodes` does; the JSON on
+    // stdout carries them too.
     for warning in &resp.warnings {
         eprintln!("warning: {warning}");
     }
@@ -603,7 +476,7 @@ pub async fn validate(ctx: Ctx, file: Option<std::path::PathBuf>) -> Result<()> 
 /// command and the parse-server. The compile -> enrich -> validate pipeline
 /// (and its error-to-diagnostic mapping) lives in `compile_strict`; the caller
 /// picks the mode (`Structural` for the editor's Problems panel, `Runtime`
-/// for pre-flight checks that must also catch missing credentials).
+/// for pre-flight checks that must also catch the runtime rules, like a provider with no model named).
 fn do_validate(
     source: &str,
     id: uuid::Uuid,
@@ -627,8 +500,8 @@ fn do_validate(
 }
 
 /// For each node type in the project, pull its catalog entry. Hidden
-/// types (Passthrough) are omitted; unknown types are skipped (parse
-/// is lenient, the editor renders them as placeholders).
+/// types are omitted; unknown types are skipped (parse is lenient, the
+/// editor renders them as placeholders).
 fn collect_catalog(
     project: &ProjectDefinition,
     catalog: &FsCatalog,
@@ -674,44 +547,14 @@ mod tests {
             weft_compiler::validate::ValidationMode::Runtime,
         );
         assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
-        assert!(resp.warnings.iter().any(|w| w.contains("broken")), "{:?}", resp.warnings);
+        assert!(resp.warnings.iter().any(|w| w.message.contains("broken")), "{:?}", resp.warnings);
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["warnings"].as_array().map(|w| w.len()), Some(resp.warnings.len()));
+        assert_eq!(json["warnings"][0]["kind"], "left_out");
     }
 
     #[test]
-    fn runtime_preview_expands_includes_using_the_unsaved_file() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("weft.toml"), "[package]\nname='preview'\nid='00000000-0000-0000-0000-000000000099'\nversion='0.1.0'\n").unwrap();
-        std::fs::create_dir(dir.path().join("nodes")).unwrap();
-        std::fs::create_dir(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/main.weft"), "batch = @include(\"batch.weft\")\n").unwrap();
-        let include = dir.path().join("src/batch.weft");
-        let saved = "Group(text: String) -> (out: String) {\n self.out = self.text\n}\n";
-        std::fs::write(&include, saved).unwrap();
-        let project = weft_compiler::project::Project::load(dir.path()).unwrap();
-        let mut catalogs = Default::default();
-        let original = super::resolve_source(saved, Some(&project), Some(&include), &mut catalogs, false).unwrap();
-        let edited = "Group(number: Number) -> (out: Number) {\n self.out = self.number\n}\n";
-        let current = super::resolve_source(edited, Some(&project), Some(&include), &mut catalogs, false).unwrap();
-        assert!(current.nodes.iter().any(|node| node.id == "batch__in" && node.inputs.iter().any(|port| port.name == "number")));
-        assert_ne!(weft_compiler::hash::compute_definition_hash(&original).unwrap(), weft_compiler::hash::compute_definition_hash(&current).unwrap());
-        assert_eq!(std::fs::read_to_string(&include).unwrap(), saved);
-    }
-
-    #[test]
-    fn a_resolve_spec_request_carries_its_spec() {
-        let req: ServerRequest = serde_json::from_str(
-            r#"{"id":3,"kind":"resolveSpec","source":"","spec":{"name":"x","from":{"a":{}}},"seeded":true}"#,
-        )
-        .unwrap();
-        assert!(matches!(req.kind, ServerRequestKind::ResolveSpec));
-        assert_eq!(req.spec.unwrap().from.keys().collect::<Vec<_>>(), vec!["a"]);
-        assert!(req.seeded);
-    }
-
-    #[tokio::test]
-    async fn server_request_carries_the_validation_mode() {
+    fn server_request_carries_the_validation_mode() {
         // The extension sends `mode` on validate requests; absent stays
         // None (and the validate handler then refuses the request).
         let req: ServerRequest = serde_json::from_str(
@@ -724,7 +567,7 @@ mod tests {
             serde_json::from_str(r#"{"id":2,"kind":"validate","source":""}"#).unwrap();
         assert_eq!(req.mode, None);
         // And the handler refuses it before touching any project state.
-        let resp = handle_request(req, &mut Default::default(), &crate::commands::Ctx::new(None, None, false).unwrap()).await;
+        let resp = handle_request(req, &mut Default::default());
         assert_eq!(
             resp.error.as_deref(),
             Some("validate requires a mode (\"structural\" or \"runtime\")")

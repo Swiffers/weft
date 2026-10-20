@@ -7,13 +7,13 @@
 //! then read the response. The wait is a parked poll, so no worker is
 //! held while fal generates, and there is no deadline: a generation the
 //! user asked for takes as long as it takes, and cancelling the
-//! execution cancels the wait.
+//! run cancels the wait and the request on fal.
 
 use serde_json::{Map, Value};
 
 use weft::access::client::{get_json, post_json};
-use weft::signal::{PollEndpoint, Predicate};
-use weft::{Access, ExecutionContext, NodeErrExt, WeftResult};
+use weft::signal::{CancelCall, PollEndpoint, Predicate};
+use weft::{Access, RunContext, NodeErrExt, WeftResult};
 
 pub const API: &str = "https://queue.fal.run";
 
@@ -40,7 +40,7 @@ pub fn checked_model(model: &str) -> WeftResult<&str> {
 /// Submit `payload` to `model`'s queue, wait on the request, and hand
 /// back the completed response. `what` names the attempt in errors.
 pub async fn run_queued(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     account: &Access,
     http: &weft::reqwest_middleware::ClientWithMiddleware,
     model: &str,
@@ -68,18 +68,23 @@ pub async fn run_queued(
         model.split('/').take(2).collect::<Vec<_>>().join("/");
     // Resume on any status that is not in flight, so a status this node
     // does not know ends the wait and is refused below instead of
-    // being waited on forever.
+    // being waited on forever. Cancelling the run cancels the request
+    // too: fal drops a queued one, and asks the runner to stop one in
+    // progress (https://fal.ai/docs/model-apis/model-endpoints/queue).
     let status = ctx
-        .await_signal(PollEndpoint {
-            url: format!("{API}/{app}/requests/{request_id}/status"),
-            interval_secs: 5,
-            access: Some(weft::primitive::AccessRef::from(account)),
-            filters: vec![
-                Predicate::neq("status", "IN_QUEUE"),
-                Predicate::neq("status", "IN_PROGRESS"),
-            ],
-            ..Default::default()
-        })
+        .await_signal_with_cancel(
+            PollEndpoint {
+                url: format!("{API}/{app}/requests/{request_id}/status"),
+                interval_secs: 5,
+                access: Some(weft::primitive::AccessRef::from(account)),
+                filters: vec![
+                    Predicate::neq("status", "IN_QUEUE"),
+                    Predicate::neq("status", "IN_PROGRESS"),
+                ],
+                ..Default::default()
+            },
+            CancelCall::put(format!("{API}/{app}/requests/{request_id}/cancel")),
+        )
         .await?;
     match status["status"].as_str().unwrap_or_default() {
         "COMPLETED" => {}

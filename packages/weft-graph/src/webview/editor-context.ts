@@ -15,7 +15,7 @@
 // changes, without the editor re-creating the context object.
 
 import type { HostMessage, WebviewMessage, EditOp, Diagnostic } from '../protocol';
-import type { ProjectDefinition, ExecutionState } from './lib/types';
+import type { ProjectDefinition, RunState } from './lib/types';
 import type { EditRpcResult } from './lib/projection/types';
 
 export interface EditorContext {
@@ -33,13 +33,13 @@ export interface EditorContext {
   /// Include-navigation depth: 0 at the entry file, >0 inside an included file.
   readonly navDepth: number;
   /// The call sites of the current navigation, outermost first (what
-  /// scopes execution values to the calls the view descended through).
+  /// scopes run values to the calls the view descended through).
   /// Empty at depth 0.
   readonly callPath: string[];
-  /// Live + replayed execution state (per-node statuses + outputs + inspector
+  /// Live + replayed run state (per-node statuses + outputs + inspector
   /// logs). A replay panel writes a past run's end-state here via the host; the
   /// canvas already colors nodes from it.
-  readonly executionState: ExecutionState;
+  readonly runState: RunState;
   /// Current inline parse/translation error, or null.
   readonly error: string | null;
   /// Structured parse/enrich diagnostics for the ACTIVE file (with line +
@@ -54,7 +54,7 @@ export interface EditorContext {
   /// graph gesture. Debounce at the call site; the host coalesces re-parses.
   editActiveSource(source: string): void;
 
-  /// Apply structural EDIT OPS (setConfig / removeConfig / ...) the way the
+  /// Apply structural EDIT OPS (set_config / remove_config / ...) the way the
   /// canvas does: through the projection RPC that optimistically tracks the op,
   /// awaits the host's reply, and adopts the post-edit truth into `project` (so
   /// the canvas AND a panel reading `ctx.project` both refresh). Use this from a
@@ -65,7 +65,7 @@ export interface EditorContext {
   /// Post a message to the host (run, navigate, refresh status, anything a
   /// `WebviewMessage` expresses). The same channel the editor itself uses.
   send(msg: WebviewMessage): void;
-  /// Subscribe to host messages (parse results, exec events, nav state, ...).
+  /// Subscribe to host messages (parse results, firing events, nav state, ...).
   /// Returns an unsubscribe fn. A panel uses this to react to host pushes it
   /// cares about beyond what the context state already surfaces.
   onMessage(handler: (msg: HostMessage) => void): () => void;

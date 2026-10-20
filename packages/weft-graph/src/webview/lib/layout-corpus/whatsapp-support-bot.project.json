@@ -14,11 +14,78 @@
       "groupBoundary": null,
       "inputs": [
         {
+          "name": "cpu",
+          "portType": "String",
+          "required": false,
+          "description": "CPUs the machine sustains (`0.25`, `1`, `250m`). A cloud install picks its cheapest machine holding this and `memory`: a quarter CPU with 1Gi is Compute Engine's `e2-micro`, about $6 a month. A local install does not cap the container.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "text"
+          },
+          "default": "0.25",
+          "label": "CPUs",
+          "fromSpec": true
+        },
+        {
+          "name": "memory",
+          "portType": "String",
+          "required": false,
+          "description": "Memory, a number followed by Gi, Mi, G or M (`1Gi`). Sized with `cpu`; a local install does not cap the container.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "text"
+          },
+          "default": "1Gi",
+          "label": "Memory",
+          "fromSpec": true
+        },
+        {
+          "name": "machineType",
+          "portType": "String",
+          "required": false,
+          "description": "Last resort: a cloud's own machine type, used as is instead of the one picked from `cpu` and `memory` (`n2-standard-4` on Compute Engine). A local install ignores it.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "text"
+          },
+          "label": "Machine type",
+          "placeholder": "picked from CPUs and memory",
+          "fromSpec": true
+        },
+        {
           "name": "_should_flow",
-          "portType": "T__should_flow",
+          "portType": "T__in___should_flow",
           "required": false,
           "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-          "exposure": "all",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_not_flow",
+          "portType": "T__in___should_not_flow",
+          "required": false,
+          "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
           "widget": {
             "kind": "textarea"
           },
@@ -29,27 +96,28 @@
         {
           "name": "bridge",
           "portType": "Infra",
-          "required": false
+          "required": true,
+          "description": "The bridge's handle. Wire it into the `bridge` input of every other WhatsApp node. Baked: made when the bridge's infra is applied, so a run that reads only this output uses the saved handle and does not run this node."
         },
         {
           "name": "status",
           "portType": "String",
-          "required": false
+          "required": true
         },
         {
           "name": "phoneNumber",
           "portType": "String",
-          "required": false
+          "required": true
         },
         {
           "name": "jid",
           "portType": "String",
-          "required": false
+          "required": true
         },
         {
           "name": "pushName",
           "portType": "String",
-          "required": false
+          "required": true
         }
       ],
       "features": {
@@ -59,17 +127,105 @@
       "images": [
         "images/bridge"
       ],
+      "bakedOutputs": [
+        "bridge"
+      ],
       "span": {
-        "startLine": 7,
+        "startLine": 9,
         "startColumn": 0,
-        "endLine": 7,
+        "endLine": 9,
         "endColumn": 23
       },
       "headerSpan": {
-        "startLine": 7,
+        "startLine": 9,
         "startColumn": 0,
-        "endLine": 7,
+        "endLine": 9,
         "endColumn": 23
+      }
+    },
+    {
+      "id": "openrouter",
+      "nodeType": "OpenRouterAccess",
+      "label": null,
+      "config": {},
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "account",
+          "portType": "Access",
+          "required": false,
+          "accepts": [
+            "literal"
+          ],
+          "widget": {
+            "kind": "access",
+            "service": "openrouter"
+          },
+          "label": "Account",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__in___should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_not_flow",
+          "portType": "T__in___should_not_flow",
+          "required": false,
+          "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "access",
+          "portType": "Access",
+          "required": true,
+          "description": "Wire into OpenRouter Model nodes' `access` input."
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 10,
+        "startColumn": 0,
+        "endLine": 10,
+        "endColumn": 29
+      },
+      "headerSpan": {
+        "startLine": 10,
+        "startColumn": 0,
+        "endLine": 10,
+        "endColumn": 29
+      },
+      "portLiterals": {
+        "account": {
+          "__weft_install_picked__": {}
+        }
       }
     },
     {
@@ -89,18 +245,183 @@
           "portType": "Infra",
           "required": true,
           "description": "The `bridge` output of the BaileyBridge node to talk through.",
-          "exposure": "all",
+          "accepts": [
+            "wire"
+          ],
           "widget": {
-            "kind": "text"
+            "kind": "textarea"
           },
           "fromSpec": true
         },
         {
+          "name": "ignoreGroups",
+          "portType": "Boolean",
+          "required": false,
+          "description": "Only fire on direct messages; group messages are dropped.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "checkbox"
+          },
+          "default": false,
+          "label": "Ignore group chats",
+          "fromSpec": true
+        },
+        {
+          "name": "messageTypes",
+          "portType": "List[String]",
+          "required": false,
+          "description": "Only fire on these types: text, image, video, audio, document, sticker, contact, location, unknown. Empty: every type except unknown. Unlisted types are dropped. unknown is anything else (a reaction, a poll, a protocol message), has no content, and fires only when listed.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "multiselect",
+            "options": [
+              "text",
+              "image",
+              "video",
+              "audio",
+              "document",
+              "sticker",
+              "contact",
+              "location",
+              "unknown"
+            ]
+          },
+          "label": "Only these message types",
+          "fromSpec": true
+        },
+        {
+          "name": "callsPerMinute",
+          "portType": "Number",
+          "required": false,
+          "description": "How many runs this trigger may start per minute, every caller and every event together. Unset, no limit. Set it when the run behind this trigger costs money (a paid model, an outside API), so a flood of calls or events cannot run up the bill. A call from outside past it is refused with 429 and a `Retry-After`; an event the trigger picked up itself (a schedule tick, a new message) past it waits in the trigger's queue and starts once a later minute has room.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "number",
+            "min": 0.0,
+            "max": null,
+            "step": 1.0
+          },
+          "label": "Runs started per minute",
+          "fromSpec": true
+        },
+        {
+          "name": "callsAtOnce",
+          "portType": "Number",
+          "required": false,
+          "description": "How many runs this trigger may have going at the same time. Unset, 100; `0` is no limit. A call from outside past it is refused with 429 and a `Retry-After` until one of the runs ends; an event the trigger picked up itself waits until one ends.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "number",
+            "min": 0.0,
+            "max": null,
+            "step": 1.0
+          },
+          "label": "Runs going at once",
+          "fromSpec": true
+        },
+        {
+          "name": "durable",
+          "portType": "Boolean",
+          "required": false,
+          "description": "Turn on if a run must carry on when its worker dies: another worker picks it up where it was, and a node that was running at that moment is failed rather than run twice (a pure node that had not passed a value on is run again instead). To make that possible, what the run did is written down before each node runs, except a pure one, and an answer before it leaves. Off (default): the run waits for its record only when it pauses or asks weft for something on its behalf, and if its worker dies mid-run the run ends cancelled and is not run again.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "checkbox"
+          },
+          "default": false,
+          "label": "Durable runs",
+          "fromSpec": true
+        },
+        {
+          "name": "recorded",
+          "portType": "Boolean",
+          "required": false,
+          "description": "Turn off for a route called every few seconds (a status a page polls). Off: no history of a run is kept. One that fails is listed in `weft runs` with its failure (which node, and why); one that reported a cost or asked weft for something its worker does not already hold (a stored file, a new connection or infrastructure address, a task such as starting or stopping its infra, a stop through `ctx.stop_tagged`) is listed with its costs and how it ended; any other leaves only a count in `weft status`. A run started by hand is always recorded. An unrecorded run cannot wait (timer, form), cannot tag itself, and cannot be durable.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "checkbox"
+          },
+          "default": true,
+          "label": "Record each run",
+          "fromSpec": true
+        },
+        {
+          "name": "keepRunsFor",
+          "portType": "String",
+          "required": false,
+          "description": "How long a run is kept once it ends, with its record, its logs, its search entry and its tags: a whole number and a unit (`30m`, `12h`, `7d`), or `forever`. Unset, as long as the project keeps runs (`[runs] keep_for` in `weft.toml`, a week when it says nothing). A run that has not ended (running, parked, or waiting for a worker) is never deleted, however old.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "text"
+          },
+          "label": "Keep runs for",
+          "fromSpec": true
+        },
+        {
+          "name": "holdSecs",
+          "portType": "Number",
+          "required": false,
+          "description": "How long, in seconds, a wait (a form, a timer) holds the run's worker when the run cannot pause: its caller is on the line and it does not outlive it, it is not recorded, or a bus between its nodes is open. The clock runs only while nothing moves in the run (no node working, nothing said on a bus), and starts over when something does. When it runs out, the waiting node fails, saying it gave up, and the node may handle that itself. `0` fails such a wait at once; at most 30 days.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "number",
+            "min": 0.0,
+            "max": 2592000.0,
+            "step": 1.0
+          },
+          "default": 60,
+          "label": "Hold seconds when a run cannot pause",
+          "fromSpec": true
+        },
+        {
           "name": "_should_flow",
-          "portType": "T__should_flow",
+          "portType": "T__in___should_flow",
           "required": false,
           "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-          "exposure": "all",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_not_flow",
+          "portType": "T__in___should_not_flow",
+          "required": false,
+          "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
           "widget": {
             "kind": "textarea"
           },
@@ -111,74 +432,97 @@
         {
           "name": "content",
           "portType": "String",
-          "required": false
+          "required": true,
+          "description": "The message's text, or the caption of a picture, video or document. Absent for a voice note, for a picture, video or document sent without a caption, and for a sticker, contact, location or unknown message. FirstInOrder over a voice note's transcript and `content` picks whichever exists."
         },
         {
           "name": "from",
           "portType": "String",
-          "required": false
+          "required": true
         },
         {
           "name": "pushName",
           "portType": "String",
-          "required": false
+          "required": true
         },
         {
           "name": "messageId",
           "portType": "String",
-          "required": false
+          "required": true
         },
         {
           "name": "timestamp",
           "portType": "Number",
-          "required": false
+          "required": true
         },
         {
           "name": "isGroup",
           "portType": "Boolean",
-          "required": false
+          "required": true
         },
         {
           "name": "chatId",
           "portType": "String",
-          "required": false
+          "required": true
         },
         {
           "name": "messageType",
           "portType": "String",
-          "required": false
+          "required": true
         },
         {
           "name": "file",
           "portType": "File",
-          "required": false,
-          "description": "Stored-file reference for image/video/audio/document/sticker messages; absent for text."
+          "required": true,
+          "description": "The stored media for image, video, audio, document and sticker messages; absent otherwise."
+        },
+        {
+          "name": "fileSize",
+          "portType": "Number",
+          "required": true,
+          "description": "Media size in bytes as WhatsApp reports it before download; absent for text. Gate on it to refuse oversized files."
+        },
+        {
+          "name": "seconds",
+          "portType": "Number",
+          "required": true,
+          "description": "Length of a voice note or video in seconds; absent otherwise. Gate on it before paying to transcribe a long one."
         }
       ],
       "features": {
         "isTrigger": true
       },
       "requiresInfra": false,
+      "firesWith": {
+        "chatId?": "String",
+        "content?": "String",
+        "fileSize?": "Number",
+        "from?": "String",
+        "isGroup?": "Boolean",
+        "messageId?": "String",
+        "messageType?": "String",
+        "pushName?": "String",
+        "seconds?": "Number",
+        "timestamp?": "Number"
+      },
       "span": {
-        "startLine": 9,
+        "startLine": 12,
         "startColumn": 0,
-        "endLine": 9,
-        "endColumn": 57
+        "endLine": 12,
+        "endColumn": 47
       },
       "headerSpan": {
-        "startLine": 9,
+        "startLine": 12,
         "startColumn": 0,
-        "endLine": 9,
+        "endLine": 12,
         "endColumn": 20
       }
     },
     {
       "id": "draft",
-      "nodeType": "LlmInference",
+      "nodeType": "LlmInferenceJson",
       "label": null,
-      "config": {
-        "parseJson": true
-      },
+      "config": {},
       "position": {
         "x": 0.0,
         "y": 0.0
@@ -190,21 +534,30 @@
           "name": "prompt",
           "portType": "String",
           "required": false,
-          "description": "The prompt to send, appended as the newest user message. Optional when a history is wired (a tool-result round re-enters with the history alone).",
-          "exposure": "all",
+          "description": "Appended as the newest user message. Optional when `historyFile` is wired (a tool-result round re-enters with the conversation alone).",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
           "widget": {
             "kind": "textarea"
           },
           "fromSpec": true
         },
         {
-          "name": "history",
-          "portType": "ChatHistory=List[ChatMessage={role: String, content: String | List[ChatContentPart={type: String, text?: String, image_url?: {url: Image, detail?: String, width?: Number, height?: Number}, input_audio?: {data: Audio, format?: String, duration_secs?: Number}, video_url?: {url: Video, duration_secs?: Number, width?: Number, height?: Number}}], name?: String, tool_call_id?: String, tool_calls?: List[ToolCall={id: String, name: String, arguments: String}], cache_breakpoint?: Boolean}]",
+          "name": "historyFile",
+          "portType": "File",
           "required": false,
-          "description": "The conversation so far (a Chat Message chain or a previous call's history output).",
-          "exposure": "wire",
+          "description": "The conversation so far, in a stored file (a previous call's or a Chat Message's `historyFile` output, or a file holding `[]` stored in the project scope to start one later runs continue). This call's turn is added to the same file, in place. Unwired, the call starts from no conversation.",
+          "accepts": [
+            "wire"
+          ],
+          "optional": true,
           "widget": {
-            "kind": "textarea"
+            "kind": "file_drop",
+            "accept": null,
+            "type": "File"
           },
           "fromSpec": true
         },
@@ -212,8 +565,12 @@
           "name": "media",
           "portType": "Image | Video | Audio | List[Media]",
           "required": false,
-          "description": "Media attached to this prompt: one stored image, audio clip, or video, or a list of them.",
-          "exposure": "assignment",
+          "description": "One stored image, audio clip, or video attached to this prompt, or a list of them.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
           "widget": {
             "kind": "file_drop",
             "accept": null,
@@ -226,8 +583,10 @@
           "name": "provider",
           "portType": "LlmProvider=JsonDict",
           "required": true,
-          "description": "The provider (wire an OpenRouter, Anthropic, OpenAI, or Custom Provider node's output): which service, which model, whose credential the call spends.",
-          "exposure": "wire",
+          "description": "Which service, model, and credential: wire an OpenRouter Model, Anthropic Model, OpenAI Model, or Custom Provider node's output. Never build this value by hand or pass it through a port typed JsonDict (a group that carries it declares the port as LlmProvider).",
+          "accepts": [
+            "wire"
+          ],
           "widget": {
             "kind": "textarea"
           },
@@ -237,8 +596,10 @@
           "name": "params",
           "portType": "Dict[String, String | Number | Boolean | List[String]]",
           "required": false,
-          "description": "Optional LlmParams node carrying the sampling settings (system prompt, temperature, ...). Unwired, the defaults apply.",
-          "exposure": "wire",
+          "description": "Optional LlmParams node (system prompt, temperature, ...). Unwired, the defaults apply.",
+          "accepts": [
+            "wire"
+          ],
           "widget": {
             "kind": "textarea"
           },
@@ -249,7 +610,9 @@
           "portType": "JsonDict | List[JsonDict]",
           "required": false,
           "description": "Tool declarations the model may call: one LLM Tool node's output, or a list of them.",
-          "exposure": "wire",
+          "accepts": [
+            "wire"
+          ],
           "widget": {
             "kind": "textarea"
           },
@@ -260,7 +623,10 @@
           "portType": "String",
           "required": false,
           "description": "Only used when tools are wired: auto lets the model decide, required forces a call, none forbids one.",
-          "exposure": "config",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "select",
             "options": [
@@ -274,24 +640,46 @@
           "fromSpec": true
         },
         {
-          "name": "parseJson",
+          "name": "autoCache",
           "portType": "Boolean",
           "required": false,
-          "description": "Parse and repair JSON from the response (changes output to Dict).",
-          "exposure": "config",
+          "description": "On: when the conversation carries no cache mark of its own, the request marks the system message and the last message before this turn. The marks are sent only, never written into `historyFile`.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "checkbox"
           },
-          "default": false,
-          "label": "Parse JSON",
+          "default": true,
+          "label": "Automatic prompt caching",
           "fromSpec": true
         },
         {
           "name": "_should_flow",
-          "portType": "T__should_flow",
+          "portType": "T__in___should_flow",
           "required": false,
           "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-          "exposure": "all",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_not_flow",
+          "portType": "T__in___should_not_flow",
+          "required": false,
+          "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
           "widget": {
             "kind": "textarea"
           },
@@ -301,87 +689,59 @@
       "outputs": [
         {
           "name": "response",
-          "portType": "MustOverride",
-          "required": false,
-          "description": "LLM response. Declare type in Weft: String without parseJson, or Dict/JsonDict with parseJson. With parseJson, you can also add custom output ports to extract specific JSON keys directly."
+          "portType": "Draft={answer: String, sensitivity: String, ..}",
+          "required": true,
+          "description": "The answer parsed as JSON, holding the type declared here (`-> (response: Verdict)`), JsonDict when none is. Absent on a turn that only called tools.",
+          "declaredType": "Draft"
         },
         {
-          "name": "history",
-          "portType": "ChatHistory=List[ChatMessage={role: String, content: String | List[ChatContentPart={type: String, text?: String, image_url?: {url: Image, detail?: String, width?: Number, height?: Number}, input_audio?: {data: Audio, format?: String, duration_secs?: Number}, video_url?: {url: Video, duration_secs?: Number, width?: Number, height?: Number}}], name?: String, tool_call_id?: String, tool_calls?: List[ToolCall={id: String, name: String, arguments: String}], cache_breakpoint?: Boolean}]",
-          "required": false,
-          "description": "The conversation including this call: the input history plus the new user message and the assistant reply. Wire it onward to continue the conversation."
+          "name": "historyFile",
+          "portType": "File",
+          "required": true,
+          "description": "The `historyFile` that came in with this call's user message and reply added (same file, next version), or, when none came in, a new file holding this turn, kept past the run. Unwired with no file in, the call keeps nothing."
         },
         {
           "name": "toolCalls",
           "portType": "List[ToolCall={id: String, name: String, arguments: String}]",
-          "required": false,
-          "description": "The tool calls the model made, if any (each with the raw JSON text of its arguments). Pulses only when the model called tools; append each result with a Chat Message node (role: tool) and wire the history back into the next LLM call."
+          "required": true,
+          "description": "Pulses only when the model called tools. Append each result with a Chat Message (role tool) and wire its `historyFile` into the next call. A call left unanswered (the run stopped before its result was appended) is answered `cancelled` by the next call."
         },
         {
-          "name": "answer",
+          "name": "error",
           "portType": "String",
           "required": true,
-          "declaredType": "String"
-        },
-        {
-          "name": "sensitivity",
-          "portType": "String",
-          "required": true,
-          "declaredType": "String"
+          "description": "Why the node failed, when this output is wired. Unwired, a failure stops the run."
         }
       ],
       "features": {
         "oneOfRequired": [
           [
             "prompt",
-            "history",
+            "historyFile",
             "media"
           ]
         ],
-        "canAddOutputPorts": true
+        "catchErrors": true
       },
       "requiresInfra": false,
       "span": {
-        "startLine": 11,
+        "startLine": 14,
         "startColumn": 0,
-        "endLine": 16,
+        "endLine": 18,
         "endColumn": 1
       },
       "headerSpan": {
-        "startLine": 11,
+        "startLine": 14,
         "startColumn": 0,
-        "endLine": 11,
-        "endColumn": 61
-      },
-      "configSpans": {
-        "parseJson": {
-          "span": {
-            "startLine": 12,
-            "startColumn": 2,
-            "endLine": 12,
-            "endColumn": 17
-          },
-          "origin": "inline"
-        }
+        "endLine": 14,
+        "endColumn": 45
       }
     },
     {
       "id": "route",
       "nodeType": "Switch",
       "label": null,
-      "config": {
-        "cases": [
-          {
-            "kind": "equals",
-            "port": "needsAPerson",
-            "value": "high"
-          },
-          {
-            "kind": "otherwise",
-            "port": "goAhead"
-          }
-        ]
-      },
+      "config": {},
       "position": {
         "x": 0.0,
         "y": 0.0
@@ -394,7 +754,10 @@
           "portType": "String",
           "required": true,
           "description": "The value the cases match against.",
-          "exposure": "assignment",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "text"
           },
@@ -405,7 +768,9 @@
           "portType": "List[JsonDict]",
           "required": true,
           "description": "One entry per branch: `{ \"kind\": \"equals\", \"value\": \"high\", \"port\": \"urgent\" }`, or any other test kind in place of `equals`. The `otherwise` kind catches everything else and goes last.",
-          "exposure": "config",
+          "accepts": [
+            "literal"
+          ],
           "widget": {
             "kind": "entry_list"
           },
@@ -414,10 +779,29 @@
         },
         {
           "name": "_should_flow",
-          "portType": "T__should_flow",
+          "portType": "T__in___should_flow",
           "required": false,
           "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-          "exposure": "all",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_not_flow",
+          "portType": "T__in___should_not_flow",
+          "required": false,
+          "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
           "widget": {
             "kind": "textarea"
           },
@@ -428,34 +812,49 @@
         {
           "name": "needsAPerson",
           "portType": "Boolean",
-          "required": false
+          "required": true
         },
         {
           "name": "goAhead",
           "portType": "Boolean",
-          "required": false
+          "required": true
         }
       ],
-      "features": {},
+      "features": {
+        "pure": true
+      },
       "requiresInfra": false,
       "span": {
-        "startLine": 19,
+        "startLine": 21,
         "startColumn": 0,
-        "endLine": 25,
+        "endLine": 27,
         "endColumn": 1
       },
       "headerSpan": {
-        "startLine": 19,
+        "startLine": 21,
         "startColumn": 0,
-        "endLine": 19,
+        "endLine": 21,
         "endColumn": 15
       },
-      "configSpans": {
+      "portLiterals": {
+        "cases": [
+          {
+            "kind": "equals",
+            "port": "needsAPerson",
+            "value": "high"
+          },
+          {
+            "kind": "otherwise",
+            "port": "goAhead"
+          }
+        ]
+      },
+      "portLiteralSpans": {
         "cases": {
           "span": {
-            "startLine": 21,
+            "startLine": 23,
             "startColumn": 2,
-            "endLine": 24,
+            "endLine": 26,
             "endColumn": 3
           },
           "origin": "inline"
@@ -466,7 +865,154 @@
       "id": "review",
       "nodeType": "HumanQuery",
       "label": null,
-      "config": {
+      "config": {},
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "title",
+          "portType": "String",
+          "required": false,
+          "description": "Shown at the top of the form.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "text"
+          },
+          "label": "Title",
+          "placeholder": "Review request",
+          "fromSpec": true
+        },
+        {
+          "name": "description",
+          "portType": "String",
+          "required": false,
+          "description": "Shown under the title.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "textarea"
+          },
+          "label": "Description",
+          "placeholder": "What you want the reviewer to do.",
+          "fromSpec": true
+        },
+        {
+          "name": "fields",
+          "portType": "List[JsonDict]",
+          "required": true,
+          "description": "Each field adds ports by its kind (see portsFromConfig).",
+          "accepts": [
+            "literal"
+          ],
+          "widget": {
+            "kind": "entry_list"
+          },
+          "label": "Form fields",
+          "fromSpec": true
+        },
+        {
+          "name": "from",
+          "portType": "String",
+          "required": true,
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "text"
+          }
+        },
+        {
+          "name": "question",
+          "portType": "String",
+          "required": true,
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "text"
+          }
+        },
+        {
+          "name": "answer",
+          "portType": "String",
+          "required": true,
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "widget": {
+            "kind": "text"
+          }
+        },
+        {
+          "name": "_should_flow",
+          "portType": "Boolean",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
+          "widget": {
+            "kind": "checkbox"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_not_flow",
+          "portType": "T__in___should_not_flow",
+          "required": false,
+          "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "sendApproved",
+          "portType": "Boolean",
+          "required": true
+        },
+        {
+          "name": "sendRejected",
+          "portType": "Boolean",
+          "required": true
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 29,
+        "startColumn": 0,
+        "endLine": 41,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 29,
+        "startColumn": 0,
+        "endLine": 29,
+        "endColumn": 20
+      },
+      "portLiterals": {
         "fields": [
           {
             "key": "from",
@@ -487,131 +1033,21 @@
         ],
         "title": "Send this answer?"
       },
-      "position": {
-        "x": 0.0,
-        "y": 0.0
-      },
-      "scope": [],
-      "groupBoundary": null,
-      "inputs": [
-        {
-          "name": "title",
-          "portType": "String",
-          "required": false,
-          "description": "Title the reviewer sees at the top of the form.",
-          "exposure": "config",
-          "widget": {
-            "kind": "text"
-          },
-          "label": "Title",
-          "placeholder": "Review request",
-          "fromSpec": true
-        },
-        {
-          "name": "description",
-          "portType": "String",
-          "required": false,
-          "description": "Description shown under the title.",
-          "exposure": "config",
-          "widget": {
-            "kind": "textarea"
-          },
-          "label": "Description",
-          "placeholder": "What you want the reviewer to do.",
-          "fromSpec": true
-        },
-        {
-          "name": "fields",
-          "portType": "List[JsonDict]",
-          "required": true,
-          "description": "Each field contributes inputs/outputs per its kind (see the node's portsFromConfig).",
-          "exposure": "config",
-          "widget": {
-            "kind": "entry_list"
-          },
-          "label": "Form fields",
-          "fromSpec": true
-        },
-        {
-          "name": "from",
-          "portType": "String",
-          "required": true,
-          "exposure": "assignment",
-          "widget": {
-            "kind": "text"
-          }
-        },
-        {
-          "name": "question",
-          "portType": "String",
-          "required": true,
-          "exposure": "assignment",
-          "widget": {
-            "kind": "text"
-          }
-        },
-        {
-          "name": "answer",
-          "portType": "String",
-          "required": true,
-          "exposure": "assignment",
-          "widget": {
-            "kind": "text"
-          }
-        },
-        {
-          "name": "_should_flow",
-          "portType": "Boolean",
-          "required": false,
-          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-          "exposure": "all",
-          "widget": {
-            "kind": "checkbox"
-          },
-          "fromSpec": true
-        }
-      ],
-      "outputs": [
-        {
-          "name": "send_approved",
-          "portType": "Boolean",
-          "required": false
-        },
-        {
-          "name": "send_rejected",
-          "portType": "Boolean",
-          "required": false
-        }
-      ],
-      "features": {},
-      "requiresInfra": false,
-      "span": {
-        "startLine": 27,
-        "startColumn": 0,
-        "endLine": 39,
-        "endColumn": 1
-      },
-      "headerSpan": {
-        "startLine": 27,
-        "startColumn": 0,
-        "endLine": 27,
-        "endColumn": 20
-      },
-      "configSpans": {
+      "portLiteralSpans": {
         "fields": {
           "span": {
-            "startLine": 30,
+            "startLine": 32,
             "startColumn": 2,
-            "endLine": 35,
+            "endLine": 37,
             "endColumn": 3
           },
           "origin": "inline"
         },
         "title": {
           "span": {
-            "startLine": 29,
+            "startLine": 31,
             "startColumn": 2,
-            "endLine": 29,
+            "endLine": 31,
             "endColumn": 28
           },
           "origin": "inline"
@@ -632,10 +1068,29 @@
       "inputs": [
         {
           "name": "_should_flow",
-          "portType": "T__should_flow",
+          "portType": "T__in___should_flow",
           "required": false,
           "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-          "exposure": "all",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_not_flow",
+          "portType": "T__in___should_not_flow",
+          "required": false,
+          "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
           "widget": {
             "kind": "textarea"
           },
@@ -645,7 +1100,11 @@
           "name": "approved",
           "portType": "Boolean",
           "required": false,
-          "exposure": "assignment",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
           "widget": {
             "kind": "checkbox"
           }
@@ -654,7 +1113,11 @@
           "name": "automatic",
           "portType": "Boolean",
           "required": false,
-          "exposure": "assignment",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
           "widget": {
             "kind": "checkbox"
           }
@@ -664,26 +1127,27 @@
         {
           "name": "value",
           "portType": "Boolean",
-          "required": false,
-          "description": "The first input that spoke, in written order. Closed when none did."
+          "required": true,
+          "description": "The first input that carried a value. Closed when none did."
         }
       ],
       "features": {
         "canAddInputPorts": true,
-        "optionalCustomInputs": true,
-        "customInputType": "T"
+        "join": true,
+        "customInputType": "T",
+        "pure": true
       },
       "requiresInfra": false,
       "span": {
-        "startLine": 41,
+        "startLine": 43,
         "startColumn": 0,
-        "endLine": 44,
+        "endLine": 46,
         "endColumn": 1
       },
       "headerSpan": {
-        "startLine": 41,
+        "startLine": 43,
         "startColumn": 0,
-        "endLine": 41,
+        "endLine": 43,
         "endColumn": 23
       }
     },
@@ -703,9 +1167,12 @@
           "name": "bridge",
           "portType": "Infra",
           "required": true,
-          "exposure": "all",
+          "description": "The `bridge` output of the BaileyBridge node to talk through.",
+          "accepts": [
+            "wire"
+          ],
           "widget": {
-            "kind": "text"
+            "kind": "textarea"
           },
           "fromSpec": true
         },
@@ -713,7 +1180,10 @@
           "name": "to",
           "portType": "String",
           "required": true,
-          "exposure": "all",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "text"
           },
@@ -723,7 +1193,10 @@
           "name": "message",
           "portType": "String",
           "required": true,
-          "exposure": "all",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "textarea"
           },
@@ -734,9 +1207,28 @@
           "portType": "Boolean",
           "required": false,
           "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-          "exposure": "all",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
           "widget": {
             "kind": "checkbox"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_not_flow",
+          "portType": "T__in___should_not_flow",
+          "required": false,
+          "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
+          "widget": {
+            "kind": "textarea"
           },
           "fromSpec": true
         }
@@ -745,32 +1237,37 @@
         {
           "name": "messageId",
           "portType": "String",
-          "required": false
+          "required": true
+        },
+        {
+          "name": "error",
+          "portType": "String",
+          "required": true,
+          "description": "Why the node failed, when this output is wired. Unwired, a failure stops the run."
         }
       ],
-      "features": {},
+      "features": {
+        "catchErrors": true
+      },
       "requiresInfra": false,
       "span": {
-        "startLine": 46,
+        "startLine": 48,
         "startColumn": 0,
-        "endLine": 52,
+        "endLine": 53,
         "endColumn": 1
       },
       "headerSpan": {
-        "startLine": 46,
+        "startLine": 48,
         "startColumn": 0,
-        "endLine": 46,
+        "endLine": 48,
         "endColumn": 19
-      },
-      "configSpans": {}
+      }
     },
     {
       "id": "draft__provider",
-      "nodeType": "OpenRouterProvider",
+      "nodeType": "OpenRouterModel",
       "label": null,
-      "config": {
-        "model": "z-ai/glm-5.3"
-      },
+      "config": {},
       "position": {
         "x": 0.0,
         "y": 0.0
@@ -779,25 +1276,29 @@
       "groupBoundary": null,
       "inputs": [
         {
-          "name": "connection",
+          "name": "access",
           "portType": "Access",
-          "required": false,
-          "exposure": "config",
+          "required": true,
+          "description": "The OpenRouter connection: wire an OpenRouter Access node's `access`.",
+          "accepts": [
+            "wire"
+          ],
           "widget": {
-            "kind": "access",
-            "service": "openrouter"
+            "kind": "textarea"
           },
-          "label": "Connection",
           "fromSpec": true
         },
         {
           "name": "model",
           "portType": "String",
           "required": true,
-          "exposure": "config",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "remote_select",
-            "access": "connection",
+            "access": "access",
             "sources": [
               {
                 "kind": "list",
@@ -808,7 +1309,7 @@
                 "public": true
               }
             ],
-            "free_text": true
+            "freeText": true
           },
           "label": "Model",
           "placeholder": "deepseek/deepseek-v4-flash-0731",
@@ -819,7 +1320,10 @@
           "portType": "String",
           "required": false,
           "description": "Serve the model from one specific OpenRouter provider (anthropic, fireworks, amazon-bedrock, ...). Leave empty to let OpenRouter route. Providers charge different rates for the same model, so pinning one also pins the price.",
-          "exposure": "config",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "text"
           },
@@ -831,8 +1335,11 @@
           "name": "providerFallbacks",
           "portType": "Boolean",
           "required": false,
-          "description": "Fall back to other serving providers when the preferred one (the pin above, or OpenRouter's top-ranked choice) is unavailable. On by default. Turning it off makes the call fail rather than be served (and billed) by someone else.",
-          "exposure": "config",
+          "description": "Fall back to other serving providers when the preferred one (the pin above, or OpenRouter's top choice) is unavailable. Off makes the call fail rather than be served and billed by someone else.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "checkbox"
           },
@@ -841,10 +1348,29 @@
         },
         {
           "name": "_should_flow",
-          "portType": "T__should_flow",
+          "portType": "T__in___should_flow",
           "required": false,
           "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-          "exposure": "all",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_not_flow",
+          "portType": "T__in___should_not_flow",
+          "required": false,
+          "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
           "widget": {
             "kind": "textarea"
           },
@@ -855,25 +1381,28 @@
         {
           "name": "provider",
           "portType": "LlmProvider=JsonDict",
-          "required": false,
-          "description": "The provider value: wire it into an LLM node's provider input."
+          "required": true,
+          "description": "Wire it into an LLM node's provider input."
         }
       ],
       "features": {},
       "requiresInfra": false,
       "span": {
-        "startLine": 14,
+        "startLine": 16,
         "startColumn": 12,
-        "endLine": 14,
-        "endColumn": 65
+        "endLine": 16,
+        "endColumn": 89
       },
-      "configSpans": {
+      "portLiterals": {
+        "model": "z-ai/glm-5.3"
+      },
+      "portLiteralSpans": {
         "model": {
           "span": {
-            "startLine": 14,
-            "startColumn": 33,
-            "endLine": 14,
-            "endColumn": 55
+            "startLine": 16,
+            "startColumn": 57,
+            "endLine": 16,
+            "endColumn": 79
           },
           "origin": "inline"
         }
@@ -883,10 +1412,7 @@
       "id": "draft__params",
       "nodeType": "LlmParams",
       "label": null,
-      "config": {
-        "systemPrompt": "You are the support account of a small software consultancy, answering\nWhatsApp messages from clients. Reply as JSON in exactly this shape:\n\n{ \"answer\": \"your reply to the message\", \"sensitivity\": \"high\" }\n\n`sensitivity` is \"high\", \"medium\" or \"low\", lowercased.\n\nWe build custom software for companies and we are close with our clients,\nso be warm and personal, never stiff or robotic. We can take on almost any\nproject. Day rate is 1000: when someone asks for a price, estimate the work\nand quote confidently.\n\nSet `sensitivity` to \"high\" whenever the message deserves a human look\nbefore the reply goes out: a quote for a big project, a complaint, anything\nlegal or contractual, or anything you are unsure about. Everything routine\nis \"low\" or \"medium\".\n",
-        "temperature": 0.75
-      },
+      "config": {},
       "position": {
         "x": 0.0,
         "y": 0.0
@@ -898,8 +1424,11 @@
           "name": "systemPrompt",
           "portType": "String",
           "required": false,
-          "description": "System prompt for every LLM node wired to these params. Seeds the conversation as its first (role: system) message and rides the history from then on; a history already opening with a system message keeps it, so to switch instructions mid-chain append a system message with the Chat Message node.",
-          "exposure": "config",
+          "description": "Seeds the conversation as its first (role system) message and rides the history from then on. A history already opening with a system message keeps its own, so to switch instructions mid-chain append a system message with Chat Message.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "textarea"
           },
@@ -911,7 +1440,11 @@
           "name": "maxTokens",
           "portType": "Number",
           "required": false,
-          "exposure": "config",
+          "description": "The most tokens the reply may hold, thinking included on a reasoning model. Unset, nothing is sent and the provider's own default applies (Anthropic, which requires one, gets the model's largest output).",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "number",
             "min": 1.0,
@@ -919,14 +1452,17 @@
             "step": 1.0
           },
           "label": "Max Tokens",
-          "placeholder": "4096",
+          "placeholder": "Provider default",
           "fromSpec": true
         },
         {
           "name": "temperature",
           "portType": "Number",
           "required": false,
-          "exposure": "config",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "number",
             "min": 0.0,
@@ -934,14 +1470,17 @@
             "step": 0.1
           },
           "label": "Temperature",
-          "placeholder": "0.7",
+          "placeholder": "Provider default",
           "fromSpec": true
         },
         {
           "name": "topP",
           "portType": "Number",
           "required": false,
-          "exposure": "config",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "number",
             "min": 0.0,
@@ -949,14 +1488,17 @@
             "step": 0.05
           },
           "label": "Top P",
-          "placeholder": "1.0",
+          "placeholder": "Provider default",
           "fromSpec": true
         },
         {
           "name": "topK",
           "portType": "Number",
           "required": false,
-          "exposure": "config",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "number",
             "min": 1.0,
@@ -971,7 +1513,10 @@
           "portType": "Number",
           "required": false,
           "description": "-2.0 to 2.0",
-          "exposure": "config",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "number",
             "min": -2.0,
@@ -979,7 +1524,7 @@
             "step": 0.1
           },
           "label": "Frequency Penalty",
-          "placeholder": "0.0",
+          "placeholder": "Provider default",
           "fromSpec": true
         },
         {
@@ -987,7 +1532,10 @@
           "portType": "Number",
           "required": false,
           "description": "-2.0 to 2.0",
-          "exposure": "config",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "number",
             "min": -2.0,
@@ -995,7 +1543,7 @@
             "step": 0.1
           },
           "label": "Presence Penalty",
-          "placeholder": "0.0",
+          "placeholder": "Provider default",
           "fromSpec": true
         },
         {
@@ -1003,7 +1551,10 @@
           "portType": "List[String]",
           "required": false,
           "description": "Generation stops when the model produces any of these strings.",
-          "exposure": "config",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "text_list"
           },
@@ -1014,8 +1565,11 @@
           "name": "reasoning",
           "portType": "Boolean",
           "required": false,
-          "description": "Enable extended thinking for supported models",
-          "exposure": "config",
+          "description": "Unset (default) sends nothing, so the provider's own default applies. Off asks the provider for no reasoning; on reasons at `reasoningEffort`. A model that cannot switch reasoning off fails with an error saying to set this on; a model with no reasoning fails with its provider's error: set this off.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "checkbox"
           },
@@ -1026,15 +1580,19 @@
           "name": "reasoningEffort",
           "portType": "String",
           "required": false,
-          "description": "Only used when reasoning is enabled",
-          "exposure": "config",
+          "description": "Only used when reasoning is on, sent as written. Unpicked means the provider's lowest effort.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "select",
             "options": [
               "low",
               "medium",
               "high"
-            ]
+            ],
+            "freeText": true
           },
           "label": "Reasoning Effort",
           "fromSpec": true
@@ -1044,7 +1602,10 @@
           "portType": "String",
           "required": false,
           "description": "Force the model's reply to start with this exact text (constrained generation).",
-          "exposure": "config",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "textarea"
           },
@@ -1056,12 +1617,15 @@
           "portType": "Number",
           "required": false,
           "description": "For reproducible outputs",
-          "exposure": "config",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
           "widget": {
             "kind": "number",
             "min": null,
             "max": null,
-            "step": null
+            "step": 1.0
           },
           "label": "Seed",
           "placeholder": "Leave empty for random",
@@ -1069,10 +1633,29 @@
         },
         {
           "name": "_should_flow",
-          "portType": "T__should_flow",
+          "portType": "T__in___should_flow",
           "required": false,
           "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-          "exposure": "all",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_not_flow",
+          "portType": "T__in___should_not_flow",
+          "required": false,
+          "description": "Whether this node runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it.",
+          "accepts": [
+            "literal",
+            "wire"
+          ],
+          "optional": true,
           "widget": {
             "kind": "textarea"
           },
@@ -1083,41 +1666,45 @@
         {
           "name": "params",
           "portType": "Dict[String, String | Number | Boolean | List[String]]",
-          "required": false,
-          "description": "The parameters object, fed into one or more LLM nodes."
+          "required": true,
+          "description": "Wire into one or more LLM nodes' params input."
         }
       ],
       "features": {},
       "requiresInfra": false,
       "span": {
-        "startLine": 15,
+        "startLine": 17,
         "startColumn": 10,
-        "endLine": 15,
-        "endColumn": 91
+        "endLine": 17,
+        "endColumn": 98
       },
-      "configSpans": {
+      "portLiterals": {
+        "systemPrompt": "You are the support account of a small software consultancy, answering\nWhatsApp messages from clients. Reply as JSON in exactly this shape:\n\n{ \"answer\": \"your reply to the message\", \"sensitivity\": \"high\" }\n\n`sensitivity` is \"high\", \"medium\" or \"low\", lowercased.\n\nWe build custom software for companies and we are close with our clients,\nso be warm and personal, never stiff or robotic. We can take on almost any\nproject. Day rate is 1000: when someone asks for a price, estimate the work\nand quote confidently.\n\nSet `sensitivity` to \"high\" whenever the message deserves a human look\nbefore the reply goes out: a quote for a big project, a complaint, anything\nlegal or contractual, or anything you are unsure about. Everything routine\nis \"low\" or \"medium\".\n",
+        "temperature": 0.75
+      },
+      "portLiteralSpans": {
         "systemPrompt": {
           "span": {
-            "startLine": 15,
+            "startLine": 17,
             "startColumn": 22,
-            "endLine": 15,
-            "endColumn": 63
+            "endLine": 17,
+            "endColumn": 70
           },
           "origin": "inline"
         },
         "temperature": {
           "span": {
-            "startLine": 15,
-            "startColumn": 65,
-            "endLine": 15,
-            "endColumn": 83
+            "startLine": 17,
+            "startColumn": 72,
+            "endLine": 17,
+            "endColumn": 90
           },
           "origin": "inline"
         }
       },
       "fileRefs": {
         "systemPrompt": {
-          "path": "prompts/support.md",
+          "path": "assets/prompts/support.md",
           "type": "String",
           "marker": "file"
         }
@@ -1132,10 +1719,10 @@
       "sourceHandle": "bridge",
       "targetHandle": "bridge",
       "span": {
-        "startLine": 9,
+        "startLine": 12,
         "startColumn": 22,
-        "endLine": 9,
-        "endColumn": 56
+        "endLine": 12,
+        "endColumn": 46
       }
     },
     {
@@ -1145,10 +1732,23 @@
       "sourceHandle": "content",
       "targetHandle": "prompt",
       "span": {
-        "startLine": 13,
+        "startLine": 15,
         "startColumn": 2,
-        "endLine": 13,
+        "endLine": 15,
         "endColumn": 21
+      }
+    },
+    {
+      "id": "e-openrouter-access-draft__provider-access",
+      "source": "openrouter",
+      "target": "draft__provider",
+      "sourceHandle": "access",
+      "targetHandle": "access",
+      "span": {
+        "startLine": 16,
+        "startColumn": 30,
+        "endLine": 16,
+        "endColumn": 55
       }
     },
     {
@@ -1158,10 +1758,10 @@
       "sourceHandle": "provider",
       "targetHandle": "provider",
       "span": {
-        "startLine": 14,
+        "startLine": 16,
         "startColumn": 12,
-        "endLine": 14,
-        "endColumn": 65
+        "endLine": 16,
+        "endColumn": 89
       }
     },
     {
@@ -1171,23 +1771,26 @@
       "sourceHandle": "params",
       "targetHandle": "params",
       "span": {
-        "startLine": 15,
+        "startLine": 17,
         "startColumn": 10,
-        "endLine": 15,
-        "endColumn": 91
+        "endLine": 17,
+        "endColumn": 98
       }
     },
     {
-      "id": "e-draft-sensitivity-route-value",
+      "id": "e-draft-response-route-value",
       "source": "draft",
       "target": "route",
-      "sourceHandle": "sensitivity",
+      "sourceHandle": "response",
       "targetHandle": "value",
+      "path": [
+        "sensitivity"
+      ],
       "span": {
-        "startLine": 20,
+        "startLine": 22,
         "startColumn": 2,
-        "endLine": 20,
-        "endColumn": 26
+        "endLine": 22,
+        "endColumn": 35
       }
     },
     {
@@ -1197,9 +1800,9 @@
       "sourceHandle": "needsAPerson",
       "targetHandle": "_should_flow",
       "span": {
-        "startLine": 28,
+        "startLine": 30,
         "startColumn": 2,
-        "endLine": 28,
+        "endLine": 30,
         "endColumn": 34
       }
     },
@@ -1210,9 +1813,9 @@
       "sourceHandle": "pushName",
       "targetHandle": "from",
       "span": {
-        "startLine": 36,
+        "startLine": 38,
         "startColumn": 2,
-        "endLine": 36,
+        "endLine": 38,
         "endColumn": 20
       }
     },
@@ -1223,36 +1826,39 @@
       "sourceHandle": "content",
       "targetHandle": "question",
       "span": {
-        "startLine": 37,
+        "startLine": 39,
         "startColumn": 2,
-        "endLine": 37,
+        "endLine": 39,
         "endColumn": 23
       }
     },
     {
-      "id": "e-draft-answer-review-answer",
+      "id": "e-draft-response-review-answer",
       "source": "draft",
       "target": "review",
-      "sourceHandle": "answer",
+      "sourceHandle": "response",
       "targetHandle": "answer",
+      "path": [
+        "answer"
+      ],
       "span": {
-        "startLine": 38,
+        "startLine": 40,
         "startColumn": 2,
-        "endLine": 38,
-        "endColumn": 22
+        "endLine": 40,
+        "endColumn": 31
       }
     },
     {
-      "id": "e-review-send_approved-allowed-approved",
+      "id": "e-review-sendApproved-allowed-approved",
       "source": "review",
       "target": "allowed",
-      "sourceHandle": "send_approved",
+      "sourceHandle": "sendApproved",
       "targetHandle": "approved",
       "span": {
-        "startLine": 42,
+        "startLine": 44,
         "startColumn": 2,
-        "endLine": 42,
-        "endColumn": 32
+        "endLine": 44,
+        "endColumn": 31
       }
     },
     {
@@ -1262,9 +1868,9 @@
       "sourceHandle": "goAhead",
       "targetHandle": "automatic",
       "span": {
-        "startLine": 43,
+        "startLine": 45,
         "startColumn": 2,
-        "endLine": 43,
+        "endLine": 45,
         "endColumn": 26
       }
     },
@@ -1275,9 +1881,9 @@
       "sourceHandle": "value",
       "targetHandle": "_should_flow",
       "span": {
-        "startLine": 48,
+        "startLine": 49,
         "startColumn": 2,
-        "endLine": 48,
+        "endLine": 49,
         "endColumn": 29
       }
     },
@@ -1288,10 +1894,10 @@
       "sourceHandle": "bridge",
       "targetHandle": "bridge",
       "span": {
-        "startLine": 49,
+        "startLine": 50,
         "startColumn": 2,
-        "endLine": 49,
-        "endColumn": 35
+        "endLine": 50,
+        "endColumn": 25
       }
     },
     {
@@ -1301,27 +1907,30 @@
       "sourceHandle": "chatId",
       "targetHandle": "to",
       "span": {
-        "startLine": 50,
+        "startLine": 51,
         "startColumn": 2,
-        "endLine": 50,
+        "endLine": 51,
         "endColumn": 16
       }
     },
     {
-      "id": "e-draft-answer-reply-message",
+      "id": "e-draft-response-reply-message",
       "source": "draft",
       "target": "reply",
-      "sourceHandle": "answer",
+      "sourceHandle": "response",
       "targetHandle": "message",
+      "path": [
+        "answer"
+      ],
       "span": {
-        "startLine": 51,
+        "startLine": 52,
         "startColumn": 2,
-        "endLine": 51,
-        "endColumn": 23
+        "endLine": 52,
+        "endColumn": 32
       }
     }
   ],
   "groups": [],
-  "createdAt": "2026-09-03T11:13:44.110345241Z",
-  "updatedAt": "2026-09-03T11:13:44.110345241Z"
+  "createdAt": "2026-10-18T11:53:07.793850813Z",
+  "updatedAt": "2026-10-18T11:53:07.793850813Z"
 }

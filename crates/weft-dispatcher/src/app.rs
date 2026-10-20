@@ -45,6 +45,8 @@ pub static DISPATCHER_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     &crate::journal::postgres::GROUP,
     // The exclusive infra ownership leases.
     &crate::infra_owner::GROUP,
+    // How many holders the platform's pool was last set to run.
+    &crate::holders::GROUP,
     &weft_task_store::tasks::GROUP,
     &crate::infra_node::GROUP,
     &crate::infra_event::GROUP,
@@ -54,7 +56,7 @@ pub static DISPATCHER_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     &weft_task_store::parked_fires::GROUP,
     // The durable terminate-sweep queue (no FK; the dispatcher owns it and
     // the reaper drains it by asking the broker to sweep a terminated
-    // execution's files).
+    // run's files).
     &crate::storage::GROUP,
     // In the one list with everything else, so a mismatch anywhere
     // surfaces in ONE error naming every stale group together.
@@ -85,19 +87,7 @@ pub static DISPATCHER_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     // weft's own calls that keep failing (a role it cannot wake, workers
     // it cannot hand a run to), for `weft status` to show.
     &weft_task_store::unanswered::GROUP,
-    &RETIRED_DISPATCHER_CURSOR,
-    &RETIRED_INFRA_EVENT_BRIDGE_CURSOR,
 ];
-
-/// The cursors the dispatcher once read the journal and the infra events
-/// with, before a run's own row and an event's notification carried what
-/// they tracked. Their tables are gone; each group stays listed, with
-/// none, so a database that still holds one is carried to its drop by the
-/// group's history (`migrations/<group>/`).
-static RETIRED_DISPATCHER_CURSOR: weft_task_store::SchemaGroup =
-    weft_task_store::SchemaGroup { name: "dispatcher_cursor", tables: &[], ddl: &[], seed: &[] };
-static RETIRED_INFRA_EVENT_BRIDGE_CURSOR: weft_task_store::SchemaGroup =
-    weft_task_store::SchemaGroup { name: "infra_event_bridge_cursor", tables: &[], ddl: &[], seed: &[] };
 
 /// The construction-time policies threaded into `build_state`: who a
 /// request authenticates as, which tenant owns a project, and how a
@@ -139,7 +129,7 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     crate::delivery::WORKERS_BACK_CHANNEL,
     weft_broker_client::lifecycle_command::INFRA_COMMAND_CHANNEL,
     crate::infra_event_bridge::INFRA_EVENT_CHANNEL,
-    crate::events::NOTIFY_CHANNEL,
+    weft_task_store::runs::EVENTS_CHANNEL,
     weft_task_store::parked_fires::PARKED_FIRE_CHANNEL,
     crate::reaper::STORAGE_SWEEP_CHANNEL,
     crate::display_feeds::LOOK_NOW_CHANNEL,
@@ -151,6 +141,7 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     crate::held::INFRA_STATUS_CHANNEL,
     crate::held::ACCESS_CHANNEL,
     crate::build::follow::BUILD_CLAIMED_CHANNEL,
+    crate::task_kinds::resync::RESYNC_GIVEN_UP_CHANNEL,
 ];
 
 /// What the dispatcher is built from: the install's config and what the
@@ -261,7 +252,13 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         tenant_router,
         project_reclaimer,
         public_base_url: config.public_url.trim_end_matches('/').to_string(),
-        internet_url: config.internet_url.clone(),
+        internet: config.internet_address(),
+        files: match &config.object_store {
+            weft_platform_traits::config::ObjectStoreSettings::S3(store) if !store.public_internet => {
+                Some(crate::files_door::FilesTarget { endpoint: store.endpoint.clone(), bucket: store.bucket.clone() })
+            }
+            _ => None,
+        },
         edge: config.edge,
         broker: RoleClient::new(CoreRole::Broker, addresses.broker.clone(), tokens.clone(), http.clone()),
         broker_line: weft_broker_client::BrokerLink::new(
@@ -316,11 +313,14 @@ pub fn task_registry() -> crate::task_executor::TaskRegistry {
     crate::task_executor::TaskRegistry::every_kind(|kind| match kind {
         TaskKind::RegisterSignal => Arc::new(crate::task_kinds::RegisterSignalExecutor),
         TaskKind::WithdrawSignal => Arc::new(crate::task_kinds::WithdrawSignalExecutor),
+        TaskKind::CancelCall => Arc::new(crate::task_kinds::CancelCallExecutor),
         TaskKind::FireSignal => Arc::new(crate::task_kinds::FireSignalExecutor),
         TaskKind::StopTagged => Arc::new(crate::task_kinds::StopTaggedExecutor),
         TaskKind::ProgramCall => Arc::new(crate::task_kinds::ProgramCallExecutor),
         TaskKind::RunNodeTest => Arc::new(crate::task_kinds::RunNodeTestExecutor),
         TaskKind::Resync => Arc::new(crate::task_kinds::ResyncExecutor),
+        TaskKind::TakeDownWait => Arc::new(crate::task_kinds::TakeDownWaitExecutor),
+        TaskKind::RemovalWait => Arc::new(crate::task_kinds::RemovalWaitExecutor),
     })
 }
 
@@ -343,7 +343,6 @@ pub fn drain_loops(state: &DispatcherState, registry: crate::task_executor::Task
         crate::lifecycle_claimer::drain_loop(state.clone()),
         crate::lapses::drain_loop(state.clone()),
         crate::run_ends::drain_loop(state.clone()),
-        crate::drain::drain_loop(state.clone()),
         crate::retention::drain_loop(state.clone()),
         crate::build::follow::drain_loop(state),
         crate::holders::drain_loop(state),
@@ -381,11 +380,10 @@ pub fn loop_wakes() -> Vec<(&'static str, &'static [WakeOn])> {
         ("lifecycle_claimer", crate::lifecycle_claimer::WAKE_ON),
         (crate::lapses::LAPSES, crate::lapses::WAKE_ON),
         ("run_ends", crate::run_ends::WAKE_ON),
-        ("drains", crate::drain::WAKE_ON),
         ("retention", crate::retention::WAKE_ON),
         ("parked_fires", crate::reaper::ON_PARKED_FIRE),
         ("storage_sweep", crate::reaper::ON_STORAGE_SWEEP),
-        ("hibernations", crate::reaper::ON_HIBERNATION),
+        (crate::reaper::DOOR_WINDOWS, crate::reaper::ON_DOOR_WINDOW),
         ("infra_returns", crate::reaper::ON_INFRA_RETURNS),
         ("holders", crate::holders::ON_HELD_SIGNALS),
         (crate::holders::HOLDER_ACCESS, crate::holders::ON_ACCESS),

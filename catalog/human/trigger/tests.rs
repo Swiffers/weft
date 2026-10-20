@@ -37,16 +37,16 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
 async fn approval_maps(rig: FakeRig) -> WeftResult<()> {
     // The compiler derives these ports from `portsFromConfig`; the rig
     // plays that role.
-    rig.output_type("decision_approved", WeftType::parse("Boolean").expect("Boolean parses"));
-    rig.output_type("decision_rejected", WeftType::parse("Boolean").expect("Boolean parses"));
+    rig.output_type("decisionApproved", WeftType::parse("Boolean").expect("Boolean parses"));
+    rig.output_type("decisionRejected", WeftType::parse("Boolean").expect("Boolean parses"));
     rig.wake(json!({ "decision": true }));
     let outcome = rig
         .run(&HumanTriggerNode, json!({ "fields": fields() }))
         .await
         .ok()?;
-    assert_eq!(outcome.outputs["decision_approved"], json!(true));
+    assert_eq!(outcome.outputs["decisionApproved"], json!(true));
     assert!(
-        !outcome.outputs.contains_key("decision_rejected"),
+        !outcome.outputs.contains_key("decisionRejected"),
         "the losing side stays un-mentioned (structural closure, not a false pulse)"
     );
     Ok(())

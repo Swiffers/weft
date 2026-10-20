@@ -19,13 +19,12 @@ That needs a replay story for a partially-consumed stream, which items were
 delivered and which pulls answered, so it comes after the rest of the durable
 work.
 
-**Type rules in metadata.** Two nodes want an output whose type metadata cannot
-write down as one type: `FirstInOrder` emits the union of its created inputs, and
-`LlmInference.response` is a `String` without `parseJson` and a record or
-`JsonDict` with it. Both make the author restate the type in the signature every
-time. The plan is a small rule language in `metadata.json`, read the way
-`portsFromConfig` is, for "the union of these inputs" or "this type when that
-input is true". It is the whole feature or nothing, because a half rule would
+**Type rules in metadata.** `FirstInOrder` wants an output whose type metadata
+cannot write down as one type: the union of its created inputs. Today every
+input it creates shares one type variable, so it cannot join a `String` branch
+with a `Number` one. The plan is a
+small rule language in `metadata.json`, read the way `portsFromConfig` is, for
+"the union of these inputs". It is the whole feature or nothing, because a half rule would
 send the editor, the validator and the runtime three different answers about one
 port.
 
@@ -36,7 +35,7 @@ shape. The ambition is for it to prove things about how a program behaves,
 through richer node metadata. A node that acts in the world says so and says how
 big the action is. A node that verifies says what strength it gives. An
 autonomous node says so. Then the compiler can check a claim across the graph:
-every path from an autonomous step to a high-stakes action passes through a
+every path from an autonomous node to a high-stakes action passes through a
 verification of at least this strength, or a critical action has three separate
 human approvals in front of it, and a program that does not hold up does not
 build. None of it works if the labels are decoration, so the other half is
@@ -62,9 +61,8 @@ weft codebase under one plan, the same shape weft gives a program.
 
 ## The editor
 
-**A version tree in the sidebar.** `weft tree` already knows every version, what
-changed, the runs beneath each, and head. The sidebar shows none of it, so you
-cannot see that two runs sit on different branches or that head moved back. The
-plan is a git-client-shaped history: a row per version, a lane per branch, the
-runs nested under their version, with branching and seed selection on the same
+**Branch lanes in the version tree.** The **Runs** view can already list runs
+by version (**Flat list / by version** on its title bar): every version as a tree, its runs under
+it, the current version (head) marked, and **Branch here** on a row. The plan is to draw it the way a
+git client does, with a lane per branch, and to pick a run's seed from the same
 view.

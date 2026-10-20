@@ -15,7 +15,6 @@ use serde::Deserialize;
 use crate::codegen;
 use crate::error::{CompileError, CompileResult};
 use crate::project::Project;
-use crate::validate::ValidationMode;
 use crate::worker_image;
 use weft_catalog::FsCatalog;
 
@@ -40,6 +39,22 @@ pub struct StagedImageBuild {
     /// What the build uses of what an install keeps on the machine that
     /// runs it (`WorkerDockerfile::uses`).
     pub uses: weft_core::images::BuildUses,
+    /// Where the built image keeps the record of the node packages its
+    /// build left out (`weft_core::builds::LEFT_OUT_RECORD_PATH`), for
+    /// whoever runs the build to read back; `None` when its Dockerfile
+    /// writes none (a custom template, `WorkerDockerfile::writes_left_out_record`).
+    pub result_file: Option<String>,
+}
+
+impl StagedImageBuild {
+    fn new(build_context: PathBuf, content_hash: String, dockerfile: &worker_image::WorkerDockerfile) -> Self {
+        Self {
+            build_context,
+            content_hash,
+            uses: dockerfile.uses(),
+            result_file: dockerfile.writes_left_out_record.then(|| weft_core::builds::LEFT_OUT_RECORD_PATH.to_string()),
+        }
+    }
 }
 
 /// The cargo crate name of every generated worker. One constant for every
@@ -95,7 +110,7 @@ impl StockProject {
         std::os::unix::fs::symlink(&stdlib, crate::project::base_catalog_dir(dir.path()))
             .map_err(CompileError::Io)?;
         let project = Project::load(dir.path())?;
-        let (definition, catalog) = crate::hash::load_enriched_project(&project)
+        let (definition, catalog) = crate::hash::load_program(&project)
             .map_err(|e| CompileError::Build(format!("compile the stock project: {e}")))?;
         Ok(Self { _dir: dir, project, definition, catalog })
     }
@@ -121,7 +136,8 @@ pub fn standard_worker_hash() -> CompileResult<String> {
 
 /// Validate + codegen + stage from an ALREADY-COMPILED definition. Pipeline:
 ///
-/// 1. Validate the (resolved) definition, abort on any error.
+/// 1. Check the (resolved) definition was settled after its last change
+///    (`crate::unsettled`): every error in it is one of its broken parts.
 /// 2. Codegen the cargo crate at `.weft/target/build/`.
 /// 3. Emit the multi-stage Dockerfile at
 ///    `.weft/target/Dockerfile.worker`.
@@ -134,10 +150,8 @@ pub fn standard_worker_hash() -> CompileResult<String> {
 /// recompiling from source: the caller resolves `@asset` refs into the
 /// definition (deferred file markers become concrete file values) BEFORE
 /// this runs, and a fresh compile-from-source here would see the raw
-/// markers instead (a file-typed `@asset` reads as a `String` at parse and
-/// would fail validation against its `File` port). This is also the only
-/// validation gate on the build path, so it runs on the resolved
-/// definition, not the raw source. `Structural` (not `Runtime`): a project
+/// markers instead of the stored files the build resolved them to. The
+/// gate runs on the resolved definition, not the raw source. `Structural` (not `Runtime`): a project
 /// may build without every secret filled; runtime-rule gaps surface at run.
 ///
 /// `bases.builder` is the shared builder-base image ref the caller
@@ -152,12 +166,13 @@ pub fn build_project(
     node_set: weft_core::builds::NodeSet,
 ) -> CompileResult<StagedImageBuild> {
     let project_root = project.root.as_path();
-    crate::bail_on_errors(crate::validate::validate_with_mode(
-        definition,
-        catalog,
-        ValidationMode::Structural,
-    ))?;
-    // Project identity arrives with each execution, never in the worker image.
+    // What does not compile is already in the definition as broken parts
+    // (`crate::compile_program`), and the build goes on around them: a
+    // part a run needs is refused when the run is cut. Anything else is a
+    // definition changed since its check.
+    let root = project_root.canonicalize().map_err(CompileError::Io)?;
+    crate::bail_on_errors(crate::unsettled(definition, catalog, Some(&root)))?;
+    // Project identity arrives with each run, never in the worker image.
     let crate_name = WORKER_CRATE_NAME;
 
     let crate_root = project_root.join(".weft").join("target").join("build");
@@ -202,7 +217,7 @@ pub fn build_project(
         crate::hash::compute_binary_hash(definition, project, &weft_root, catalog, node_set)
             .map_err(|e| CompileError::Build(format!("compute binary hash: {e}")))?;
 
-    Ok(StagedImageBuild { build_context, content_hash, uses: dockerfile_summary.uses() })
+    Ok(StagedImageBuild::new(build_context, content_hash, &dockerfile_summary))
 }
 
 /// Stage the docker build context under
@@ -213,7 +228,7 @@ pub fn build_project(
 ///   Dockerfile           (copy of Dockerfile.worker)
 ///   build/               (the generated cargo crate)
 ///   weft/                (the weft workspace: crates, Cargo.toml, Cargo.lock)
-///   project-nodes/       (the project's nodes/ dir: every node's source)
+///   project-nodes/       (every node's source, at its path in the project)
 /// ```
 ///
 /// `weft/` carries only the language runtime (the workspace crates the
@@ -224,8 +239,9 @@ pub fn build_project(
 /// `node_modules/`).
 ///
 /// `project-nodes/` holds ONLY the package roots the project actually
-/// references, each copied to its path relative to `nodes/` so the
-/// `#[path]` shims resolve. Discovery already walked `nodes/` and
+/// references, each copied to its path relative to the project root
+/// (`nodes/...`, or `src/...` for a node beside the code) so the
+/// `#[path]` shims resolve. Discovery already walked both node roots and
 /// grouped nodes under package roots; staging copies those roots
 /// rather than re-walking the tree, so there is a single directory
 /// walker (discovery) and nothing for a second walker to disagree
@@ -291,19 +307,18 @@ fn stage_project_nodes(
                 project_root.display()
             ))
         })?;
-        // The shared node-tree exclude (same set the source hash walks
-        // over), so staging and hashing agree on a node's byte-content:
-        // a file the build copies but the hash skips (or vice versa)
-        // is how a stale worker image gets served.
-        let staged = dest.join(rel);
-        copy_dir_filtered(&root, &staged, &weft_catalog::is_node_tree_excluded)?;
-        stamp_package_tree(&staged)?;
+        // The package-build exclude (same set the package hash walks
+        // over, `hash::hash_package_root`), so staging and hashing agree
+        // on a node's byte-content: a file the build copies but the hash
+        // skips (or vice versa) is how a stale worker image gets served.
+        copy_dir_dated(&root, &dest.join(rel), &weft_catalog::is_left_out_of_package_build, FileDates::FromContent)?;
     }
     Ok(())
 }
 
-/// The modification time every staged package file carries, whatever the
-/// file had on disk.
+/// The modification time a staged package file with `content` carries,
+/// whatever the file had on disk: a date in 2020 to 2024, to the
+/// nanosecond, read off the content's sha256.
 ///
 /// Cargo reuses a compiled crate only while none of its sources is newer
 /// than the compile, and a package compiles in a crate whose directory is
@@ -313,20 +328,27 @@ fn stage_project_nodes(
 /// from one checkout and a cloud build stages the standard library from
 /// another (the runtime image's copy), and a fresh checkout dates every
 /// file at the moment it was made, so every precompiled package looked
-/// edited and every cloud build compiled the whole library again. One
-/// fixed date on both sides makes an unchanged package reused wherever it
-/// was compiled; a changed one lands in a new directory and compiles.
-pub(crate) fn package_source_mtime() -> std::time::SystemTime {
-    // 2020-01-01.
-    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800)
-}
-
-/// Give every file under `dir` [`package_source_mtime`].
-fn stamp_package_tree(dir: &Path) -> CompileResult<()> {
-    for file in crate::hash::walk_dir(dir).map_err(|e| CompileError::Build(format!("walk {}: {e}", dir.display())))? {
-        stamp_mtime(&file, package_source_mtime());
-    }
-    Ok(())
+/// edited and every cloud build compiled the whole library again. A date
+/// read off the content is the same on both sides for the same file, so
+/// an unchanged package is reused wherever it was compiled. It is never
+/// one fixed date: Docker sends a build context's files again only when
+/// their size or date changed since the last build of that context, so a
+/// fixed date kept an edit that left a file's size alone (a letter's case)
+/// out of the build, which then compiled the old file. The seconds and
+/// the nanoseconds come from separate parts of the digest, so two
+/// contents of one size share a date about once in 10^17.
+pub(crate) fn package_source_mtime(content: &[u8]) -> std::time::SystemTime {
+    use sha2::Digest;
+    // 2020-01-01, and five years past it: always in the past, so a cached
+    // compile is never older than its sources.
+    const START: u64 = 1_577_836_800;
+    const SPAN: u64 = 5 * 365 * 24 * 3600;
+    let digest = sha2::Sha256::digest(content);
+    let word = |at: usize| u64::from_be_bytes(digest[at..at + 8].try_into().expect("a sha256 is 32 bytes"));
+    let secs = word(0) % SPAN;
+    // The low 30 bits of another word, folded under a second.
+    let nanos = (word(8) & ((1 << 30) - 1)) % 1_000_000_000;
+    std::time::UNIX_EPOCH + std::time::Duration::new(START + secs, nanos as u32)
 }
 
 /// The bare content-addressed node-test image tag,
@@ -409,7 +431,7 @@ pub fn build_test_artifact(
 
     let content_hash = node_test_content_hash(project, catalog, package_name)?;
 
-    Ok(StagedImageBuild { build_context, content_hash, uses: dockerfile_summary.uses() })
+    Ok(StagedImageBuild::new(build_context, content_hash, &dockerfile_summary))
 }
 
 /// The node-test image's Dockerfile: the worker recipe, started as the
@@ -541,11 +563,32 @@ pub fn stage_worker_workspace(weft_root: &Path, dest: &Path) -> CompileResult<()
             }
         }
     }
+    stage_empty_workspace_hack(dest)?;
     write_scoped_workspace_manifest(weft_root, dest, &closure)?;
     let lock_src = weft_root.join("Cargo.lock");
     let lock_dst = dest.join("Cargo.lock");
     std::fs::copy(&lock_src, &lock_dst).map_err(CompileError::Io)?;
     mirror_mtime(&lock_src, &lock_dst);
+    Ok(())
+}
+
+/// Write the empty stand-in for [`codegen::WORKSPACE_HACK_CRATE`] at
+/// `dest/crates/`: same name and version, no dependencies, so the closure
+/// crates' path dependency on it resolves and the worker compiles none of
+/// the workspace's feature union. Each file is dated from its content
+/// (`package_source_mtime`): a fresh wall-clock date on every staging would
+/// make cargo rebuild it, and with it every engine crate above it.
+fn stage_empty_workspace_hack(dest: &Path) -> CompileResult<()> {
+    let dir = dest.join("crates").join(codegen::WORKSPACE_HACK_CRATE);
+    std::fs::create_dir_all(dir.join("src")).map_err(CompileError::Io)?;
+    let manifest = format!(
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n",
+        codegen::WORKSPACE_HACK_CRATE
+    );
+    for (path, content) in [(dir.join("Cargo.toml"), manifest.as_str()), (dir.join("src").join("lib.rs"), "")] {
+        std::fs::write(&path, content).map_err(CompileError::Io)?;
+        stamp_mtime(&path, package_source_mtime(content.as_bytes()));
+    }
     Ok(())
 }
 
@@ -626,8 +669,8 @@ pub(crate) fn stamp_mtime(dst: &Path, modified: std::time::SystemTime) {
 
 /// Stage the builder-base docker build CONTEXT into
 /// `<weft_root>/.weft-base-context/` (see [`stage_builder_base_context_at`]).
-pub fn stage_builder_base_context(weft_root: &Path) -> CompileResult<PathBuf> {
-    stage_builder_base_context_at(weft_root, &weft_root.join(worker_image::BASE_CONTEXT_DIR))
+pub fn stage_builder_base_context(weft_root: &Path, install: &weft_core::infra::Install) -> CompileResult<PathBuf> {
+    stage_builder_base_context_at(weft_root, &weft_root.join(worker_image::BASE_CONTEXT_DIR), install)
 }
 
 /// Stage the builder-base docker build CONTEXT at `ctx`, holding exactly what
@@ -664,24 +707,25 @@ pub fn stage_builder_base_context(weft_root: &Path) -> CompileResult<PathBuf> {
 /// compile cache; a project compiles only the packages it edited or added
 /// and its thin top crate.
 ///
-/// The Dockerfile is RENDERED, not copied: `{{target_cache_key}}` becomes a
-/// hash of Cargo.lock + rust-toolchain.toml, so a dependency or toolchain
-/// change starts a fresh compile cache instead of inheriting (and baking into
-/// the image) every artifact ever built; `{{worker_binary}}` names the binary
-/// the cache sweep keeps; `{{install_build_system_packages}}` and
+/// The Dockerfile is RENDERED, not copied: `{{target_cache_key}}` becomes
+/// [`install_cache_key`] for `install`, so another branch's install never
+/// shares the compile cache and a toolchain change starts a fresh one (the
+/// sweep after the build keeps the cache, and so the image, to what that
+/// build used, whatever the lock did); `{{install_build_system_packages}}` and
 /// `{{build_env_lines}}` are what the stdlib packages need to compile
 /// (`StockProject::builder_stage`), the same lines a project's builder stage
 /// would carry, which is why a project FROMing the base installs only what
 /// lies beyond them. The base hash keeps covering the SOURCE template and the
 /// packages' `deps.toml`; the rendered values are pure functions of files it
-/// already covers.
+/// already covers, but for the cache key's install, which only picks the
+/// cache a build compiles in and never what the image holds.
 ///
 /// Regenerated wholesale on every call (it is a derived artifact): a stale
 /// leftover crate from a previous closure would otherwise linger in the
 /// context and the baked image. Callers only invoke this when the
 /// content-addressed base tag is absent, so the staging cost is paid exactly
 /// once per base rebuild.
-pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path) -> CompileResult<PathBuf> {
+pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path, install: &weft_core::infra::Install) -> CompileResult<PathBuf> {
     if ctx.exists() {
         std::fs::remove_dir_all(ctx).map_err(CompileError::Io)?;
     }
@@ -707,16 +751,14 @@ pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path) -> CompileRes
     let template_path = weft_root.join(crate::hash::BUILDER_BASE_DOCKERFILE);
     let mut rendered = std::fs::read_to_string(&template_path).map_err(CompileError::Io)?;
     for (token, value) in [
-        ("{{target_cache_key}}", target_cache_key(weft_root)?),
-        ("{{worker_binary}}", sanitize_crate_name(WORKER_CRATE_NAME)),
+        ("{{target_cache_key}}", install_cache_key(weft_root, install)?),
         ("{{install_build_system_packages}}", install_packages),
         ("{{build_env_lines}}", env_lines),
     ] {
         if !rendered.contains(token) {
             return Err(CompileError::Build(format!(
                 "{} lost its {token} token; the base would stop keying its compile cache \
-                 on the lock + toolchain, stop sweeping it, or stop installing what the \
-                 stock worker compiles with",
+                 on the install and toolchain, or stop installing what the stock worker compiles with",
                 template_path.display()
             )));
         }
@@ -738,43 +780,78 @@ pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path) -> CompileRes
     Ok(ctx.to_path_buf())
 }
 
-/// The builder-base compile-cache key: a short hash of `Cargo.lock` +
-/// `rust-toolchain.toml`. Exactly the inputs whose change makes previous
-/// cache contents dead weight (new dependency versions, new toolchain);
-/// engine source edits keep the key, so they stay incremental.
-fn target_cache_key(weft_root: &Path) -> CompileResult<String> {
+/// What the id of the builder base's compile cache mount starts with,
+/// before [`install_cache_key`]. The runtime image's has its own prefix
+/// (`weft-cargo-target-runtime-`, kept by the CLI that builds it).
+// SYNC: BUILDER_BASE_CACHE_MOUNT_ID_PREFIX <-> deploy/docker/worker-builder-base.Dockerfile (weft-builder-base-target-{{target_cache_key}})
+pub const BUILDER_BASE_CACHE_MOUNT_ID_PREFIX: &str = "weft-builder-base-target-";
+
+/// The key of a compile cache that builds weft's own crates (the builder
+/// base's, the runtime image's) for `install`: its label (`default`, or
+/// its name), then a short hash of `rust-toolchain.toml`,
+/// `<install>-<hash>`.
+///
+/// The install, because cargo tells a crate's sources changed by their
+/// modification times alone, and every checkout's crates sit at the same
+/// path inside the build: two branches' installs sharing one cache each
+/// find the other's newer artifacts fresh for their own older sources, and
+/// an image tagged with one branch's content carries the other's code.
+/// Each branch has an install of its own, built from its one checkout, so
+/// the install is the cache's owner too: `weft daemon remove` drops its
+/// caches, and `weft clean --images --all` those of installs no longer on
+/// the machine ([`install_of_cache_key`]). The toolchain, because its
+/// change makes everything cached dead weight. NOT the lock: a dependency
+/// bump keeps the cache and recompiles only what it moved, and what bounds
+/// the cache is the sweep each of the two builds runs after compiling
+/// (`worker_image::CACHE_GC_SCRIPT`, `this-build`), which drops every unit
+/// that build did not use. Source edits keep the key too, so they stay
+/// incremental.
+pub fn install_cache_key(weft_root: &Path, install: &weft_core::infra::Install) -> CompileResult<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    for rel in ["Cargo.lock", "rust-toolchain.toml"] {
-        hasher.update(
-            std::fs::read(weft_root.join(rel)).map_err(CompileError::Io)?,
-        );
-    }
-    let digest = hasher.finalize();
-    Ok(digest
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>())
+    hasher.update(std::fs::read(weft_root.join("rust-toolchain.toml")).map_err(CompileError::Io)?);
+    let hash: String = hasher.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect();
+    Ok(format!("{}-{hash}", install.label_value()))
+}
+
+/// The install (its label) a key of [`install_cache_key`] is for. `None`
+/// for a key with no install in it, made before each install had caches
+/// of its own: no install builds in one any more.
+pub fn install_of_cache_key(key: &str) -> Option<&str> {
+    // A label holds no `-` (`Install::named`), and the hash none either.
+    key.split_once('-').map(|(install, _)| install)
 }
 
 /// Recursive directory copy with a simple exclude list matched on
 /// the immediate entry name. Skips symlinks to avoid infinite
 /// recursion and unexpected escapes from the staged context.
 ///
-/// Preserves mtime on every copied file. The staged build context
-/// feeds straight into docker, which preserves the host mtime on
-/// `COPY`. Cargo's fingerprint short-circuits a clean crate when
-/// every source file's mtime is older than the crate's rlib in the
-/// target dir; without mtime preservation a fresh stage gives every
-/// file a wall-clock mtime, every per-package crate looks dirty,
-/// and cargo recompiles all of them on every edit. Preserving the
-/// host mtime keeps unchanged sources looking unchanged inside the
-/// container, so cargo only rebuilds the package whose node source
-/// genuinely changed (plus the worker relink).
+/// Preserves mtime on every copied file. A staged build context feeds
+/// straight into docker, which preserves the host mtime on `COPY`, and
+/// cargo's fingerprint short-circuits a clean crate only while every
+/// source file's mtime is older than the crate's rlib in the target dir:
+/// with wall-clock mtimes every crate staged this way (the workspace
+/// slice a worker links) would look dirty on every build. A package's
+/// staged files are dated by their content instead
+/// ([`package_source_mtime`], through [`copy_dir_dated`]).
 /// `exclude` names the entries left out, at any depth.
 pub fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &dyn Fn(&str) -> bool) -> CompileResult<()> {
-    copy_dir_filtered_inner(src, dst, exclude, &mut Default::default())
+    copy_dir_dated(src, dst, exclude, FileDates::Mirrored)
+}
+
+/// What date a copied file carries.
+#[derive(Clone, Copy)]
+enum FileDates {
+    /// The source file's.
+    Mirrored,
+    /// The one its content gives it ([`package_source_mtime`]), read off
+    /// the bytes as they are copied.
+    FromContent,
+}
+
+/// [`copy_dir_filtered`], each file dated as `dates` says.
+fn copy_dir_dated(src: &Path, dst: &Path, exclude: &dyn Fn(&str) -> bool, dates: FileDates) -> CompileResult<()> {
+    copy_dir_filtered_inner(src, dst, exclude, dates, &mut Default::default())
 }
 
 /// Symlinks are followed and their TARGET bytes copied (`fs::copy`
@@ -785,11 +862,12 @@ fn copy_dir_filtered_inner(
     src: &Path,
     dst: &Path,
     exclude: &dyn Fn(&str) -> bool,
+    dates: FileDates,
     chain: &mut Vec<PathBuf>,
 ) -> CompileResult<()> {
     let canon = weft_catalog::guard_node_tree_cycle(src, chain).map_err(CompileError::Io)?;
     chain.push(canon);
-    let result = copy_dir_filtered_entries(src, dst, exclude, chain);
+    let result = copy_dir_filtered_entries(src, dst, exclude, dates, chain);
     chain.pop();
     result
 }
@@ -798,6 +876,7 @@ fn copy_dir_filtered_entries(
     src: &Path,
     dst: &Path,
     exclude: &dyn Fn(&str) -> bool,
+    dates: FileDates,
     chain: &mut Vec<PathBuf>,
 ) -> CompileResult<()> {
     std::fs::create_dir_all(dst).map_err(CompileError::Io)?;
@@ -812,10 +891,23 @@ fn copy_dir_filtered_entries(
         let to = dst.join(&name);
         let kind = weft_catalog::node_tree_entry_kind(&from).map_err(CompileError::Io)?;
         if kind == weft_catalog::NodeTreeEntryKind::Dir {
-            copy_dir_filtered_inner(&from, &to, exclude, chain)?;
+            copy_dir_filtered_inner(&from, &to, exclude, dates, chain)?;
         } else {
-            std::fs::copy(&from, &to).map_err(CompileError::Io)?;
-            mirror_mtime(&from, &to);
+            match dates {
+                FileDates::Mirrored => {
+                    std::fs::copy(&from, &to).map_err(CompileError::Io)?;
+                    mirror_mtime(&from, &to);
+                }
+                FileDates::FromContent => {
+                    // Read once, for the copy and its date alike; the
+                    // mode goes along as `fs::copy` would take it.
+                    let content = std::fs::read(&from).map_err(CompileError::Io)?;
+                    std::fs::write(&to, &content).map_err(CompileError::Io)?;
+                    let mode = std::fs::metadata(&from).map_err(CompileError::Io)?.permissions();
+                    std::fs::set_permissions(&to, mode).map_err(CompileError::Io)?;
+                    stamp_mtime(&to, package_source_mtime(&content));
+                }
+            }
         }
     }
     Ok(())
@@ -1121,7 +1213,8 @@ pub fn drop_built_binary(binary: &Path) {
 }
 
 /// Build the catalog for a project: discover every node under its
-/// `nodes/` directory. That is the single source of truth (the stdlib
+/// `nodes/` directory and beside its code under `src/`
+/// (`crate::project::node_roots`). That is the single source of truth (the stdlib
 /// is cloned in at `weft new`), so the project is self-contained and
 /// nothing reaches into the weft installation at build time. A node or
 /// package that fails to load is left out and recorded
@@ -1136,6 +1229,31 @@ pub fn build_project_catalog(project_root: &Path) -> CompileResult<FsCatalog> {
 mod tests {
     use super::sanitize_crate_name;
 
+    /// Two installs on the same toolchain never share a compile cache, and
+    /// each key says whose it is; an install keeps its cache across source
+    /// edits and dependency bumps, and moves to a fresh one when its
+    /// toolchain does.
+    #[test]
+    fn each_install_compiles_in_a_cache_of_its_own() {
+        use weft_core::infra::Install;
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::write(checkout.path().join("Cargo.lock"), "lock").unwrap();
+        std::fs::write(checkout.path().join("rust-toolchain.toml"), "[toolchain]\nchannel = \"1.94.0\"\n").unwrap();
+        let key = |install: &Install| super::install_cache_key(checkout.path(), install).unwrap();
+        let (deploy, main) = (Install::named("deploy").unwrap(), Install::default_install());
+        assert_ne!(key(&deploy), key(&main));
+        assert_eq!(super::install_of_cache_key(&key(&deploy)), Some("deploy"));
+        assert_eq!(super::install_of_cache_key(&key(&main)), Some("default"));
+        assert_eq!(super::install_of_cache_key("0123456789abcdef"), None, "a key from before caches had an install");
+        let before = key(&deploy);
+        std::fs::write(checkout.path().join("lib.rs"), "fn edited() {}").unwrap();
+        assert_eq!(key(&deploy), before, "a source edit keeps the cache");
+        std::fs::write(checkout.path().join("Cargo.lock"), "bumped").unwrap();
+        assert_eq!(key(&deploy), before, "a dependency bump keeps the cache too");
+        std::fs::write(checkout.path().join("rust-toolchain.toml"), "[toolchain]\nchannel = \"1.95.0\"\n").unwrap();
+        assert_ne!(key(&deploy), before, "a toolchain change starts a fresh one");
+    }
+
     /// A platform starts the node-test image with no arguments, so the
     /// image itself must start the test server, after the worker recipe
     /// whether or not that ends its last line.
@@ -1145,6 +1263,43 @@ mod tests {
         let expected = "FROM x\nENTRYPOINT [\"/usr/local/bin/worker\"]\nCMD [\"serve\"]\n";
         assert_eq!(super::test_server_dockerfile(recipe), expected);
         assert_eq!(super::test_server_dockerfile(&format!("{recipe}\n")), expected);
+    }
+
+    /// A staged file's date is read off its content: the same everywhere
+    /// for the same file, and never the same across an edit, even one that
+    /// keeps the file's size (Docker resends a context's file only when its
+    /// size or date changed).
+    #[test]
+    fn a_package_files_date_is_its_contents() {
+        let date = super::package_source_mtime;
+        assert_eq!(date(b"FileHandle::key"), date(b"FileHandle::key"), "the same content, the same date, on every checkout");
+        assert_ne!(date(b"FileHandle::Key"), date(b"FileHandle::key"), "an edit of the same size changes the date");
+        let nanos = |content: &[u8]| date(content).duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
+        assert_ne!((nanos(b"FileHandle::Key"), nanos(b"FileHandle::key")), (0, 0), "dated to the nanosecond");
+        let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        for content in [&b""[..], b"x", b"fn main() {}"] {
+            let at = date(content);
+            assert!(at >= start && at < std::time::SystemTime::now(), "a date in the past");
+        }
+    }
+
+    /// A worker build gets an empty `weft-workspace-hack`: the real one turns
+    /// on every feature the CLI and the dispatcher use, which a worker would
+    /// then compile. The engine crates still name it, so the stand-in must
+    /// be there, dated from its content so cargo keeps reusing what sits
+    /// above it.
+    #[test]
+    fn a_worker_build_gets_an_empty_workspace_hack() {
+        let weft_root = super::resolve_weft_root().expect("resolve weft root");
+        let dir = tempfile::tempdir().unwrap();
+        super::stage_worker_workspace(&weft_root, dir.path()).expect("stage");
+        let hack = dir.path().join("crates").join(crate::codegen::WORKSPACE_HACK_CRATE);
+        let manifest = std::fs::read_to_string(hack.join("Cargo.toml")).unwrap();
+        assert!(!manifest.contains("[dependencies]"), "{manifest}");
+        assert!(manifest.contains("name = \"weft-workspace-hack\""), "{manifest}");
+        assert_eq!(std::fs::read_to_string(hack.join("src/lib.rs")).unwrap(), "");
+        let dated = std::fs::metadata(hack.join("src/lib.rs")).unwrap().modified().unwrap();
+        assert_eq!(dated, super::package_source_mtime(b""));
     }
 
     /// The builder base compiles the STOCK WORKER: the staged context
@@ -1158,16 +1313,17 @@ mod tests {
     fn the_builder_base_context_carries_the_stock_worker_and_the_stdlib() {
         let weft_root = super::resolve_weft_root().expect("resolve weft root");
         let dir = tempfile::tempdir().unwrap();
-        let ctx = super::stage_builder_base_context_at(&weft_root, &dir.path().join("ctx")).expect("stage");
+        let ctx = super::stage_builder_base_context_at(&weft_root, &dir.path().join("ctx"), &weft_core::infra::Install::default_install()).expect("stage");
         let crate_root = ctx.join(crate::worker_image::WARMUP_CRATE_DIR);
         let manifest = std::fs::read_to_string(crate_root.join("Cargo.toml")).unwrap();
-        assert!(manifest.contains("pkg_format = { path = \"./pkg_format-"), "{manifest}");
+        assert!(manifest.contains("pkg_format = { optional = true, path = \"./pkg_format-"), "{manifest}");
         assert!(crate_root.join(crate::worker_image::CACHE_GC_SCRIPT_NAME).is_file());
         // Staged at its project-relative path: a node under `nodes/` and
         // one beside the code under `src/` land side by side under the mount.
         assert!(ctx.join("project-nodes/nodes/base_catalog/basic/format/mod.rs").is_file());
-        // Every package file, staged and generated, carries the one fixed
-        // date, so a package compiled from another checkout is reused.
+        // Every package file, staged and generated, carries the date its
+        // content gives it, so a package compiled from another checkout is
+        // reused.
         let pkg_dir = std::fs::read_dir(&crate_root)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -1179,11 +1335,14 @@ mod tests {
             pkg_dir.join("src/lib.rs"),
         ] {
             let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
-            assert_eq!(modified, super::package_source_mtime(), "{}", file.display());
+            assert_eq!(modified, super::package_source_mtime(&std::fs::read(&file).unwrap()), "{}", file.display());
         }
         let dockerfile = std::fs::read_to_string(ctx.join("Dockerfile")).unwrap();
         assert!(!dockerfile.contains("{{"), "every token rendered: {dockerfile}");
-        assert!(dockerfile.contains(&format!("/work {}", sanitize_crate_name(super::WORKER_CRATE_NAME))));
+        assert!(
+            dockerfile.contains("weft-cache-gc.sh this-build /cache/target/release /tmp/cargo-messages.json"),
+            "the base keeps its cache to what its build used: {dockerfile}"
+        );
         assert!(dockerfile.contains("COPY project-nodes /weft/project-nodes"));
     }
 

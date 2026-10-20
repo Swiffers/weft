@@ -520,7 +520,7 @@ async fn rewrite_failed(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     for (extra, says) in [
         (json!({ "diarizationThreshold": 0.3 }), "only `diarize` turns on"),
         (json!({ "diarize": true, "diarizationThreshold": 0.3, "numSpeakers": 2 }), "only without `numSpeakers`"),
@@ -553,7 +553,7 @@ async fn refused(rig: FakeRig) -> WeftResult<()> {
         (json!({ "additionalFormats": [{ "format": "docx", "maxCharactersPerLine": 40 }] }), "srt and txt only"),
     ] {
         let err = rig.run(&ElevenLabsTranscribeFileNode, inputs(&rig, extra.clone())).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `error` wired: {extra}: {err}");
+        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {extra}: {err}");
         assert!(err.contains(says), "{extra}: {err}");
     }
     assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");

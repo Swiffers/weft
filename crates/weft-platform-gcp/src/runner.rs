@@ -25,7 +25,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use weft_platform_traits::config::GcpPlatform;
-use weft_platform_traits::runner::PlatformRefused;
+use weft_platform_traits::runner::{PlatformRefused, WorkerWontStart};
 use weft_platform_traits::{Patience, Runner, WorkerEndpoint, WorkerSettings, WorkerStarting, WorkerTarget};
 
 use crate::api::{is_status, Google};
@@ -51,7 +51,7 @@ const SETTLE_POLL: Duration = Duration::from_secs(5);
 /// How long a [`Patience::Brief`] caller (a delivery, a live caller)
 /// waits on a bring-up before it hears [`WorkerStarting`]. Well under a delivery's
 /// lease, so a delivery is given back before its lease can lapse and hand
-/// the same execution out twice.
+/// the same run out twice.
 const CALLER_HOLD: Duration = Duration::from_secs(20);
 
 /// A bring-up's outcome as every caller sharing it reads it: the address,
@@ -59,13 +59,24 @@ const CALLER_HOLD: Duration = Duration::from_secs(20);
 type Landed = Option<Result<String, Fault>>;
 
 /// A failed bring-up as every caller sharing it reads it (an
-/// `anyhow::Error` cannot be shared): the failure in words, and whether
-/// Google refused weft's call ([`REFUSING_STATUSES`]), which each caller
-/// hears as [`PlatformRefused`].
+/// `anyhow::Error` cannot be shared): the failure in words, and what kind
+/// of failure each caller hears it as.
 #[derive(Debug, Clone)]
 struct Fault {
     words: String,
-    refused: bool,
+    kind: FaultKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaultKind {
+    /// Google refused weft's call ([`REFUSING_STATUSES`]), heard as
+    /// [`PlatformRefused`].
+    Refused,
+    /// The revision itself failed to start (`RevisionStanding::Failed`),
+    /// heard as [`WorkerWontStart`].
+    WontStart,
+    /// Anything else: no answer, a timeout.
+    Other,
 }
 
 /// What Google answers when it refuses weft's call rather than failing to
@@ -78,14 +89,21 @@ const REFUSING_STATUSES: [u16; 3] = [400, 401, 403];
 
 impl Fault {
     fn of(e: &anyhow::Error) -> Self {
-        Self { words: format!("{e:#}"), refused: REFUSING_STATUSES.iter().any(|status| is_status(e, *status)) }
+        let kind = if WorkerWontStart::is(e) {
+            FaultKind::WontStart
+        } else if REFUSING_STATUSES.iter().any(|status| is_status(e, *status)) {
+            FaultKind::Refused
+        } else {
+            FaultKind::Other
+        };
+        Self { words: format!("{e:#}"), kind }
     }
 
     fn into_error(self) -> anyhow::Error {
-        if self.refused {
-            anyhow::Error::new(PlatformRefused { why: self.words })
-        } else {
-            anyhow::anyhow!(self.words)
+        match self.kind {
+            FaultKind::Refused => anyhow::Error::new(PlatformRefused { why: self.words }),
+            FaultKind::WontStart => anyhow::Error::new(WorkerWontStart { why: self.words }),
+            FaultKind::Other => anyhow::anyhow!(self.words),
         }
     }
 }
@@ -131,7 +149,7 @@ impl Flights {
             let (name, took) = (&landing.key.0, started.elapsed());
             match &landed {
                 Ok(at) => tracing::info!(target: "weft_platform_gcp::runner", %name, ?took, %at, "the program's worker is up"),
-                Err(e) => tracing::warn!(target: "weft_platform_gcp::runner", %name, ?took, error = %e.words, refused = e.refused, "bringing up the program's worker failed"),
+                Err(e) => tracing::warn!(target: "weft_platform_gcp::runner", %name, ?took, error = %e.words, kind = ?e.kind, "bringing up the program's worker failed"),
             }
             // Out of the map before the outcome is sent, so a caller that
             // reads the outcome and asks again starts afresh.
@@ -147,7 +165,7 @@ impl Flights {
         let landed = async {
             match rx.wait_for(Option::is_some).await {
                 Ok(landed) => landed.clone().expect("waited for an outcome"),
-                Err(_) => Err(Fault { words: format!("the bring-up of {what} stopped without an outcome"), refused: false }),
+                Err(_) => Err(Fault { words: format!("the bring-up of {what} stopped without an outcome"), kind: FaultKind::Other }),
             }
         };
         let landed = match patience {
@@ -571,7 +589,9 @@ impl CloudRunRunner {
                 },
                 RevisionStanding::Settling => tokio::time::sleep(SETTLE_POLL).await,
                 RevisionStanding::Failed(why) => {
-                    anyhow::bail!("the program's worker ({service}, revision {tag}) failed to start: {why}; fix the program and build again")
+                    return Err(anyhow::Error::new(WorkerWontStart {
+                        why: format!("the program's worker ({service}, revision {tag}) failed to start: {why}"),
+                    }));
                 }
                 RevisionStanding::Due => {
                     let gate = self.gate(&service);
@@ -791,11 +811,36 @@ impl Runner for CloudRunRunner {
         self.known.lock().remove(&(names::worker_service(target.project), Self::tag_of(target)));
     }
 
-    async fn retire(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<()> {
+    async fn kill_workers(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<()> {
         let value = project.simple().to_string();
-        let all = self.labeled("weft-project", &value).await?;
+        let all = self.labeled("weft-project", &value).await.map_err(|e| anyhow::anyhow!(
+            "could not list the project's worker services ({e:#}); find them with `gcloud run services list \
+             --project {} --region {} --filter=metadata.labels.weft-project={value}` and delete each with \
+             `gcloud run services delete <name> --project {} --region {}`",
+            self.gcp.project, self.gcp.region, self.gcp.project, self.gcp.region,
+        ))?;
         self.known.lock().retain(|_, k| k.project != project);
-        self.delete_all(all).await?;
+        // Deleting a service stops its instances outright. Every one is
+        // tried, so the error names all that are left.
+        let mut left = Vec::new();
+        for name in all {
+            if let Err(e) = self.delete_all(vec![name.clone()]).await {
+                left.push((name.rsplit('/').next().unwrap_or(&name).to_string(), e));
+            }
+        }
+        if left.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<&str> = left.iter().map(|(name, _)| name.as_str()).collect();
+        let why: Vec<String> = left.iter().map(|(name, e)| format!("{name}: {e:#}")).collect();
+        anyhow::bail!(
+            "the project's worker services {} are still running ({}); delete them by hand with \
+             `gcloud run services delete <name> --project {} --region {}`",
+            names.join(", "), why.join("; "), self.gcp.project, self.gcp.region,
+        )
+    }
+
+    async fn retire(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<()> {
         crate::accounts::revoke_project_account(&self.google, &self.gcp, project).await
     }
 
@@ -1021,6 +1066,13 @@ mod tests {
         let crashed = flights.wait(failed, Patience::ToTheEnd, "svc").await.unwrap_err();
         assert_eq!(format!("{crashed:#}"), "the revision crashed");
         assert!(!PlatformRefused::is(&crashed), "a failure Google did not refuse is no refusal");
+        assert!(!WorkerWontStart::is(&crashed), "nor a worker that cannot start");
+        let failed = flights.join(key(), || async {
+            Err(anyhow::Error::new(WorkerWontStart { why: "the container exited".into() }))
+        });
+        let wont = flights.wait(failed, Patience::ToTheEnd, "svc").await.unwrap_err();
+        assert!(WorkerWontStart::is(&wont), "a revision that failed to start reaches every caller as such: {wont:#}");
+        assert!(format!("{wont:#}").contains("the container exited"), "{wont:#}");
     }
 
     /// Google refusing weft's call, under whatever context the bring-up

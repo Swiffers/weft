@@ -39,8 +39,8 @@
             "label": "name",
             "value": "id",
             "page": {
-              "cursor_param": "cursor",
-              "cursor_path": "response_metadata.next_cursor"
+              "cursorParam": "cursor",
+              "cursorPath": "response_metadata.next_cursor"
             }
           },
           {
@@ -64,8 +64,5 @@
       "type": "Boolean",
       "description": "True once the message is gone."
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

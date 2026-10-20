@@ -1,6 +1,7 @@
 # Custom types
 
-Give a shape a name and every node can use it.
+Give a shape a name in a node's `metadata.json`, and every node in the project
+can use it.
 
 ```json
 "types": {
@@ -9,78 +10,85 @@ Give a shape a name and every node can use it.
 }
 ```
 
-Then in any node's ports, including other people's:
+Then in the ports of any node in the project, including nodes from other
+packages:
 
 ```json
 "inputs": [ { "name": "messages", "type": "ChatHistory", "required": true } ]
 ```
 
-## They are global, and compared by name
+A named type is only equal to itself. Declare `"CustomerId": "String"` and a
+port that wants a `CustomerId` refuses a plain `String` unless the program puts
+a `Cast` in between, while a `CustomerId` goes into a port that wants a
+`String` with nothing in between. For how names compare and what fits into what, go and read
+[types](../language/types.md#giving-a-type-a-name).
 
-Every `metadata.json` in the project contributes its `types` to one table
-before anything else is parsed, so a name declared by one package is usable by
-every node.
+## One table for the whole project
 
-The comparison is by **name**, not shape. `CustomerId` declared as `String` is
-a different type from `String`, and wiring one into the other is a mismatch.
-That is the point: a customer id should not land in a port that wanted any old
-string.
+Every `metadata.json` in the project adds its `types` to one table before any
+port is read, and the program's own `.weft` files can use these names too. If
+several nodes in a package share a type, declare it once in the package root's
+`metadata.json`.
 
-A named type flows **into** its shape for free, because the name falls away
-when it is not needed. Going the other way, from a plain shape to a named one,
-needs a `Cast`, which checks the value really has that shape.
+Two files may declare the same name with the same shape: the two declarations
+count as one. If two `metadata.json` files declare it with different shapes,
+the nodes of both are left out of the catalog, each with an error saying the
+name is declared twice with different bodies.
+
+A `type` written in a `.weft` file is stricter: it may never reuse a name the
+program can already see, including the names `metadata.json` files declare,
+even to declare the same shape.
+
+## Records that take extra keys
+
+A record refuses any key it does not declare. If your node's type describes
+data that comes from outside and may carry more than you read (a provider's
+answer, a webhook's body), end it with `..`:
+
+```json
+"types": { "Charge": "{ id: String, amount: Number, .. }" }
+```
+
+Such a record accepts a value with extra keys. weft drops them when your node
+emits the value and when a `Cast` produces it, so what flows on carries only
+`id` and `amount`. A missing field or
+a field of the wrong type still fails.
 
 ## What travels
 
-The name carries its shape with it. A port typed `ChatMessage` stores as
-`ChatMessage={ role: String, content: String }`, so anything reading a saved
+The name carries its shape with it. A port typed `ChatMessage` is stored as
+`ChatMessage={role: String, content: String}`, so anything reading a saved
 project or a journal row understands it with no table to consult, and a run
 that started yesterday keeps the shape it started with even if you edit the
 declaration today.
 
-## Where to put them
+If you write that stored form into a port's type yourself and its shape
+differs from the declaration (`"type": "ChatMessage={role: String}"`), the
+build fails with `named-type-conflict`.
 
-A package root's `metadata.json` can declare the types its nodes share, once,
-and every node in it inherits them.
+## Making your node a cast
 
-Two packages declaring the same name with the same shape is fine and absorbs.
-Two declaring it with different shapes names both, and a port that restates a
-declared name with a different shape is the `named-type-conflict` error. A
-named type has one body everywhere.
-
-Nothing shadows. A name already visible cannot be redeclared, not even to the
-same thing.
-
-## Cast
-
-Any node can declare itself a cast:
+If your node converts its input into whatever type the program gives its
+output, the way `Cast` does, name the two ports here:
 
 ```json
 "features": { "castPorts": { "input": "value", "output": "value" } }
 ```
 
-The compiler reads the declaration, never the node's name, so this is a thing
-any node can be rather than one built-in.
-
-At compile time, the resolved pair of types has to be a conversion that exists:
-
-| From | Into |
-|---|---|
-| `String` | A number, a boolean, or any object shape, parsed as JSON and then checked |
-| Anything that is not a file or a live handle | `String` |
-| `Number` | `Boolean`, and back |
-| Any object shape | A record or a named type, checked against the declared shape |
-
-Anything else is refused at compile time:
+Where the node is used, the pair of types its two ports end up with has to be
+a conversion `Cast` knows (for the table of those, go and read
+[Cast](../language/types.md#cast)), and any other pair is the `cast-not-allowed` error when the program compiles:
 
 ```text
 no cast from JsonDict into Number; a cast parses text, stringifies data, or
 validates an object shape against a declared type
 ```
 
-At run time, the check names the field that was wrong, like
-`messages[2].role: expected String, got Number`, rather than failing with a
-shrug.
+Your node does the conversion itself when it runs, the way `Cast` does:
 
-Stored files, buses and connections do not turn into text, so those casts do
-not exist.
+```rust
+let target = ctx.output_type("value")?;
+let cast = target
+    .cast_value(&value)
+    .node_err(format!("casting the value into {target}"))?;
+```

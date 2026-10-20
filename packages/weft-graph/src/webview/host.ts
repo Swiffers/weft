@@ -10,7 +10,7 @@
 // client, and VS Code's is the default only because `acquireVsCodeApi` being
 // present is a reliable way to detect it.
 
-import type { HostMessage, WebviewMessage } from '../protocol';
+import type { HostMessage, StoredFileDownload, WebviewMessage } from '../protocol';
 
 /// The seam each consumer implements: deliver a `WebviewMessage` to the host,
 /// and call `receive` for every `HostMessage` the host emits. `dispose` tears
@@ -132,7 +132,7 @@ export function teardownTransport(): void {
 // ---- host request/reply calls ----
 //
 // Several webview features ask the host something and await a correlated
-// reply (graph edits, post-rejection resyncs, the storage handshake, the
+// reply (graph edits, post-rejection resyncs, the stored-file link, the
 // asset picker, the project-file listing). ONE registry correlates them all:
 // a reply is matched by (kind, requestId), riding the same fan-out as every
 // other host message so it rebinds on a transport swap like everything else.
@@ -256,11 +256,12 @@ export function openExternalUrl(url: string): void {
   send({ kind: 'openExternalUrl', url });
 }
 
-/// Resolve a stored image to the box's public URL for inline rendering. Runs
-/// the download handshake through `storageCall`. Rejects with the host's reason
-/// (expired/deleted) so the caller can show a fallback.
+/// Resolve a stored file to a short-lived presigned link straight to the
+/// object store, for an inline <img>/<video>/<audio> to load (the store
+/// answers any `Range` of it, so a video seeks). Rejects with the host's
+/// reason (expired/deleted) so the caller can show a fallback.
 export async function resolveStoredFileUrl(key: string): Promise<string> {
-  const r = await storageCall<{ url?: string }>('files/download', { key });
+  const r = await storageCall<StoredFileDownload | undefined>('files/download', { key });
   if (!r?.url) throw new Error('stored file unavailable');
   return r.url;
 }

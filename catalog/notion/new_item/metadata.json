@@ -23,7 +23,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "from_url",
@@ -40,7 +40,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "depends_on": [
+        "dependsOn": [
           "database"
         ],
         "sources": [
@@ -73,6 +73,7 @@
     {
       "name": "page",
       "type": "JsonDict",
+      "narrowable": true,
       "description": "The new row, the raw Notion page object."
     },
     {
@@ -86,6 +87,7 @@
     {
       "name": "properties",
       "type": "JsonDict",
+      "narrowable": true,
       "description": "The row's property values."
     }
   ],

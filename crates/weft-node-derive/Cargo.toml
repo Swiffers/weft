@@ -18,6 +18,7 @@ serde_json = { workspace = true }
 # author-facing alias), `weft_core` inside the workspace. This resolves
 # the right one from the invoking crate's Cargo.toml.
 proc-macro-crate = "3"
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [dev-dependencies]
 tempfile = "3"

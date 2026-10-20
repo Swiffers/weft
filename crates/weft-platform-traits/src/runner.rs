@@ -2,9 +2,9 @@
 //!
 //! A worker is the project's compiled program serving HTTP. Weft does not
 //! keep workers running and hand them work from a queue: it CALLS a worker
-//! for each execution (`POST /run/<execution_id>`, or the caller's own
+//! for each run (`POST /run/<run_id>`, or the caller's own
 //! forwarded request for a live one), and the worker answers when the
-//! execution ends or waits on something outside it. That is the whole
+//! run ends or waits on something outside it. That is the whole
 //! protocol, and it is weft's, the same on every platform (see
 //! `weft_engine::worker_server`).
 //!
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Everything the platform needs to run one project's workers at one
 /// image. A project can have several images live at once (a new build
-/// while older executions still resume on the image they started on), so
+/// while older runs still resume on the image they started on), so
 /// the image is part of the target, not a property of the project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerTarget {
@@ -442,6 +442,33 @@ impl PlatformRefused {
     }
 }
 
+/// The answer [`Runner::endpoint`] gives when the workers of the build
+/// asked for cannot run at all: started, they exit (a local container, a
+/// Cloud Run revision that failed), or the build's image is gone. A definite answer about that build, which no
+/// retry changes: what runs on it ends at once and says so, rather than
+/// waiting for a worker that will never come. [`WorkerWontStart::is`]
+/// recognizes it.
+#[derive(Debug)]
+pub struct WorkerWontStart {
+    /// Why, in the platform's words (its last lines, its reason).
+    pub why: String,
+}
+
+impl std::fmt::Display for WorkerWontStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the worker of this build cannot start: {}", self.why)
+    }
+}
+
+impl std::error::Error for WorkerWontStart {}
+
+impl WorkerWontStart {
+    /// Whether `e` is (or wraps) this answer.
+    pub fn is(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<WorkerWontStart>().is_some()
+    }
+}
+
 /// The port [`Runner::front`] was asked to publish is held by another
 /// program on the machine. [`PortTaken::of`] recognizes it.
 #[derive(Debug)]
@@ -552,8 +579,16 @@ pub trait Runner: Send + Sync {
     /// any more (every trigger it has was wiped). Its workers go once idle.
     async fn let_front_go(&self, project: uuid::Uuid) -> anyhow::Result<()>;
 
-    /// Remove everything the platform keeps for the project's workers
-    /// (a service, stopped containers). Idempotent.
+    /// Kill every worker the project has, outright (the runs on them die
+    /// with them), and remove what runs them (a service, stopped
+    /// containers). What removing a project does before it erases a row:
+    /// a worker left alive would keep serving from what it remembers of a
+    /// project that is gone. An error names what still runs and how to
+    /// stop it by hand. Idempotent.
+    async fn kill_workers(&self, tenant: &str, project: uuid::Uuid) -> anyhow::Result<()>;
+
+    /// Remove what the platform keeps for the project once its workers
+    /// are gone (on a cloud, the account its workers ran as). Idempotent.
     async fn retire(&self, tenant: &str, project: uuid::Uuid) -> anyhow::Result<()>;
 
     /// Remove what the platform keeps running from `image` (a container,
@@ -573,6 +608,7 @@ pub mod fake {
         Endpoint { project: uuid::Uuid },
         Front { target: WorkerTarget, port: Option<u16> },
         LetFrontGo { project: uuid::Uuid },
+        KillWorkers { project: uuid::Uuid },
         Retire { project: uuid::Uuid },
         ForgetImage(String),
     }
@@ -609,6 +645,10 @@ pub mod fake {
         }
         async fn let_front_go(&self, project: uuid::Uuid) -> anyhow::Result<()> {
             self.calls.lock().push(RunnerCall::LetFrontGo { project });
+            Ok(())
+        }
+        async fn kill_workers(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<()> {
+            self.calls.lock().push(RunnerCall::KillWorkers { project });
             Ok(())
         }
         async fn retire(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<()> {

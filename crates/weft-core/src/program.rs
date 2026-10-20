@@ -14,17 +14,18 @@
 //! instance limits are enforced at the outside doors (an instance token, the
 //! `Weft-Instance` header), not here.
 //!
-//! A call that takes something down carries a [`DeactivateSpec`] (what
-//! happens to parked and running work) and a [`StopSelf`]: the calling run
-//! is never among the runs a take-down reaches, and `StopSelf::Include`
-//! stops it too, after the take-down is queued.
+//! A call that takes something down carries a [`TakeDownChoice`] (what
+//! happens at the door, to what is held and to what is running; the rest
+//! is the command's default) and a [`StopSelf`]: the calling run is never
+//! among the runs a take-down reaches, and `StopSelf::Include` stops it
+//! too, after the take-down is queued.
 
 use serde::{Deserialize, Serialize};
 
 use crate::activation::ActivationScope;
 use crate::instance::InstanceId;
-use crate::running_policy::{DeactivateSpec, RunningPolicy};
 use crate::tag::StopSelf;
+use crate::take_down::{ReleaseHeld, TakeDownChoice};
 
 /// One call a program makes on its project.
 // SYNC: ProgramCall <-> crates/weft-dispatcher/src/task_kinds/program_call.rs (the executor's match)
@@ -36,11 +37,16 @@ pub enum ProgramCall {
     /// is queued; `ctx.infra(..).start()` then waits on
     /// [`ProgramCall::InfraStatus`] until it runs.
     InfraStart { node: String, instance: Option<InstanceId> },
-    /// Scale a copy down, keeping its disk.
-    InfraStop { node: String, instance: Option<InstanceId>, spec: DeactivateSpec },
+    /// Scale a copy down, keeping its disk, taking down the triggers whose
+    /// cut contains it as `take_down` says.
+    InfraStop { node: String, instance: Option<InstanceId>, take_down: TakeDownChoice },
     /// Delete a copy and its disks, keeping the ones its node lists in
     /// `keepOnTerminate` unless `disks` says the owner is going for good.
-    InfraTerminate { node: String, instance: Option<InstanceId>, spec: DeactivateSpec, disks: crate::infra::TerminateDisks },
+    InfraTerminate { node: String, instance: Option<InstanceId>, take_down: TakeDownChoice, disks: crate::infra::TerminateDisks },
+    /// Build nothing and cycle a running copy onto the registered build's
+    /// infra (a stop, then a start), taking down the triggers whose cut
+    /// contains it as `take_down` says; they come back with it.
+    InfraUpgrade { node: String, instance: Option<InstanceId>, take_down: TakeDownChoice },
     /// One copy's state, or none when it was never started (or was
     /// terminated).
     InfraStatus { node: String, instance: Option<InstanceId> },
@@ -48,10 +54,10 @@ pub enum ProgramCall {
     /// instance's.
     InfraCopies { node: String },
     /// Activate triggers: the ones `scope` names, or every trigger of its
-    /// owner.
-    TriggerActivate { scope: ActivationScope },
+    /// owners, releasing or dropping what they held as `held` says.
+    TriggerActivate { scope: ActivationScope, held: ReleaseHeld },
     /// Take triggers down.
-    TriggerDeactivate { scope: ActivationScope, spec: DeactivateSpec },
+    TriggerDeactivate { scope: ActivationScope, take_down: TakeDownChoice },
     /// An instance's connections.
     ConnectionsList { instance: InstanceId },
     /// Forget every connection of an instance (the values naming them go
@@ -76,18 +82,21 @@ pub enum ProgramCall {
     InstancesList,
     /// What calls cost, filtered.
     CostsList { filter: CostFilter },
-    /// Delete runs matching `filter`. Runs still going follow `running`:
-    /// `cancel` stops them (their rows go with the next clean), `wait`
-    /// leaves them running.
-    RunsClean { filter: RunFilter, running: RunningPolicy },
+    /// Delete runs matching `filter`. Runs still going follow `running`
+    /// ([`StillGoing`]).
+    RunsClean { filter: RunFilter, running: StillGoing },
     /// The newest runs matching `filter`, at most `limit` of them
     /// (1 to [`MAX_RUNS_PAGE`]), with how many match in all
-    /// ([`ExecutionPage`]).
+    /// ([`RunPage`]).
     RunsList { filter: RunFilter, limit: u32 },
     /// How many runs match `filter` ([`RunsCounted`]).
     RunsCount { filter: RunFilter },
     /// Revoke instance tokens: every token of `instance`, or the one `id`.
     TokensRevoke { instance: InstanceId, id: Option<uuid::Uuid> },
+    /// Where one node of a run of this project stands ([`NodeState`]),
+    /// read from that run's record. `node` is spelled the way `--from`
+    /// takes it; a node inside a loop is refused, a loop itself is read.
+    NodeState { run: crate::RunId, node: String },
 }
 
 impl ProgramCall {
@@ -98,6 +107,7 @@ impl ProgramCall {
             self,
             ProgramCall::InfraStop { .. }
                 | ProgramCall::InfraTerminate { .. }
+                | ProgramCall::InfraUpgrade { .. }
                 | ProgramCall::TriggerDeactivate { .. }
                 | ProgramCall::RunsClean { .. }
         )
@@ -110,6 +120,7 @@ impl ProgramCall {
             ProgramCall::InfraStart { .. } => "weft.infra.start",
             ProgramCall::InfraStop { .. } => "weft.infra.stop",
             ProgramCall::InfraTerminate { .. } => "weft.infra.terminate",
+            ProgramCall::InfraUpgrade { .. } => "weft.infra.upgrade",
             ProgramCall::InfraStatus { .. } => "weft.infra.status",
             ProgramCall::InfraCopies { .. } => "weft.infra.copies",
             ProgramCall::TriggerActivate { .. } => "weft.triggers.activate",
@@ -125,6 +136,7 @@ impl ProgramCall {
             ProgramCall::RunsList { .. } => "weft.runs.list",
             ProgramCall::RunsCount { .. } => "weft.runs.count",
             ProgramCall::TokensRevoke { .. } => "weft.tokens.revoke",
+            ProgramCall::NodeState { .. } => "weft.runs.node_state",
         }
     }
 }
@@ -133,7 +145,7 @@ impl ProgramCall {
 /// happens to the asker when the call takes it down, and the call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProgramCallPayload {
-    /// The calling run (its execution).
+    /// The calling run (its run).
     pub by: uuid::Uuid,
     pub stop_self: StopSelf,
     pub call: ProgramCall,
@@ -151,6 +163,7 @@ pub struct ProgramCallOutcome {
 
 /// One copy of an infra node, as `ctx.infra(..).status()` and
 /// `.copies()` answer it.
+// SYNC: InfraCopy <-> packages/weft-graph/src/protocol.ts InfraCopy
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InfraCopy {
     /// The node, spelled the way the program writes it.
@@ -179,7 +192,7 @@ impl InfraCopy {
 /// install has not picked, or a hand-over that kept failing, which holds
 /// the trigger's queue. What they wait on hands them over again, and so
 /// does activating the trigger.
-// SYNC: WaitingFires <-> packages/weft-graph/src/protocol.ts ActivationEntry.waiting
+// SYNC: WaitingFires <-> packages/weft-graph/src/protocol.ts WaitingFires
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitingFires {
     pub fires: u32,
@@ -239,6 +252,7 @@ pub struct TokensRevoked {
 }
 
 /// One instance's activation of a trigger that exists once per instance.
+// SYNC: InstanceTrigger <-> packages/weft-graph/src/protocol.ts InstanceTrigger
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceTrigger {
     /// The trigger, spelled the way the program writes it.
@@ -249,9 +263,11 @@ pub struct InstanceTrigger {
 }
 
 /// Everything weft holds for one instance of the project, as
-/// `ctx.instances().list()` answers it: counts and states, never a value or
-/// a secret.
+/// `ctx.instances().list()`, `weft instances` and the editor's instance
+/// picker read it: counts and states, never a value or a secret.
+// SYNC: InstanceHoldings <-> packages/weft-graph/src/protocol.ts InstanceHoldings
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InstanceHoldings {
     pub instance: InstanceId,
     /// Values the instance gave for `@instance_filled` fields.
@@ -264,11 +280,14 @@ pub struct InstanceHoldings {
     pub copies: Vec<InfraCopy>,
     /// Its activations of per-instance triggers.
     pub triggers: Vec<InstanceTrigger>,
+    /// When its latest run started (unix seconds); `None` when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_unix: Option<i64>,
 }
 
 impl InstanceHoldings {
     fn empty(instance: InstanceId) -> Self {
-        Self { instance, values: 0, connections: 0, tokens: 0, copies: Vec::new(), triggers: Vec::new() }
+        Self { instance, values: 0, connections: 0, tokens: 0, copies: Vec::new(), triggers: Vec::new(), last_run_unix: None }
     }
 
     /// One entry per instance that appears in any of the sources, sorted by
@@ -280,6 +299,7 @@ impl InstanceHoldings {
         tokens: Vec<(InstanceId, u32)>,
         copies: Vec<InfraCopy>,
         triggers: Vec<(InstanceId, InstanceTrigger)>,
+        last_runs: Vec<(InstanceId, i64)>,
     ) -> Vec<InstanceHoldings> {
         let mut by_instance = std::collections::BTreeMap::<InstanceId, InstanceHoldings>::new();
         fn at(by_instance: &mut std::collections::BTreeMap<InstanceId, InstanceHoldings>, instance: InstanceId) -> &mut InstanceHoldings {
@@ -302,14 +322,18 @@ impl InstanceHoldings {
         for (instance, trigger) in triggers {
             at(&mut by_instance, instance).triggers.push(trigger);
         }
+        for (instance, at_unix) in last_runs {
+            let held = at(&mut by_instance, instance);
+            held.last_run_unix = held.last_run_unix.max(Some(at_unix));
+        }
         by_instance.into_values().collect()
     }
 }
 
 crate::wire_enum! {
     /// Where a run stands, as a filter asks for it: each word is the
-    /// [`ExecutionSummary::status`] a run reads in a listing.
-    // SYNC: RunStatus <-> crates/weft-dispatcher/src/journal/postgres.rs list_executions (status clause), extension-vscode/src/sidebar/runSearch.ts STATUSES, extension-vscode/src/sidebar/executions.ts RunStatus
+    /// [`RunSummary::status`] a run reads in a listing.
+    // SYNC: RunStatus <-> crates/weft-dispatcher/src/journal/postgres.rs list_runs (status clause), extension-vscode/src/sidebar/runSearch.ts STATUSES, extension-vscode/src/sidebar/runs.ts RunStatus
     pub enum RunStatus {
         /// Not ended: no terminal event yet. A run parked on a wait has
         /// not ended either, so it is here too.
@@ -337,8 +361,9 @@ impl RunStatus {
 
 /// Which runs a clean (or a listing) reaches. Every filter narrows; none
 /// set is every run of the project.
-// SYNC: RunFilter <-> crates/weft-cli/src/commands/executions.rs (clean's flags)
+// SYNC: RunFilter <-> crates/weft-cli/src/commands/runs.rs (clean's flags)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunFilter {
     /// Runs for this instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -358,8 +383,85 @@ pub struct RunFilter {
     pub older_than_secs: Option<u64>,
 }
 
+crate::wire_enum! {
+    /// Where one node of a run stands ([`NodeState::status`]).
+    // SYNC: NodeStatus <-> catalog/logic/get_node_state/metadata.json (the `state` output's description)
+    pub enum NodeStatus {
+        /// It has not fired in this run (yet).
+        Pending = "pending",
+        Running = "running",
+        /// It is waiting on a signal (`ctx.await_signal`): an outside job,
+        /// a person, a timer.
+        Waiting = "waiting",
+        Completed = "completed",
+        Failed = "failed",
+        Skipped = "skipped",
+        /// The run was cancelled while it had not finished.
+        Cancelled = "cancelled",
+    }
+}
+
+/// Where one node of a run stands, as `ProgramCall::NodeState` answers
+/// it, read from the run's record, so it stays readable for as long as
+/// the run is kept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "NodeStateWire", into = "NodeStateWire")]
+pub struct NodeState {
+    pub status: NodeStatus,
+    /// While it waits: what its wait kept of the last answer it saw (a
+    /// poll of an outside job's status); `None` before the first one, and
+    /// for a wait whose kind has no answer to keep. On the wire as `live`
+    /// (the raw answer, unparsed) or `liveTooLarge` (its size in bytes,
+    /// past what a wait keeps), never both.
+    pub live: Option<crate::signal::listener_protocol::LastAnswer>,
+    /// When it failed: the error, as raw text.
+    pub error: Option<String>,
+}
+
+/// [`NodeState`] as the program reads it: `live` and `liveTooLarge` are
+/// two keys of one answer, so a shape holding both, or either of the
+/// wrong type, is refused rather than read as no answer.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NodeStateWire {
+    status: NodeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    live_too_large: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl TryFrom<NodeStateWire> for NodeState {
+    type Error = String;
+
+    fn try_from(wire: NodeStateWire) -> Result<Self, String> {
+        use crate::signal::listener_protocol::LastAnswer;
+        let live = match (wire.live, wire.live_too_large) {
+            (Some(text), None) => Some(LastAnswer::Kept(text)),
+            (None, Some(bytes)) => Some(LastAnswer::TooLarge(bytes)),
+            (None, None) => None,
+            (Some(_), Some(_)) => return Err("a node's state holds both `live` and `liveTooLarge`".into()),
+        };
+        Ok(Self { status: wire.status, live, error: wire.error })
+    }
+}
+
+impl From<NodeState> for NodeStateWire {
+    fn from(state: NodeState) -> Self {
+        use crate::signal::listener_protocol::LastAnswer;
+        let (live, live_too_large) = match state.live {
+            Some(LastAnswer::Kept(text)) => (Some(text), None),
+            Some(LastAnswer::TooLarge(bytes)) => (None, Some(bytes)),
+            None => (None, None),
+        };
+        Self { status: state.status, live, live_too_large, error: state.error }
+    }
+}
+
 /// The most runs one listing answers (`ctx.runs().list(..)`, the
-/// executions page): a listing past it pages with a narrower filter.
+/// runs page): a listing past it pages with a narrower filter.
 pub const MAX_RUNS_PAGE: u32 = 200;
 
 /// What `ProgramCall::RunsCount` answers: how many runs match.
@@ -370,17 +472,32 @@ pub struct RunsCounted {
 
 /// What a clean did.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CleanOutcome {
     /// Runs deleted.
     pub deleted: u64,
     /// Runs still going that were cancelled (`running: cancel`); their
     /// rows go with the next clean.
     pub cancelled: u64,
-    /// Runs still going that were left alone (`running: wait`).
+    /// Runs still going that were left alone (`running: leave`).
     pub left_running: u64,
 }
 
-/// `POST /executions/clean`: delete every run the filter reaches. What
+crate::wire_enum! {
+    /// What a clean does with the runs it matches that are still going: a
+    /// run is never deleted from under itself.
+    #[derive(Default)]
+    pub enum StillGoing {
+        /// Leave them running: a clean never stops a run nobody asked it
+        /// to stop.
+        #[default]
+        Leave = "leave",
+        /// Cancel them; their rows go with the next clean.
+        Cancel = "cancel",
+    }
+}
+
+/// `POST /runs/clean`: delete every run the filter reaches. What
 /// `weft clean --project .. --instance .. --status ..` sends; a program's
 /// `ctx.runs()..clean(..)` runs the same clean.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -390,22 +507,18 @@ pub struct CleanRequest {
     pub project: Option<uuid::Uuid>,
     #[serde(default)]
     pub filter: RunFilter,
-    /// What happens to matching runs still going. Absent is `wait`: a
-    /// clean never stops a run nobody asked it to stop.
-    #[serde(default = "default_clean_running")]
-    pub running: RunningPolicy,
+    /// What happens to matching runs still going.
+    #[serde(default)]
+    pub running: StillGoing,
 }
 
-fn default_clean_running() -> RunningPolicy {
-    RunningPolicy::Wait
-}
-
-/// One run, as the executions listing shows it.
-// SYNC: ExecutionSummary <-> weavemind/website/src/routes/(app)/executions/+page.ts (Execution),
-//       extension-vscode/src/sidebar/executions.ts (ExecutionSummary)
+/// One run, as the runs listing shows it.
+// SYNC: RunSummary <-> weavemind/website/src/routes/(app)/executions/+page.ts (Execution),
+//       extension-vscode/src/sidebar/runs.ts (RunSummary)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionSummary {
-    pub execution_id: crate::ExecutionId,
+#[serde(rename_all = "camelCase")]
+pub struct RunSummary {
+    pub run_id: crate::RunId,
     pub project_id: uuid::Uuid,
     pub entry_node: String,
     /// Where the run stands: a running run parked on a wait reads
@@ -415,21 +528,21 @@ pub struct ExecutionSummary {
     /// manual run), or one of the two setup phases an activate /
     /// resync / infra start runs. The listing mixes all three, and
     /// "has my trigger fired since the change" is unanswerable without
-    /// it. Copied from the `ExecutionStarted` row, or, when that row
-    /// no longer decodes, from the `execution.phase` column the
+    /// it. Copied from the `RunStarted` row, or, when that row
+    /// no longer decodes, from the `run.phase` column the
     /// listing filtered on.
     pub phase: crate::primitive::Phase,
     pub started_at: u64,
     pub completed_at: Option<u64>,
-    /// The tags the run put on itself (`ctx.tag_execution`), in the
+    /// The tags the run put on itself (`ctx.tag_run`), in the
     /// order it claimed them. Empty for a run that never tagged.
     pub tags: Vec<String>,
     /// For a `cancelled` run: who or what stopped it (a person, a
     /// sibling run, the caller leaving, the runtime). What the
-    /// executions panel draws the row's icon and words from. `None`
+    /// runs panel draws the row's icon and words from. `None`
     /// for every other status, and for a cancel row written without
     /// a cause.
-    pub cancel_cause: Option<crate::exec::CancelCause>,
+    pub cancel_cause: Option<crate::run::CancelCause>,
     /// For a `failed` run: what failed it, as its terminal row says.
     /// `None` for every other status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -438,29 +551,29 @@ pub struct ExecutionSummary {
     /// flow). A completed run with skips is still completed; the count
     /// is what the panel says beside it.
     pub skipped_nodes: u64,
-    /// Who the run is for (`ExecutionStarted.instance`); `None` for a run
+    /// Who the run is for (`RunStarted.instance`); `None` for a run
     /// for nobody in particular.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<InstanceId>,
 }
 
-/// One page of executions plus the total number matching the same filters
+/// One page of runs plus the total number matching the same filters
 /// (ignoring limit/offset), so a consumer can render page controls without a
 /// second count round-trip.
-// SYNC: ExecutionPage <-> weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage),
-//       extension-vscode/src/sidebar/executions.ts (ExecutionPage)
+// SYNC: RunPage <-> weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage),
+//       extension-vscode/src/sidebar/runs.ts (RunPage)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionPage {
-    pub executions: Vec<ExecutionSummary>,
+pub struct RunPage {
+    pub runs: Vec<RunSummary>,
     pub total: u64,
 }
 
-/// `GET /executions/{id}`: one run as the listing shows it, and what it
+/// `GET /runs/{id}`: one run as the listing shows it, and what it
 /// is parked on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionDetail {
+pub struct RunDetail {
     #[serde(flatten)]
-    pub summary: ExecutionSummary,
+    pub summary: RunSummary,
     /// The waits the run holds, in registration order; empty unless it is
     /// `waiting_for_input`. They ride with the status they produced, so a
     /// client that learns the run is parked learns from the same read
@@ -470,7 +583,7 @@ pub struct ExecutionDetail {
 
 /// One wait a parked run holds: the node, the token that answers it, and
 /// the signal kind (a `timer` is woken, anything else expects a value).
-/// What `weft wake <execution_id> <node>` matches against.
+/// What `weft wake <run_id> <node>` matches against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParkedWait {
     /// The waiting node's place, spelled the way a person writes it
@@ -482,35 +595,37 @@ pub struct ParkedWait {
     pub kind: String,
 }
 
-/// `GET /executions/resolve/{prefix}`: the one execution of the caller's
+/// `GET /runs/resolve/{prefix}`: the one run of the caller's
 /// whose id starts with the prefix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResolvedExecution {
-    pub execution_id: crate::ExecutionId,
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedRun {
+    pub run_id: crate::RunId,
 }
 
-/// `DELETE /executions/{id}`: the run's project, and the versions the run
+/// `DELETE /runs/{id}`: the run's project, and the versions the run
 /// left bare that went with it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeletedExecution {
+pub struct DeletedRun {
     pub project: uuid::Uuid,
     pub swept: Vec<String>,
 }
 
-/// `GET /executions/{id}/logs`: the tail of a run's log, and the limit
+/// `GET /runs/{id}/logs`: the tail of a run's log, and the limit
 /// that cut it, so a reader can tell a full page from the whole log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionLogs {
+pub struct RunLogs {
     pub limit: u32,
-    pub lines: Vec<ExecutionLogLine>,
+    pub lines: Vec<RunLogLine>,
 }
 
 /// One line of a run's log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionLogLine {
+#[serde(rename_all = "camelCase")]
+pub struct RunLogLine {
     /// The seed run this line was carried over from, for a seeded run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inherited_from: Option<crate::ExecutionId>,
+    pub inherited_from: Option<crate::RunId>,
     pub at_unix: u64,
     pub level: String,
     /// The firing this line is about: the node, and the loop
@@ -551,6 +666,7 @@ impl PaidBy {
 
 /// Which cost records `ctx.costs()` reads. Every filter narrows.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CostFilter {
     /// Costs of runs for this instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -562,7 +678,7 @@ pub struct CostFilter {
     pub service: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paid_by: Option<PaidBy>,
-    /// Costs of one run (`ctx.execution_id` for the calling run's own).
+    /// Costs of one run (`ctx.run_id` for the calling run's own).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<uuid::Uuid>,
     /// Costs booked at or after this unix second.
@@ -573,6 +689,7 @@ pub struct CostFilter {
 /// One cost record, as `ctx.costs().list()` answers it. Weft reports the
 /// price it measured; what anybody is billed is the program's business.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CostRecord {
     pub run: uuid::Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -590,6 +707,7 @@ pub struct CostRecord {
 /// An instance token a program minted. The value is shown here once; the
 /// server keeps only its hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MintedInstanceToken {
     /// Revoke it by this id.
     pub id: uuid::Uuid,
@@ -602,9 +720,42 @@ pub struct MintedInstanceToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::running_policy::DeactivationMode;
 
     crate::wire_enum_roundtrip_tests!(RunStatus);
+    crate::wire_enum_roundtrip_tests!(StillGoing);
+    crate::wire_enum_roundtrip_tests!(NodeStatus);
+    use crate::signal::listener_protocol::LastAnswer;
+
+    /// A node's state reaches the program in the shape `GetNodeState`
+    /// hands on: its status word, and the raw answer or error only when
+    /// there is one.
+    #[test]
+    fn a_node_state_reaches_the_program_in_its_wire_shape() {
+        let waiting = NodeState { status: NodeStatus::Waiting, live: Some(LastAnswer::Kept("{\"status\":\"IN_QUEUE\"}".into())), error: None };
+        assert_eq!(
+            serde_json::to_value(&waiting).unwrap(),
+            serde_json::json!({ "status": "waiting", "live": "{\"status\":\"IN_QUEUE\"}" })
+        );
+        let large = NodeState { status: NodeStatus::Waiting, live: Some(LastAnswer::TooLarge(70_000)), error: None };
+        let wire = serde_json::to_value(&large).unwrap();
+        assert_eq!(wire, serde_json::json!({ "status": "waiting", "liveTooLarge": 70_000 }));
+        assert_eq!(serde_json::from_value::<NodeState>(wire).unwrap(), large);
+        for refused in [
+            serde_json::json!({ "status": "waiting", "live": "a", "liveTooLarge": 3 }),
+            serde_json::json!({ "status": "waiting", "live": 5 }),
+            serde_json::json!({ "status": "waiting", "liveTooLarge": "x" }),
+        ] {
+            assert!(serde_json::from_value::<NodeState>(refused.clone()).is_err(), "{refused}");
+        }
+        let failed = NodeState { status: NodeStatus::Failed, live: None, error: Some("boom".into()) };
+        let wire = serde_json::to_value(&failed).unwrap();
+        assert_eq!(wire, serde_json::json!({ "status": "failed", "error": "boom" }));
+        assert_eq!(serde_json::from_value::<NodeState>(wire).unwrap(), failed);
+        let call = ProgramCall::NodeState { run: crate::RunId::from_u128(4), node: "one.render".into() };
+        let wire = serde_json::to_value(&call).unwrap();
+        assert_eq!(wire["call"], "node_state");
+        assert_eq!(serde_json::from_value::<ProgramCall>(wire).unwrap(), call);
+    }
 
     #[test]
     fn running_reaches_a_run_parked_on_a_wait_and_waiting_only_that() {
@@ -613,14 +764,6 @@ mod tests {
         assert!(RunStatus::Failed.reaches(RunStatus::Failed) && !RunStatus::Failed.reaches(RunStatus::Running));
     }
 
-    fn spec() -> DeactivateSpec {
-        DeactivateSpec {
-            mode: DeactivationMode::Wipe,
-            grace_minutes: 0,
-            running_policy: RunningPolicy::Cancel,
-            drain_timeout_secs: None,
-        }
-    }
 
     #[test]
     fn paid_by_covers_its_own_kind_of_credential() {
@@ -638,11 +781,12 @@ mod tests {
         let call = ProgramCall::InfraStop {
             node: "bridge".into(),
             instance: Some(InstanceId::new("ada").unwrap()),
-            spec: spec(),
+            take_down: TakeDownChoice { running: Some(crate::take_down::Running::Cancel), ..Default::default() },
         };
         let wire = serde_json::to_value(&call).unwrap();
         assert_eq!(wire["call"], "infra_stop");
         assert_eq!(wire["instance"], "ada");
+        assert_eq!(wire["take_down"], serde_json::json!({ "running": "cancel" }));
         let back: ProgramCall = serde_json::from_value(wire).unwrap();
         assert_eq!(back, call);
     }
@@ -684,8 +828,11 @@ mod tests {
             // The shared copy belongs to no instance in this listing.
             vec![copy(None, crate::infra::InfraNodeStatus::Running), copy(Some("bob"), crate::infra::InfraNodeStatus::Stopped)],
             vec![(instance("cyd"), waiting.clone())],
+            vec![(instance("ada"), 5), (instance("ada"), 9)],
         );
         let instances: Vec<&str> = merged.iter().map(|m| m.instance.as_str()).collect();
+        assert_eq!(merged[0].last_run_unix, Some(9), "the latest run counts");
+        assert_eq!(merged[1].last_run_unix, None);
         assert_eq!(instances, ["ada", "bob", "cyd"]);
         assert_eq!((merged[0].values, merged[0].connections, merged[0].tokens), (3, 0, 2));
         assert!(merged[0].copies.is_empty() && merged[0].triggers.is_empty());
@@ -697,7 +844,7 @@ mod tests {
 
     #[test]
     fn holdings_of_no_instance_merge_to_nothing() {
-        assert!(InstanceHoldings::merge(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()).is_empty());
+        assert!(InstanceHoldings::merge(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()).is_empty());
     }
 
     #[test]
@@ -705,7 +852,7 @@ mod tests {
         assert!(ProgramCall::InfraTerminate {
             node: "x".into(),
             instance: None,
-            spec: spec(),
+            take_down: TakeDownChoice::default(),
             disks: crate::infra::TerminateDisks::KeepListed,
         }.takes_down());
         assert!(!ProgramCall::InfraStart { node: "x".into(), instance: None }.takes_down());
@@ -725,6 +872,61 @@ mod tests {
         assert_eq!(serde_json::from_value::<ProgramCall>(wire).unwrap(), count);
         assert!(!list.takes_down() && !count.takes_down());
         assert_eq!(serde_json::to_value(RunsCounted { total: 3 }).unwrap(), serde_json::json!({ "total": 3 }));
+    }
+
+    #[test]
+    fn a_run_listing_names_its_fields_in_camel_case() {
+        let run = RunSummary {
+            run_id: crate::RunId::from_u128(1),
+            project_id: uuid::Uuid::from_u128(2),
+            entry_node: "hook".into(),
+            status: RunStatus::WaitingForInput,
+            phase: crate::primitive::Phase::Fire,
+            started_at: 10,
+            completed_at: None,
+            tags: vec!["draft".into()],
+            cancel_cause: None,
+            error: None,
+            skipped_nodes: 3,
+            instance: None,
+        };
+        let page = RunPage { runs: vec![run], total: 1 };
+        let wire = serde_json::to_value(&page).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({ "runs": [{
+                "runId": "00000000-0000-0000-0000-000000000001",
+                "projectId": "00000000-0000-0000-0000-000000000002",
+                "entryNode": "hook",
+                "status": "waiting_for_input",
+                "phase": "fire",
+                "startedAt": 10,
+                "completedAt": null,
+                "tags": ["draft"],
+                "cancelCause": null,
+                "skippedNodes": 3,
+            }], "total": 1 })
+        );
+        let back: RunPage = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.runs[0].run_id, page.runs[0].run_id);
+        assert_eq!(
+            serde_json::to_value(ResolvedRun { run_id: crate::RunId::nil() }).unwrap(),
+            serde_json::json!({ "runId": "00000000-0000-0000-0000-000000000000" })
+        );
+        let line = RunLogLine {
+            inherited_from: Some(crate::RunId::nil()),
+            at_unix: 4,
+            level: "info".into(),
+            node: None,
+            frames: Default::default(),
+            message: "m".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(line).unwrap(),
+            serde_json::json!({ "inheritedFrom": "00000000-0000-0000-0000-000000000000", "atUnix": 4, "level": "info", "message": "m" })
+        );
+        let filter = RunFilter { older_than_secs: Some(60), ..RunFilter::default() };
+        assert_eq!(serde_json::to_value(&filter).unwrap(), serde_json::json!({ "olderThanSecs": 60 }));
     }
 
     #[test]

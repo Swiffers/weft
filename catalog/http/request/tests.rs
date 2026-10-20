@@ -19,13 +19,15 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("method_headers_and_body_ride_the_request", request_shape),
         NodeTest::fake("a_bad_method_fails_the_run_even_with_error_wired", bad_method_wired),
         NodeTest::fake("a_binary_body_is_stored_whole_as_a_file", binary_body),
+        NodeTest::fake("a_text_body_too_big_for_a_wire_is_stored_whole_as_a_file", oversize_text_body),
+        NodeTest::fake("a_text_body_too_big_for_a_wire_fails_when_only_body_is_wired", oversize_text_body_unwired_file),
         NodeTest::fake("the_recipe_sets_the_named_header", connection_header),
         NodeTest::fake("a_header_set_twice_is_refused", header_set_twice),
     ]
 }
 
 async fn bad_method_wired(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig
         .run(
             &HttpRequestNode,
@@ -120,6 +122,41 @@ async fn binary_body(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(file.mime_type, "image/png");
     assert_eq!(file.filename, "logo.png");
     assert_eq!(&rig.stored_bytes(&file.key)?[..], png, "every byte survives");
+    Ok(())
+}
+
+/// A JSON object of about 120 KB, more than the 100 KB a wire carries.
+fn oversize_json() -> Vec<u8> {
+    let text = "x".repeat(weft::storage::MAX_WIRE_VALUE_BYTES + 20 * 1024);
+    serde_json::to_vec(&json!({ "items": text })).expect("json")
+}
+
+async fn oversize_text_body(rig: FakeRig) -> WeftResult<()> {
+    let big = oversize_json();
+    rig.respond_raw("GET", "/export.json", 200, "application/json; charset=utf-8", big.clone());
+    rig.wire_output("body");
+    rig.wire_output("file");
+    let outcome = rig
+        .run(&HttpRequestNode, json!({ "url": "https://api.example/export.json", "method": "GET" }))
+        .await
+        .ok()?;
+    assert!(outcome.outputs.get("body").is_none(), "a body past the wire limit never rides `body`");
+    let file = weft::StoredFile::from_value(outcome.output("file")?)?;
+    assert_eq!(file.mime_type, "application/json", "stored as the type the response named");
+    assert_eq!(&rig.stored_bytes(&file.key)?[..], &big[..], "the whole body, uncut");
+    assert_eq!(outcome.outputs["ok"], json!(true));
+    Ok(())
+}
+
+async fn oversize_text_body_unwired_file(rig: FakeRig) -> WeftResult<()> {
+    rig.respond_raw("GET", "/export.json", 200, "application/json", oversize_json());
+    rig.wire_output("body");
+    let err = rig
+        .run(&HttpRequestNode, json!({ "url": "https://api.example/export.json", "method": "GET" }))
+        .await
+        .failure()?;
+    assert!(err.contains("121 KB") && err.contains("at most 100 KB"), "it says the weight and the limit: {err}");
+    assert!(err.contains("Wire `file`"), "it names the fix: {err}");
     Ok(())
 }
 

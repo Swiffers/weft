@@ -8,7 +8,7 @@
 //! (`{"__weft_<image|video|audio|blob>__": {key, mimeType, sizeBytes,
 //! filename}}`, NO url). Bytes never ride the journal/pulse/task
 //! path; they flow worker<->box or client<->box directly. The key is
-//! the full tenant-local storage path (`exec/<execution_id>/<id>`,
+//! the full tenant-local storage path (`run/<run_id>/<id>`,
 //! `project/<project_id>/<id>`, `shared/<name>/<id>`), so a key
 //! alone names both the file and the scope wall that guards it.
 
@@ -27,6 +27,10 @@ pub mod key;
 pub mod diff;
 #[cfg(feature = "runtime")]
 pub mod media;
+/// The upload slot: a page's visitor uploading a file straight to storage,
+/// and the route that receives it.
+#[cfg(feature = "runtime")]
+pub mod slot;
 
 /// The most one port value may weigh on a wire, as JSON. Bytes belong
 /// in storage (a stored-file value is a few hundred bytes whatever the
@@ -40,19 +44,114 @@ pub const MAX_WIRE_VALUE_BYTES: usize = 100 * 1024;
 /// file is about to land. The broker sets it on every such refusal and the
 /// dispatcher passes it through, so a client tells "ask again shortly"
 /// apart from a conflict that will not resolve on its own.
+// SYNC: COMPLETING_HEADER <-> packages/weft-connect/src/core/upload.ts COMPLETING_HEADER
 pub const COMPLETING_HEADER: &str = "x-weft-completing";
 
-/// Whether `value` may travel a wire from port `port` of node `node`:
-/// the refusal names the port, the weight and where bytes belong.
-pub fn check_wire_value(node: &str, port: &str, value: &Value) -> Result<(), String> {
-    let bytes = serde_json::to_vec(value).map(|v| v.len()).unwrap_or(usize::MAX);
-    if bytes <= MAX_WIRE_VALUE_BYTES {
-        return Ok(());
+/// What `value` weighs on a wire: its compact JSON, in bytes. The one
+/// measure [`check_wire_value`] holds to [`MAX_WIRE_VALUE_BYTES`], so a
+/// node that bounds its own output with it can never disagree with the
+/// refusal. A value that does not serialize weighs `usize::MAX`.
+pub fn wire_weight<T: Serialize + ?Sized>(value: &T) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |v| v.len())
+}
+
+/// The longest start of `text`, cut between two characters, that
+/// weighs at most `budget` on a wire as a JSON string ([`wire_weight`]:
+/// its UTF-8 bytes, the two quotes, and every escape JSON writes, so a
+/// newline counts two). For a node that keeps a text under the limit
+/// itself and says it cut it. A budget below 2, the weight of the empty
+/// string, has no answer and is the caller's bug: it panics.
+pub fn cut_to_weight(text: &str, budget: usize) -> &str {
+    assert!(budget >= 2, "cut_to_weight: a budget of {budget} bytes holds not even the empty string's two quotes");
+    if wire_weight(text) <= budget {
+        return text;
     }
+    // Every place `text` can be cut, the empty start included.
+    let ends: Vec<usize> = text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len())).collect();
+    let fits = |i: usize| wire_weight(&text[..ends[i]]) <= budget;
+    // The weight only grows with the length, so a binary search finds
+    // the last cut that fits: `lo` fits (or is the empty start), `hi`
+    // does not.
+    let (mut lo, mut hi) = (0, ends.len() - 1);
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    &text[..ends[lo]]
+}
+
+/// `text` cut to at most `max_chars` characters, and further, with
+/// [`cut_to_weight`], to what one port carries when even that weighs
+/// more than a wire takes, with whether anything was cut. The shape of
+/// a node's text setting like `maxChars` paired with a `truncated`
+/// output.
+pub fn cap_text(text: &str, max_chars: usize) -> (&str, bool) {
+    let by_chars = match text.char_indices().nth(max_chars) {
+        Some((i, _)) => &text[..i],
+        None => text,
+    };
+    let cut = cut_to_weight(by_chars, MAX_WIRE_VALUE_BYTES);
+    (cut, cut.len() < text.len())
+}
+
+/// A weight said the way every refusal over the limit says it: "117
+/// KB, and a wire carries at most 100 KB". A refusal puts it after its
+/// own subject ("port 'x' of 'y' carries ...", "the rows weigh ...")
+/// and adds its own fix.
+pub fn wire_weight_said(bytes: usize) -> String {
+    format!("{} KB, and a wire carries at most {} KB", bytes.div_ceil(1024), MAX_WIRE_VALUE_BYTES / 1024)
+}
+
+/// When `value` weighs more than a wire carries, its weight said
+/// ([`wire_weight_said`]); `None` when it fits.
+pub fn over_wire<T: Serialize + ?Sized>(value: &T) -> Option<String> {
+    let bytes = wire_weight(value);
+    (bytes > MAX_WIRE_VALUE_BYTES).then(|| wire_weight_said(bytes))
+}
+
+/// Where a page of a list ends: the items from `offset` (past the end
+/// is an empty page at the end) that one wire carries as a list, at
+/// most `max` of them. `Err(index)` when the page's first item, at
+/// `index`, weighs more than a wire on its own: no page can hold it,
+/// so the caller decides, once, whether to refuse it or cut it. `max`
+/// is at least 1: an empty page would never move a cursor on, so a
+/// page size of 0 is the caller's bug and panics (a node refuses such a
+/// setting where it reads it).
+pub fn wire_page(items: &[Value], offset: usize, max: usize) -> Result<std::ops::Range<usize>, usize> {
+    assert!(max >= 1, "wire_page: a page of at most 0 items never moves on");
+    let start = offset.min(items.len());
+    // The list's own brackets, then each item and the comma before it.
+    let mut total = 2;
+    let mut end = start;
+    for item in items[start..].iter().take(max) {
+        let added = wire_weight(item) + usize::from(end > start);
+        if total + added > MAX_WIRE_VALUE_BYTES {
+            break;
+        }
+        total += added;
+        end += 1;
+    }
+    if end == start && start < items.len() {
+        return Err(start);
+    }
+    Ok(start..end)
+}
+
+/// Whether `value` may travel a wire from port `port` of node `node`:
+/// the refusal names the port, the weight, the limit, and the two ways
+/// out, since what fits depends on what the value is.
+pub fn check_wire_value(node: &str, port: &str, value: &Value) -> Result<(), String> {
+    let Some(weight) = over_wire(value) else {
+        return Ok(());
+    };
     Err(format!(
-        "port '{port}' of '{node}' carries {} KB; a wire carries at most {} KB. Bytes belong in a stored file: put the data in storage and send the file value",
-        bytes.div_ceil(1024),
-        MAX_WIRE_VALUE_BYTES / 1024
+        "port '{port}' of '{node}' carries {weight}. Return less: one page of it with where the next \
+         one starts, or a part that says it was cut. Or store the data and send the stored file \
+         instead, whose value weighs a few hundred bytes whatever the file holds"
     ))
 }
 
@@ -247,22 +346,22 @@ pub async fn collect_stream(mut stream: ByteStream) -> std::io::Result<bytes::By
 
 /// Which key-prefix wall a storage handle operates inside. One box
 /// per tenant; the scope picks the prefix, the caller's verified
-/// identity picks the values inside it (its own execution / project).
+/// identity picks the values inside it (its own run / project).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StorageScope {
-    /// `exec/<execution_id>/`: walled to a single run, swept on terminate
+    /// `run/<run_id>/`: walled to a single run, swept on terminate
     /// unless kept. The default.
     #[default]
-    Execution,
+    Run,
     /// `project/<project_id>/`: outlives runs, shared across the
-    /// project's executions, wiped by `weft clean` / `weft rm`.
+    /// project's runs, wiped by `weft clean` / `weft rm`.
     Project,
     /// `shared/<name>/`: tenant-scoped shared space. Projects that
     /// name the same `name` meet in the same prefix; first use by a
     /// project auto-grants it. Opt-in by naming.
     Shared { name: String },
-    /// `asset/<project_id>/`: the project's PUBLISHED ASSETS, the storage
+    /// `asset/<sha256>`: the project's PUBLISHED ASSETS, named by content, the storage
     /// copies of files the source references via `@asset`. Current source
     /// references protect their copies; replaced/removed ones receive the
     /// default access-renewed TTL (content-hash ids). Workers READ this
@@ -295,7 +394,7 @@ impl StorageScope {
 
 /// How long a stored file lives, in any scope but the asset one. Every
 /// access bumps the expiry back to now + TTL, so actively-used files
-/// never expire. On an execution file, keeping it at all is also what
+/// never expire. On a run file, keeping it at all is also what
 /// makes it survive the end of its run. `Default` resolves to
 /// [`DEFAULT_KEEP_TTL_SECS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,12 +443,12 @@ pub struct StoredFileMeta {
     #[serde(rename = "sizeBytes")]
     pub size_bytes: u64,
     pub filename: String,
-    /// True iff this exec-scoped file is flagged to survive the
+    /// True iff this run-scoped file is flagged to survive the
     /// terminate sweep. Always false in the other scopes, which outlive
     /// runs without a flag (their lifetime is `keep_ttl_secs`).
     pub keep: bool,
     /// Unix seconds at which this file expires, renewed on access. `None`
-    /// = no expiry (a file stored with no lifetime outside the execution
+    /// = no expiry (a file stored with no lifetime outside the run
     /// scope, a current source asset, `KeepTtl::Never`).
     #[serde(rename = "expiresAtUnix")]
     pub expires_at_unix: Option<i64>,
@@ -377,7 +476,8 @@ fn first_file_version() -> u64 {
 /// concrete `__weft_<kind>__` marker (see `to_value`). The ONLY thing
 /// that flows on edges / into the journal for a stored file. Carries
 /// NO url: byte access always goes through an authenticated fetch (or
-/// an explicit, expiring presigned URL a node deliberately mints). The
+/// an expiring link a node deliberately asks for, `internal_link` /
+/// `external_link`). The
 /// concrete kind (Image/Video/Audio/Blob) is derived from `mime_type`.
 // SYNC: StoredFile <-> packages/weft-graph/src/protocol.ts FileValueWire
 //       (per-kind markers __weft_image__/video/audio/blob, parseFileValue)
@@ -392,10 +492,53 @@ pub struct StoredFile {
     /// Which write of the file's content this value names. A key is
     /// never reused and every change of the bytes bumps the version, so
     /// (key, version) is one exact content: what an edit compares
-    /// before it writes, and what a re-run that reuses a step's output
+    /// before it writes, and what a re-run that reuses a node's output
     /// checks the file still holds.
     #[serde(default = "first_file_version")]
     pub version: u64,
+    /// How long a link handed out for this file lives, in seconds, when
+    /// whoever made the value chose (`StorageHandle::link_lifetime`, the
+    /// `LinkOptions` node); absent, [`DEFAULT_LINK_SECS`]. It rides the
+    /// value, not the stored file: two values of one file may hand out
+    /// links of different lives.
+    #[serde(
+        default,
+        rename = "linkSecs",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "link_secs_in_range"
+    )]
+    pub link_secs: Option<u64>,
+}
+
+/// A value's `linkSecs` read off the wire, refused when no link can live
+/// that long ([`checked_link_secs`]).
+fn link_secs_in_range<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    Option::<u64>::deserialize(deserializer)?
+        .map(checked_link_secs)
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
+/// How long a link to a stored file lives when its value names no
+/// lifetime ([`StoredFile::link_secs`]).
+pub const DEFAULT_LINK_SECS: u64 = 15 * 60;
+
+/// The longest a link to a stored file lives: seven days, the longest a
+/// storage signature allows.
+pub const MAX_LINK_SECS: u64 = 7 * 24 * 3600;
+
+/// `secs` when a link can live that long (one second to
+/// [`MAX_LINK_SECS`]), else the refusal naming the range. Checked
+/// wherever a lifetime enters a value, so a value never carries one
+/// that every link made from it would fail on. Zero reads "under a
+/// second": a lifetime handed in finer than whole seconds (a `Duration`
+/// of half a second) arrives here as 0.
+pub fn checked_link_secs(secs: u64) -> Result<u64, String> {
+    match secs {
+        0 => Err("a link lives 1 second to 7 days, not under a second".to_string()),
+        secs if secs <= MAX_LINK_SECS => Ok(secs),
+        secs => Err(format!("a link lives 1 second to 7 days, not {secs} seconds")),
+    }
 }
 
 impl From<&StoredFileMeta> for StoredFile {
@@ -406,6 +549,7 @@ impl From<&StoredFileMeta> for StoredFile {
             size_bytes: meta.size_bytes,
             filename: meta.filename.clone(),
             version: meta.version,
+            link_secs: None,
         }
     }
 }
@@ -498,7 +642,10 @@ pub fn stored_files_within(value: &Value) -> Vec<StoredFile> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileHandle {
     /// The bytes live in the storage bucket under this tenant-local key.
-    Key(String),
+    /// `link_secs` is the value's own link lifetime
+    /// ([`StoredFile::link_secs`]), which every link handed out for it
+    /// lives.
+    Key { key: String, link_secs: Option<u64> },
     /// The bytes live at this external URL, fetched directly by the worker.
     Url {
         url: String,
@@ -511,6 +658,12 @@ pub enum FileHandle {
 }
 
 impl FileHandle {
+    /// The handle of the stored file at `key`, handing out links of the
+    /// default lifetime.
+    pub fn key(key: impl Into<String>) -> Self {
+        FileHandle::Key { key: key.into(), link_secs: None }
+    }
+
     /// Parse a file value into its handle. Accepts a bare key string (a node
     /// held onto a key), a `key`-backed marker, or a `url`-backed marker.
     /// Errors loud on a value that is neither, or a marker whose only handle
@@ -521,7 +674,7 @@ impl FileHandle {
             if s.is_empty() {
                 return Err(WeftError::Input("empty storage key".into()));
             }
-            return Ok(FileHandle::Key(s.to_string()));
+            return Ok(FileHandle::key(s));
         }
         let obj = value.as_object().ok_or_else(|| {
             WeftError::Input(format!(
@@ -545,7 +698,16 @@ impl FileHandle {
             if key.is_empty() {
                 return Err(WeftError::Input("file marker has an empty key".into()));
             }
-            return Ok(FileHandle::Key(key.to_string()));
+            let link_secs = match payload.get("linkSecs") {
+                None | Some(Value::Null) => None,
+                Some(secs) => {
+                    let secs = secs.as_u64().ok_or_else(|| {
+                        WeftError::Input(format!("file marker's linkSecs is not a whole number of seconds: {secs}"))
+                    })?;
+                    Some(checked_link_secs(secs).map_err(WeftError::Input)?)
+                }
+            };
+            return Ok(FileHandle::Key { key: key.to_string(), link_secs });
         }
         if let Some(url) = payload.get("url").and_then(Value::as_str) {
             if url.is_empty() {
@@ -616,10 +778,111 @@ pub struct IdentityLookupResponse {
     pub file: Option<StoredFileMeta>,
 }
 
-/// `POST /v1/storage/presign`: a presigned GET URL for one file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PresignResponse {
+/// A link to a stored file: where to fetch it, and whether the open
+/// internet can (a provider handed a link it cannot open gets the bytes
+/// in its request instead). What `StorageHandle::internal_link` and
+/// `external_link` answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileLink {
     pub url: String,
+    pub public: bool,
+}
+
+/// The answer to a [`LinkRequest`]: the link, and the record of the file
+/// it opens (what a send beside the link names it by).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkAnswer {
+    pub link: FileLink,
+    pub file: StoredFileMeta,
+}
+
+/// Who opens a link to a stored file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkReach {
+    /// Node code inside the install: straight to storage, at the address
+    /// a worker reaches it by, never through a tunnel.
+    Internal,
+    /// Anything outside the install's containers (a browser, an app, an
+    /// outside service): the project's visitor address, else weft's
+    /// tunnel, else the install's own address (`public: false`); on a
+    /// cloud install, the store's own link.
+    External,
+}
+
+/// `POST /v1/storage/link`: a link to one file for `reach`, living
+/// `ttl_secs` (the value's `linkSecs`, else [`DEFAULT_LINK_SECS`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkRequest {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+    pub reach: LinkReach,
+}
+
+/// `POST /v1/storage/copy`: copy the stored file at `key` into `scope`
+/// inside storage. `identity` and `keep` as for an upload's begin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopyRequest {
+    pub key: String,
+    pub scope: StorageScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<KeepTtl>,
+}
+
+/// Who a link the control plane asks for is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LinkReader {
+    /// A person's machine: the CLI, the editor, a browser beside them.
+    Person,
+    /// weft's own process (the dispatcher reading a version's file).
+    Runtime,
+    /// Somebody outside the install reaching it as `project`'s callers
+    /// do (a browser extension showing a form's file): the link a node's
+    /// `external_link` gives.
+    Outside { project: String },
+}
+
+/// `POST /v1/storage/admin/link`: a download link for one file, for
+/// `reader`, answered as a [`PresignResult`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminLinkRequest {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+    pub reader: LinkReader,
+}
+
+/// The `Content-Disposition` every link weft hands out for a stored file
+/// answers with: a download, under the file's name. Opening a link in a
+/// tab never shows the file under the address it came from, whatever its
+/// type; an `<img>`, `<video>` or `<audio>` ignores it and still shows
+/// or plays the file. The quoted name is for old clients (ASCII only,
+/// quotes and backslashes dropped), the encoded one the exact name.
+pub fn download_disposition(filename: &str) -> String {
+    format!("attachment; {}", disposition_filename(filename))
+}
+
+/// `filename="..."; filename*=UTF-8''...` for `filename`, what a
+/// `Content-Disposition` names a file by.
+pub fn disposition_filename(filename: &str) -> String {
+    let plain: String = filename
+        .chars()
+        .map(|c| if c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\' { c } else { '_' })
+        .collect();
+    let encoded: String = filename
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'~' => (b as char).to_string(),
+            other => format!("%{other:02X}"),
+        })
+        .collect();
+    format!("filename=\"{plain}\"; filename*=UTF-8''{encoded}")
 }
 
 // The upload contract is multipart: `begin` mints the key and (for a known
@@ -635,6 +898,7 @@ pub struct PresignResponse {
 /// quota immediately); `None` for an unknown-length stream (each part is
 /// charged as it is reserved).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadBeginRequest {
     pub scope: StorageScope,
     pub mime_type: String,
@@ -660,6 +924,7 @@ pub struct UploadBeginRequest {
 /// replaced file's value (its own key, its new size). The file keeps its
 /// key, scope, name, type and lifetime; only its content changes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadReplaceRequest {
     pub key: String,
     #[serde(default)]
@@ -709,7 +974,9 @@ pub enum ReplaceOutcome {
 /// answers `already_stored: true` with the existing key: there is nothing to
 /// transfer, the caller must not reserve parts, and `part_size` is a
 /// meaningless 0.
+// SYNC: UploadBeginResponse <-> packages/weft-connect/src/core/upload.ts UploadBeginAnswer
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadBeginResponse {
     pub key: String,
     pub part_size: u64,
@@ -741,6 +1008,7 @@ pub struct UploadBeginResponse {
 /// unfinishable until the hourly sweep removed it. Now they both ask for
 /// part 3, both write the same bytes to it, and whichever completes
 /// first is the answer for both.
+// SYNC: UploadPartsRequest <-> packages/weft-connect/src/core/upload.ts UploadPartsBody
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadPartsRequest {
     pub key: String,
@@ -749,7 +1017,9 @@ pub struct UploadPartsRequest {
 
 /// One part a caller is about to upload: which part of the file it is,
 /// and how many bytes it will PUT.
+// SYNC: PartAsk <-> packages/weft-connect/src/core/upload.ts PartAsk
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PartAsk {
     /// 1-based, and it IS the position: part `n` of an upload whose part
     /// size is `p` carries the file's bytes from `(n - 1) * p`.
@@ -759,7 +1029,9 @@ pub struct PartAsk {
 
 /// One reserved part: its assigned number, its exact byte size, and the
 /// presigned URL to PUT exactly that many bytes to.
+// SYNC: PresignedPart <-> packages/weft-connect/src/core/upload.ts PresignedPart
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PresignedPart {
     pub part_number: i32,
     pub size_bytes: u64,
@@ -779,6 +1051,7 @@ pub struct PresignedPart {
     pub url: String,
 }
 
+// SYNC: UploadPartsResponse <-> packages/weft-connect/src/core/upload.ts UploadPartsAnswer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadPartsResponse {
     pub parts: Vec<PresignedPart>,
@@ -787,7 +1060,9 @@ pub struct UploadPartsResponse {
 /// `POST /v1/storage/upload/part-done`: report a landed part. The etag is the
 /// bucket's response header VERBATIM (quotes included); the server records the
 /// part's size from its own reservation, never from the caller.
+// SYNC: PartDoneRequest <-> packages/weft-connect/src/core/upload.ts PartDoneBody
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PartDoneRequest {
     pub key: String,
     pub part_number: i32,
@@ -796,6 +1071,7 @@ pub struct PartDoneRequest {
 
 /// `POST /v1/storage/upload/complete`: finalize the upload (all reserved
 /// parts must have been reported done). Responds with the stored-file value.
+// SYNC: UploadCompleteRequest <-> packages/weft-connect/src/core/upload.ts UploadKeyBody
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadCompleteRequest {
     pub key: String,
@@ -803,12 +1079,15 @@ pub struct UploadCompleteRequest {
 
 /// `POST /v1/storage/upload/resume`: after an interruption, learn which
 /// reserved parts never landed and get fresh URLs for exactly those.
+// SYNC: UploadResumeRequest <-> packages/weft-connect/src/core/upload.ts UploadKeyBody
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadResumeRequest {
     pub key: String,
 }
 
+// SYNC: UploadResumeResponse <-> packages/weft-connect/src/core/upload.ts UploadResumeAnswer
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadResumeResponse {
     pub part_size: u64,
     pub missing: Vec<PresignedPart>,
@@ -828,6 +1107,7 @@ pub struct UploadResumeResponse {
 
 /// `POST /v1/storage/upload/abort`: cancel an in-flight upload, freeing its
 /// quota reservation and discarding any landed parts.
+// SYNC: UploadAbortRequest <-> packages/weft-connect/src/core/upload.ts UploadKeyBody
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadAbortRequest {
     pub key: String,
@@ -841,62 +1121,12 @@ pub struct DownloadUrlResponse {
     pub url: String,
 }
 
-/// `POST /v1/storage/keep`: extend an execution-scoped file's lifetime past the
+/// `POST /v1/storage/keep`: extend a run-scoped file's lifetime past the
 /// run that created it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeepRequest {
     pub key: String,
     pub ttl: KeepTtl,
-}
-
-/// `POST /v1/storage/presign`: mint a temporary link to a stored file, scoped
-/// to the one key with a short TTL: the internet-reachable link when the
-/// install serves one, else one signed for the install's own address.
-/// `POST /v1/storage/public-link` takes the same shape plus `reach`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PresignRequest {
-    pub key: String,
-    pub ttl_secs: Option<u64>,
-    /// Who the link is for (public-link only; presign ignores it).
-    #[serde(default)]
-    pub reach: LinkReach,
-}
-
-/// Who has to be able to open a minted link. The two askers reach
-/// different addresses: a provider on the open internet cannot open a
-/// loopback link, while the browser that just called a local install's
-/// route reached it at that very loopback address.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LinkReach {
-    /// The open internet (a provider fetching media): only an address
-    /// the internet resolves counts; a local install answers `None`.
-    #[default]
-    Internet,
-    /// A caller of this install (the browser a route answers). `base` is
-    /// the address that caller's request came in on
-    /// ([`crate::caller::LiveRequest::base_url`]): the link is built on
-    /// it, so a browser on the loopback port gets a loopback link and one
-    /// on the tunnel gets a tunnel link. `None` (a run no request
-    /// started) falls back to the install's configured address: the
-    /// internet one when there is one, else its own stable base.
-    Caller {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        base: Option<String>,
-    },
-}
-
-/// `POST /v1/storage/public-link`: mint a temporary URL for the file
-/// at whatever address the request's [`LinkReach`] asks for. Under
-/// `Internet` that is an address the internet resolves, and `url: None`
-/// means there is none (no publicly addressable store and no public
-/// relay), so the caller falls back to inline bytes. Under `Caller` it
-/// is that same address when there is one, else the install's own base,
-/// loopback included, so `None` there means the install has neither.
-/// Same request shape as presign.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PublicLinkResponse {
-    pub url: Option<String>,
 }
 
 // The broker's control-plane admin envelopes (the dispatcher's CLI-verb proxy:
@@ -920,32 +1150,23 @@ pub struct TenantUsage {
     pub file_count: u64,
 }
 
-/// `POST /v1/storage/admin/presign` response, returned verbatim as the
-/// dispatcher's `/storage/files/download` response (the presign result IS the
+/// `POST /v1/storage/admin/link` response, returned verbatim as the
+/// dispatcher's `/storage/files/download` response (the link IS the
 /// download handshake; no separate same-fields struct). Carries the file's
-/// friendly name and total size besides the URL: a presigned S3 GET has no
-/// `x-weft-meta`, so the CLI gets these from the handshake.
+/// friendly name and total size besides the link, so a client names the
+/// file and can resume it (`Range`) without a request of its own first.
+// SYNC: PresignResult <-> packages/weft-graph/src/protocol.ts StoredFileDownload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresignResult {
     pub url: String,
     pub filename: String,
     #[serde(rename = "sizeBytes")]
     pub size_bytes: u64,
-}
-
-/// `POST /v1/storage/admin/download-link` response: a minted relay
-/// token (resolved at the dispatcher's `/public/files/{token}` route)
-/// plus the file's friendly name and size. The relay link is what a
-/// BROWSER download rides: unlike a presigned bucket URL, whose SigV4
-/// signature covers the exact host the browser must send, a token URL
-/// survives any port forward, tunnel, or proxy rewrite between the
-/// user and the dispatcher.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DownloadLinkResult {
-    pub token: String,
-    pub filename: String,
-    #[serde(rename = "sizeBytes")]
-    pub size_bytes: u64,
+    /// The file's version when the link was made: a download that asks
+    /// for a fresh link to carry on holds it to the same content.
+    pub version: u64,
+    /// Whether the open internet opens the link (see [`FileLink`]).
+    pub public: bool,
 }
 
 /// `POST /v1/storage/admin/wipe-prefix`: wipe a whole scope/tenant prefix.
@@ -962,7 +1183,7 @@ pub struct WipePrefixResponse {
 // The admin upload surface: the dispatcher drives the same multipart upload
 // contract as a worker, on behalf of a tenant's editor session (a file-drop
 // config field). Editor uploads are always PROJECT-scoped (there is no
-// execution at edit time, and project files persist without a keep flag), so
+// run at edit time, and project files persist without a keep flag), so
 // `begin` names the project explicitly; every later verb is key-addressed and
 // carries only the acting tenant (the key itself names project + tenant, and
 // the broker re-checks they match).
@@ -1025,6 +1246,7 @@ pub struct AssetsPublished {
 /// `content_hash` is the sha256 that becomes the key id, so content the
 /// tenant already stores, from whichever project, answers "already stored".
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AssetUploadBeginRequest {
     pub mime_type: String,
     pub filename: String,
@@ -1044,10 +1266,12 @@ pub struct AssetsHeldRequest {
 
 /// The answer to [`AssetsHeldRequest`]: `content hash -> stored key` for
 /// every named content the tenant stores whole (an upload still in flight
-/// is not held).
+/// is not held), and for every other one the key its upload is stored
+/// under (`unheld`), which a check that uploads nothing stands in with.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AssetsHeldResponse {
     pub keys: std::collections::BTreeMap<String, String>,
+    pub unheld: std::collections::BTreeMap<String, String>,
 }
 
 /// `POST /storage/files/download`: a download link for one of the
@@ -1062,7 +1286,7 @@ pub struct DownloadRequest {
 }
 
 /// `DELETE /storage/files`: exactly one of `key` (one file) or `prefix`
-/// (a whole space, e.g. `shared/team/` or `exec/<execution_id>/`).
+/// (a whole space, e.g. `shared/team/` or `run/<run_id>/`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoveFilesRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1077,18 +1301,18 @@ pub struct FilesRemoved {
     pub removed: u64,
 }
 
-/// `POST /v1/storage/admin/sweep-exec`: terminate-sweep one execution's un-kept
-/// exec files (crashed uploads reaped; completed files stamped to expire
+/// `POST /v1/storage/admin/sweep-run`: terminate-sweep one run's un-kept
+/// run files (crashed uploads reaped; completed files stamped to expire
 /// after the post-run linger).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SweepExecRequest {
+pub struct SweepRunRequest {
     pub tenant: String,
-    pub execution_id: String,
+    pub run_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SweepExecResponse {
-    /// Rows removed outright (crashed/abandoned uploads under the execution).
+pub struct SweepRunResponse {
+    /// Rows removed outright (crashed/abandoned uploads under the run).
     pub swept: u64,
     /// Completed un-kept files stamped with the post-run linger expiry
     /// (deleted by the expiry sweep once it passes).
@@ -1105,7 +1329,7 @@ pub struct SweepExecResponse {
 ///
 /// This is the one place the language looks at BYTES to name a type. The
 /// stored MIME of a synced asset comes from here first (a PNG named
-/// `.txt` is still `image/png`), and [`check_declared_kind`] holds an
+/// `.txt` is still `image/png`), and [`received_file`] holds an
 /// `@asset` declaration to it; it never picks a marker.
 pub fn sniff_mime(head: &[u8]) -> Option<&'static str> {
     let starts = |sig: &[u8]| head.starts_with(sig);
@@ -1195,54 +1419,181 @@ pub fn sniff_mime(head: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// The kind of file a byte prefix announces itself as: [`sniff_mime`]
-/// read as a kind, and only for the media kinds (a PDF or a zip has a
-/// signature but is a `Blob`, which no `@asset` declaration is held to).
-pub fn sniff_file_kind(head: &[u8]) -> Option<crate::weft_type::FileKind> {
+/// What a file handed over for a place declared `declared` (a caller's
+/// upload, an `@asset` in source) is stored as: its media type and the
+/// kind of file value it becomes, or why the place cannot take it. An
+/// `Image` declaration over video bytes is refused naming both kinds,
+/// bytes with no known signature cannot be a declared media kind, and a
+/// union is held to its file members (`Image | Null` takes only an
+/// image, `Media` any of image, video, audio).
+///
+/// The error names WHAT is wrong and nothing about where it came from:
+/// a caller must never be shown a piece of weft syntax their request has
+/// nothing to do with. Each caller frames it.
+///
+/// The stored type is the one the sender stated (`claimed`: a request's
+/// `Content-Type`, a `data:` link's), so a `.csv` stays `text/csv`. The
+/// first bytes only fill it in when none was stated (two containers hold
+/// either video or audio, WebM and MP4, and the declaration picks which),
+/// and catch a stated media kind the bytes plainly are not (`image/png`
+/// over an mp3). With nothing stated and nothing recognized, the file is
+/// `application/octet-stream`. A place that admits `Blob` but not the kind
+/// the bytes are takes them as plain bytes when nothing was stated; a
+/// stated type the place does not admit is refused. A declaration that is
+/// not a file type takes the file as it is (its caller decides).
+pub fn received_file(
+    bytes: &[u8],
+    claimed: Option<&str>,
+    declared: &crate::weft_type::WeftType,
+) -> Result<(String, crate::weft_type::FileKind), String> {
     use crate::weft_type::FileKind;
-    match FileKind::from_mime(sniff_mime(head)?) {
-        FileKind::Blob => None,
-        kind => Some(kind),
+    let admitted = declared.admitted_file_kinds();
+    let expected = || admitted.iter().map(|k| k.primitive().to_string()).collect::<Vec<_>>().join(" or ");
+    let sniffed = sniff_mime(bytes);
+    // Every kind the bytes could be: one, or either of a container's two.
+    let byte_kinds: Vec<FileKind> = match sniffed {
+        Some(mime) if audio_or_video(mime).is_some() => vec![FileKind::Video, FileKind::Audio],
+        Some(mime) => vec![FileKind::from_mime(mime)],
+        None => Vec::new(),
+    };
+    // A media place holds the bytes to its kinds whatever was stated.
+    if !admitted.is_empty() && !admitted.contains(&FileKind::Blob) && !byte_kinds.iter().any(|k| admitted.contains(k)) {
+        return Err(match byte_kinds.first() {
+            Some(found) => format!("the bytes are {}, not the {} that was declared", found.primitive(), expected()),
+            None => format!(
+                "the bytes carry no {} signature this weft knows (declare it Blob to skip the check)",
+                expected()
+            ),
+        });
+    }
+    // A stated type that names no media kind (`application/octet-stream`,
+    // curl's form type) says nothing about bytes that ARE a media kind a
+    // place needs: those are read off the bytes, as when nothing was
+    // stated. Any other statement stands.
+    let stated = claimed.map(str::trim).filter(|mime| !mime.is_empty()).filter(|mime| {
+        FileKind::from_mime(mime) != FileKind::Blob
+            || admitted.is_empty()
+            || admitted.contains(&FileKind::Blob)
+            || !byte_kinds.iter().any(|k| admitted.contains(k))
+    });
+    let mime = match (stated, sniffed) {
+        // The media type itself is case-blind (`Image/PNG` is `image/png`):
+        // it is stored lower-cased, its parameters as sent. A container
+        // stated as the half the place does not take (`video/webm` over a
+        // voice clip for an Audio place) is the half it does.
+        (Some(stated), _) => {
+            let (essence, params) = stated.split_once(';').map_or((stated, ""), |(e, p)| (e, p));
+            let essence = essence.trim().to_ascii_lowercase();
+            let essence = match sniffed.and_then(audio_or_video) {
+                Some(container) if [container.0, container.1].contains(&essence.as_str()) => {
+                    container_half(essence, container, &admitted)
+                }
+                _ => essence,
+            };
+            if params.is_empty() { essence } else { format!("{essence};{params}") }
+        }
+        (None, Some(sniffed)) => {
+            let fits = |kind: FileKind| admitted.is_empty() || admitted.contains(&kind);
+            match audio_or_video(sniffed) {
+                Some((_, audio)) if fits(FileKind::Audio) && !fits(FileKind::Video) => audio.to_string(),
+                Some((video, _)) if fits(FileKind::Video) => video.to_string(),
+                _ if fits(FileKind::from_mime(sniffed)) => sniffed.to_string(),
+                _ => OCTET_STREAM.to_string(),
+            }
+        }
+        (None, None) => OCTET_STREAM.to_string(),
+    };
+    let kind = FileKind::from_mime(&mime);
+    if !admitted.is_empty() && !admitted.contains(&kind) {
+        return Err(format!("it was sent as {mime}, which is not the {} that was declared", expected()));
+    }
+    if kind != FileKind::Blob && !byte_kinds.is_empty() && !byte_kinds.contains(&kind) {
+        return Err(format!("it was sent as {mime}, but the bytes are {}", byte_kinds[0].primitive()));
+    }
+    Ok((mime, kind))
+}
+
+const OCTET_STREAM: &str = "application/octet-stream";
+
+/// The media type a stored file of type `mime` is handed over as to a
+/// place of type `declared`, or why it does not fit. The file's type is
+/// already settled (read off its bytes when it was stored,
+/// [`received_file`]), so this holds it to the place's file kinds: a place
+/// that takes `Blob` takes any file, a media place its own kinds, and a
+/// container that holds either video or audio (WebM, MP4) is handed over
+/// as the half the place takes. The media type comes back lower-cased as
+/// [`received_file`] stores it, its parameters as they were. A
+/// declaration that is not a file type is refused: a file has no place
+/// there. The refusal names both types and nothing about where the file
+/// came from; each caller frames it.
+pub fn fit_mime(mime: &str, declared: &crate::weft_type::WeftType) -> Result<String, String> {
+    use crate::weft_type::FileKind;
+    let admitted = declared.admitted_file_kinds();
+    if admitted.is_empty() {
+        return Err(format!("the place is declared {declared}, which takes no file"));
+    }
+    let (essence, params) = mime.split_once(';').map_or((mime, ""), |(e, p)| (e, p));
+    let essence = essence.trim().to_ascii_lowercase();
+    let essence = match audio_or_video(&essence) {
+        Some(container) => container_half(essence, container, &admitted),
+        None => essence,
+    };
+    let kind = FileKind::from_mime(&essence);
+    if !admitted.contains(&FileKind::Blob) && !admitted.contains(&kind) {
+        let expected = admitted.iter().map(|k| k.primitive().to_string()).collect::<Vec<_>>().join(" or ");
+        return Err(format!("{essence} is {}, not the {expected} that was declared", kind.primitive()));
+    }
+    Ok(if params.is_empty() { essence } else { format!("{essence};{params}") })
+}
+
+/// Does a file already handed over as `mime` ([`fit_mime`]'s answer for the
+/// place it first went to) fit a place of type `declared` as it is? A
+/// handed-over file is one type, so one that fits only as the other half
+/// of its container (an `audio/webm` sent on to a Video place) is refused
+/// with the type it would need, as a file that does not fit at all is.
+pub fn fits_as_handed_over(mime: &str, declared: &crate::weft_type::WeftType) -> Result<(), String> {
+    let fitted = fit_mime(mime, declared)?;
+    if fitted != mime {
+        return Err(format!("it was handed over as {mime}, and the {declared} here takes it only as {fitted}"));
+    }
+    Ok(())
+}
+
+/// The half of `container` (its video and audio types) a file stated as
+/// `essence`, one of the two, is held as by a place admitting `admitted`:
+/// the stated half, unless the place takes only the other.
+fn container_half(
+    essence: String,
+    (video, audio): (&'static str, &'static str),
+    admitted: &[crate::weft_type::FileKind],
+) -> String {
+    use crate::weft_type::FileKind;
+    let kind = FileKind::from_mime(&essence);
+    let other = if kind == FileKind::Audio { (FileKind::Video, video) } else { (FileKind::Audio, audio) };
+    if !admitted.is_empty() && !admitted.contains(&kind) && admitted.contains(&other.0) {
+        other.1.to_string()
+    } else {
+        essence
     }
 }
 
-/// Hold a file's bytes to the kind something declared for them: an
-/// `Image` declaration over video bytes is a loud error naming both
-/// kinds, and bytes with no known signature cannot be the declared kind
-/// either. `Blob` checks nothing (it is the declaration for "bytes of
-/// any shape"), and so does a declaration that is not a file type.
-///
-/// The error names WHAT is wrong and nothing about where it came from,
-/// because the same check runs over an `@asset` in source and over a
-/// caller's upload, and a caller must never be shown a piece of weft
-/// syntax their request has nothing to do with. Each caller frames it.
-pub fn check_declared_kind(
-    declared: &crate::weft_type::WeftType,
-    head: &[u8],
-) -> Result<(), String> {
-    use crate::weft_type::FileKind;
-    let Some(kind) = declared.concrete_file_kind() else { return Ok(()) };
-    if kind == FileKind::Blob {
-        return Ok(());
-    }
-    match sniff_file_kind(head) {
-        Some(found) if found == kind => Ok(()),
-        Some(found) => Err(format!(
-            "the bytes are {}, not the {} that was declared",
-            found.primitive(),
-            kind.primitive()
-        )),
-        None => Err(format!(
-            "the bytes carry no {} signature this weft knows (declare it Blob to skip \
-             the check)",
-            kind.primitive()
-        )),
+/// The (video, audio) media types of a container that holds either,
+/// read from its type.
+pub fn audio_or_video(mime: &str) -> Option<(&'static str, &'static str)> {
+    match mime {
+        "video/webm" | "audio/webm" => Some(("video/webm", "audio/webm")),
+        "video/mp4" | "audio/mp4" => Some(("video/mp4", "audio/mp4")),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod sniff_tests {
-    use super::{check_declared_kind, sniff_file_kind, sniff_mime};
+    use super::{received_file, sniff_mime};
+
+    fn check_declared_kind(declared: &WeftType, head: &[u8]) -> Result<(), String> {
+        received_file(head, None, declared).map(|_| ())
+    }
     use crate::weft_type::{FileKind, WeftPrimitive, WeftType};
 
     #[test]
@@ -1272,6 +1623,7 @@ mod sniff_tests {
 
     #[test]
     fn signatures_name_their_kind() {
+        let sniff_file_kind = |head: &[u8]| sniff_mime(head).map(FileKind::from_mime).filter(|k| *k != FileKind::Blob);
         assert_eq!(sniff_file_kind(b"\x89PNG\r\n\x1a\n...."), Some(FileKind::Image));
         assert_eq!(sniff_file_kind(b"\xff\xd8\xff\xe0JFIF"), Some(FileKind::Image));
         assert_eq!(sniff_file_kind(b"RIFF\0\0\0\0WEBPVP8 "), Some(FileKind::Image));
@@ -1300,6 +1652,60 @@ mod sniff_tests {
         assert!(check_declared_kind(&WeftType::primitive(WeftPrimitive::String), b"ID3").is_ok());
     }
 
+    /// A union is held to its file members: an optional image still
+    /// takes only an image, and `Media` takes any media kind but no
+    /// unrecognized bytes. `File` admits Blob, so it checks nothing.
+    #[test]
+    fn a_union_is_held_to_its_file_members() {
+        let optional_image = WeftType::parse("Image | Null").unwrap();
+        assert!(check_declared_kind(&optional_image, b"\x89PNG\r\n\x1a\n").is_ok());
+        let e = check_declared_kind(&optional_image, b"ID3\x04").unwrap_err();
+        assert!(e.contains("are Audio, not the Image"), "{e}");
+        let media = WeftType::parse("Media").unwrap();
+        assert!(check_declared_kind(&media, b"ID3\x04").is_ok());
+        let e = check_declared_kind(&media, b"just text").unwrap_err();
+        assert!(e.contains("no Image or Video or Audio signature"), "{e}");
+        assert!(check_declared_kind(&WeftType::parse("File").unwrap(), b"just text").is_ok());
+    }
+
+    /// The bytes decide the stored type; a sender's claim only picks
+    /// audio or video in a container that holds either.
+    #[test]
+    fn a_received_file_keeps_the_type_it_was_sent_as() {
+        use crate::weft_type::FileKind;
+        let file = WeftType::parse("File").unwrap();
+        let png = b"\x89PNG\r\n\x1a\n";
+        assert_eq!(received_file(png, Some("image/x-anything"), &file).unwrap(), ("image/x-anything".into(), FileKind::Image));
+        assert_eq!(received_file(b"a,b\n1,2", Some("text/csv"), &file).unwrap(), ("text/csv".into(), FileKind::Blob));
+        // Nothing stated: the bytes fill it in, else plain bytes.
+        assert_eq!(received_file(png, None, &file).unwrap(), ("image/png".into(), FileKind::Image));
+        assert_eq!(received_file(b"a,b\n1,2", None, &file).unwrap(), ("application/octet-stream".into(), FileKind::Blob));
+        // A generic statement over a picture for an Image place: the
+        // bytes decide; an upper-case statement reads as its kind.
+        let image = WeftType::parse("Image").unwrap();
+        assert_eq!(received_file(png, Some("application/octet-stream"), &image).unwrap(), ("image/png".into(), FileKind::Image));
+        assert_eq!(received_file(png, Some("Image/PNG"), &image).unwrap(), ("image/png".into(), FileKind::Image));
+        // A stated media kind the bytes plainly are not is refused.
+        let e = received_file(b"ID3\x04 an mp3", Some("image/png"), &file).unwrap_err();
+        assert!(e.contains("sent as image/png, but the bytes are Audio"), "{e}");
+        // A Blob place takes unrecognized or unstated bytes as plain bytes,
+        // and refuses a stated type it does not admit.
+        let blob = WeftType::parse("Blob").unwrap();
+        assert_eq!(received_file(png, None, &blob).unwrap(), ("application/octet-stream".into(), FileKind::Blob));
+        let e = received_file(png, Some("image/png"), &blob).unwrap_err();
+        assert!(e.contains("sent as image/png, which is not the Blob"), "{e}");
+        // WebM holds either: the statement, then the declaration, picks.
+        let webm = b"\x1aE\xdf\xa3\x01\x00\x00\x00";
+        let audio = WeftType::parse("Audio").unwrap();
+        assert_eq!(received_file(webm, Some("audio/webm"), &file).unwrap(), ("audio/webm".into(), FileKind::Audio));
+        assert_eq!(received_file(webm, None, &audio).unwrap(), ("audio/webm".into(), FileKind::Audio));
+        assert_eq!(received_file(webm, None, &file).unwrap(), ("video/webm".into(), FileKind::Video));
+        // Stated as the container's other half, it is the half the place takes.
+        assert_eq!(received_file(webm, Some("video/webm"), &audio).unwrap(), ("audio/webm".into(), FileKind::Audio));
+        let e = received_file(webm, Some("audio/webm"), &WeftType::parse("Image").unwrap()).unwrap_err();
+        assert!(e.contains("not the Image"), "{e}");
+    }
+
     /// The reason says what is wrong with the bytes and nothing about
     /// weft's own syntax: a caller uploading a file must not be shown
     /// `@asset(...)`, which belongs to source they never wrote.
@@ -1313,7 +1719,16 @@ mod sniff_tests {
 
 #[cfg(test)]
 mod disposition_tests {
-    use super::filename_from_disposition;
+    use super::{download_disposition, filename_from_disposition};
+
+    /// A link is a download under the file's own name: plain for old
+    /// clients, exact in the encoded form, and read back to the name.
+    #[test]
+    fn a_link_downloads_under_the_files_name() {
+        let disposition = download_disposition("été a\"b.pdf");
+        assert_eq!(disposition, "attachment; filename=\"_t_ a_b.pdf\"; filename*=UTF-8''%C3%A9t%C3%A9%20a%22b.pdf");
+        assert_eq!(filename_from_disposition(&disposition), Some("été a\"b.pdf".to_string()));
+    }
 
     /// The name a server gives its own file, in the three shapes a
     /// server writes it, and never a path.
@@ -1359,8 +1774,85 @@ mod tests {
         assert!(check_wire_value("n", "out", &at_cap).is_ok(), "the cap itself passes");
         let over = json!("x".repeat(MAX_WIRE_VALUE_BYTES));
         let refusal = check_wire_value("pic", "bytes", &over).unwrap_err();
-        assert!(refusal.starts_with("port 'bytes' of 'pic' carries 101 KB; a wire carries at most 100 KB"), "{refusal}");
-        assert!(refusal.contains("stored file"), "{refusal}");
+        assert!(refusal.starts_with("port 'bytes' of 'pic' carries 101 KB, and a wire carries at most 100 KB"), "{refusal}");
+        let less = refusal.find("Return less: one page of it").expect("the way out any node or script has");
+        let stored = refusal.find("send the stored file").expect("the way out for bytes");
+        assert!(less < stored, "returning less comes first: {refusal}");
+    }
+
+    #[test]
+    fn wire_weight_is_the_measure_the_refusal_uses() {
+        // `"x...x"` weighs its length and the two quotes.
+        let fits = "x".repeat(MAX_WIRE_VALUE_BYTES - 2);
+        assert_eq!(wire_weight(fits.as_str()), MAX_WIRE_VALUE_BYTES);
+        assert!(check_wire_value("n", "out", &json!(fits)).is_ok());
+        let over = "x".repeat(MAX_WIRE_VALUE_BYTES - 1);
+        assert_eq!(wire_weight(&json!(over)), MAX_WIRE_VALUE_BYTES + 1);
+        assert!(check_wire_value("n", "out", &json!(over)).is_err());
+        // A newline is two bytes of JSON, a slice weighs as a list.
+        assert_eq!(wire_weight("a\nb"), 6);
+        assert_eq!(wire_weight(&[json!(1), json!(2)][..]), 5);
+    }
+
+    #[test]
+    fn a_cut_lands_between_characters_and_fits_its_budget() {
+        // "é" is two bytes: a budget of 5 holds the quotes and one "é",
+        // and never half of the next.
+        assert_eq!(cut_to_weight("ééé", 5), "é");
+        assert_eq!(cut_to_weight("ééé", 6), "éé");
+        assert_eq!(cut_to_weight("abc", 100), "abc", "what fits stays whole");
+        assert_eq!(cut_to_weight("abc", 2), "", "only the quotes fit");
+        assert_eq!(cut_to_weight("a\nb", 5), "a\n", "an escape counts what it weighs");
+        let long = "x".repeat(MAX_WIRE_VALUE_BYTES * 2);
+        assert_eq!(wire_weight(cut_to_weight(&long, MAX_WIRE_VALUE_BYTES)), MAX_WIRE_VALUE_BYTES);
+    }
+
+    #[test]
+    fn a_wire_page_stops_at_its_size_and_at_what_a_wire_carries() {
+        let small: Vec<Value> = (0..5).map(|i| json!({ "n": i })).collect();
+        assert_eq!(wire_page(&small, 0, 2), Ok(0..2), "at most the page size");
+        assert_eq!(wire_page(&small, 4, 2), Ok(4..5), "the last page holds what is left");
+        assert_eq!(wire_page(&small, 9, 2), Ok(5..5), "past the end is an empty page");
+        // Three items of 40 KB: two fit a wire, whatever the page size.
+        let heavy: Vec<Value> = (0..3).map(|_| json!({ "a": "x".repeat(40 * 1024) })).collect();
+        assert_eq!(wire_page(&heavy, 0, 500), Ok(0..2));
+        assert!(wire_weight(&heavy[0..2]) <= MAX_WIRE_VALUE_BYTES);
+        assert_eq!(wire_page(&heavy, 2, 500), Ok(2..3));
+        // An item no page can hold is named, wherever the page starts.
+        let huge = vec![json!(1), json!({ "a": "x".repeat(MAX_WIRE_VALUE_BYTES) })];
+        assert_eq!(wire_page(&huge, 1, 500), Err(1));
+        assert_eq!(wire_page(&huge, 0, 500), Ok(0..1), "a page before it stops short of it");
+    }
+
+    #[test]
+    #[should_panic(expected = "not even the empty string")]
+    fn a_budget_below_the_empty_string_is_a_caller_bug() {
+        cut_to_weight("abc", 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "never moves on")]
+    fn a_page_of_zero_items_is_a_caller_bug() {
+        let _ = wire_page(&[json!(1)], 0, 0);
+    }
+
+    #[test]
+    fn over_wire_says_the_weight_and_the_limit() {
+        assert_eq!(over_wire(&json!({ "a": 1 })), None);
+        let over = json!("x".repeat(MAX_WIRE_VALUE_BYTES));
+        assert_eq!(over_wire(&over).as_deref(), Some("101 KB, and a wire carries at most 100 KB"));
+    }
+
+    #[test]
+    fn cap_text_counts_characters_then_the_wire_and_says_whether_it_cut() {
+        assert_eq!(cap_text("hello", 10), ("hello", false));
+        assert_eq!(cap_text("héllo", 3), ("hél", true), "characters, not bytes");
+        // Fifty thousand characters of three bytes each: the character
+        // cap keeps them all, and the wire is what cuts.
+        let heavy = "日".repeat(50_000);
+        let (cut, was_cut) = cap_text(&heavy, 50_000);
+        assert!(was_cut);
+        assert!(wire_weight(cut) <= MAX_WIRE_VALUE_BYTES && wire_weight(cut) + 3 > MAX_WIRE_VALUE_BYTES);
     }
 
     #[test]
@@ -1413,8 +1905,8 @@ mod tests {
                 "tenant": "alice",
                 "key": "alice/project/p1/f",
                 "parts": [
-                    {"part_number": 1, "size_bytes": 5},
-                    {"part_number": 2, "size_bytes": 3},
+                    {"partNumber": 1, "sizeBytes": 5},
+                    {"partNumber": 2, "sizeBytes": 3},
                 ],
             })
         );
@@ -1437,17 +1929,17 @@ mod tests {
         let v = serde_json::to_value(&begin).unwrap();
         assert_eq!(
             v,
-            json!({"tenant": "alice", "mime_type": "image/png",
-                   "filename": "x.png", "declared_size": 8,
-                   "content_hash": "a".repeat(64)})
+            json!({"tenant": "alice", "mimeType": "image/png",
+                   "filename": "x.png", "declaredSize": 8,
+                   "contentHash": "a".repeat(64)})
         );
         let back: Tenanted<AssetUploadBeginRequest> = serde_json::from_value(v).unwrap();
         assert_eq!(back.inner.content_hash, "a".repeat(64));
         // declared_size is optional on the wire; content_hash is not (the
         // admin surface uploads only the content-addressed asset plane).
         let min: Tenanted<AssetUploadBeginRequest> = serde_json::from_value(json!({
-            "tenant": "t", "mime_type": "a/b", "filename": "f",
-            "content_hash": "b".repeat(64)
+            "tenant": "t", "mimeType": "a/b", "filename": "f",
+            "contentHash": "b".repeat(64)
         }))
         .unwrap();
         assert_eq!(min.inner.declared_size, None);
@@ -1456,11 +1948,12 @@ mod tests {
     #[test]
     fn stored_file_value_round_trip() {
         let m = StoredFile {
-            key: "exec/0188-execution_id/9f3a".into(),
+            key: "run/0188-run_id/9f3a".into(),
             mime_type: "audio/ogg".into(),
             size_bytes: 4_200_000,
             filename: "clip.ogg".into(),
             version: 3,
+            link_secs: None,
         };
         let v = m.to_value();
         // Exact wire shape: the CONCRETE marker (audio/ogg -> __weft_audio__),
@@ -1468,7 +1961,7 @@ mod tests {
         assert_eq!(
             v,
             json!({"__weft_audio__": {
-                "key": "exec/0188-execution_id/9f3a",
+                "key": "run/0188-run_id/9f3a",
                 "mimeType": "audio/ogg",
                 "sizeBytes": 4_200_000u64,
                 "filename": "clip.ogg",
@@ -1483,11 +1976,12 @@ mod tests {
         assert_eq!(StoredFile::from_value(&older).unwrap().version, FIRST_FILE_VERSION);
         // A non image/video/audio mime takes the Blob marker.
         let pdf = StoredFile {
-            key: "exec/c/x".into(),
+            key: "run/c/x".into(),
             mime_type: "application/pdf".into(),
             size_bytes: 10,
             filename: "x.pdf".into(),
             version: FIRST_FILE_VERSION,
+            link_secs: None,
         };
         assert!(pdf.to_value().get("__weft_blob__").is_some());
         assert_eq!(StoredFile::from_value(&pdf.to_value()).unwrap(), pdf);
@@ -1496,11 +1990,12 @@ mod tests {
     #[test]
     fn stored_file_value_is_typed_by_its_marker() {
         let m = StoredFile {
-            key: "exec/c/1".into(),
+            key: "run/c/1".into(),
             mime_type: "audio/ogg".into(),
             size_bytes: 1,
             filename: "a.ogg".into(),
             version: FIRST_FILE_VERSION,
+            link_secs: None,
         };
         let t = crate::weft_type::WeftType::infer(&m.to_value());
         assert_eq!(
@@ -1520,7 +2015,7 @@ mod tests {
         }});
         assert_eq!(
             serde_json::from_value::<FileHandle>(key_backed).unwrap(),
-            FileHandle::Key("k1".into())
+            FileHandle::key("k1")
         );
         let url_backed = json!({"__weft_image__": {
             "url": "https://x.com/a.png", "mimeType": "image/png", "sizeBytes": 3, "filename": "a.png"
@@ -1531,7 +2026,7 @@ mod tests {
         ));
         assert_eq!(
             serde_json::from_value::<FileHandle>(json!("bare-key")).unwrap(),
-            FileHandle::Key("bare-key".into())
+            FileHandle::key("bare-key")
         );
         let data_backed = json!({"__weft_image__": {
             "data": "aGk=", "mimeType": "image/png", "sizeBytes": 2, "filename": "a.png"
@@ -1552,12 +2047,113 @@ mod tests {
         assert!(StoredFile::from_value(&url_file).is_err());
     }
 
+    /// A link lives one second to seven days, and a value carrying a
+    /// lifetime outside that is refused when it is read, as a handle and
+    /// as a stored file alike.
+    #[test]
+    fn a_value_carries_only_a_link_lifetime_a_link_can_live() {
+        assert_eq!(checked_link_secs(1), Ok(1));
+        assert_eq!(checked_link_secs(MAX_LINK_SECS), Ok(MAX_LINK_SECS));
+        assert_eq!(checked_link_secs(0).unwrap_err(), "a link lives 1 second to 7 days, not under a second");
+        assert!(checked_link_secs(MAX_LINK_SECS + 1).is_err());
+        let file = |secs: u64| {
+            json!({"__weft_blob__": {"key": "project/p/1", "mimeType": "text/plain", "sizeBytes": 1, "filename": "a.txt", "linkSecs": secs}})
+        };
+        for secs in [1, MAX_LINK_SECS] {
+            assert_eq!(StoredFile::from_value(&file(secs)).unwrap().link_secs, Some(secs));
+            assert_eq!(
+                FileHandle::from_value(&file(secs)).unwrap(),
+                FileHandle::Key { key: "project/p/1".into(), link_secs: Some(secs) }
+            );
+        }
+        for secs in [0, MAX_LINK_SECS + 1, 10 * 365 * 24 * 3600] {
+            let refused = StoredFile::from_value(&file(secs)).unwrap_err().to_string();
+            assert!(refused.contains("a link lives 1 second to 7 days"), "{refused}");
+            let refused = FileHandle::from_value(&file(secs)).unwrap_err();
+            assert!(matches!(refused, WeftError::Input(_)), "{refused:?}");
+            assert!(refused.to_string().contains("a link lives 1 second to 7 days"), "{refused}");
+        }
+    }
+
+    /// A stored file fits a place by its type: a place taking `Blob` any
+    /// file, a media place its own kinds.
+    #[test]
+    fn fit_mime_holds_a_file_to_the_places_kinds() {
+        let ty = |t: &str| crate::weft_type::WeftType::parse(t).unwrap();
+        assert_eq!(fit_mime("image/png", &ty("Image")).unwrap(), "image/png");
+        assert_eq!(fit_mime("image/png", &ty("Media")).unwrap(), "image/png");
+        assert_eq!(fit_mime("application/pdf", &ty("File")).unwrap(), "application/pdf");
+        assert_eq!(fit_mime("text/csv", &ty("File | Null")).unwrap(), "text/csv");
+        assert_eq!(fit_mime("video/mp4", &ty("Blob")).unwrap(), "video/mp4");
+        assert_eq!(
+            fit_mime("video/mp4", &ty("Image")).unwrap_err(),
+            "video/mp4 is Video, not the Image that was declared"
+        );
+        assert!(fit_mime("image/png", &ty("Video")).is_err());
+        assert!(fit_mime("audio/mpeg", &ty("Video")).is_err(), "an mp3 holds no video");
+        assert!(fit_mime("application/octet-stream", &ty("Media")).is_err());
+        assert!(fit_mime("application/octet-stream", &ty("Image | Null")).is_err());
+    }
+
+    /// The media type is lower-cased as `received_file` stores it; its
+    /// parameters stay as they were.
+    #[test]
+    fn fit_mime_lower_cases_the_media_type_and_keeps_its_parameters() {
+        let ty = |t: &str| crate::weft_type::WeftType::parse(t).unwrap();
+        assert_eq!(fit_mime("Image/PNG; q=1", &ty("Image | Null")).unwrap(), "image/png; q=1");
+        assert_eq!(fit_mime("Video/MP4", &ty("Audio")).unwrap(), "audio/mp4");
+    }
+
+    /// A container that holds either video or audio is handed over as the
+    /// half the place takes, and as the half it was stored as when the
+    /// place takes that.
+    #[test]
+    fn fit_mime_hands_a_container_over_as_the_half_the_place_takes() {
+        let ty = |t: &str| crate::weft_type::WeftType::parse(t).unwrap();
+        assert_eq!(fit_mime("video/webm", &ty("Audio")).unwrap(), "audio/webm");
+        assert_eq!(fit_mime("video/mp4", &ty("Audio")).unwrap(), "audio/mp4");
+        assert_eq!(fit_mime("audio/webm", &ty("Video")).unwrap(), "video/webm");
+        assert_eq!(fit_mime("audio/webm;codecs=opus", &ty("Video | Null")).unwrap(), "video/webm;codecs=opus");
+        assert_eq!(fit_mime("audio/webm", &ty("Media")).unwrap(), "audio/webm");
+        assert_eq!(fit_mime("video/webm", &ty("Video | Audio")).unwrap(), "video/webm");
+        assert_eq!(fit_mime("audio/mp4", &ty("File")).unwrap(), "audio/mp4");
+    }
+
+    /// A file already handed over fits again only as the type it went as.
+    #[test]
+    fn a_handed_over_file_fits_again_only_as_its_own_type() {
+        let ty = |t: &str| crate::weft_type::WeftType::parse(t).unwrap();
+        assert!(fits_as_handed_over("audio/webm", &ty("Audio")).is_ok());
+        assert!(fits_as_handed_over("audio/webm", &ty("Media")).is_ok());
+        assert!(fits_as_handed_over("image/png; q=1", &ty("File")).is_ok());
+        assert_eq!(
+            fits_as_handed_over("audio/webm", &ty("Video")).unwrap_err(),
+            "it was handed over as audio/webm, and the Video here takes it only as video/webm"
+        );
+        assert_eq!(
+            fits_as_handed_over("image/png", &ty("Audio")).unwrap_err(),
+            "image/png is Image, not the Audio that was declared"
+        );
+        assert!(fits_as_handed_over("image/png", &ty("String")).is_err());
+    }
+
+    /// A declaration that is not a file type takes no file.
+    #[test]
+    fn fit_mime_refuses_a_place_that_is_not_a_file_type() {
+        let ty = |t: &str| crate::weft_type::WeftType::parse(t).unwrap();
+        assert_eq!(
+            fit_mime("application/pdf", &ty("String")).unwrap_err(),
+            "the place is declared String, which takes no file"
+        );
+        assert!(fit_mime("image/png", &ty("Number | Null")).is_err());
+    }
+
     #[test]
     fn file_handle_parses_key_and_url_forms() {
         // A bare key string is a Key handle.
         assert_eq!(
             FileHandle::from_value(&json!("project/p/1")).unwrap(),
-            FileHandle::Key("project/p/1".into())
+            FileHandle::key("project/p/1")
         );
         assert!(FileHandle::from_value(&json!("")).is_err());
 
@@ -1568,11 +2164,24 @@ mod tests {
             size_bytes: 9,
             filename: "d.pdf".into(),
             version: FIRST_FILE_VERSION,
+            link_secs: None,
         };
         assert_eq!(
             FileHandle::from_value(&key_file.to_value()).unwrap(),
-            FileHandle::Key("shared/team/2".into())
+            FileHandle::key("shared/team/2")
         );
+        // A value's own link lifetime rides on its handle, and on the wire
+        // only when it was set.
+        let lasting = StoredFile { link_secs: Some(7200), ..key_file.clone() };
+        assert_eq!(lasting.to_value()["__weft_blob__"]["linkSecs"], json!(7200));
+        assert!(key_file.to_value()["__weft_blob__"].get("linkSecs").is_none());
+        assert_eq!(
+            FileHandle::from_value(&lasting.to_value()).unwrap(),
+            FileHandle::Key { key: "shared/team/2".into(), link_secs: Some(7200) }
+        );
+        let mut torn = lasting.to_value();
+        torn["__weft_blob__"]["linkSecs"] = json!("soon");
+        assert!(FileHandle::from_value(&torn).is_err());
 
         // A url-backed marker is a Url handle, carrying the declared metadata.
         let url_file = json!({"__weft_image__": {
@@ -1614,34 +2223,35 @@ mod tests {
     }
 
     #[test]
-    fn keep_and_presign_request_wire_shapes() {
+    fn keep_and_link_request_wire_shapes() {
         // Worker -> broker envelopes: exact wire, both directions.
-        let keep = KeepRequest { key: "t/exec/c/1".into(), ttl: KeepTtl::Secs { secs: 60 } };
+        let keep = KeepRequest { key: "t/run/c/1".into(), ttl: KeepTtl::Secs { secs: 60 } };
         let v = serde_json::to_value(&keep).unwrap();
-        assert_eq!(v, json!({"key": "t/exec/c/1", "ttl": {"kind": "secs", "secs": 60}}));
+        assert_eq!(v, json!({"key": "t/run/c/1", "ttl": {"kind": "secs", "secs": 60}}));
         let back: KeepRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back.key, keep.key);
         assert_eq!(back.ttl, keep.ttl);
 
-        let reach = LinkReach::Caller { base: Some("http://127.0.0.1:14111".into()) };
-        let presign = PresignRequest { key: "t/project/p/1".into(), ttl_secs: Some(900), reach: reach.clone() };
-        let v = serde_json::to_value(&presign).unwrap();
+        let link = LinkRequest { key: "t/project/p/1".into(), ttl_secs: Some(900), reach: LinkReach::External };
+        let v = serde_json::to_value(&link).unwrap();
+        assert_eq!(v, json!({"key": "t/project/p/1", "ttlSecs": 900, "reach": "external"}));
+        let back: LinkRequest = serde_json::from_value(v).unwrap();
+        assert_eq!((back.key, back.ttl_secs, back.reach), (link.key, link.ttl_secs, link.reach));
+        // No lifetime named: the value's own default is asked for.
+        let bare: LinkRequest = serde_json::from_value(json!({"key": "k", "reach": "internal"})).unwrap();
+        assert_eq!((bare.ttl_secs, bare.reach), (None, LinkReach::Internal));
         assert_eq!(
-            v,
-            json!({"key": "t/project/p/1", "ttl_secs": 900, "reach": {"caller": {"base": "http://127.0.0.1:14111"}}})
+            serde_json::to_value(FileLink { url: "https://x/f".into(), public: false }).unwrap(),
+            json!({"url": "https://x/f", "public": false})
         );
-        let back: PresignRequest = serde_json::from_value(v).unwrap();
-        assert_eq!(back.key, presign.key);
-        assert_eq!(back.ttl_secs, presign.ttl_secs);
-        assert_eq!(back.reach, reach);
-        // A caller no request stands behind names no base.
-        let unbased = serde_json::to_value(LinkReach::Caller { base: None }).unwrap();
-        assert_eq!(unbased, json!({"caller": {}}));
-        assert_eq!(serde_json::from_value::<LinkReach>(unbased).unwrap(), LinkReach::Caller { base: None });
+        let admin = AdminLinkRequest { key: "t/project/p/1".into(), ttl_secs: None, reader: LinkReader::Person };
+        assert_eq!(serde_json::to_value(&admin).unwrap(), json!({"key": "t/project/p/1", "reader": {"kind": "person"}}));
+        let outside = LinkReader::Outside { project: "p".into() };
+        assert_eq!(serde_json::to_value(&outside).unwrap(), json!({"kind": "outside", "project": "p"}));
 
         let replace = UploadReplaceRequest { key: "t/project/p/1".into(), declared_size: Some(12), expected_version: Some(4) };
         let v = serde_json::to_value(&replace).unwrap();
-        assert_eq!(v, json!({"key": "t/project/p/1", "declared_size": 12, "expected_version": 4}));
+        assert_eq!(v, json!({"key": "t/project/p/1", "declaredSize": 12, "expectedVersion": 4}));
         let back: UploadReplaceRequest = serde_json::from_value(v).unwrap();
         assert_eq!(
             (back.key, back.declared_size, back.expected_version),
@@ -1650,20 +2260,17 @@ mod tests {
         // An overwrite names no version.
         let blind: UploadReplaceRequest = serde_json::from_value(json!({"key": "t/project/p/1"})).unwrap();
         assert_eq!(blind.expected_version, None);
-        // An older asker sends no reach: the internet, the strict one.
-        let bare: PresignRequest = serde_json::from_value(json!({"key": "t/project/p/1", "ttl_secs": null})).unwrap();
-        assert_eq!(bare.reach, LinkReach::Internet);
     }
 
     #[test]
     fn admin_envelope_wire_shapes() {
         // Dispatcher admin-proxy <-> broker envelopes: the camelCase renames are
         // the wire contract the CLI download handshake also reads verbatim.
-        let r = PresignResult { url: "https://b/x".into(), filename: "a.pdf".into(), size_bytes: 9 };
+        let r = PresignResult { url: "https://b/x".into(), filename: "a.pdf".into(), size_bytes: 9, version: 1, public: false };
         let v = serde_json::to_value(&r).unwrap();
-        assert_eq!(v, json!({"url": "https://b/x", "filename": "a.pdf", "sizeBytes": 9}));
+        assert_eq!(v, json!({"url": "https://b/x", "filename": "a.pdf", "sizeBytes": 9, "version": 1, "public": false}));
         let back: PresignResult = serde_json::from_value(v).unwrap();
-        assert_eq!(back.size_bytes, 9);
+        assert_eq!((back.size_bytes, back.version, back.public), (9, 1, false));
 
         let u = TenantUsage { stored_bytes: 42, file_count: 3 };
         let v = serde_json::to_value(&u).unwrap();
@@ -1676,16 +2283,16 @@ mod tests {
             json!({"tenant": "t1"})
         );
         assert_eq!(
-            serde_json::to_value(WipePrefixRequest { prefix: "t1/exec/c/".into() }).unwrap(),
-            json!({"prefix": "t1/exec/c/"})
+            serde_json::to_value(WipePrefixRequest { prefix: "t1/run/c/".into() }).unwrap(),
+            json!({"prefix": "t1/run/c/"})
         );
         assert_eq!(serde_json::to_value(WipePrefixResponse { wiped: 2 }).unwrap(), json!({"wiped": 2}));
         assert_eq!(
-            serde_json::to_value(SweepExecRequest { tenant: "t1".into(), execution_id: "c1".into() }).unwrap(),
-            json!({"tenant": "t1", "execution_id": "c1"})
+            serde_json::to_value(SweepRunRequest { tenant: "t1".into(), run_id: "c1".into() }).unwrap(),
+            json!({"tenant": "t1", "run_id": "c1"})
         );
         assert_eq!(
-            serde_json::to_value(SweepExecResponse { swept: 1, lingering: 2 }).unwrap(),
+            serde_json::to_value(SweepRunResponse { swept: 1, lingering: 2 }).unwrap(),
             json!({"swept": 1, "lingering": 2})
         );
     }
@@ -1693,8 +2300,8 @@ mod tests {
     #[test]
     fn scope_wire_shape() {
         assert_eq!(
-            serde_json::to_value(StorageScope::Execution).unwrap(),
-            json!({"kind": "execution"})
+            serde_json::to_value(StorageScope::Run).unwrap(),
+            json!({"kind": "run"})
         );
         assert_eq!(
             serde_json::to_value(StorageScope::Shared { name: "team".into() }).unwrap(),
@@ -1722,7 +2329,7 @@ mod tests {
     #[test]
     fn stored_file_meta_wire_shape() {
         let m = StoredFileMeta {
-            key: "exec/c/1".into(),
+            key: "run/c/1".into(),
             mime_type: "video/mp4".into(),
             size_bytes: 5,
             filename: "v.mp4".into(),
@@ -1746,8 +2353,8 @@ mod tests {
     fn upload_envelopes_wire_shape() {
         // begin: declared_size and keep are optional on the wire.
         let b: UploadBeginRequest = serde_json::from_value(json!({
-            "scope": {"kind": "execution"},
-            "mime_type": "image/png",
+            "scope": {"kind": "run"},
+            "mimeType": "image/png",
             "filename": "a.png",
         }))
         .unwrap();
@@ -1755,16 +2362,16 @@ mod tests {
         assert!(b.keep.is_none());
         let b2: UploadBeginRequest = serde_json::from_value(json!({
             "scope": {"kind": "project"},
-            "mime_type": "image/png",
+            "mimeType": "image/png",
             "filename": "a.png",
             "keep": {"kind": "never"},
-            "declared_size": 42,
+            "declaredSize": 42,
         }))
         .unwrap();
         assert_eq!(b2.declared_size, Some(42));
 
         let r = UploadBeginResponse {
-            key: "t/exec/c/1".into(),
+            key: "t/run/c/1".into(),
             part_size: 8 << 20,
             already_stored: false,
             resume: false,
@@ -1773,16 +2380,16 @@ mod tests {
         assert_eq!(
             v,
             json!({
-                "key": "t/exec/c/1",
-                "part_size": 8_388_608u64,
-                "already_stored": false,
+                "key": "t/run/c/1",
+                "partSize": 8_388_608u64,
+                "alreadyStored": false,
                 "resume": false,
             })
         );
         // Both flags default false on the wire, so a begin reply without
         // them parses as a fresh reservation.
         let back: UploadBeginResponse =
-            serde_json::from_value(json!({"key": "t/exec/c/1", "part_size": 1})).unwrap();
+            serde_json::from_value(json!({"key": "t/run/c/1", "partSize": 1})).unwrap();
         assert!(!back.already_stored);
         assert!(!back.resume);
 
@@ -1790,11 +2397,11 @@ mod tests {
         let v = serde_json::to_value(UploadPartsResponse { parts: vec![p.clone()] }).unwrap();
         assert_eq!(
             v,
-            json!({"parts": [{"part_number": 2, "size_bytes": 5, "offset_bytes": 8, "url": "u"}]})
+            json!({"parts": [{"partNumber": 2, "sizeBytes": 5, "offsetBytes": 8, "url": "u"}]})
         );
 
         let d: PartDoneRequest = serde_json::from_value(json!({
-            "key": "k", "part_number": 1, "etag": "\"abc\"",
+            "key": "k", "partNumber": 1, "etag": "\"abc\"",
         }))
         .unwrap();
         // The etag survives verbatim, quotes included.
@@ -1816,9 +2423,9 @@ mod tests {
         // that stands for somewhere else in it.
         assert!(
             serde_json::from_value::<UploadResumeResponse>(serde_json::json!({
-                "part_size": 8,
-                "missing": [{"part_number": 1, "size_bytes": 8, "url": "u"}],
-                "reserved_bytes": 8,
+                "partSize": 8,
+                "missing": [{"partNumber": 1, "sizeBytes": 8, "url": "u"}],
+                "reservedBytes": 8,
             }))
             .is_err(),
             "offset_bytes must be required"

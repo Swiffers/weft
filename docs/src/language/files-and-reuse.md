@@ -25,7 +25,21 @@ Both refuse a path that climbs out of the project, and `@include` refuses it on
 the spelling before it even looks, so a `../` that escapes is refused whether
 or not anything is there.
 
-`@asset` is the exception: it may name a file anywhere on your machine by an
+A path starting with `__catalog/` is measured from neither place: it is
+measured from the project's `nodes/` folder, where the standard library and
+your shared nodes live, and it may not climb out of `nodes/`. If you want to
+include `nodes/my_pkg/triage.weft`, write
+`@include("__catalog/my_pkg/triage.weft")`, and that spelling reaches it from
+any file in the project. In `@file` and `@asset`, which are already measured
+from the root, `__catalog/x` is `nodes/x`, so a file under `nodes/` can name
+its neighbours the same way in all three.
+
+If you put a `.weft` file under `nodes/` for others to include, make its
+first line a `#` comment saying what it does: `weft describe-nodes --list`
+ends with every such file, spelled the way you include it, with that line
+beside it.
+
+`@asset` is the one exception to the rule that a path stays inside the project: it may name a file anywhere on your machine by an
 absolute path, or under `~`, and it is read from where it sits and uploaded
 when you build.
 
@@ -53,18 +67,21 @@ nothing to write back to. The error points you at `@asset`.
 ## @asset
 
 ```weft
-badge = Text {
-  value: @asset("https://example.com/terms.txt")
+terms = Text {
+  value: @asset("https://example.com/terms.txt", String)
 }
-stamp = Watermark {
+fal = FalAccess
+sharper = FalUpscaleImage {
+  account: fal.access
   image: @asset("assets/logo.png", Image)
 }
 ```
 
-The type is **required** for a file, and it has to name one concrete kind:
-`Image`, `Video`, `Audio` or `Blob`. `File` and `Media` are refused, because a
-value carries exactly one marker and those leave it open. weft will not guess
-the kind from the extension or from the bytes.
+The type is **required**, because weft will not guess it from the extension
+or from the bytes. For text, it is the type to read the text as
+(`String`, `Number`, `JsonDict`, a record). For a file, it names one concrete
+kind: `Image`, `Video`, `Audio` or `Blob`. `File` and `Media` are refused:
+each covers several kinds, and weft has to know which one the file is.
 
 It is fetched or read when you build, not when you write it, so a URL is
 resolved once into your project rather than every run.
@@ -81,7 +98,11 @@ An included file is one group, and its header is the interface:
 # triage.weft
 Group(email: JsonDict) -> (severity: String) {
   # Classify an inbound ticket
-  ...
+  classify = ExecPython(email: JsonDict) -> (severity: String) {
+    email: self.email
+    code: "return {'severity': 'high' if 'urgent' in str(email) else 'low'}"
+  }
+  self.severity = classify.severity
 }
 ```
 
@@ -110,6 +131,16 @@ call site, the body runs, and the results come back to that site alone.
 Ten includes of the same file are one body and ten frames, the way ten
 iterations of a loop are one body and ten frames. The two nest freely, so a
 loop inside an include inside a loop is just a deeper stack.
+
+Only the type check runs once per include. If `blur.weft` holds
+`Group[T: Media](file: T) -> (out: T)` (`[T: Media]` limits `T` to kinds of
+`Media`; without it, `T` takes any type),
+you can include it once fed an `Image` and once fed a `Video`, and each `out`
+keeps the type that went in. That holds however deep you go: for a group
+nested inside the file, for a node's type variable, and for another file the
+file includes. If `img` and `vid` are your two includes of `blur.weft`, and it
+includes a file as `inner`, `img.inner` and `vid.inner` each get their own
+types. The nodes and their code stay one copy each.
 
 ### Naming a node inside one
 

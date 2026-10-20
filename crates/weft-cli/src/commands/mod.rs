@@ -8,13 +8,15 @@ pub mod ensure;
 pub mod run;
 pub mod follow;
 pub mod stop;
+pub mod node_state;
+pub mod wait;
 pub mod activate;
 pub mod bake;
 pub mod deactivate;
 pub mod cancel_activate;
 pub mod cancel_build;
-pub mod cancel_running;
 pub mod resync;
+pub mod instances;
 pub mod ps;
 pub mod rm;
 pub mod logs;
@@ -25,7 +27,7 @@ pub mod infra_env;
 pub mod catalog;
 pub mod describe_nodes;
 pub mod parse;
-pub mod executions;
+pub mod runs;
 pub mod status;
 pub mod test_node;
 pub mod tangle;
@@ -37,6 +39,7 @@ pub mod options;
 pub mod files;
 // The version tree and its verbs.
 pub mod versions;
+pub mod snapshot;
 pub mod checkpoint;
 pub mod branch;
 pub mod running_source;
@@ -191,24 +194,22 @@ impl Ctx {
     /// given, the walk never happens.
     fn install(&self) -> anyhow::Result<&Install> {
         self.install
-            .get_or_init(|| self.resolve_install(|| Ok(self.project_here()?.cloned())))
+            .get_or_init(|| self.resolve_install())
             .as_ref()
             .map_err(|e| anyhow::anyhow!("{e:#}"))
     }
 
-    /// Resolve the install from the flags, the given project lookup and
-    /// the disk, uncached. A one-shot command goes through
-    /// [`Ctx::install`] (the cwd project); a long-lived one goes through
-    /// [`Ctx::fresh_client`] (the project of the request at hand).
-    fn resolve_install(&self, project: impl FnOnce() -> anyhow::Result<Option<Project>>) -> anyhow::Result<Install> {
+    /// [`Ctx::install`]'s work: the install from the flags, the cwd
+    /// project and the disk, uncached.
+    fn resolve_install(&self) -> anyhow::Result<Install> {
         let on = self.on.as_deref();
         let url = resolve_dispatcher_url(self.dispatcher.as_ref().and_then(|d| d.beside(on)).map(str::to_owned), on, || {
             // A broken weft.toml only matters when the project's
             // targets are read: outside the default target it is
             // the answer's error; for the local default the verb
             // that needs the project reports it.
-            match project() {
-                Ok(found) => Ok(found),
+            match self.project_here() {
+                Ok(found) => Ok(found.cloned()),
                 Err(e) if on.is_some() => Err(e),
                 Err(_) => Ok(None),
             }
@@ -281,19 +282,6 @@ impl Ctx {
         Ok(crate::client::DispatcherClient::new(install.url.clone(), install.operator_key.clone()).for_target(self.on()))
     }
 
-    /// A client resolved afresh on every call, never cached: a long-lived
-    /// process (the editor's parse server) outlives any one state of the
-    /// install, so an install that starts, or credentials that get fixed,
-    /// after it launched are picked up by the next request, and a failure
-    /// is that request's error rather than the process's. The project is
-    /// the REQUEST's (a parse server serves files from many projects, and
-    /// its own cwd names none of them), re-read each time so a weft.toml
-    /// edit is seen.
-    pub fn fresh_client(&self, project: Option<&Project>) -> anyhow::Result<crate::client::DispatcherClient> {
-        let install = self.resolve_install(|| Ok(project.cloned()))?;
-        Ok(crate::client::DispatcherClient::new(install.url, install.operator_key).for_target(self.on()))
-    }
-
     /// The cwd-discovered project, lazy-loaded and cached, keeping
     /// [`Project::find`]'s three answers apart: found, no weft.toml
     /// anywhere up the tree (`Ok(None)`), or a manifest that is here
@@ -338,18 +326,18 @@ impl Ctx {
     /// don't have to repeat the trap), then the error propagates
     /// wrapped as [`crate::progress::Reported`]: the user has seen it,
     /// and `main` only turns it into the exit code.
-    pub async fn with_progress<F, Fut>(
+    pub async fn with_progress<T, F, Fut>(
         &self,
         verb: crate::progress::ActionVerb,
         body: F,
-    ) -> anyhow::Result<()>
+    ) -> anyhow::Result<T>
     where
         F: FnOnce(crate::progress::Progress) -> Fut,
-        Fut: std::future::Future<Output = anyhow::Result<()>>,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
     {
         let progress = self.progress(verb);
         match body(progress.clone()).await {
-            Ok(()) => Ok(()),
+            Ok(done) => Ok(done),
             Err(e) => {
                 // Skip the auto-trap if the body already emitted a
                 // structured error: the editor would otherwise see
@@ -364,23 +352,23 @@ impl Ctx {
     }
 }
 
-/// The full execution an execution argument names. A whole uuid is taken
+/// The full run a run argument names. A whole uuid is taken
 /// as it is; anything shorter is the start of one, and the dispatcher
-/// answers the single execution of yours it starts (or says it starts
-/// none, or several). Every command that takes an execution goes through
+/// answers the single run of yours it starts (or says it starts
+/// none, or several). Every command that takes a run goes through
 /// here, so `weft events 3f2a` works the way `weft stop 3f2a` does.
-pub async fn resolve_execution_id(ctx: &Ctx, input: &str) -> anyhow::Result<String> {
+pub async fn resolve_run_id(ctx: &Ctx, input: &str) -> anyhow::Result<String> {
     if uuid::Uuid::parse_str(input).is_ok() {
         return Ok(input.to_string());
     }
     let resp = ctx
         .client()?
-        .get_json(&format!("/executions/resolve/{input}"))
+        .get_json(&format!("/runs/resolve/{input}"))
         .await
-        .map_err(|e| anyhow::anyhow!("'{input}' names no execution: {e}"))?;
-    let resolved: weft_core::program::ResolvedExecution =
-        serde_json::from_value(resp).map_err(|e| anyhow::anyhow!("read the resolved execution: {e}"))?;
-    Ok(resolved.execution_id.to_string())
+        .map_err(|e| anyhow::anyhow!("'{input}' names no run: {e}"))?;
+    let resolved: weft_core::program::ResolvedRun =
+        serde_json::from_value(resp).map_err(|e| anyhow::anyhow!("read the resolved run: {e}"))?;
+    Ok(resolved.run_id.to_string())
 }
 
 /// One node of the program, from the way a person spells it:
@@ -401,7 +389,7 @@ pub fn node_address_for(ctx: &Ctx, spelled: &str) -> anyhow::Result<String> {
     // refused there, naming the run or the project). So the spelling
     // goes as it is, and it is the top-level node it names.
     let Some(project) = ctx.project_here()? else { return Ok(spelled.to_string()) };
-    let (definition, _) = weft_compiler::hash::load_enriched_project(project)?;
+    let (definition, _) = weft_compiler::hash::load_program(project)?;
     let (id, call_path) = resolve_node(project, &definition, spelled)?;
     Ok(weft_core::project::address_of(&definition, &id, &call_path))
 }
@@ -409,11 +397,13 @@ pub fn node_address_for(ctx: &Ctx, spelled: &str) -> anyhow::Result<String> {
 /// What a spelling a person wrote names in the compiled definition:
 /// the thing's own id and the call path that use of it runs under
 /// (`auth.check` is the node `Auth.check` under `["auth"]`).
+#[derive(Debug)]
 pub enum Spelled {
     Node { id: String, call_path: Vec<String> },
     /// A group, a loop or an include site. The commands that take a
     /// node refuse it; `weft events --node` takes it, because a
-    /// group's own rows are its boundaries' and come with it.
+    /// group has rows of its own: its `scope_decided` rows (and a
+    /// loop's, its boundaries' rows).
     Group { id: String, call_path: Vec<String> },
 }
 
@@ -481,14 +471,14 @@ pub fn resolve_spelling(
 /// and names through the call site everywhere a person can see. It
 /// resolves, because it IS the id, and taking it would teach a person a
 /// spelling no other command accepts; so it is refused with the one
-/// that works. A boundary the compiler made (`gate__in`) is named by
-/// its group.
+/// that works. A loop's boundary the compiler made (`doubler__in`) is
+/// named by its loop; any other name ending that way is read as written.
 fn read_spelling(definition: &weft_core::ProjectDefinition, spelled: &str) -> anyhow::Result<Spelled> {
-    if let Some((group, _)) = spelled.rsplit_once("__in").or_else(|| spelled.rsplit_once("__out")).filter(|(_, rest)| rest.is_empty()) {
-        anyhow::bail!("'{spelled}' is a group boundary the compiler made; name the group, `{group}`, and its rows come with it");
-    }
-    if let Some((group, _)) = spelled.rsplit_once(".__in").or_else(|| spelled.rsplit_once(".__out")).filter(|(_, rest)| rest.is_empty()) {
-        anyhow::bail!("'{spelled}' is a boundary the compiler made; name the site, `{group}`, and its rows come with it");
+    if let Some(group) = weft_core::project::boundary_loop(spelled) {
+        let (id, _) = weft_core::project::resolve_address(definition, group);
+        if definition.groups.iter().any(|g| g.id == id && matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+            anyhow::bail!("'{spelled}' is a loop's boundary the compiler made; name the loop, `{group}`, and its rows come with it");
+        }
     }
     let (id, call_path) = weft_core::project::resolve_address(definition, spelled);
     let Some(node) = definition.nodes.iter().find(|n| n.id == id) else {
@@ -501,7 +491,7 @@ fn read_spelling(definition: &weft_core::ProjectDefinition, spelled: &str) -> an
             spelled.rsplit('.').next().unwrap_or(spelled)
         );
     };
-    if call_path.is_empty() && weft_core::project::selection::enclosing_body(definition, node).is_some() {
+    if call_path.is_empty() && weft_core::project::places::enclosing_body(definition, node).is_some() {
         anyhow::bail!(
             "'{spelled}' is inside an included file; name it through the site that \
              includes the file, like `site.{}`",
@@ -621,13 +611,6 @@ mod tests {
         let error = error.to_string();
         assert!(error.contains(&format!("install '{name}' has no ports yet")), "{error}");
         assert!(ctx.install_access().is_err(), "the cached error answers every later use");
-        // The install starts after this process did: a fresh resolution
-        // sees it, the cached one keeps its answer.
-        let dir = weft_core::infra::Install::from_env().unwrap().dir();
-        weft_core::ports::InstallPorts::DEFAULT.save(&dir).expect("save ports");
-        assert!(ctx.fresh_client(None).is_ok(), "a fresh resolution picks up the started install");
-        assert!(ctx.client().is_err(), "the cached error is kept for a one-shot command");
-        std::fs::remove_dir_all(&dir).unwrap();
         std::env::remove_var(weft_core::infra::INSTALL_ENV);
     }
 
@@ -666,5 +649,30 @@ mod tests {
         })
         .unwrap();
         assert_eq!(url, "http://x");
+    }
+
+    /// A name ending `__in` or `__out` is refused as a loop's boundary only
+    /// when what comes before it is a loop; any other such name is read as
+    /// written.
+    #[test]
+    fn only_a_loops_boundary_is_refused_as_one() {
+        let definition: weft_core::ProjectDefinition = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [{
+                "id": "fan__out", "nodeType": "T", "config": {}, "position": { "x": 0.0, "y": 0.0 },
+                "inputs": [], "outputs": [],
+            }],
+            "edges": [],
+            "groups": [
+                { "id": "lp", "kind": "loop", "loopConfig": {}, "nodeIds": [] },
+                { "id": "g", "kind": "group", "nodeIds": [] },
+            ],
+        }))
+        .unwrap();
+        let refused = super::read_spelling(&definition, "lp__in").unwrap_err().to_string();
+        assert!(refused.contains("loop's boundary") && refused.contains("`lp`"), "{refused}");
+        assert!(matches!(super::read_spelling(&definition, "fan__out"), Ok(super::Spelled::Node { id, .. }) if id == "fan__out"));
+        let unknown = super::read_spelling(&definition, "g__in").unwrap_err().to_string();
+        assert!(unknown.contains("names no node") && !unknown.contains("boundary"), "{unknown}");
     }
 }

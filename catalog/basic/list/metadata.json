@@ -1,7 +1,7 @@
 {
   "type": "List",
   "label": "Build a list",
-  "description": "Build one list from wired values, one input port per item: `List(first: String, second: String) -> (list: List[String])` gives `[first, second]`, in the order the ports are written. Declare the type on the `list` output. Ports are required, so a closed branch skips the node; an item written `name?:` is left out when nothing arrives (no gap, no null).",
+  "description": "Build one list from wired values, one input port per item: `List(first: String, second: String)` gives `[first, second]`, in the order the ports are written. Every item is one type `T`, worked out from what is wired; items of different kinds need the list's type declared (`-> (list: List[Media])` holds an Image and a Video). Ports are required, so a closed branch skips the node; an item written `name?:` is left out when nothing arrives (no gap, no null).",
   "tags": [
     "list",
     "array",
@@ -15,12 +15,13 @@
   "outputs": [
     {
       "name": "list",
-      "type": "MustOverride",
-      "description": "The items in written order. Declare its type: `-> (list: List[String])`."
+      "type": "List[T]",
+      "description": "The items in written order. Declare its type when the items are of different kinds: `-> (list: List[Media])`."
     }
   ],
   "features": {
     "pure": true,
-    "canAddInputPorts": true
+    "canAddInputPorts": true,
+    "customInputType": "T"
   }
 }

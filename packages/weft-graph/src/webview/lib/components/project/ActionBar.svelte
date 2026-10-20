@@ -1,45 +1,32 @@
 <script lang="ts">
-	import { Play, Square, Zap, Database, Loader2, ChevronUp, Terminal } from '@lucide/svelte';
-	import { specSummary, specForAction, type RunSpec } from '../../../../run-spec';
+	import type { Snippet } from 'svelte';
+	import { Square, Loader2, Terminal } from '@lucide/svelte';
 	import type {
 		ActionBarState,
 		ActionAvailability,
 		ActionVerb,
-		BackendSnapshot,
-		ActionBarOverlay,
 		BarPhase,
 		SourceLocation,
 	} from '../../../../protocol';
 	import ActionDetailsModal from './ActionDetailsModal.svelte';
-	import { runLabel } from '../../run-targets';
-	import { isVerbOffered, resyncStopped, sourceInfraReady, type VerbInputs } from '../../verb-gates';
+	import { resyncStopped, type VerbInputs } from '../../verb-gates';
 
-	let specMenuOpen = $state(false);
+	// The bottom bar: what is going on right now (the run you follow with
+	// its Stop, a build, a verb working, a setup or an infra change under
+	// way with its cancel), and in the same bar what the selected nodes
+	// offer (`selection`). Every lifecycle verb lives there, acting on the
+	// selected nodes. With nothing going on, nothing selected and no
+	// subgraph to show, no bar is drawn.
 
 	let {
 		state: barState,
-		drift,
-		onRun,
-		runTargetCount,
-		specs = [],
-		focusedGroup = null,
-		onRunSpec,
-		onOpenSpecDialog,
-		onOpenSpecMenu,
-		onActivate,
+		status,
+		runProgress,
+		selection,
 		onCancelActivate,
 		onCancelBuild,
 		onCancelInfra,
-		onDeactivate,
-		onReactivate,
-		onCancelRunning,
-		onResumeActive,
-		onResync,
 		onResumeResync,
-		onStartInfra,
-		onStopInfra,
-		onTerminateInfra,
-		onUpgradeInfra,
 		onStop,
 		onDismissError,
 		onOpenLocation,
@@ -47,137 +34,47 @@
 		onToggleTriggerSubgraph,
 		showInfraSubgraph = false,
 		showTriggerSubgraph = false,
-		nodeCount = 1,
 		hasInfra = false,
 		hasTriggers = false,
-		runTargetsAvoidTriggers = false,
-		runTargetsInfraReady = true,
 	}: {
 		// Single source of truth. The host's ActionBarStore pushes
 		// every transition; this component is a pure renderer.
-		// `backend` is always present, `overlay` carries the current
-		// user-action layer, `error` sits as a sticky banner.
 		state: ActionBarState;
-		// Drift signals stay live regardless of overlay. Lights the
-		// Resync / Upgrade buttons; resolved on the next status fetch.
-		drift: ActionAvailability | undefined;
-		// Verb-action callbacks. The webview never decides which
-		// verb to run from the state; it just calls the right handler
-		// when the user clicks. The host decides scope (infra vs
-		// trigger) based on graph contents at the time of the click.
-		onRun?: () => void;
-		/// How many output nodes the run is aimed at. Zero is the ordinary
-		/// run, and the button says so plainly.
-		runTargetCount?: number;
-		/// The project's specs (`examples/*.json`), already ordered with
-		/// the ones scoped to `focusedGroup` first, for the Run menu.
-		specs?: RunSpec[];
-		/// The group the user stands in (inside an include), if any: the
-		/// menu offers "Run this group" for it first.
-		focusedGroup?: string | null;
-		/// Run a saved spec by name (`weft run <name>`).
-		onRunSpec?: (name: string) => void;
-		/// Open the spec dialog, with a spec filled in or blank.
-		onOpenSpecDialog?: (initial?: RunSpec) => void;
-		/// The menu is opening: refresh the spec list.
-		onOpenSpecMenu?: () => void;
-		onActivate?: () => void;
-		// Mid-activate: cancel TriggerSetup, wipe partial signals,
-		// flip back to Inactive.
+		/// The latest status answer: which triggers are turning on.
+		status: ActionAvailability | undefined;
+		/// How far the followed run got, when one is followed.
+		runProgress?: { done: number; total: number | null };
+		/// What the selected nodes offer (the contextual bar), drawn in
+		/// this bar after what is going on; absent with nothing selected.
+		selection?: Snippet;
+		/// A trigger setup under way: stop it, the triggers it has not
+		/// turned on yet stay off.
 		onCancelActivate?: () => void;
-		// Mid-build (backend transition=building): cancel the
-		// build. Cancel reconciles, never asserts: the
-		// displayed state is whatever the backend reports next.
+		/// Mid-build: cancel the build. The next status says what happened.
 		onCancelBuild?: () => void;
-		// Mid-infra-flip (rollup provisioning/stopping/terminating):
-		// HALT the in-flight infra work; per-node partial state stays.
+		/// Mid infra change: HALT it; per-node partial state stays.
 		onCancelInfra?: () => void;
-		onDeactivate?: () => void;
-		// Inactive-with-preserved-state path. Host opens the
-		// 3-option reactivate-choice dialog before posting activate.
-		onReactivate?: () => void;
-		// Mid-deactivate: cancel any still-running executions to
-		// unblock the drain.
-		onCancelRunning?: () => void;
-		// Mid-deactivate: roll back to active. Anything that parked
-		// during the transient drains immediately.
-		onResumeActive?: () => void;
-		onResync?: () => void;
-		// A resync that stopped: take it up again where it stopped.
+		/// A resync that stopped: take it up again where it stopped.
 		onResumeResync?: () => void;
-		onStartInfra?: () => void;
-		onStopInfra?: () => void;
-		onTerminateInfra?: () => void;
-		onUpgradeInfra?: () => void;
-		// Generic Stop. The host inspects the bar overlay to decide
-		// whether to kill the CLI process group or POST cancel on
-		// the active execution.
+		/// Generic Stop: the host kills the CLI verb working, or cancels
+		/// the followed run.
 		onStop?: () => void;
-		// X-button on the error banner. Webview posts `dismissError`;
-		// the host clears the slot's error so the banner stops
-		// rendering until the next failure.
 		onDismissError?: () => void;
-		// A diagnostic's file:line:column in the details modal. Host
-		// opens that file in the source editor at the position.
+		/// A diagnostic's file:line:column in the details modal.
 		onOpenLocation: (location: SourceLocation) => void;
 		onToggleInfraSubgraph?: () => void;
 		onToggleTriggerSubgraph?: () => void;
 		showInfraSubgraph?: boolean;
 		showTriggerSubgraph?: boolean;
-		// Used to grey out Run when the graph is empty (no parser
-		// success yet); not part of backend state.
-		nodeCount?: number;
-		// Static graph-derived: does this project DECLARE infra /
-		// trigger nodes in source. Comes from the parsed project,
-		// independent of backend state. Drives section visibility
-		// (don't show Infra section if no infra nodes exist).
+		/// Does the SOURCE declare infra / trigger nodes: whether the
+		/// subgraph toggles are drawn.
 		hasInfra?: boolean;
 		hasTriggers?: boolean;
-		/// True when the aimed run's upstream walk reaches no trigger, so
-		/// Run is offered even while the trigger lifecycle is visible.
-		runTargetsAvoidTriggers?: boolean;
-		/// True when every infra node inside the aimed run's subgraph
-		/// reports running (vacuously true with no targets or no infra
-		/// there). Gates the aimed run the way the whole-graph rollup
-		/// gates the ordinary one.
-		runTargetsInfraReady?: boolean;
 	} = $props();
 
-	// ─── Convenience accessors (all backend-side facts) ──────────
-	const backend = $derived<BackendSnapshot>(barState.backend);
-	const overlay = $derived<ActionBarOverlay>(barState.overlay);
+	const backend = $derived(barState.backend);
+	const overlay = $derived(barState.overlay);
 
-	// Drift bits. The dispatcher reports three independent signals;
-	// each is resolved by its own verb.
-	//   `binaryDrift`    → `build` (worker image inputs changed)
-	//   `definitionDrift` → `resync` (runtime project shape changed)
-	//   `infraDrift`     → `infra_start` / upgrade (infra closure changed)
-	// Today the action bar still lights a single "Resync" affordance
-	// when EITHER binary or definition drifts (the user-facing label
-	// covers both, and the verb is `resync`); `sourceDrift` is the
-	// derived OR until the action bar gets a dedicated Rebuild slot.
-	const binaryDrift = $derived(drift?.binaryDrift ?? false);
-	const definitionDrift = $derived(drift?.definitionDrift ?? false);
-	const sourceDrift = $derived(binaryDrift || definitionDrift);
-	const infraDrift = $derived(drift?.infraDrift ?? false);
-	const hasPreservedState = $derived.by((): boolean => {
-		const p = drift?.preservation;
-		return !!p && (p.parked + p.suspended) > 0;
-	});
-
-	// Infra section visibility, OR-ed with the backend's live state.
-	// `orphanedInfra` is the never-lose-track guarantee: live infra
-	// whose node was deleted from source keeps the controls visible
-	// (Model 1: it never gates run, so visibility is the only thing
-	// standing between the user and forgotten billed infra).
-	const infraExists = $derived(
-		hasInfra || backend.infraRollup !== 'none' || backend.orphanedInfra,
-	);
-
-	/// What the verb gates read: the dispatcher's table plus what the
-	/// source in front of the user says. The rules themselves live in
-	/// `verb-gates.ts`, where they are one pure function with its own
-	/// tests instead of a pile of conditions spread across the slots.
 	const verbInputs = $derived<VerbInputs>({
 		removing: backend.removing,
 		available: backend.available,
@@ -188,63 +85,11 @@
 		transition: backend.transition,
 		infraBusy: backend.infraBusy,
 	});
-	const infraReady = $derived(sourceInfraReady(verbInputs));
-	const isVerbAvailable = (v: ActionVerb): boolean => isVerbOffered(v, verbInputs);
+	const offered = (verb: ActionVerb) => backend.available.includes(verb);
 
-	// The triggers that are off while the others run, as the second
-	// button names them: two by name, then a count.
-	function offNames(off: string[]): string {
-		if (off.length === 0) return 'the triggers that are off';
-		if (off.length <= 2) return off.join(', ');
-		return `${off.slice(0, 2).join(', ')} and ${off.length - 2} more`;
-	}
-
-	function offTitle(off: string[]): string {
-		const which = off.length > 0 ? `Off while the others run: ${off.join(', ')}.` : 'Some triggers are off while the others run.';
-		return `${which} An infra stop takes down the triggers reading it. Turn them back on.`;
-	}
-
-	// The build-transition axis. While a build is in flight, the whole bar
-	// is in the unified transitional pattern: the slot that owns the verb
-	// shows "Building... (cancel)" and every other verb is gated (the
-	// backend rejects them anyway; greying is the courtesy). A resync is
-	// not a build: its triggers show the step it is at, and the verbs it
-	// leaves offered (that step's cancel) come from the backend's list.
-	const buildTransition = $derived(backend.transition);
-	// SYNC: building <-> crates/weft-core/src/projects.rs (ProjectTransition::is_building)
-	const building = $derived(buildTransition === 'building' || buildTransition === 'cancelling_build');
-
-	// ─── Overlay accessors ───────────────────────────────────────
-	const cliVerb = $derived(overlay.kind === 'cli_running' ? overlay.verb : undefined);
-	const cliPhase = $derived(overlay.kind === 'cli_running' ? overlay.phase : undefined);
-	const cliDetail = $derived(overlay.kind === 'cli_running' ? overlay.detail : undefined);
-	// A `pending` overlay (an HTTP verb in flight) carries its VERB, so it belongs
-	// to the SLOT that owns that verb, exactly like `cli_running`. Routing it to
-	// the right slot is what keeps the button transforming IN PLACE (a pending
-	// activate turns the trigger slot into "Activating...") instead of showing a
-	// stray spinner in the middle slot NEXT TO the still-rendered Activate button.
-	const pendingVerb = $derived(overlay.kind === 'pending' ? overlay.verb : undefined);
-	const pendingMessage = $derived(overlay.kind === 'pending' ? overlay.message : undefined);
-	const isExecRunning = $derived(overlay.kind === 'execution_running');
-
-	/// Label for the CLI-running spinner.
-	///
-	/// Mirrors the trigger flow: the spinner's intent comes from the
-	/// VERB the user clicked (Stop / Terminate / Start / Activate
-	/// / Restart), not from the phase. Phases are progress within a
-	/// verb, used here only when they carry information that swaps
-	/// the wording mid-flight (e.g. "Building..." → "Loading...").
-	///
-	/// `verb` is always set whenever `phase` is set (both come from
-	/// the same `cli_running` overlay).
-	function cliPhaseLabel(
-		phase: BarPhase | undefined,
-		verb: ActionVerb | undefined,
-		detail?: Record<string, unknown>,
-	): string {
-		if (phase === undefined) return '';
-		// Phase-specific overrides for stages that have their own
-		// dedicated user-facing wording.
+	/// Label for a CLI verb working: the verb the person clicked, or the
+	/// phase when it says something the verb does not ("Building...").
+	function cliPhaseLabel(phase: BarPhase, verb: ActionVerb, detail?: Record<string, unknown>): string {
 		switch (phase) {
 			case 'preflight': return 'Checking...';
 			case 'build_start':
@@ -252,12 +97,8 @@
 			case 'build_image_done':
 			case 'build_wait': return 'Building...';
 			case 'build_unreachable': {
-				// The install did not answer the last look at the build: the
-				// build may go on there, but nothing here can see it, so the
-				// bar stops saying "Building..." until it answers again.
 				// SYNC: the build_unreachable detail <-> crates/weft-cli/src/progress.rs (Progress::build_unreachable)
-				const elapsed =
-					typeof detail?.elapsedSeconds === 'number' ? ` (${detail.elapsedSeconds}s)` : '';
+				const elapsed = typeof detail?.elapsedSeconds === 'number' ? ` (${detail.elapsedSeconds}s)` : '';
 				return `Install not answering, looking again${elapsed}...`;
 			}
 			case 'build_done': return 'Loading...';
@@ -265,353 +106,103 @@
 			case 'infra_provision_done': return 'Provisioning infra...';
 			case 'trigger_register_start':
 			case 'trigger_register_done': return 'Registering triggers...';
-			case 'drain_wait': {
-				// The bar would otherwise keep saying "Deactivating
-				// triggers..." for as long as the running executions
-				// take, which is the exact stretch this event exists to
-				// explain. The cap is shown when the person set one, so
-				// a long wait reads as the wait they asked for.
-				const cap =
-					typeof detail?.capSeconds === 'number' ? ` (up to ${detail.capSeconds}s)` : '';
-				return `Waiting for running executions${cap}...`;
-			}
+			// The call waits for the runs going to end before it lands:
+			// without this the bar looks hung for as long as they take.
+			case 'drain_wait': return 'Waiting for the runs still going...';
 			case 'warning': {
-				// Something the person should know that is not a failure:
-				// the verb carries on and still ends `complete`. Swallowing
-				// it left the bar showing the generic verb label and the
-				// message nowhere at all.
+				// Something the person should know that is not a failure;
+				// the verb carries on and still ends `complete`.
 				const message = typeof detail?.message === 'string' ? detail.message : '';
 				return message ? `Careful: ${message}` : 'Careful...';
 			}
 			case 'infra_wait': {
-				// The heartbeat of an unbounded wait (fires for start,
-				// stop, and terminate alike): show which verb waits, for
-				// how long, and what each copy starting is doing now, so a
-				// stuck state stays legible.
 				// SYNC: the infra_wait detail <-> crates/weft-cli/src/progress.rs (Progress::infra_wait)
 				const which = typeof detail?.verb === 'string' ? ` ${detail.verb}` : '';
-				const elapsed =
-					typeof detail?.elapsedSeconds === 'number' ? ` (${detail.elapsedSeconds}s)` : '';
+				const elapsed = typeof detail?.elapsedSeconds === 'number' ? ` (${detail.elapsedSeconds}s)` : '';
 				const doing = Array.isArray(detail?.doing)
 					? detail.doing.filter((d: unknown): d is string => typeof d === 'string')
 					: [];
 				return `Waiting for infra${which}${elapsed}${doing.length ? `: ${doing.join('; ')}` : '...'}`;
 			}
 		}
-		// Default: derive from the verb. Covers the dispatcher-call
-		// phases and any future phase that doesn't have its own
-		// override above.
 		switch (verb) {
 			case 'infra_start': return 'Starting infra...';
 			case 'infra_stop': return 'Stopping infra...';
 			case 'infra_terminate': return 'Terminating infra...';
 			case 'infra_upgrade': return 'Upgrading infra...';
 			case 'infra_cancel': return 'Cancelling infra...';
-			case 'infra_node_stop': return 'Stopping node...';
-			case 'infra_node_terminate': return 'Terminating node...';
-			case 'activate':
-			case 'reactivate':
-			case 'resume_active': return 'Activating triggers...';
+			case 'activate': return 'Turning triggers on...';
 			case 'bake': return 'Preparing trigger settings...';
-			case 'cancel_activate': return 'Cancelling activate...';
+			case 'cancel_activate': return 'Cancelling the setup...';
 			case 'cancel_build': return 'Cancelling build...';
-			case 'deactivate': return 'Deactivating triggers...';
-			case 'cancel_running': return 'Cancelling running...';
+			case 'deactivate': return 'Turning triggers off...';
 			case 'resync': return 'Resyncing...';
-			case 'run': return 'Running...';
+			case 'run': return 'Starting the run...';
 			case 'build': return 'Building...';
 			case 'rm': return 'Removing...';
 		}
-		// A phase set with no verb (the type allows `verb: undefined` even
-		// though in practice a cli_running overlay carries both): fall back to a
-		// generic label rather than nothing.
-		if (verb === undefined) return 'Working...';
-		// `verb` is `never` here once every ActionVerb variant is covered above;
-		// adding a new verb to the union forces a compile error here.
 		const _exhaustive: never = verb;
 		return _exhaustive;
 	}
 
-	// ─── Slot-state derivations ──────────────────────────────────
-	//
-	// Three slots, three exhaustive discriminated unions. Each slot
-	// projects (backend, overlay, source-flags) -> render-time state.
-	// The match arms in the template enumerate every variant; new
-	// states land as new variants and TypeScript yells about missing
-	// arms.
-
-	type InfraSlotState =
-		| { kind: 'absent' }
-		| { kind: 'cli_working'; phase: BarPhase }
-		// An HTTP infra verb POST in flight, before /status catches up.
+	/// What the bar shows, the first that holds: a verb this editor runs,
+	/// a Stop on its way, a build, a trigger setup, a resync, an infra
+	/// change, the run followed. Each in-flight state carries the cancel
+	/// the dispatcher offers for it.
+	type Slot =
+		| { kind: 'idle' }
+		| { kind: 'cli'; label: string }
 		| { kind: 'pending'; message: string }
-		// An infra setup running that this bar did not start.
-		| { kind: 'setup' }
-		| {
-			kind: 'rollup';
-			rollup: BackendSnapshot['infraRollup'];
-			canStart: boolean;
-			canStop: boolean;
-			canTerminate: boolean;
-			canUpgrade: boolean;
-			showDrift: boolean;
-		};
+		| { kind: 'working'; label: string; onCancel?: () => void }
+		| { kind: 'resync_stopped' }
+		| { kind: 'run'; runId: string };
 
-	type MiddleSlotState =
-		| { kind: 'absent' }
-		| { kind: 'cli_working'; phase: BarPhase }
-		| { kind: 'building'; cancelling: boolean }
-		| { kind: 'pending'; message: string }
-		| { kind: 'stop_execution' }
-		// The one-click Run that fires every root. Off (slot absent) in a
-		// project whose triggers are the entry point: the trigger
-		// lifecycle is the button there, and the spec menu rides on THAT
-		// button (see `specMenuHost`) so the chevron is never stranded.
-		| { kind: 'run'; enabled: boolean };
-
-	type TriggerSlotState =
-		| { kind: 'absent' }
-		| { kind: 'cli_working'; phase: BarPhase }
-		| { kind: 'building'; cancelling: boolean }
-		// `turnOn`: some triggers are off while the others run (an infra
-		// stop took down the ones reading it), and this verb turns them on.
-		| { kind: 'active'; canDeactivate: boolean; showDrift: boolean; turnOn?: 'activate' | 'reactivate' }
-		| { kind: 'activating'; canCancel: boolean }
-		// A resync stopped with the triggers it took down still down: take
-		// it up again where it stopped, or give it up and leave them down.
-		| { kind: 'resync_stopped'; enabled: boolean }
-		| { kind: 'deactivating'; runningCount: number; canCancel: boolean; canResume: boolean }
-		| { kind: 'reactivate'; mode: string; enabled: boolean }
-		// An HTTP trigger verb POST in flight, before /status catches up: a
-		// spinner with the verb's message, IN this slot (so no stray sibling).
-		| { kind: 'pending'; message: string }
-		| { kind: 'inactive_fresh'; enabled: boolean };
-
-	// One gate for every user-actionable verb: an overlay is in flight
-	// (CLI verb / pending HTTP verb) OR the backend reports a build
-	// transition. Transitional = the only offered action is its cancel.
-	const verbsBlocked = $derived(
-		overlay.kind === 'cli_running'
-			|| overlay.kind === 'pending'
-			|| building,
+	const turningOn = $derived(
+		backend.status === 'activating'
+			|| (status?.triggers ?? []).some((t) => [t.shared, ...(t.copies ?? [])].some((c) => c?.state === 'turning_on')),
+	);
+	/// An infra change under way, whoever started it (this editor, a
+	/// terminal, an assistant).
+	const infraMoving = $derived(
+		barState.infraSetup
+			|| backend.infraBusy
+			|| backend.infraRollup === 'provisioning'
+			|| backend.infraRollup === 'stopping'
+			|| backend.infraRollup === 'terminating',
 	);
 
-	const infraSlot = $derived.by((): InfraSlotState => {
-		if (!infraExists) return { kind: 'absent' };
-		// Spinner if a CLI infra verb is in flight.
-		if (cliVerb && cliPhase !== undefined && isInfraVerb(cliVerb)) {
-			return { kind: 'cli_working', phase: cliPhase };
+	const slot = $derived.by((): Slot => {
+		if (overlay.kind === 'cli_running') return { kind: 'cli', label: cliPhaseLabel(overlay.phase, overlay.verb, overlay.detail) };
+		if (overlay.kind === 'pending') return { kind: 'pending', message: overlay.message };
+		if (backend.transition === 'building' || backend.transition === 'cancelling_build') {
+			return backend.transition === 'cancelling_build'
+				? { kind: 'working', label: 'Cancelling build...' }
+				: { kind: 'working', label: 'Building...', onCancel: offered('cancel_build') ? onCancelBuild : undefined };
 		}
-		// A pending HTTP infra verb owns this slot: show its spinner in place.
-		if (pendingVerb !== undefined && isInfraVerb(pendingVerb) && pendingMessage !== undefined) {
-			return { kind: 'pending', message: pendingMessage };
+		if (resyncStopped(verbInputs)) return { kind: 'resync_stopped' };
+		if (backend.transition === 'resyncing') {
+			return { kind: 'working', label: 'Resyncing...', onCancel: offered('cancel_activate') ? onCancelActivate : undefined };
 		}
-		// An infra setup started anywhere else (a terminal, an assistant):
-		// the same verb working, with the cancel the dispatcher offers
-		// for it.
-		if (barState.infraSetup) {
-			return { kind: 'setup' };
+		if (turningOn) {
+			return { kind: 'working', label: 'Turning triggers on...', onCancel: offered('cancel_activate') ? onCancelActivate : undefined };
 		}
-		return {
-			kind: 'rollup',
-			rollup: backend.infraRollup,
-			canStart: !verbsBlocked && nodeCount > 0 && isVerbAvailable('infra_start'),
-			canStop: !verbsBlocked && isVerbAvailable('infra_stop'),
-			// Trust the dispatcher's available_actions verbatim (it's
-			// the state machine). No redundant rollup re-gate: the old
-			// `rollup === running|stopped` check wrongly hid Terminate
-			// in `partial` (per-unit mixed state).
-			canTerminate: !verbsBlocked && isVerbAvailable('infra_terminate'),
-			canUpgrade: !verbsBlocked && infraDrift && isVerbAvailable('infra_upgrade'),
-			showDrift: infraDrift,
-		};
+		if (infraMoving) {
+			const label = backend.infraRollup === 'stopping' ? 'Stopping infra...'
+				: backend.infraRollup === 'terminating' ? 'Terminating infra...'
+				: 'Starting infra...';
+			return { kind: 'working', label, onCancel: offered('infra_cancel') ? onCancelInfra : undefined };
+		}
+		if (overlay.kind === 'run_running') return { kind: 'run', runId: overlay.runId };
+		return { kind: 'idle' };
 	});
 
-	// Trigger slot is visible whenever EITHER the source declares
-	// triggers OR the backend reports a non-trivial trigger lifecycle.
-	// That covers the "deleted the trigger from source but backend
-	// still has it active" case: the user needs Deactivate (and
-	// Resync) to bring backend back in line with source.
-	//
-	// Preserved state alone does not light it. A plain run parked on a
-	// question is a preserved signal too, and it belongs to the run,
-	// not to activation: with no trigger anywhere the dispatcher
-	// offers only `run`, and lighting the slot on the count hid Run
-	// behind an Activate the dispatcher refuses. The slot lights on
-	// preserved state only when the dispatcher offers Reactivate for
-	// it, which is what says the state is a trigger's.
-	const triggerSlotVisible = $derived(
-		hasTriggers
-			|| backend.status === 'active'
-			|| backend.status === 'activating'
-			|| backend.status === 'deactivating'
-			|| (hasPreservedState && isVerbAvailable('reactivate'))
-	);
-
-	const middleSlot = $derived.by((): MiddleSlotState => {
-		// CLI run/build claims the spinner.
-		if (cliVerb && cliPhase !== undefined && isMiddleVerb(cliVerb)) {
-			return { kind: 'cli_working', phase: cliPhase };
-		}
-		// Backend-reported build. Owned by the trigger slot
-		// when that slot is visible (an activate launched it there);
-		// otherwise the run button owns it.
-		if (building && !triggerSlotVisible) {
-			return { kind: 'building', cancelling: buildTransition === 'cancelling_build' };
-		}
-		// HTTP-driven action awaiting backend confirmation: only when the pending
-		// verb is a MIDDLE verb (run / cancel_build). A pending trigger or infra
-		// verb is owned by its own slot, so it must NOT also spin here.
-		if (pendingVerb !== undefined && isMiddleVerb(pendingVerb) && pendingMessage !== undefined) {
-			return { kind: 'pending', message: pendingMessage };
-		}
-		// Currently following a live execution: show Stop Execution
-		// regardless of project shape (triggered projects still
-		// fire executions that the user may want to cancel).
-		if (isExecRunning) {
-			return { kind: 'stop_execution' };
-		}
-		// No execution in flight: the one-click Run only when the
-		// trigger slot is hidden. Whenever the trigger slot is visible
-		// (source has triggers, or backend still has them active /
-		// deactivating / preserved for a Reactivate), the trigger lifecycle is the
-		// right entry point and a bare Run would conflict. The
-		// exception is an aimed run that walks through no trigger (a
-		// hand-fired maintenance branch): that run is an ordinary
-		// one-shot, so the button comes back beside the trigger
-		// lifecycle. The spec menu is there either way: a saved
-		// example runs the project from its own starting values.
-		if (triggerSlotVisible && !runTargetsAvoidTriggers) return { kind: 'absent' };
-		return { kind: 'run', enabled: runEnabled };
-	});
-
-	// Source-derived gate: Run is only legal once the infra it
-	// would touch is Running. An aimed run consults only ITS
-	// subgraph's infra nodes (per-node status); the ordinary run
-	// touches everything, so the whole-graph rollup gates it. The
-	// dispatcher has the same rule, and the bar re-derives it from the
-	// parsed graph because a run's gate is the whole graph on both
-	// sides: whatever the dispatcher has registered, the source in
-	// front of the user is the newer word on which infra a run needs.
-	// The spec menu shares the gate: a saved example runs as an
-	// ordinary one-shot from its own starting values.
-	const runEnabled = $derived.by(() => {
-		// A run waits on the infra IT would touch, and only that. An
-		// aimed run touches its own subgraph, so its per-node answer is
-		// the whole gate: the dispatcher never hears what a run is aimed
-		// at until it is sent, and an unrelated infra node being down
-		// has no bearing on it. An ordinary run touches everything, so
-		// the whole-graph rollup gates it.
-		const infraForThisRun = (runTargetCount ?? 0) > 0 ? runTargetsInfraReady : infraReady;
-		return !verbsBlocked && nodeCount > 0 && infraForThisRun
-			&& isVerbAvailable('run');
-	});
-
-	// Where the spec menu chevron lives. It is glued to the right of
-	// the project's main button: Run when the one-click Run is up,
-	// otherwise the trigger lifecycle button (Activate / Reactivate /
-	// Deactivate). During a spinner state (building, activating...)
-	// there is no button to glue to and every verb is blocked, so the
-	// menu is hidden rather than stranded beside the spinner.
-	const specMenuHost = $derived.by((): 'run' | 'trigger' | 'none' => {
-		if (middleSlot.kind === 'run') return 'run';
-		if (middleSlot.kind !== 'absent') return 'none';
-		const k = triggerSlot.kind;
-		return k === 'inactive_fresh' || k === 'reactivate' || k === 'active' ? 'trigger' : 'none';
-	});
-
-	const triggerSlot = $derived.by((): TriggerSlotState => {
-		if (!triggerSlotVisible) return { kind: 'absent' };
-		// Spinner if a CLI trigger verb is in flight.
-		if (cliVerb && cliPhase !== undefined && isTriggerVerb(cliVerb)) {
-			return { kind: 'cli_working', phase: cliPhase };
-		}
-		// An HTTP trigger verb (activate / deactivate / ...) is POSTed and awaiting
-		// the /status refresh: show the transitional spinner HERE (this slot owns
-		// the verb), so the button transforms in place instead of leaving the
-		// Activate button up while a spinner appears in the middle slot.
-		if (pendingVerb !== undefined && isTriggerVerb(pendingVerb) && pendingMessage !== undefined) {
-			return { kind: 'pending', message: pendingMessage };
-		}
-		// Backend-reported build launched from this slot
-		// (an activate on a not-yet-built project).
-		if (building) {
-			return { kind: 'building', cancelling: buildTransition === 'cancelling_build' };
-		}
-		if (resyncStopped(verbInputs)) {
-			return { kind: 'resync_stopped', enabled: !verbsBlocked };
-		}
-		switch (backend.status) {
-			case 'active':
-				return {
-					kind: 'active',
-					canDeactivate: !verbsBlocked && nodeCount > 0 && isVerbAvailable('deactivate'),
-					showDrift: sourceDrift && isVerbAvailable('resync'),
-					turnOn: verbsBlocked || nodeCount === 0
-						? undefined
-						: isVerbAvailable('reactivate') ? 'reactivate'
-						: isVerbAvailable('activate') ? 'activate'
-						: undefined,
-				};
-			case 'activating':
-				return {
-					kind: 'activating',
-					canCancel: !verbsBlocked && isVerbAvailable('cancel_activate'),
-				};
-			case 'deactivating':
-				return {
-					kind: 'deactivating',
-					runningCount: backend.runningCount,
-					canCancel: !verbsBlocked && backend.runningCount > 0
-						&& isVerbAvailable('cancel_running'),
-					canResume: !verbsBlocked && isVerbAvailable('resume_active'),
-				};
-			case 'inactive':
-			case 'registered':
-				if (hasPreservedState && isVerbAvailable('reactivate')) {
-					return {
-						kind: 'reactivate',
-						mode: backend.mode,
-						enabled: !verbsBlocked && nodeCount > 0
-							&& isVerbAvailable('reactivate'),
-					};
-				}
-				return {
-					kind: 'inactive_fresh',
-					enabled: !verbsBlocked && nodeCount > 0
-						&& isVerbAvailable('activate'),
-				};
-			case 'unknown':
-			default:
-				return {
-					kind: 'inactive_fresh',
-					enabled: !verbsBlocked && nodeCount > 0
-						&& isVerbAvailable('activate'),
-				};
-		}
-	});
-
-	function isInfraVerb(v: ActionVerb): boolean {
-		return v === 'infra_start' || v === 'infra_stop'
-			|| v === 'infra_terminate' || v === 'infra_upgrade'
-			|| v === 'infra_cancel'
-			|| v === 'infra_node_stop' || v === 'infra_node_terminate';
-	}
-	function isMiddleVerb(v: ActionVerb): boolean {
-		return v === 'run' || v === 'cancel_build';
-	}
-	function isTriggerVerb(v: ActionVerb): boolean {
-		return v === 'activate' || v === 'cancel_activate'
-			|| v === 'deactivate' || v === 'reactivate'
-			|| v === 'resume_active' || v === 'cancel_running'
-			|| v === 'resync';
-	}
-
-
-	// CSS helpers for the floating action bar.
 	const btn = 'flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors';
-	const btnDisabled = 'disabled:opacity-50 disabled:cursor-not-allowed';
 	const labelCss = 'font-medium text-[11px] uppercase tracking-wider';
+
+	const showInfraToggle = $derived(hasInfra && !!onToggleInfraSubgraph);
+	const showTriggerToggle = $derived(hasTriggers && !!onToggleTriggerSubgraph);
+	/// Anything before the selection's part: an eye, or what is going on.
+	const anyStatus = $derived(showInfraToggle || showTriggerToggle || slot.kind !== 'idle');
 
 	const errorMessage = $derived(barState.error?.message);
 	const errorVerb = $derived(barState.error?.verb);
@@ -620,15 +211,11 @@
 	// What the verb on the bar has printed to the terminal. Present while
 	// it runs and, when it fails, for as long as the failure is up.
 	const activity = $derived(barState.activity);
-	/// Is the verb whose output this is still going? Comparing the verbs
-	/// matters: after one fails and another starts, the bar is running
-	/// something, but not the thing the captured output came from.
-	const activityRunning = $derived(
-		overlay.kind === 'cli_running' && overlay.verb === activity?.verb,
-	);
-	/// The pill's one line: the last thing the verb printed. A build
-	/// spends minutes on one step, so the newest line is the one that
-	/// says where it is.
+	/// Is the verb whose output this is still going? After one fails and
+	/// another starts, the bar is running something, but not the thing the
+	/// captured output came from.
+	const activityRunning = $derived(overlay.kind === 'cli_running' && overlay.verb === activity?.verb);
+	/// The pill's one line: the last thing the verb printed.
 	const activityTail = $derived(activity?.lines[activity.lines.length - 1] ?? '');
 
 	let detailsOpen: boolean = $state(false);
@@ -637,12 +224,10 @@
 	});
 </script>
 
-<div class="absolute bottom-6 left-1/2 -translate-x-1/2 flex flex-col items-center gap-1 z-20">
+<div class="flex flex-col items-center gap-1">
 
-	<!-- Sticky error banner. Whole banner is clickable: opens the
-	     details modal. The trailing X dismisses the error entirely
-	     (clears the banner). Lives independently of the slots; the
-	     banner is also cleared by a successful idle push. -->
+	<!-- Sticky error banner. The whole banner opens the details modal;
+	     the trailing X dismisses the error. -->
 	{#if errorMessage}
 		<div class="flex items-center gap-1 bg-red-50 border border-red-200 rounded-lg shadow-sm">
 			<button
@@ -668,11 +253,9 @@
 		</div>
 	{/if}
 
-	<!-- What the verb is printing to the terminal. Nothing else in the
-	     graph shows it, so it gets its own pill: one line, the newest,
-	     and the whole thing in the same modal on click. It sits UNDER a
-	     failure's banner, because the failure is the headline and this
-	     is the trace behind it. -->
+	<!-- What the verb is printing to the terminal: one line, the newest,
+	     and the whole of it in the same modal on click. It sits under a
+	     failure's banner: the failure is the headline, this the trace. -->
 	{#if activity && activityTail}
 		<button
 			type="button"
@@ -700,64 +283,71 @@
 		{onOpenLocation}
 	/>
 
-	<div class="flex items-center gap-1.5 p-1.5 bg-white border border-zinc-200 rounded-xl shadow-xl backdrop-blur-md">
+	{#if anyStatus || selection}
+	<div class="flex flex-wrap items-center justify-center gap-1.5 p-1.5 bg-white border border-zinc-200 rounded-xl shadow-xl backdrop-blur-md max-w-[90vw]">
+		{#if showInfraToggle}
+			<button
+				class="flex items-center justify-center w-7 h-7 rounded-lg transition-colors {showInfraSubgraph ? 'bg-blue-100 text-blue-600 border border-blue-200' : 'bg-white text-zinc-400 border border-zinc-200 hover:bg-zinc-50'}"
+				onclick={onToggleInfraSubgraph}
+				title={showInfraSubgraph ? 'Hide infrastructure subgraph' : 'Show infrastructure subgraph'}
+			>
+				{@render eyeIcon(showInfraSubgraph)}
+			</button>
+		{/if}
+		{#if showTriggerToggle}
+			<button
+				class="flex items-center justify-center w-7 h-7 rounded-lg transition-colors {showTriggerSubgraph ? 'bg-emerald-100 text-emerald-600 border border-emerald-200' : 'bg-white text-zinc-400 border border-zinc-200 hover:bg-zinc-50'}"
+				onclick={onToggleTriggerSubgraph}
+				title={showTriggerSubgraph ? 'Hide trigger subgraph' : 'Show trigger subgraph'}
+			>
+				{@render eyeIcon(showTriggerSubgraph)}
+			</button>
+		{/if}
 
-		<!-- ════════ INFRA SLOT (left) ════════ -->
-		{#if infraSlot.kind !== 'absent'}
-			<div class="flex items-center">
-				{@render infraSlotButtons(infraSlot)}
-				{#if onToggleInfraSubgraph}
-					<div class="w-px h-5 bg-zinc-200 mx-1.5"></div>
-					<button
-						class="flex items-center justify-center w-7 h-7 rounded-lg transition-colors {showInfraSubgraph ? 'bg-blue-100 text-blue-600 border border-blue-200' : 'bg-white text-zinc-400 border border-zinc-200 hover:bg-zinc-50'}"
-						onclick={onToggleInfraSubgraph}
-						title={showInfraSubgraph ? 'Hide infrastructure subgraph' : 'Show infrastructure subgraph'}
-					>
-						{@render eyeIcon(showInfraSubgraph)}
-					</button>
+		{#if slot.kind === 'cli'}
+			{@render workingButton(slot.label, onStop)}
+		{:else if slot.kind === 'pending'}
+			{@render workingButton(slot.message)}
+		{:else if slot.kind === 'working'}
+			{@render workingButton(slot.label, slot.onCancel)}
+		{:else if slot.kind === 'resync_stopped'}
+			<span class="text-[10px] font-medium text-red-600 uppercase tracking-wider whitespace-nowrap px-1">Resync stopped</span>
+			<button
+				class="{btn} bg-amber-50 text-amber-700 border border-amber-300 hover:bg-amber-100"
+				onclick={onResumeResync}
+				title="A resync stopped with the triggers it took down still down. Try it again where it stopped."
+			>
+				<span class={labelCss}>Resync</span>
+			</button>
+			<button
+				class="{btn} bg-white text-zinc-700 border border-zinc-300 hover:bg-zinc-50"
+				onclick={onCancelActivate}
+				title="Give the resync up and leave the triggers it took down off."
+			>
+				<span class={labelCss}>Give up</span>
+			</button>
+		{:else if slot.kind === 'run'}
+			<button class="{btn} bg-orange-50 text-orange-600 border border-orange-200 hover:bg-orange-100" onclick={onStop}>
+				<Square class="w-3.5 h-3.5" />
+				<span class={labelCss}>Stop</span>
+			</button>
+			<span class="px-1 text-[11px] text-zinc-600 whitespace-nowrap">
+				run <span class="font-mono">{slot.runId.slice(0, 4)}...</span>
+				{#if runProgress}
+					{runProgress.total !== null ? `${runProgress.done}/${runProgress.total}` : runProgress.done} nodes
 				{/if}
-			</div>
+			</span>
 		{/if}
 
-		<!-- ════════ MIDDLE SLOT (run / stop-exec / pending / cli) ════════ -->
-		{#if middleSlot.kind !== 'absent'}
-			{#if infraSlot.kind !== 'absent'}
+		{#if selection}
+			{#if anyStatus}
 				<div class="w-px h-6 bg-zinc-200 mx-1"></div>
 			{/if}
-			{@render middleSlotButton(middleSlot)}
-		{/if}
-
-		<!-- ════════ TRIGGER SLOT (right) ════════ -->
-		{#if triggerSlot.kind !== 'absent'}
-			{#if infraSlot.kind !== 'absent' || middleSlot.kind !== 'absent'}
-				<div class="w-px h-6 bg-zinc-200 mx-1"></div>
-			{/if}
-			{@render triggerSlotButton(triggerSlot)}
-			{#if onToggleTriggerSubgraph}
-				<button
-					class="flex items-center justify-center w-7 h-7 rounded-lg transition-colors {showTriggerSubgraph ? 'bg-emerald-100 text-emerald-600 border border-emerald-200' : 'bg-white text-zinc-400 border border-zinc-200 hover:bg-zinc-50'}"
-					onclick={onToggleTriggerSubgraph}
-					title={showTriggerSubgraph ? 'Hide trigger subgraph' : 'Show trigger subgraph'}
-				>
-					{@render eyeIcon(showTriggerSubgraph)}
-				</button>
-			{/if}
-
-			<!-- Trigger drift addendum: only meaningful in `active` state. -->
-			{#if triggerSlot.kind === 'active' && triggerSlot.showDrift}
-				<div class="w-px h-6 bg-amber-300 mx-1"></div>
-				<span class="text-[10px] font-medium text-amber-600 uppercase tracking-wider whitespace-nowrap">Out of sync</span>
-				{@render resyncButton()}
-			{/if}
+			{@render selection()}
 		{/if}
 	</div>
+	{/if}
 </div>
-
-<!-- ════════════════════════════════════════════════════════════
-     Snippets. Each match arm renders one variant of one slot.
-     New variants land here next to a new arm in the slot's
-     discriminated union; TypeScript catches missing arms.
-     ════════════════════════════════════════════════════════════ -->
 
 {#snippet eyeIcon(open: boolean)}
 	<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -769,12 +359,9 @@
 	</svg>
 {/snippet}
 
-<!-- THE one transitional pattern: the button that launched the action
-     shows its "...-ing" label AND offers cancel, wired to the matching
-     cancel verb. `onCancel` absent = the transitional state is not
-     cancellable right now (e.g. cancel already requested); the button
-     still shows the live state. Cancel reconciles, never asserts: the
-     next backend snapshot decides what renders. -->
+<!-- THE one in-flight pattern: the "...-ing" label AND its cancel, when
+     there is one right now. Cancel reconciles, never asserts: the next
+     status decides what renders. -->
 <!-- Default-param form, NOT `onCancel?`: snippet parameters live in the
      MARKUP, which no script preprocessor touches, so a TS optional marker
      passes verbatim into the compiled JS and breaks the build ("Expected ',',
@@ -784,294 +371,9 @@
 		class="{btn} bg-red-50 text-red-600 border border-red-200 hover:bg-red-100"
 		onclick={onCancel}
 		disabled={!onCancel}
-		title={onCancel ? 'Cancel the in-flight action' : undefined}
+		title={onCancel ? 'Cancel it' : undefined}
 	>
 		<Loader2 class="w-3.5 h-3.5 animate-spin" />
 		<span class={labelCss}>{text}{onCancel ? ' (Cancel)' : ''}</span>
-	</button>
-{/snippet}
-
-{#snippet infraSlotButtons(slot: InfraSlotState)}
-	{#if slot.kind === 'absent'}
-		<!-- never rendered: outer guard skips the section -->
-	{:else if slot.kind === 'cli_working'}
-		{@render workingButton(cliPhaseLabel(slot.phase, cliVerb, cliDetail), onStop)}
-	{:else if slot.kind === 'pending'}
-		{@render workingButton(slot.message)}
-	{:else if slot.kind === 'setup'}
-		{@render workingButton('Starting infra...', isVerbAvailable('infra_cancel') ? onCancelInfra : undefined)}
-	{:else}
-		{#if slot.rollup === 'stopping' || slot.rollup === 'terminating' || slot.rollup === 'provisioning'}
-			<!-- Supervisor-driven transients. The dispatcher offers
-			     exactly one action here: infra_cancel (HALT the
-			     in-flight work; per-node partial state stays visible
-			     for per-node terminate/retry). -->
-			{@render workingButton(
-				slot.rollup === 'stopping'
-					? 'Stopping infra...'
-					: slot.rollup === 'terminating'
-						? 'Terminating infra...'
-						: 'Provisioning infra...',
-				isVerbAvailable('infra_cancel') ? onCancelInfra : undefined,
-			)}
-		{:else if slot.rollup === 'running'}
-			<button class="{btn} {btnDisabled} bg-zinc-100 text-zinc-700 border border-zinc-200 hover:bg-zinc-200" onclick={onStopInfra} disabled={!slot.canStop}>
-				<Square class="w-3.5 h-3.5" />
-				<span class={labelCss}>Stop Infra</span>
-				<span class="flex h-1.5 w-1.5 relative ml-0.5">
-					<span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-					<span class="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-500"></span>
-				</span>
-			</button>
-			{#if slot.canUpgrade && onUpgradeInfra}
-				<div class="w-px h-5 bg-amber-300 mx-1"></div>
-				<button
-					class="{btn} bg-amber-50 text-amber-700 border border-amber-300 hover:bg-amber-100"
-					onclick={onUpgradeInfra}
-					title="Source changed since infra started; rebuild infra images"
-				>
-					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg>
-					<span class={labelCss}>Upgrade Infra</span>
-				</button>
-			{/if}
-		{:else}
-			<!-- Non-transient, non-running ('none', 'stopped',
-			     'partial', 'failed', 'flaky') all present "Start
-			     Infra" as the next step. The dispatcher's
-			     available_actions decides whether the button is
-			     enabled; the rollup decides the rendering siblings
-			     (trash button visibility, drift dot). -->
-			<button
-				class="{btn} {btnDisabled} bg-blue-50 text-blue-600 border border-blue-200 hover:bg-blue-100"
-				onclick={onStartInfra}
-				disabled={!slot.canStart}
-			>
-				<Database class="w-3.5 h-3.5" />
-				<span class={labelCss}>Start Infra</span>
-			</button>
-		{/if}
-		{#if slot.canTerminate && onTerminateInfra}
-			<button
-				class="{btn} ml-1 bg-red-50 text-red-600 border border-red-200 hover:bg-red-100"
-				onclick={onTerminateInfra}
-				title="Terminate Infra"
-			>
-				<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
-			</button>
-		{/if}
-	{/if}
-{/snippet}
-
-{#snippet middleSlotButton(slot: MiddleSlotState)}
-	{#if slot.kind === 'absent'}
-		<!-- never rendered: outer guard skips the section -->
-	{:else if slot.kind === 'cli_working'}
-		{@render workingButton(cliPhaseLabel(slot.phase, cliVerb, cliDetail), onStop)}
-	{:else if slot.kind === 'building'}
-		{@render workingButton(
-			slot.cancelling ? 'Cancelling build...' : 'Building...',
-			slot.cancelling ? undefined : onCancelBuild,
-		)}
-	{:else if slot.kind === 'pending'}
-		{@render workingButton(slot.message, undefined)}
-	{:else if slot.kind === 'stop_execution'}
-		<button
-			class="{btn} bg-orange-50 text-orange-600 border border-orange-200 hover:bg-orange-100"
-			onclick={onStop}
-		>
-			<Square class="w-3.5 h-3.5" />
-			<span class={labelCss}>Stop Execution</span>
-		</button>
-	{:else if slot.kind === 'run' && onRun}
-		<div class="relative flex items-stretch">
-			<button
-				class="{btn} {btnDisabled} px-6 bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800 rounded-r-none"
-				onclick={onRun}
-				disabled={!slot.enabled}
-			>
-				<Play class="w-3.5 h-3.5" />
-				<span class={labelCss}>{runLabel(runTargetCount ?? 0)}</span>
-			</button>
-			{@render specMenu('bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800 border-l-zinc-700')}
-		</div>
-	{/if}
-{/snippet}
-
-<!-- The spec menu chevron and its dropdown: the project's specs, "Run
-     this group" when the user stands inside one, and the dialog for a
-     one-off. Glued to the right edge of its host button (the host drops
-     its right rounding, the chevron its left one), painted in the
-     host's colors. The bar sits at the bottom of the screen, so the
-     menu opens UPWARD and the chevron points up while closed, down
-     while open (it is then the thing to click to close it). Must be
-     rendered inside a `relative` wrapper with its host. -->
-{#snippet specMenu(hostCss: string)}
-			<button
-				class="{btn} {btnDisabled} px-1.5 rounded-l-none border-l {hostCss}"
-				onclick={() => { specMenuOpen = !specMenuOpen; if (specMenuOpen) onOpenSpecMenu?.(); }}
-				disabled={!runEnabled}
-				title={specMenuOpen ? 'Close' : 'Run a saved example, this group, or a one-off'}
-			>
-				<ChevronUp class="w-3.5 h-3.5 transition-transform {specMenuOpen ? 'rotate-180' : ''}" />
-			</button>
-			{#if specMenuOpen}
-				<div class="absolute right-0 bottom-full mb-1 z-50 min-w-64 bg-white border rounded-lg shadow-lg p-1 text-xs">
-					{#if focusedGroup}
-						<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted font-medium" onclick={() => { specMenuOpen = false; onOpenSpecDialog?.(specForAction('group', focusedGroup)); }}>
-							Run this group ({focusedGroup})…
-						</button>
-					{/if}
-					{#each specs as spec (spec.name)}
-						<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted flex justify-between gap-3" onclick={() => { specMenuOpen = false; onRunSpec?.(spec.name); }}>
-							<span class="font-mono">{spec.name}</span>
-							<span class="text-zinc-400">{specSummary(spec)}</span>
-						</button>
-					{/each}
-					{#if specs.length === 0}
-						<div class="px-2 py-1.5 text-zinc-400">no specs in examples/</div>
-					{/if}
-					<div class="my-1 border-t"></div>
-					<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted" onclick={() => { specMenuOpen = false; onOpenSpecDialog?.(); }}>
-						Run from a spec…
-					</button>
-				</div>
-			{/if}
-{/snippet}
-
-{#snippet triggerSlotButton(slot: TriggerSlotState)}
-	{#if slot.kind === 'absent'}
-		<!-- never rendered: outer guard skips the section -->
-	{:else if slot.kind === 'cli_working'}
-		{@render workingButton(cliPhaseLabel(slot.phase, cliVerb, cliDetail), onStop)}
-	{:else if slot.kind === 'building'}
-		{@render workingButton(
-			slot.cancelling ? 'Cancelling build...' : 'Building...',
-			slot.cancelling ? undefined : onCancelBuild,
-		)}
-	{:else if slot.kind === 'pending'}
-		{@render workingButton(slot.message)}
-	{:else if slot.kind === 'active'}
-		<div class="flex items-center gap-1.5">
-			<div class="relative flex items-stretch">
-				<button
-					class="{btn} {btnDisabled} bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700 {specMenuHost === 'trigger' ? 'rounded-r-none' : ''}"
-					onclick={onDeactivate}
-					disabled={!slot.canDeactivate}
-				>
-					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
-					<span class={labelCss}>Deactivate</span>
-					<span class="flex h-2 w-2 relative ml-1">
-						<span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-						<span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
-					</span>
-				</button>
-				{#if specMenuHost === 'trigger'}
-					{@render specMenu('bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700 border-l-emerald-500')}
-				{/if}
-			</div>
-			{#if slot.turnOn}
-				<button
-					class="{btn} {btnDisabled} bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800"
-					onclick={slot.turnOn === 'reactivate' ? onReactivate : onActivate}
-					title={offTitle(backend.triggersOff)}
-				>
-					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-					<span class={labelCss}>{slot.turnOn === 'reactivate' ? 'Reactivate' : 'Activate'} {offNames(backend.triggersOff)}</span>
-				</button>
-			{/if}
-		</div>
-	{:else if slot.kind === 'activating'}
-		{@render workingButton(
-			'Activating...',
-			slot.canCancel ? onCancelActivate : undefined,
-		)}
-	{:else if slot.kind === 'resync_stopped'}
-		<div class="flex items-center gap-1.5">
-			<span class="text-[10px] font-medium text-red-600 uppercase tracking-wider whitespace-nowrap">Resync stopped</span>
-			<button
-				class="{btn} {btnDisabled} bg-amber-50 text-amber-700 border border-amber-300 hover:bg-amber-100"
-				onclick={onResumeResync}
-				disabled={!slot.enabled}
-				title="A resync stopped with the triggers it took down still down. Try it again where it stopped."
-			>
-				<span class={labelCss}>Resync</span>
-			</button>
-			<button
-				class="{btn} {btnDisabled} bg-white text-zinc-700 border border-zinc-300 hover:bg-zinc-50"
-				onclick={onCancelActivate}
-				disabled={!slot.enabled}
-				title="Give the resync up and leave the triggers it took down off."
-			>
-				<span class={labelCss}>Give up</span>
-			</button>
-		</div>
-	{:else if slot.kind === 'deactivating'}
-		<div class="flex items-center gap-1.5">
-			{@render workingButton(
-				`Deactivating (${slot.runningCount} running)...`,
-				slot.canCancel ? onCancelRunning : undefined,
-			)}
-			{#if slot.canResume}
-				<button
-					class="{btn} {btnDisabled} bg-zinc-900 text-white hover:bg-zinc-800"
-					onclick={onResumeActive}
-					title="Roll back to active; new fires resume immediately"
-				>
-					<Zap class="w-3.5 h-3.5" />
-					<span class={labelCss}>Resume Active</span>
-				</button>
-			{/if}
-		</div>
-	{:else if slot.kind === 'reactivate'}
-		<div class="flex items-center gap-1.5">
-			<span class="px-2 py-1 rounded-md bg-zinc-100 text-zinc-600 border border-zinc-200 text-[11px] font-medium capitalize">
-				{slot.mode}
-			</span>
-			<div class="relative flex items-stretch">
-				<button
-					class="{btn} {btnDisabled} bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800 {specMenuHost === 'trigger' ? 'rounded-r-none' : ''}"
-					onclick={onReactivate}
-					disabled={!slot.enabled}
-					title="Reactivate; choose how to handle preserved state"
-				>
-					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-					<span class={labelCss}>Reactivate</span>
-				</button>
-				{#if specMenuHost === 'trigger'}
-					{@render specMenu('bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800 border-l-zinc-700')}
-				{/if}
-			</div>
-		</div>
-	{:else}
-		<div class="relative flex items-stretch">
-			<button
-				class="{btn} {btnDisabled} bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800 {specMenuHost === 'trigger' ? 'rounded-r-none' : ''}"
-				onclick={onActivate}
-				disabled={!slot.enabled}
-			>
-				<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-				<span class={labelCss}>Activate</span>
-			</button>
-			{#if specMenuHost === 'trigger'}
-				{@render specMenu('bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800 border-l-zinc-700')}
-			{/if}
-		</div>
-	{/if}
-{/snippet}
-
-{#snippet resyncButton()}
-	<button
-		class="{btn} {btnDisabled} bg-amber-50 text-amber-700 border border-amber-300 hover:bg-amber-100"
-		onclick={onResync}
-		disabled={!isVerbAvailable('resync')}
-		title="Project changed since activation. Resync to apply changes."
-	>
-		<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5">
-			<path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
-			<path d="M3 3v5h5"/>
-			<path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
-			<path d="M16 16h5v5"/>
-		</svg>
-		<span class={labelCss}>Resync</span>
 	</button>
 {/snippet}

@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use weft::context::LogLevel;
 use weft::access::client::required_str;
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::api;
 
@@ -45,7 +45,7 @@ impl Node for SlackSendMessageNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let channel: Option<String> = ctx.inputs.opt("channel")?;
         let user: Option<String> = ctx.inputs.opt("user")?;

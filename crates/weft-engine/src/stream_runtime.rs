@@ -38,7 +38,7 @@ pub enum AbsorbKind<'a> {
 }
 
 pub struct StreamRuntime {
-    /// The execution's shared wait tracker, handed to every feed so
+    /// The run's shared wait tracker, handed to every feed so
     /// consumer pulls register their waits.
     waits: Arc<WaitTracker>,
     /// Live feeds by consuming firing and input port. An entry exists

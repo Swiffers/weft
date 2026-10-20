@@ -8,10 +8,10 @@ and has no address they can reach, so weft opens one for you:
 ./setup.sh --public-url
 ```
 
-That starts a tunnel from your machine to a separate port (14112) where weft
-serves a short list of paths and nothing else. The choice sticks, so later
-installs
-keep it open until you say otherwise.
+That opens a tunnel from a public address to a port of its own on your machine
+(14112 on the default install), where weft serves a short list of paths. The
+choice sticks: later runs of `./setup.sh` keep the tunnel open until you pass
+`--no-public-url`.
 
 ## What it exposes, and what it does not
 
@@ -20,18 +20,19 @@ These paths, and nothing else. Everything else on that address answers 404.
 | Path | What arrives there |
 |---|---|
 | `POST /events/<service>/<topic>` | A provider pushing you an event. A GET there answers 404 |
-| `POST /signal/<token>` | Somebody answering a waiting step through its link |
-| `DELETE /signal/<token>` | Somebody cancelling that waiting step through the same link |
-| `POST /signal/<token>/skip` | Somebody skipping that waiting step |
-| `GET /signal-token/signals` | A client holding a signal token, listing the steps waiting on it |
-| `DELETE /signal-token/signals` | That client clearing every step it listed |
+| `POST /signal/<token>` | Somebody answering a waiting node through its link |
+| `DELETE /signal/<token>` | A client cancelling the run waiting behind that link, and every other wait of that run with it. It needs a signal token minted without `--tags`: either a token for whole projects, or an instance token (`weft token mint --instance`), which can only cancel its own instance's waits. On a trigger's link, it drops that trigger's signal instead |
+| `POST /signal/<token>/skip` | Somebody skipping that waiting node |
+| `GET /signal-token/signals` | A client holding a signal token, listing the nodes waiting on it |
+| `DELETE /signal-token/signals` | That client cancelling every run it can see waiting on anything (a form, a timer, a poll), and dropping every trigger signal it can see, listed or not: a webhook's or a schedule's too. It needs a token that covers whole projects (minted with `weft token mint` without `--tags`, not an instance token) |
 | `GET /signal-token/signals/<signal>/files/<field>` | That client asking for a fresh link to a file a listed form shows |
 | `GET /signal-token/health` | That client checking its token still works |
 | `GET /signal-token/displays` | That client listing what your nodes are showing (a QR code, say) |
 | `GET /signal-token/displays/<project>/<node>` | That client reading one node's display |
 | `POST /signal-token/displays/<project>/<node>/action` | That client pressing a button on it |
-| `/instance/...` | Somebody holding an instance token for one of your programs: that instance's fields, its connections, its runs |
-| `GET /public/files/<token>` | Somebody fetching a file link your program handed out |
+| `/instance/...` | Somebody holding an instance token for one of your programs: that instance's fields, its connections, its runs (a failed run shows only `Something went wrong`; the reason stays on the run's record, where `weft logs <run id>` shows it to you) |
+| `GET`, `HEAD` or `PUT /files/runtime/...` | Somebody opening a file link your program handed out, or a page sending a part of an upload. The link's own signature is what lets it in |
+| `POST /files/upload/<step>` | A page uploading a file through an upload slot your program handed it |
 | `/connect/<tenant>/<project id>/<path>` | A caller of one of your routes or sockets |
 | `/infra/<project>/<copy>/...` | A caller of an infrastructure endpoint your node opened to the public |
 | `GET /access/oauth/callback` | A provider sending you back after you approve a connection |
@@ -39,9 +40,10 @@ These paths, and nothing else. Everything else on that address answers 404.
 | `POST /<tenant>/<project id>/<path>` | A trigger of yours that fires on a plain POST to its own path |
 | `/`, `/index.html`, `/logo.png` | A small page saying this address is a weft install |
 
-Every `/signal-token/...` request carries the signal token in its
-`Authorization: Bearer` header, never in the path, so it stays out of proxy
-logs.
+Every `/signal-token/...` request, and a `DELETE /signal/<token>`, carries the
+signal token in its `Authorization: Bearer` header, so it stays out of proxy
+logs. The `<token>` in a `/signal/` path is a different one: the link's own
+token, which is made to be pasted.
 
 Your dispatcher's real API, your projects, your journal and your runs are not
 on that port at all, so nothing arriving through the tunnel can reach them.
@@ -87,7 +89,7 @@ own. You need a Cloudflare account with that domain on it.
    service to the port weft serves those paths on: on Linux,
    `http://127.0.0.1:14112`, because the tunnel shares your machine's
    network; on macOS, `http://host.docker.internal:14112`. 14112 is the
-   main install's port. A branch's install has its own: the `outside` value
+   default install's port. A branch's install has its own: the `outside` value
    in `ports.json`, in the folder `weft daemon which` prints.
 3. Install with both set:
 
@@ -108,6 +110,71 @@ naming the value it expects.
 ```
 
 The tunnel comes down and the address stops answering.
+
+## Devices on your own network
+
+If you want a phone or another computer on your wifi to open what your program
+hands out, without the internet in between, give weft this machine's address
+on that network:
+
+```bash
+WEFT_NETWORK_ADDRESS=192.168.1.20 weft daemon start
+```
+
+```text
+network address: http://192.168.1.20:14112 (the doors outside callers use, for devices on this machine's network; a start with WEFT_NETWORK_ADDRESS=off closes it)
+```
+
+weft then answers the paths in the table above on that address too, on the
+port the tunnel uses (14112 on the default install), and nothing else: your projects and runs stay on `127.0.0.1`. weft
+remembers the address for every later start. If you want to close it, start
+once with `WEFT_NETWORK_ADDRESS=off`.
+
+It takes the bare IP (`ip -brief address` lists yours), and weft adds the
+scheme and the port itself. The start refuses a value with a scheme, a port or
+a path. It also refuses a loopback address (no other device can reach
+it), `0.0.0.0` or `::` (that would open these paths on every network this
+machine is on), a link-local IPv6 one starting `fe80:`, and one this machine
+does not have. Each refusal names
+what to give instead.
+
+## Your own site in front
+
+If your project has its own site and you want links to its stored files to
+go through that site, tell weft the address where the site passes its
+visitors' calls on to weft (the `weftPassThrough` helper from `@weft/connect/server`,
+mounted at `/weft` on the site):
+
+```bash
+weft frontend visitor-address shop https://shop.example/weft
+```
+
+`shop` is the name you gave the frontend with `weft frontend add`. If you are
+making the frontend now, `weft frontend add shop --visitor-address
+https://shop.example/weft` sets it in the same step. To clear it, give `off` in
+place of the address. One
+frontend per project can hold it: asking for a second is refused, naming the
+frontend that has it.
+
+## Which address a file link gets
+
+When your program hands somebody outside a link to a stored file (a file in a
+route's answer, say), the link goes through this tunnel only on a local install
+whose project has no visitor address. With the tunnel closed too, it goes to
+the install's own address: the network address if you set one, which only
+devices on your network can open, otherwise `127.0.0.1`, which only this
+machine can open. For the full order and what a node sees, go and read
+[handing a file out](../nodes/storage.md#handing-a-file-out).
+
+If your tunnel is the one whose address changes on restart (`./setup.sh
+--public-url` without a hostname of your own), weft asks it for its address each time it makes a
+link, so a new link always carries the current address. A link handed out
+before the tunnel restarted still points at the old one. If the tunnel cannot say its address at that
+moment, the link is refused:
+
+```text
+the install's tunnel does not say its address right now; `weft daemon start` opens it again
+```
 
 ## When you do not need it
 

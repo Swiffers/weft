@@ -57,7 +57,7 @@ frontend ls --on prod` shows that address).
 
 `weft workers` shows a project's worker settings and which come from the install: copies kept warm (`min_instances`), the most copies (`max_instances`), how many calls Cloud Run sends one copy at once (`concurrency`, 80), CPU (unset is one CPU on a cloud install), memory, how long a copy keeps a pool its runs share once nothing uses it (`shared_idle_seconds`), how many runs one copy takes at once (`max_runs_at_once`, unset is one per MiB of memory and never fewer than 64), and how long a call waits for room before it is turned away (`max_queue_wait_seconds`, 30). Before you run `weft workers set --min-instances 1`, tell the user: it keeps
 one copy warm so the first call never waits for a start, and on a cloud
-install that copy is billed all the time. On a cloud install one stretch of a run lasts an hour at most (Cloud Run cuts a request there, and the run stops itself a minute before): a run that pauses whole (every branch waiting on a timer or a form) starts a fresh hour when it picks back up, so split work that can take longer with a pause. A pause does not help while a caller is still on the line (a route with `outlivesCaller` off) or while a bus between its nodes is open: such a run's wait holds its copy, and it stops at 59 minutes, telling the client to reconnect. A route with `outlivesCaller` whose caller has gone moves its run off the caller's copy once the steps it was running end, and carries it on with a fresh hour; a run with a bus open between its nodes cannot move, so it keeps running on that copy for as long as the copy stays up. A run whose trigger leaves `durable` off (the default) ends cancelled if its copy dies mid-run, and is not run again; if a trigger's runs have to carry on after that (they move money, say), set `durable: true` on it.
+install that copy is billed all the time. On a cloud install one stretch of a run lasts an hour at most (Cloud Run cuts a request there, and the run stops itself a minute before): a run that pauses whole (every branch waiting on a timer or a form) starts a fresh hour when it picks back up, so split work that can take longer with a pause. A pause does not help while a caller is still on the line (a route with `outlivesCaller` off) or while a bus between its nodes is open: such a run's wait holds its copy, and it stops at 59 minutes, telling the client to reconnect. A route with `outlivesCaller` whose caller has gone moves its run off the caller's copy once the nodes it was running end, and carries it on with a fresh hour; a run with a bus open between its nodes cannot move, so it keeps running on that copy for as long as the copy stays up. A run whose trigger leaves `durable` off (the default) ends cancelled if its copy dies mid-run, and is not run again; if a trigger's runs have to carry on after that (they move money, say), set `durable: true` on it.
 
 A trigger that holds a connection open (a stream or a socket it listens to,
 an event subscription that dials out) runs on a holder, which weft starts
@@ -99,12 +99,19 @@ folder:
    themselves and types it into its hidden prompt.
 3. `weft ci add --cloud gcp`: writes `.github/workflows/deploy.yml`. The
    workflow, run by hand from the repository's Actions tab, asks the
-   install which weft it runs and builds that CLI, deploys the program (`weft activate
-   --on <target>` when it is off, `weft resync --on <target> --mode park`
-   when it is on), then, when the install hosts a frontend for the
-   repository, builds `front/` with Docker and runs it on that frontend's
-   Cloud Run service, which calls the install at its address and reaches the
-   program's infrastructure over the install's private network.
+   install which weft it runs and builds that CLI, then deploys the
+   program: `weft infra upgrade --all`, then `weft resync --all`, which
+   bring onto the new version only the [infra] already running and the
+   triggers already on, the program's own and every instance's. It never
+   turns anything on, so a trigger or a piece of [infra] somebody took down
+   stays down, and a first deploy needs steps 6 and 8 below. The
+   workflow's `RUNNING: wait` setting makes both commands let the runs
+   going finish on their old version, however long they take. If the user
+   would rather stop them at once, they set it to `cancel`. Then, when the install hosts a frontend for the
+   repository, it builds `front/` with Docker and runs it on that
+   frontend's Cloud Run service, which calls the install at its address
+   and reaches the program's infrastructure over the install's private
+   network.
    `weft new --ci gcp` writes the same file when the project is made. If it
    refuses because the file "was changed since weft wrote it (or weft never
    wrote it)", the file is somebody's own and weft never overwrites it: tell
@@ -120,23 +127,24 @@ folder:
    install's builder (the worker and every piece's image, about 2 minutes
    the first time, nothing when they are built already), then brings each
    piece up: on GCP each boots a machine of its own, about 2 to 3 minutes,
-   and several pieces boot side by side. The workflow's activate refuses
-   while a trigger reads infra that is not running.
+   and several pieces boot side by side.
 7. `weft target export prod --github`: needs step 2 first, and the
    repository already on GitHub. It sets the variables and secrets the
    workflow reads, with `gh` (logged in, run inside the repo): it mints
    an operator key for CI. If the install hosts a frontend for this repository, it also gives that frontend a new token and names its Cloud Run service; the old token keeps working until the workflow's next run deploys the new one and retires it. Every run mints new ones, so it runs once per setup, or again
-   when a CI credential was lost. Without `--github` it prints the variables and writes the secrets to a file only you can read, which the user copies into the repository's secrets and then deletes. It also lists every connection the program needs that prod still has no pick for (or says every one is picked): the workflow cannot turn
-   the program on until those are picked (step 5).
+   when a CI credential was lost. Without `--github` it prints the variables and writes the secrets to a file only you can read, which the user copies into the repository's secrets and then deletes. It also lists every connection the program needs that prod still has no pick for (or says every one is picked): `weft activate --on prod` (step 8) refuses until those are picked (step 5).
    If the project has a frontend, its server's own settings go out with
    this same export: the user writes them into `front/.env.prod` first
    ([The frontend on a cloud install](#the-frontend-on-a-cloud-install)
    says what goes in it), and the export runs as `weft target export prod
    --github --front-env front/.env.prod`.
+8. Run `weft activate --on prod` once to turn the program's triggers on:
+   every run of the workflow after that brings them up to date.
 
 Then the user runs the workflow from the repository's Actions tab: about a
 minute and a half for the program, plus however long the frontend's build
-takes.
+takes, plus however long the runs going take to end while `RUNNING` is
+`wait`.
 
 ## A project's frontend: `weft frontend`
 
@@ -215,29 +223,28 @@ project's sources, only the files the install does not have yet. The
 install compiles that snapshot itself, builds the images it needs, and
 activates. So a deploy of an unchanged project builds nothing.
 
-Activate never starts infrastructure. On a first deploy of a program with
-infra (a database, a bridge), run `weft infra start --on prod` first (step 6
-above, which builds the program too): if a trigger reads infra that is not
-running, activate refuses with "these triggers' infra is not running:
-<node>", and while it is still starting, with "this program's infra is
-changing (infra provisioning)". On GCP each piece boots a machine, so it
-takes a few minutes; `weft status --on prod` shows each one's state.
+Activate never starts infrastructure, so on a first deploy of a program
+with infra (a database, a bridge), run `weft infra start --on prod` first
+(step 6 above, which builds the program too). The `weft-running` skill has
+what activate says when infra is down. On GCP each piece boots a machine, so it takes a
+few minutes; `weft status --on prod` shows each one's state.
 
-`weft activate` is for a program that is off. Once its triggers are on, it
-refuses, and a change goes live with `weft resync --on prod --mode <mode>`,
-which takes the triggers down and brings them back on the new version. On
-prod, pick `park` (events that arrive meanwhile wait and run on the new
-version once the triggers are back, while a caller on a route is told to
-try again in a moment) or `hibernate` (the same for a grace window),
-because those events can be real people's. `wipe` drops them and
-cancels the work waiting on the triggers: fine on a dev install, and on
-prod only when the user says so.
+`weft activate` turns on what is off. A change to a program whose triggers
+are on goes live with `weft infra upgrade --on prod --all`, then `weft
+resync --on prod --all` (the workflow's own two steps), never a plain
+`weft resync`, which reaches only the program's own triggers. While the
+resync has a trigger down, what arrives is held and runs on the new
+version, and the runs still going finish on the old one first; for the three answers every take-down gives, and why a
+new trigger cannot be turned on before that resync, go and read the
+`weft-running` skill, "Taking triggers down, and bringing them back". Pass
+`--held drop` or `--door refuse` on prod only when the user says so: both
+throw away work.
 
 Every target keeps its own versions: `weft tree --on prod` lists what was
 deployed there. To roll back, put an older one's files back in the folder
-with `weft branch <id> --on prod`, then `weft resync --on prod --mode park`
-(or `weft activate --on prod` if the program is off). Its
-images are already built, so nothing rebuilds. `weft branch` refuses while
+with `weft branch <id> --on prod`, then `weft infra upgrade --on prod --all`
+and `weft resync --on prod --all` (or `weft activate --on prod` if the
+program is off). Its images are already built, so nothing rebuilds. `weft branch` refuses while
 the folder holds changes no version records; `--discard` throws those
 changes away, and you pass it only when the user said to.
 
@@ -281,10 +288,11 @@ A connection prod does not hold yet is added one of two ways:
 
 - **A key the project issued itself**, kept in the project's own `.env`
   (the key that guards its own API, a webhook signing secret): the
-  deployer stores it without ever reading it, by loading `.env` into the
-  command's environment and naming the variable, so the value goes from
-  the file to the install and never through the chat:
-  `set -a; . ./.env; set +a; weft connect --on prod --node <node> --door own --set-env <field>=<VARIABLE>`.
+  deployer stores it without ever reading it, by naming the variable:
+  weft loads the project's `.env` into its own environment when it starts,
+  so the value goes from the file to the install and never through the
+  chat: `weft connect --on prod --node <node> --door own --set-env <field>=<VARIABLE>`,
+  run from the project folder.
 - **A person's own account** (a sign-in, a key a provider gave the user):
   the user adds it, with the command you hand them (`weft connect --on prod
   --node <node>`).

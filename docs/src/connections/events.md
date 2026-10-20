@@ -42,10 +42,12 @@ A `webhook` topic declares how the provider's pushes are handled:
 
 | Key | What it is |
 |---|---|
-| `verify` | How a push is proved real: an HMAC, an Ed25519 or ECDSA signature, an API key, OIDC, or a token weft minted |
+| `verify` | How a push is proved real: `hmac`, `signature` (Ed25519 or ECDSA), `oidc`, or `token_echo` (the push carries back a token weft minted) |
 | `handshake` | The one-off proof of ownership: echo a field from the body, echo a query parameter, or call a URL back |
-| `event_path` | Where the event sits inside the envelope |
-| `route_by` | Whether the event names the provider account, or an id weft minted |
+| `eventPath` | Where the event sits inside the envelope |
+| `routeBy` | `account` (the default: the event names the provider account) or `subscription` (it names an id weft minted when it subscribed) |
+| `idPath` | Where a push carries the subscription id weft minted. Needed with `routeBy: subscription` |
+| `tokenPath` | Where a push carries the token weft minted. Needed with `token_echo` |
 | `decode` | For an event wrapped in base64 or a form encoding |
 | `subscribe` | The calls that create, renew and cancel the subscription |
 
@@ -70,8 +72,9 @@ And the one you are most likely to meet:
 this trigger needs 'slack' to deliver events TO your weft, which requires your
 weft to be reachable from the internet, and it is not. If you accept making its
 public trigger surface reachable, rerun `./setup.sh --public-url`, then `weft
-activate` (or `weft resync`, when the trigger is already on); or use a
-connection that supports dialing out (your own provider app), where the
+activate`, or, when the trigger is already on, turn it off and on again
+(`weft deactivate --trigger <name>`, then `weft activate --trigger <name>`);
+or use a connection that supports dialing out (your own provider app), where the
 service offers one. See https://weavemindai.github.io/weft/connections/events.html
 ```
 

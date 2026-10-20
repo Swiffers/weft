@@ -122,16 +122,20 @@ async fn poll_handler(State(body): State<Arc<Mutex<String>>>) -> impl IntoRespon
 /// "is it done yet" endpoint: the first `pending` reads answer
 /// `{"status": "IN_PROGRESS"}`, every read after them answers
 /// `{"status": "COMPLETED", "result": <result>}`. Counts the reads, so a
-/// test can see the job was polled until done and not after.
+/// test can see the job was polled until done and not after, and the
+/// calls to its cancel address (`PUT /cancel`), so a test can see a
+/// cancelled run's last call reached it, and how many times.
 pub struct JobFake {
     base_url: String,
     reads: Arc<std::sync::atomic::AtomicUsize>,
+    cancels: Arc<std::sync::atomic::AtomicUsize>,
     _server: AbortOnDrop,
 }
 
 #[derive(Clone)]
 struct JobState {
     reads: Arc<std::sync::atomic::AtomicUsize>,
+    cancels: Arc<std::sync::atomic::AtomicUsize>,
     pending: usize,
     result: Arc<String>,
 }
@@ -141,15 +145,29 @@ impl JobFake {
     /// is done with `result`.
     pub async fn start(pending: usize, result: &str) -> Result<Self> {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (gateway, listener, port) = bind_host("job").await?;
+        let state = JobState { reads: reads.clone(), cancels: cancels.clone(), pending, result: Arc::new(result.to_string()) };
         let app = Router::new()
             .route("/status", get(job_status))
-            .with_state(JobState { reads: reads.clone(), pending, result: Arc::new(result.to_string()) });
+            .route("/cancel", axum::routing::put(job_cancel))
+            .with_state(state);
         Ok(Self {
             base_url: format!("http://{gateway}:{port}"),
             reads,
+            cancels,
             _server: serve_axum(listener, app),
         })
+    }
+
+    /// The reachable URL of the job's cancel address (`<base>/cancel`).
+    pub fn cancel_url(&self) -> String {
+        format!("{}/cancel", self.base_url)
+    }
+
+    /// How many times the job was asked to cancel so far.
+    pub fn cancels(&self) -> usize {
+        self.cancels.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The reachable URL of the status address (`<base>/status`).
@@ -163,6 +181,11 @@ impl JobFake {
     }
 }
 
+async fn job_cancel(State(state): State<JobState>) -> impl IntoResponse {
+    state.cancels.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    axum::Json(serde_json::json!({ "status": "CANCELLED" }))
+}
+
 async fn job_status(State(state): State<JobState>) -> impl IntoResponse {
     let seen = state.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if seen < state.pending {
@@ -170,6 +193,96 @@ async fn job_status(State(state): State<JobState>) -> impl IntoResponse {
     } else {
         axum::Json(serde_json::json!({ "status": "COMPLETED", "result": *state.result }))
     }
+}
+
+/// A scripted model behind an OpenAI-compatible chat endpoint
+/// (`POST /chat/completions`), for a `CustomProvider` whose base URL is
+/// [`ChatFake::base_url`]: the Nth call answers the Nth scripted
+/// assistant message (as one streamed chunk when the call asks for a
+/// stream, the way the LLM nodes call), so a test drives an agent through exact turns
+/// without paying for a model. A call past the script answers 500, so
+/// an agent that asked once too often fails loudly. Keeps every request
+/// body, so a test can read what the agent sent back.
+pub struct ChatFake {
+    base_url: String,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    _server: AbortOnDrop,
+}
+
+#[derive(Clone)]
+struct ChatState {
+    script: Arc<Vec<serde_json::Value>>,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl ChatFake {
+    /// Bind the fake: each of `replies` is one assistant message (`content`,
+    /// and `tool_calls` for a turn that calls tools), answered in order.
+    pub async fn start(replies: Vec<serde_json::Value>) -> Result<Self> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (gateway, listener, port) = bind_host("chat").await?;
+        let state = ChatState { script: Arc::new(replies), requests: requests.clone() };
+        let app = Router::new().route("/chat/completions", axum::routing::post(chat_completion)).with_state(state);
+        Ok(Self { base_url: format!("http://{gateway}:{port}"), requests, _server: serve_axum(listener, app) })
+    }
+
+    /// The base URL a `CustomProvider` takes.
+    pub fn base_url(&self) -> String {
+        self.base_url.clone()
+    }
+
+    /// Every request body received so far, in order.
+    pub async fn requests(&self) -> Vec<serde_json::Value> {
+        self.requests.lock().await.clone()
+    }
+}
+
+async fn chat_completion(
+    State(state): State<ChatState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> axum::response::Response {
+    let streams = body["stream"] == serde_json::json!(true);
+    let turn = {
+        let mut requests = state.requests.lock().await;
+        requests.push(body);
+        requests.len() - 1
+    };
+    let Some(message) = state.script.get(turn) else {
+        let said = format!("the chat fake was scripted for {} calls; this is call {}", state.script.len(), turn + 1);
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, said).into_response();
+    };
+    let finish = if message.get("tool_calls").is_some() { "tool_calls" } else { "stop" };
+    let usage = serde_json::json!({ "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 });
+    if streams {
+        // The whole message as one delta (each tool call with its index,
+        // the way a streamed call names which call a piece belongs to),
+        // then the finish, then the end marker.
+        let mut delta = message.clone();
+        if let Some(calls) = delta.get_mut("tool_calls").and_then(serde_json::Value::as_array_mut) {
+            for (index, call) in calls.iter_mut().enumerate() {
+                call["index"] = serde_json::json!(index);
+            }
+        }
+        let chunk = |choice: serde_json::Value, usage: Option<serde_json::Value>| {
+            let mut frame = serde_json::json!({ "id": format!("chatcmpl-{turn}"), "model": "scripted", "choices": [choice] });
+            if let Some(usage) = usage {
+                frame["usage"] = usage;
+            }
+            format!("data: {frame}\n\n")
+        };
+        let mut sse = chunk(serde_json::json!({ "index": 0, "delta": delta }), None);
+        sse.push_str(&chunk(serde_json::json!({ "index": 0, "delta": {}, "finish_reason": finish }), Some(usage)));
+        sse.push_str("data: [DONE]\n\n");
+        return ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response();
+    }
+    axum::Json(serde_json::json!({
+        "id": format!("chatcmpl-{turn}"),
+        "object": "chat.completion",
+        "model": "scripted",
+        "choices": [{ "index": 0, "message": message, "finish_reason": finish }],
+        "usage": usage,
+    }))
+    .into_response()
 }
 
 /// A fake HTTP server that serves fixed bytes at `/bytes`. Used by the storage

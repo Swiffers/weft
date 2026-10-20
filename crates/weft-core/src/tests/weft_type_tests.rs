@@ -45,7 +45,7 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn parse_dict() {
       assert_eq!(
           WeftType::parse("Dict[String, Number]"),
-          Some(WeftType::dict(WeftType::primitive(WeftPrimitive::String), WeftType::primitive(WeftPrimitive::Number)))
+          Some(WeftType::dict(WeftType::primitive(WeftPrimitive::Number)))
       );
   }
 
@@ -69,11 +69,6 @@ fn file_url(mime: &str) -> serde_json::Value {
       assert_eq!(WeftType::parse("T"), Some(WeftType::TypeVar("T".to_string())));
       assert_eq!(WeftType::parse("T1"), Some(WeftType::TypeVar("T1".to_string())));
       assert_eq!(WeftType::parse("T42"), Some(WeftType::TypeVar("T42".to_string())));
-  }
-
-  #[test]
-  fn parse_must_override() {
-      assert_eq!(WeftType::parse("MustOverride"), Some(WeftType::MustOverride));
   }
 
   // ── Media alias tests ────────────────────────────────────────────────
@@ -132,7 +127,7 @@ fn file_url(mime: &str) -> serde_json::Value {
   #[test]
   fn parse_dict_string_media() {
       let t = WeftType::parse("Dict[String, Media]").unwrap();
-      if let WeftType::Dict(_, v) = &t {
+      if let WeftType::Dict(v) = &t {
           assert!(matches!(v.as_ref(), WeftType::Union(_)));
       } else {
           panic!("expected dict");
@@ -297,7 +292,6 @@ fn file_url(mime: &str) -> serde_json::Value {
           "T",
           "T1",
           "List[T]",
-          "MustOverride",
       ];
       for case in cases {
           let parsed = WeftType::parse(case).unwrap();
@@ -357,11 +351,12 @@ fn file_url(mime: &str) -> serde_json::Value {
   }
 
   #[test]
-  fn compatibility_must_override() {
+  fn compatibility_port_var() {
+      // An untyped port's own variable takes its type from what is wired.
       let s = WeftType::primitive(WeftPrimitive::String);
-      let mo = WeftType::must_override();
-      assert!(WeftType::is_compatible(&s, &mo));
-      assert!(WeftType::is_compatible(&mo, &s));
+      let v = WeftType::port_var(crate::weft_type::PortSide::Input, "x");
+      assert!(WeftType::is_compatible(&s, &v));
+      assert!(WeftType::is_compatible(&v, &s));
   }
 
   // ── List covariance and nested type tests ───────────────────────────
@@ -392,8 +387,8 @@ fn file_url(mime: &str) -> serde_json::Value {
       let n = WeftType::primitive(WeftPrimitive::Number);
       let sn = WeftType::union(vec![s.clone(), n.clone()]);
 
-      let ds = WeftType::dict(s.clone(), s.clone());
-      let dsn = WeftType::dict(s.clone(), sn.clone());
+      let ds = WeftType::dict(s.clone());
+      let dsn = WeftType::dict(sn.clone());
 
       // Dict[String, String] → Dict[String, String|Number]: OK (value narrows)
       assert!(WeftType::is_compatible(&ds, &dsn));
@@ -425,8 +420,8 @@ fn file_url(mime: &str) -> serde_json::Value {
       let snb = WeftType::union(vec![s.clone(), n.clone(), b.clone()]);
 
       // List[Dict[String, String|Number]] → List[Dict[String, String|Number|Boolean]]
-      let ld_sn = WeftType::list(WeftType::dict(s.clone(), sn.clone()));
-      let ld_snb = WeftType::list(WeftType::dict(s.clone(), snb.clone()));
+      let ld_sn = WeftType::list(WeftType::dict(sn.clone()));
+      let ld_snb = WeftType::list(WeftType::dict(snb.clone()));
 
       // Narrower dict values fit into wider → OK
       assert!(WeftType::is_compatible(&ld_sn, &ld_snb));
@@ -441,12 +436,12 @@ fn file_url(mime: &str) -> serde_json::Value {
       let b = WeftType::primitive(WeftPrimitive::Boolean);
 
       // Dict[String, Dict[String, String|Number]]
-      let inner_sn = WeftType::dict(s.clone(), WeftType::union(vec![s.clone(), n.clone()]));
-      let outer_sn = WeftType::dict(s.clone(), inner_sn);
+      let inner_sn = WeftType::dict(WeftType::union(vec![s.clone(), n.clone()]));
+      let outer_sn = WeftType::dict(inner_sn);
 
       // Dict[String, Dict[String, String|Boolean]]
-      let inner_sb = WeftType::dict(s.clone(), WeftType::union(vec![s.clone(), b.clone()]));
-      let outer_sb = WeftType::dict(s.clone(), inner_sb);
+      let inner_sb = WeftType::dict(WeftType::union(vec![s.clone(), b.clone()]));
+      let outer_sb = WeftType::dict(inner_sb);
 
       // Dict[String, Dict[String, String|Number]] → Dict[String, Dict[String, String|Boolean]]
       // Inner dict values: String|Number → String|Boolean. Number not in String|Boolean → fails
@@ -462,12 +457,12 @@ fn file_url(mime: &str) -> serde_json::Value {
       let b = WeftType::primitive(WeftPrimitive::Boolean);
 
       // Dict[String, Dict[String, String]]
-      let inner_s = WeftType::dict(s.clone(), s.clone());
-      let outer_s = WeftType::dict(s.clone(), inner_s);
+      let inner_s = WeftType::dict(s.clone());
+      let outer_s = WeftType::dict(inner_s);
 
       // Dict[String, Dict[String, String|Number|Boolean]]
-      let inner_snb = WeftType::dict(s.clone(), WeftType::union(vec![s.clone(), n.clone(), b.clone()]));
-      let outer_snb = WeftType::dict(s.clone(), inner_snb);
+      let inner_snb = WeftType::dict(WeftType::union(vec![s.clone(), n.clone(), b.clone()]));
+      let outer_snb = WeftType::dict(inner_snb);
 
       // Dict[String, Dict[String, String]] → Dict[String, Dict[String, String|Number|Boolean]]
       // String fits into String|Number|Boolean → OK
@@ -482,9 +477,9 @@ fn file_url(mime: &str) -> serde_json::Value {
       let n = WeftType::primitive(WeftPrimitive::Number);
 
       // List[List[Dict[String, String]]]
-      let t1 = WeftType::list(WeftType::list(WeftType::dict(s.clone(), s.clone())));
+      let t1 = WeftType::list(WeftType::list(WeftType::dict(s.clone())));
       // List[List[Dict[String, String|Number]]]
-      let t2 = WeftType::list(WeftType::list(WeftType::dict(s.clone(), WeftType::union(vec![s.clone(), n.clone()]))));
+      let t2 = WeftType::list(WeftType::list(WeftType::dict(WeftType::union(vec![s.clone(), n.clone()]))));
 
       // Narrow → Wide: OK
       assert!(WeftType::is_compatible(&t1, &t2));
@@ -505,7 +500,7 @@ fn file_url(mime: &str) -> serde_json::Value {
 
   #[test]
   fn runtime_check_dict() {
-      let d = WeftType::dict(WeftType::primitive(WeftPrimitive::String), WeftType::primitive(WeftPrimitive::Number));
+      let d = WeftType::dict(WeftType::primitive(WeftPrimitive::Number));
       assert!(check(&d, &serde_json::json!({"a": 1, "b": 2})));
       assert!(!check(&d, &serde_json::json!({"a": "not a number"})));
   }
@@ -628,10 +623,11 @@ fn file_url(mime: &str) -> serde_json::Value {
   }
 
   #[test]
-  fn runtime_check_media_with_data_field() {
-      // The handle may be `data` (inline) instead of `url`/`key`.
+  fn runtime_check_refuses_a_marker_with_only_a_data_field() {
+      // Nothing in weft reads a file through inline `data`, so a marker
+      // whose only handle it is is no file value.
       let img = WeftType::primitive(WeftPrimitive::Image);
-      assert!(check(&img, &file_val("image/png", "data", "base64...")));
+      assert!(!check(&img, &file_val("image/png", "data", "base64...")));
   }
 
   // ── Runtime check: unions ───────────────────────────────────────────
@@ -664,7 +660,6 @@ fn file_url(mime: &str) -> serde_json::Value {
   #[test]
   fn runtime_check_list_of_dicts() {
       let t = WeftType::list(WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::primitive(WeftPrimitive::Number),
       ));
       assert!(check(&t, &serde_json::json!([{"a": 1}, {"b": 2}])));
@@ -676,7 +671,6 @@ fn file_url(mime: &str) -> serde_json::Value {
   #[test]
   fn runtime_check_dict_with_union_values() {
       let t = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::union(vec![
               WeftType::primitive(WeftPrimitive::String),
               WeftType::primitive(WeftPrimitive::Number),
@@ -704,8 +698,8 @@ fn file_url(mime: &str) -> serde_json::Value {
   }
 
   #[test]
-  fn runtime_check_must_override_always_passes() {
-      let t = WeftType::MustOverride;
+  fn runtime_check_port_var_always_passes() {
+      let t = WeftType::port_var(crate::weft_type::PortSide::Input, "x");
       assert!(check(&t, &serde_json::json!("anything")));
       assert!(check(&t, &serde_json::json!(42)));
   }
@@ -754,7 +748,6 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn runtime_check_dict_with_nullable_values() {
       // Dict[String, String | Null] : values can be strings or null
       let t = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::union(vec![
               WeftType::primitive(WeftPrimitive::String),
               WeftType::primitive(WeftPrimitive::Null),
@@ -767,7 +760,7 @@ fn file_url(mime: &str) -> serde_json::Value {
   #[test]
   fn runtime_check_dict_without_null_rejects_null_value() {
       // Dict[String, String] : null values NOT allowed
-      let t = WeftType::dict(WeftType::primitive(WeftPrimitive::String), WeftType::primitive(WeftPrimitive::String));
+      let t = WeftType::dict(WeftType::primitive(WeftPrimitive::String));
       assert!(!check(&t, &serde_json::json!({"a": "hello", "b": null})));
   }
 
@@ -792,9 +785,7 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn runtime_check_nested_nullable() {
       // Dict[String, Dict[String, Number | Null]]
       let t = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::dict(
-              WeftType::primitive(WeftPrimitive::String),
               WeftType::union(vec![
                   WeftType::primitive(WeftPrimitive::Number),
                   WeftType::primitive(WeftPrimitive::Null),
@@ -849,9 +840,9 @@ fn file_url(mime: &str) -> serde_json::Value {
   #[test]
   fn runtime_check_empty_dict_compatible_with_any() {
       // Empty dict infers as Dict[String, Empty], compatible with any Dict[String, X]
-      let t = WeftType::dict(WeftType::primitive(WeftPrimitive::String), WeftType::primitive(WeftPrimitive::Number));
+      let t = WeftType::dict(WeftType::primitive(WeftPrimitive::Number));
       assert!(check(&t, &serde_json::json!({})));
-      let t2 = WeftType::dict(WeftType::primitive(WeftPrimitive::String), WeftType::primitive(WeftPrimitive::Boolean));
+      let t2 = WeftType::dict(WeftType::primitive(WeftPrimitive::Boolean));
       assert!(check(&t2, &serde_json::json!({})));
   }
 
@@ -860,7 +851,6 @@ fn file_url(mime: &str) -> serde_json::Value {
       // Real LLM output with parseJson: Dict[String, List[String]]
       // This is the actual shape that caused a runtime type error
       let expected_type = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::list(WeftType::primitive(WeftPrimitive::String)),
       );
       let actual_value = serde_json::json!({
@@ -888,7 +878,6 @@ fn file_url(mime: &str) -> serde_json::Value {
       // Same shape but declared as Dict[String, String | Number | Boolean]
       // Arrays inside the dict would NOT match because List[String] is not String|Number|Boolean
       let wrong_type = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::union(vec![
               WeftType::primitive(WeftPrimitive::String),
               WeftType::primitive(WeftPrimitive::Number),
@@ -909,7 +898,6 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn runtime_check_list_of_dicts_wrong_inner_value() {
       // List[Dict[String, Number]] but one dict has a String value
       let t = WeftType::list(WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::primitive(WeftPrimitive::Number),
       ));
       assert!(!check(&t, &serde_json::json!([{"a": 1}, {"b": "wrong"}])));
@@ -918,7 +906,6 @@ fn file_url(mime: &str) -> serde_json::Value {
   #[test]
   fn runtime_check_list_of_dicts_one_element_not_dict() {
       let t = WeftType::list(WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::primitive(WeftPrimitive::Number),
       ));
       assert!(!check(&t, &serde_json::json!([{"a": 1}, "not a dict"])));
@@ -941,9 +928,7 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn runtime_check_dict_of_dicts_wrong_inner_value() {
       // Dict[String, Dict[String, Number]] but inner dict has a wrong value
       let t = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::dict(
-              WeftType::primitive(WeftPrimitive::String),
               WeftType::primitive(WeftPrimitive::Number),
           ),
       );
@@ -956,7 +941,6 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn runtime_check_list_of_list_of_dict_wrong_at_deepest() {
       // List[List[Dict[String, Number]]] : wrong at the deepest level
       let t = WeftType::list(WeftType::list(WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::primitive(WeftPrimitive::Number),
       )));
       assert!(check(&t, &serde_json::json!([[{"a": 1}], [{"b": 2}]])));
@@ -969,7 +953,6 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn runtime_check_dict_with_union_wrong_variant() {
       // Dict[String, String | Number] : Boolean is not in the union
       let t = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::union(vec![
               WeftType::primitive(WeftPrimitive::String),
               WeftType::primitive(WeftPrimitive::Number),
@@ -1003,9 +986,7 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn runtime_check_deeply_nested_correct() {
       // Dict[String, List[Dict[String, String | Number]]]
       let t = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::list(WeftType::dict(
-              WeftType::primitive(WeftPrimitive::String),
               WeftType::union(vec![
                   WeftType::primitive(WeftPrimitive::String),
                   WeftType::primitive(WeftPrimitive::Number),
@@ -1024,9 +1005,7 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn runtime_check_deeply_nested_wrong_at_leaf() {
       // Same type but Boolean sneaks in at the deepest level
       let t = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::list(WeftType::dict(
-              WeftType::primitive(WeftPrimitive::String),
               WeftType::union(vec![
                   WeftType::primitive(WeftPrimitive::String),
                   WeftType::primitive(WeftPrimitive::Number),
@@ -1044,9 +1023,7 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn runtime_check_deeply_nested_wrong_at_middle() {
       // Dict[String, List[Dict[String, Number]]] : middle layer has a string instead of dict
       let t = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::list(WeftType::dict(
-              WeftType::primitive(WeftPrimitive::String),
               WeftType::primitive(WeftPrimitive::Number),
           )),
       );
@@ -1059,7 +1036,6 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn runtime_check_deeply_nested_wrong_at_outer() {
       // Dict[String, List[String]] : outer value is not a list
       let t = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::list(WeftType::primitive(WeftPrimitive::String)),
       );
       assert!(!check(&t, &serde_json::json!({
@@ -1098,17 +1074,13 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn json_dict_compatible_with_dict_string_v() {
       let jd = WeftType::JsonDict;
       let dict_str_num = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::primitive(WeftPrimitive::Number),
       );
       let dict_str_bool = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::primitive(WeftPrimitive::Boolean),
       );
       let dict_str_nested = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::dict(
-              WeftType::primitive(WeftPrimitive::String),
               WeftType::primitive(WeftPrimitive::Number),
           ),
       );
@@ -1133,16 +1105,20 @@ fn file_url(mime: &str) -> serde_json::Value {
       assert!(!WeftType::is_compatible(&WeftType::primitive(WeftPrimitive::String), &jd));
   }
 
+  /// A dict's keys are always text, so `Dict[String, V]` is the one
+  /// spelling: it reads and prints as written, and any other key type
+  /// fails to parse pointing at a list of key/value records.
   #[test]
-  fn json_dict_not_compatible_with_dict_number_key() {
-      let jd = WeftType::JsonDict;
-      let dict_num_str = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::Number),
-          WeftType::primitive(WeftPrimitive::String),
-      );
-      // Dict[Number, String] → JsonDict: incompatible (key must be String)
-      assert!(!WeftType::is_compatible(&dict_num_str, &jd));
-      assert!(!WeftType::is_compatible(&jd, &dict_num_str));
+  fn a_dict_keyed_by_anything_but_text_does_not_parse() {
+      let t = WeftType::try_parse("Dict[String, Number]").expect("a text key parses");
+      assert_eq!(t, WeftType::dict(WeftType::primitive(WeftPrimitive::Number)));
+      assert_eq!(t.to_string(), "Dict[String, Number]");
+      for text in ["Dict[Number, String]", "Dict[Video, String]", "Dict[T, String]"] {
+          let e = WeftType::try_parse(text).expect_err(text);
+          assert!(e.contains("keys are always text"), "{text}: {e}");
+          assert!(e.contains("List[{key:"), "{text}: {e}");
+          assert_eq!(WeftType::parse(text), None, "{text}");
+      }
   }
 
   #[test]
@@ -1152,7 +1128,6 @@ fn file_url(mime: &str) -> serde_json::Value {
           WeftType::primitive(WeftPrimitive::String),
       ]);
       let dict = WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::primitive(WeftPrimitive::Number),
       );
       // Dict[String, Number] → JsonDict | String: compatible (matches JsonDict variant)
@@ -1167,7 +1142,6 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn list_json_dict_compatible_with_list_dict() {
       let list_jd = WeftType::list(WeftType::JsonDict);
       let list_dict = WeftType::list(WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::primitive(WeftPrimitive::Number),
       ));
       assert!(WeftType::is_compatible(&list_jd, &list_dict));
@@ -1245,7 +1219,6 @@ fn file_url(mime: &str) -> serde_json::Value {
       assert!(check(&WeftType::list(WeftType::list(WeftType::primitive(WeftPrimitive::String))), &serde_json::json!([])));
       // List[Dict[String, Number]] accepts []
       assert!(check(&WeftType::list(WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::primitive(WeftPrimitive::Number),
       )), &serde_json::json!([])));
       // List[JsonDict] accepts []
@@ -1256,10 +1229,9 @@ fn file_url(mime: &str) -> serde_json::Value {
 
   #[test]
   fn empty_dict_compatible_with_dict_of_anything() {
-      assert!(check(&WeftType::dict(WeftType::primitive(WeftPrimitive::String), WeftType::primitive(WeftPrimitive::String)), &serde_json::json!({})));
-      assert!(check(&WeftType::dict(WeftType::primitive(WeftPrimitive::String), WeftType::primitive(WeftPrimitive::Number)), &serde_json::json!({})));
+      assert!(check(&WeftType::dict(WeftType::primitive(WeftPrimitive::String)), &serde_json::json!({})));
+      assert!(check(&WeftType::dict(WeftType::primitive(WeftPrimitive::Number)), &serde_json::json!({})));
       assert!(check(&WeftType::dict(
-          WeftType::primitive(WeftPrimitive::String),
           WeftType::list(WeftType::primitive(WeftPrimitive::String)),
       ), &serde_json::json!({})));
       // JsonDict accepts {}
@@ -1439,7 +1411,7 @@ fn file_url(mime: &str) -> serde_json::Value {
   #[test]
   fn cast_rejects_unresolved_types() {
       assert!(ty("T").cast_text("anything").is_err());
-      assert!(WeftType::MustOverride.cast_text("anything").is_err());
+      assert!(WeftType::port_var(crate::weft_type::PortSide::Input, "x").cast_text("anything").is_err());
   }
 
   #[test]
@@ -1677,7 +1649,7 @@ fn reg_parse(s: &str) -> WeftType {
 #[test]
 fn record_syntax_parses_and_round_trips_display() {
     let t = WeftType::parse("{ role: String, name?: String, parts: List[Number] }").unwrap();
-    let WeftType::Record(fields) = &t else { panic!("not a record: {t}") };
+    let WeftType::Record { fields, open: false } = &t else { panic!("not a closed record: {t}") };
     assert_eq!(fields.len(), 3);
     assert!(!fields[0].optional && fields[1].optional);
     // Display round-trips through parse.
@@ -1758,7 +1730,7 @@ fn named_union_body_wire_form_is_unambiguous() {
     let optional = WeftType::Union(vec![
         WeftType::Named {
             name: "Profile".into(),
-            body: Box::new(WeftType::Record(vec![RecordField {
+            body: Box::new(WeftType::record(vec![RecordField {
                 name: "name".into(),
                 ty: WeftType::Primitive(WeftPrimitive::String),
                 optional: false,
@@ -1796,15 +1768,30 @@ fn registry_build_absorbs_identical_and_refuses_conflicts() {
     .unwrap_err();
     assert!(err.contains("declared twice") && err.contains("pkg2"), "{err}");
     // Reserved and malformed names refused.
-    for bad in ["String", "List", "Media", "T", "T3", "MustOverride", "lower", "Has Space"] {
+    for bad in ["String", "List", "Media", "T", "T3", "lower", "Has Space"] {
         assert!(
             TypeRegistry::build(&[d(bad, "String", "pkg")]).is_err(),
             "{bad:?} must be refused"
         );
     }
+    // `MustOverride` is no longer reserved: an ordinary declarable name.
+    TypeRegistry::build(&[d("MustOverride", "String", "pkg")]).unwrap();
     // A cycle fails loud instead of spinning.
     let err = TypeRegistry::build(&[d("A", "List[B]", "p"), d("B", "List[A]", "p")]).unwrap_err();
     assert!(err.contains("could not be resolved"), "{err}");
+    assert!(err.contains("`A` = `List[B]` (p): it names `B`, which cannot resolve either"), "{err}");
+    // A chain ending on a name nobody declares names that name on its
+    // own line.
+    let err = TypeRegistry::build(&[d("A", "List[B]", "p"), d("B", "List[Nope]", "p")]).unwrap_err();
+    assert!(err.contains("`B` = `List[Nope]` (p): `Nope` is not a type"), "{err}");
+}
+
+#[test]
+fn a_group_paren_is_stripped_only_when_it_wraps_the_whole_type() {
+    assert_eq!(WeftType::try_parse("(String | Number)").unwrap(), WeftType::parse("String | Number").unwrap());
+    let e = WeftType::try_parse("(String)(Number)").unwrap_err();
+    assert!(e.contains("`(String)(Number)`"), "the outer pair must not be stripped: {e}");
+    assert!(WeftType::try_parse("(String]").is_err(), "a closer that does not match is no group");
 }
 
 #[test]
@@ -2114,7 +2101,7 @@ fn the_wire_named_form_refuses_a_typevar_body_but_stays_registry_independent() {
     assert!(WeftType::parse("MyBox=List[T]").is_none(), "a typevar body is refused");
     // Parsing stays PURE: a wire string deserializes identically with
     // or without a registry, even one whose declaration has since been
-    // EDITED (a resumed execution must get the exact shape it started
+    // EDITED (a resumed run must get the exact shape it started
     // on). Restatement agreement is the compiler's job
     // (`named-type-conflict`), never the parser's.
     let reg = std::sync::Arc::new(
@@ -2158,4 +2145,256 @@ fn a_named_alias_over_files_still_offers_the_file_picker() {
     let control = single.file_control().expect("a named file primitive keeps its name");
     assert_eq!(control.file_type, single, "the written type keeps the alias");
     assert!(WeftType::parse("Row=List[String]").expect("parses").file_control().is_none());
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Open records, fits_within, substitution, type parameters
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn an_open_record_parses_prints_and_round_trips_on_the_wire() {
+    let t = ty("{ email: String, age?: Number, .. }");
+    let WeftType::Record { fields, open: true } = &t else { panic!("not an open record: {t}") };
+    assert_eq!(fields.len(), 2);
+    assert!(!fields[0].optional && fields[1].optional);
+    assert_eq!(t.to_string(), "{email: String, age?: Number, ..}");
+    assert_eq!(ty(&t.to_string()), t);
+    let json = serde_json::to_string(&t).unwrap();
+    let back: WeftType = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, t);
+    assert_eq!(back.wire_string(), t.wire_string());
+}
+
+#[test]
+fn an_open_record_takes_dot_dot_last_and_at_least_one_field() {
+    let e = WeftType::try_parse("{ .., email: String }").unwrap_err();
+    assert!(e.contains("comes last"), "{e}");
+    for empty in ["{ .. }", "{}"] {
+        let e = WeftType::try_parse(empty).unwrap_err();
+        assert!(e.contains("declares no field"), "{empty}: {e}");
+    }
+}
+
+#[test]
+fn record_equality_tells_open_from_closed() {
+    assert_ne!(ty("{ a: String, .. }"), ty("{ a: String }"));
+    assert_eq!(ty("{ a: String, .. }"), ty("{ a: String, .. }"));
+    assert_eq!(WeftType::record(vec![RecordField {
+        name: "a".into(),
+        ty: WeftType::primitive(WeftPrimitive::String),
+        optional: false,
+    }]), ty("{ a: String }"), "record() builds a closed one");
+}
+
+#[test]
+fn validate_value_refuses_an_unknown_key_only_on_a_closed_record() {
+    use serde_json::json;
+    let value = json!({ "email": "a@b", "utm": "x" });
+    let e = ty("{ email: String }").validate_value(&value).unwrap_err();
+    assert!(e.contains("unknown field \"utm\""), "{e}");
+    ty("{ email: String, .. }").validate_value(&value).expect("an open record takes it");
+    for t in ["{ email: String }", "{ email: String, .. }"] {
+        let e = ty(t).validate_value(&json!({})).unwrap_err();
+        assert!(e.contains("missing required field \"email\""), "{t}: {e}");
+    }
+}
+
+#[test]
+fn conform_value_drops_what_an_open_record_does_not_declare_at_any_depth() {
+    use serde_json::json;
+    let list = ty("List[{ email: String, .. }]");
+    assert_eq!(
+        list.conform_value(json!([{ "email": "a", "utm": 1 }, { "email": "b" }])).unwrap(),
+        json!([{ "email": "a" }, { "email": "b" }]),
+    );
+    let nested = ty("{ id: Number, user: { email: String, .. } }");
+    assert_eq!(
+        nested.conform_value(json!({ "id": 1, "user": { "email": "a", "utm": "x" } })).unwrap(),
+        json!({ "id": 1, "user": { "email": "a" } }),
+    );
+    let e = nested
+        .conform_value(json!({ "id": 1, "extra": true, "user": { "email": "a" } }))
+        .unwrap_err();
+    assert!(e.contains("unknown field \"extra\""), "the closed parent still refuses: {e}");
+
+    let closed = ty("{ a: String, b?: Number }");
+    let value = json!({ "a": "x", "b": null });
+    assert_eq!(closed.conform_value(value.clone()).unwrap(), value, "a closed record's value is untouched");
+}
+
+#[test]
+fn cast_value_into_an_open_record_drops_unknown_keys() {
+    use serde_json::json;
+    let open = ty("{ email: String, .. }");
+    assert_eq!(open.cast_value(&json!({ "email": "a", "utm": "x" })).unwrap(), json!({ "email": "a" }));
+    let e = ty("{ email: String }").cast_value(&json!({ "email": "a", "utm": "x" })).unwrap_err();
+    assert!(e.contains("utm"), "{e}");
+}
+
+#[test]
+fn record_compatibility_lets_an_open_target_take_undeclared_fields() {
+    let compat = WeftType::is_compatible;
+    let source = ty("{ email: String, utm: String }");
+    assert!(!compat(&source, &ty("{ email: String }")), "unknown field into a closed target");
+    assert!(compat(&source, &ty("{ email: String, .. }")), "unknown field into an open target");
+    for target in ["{ email: String, age: Number }", "{ email: String, age: Number, .. }"] {
+        assert!(!compat(&source, &ty(target)), "missing required `age` into {target}");
+    }
+}
+
+#[test]
+fn fits_within_narrows_files_records_and_stream_items() {
+    assert!(WeftType::fits_within(&ty("Image"), &ty("Media")));
+    assert!(!WeftType::fits_within(&ty("File"), &ty("Media")));
+    assert!(WeftType::fits_within(&ty("{ a: String }"), &WeftType::JsonDict));
+    let stream = ty("Generator[{ a: String }]");
+    let bound = ty("Generator[JsonDict]");
+    assert!(WeftType::fits_within(&stream, &bound), "a stream narrows item-wise");
+    assert!(!WeftType::is_compatible(&stream, &bound), "wiring one stream into another stays invariant");
+}
+
+/// A named bound stays nominal: only its own name fits it, never the
+/// bare structure nor another name over the same body.
+#[test]
+fn fits_within_keeps_a_named_bound_nominal() {
+    let rows = ty("Rows=Generator[Number]");
+    assert!(!WeftType::fits_within(&ty("Generator[Number]"), &rows));
+    assert!(!WeftType::fits_within(&ty("Other=Generator[Number]"), &rows));
+    assert!(WeftType::fits_within(&rows, &rows));
+    assert!(WeftType::fits_within(&rows, &ty("Generator[Number]")), "a name decays into its structure");
+}
+
+/// An optional record field may hold null, so a dict it flows into must
+/// take null too.
+#[test]
+fn a_record_with_an_optional_field_needs_a_dict_taking_null() {
+    assert!(!WeftType::is_compatible(&ty("{ a?: Number }"), &ty("Dict[String, Number]")));
+    assert!(WeftType::is_compatible(&ty("{ a?: Number }"), &ty("Dict[String, Number | Null]")));
+    assert!(WeftType::is_compatible(&ty("{ a: Number }"), &ty("Dict[String, Number]")));
+}
+
+/// A union whose members would hand the same value on differently is
+/// refused rather than read through whichever member was written first.
+#[test]
+fn conform_refuses_a_union_reading_a_value_two_ways() {
+    use serde_json::json;
+    let value = json!({ "a": "x", "b": "y" });
+    for written in ["{ a: String, .. } | JsonDict", "JsonDict | { a: String, .. }"] {
+        let e = ty(written).conform_value(value.clone()).unwrap_err();
+        assert!(e.contains("ambiguous value"), "{written}: {e}");
+    }
+    // Members that agree on the value are no ambiguity.
+    assert_eq!(ty("{ a: String, .. } | { a: String, b?: String, .. }").conform_value(json!({ "a": "x" })).unwrap(), json!({ "a": "x" }));
+    assert_eq!(ty("{ a: String, .. } | Number").conform_value(value).unwrap(), json!({ "a": "x" }));
+}
+
+/// Substitution rewrites every shape a type variable can occur in, so
+/// a binding never leaves a port half-resolved. (No Named case: the
+/// registry refuses a declared body carrying a type variable.)
+#[test]
+fn substitute_var_rewrites_every_shape_a_typevar_can_occur_in() {
+    let number = ty("Number");
+    for (before, after) in [
+        ("{a: T, b: String}", "{a: Number, b: String}"),
+        ("Generator[T]", "Generator[Number]"),
+        ("T | Null", "Number | Null"),
+        ("Dict[String, T]", "Dict[String, Number]"),
+    ] {
+        let mut t = ty(before);
+        assert!(t.substitute_var("T", &number), "{before}");
+        assert_eq!(t, ty(after), "{before}");
+    }
+    let mut untouched = ty("List[T2]");
+    assert!(!untouched.substitute_var("T", &number));
+    assert_eq!(untouched, ty("List[T2]"));
+}
+
+#[test]
+fn substituting_a_union_into_a_union_flattens_it() {
+    let mut t = ty("T | Null");
+    assert!(t.substitute_var("T", &ty("String | Number")));
+    assert_eq!(t, ty("String | Number | Null"));
+    let WeftType::Union(members) = &t else { panic!("not a union: {t}") };
+    assert_eq!(members.len(), 3, "one flat union: {t}");
+}
+
+#[test]
+fn type_param_lists_parse_in_written_order() {
+    let params = TypeParam::parse_list("[T: Media, T2: List[T]]").unwrap();
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[0], TypeParam::new("T", WeftType::media()));
+    assert_eq!(params[1], TypeParam::new("T2", ty("List[T]")));
+    TypeParam::check_declarations(&params).expect("a bound may name an earlier variable");
+
+    let e = TypeParam::parse_list("[T]").unwrap_err();
+    assert!(e.contains("has no bound"), "{e}");
+    let e = TypeParam::parse_list("[]").unwrap_err();
+    assert!(e.contains("empty type parameter list"), "{e}");
+    let e = TypeParam::parse_list("[T: Foo]").unwrap_err();
+    assert!(e.contains("the bound of type parameter `T`"), "{e}");
+}
+
+#[test]
+fn type_param_declarations_refuse_a_non_variable_a_duplicate_and_a_cycle() {
+    let e = TypeParam::check_declarations(&[TypeParam::new("Foo", ty("String"))]).unwrap_err();
+    assert!(e.contains("`Foo` is not a type variable"), "{e}");
+
+    let twice = [TypeParam::new("T", ty("String")), TypeParam::new("T", ty("Number"))];
+    let e = TypeParam::check_declarations(&twice).unwrap_err();
+    assert!(e.contains("declared twice"), "{e}");
+
+    let cycle = TypeParam::parse_list("[T1: List[T2], T2: List[T1]]").unwrap();
+    let e = TypeParam::check_declarations(&cycle).unwrap_err();
+    assert!(e.contains("`T1`") && e.contains("`T2`"), "{e}");
+    assert!(e.contains("T1 -> T2 -> T1"), "{e}");
+
+    // A node type's bounds and the ones a program writes over them are
+    // checked together: each alone is acyclic, the two make a cycle.
+    let mut combined = TypeParam::parse_list("[T: List[T2], T2: String]").unwrap();
+    combined.extend(TypeParam::parse_list("[T2: List[T]]").unwrap());
+    let e = TypeParam::check_cycles(&combined).unwrap_err();
+    assert!(e.contains("cycle"), "{e}");
+    assert_eq!(TypeParam::written_entries("[T: Image | Video, T2: { a: String, .. }]").unwrap(), vec!["T: Image | Video", "T2: { a: String, .. }"]);
+}
+
+#[test]
+fn an_unused_type_param_is_refused() {
+    let params = TypeParam::parse_list("[T: Media, T2: String]").unwrap();
+    let used: std::collections::BTreeSet<std::string::String> = ["T".to_string()].into();
+    let e = TypeParam::check_used(&params, &used).unwrap_err();
+    assert!(e.contains("`T2`") && e.contains("no port uses it"), "{e}");
+    let both: std::collections::BTreeSet<std::string::String> = ["T".to_string(), "T2".to_string()].into();
+    TypeParam::check_used(&params, &both).expect("every parameter is used");
+}
+
+#[test]
+fn a_type_param_violation_is_reported_only_once_there_is_something_to_check() {
+    let mut media = TypeParam::new("T", WeftType::media());
+    assert_eq!(media.violation(), None, "unresolved");
+
+    let mut chained = TypeParam::new("T2", ty("List[T]"));
+    chained.resolved = Some(ty("Number"));
+    assert_eq!(chained.violation(), None, "the bound still holds a variable");
+
+    media.resolved = Some(ty("String"));
+    let e = media.violation().expect("String does not fit Media");
+    assert!(e.contains(&WeftType::media().to_string()) && e.contains("String"), "{e}");
+
+    media.resolved = Some(ty("Image"));
+    assert_eq!(media.violation(), None, "Image fits Media");
+}
+
+#[test]
+fn an_unresolved_leaf_takes_any_value_inside_a_checked_shape() {
+    use serde_json::json;
+    let open_ended = ty("List[T]");
+    assert_eq!(open_ended.conform_value(json!([1, "a"])).unwrap(), json!([1, "a"]));
+    assert!(open_ended.conform_value(json!("not a list")).is_err());
+    // A record holding a variable is still a record: its undeclared keys
+    // drop when it is open, and a closed one refuses them.
+    assert_eq!(ty("{ x: T, .. }").conform_value(json!({ "x": 1, "y": 2 })).unwrap(), json!({ "x": 1 }));
+    assert!(ty("{ x: T }").conform_value(json!({ "x": 1, "y": 2 })).is_err());
+
+    let e = ty("{ score: Number }").conform_value(json!({})).unwrap_err();
+    assert!(e.contains("missing required field \"score\""), "{e}");
 }

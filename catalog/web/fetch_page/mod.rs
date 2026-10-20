@@ -1,12 +1,13 @@
 //! FetchPage: one URL to clean markdown through Firecrawl (JS
-//! rendered, boilerplate stripped), the shape an LLM step consumes
-//! directly.
+//! rendered, boilerplate stripped), the shape an LLM node consumes
+//! directly. The markdown is cut at `maxChars`, and shorter still if
+//! it would weigh more than a wire carries, and `truncated` says when.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[cfg(feature = "node-tests")]
 mod tests;
@@ -21,10 +22,12 @@ impl Node for FetchPageNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let url: String = ctx.inputs.get("url")?;
         let only_main: bool = ctx.inputs.get("onlyMainContent")?;
+        // `maxChars` declares a metadata default, so the bag holds it.
+        let max_chars: f64 = ctx.inputs.get("maxChars")?;
 
         let http = ctx.client(&access).await?;
         let answer = super::firecrawl::call(
@@ -43,8 +46,8 @@ impl Node for FetchPageNode {
         let markdown = answer
             .pointer("/data/markdown")
             .and_then(Value::as_str)
-            .node_err("firecrawl: the scrape succeeded but its answer carries no markdown")?
-            .to_string();
+            .node_err("firecrawl: the scrape succeeded but its answer carries no markdown")?;
+        let (markdown, truncated) = weft::storage::cap_text(markdown, max_chars as usize);
         // A title is genuinely optional (many pages have none).
         let title = answer
             .pointer("/data/metadata/title")
@@ -52,7 +55,10 @@ impl Node for FetchPageNode {
             .unwrap_or_default()
             .to_string();
         ctx.pulse_downstream(
-            NodeOutput::new().set("markdown", markdown).set("title", title),
+            NodeOutput::new()
+                .set("markdown", markdown.to_string())
+                .set("title", title)
+                .set("truncated", truncated),
         )
         .await
     }

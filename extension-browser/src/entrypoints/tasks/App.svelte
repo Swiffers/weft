@@ -344,7 +344,7 @@
     }
   }
 
-  /// Skip = decline the question: the step that asked ends skipped,
+  /// Skip = decline the question: the node that asked ends skipped,
   /// its outputs close and what reads them skips. Sibling tasks of
   /// the same run keep going. No confirmation: low blast radius.
   async function handleSkip() {
@@ -376,7 +376,7 @@
       error = 'A trigger has no run to cancel.';
       return;
     }
-    if (!confirm('Cancel the entire run? Every related task will be dropped and the execution will be marked failed.')) return;
+    if (!confirm('Cancel the entire run? Every related task will be dropped and the run will end cancelled.')) return;
     try {
       await cancelRun(t);
       settleTask(t.token);
@@ -697,14 +697,14 @@
                     <button
                       class="btn btn-secondary"
                       onclick={handleSkip}
-                      title="Skip: the step that asked ends skipped, and what reads its answer skips too. The rest of the run continues."
+                      title="Skip: the node that asked ends skipped, and what reads its answer skips too. The rest of the run continues."
                     >
                       Skip
                     </button>
                     <button
                       class="btn btn-danger"
                       onclick={handleCancelRun}
-                      title="Cancel run: kill this whole execution. Every related task is dropped and the run is marked failed (still inspectable in the journal)."
+                      title="Cancel run: kill this whole run. Every related task is dropped and the run ends cancelled (still inspectable in the journal)."
                     >
                       Cancel run
                     </button>

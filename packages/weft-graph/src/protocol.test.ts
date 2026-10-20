@@ -1,5 +1,28 @@
 import { describe, expect, it } from 'vitest';
-import { parseFileValue, typeReferencesFile, type CatalogEntry, type Widget } from './protocol';
+import { describeOwnerTriggers, narrowingBound, TAKE_DOWN_DEFAULT, parseFileValue, tryParseWeftType, typeReferencesFile, type CatalogEntry, type NodeDefinition, type OutputSpec, type Widget } from './protocol';
+import { declarationProblem, declarationRule } from './webview/lib/projection/header-ports';
+import { NODE_TYPE_CONFIG, registerCatalog } from './webview/lib/nodes/index.svelte';
+
+describe('TAKE_DOWN_DEFAULT', () => {
+  it('destroys nothing: the door takes, what is held stays, the runs going are waited for', () => {
+    expect(TAKE_DOWN_DEFAULT).toEqual({ door: 'take', held: 'keep', running: 'wait' });
+  });
+});
+
+describe('describeOwnerTriggers', () => {
+  it('names the program\'s own triggers as they are', () => {
+    expect(describeOwnerTriggers([{ owner: { kind: 'shared' }, triggers: ['door', 'feed'] }])).toBe("'door', 'feed'");
+  });
+
+  it('names an instance\'s triggers with the instance, owners apart', () => {
+    expect(
+      describeOwnerTriggers([
+        { owner: { kind: 'shared' }, triggers: ['door'] },
+        { owner: { kind: 'instance', instance: 'ada' }, triggers: ['inbox'] },
+      ]),
+    ).toBe("'door'; 'inbox' of instance 'ada'");
+  });
+});
 
 describe('typeReferencesFile', () => {
 	it('matches file primitives and aliases, alone and in composites', () => {
@@ -14,9 +37,7 @@ describe('typeReferencesFile', () => {
 		}
 	});
 
-	it('answers structurally: a dict KEY is an index, never a stored value', () => {
-		// Mirrors Rust's Dict(_, v) arm; the old token regex could not
-		// tell the two positions apart.
+	it('answers structurally from a dict value, and a dict keyed by a file is no type', () => {
 		expect(typeReferencesFile('Dict[String, Image]')).toBe(true);
 		expect(typeReferencesFile('Dict[Image, String]')).toBe(false);
 	});
@@ -36,8 +57,8 @@ describe('parseFileValue', () => {
 
 	it('parses a key-backed file value from any concrete marker', () => {
 		for (const marker of ['__weft_image__', '__weft_video__', '__weft_audio__', '__weft_blob__']) {
-			const parsed = parseFileValue({ [marker]: { key: 'exec/c1/f1', ...meta } });
-			expect(parsed, marker).toEqual({ key: 'exec/c1/f1', ...meta });
+			const parsed = parseFileValue({ [marker]: { key: 'run/c1/f1', ...meta } });
+			expect(parsed, marker).toEqual({ key: 'run/c1/f1', ...meta });
 		}
 	});
 
@@ -52,11 +73,19 @@ describe('parseFileValue', () => {
 		expect(parsed?.url).toBeUndefined();
 	});
 
+	it('carries a key-backed value\'s link lifetime, and refuses one that is not whole seconds', () => {
+		expect(parseFileValue({ __weft_image__: { key: 'k', linkSecs: 7200, ...meta } })).toEqual({ key: 'k', linkSecs: 7200, ...meta });
+		expect(parseFileValue({ __weft_image__: { key: 'k', linkSecs: null, ...meta } })).toEqual({ key: 'k', ...meta });
+		expect(parseFileValue({ __weft_image__: { key: 'k', linkSecs: 1.5, ...meta } })).toBeNull();
+		expect(parseFileValue({ __weft_image__: { key: 'k', linkSecs: '60', ...meta } })).toBeNull();
+		expect(parseFileValue({ __weft_image__: { key: 'k', linkSecs: -1, ...meta } })).toBeNull();
+	});
+
 	it('returns null for data-backed markers and non-file values', () => {
 		expect(parseFileValue({ __weft_image__: { data: 'aGk=', ...meta } })).toBeNull();
 		expect(parseFileValue({ __weft_image__: { key: '', ...meta } })).toBeNull();
 		expect(parseFileValue({ notAMarker: { key: 'k', ...meta } })).toBeNull();
-		expect(parseFileValue('exec/c1/f1')).toBeNull();
+		expect(parseFileValue('run/c1/f1')).toBeNull();
 		expect(parseFileValue(null)).toBeNull();
 	});
 });
@@ -72,7 +101,7 @@ describe('catalog wire fixture', () => {
 		const fixture: CatalogEntry = {
 			type: 'Fixture', label: 'Fixture', description: 'd',
 			tags: ['a'], icon: 'Zap', color: '#123456',
-			requires_infra: true,
+			requiresInfra: true,
 			inputs: [
 				{ name: 'code', type: 'String', required: true, accepts: ['literal', 'wire'],
 				  widget: { kind: 'code', language: 'python' } },
@@ -85,7 +114,7 @@ describe('catalog wire fixture', () => {
 				  requiresScopes: ['s.read'], requiresValues: ['host'] },
 				{ name: 'sheet', type: 'String', accepts: ['literal', 'wire'],
 				  widget: { kind: 'remote_select', access: 'grant',
-				            sources: [{ kind: 'granted', from: 'sheets', label: 'label', value: 'id' }], depends_on: ['pick'] } },
+				            sources: [{ kind: 'granted', from: 'sheets', label: 'label', value: 'id' }], dependsOn: ['pick'] } },
 				{ name: 'img', type: 'Image', accepts: ['literal', 'wire'],
 				  widget: { kind: 'file_drop', type: 'Image', accept: 'image/png' } },
 			],
@@ -138,5 +167,86 @@ describe('catalog wire fixture', () => {
 			}
 		};
 		expect(label({ kind: 'text' })).toBe('text');
+	});
+});
+
+describe('narrowable outputs and type parameters on the wire', () => {
+	it('reads an output narrowing bound', () => {
+		const route: OutputSpec[] = [
+			{ name: 'answer', type: 'JsonDict', narrowable: true },
+			{ name: 'body', type: 'JsonDict', narrowable: 'JsonDict | String | File' },
+			{ name: 'status', type: 'Number' },
+		];
+		expect(route.map(narrowingBound)).toEqual(['JsonDict', 'JsonDict | String | File', null]);
+	});
+
+	it("holds a declaration to a catalog entry's bounds and to a node's resolved ones", () => {
+		const entry = {
+			type: 'KeepFile', label: 'Keep File', description: '', tags: [],
+			inputs: [{ name: 'file', type: 'T', required: true }, { name: 'more', type: 'T2', required: true }],
+			outputs: [],
+			typeParams: { T: 'Media', T2: 'List[T]' },
+		} as unknown as CatalogEntry;
+		registerCatalog({ KeepFile: entry });
+		const template = NODE_TYPE_CONFIG.KeepFile;
+		const file = declarationRule('input', template.defaultInputs[0], template.typeParams);
+		expect(declarationProblem(file, 'String')).toBe('`T` has to fit in Media, and what is connected makes it String');
+		expect(declarationProblem(file, 'Image')).toBeNull();
+
+		const node: Pick<NodeDefinition, 'typeParams'> = {
+			typeParams: [{ name: 'T', bound: 'Media', resolved: 'Video' }, { name: 'T2', bound: 'List[T]' }],
+		};
+		const more = declarationRule('input', template.defaultInputs[1], node.typeParams);
+		expect(declarationProblem(more, 'List[Video]')).toBeNull();
+		expect(declarationProblem(more, 'List[Image]')).toBe('`T2` has to fit in List[Video], and what is connected makes it List[Image]');
+	});
+});
+
+describe('tryParseWeftType leaves only declarable unknown names to the compiler', () => {
+	const refusal = (s: string) => {
+		const parsed = tryParseWeftType(s);
+		if (parsed.ok) throw new Error(`${s} parsed`);
+		return parsed;
+	};
+
+	it('an unknown declarable name is the compiler\'s, wherever it sits', () => {
+		for (const s of ['Verdict', 'List[Verdict]', 'Verdict | Number', '{ a: Verdict, b?: Score }', 'Dict[String, Verdict]']) {
+			expect(refusal(s).unknownName, s).toBe(true);
+		}
+		expect(refusal('Verdict | Score').error).toBe('`Verdict` is not a type');
+	});
+
+	// SYNC assertions with crates/weft-core/src/weft_type.rs parse_single_type
+	it('a name no project can declare is refused outright', () => {
+		for (const s of ['List', 'Dict', 'Generator', 'string', 'List[string]']) {
+			expect(refusal(s).unknownName, s).toBe(false);
+		}
+		expect(refusal('List').error).toBe('`List` is not a type');
+		expect(refusal('string').error).toBe('`string` is not a type');
+	});
+
+	it('a definite error elsewhere wins over an unknown name before it', () => {
+		const key = refusal('Dict[Number, Verdict]');
+		expect(key.unknownName).toBe(false);
+		expect(key.error).toBe(
+			"`Dict[Number, Verdict]`: a dict's keys are always text, so its key type is `String`. "
+			+ 'To key by a Number, use `List[{key: Number, value: Verdict}]`',
+		);
+		const foo = refusal('Verdict | Foo[String]');
+		expect(foo.unknownName).toBe(false);
+		expect(foo.error).toBe('`Foo[...]` is not a type; the types that take one are List, Generator and Dict');
+		const field = refusal('{a: Verdict, b}');
+		expect(field.unknownName).toBe(false);
+		expect(field.error).toBe('`{a: Verdict, b}`: the field `b` has no type (`name: Type`)');
+	});
+
+	it('a declared name that is no type name says why, like the compiler', () => {
+		expect(refusal('verdict=String').error).toBe(
+			'`verdict=String`: `verdict` is not a type name: a type name starts with an uppercase letter '
+			+ 'and contains only letters, digits, and underscores',
+		);
+		expect(refusal('List=String').error).toBe('`List=String`: `List` is not a type name: `List` is reserved by the type language');
+		expect(refusal('Media=String').error).toBe('`Media=String`: `Media` is not a type name: `Media` is reserved by the type language');
+		expect(refusal('Kind=Verdict').unknownName).toBe(true);
 	});
 });

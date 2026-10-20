@@ -20,11 +20,9 @@
 
 use async_trait::async_trait;
 
-use serde_json::Value;
-
 use weft::node::NodeOutput;
 use weft::storage::FileHandle;
-use weft::{node_bail, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{node_bail, RunContext, Node, NodeManifest, WeftResult};
 
 use super::chat;
 
@@ -41,12 +39,12 @@ impl Node for ChatHistoryAppendNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let history_ty = chat::history_type()?;
         let history_file: Option<FileHandle> = ctx.inputs.opt("historyFile")?;
         let role: String = ctx.inputs.get("role")?;
         let text: Option<String> = ctx.inputs.opt("text")?;
-        let media: Vec<Value> = ctx.inputs.list("media")?;
+        let media = chat::media_input(&ctx)?;
         let tool_call_id: Option<String> = ctx.inputs.opt("toolCallId")?;
         let cache_breakpoint: bool = ctx.inputs.get_or("cacheBreakpoint", false)?;
 

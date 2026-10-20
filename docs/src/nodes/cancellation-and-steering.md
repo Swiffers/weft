@@ -30,15 +30,23 @@ That one is cheap enough to call every iteration.
 The flag is sticky. Once it is set, every later check sees it, so there is no
 race between the cancel arriving and your next look.
 
-What needs an arm: every wait, every long call to somebody else, and every read
-that could block for minutes.
+If your node waits on something itself (a sleep, a long call to somebody
+else, a read that could block for minutes), race it against
+`cancel.cancelled()` in a `select!` like the one above. The waits weft parks
+for you need none: `ctx.await_signal`, `ctx.await_signal_with_cancel`, and the
+ctx calls that wait through them, like `infra(..).start()`. Cancelling the run
+takes those down for you.
+
+If the wait is on a job a provider runs, and you want the provider
+told too, go and read [if the run is cancelled while the job
+runs](durable-execution.md#if-the-run-is-cancelled-while-the-job-runs).
 
 ## Stopping other runs
 
 A run can tag itself, and a run can stop every run carrying a tag.
 
 ```rust
-ctx.tag_execution(["chat_7"]).await?;
+ctx.tag_run(["chat_7"]).await?;
 ctx.stop_tagged("chat_7", StopSelf::Keep).await?;
 ```
 
@@ -50,7 +58,7 @@ run stops the first two and answers once.
 | `StopSelf::Keep` | Stop the others, keep running |
 | `StopSelf::Include` | Stop everything carrying the tag, including this run |
 
-It reaches running executions, ones parked on a signal or a timer, whose wake
+It reaches runs that are working, ones parked on a signal or a timer, whose wake
 is erased so they never come back, and ones whose wake is already on its way,
 which find the run gone and do nothing. Each one is recorded as cancelled,
 naming this run and the tag, so it reads as a decision rather than a failure.
@@ -90,7 +98,7 @@ The fake rig does not stop anything. It records what your node asked for, and
 you assert on that:
 
 ```rust
-assert_eq!(rig.execution_tags(), vec!["chat_7"]);
+assert_eq!(rig.run_tags(), vec![vec!["chat_7"]]);
 assert_eq!(rig.stops().len(), 1);
 ```
 
@@ -98,7 +106,8 @@ assert_eq!(rig.stops().len(), 1);
 
 `StopSelf` is also the last argument of every call that takes part of the
 project down (`ctx.infra("bridge").stop(..)`, `terminate(..)`,
-`ctx.trigger("receive").deactivate(..)`, `ctx.runs().clean(..)`). For what
+`wipe(..)`, `upgrade(..)`, `ctx.trigger("receive").deactivate(..)`,
+`ctx.runs().clean(..)`). For what
 `Keep` and `Include` do there, go and read
 [taking something down from a run](../running/instances.md#taking-something-down-from-a-run).
 

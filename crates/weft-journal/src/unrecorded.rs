@@ -7,7 +7,7 @@
 //!
 //! What is written of it, through its writer lane like any run's record
 //! and marked as not recorded on its row:
-//! - when it fails, its birth and its failure, which names the step that
+//! - when it fails, its birth and its failure, which names the node that
 //!   failed and why: nothing of what ran before;
 //! - before it does something that names it to the install (asks for a
 //!   stored file, a connection or an infrastructure address its worker
@@ -19,12 +19,12 @@
 //! A run that does neither leaves nothing, whether it completes or is
 //! cancelled.
 
-use crate::events::ExecEvent;
+use crate::events::RunEvent;
 
 /// An unrecorded run's note: its birth until something makes it written.
 #[derive(Debug, Default)]
 pub struct UnrecordedNote {
-    birth: Option<Box<ExecEvent>>,
+    birth: Option<Box<RunEvent>>,
     /// Its birth was written: its row exists.
     written: bool,
 }
@@ -37,16 +37,16 @@ impl UnrecordedNote {
     }
 
     /// What of `events` is written now (see the module doc), in order.
-    pub fn route(&mut self, events: Vec<ExecEvent>) -> Vec<ExecEvent> {
+    pub fn route(&mut self, events: Vec<RunEvent>) -> Vec<RunEvent> {
         let mut out = Vec::new();
         for event in events {
             match &event {
-                ExecEvent::ExecutionStarted { .. } => self.birth = Some(Box::new(event)),
-                ExecEvent::CostReported { .. } | ExecEvent::ExecutionFailed { .. } => {
+                RunEvent::RunStarted { .. } => self.birth = Some(Box::new(event)),
+                RunEvent::CostReported { .. } | RunEvent::RunFailed { .. } => {
                     out.extend(self.take_birth());
                     out.push(event);
                 }
-                _ if event.is_execution_terminal() && self.written => out.push(event),
+                _ if event.is_run_terminal() && self.written => out.push(event),
                 _ => {}
             }
         }
@@ -61,7 +61,7 @@ impl UnrecordedNote {
     /// Its birth, when not written yet: what makes its row exist before
     /// something names it to the install. The run counts as written from
     /// here on.
-    pub fn take_birth(&mut self) -> Option<ExecEvent> {
+    pub fn take_birth(&mut self) -> Option<RunEvent> {
         self.written = true;
         self.birth.take().map(|birth| *birth)
     }
@@ -70,11 +70,11 @@ impl UnrecordedNote {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weft_core::ExecutionId;
+    use weft_core::RunId;
 
-    fn log(message: &str) -> ExecEvent {
-        ExecEvent::LogLine {
-            execution_id: ExecutionId::nil(),
+    fn log(message: &str) -> RunEvent {
+        RunEvent::LogLine {
+            run_id: RunId::nil(),
             node_id: "n".into(),
             frames: Vec::new(),
             level: "info".into(),
@@ -85,18 +85,18 @@ mod tests {
         }
     }
 
-    fn birth() -> ExecEvent {
+    fn birth() -> RunEvent {
         serde_json::from_value(serde_json::json!({
-            "kind": "execution_started", "project_id": ExecutionId::nil(),
+            "kind": "run_started", "project_id": RunId::nil(),
             "entry_node": "door", "phase": "fire", "at_unix": 0
         }))
         .expect("a birth")
     }
 
-    fn ended(failed: bool) -> ExecEvent {
+    fn ended(failed: bool) -> RunEvent {
         match failed {
-            true => ExecEvent::ExecutionFailed { execution_id: ExecutionId::nil(), error: "n: boom".into(), at_unix: 0 },
-            false => ExecEvent::ExecutionCompleted { execution_id: ExecutionId::nil(), at_unix: 0 },
+            true => RunEvent::RunFailed { run_id: RunId::nil(), error: "n: boom".into(), at_unix: 0 },
+            false => RunEvent::RunCompleted { run_id: RunId::nil(), at_unix: 0 },
         }
     }
 
@@ -109,7 +109,7 @@ mod tests {
         let mut note = UnrecordedNote::default();
         assert!(note.route(vec![birth(), log("a")]).is_empty());
         let written = note.route(vec![log("b"), ended(true)]);
-        assert!(matches!(written.as_slice(), [ExecEvent::ExecutionStarted { .. }, ExecEvent::ExecutionFailed { .. }]), "{written:?}");
+        assert!(matches!(written.as_slice(), [RunEvent::RunStarted { .. }, RunEvent::RunFailed { .. }]), "{written:?}");
     }
 
     /// A run named to the install writes its birth once, then its ending
@@ -118,9 +118,9 @@ mod tests {
     fn a_named_run_ends_its_row() {
         let mut note = UnrecordedNote::default();
         assert!(note.route(vec![birth()]).is_empty());
-        assert!(matches!(note.take_birth(), Some(ExecEvent::ExecutionStarted { .. })));
+        assert!(matches!(note.take_birth(), Some(RunEvent::RunStarted { .. })));
         assert!(note.take_birth().is_none());
         let written = note.route(vec![log("a"), ended(false)]);
-        assert!(matches!(written.as_slice(), [ExecEvent::ExecutionCompleted { .. }]), "{written:?}");
+        assert!(matches!(written.as_slice(), [RunEvent::RunCompleted { .. }]), "{written:?}");
     }
 }

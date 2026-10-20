@@ -5,7 +5,7 @@ description: "Read when the user asks what a run costs, or when a node is wired 
 
 # What a call costs
 
-A node never computes what its API call cost. Every cost figure in weft comes from a [meter]: separate code that watches the request go out and the answer come back, and works out the real number. The number lands on [the trail], the durable record of what an execution spent, read with `weft events <execution-id> --kind cost_reported`.
+A node never computes what its API call cost. Every cost figure in weft comes from a [meter]: separate code that watches the request go out and the answer come back, and works out the real number. The number lands on [the trail], the durable record of what a run spent, read with `weft events <run-id> --kind cost_reported`. If the user wants a ceiling on what one instance spends (one customer, one chat), the program reads that record before the paid call: for the shape and its limits, go and read the `weft-instances` skill, "Tokens and costs".
 
 ## Two kinds of meter, and only one of them is yours
 
@@ -328,13 +328,13 @@ async fn priceable(&self, path: &str, follow_up: FollowUp<'_>) -> anyhow::Result
 You run the program, then read [the trail]:
 
 ```text
-weft events <execution-id> --kind cost_reported
+weft events <run-id> --kind cost_reported
 ```
 
-Each measured call prints a `cost_reported` line carrying `service=` and `amount_usd=`, plus whatever metadata your `resolve` returned. No line at all means the route classified `Unknown`, or `register_meter!` never ran.
+Each measured call prints a `cost_reported` line carrying `service=` and `amountUsd=`, plus whatever metadata your `resolve` returned. No line at all means the route classified `Unknown`, or `register_meter!` never ran.
 
 ## The rest of the trait
 
 `observe_session` prices a long-lived socket that accrues as it goes. If your meter classifies any route `BillableSession`, implement it; the default refuses every session on that route. For it, the full trait, and what a [meter] must do before weft ships it, go and read [Measuring what a call costs](https://weavemindai.github.io/weft/connections/meters.html).
 
-Every snippet on this page is compiled in weft's own `crates/weft-providers/tests/skill_example_meter.rs`, and all but `priceable` are exercised there too. If you change one here, you change it there.
+Every snippet on this page is compiled in weft's own `crates/weft-providers/tests/integration/skill_example_meter.rs`, and all but `priceable` are exercised there too. If you change one here, you change it there.

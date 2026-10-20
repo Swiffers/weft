@@ -1,7 +1,7 @@
 //! The broker's runtime-file HTTP surface (`ctx.storage`).
 //!
 //! Worker data path (bearer = the worker's platform identity token, resolved
-//! in-process to `Worker { tenant, project, execution_id }`). BYTES never transit the
+//! in-process to `Worker { tenant, project, run_id }`). BYTES never transit the
 //! broker: it mints presigned URLs and the worker moves bytes direct to/from the
 //! bucket.
 //!   POST   /v1/storage/upload/begin      mint the key, charge a known size, open the upload
@@ -16,16 +16,25 @@
 //!   DELETE /v1/storage/files/{*key}
 //!   GET    /v1/storage/list?scope=...
 //!   POST   /v1/storage/keep
-//!   POST   /v1/storage/presign           presigned GET URL for external APIs
+//!   POST   /v1/storage/link              a link for node code or for the outside
+//!   POST   /v1/storage/copy              a copy into a scope, inside the bucket
+//!   POST   /v1/storage/upload-slot       a slot a page uploads one file through
+//!   POST   /v1/storage/upload/claim      the file a slot uploaded, for this run
 //!
 //! Control-plane admin path (bearer = the dispatcher's SA -> ControlPlane;
 //! the CLI `weft files` verbs proxy through the dispatcher to here):
 //!   POST   /v1/storage/admin/tenant-list    one tenant's files
 //!   POST   /v1/storage/admin/tenant-usage   one tenant's (count, bytes)
 //!   DELETE /v1/storage/admin/files/{*key}   delete one file
-//!   POST   /v1/storage/admin/presign        presign one file
+//!   POST   /v1/storage/admin/link           a download link, for a person, weft or the outside
 //!   POST   /v1/storage/admin/wipe-prefix    weft rm / weft clean
-//!   POST   /v1/storage/admin/sweep-exec     terminate sweep for one execution
+//!   POST   /v1/storage/admin/sweep-run     terminate sweep for one run
+//!
+//! A page's upload through a slot (bearer = the dispatcher, which passes
+//! the page's verbs on from its `/files/upload/...` door; the slot in each
+//! body is the page's credential, checked here):
+//!   POST   /v1/storage/slot/{begin,parts,part-done,complete,resume,abort}
+//!   POST   /v1/storage/slot/check     whether `begin` would take the file, reserving nothing
 //!
 //! The broker is the single gatekeeper: it verifies the caller, runs the pure
 //! `key` wall, enforces quota, records metadata, and is the ONLY thing that signs
@@ -42,26 +51,28 @@ use axum::{Json, Router};
 use serde::Deserialize;
 
 use weft_core::storage::key::{self, CallerAuth};
+use weft_core::storage::slot::{
+    ClaimUploadRequest, ClaimUploadResponse, SlotBeginRequest, Slotted, UploadSlotClaims, UploadSlotRequest, UploadSlotResponse,
+};
 use weft_core::storage::{
-    AssetUploadBeginRequest, AssetsHeldRequest, AssetsHeldResponse, DownloadUrlResponse, ListFilesResponse,
-    PartDoneRequest,
-    PresignResponse, PresignResult, StorageScope, StoredFile, StoredFileMeta, SweepExecRequest,
-    SweepExecResponse, Tenanted, TenantScopeRequest, TenantUsage, UploadAbortRequest,
-    UploadBeginRequest, UploadBeginResponse, UploadCompleteRequest, UploadPartsRequest,
-    UploadPartsResponse, UploadResumeRequest, UploadResumeResponse, WipePrefixRequest,
-    WipePrefixResponse,
+    AdminLinkRequest, AssetUploadBeginRequest, AssetsHeldRequest, AssetsHeldResponse, CopyRequest,
+    DownloadUrlResponse, FileLink, LinkAnswer, LinkReach, LinkReader, LinkRequest, ListFilesResponse, PartDoneRequest,
+    PresignResult, StorageScope, StoredFile, StoredFileMeta, SweepRunRequest, SweepRunResponse, Tenanted,
+    TenantScopeRequest, TenantUsage, UploadAbortRequest, UploadBeginRequest, UploadBeginResponse,
+    UploadCompleteRequest, UploadPartsRequest, UploadPartsResponse, UploadResumeRequest,
+    UploadResumeResponse, WipePrefixRequest, WipePrefixResponse,
 };
 use weft_platform_traits::PresignAudience;
 
 use crate::auth::control_plane;
-use crate::runtime_store::{RuntimeStore, RuntimeStoreError};
+use crate::runtime_store::RuntimeStoreError;
 use crate::state::BrokerState;
 
-/// The execution claim a worker stamps on every storage call, so the broker scopes
-/// the op to that execution. (The file's scope / mime / filename / keep travel
+/// The run claim a worker stamps on every storage call, so the broker scopes
+/// the op to that run. (The file's scope / mime / filename / keep travel
 /// in the JSON body of upload/begin, not headers.)
-// SYNC: HDR_EXECUTION_ID <-> crates/weft-engine/src/storage.rs (HDR_EXECUTION_ID)
-pub const HDR_EXECUTION_ID: &str = "x-weft-execution-id";
+// SYNC: HDR_RUN_ID <-> crates/weft-engine/src/storage.rs (HDR_RUN_ID)
+pub const HDR_RUN_ID: &str = "x-weft-run-id";
 
 /// A refusal: a status and a message, plus the "still completing" marker
 /// ([`weft_core::storage::COMPLETING_HEADER`]) when the refusal is that
@@ -111,8 +122,19 @@ pub fn router() -> Router<Arc<BrokerState>> {
         .route("/v1/storage/list", get(list_files))
         .route("/v1/storage/identity", post(find_identity))
         .route("/v1/storage/keep", post(keep_file))
-        .route("/v1/storage/presign", post(presign))
-        .route("/v1/storage/public-link", post(public_link))
+        .route("/v1/storage/link", post(link))
+        .route("/v1/storage/copy", post(copy_file))
+        .route("/v1/storage/upload-slot", post(upload_slot))
+        .route("/v1/storage/upload/claim", post(claim_upload))
+        // A page's upload through a slot, passed on by the dispatcher's
+        // `/files/upload/...` door: the four-step upload, held to the slot.
+        .route("/v1/storage/slot/check", post(slot_check))
+        .route("/v1/storage/slot/begin", post(slot_begin))
+        .route("/v1/storage/slot/parts", post(slot_parts))
+        .route("/v1/storage/slot/part-done", post(slot_part_done))
+        .route("/v1/storage/slot/complete", post(slot_complete))
+        .route("/v1/storage/slot/resume", post(slot_resume))
+        .route("/v1/storage/slot/abort", post(slot_abort))
         // Admin upload: the dispatcher drives the SAME multipart contract on
         // behalf of a tenant's editor session (a file-drop config field).
         // Project-scoped only; part URLs are presigned for the browser-facing
@@ -129,11 +151,9 @@ pub fn router() -> Router<Arc<BrokerState>> {
         .route("/v1/storage/admin/tenant-usage", post(admin_tenant_usage))
         .route("/v1/storage/admin/files/{*key}", delete(admin_delete_file))
         .route("/v1/storage/admin/meta/{*key}", get(admin_meta))
-        .route("/v1/storage/admin/presign", post(admin_presign))
-        .route("/v1/storage/admin/download-link", post(admin_download_link))
-        .route("/v1/storage/admin/relay/{token}", axum::routing::get(admin_relay))
+        .route("/v1/storage/admin/link", post(admin_link))
         .route("/v1/storage/admin/wipe-prefix", post(admin_wipe_prefix))
-        .route("/v1/storage/admin/sweep-exec", post(admin_sweep_exec))
+        .route("/v1/storage/admin/sweep-run", post(admin_sweep_run))
 }
 
 // ---------- error mapping ----------
@@ -155,6 +175,11 @@ fn map_err(e: RuntimeStoreError) -> ApiError {
         RuntimeStoreError::QuotaExceeded(m) => (StatusCode::PAYLOAD_TOO_LARGE, m),
         RuntimeStoreError::Conflict(m) | RuntimeStoreError::Completing(m) => (StatusCode::CONFLICT, m),
         RuntimeStoreError::Lost(m) => (StatusCode::GONE, m),
+        RuntimeStoreError::NoUpload(m) => (StatusCode::NOT_FOUND, m),
+        // The bucket refused rows, named in the message and marked; waiting
+        // does not clear it, so it is a plain conflict (a wipe left waiting on
+        // a live claim answers `Completing` instead, the "ask again" one).
+        RuntimeStoreError::RemovalIncomplete(m) => (StatusCode::CONFLICT, m),
         // SYNC: replace outcome statuses <-> crates/weft-engine/src/storage.rs WorkerStorage::replace
         RuntimeStoreError::Stale(m) => (StatusCode::PRECONDITION_FAILED, m),
         // A dropped database connection is said as one (logged with its
@@ -201,12 +226,12 @@ fn map_anyhow(e: anyhow::Error) -> ApiError {
 
 // ---------- caller resolution ----------
 
-/// Resolve the worker caller for a data-path request (the `x-weft-execution_id`
-/// header carries the optional execution claim). Rejects a
+/// Resolve the worker caller for a data-path request (the `x-weft-run_id`
+/// header carries the optional run claim). Rejects a
 /// control-plane caller on the data path (it uses the admin surface).
 async fn worker_caller(state: &Arc<BrokerState>, headers: &HeaderMap) -> Result<CallerAuth, ApiError> {
-    let execution_id = headers.get(HDR_EXECUTION_ID).and_then(|v| v.to_str().ok());
-    let caller = crate::auth::resolve_storage_caller(state, headers, execution_id).await?;
+    let run_id = headers.get(HDR_RUN_ID).and_then(|v| v.to_str().ok());
+    let caller = crate::auth::resolve_storage_caller(state, headers, run_id).await?;
     match &caller {
         CallerAuth::Worker { .. } => Ok(caller),
         CallerAuth::ControlPlane | CallerAuth::Tenant { .. } => Err(ApiError::from((
@@ -255,7 +280,7 @@ async fn upload_begin(
         return Err(ApiError::from((
             StatusCode::FORBIDDEN,
             "the asset scope is managed by the pre-build asset sync; node code writes \
-             execution/project/shared scopes"
+             run/project/shared scopes"
                 .into(),
         )));
     }
@@ -271,6 +296,7 @@ async fn upload_begin(
                 declared_size: req.declared_size,
                 content_hash: None,
                 identity: req.identity.as_deref(),
+                slot: None,
             },
             state.entitlements.as_ref(),
         )
@@ -343,7 +369,7 @@ async fn upload_parts(
             &req.key,
             &req.parts,
             state.entitlements.as_ref(),
-            PresignAudience::Internal,
+            &PresignAudience::Internal,
         )
         .await
         .map_err(map_err)?;
@@ -392,7 +418,7 @@ async fn upload_resume(
     let caller = worker_caller(&state, &headers).await?;
     let store = &state.runtime_store;
     let (part_size, missing, reserved_bytes) = store
-        .resume_upload(&caller, &req.key, state.entitlements.as_ref(), PresignAudience::Internal)
+        .resume_upload(&caller, &req.key, state.entitlements.as_ref(), &PresignAudience::Internal)
         .await
         .map_err(map_err)?;
     Ok(Json(UploadResumeResponse { part_size, missing, reserved_bytes }))
@@ -419,22 +445,15 @@ async fn download_url(
     State(state): State<Arc<BrokerState>>,
     Path(key): Path<String>,
     headers: HeaderMap,
-    axum::extract::Query(q): axum::extract::Query<DownloadUrlQuery>,
 ) -> Result<Json<DownloadUrlResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = &state.runtime_store;
     let parsed = wall(&caller, &key)?;
-    let (meta, url) = store
-        .download_url(&parsed, PresignAudience::Internal, q.ttl_secs, false)
+    let (meta, url, _) = state
+        .runtime_store
+        .link(&parsed, PresignAudience::Internal, None, false)
         .await
         .map_err(map_err)?;
     Ok(Json(DownloadUrlResponse { meta, url }))
-}
-
-#[derive(Deserialize)]
-struct DownloadUrlQuery {
-    #[serde(default)]
-    ttl_secs: Option<u64>,
 }
 
 async fn get_meta(
@@ -526,136 +545,414 @@ async fn keep_file(
     Ok(Json(store.keep(&parsed, req.ttl).await.map_err(map_err)?))
 }
 
-/// `POST /v1/storage/presign`: the link a node body hands out for a stored
-/// file, and the `url` the runtime puts on every file marker before a body
-/// runs. The internet-reachable link when the install serves one (so a
-/// provider can fetch it too), else a URL signed for the install's own
-/// address: the node body can fetch that one, nothing outside can.
-async fn presign(
+/// `POST /v1/storage/link`: a link to one of the caller's files for node
+/// code (`internal`, straight to the bucket at the workers' address) or
+/// for the outside (`external`, [`link_route`]), whether the open
+/// internet opens it, and the file it opens. An outside link reads the
+/// project's visitor address in the same statement that reads the file.
+async fn link(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
-    Json(req): Json<weft_core::storage::PresignRequest>,
-) -> Result<Json<PresignResponse>, ApiError> {
+    Json(req): Json<LinkRequest>,
+) -> Result<Json<LinkAnswer>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = &state.runtime_store;
     let parsed = wall(&caller, &req.key)?;
-    let url = match public_link_url(&state, store, &parsed, req.ttl_secs, &weft_core::storage::LinkReach::Internet).await? {
-        Some(url) => url,
-        None => {
-            store
-                .download_url(&parsed, PresignAudience::Internal, req.ttl_secs, true)
-                .await
-                .map_err(map_err)?
-                .1
-        }
+    let visitors_of = match req.reach {
+        LinkReach::External => Some(caller_project(&caller)?),
+        LinkReach::Internal => None,
     };
-    Ok(Json(PresignResponse { url }))
+    let granted = state.runtime_store.grant_link(&parsed, req.ttl_secs, true, visitors_of).await.map_err(map_err)?;
+    let (audience, public) = link_route(&state, req.reach, granted.visitor_address.clone()).await?;
+    let url = state.runtime_store.sign_link(&granted, audience).await.map_err(map_err)?;
+    Ok(Json(LinkAnswer { link: FileLink { url, public }, file: granted.file }))
 }
 
-/// `POST /v1/storage/public-link`: a URL the asker named in `reach` can
-/// fetch the file from, or `url: None` when there is none (an internet
-/// asker then inlines the bytes instead).
-async fn public_link(
+/// The project a worker caller acts for.
+fn caller_project(caller: &CallerAuth) -> Result<uuid::Uuid, ApiError> {
+    match caller {
+        CallerAuth::Worker { project_id, .. } => project_uuid(project_id),
+        _ => Err(ApiError::from((StatusCode::FORBIDDEN, "only a project's own callers ask for its links".into()))),
+    }
+}
+
+fn project_uuid(project: &str) -> Result<uuid::Uuid, ApiError> {
+    project.parse().map_err(|_| ApiError::from((StatusCode::BAD_REQUEST, format!("'{project}' is not a project id"))))
+}
+
+/// [`route_link`] with this install's store, own address and internet
+/// address.
+async fn link_route(state: &BrokerState, reach: LinkReach, visitor: Option<String>) -> Result<(PresignAudience, bool), ApiError> {
+    route_link(reach, state.object_store_public_internet, visitor, &state.own_base_url, || state.internet_base()).await
+}
+
+/// The audience of a page's upload parts through a slot of `project`:
+/// the way an outside link of the project goes. The visitor address is
+/// read only when the store does not take the page's bytes itself.
+async fn slot_parts_audience(state: &BrokerState, project: &str) -> Result<PresignAudience, ApiError> {
+    let visitor = match state.object_store_public_internet {
+        true => None,
+        false => visitor_address(state, project_uuid(project)?).await?,
+    };
+    Ok(link_route(state, LinkReach::External, visitor).await?.0)
+}
+
+/// The address `project` declared its visitors reach the install at (a
+/// site that passes `/weft/...` on), when it declared one.
+async fn visitor_address(state: &BrokerState, project: uuid::Uuid) -> Result<Option<String>, ApiError> {
+    sqlx::query_scalar("SELECT visitor_address FROM project_frontend WHERE project_id = $1 AND visitor_address IS NOT NULL")
+        .bind(project)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| map_anyhow(anyhow::Error::from(e).context("read the project's visitor address")))
+}
+
+/// Where a link goes, and whether the open internet opens it. Node code
+/// (`internal`) reaches the store at the workers' address, which the
+/// internet opens only on a store it reaches (`store_public`, Cloud
+/// Storage). For the outside (`external`): the store's own link when the
+/// internet reaches it; else through the install's forwarder at the
+/// project's `visitor` address, else at the install's internet address
+/// (`internet`, asked only when no visitor address applies: a quick
+/// tunnel's is a call to cloudflared), both public; else at the install's
+/// `own` address, which only its machine or its network opens. An
+/// internet address that cannot be read refuses the link: one through a
+/// tunnel that is down would work for nobody.
+async fn route_link<F, Fut>(
+    reach: LinkReach,
+    store_public: bool,
+    visitor: Option<String>,
+    own: &str,
+    internet: F,
+) -> Result<(PresignAudience, bool), ApiError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Option<String>>>,
+{
+    if reach == LinkReach::Internal {
+        return Ok((PresignAudience::Internal, store_public));
+    }
+    if store_public {
+        return Ok((PresignAudience::External, true));
+    }
+    if let Some(base) = visitor {
+        return Ok((PresignAudience::Forwarded { base }, true));
+    }
+    let internet = internet().await.map_err(|e| {
+        tracing::error!(target: "weft_broker::runtime_storage", error = format!("{e:#}"), "the install's internet address could not be read");
+        ApiError::from((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the install's tunnel does not say its address right now; `weft daemon start` opens it again".to_string(),
+        ))
+    })?;
+    Ok(match internet {
+        Some(base) => (PresignAudience::Forwarded { base }, true),
+        None => (PresignAudience::Forwarded { base: own.to_string() }, false),
+    })
+}
+
+/// `POST /v1/storage/copy`: copy one of the caller's files into a scope
+/// it writes, inside the bucket.
+async fn copy_file(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
-    Json(req): Json<weft_core::storage::PresignRequest>,
-) -> Result<Json<weft_core::storage::PublicLinkResponse>, ApiError> {
+    Json(req): Json<CopyRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
-    let store = &state.runtime_store;
-    let parsed = wall(&caller, &req.key)?;
-    let url = public_link_url(&state, store, &parsed, req.ttl_secs, &req.reach).await?;
-    Ok(Json(weft_core::storage::PublicLinkResponse { url }))
+    let from = wall(&caller, &req.key)?;
+    let meta = state
+        .runtime_store
+        .copy_file(&caller, &from, &req.scope, req.identity.as_deref(), req.keep, state.entitlements.as_ref())
+        .await
+        .map_err(map_err)?;
+    Ok(Json(StoredFile::from(&meta).to_value()))
 }
 
-/// Mint the link for a file, or `None` when the asker has no address
-/// to be given. Three configurations, one rule each:
-/// - the open internet reaches the store's presigned URLs
-///   (`ObjectStoreSettings::public_internet`): the bucket's own presigned
-///   URL, zero relay hops;
-/// - a base exists for the asker ([`relay_base`]): a relay link under
-///   it, resolved by the public `/public/files/{token}` route;
-/// - neither: no link exists.
-async fn public_link_url(
-    state: &BrokerState,
-    store: &RuntimeStore,
-    parsed: &key::ParsedKey,
-    ttl_secs: Option<u64>,
-    reach: &weft_core::storage::LinkReach,
-) -> Result<Option<String>, ApiError> {
-    let base = relay_base(state.internet_base(), &state.public_base_url, reach)?;
-    Ok(match link_route(state.object_store_public_internet, base) {
-        LinkRoute::DirectPresign => Some(store.presign(parsed, ttl_secs).await.map_err(map_err)?),
-        LinkRoute::Relay(base) => {
-            let token = store.mint_public_link(parsed, ttl_secs).await.map_err(map_err)?;
-            Some(format!("{}/public/files/{token}", base.trim_end_matches('/')))
+/// `POST /v1/storage/upload-slot`: a slot the caller's page uploads one
+/// file through, signed for the caller's project. A slot into the run's
+/// own instance names that instance.
+async fn upload_slot(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<UploadSlotRequest>,
+) -> Result<Json<UploadSlotResponse>, ApiError> {
+    let caller = worker_caller(&state, &headers).await?;
+    req.validate().map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+    let CallerAuth::Worker { tenant, project_id, instance, .. } = &caller else {
+        return Err(ApiError::from((StatusCode::FORBIDDEN, "a slot is asked by a project's run".into())));
+    };
+    let scope = match req.scope {
+        StorageScope::Instance { of: None } => {
+            let instance = instance.as_deref().ok_or_else(|| {
+                ApiError::from((StatusCode::BAD_REQUEST, "this run is for no instance, so a slot into its instance names one".to_string()))
+            })?;
+            let instance = weft_core::instance::InstanceId::new(instance).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+            StorageScope::instance_of(instance)
         }
-        LinkRoute::InstallOnly => None,
-    })
+        scope => scope,
+    };
+    let claims = UploadSlotClaims {
+        sid: uuid::Uuid::new_v4().to_string(),
+        tenant: tenant.clone(),
+        project: project_id.clone(),
+        scope,
+        max_bytes: req.max_bytes,
+        accepts: req.accepts,
+        exp: now_unix() + (req.minutes * 60) as i64,
+        keep: req.keep,
+    };
+    Ok(Json(UploadSlotResponse { slot: state.slot_key.mint(&claims) }))
 }
 
-/// Which way a file link is served, decided from two configured facts
-/// alone: the operator's declaration that the bucket's public endpoint
-/// is a real internet host, and whether an internet-reachable base
-/// exists at all.
-#[derive(Debug, PartialEq, Eq)]
-enum LinkRoute<'a> {
-    /// The bucket's own presigned URL, zero relay hops.
-    DirectPresign,
-    /// A relay link under the internet base.
-    Relay(&'a str),
-    /// No internet-reachable link exists: a node body gets a link signed
-    /// for the install's own address, and an outside consumer gets the
-    /// bytes inline.
-    InstallOnly,
+/// `POST /v1/storage/upload/claim`: the files pages uploaded through
+/// slots of the caller's project, received by the caller's run, each into
+/// a place of the type its claim names, all of them or none. Every refusal
+/// a slot or its upload meets is the run's caller's to fix (they sent the
+/// slot), so it is answered in the slot's own words, naming which slot of
+/// the call, with a status the engine hands back as their input error: a
+/// slot that does not read 400, one whose time is over 410, a file that
+/// does not fit 400, nothing uploaded 404, received by another run or made
+/// for another project 409. Only the worker's own credentials meet
+/// 401/403.
+// SYNC: claim refusal statuses <-> crates/weft-engine/src/storage.rs is_slot_refusal
+async fn claim_upload(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<ClaimUploadRequest>,
+) -> Result<Json<ClaimUploadResponse>, ApiError> {
+    let caller = worker_caller(&state, &headers).await?;
+    let now = now_unix();
+    let read = req
+        .claims
+        .iter()
+        .map(|claim| {
+            let named = |why: String| crate::runtime_store::of_slot_message(&claim.slot, &why);
+            let claims = state.slot_key.read(&claim.slot, now).map_err(|why| {
+                // A slot that reads at any moment is a real one whose time is over.
+                let ended = state.slot_key.read(&claim.slot, i64::MIN).is_ok();
+                ApiError::from((if ended { StatusCode::GONE } else { StatusCode::BAD_REQUEST }, named(why)))
+            })?;
+            let fits = received_into(&claim.fits).map_err(|why| (StatusCode::BAD_REQUEST, named(why)))?;
+            Ok((claims, fits))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let slots: Vec<_> = req
+        .claims
+        .iter()
+        .zip(&read)
+        .map(|(claim, (claims, fits))| crate::runtime_store::ClaimedSlot { slot: &claim.slot, claims, fits })
+        .collect();
+    let received = state.runtime_store.claim_uploads(&caller, &slots).await.map_err(map_err)?;
+    Ok(Json(ClaimUploadResponse { files: received.iter().map(|meta| StoredFile::from(meta).to_value()).collect() }))
 }
 
-/// The base a relay link is minted under for `reach`. An internet
-/// asker gets the internet address. A caller of the install gets the
-/// address its own request came in on, when the run carries one: one
-/// install answers on several addresses at once, and the caller can
-/// reach exactly the one it used. A caller no request stands behind
-/// gets the configured address: the internet one when there is one,
-/// else the install's own stable base.
-///
-/// The caller's base is taken as the worker states it. That is safe for
-/// the same reason a request-built link is: the link is a capability URL
-/// whose token is the credential, so a base pointing elsewhere only
-/// sends the token somewhere its holder chose. It must still be a bare
-/// http(s) address, or the link built on it would not be a link.
-fn relay_base<'a>(
-    internet_base: Option<&'a str>,
-    install_base: &'a str,
-    reach: &'a weft_core::storage::LinkReach,
-) -> Result<Option<&'a str>, ApiError> {
-    Ok(match reach {
-        weft_core::storage::LinkReach::Internet => internet_base,
-        weft_core::storage::LinkReach::Caller { base: Some(base) } => Some(caller_base(base)?),
-        weft_core::storage::LinkReach::Caller { base: None } => internet_base.or(Some(install_base)),
-    })
-}
-
-/// A caller's base, refused unless it is an http(s) address with a host
-/// and nothing past an optional path (no query, fragment or userinfo).
-fn caller_base(base: &str) -> Result<&str, ApiError> {
-    let refused = || (StatusCode::BAD_REQUEST, format!("the caller's base '{base}' is not an http(s) address"));
-    let parsed = url::Url::parse(base).map_err(|_| refused())?;
-    let bare = matches!(parsed.scheme(), "http" | "https")
-        && parsed.host_str().is_some()
-        && parsed.query().is_none()
-        && parsed.fragment().is_none()
-        && parsed.username().is_empty()
-        && parsed.password().is_none();
-    if bare { Ok(base) } else { Err(refused().into()) }
-}
-
-fn link_route(bucket_internet: bool, internet_base: Option<&str>) -> LinkRoute<'_> {
-    if bucket_internet {
-        LinkRoute::DirectPresign
-    } else if let Some(base) = internet_base {
-        LinkRoute::Relay(base)
-    } else {
-        LinkRoute::InstallOnly
+/// The type of the place a received upload is sent to (`Image`, `Video |
+/// Null`, as the engine writes it), which must take a file.
+fn received_into(fits: &str) -> Result<weft_core::weft_type::WeftType, String> {
+    let ty = weft_core::weft_type::WeftType::try_parse(fits).map_err(|why| format!("'{fits}' is not a type: {why}"))?;
+    if ty.admitted_file_kinds().is_empty() {
+        return Err(format!("an upload is a file, and a place of type {fits} takes none"));
     }
+    Ok(ty)
+}
+
+/// Seconds since the unix epoch, as the store's rows count them.
+fn now_unix() -> i64 {
+    crate::handlers::unix_now_secs() as i64
+}
+
+// ---------- a page's upload through a slot ----------
+//
+// The dispatcher passes a page's verbs on (it is the caller, as the
+// control plane); the slot in each body is the page's own credential. Each
+// verb acts as the slot's project, on the slot's one upload and nothing
+// else of the project's.
+
+/// The slot a page's verb names, read, and the caller its upload is made
+/// as: the slot's project (and instance), with no run.
+async fn slot_caller(state: &Arc<BrokerState>, headers: &HeaderMap, slot: &str) -> Result<(UploadSlotClaims, CallerAuth), ApiError> {
+    control_plane(state, headers).await?;
+    let claims = state.slot_key.read(slot, now_unix()).map_err(|why| (StatusCode::FORBIDDEN, why))?;
+    let instance = match &claims.scope {
+        StorageScope::Instance { of } => of.as_ref().map(|i| i.as_str().to_string()),
+        _ => None,
+    };
+    let caller = CallerAuth::Worker { tenant: claims.tenant.clone(), project_id: claims.project.clone(), run_id: None, instance };
+    Ok((claims, caller))
+}
+
+/// [`slot_caller`] for a verb on an upload already begun, held to the
+/// slot's own upload.
+async fn slot_upload(state: &Arc<BrokerState>, headers: &HeaderMap, slot: &str, key: &str) -> Result<(UploadSlotClaims, CallerAuth), ApiError> {
+    let (claims, caller) = slot_caller(state, headers, slot).await?;
+    if !state.runtime_store.is_slot_upload(key, &claims.sid).await.map_err(map_err)? {
+        return Err(ApiError::from((StatusCode::FORBIDDEN, "this is not the slot's upload".into())));
+    }
+    Ok((claims, caller))
+}
+
+/// A page's begin, read and held to its slot: the stated type against
+/// the slot's type, the name and type as serveable (the store holds the
+/// size to the slot's largest). What `begin` reserves and `check` asks
+/// about, so the two refuse alike.
+struct SlotBegin {
+    claims: UploadSlotClaims,
+    caller: CallerAuth,
+    mime: String,
+    /// Where the upload waits: a run-scoped slot's waits in the project
+    /// until the run that receives it takes it into its own space.
+    scope: StorageScope,
+    filename: String,
+    size_bytes: u64,
+    /// The sha256 the page states for the file, when it hashed it.
+    sha256: Option<String>,
+}
+
+impl SlotBegin {
+    async fn read(state: &Arc<BrokerState>, headers: &HeaderMap, slot: &str, req: SlotBeginRequest) -> Result<Self, ApiError> {
+        let (claims, caller) = slot_caller(state, headers, slot).await?;
+        let accepts = weft_core::storage::slot::accepted_type(&claims.accepts).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+        let mime = match req.mime_type.trim() {
+            "" => "application/octet-stream".to_string(),
+            stated => stated.to_string(),
+        };
+        let stated = weft_core::weft_type::FileKind::from_mime(&mime);
+        let admitted = accepts.admitted_file_kinds();
+        if stated != weft_core::weft_type::FileKind::Blob && !admitted.contains(&stated) && !admitted.contains(&weft_core::weft_type::FileKind::Blob) {
+            return Err(ApiError::from((StatusCode::BAD_REQUEST, format!("a {mime} file is not what this upload takes ({accepts})"))));
+        }
+        validate_serveable(&mime, &req.filename)?;
+        let scope = match &claims.scope {
+            StorageScope::Run => StorageScope::Project,
+            scope => scope.clone(),
+        };
+        Ok(Self { claims, caller, mime, scope, filename: req.filename, size_bytes: req.size_bytes, sha256: req.sha256 })
+    }
+
+    fn spec(&self) -> crate::runtime_store::UploadSpec<'_> {
+        crate::runtime_store::UploadSpec {
+            scope: &self.scope,
+            mime: &self.mime,
+            filename: &self.filename,
+            keep: None,
+            declared_size: Some(self.size_bytes),
+            content_hash: None,
+            identity: None,
+            slot: Some(crate::runtime_store::SlotUpload {
+                sid: &self.claims.sid,
+                ends_unix: self.claims.exp,
+                max_bytes: self.claims.max_bytes,
+                accepts: &self.claims.accepts,
+                sha256: self.sha256.as_deref(),
+            }),
+        }
+    }
+}
+
+/// `POST /v1/storage/slot/check`: 204 when `begin` would take this file,
+/// else the very refusal `begin` gives, reserving nothing: what a page
+/// asks before it hashes a file it may not send, and so names no sha256.
+async fn slot_check(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(Slotted { slot, inner: req }): Json<Slotted<SlotBeginRequest>>,
+) -> Result<Response, ApiError> {
+    let begin = SlotBegin::read(&state, &headers, &slot, req).await?;
+    state.runtime_store.check_slot_upload(&begin.caller, &begin.spec(), state.entitlements.as_ref()).await.map_err(map_err)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `POST /v1/storage/slot/begin`: begin the slot's one upload (or carry on
+/// with it), held to the slot's size and type.
+async fn slot_begin(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(Slotted { slot, inner: req }): Json<Slotted<SlotBeginRequest>>,
+) -> Result<Json<UploadBeginResponse>, ApiError> {
+    let begin = SlotBegin::read(&state, &headers, &slot, req).await?;
+    let begun = state
+        .runtime_store
+        .begin_slot_upload(&begin.caller, &begin.spec(), state.entitlements.as_ref())
+        .await
+        .map_err(map_err)?;
+    Ok(Json(match begun {
+        crate::runtime_store::BeginUpload::Ready { key, part_size } => UploadBeginResponse { key, part_size, already_stored: false, resume: false },
+        crate::runtime_store::BeginUpload::Resume { key, part_size } => UploadBeginResponse { key, part_size, already_stored: false, resume: true },
+        crate::runtime_store::BeginUpload::AlreadyStored { key } => {
+            UploadBeginResponse { key, part_size: 0, already_stored: true, resume: false }
+        }
+    }))
+}
+
+async fn slot_parts(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(Slotted { slot, inner: req }): Json<Slotted<UploadPartsRequest>>,
+) -> Result<Json<UploadPartsResponse>, ApiError> {
+    let (claims, caller) = slot_upload(&state, &headers, &slot, &req.key).await?;
+    let audience = slot_parts_audience(&state, &claims.project).await?;
+    let parts = state
+        .runtime_store
+        .reserve_parts(&caller, &req.key, &req.parts, state.entitlements.as_ref(), &audience)
+        .await
+        .map_err(map_err)?;
+    Ok(Json(UploadPartsResponse { parts }))
+}
+
+async fn slot_part_done(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(Slotted { slot, inner: req }): Json<Slotted<PartDoneRequest>>,
+) -> Result<Response, ApiError> {
+    let (_, caller) = slot_upload(&state, &headers, &slot, &req.key).await?;
+    state.runtime_store.record_part(&caller, &req.key, req.part_number, &req.etag).await.map_err(map_err)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `POST /v1/storage/slot/complete`: land the slot's upload (held to the
+/// slot's type as it lands), and read it back for its hash once landed.
+async fn slot_complete(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(Slotted { slot, inner: req }): Json<Slotted<UploadCompleteRequest>>,
+) -> Result<Response, ApiError> {
+    let (_, caller) = slot_upload(&state, &headers, &slot, &req.key).await?;
+    state.runtime_store.complete_upload(&caller, &req.key).await.map_err(map_err)?;
+    // Read back after the answer: the page waits for nothing, and a hash
+    // that never lands only means this content is uploaded in full the
+    // next time too.
+    let store = state.runtime_store.clone();
+    let key = req.key.clone();
+    tokio::spawn(async move {
+        if let Err(e) = store.hash_upload(&key).await {
+            tracing::warn!(target: "weft_broker::runtime_storage", key = %key, error = format!("{e:#}"), "an upload could not be read back for its hash");
+        }
+    });
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn slot_resume(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(Slotted { slot, inner: req }): Json<Slotted<UploadResumeRequest>>,
+) -> Result<Json<UploadResumeResponse>, ApiError> {
+    let (claims, caller) = slot_upload(&state, &headers, &slot, &req.key).await?;
+    let audience = slot_parts_audience(&state, &claims.project).await?;
+    let (part_size, missing, reserved_bytes) = state
+        .runtime_store
+        .resume_upload(&caller, &req.key, state.entitlements.as_ref(), &audience)
+        .await
+        .map_err(map_err)?;
+    Ok(Json(UploadResumeResponse { part_size, missing, reserved_bytes }))
+}
+
+async fn slot_abort(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(Slotted { slot, inner: req }): Json<Slotted<UploadAbortRequest>>,
+) -> Result<Response, ApiError> {
+    let (_, caller) = slot_upload(&state, &headers, &slot, &req.key).await?;
+    state.runtime_store.abort_upload(&caller, &req.key).await.map_err(map_err)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Parse the key through the wall's grammar and confirm the caller may touch
@@ -716,6 +1013,7 @@ async fn admin_upload_begin(
                 declared_size: req.declared_size,
                 content_hash: Some(&req.content_hash),
                 identity: None,
+                slot: None,
             },
             state.entitlements.as_ref(),
         )
@@ -755,7 +1053,12 @@ async fn admin_assets_held(
 ) -> Result<Json<AssetsHeldResponse>, ApiError> {
     control_plane(&state, &headers).await?;
     let keys = state.runtime_store.held_assets(&req.tenant, &req.inner.hashes).await.map_err(map_err)?;
-    Ok(Json(AssetsHeldResponse { keys }))
+    let mut unheld = std::collections::BTreeMap::new();
+    for hash in req.inner.hashes.iter().filter(|hash| !keys.contains_key(*hash)) {
+        let parsed = key::ParsedKey::asset(&req.tenant, hash).map_err(|e| ApiError::from((StatusCode::BAD_REQUEST, e)))?;
+        unheld.insert(hash.clone(), parsed.to_key());
+    }
+    Ok(Json(AssetsHeldResponse { keys, unheld }))
 }
 
 async fn admin_upload_parts(
@@ -772,7 +1075,7 @@ async fn admin_upload_parts(
             &req.inner.key,
             &req.inner.parts,
             state.entitlements.as_ref(),
-            PresignAudience::External,
+            &PresignAudience::External,
         )
         .await
         .map_err(map_err)?;
@@ -814,7 +1117,7 @@ async fn admin_upload_resume(
     let store = &state.runtime_store;
     let caller = tenant_caller_for_key(&req.tenant, &req.inner.key)?;
     let (part_size, missing, reserved_bytes) = store
-        .resume_upload(&caller, &req.inner.key, state.entitlements.as_ref(), PresignAudience::External)
+        .resume_upload(&caller, &req.inner.key, state.entitlements.as_ref(), &PresignAudience::External)
         .await
         .map_err(map_err)?;
     Ok(Json(UploadResumeResponse { part_size, missing, reserved_bytes }))
@@ -875,93 +1178,57 @@ async fn admin_delete_file(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// GET /v1/storage/admin/relay/{token}: stream a minted public-relay
-/// link's bytes. The dispatcher's public `/public/files/{token}` route
-/// forwards here because its egress is locked to the control plane;
-/// the broker is the one service with bucket reach, so it resolves the
-/// token (missing and expired are an identical 404) and streams the
-/// presigned internal fetch through.
-async fn admin_relay(
+/// `POST /v1/storage/admin/link`: a download link for one file, with its
+/// name, size and version, and whether the open internet opens it: for a
+/// person's machine (the CLI, the editor), for weft's own process (a
+/// version build reading its files), or for somebody outside reaching the
+/// install as a project's callers do. An outside link's file is checked
+/// to be one that project's callers reach ([`outside_reader`]), so a
+/// dispatcher bug can still never hand out another tenant's file.
+async fn admin_link(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
-    axum::extract::Path(token): axum::extract::Path<String>,
-) -> Result<axum::response::Response, ApiError> {
-    control_plane(&state, &headers).await?;
-    let store = &state.runtime_store;
-    let Some(link) = store
-        .resolve_public_link(&token)
-        .await
-        .map_err(|e| map_err(RuntimeStoreError::Other(e)))?
-    else {
-        return Err(ApiError::from((StatusCode::NOT_FOUND, "no such file link".into())));
-    };
-    static RELAY_HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let http = RELAY_HTTP.get_or_init(reqwest::Client::new);
-    let upstream = http.get(&link.fetch_url).send().await.map_err(|e| {
-        tracing::error!(target: "weft_broker::runtime_storage", error = %e, "relay bucket fetch failed");
-        (StatusCode::BAD_GATEWAY, "file fetch failed".to_string())
-    })?;
-    if !upstream.status().is_success() {
-        tracing::error!(
-            target: "weft_broker::runtime_storage",
-            status = %upstream.status(),
-            "relay bucket fetch refused"
-        );
-        return Err(ApiError::from((StatusCode::BAD_GATEWAY, "file fetch failed".to_string())));
-    }
-    // content-length only when the bucket stated one for THIS response
-    // (restating the row's size against a body someone else produced
-    // would lie on a torn or replaced object; absent = chunked).
-    // mime/filename passed validate_serveable at the upload boundary,
-    // so both are header-safe as stored.
-    let mut resp = axum::response::Response::builder()
-        .header("content-type", link.mime_type)
-        .header("content-disposition", format!("inline; filename=\"{}\"", link.filename));
-    if let Some(len) = upstream.headers().get("content-length") {
-        resp = resp.header("content-length", len);
-    }
-    resp.body(axum::body::Body::from_stream(upstream.bytes_stream())).map_err(|e| {
-        tracing::error!(target: "weft_broker::runtime_storage", error = %e, "relay response build failed");
-        ApiError::from((StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_STORAGE_ERROR_BODY.to_string()))
-    })
-}
-
-async fn admin_presign(
-    State(state): State<Arc<BrokerState>>,
-    headers: HeaderMap,
-    Json(req): Json<weft_core::storage::PresignRequest>,
+    Json(req): Json<AdminLinkRequest>,
 ) -> Result<Json<PresignResult>, ApiError> {
     control_plane(&state, &headers).await?;
-    let store = &state.runtime_store;
     let parsed = key::parse_key(&req.key).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    // Read the meta first (name + size) so a missing file is a clean 404 before
-    // minting, then presign (which also bumps a kept file's TTL).
-    let meta = store.meta(&parsed).await.map_err(map_err)?;
-    let url = store.presign(&parsed, req.ttl_secs).await.map_err(map_err)?;
-    Ok(Json(PresignResult { url, filename: meta.filename, size_bytes: meta.size_bytes }))
+    let (visitors_of, hands_out) = match &req.reader {
+        LinkReader::Person => (None, true),
+        LinkReader::Runtime => (None, false),
+        LinkReader::Outside { project } => (Some(outside_reader(&state, project, &parsed).await?), true),
+    };
+    let granted = state.runtime_store.grant_link(&parsed, req.ttl_secs, hands_out, visitors_of).await.map_err(map_err)?;
+    // A person's and weft's own links are the store's, which the internet
+    // opens when it reaches the store.
+    let (audience, public) = match &req.reader {
+        LinkReader::Person => (PresignAudience::External, state.object_store_public_internet),
+        LinkReader::Runtime => (PresignAudience::Runtime, state.object_store_public_internet),
+        LinkReader::Outside { .. } => link_route(&state, LinkReach::External, granted.visitor_address.clone()).await?,
+    };
+    let url = state.runtime_store.sign_link(&granted, audience).await.map_err(map_err)?;
+    let file = granted.file;
+    Ok(Json(PresignResult { url, filename: file.filename, size_bytes: file.size_bytes, version: file.version, public }))
 }
 
-/// Mint a relay download token for one file (the dispatcher builds the
-/// `/public/files/{token}` URL on its own public base). The browser
-/// lane of the download handshake: host-rewrite-proof where a presigned
-/// bucket URL is not (its signature covers the exact host).
-async fn admin_download_link(
-    State(state): State<Arc<BrokerState>>,
-    headers: HeaderMap,
-    Json(req): Json<weft_core::storage::PresignRequest>,
-) -> Result<Json<weft_core::storage::DownloadLinkResult>, ApiError> {
-    control_plane(&state, &headers).await?;
-    let store = &state.runtime_store;
-    let parsed = key::parse_key(&req.key).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    // Meta first (name + size) so a missing file is a clean 404 before
-    // minting, mirroring admin_presign.
-    let meta = store.meta(&parsed).await.map_err(map_err)?;
-    let token = store.mint_public_link(&parsed, req.ttl_secs).await.map_err(map_err)?;
-    Ok(Json(weft_core::storage::DownloadLinkResult {
-        token,
-        filename: meta.filename,
-        size_bytes: meta.size_bytes,
-    }))
+/// The project an outside link is for, once the file at `parsed` is
+/// checked to be one its callers reach: the project's tenant, and its
+/// own files (a run's only when the run is the project's), with the same
+/// wall a worker of the project meets.
+async fn outside_reader(state: &BrokerState, project: &str, parsed: &key::ParsedKey) -> Result<uuid::Uuid, ApiError> {
+    let project = project_uuid(project)?;
+    let tenant = crate::scope::lookup_project_tenant(&state.scope_cache, &state.pool, project).await?;
+    let run_id = match &parsed.scope {
+        key::KeyScope::Run { run_id } => {
+            let run: weft_core::RunId =
+                run_id.parse().map_err(|_| ApiError::from((StatusCode::BAD_REQUEST, format!("'{run_id}' is not a run id"))))?;
+            let scope = crate::scope::lookup_run_id_scope(&state.scope_cache, &state.pool, run).await?;
+            (scope.project == project).then(|| run_id.clone())
+        }
+        _ => None,
+    };
+    let reader = CallerAuth::Worker { tenant, project_id: project.to_string(), run_id, instance: None };
+    key::check_key_access(&reader, parsed).map_err(|e| (StatusCode::FORBIDDEN, e))?;
+    Ok(project)
 }
 
 async fn admin_wipe_prefix(
@@ -974,24 +1241,32 @@ async fn admin_wipe_prefix(
     // The wipe prefix must be a scope/tenant boundary (the wall's grammar):
     // never a bare `starts_with` that could reach across tenants or owners.
     key::validate_wipe_prefix(&req.prefix).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let wiped = store.wipe_prefix(&req.prefix).await.map_err(map_anyhow)?;
+    let wiped = store.wipe_prefix(&req.prefix).await.map_err(map_err)?;
     Ok(Json(WipePrefixResponse { wiped }))
 }
 
-async fn admin_sweep_exec(
+async fn admin_sweep_run(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
-    Json(req): Json<SweepExecRequest>,
-) -> Result<Json<SweepExecResponse>, ApiError> {
+    Json(req): Json<SweepRunRequest>,
+) -> Result<Json<SweepRunResponse>, ApiError> {
     control_plane(&state, &headers).await?;
     let store = &state.runtime_store;
-    let (swept, lingering) = store.sweep_exec(&req.tenant, &req.execution_id).await.map_err(map_anyhow)?;
-    Ok(Json(SweepExecResponse { swept, lingering }))
+    let swept = store.sweep_run(&req.tenant, &req.run_id).await.map_err(map_anyhow)?;
+    // A row the bucket refused is marked and shown in `weft status` (the one
+    // record of it); the run's end is done with either way.
+    if !swept.refused.is_empty() {
+        tracing::warn!(
+            target: "weft_broker::runtime_storage", tenant = %req.tenant, run_id = %req.run_id,
+            refused = %swept.refused.join("; "), "the end-of-run sweep left rows the bucket refused to remove"
+        );
+    }
+    Ok(Json(SweepRunResponse { swept: swept.reaped, lingering: swept.lingering }))
 }
 
 #[cfg(test)]
 mod link_route_tests {
-    use super::{link_route, map_err, LinkRoute, RuntimeStoreError, StatusCode};
+    use super::{map_err, route_link, LinkReach, PresignAudience, RuntimeStoreError, StatusCode};
 
     #[test]
     fn unavailable_uploaded_file_explains_expiry_and_how_to_recover() {
@@ -1025,53 +1300,108 @@ mod link_route_tests {
         assert!(!conflict.headers().contains_key(weft_core::storage::COMPLETING_HEADER));
     }
 
+    /// A removal that left rows answers a 409 carrying what it left and
+    /// why, never the generic internal body.
+    #[test]
+    fn an_incomplete_removal_says_what_it_left() {
+        let super::ApiError { status, message, completing } =
+            map_err(RuntimeStoreError::RemovalIncomplete("left 1 the storage bucket refused to remove".into()));
+        assert_eq!((status, completing), (StatusCode::CONFLICT, false));
+        assert!(message.contains("refused to remove"), "{message}");
+    }
+
     #[test]
     fn unavailable_generated_file_does_not_claim_a_fixed_thirty_day_lifetime() {
-        let message = map_err(RuntimeStoreError::NotFound("tenant/exec/execution_id/file".into())).message;
+        let message = map_err(RuntimeStoreError::NotFound("tenant/run/run_id/file".into())).message;
         assert!(message.contains("keep duration"), "{message}");
         assert!(!message.contains("30 days"), "{message}");
     }
 
-    /// A caller's link rides the address its request came in on, even
-    /// when the install has an internet address; only a caller no request
-    /// stands behind falls back to the configured ones. An internet asker
-    /// never gets the loopback base.
-    #[test]
-    fn a_caller_link_rides_the_callers_own_address() {
-        use weft_core::storage::LinkReach;
-        let tunnel = Some("https://weft-dev.example.com");
-        let local = "http://127.0.0.1:14111";
-        let caller = LinkReach::Caller { base: Some(local.to_string()) };
-        assert_eq!(super::relay_base(tunnel, "http://install", &caller).unwrap(), Some(local));
-        let unbased = LinkReach::Caller { base: None };
-        assert_eq!(super::relay_base(tunnel, "http://install", &unbased).unwrap(), tunnel);
-        assert_eq!(super::relay_base(None, "http://install", &unbased).unwrap(), Some("http://install"));
-        assert_eq!(super::relay_base(None, "http://install", &LinkReach::Internet).unwrap(), None);
-        assert_eq!(super::relay_base(tunnel, "http://install", &LinkReach::Internet).unwrap(), tunnel);
+    const OWN: &str = "http://127.0.0.1:14111";
+
+    fn forwarded(base: &str) -> PresignAudience {
+        PresignAudience::Forwarded { base: base.into() }
     }
 
-    /// A caller's own address is only ever a bare http(s) base: anything
-    /// else is refused rather than turned into a link to nowhere.
-    #[test]
-    fn a_caller_base_is_a_bare_http_address() {
-        for good in ["http://127.0.0.1:14111", "https://weft.example.com", "https://site.example/weft"] {
-            assert_eq!(super::caller_base(good).unwrap(), good);
-        }
-        for bad in ["ftp://x.example", "not a url", "https://u:p@x.example", "https://x.example/?q=1", "https://x.example/#f"] {
-            assert_eq!(super::caller_base(bad).unwrap_err().status, StatusCode::BAD_REQUEST, "{bad}");
+    /// What the internet address read answers, and a note that it was read.
+    fn internet(answer: anyhow::Result<Option<String>>) -> (std::sync::Arc<std::sync::atomic::AtomicBool>, impl FnOnce() -> std::future::Ready<anyhow::Result<Option<String>>>) {
+        let read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = read.clone();
+        (read, move || {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(answer)
+        })
+    }
+
+    fn tunnel() -> anyhow::Result<Option<String>> {
+        Ok(Some("https://t.example".into()))
+    }
+
+    /// Node code reaches the store at the workers' address, which the
+    /// internet opens only on a store it reaches.
+    #[tokio::test]
+    async fn an_internal_link_is_public_only_on_a_public_store() {
+        for store_public in [false, true] {
+            let (read, ask) = internet(tunnel());
+            let route = route_link(LinkReach::Internal, store_public, Some("https://shop.example".into()), OWN, ask).await.unwrap();
+            assert_eq!(route, (PresignAudience::Internal, store_public));
+            assert!(!read.load(std::sync::atomic::Ordering::SeqCst));
         }
     }
 
+    /// A store the internet reaches signs its own link, whatever else the
+    /// install has.
+    #[tokio::test]
+    async fn an_outside_link_on_a_public_store_is_the_stores() {
+        let (read, ask) = internet(tunnel());
+        let route = route_link(LinkReach::External, true, Some("https://shop.example".into()), OWN, ask).await.unwrap();
+        assert_eq!(route, (PresignAudience::External, true));
+        assert!(!read.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// The project's visitor address wins, and the tunnel is never asked.
+    #[tokio::test]
+    async fn an_outside_link_goes_through_the_visitor_address_without_asking_the_tunnel() {
+        let (read, ask) = internet(Err(anyhow::anyhow!("never asked")));
+        let route = route_link(LinkReach::External, false, Some("https://shop.example/weft".into()), OWN, ask).await.unwrap();
+        assert_eq!(route, (forwarded("https://shop.example/weft"), true));
+        assert!(!read.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// With no visitor address: the internet address, public; with none
+    /// either, the install's own, which the internet does not open.
+    #[tokio::test]
+    async fn an_outside_link_without_a_site_goes_through_the_internet_else_the_own_address() {
+        let (read, ask) = internet(tunnel());
+        assert_eq!(route_link(LinkReach::External, false, None, OWN, ask).await.unwrap(), (forwarded("https://t.example"), true));
+        assert!(read.load(std::sync::atomic::Ordering::SeqCst));
+        let (_, ask) = internet(Ok(None));
+        assert_eq!(route_link(LinkReach::External, false, None, OWN, ask).await.unwrap(), (forwarded(OWN), false));
+    }
+
+    /// A tunnel that cannot say its address refuses the link: one through
+    /// a tunnel that is down would open for nobody.
+    #[tokio::test]
+    async fn an_unreadable_tunnel_refuses_the_outside_link() {
+        let (_, ask) = internet(Err(anyhow::anyhow!("cloudflared is down")));
+        let refused = route_link(LinkReach::External, false, None, OWN, ask).await.unwrap_err();
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The place a claim sends a file to takes one, nullable or not, as
+    /// the engine writes its type.
     #[test]
-    fn route_follows_the_configured_facts() {
-        // Internet-declared bucket wins outright (even with a base up:
-        // the direct URL is the no-hop path).
-        assert_eq!(link_route(true, None), LinkRoute::DirectPresign);
-        assert_eq!(link_route(true, Some("https://x.example")), LinkRoute::DirectPresign);
-        // Private bucket + internet base: relay under the base.
-        assert_eq!(link_route(false, Some("https://x.example")), LinkRoute::Relay("https://x.example"));
-        // Neither: no internet link; a node body gets the install
-        // address, an outside consumer the bytes.
-        assert_eq!(link_route(false, None), LinkRoute::InstallOnly);
+    fn a_claim_goes_into_a_place_that_takes_a_file() {
+        assert!(super::received_into("Video | Null").is_ok());
+        assert!(super::received_into("File").is_ok());
+        assert!(super::received_into("String").is_err());
+        assert!(super::received_into("not a type ((").is_err());
+    }
+
+    /// A slot with no upload is said as one, never as a missing file.
+    #[test]
+    fn a_slot_with_no_upload_says_so() {
+        let super::ApiError { status, message, .. } = map_err(RuntimeStoreError::NoUpload("nothing was uploaded".into()));
+        assert_eq!((status, message.as_str()), (StatusCode::NOT_FOUND, "nothing was uploaded"));
     }
 }

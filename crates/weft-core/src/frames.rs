@@ -84,10 +84,10 @@ pub fn call_path(frames: &LoopFrames) -> Vec<&str> {
 /// program down, outermost first; empty outside every included file).
 /// A body is compiled once and reached through every site that
 /// includes it, so `Clean.strip` under `one` and under `two` are two
-/// places in a run, with their own gates, wires, backups and results:
-/// what a run selection, a kick plan and a seed are keyed by. The loop
+/// places in a run, with their own gates, wires, handed values and
+/// results: what a cut, a kick plan and a seed are keyed by. The loop
 /// iterations a place runs in are not part of it (see
-/// `FiringLocation` for one execution).
+/// `FiringLocation` for one run).
 ///
 /// Written as one string, `one/Clean.strip` (the path, then the id,
 /// `/`-joined; a top-level place is its id), so it keys a JSON object.
@@ -168,13 +168,13 @@ impl TryFrom<String> for Located {
     }
 }
 
-/// One node EXECUTION: a node id plus the loop frames it fires under
-/// (a node inside a loop runs as distinct executions, one per frame).
-/// The key for per-execution state: the engine's stuck-check lanes
+/// One FIRING: a node id plus the loop frames it fires under
+/// (a node inside a loop runs as distinct runs, one per frame).
+/// The key for per-run state: the engine's stuck-check lanes
 /// (see `liveness`) and the persisted `awaited_sequences` on
 /// `NodeRunState`. Lives here, not in `liveness`, because it is a
 /// pure identity the parse-only build needs too.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct FiringLocation {
     pub node_id: String,
     pub frames: LoopFrames,

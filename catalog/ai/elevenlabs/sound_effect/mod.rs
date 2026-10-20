@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::elevenlabs::{audio_file_type, emit_audio, API};
 use super::flows::set_some;
@@ -23,7 +23,7 @@ impl Node for ElevenLabsSoundEffectNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let text: String = ctx.inputs.get("text")?;
         let model: String = ctx.inputs.get("model")?;

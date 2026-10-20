@@ -9,7 +9,8 @@
 	/// something other than the node in front of you.
 	import { ArrowDown, ArrowUp, X } from '@lucide/svelte';
 	import type { CallerInspectorEvent } from '../../../../protocol';
-	import { formatClockTime, formatStreamBody } from '../../utils/stream-log';
+	import { formatClockTime } from '../../utils/stream-log';
+	import { callerCopyText, callerLines } from '../../utils/caller-log';
 	import CopyButton from '../ui/CopyButton.svelte';
 
 	let {
@@ -20,52 +21,11 @@
 		onClose: () => void;
 	} = $props();
 
-	/// One line per thing that happened, in the order it happened.
-	///
-	/// A window row is not a thing that happened: it is the journal's
-	/// way of writing a second's worth of messages as one row, so it is
-	/// unpacked back into the messages it holds. What a reader wants is
-	/// the conversation, not the shape it was stored in.
-	interface Line {
-		atUnix: number;
-		/// 'in' the caller spoke, 'out' the program did, 'note' neither
-		/// (connected, errored, hung up).
-		side: 'in' | 'out' | 'note';
-		text: string;
-		/// The program's last word on this exchange.
-		terminal?: boolean;
-	}
-
-	const lines = $derived<Line[]>(
-		events.flatMap((event): Line[] => {
-			switch (event.kind) {
-				case 'connected':
-					return [{ atUnix: event.atUnix, side: 'note', text: `the caller connected over ${event.protocol}` }];
-				case 'errored':
-					return [{ atUnix: event.atUnix, side: 'note', text: `something went wrong: ${event.message}` }];
-				case 'disconnected':
-					return [{ atUnix: event.atUnix, side: 'note', text: `the caller went away (${event.reason})` }];
-				case 'window':
-					return event.messages.map((m) => ({
-						atUnix: m.atUnix,
-						side: m.direction === 'inbound' ? 'in' : 'out',
-						text: formatStreamBody(m.payload, m.payloadByteSize, m.trimmed, 'message'),
-						terminal: m.terminal,
-					}));
-			}
-		}),
-	);
+	const lines = $derived(callerLines(events));
 
 	/// The same conversation as plain text, for pasting into a message
 	/// to somebody who cannot open this panel.
-	const copyText = $derived(
-		lines
-			.map((l) => {
-				const who = l.side === 'in' ? 'caller' : l.side === 'out' ? 'program' : '*';
-				return `${formatClockTime(l.atUnix)}  ${who}: ${l.text}`;
-			})
-			.join('\n'),
-	);
+	const copyText = $derived(callerCopyText(lines));
 </script>
 
 <div class="w-[32rem] max-w-[90vw] border border-zinc-200 rounded-md bg-white shadow-lg overflow-hidden">
@@ -101,8 +61,11 @@
 						<ArrowDown class="w-3 h-3 text-blue-600 shrink-0" />
 						<span class="text-zinc-800 break-words whitespace-pre-wrap">{line.text}</span>
 					{:else}
-						<ArrowUp class="w-3 h-3 text-emerald-600 shrink-0" />
-						<span class="text-zinc-800 break-words whitespace-pre-wrap">{line.text}</span>
+						<ArrowUp class="w-3 h-3 shrink-0 {line.dropped ? 'text-zinc-300' : 'text-emerald-600'}" />
+						<span class="break-words whitespace-pre-wrap {line.dropped ? 'text-zinc-400 line-through' : 'text-zinc-800'}">{line.text}</span>
+						{#if line.dropped}
+							<span class="text-[9px] text-amber-600 shrink-0">({line.dropped})</span>
+						{/if}
 						{#if line.terminal}
 							<span class="text-[9px] text-zinc-400 shrink-0">(the answer)</span>
 						{/if}

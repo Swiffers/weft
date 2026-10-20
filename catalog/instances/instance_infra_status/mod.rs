@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 use super::lifecycle::instance;
 
@@ -21,7 +21,7 @@ impl Node for InstanceInfraStatusNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let node: String = ctx.inputs.get("node")?;
         let copy = ctx.infra(node).instance(instance(&ctx)?).status().await?;
         let running = copy.as_ref().is_some_and(|c| c.is_running());

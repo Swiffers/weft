@@ -23,7 +23,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "from_url",
@@ -40,7 +40,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "depends_on": [
+        "dependsOn": [
           "database"
         ],
         "sources": [
@@ -83,14 +83,12 @@
     {
       "name": "items",
       "type": "List[JsonDict]",
+      "narrowable": true,
       "description": "The matching pages, raw Notion page objects."
     },
     {
       "name": "count",
       "type": "Number"
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

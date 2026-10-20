@@ -6,28 +6,28 @@
 //! event a listener picks up itself (a timer's tick, a message on a
 //! connection it holds), and a caller on the line of a live route. While
 //! the trigger is on, each becomes a run (or the answer reaches its run)
-//! at once. While it is off, the way it went down decides, the same for
-//! all four:
+//! at once. While it is down, its door decides, the same for all four
+//! (`crate::take_down::Door`):
 //!
-//! - **park**: everything happens as usual except that nothing becomes a
-//!   run: the work waits, and runs once the trigger is back on, on the
-//!   version it comes back with. Listeners keep listening, so a trigger
-//!   that fires by itself keeps firing and each fire waits too.
-//! - **hibernate**: the same until its grace window ends; after it, new
-//!   work is refused and the listeners stop.
-//! - **wipe**: work is refused at once.
+//! - **take** and **hide**: everything happens as usual except that
+//!   nothing becomes a run: the work is held, and runs once the trigger is
+//!   back on, on the version it comes back with. Listeners keep listening,
+//!   so a trigger that fires by itself keeps firing and each fire is held
+//!   too. With `doorForMinutes`, once that window ends, new work is
+//!   refused and the listeners stop.
+//! - **refuse**: work is refused at once.
 //!
-//! An activation still being set up takes work the way a parked one does:
+//! An activation still being set up takes work the way a held one does:
 //! its listeners may not all be ready, and the setup's end runs what
 //! waited. A caller on the line is the exception: nothing holds a caller
 //! (the worker it reached goes away on an update), so a caller arriving
 //! while the trigger is not on is answered `503` with a `Retry-After` at
 //! once, and retries (the worker's door).
 //!
-//! What a person SEES while a trigger is off is a separate rule, kept on
-//! the activation as `fires_visible_to_consumers`: a parked trigger's
-//! questions stay listed for the people who answer them, a hibernated
-//! one's are hidden.
+//! What a person SEES while a trigger is down is a separate rule, kept on
+//! the activation as `fires_visible_to_consumers`: a door that takes keeps
+//! the trigger's questions listed for the people who answer them, one that
+//! hides does not.
 
 use serde::{Deserialize, Serialize};
 
@@ -38,11 +38,11 @@ use crate::projects::ProjectStatus;
 pub enum Arrival {
     /// The trigger is on: the work becomes its run now.
     Live,
-    /// The trigger is parked (or hibernating within its grace window, or
-    /// being set up): the work waits for it to be back on.
+    /// The trigger is down and its door holds (within its window, when it
+    /// has one), or it is being set up: the work waits for it to be back on.
     Wait,
-    /// The trigger takes no work: wiped, never switched on, or past its
-    /// hibernation's grace window.
+    /// The trigger takes no work: its door refuses, it was never switched
+    /// on, or its door's window ended.
     Refused,
 }
 
@@ -58,7 +58,7 @@ pub struct Standing {
 
 impl Standing {
     /// What becomes of work arriving at `now_unix`.
-    // SYNC: arrival <-> weft_broker_client::protocol::ACTIVATION_LISTENS, IN_GRACE_WINDOW_SQL (crates/weft-dispatcher/src/activation_store.rs)
+    // SYNC: arrival <-> weft_broker_client::protocol::ACTIVATION_LISTENS, DOOR_WINDOW_OPEN_SQL (crates/weft-dispatcher/src/activation_store.rs)
     pub fn arrival(&self, now_unix: i64) -> Arrival {
         match self.status {
             // A signal no activation governs (a wait of a run started by
@@ -66,7 +66,7 @@ impl Standing {
             // so work for it never waits.
             ProjectStatus::Active => Arrival::Live,
             ProjectStatus::Registered => Arrival::Refused,
-            ProjectStatus::Activating | ProjectStatus::Deactivating | ProjectStatus::Inactive => {
+            ProjectStatus::Activating | ProjectStatus::Inactive => {
                 let past_grace = self.fires_deadline_unix.is_some_and(|deadline| now_unix > deadline);
                 if self.accepting_fires && !past_grace {
                     Arrival::Wait
@@ -98,16 +98,14 @@ mod tests {
     }
 
     #[test]
-    fn work_waits_while_parked_or_hibernating_and_is_refused_once_wiped_or_past_grace() {
+    fn work_is_held_while_the_door_holds_and_refused_once_it_refuses_or_its_window_ended() {
         assert_eq!(standing(ProjectStatus::Active, true, None).arrival(10), Arrival::Live);
-        assert_eq!(standing(ProjectStatus::Inactive, true, None).arrival(10), Arrival::Wait, "parked");
-        assert_eq!(standing(ProjectStatus::Inactive, true, Some(20)).arrival(10), Arrival::Wait, "hibernating, in grace");
-        assert_eq!(standing(ProjectStatus::Inactive, true, Some(20)).arrival(21), Arrival::Refused, "hibernating, past grace");
-        assert_eq!(standing(ProjectStatus::Inactive, false, Some(20)).arrival(21), Arrival::Refused, "a hibernation whose end was marked");
-        assert_eq!(standing(ProjectStatus::Inactive, false, None).arrival(10), Arrival::Refused, "wiped");
+        assert_eq!(standing(ProjectStatus::Inactive, true, None).arrival(10), Arrival::Wait, "the door takes");
+        assert_eq!(standing(ProjectStatus::Inactive, true, Some(20)).arrival(10), Arrival::Wait, "within the door's window");
+        assert_eq!(standing(ProjectStatus::Inactive, true, Some(20)).arrival(21), Arrival::Refused, "past the door's window");
+        assert_eq!(standing(ProjectStatus::Inactive, false, Some(20)).arrival(21), Arrival::Refused, "a window whose end was marked");
+        assert_eq!(standing(ProjectStatus::Inactive, false, None).arrival(10), Arrival::Refused, "the door refuses");
         assert_eq!(standing(ProjectStatus::Activating, true, None).arrival(10), Arrival::Wait, "being set up");
-        assert_eq!(standing(ProjectStatus::Deactivating, true, None).arrival(10), Arrival::Wait, "going down to park");
-        assert_eq!(standing(ProjectStatus::Deactivating, false, None).arrival(10), Arrival::Refused, "going down to wipe");
         assert_eq!(standing(ProjectStatus::Registered, true, None).arrival(10), Arrival::Refused, "never switched on");
     }
 }

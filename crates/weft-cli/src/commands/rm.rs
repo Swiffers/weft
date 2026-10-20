@@ -8,14 +8,17 @@
 //! | (none)      | unregister: the dispatcher deactivates the project,     |
 //! |             | terminates its infra containers and disks, erases its   |
 //! |             | runs, reclaims its stored data, and drops the row       |
-//! | `--journal` | also drop this project's execution + log rows           |
+//! | `--journal` | also drop this project's run + log rows           |
 //! | `--local`   | also wipe this project's build artifacts on the host    |
 //! | `--all`     | implies the two levels above                            |
 //!
 //! Flags are additive. `--all` is pure sugar. The dispatcher-side
-//! teardown is ONE call (`DELETE /projects/{id}`): the dispatcher owns
-//! the deactivate + infra + storage cascade, so the CLI never re-derives
-//! which of those steps apply. Worker images are content addressed and
+//! teardown is two calls: `POST /projects/{id}/quiesce` takes the project
+//! down and answers the task waiting for what that cancelled, which is
+//! followed in short looks however long it takes (Ctrl+C stops following,
+//! the wait goes on, and `weft rm` again picks it up); then `DELETE
+//! /projects/{id}` owns the infra + storage cascade, so the CLI never
+//! re-derives which of those steps apply. Worker images are content addressed and
 //! shared across projects, so no per-project level can reclaim them;
 //! `weft clean --images` is the reclaimer.
 
@@ -31,7 +34,8 @@ pub struct RmArgs {
     pub journal: bool,
     pub local: bool,
     pub all: bool,
-    /// `weft rm --force`: skip the supervisor terminate-wait window.
+    /// `weft rm --force`: skip the supervisor terminate-wait window, and
+    /// go on past cloud leftovers (never past a worker it cannot kill).
     pub force: bool,
     /// `weft rm --yes`: the confirmation, answered up front.
     pub yes: bool,
@@ -63,16 +67,17 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
         );
     }
 
-    // The base verb is already the big one: triggers wiped, runs
+    // The base verb is already the big one: triggers taken down with
+    // nothing kept, runs
     // cancelled and erased, infra processes terminated, stored data
     // reclaimed. Nothing
     // that irreversible runs on a bare command: a terminal is asked,
     // and a script has to say `--yes`.
     let project_id = resolve_project_id(&ctx, project)?;
     if !yes {
-        let mut levels = vec!["unregister it (triggers wiped, runs cancelled and erased, infra terminated, stored data reclaimed)"];
+        let mut levels = vec!["unregister it (triggers taken down with nothing kept, runs cancelled and erased, infra terminated, stored data reclaimed)"];
         if journal {
-            levels.push("drop its execution and log rows");
+            levels.push("drop its run and log rows");
         }
         if local {
             levels.push("wipe .weft/target/ here");
@@ -89,21 +94,41 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
         let ctx = ctx_inner;
         let client = ctx.client()?;
 
-        // Journal rows BEFORE unregistering: deleting an execution is
-        // authorized through its project row, so once the project is
-        // unregistered its rows become undeletable until the project
-        // re-registers.
-        if journal {
-            drop_journal_rows(&progress, &client, &project_id).await?;
+        // The project marked being removed and taken down whole, every
+        // live run cancelled (started by a trigger, by hand, or
+        // unrecorded), then what that cancelled followed until it is
+        // over: the cancelled runs' last calls, and, for `--journal`,
+        // every run ended, since a run still going would keep appending
+        // events to a run mid-erase. Already gone (a rerun after a
+        // finished rm) is rm's end state: its runs went with it.
+        let quiesce = format!("/projects/{project_id}/quiesce");
+        progress.dispatcher_call_start(&quiesce);
+        let body = serde_json::to_value(weft_core::projects::QuiesceRequest { every_run: journal })?;
+        let quiesced = client
+            .post_idempotent_json(&quiesce, &body)
+            .await
+            .with_context(|| format!("could not take project {project_id} down to remove it"))?
+            .map(serde_json::from_value::<weft_core::projects::Quiesced>)
+            .transpose()
+            .context("read the quiesce's answer")?;
+        if let Some(quiesced) = quiesced {
+            super::follow::follow_task(&client, &progress, &project_id, quiesced.waiting)
+                .await
+                .context("waiting for what the removal cancelled to be over")?;
+            progress.dispatcher_call_done(serde_json::json!({ "step": "quiesce" }));
+            // Journal rows BEFORE unregistering: deleting a run is
+            // authorized through its project row.
+            if journal {
+                drop_journal_rows(&progress, &client, &project_id).await?;
+            }
         }
 
-        // ONE call is the whole dispatcher-side teardown: the dispatcher
-        // deactivates the project (wipes its signals, cancels running
-        // executions), terminates its infra processes, reclaims its stored
-        // data, then drops the row. `--force` flips on the dispatcher's
-        // skip-the-wait switch: without it, the dispatcher waits up to
-        // 120s for the supervisor to confirm the terminate command
-        // landed before deleting the project.
+        // The rest of the teardown is one call: the dispatcher kills the
+        // project's workers, terminates its infra processes, reclaims its
+        // stored data, then drops the row. `--force` flips
+        // on the dispatcher's skip-the-wait switch: without it, the
+        // dispatcher waits up to 120s for the supervisor to confirm the
+        // terminate command landed before deleting the project.
         let unregister_path = if force {
             format!("/projects/{project_id}?force=true")
         } else {
@@ -137,17 +162,17 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
     .await
 }
 
-/// One page of the project's journal listing: the executions on the first
+/// One page of the project's journal listing: the runs on the first
 /// page, newest first.
 async fn journal_page(
     client: &crate::client::DispatcherClient,
     project_id: &str,
 ) -> Result<Vec<String>> {
-    let page: weft_core::program::ExecutionPage = serde_json::from_value(
-        client.get_json(&format!("/executions?project_id={project_id}")).await.context("list executions")?,
+    let page: weft_core::program::RunPage = serde_json::from_value(
+        client.get_json(&format!("/runs?project_id={project_id}")).await.context("list runs")?,
     )
-    .context("read the executions listing")?;
-    Ok(page.executions.iter().map(|e| e.execution_id.to_string()).collect())
+    .context("read the runs listing")?;
+    Ok(page.runs.iter().map(|e| e.run_id.to_string()).collect())
 }
 
 async fn drop_journal_rows(
@@ -155,16 +180,16 @@ async fn drop_journal_rows(
     client: &crate::client::DispatcherClient,
     project_id: &str,
 ) -> Result<()> {
-    // Walk the execution list and delete executions individually (the
+    // Walk the run list and delete runs individually (the
     // dispatcher has no bulk DELETE for a project's journal rows).
     // Deleting shifts offsets, so re-fetch the FIRST page after each
     // batch until it comes back empty. Termination is structural:
-    // every round must list at least one execution we have not deleted
-    // yet; a page of only already-deleted executions means DELETE
+    // every round must list at least one run we have not deleted
+    // yet; a page of only already-deleted runs means DELETE
     // reported success while the row survived, so bail loudly
     // instead of spinning. (Progress is measured on the drained set,
     // never on the live total: a run started mid-drop is just a new
-    // execution the next round deletes.)
+    // run the next round deletes.)
     let mut dropped: HashSet<String> = HashSet::new();
     loop {
         let rows = journal_page(client, project_id).await?;
@@ -174,39 +199,17 @@ async fn drop_journal_rows(
         let fresh: Vec<&String> = rows.iter().filter(|c| !dropped.contains(*c)).collect();
         if fresh.is_empty() {
             anyhow::bail!(
-                "journal drop stalled: the dispatcher still lists {} execution_ids whose \
+                "journal drop stalled: the dispatcher still lists {} run_ids whose \
                  DELETE already reported success",
                 rows.len()
             );
         }
-        if dropped.is_empty() {
-            // Quiesce before the first delete: a run still going would
-            // keep appending events to an execution mid-erase. The dispatcher
-            // wipes every trigger and cancels EVERY live run of the
-            // project (started by a trigger, by hand, or unrecorded),
-            // and answers only once none is live. Only reached when
-            // rows exist, so a rerun after a completed rm (project
-            // already gone, nothing to drop) skips it instead of failing
-            // on the missing project.
-            progress.dispatcher_call_start(&format!("/projects/{project_id}/quiesce"));
+        for run_id in fresh {
             client
-                .post_with_body(&format!("/projects/{project_id}/quiesce"), &serde_json::json!({}))
+                .delete(&format!("/runs/{run_id}"))
                 .await
-                .with_context(|| format!(
-                    "could not quiesce project {project_id} before dropping its \
-                     journal rows. If the project is no longer registered, its \
-                     history is still stored but cannot be dropped until it \
-                     re-registers: run `weft run` in the project folder, then \
-                     rerun `weft rm --journal`"
-                ))?;
-            progress.dispatcher_call_done(serde_json::json!({ "step": "quiesce" }));
-        }
-        for execution_id in fresh {
-            client
-                .delete(&format!("/executions/{execution_id}"))
-                .await
-                .with_context(|| format!("delete execution {execution_id}"))?;
-            dropped.insert(execution_id.clone());
+                .with_context(|| format!("delete run {run_id}"))?;
+            dropped.insert(run_id.clone());
         }
     }
     progress.dispatcher_call_done(serde_json::json!({

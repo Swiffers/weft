@@ -10,7 +10,8 @@
 //! install's picks), is then set up again on what is stored, each owner
 //! once. A pick is the install's, not a trigger's, so it stays stored
 //! when a setup fails: the answer then says so and names the triggers
-//! still armed on the old connection, which `weft resync` sets up again.
+//! still armed on the old connection, which turning them off and on again
+//! sets up again (`weft resync` leaves them: they are not behind a build).
 
 use axum::http::StatusCode;
 
@@ -25,7 +26,7 @@ use crate::state::DispatcherState;
 
 type ApiError = (StatusCode, String);
 
-/// Pick `set` and forget `clear` (step, field) for `project_id` on this
+/// Pick `set` and forget `clear` (node, field) for `project_id` on this
 /// install, all or none, re-arming the live triggers that read any of
 /// them (see the module docs).
 pub async fn change(
@@ -52,26 +53,26 @@ pub async fn change(
     // and is spelled the way the program spells that place, which is how
     // the pick was stored.
     let mut cleared: Vec<(String, String)> = Vec::new();
-    for (step, field) in clear {
-        let step = match &project {
+    for (place, field) in clear {
+        let place = match &project {
             Some(project) => {
-                let (id, path) = weft_core::project::resolve_address(project, step);
+                let (id, path) = weft_core::project::resolve_address(project, place);
                 match project.nodes.iter().find(|n| n.id == id) {
                     Some(node) if !weft_core::picks::picked_fields(node).any(|f| f == field) => {
-                        return Err((StatusCode::BAD_REQUEST, format!("'{step}.{field}' is no connection picked on the install")));
+                        return Err((StatusCode::BAD_REQUEST, format!("'{place}.{field}' is no connection picked on the install")));
                     }
                     Some(_) => weft_core::project::address_of(project, &id, &path),
-                    None => step.clone(),
+                    None => place.clone(),
                 }
             }
-            None => step.clone(),
+            None => place.clone(),
         };
-        cleared.push((step, field.clone()));
+        cleared.push((place, field.clone()));
     }
     let writes: Vec<weft_access_store::PickWrite> = checked
         .iter()
         .map(|c| weft_access_store::PickWrite {
-            step: c.step.clone(),
+            node: c.node.clone(),
             field: c.field.clone(),
             grant_id: c.connection,
             service: c.service.clone(),
@@ -80,7 +81,7 @@ pub async fn change(
     // Which fields change, for finding the triggers that read them.
     let mut changes = ValueChanges { cleared: cleared.iter().cloned().collect(), ..Default::default() };
     for c in &checked {
-        changes.set.entry(c.step.clone()).or_default().insert(c.field.clone(), serde_json::Value::Null);
+        changes.set.entry(c.node.clone()).or_default().insert(c.field.clone(), serde_json::Value::Null);
     }
     if changes.is_empty() {
         return Ok(ValuesChanged::default());
@@ -152,7 +153,7 @@ impl Store<'_> {
                 let stored = weft_access_store::stored_fields(&mut *conn, tenant, project_id).await.map_err(access_error)?;
                 weft_core::picks::check_move(project, &stored, request).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
                 let mut changes = ValueChanges::default();
-                for moved in stored.iter().filter(|s| s.step == request.from) {
+                for moved in stored.iter().filter(|s| s.node == request.from) {
                     changes.set.entry(request.to.clone()).or_default().insert(moved.field.clone(), serde_json::Value::Null);
                 }
                 Ok(changes)
@@ -286,7 +287,7 @@ async fn rearm(state: &DispatcherState, project_id: uuid::Uuid, live: &[Activati
         loop {
             let mut heard = state.signals.subscribe();
             let request = weft_core::activation::ActivateRequest {
-                scope: weft_core::activation::ActivationScope { triggers: triggers.clone(), instance: owner.instance().cloned() },
+                scope: weft_core::activation::ActivationScope::of_owner(triggers.clone(), &owner),
                 ..Default::default()
             };
             match crate::api::project::activate_with(state, project_id, request, crate::api::project::ActivateAsker::Rearm(&rearm)).await {
@@ -319,8 +320,10 @@ async fn rearm(state: &DispatcherState, project_id: uuid::Uuid, live: &[Activati
     Err((
         StatusCode::CONFLICT,
         format!(
-            "the pick is stored, but these triggers are still set up with the connection they had, \
-             and `weft resync --mode park` sets them up again (the work waiting on them stays):\n  {}",
+            "the pick is stored, but these triggers are still set up with the connection they had. \
+             To set them up again, turn them off and on (`weft deactivate --trigger <name>`, then \
+             `weft activate --trigger <name>`, with `--instance <id>` for an instance's); the work \
+             waiting on them is kept:\n  {}",
             failed.join("\n  ")
         ),
     ))

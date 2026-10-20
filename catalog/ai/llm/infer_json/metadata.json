@@ -1,0 +1,93 @@
+{
+  "type": "LlmInferenceJson",
+  "label": "LLM (JSON)",
+  "description": "AI language model completion whose answer is JSON: the same call as the LLM node (provider, params, tools, a conversation kept in a file), with the reply repaired, parsed, and held to the type the program declares on `response` (`x = LlmInferenceJson -> (response: Verdict) { ... }` with `Verdict` a record type). A record without `..` refuses keys it does not declare; with `..` (`{ label: String, .. }`) they are dropped. An answer that is not JSON or does not fit fails the node, caught on `_error` when it is wired, with the reason (`the model's answer does not fit Verdict: value: missing required field \"score\"`), and leaves `historyFile` exactly as it came in, so a retry in a Loop sends the model the same conversation with the reason in its prompt. A turn that only calls tools emits `toolCalls` and no `response`; the tool loop is wired as on the LLM node.",
+  "tags": [
+    "ai",
+    "gpt",
+    "claude",
+    "completion",
+    "json",
+    "structured",
+    "extract"
+  ],
+  "icon": "BrainCircuit",
+  "color": "#7c6f9f",
+  "inputs": [
+    {
+      "name": "prompt",
+      "type": "String",
+      "widget": { "kind": "textarea" },
+      "description": "Appended as the newest user message. Optional when `historyFile` is wired (a tool-result round re-enters with the conversation alone)."
+    },
+    {
+      "name": "historyFile",
+      "type": "File",
+      "accepts": ["wire"],
+      "description": "The conversation so far, in a stored file (a previous call's or a Chat Message's `historyFile` output, or a file holding `[]` stored in the project scope to start one later runs continue). This call's turn is added to the same file, in place. Unwired, the call starts from no conversation."
+    },
+    {
+      "name": "media",
+      "type": "Media | List[Media | Null]",
+      "description": "One stored image, audio clip, or video attached to this prompt, or a list of them (a null in the list is no media, so a loop's gathered list goes in as it comes)."
+    },
+    {
+      "name": "provider",
+      "type": "LlmProvider",
+      "required": true,
+      "accepts": ["wire"],
+      "description": "Which service, model, and credential: wire an OpenRouter Model, Anthropic Model, OpenAI Model, or Custom Provider node's output. Never build this value by hand or pass it through a port typed JsonDict (a group that carries it declares the port as LlmProvider)."
+    },
+    {
+      "name": "params",
+      "type": "Dict[String, String | Number | Boolean | List[String]]",
+      "accepts": ["wire"],
+      "description": "Optional LlmParams node (system prompt, temperature, ...). Unwired, the defaults apply."
+    },
+    {
+      "name": "tools",
+      "type": "JsonDict | List[JsonDict]",
+      "accepts": ["wire"],
+      "description": "Tool declarations the model may call: one LLM Tool node's output, or a list of them."
+    },
+    {
+      "name": "toolChoice",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": ["auto", "required", "none"]
+      },
+      "default": "auto",
+      "label": "Tool choice",
+      "description": "Only used when tools are wired: auto lets the model decide, required forces a call, none forbids one."
+    },
+    {
+      "name": "autoCache",
+      "type": "Boolean",
+      "default": true,
+      "label": "Automatic prompt caching",
+      "description": "On: when the conversation carries no cache mark of its own, the request marks the system message and the last message before this turn. The marks are sent only, never written into `historyFile`."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "response",
+      "type": "JsonDict",
+      "narrowable": true,
+      "description": "The answer parsed as JSON, holding the type declared here (`-> (response: Verdict)`), JsonDict when none is. Absent on a turn that only called tools."
+    },
+    {
+      "name": "historyFile",
+      "type": "File",
+      "description": "The `historyFile` that came in with this call's user message and reply added (same file, next version), or, when none came in, a new file holding this turn, kept past the run. Unwired with no file in, the call keeps nothing."
+    },
+    {
+      "name": "toolCalls",
+      "type": "List[ToolCall]",
+      "description": "Pulses only when the model called tools. Append each result with a Chat Message (role tool) and wire its `historyFile` into the next call. A call left unanswered (the run stopped before its result was appended) is answered `cancelled` by the next call."
+    }
+  ],
+  "features": {
+    "oneOfRequired": [["prompt", "historyFile", "media"]]
+  }
+}

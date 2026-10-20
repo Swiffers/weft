@@ -20,23 +20,23 @@
 //! quoted phrase, the runs carrying it as written).
 
 use sqlx::PgPool;
-use weft_core::ExecutionId;
-use weft_journal::ExecEvent;
+use weft_core::RunId;
+use weft_journal::RunEvent;
 
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
-    name: "execution_search",
+    name: "run_search",
     tables: &["run_search_queue", "run_search"],
     ddl: &[
         // The ended recorded runs whose entry is not built yet.
         r#"CREATE TABLE IF NOT EXISTS run_search_queue (
-            execution_id UUID PRIMARY KEY
+            run_id UUID PRIMARY KEY
         )"#,
         // One row per indexed run: its words, in the `simple` configuration
         // (every word as written, lowercased, no language's stemming or
         // stop words: an id or a name is found as it is), and the nodes it
         // started, spelled the way the record names them.
         r#"CREATE TABLE IF NOT EXISTS run_search (
-            execution_id UUID PRIMARY KEY,
+            run_id UUID PRIMARY KEY,
             words TSVECTOR NOT NULL,
             nodes TEXT[] NOT NULL
         )"#,
@@ -58,12 +58,12 @@ pub struct Entry {
 
 impl Entry {
     /// The entry of a run whose record is `events`.
-    pub fn of(events: &[ExecEvent]) -> Self {
+    pub fn of(events: &[RunEvent]) -> Self {
         let mut words = weft_journal::search::SearchText::default();
         let mut nodes = std::collections::BTreeSet::new();
         for event in events {
             words.push(event);
-            if let ExecEvent::NodeStarted { node_id, .. } = event {
+            if let RunEvent::NodeStarted { node_id, .. } = event {
                 nodes.insert(node_id.clone());
             }
         }
@@ -88,32 +88,32 @@ pub async fn index_queued(pool: &PgPool) -> anyhow::Result<usize> {
 /// One round: up to [`ROUND`] queued runs indexed; answers how many.
 async fn round(pool: &PgPool) -> anyhow::Result<usize> {
     let mut tx = pool.begin().await?;
-    let ids: Vec<ExecutionId> = sqlx::query_scalar(
-        "SELECT execution_id FROM run_search_queue ORDER BY execution_id LIMIT $1 FOR UPDATE SKIP LOCKED",
+    let ids: Vec<RunId> = sqlx::query_scalar(
+        "SELECT run_id FROM run_search_queue ORDER BY run_id LIMIT $1 FOR UPDATE SKIP LOCKED",
     )
     .bind(ROUND)
     .fetch_all(&mut *tx)
     .await?;
-    for execution_id in &ids {
-        let record = weft_journal::record::read_record(&mut tx, *execution_id, None).await?;
-        let entry = match record.events(*execution_id) {
+    for run_id in &ids {
+        let record = weft_journal::record::read_record(&mut tx, *run_id, None).await?;
+        let entry = match record.events(*run_id) {
             Ok(events) => Entry::of(&events),
             Err(e) => {
-                tracing::warn!(target: "weft_dispatcher::search", %execution_id, error = %e, "a run's record does not read; it is not searchable");
+                tracing::warn!(target: "weft_dispatcher::search", %run_id, error = %e, "a run's record does not read; it is not searchable");
                 Entry::default()
             }
         };
         sqlx::query(
-            "INSERT INTO run_search (execution_id, words, nodes) VALUES ($1, to_tsvector('simple', $2), $3) \
-             ON CONFLICT (execution_id) DO NOTHING",
+            "INSERT INTO run_search (run_id, words, nodes) VALUES ($1, to_tsvector('simple', $2), $3) \
+             ON CONFLICT (run_id) DO NOTHING",
         )
-        .bind(execution_id)
+        .bind(run_id)
         .bind(&entry.words)
         .bind(&entry.nodes)
         .execute(&mut *tx)
         .await?;
     }
-    sqlx::query("DELETE FROM run_search_queue WHERE execution_id = ANY($1)").bind(&ids).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM run_search_queue WHERE run_id = ANY($1)").bind(&ids).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(ids.len())
 }
@@ -125,11 +125,11 @@ mod tests {
     /// An entry holds the run's values and the nodes it started, each once.
     #[test]
     fn an_entry_is_the_runs_words_and_started_nodes() {
-        let execution_id = weft_core::ExecutionId::from_u128(7);
+        let run_id = weft_core::RunId::from_u128(7);
         let events = vec![
-            ExecEvent::NodeStarted { execution_id, node_id: "lookup".into(), frames: vec![], at_unix: 0 },
-            ExecEvent::LogLine {
-                execution_id,
+            RunEvent::NodeStarted { run_id, node_id: "lookup".into(), frames: vec![], at_unix: 0 },
+            RunEvent::LogLine {
+                run_id,
                 node_id: "lookup".into(),
                 frames: vec![],
                 level: "info".into(),
@@ -138,8 +138,8 @@ mod tests {
                 seq: None,
                 at_unix: 0,
             },
-            ExecEvent::NodeStarted { execution_id, node_id: "lookup".into(), frames: vec![], at_unix: 0 },
-            ExecEvent::NodeStarted { execution_id, node_id: "cards.post".into(), frames: vec![], at_unix: 0 },
+            RunEvent::NodeStarted { run_id, node_id: "lookup".into(), frames: vec![], at_unix: 0 },
+            RunEvent::NodeStarted { run_id, node_id: "cards.post".into(), frames: vec![], at_unix: 0 },
         ];
         let entry = Entry::of(&events);
         assert!(entry.words.contains("ada@example.com"), "{}", entry.words);

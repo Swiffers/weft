@@ -4,7 +4,8 @@
 //!
 //! - **apply**: resolve the InfraSpec (weft-core) for the copy, apply the
 //!   units that are down (or new) through the host, wait for them to be
-//!   ready, write the `infra_node` row via `set_applied`. The copy's
+//!   ready, write the `infra_node` row via `set_applied` (with the
+//!   node's health rules, which the health loop runs on it). The copy's
 //!   id is derived from (project, node, instance),
 //!   so every apply
 //!   of it, the first after a terminate included, finds the copy's disks
@@ -162,7 +163,7 @@ const READINESS_BREADCRUMB_INTERVAL: Duration = Duration::from_secs(30);
 /// the user terminates/retries per-node from where it stopped).
 #[derive(Debug)]
 pub(crate) struct CancelledByUser {
-    /// Where execution halted, for the outcome message.
+    /// Where run halted, for the outcome message.
     pub at: &'static str,
 }
 
@@ -1027,6 +1028,7 @@ async fn execute_apply(
             instance,
             &copy_id,
             spec.keep_on_terminate.clone(),
+            spec.health_rules.clone(),
             resolve_units(
                 &spec,
                 node_id,
@@ -1124,6 +1126,7 @@ async fn execute_apply(
             &applied_spec_hash,
             addresses,
             spec.keep_on_terminate.clone(),
+            spec.health_rules.clone(),
             notes,
             // `transitioning = false`: readiness waited, the reconciled
             // units' old copies are replaced, so their PRIOR image refs

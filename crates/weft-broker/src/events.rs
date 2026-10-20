@@ -63,10 +63,27 @@ fn listener_only(caller: &crate::auth::CallerIdentity) -> Result<(), ApiError> {
 /// node maps to the operator's machine); a provider on the internet
 /// cannot reach it, so for
 /// subscriptions it counts as "no public address" and meets the
-/// teaching error instead of a subscribe that can never deliver.
-pub fn receiver_url(state: &BrokerState, service: &str, topic: &str) -> Option<String> {
-    let base = state.internet_base()?;
-    Some(format!("{}/events/{service}/{topic}", base.trim_end_matches('/')))
+/// teaching error instead of a subscribe that can never deliver. A quick
+/// tunnel that cannot say its address is an error.
+pub async fn receiver_url(state: &BrokerState, service: &str, topic: &str) -> anyhow::Result<Option<String>> {
+    let Some(base) = state.internet_base().await? else { return Ok(None) };
+    Ok(Some(format!("{}/events/{service}/{topic}", base.trim_end_matches('/'))))
+}
+
+/// Whether verifying a push under `verify` reads the address the
+/// provider was told to post to: a signature over it (Twilio's), or an
+/// identity token whose audience defaults to it when no receiving app
+/// names one.
+fn uses_receiver_url(verify: &VerifyKind, receiving_apps: &[crate::app_provider::RegisteredApp]) -> bool {
+    match verify {
+        VerifyKind::Hmac { concat, .. } | VerifyKind::Signature { concat, .. } => {
+            concat.covers(weft_core::access::events::SignedPart::Url)
+        }
+        VerifyKind::Oidc { .. } => {
+            receiving_apps.iter().find_map(|a| a.events.as_ref()).is_none_or(|e| e.audience.is_none())
+        }
+        VerifyKind::TokenEcho | VerifyKind::ApiKeys { .. } => false,
+    }
 }
 
 // ---------- Listener serving surface ----------
@@ -103,18 +120,23 @@ async fn listener_resolve(
 /// whether it is an infra endpoint, whose address can move (a local
 /// unit's port on the machine moves when the unit is made again), so the
 /// listener asks again after a connect to it fails. Listener role only,
-/// and only for a signal it holds: the project comes off that signal's
-/// row, so only that project's infra is looked at.
+/// and only for a signal it holds, or a cancelled wait whose last call it
+/// is sending: the project comes off that signal's row (or that call's
+/// task), so only that project's infra is looked at.
 async fn listener_infra_address(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
     Json(req): Json<ListenerInfraAddressRequest>,
 ) -> Result<Json<ListenerInfraAddress>, ApiError> {
     listener_only(&caller)?;
-    let project = crate::held_signals::signal_held_project(&state.pool, &req.signal_token)
-        .await
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "no signal is held under this token".to_string()))?;
+    let held = crate::held_signals::signal_held_project(&state.pool, &req.signal_token).await.map_err(internal)?;
+    let project = match held {
+        Some(project) => project,
+        None => crate::held_signals::cancel_call_project(&state.pool, &req.signal_token)
+            .await
+            .map_err(internal)?
+            .ok_or((StatusCode::NOT_FOUND, "no signal is held under this token, and no last call of it is being sent".to_string()))?,
+    };
     let rows: Vec<(Value, Value)> =
         sqlx::query_as("SELECT endpoints_json, install_endpoints_json FROM infra_node WHERE project_id = $1")
             .bind(project)
@@ -165,11 +187,13 @@ async fn subscription_ensure(
 ) -> Result<Json<SubscriptionEnsureResponse>, ApiError> {
     listener_only(&caller)?;
     let access_id = parse_access_id(&req.access_id)?;
-    // `None` when this weft has no internet-reachable address; the
-    // store refuses (with the teaching error) exactly when the topic
-    // must TELL the provider where to send. A topic whose delivery
-    // address is operator-configured at the provider needs nothing.
-    let url = receiver_url(&state, &req.service, &req.topic);
+    // Read only right before a subscribe call, so a recipe with no
+    // subscribe call, or a subscription needing no renewal, never asks a
+    // quick tunnel its address. `None` when this weft has no
+    // internet-reachable address; the store then refuses with the
+    // teaching error.
+    let (service, topic) = (req.service.clone(), req.topic.clone());
+    let receiver = || async { receiver_url(&state, &service, &topic).await };
     let ensured = weft_access_store::ensure_subscription(
         &state.pool,
         &state.lock_pool,
@@ -181,8 +205,8 @@ async fn subscription_ensure(
             access_id,
             signal_token: req.signal_token,
             params: req.params,
-            receiver_url: url,
         },
+        receiver,
     )
     .await
     .map_err(crate::handlers::store_err)?;
@@ -291,10 +315,34 @@ async fn verify_and_route(
         .filter(|a| a.events.is_some())
         .collect();
 
+    // The subscription the push names, for a recipe that routes by one
+    // (a token echo always does): read once, for the token echo's proof
+    // and for the routing below.
+    let presented_id = match (&webhook.route_by, &webhook.verify) {
+        (weft_core::access::events::RouteBy::Subscription, _) | (_, VerifyKind::TokenEcho) => {
+            let id_path = webhook.id_path.as_deref().unwrap_or_default();
+            read_path(&parse_body(body_bytes), &req.headers, id_path).map(display_of)
+        }
+        _ => None,
+    };
+    let named = match &presented_id {
+        Some(id) => weft_access_store::subscription_by_id(&state.pool, id, &req.service, &req.topic)
+            .await
+            .map_err(internal)?,
+        None => None,
+    };
+
     // The push as the schemes see it. The url is where the provider
-    // was TOLD to post (the receiver's own address for this topic):
-    // the address-signing schemes (Twilio's) cover exactly that.
-    let receiver = receiver_url(state, &req.service, &req.topic);
+    // was TOLD to post, and that is the receiver's address as it is now:
+    // a push only arrives at the address the provider sends to, and once
+    // the address changes (a quick tunnel's new hostname) the old one is
+    // dead, so a push that arrived was sent to the current one. It is
+    // read only for a scheme that uses it, so no other push pays for
+    // asking a quick tunnel its address.
+    let receiver = match uses_receiver_url(&webhook.verify, &receiving_apps) {
+        true => receiver_url(state, &req.service, &req.topic).await.map_err(internal)?,
+        false => None,
+    };
     let push = weft_core::access::verify::PushParts {
         body: body_bytes,
         headers: &req.headers,
@@ -346,24 +394,13 @@ async fn verify_and_route(
             (vec![client_id], None)
         }
         VerifyKind::TokenEcho => {
-            // The proof is the token weft minted at subscribe time;
-            // the push names its subscription and echoes the token.
-            let body_json = parse_body(body_bytes);
-            let id_path = webhook.id_path.as_deref().unwrap_or_default();
-            let presented_id = read_path(&body_json, &req.headers, id_path)
-                .map(display_of)
-                .ok_or_else(|| refused(&req.service, VerifyError::MissingHeader("subscription id".into())))?;
-            let token_path = webhook.token_path.as_deref().unwrap_or_default();
-            let presented_token = read_path(&body_json, &req.headers, token_path).map(display_of);
-            let sub = weft_access_store::subscription_by_id(
-                &state.pool,
-                &presented_id,
-                &req.service,
-                &req.topic,
-            )
-            .await
-            .map_err(internal)?;
-            let Some(sub) = sub else {
+            // The proof is the token weft minted at subscribe time; the
+            // push named its subscription (read above) and echoes the
+            // token.
+            if presented_id.is_none() {
+                return Err(refused(&req.service, VerifyError::MissingHeader("subscription id".into())));
+            }
+            let Some(sub) = named.clone() else {
                 // An unknown minted id: a lapsed channel still
                 // delivering inside its overlap window, or noise.
                 // Either way there is nothing to feed; 200-drop.
@@ -371,6 +408,8 @@ async fn verify_and_route(
                     reason: "no subscription behind this push".into(),
                 }));
             };
+            let token_path = webhook.token_path.as_deref().unwrap_or_default();
+            let presented_token = read_path(&parse_body(body_bytes), &req.headers, token_path).map(display_of);
             let secrets = VerifySecrets {
                 minted_token: Some(sub.token.clone()),
                 presented_token,
@@ -396,7 +435,7 @@ async fn verify_and_route(
             let audience = configured
                 .as_ref()
                 .and_then(|e| e.audience.clone())
-                .or_else(|| receiver_url(state, &req.service, &req.topic))
+                .or_else(|| receiver.clone())
                 .ok_or_else(|| refused(&req.service, VerifyError::NotConfigured("push audience")))?;
             let claims = verify_identity_token(token, &audience, &issuers, jwks_url)
                 .await
@@ -466,41 +505,20 @@ async fn verify_and_route(
     let named_event = topic.named_event(&event, &req.headers);
 
     // Routing follows the recipe's OWN declaration, never the
-    // verification scheme: `route_by` is the one switch (validation
-    // already ties `subscription` routing to a declared `id_path`).
+    // verification scheme: `routeBy` is the one switch (validation
+    // already ties `subscription` routing to a declared `idPath`).
     // The token-echo proof happens to look its subscription up during
     // verification; any other scheme routing by subscription looks it
     // up here, by the same (id, service, topic) key.
     match webhook.route_by {
         weft_core::access::events::RouteBy::Subscription => {
-            let sub = match subscription {
-                Some(sub) => sub,
-                None => {
-                    let body_json = parse_body(body_bytes);
-                    let id_path = webhook.id_path.as_deref().unwrap_or_default();
-                    let Some(presented_id) =
-                        read_path(&body_json, &req.headers, id_path).map(display_of)
-                    else {
-                        return Ok(Json(EventVerdict::Drop {
-                            reason: "the push names no subscription".into(),
-                        }));
-                    };
-                    let sub = weft_access_store::subscription_by_id(
-                        &state.pool,
-                        &presented_id,
-                        &req.service,
-                        &req.topic,
-                    )
-                    .await
-                    .map_err(internal)?;
-                    match sub {
-                        Some(sub) => sub,
-                        None => {
-                            return Ok(Json(EventVerdict::Drop {
-                                reason: "no subscription behind this push".into(),
-                            }))
-                        }
-                    }
+            let sub = match (subscription.or(named), presented_id) {
+                (Some(sub), _) => sub,
+                (None, None) => {
+                    return Ok(Json(EventVerdict::Drop { reason: "the push names no subscription".into() }));
+                }
+                (None, Some(_)) => {
+                    return Ok(Json(EventVerdict::Drop { reason: "no subscription behind this push".into() }));
                 }
             };
             Ok(Json(EventVerdict::Deliver {
@@ -629,7 +647,7 @@ static JWKS_CACHE: tokio::sync::Mutex<
 const JWKS_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Verify a signed OIDC identity token: signature against the keys
-/// published at the recipe's `jwks_url`, audience, expiry (the
+/// published at the recipe's `jwksUrl`, audience, expiry (the
 /// library refuses expired tokens), the recipe's issuers. Claim
 /// policy beyond that is [`check_identity_claims`]'s.
 async fn verify_identity_token(
@@ -716,7 +734,7 @@ mod tests {
             serde_json::json!({
                 "verify": { "kind": "oidc",
                             "issuers": ["https://accounts.google.com"],
-                            "jwks_url": "https://www.googleapis.com/oauth2/v3/certs" },
+                            "jwksUrl": "https://www.googleapis.com/oauth2/v3/certs" },
                 "decode": { "path": "message.data", "encoding": "base64_json" }
             }),
         )
@@ -746,8 +764,8 @@ mod tests {
         let recipe: weft_core::access::events::WebhookRecipe = serde_json::from_value(
             serde_json::json!({
                 "verify": { "kind": "hmac",
-                            "signature_header": "X-Slack-Signature",
-                            "timestamp_header": "X-Slack-Request-Timestamp",
+                            "signatureHeader": "X-Slack-Signature",
+                            "timestampHeader": "X-Slack-Request-Timestamp",
                             "concat": "v0:{timestamp}:{body}",
                             "prefix": "v0=" },
                 "decode": { "path": "payload", "encoding": "form_json" }

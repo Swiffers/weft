@@ -94,6 +94,30 @@ test("an edit to a file main.weft includes, however deep, validates main.weft", 
   ])
 })
 
+test("an edit to a file main.weft includes through __catalog/ validates main.weft", async () => {
+  reset()
+  files.set("/workspace/project/weft.toml", "")
+  files.set("/workspace/project/src/main.weft", "one = @include(\"__catalog//my_pkg/./triage.weft\")\n")
+  files.set("/workspace/project/nodes/my_pkg/triage.weft", "two = @include(\"step.weft\")\n")
+  files.set("/workspace/project/nodes/my_pkg/step.weft", "leaf")
+
+  await run({}, { files: [{ filePath: "project/nodes/my_pkg/step.weft" }] })
+
+  assert.deepEqual(spawns.map(({ command }) => command.at(-1)), ["/workspace/project/src/main.weft"])
+})
+
+test("a __catalog/ path that climbs out of nodes/ leads nowhere, as the compiler refuses it", async () => {
+  reset()
+  files.set("/workspace/project/weft.toml", "")
+  files.set("/workspace/project/src/main.weft", "one = @include(\"__catalog/../src/lib/step.weft\")\ntwo = @include(\"__catalog/x/../../nodes/y.weft\")\n")
+  files.set("/workspace/project/nodes/y.weft", "leaf")
+  files.set("/workspace/project/src/lib/step.weft", "leaf")
+
+  await run({}, { files: [{ filePath: "project/src/lib/step.weft" }] })
+
+  assert.deepEqual(spawns.map(({ command }) => command.at(-1)), ["/workspace/project/src/lib/step.weft"])
+})
+
 test("reports stderr failures and keeps runtime findings out of edit feedback", async () => {
   reset()
   files.set("/workspace/project/weft.toml", "")
@@ -182,4 +206,31 @@ test("an edit to a .weft file reports unknown node types as before", async () =>
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+test("spelling warnings ride along under their own heading, the catalog's only after a node edit", async () => {
+  reset()
+  files.set("/workspace/project/weft.toml", "")
+  files.set("/workspace/project/src/main.weft", "main")
+  const answer = JSON.stringify({
+    diagnostics: [
+      { severity: "warning", code: "not-camel-case", line: 1, column: 0, message: "node 'send_reply' is not camelCase: write 'sendReply'" },
+      { severity: "warning", code: "unused", line: 2, column: 0, message: "something else" },
+    ],
+    warnings: [
+      { kind: "spelling", message: "MyThing (nodes/my_thing/metadata.json): input 'chat_id' is not camelCase: write 'chatId'" },
+      { kind: "left_out", message: "an unrelated catalog warning" },
+    ],
+  })
+  results.push({ exit: 0, stdout: answer, stderr: "" })
+  let output = await run({}, { files: [{ filePath: "project/src/main.weft" }] })
+  assert.match(output.output, /weft: 1 spelling warning \(the program runs/)
+  assert.match(output.output, /\[not-camel-case\] node 'send_reply'/)
+  assert.doesNotMatch(output.output, /chat_id|something else|weft validation feedback/)
+
+  results.push({ exit: 0, stdout: answer, stderr: "" })
+  output = await run({}, { files: [{ filePath: "project/nodes/my_thing/metadata.json" }] })
+  assert.match(output.output, /weft: 2 spelling warnings/)
+  assert.match(output.output, /input 'chat_id' is not camelCase/)
+  assert.doesNotMatch(output.output, /unrelated catalog warning/)
 })

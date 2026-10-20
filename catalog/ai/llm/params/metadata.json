@@ -28,8 +28,8 @@
         "step": 1
       },
       "label": "Max Tokens",
-      "placeholder": "4096",
-      "description": "The most tokens the reply may hold, thinking included on a reasoning model. Unset, nothing is sent and the provider's own default applies."
+      "placeholder": "Provider default",
+      "description": "The most tokens the reply may hold, thinking included on a reasoning model. Unset, nothing is sent and the provider's own default applies (Anthropic, which requires one, gets the model's largest output)."
     },
     {
       "name": "temperature",
@@ -41,7 +41,7 @@
         "step": 0.1
       },
       "label": "Temperature",
-      "placeholder": "0.7"
+      "placeholder": "Provider default"
     },
     {
       "name": "topP",
@@ -53,7 +53,7 @@
         "step": 0.05
       },
       "label": "Top P",
-      "placeholder": "1.0"
+      "placeholder": "Provider default"
     },
     {
       "name": "topK",
@@ -75,7 +75,7 @@
         "step": 0.1
       },
       "label": "Frequency Penalty",
-      "placeholder": "0.0",
+      "placeholder": "Provider default",
       "description": "-2.0 to 2.0"
     },
     {
@@ -88,7 +88,7 @@
         "step": 0.1
       },
       "label": "Presence Penalty",
-      "placeholder": "0.0",
+      "placeholder": "Provider default",
       "description": "-2.0 to 2.0"
     },
     {
@@ -100,16 +100,15 @@
     {
       "name": "reasoning",
       "type": "Boolean",
-      "default": false,
       "label": "Enable Reasoning",
-      "description": "Off (default) sends no reasoning request; on reasons at `reasoningEffort`. A model that cannot switch reasoning off fails with an error saying to set this on; a model with no reasoning fails with its provider's error: set this off."
+      "description": "Unset (default) sends nothing, so the provider's own default applies. Off asks the provider for no reasoning; on reasons at `reasoningEffort`. A model that cannot switch reasoning off fails with an error saying to set this on; a model with no reasoning fails with its provider's error: set this off."
     },
     {
       "name": "reasoningEffort",
       "type": "String",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "low",
           "medium",
@@ -117,7 +116,7 @@
         ]
       },
       "label": "Reasoning Effort",
-      "description": "Only used when reasoning is on. Unpicked means `low`."
+      "description": "Only used when reasoning is on, sent as written. Unpicked means the provider's lowest effort."
     },
     {
       "name": "forcePrepend",

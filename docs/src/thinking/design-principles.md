@@ -10,7 +10,7 @@ you can read.
 In most systems that logic is buried in code you never open: a retry loop, a
 queue, an `if` three calls deep. In weft it is written down in the graph and
 checked before the run, so you can find where a decision is made and change it
-without touching the steps around it.
+without touching the nodes around it.
 
 You read it from the outside in. A group's interface says what goes in and what
 comes out, and its boundary is real to the compiler, so nothing reaches inside
@@ -31,7 +31,7 @@ For where the line sits today, go and read
 ## The language knows nothing about your nodes
 
 The compiler, the dispatcher and the runtime never mention a node by name or
-hardcode its fields. A Postgres step and a model step look the same to the
+hardcode its fields. A Postgres node and a model node look the same to the
 language, and everything a node needs, it asks for through the ctx.
 
 So adding a node that needs something new means building a general mechanism in

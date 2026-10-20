@@ -1,7 +1,7 @@
 //! The install's database schema: every group of tables it holds, in one
 //! list. The boot applies it in one guarded pass, the migration generator
 //! (`examples/schema_migration.rs`) writes migrations from it, and the
-//! agreement test (`tests/schema_agreement.rs`) builds from it, so none
+//! agreement test (`tests/db/schema_agreement.rs`) builds from it, so none
 //! of the three can leave a group out.
 
 use anyhow::Context as _;

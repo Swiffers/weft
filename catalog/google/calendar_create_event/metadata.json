@@ -28,7 +28,7 @@
         "options": [
           "primary"
         ],
-        "free_text": true
+        "freeText": true
       }
     },
     {
@@ -77,8 +77,5 @@
       "name": "link",
       "type": "String"
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

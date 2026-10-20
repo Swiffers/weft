@@ -47,7 +47,7 @@ markdown injection is the one exception: it only says where a weft block
 starts and ends, then hands the body to `weft.tmLanguage.json`.
 
 The vocabulary half of that is checked:
-`crates/weft-compiler/tests/highlighting_vocabulary.rs` fails, naming the
+`crates/weft-compiler/tests/integration/highlighting_vocabulary.rs` fails, naming the
 word, when the compiler knows a reserved type or a primitive that a grammar
 does not. What each piece of source actually turns into is checked here, in
 `highlight-weft.test.js` (`pnpm test`).
@@ -75,7 +75,7 @@ painted as a type.
 
 <!-- SYNC: the reserved-key rule in weft.tmLanguage.json (JSON takes no
      comments, so this marker stands in for it) <->
-     crates/weft-core/src/exec/skip.rs SHOULD_FLOW_PORT,
+     crates/weft-core/src/run/skip.rs SHOULD_FLOW_PORT,
      packages/weft-graph/src/protocol.ts SHOULD_FLOW_PORT,
      docs/src/language/syntax.md (reserved keys) -->
 

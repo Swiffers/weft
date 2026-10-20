@@ -16,13 +16,13 @@
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
-use weft_core::exec::CancelCause;
-use weft_core::project::selection::{RecordedSelection, RunSelection};
+use weft_core::run::CancelCause;
+use weft_core::project::ProjectDefinition;
 use weft_core::projects::PROJECT_BEING_REMOVED;
 use weft_core::run_settings::KeepFor;
-use weft_core::ExecutionId;
+use weft_core::RunId;
 
-use crate::events::ExecEvent;
+use crate::events::RunEvent;
 use crate::traits::JournalRow;
 
 /// Who the record says wrote a row the dispatcher wrote (`run_log.writer`).
@@ -43,24 +43,86 @@ pub struct RunLogRow {
     pub events: Vec<u8>,
 }
 
-/// A run's selection as the record keeps it (`run_selection`).
+/// A program a run runs, as the record keeps it (`project_definition`,
+/// under its hash). A run started with bounds runs a cut of its project
+/// (`weft_core::project::cut`): the cut is a program of its own, kept the
+/// first time a run names it, so the run reads it back by its hash like
+/// any other (on every resume, for every reader of its record).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredSelection {
-    pub digest: String,
-    pub selection: RunSelection,
+pub struct StoredProgram {
+    pub project_id: uuid::Uuid,
+    pub definition_hash: String,
+    pub project_json: String,
 }
 
-impl StoredSelection {
-    pub fn of(recorded: &RecordedSelection) -> Self {
-        Self { digest: recorded.digest().to_string(), selection: (**recorded.selection()).clone() }
+impl StoredProgram {
+    /// `program`, of `project_id`, under the hash it is read back by.
+    pub fn of(project_id: uuid::Uuid, program: &ProjectDefinition) -> anyhow::Result<Self> {
+        Ok(Self {
+            project_id,
+            definition_hash: weft_core::project::hash::compute_definition_hash(program)?,
+            project_json: serde_json::to_string(program)?,
+        })
+    }
+
+    /// Refuse a program that is not what it says: its JSON is no program
+    /// of its project, or does not hash to the hash it is kept under (a
+    /// run reading it back by that hash would run something else).
+    pub fn check(&self) -> anyhow::Result<()> {
+        let program: ProjectDefinition = serde_json::from_str(&self.project_json)
+            .map_err(|e| anyhow::anyhow!("program {} does not read as a program: {e}", self.definition_hash))?;
+        anyhow::ensure!(program.id == self.project_id, "program {} is of project {}, not {}", self.definition_hash, program.id, self.project_id);
+        let hash = weft_core::project::hash::compute_definition_hash(&program)?;
+        anyhow::ensure!(hash == self.definition_hash, "program {} hashes to {hash}", self.definition_hash);
+        Ok(())
     }
 }
 
-/// A run's record as read, raw: the selection its birth names (read with
-/// it, so its birth decodes) and its rows from some `seq` on.
+/// The program a run runs, as its birth names it and its start keeps it:
+/// the program (a cut of the registered one, or the registered one
+/// itself when the cut keeps everything) and, for a cut, the registered
+/// program it was cut from. Built once ([`Self::of`]); the birth
+/// (`crate::birth::Birth`) names the run's program from it, and the start
+/// that keeps the cut ([`Queued`], a worker's batch) keeps it from it, so
+/// the two cannot name different programs.
+#[derive(Debug, Clone)]
+pub struct RunsProgram {
+    stored: std::sync::Arc<StoredProgram>,
+    cut_from: Option<String>,
+}
+
+impl RunsProgram {
+    /// `cut`, of `project_id`, cut from the registered program whose hash
+    /// is `registered_hash`. A cut that hashes to the registered program
+    /// is that program: it names no `cut_from` and keeps nothing.
+    pub fn of(registered_hash: &str, project_id: uuid::Uuid, cut: &ProjectDefinition) -> anyhow::Result<Self> {
+        let stored = StoredProgram::of(project_id, cut)?;
+        let cut_from = (stored.definition_hash != registered_hash).then(|| registered_hash.to_string());
+        Ok(Self { stored: std::sync::Arc::new(stored), cut_from })
+    }
+
+    /// The hash the run's birth names its program by.
+    pub fn definition_hash(&self) -> &str {
+        &self.stored.definition_hash
+    }
+
+    /// The registered program a cut was cut from
+    /// (`RunEvent::RunStarted::cut_from`); `None` for the registered
+    /// program itself.
+    pub fn cut_from(&self) -> Option<&str> {
+        self.cut_from.as_deref()
+    }
+
+    /// What the run's start keeps with it: the cut, when it is one. The
+    /// registered program is kept already, by the build that registered it.
+    pub fn kept(&self) -> Option<&std::sync::Arc<StoredProgram>> {
+        self.cut_from.is_some().then_some(&self.stored)
+    }
+}
+
+/// A run's record as read, raw: its rows from some `seq` on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawRecord {
-    pub selection: Option<StoredSelection>,
     pub rows: Vec<RunLogRow>,
 }
 
@@ -68,8 +130,8 @@ impl RawRecord {
     /// The record's events, each with its place. One row that does not
     /// decode fails the whole read: a fold over part of a run rebuilds a
     /// run that never was.
-    pub fn decode(&self, execution_id: ExecutionId) -> Result<Vec<JournalRow>, String> {
-        let (decoded, bad) = self.decode_lossy(execution_id);
+    pub fn decode(&self, run_id: RunId) -> Result<Vec<JournalRow>, String> {
+        let (decoded, bad) = self.decode_lossy(run_id);
         match bad.into_iter().next() {
             Some(reason) => Err(reason),
             None => Ok(decoded),
@@ -79,12 +141,11 @@ impl RawRecord {
     /// The record's events for DISPLAY: every row that decodes, and the
     /// reason of each row that does not, naming it, so a reader shows
     /// what exists and says what it cannot.
-    pub fn decode_lossy(&self, execution_id: ExecutionId) -> (Vec<JournalRow>, Vec<String>) {
-        let selection = self.selection.as_ref().map(|stored| RecordedSelection::read(stored.digest.clone(), stored.selection.clone()));
+    pub fn decode_lossy(&self, run_id: RunId) -> (Vec<JournalRow>, Vec<String>) {
         let mut decoded = Vec::new();
         let mut bad = Vec::new();
         for row in &self.rows {
-            match crate::stored::decode(execution_id, selection.as_ref(), &row.events) {
+            match crate::stored::decode(run_id, &row.events) {
                 Ok(events) => decoded
                     .extend(events.into_iter().enumerate().map(|(index, event)| JournalRow { seq: row.seq, index: index as u32, event })),
                 Err(reason) => bad.push(reason),
@@ -94,8 +155,8 @@ impl RawRecord {
     }
 
     /// The record's events, in order (see [`Self::decode`]).
-    pub fn events(&self, execution_id: ExecutionId) -> Result<Vec<ExecEvent>, String> {
-        Ok(self.decode(execution_id)?.into_iter().map(|row| row.event).collect())
+    pub fn events(&self, run_id: RunId) -> Result<Vec<RunEvent>, String> {
+        Ok(self.decode(run_id)?.into_iter().map(|row| row.event).collect())
     }
 }
 
@@ -143,12 +204,12 @@ pub struct Ending {
 
 impl Ending {
     /// The ending `event` records, if it is one.
-    pub fn of(event: &ExecEvent) -> Option<Self> {
+    pub fn of(event: &RunEvent) -> Option<Self> {
         let at = event.at_unix() as i64;
         match event {
-            ExecEvent::ExecutionCompleted { .. } => Some(Self { at, outcome: Outcome::Completed, error: None, cancel_cause: None }),
-            ExecEvent::ExecutionFailed { error, .. } => Some(Self { at, outcome: Outcome::Failed, error: Some(error.clone()), cancel_cause: None }),
-            ExecEvent::ExecutionCancelled { cause, .. } => {
+            RunEvent::RunCompleted { .. } => Some(Self { at, outcome: Outcome::Completed, error: None, cancel_cause: None }),
+            RunEvent::RunFailed { error, .. } => Some(Self { at, outcome: Outcome::Failed, error: Some(error.clone()), cancel_cause: None }),
+            RunEvent::RunCancelled { cause, .. } => {
                 Some(Self { at, outcome: Outcome::Cancelled, error: None, cancel_cause: cause.clone() })
             }
             _ => None,
@@ -171,7 +232,7 @@ pub struct Written {
 
 impl Written {
     /// What `events`, all of one run, say.
-    pub fn of(events: &[ExecEvent]) -> Self {
+    pub fn of(events: &[RunEvent]) -> Self {
         let mut written = Self::default();
         written.add(events);
         written
@@ -180,12 +241,12 @@ impl Written {
     /// Add what `events` say to what this already holds. A run has one
     /// ending: a second one in its record would be a writer's bug, and the
     /// first stands.
-    pub fn add(&mut self, events: &[ExecEvent]) {
+    pub fn add(&mut self, events: &[RunEvent]) {
         for event in events {
             match event {
-                ExecEvent::CostReported { amount_usd: Some(usd), .. } => self.cost_micro_usd += micro_usd(*usd),
-                ExecEvent::NodeSkipped { .. } => self.skipped += 1,
-                ExecEvent::SuspensionResolved { token, .. } | ExecEvent::SuspensionSkipped { token, .. } => {
+                RunEvent::CostReported { amount_usd: Some(usd), .. } => self.cost_micro_usd += micro_usd(*usd),
+                RunEvent::NodeSkipped { .. } => self.skipped += 1,
+                RunEvent::SuspensionResolved { token, .. } | RunEvent::SuspensionSkipped { token, .. } => {
                     self.resolved.push(token.clone())
                 }
                 _ => {}
@@ -203,7 +264,7 @@ pub fn micro_usd(usd: f64) -> i64 {
 }
 
 /// The columns a run's row is born with, read off its birth (its
-/// `ExecutionStarted`), with how long it is kept once it ended, resolved
+/// `RunStarted`), with how long it is kept once it ended, resolved
 /// against its project's default.
 // SYNC: Born's fields <-> weft_record_batch's `p_born` (crates/weft-dispatcher/src/journal/postgres.rs)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -218,9 +279,11 @@ pub struct Born {
     pub fired_by: Option<String>,
     pub source_version: Option<String>,
     pub definition_hash: Option<String>,
+    /// The registered program a run of a cut was cut from
+    /// (`RunEvent::RunStarted::cut_from`).
+    pub cut_from: Option<String>,
     pub binary_hash: Option<String>,
-    pub selection: Option<String>,
-    pub seed_of: Option<ExecutionId>,
+    pub seed_of: Option<RunId>,
     pub started_at: i64,
     pub keep_for: Option<i64>,
 }
@@ -228,9 +291,9 @@ pub struct Born {
 impl Born {
     /// The row `birth` makes, kept for `keep_for` once it ended; `None`
     /// when `birth` is not a birth.
-    pub fn of(birth: &ExecEvent, keep_for: KeepFor) -> Option<Self> {
-        let ExecEvent::ExecutionStarted {
-            project_id, entry_node, phase, definition_hash, binary_hash, source_version, run_kind, selection, seed, instance,
+    pub fn of(birth: &RunEvent, keep_for: KeepFor) -> Option<Self> {
+        let RunEvent::RunStarted {
+            project_id, entry_node, phase, definition_hash, cut_from, binary_hash, source_version, run_kind, seed, instance,
             fired_trigger, settings, at_unix, ..
         } = birth
         else {
@@ -247,8 +310,8 @@ impl Born {
             fired_by: fired_trigger.clone(),
             source_version: source_version.clone(),
             definition_hash: definition_hash.clone(),
+            cut_from: cut_from.clone(),
             binary_hash: binary_hash.clone(),
-            selection: selection.as_ref().map(|selection| selection.digest().to_string()),
             seed_of: seed.as_ref().map(|seed| seed.parent),
             started_at: *at_unix as i64,
             keep_for: keep_for.seconds(),
@@ -298,7 +361,7 @@ impl Fate {
 /// did not end now).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recorded {
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub fate: Fate,
     pub project_id: Option<uuid::Uuid>,
     pub tell_end: bool,
@@ -313,7 +376,7 @@ pub struct Recorded {
 /// One run's answer as `weft_record_batch` gives it: its id, its fate,
 /// its project, whether it ended with somebody to tell, its erase time,
 /// whether it was born unwatched.
-type RecordedRow = (ExecutionId, String, Option<uuid::Uuid>, bool, Option<i64>, bool);
+type RecordedRow = (RunId, String, Option<uuid::Uuid>, bool, Option<i64>, bool);
 
 /// Write one batch of a worker's writer lane (`crate::frame`): every run
 /// of it in one statement and one transaction, synced to disk when the
@@ -344,7 +407,7 @@ pub async fn record_batch(
     let mut resolved_token = Vec::new();
     for (at, run) in head.runs.iter().enumerate() {
         let ordinal = i32::try_from(at + 1)?;
-        ids.push(run.execution_id);
+        ids.push(run.run_id);
         epochs.push(run.epoch);
         first.push(run.first_seq);
         last.push(run.first_seq + i32::try_from(run.row_sizes.len())? - 1);
@@ -365,7 +428,7 @@ pub async fn record_batch(
     let rows: Vec<&[u8]> = batch.rows.clone();
     let now = unix_now();
     let answered: Vec<RecordedRow> = sqlx::query_as(
-        "SELECT o_execution_id, o_fate, o_project_id, o_tell_end, o_keep_until, o_unwatched FROM weft_record_batch(\
+        "SELECT o_run_id, o_fate, o_project_id, o_tell_end, o_keep_until, o_unwatched FROM weft_record_batch(\
          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
     )
     .bind(writer)
@@ -388,7 +451,7 @@ pub async fn record_batch(
     .bind(&rows)
     .bind(&resolved_run)
     .bind(&resolved_token)
-    .bind(sqlx::types::Json(&head.selections))
+    .bind(sqlx::types::Json(&head.programs))
     .fetch_all(&mut *conn)
     .await?;
     anyhow::ensure!(
@@ -399,8 +462,8 @@ pub async fn record_batch(
     );
     answered
         .into_iter()
-        .map(|(execution_id, fate, project_id, tell_end, keep_until, unwatched)| {
-            Ok(Recorded { execution_id, fate: Fate::parse(&fate)?, project_id, tell_end, keep_until, unwatched })
+        .map(|(run_id, fate, project_id, tell_end, keep_until, unwatched)| {
+            Ok(Recorded { run_id, fate: Fate::parse(&fate)?, project_id, tell_end, keep_until, unwatched })
         })
         .collect()
 }
@@ -411,8 +474,8 @@ pub async fn record_batch(
 #[derive(Debug, Clone)]
 pub struct Queued<'a> {
     /// Its birth, its kicks, and what it is born holding (`events[0]` is
-    /// its `ExecutionStarted`).
-    pub events: &'a [ExecEvent],
+    /// its `RunStarted`).
+    pub events: &'a [RunEvent],
     pub tenant: &'a str,
     pub keep_for: KeepFor,
     /// Somebody waits on its ending: a trigger setup, whose bake is made
@@ -422,10 +485,14 @@ pub struct Queued<'a> {
     pub stale: &'a [String],
     pub spec: Option<&'a serde_json::Value>,
     pub example: Option<&'a str>,
+    /// The program its birth was born naming (`crate::birth::Birth`): its
+    /// cut is kept with the run, once. `None` for a birth built by hand
+    /// that names a registered program or none.
+    pub program: Option<&'a RunsProgram>,
 }
 
 /// Start `queued` on the caller's transaction: its row (`queued`, no owner,
-/// never claimed), its record's first row and its selection, and the
+/// never claimed), its record's first row and the cut it runs, and the
 /// delivery woken. `false` when the run is already on record (a retried
 /// start, by its id): nothing is written then. Errs, writing nothing, when
 /// its project has no row or is being removed. A queued run is started by
@@ -433,31 +500,43 @@ pub struct Queued<'a> {
 /// version's trigger runs (those are counted as workers bear them).
 pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> anyhow::Result<bool> {
     let birth = queued.events.first().ok_or_else(|| anyhow::anyhow!("a run is started with at least its birth"))?;
-    let execution_id = birth.execution_id();
-    let born = Born::of(birth, queued.keep_for).ok_or_else(|| anyhow::anyhow!("run {execution_id} is started with a row that is not its birth"))?;
-    if let Some(stray) = queued.events.iter().find(|event| event.execution_id() != execution_id) {
-        anyhow::bail!("the start of run {execution_id} carries a row of run {}", stray.execution_id());
+    let run_id = birth.run_id();
+    let born = Born::of(birth, queued.keep_for).ok_or_else(|| anyhow::anyhow!("run {run_id} is started with a row that is not its birth"))?;
+    if let Some(stray) = queued.events.iter().find(|event| event.run_id() != run_id) {
+        anyhow::bail!("the start of run {run_id} carries a row of run {}", stray.run_id());
     }
-    if let ExecEvent::ExecutionStarted { selection: Some(selection), .. } = birth {
-        insert_selection_in(conn, selection).await?;
+    // The birth names the program it was born with: a cut it names is the
+    // one kept with it, and nothing else is.
+    let (named, cut_from) = match queued.program {
+        Some(program) => (Some(program.definition_hash()), program.cut_from()),
+        None => (born.definition_hash.as_deref(), None),
+    };
+    anyhow::ensure!(
+        born.definition_hash.as_deref() == named && born.cut_from.as_deref() == cut_from,
+        "run {run_id} is born naming program {:?} cut from {:?}, but is started with program {named:?} cut from {cut_from:?}",
+        born.definition_hash,
+        born.cut_from,
+    );
+    if let Some(cut) = queued.program.and_then(RunsProgram::kept) {
+        anyhow::ensure!(cut.project_id == born.project_id, "run {run_id} of project {} is started with a cut of project {}", born.project_id, cut.project_id);
     }
     let written = Written::of(queued.events);
     // A queued run has not run: an ending in its start would leave a row
     // that waits for a worker over a record that says it ended.
-    anyhow::ensure!(written.ended.is_none(), "run {execution_id} is started with its ending");
+    anyhow::ensure!(written.ended.is_none(), "run {run_id} is started with its ending");
     // Only for a project still there and not being removed: `weft rm`
     // marks the project first and takes its runs down after, so a run
     // started once the mark is in would outlive the take-down.
     let inserted = sqlx::query(
-        "INSERT INTO run (execution_id, project_id, tenant_id, phase, kind, keeping, recorded, entry_node, instance_id, \
-             fired_by, source_version, definition_hash, binary_hash, selection, seed_of, stale, spec, example, state, \
-             epoch, last_seq, attempts, watch_end, started_at, skipped, cost_micro_usd, keep_for) \
-         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'queued', \
-             0, 0, 0, $19, $20, $21, $22, $23 \
+        "INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, entry_node, instance_id, \
+             fired_by, source_version, definition_hash, binary_hash, seed_of, stale, spec, example, state, \
+             epoch, last_seq, attempts, watch_end, started_at, skipped, cost_micro_usd, keep_for, cut_from) \
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'queued', \
+             0, 0, 0, $18, $19, $20, $21, $22, $23 \
          WHERE EXISTS (SELECT 1 FROM project WHERE id = $2 AND NOT removing) \
-         ON CONFLICT (execution_id) DO NOTHING",
+         ON CONFLICT (run_id) DO NOTHING",
     )
-    .bind(execution_id)
+    .bind(run_id)
     .bind(born.project_id)
     .bind(queued.tenant)
     .bind(&born.phase)
@@ -470,7 +549,6 @@ pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> a
     .bind(&born.source_version)
     .bind(&born.definition_hash)
     .bind(&born.binary_hash)
-    .bind(&born.selection)
     .bind(born.seed_of)
     .bind(queued.stale)
     .bind(queued.spec)
@@ -480,6 +558,7 @@ pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> a
     .bind(written.skipped)
     .bind(written.cost_micro_usd)
     .bind(born.keep_for)
+    .bind(&born.cut_from)
     .execute(&mut *conn)
     .await?;
     if inserted.rows_affected() == 0 {
@@ -490,12 +569,16 @@ pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> a
             .await?;
         return match removing {
             Some(false) => Ok(false),
-            Some(true) => anyhow::bail!("run {execution_id} is not started for project {project}: {PROJECT_BEING_REMOVED}"),
-            None => anyhow::bail!("run {execution_id} is started for project {project}, which has no row: it was removed, or was never registered"),
+            Some(true) => anyhow::bail!("run {run_id} is not started for project {project}: {PROJECT_BEING_REMOVED}"),
+            None => anyhow::bail!("run {run_id} is started for project {project}, which has no row: it was removed, or was never registered"),
         };
     }
-    sqlx::query("INSERT INTO run_log (execution_id, seq, events, writer, written_at) VALUES ($1, 0, $2, $3, $4)")
-        .bind(execution_id)
+    // Only now that the run is on record: a refused start keeps nothing.
+    if let Some(program) = queued.program {
+        insert_cut_in(conn, program).await?;
+    }
+    sqlx::query("INSERT INTO run_log (run_id, seq, events, writer, written_at) VALUES ($1, 0, $2, $3, $4)")
+        .bind(run_id)
         .bind(crate::stored::encode(queued.events))
         .bind(DISPATCHER)
         .bind(unix_now())
@@ -516,13 +599,23 @@ pub async fn notify_queued_in(conn: &mut PgConnection, project_id: uuid::Uuid) -
     Ok(())
 }
 
-/// Keep `selection` in the record, once.
-pub async fn insert_selection_in(conn: &mut PgConnection, selection: &RecordedSelection) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO run_selection (digest, selection) VALUES ($1, $2) ON CONFLICT (digest) DO NOTHING")
-        .bind(selection.digest())
-        .bind(sqlx::types::Json(&**selection.selection()))
-        .execute(&mut *conn)
-        .await?;
+/// Keep the cut `program` runs in the record, once, marked with the
+/// registered program it was cut from (`project_definition.cut_from`, so
+/// it never reads as a registered version). Nothing for a run of the
+/// registered program itself.
+async fn insert_cut_in(conn: &mut PgConnection, program: &RunsProgram) -> anyhow::Result<()> {
+    let Some(cut) = program.kept() else { return Ok(()) };
+    sqlx::query(
+        "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, cut_from) \
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (project_id, definition_hash) DO NOTHING",
+    )
+    .bind(cut.project_id)
+    .bind(&cut.definition_hash)
+    .bind(&cut.project_json)
+    .bind(unix_now())
+    .bind(program.cut_from())
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 
@@ -549,7 +642,7 @@ pub enum Appended {
     Missing,
 }
 
-/// The row of `execution_id`, locked for the caller's transaction, as a
+/// The row of `run_id`, locked for the caller's transaction, as a
 /// writer that is not its owner reads it.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Locked {
@@ -567,22 +660,27 @@ pub struct Locked {
     /// only a queued run carries (`run.waited_on_workers`): read when it
     /// leaves the queue, never for whether it still waits on them now.
     pub waited_on_workers: bool,
+    /// Why it was asked to stop while a worker drove it
+    /// (`run.cancel_requested`): the worker that drives it ends it for
+    /// this, and whoever lets go of it must not leave it waiting with the
+    /// ask unread.
+    pub cancel_requested: Option<sqlx::types::Json<CancelCause>>,
 }
 
-/// Lock `execution_id`'s row on the caller's transaction (`FOR UPDATE`),
+/// Lock `run_id`'s row on the caller's transaction (`FOR UPDATE`),
 /// the one serialization point of a run every writer that is not its
 /// owner goes through.
-pub async fn lock_in(conn: &mut PgConnection, execution_id: ExecutionId) -> anyhow::Result<Option<Locked>> {
+pub async fn lock_in(conn: &mut PgConnection, run_id: RunId) -> anyhow::Result<Option<Locked>> {
     Ok(sqlx::query_as(
-        "SELECT project_id, tenant_id, state, keeping, owner, last_seq, epoch, keep_for, definition_hash, waited_on_workers \
-         FROM run WHERE execution_id = $1 FOR UPDATE",
+        "SELECT project_id, tenant_id, state, keeping, owner, last_seq, epoch, keep_for, definition_hash, waited_on_workers, \
+         cancel_requested FROM run WHERE run_id = $1 FOR UPDATE",
     )
-    .bind(execution_id)
+    .bind(run_id)
     .fetch_optional(&mut *conn)
     .await?)
 }
 
-/// Write `events` into the record of `execution_id`, which nobody drives,
+/// Write `events` into the record of `run_id`, which nobody drives,
 /// at `last_seq + 1`, on the caller's transaction, and move the run as
 /// `then` says (an ending in `events` ends it whatever `then` says). Its
 /// costs, skips and ending go on its row in the same statement. `writer`
@@ -592,21 +690,21 @@ pub async fn lock_in(conn: &mut PgConnection, execution_id: ExecutionId) -> anyh
 /// commits (`weft_task_store::announce::committed`).
 pub async fn append_unowned_in(
     conn: &mut PgConnection,
-    execution_id: ExecutionId,
-    events: &[ExecEvent],
+    run_id: RunId,
+    events: &[RunEvent],
     writer: &str,
     then: Then,
 ) -> anyhow::Result<Appended> {
-    let Some(locked) = lock_in(conn, execution_id).await? else { return Ok(Appended::Missing) };
-    append_locked_in(conn, execution_id, &locked, events, writer, then).await
+    let Some(locked) = lock_in(conn, run_id).await? else { return Ok(Appended::Missing) };
+    append_locked_in(conn, run_id, &locked, events, writer, then).await
 }
 
 /// [`append_unowned_in`] on a row the caller already locked ([`lock_in`]).
 pub async fn append_locked_in(
     conn: &mut PgConnection,
-    execution_id: ExecutionId,
+    run_id: RunId,
     locked: &Locked,
-    events: &[ExecEvent],
+    events: &[RunEvent],
     writer: &str,
     then: Then,
 ) -> anyhow::Result<Appended> {
@@ -616,14 +714,14 @@ pub async fn append_locked_in(
     if locked.state == "ended" {
         return Ok(Appended::Ended);
     }
-    if let Some(stray) = events.iter().find(|event| event.execution_id() != execution_id) {
-        anyhow::bail!("a write to run {execution_id} carries a row of run {}", stray.execution_id());
+    if let Some(stray) = events.iter().find(|event| event.run_id() != run_id) {
+        anyhow::bail!("a write to run {run_id} carries a row of run {}", stray.run_id());
     }
     let seq = locked.last_seq + 1;
     let now = unix_now();
     if !events.is_empty() {
-        sqlx::query("INSERT INTO run_log (execution_id, seq, events, writer, written_at) VALUES ($1, $2, $3, $4, $5)")
-            .bind(execution_id)
+        sqlx::query("INSERT INTO run_log (run_id, seq, events, writer, written_at) VALUES ($1, $2, $3, $4, $5)")
+            .bind(run_id)
             .bind(seq)
             .bind(crate::stored::encode(events))
             .bind(writer)
@@ -647,11 +745,11 @@ pub async fn append_locked_in(
              ended_at = $6, outcome = $7, error = $8, cancel_cause = $9, keep_until = $6 + keep_for, \
              delivered_until = NULL, busy_since = CASE WHEN $6 IS NULL THEN busy_since END, \
              waited_on_workers = waited_on_workers AND $6 IS NULL, \
-             holds_signals = ($6 IS NOT NULL AND EXISTS (SELECT 1 FROM signal s WHERE s.execution_id = $1)) \
-         WHERE execution_id = $1 \
+             holds_signals = ($6 IS NOT NULL AND EXISTS (SELECT 1 FROM signal s WHERE s.run_id = $1)) \
+         WHERE run_id = $1 \
          RETURNING $6 IS NOT NULL AND (watch_end OR holds_signals), $6 IS NOT NULL AND keep_for IS NOT NULL",
     )
-    .bind(execution_id)
+    .bind(run_id)
     .bind(if events.is_empty() { locked.last_seq } else { seq })
     .bind(state)
     .bind(written.cost_micro_usd)
@@ -666,11 +764,11 @@ pub async fn append_locked_in(
     let mut payloads = Vec::new();
     if !events.is_empty() {
         channels.push(crate::RUN_LOG_CHANNEL);
-        payloads.extend(crate::run_log_payloads(&locked.project_id, [&execution_id]));
+        payloads.extend(crate::run_log_payloads(&locked.project_id, [&run_id]));
     }
     if tell_end {
         channels.push(crate::RUN_ENDED_CHANNEL);
-        payloads.extend(crate::run_ended_payloads([&execution_id]));
+        payloads.extend(crate::run_ended_payloads([&run_id]));
     }
     if erased_later {
         channels.push(crate::RETENTION_CHANNEL);
@@ -702,20 +800,20 @@ pub async fn append_locked_in(
     if ended.is_some() {
         // An answer handed to the run that it never took has nobody left
         // to take it.
-        sqlx::query("DELETE FROM parked_fire WHERE execution_id = $1").bind(execution_id).execute(&mut *conn).await?;
+        sqlx::query("DELETE FROM parked_fire WHERE run_id = $1").bind(run_id).execute(&mut *conn).await?;
         sqlx::query(
-            "INSERT INTO run_search_queue (execution_id) SELECT $1 FROM run WHERE execution_id = $1 AND recorded \
-             ON CONFLICT (execution_id) DO NOTHING",
+            "INSERT INTO run_search_queue (run_id) SELECT $1 FROM run WHERE run_id = $1 AND recorded \
+             ON CONFLICT (run_id) DO NOTHING",
         )
-        .bind(execution_id)
+        .bind(run_id)
         .execute(&mut *conn)
         .await?;
         sqlx::query(
-            "INSERT INTO storage_sweep (execution_id, tenant_id, enqueued_at_unix) \
-             SELECT execution_id, tenant_id, $2 FROM run WHERE execution_id = $1 AND wrote_files \
-             ON CONFLICT (execution_id) DO NOTHING",
+            "INSERT INTO storage_sweep (run_id, tenant_id, enqueued_at_unix) \
+             SELECT run_id, tenant_id, $2 FROM run WHERE run_id = $1 AND wrote_files \
+             ON CONFLICT (run_id) DO NOTHING",
         )
-        .bind(execution_id)
+        .bind(run_id)
         .bind(now)
         .execute(&mut *conn)
         .await?;
@@ -723,26 +821,26 @@ pub async fn append_locked_in(
     Ok(Appended::At(seq))
 }
 
-/// Write the answers handed to `execution_id` while a worker drove it
+/// Write the answers handed to `run_id` while a worker drove it
 /// (`weft_task_store::parked_fires::hand_answer_in`) into its record, as
 /// `SuspensionResolved` (or `SuspensionSkipped` for a skip) at
 /// `last_seq + 1`, and queue it for a worker to
 /// carry on, on the caller's transaction with its row locked as `locked`
 /// and no owner left (its worker just let go of it, or went away). Answers
 /// whether any were waiting; with none, nothing is written.
-pub async fn resolve_handed_in(conn: &mut PgConnection, execution_id: ExecutionId, locked: &Locked, writer: &str) -> anyhow::Result<bool> {
-    let handed = weft_task_store::parked_fires::answers_for(&mut *conn, execution_id).await?;
+pub async fn resolve_handed_in(conn: &mut PgConnection, run_id: RunId, locked: &Locked, writer: &str) -> anyhow::Result<bool> {
+    let handed = weft_task_store::parked_fires::answers_for(&mut *conn, run_id).await?;
     if handed.is_empty() {
         return Ok(false);
     }
     let at_unix = unix_now() as u64;
-    let resolved: Vec<ExecEvent> = handed
+    let resolved: Vec<RunEvent> = handed
         .into_iter()
-        .map(|(token, answer)| ExecEvent::wait_answered(execution_id, token, answer, at_unix))
+        .map(|(token, answer)| RunEvent::wait_answered(run_id, token, answer, at_unix))
         .collect();
-    match append_locked_in(conn, execution_id, locked, &resolved, writer, Then::Queued).await? {
+    match append_locked_in(conn, run_id, locked, &resolved, writer, Then::Queued).await? {
         Appended::At(_) => Ok(true),
-        other => anyhow::bail!("run {execution_id} was locked with no owner, yet the answers handed to it were not written: {other:?}"),
+        other => anyhow::bail!("run {run_id} was locked with no owner, yet the answers handed to it were not written: {other:?}"),
     }
 }
 
@@ -756,42 +854,42 @@ pub enum GaveUp {
     NotOwned,
 }
 
-/// End `execution_id`, a run `owner` drives but whose record it can no
+/// End `run_id`, a run `owner` drives but whose record it can no
 /// longer write (a write of it failed): its owner is cleared and, after
 /// the last row that landed, every charge its record leaves open is booked
 /// unknown (`crate::fold::unpriced_charges_closed`: the worker's own
 /// booking of them could not be written) and its ending, failed with
 /// `why`, is written, on the caller's transaction. Refused when `owner`
 /// does not drive it.
-pub async fn give_up_in(conn: &mut PgConnection, execution_id: ExecutionId, owner: &str, why: &str) -> anyhow::Result<GaveUp> {
-    let Some(mut locked) = lock_in(conn, execution_id).await? else { return Ok(GaveUp::NotOwned) };
+pub async fn give_up_in(conn: &mut PgConnection, run_id: RunId, owner: &str, why: &str) -> anyhow::Result<GaveUp> {
+    let Some(mut locked) = lock_in(conn, run_id).await? else { return Ok(GaveUp::NotOwned) };
     if locked.state != "running" || locked.owner.as_deref() != Some(owner) {
         return Ok(GaveUp::NotOwned);
     }
-    sqlx::query("UPDATE run SET owner = NULL WHERE execution_id = $1").bind(execution_id).execute(&mut *conn).await?;
+    sqlx::query("UPDATE run SET owner = NULL WHERE run_id = $1").bind(run_id).execute(&mut *conn).await?;
     locked.owner = None;
     let at_unix = unix_now() as u64;
     // A record that does not read still ends: the run's ending is what
     // matters most, and the charges it may leave open are said lost.
-    let mut writes = match read_record(&mut *conn, execution_id, None).await?.events(execution_id) {
+    let mut writes = match read_record(&mut *conn, run_id, None).await?.events(run_id) {
         Ok(record) => crate::fold::unpriced_charges_closed(
-            execution_id,
+            run_id,
             &record,
             "the run's record could not be written, so it ended before the job was read back",
             at_unix,
         ),
         Err(e) => {
             tracing::error!(
-                target: "weft_journal::record", %execution_id, error = %e,
+                target: "weft_journal::record", %run_id, error = %e,
                 "a run given up has a record that does not read; any charge it left open stays off its cost trail"
             );
             Vec::new()
         }
     };
-    writes.push(ExecEvent::ExecutionFailed { execution_id, error: why.to_string(), at_unix });
-    match append_locked_in(conn, execution_id, &locked, &writes, GAVE_UP, Then::Stays).await? {
+    writes.push(RunEvent::RunFailed { run_id, error: why.to_string(), at_unix });
+    match append_locked_in(conn, run_id, &locked, &writes, GAVE_UP, Then::Stays).await? {
         Appended::At(seq) => Ok(GaveUp::Ended(seq)),
-        other => anyhow::bail!("run {execution_id} was locked running with no owner, yet its ending was not written: {other:?}"),
+        other => anyhow::bail!("run {run_id} was locked running with no owner, yet its ending was not written: {other:?}"),
     }
 }
 
@@ -822,7 +920,7 @@ pub fn delivered_until(now: i64) -> i64 {
     now + weft_core::time_scale::scaled_secs(weft_task_store::worker_door::WORKER_LEASE_SECS)
 }
 
-/// Claim queued run `execution_id` of `project_id` for `owner`: it is
+/// Claim queued run `run_id` of `project_id` for `owner`: it is
 /// running, owned by `owner` under a raised epoch, and it counts as
 /// `owner`'s until [`delivered_until`] whatever its lease says; the tries
 /// its delivery counted (refusals, hand-offs with no answer, a stretch of
@@ -839,20 +937,20 @@ pub fn delivered_until(now: i64) -> i64 {
 /// under a new epoch: the answer of one that committed may have been lost
 /// on its way, and the worker never drives a run twice (it asks only for
 /// a run it is not driving), so nothing was written under the old epoch.
-pub async fn claim(conn: &mut PgConnection, execution_id: ExecutionId, project_id: uuid::Uuid, owner: &str) -> anyhow::Result<Option<Claimed>> {
+pub async fn claim(conn: &mut PgConnection, run_id: RunId, project_id: uuid::Uuid, owner: &str) -> anyhow::Result<Option<Claimed>> {
     // The row is locked first and its mark read off the version the lock
     // waited for (a `busy` that committed meanwhile included), then
     // cleared by the update, in one statement.
     let claimed: Option<ClaimedRow> = sqlx::query_as(
         "WITH was AS (SELECT waited_on_workers FROM run \
-                      WHERE execution_id = $1 AND project_id = $2 AND (state = 'queued' OR (state = 'running' AND owner = $3)) \
+                      WHERE run_id = $1 AND project_id = $2 AND (state = 'queued' OR (state = 'running' AND owner = $3)) \
                       FOR UPDATE) \
          UPDATE run SET state = 'running', owner = $3, epoch = epoch + 1, attempts = attempts + 1, delivered_until = $4, \
              refusals = 0, unreached = 0, busy_since = NULL, waited_on_workers = FALSE \
-         FROM was WHERE run.execution_id = $1 \
+         FROM was WHERE run.run_id = $1 \
          RETURNING run.epoch, run.attempts, run.definition_hash, run.cancel_requested, was.waited_on_workers",
     )
-    .bind(execution_id)
+    .bind(run_id)
     .bind(project_id)
     .bind(owner)
     .bind(delivered_until(unix_now()))
@@ -862,31 +960,21 @@ pub async fn claim(conn: &mut PgConnection, execution_id: ExecutionId, project_i
     if waited_on_workers {
         weft_task_store::unanswered::delivery_waits_ended(&mut *conn, project_id).await?;
     }
-    let definition_hash = definition_hash.ok_or_else(|| anyhow::anyhow!("run {execution_id} runs no program, so no worker can claim it"))?;
-    let record = read_record(conn, execution_id, None).await?;
+    let definition_hash = definition_hash.ok_or_else(|| anyhow::anyhow!("run {run_id} runs no program, so no worker can claim it"))?;
+    let record = read_record(conn, run_id, None).await?;
     Ok(Some(Claimed { epoch, attempts, definition_hash, cancel_requested: cancel_requested.map(|cause| cause.0), record }))
 }
 
-/// The record of `execution_id`: its rows after `after` (every row when
-/// `None`, with the selection its birth names).
-pub async fn read_record(conn: &mut PgConnection, execution_id: ExecutionId, after: Option<i32>) -> anyhow::Result<RawRecord> {
-    let selection = match after {
-        Some(_) => None,
-        None => sqlx::query_as::<_, (String, sqlx::types::Json<RunSelection>)>(
-            "SELECT s.digest, s.selection FROM run r JOIN run_selection s ON s.digest = r.selection WHERE r.execution_id = $1",
-        )
-        .bind(execution_id)
-        .fetch_optional(&mut *conn)
-        .await?
-        .map(|(digest, selection)| StoredSelection { digest, selection: selection.0 }),
-    };
+/// The record of `run_id`: its rows after `after` (every row when
+/// `None`).
+pub async fn read_record(conn: &mut PgConnection, run_id: RunId, after: Option<i32>) -> anyhow::Result<RawRecord> {
     let rows: Vec<(i32, Vec<u8>)> =
-        sqlx::query_as("SELECT seq, events FROM run_log WHERE execution_id = $1 AND seq > $2 ORDER BY seq")
-            .bind(execution_id)
+        sqlx::query_as("SELECT seq, events FROM run_log WHERE run_id = $1 AND seq > $2 ORDER BY seq")
+            .bind(run_id)
             .bind(after.unwrap_or(-1))
             .fetch_all(&mut *conn)
             .await?;
-    Ok(RawRecord { selection, rows: rows.into_iter().map(|(seq, events)| RunLogRow { seq, events }).collect() })
+    Ok(RawRecord { rows: rows.into_iter().map(|(seq, events)| RunLogRow { seq, events }).collect() })
 }
 
 fn unix_now() -> i64 {
@@ -911,8 +999,8 @@ mod base64_bytes {
 mod tests {
     use super::*;
 
-    fn run() -> ExecutionId {
-        ExecutionId::from_u128(3)
+    fn run() -> RunId {
+        RunId::from_u128(3)
     }
 
     /// An ending with no error and no cause carries neither key: the batch
@@ -920,11 +1008,11 @@ mod tests {
     /// a value no reader decodes.
     #[test]
     fn an_ending_without_a_cause_carries_no_cause() {
-        let completed = Ending::of(&ExecEvent::ExecutionCompleted { execution_id: run(), at_unix: 5 }).unwrap();
+        let completed = Ending::of(&RunEvent::RunCompleted { run_id: run(), at_unix: 5 }).unwrap();
         let wire = serde_json::to_value(&completed).unwrap();
         assert_eq!(wire, serde_json::json!({ "at": 5, "outcome": "completed" }));
         assert_eq!(serde_json::from_value::<Ending>(wire).unwrap(), completed);
-        let cancelled = Ending::of(&ExecEvent::ExecutionCancelled { execution_id: run(), reason: "stopped".into(), cause: Some(CancelCause::User), at_unix: 6 }).unwrap();
+        let cancelled = Ending::of(&RunEvent::RunCancelled { run_id: run(), reason: "stopped".into(), cause: Some(CancelCause::User), at_unix: 6 }).unwrap();
         assert!(serde_json::to_value(&cancelled).unwrap().get("cancel_cause").is_some());
     }
 
@@ -932,19 +1020,18 @@ mod tests {
     /// display read keeps every other row and names the bad one.
     #[test]
     fn a_bad_row_fails_the_strict_read_and_is_named_by_the_display_read() {
-        let execution_id = run();
-        let completed = ExecEvent::ExecutionCompleted { execution_id, at_unix: 2 };
+        let run_id = run();
+        let completed = RunEvent::RunCompleted { run_id, at_unix: 2 };
         let record = RawRecord {
-            selection: None,
             rows: vec![
                 RunLogRow { seq: 1, events: b"not zstd".to_vec() },
                 RunLogRow { seq: 2, events: crate::stored::encode(std::slice::from_ref(&completed)) },
             ],
         };
-        assert!(record.decode(execution_id).unwrap_err().contains(&execution_id.to_string()));
-        let (rows, bad) = record.decode_lossy(execution_id);
+        assert!(record.decode(run_id).unwrap_err().contains(&run_id.to_string()));
+        let (rows, bad) = record.decode_lossy(run_id);
         assert_eq!(rows.iter().map(|row| (row.seq, row.index)).collect::<Vec<_>>(), [(2, 0)]);
-        assert!(matches!(rows[0].event, ExecEvent::ExecutionCompleted { at_unix: 2, .. }));
+        assert!(matches!(rows[0].event, RunEvent::RunCompleted { at_unix: 2, .. }));
         assert_eq!(bad.len(), 1);
     }
 
@@ -953,9 +1040,9 @@ mod tests {
     /// ending stands.
     #[test]
     fn a_write_says_what_its_events_say() {
-        let execution_id = run();
-        let cost = |amount_usd| ExecEvent::CostReported {
-            execution_id,
+        let run_id = run();
+        let cost = |amount_usd| RunEvent::CostReported {
+            run_id,
             node_id: "llm".into(),
             frames: Vec::new(),
             cost_id: "c".into(),
@@ -971,16 +1058,16 @@ mod tests {
         let events = vec![
             cost(Some(0.25)),
             cost(None),
-            ExecEvent::NodeSkipped {
-                execution_id,
+            RunEvent::NodeSkipped {
+                run_id,
                 node_id: "x".into(),
                 frames: Vec::new(),
-                reason: weft_core::exec::skip::SkipReason::DidNotFlow,
+                reason: weft_core::run::skip::SkipReason::DidNotFlow,
                 at_unix: 1,
             },
-            ExecEvent::SuspensionResolved { execution_id, token: "t".into(), value: serde_json::Value::Null, at_unix: 2 },
-            ExecEvent::ExecutionFailed { execution_id, error: "boom".into(), at_unix: 3 },
-            ExecEvent::ExecutionCompleted { execution_id, at_unix: 4 },
+            RunEvent::SuspensionResolved { run_id, token: "t".into(), value: serde_json::Value::Null, at_unix: 2 },
+            RunEvent::RunFailed { run_id, error: "boom".into(), at_unix: 3 },
+            RunEvent::RunCompleted { run_id, at_unix: 4 },
         ];
         let written = Written::of(&events);
         assert_eq!(written.cost_micro_usd, 250_000);
@@ -989,22 +1076,20 @@ mod tests {
         assert_eq!(written.ended, Some(Ending { at: 3, outcome: Outcome::Failed, error: Some("boom".into()), cancel_cause: None }));
     }
 
-    /// A record read raw decodes to its events with their places, its
-    /// birth's selection resolved from what was read with it.
+    /// A record read raw decodes to its events with their places, and
+    /// crosses the wire whole.
     #[test]
     fn a_raw_record_decodes_with_its_places() {
-        let execution_id = run();
-        let selection = RecordedSelection::new(RunSelection::default());
-        let birth = ExecEvent::ExecutionStarted {
-            execution_id,
+        let run_id = run();
+        let birth = RunEvent::RunStarted {
+            run_id,
             project_id: uuid::Uuid::nil(),
             entry_node: "door".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("d".into()),
-            binary_hash: None,
+            binary_hash: None, cut_from: None, given: Default::default(),
             source_version: None,
-            run_kind: weft_core::exec::RunKind::Execution,
-            selection: Some(selection.clone()),
+            run_kind: weft_core::run::RunKind::Project,
             seed: None,
             instance: None,
             instance_values: Default::default(),
@@ -1013,20 +1098,17 @@ mod tests {
             settings: Default::default(),
             at_unix: 0,
         };
-        let done = ExecEvent::ExecutionCompleted { execution_id, at_unix: 1 };
+        let done = RunEvent::RunCompleted { run_id, at_unix: 1 };
         let record = RawRecord {
-            selection: Some(StoredSelection::of(&selection)),
             rows: vec![
                 RunLogRow { seq: 0, events: crate::stored::encode(std::slice::from_ref(&birth)) },
                 RunLogRow { seq: 1, events: crate::stored::encode(std::slice::from_ref(&done)) },
             ],
         };
-        let rows = record.decode(execution_id).unwrap();
+        let rows = record.decode(run_id).unwrap();
         assert_eq!(rows.iter().map(|row| (row.seq, row.index)).collect::<Vec<_>>(), vec![(0, 0), (1, 0)]);
-        assert!(matches!(&rows[0].event, ExecEvent::ExecutionStarted { selection: Some(read), .. } if *read == selection));
+        assert!(matches!(&rows[0].event, RunEvent::RunStarted { entry_node, .. } if entry_node == "door"));
         let wire = serde_json::to_string(&record).unwrap();
         assert_eq!(serde_json::from_str::<RawRecord>(&wire).unwrap(), record, "a record crosses the wire whole");
-        let without = RawRecord { selection: None, ..record };
-        assert!(without.decode(execution_id).unwrap_err().contains(selection.digest()), "a birth needs its selection");
     }
 }

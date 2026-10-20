@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 
 use weft::storage::FileHandle;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct MediaDisplayNode;
@@ -28,7 +28,7 @@ impl Node for MediaDisplayNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         // The media union on the port already guarantees this is
         // displayable media; the only thing left to enforce is that it
         // carries a handle the preview can resolve (a storage key or

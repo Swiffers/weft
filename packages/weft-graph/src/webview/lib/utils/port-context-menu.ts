@@ -6,6 +6,7 @@
 
 import { untrack } from 'svelte';
 import type { PortDefinition } from '../types';
+import { declarationProblem, type DeclarationRule, type InputRequiredness } from '../projection/header-ports';
 
 /// An informational row (a role header, an explainer, a conflict
 /// reason): plain text, no click handler, not in the tab order, and a
@@ -32,10 +33,17 @@ export interface PortMenuAction {
 	/// SHOW than to name: the gate's flip draws the mark it will leave
 	/// behind, so the row reads "click this to get that".
 	icon?: string;
-	editable?: {
-		value: string;
-		onCommit: (newValue: string) => void;
-	};
+	editable?: TypeEditor;
+}
+
+/** The inline editor an editable row swaps itself for. `check` answers
+ *  why a value may not be committed (shown under the input, which stays
+ *  open), or null; `hint` is a line shown under the input from the start. */
+export interface TypeEditor {
+	value: string;
+	onCommit: (newValue: string) => void;
+	check?: (newValue: string) => string | null;
+	hint?: string;
 }
 
 export type PortMenuItem = PortMenuNote | PortMenuAction;
@@ -43,16 +51,19 @@ export type PortMenuItem = PortMenuNote | PortMenuAction;
 /** Parameters for the shared port menu builder. Both ProjectNode and GroupNode
  *  call `buildPortMenuItems` with their own port + callbacks so the menu
  *  content stays identical across all port surfaces in the graph. */
-/** The side of the port, and with it the ONE writer only an input
- *  has: requiredness has no runtime meaning on an output, so an output
- *  caller cannot be handed the writer (the type forbids it) and an input
- *  caller cannot forget it (the type requires it). The writer sets the
- *  port's requiredness to exactly the value the menu row promised; the
- *  menu is a frozen snapshot, so a toggle against LIVE state could
- *  write the opposite after a reparse landed under the open menu. */
+/** The side of the port, and with it what only an input has: where
+ *  its requiredness stands (`nodeInputRequiredness` for a node input;
+ *  a container port is `required` or `optional`) and the ONE writer.
+ *  Requiredness has no runtime meaning on an output, so an output caller
+ *  cannot be handed either (the type forbids it) and an input caller
+ *  cannot forget them (the type requires them). The writer makes the
+ *  port exactly what the menu row promised (`true`: written `x:`,
+ *  `false`: written `x?:`); the menu is a frozen snapshot, so a toggle
+ *  against LIVE state could write the opposite after a reparse landed
+ *  under the open menu. */
 export type PortMenuSide =
-	| { side: 'input'; onSetRequired: (required: boolean) => void }
-	| { side: 'output'; onSetRequired?: never };
+	| { side: 'input'; requiredness: InputRequiredness; onSetRequired: (required: boolean) => void }
+	| { side: 'output'; requiredness?: never; onSetRequired?: never };
 
 export interface BasePortMenuOptions {
 	port: PortDefinition;
@@ -68,12 +79,17 @@ export interface BasePortMenuOptions {
 	 *  emitter must not write into the header. */
 	configDerived?: boolean;
 	onSetType: (newType: string) => void;
+	/** What the program may declare on this port (`declarationRule` from
+	 *  projection/header-ports): absent or `free` takes any type, `fits`
+	 *  only one that fits its bound, and `fixed` offers no type edit at
+	 *  all (the node always gives the output its own type). */
+	typeRule?: DeclarationRule;
 	onRemove: () => void;
 	/** Loop-specific role context. Set ONLY when the menu is being built for
 	 *  a port on a Loop container; the strip surfaces the four derived roles
 	 *  (broadcast / iter / gather / carry) and lets the user cycle the port
 	 *  to the legal alternatives. The handlers translate the chosen role to
-	 *  the right cascade of setConfig / updateGroupPorts ops. */
+	 *  the right cascade of set_config / update_group_ports ops. */
 	loopRole?: LoopPortRoleContext;
 	/** Set ONLY on an input whose value each instance could fill: not wired,
 	 *  not a `_` key, not on an include. The menu then offers the same
@@ -208,41 +224,68 @@ export function buildPortMenuItems(opts: BuildPortMenuOptions): PortMenuItem[] {
 
 	if (opts.instanceFilled) items.push(instanceFilledMenuItem(opts.instanceFilled));
 
-	// Required toggle (inputs only; outputs do not have runtime required
-	// semantics, and only an input caller hands over the writer). An input
-	// required only once wired has its requiredness decided by its wiring
-	// (the compiler refuses a header making it required), so it says so
-	// instead of offering the toggle.
-	if (opts.side === 'input' && port.requiredWhenWired) {
-		items.push({
-			label: 'Required when wired, optional while unwired: its wiring decides.',
-			note: true,
-			color: '#71717a',
-		});
-	} else if (opts.side === 'input') {
+	// Requiredness rows (inputs only; outputs do not have runtime required
+	// semantics, and only an input caller hands over the writer). One the
+	// node requires cannot be made optional (the compiler refuses `x?:`
+	// there, since the node's code needs it), so it says so. One the
+	// program never wrote changes with its wiring, so it says that, and
+	// offers both written states.
+	if (opts.side === 'input') {
 		const setRequired = opts.onSetRequired;
-		items.push({
-			label: port.required ? '☐ Make optional' : '☑ Make required',
-			onClick: () => setRequired(!port.required),
-		});
+		const makeRequired: PortMenuAction = { label: '☑ Make required', onClick: () => setRequired(true) };
+		switch (opts.requiredness) {
+			case 'node_requires':
+				items.push({ label: 'Required: this node’s code needs it.', note: true, color: '#71717a' });
+				break;
+			case 'required':
+				items.push({ label: '☐ Make optional', onClick: () => setRequired(false) });
+				break;
+			case 'optional':
+				items.push(makeRequired);
+				break;
+			case 'wiring':
+				items.push({
+					label: 'Optional while unwired; once wired, the node skips if its wire delivers nothing.',
+					note: true,
+					color: '#71717a',
+				});
+				items.push(makeRequired);
+				items.push({ label: '☐ Make optional, even when wired', onClick: () => setRequired(false) });
+				break;
+		}
 	}
 
 	// Type edit. Click swaps the row in place for an `<input>`; Enter
 	// commits, Escape cancels, blur commits. We can't use the browser
-	// `prompt()` here because VS Code webviews block it.
-	items.push({
-		label: `✎ Type: ${port.portType}`,
-		onClick: () => {/* handled by the editable path */},
-		editable: {
-			value: port.portType,
-			onCommit: (newValue) => {
-				const trimmed = newValue.trim();
-				if (trimmed && trimmed !== port.portType) {
-					onSetType(trimmed);
-				}
+	// `prompt()` here because VS Code webviews block it. An output the
+	// node always gives its own type says so instead.
+	const rule: DeclarationRule = opts.typeRule ?? { kind: 'free' };
+	if (rule.kind === 'fixed') {
+		items.push({
+			label: `Type: ${port.portType} (this node always gives it this type)`,
+			note: true,
+			color: '#71717a',
+		});
+	} else {
+		items.push({
+			label: `✎ Type: ${port.portType}`,
+			onClick: () => {/* handled by the editable path */},
+			editable: {
+				value: port.portType,
+				check: (newValue) => {
+					const trimmed = newValue.trim();
+					return trimmed && trimmed !== port.portType ? declarationProblem(rule, trimmed) : null;
+				},
+				...(rule.kind === 'fits' && rule.narrowable ? { hint: `Any type that fits in ${rule.bound}` } : {}),
+				onCommit: (newValue) => {
+					const trimmed = newValue.trim();
+					if (trimmed && trimmed !== port.portType) {
+						onSetType(trimmed);
+					}
+				},
 			},
-		},
-	});
+		});
+	}
 
 	// Delete, labeled by what it will DO (see portDeleteAction): a
 	// custom port truly goes; an override drops back to its catalog
@@ -364,7 +407,7 @@ function createPortContextMenu(
 			row.appendChild(btn);
 		};
 
-		const renderInput = (edit: { value: string; onCommit: (newValue: string) => void }) => {
+		const renderInput = (edit: TypeEditor) => {
 			// Once settled (committed or discarded), nothing commits again.
 			let settled = false;
 			row.innerHTML = '';
@@ -376,6 +419,10 @@ function createPortContextMenu(
 			input.placeholder = 'Type name (e.g. String, List[Number])';
 			input.style.cssText = 'width:100%;box-sizing:border-box;font-size:12px;font-family:inherit;padding:4px 6px;border:1px solid #d4d4d8;border-radius:4px;background:white;color:#18181b;outline:none;';
 			input.addEventListener('focus', () => { input.style.borderColor = '#71717a'; });
+			// Under the input: the hint, replaced by why a value was refused.
+			const note = document.createElement('div');
+			note.style.cssText = 'padding:4px 2px 0;font-size:11px;color:#71717a;white-space:normal;max-width:320px;';
+			if (edit.hint) note.textContent = edit.hint;
 			input.addEventListener('blur', commit);
 			input.addEventListener('keydown', (e) => {
 				if (e.key === 'Enter') {
@@ -395,11 +442,21 @@ function createPortContextMenu(
 			});
 			function commit() {
 				if (settled || disposed) return;
+				// A refused value keeps the input open, saying why, so the
+				// author fixes it instead of losing what they typed.
+				const problem = edit.check?.(input.value);
+				if (problem) {
+					note.textContent = problem;
+					note.style.color = '#ef4444';
+					input.style.borderColor = '#ef4444';
+					return;
+				}
 				settled = true;
 				edit.onCommit(input.value);
 				onClose();
 			}
 			wrap.appendChild(input);
+			if (edit.hint || edit.check) wrap.appendChild(note);
 			row.appendChild(wrap);
 			// Defer focus + select to next tick so the click that
 			// triggered the swap doesn't immediately blur the input.

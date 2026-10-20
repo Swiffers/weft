@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use weft::node::NodeOutput;
 use weft::signal::{PollDelta, PollEndpoint, Predicate};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct TelegramReceiveMessageNode;
@@ -46,7 +46,7 @@ impl Node for TelegramReceiveMessageNode {
         tests::tests()
     }
 
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn setup_trigger(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let chat_id: Option<String> = ctx.inputs.opt("chatId")?;
         let keyword: Option<String> = ctx.inputs.opt("keyword")?;
@@ -87,7 +87,7 @@ impl Node for TelegramReceiveMessageNode {
         .await
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let wake = ctx.wake.record()?;
         let message = &wake["item"]["message"];
         let text = message["text"].as_str().unwrap_or_default().to_string();

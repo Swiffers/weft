@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs"
 import { readdir, readFile } from "node:fs/promises"
 import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 
@@ -47,19 +48,31 @@ const projectRoot = async (start: string) => {
 }
 
 const INCLUDE = /@include\(\s*"([^"]+)"\s*\)/g
+const CATALOG_PREFIX = "__catalog/"
 
 // The file to validate for an edit to a `.weft` file: the project's entry
 // `src/main.weft` when the file is that entry or is pulled in by it, directly
 // or through other includes (an included file checked alone misses what its
 // includer wires into it, and reports false errors such as an unmet required
 // port); the file itself when nothing includes it. An `@include` path is
-// relative to the file that writes it.
+// relative to the file that writes it, except one starting `__catalog/`, which
+// is measured from the project's `nodes/` wherever it is written.
+// A path with its links followed, the way the compiler reads it. A path
+// that does not exist is compared as written: it leads nowhere either way.
+const real = (path: string) => {
+  try {
+    return realpathSync(path)
+  } catch {
+    return path
+  }
+}
+
 const entryFor = async (root: string, edited: string) => {
   const entry = join(root, "src", "main.weft")
   if (!(await Bun.file(entry).exists())) return edited
-  const want = resolve(edited)
+  const want = real(resolve(edited))
   const seen = new Set<string>()
-  const stack = [resolve(entry)]
+  const stack = [real(resolve(entry))]
   while (stack.length) {
     const current = stack.pop() as string
     if (seen.has(current)) continue
@@ -74,7 +87,31 @@ const entryFor = async (root: string, edited: string) => {
     }
     for (const line of text.split("\n")) {
       if (line.trimStart().startsWith("#")) continue
-      for (const match of line.matchAll(INCLUDE)) stack.push(resolve(dirname(current), match[1]))
+      for (const match of line.matchAll(INCLUDE)) {
+        const written = match[1]
+        if (!written.startsWith(CATALOG_PREFIX)) {
+          stack.push(real(resolve(dirname(current), written)))
+          continue
+        }
+        // The rest is normalized on its own, the way the compiler reads it:
+        // any `..` that climbs out of `nodes/` (even one that comes back in)
+        // is refused there, so it leads nowhere here.
+        const parts: string[] = []
+        let escapes = false
+        for (const part of written.slice(CATALOG_PREFIX.length).split("/")) {
+          if (part === "" || part === ".") continue
+          if (part === "..") {
+            if (parts.length === 0) {
+              escapes = true
+              break
+            }
+            parts.pop()
+            continue
+          }
+          parts.push(part)
+        }
+        if (!escapes) stack.push(real(join(root, "nodes", ...parts)))
+      }
     }
   }
   return edited
@@ -194,20 +231,51 @@ const validate = async (root: string, target: string, nodeEdit: boolean) => {
   }
 
   try {
-    const diagnostics = JSON.parse(stdout).diagnostics ?? []
+    const answer = JSON.parse(stdout)
+    const diagnostics = answer.diagnostics ?? []
+    // Errors, minus the rule-runtime findings (a provider with no model named
+    // yet, and cousins): those are fixed by a pick, never by a source edit.
+    // One warning rides along: `level-too-large`, the compiler saying a level
+    // of the graph is becoming a wall.
     let findings = diagnostics.filter((diagnostic: any) =>
       (diagnostic.severity === "error" && diagnostic.code !== "rule-runtime") ||
       (diagnostic.severity === "warning" && diagnostic.code === "level-too-large"),
     )
     if (nodeEdit) findings = await dropUnwritten(root, target, findings)
-    if (!findings.length) return
-    return "weft validation feedback:\n" + findings.map((diagnostic: any) =>
-      `  ${diagnostic.file ?? target}:${diagnostic.line ?? "?"}:${diagnostic.column ?? "?"} [${diagnostic.code ?? "diagnostic"}] ${diagnostic.message ?? ""}`,
-    ).join("\n")
+    // Names the model chose that are spelled off the weft way: the
+    // compiler's `not-camel-case` (the program's names), and, after a node
+    // edit, the catalog's spelling warnings (a node's metadata.json). The
+    // catalog lines carry no code, so they are picked by their `kind`.
+    // They get their own heading, so the model tells law-breaking from
+    // spelling at a glance.
+    const spelling = diagnostics.filter((diagnostic: any) =>
+      diagnostic.severity === "warning" && diagnostic.code === "not-camel-case",
+    )
+    const catalogSpelling: string[] = nodeEdit
+      ? (answer.warnings ?? [])
+          .filter((warning: unknown): warning is { kind: string; message: string } =>
+            typeof warning === "object" && warning !== null && (warning as { kind?: unknown }).kind === "spelling",
+          )
+          .map((warning) => warning.message)
+      : []
+    if (!findings.length && !spelling.length && !catalogSpelling.length) return
+    const sections: string[] = []
+    if (findings.length) sections.push("weft validation feedback:\n" + findings.map(formatFinding(target)).join("\n"))
+    if (spelling.length || catalogSpelling.length) {
+      const count = spelling.length + catalogSpelling.length
+      sections.push(
+        `weft: ${count} spelling warning${count === 1 ? "" : "s"} (the program runs; rename to the spelling given):\n` +
+          [...spelling.map(formatFinding(target)), ...catalogSpelling.map((warning) => `  ${warning}`)].join("\n"),
+      )
+    }
+    return sections.join("\n")
   } catch {
     return
   }
 }
+
+const formatFinding = (target: string) => (diagnostic: any) =>
+  `  ${diagnostic.file ?? target}:${diagnostic.line ?? "?"}:${diagnostic.column ?? "?"} [${diagnostic.code ?? "diagnostic"}] ${diagnostic.message ?? ""}`
 
 const plugin = async ({ directory }: { directory: string }) => ({
   "tool.execute.after": async (input: { tool: string; args?: any }, output: { output: string; metadata?: any }) => {

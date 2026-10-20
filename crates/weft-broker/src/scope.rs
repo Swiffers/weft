@@ -29,7 +29,7 @@ use tokio::sync::Mutex;
 use crate::auth::CallerIdentity;
 
 /// Cache size per resource kind. 100k is well above any realistic
-/// active-execution count and avoids the perf cliff DashMap's "drop
+/// active-run count and avoids the perf cliff DashMap's "drop
 /// half the iter" eviction was producing.
 const CACHE_CAPACITY: usize = 100_000;
 
@@ -44,7 +44,7 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 #[derive(Clone)]
 pub struct ScopeCache {
     project_to_tenant: Arc<Mutex<LruCache<uuid::Uuid, (String, Instant)>>>,
-    execution_id_to_scope: Arc<Mutex<LruCache<weft_core::ExecutionId, (ExecutionScope, Instant)>>>,
+    run_id_to_scope: Arc<Mutex<LruCache<weft_core::RunId, (RunScope, Instant)>>>,
     signal_to_scope: Arc<Mutex<LruCache<String, (ProjectScope, Instant)>>>,
 }
 
@@ -53,7 +53,7 @@ impl ScopeCache {
         let cap = NonZeroUsize::new(CACHE_CAPACITY).expect("non-zero capacity");
         Self {
             project_to_tenant: Arc::new(Mutex::new(LruCache::new(cap))),
-            execution_id_to_scope: Arc::new(Mutex::new(LruCache::new(cap))),
+            run_id_to_scope: Arc::new(Mutex::new(LruCache::new(cap))),
             signal_to_scope: Arc::new(Mutex::new(LruCache::new(cap))),
         }
     }
@@ -103,7 +103,7 @@ pub async fn require_project_owned_by(
     Ok(owner.tenant)
 }
 
-/// WHOSE an execution is: the tenant that owns it and the project it
+/// WHOSE a run is: the tenant that owns it and the project it
 /// belongs to. One row answers both, so they are read together and
 /// can never be a stale tenant against a live project.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,36 +112,36 @@ pub struct ProjectScope {
     pub project: uuid::Uuid,
 }
 
-/// WHOSE an execution is, and who it is for: its project scope, plus the
+/// WHOSE a run is, and who it is for: its project scope, plus the
 /// instance its run was started for (`run.instance_id`, born with the run
 /// and never changed). What every worker call about a run
 /// resolves to, so an instance's pick, copy or storage is found from the
 /// run itself and never from anything the worker says.
 #[derive(Debug, Clone)]
-pub struct ExecutionScope {
+pub struct RunScope {
     pub tenant: String,
     pub project: uuid::Uuid,
     pub instance: Option<weft_core::instance::InstanceId>,
 }
 
-impl ExecutionScope {
+impl RunScope {
     pub fn project_scope(&self) -> ProjectScope {
         ProjectScope { tenant: self.tenant.clone(), project: self.project }
     }
 }
 
-/// Resolve who `execution_id` belongs to, enforcing ownership. See
+/// Resolve who `run_id` belongs to, enforcing ownership. See
 /// `require_project_owned_by` for the tenant-vs-control-plane rule. A
 /// worker writes a run's record before any call that names it, so a run
 /// the broker cannot find is no run of the caller's.
-pub async fn require_execution_id_scope(
+pub async fn require_run_id_scope(
     cache: &ScopeCache,
     pool: &PgPool,
     caller: &CallerIdentity,
-    execution_id: weft_core::ExecutionId,
-) -> Result<ExecutionScope, (StatusCode, String)> {
-    let scope = lookup_execution_id_scope(cache, pool, execution_id).await?;
-    enforce_scope(caller, "execution_id", &execution_id.to_string(), &scope.project_scope())?;
+    run_id: weft_core::RunId,
+) -> Result<RunScope, (StatusCode, String)> {
+    let scope = lookup_run_id_scope(cache, pool, run_id).await?;
+    enforce_scope(caller, "run_id", &run_id.to_string(), &scope.project_scope())?;
     Ok(scope)
 }
 
@@ -213,7 +213,7 @@ fn enforce_scope(
     Ok(())
 }
 
-async fn lookup_project_tenant(
+pub(crate) async fn lookup_project_tenant(
     cache: &ScopeCache,
     pool: &PgPool,
     project_id: uuid::Uuid,
@@ -238,27 +238,27 @@ async fn lookup_project_tenant(
     Ok(tenant)
 }
 
-async fn lookup_execution_id_scope(
+pub(crate) async fn lookup_run_id_scope(
     cache: &ScopeCache,
     pool: &PgPool,
-    execution_id: weft_core::ExecutionId,
-) -> Result<ExecutionScope, (StatusCode, String)> {
-    if let Some(scope) = cache_get(&cache.execution_id_to_scope, &execution_id).await {
+    run_id: weft_core::RunId,
+) -> Result<RunScope, (StatusCode, String)> {
+    if let Some(scope) = cache_get(&cache.run_id_to_scope, &run_id).await {
         return Ok(scope);
     }
     let row: Option<(String, uuid::Uuid, Option<String>)> =
-        sqlx::query_as("SELECT tenant_id, project_id, instance_id FROM run WHERE execution_id = $1")
-            .bind(execution_id)
+        sqlx::query_as("SELECT tenant_id, project_id, instance_id FROM run WHERE run_id = $1")
+            .bind(run_id)
             .fetch_optional(pool)
             .await
             .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("run lookup")))?;
-    let (tenant, project, instance) = row.ok_or((StatusCode::NOT_FOUND, "unknown execution".into()))?;
+    let (tenant, project, instance) = row.ok_or((StatusCode::NOT_FOUND, "unknown run".into()))?;
     let instance = instance
         .map(weft_core::instance::InstanceId::new)
         .transpose()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("corrupt run.instance_id: {e}")))?;
-    let scope = ExecutionScope { tenant, project, instance };
-    cache_put(&cache.execution_id_to_scope, execution_id, scope.clone()).await;
+    let scope = RunScope { tenant, project, instance };
+    cache_put(&cache.run_id_to_scope, run_id, scope.clone()).await;
     Ok(scope)
 }
 

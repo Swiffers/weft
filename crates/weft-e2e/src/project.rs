@@ -113,15 +113,15 @@ impl Project {
     pub fn definition(&self) -> Result<weft_core::ProjectDefinition> {
         let project = weft_compiler::project::Project::load(&self.dir)
             .map_err(|e| anyhow::anyhow!("load {}: {e}", self.dir.display()))?;
-        let (definition, _) = weft_compiler::hash::load_enriched_project(&project)
+        let (definition, _) = weft_compiler::hash::load_program(&project)
             .map_err(|e| anyhow::anyhow!("compile {}: {e}", self.dir.display()))?;
         Ok(definition)
     }
 
     /// Observe a run to its end and read it through this program, so
     /// every node in an assertion is spelled the way the source reads.
-    pub async fn settled(&self, execution_id: Uuid) -> Result<crate::run::SettledRun> {
-        Ok(crate::run::SettledRun::observe(&self.disp, execution_id).await?.reading(self.definition()?))
+    pub async fn settled(&self, run_id: Uuid) -> Result<crate::run::SettledRun> {
+        Ok(crate::run::SettledRun::observe(&self.disp, run_id).await?.reading(self.definition()?))
     }
 
     /// The temp working directory (where `weft` runs).

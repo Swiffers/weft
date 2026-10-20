@@ -266,13 +266,13 @@ pub const INFRA_STATUS_CHANNEL: &str = "weft_infra_status";
 /// `tenant:<tenant>` for a connection shared across the tenant's projects.
 pub const ACCESS_CHANNEL: &str = "weft_access";
 
-/// Announced with `<project id> <execution id>` when a running execution
+/// Announced with `<project id> <run id>` when a running run
 /// is asked to stop: the worker driving it fires its flag
 /// (`weft_task_store::runs`).
 pub use weft_task_store::runs::CANCEL_CHANNEL;
 
-/// Announced with `<project id> <execution id>` when an answer is handed to
-/// a running execution (and with a project's id alone when an event waits
+/// Announced with `<project id> <run id>` when an answer is handed to
+/// a running run (and with a project's id alone when an event waits
 /// for its trigger, which rides no line): the worker driving the run reads
 /// its answers (`weft_task_store::parked_fires`).
 pub use weft_task_store::parked_fires::PARKED_FIRE_CHANNEL;

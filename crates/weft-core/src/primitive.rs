@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ExecutionId;
+use crate::RunId;
 
 // ----- Wake signals (unified trigger + suspension mechanism) ----------
 //
@@ -29,7 +29,7 @@ use crate::ExecutionId;
 // or match dispatch.
 
 /// A wake-signal instance ready to be registered. Per-kind config
-/// only; lifecycle metadata (entry vs resume, owning execution)
+/// only; lifecycle metadata (entry vs resume, owning run)
 /// rides the dispatcher's `PrepareRequest`, not the spec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalSpec {
@@ -67,11 +67,17 @@ pub struct SignalSpec {
     /// every public entry. Default = the language defaults.
     #[serde(default, skip_serializing_if = "crate::signal::EntryLimits::is_default")]
     pub limits: crate::signal::EntryLimits,
-    /// How the executions this signal starts are kept
+    /// How the runs this signal starts are kept
     /// (`crate::run_settings`): fast or durable, recorded or not. Set by whatever registers the signal; written
     /// beside the other fields, each default left out.
     #[serde(flatten)]
     pub settings: crate::run_settings::RunSettings,
+    /// The last call a run's wait sends if its run is cancelled while it
+    /// waits (`crate::signal::cancel_call`). Kind-independent like
+    /// `access`, which it is sent as. A run's wait only: an entry trigger
+    /// has no run to cancel, and its registration is refused.
+    #[serde(default, rename = "onCancel", skip_serializing_if = "Option::is_none")]
+    pub on_cancel: Option<crate::signal::CancelCall>,
 }
 
 /// Preparing an entry captures it; waiting on a signal registers a live
@@ -101,6 +107,7 @@ impl SignalSpec {
             match_predicates: Vec::new(),
             limits: crate::signal::EntryLimits::default(),
             settings: crate::run_settings::RunSettings::default(),
+            on_cancel: None,
         }
     }
 }
@@ -265,40 +272,50 @@ impl SignalRouting {
     }
 }
 
-// ----- Execution snapshot ---------------------------------------------
+// ----- Run snapshot ---------------------------------------------
 
-/// An execution's state as the journal fold rebuilds it: the pulse
-/// table, the per-node execution records, the loop instances, the
+/// A run's state as the journal fold rebuilds it: the pulse
+/// table, the per-node firing records, the loop instances, the
 /// kicks, and the active suspensions. Everything a fresh worker needs
 /// to resume; the fold is the only writer, and a resume never reads
 /// anything the fold did not derive from the journal's rows plus the
 /// program. Never persisted: replay is the source of truth.
 #[cfg(feature = "runtime")]
 #[derive(Debug, Clone)]
-pub struct ExecutionSnapshot {
-    pub execution_id: ExecutionId,
-    /// The immutable selection and supplied inputs recorded at birth.
-    pub selection: Option<crate::project::selection::RunSelection>,
-    /// The worker binary the run was born on (`ExecutionStarted`): with
+pub struct RunSnapshot {
+    pub run_id: RunId,
+    /// Every scope copy decided so far (`crate::run::scope`): derived
+    /// from the pulses, never from a row of its own.
+    pub scopes: crate::run::scope::ScopeTable,
+    /// The worker binary the run was born on (`RunStarted`): with
     /// the definition hash it names the program identity, read from the
     /// project's stored code when reuse needs it.
     pub binary_hash: Option<String>,
+    /// The hash of the program the run runs (`RunStarted`): its cut, for
+    /// a run of a cut.
+    pub definition_hash: Option<String>,
+    /// The registered program the run's own was cut from (`RunStarted`),
+    /// for a run of a cut: the program its results are held against when
+    /// a seed reuses them.
+    pub cut_from: Option<String>,
+    /// What the run is given at the places its program says (`RunStarted`).
+    pub given: std::sync::Arc<crate::project::Given>,
     /// Chosen history includes bodies of zero-iteration loops, which have no
     /// firing record on which to store an origin.
-    pub inherited_origins: std::collections::BTreeMap<crate::frames::Located, ExecutionId>,
+    pub inherited_origins: std::collections::BTreeMap<crate::frames::Located, RunId>,
     pub pulses: crate::pulse::PulseTable,
-    pub executions: crate::exec::NodeExecutionTable,
+    pub firings: crate::run::NodeFiringTable,
     pub suspensions: HashMap<String, SuspensionInfo>,
     /// Every loop instance, as the fold drove it from the loop rows.
     /// A resumed worker takes it over as its own runtime.
-    pub loop_runtime: crate::exec::loop_runtime::LoopRuntime,
-    /// Nodes kicked into this execution, keyed by where they fire. The
+    pub loop_runtime: crate::run::loop_runtime::LoopRuntime,
+    /// Nodes kicked into this run, keyed by where they fire. The
     /// scheduler dispatches a kicked node once even when it has no
     /// wired pending inputs (it IS an entry point). Folded from
-    /// `ExecEvent::NodeKicked` (the run's roots, at frames `[]`), from
-    /// a group's In boundary firing (the body's roots, at the group's
-    /// frames) and from `ExecEvent::LoopIterationLaunched` (a loop
-    /// body's roots, at the iteration's frames). `dispatched=true` once
+    /// `RunEvent::NodeKicked` (the run's roots, at frames `[]`), from
+    /// a scope's copy opening (its members no wire feeds, at its frames)
+    /// and from `RunEvent::LoopIterationLaunched` (a loop body's roots,
+    /// at the iteration's frames). `dispatched=true` once
     /// the engine has consumed the kick (the node started at that
     /// location; further kicks at the same location are a no-op).
     pub kicked: HashMap<crate::frames::FiringLocation, KickedNode>,
@@ -352,24 +369,24 @@ pub struct JournalCorruption {
 // SYNC: CorruptionSite <-> packages/weft-graph/src/protocol.ts CorruptionSite
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CorruptionSite {
-    /// `ExecEvent::PortEmitted` could not be put on the wires (the
+    /// `RunEvent::PortEmitted` could not be put on the wires (the
     /// program has no such node or port, or a wire cannot read the
     /// value).
     PortEmitted,
-    /// `ExecEvent::PortClosed` names a port the program does not
+    /// `RunEvent::PortClosed` names a port the program does not
     /// declare.
     PortClosed,
-    /// `ExecEvent::PulsesConsumed` fold path (`parse_absorbed_ids` on
+    /// `RunEvent::PulsesConsumed` fold path (`parse_absorbed_ids` on
     /// `pulse_ids`).
     PulsesConsumed,
     /// A node lifecycle row (`NodeStarted`, a terminal) names a node
     /// the program does not have, or a firing the fold has no record
     /// for.
     NodeLifecycle,
-    /// `ExecEvent::LoopInstantiated` arrived for a LoopIn the program
+    /// `RunEvent::LoopInstantiated` arrived for a LoopIn the program
     /// does not have, or its config and inputs do not make a loop.
     LoopInstantiated,
-    /// `ExecEvent::LoopStreamEnded` arrived for a `LoopInstanceKey`
+    /// `RunEvent::LoopStreamEnded` arrived for a `LoopInstanceKey`
     /// with no preceding `LoopInstantiated`. Writer-order bug or row
     /// loss.
     LoopStreamEnded,
@@ -383,7 +400,11 @@ pub enum CorruptionSite {
     /// `LoopTerminated` arrived for a `LoopInstanceKey` with no preceding
     /// `LoopInstantiated`, or its outward emit cannot be rebuilt.
     LoopTerminated,
-    /// A journal row whose JSON no longer decodes to any `ExecEvent`
+    /// `RunEvent::RunStarted` gives the run values at places its program
+    /// does not say it is given something, or misses one it says
+    /// (`weft_core::project::Given::check_against`).
+    RunGiven,
+    /// A journal row whose JSON no longer decodes to any `RunEvent`
     /// at all (the display read surfaces it; state-rebuilding reads
     /// refuse the whole log instead).
     UndecodableRow,
@@ -431,7 +452,7 @@ pub enum AwaitedEntryKind {
 
 /// How a past `ctx.await_signal` ended. The first ending on record
 /// stands: an answer that comes after a wait was given up is ignored.
-// SYNC: AwaitEnd <-> extension-vscode/src/execFollower.ts AwaitEnd
+// SYNC: AwaitEnd <-> extension-vscode/src/runFollower.ts AwaitEnd
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AwaitEnd {
@@ -440,8 +461,8 @@ pub enum AwaitEnd {
     /// The run held it in its worker and gave it up
     /// (`SuspensionGaveUp`): the call failed with `error`.
     GaveUp { error: String },
-    /// A person skipped it (`SuspensionSkipped`): the call ends its step
-    /// skipped ([`crate::error::WeftError::WaitSkipped`]).
+    /// A person skipped it (`SuspensionSkipped`): the call ends its node's
+    /// firing skipped ([`crate::error::WeftError::WaitSkipped`]).
     Skipped,
 }
 
@@ -467,7 +488,7 @@ impl WaitAnswer {
 
 /// The error a waiting call returns when a person skipped it.
 pub fn wait_skipped() -> crate::error::WeftError {
-    crate::error::WeftError::WaitSkipped("a person skipped what this step was waiting for".into())
+    crate::error::WeftError::WaitSkipped("a person skipped what this node was waiting for".into())
 }
 
 /// What a body's `ctx.await_signal` finds in its journal at its call
@@ -480,10 +501,30 @@ pub enum ReplayedAwait {
     Pending { token: String },
 }
 
+/// The steps of a firing's journal a new firing of the same code may
+/// replay (a seeded run re-running a node, `weft run --seed`): in call
+/// order from the first, every `ctx.run` and every wait somebody
+/// answered, up to the first wait that was not (still open, given up,
+/// skipped) or a gap in the order. The new firing asks that one again.
+pub fn answered_steps(entries: &[AwaitedEntry]) -> Vec<AwaitedEntry> {
+    let mut ordered: Vec<&AwaitedEntry> = entries.iter().collect();
+    ordered.sort_by_key(|entry| entry.call_index);
+    let mut steps = Vec::new();
+    for (at, entry) in ordered.into_iter().enumerate() {
+        let settled = match &entry.kind {
+            AwaitedEntryKind::Run { .. } => true,
+            AwaitedEntryKind::Await { ended, .. } => matches!(ended, Some(AwaitEnd::Answered { .. })),
+        };
+        if !settled || entry.call_index as usize != at { break; }
+        steps.push(entry.clone());
+    }
+    steps
+}
+
 /// The replay decision for a `ctx.await_signal` at `call_index`: pops
 /// the next journal entry of the (node, frames) sequence. `None` when
 /// the sequence is exhausted (a fresh await, to be registered). The
-/// ONE reading of the journal for both the execution engine and the
+/// ONE reading of the journal for both the run engine and the
 /// node-test rig, so a body a test replays green replays the same in
 /// production: a mismatched index or a `ctx.run` where an await was
 /// journaled means the body's call order changed, which is refused.
@@ -495,7 +536,7 @@ pub fn replay_await(
         return Ok(None);
     };
     if entry.call_index != call_index {
-        return Err(crate::error::WeftError::NodeExecution(format!(
+        return Err(crate::error::WeftError::NodeFailed(format!(
             "await_signal call_index mismatch (counter={call_index}, journal={}). \
              This means the node body's call order changed between replays. \
              Wrap any non-deterministic logic between awaits in `ctx.run`.",
@@ -509,7 +550,7 @@ pub fn replay_await(
             Some(AwaitEnd::Skipped) => Err(wait_skipped()),
             None => Ok(Some(ReplayedAwait::Pending { token })),
         },
-        AwaitedEntryKind::Run { name, .. } => Err(crate::error::WeftError::NodeExecution(format!(
+        AwaitedEntryKind::Run { name, .. } => Err(crate::error::WeftError::NodeFailed(format!(
             "await_signal at call_index={call_index} but journal has Run('{name}'). \
              This means the node body called `ctx.run` here on a previous run \
              and `ctx.await_signal` now; non-deterministic bodies are not safe \
@@ -531,7 +572,7 @@ pub fn replay_run(
         return Ok(None);
     };
     if entry.call_index != call_index {
-        return Err(crate::error::WeftError::NodeExecution(format!(
+        return Err(crate::error::WeftError::NodeFailed(format!(
             "ctx.run('{name}') call_index mismatch (counter={call_index}, journal={}). \
              This means the node body's call order changed between replays. \
              Wrap any non-deterministic logic in `ctx.run`.",
@@ -540,7 +581,7 @@ pub fn replay_run(
     }
     match entry.kind {
         AwaitedEntryKind::Run { value, .. } => Ok(Some(value)),
-        AwaitedEntryKind::Await { .. } => Err(crate::error::WeftError::NodeExecution(format!(
+        AwaitedEntryKind::Await { .. } => Err(crate::error::WeftError::NodeFailed(format!(
             "ctx.run('{name}') at call_index={call_index} but journal has Await. \
              This means the node body called `ctx.await_signal` here on a previous \
              run and `ctx.run` now; non-deterministic bodies are not safe to \
@@ -568,7 +609,7 @@ pub struct SuspensionInfo {
 }
 
 /// One kicked root node in a folded snapshot. A kicked node is an
-/// entry point of a fresh execution (a firing trigger, a manual-run
+/// entry point of a fresh run (a firing trigger, a manual-run
 /// root, an InfraSetup root) that has no wired pending inputs and so
 /// would never become ready on its own. The scheduler dispatches it
 /// once, at the frames its key names. The optional `payload` carries
@@ -577,7 +618,7 @@ pub struct SuspensionInfo {
 /// it via the `ctx.wake` bag in Fire phase.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KickedNode {
-    /// This kick IS the firing trigger of the execution. Explicit,
+    /// This kick IS the firing trigger of the run. Explicit,
     /// never inferred from payload presence: a fire with an empty
     /// body has a `null` payload, which `Option<Value>` cannot keep
     /// apart from "no payload" across a JSON round trip.
@@ -612,14 +653,16 @@ pub struct KickedNode {
 pub struct LoopInstanceKey {
     pub group_id: String,
     pub parent_frames: crate::frames::LoopFrames,
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
 }
 
 /// Why a stream ended: the wire vocabulary shared by the generator
 /// runtime (`crate::generator` re-exports it), the journal's loop
 /// snapshots, and the fold. `Finished` is the clean end; `Failed`
 /// carries the producer's error so a consumer's pull surfaces it
-/// through `?` instead of reading a truncated stream as complete.
+/// through `?` instead of reading a truncated stream as complete. A
+/// bus's close carries it too (`crate::bus::FiringBuses`).
+// SYNC: StreamEnd <-> packages/weft-graph/src/protocol.ts StreamEnd
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StreamEnd {
@@ -644,7 +687,7 @@ pub enum LoopTerminationReason {
 /// Which lifecycle phase this invocation belongs to. Three-runtime
 /// model: infra setup provisions long-lived resources (infra processes),
 /// trigger setup captures settings for listeners, and fire runs the
-/// regular execution subgraph. Activation arms the captured listeners.
+/// regular run subgraph. Activation arms the captured listeners.
 ///
 /// Engine/journal vocabulary only: nodes never see it. The engine
 /// routes each phase to the right `Node` method from the manifest
@@ -654,11 +697,11 @@ pub enum LoopTerminationReason {
 /// - `InfraSetup`: an infra node is being provisioned.
 /// - `TriggerSetup`: a trigger node (or its upstream) is being set
 ///   up. The trigger captures the wake signal and its input values.
-/// - `Fire`: the normal fire-time execution. The firing trigger
+/// - `Fire`: the normal fire-time run. The firing trigger
 ///   receives the wake payload, its outputs flow downstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-// SYNC: Phase <-> packages/weft-graph/src/protocol.ts EXECUTION_PHASES
+// SYNC: Phase <-> packages/weft-graph/src/protocol.ts RUN_PHASES
 pub enum Phase {
     InfraSetup,
     TriggerSetup,
@@ -685,4 +728,30 @@ impl Phase {
 
     /// Every phase, for a caller that has to offer the choice.
     pub const ALL: [Phase; 3] = [Self::InfraSetup, Self::TriggerSetup, Self::Fire];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(call_index: u32) -> AwaitedEntry {
+        AwaitedEntry { call_index, kind: AwaitedEntryKind::Run { name: format!("step{call_index}"), value: Value::from(call_index) } }
+    }
+
+    fn wait(call_index: u32, ended: Option<AwaitEnd>) -> AwaitedEntry {
+        AwaitedEntry { call_index, kind: AwaitedEntryKind::Await { token: format!("t{call_index}"), ended } }
+    }
+
+    /// A new firing replays, in call order, every step up to the first
+    /// wait nobody answered, and asks that one again.
+    #[test]
+    fn answered_steps_stop_at_the_first_wait_nobody_answered() {
+        let answered = wait(1, Some(AwaitEnd::Answered { value: Value::from("yes") }));
+        let entries = vec![wait(2, None), answered.clone(), run(0), run(3)];
+        assert_eq!(answered_steps(&entries), vec![run(0), answered.clone()]);
+        let gave_up = vec![run(0), wait(1, Some(AwaitEnd::GaveUp { error: "gone".into() })), run(2)];
+        assert_eq!(answered_steps(&gave_up), vec![run(0)]);
+        assert_eq!(answered_steps(&[wait(0, Some(AwaitEnd::Skipped))]), Vec::new());
+        assert_eq!(answered_steps(&[run(0), run(2)]), vec![run(0)], "a gap in the order ends the replay");
+    }
 }

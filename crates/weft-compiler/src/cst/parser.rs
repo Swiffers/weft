@@ -180,15 +180,16 @@ impl<'a> Parser<'a> {
         // A leading `Group` keyword:
         //  - `Group =` is `Group`-used-as-a-name -> a node decl (lowering rejects
         //    the reserved name loudly). Falls through to the IDENT/decl path.
-        //  - `Group` then `(` / `->` / `{` / end-of-line is an anonymous group
-        //    (an included file's sole top-level group).
+        //  - `Group` then `[` (its type parameters) / `(` / `->` / `{` /
+        //    end-of-line is an anonymous group (an included file's sole
+        //    top-level group).
         //  - anything else after `Group` (`Group.x`, `Group: v`, ...) is
         //    malformed: NOT a valid anon-group head, so Unknown (one error node),
         //    never a phantom group decl + a stray error sibling.
         if first == K::KW_GROUP {
             return match sig.get(1).map(|(_, k)| *k) {
                 Some(K::EQ) => LineShape::Node, // Group-as-a-name; lowering rejects it
-                None | Some(K::L_PAREN) | Some(K::ARROW) | Some(K::L_BRACE) => LineShape::AnonGroup,
+                None | Some(K::JSON_VALUE) | Some(K::L_PAREN) | Some(K::ARROW) | Some(K::L_BRACE) => LineShape::AnonGroup,
                 _ => LineShape::Unknown,
             };
         }
@@ -364,6 +365,7 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
+        self.maybe_parse_type_params();
         // input signature `(...)`
         self.skip_inline_trivia_then(|p| {
             if p.cur() == Some(SyntaxKind::L_PAREN) {
@@ -386,6 +388,17 @@ impl<'a> Parser<'a> {
             self.builder.finish_node();
         }
         self.builder.finish_node(); // HEADER
+    }
+
+    /// `[T: Media]` type parameters, written right after a type name the
+    /// way `List[T]` is: the lexer hands a `[...]` run over as one
+    /// JSON_VALUE token, and nothing else may follow a type name there.
+    fn maybe_parse_type_params(&mut self) {
+        if self.cur() == Some(SyntaxKind::JSON_VALUE) {
+            self.builder.start_node(SyntaxKind::TYPE_PARAMS.into());
+            self.bump();
+            self.builder.finish_node();
+        }
     }
 
     /// Parse a `(...)` port signature wrapped in `kind` (PORT_SIG_IN). The
@@ -751,6 +764,7 @@ impl<'a> Parser<'a> {
     fn parse_inline_expr(&mut self) {
         self.builder.start_node(SyntaxKind::INLINE_EXPR.into());
         self.bump(); // Type
+        self.maybe_parse_type_params();
         // The signatures wear the same PORT_SIG_IN / PORT_SIG_OUT wrappers a
         // HEADER gives them, so the one port lowering reads both shapes.
         // Bare PORT_DECLs under the INLINE_EXPR once left an inline node

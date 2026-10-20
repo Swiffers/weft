@@ -12,7 +12,6 @@ export const PORT_TYPE_COLORS: Record<string, string> = {
 	List: '#5a8a8a',     // Monokai teal
 	Dict: '#7c6f9f',     // Monokai purple
 	TypeVar: '#6366f1',  // Indigo
-	MustOverride: '#ef4444', // Red (needs attention)
 	Bus: '#d97706',      // Amber-600 (live-channel signal)
 	Access: '#0d9488',   // Teal-600 (credential grant)
 	Infra: '#2563eb',    // Blue-600 (handle on a running service)
@@ -44,7 +43,6 @@ function colorForParsed(t: WeftType): string {
 		case 'record': return PORT_TYPE_COLORS.Dict;
 		case 'named': return colorForParsed(t.body);
 		case 'typevar': return PORT_TYPE_COLORS.TypeVar;
-		case 'must_override': return PORT_TYPE_COLORS.MustOverride;
 		case 'bus': return PORT_TYPE_COLORS.Bus;
 		case 'access': return PORT_TYPE_COLORS.Access;
 		case 'infra': return PORT_TYPE_COLORS.Infra;

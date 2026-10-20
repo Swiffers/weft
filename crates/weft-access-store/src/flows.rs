@@ -633,6 +633,7 @@ async fn insert_grant(
 /// browser and polls the parked outcome exactly like a consent's.
 // SYNC: BeginPicker <-> packages/weft-graph/src/webview/lib/components/project/editor-connect.ts beginPicker (the picker/begin body)
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BeginPicker {
     /// The instance the pick is for (its own door); `None`: the author.
     /// Set by the dispatcher alone, never taken from the caller.
@@ -1000,7 +1001,7 @@ pub async fn begin_oauth(
 
     let mut url: url::Url = auth_url
         .parse()
-        .map_err(|e| AccessError::Invalid(format!("bad auth_url '{auth_url}': {e}")))?;
+        .map_err(|e| AccessError::Invalid(format!("bad authUrl '{auth_url}': {e}")))?;
     {
         let mut q = url.query_pairs_mut();
         q.append_pair("response_type", "code");
@@ -1488,7 +1489,7 @@ async fn finish_connect(
 /// non-success status AND on the Slack-style `{"ok": false}` body
 /// (Slack answers 200 for errors).
 /// Place the app's client_id + client_secret where the spec's
-/// `token_auth` says the token endpoint reads them: `Body` pushes them
+/// `tokenAuth` says the token endpoint reads them: `Body` pushes them
 /// into the form params (the return is `None`), `Basic` hands them
 /// back for the request's HTTP Basic header. One helper so exchange,
 /// refresh, and client-credentials can never disagree.
@@ -2119,13 +2120,13 @@ pub async fn delete_published_grants<'e>(
 
 // ---------- Instance values (what an instance provides for `@instance_filled`) ----------
 
-/// One value an instance provides: `value` for `field` of the step at `step`
+/// One value an instance provides: `value` for `field` of the node at `node`
 /// (its place, spelled). `connection` is set when the field is a
 /// connection field: the value is then the `{id, ..}` handle of one of
 /// the instance's own connections to that service.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstanceValueWrite {
-    pub step: String,
+    pub node: String,
     pub field: String,
     pub value: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2140,7 +2141,7 @@ pub struct ConnectionValue {
     pub service: String,
 }
 
-/// Store `writes` and forget `clears` (step, field) for instance `instance`
+/// Store `writes` and forget `clears` (node, field) for instance `instance`
 /// of `project_id`, all or none, on `conn` (the caller's transaction).
 /// A connection value must be the instance's own connection in that
 /// project and of the field's service, or the whole change is refused: a
@@ -2176,37 +2177,37 @@ pub async fn change_instance_values(
         if grant_service != connection.service {
             return Err(AccessError::Invalid(format!(
                 "'{}.{}' connects to '{}', and connection {} is a '{grant_service}' one",
-                write.step, write.field, connection.service, connection.grant_id
+                write.node, write.field, connection.service, connection.grant_id
             ))
             .into());
         }
     }
     for write in writes {
         sqlx::query(
-            "INSERT INTO instance_value (tenant_id, project_id, instance_id, step, field, value, grant_id)
+            "INSERT INTO instance_value (tenant_id, project_id, instance_id, node, field, value, grant_id)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (project_id, instance_id, step, field) DO UPDATE
+             ON CONFLICT (project_id, instance_id, node, field) DO UPDATE
                SET value = EXCLUDED.value, grant_id = EXCLUDED.grant_id, set_at = now()",
         )
         .bind(tenant)
         .bind(project_id)
         .bind(instance.as_str())
-        .bind(&write.step)
+        .bind(&write.node)
         .bind(&write.field)
         .bind(&write.value)
         .bind(write.connection.as_ref().map(|c| c.grant_id))
         .execute(&mut *conn)
         .await?;
     }
-    for (step, field) in clears {
+    for (node, field) in clears {
         sqlx::query(
             "DELETE FROM instance_value
-             WHERE tenant_id = $1 AND project_id = $2 AND instance_id = $3 AND step = $4 AND field = $5",
+             WHERE tenant_id = $1 AND project_id = $2 AND instance_id = $3 AND node = $4 AND field = $5",
         )
         .bind(tenant)
         .bind(project_id)
         .bind(instance.as_str())
-        .bind(step)
+        .bind(node)
         .bind(field)
         .execute(&mut *conn)
         .await?;
@@ -2214,7 +2215,7 @@ pub async fn change_instance_values(
     Ok(())
 }
 
-/// Every value instance `instance` of `project_id` provides, by step and
+/// Every value instance `instance` of `project_id` provides, by node and
 /// field. A connection value comes back as the handle a source pick
 /// holds (`{id, identity}`), its identity read from the connection now.
 pub async fn instance_values<'e>(
@@ -2223,10 +2224,10 @@ pub async fn instance_values<'e>(
     project_id: uuid::Uuid,
     instance: &weft_core::instance::InstanceId,
 ) -> anyhow::Result<weft_core::instance::InstanceValues> {
-    /// step, field, value, the connection it names, that connection's identity.
+    /// node, field, value, the connection it names, that connection's identity.
     type Row = (String, String, Value, Option<uuid::Uuid>, Option<String>);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT v.step, v.field, v.value, v.grant_id, g.identity FROM instance_value v
+        "SELECT v.node, v.field, v.value, v.grant_id, g.identity FROM instance_value v
          LEFT JOIN access_grant g ON g.id = v.grant_id
          WHERE v.tenant_id = $1 AND v.project_id = $2 AND v.instance_id = $3",
     )
@@ -2236,12 +2237,12 @@ pub async fn instance_values<'e>(
     .fetch_all(executor)
     .await?;
     let mut values = weft_core::instance::InstanceValues::new();
-    for (step, field, value, grant_id, identity) in rows {
+    for (node, field, value, grant_id, identity) in rows {
         let value = match grant_id {
             Some(id) => connection_handle(id, identity.as_deref()),
             None => value,
         };
-        values.entry(step).or_default().insert(field, value);
+        values.entry(node).or_default().insert(field, value);
     }
     Ok(values)
 }

@@ -34,9 +34,8 @@ use crate::frames::Located;
 /// A hex-encoded SHA-256 digest. 64 chars.
 pub type SourceHash = String;
 
-/// Immutable graph and production-code identity captured with an execution.
+/// Immutable graph and production-code identity captured with a run.
 /// Definition storage remains keyed by its graph hash alone.
-// SYNC: ProgramIdentity <-> packages/weft-graph/src/run-spec.ts ProgramIdentity
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProgramIdentity {
@@ -67,48 +66,61 @@ impl ProgramIdentity {
         hex(&hasher.finalize())
     }
 
-    /// Each result depends on its actual data paths and enclosing controls.
-    /// Whole loops share one dependency identity and cannot reuse a partial body.
-    /// One digest per PLACE: a node of an included file has one per call
-    /// that reaches it, since what feeds it there is that call's chain.
+    /// Each result depends on its actual data paths and the scopes around
+    /// them (their gates decide whether it runs). Whole loops share one
+    /// dependency identity and cannot reuse a partial body. One digest per
+    /// PLACE: a node of an included file has one per call that reaches it,
+    /// since what feeds it there is that call's chain.
     pub fn slice_hashes(&self, project: &ProjectDefinition) -> anyhow::Result<BTreeMap<Located, SourceHash>> {
         anyhow::ensure!(self.definition_hash == compute_definition_hash(project)?, "program identity does not match its graph");
         let graph = super::graph::ProjectGraph::new(project);
-        super::selection::every_place_in(&graph).into_iter().map(|place| {
-            let selection = super::selection::RunSelection::dependencies_in(&graph, std::slice::from_ref(&place));
-            let ids: HashSet<String> = selection.nodes.iter().map(|p| p.id.clone()).collect();
-            let mut slice = project.clone();
-            slice.nodes.retain(|node| ids.contains(&node.id));
-            slice.nodes.sort_by(|a, b| a.id.cmp(&b.id));
-            slice.edges.retain(|edge| selection.edges.iter().any(|wire| wire.id == edge.id));
-            for boundary in slice.nodes.iter_mut().filter(|node| super::boundary_types::is_port_selected(&node.node_type)) {
-                // The ports read at any place the boundary is at in this slice.
-                let ports: std::collections::BTreeSet<&String> = selection.boundary_ports.iter()
-                    .filter(|(at, _)| at.id == boundary.id).flat_map(|(_, ports)| ports).collect();
-                let relevant = |port: &str| ports.iter().any(|p| p.as_str() == port);
-                boundary.inputs.retain(|port| relevant(&port.name));
-                boundary.outputs.retain(|port| relevant(&port.name));
-                boundary.port_literals.retain(|port, _| relevant(port));
-            }
+        super::places::every_place_in(&graph).into_iter().map(|place| {
+            let walked = super::cut::walk_bounds(&graph, &super::cut::Bounds::setup(std::slice::from_ref(&place)));
+            let mut ids: HashSet<String> = walked.runs.iter().map(|p| p.id.clone()).collect();
+            ids.extend(walked.runs.iter().flat_map(|p| super::places::scopes_around(&graph, p)).map(|scope| scope.id));
             let mut hasher = Sha256::new();
-            hasher.update(b"weft-production-slice-v2\n");
-            hash_definition_slice(&mut hasher, &slice, &ids)?;
+            hasher.update(b"weft-production-slice-v3\n");
+            hash_definition_slice(&mut hasher, project, &ids)?;
             // The places themselves: two slices of one id under different
             // calls hold the same nodes and differ in the chain of sites.
-            for place in &selection.nodes {
+            for place in &walked.runs {
                 hasher.update(place.to_string().as_bytes());
                 hasher.update(b"\n");
             }
-            for member in &slice.nodes {
-                let implementation = self.implementations.get(&member.node_type)
-                    .ok_or_else(|| anyhow::anyhow!("program identity is missing implementation '{}'", member.node_type))?;
-                hasher.update(member.node_type.as_bytes());
+            let mut types: Vec<&str> = project.nodes.iter().filter(|node| ids.contains(&node.id)).map(|node| node.node_type.as_str()).collect();
+            types.sort_unstable();
+            for node_type in types {
+                let implementation = self.implementations.get(node_type)
+                    .ok_or_else(|| anyhow::anyhow!("program identity is missing implementation '{node_type}'"))?;
+                hasher.update(node_type.as_bytes());
                 hasher.update(b"=");
                 hasher.update(implementation.as_bytes());
                 hasher.update(b"\n");
             }
             Ok((place, hex(&hasher.finalize())))
         }).collect()
+    }
+}
+
+impl ProgramIdentity {
+    /// The fingerprint of `node_id`'s own code: its definition in
+    /// `project` (its settings, its ports, what is written in its braces)
+    /// and the implementation of its type. Two programs agree on it
+    /// exactly when the node itself is unchanged, whatever feeds it: what
+    /// lets a seeded run that runs a node again replay the answers its
+    /// waits were given (`crate::primitive::answered_steps`).
+    pub fn node_hash(&self, project: &ProjectDefinition, node_id: &str) -> anyhow::Result<SourceHash> {
+        let node = project.nodes.iter().find(|node| node.id == node_id)
+            .ok_or_else(|| anyhow::anyhow!("the program has no node '{node_id}'"))?;
+        let implementation = self.implementations.get(&node.node_type)
+            .ok_or_else(|| anyhow::anyhow!("program identity is missing implementation '{}'", node.node_type))?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"weft-node-code-v1\n");
+        hash_definition_slice(&mut hasher, project, &HashSet::from([node_id.to_string()]))?;
+        hasher.update(node.node_type.as_bytes());
+        hasher.update(b"=");
+        hasher.update(implementation.as_bytes());
+        Ok(hex(&hasher.finalize()))
     }
 }
 
@@ -120,7 +132,7 @@ impl ProgramIdentity {
 /// source spans and layout positions are stripped before hashing.
 ///
 /// Used as the resync drift signal AND as the identity key the
-/// worker fetches the definition with at execution claim time
+/// worker fetches the definition with at run claim time
 /// (`(project_id, definition_hash)`).
 ///
 /// PURE over the definition (no filesystem access): the browser WASM
@@ -143,9 +155,10 @@ impl ProgramIdentity {
 ///   the file's PATH is non-semantic, its expanded topology is what runs)
 ///   and `sourceFile` (the absolute path a diagnostic anchors to; the same
 ///   project compiled from two directories must hash the same).
-/// - per edge: `span` / `sourceFile`. Per group: `span` / `headerSpan` /
-///   `portLiteralSpans` / `sourceFile` / `description` (the authored
-///   `# ...` comment: prose, not shape).
+/// - per edge, and per crossing of its `via`: `span` / `sourceFile`. Per
+///   group: `span` / `headerSpan` / `portLiteralSpans` / `sourceFile` /
+///   `fileRefs` / `description` (the authored `# ...` comment: prose, not
+///   shape).
 /// - per port (any of `inputs` / `outputs` / `inPorts` / `outPorts`):
 ///   `declaredType` (header spelling) and the catalog prose an input
 ///   mirrors from its metadata: `description`, `label`, `placeholder`.
@@ -179,8 +192,13 @@ pub fn compute_definition_hash(project: &ProjectDefinition) -> anyhow::Result<So
     for key in ["id", "createdAt", "updatedAt"] {
         obj.remove(key);
     }
+    // What does not compile follows from the nodes and wires above (a
+    // placeholder, a port type), and its wording carries line numbers, so
+    // moving a broken line would otherwise read as a new program.
+    obj.remove("broken");
     strip_keys(obj.get_mut("nodes"), NODE_HASH_STRIPS);
     strip_keys(obj.get_mut("edges"), EDGE_HASH_STRIPS);
+    strip_crossing_spans(obj.get_mut("edges"));
     strip_keys(obj.get_mut("groups"), GROUP_HASH_STRIPS);
     strip_port_presentation(obj.get_mut("nodes"));
     strip_port_presentation(obj.get_mut("groups"));
@@ -193,36 +211,49 @@ pub fn compute_definition_hash(project: &ProjectDefinition) -> anyhow::Result<So
 
 
 /// Fold `closure`'s slice of the definition into `hasher`: the
-/// closure's nodes and the edges between them, in the definition
-/// hash's canonical form (same non-semantic strips, see
-/// [`compute_definition_hash`]), sorted by id so source order and
-/// unrelated graph edits cannot move the digest. Production slice identity and the
-/// compiler's infra hash are both this fold under their own prefix.
+/// closure's nodes and groups (ids in `closure`) and the wires between
+/// them, in the definition hash's canonical form (same non-semantic
+/// strips, see [`compute_definition_hash`]), sorted by id so source order
+/// and unrelated graph edits cannot move the digest. Production slice
+/// identity and the compiler's infra hash are both this fold under their
+/// own prefix.
 pub fn hash_definition_slice(
     hasher: &mut Sha256,
     project: &ProjectDefinition,
     closure: &HashSet<String>,
 ) -> anyhow::Result<()> {
-    let mut nodes: Vec<serde_json::Value> = project
+    let sorted = |mut values: Vec<serde_json::Value>| {
+        values.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        values
+    };
+    let nodes: Vec<serde_json::Value> = project
         .nodes
         .iter()
         .filter(|n| closure.contains(&n.id))
         .map(serde_json::to_value)
         .collect::<Result<_, _>>()
         .map_err(|e| anyhow::anyhow!("serialize slice node: {e}"))?;
-    nodes.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-    let mut edges: Vec<serde_json::Value> = project
+    let groups: Vec<serde_json::Value> = project
+        .groups
+        .iter()
+        .filter(|g| closure.contains(&g.id))
+        .map(serde_json::to_value)
+        .collect::<Result<_, _>>()
+        .map_err(|e| anyhow::anyhow!("serialize slice group: {e}"))?;
+    let edges: Vec<serde_json::Value> = project
         .edges
         .iter()
         .filter(|e| closure.contains(&e.source) && closure.contains(&e.target))
         .map(serde_json::to_value)
         .collect::<Result<_, _>>()
         .map_err(|e| anyhow::anyhow!("serialize slice edge: {e}"))?;
-    edges.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-    let mut slice = serde_json::json!({ "nodes": nodes, "edges": edges });
+    let mut slice = serde_json::json!({ "nodes": sorted(nodes), "groups": sorted(groups), "edges": sorted(edges) });
     strip_keys(slice.get_mut("nodes"), NODE_HASH_STRIPS);
+    strip_keys(slice.get_mut("groups"), GROUP_HASH_STRIPS);
     strip_keys(slice.get_mut("edges"), EDGE_HASH_STRIPS);
+    strip_crossing_spans(slice.get_mut("edges"));
     strip_port_presentation(slice.get_mut("nodes"));
+    strip_port_presentation(slice.get_mut("groups"));
     canonicalize_key_order(&mut slice);
     hasher.update(b"definition-slice:");
     hasher.update(
@@ -247,8 +278,19 @@ const NODE_HASH_STRIPS: &[&str] = &[
 ];
 const EDGE_HASH_STRIPS: &[&str] = &["span", "sourceFile"];
 // `description` is the group's authored `# ...` comment: prose, never
-// the runtime shape, so rewording it must not light a resync.
-const GROUP_HASH_STRIPS: &[&str] = &["span", "headerSpan", "portLiteralSpans", "sourceFile", "description"];
+// the runtime shape, so rewording it must not light a resync. `fileRefs`
+// is a node's own strip, for a literal on a group's port.
+const GROUP_HASH_STRIPS: &[&str] = &["span", "headerSpan", "portLiteralSpans", "sourceFile", "description", "fileRefs"];
+
+/// Strip each wire's crossings of where their legs were written (a
+/// crossing's `span` and `sourceFile`, the same strips as the wire's own):
+/// formatting the source must not move a digest.
+fn strip_crossing_spans(edges: Option<&mut serde_json::Value>) {
+    let Some(serde_json::Value::Array(edges)) = edges else { return };
+    for edge in edges {
+        strip_keys(edge.get_mut("via"), EDGE_HASH_STRIPS);
+    }
+}
 
 /// Remove the per-port PRESENTATION members from every port list of
 /// every element. `declaredType` records how the source HEADER spells a

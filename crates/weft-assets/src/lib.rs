@@ -18,7 +18,7 @@
 //! After resolving ALL file references, the driver publishes the complete
 //! set of [`referenced_asset_keys`] to storage. An asset some project of the
 //! tenant references does not expire; one nothing references any more
-//! receives the usual access-renewed TTL. Old executions keep their original
+//! receives the usual access-renewed TTL. Old runs keep their original
 //! keys and may read those files until they expire.
 //!
 //! I/O is behind two traits so the sync's orchestration is contract-testable
@@ -27,7 +27,7 @@
 //!
 //! The hash-diff-upload core is [`publish_hashed`], and it is not only
 //! the asset sync's: a version snapshot (`weft checkpoint`, every `weft
-//! run`) publishes the project's files through [`publish_files`] into
+//! run`) publishes the project's files through it into
 //! the same content-addressed plane, so a file identical to one any
 //! version of any of the tenant's projects held costs nothing to record
 //! again, and neither does the standard library the install preloads.
@@ -95,14 +95,14 @@ pub trait AssetStore: Send + Sync {
 
 /// The tenant's assets the resolved definition uses, including nested file
 /// values and files selected by stored key instead of disk path.
-/// Execution/project/shared files keep their own lifetime rules.
+/// Run/project/shared files keep their own lifetime rules.
 pub fn referenced_asset_keys(project: &ProjectDefinition) -> Result<Vec<String>> {
     let mut keys = BTreeSet::new();
     for node in &project.nodes {
         for port in &node.inputs {
             let Some(value) = node.written_value(&port.name).or(port.default.as_ref()) else { continue };
             for slot in media_slots(value, &port.port_type) {
-                if let MediaSlotContent::Stored { handle: FileHandle::Key(key), .. } =
+                if let MediaSlotContent::Stored { handle: FileHandle::Key { key, .. }, .. } =
                     classify_media_slot(&slot).map_err(anyhow::Error::msg)?
                 {
                     let parsed = parse_key(&key).map_err(anyhow::Error::msg)?;
@@ -173,6 +173,14 @@ pub struct Published {
     pub key: String,
 }
 
+/// The media type the store records for a file at `path` whose first
+/// bytes are `head` ([`hash_reader_peeking`]): named from the bytes, the
+/// filename when they carry no signature. The one rule every publisher of
+/// a project's files names a type by.
+pub fn media_type(head: &[u8], path: &str) -> String {
+    weft_core::storage::sniff_mime(head).unwrap_or_else(|| weft_core::storage::mime_from_filename(path)).to_string()
+}
+
 /// Hash every file in `paths` through `source`, naming each one's media
 /// type from its first bytes (the filename when the bytes carry no
 /// signature). Every path that cannot be read is collected and reported
@@ -184,9 +192,7 @@ pub fn hash_files(paths: &[String], source: &dyn AssetSource) -> Result<Vec<Hash
     for path in paths {
         match source.open(path).and_then(hash_reader_peeking) {
             Ok((hash, size, head)) => {
-                let mime = weft_core::storage::sniff_mime(&head)
-                    .unwrap_or_else(|| weft_core::storage::mime_from_filename(path));
-                hashed.push(HashedFile { path: path.clone(), hash, size, mime: mime.to_string() });
+                hashed.push(HashedFile { path: path.clone(), hash, size, mime: media_type(&head, path) });
             }
             Err(e) => broken.push(format!("  {path}: {e:#}")),
         }
@@ -201,7 +207,7 @@ pub fn hash_files(paths: &[String], source: &dyn AssetSource) -> Result<Vec<Hash
 /// key: `content hash -> full storage key`. The content-addressed core
 /// every publisher shares (an `@asset` sync, a version snapshot): diff
 /// against what the store already holds, upload only the missing
-/// content, never delete an existing file (a paused execution may still
+/// content, never delete an existing file (a paused run may still
 /// need an earlier version). Each missing file is uploaded from a
 /// snapshot verified against its recorded hash first: parts are stored
 /// by number under a key that is the content's hash, so bytes that do
@@ -301,7 +307,7 @@ pub async fn publish_files(
 /// kind its `@asset` declared (an `Image` over an mp3), is collected and
 /// reported in ONE loud error (so a build with three broken refs names all
 /// three, not the first). Upload failures abort loudly. No existing file is
-/// deleted: a paused execution may still need an earlier version.
+/// deleted: a paused run may still need an earlier version.
 pub async fn sync_assets(
     refs: &[FileRef],
     source: &dyn AssetSource,
@@ -321,15 +327,22 @@ pub async fn sync_assets(
                 // The check reports only what is wrong with the bytes;
                 // the `@asset(...)` that declared them is this caller's
                 // to name, since this is the one place it is the source.
-                match weft_core::storage::check_declared_kind(&r.ty, &head)
+                // The stored type is the bytes' own, since identical bytes
+                // share one stored asset, except where the bytes hold either
+                // of two media kinds (WebM, MP4) and the declaration picked
+                // the other one (an audio clip in a video container).
+                match weft_core::storage::received_file(&head, None, &r.ty)
                     .map_err(|why| format!("@asset({:?}, {}): {why}", r.path, r.ty))
                 {
-                    Ok(()) => {
-                        let mime = weft_core::storage::sniff_mime(&head)
-                            .unwrap_or_else(|| weft_core::storage::mime_from_filename(&r.path));
+                    Ok((received, kind)) => {
+                        use weft_core::weft_type::FileKind;
+                        let mime = match weft_core::storage::sniff_mime(&head) {
+                            Some(sniffed) if kind != FileKind::Blob && FileKind::from_mime(sniffed) != kind => received,
+                            _ => media_type(&head, &r.path),
+                        };
                         hashed.push((
                             r,
-                            HashedFile { path: r.path.clone(), hash, size, mime: mime.to_string() },
+                            HashedFile { path: r.path.clone(), hash, size, mime },
                         ));
                     }
                     Err(e) => broken.push(format!("  {e}")),
@@ -363,6 +376,7 @@ pub async fn sync_assets(
             filename: r.path.clone(),
             // An asset is addressed by its content and never replaced.
             version: weft_core::storage::FIRST_FILE_VERSION,
+            link_secs: None,
         };
         map.insert(r.resolution_key(), weft_core::storage::typed_file_value(&file, &r.ty));
     }

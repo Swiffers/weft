@@ -39,7 +39,7 @@ change something underneath you. CONTRIBUTING.md has the rest.
       layer](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#which-layer-a-test-belongs-at).
 - [ ] A bug fix has a regression test that fails before the fix.
 - [ ] Docs updated, if this changes behavior the docs describe.
-- [ ] If you changed SQL, the `db-tests` suites pass against a real Postgres.
+- [ ] If you changed SQL, `scripts/run-db-tests.sh` passes against a real Postgres.
 - [ ] A new node holds up against [the review
       list](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#writing-a-node-for-the-standard-catalogue).
 - [ ] If you built this with an AI assistant, `/flow-4-review` and

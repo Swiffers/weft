@@ -1,48 +1,81 @@
 import { describe, expect, it } from 'vitest';
-import { copiedPortSigs, headerPortSigs, headerWorthy, partitionRemovals, portDeleteAction, removedPortNames } from './header-ports';
-import { SHOULD_FLOW_PORT } from '../../../protocol';
+import { copiedPortSigs, declarationProblem, declarationRule, headerPortSigs, headerWorthy, nodeInputRequiredness, partitionRemovals, portDeleteAction, removedPortNames } from './header-ports';
+import { ERROR_PORT, SHOULD_FLOW_PORT } from '../../../protocol';
 
 // The bug this pins: adding one custom output through the editor once
 // wrote the node type's ENTIRE resolved signature into source,
-// `_should_flow` and MustOverride placeholders included; and a naive
+// `_should_flow` and placeholder types included; and a naive
 // rendered-vs-default type compare would freeze inference-resolved
 // generics into the header as if the author wrote them.
 
 const defaults = [
 	{ name: 'data', required: false, portType: 'T' },
-	{ name: 'response', required: false, portType: 'MustOverride' },
+	{ name: 'response', required: false, portType: 'T__response' },
+	{ name: 'prompt', required: true, portType: 'String' },
 ];
 
 const none = { sigs: [], reverted: [] };
+const unwired = new Set<string>();
+const wired = (...names: string[]) => new Set(names);
 
 describe('headerPortSigs', () => {
 	it('an untouched catalog port is not written', () => {
 		const p = [{ name: 'data', required: false, portType: 'T' }];
-		expect(headerPortSigs(p, p, defaults)).toEqual(none);
+		expect(headerPortSigs(p, p, defaults, unwired)).toEqual(none);
+		expect(headerPortSigs(p, p, defaults, wired('data'))).toEqual(none);
 	});
 
 	it('an inference-resolved generic is NOT mistaken for an override', () => {
 		// Catalog says `data: T`; wired to a String it renders as String,
 		// with no declaredType because the header never declared it.
 		const p = [{ name: 'data', required: false, portType: 'String' }];
-		expect(headerPortSigs(p, p, defaults)).toEqual(none);
+		expect(headerPortSigs(p, p, defaults, wired('data'))).toEqual(none);
 	});
 
 	it('a declared override round-trips its DECLARED type, not the rendered one', () => {
-		const p = [{ name: 'response', required: false, portType: 'MyThing', declaredType: 'JsonDict' }];
-		expect(headerPortSigs(p, p, defaults)).toEqual({
+		const p = [{ name: 'response', required: false, optional: true, portType: 'MyThing', declaredType: 'JsonDict' }];
+		expect(headerPortSigs(p, p, defaults, unwired)).toEqual({
 			sigs: [{ name: 'response', required: false, portType: 'JsonDict', rendered: 'MyThing' }],
 			reverted: [],
 		});
 	});
 
-	it('a gesture retype is written with the new type, even on a catalog port', () => {
+	it('a retype of an optional catalog port the program never wrote keeps its meaning at the current wiring', () => {
+		// Wired, it already waits for its value, so `data: Number` (always
+		// required) means the same; unwired, the node runs without it, so
+		// `data?: Number` means the same.
 		const prev = [{ name: 'data', required: false, portType: 'T' }];
 		const next = [{ name: 'data', required: false, portType: 'Number' }];
-		expect(headerPortSigs(prev, next, defaults)).toEqual({
+		expect(headerPortSigs(prev, next, defaults, wired('data'))).toEqual({
+			sigs: [{ name: 'data', required: true, portType: 'Number', rendered: 'Number' }],
+			reverted: [],
+		});
+		expect(headerPortSigs(prev, next, defaults, unwired)).toEqual({
 			sigs: [{ name: 'data', required: false, portType: 'Number', rendered: 'Number' }],
 			reverted: [],
 		});
+	});
+
+	it('a port the node requires is always written without `?`', () => {
+		const prev = [{ name: 'prompt', required: true, portType: 'String' }];
+		const retyped = [{ name: 'prompt', required: true, portType: 'String | Number' }];
+		const askedOptional = [{ name: 'prompt', required: false, optional: true, portType: 'String | Number' }];
+		for (const next of [retyped, askedOptional]) {
+			expect(headerPortSigs(prev, next, defaults, unwired).sigs).toEqual([
+				{ name: 'prompt', required: true, portType: 'String | Number', rendered: 'String | Number' },
+			]);
+		}
+	});
+
+	it('a port the program wrote keeps its own spelling whatever its wiring', () => {
+		const optional = [{ name: 'data', required: false, optional: true, portType: 'Number', declaredType: 'Number' }];
+		expect(headerPortSigs(optional, optional, defaults, wired('data')).sigs).toEqual([
+			{ name: 'data', required: false, portType: 'Number', rendered: 'Number' },
+		]);
+		const required = [{ name: 'data', required: true, portType: 'Number', declaredType: 'Number' }];
+		expect(headerPortSigs(required, required, defaults, unwired).sigs).toEqual([
+			{ name: 'data', required: true, portType: 'Number', rendered: 'Number' },
+		]);
 	});
 
 	it('a required-only toggle keeps the CATALOG type, never the rendered one', () => {
@@ -52,39 +85,48 @@ describe('headerPortSigs', () => {
 		// so the projection keeps showing it.
 		const prev = [{ name: 'data', required: false, portType: 'String' }];
 		const next = [{ name: 'data', required: true, portType: 'String' }];
-		expect(headerPortSigs(prev, next, defaults)).toEqual({
+		expect(headerPortSigs(prev, next, defaults, wired('data'))).toEqual({
 			sigs: [{ name: 'data', required: true, portType: 'T', rendered: 'String' }],
 			reverted: [],
 		});
 	});
 
 	it('a required-only toggle on a DECLARED port keeps the declared spelling', () => {
-		const prev = [{ name: 'x', required: false, portType: 'String', declaredType: 'T' }];
+		const prev = [{ name: 'x', required: false, optional: true, portType: 'String', declaredType: 'T' }];
 		const next = [{ name: 'x', required: true, portType: 'String', declaredType: 'T' }];
-		expect(headerPortSigs(prev, next, defaults)).toEqual({
+		expect(headerPortSigs(prev, next, defaults, unwired)).toEqual({
 			sigs: [{ name: 'x', required: true, portType: 'T', rendered: 'String' }],
 			reverted: [],
 		});
 	});
 
-	it('reverting to the catalog default UN-declares the port instead of freezing it', () => {
-		// Toggle required on (previous gesture declared it, apply stamped
-		// declaredType), then toggle it back off: the port now restates
-		// its default exactly, so it leaves the header rather than
-		// staying as a frozen `data: T` line. The revert is REPORTED so
-		// the optimistic projection lands on the reparse's surface.
+	it('a requiredness the gesture just set is written, even over the default type', () => {
+		// `data?: T` means "runs without it even when wired", which the
+		// catalog's own `data` does not: the author asked for it.
 		const prev = [{ name: 'data', required: true, portType: 'String', declaredType: 'T' }];
-		const next = [{ name: 'data', required: false, portType: 'String', declaredType: 'T' }];
-		expect(headerPortSigs(prev, next, defaults)).toEqual({
-			sigs: [],
-			reverted: [{ name: 'data', required: false, portType: 'String' }],
+		const next = [{ name: 'data', required: false, optional: true, portType: 'String', declaredType: 'T' }];
+		expect(headerPortSigs(prev, next, defaults, unwired)).toEqual({
+			sigs: [{ name: 'data', required: false, portType: 'T', rendered: 'String' }],
+			reverted: [],
 		});
 	});
 
-	it('retyping back to the catalog default un-declares too', () => {
-		const prev = [{ name: 'data', required: false, portType: 'Number', declaredType: 'Number' }];
-		const next = [{ name: 'data', required: false, portType: 'T', declaredType: 'Number' }];
-		expect(headerPortSigs(prev, next, defaults)).toEqual({
+	it('retyping back to the catalog default un-declares a line that means what the default means at this wiring', () => {
+		const prev = [{ name: 'data', required: false, optional: true, portType: 'Number', declaredType: 'Number' }];
+		const next = [{ name: 'data', required: false, optional: true, portType: 'T', declaredType: 'Number' }];
+		expect(headerPortSigs(prev, next, defaults, unwired)).toEqual({
+			sigs: [],
+			reverted: [{ name: 'data', required: false, portType: 'T' }],
+		});
+		// Wired, `data?: T` would run without a closed wire's value where
+		// the default skips, so the line stays.
+		expect(headerPortSigs(prev, next, defaults, wired('data'))).toEqual({
+			sigs: [{ name: 'data', required: false, portType: 'T', rendered: 'T' }],
+			reverted: [],
+		});
+		const prevReq = [{ name: 'data', required: true, portType: 'Number', declaredType: 'Number' }];
+		const nextReq = [{ name: 'data', required: true, portType: 'T', declaredType: 'Number' }];
+		expect(headerPortSigs(prevReq, nextReq, defaults, wired('data'))).toEqual({
 			sigs: [],
 			reverted: [{ name: 'data', required: false, portType: 'T' }],
 		});
@@ -92,30 +134,65 @@ describe('headerPortSigs', () => {
 
 	it('a newly added custom port is written', () => {
 		const next = [{ name: 'haiku', required: false, portType: 'String' }];
-		expect(headerPortSigs([], next, defaults)).toEqual({
+		expect(headerPortSigs([], next, defaults, unwired)).toEqual({
 			sigs: [{ name: 'haiku', required: false, portType: 'String', rendered: 'String' }],
 			reverted: [],
 		});
 	});
 
+	it('a port with no type, new or declared, is written as its bare name', () => {
+		// No type chosen yet: the header names the port alone and the port
+		// holds its own variable until something is wired.
+		const fresh = [
+			{ name: 'haiku', required: false, portType: 'T__haiku', declaredType: '' },
+			{ name: 'out', required: true, portType: 'T__out', declaredType: '' },
+		];
+		expect(headerPortSigs([], fresh, defaults, unwired).sigs).toEqual([
+			{ name: 'haiku', required: false, portType: '', rendered: 'T__haiku' },
+			{ name: 'out', required: true, portType: '', rendered: 'T__out' },
+		]);
+		// Declared with no type and resolved by a wire: still the bare name.
+		const declared = [{ name: 'note', required: true, portType: 'String', declaredType: '' }];
+		expect(headerPortSigs(declared, declared, defaults, wired('note')).sigs).toEqual([
+			{ name: 'note', required: true, portType: '', rendered: 'String' },
+		]);
+	});
+
+	it('a header type that does not parse is written back as the author typed it', () => {
+		const p = [{ name: 'note', required: true, portType: 'T__note', declaredType: 'Strng' }];
+		expect(headerPortSigs(p, p, defaults, unwired).sigs).toEqual([
+			{ name: 'note', required: true, portType: 'Strng', rendered: 'T__note' },
+		]);
+	});
+
 	it('a polluted header (declares its catalog defaults verbatim) heals to empty', () => {
 		const p = [
-			{ name: 'data', required: false, portType: 'T', declaredType: 'T' },
-			{ name: 'response', required: false, portType: 'MustOverride', declaredType: 'MustOverride' },
+			{ name: 'prompt', required: true, portType: 'String', declaredType: 'String' },
 			{ name: SHOULD_FLOW_PORT, required: false, portType: 'T__should_flow', declaredType: 'T__should_flow' },
 		];
-		expect(headerPortSigs(p, p, defaults)).toEqual({
+		expect(headerPortSigs(p, p, defaults, unwired)).toEqual({
 			sigs: [],
-			reverted: [
-				{ name: 'data', required: false, portType: 'T' },
-				{ name: 'response', required: false, portType: 'MustOverride' },
-			],
+			reverted: [{ name: 'prompt', required: true, portType: 'String' }],
 		});
+	});
+
+	it('an untouched `x?:` line over an optional catalog port is kept: it means more than the default', () => {
+		const p = [{ name: 'data', required: false, optional: true, portType: 'T', declaredType: 'T' }];
+		expect(headerPortSigs(p, p, defaults, unwired)).toEqual({
+			sigs: [{ name: 'data', required: false, portType: 'T', rendered: 'T' }],
+			reverted: [],
+		});
+	});
+
+	it('_error is never written into the header, even when the previous list lacked it', () => {
+		const err = { name: ERROR_PORT, required: false, portType: 'String' };
+		expect(headerPortSigs([], [err], [...defaults, err], unwired)).toEqual(none);
+		expect(headerPortSigs([], [err], defaults, unwired)).toEqual(none);
 	});
 
 	it('a declared custom port whose generic got inference-resolved round-trips the authored generic', () => {
 		const p = [{ name: 'x', required: true, portType: 'String', declaredType: 'T' }];
-		expect(headerPortSigs(p, p, defaults)).toEqual({
+		expect(headerPortSigs(p, p, defaults, wired('x'))).toEqual({
 			sigs: [{ name: 'x', required: true, portType: 'T', rendered: 'String' }],
 			reverted: [],
 		});
@@ -126,10 +203,23 @@ describe('headerPortSigs', () => {
 			{ name: 'a', required: true, portType: 'String', declaredType: 'String' },
 			{ name: 'b', required: true, portType: 'String' },
 		];
-		expect(headerPortSigs(p, p, undefined)).toEqual({
+		expect(headerPortSigs(p, p, undefined, unwired)).toEqual({
 			sigs: [{ name: 'a', required: true, portType: 'String', rendered: 'String' }],
 			reverted: [],
 		});
+	});
+});
+
+describe('nodeInputRequiredness', () => {
+	it('names the four states a node input can be in', () => {
+		const prompt = defaults[2];
+		const data = defaults[0];
+		expect(nodeInputRequiredness({ name: 'prompt', required: true, portType: 'String' }, prompt)).toBe('node_requires');
+		expect(nodeInputRequiredness({ name: 'data', required: true, portType: 'T' }, data)).toBe('required');
+		expect(nodeInputRequiredness({ name: 'data', required: false, optional: true, portType: 'T' }, data)).toBe('optional');
+		expect(nodeInputRequiredness({ name: 'data', required: false, portType: 'T' }, data)).toBe('wiring');
+		// A port the program added has no catalog side to require it.
+		expect(nodeInputRequiredness({ name: 'extra', required: true, portType: 'String' }, undefined)).toBe('required');
 	});
 });
 
@@ -179,28 +269,28 @@ describe('headerWorthy', () => {
 
 describe('a declared line restating a catalog port', () => {
 	it('is un-declared by the restates-the-default gate, whatever the port accepts', () => {
-		// `HumanTrigger(title: String)` over a catalog `title: String`:
-		// the line says nothing the catalog does not, so the next
-		// gesture heals it out of the header.
-		const catalog = [{ name: 'title', required: false, portType: 'String', accepts: ['literal'] as const }];
-		const p = [{ name: 'title', required: false, portType: 'String', declaredType: 'String', accepts: ['literal'] as const }];
-		expect(headerPortSigs(p, p, catalog)).toEqual({
+		// `HumanTrigger(title: String)` over a catalog `title: String`
+		// the node requires: the line says nothing the catalog does not,
+		// so the next gesture heals it out of the header.
+		const catalog = [{ name: 'title', required: true, portType: 'String', accepts: ['literal'] as const }];
+		const p = [{ name: 'title', required: true, portType: 'String', declaredType: 'String', accepts: ['literal'] as const }];
+		expect(headerPortSigs(p, p, catalog, unwired)).toEqual({
 			sigs: [],
-			reverted: [{ name: 'title', required: false, portType: 'String' }],
+			reverted: [{ name: 'title', required: true, portType: 'String' }],
 		});
 	});
 });
 
 describe('partitionRemovals typing', () => {
-	it('omits a nested generic, keeps MustOverride, omits an unparseable spelling', () => {
+	it("omits a nested generic, a port's own variable, and an unparseable spelling", () => {
 		const provided = [
 			{ name: 'items', required: true, portType: 'List[T]' },
-			{ name: 'response', required: false, portType: 'MustOverride' },
+			{ name: 'response', required: false, portType: 'T__response' },
 			{ name: 'odd', required: true, portType: 'Strng' },
 		];
 		expect(partitionRemovals(['items', 'response', 'odd'], provided).reverted).toEqual([
 			{ name: 'items', required: true },
-			{ name: 'response', required: false, portType: 'MustOverride' },
+			{ name: 'response', required: false },
 			{ name: 'odd', required: true },
 		]);
 	});
@@ -213,7 +303,7 @@ describe('shadow declarations', () => {
 		// defaults alone), so a hand-authored shadow line is the
 		// author's record and survives every unrelated gesture.
 		const p = [{ name: 'photo', required: true, portType: 'Image', declaredType: 'Image' }];
-		expect(headerPortSigs(p, p, defaults).sigs).toEqual([
+		expect(headerPortSigs(p, p, defaults, unwired).sigs).toEqual([
 			{ name: 'photo', required: true, portType: 'Image', rendered: 'Image' },
 		]);
 	});
@@ -252,5 +342,95 @@ describe('removedPortNames', () => {
 	it('_should_flow is never removable, even off a filtered list', () => {
 		const prev = [{ name: SHOULD_FLOW_PORT }, { name: 'a' }];
 		expect(removedPortNames(prev, [])).toEqual(['a']);
+	});
+
+	it('_error is never removable, even off the card\'s output rows (which leave it out)', () => {
+		const prev = [{ name: 'a' }, { name: ERROR_PORT }];
+		expect(removedPortNames(prev, [{ name: 'a' }])).toEqual([]);
+	});
+});
+
+// SYNC assertions with crates/weft-core/src/node.rs NodeMetadata::output_declaration_fits
+describe('declarationRule / declarationProblem', () => {
+	const out = (portType: string, narrowable?: true | string) =>
+		({ name: 'out', portType, required: true, ...(narrowable !== undefined ? { narrowable } : {}) });
+
+	it('a port the program added takes any type', () => {
+		expect(declarationRule('output', undefined)).toEqual({ kind: 'free' });
+		expect(declarationProblem({ kind: 'free' }, 'Verdict')).toBeNull();
+	});
+
+	it('a narrowable output takes what fits its own type, a stream item-wise', () => {
+		const rule = declarationRule('output', out('JsonDict', true));
+		expect(rule).toEqual({ kind: 'fits', bound: 'JsonDict', narrowable: true });
+		expect(declarationProblem(rule, '{ verdict: String }')).toBeNull();
+		expect(declarationProblem(rule, 'String')).toContain('does not fit in JsonDict');
+		const stream = declarationRule('output', out('Generator[JsonDict]', true));
+		expect(declarationProblem(stream, 'Generator[{ id: Number }]')).toBeNull();
+	});
+
+	it('a narrowable output with a wider bound takes what fits that bound', () => {
+		const rule = declarationRule('output', out('JsonDict', 'JsonDict | String | File'));
+		expect(declarationProblem(rule, 'String')).toBeNull();
+		expect(declarationProblem(rule, 'Image')).toBeNull();
+		expect(declarationProblem(rule, 'Number')).not.toBeNull();
+	});
+
+	it('any other concrete output is fixed to its own type', () => {
+		const rule = declarationRule('output', out('String'));
+		expect(rule).toEqual({ kind: 'fixed', type: 'String' });
+		expect(declarationProblem(rule, 'String')).toBeNull();
+		expect(declarationProblem(rule, 'Number')).not.toBeNull();
+	});
+
+	it('an output holding a variable and an input narrow within their own type', () => {
+		expect(declarationRule('output', out('List[T]'))).toEqual({ kind: 'fits', bound: 'List[T]', narrowable: false });
+		const input = declarationRule('input', { name: 'x', portType: 'Media', required: true });
+		expect(declarationProblem(input, 'Image')).toBeNull();
+		expect(declarationProblem(input, 'Blob')).not.toBeNull();
+	});
+
+	// SYNC assertions with crates/weft-compiler/src/validate.rs check_type_bounds (TypeParam::violation)
+	it('a declaration pinning a bounded variable has to fit the bound', () => {
+		const media = [{ name: 'T', bound: 'Media' }];
+		const input = declarationRule('input', { name: 'file', portType: 'T', required: true }, media);
+		expect(input).toEqual({ kind: 'fits', bound: 'T', narrowable: false, typeParams: media });
+		expect(declarationProblem(input, 'String')).toBe('`T` has to fit in Media, and what is connected makes it String');
+		expect(declarationProblem(input, 'Image')).toBeNull();
+		expect(declarationProblem(input, 'Media')).toBeNull();
+		// Bound through a container, on an output that holds the variable.
+		const output = declarationRule('output', out('List[T]'), media);
+		expect(declarationProblem(output, 'List[Number]')).toBe('`T` has to fit in Media, and what is connected makes it Number');
+		expect(declarationProblem(output, 'List[Video]')).toBeNull();
+	});
+
+	it('a bound naming another variable reads that one from the same declaration or the node', () => {
+		const params = [{ name: 'T', bound: 'Media' }, { name: 'T2', bound: 'List[T]' }];
+		const rule = declarationRule('input', { name: 'pair', portType: '{ one: T, many: T2 }', required: true }, params);
+		expect(declarationProblem(rule, '{ one: Image, many: List[Image] }')).toBeNull();
+		expect(declarationProblem(rule, '{ one: Image, many: List[Video] }'))
+			.toBe('`T2` has to fit in List[Image], and what is connected makes it List[Video]');
+		const resolved = [{ name: 'T', bound: 'Media', resolved: 'Audio' }, { name: 'T2', bound: 'List[T]' }];
+		const many = declarationRule('input', { name: 'many', portType: 'T2', required: true }, resolved);
+		expect(declarationProblem(many, 'List[Audio]')).toBeNull();
+		expect(declarationProblem(many, 'List[Image]')).toContain('`T2` has to fit in List[Audio]');
+	});
+
+	it('one declaration pinning a variable two ways is refused', () => {
+		const rule = declarationRule('input', { name: 'pair', portType: '{ a: T, b: T }', required: true }, [{ name: 'T', bound: 'Media' }]);
+		expect(declarationProblem(rule, '{ a: Image, b: Video }')).toContain("pin type 'T' to two different types (Image and Video)");
+	});
+
+	it('a port with no variable, or a node with no bounds, carries none', () => {
+		const media = [{ name: 'T', bound: 'Media' }];
+		expect(declarationRule('input', { name: 'x', portType: 'String', required: true }, media))
+			.toEqual({ kind: 'fits', bound: 'String', narrowable: false });
+		const unbounded = declarationRule('input', { name: 'x', portType: 'T', required: true }, []);
+		expect(declarationProblem(unbounded, 'String')).toBeNull();
+	});
+
+	it("refuses a spelling the compiler would, but leaves a declared type's name to it", () => {
+		expect(declarationProblem({ kind: 'free' }, 'Dict[Number, String]')).toContain('List[{key: Number, value: String}]');
+		expect(declarationProblem(declarationRule('output', out('JsonDict', true)), 'Verdict')).toBeNull();
 	});
 });

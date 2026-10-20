@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
 use weft::access::client::get_json;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::gmail::{non_blank_list, API};
 
@@ -26,7 +26,7 @@ impl Node for GmailLabelNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("id")?;
         let add = non_blank_list(&ctx.inputs, "add")?;

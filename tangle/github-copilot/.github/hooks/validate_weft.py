@@ -7,10 +7,11 @@ The compiler has three tiers, and this hook is the first one:
      local, nothing runs. A broken edit is named the moment it lands.
   2. runtime tier: rule-runtime checks (a connection not picked, other
      things only knowable once the program runs). `weft validate` reports
-     them; a build deliberately skips them and a run is not gated on
-     them, so they surface at execution as a loud node failure. Fixed by
-     a click in the editor, never the source, so they never belong in
-     the edit loop.
+     them; a build deliberately skips them, and a run, an activate or a
+     resync is refused before it starts while one is open, naming the
+     `weft connect` that fixes it. Fixed by a pick (a click in the editor
+     or that command), never the source, so they never belong in the
+     edit loop.
   3. full compilation: `weft build`, structural errors only by design (a
      program still being wired up still builds) plus the cargo and image
      build.
@@ -20,12 +21,16 @@ keeps tier-1 findings: severity "error" minus the rule-runtime slug. The finding
 `additionalContext`, which Copilot appends to the tool result the model
 sees, on the same turn as the edit.
 
-One warning rides along: `level-too-large` (a level of the graph holding
-more than fifteen items). It is not an error, the program still runs, but
-the model is the one writing the graph, and this is the compiler's way of
-saying the file is becoming a wall. It is printed under its own heading so
-the model can tell law-breaking (errors) from unreadability (this) at a
-glance.
+Two kinds of warning ride along. `level-too-large` (a level of the graph
+holding more than fifteen items) is not an error, the program still runs,
+but the model is the one writing the graph, and this is the compiler's way
+of saying the file is becoming a wall. Spelling warnings are the other: a
+name the program chose that is not camelCase (`not-camel-case`, with the
+fix), and, after an edit under `nodes/`, the catalog's warnings about a
+name a node's `metadata.json` spells off the weft way. The model chose
+those names, so it is the one to fix them while the file is open. Each
+kind is printed under its own heading so the model can tell law-breaking
+(errors) from unreadability and spelling at a glance.
 
 Silence means clean: exit 0 with no output when there is nothing to say,
 when the edit touched nothing weft-related, or when the toolchain needed to
@@ -69,6 +74,7 @@ def project_root(start: str):
 
 
 INCLUDE = re.compile(r'@include\(\s*"([^"]+)"\s*\)')
+CATALOG_PREFIX = "__catalog/"
 
 
 def entry_for(root: str, path: str) -> str:
@@ -78,7 +84,8 @@ def entry_for(root: str, path: str) -> str:
     checked alone misses what its includer wires into it, and reports
     false errors such as an unmet required port); `path` itself when
     nothing includes it. An `@include` path is relative to the file that
-    writes it."""
+    writes it, except one starting `__catalog/`, which is measured from the
+    project's `nodes/` wherever it is written."""
     entry = os.path.join(root, "src", "main.weft")
     if not os.path.isfile(entry):
         return path
@@ -101,7 +108,25 @@ def entry_for(root: str, path: str) -> str:
             if line.lstrip().startswith("#"):
                 continue
             for rel in INCLUDE.findall(line):
-                stack.append(os.path.realpath(os.path.join(os.path.dirname(cur), rel)))
+                if rel.startswith(CATALOG_PREFIX):
+                    # The rest is normalized on its own, the way the
+                    # compiler reads it: any `..` that climbs out of
+                    # `nodes/` (even one that comes back in) is refused
+                    # there, so it leads nowhere here.
+                    parts = []
+                    for part in rel[len(CATALOG_PREFIX):].split("/"):
+                        if part in ("", "."):
+                            continue
+                        if part == "..":
+                            if not parts:
+                                break
+                            parts.pop()
+                            continue
+                        parts.append(part)
+                    else:
+                        stack.append(os.path.realpath(os.path.join(root, "nodes", *parts)))
+                else:
+                    stack.append(os.path.realpath(os.path.join(os.path.dirname(cur), rel)))
     return path
 
 
@@ -141,12 +166,12 @@ def validate(root: str, target: str, node_edit: bool = False):
         return None
     diags = out.get("diagnostics") or []
     # Tier 1 only: `weft validate` runs the strict pipeline in runtime
-    # mode, which adds rule-runtime findings (an unpicked connection and
-    # cousins). Those are runtime rules: a build deliberately skips them,
-    # a run is not gated on them, and they fire at execution as a loud
-    # node failure, fixed by a click in the editor rather than a source
-    # edit. Blocking the edit loop on them would trap the model on an
-    # error it cannot fix in source.
+    # mode, which adds rule-runtime findings (a provider with no model
+    # named yet, and cousins). Those are runtime rules: a build deliberately skips them,
+    # and a run, an activate or a resync is refused before it starts
+    # while one is open, fixed by a pick rather than a source edit.
+    # Blocking the edit loop on them would trap the model on an error it
+    # cannot fix in source.
     errors = [
         d for d in diags
         if d.get("severity") == "error" and d.get("code") != "rule-runtime"
@@ -161,7 +186,21 @@ def validate(root: str, target: str, node_edit: bool = False):
         d for d in diags
         if d.get("severity") == "warning" and d.get("code") == "level-too-large"
     ]
-    if not errors and not level_warnings:
+    # Names the model chose that are spelled off the weft way: the
+    # compiler's `not-camel-case` (the program's names), and, after a node
+    # edit, the catalog's spelling warnings (a node's metadata.json). The
+    # catalog lines carry no code, so they are picked by their `kind`.
+    spelling = [
+        d for d in diags
+        if d.get("severity") == "warning" and d.get("code") == "not-camel-case"
+    ]
+    catalog_spelling = []
+    if node_edit:
+        catalog_spelling = [
+            w for w in (out.get("warnings") or [])
+            if isinstance(w, dict) and w.get("kind") == "spelling"
+        ]
+    if not errors and not level_warnings and not spelling and not catalog_spelling:
         return None
     lines = []
     if errors:
@@ -174,6 +213,14 @@ def validate(root: str, target: str, node_edit: bool = False):
             len(level_warnings), "" if len(level_warnings) == 1 else "s"))
         for d in level_warnings:
             lines.append(_format_finding(d, target))
+    if spelling or catalog_spelling:
+        count = len(spelling) + len(catalog_spelling)
+        lines.append("weft: {} spelling warning{} (the program runs; rename to the spelling given):".format(
+            count, "" if count == 1 else "s"))
+        for d in spelling:
+            lines.append(_format_finding(d, target))
+        for w in catalog_spelling:
+            lines.append("  " + w.get("message", ""))
     return "\n".join(lines)
 
 

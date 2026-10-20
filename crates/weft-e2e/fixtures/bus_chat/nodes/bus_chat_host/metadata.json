@@ -20,5 +20,5 @@
       "type": "Boolean"
     }
   ],
-  "requires_infra": false
+  "requiresInfra": false
 }

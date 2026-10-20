@@ -22,11 +22,11 @@ weft::access_node!(SlackAccessNode);
 | `test` | none | A call made at connect time to check it works, and where identity usually comes from. Whatever permission it needs must be granted on every connection (see `always` below) |
 | `identity` | none | The display name, assembled from stored values, like `"{team} / {user}"` |
 | `permissions` | `[]` | The permission catalogue people tick from |
-| `all_permissions_url` | none | Where the provider's full list is, when yours is a subset |
+| `allPermissionsUrl` | none | Where the provider's full list is, when yours is a subset |
 | `verification` | silent, free | What the check can learn and what it costs |
-| `connection_optional` | `false` | The node runs with nothing picked |
-| `callback_https` | `false` | The provider refuses plain http callbacks |
-| `own_page` | none | What the "your own" door shows beyond its paste fields |
+| `connectionOptional` | `false` | The node runs with nothing picked |
+| `callback` | `any` | What address the provider accepts for its OAuth callback: `any`, `https` (it refuses plain http, like Slack), or `domain` (https on a domain name, never an IP address, like Google) |
+| `ownPage` | none | What the "your own" door shows beyond its paste fields |
 | `events` | `{}` | How this service reports events, by topic |
 | `verify` | none | How a caller presenting this connection is checked, on a gated route |
 | `capabilities` | `[]` | Named groups of optional fields, each unlocking one thing |
@@ -37,10 +37,10 @@ weft::access_node!(SlackAccessNode);
 | `kind` | For | Keys |
 |---|---|---|
 | `static` | Paste a key | `fields` |
-| `oauth2` | Sign in | `grant`, `token_url`, `scope_delimiter`, `auth_params`, `extra_params`, `registration_fields`, `captures`, `token_auth`, `refresh` |
-| `mint_jwt` | Sign your own assertion | `fields`, `algorithm`, `claims`, `jwt_ttl_secs`, `exchange` |
+| `oauth2` | Sign in | `grant`, `tokenUrl`, `scopeDelimiter`, `authParams`, `extraParams`, `registrationFields`, `captures`, `tokenAuth`, `refresh` |
+| `mint_jwt` | Sign your own assertion | `fields`, `algorithm`, `claims`, `jwtTtlSecs`, `exchange` |
 
-The `grant` is `authorization_code` with an `auth_url` and PKCE on by default,
+The `grant` is `authorization_code` with an `authUrl` and PKCE on by default,
 or `client_credentials`.
 
 There is a fourth, `runtime`, and **you never write it.** It is the stored form
@@ -78,9 +78,9 @@ to reconnect.
 
 A curated catalogue, not the provider's whole list. On a provider with hundreds
 of scopes, list the ones your nodes actually need and point
-`all_permissions_url` at the rest.
+`allPermissionsUrl` at the rest.
 
-`default: true` starts it ticked. `own_only: true` means the runtime's own
+`default: true` starts it ticked. `ownOnly: true` means the runtime's own
 credential can never serve it, which greys out the shared option for anyone who
 ticks it.
 
@@ -93,7 +93,7 @@ call that reads Drive fails every connection that did not tick Drive. Only
 mark a permission `always` when the provider grants it without a review and an
 app allows it without being set up for it, because every app and every
 connection asks for it. An `always` permission cannot also be `default` or
-`own_only`.
+`ownOnly`.
 
 ## Verification
 
@@ -104,6 +104,7 @@ Say honestly what your check can learn:
 | `reports_permissions` | The provider states what it granted |
 | `self_introspect` | The credential can describe itself |
 | `reports_validity` | Only "alive", never "what" |
+| `probe` | A real call whose refusal would be read back. No check uses it yet |
 | `silent` | Nothing knowable |
 
 Only the first two make the recorded permissions authoritative, and only those
@@ -112,15 +113,17 @@ let weft block a node before it calls.
 `cost` is `free`, `ambiguous` or `paid`, and **only `free` runs on its own**. A
 check that might bill is never run without being asked.
 
-Today every service in the shipped catalog declares `free`, and nine of the
-thirteen declare `reports_validity`. So in practice the only way a connection
-is genuinely verified right now is the OAuth scope echo, where the provider
-tells weft what it granted. A `probe` rung exists in the type and nothing
-implements it.
+Today the shipped catalog has 21 services. Thirteen of them declare a
+verification, all `free`: three `reports_permissions`, nine `reports_validity`
+and one `silent`. The eight that declare none take the default, `silent` and
+`free`. So in practice the only way a connection's *permissions* are verified
+right now is the OAuth scope echo, where the provider tells weft what it
+granted. A `probe` would only learn about the one call it makes, so like
+`reports_validity` it leaves the permissions recorded as claimed.
 
 ## Your own door
 
-`own_page` is what that door shows:
+`ownPage` is what that door shows:
 
 | Key | What it is |
 |---|---|

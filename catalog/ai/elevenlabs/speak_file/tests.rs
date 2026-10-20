@@ -292,7 +292,7 @@ async fn zero_retention(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn refused_pairs(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     for (extra, says) in [
         (json!({ "model": "eleven_multilingual_v2", "languageCode": "fr" }), "takes no `languageCode`"),
         (json!({ "model": "eleven_v3", "previousRequestIds": ["r"] }), "`nextRequestIds` on eleven_v3"),
@@ -305,7 +305,7 @@ async fn refused_pairs(rig: FakeRig) -> WeftResult<()> {
         (json!({ "outputFormat": "ulaw_8000", "pan": 0.5 }), "`pan` makes the audio stereo"),
     ] {
         let err = rig.run(&ElevenLabsSpeakFileNode, inputs(&rig, extra.clone())).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `error` wired: {extra}: {err}");
+        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {extra}: {err}");
         assert!(err.contains(says), "{extra}: {err}");
     }
     assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");

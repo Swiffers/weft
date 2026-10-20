@@ -18,7 +18,7 @@ pub fn tests() -> Vec<NodeTest> {
 async fn order(rig: FakeRig) -> WeftResult<()> {
     rig.answer_program_call("weft.connections.forget", json!({ "forgotten": 2 }));
     rig.answer_program_call("weft.tokens.revoke", json!({ "revoked": 1 }));
-    rig.answer_program_call("weft.runs.clean", json!({ "deleted": 3, "cancelled": 0, "left_running": 0 }));
+    rig.answer_program_call("weft.runs.clean", json!({ "deleted": 3, "cancelled": 0, "leftRunning": 0 }));
     let ada = StorageScope::instance_of(InstanceId::new("ada").expect("a valid id"));
     let grace = StorageScope::instance_of(InstanceId::new("grace").expect("a valid id"));
     let theirs = rig.store_file_in(&ada, "notes.txt", "text/plain", "ada's notes");
@@ -42,6 +42,12 @@ async fn order(rig: FakeRig) -> WeftResult<()> {
     );
     let selves: Vec<StopSelf> = calls.iter().map(|(_, s)| *s).collect();
     assert_eq!(selves, vec![StopSelf::Keep, StopSelf::Keep, StopSelf::Keep, StopSelf::Keep, StopSelf::Keep, StopSelf::Include]);
+    match &calls[0].0 {
+        ProgramCall::TriggerDeactivate { take_down, .. } => {
+            assert_eq!(*take_down, weft::TakeDown::REMOVE.choice(), "nothing of the instance's triggers is kept");
+        }
+        other => panic!("unexpected call {other:?}"),
+    }
     match &calls[1].0 {
         ProgramCall::InfraTerminate { node, disks, .. } => {
             assert_eq!(node, "bridge");

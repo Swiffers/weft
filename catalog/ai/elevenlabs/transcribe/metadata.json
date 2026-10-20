@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsTranscribe",
   "label": "ElevenLabs Transcribe (Realtime)",
-  "description": "Realtime speech-to-text over a live audio bus (Scribe v2 realtime): 16-bit PCM or 8 kHz μ-law in, each committed segment out on a text bus as it is spoken, the full transcript as a JSON file at the end. When you ask for them, each segment also comes with its word timings, its language, the names, numbers and other entities found in it, and a rewritten version. A failure after the stream has opened fails the run, so a cut-off stream is never mistaken for a finished one.",
+  "description": "Realtime speech-to-text over a live audio bus (Scribe v2 realtime): 16-bit PCM or 8 kHz μ-law in, each committed segment out on a text bus as it is spoken, the full transcript as a JSON file at the end. When you ask for them, each segment also comes with its word timings, its language, the names, numbers and other entities found in it, and a rewritten version. The segments bus opens with the first segment: a session refused before it is a failure `_error` can catch, and one that breaks off after it fails the run and ends the bus failed, so a cut-off stream is never mistaken for a finished one. An audio bus that ended failed fails the node.",
   "tags": [
     "ai",
     "audio",
@@ -38,7 +38,7 @@
       "default": "scribe_v2_realtime",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "scribe_v2_realtime"
         ]
@@ -245,5 +245,8 @@
         "port": "transcriptEdit"
       }
     }
-  ]
+  ],
+  "features": {
+    "journalSettings": true
+  }
 }

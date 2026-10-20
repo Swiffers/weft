@@ -2,7 +2,7 @@
 //!
 //! Owns:
 //! - Event routing (webhook URLs, form URLs, cron, infra events).
-//! - Handing executions to the project's workers (`delivery`, through
+//! - Handing runs to the project's workers (`delivery`, through
 //!   the platform's `Runner`).
 //! - Infrastructure orchestration: the `infra_lifecycle_command` table the
 //!   project's supervisor claims, and a bridge that fans supervisor-emitted
@@ -24,11 +24,13 @@ pub mod build;
 pub mod delivery;
 pub mod domains;
 pub mod drain;
+pub mod infra_reach;
 pub mod door;
 pub mod frontends;
 pub mod held;
 pub mod holders;
 pub mod entry_limits;
+pub mod files_door;
 pub mod display_feeds;
 pub mod events;
 pub mod infra_event;
@@ -48,6 +50,7 @@ pub mod live_view;
 pub mod proxy;
 pub mod instance_values;
 pub mod install_picks;
+pub mod node_state;
 pub mod projection;
 pub mod project_store;
 pub mod front;

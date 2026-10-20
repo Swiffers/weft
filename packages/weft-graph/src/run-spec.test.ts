@@ -1,117 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import {
-  exampleNameProblem,
-  addressOf,
-  groupOfCallPath,
-  isFrozen,
-  orderSpecsForMenu,
-  parseRunSpec,
-  parseSuppliedJson,
-  specForAction,
-  specScopedTo,
-  specSummary,
-  specToRunArgs,
-  type RunSpec,
-} from './run-spec';
+import { addressOf, groupOfCallPath, specScopedTo, type RunSpec } from './run-spec';
 
 describe('run spec', () => {
-  it('refuses duplicate supplied JSON keys without confusing quoted braces or sibling objects', () => {
-    for (const text of ['{"x":1,"x":2}', '{"rows":[{"x":1,"x":2}]}', '{"x":1,"\\u0078":2}']) {
-      expect(() => parseSuppliedJson(text)).toThrow("duplicate key 'x'");
-    }
-    for (const value of [{ text: '"x":1, {[]}' }, [{ x: 1 }, { x: 2 }], { a: { x: 1 }, b: { x: 2 } }, null, 'hello', 42]) {
-      expect(parseSuppliedJson(JSON.stringify(value))).toEqual(value);
-    }
-    expect(() => parseSuppliedJson('{"unfinished":')).toThrow();
-  });
-  it('rejects obsolete and malformed file shapes while preserving evidence', () => {
-    for (const field of ['scope', 'kicks', 'provided', 'emitted', 'input']) {
-      expect(() => parseRunSpec({ name: 'x', [field]: {} })).toThrow('unknown field');
-    }
-    expect(() => parseRunSpec({ name: 'x', from: { a: [] } })).toThrow('expected an object');
-    expect(() => parseRunSpec({ name: 'x', from: ['a'] })).toThrow('expected an object');
-    expect(() => parseRunSpec({ name: 'x', fire: ['a'] })).toThrow('expected [trigger, payload]');
-    const spec = { name: 'x', before: ['send'], emit: { a: { rows: [1, 2] } },
-      answers: [{ node: 'review', payload: 'yes', question: 'Continue?' }], caller: [{ text: 'hello' }] };
-    expect(parseRunSpec(spec)).toEqual(spec);
-  });
-  it('reads a wait ending as a payload (null included), a skip or a give-up, and refuses two or none', () => {
-    for (const answer of [{ node: 'review', payload: null }, { node: 'review', skipped: true }, { node: 'review', gave_up: "node 'review' gave up its wait: quiet" }]) {
-      const spec = { name: 'x', answers: [answer] };
-      expect(parseRunSpec(spec)).toEqual(spec);
-    }
-    const two: Array<[Record<string, unknown>, string]> = [
-      [{ payload: null, skipped: true }, '(a payload and "skipped": true)'],
-      [{ payload: 1, gave_up: 'quiet' }, '(a payload and "gave_up")'],
-      [{ skipped: true, gave_up: 'quiet' }, '("skipped": true and "gave_up")'],
-    ];
-    for (const [ending, named] of two) {
-      expect(() => parseRunSpec({ name: 'x', answers: [{ node: 'review', ...ending }] })).toThrow(`ended more than one way ${named}`);
-    }
-    expect(() => parseRunSpec({ name: 'x', answers: [{ node: 'review' }] })).toThrow('says nothing about how its wait ended');
-    expect(() => parseRunSpec({ name: 'x', answers: [{ node: 'review', skipped: false }] })).toThrow('says nothing about how its wait ended');
-    expect(() => parseRunSpec({ name: 'x', answers: [{ node: 'review', gave_up: 3 }] })).toThrow('gave_up');
-  });
-  it('reads how long a run is kept and refuses what is no duration', () => {
-    expect(parseRunSpec({ name: 'x', settings: { keep_for: '12h' } }).settings).toEqual({ keep_for: '12h' });
-    expect(parseRunSpec({ name: 'x', settings: { keep_for: 'forever' } }).settings).toEqual({ keep_for: 'forever' });
-    expect(() => parseRunSpec({ name: 'x', settings: { keep_for: 'a week' } })).toThrow('keep_for');
-  });
-  it('reads how long a wait holds and refuses what is no hold', () => {
-    expect(parseRunSpec({ name: 'x', settings: { hold_secs: 0 } }).settings).toEqual({ hold_secs: 0 });
-    expect(() => parseRunSpec({ name: 'x', settings: { hold_secs: 1.5 } })).toThrow('hold_secs');
-    expect(() => parseRunSpec({ name: 'x', settings: { hold_secs: 30 * 24 * 3600 + 1 } })).toThrow('hold_secs');
-  });
-
-  it('reads how a run is kept', () => {
-    const kept = { name: 'x', settings: { keeping: 'durable' } };
-    expect(parseRunSpec(kept)).toEqual(kept);
-    expect(() => parseRunSpec({ name: 'x', settings: { runClass: 'long' } })).toThrow('unknown field');
-    expect(() => parseRunSpec({ name: 'x', settings: { keeping: 'slow' } })).toThrow('keeping');
-    // A null is left out, as the runtime reads it.
-    expect(() => parseRunSpec({ name: 'x', settings: { keeping: null } })).not.toThrow();
-    // A run started by hand is always recorded: there is nothing to choose.
-    expect(() => parseRunSpec({ name: 'x', settings: { recorded: false } })).toThrow('unknown field');
-  });
-  it('turns a spec into the same flags a person would type', () => {
-    const spec: RunSpec = {
-      name: 'x',
-      from: { classify: { text: 'hi' }, bare: {} }, target: ['reply'], before: ['send'],
-      fire: ['inbound', { a: 1 }],
-      emit: { bridge: { url: 'http://x' } },
-    };
-    expect(specToRunArgs(spec)).toEqual([
-      '--from', 'classify={"text":"hi"}', '--from', 'bare',
-      '--target', 'reply',
-      '--before', 'send',
-      '--fire', 'inbound={"a":1}',
-      '--emit', 'bridge={"url":"http://x"}',
-    ]);
-    expect(specToRunArgs({ name: 'plain' })).toEqual([]);
-    expect(specToRunArgs({ name: 'batch', group: ['batch', { items: [1, 2] }] })).toEqual(['--group', 'batch={"items":[1,2]}']);
-    expect(specToRunArgs({ name: 'batch', group: ['batch', {}] })).toEqual(['--group', 'batch']);
-    expect(specToRunArgs({ name: 'fed', from: { 'hear.note': {} }, feed: ['hear.note'] }))
-      .toEqual(['--from', 'hear.note', '--feed', 'hear.note']);
-    // The seed checkbox has to travel: the dialog resolves the spec WITH
-    // seeding to decide it is runnable, so a run without `--seed` is
-    // refused for an input the preview said was covered.
-    expect(specToRunArgs({ name: 'plain' }, true)).toEqual(['--seed']);
-    // The instance and how the run is kept travel too, or a one-off run
-    // of a saved spec would run somewhere else, kept some other way.
-    expect(specToRunArgs({ name: 'kept', instance: 'ws-a', settings: { keeping: 'durable' } }))
-      .toEqual(['--instance', 'ws-a', '--durable']);
-    expect(specToRunArgs({ name: 'kept', settings: { keep_for: '30d' } })).toEqual(['--keep-for', '30d']);
-    expect(specToRunArgs({ name: 'held', settings: { hold_secs: 0 } })).toEqual(['--hold-secs', '0']);
-    expect(specToRunArgs({ name: 'over', settings: { keeping: 'fast' } })).toEqual(['--fast']);
-  });
-
-  it('summarises a spec for a menu', () => {
-    expect(specSummary({ name: 'plain' })).toBe('whole graph');
-    expect(specSummary({ name: 'g', from: { a: { p: 1 } }, expected: { wires: [] } }))
-      .toBe('from a, 1 input backups, frozen');
-    expect(isFrozen({ name: 'a', expected: { wires: [] } })).toBe(true);
-  });
-
   it('reads the group the user stands in off the include prefix', () => {
     expect(groupOfCallPath([])).toBeNull();
     expect(groupOfCallPath(['c'])).toBe('c');
@@ -122,37 +12,30 @@ describe('run spec', () => {
     expect(addressOf(['c', 'C.inner'], 'Inner.deep')).toBe('c.inner.deep');
   });
 
-  it('puts the specs scoped to the focused group first', () => {
+  it('spells a node in a group, in an opened include, and a whole box, as weft run --target reads them', () => {
+    // A group's member carries the group in its id: the place is the id.
+    expect(addressOf([], 'triage.parse')).toBe('triage.parse');
+    // A whole group box, or a whole include box, is its own id.
+    expect(addressOf([], 'triage')).toBe('triage');
+    expect(addressOf([], 'c')).toBe('c');
+    // Inside the file `c` includes, a group in that file keeps its
+    // name under the site.
+    expect(addressOf(['c'], 'C.grp.x')).toBe('c.grp.x');
+    // An include inside a group of the program: the site's id carries
+    // the group, and the body's prefix comes off what it holds.
+    expect(addressOf(['triage.c'], 'C.door')).toBe('triage.c.door');
+  });
+
+  it('knows which specs are scoped to a group', () => {
     const specs: RunSpec[] = [
       { name: 'whole' },
       { name: 'b-inner', from: { 'triage.parse': {} } },
       { name: 'a-group', group: ['triage', {}] },
       { name: 'other', group: ['billing', {}] },
     ];
+    expect(specScopedTo(specs[0], 'triage')).toBe(false);
     expect(specScopedTo(specs[1], 'triage')).toBe(true);
+    expect(specScopedTo(specs[2], 'triage')).toBe(true);
     expect(specScopedTo(specs[3], 'triage')).toBe(false);
-    expect(orderSpecsForMenu(specs, 'triage').map((s) => s.name)).toEqual(['a-group', 'b-inner', 'other', 'whole']);
-    expect(orderSpecsForMenu(specs, null).map((s) => s.name)).toEqual(['a-group', 'b-inner', 'other', 'whole']);
-  });
-
-  it('opens the dialog with the node action filled in', () => {
-    expect(specForAction('from', 'g.inner')).toEqual({ name: 'from-g-inner', from: { 'g.inner': {} } });
-    expect(specForAction('group', 'triage')).toEqual({ name: 'group-triage', group: ['triage', {}] });
-  });
-
-  it('refuses an example name that is a path, and suggests the name meant', () => {
-    // The rule the CLI applies, so the dialog can say no before it
-    // closes: closing destroys every field the person typed.
-    expect(exampleNameProblem('happy-path')).toBeUndefined();
-    expect(exampleNameProblem('a name with spaces')).toBeUndefined();
-    expect(exampleNameProblem('flows/happy')).toBe('an example is named, not a path: use `happy`');
-    expect(exampleNameProblem('happy.json')).toBe('an example is named, not a path: use `happy`');
-    // The suggestion survives the same rule: `...json` strips to `..`,
-    // which is not a name either, so there is nothing to suggest.
-    expect(exampleNameProblem('...json')).toBe('an example needs a name (a word, not a path or a directory)');
-    expect(exampleNameProblem('')).toBe('an example needs a name (a word, not a path or a directory)');
-    // A dash-leading name is read as a flag by `weft run <name>`, so it
-    // is refused here rather than written and then unrunnable.
-    expect(exampleNameProblem('-x')).toBe('an example cannot start with a dash');
   });
 });

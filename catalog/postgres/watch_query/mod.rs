@@ -1,38 +1,36 @@
 //! PostgresWatchQuery: keep one query's result live on a bus.
 //!
 //! The query runs at start and again every `intervalSecs`; each time
-//! the rows differ from the last run they go out as one `rows` message
-//! on the bus. A `channel` adds a second wake: the node LISTENs on it
+//! the rows differ from the last run they go out as one message on the
+//! `rows` bus, and each time the FIRST row differs it goes out on the
+//! `row` bus. A `channel` adds a second wake: the node LISTENs on it
 //! and a `NOTIFY` re-runs the query at once, so a trigger in the
 //! database turns the cadence into a backstop. The node runs until
-//! the run ends (a caller leaving ends a route's run), and the bus
-//! closes with it, which is what the Stream behind it reads as the
+//! the run ends (a caller leaving ends a route's run), and the buses
+//! close with it, which is what the Stream behind one reads as the
 //! end of the feed.
 //!
 //! Parameters bind exactly like PostgresExecuteQuery: every `$name`
 //! is the port of that name. One statement only: a script has no one
 //! result to watch.
 //!
-//! An output port named after a COLUMN is its own bus carrying that
-//! column out of the first row, so the common live-counter shape
-//! (`-> (count: Bus)` over `select count(*)`) sends `7` rather than
-//! `[{"count": 7}]` for every consumer to unwrap. Same rule as
-//! PostgresExecuteQuery's declared outputs, one result later: the
-//! first row's columns by name. A tick whose query answered no rows
-//! sends nothing on those ports and does not close them, because the
-//! next tick may well answer one.
+//! `row` is PostgresExecuteQuery's `row` one result later, with one
+//! difference a feed forces: a result with no rows sends `null` rather
+//! than closing the bus, because closing would end the feed for good
+//! while the next run may well answer a row, and sending nothing would
+//! leave a reader showing a row that is gone. Neither bus can be
+//! declared narrower: a bus carries no type for its messages, so there
+//! is nothing for a declaration to hold them to.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::bus::BusOptions;
+use weft::context::PendingBus;
 use weft::signal::poll_endpoint::MIN_POLL_INTERVAL_SECS;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::postgres::{
-    connect_alone, connect_listening, mistake, plan, query_json, refuse_shadowed_columns,
-    refuse_unanswered_ports, ListenEvent, Plan,
-};
+use super::postgres::{connect_alone, connect_listening, mistake, plan, query_json, ListenEvent, Plan};
 
 #[derive(NodeManifest)]
 pub struct PostgresWatchQueryNode;
@@ -68,7 +66,7 @@ impl Node for PostgresWatchQueryNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let query: String = ctx.inputs.get("query")?;
         let interval = cadence(ctx.inputs.get("intervalSecs")?)?;
@@ -97,37 +95,28 @@ impl Node for PostgresWatchQueryNode {
             None => (connect_alone(&ctx, &conn).await?, None),
         };
 
-        let bus = ctx.open_bus("rows", BusOptions::default(), "watch").await?;
-        // One bus per declared column port, opened before the first
-        // query so a consumer parked on any of them is attached for the
-        // opening result.
-        let columns = declared_columns(&ctx);
-        let mut column_buses = Vec::with_capacity(columns.len());
-        for column in &columns {
-            column_buses
-                .push((column.clone(), ctx.open_bus(column, BusOptions::default(), "watch").await?));
-        }
+        // Both open with the first result, so a query that fails before
+        // it answers is a failure `_error` can catch, and a consumer of
+        // either is attached for the opening result.
+        let mut rows_bus = read_bus(&ctx, "rows")?;
+        let mut row_bus = read_bus(&ctx, "row")?;
         let cancel = ctx.cancellation();
-        let mut last: Option<Vec<Value>> = None;
+        let mut last_rows: Option<Vec<Value>> = None;
+        let mut last_row: Option<Value> = None;
         loop {
             let rows = query_json(&client, &sql, &names, &values).await?;
-            // A column named `rows` asks for the port the whole result
-            // already rides on, so it would never reach a reader.
-            if let Some(first) = rows.first() {
-                refuse_shadowed_columns(first, &["rows"])?;
-                refuse_unanswered_ports(first, &ctx.data_outputs(), &["rows"])?;
-            }
-            if changed(last.as_deref(), &rows) {
-                bus.send("rows", json!(rows)).node_err("sending the rows on the bus")?;
-                for (column, value) in first_row_columns(&rows, &columns) {
-                    let bus = column_buses
-                        .iter()
-                        .find(|(name, _)| name == &column)
-                        .map(|(_, bus)| bus)
-                        .expect("a bus per declared column, opened above");
-                    bus.send(&column, value).node_err("sending a column on the bus")?;
+            let row = first_row(&rows);
+            if changed(last_rows.as_deref(), rows.as_slice()) {
+                if let Some(bus) = &mut rows_bus {
+                    bus.open().await?.send("rows", json!(rows)).node_err("sending the rows on the bus")?;
                 }
-                last = Some(rows);
+                last_rows = Some(rows);
+            }
+            if changed(last_row.as_ref(), &row) {
+                if let Some(bus) = &mut row_bus {
+                    bus.open().await?.send("row", row.clone()).node_err("sending the first row on the bus")?;
+                }
+                last_row = Some(row);
             }
             // The next wake: the cadence, a notification, or the run
             // ending. A notification arriving during the query is not
@@ -153,41 +142,24 @@ impl Node for PostgresWatchQueryNode {
     }
 }
 
-/// What each declared column port carries out of a change: that column
-/// of the FIRST row, for every column the row actually has.
-///
-/// A tick whose query answered no rows sends nothing and closes
-/// nothing: the next tick may well answer one, and closing would end
-/// the feed for good.
-fn first_row_columns(rows: &[Value], columns: &[String]) -> Vec<(String, Value)> {
-    let Some(first) = rows.first() else { return Vec::new() };
-    columns
-        .iter()
-        .map(|column| {
-            let value = first
-                .get(column)
-                .expect("refuse_unanswered_ports bails on a declared column the first row lacks");
-            (column.clone(), value.clone())
-        })
-        .collect()
+/// What the `row` bus carries for one result: its first row, or
+/// `null` when it answered none.
+pub fn first_row(rows: &[Value]) -> Value {
+    rows.first().cloned().unwrap_or(Value::Null)
 }
 
-/// The output ports the author declared beyond `rows`: each names a
-/// column of the watched query, and each becomes its own bus.
-fn declared_columns(ctx: &ExecutionContext) -> Vec<String> {
-    let mut columns: Vec<String> =
-        ctx.data_outputs().into_keys().filter(|name| name != "rows").collect();
-    // The declared map has no order of its own; a stable one keeps the
-    // bus markers going out the same way on every run, which the
-    // journal compares across runs.
-    columns.sort();
-    columns
+/// The bus on `port`, only when something reads it (a journaled bus
+/// records every message, so one nobody reads would be written on every
+/// change for nothing), opening with the first piece it carries.
+fn read_bus<'c>(ctx: &'c RunContext, port: &str) -> WeftResult<Option<PendingBus<'c>>> {
+    let journal = ctx.journal_policy()?;
+    Ok(ctx.is_output_wired(port).then(|| ctx.pending_bus(port, BusOptions { journal, ..BusOptions::default() }, "watch")))
 }
 
-/// Whether the result moved since the last message. The first result
+/// Whether a bus's value moved since its last message. The first one
 /// always counts: a feed opens with what is there.
-pub fn changed(last: Option<&[Value]>, rows: &[Value]) -> bool {
-    last != Some(rows)
+pub fn changed<T: PartialEq + ?Sized>(last: Option<&T>, now: &T) -> bool {
+    last != Some(now)
 }
 
 /// The next notification: `Ok` when one arrived, and the reason the

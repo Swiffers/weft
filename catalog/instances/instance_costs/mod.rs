@@ -1,11 +1,11 @@
 //! InstanceCosts: what one instance's runs cost, narrowed by the optional
-//! filters, with the measured total.
+//! filters, with the measured total and how many calls it is missing.
 
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
 use weft::program::PaidBy;
-use weft::{node_bail, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{node_bail, RunContext, RunId, Node, NodeManifest, WeftError, WeftResult};
 
 use super::lifecycle::instance;
 
@@ -22,8 +22,16 @@ impl Node for InstanceCostsNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let mut query = ctx.costs().instance(instance(&ctx)?);
+        // Never skipped when blank: a run id that did not arrive must not
+        // widen the read to every run of the instance.
+        if let Some(given) = ctx.inputs.opt::<String>("run")? {
+            let run: RunId = given.trim().parse().map_err(|_| {
+                WeftError::Input(format!("run takes a run id (the one GetRunId gives), so it cannot be '{given}'"))
+            })?;
+            query = query.run(run);
+        }
         if let Some(service) = ctx.inputs.opt::<String>("service")?.filter(|s| !s.trim().is_empty()) {
             query = query.service(service);
         }
@@ -45,6 +53,13 @@ impl Node for InstanceCostsNode {
         // Folded from 0.0: `Sum` for f64 starts at -0.0, so an instance
         // with no records would read a total of -0.
         let total: f64 = records.iter().filter_map(|r| r.amount_usd).fold(0.0, |sum, amount| sum + amount);
-        ctx.pulse_downstream(NodeOutput::new().set_serialized("records", &records)?.set("totalUsd", total)).await
+        let unpriced = records.iter().filter(|r| r.amount_usd.is_none()).count();
+        ctx.pulse_downstream(
+            NodeOutput::new()
+                .set_serialized("records", &records)?
+                .set("totalUsd", total)
+                .set("unpricedCalls", unpriced),
+        )
+        .await
     }
 }

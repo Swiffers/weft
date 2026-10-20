@@ -6,14 +6,13 @@
   import { MessagesSquare } from '@lucide/svelte';
   import GraphToolbar from './lib/components/project/GraphToolbar.svelte';
   import CallerPanel from './lib/components/project/CallerPanel.svelte';
-  import DeactivationPicker from './lib/components/project/DeactivationPicker.svelte';
   import { send, onMessage, teardownTransport, hostRequest, cancelPendingHostRequests, HostRequestCancelled } from './host';
   import { registerCatalog, setCatalog } from './lib/nodes';
   import { translateProject } from './host-bridge';
   import { projectHasInfra, projectHasTriggers } from './lib/utils/node-roles';
-  import type { ProjectDefinition as V1Project, NodeExecution, ExecutionState } from './lib/types';
+  import type { ProjectDefinition as V1Project, NodeFiring, RunState } from './lib/types';
   import { bareRecord } from './lib/types';
-  import type { ActionBarState, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, TriggerChoiceIntent, WebviewMessage } from '../protocol';
+  import type { ActionBarState, CatalogWarning, ActionAvailability, LifecycleAction, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, FollowMode, ProjectDefinition as ProtocolProject, HostMessage, RunCheck, WebviewMessage } from '../protocol';
   import type { EditRpcResult } from './lib/projection/types';
   import { idleActionBarState } from '../status';
   import { credentialOwnerKind } from '../protocol';
@@ -55,7 +54,7 @@
   // failure (catalogError.error) or per-node soft warnings. Lives on
   // its own so a successful parse can't erase a live catalog problem.
   let catalogError: string | null = $state(null);
-  let catalogWarnings: string[] = $state([]);
+  let catalogWarnings: CatalogWarning[] = $state([]);
   // The in-canvas problems pill: parse + catalog problems folded into
   // one surface, each entry a short collapsed label plus the full text
   // for the expanded view.
@@ -65,8 +64,8 @@
       ? [{ label: 'node catalog error', text: catalogError, severity: 'error' as const }]
       : []),
     ...catalogWarnings.map((w) => ({
-      label: 'node catalog warning',
-      text: w,
+      label: w.kind === 'spelling' ? 'node spelling warning' : 'node catalog warning',
+      text: w.message,
       severity: 'warning' as const,
     })),
   ]);
@@ -217,9 +216,9 @@
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let editorRef: any = $state();
 
-  // Live execution state fed by the host's exec follower.
+  // Live run state fed by the host's run follower.
   // nodeOutputs snapshots the last-observed output per node;
-  // nodeExecutions tracks the rolling history per node.
+  // nodeFirings tracks the rolling history per node.
   //
   // busLogByBus is the source of truth for bus conversations: every
   // bus event ever observed (live or replay), keyed by busId. The
@@ -229,9 +228,9 @@
   // from the first BusParticipant edge the dispatcher derives from
   // the bus marker JSON.
   /// A canvas with no run painted on it. `isRunning` is true while a
-  /// run is about to be replayed onto it (`execReset`), false when
-  /// there is simply nothing to show (startup, `execCleared`).
-  function emptyExecutionState(isRunning: boolean): ExecutionState {
+  /// run is about to be replayed onto it (`runReset`), false when
+  /// there is simply nothing to show (startup, `runCleared`).
+  function emptyRunState(isRunning: boolean): RunState {
     return {
       isRunning,
       scope: undefined,
@@ -239,49 +238,51 @@
       version: undefined,
       tags: [],
       nodeOutputs: bareRecord(),
-      nodeExecutions: bareRecord(),
+      nodeFirings: bareRecord(),
       busLogByBus: bareRecord(),
       busMetaByBus: bareRecord(),
       busParticipantsByBus: bareRecord(),
       journalCorruptions: [],
       loopEventsByGroup: {},
+      scopeDecisions: bareRecord(),
       callerLog: [],
     };
   }
-  let executionState = $state<ExecutionState>(emptyExecutionState(false));
+  let runState = $state<RunState>(emptyRunState(false));
   // The run this view paints: the followed one, or nothing when the view
   // is no place (a run's rows belong to a call, and a file opened on its
   // own names none). ONE gate, here, so the editor, the toolbar's follow
   // controls, the caller panel and the slot context all read the same
   // answer instead of each checking for itself.
-  const shownExecutionState = $derived(interactive ? executionState : emptyExecutionState(false));
+  const shownRunState = $derived(interactive ? runState : emptyRunState(false));
 
-  // Dedup keys for append-only inspector logs. The execution follower
+  // Dedup keys for append-only inspector logs. The run follower
   // subscribes to the live SSE stream BEFORE replaying the journal
   // snapshot, so an event can arrive via BOTH the replay and the live
-  // buffer (the overlap window). Node executions are idempotent (keyed
+  // buffer (the overlap window). Node firings are idempotent (keyed
   // by (nodeId, framesKey), mutated in place), but bus and loop logs
   // are append-only, so without dedup the same chat line / loop
   // iteration would render twice. Bus events carry a per-bus `offset`;
   // loop events are keyed by (groupId, kind, parentFrames, index).
-  // Reset on execReset (a fresh follow). Kept OUTSIDE `executionState`
+  // Reset on runReset (a fresh follow). Kept OUTSIDE `runState`
   // ($state) since they're pure bookkeeping, not rendered.
   let seenBusKeys = new Set<string>();
   let seenLoopKeys = new Set<string>();
   let seenCallerOffsets = new Set<string>();
 
   // What each node is showing, keyed by node id. An infra node's
-  // container and the listener kind holding a trigger's signal both
-  // serve the same shape, so there is one map for both.
+  // container and the listener kind holding a signal (a trigger's, or
+  // a wait's in the followed run) all serve the same shape, so there is
+  // one map for all of them.
   //
-  //   - a node with a display (infra serving /live, or a trigger)
-  //     → displayByNode
+  //   - a node with a display (infra serving /live, a trigger, or a
+  //     node waiting in the followed run) → displayByNode
   //   - debug nodes (features.showDebugPreview)
-  //     → executionState.nodeOutputs
+  //     → runState.nodeOutputs
   //   - everything else → no body panel; modal inspector only.
   //
   // Each entry is `NodeFeedState`: ok with items, absent, or error
-  // with a message. NEVER a fallback to execution data.
+  // with a message. NEVER a fallback to run data.
   let displayByNode = $state<Record<string, NodeFeedState>>(bareRecord());
 
   // Source-derived flags: does the project DECLARE infra / trigger
@@ -306,7 +307,7 @@
   // Auto-follow state. The host-side controller owns the actual
   // decisions; we just render the badge and forward clicks.
   let followMode = $state<FollowMode>('following');
-  let followExecutionId = $state<string | undefined>(undefined);
+  let followRunId = $state<string | undefined>(undefined);
   let followPendingCount = $state(0);
   /// Why the followed run cannot be painted whole, when it cannot: the
   /// code it ran is no longer recorded, so the rows are all there and
@@ -314,7 +315,7 @@
   /// canvas with nothing on it and no reason for it reads as a broken
   /// viewer and sends people looking for a bug that is not there.
   const runNotPainted = $derived(
-    executionState.journalCorruptions.find((c) => c.site === 'MissingProgram')?.reason,
+    runState.journalCorruptions.find((c) => c.site === 'MissingProgram')?.reason,
   );
   /// Whether the caller panel is showing. Closed on every load: it is a
   /// thing you go and look at, not a thing that takes up the canvas
@@ -328,10 +329,10 @@
   // layer, `error` sticky banner.
   let actionBarState = $state<ActionBarState>(idleActionBarState());
 
-  // Latest /status snapshot. Drives the action bar's drift
-  // indicators (Resync/Upgrade lights) AND the graph's per-node
-  // infra badges. Stays current across cli_running so the lights
-  // don't blink mid-verb.
+  // Latest /status snapshot: every trigger's, infra copy's and
+  // instance's state. Drives the node badges, the contextual bar's
+  // counts and the bottom bar's in-flight states. Stays current across
+  // cli_running so the badges don't blink mid-verb.
   let statusSnapshot = $state<ActionAvailability | undefined>(undefined);
 
   onMount(() => {
@@ -371,10 +372,6 @@
       // editApplied and sourceResynced replies are consumed by the shared
       // hostRequest correlator (see requestEdit/requestResync above), not
       // handled here.
-      if (msg.kind === 'needsTriggerChoice') {
-        deactivationIntent = msg.intent;
-        return;
-      }
       if (msg.kind === 'codeEditTouched') {
         // An external change landed on the watched doc: slide the editor's
         // auto-lock forward (source-mutating graph gestures pause for 1s).
@@ -465,36 +462,32 @@
         catalogWarnings = msg.warnings ?? [];
         return;
       }
-      if (msg.kind === 'execReset' || msg.kind === 'execCleared') {
-        executionState = emptyExecutionState(msg.kind === 'execReset');
+      if (msg.kind === 'runReset' || msg.kind === 'runCleared') {
+        runState = emptyRunState(msg.kind === 'runReset');
         seenBusKeys = new Set();
         seenLoopKeys = new Set();
         seenCallerOffsets = new Set();
         return;
       }
-      if (msg.kind === 'execScope') {
+      if (msg.kind === 'runScope') {
         // The run's birth: what it is held to, and what it inherits.
-        executionState.scope = msg.subgraph;
-        executionState.seed = msg.seed;
+        runState.scope = msg.subgraph;
+        runState.seed = msg.seed;
         return;
       }
-      if (msg.kind === 'execVersion') {
-        if (followExecutionId && msg.executionId !== followExecutionId) return;
+      if (msg.kind === 'runVersion') {
+        if (followRunId && msg.runId !== followRunId) return;
         // Both null means there is no followed run here any more (the
         // graph moved to another project), so the banner goes rather
         // than reading as "this run matches disk".
-        executionState.version =
+        runState.version =
           msg.version === null && msg.diskVersion === null
             ? undefined
             : { version: msg.version, diskVersion: msg.diskVersion };
         return;
       }
-      if (msg.kind === 'specsListed') {
-        specs = msg.specs;
-        return;
-      }
-      if (msg.kind === 'execTerminal') {
-        // The dispatcher reached ExecutionCompleted / ExecutionFailed.
+      if (msg.kind === 'runTerminal') {
+        // The dispatcher reached RunCompleted / RunFailed.
         // Whatever the per-node tally says, the run is over: hide
         // the Stop button. Close EVERY non-terminal row (in case a
         // NodeCompleted slipped through SSE, a parallel-loop iteration
@@ -502,21 +495,21 @@
         // `waiting_for_input` when the run was cancelled): only
         // completed/failed/skipped/cancelled are terminal, so anything
         // else (running, waiting_for_input) must be force-closed to the
-        // execution's terminal state, not just the last `running` row.
-        executionState.isRunning = false;
+        // run's terminal state, not just the last `running` row.
+        runState.isRunning = false;
         // Keep how it ended: a cancel's cause is what tells a run a
         // sibling stopped (through `ctx.stop_tagged`) apart from one a
         // person stopped, and the inspector shows it on the run.
-        executionState.terminal = { state: msg.state, reason: msg.reason, cause: msg.cause };
+        runState.terminal = { state: msg.state, reason: msg.reason, cause: msg.cause };
         // The journal's stamp, so a replayed run closes its rows at the
         // time it really ended, not at the time it was opened. A row
         // journaled after the terminal (a node that started in the same
         // second the cancel landed) closes at its own start, never
         // before it.
         const now = msg.atUnix * 1000;
-        const isTerminal = (s: NodeExecution['status']) =>
+        const isTerminal = (s: NodeFiring['status']) =>
           s === 'completed' || s === 'failed' || s === 'skipped' || s === 'cancelled';
-        const rows = bareRecord(executionState.nodeExecutions);
+        const rows = bareRecord(runState.nodeFirings);
         for (const [nodeId, history] of Object.entries(rows)) {
           if (history.some((r) => !isTerminal(r.status))) {
             rows[nodeId] = history.map((r) =>
@@ -526,10 +519,10 @@
             );
           }
         }
-        executionState.nodeExecutions = rows;
+        runState.nodeFirings = rows;
         return;
       }
-      if (msg.kind === 'execCost') {
+      if (msg.kind === 'runCost') {
         // One metered call's cost, added onto the matching firing's total.
         // Dedup by the record's stable identity: the dispatcher re-streams
         // journal events on every follow/reconnect (replay + live overlap),
@@ -537,7 +530,7 @@
         // sets the firing's costUnknown flag so it renders as "unknown",
         // never disappearing into a $0-looking total.
         const framesKey = JSON.stringify(msg.frames);
-        const rows = executionState.nodeExecutions[msg.nodeId];
+        const rows = runState.nodeFirings[msg.nodeId];
         const idx = rows?.findIndex((r) => r.framesKey === framesKey) ?? -1;
         if (!rows || idx < 0) {
           // The firing's row must already exist (node_started precedes any
@@ -551,7 +544,7 @@
         if (seen.includes(msg.costId)) {
           return;
         }
-        executionState.nodeExecutions = bareRecord(executionState.nodeExecutions, {
+        runState.nodeFirings = bareRecord(runState.nodeFirings, {
           [msg.nodeId]: rows.map((r, i) =>
             i === idx
               ? {
@@ -587,7 +580,7 @@
         // the file's key and the version the change produced: the same
         // journal row arrives twice when replay and live overlap.
         const framesKey = JSON.stringify(msg.frames);
-        const rows = executionState.nodeExecutions[msg.nodeId];
+        const rows = runState.nodeFirings[msg.nodeId];
         const idx = rows?.findIndex((r) => r.framesKey === framesKey) ?? -1;
         if (!rows || idx < 0) {
           // node_started precedes every edit on both paths: a miss is an
@@ -599,15 +592,15 @@
         if (seen.some((f) => f.key === msg.edit.key && f.toVersion === msg.edit.toVersion)) {
           return;
         }
-        executionState.nodeExecutions = bareRecord(executionState.nodeExecutions, {
+        runState.nodeFirings = bareRecord(runState.nodeFirings, {
           [msg.nodeId]: rows.map((r, i) => (i === idx ? { ...r, fileEdits: [...seen, msg.edit] } : r)),
         });
         return;
       }
-      if (msg.kind === 'execEvent') {
+      if (msg.kind === 'firingEvent') {
         const e = msg.event;
         const state = e.state;
-        // One execution row per (nodeId, framesKey). The dispatcher
+        // One run row per (nodeId, framesKey). The dispatcher
         // produces state events (running/waiting_for_input/completed/
         // failed/skipped/cancelled) on the same record; we mutate
         // the existing row, not append. A fresh dispatch after a
@@ -615,7 +608,7 @@
         // per (node, frames)). Rows are stamped with the journal's own
         // time, so a replay reads as when it happened.
         const now = e.atUnix * 1000;
-        const rows = executionState.nodeExecutions[e.nodeId] ?? [];
+        const rows = runState.nodeFirings[e.nodeId] ?? [];
         // Key the record by frame stack: each firing
         // at a distinct frame stack gets its own card so parallel fan-outs
         // don't cross-correlate. `lane` is a structured array;
@@ -623,7 +616,7 @@
         // needs.
         const framesKey = JSON.stringify(e.frames);
         const idx = rows.findIndex((r) => r.framesKey === framesKey);
-        let nextRows: NodeExecution[];
+        let nextRows: NodeFiring[];
         if (idx < 0) {
           // First event for this (node, frames). Open the record.
           nextRows = [
@@ -631,7 +624,7 @@
             {
               id: `${e.nodeId}-${framesKey}-${now}`,
               nodeId: e.nodeId,
-              status: state as NodeExecution['status'],
+              status: state as NodeFiring['status'],
               pulseId: `${e.nodeId}-${framesKey}-${now}`,
               startedAt: now,
               completedAt:
@@ -641,7 +634,7 @@
               error: e.error,
               costUsd: 0,
               logs: [],
-              executionId: '',
+              runId: '',
               frames: e.frames,
               framesKey,
               input: e.input,
@@ -650,7 +643,6 @@
               output: e.output,
               inheritedFrom: e.inheritedFrom,
               providedPorts: e.providedPorts,
-              backupPorts: e.backupPorts,
               inheritedPorts: e.inheritedPorts,
             },
           ];
@@ -658,7 +650,7 @@
           // Existing record: mutate in place per state.
           nextRows = rows.map((r, i) => {
             if (i !== idx) return r;
-            const updated: NodeExecution = { ...r, status: state as NodeExecution['status'] };
+            const updated: NodeFiring = { ...r, status: state as NodeFiring['status'] };
             if (state === 'completed' || state === 'failed' || state === 'skipped' || state === 'cancelled') {
               updated.completedAt = now;
               if (e.output !== undefined) updated.output = e.output;
@@ -669,7 +661,6 @@
             }
             if (e.inheritedFrom !== undefined) updated.inheritedFrom = e.inheritedFrom;
             if (e.providedPorts !== undefined) updated.providedPorts = e.providedPorts;
-            if (e.backupPorts !== undefined) updated.backupPorts = e.backupPorts;
             if (e.inheritedPorts !== undefined) updated.inheritedPorts = e.inheritedPorts;
             // closedPorts may arrive on node_started (state=running) or
             // node_skipped (state=skipped); always refresh from the event
@@ -687,19 +678,31 @@
             return updated;
           });
         }
-        executionState.nodeExecutions = bareRecord(executionState.nodeExecutions, {
+        runState.nodeFirings = bareRecord(runState.nodeFirings, {
           [e.nodeId]: nextRows,
         });
         // Debug preview (`features.showDebugPreview`) reads its
-        // last output from `executionState.nodeOutputs[id]`. Update
+        // last output from `runState.nodeOutputs[id]`. Update
         // it on completion. Earlier this rode the liveData channel;
-        // now it taps the exec event directly so a node's display
+        // now it taps the firing event directly so a node's display
         // cannot interfere.
         if (state === 'completed' && e.output !== undefined) {
-          executionState.nodeOutputs = bareRecord(executionState.nodeOutputs, {
+          runState.nodeOutputs = bareRecord(runState.nodeOutputs, {
             [e.nodeId]: e.output,
           });
         }
+        return;
+      }
+      if (msg.kind === 'scopeDecided') {
+        // A copy is decided once; the replay and the live stream overlap,
+        // so the same decision can arrive twice and the first one stands.
+        const e = msg.event;
+        const framesKey = JSON.stringify(e.frames);
+        const decided = runState.scopeDecisions[e.scope] ?? [];
+        if (decided.some((d) => JSON.stringify(d.frames) === framesKey)) return;
+        runState.scopeDecisions = bareRecord(runState.scopeDecisions, {
+          [e.scope]: [...decided, e],
+        });
         return;
       }
       if (msg.kind === 'busEvent') {
@@ -714,14 +717,14 @@
         const busKey = `${busId}:${msg.event.offset}`;
         if (seenBusKeys.has(busKey)) return;
         seenBusKeys.add(busKey);
-        const log = executionState.busLogByBus[busId] ?? [];
-        executionState.busLogByBus = bareRecord(executionState.busLogByBus, {
+        const log = runState.busLogByBus[busId] ?? [];
+        runState.busLogByBus = bareRecord(runState.busLogByBus, {
           [busId]: [...log, msg.event],
         });
         return;
       }
       if (msg.kind === 'callerEvent') {
-        // One caller per execution: a flat ordered log. Dedup on the
+        // One caller per run: a flat ordered log. Dedup on the
         // row's own position (an offset for a lifecycle row, the span
         // for a window of messages) because the replay snapshot and the
         // live stream overlap during a replay follow.
@@ -731,7 +734,7 @@
             : `caller:${msg.event.offset}`;
         if (seenCallerOffsets.has(callerKey)) return;
         seenCallerOffsets.add(callerKey);
-        executionState.callerLog = [...executionState.callerLog, msg.event];
+        runState.callerLog = [...runState.callerLog, msg.event];
         return;
       }
       if (msg.kind === 'loopEvent') {
@@ -745,28 +748,28 @@
         const loopKey = `${gid}:${msg.event.kind}:${JSON.stringify(msg.event.parentFrames)}:${idx}`;
         if (seenLoopKeys.has(loopKey)) return;
         seenLoopKeys.add(loopKey);
-        const log = executionState.loopEventsByGroup[gid] ?? [];
-        executionState.loopEventsByGroup = {
-          ...executionState.loopEventsByGroup,
+        const log = runState.loopEventsByGroup[gid] ?? [];
+        runState.loopEventsByGroup = {
+          ...runState.loopEventsByGroup,
           [gid]: [...log, msg.event],
         };
         return;
       }
-      if (msg.kind === 'execTags') {
+      if (msg.kind === 'runTags') {
         // The run tagged itself. Accumulate the set in claim order; the
         // same tag can arrive twice (replay then live, or a body re-run
         // re-tagging), so it is deduplicated here.
-        const seen = new Set(executionState.tags);
+        const seen = new Set(runState.tags);
         const fresh = msg.tags.filter((t) => !seen.has(t));
-        if (fresh.length > 0) executionState.tags = [...executionState.tags, ...fresh];
+        if (fresh.length > 0) runState.tags = [...runState.tags, ...fresh];
         return;
       }
       if (msg.kind === 'journalCorruption') {
         // One-shot at replay: append. The inspector aggregates these
-        // into a muted "N journal rows corrupted" line per execution.
+        // into a muted "N journal rows corrupted" line per run.
         // Not alarming; the user only sees it if they look.
-        executionState.journalCorruptions = [
-          ...executionState.journalCorruptions,
+        runState.journalCorruptions = [
+          ...runState.journalCorruptions,
           { site: msg.site, reason: msg.reason },
         ];
         return;
@@ -779,11 +782,11 @@
         // bus also seeds `busMetaByBus[busId]` from the dispatcher-
         // derived mode, so the inspector renders the panel header
         // badge from the same source as participation.
-        const set = executionState.busParticipantsByBus[msg.busId] ?? new Set<string>();
+        const set = runState.busParticipantsByBus[msg.busId] ?? new Set<string>();
         if (!set.has(msg.nodeId)) {
           const next = new Set(set);
           next.add(msg.nodeId);
-          executionState.busParticipantsByBus = bareRecord(executionState.busParticipantsByBus, {
+          runState.busParticipantsByBus = bareRecord(runState.busParticipantsByBus, {
             [msg.busId]: next,
           });
         }
@@ -793,7 +796,7 @@
         // silently mutate a known-good state with a known-bad one.
         // Log loud so the bug is visible in the dev tools without
         // corrupting the UI.
-        const prevMeta = executionState.busMetaByBus[msg.busId];
+        const prevMeta = runState.busMetaByBus[msg.busId];
         if (prevMeta) {
           if (prevMeta.ephemeral !== msg.meta.ephemeral) {
             console.warn(
@@ -801,7 +804,7 @@
             );
           }
         } else {
-          executionState.busMetaByBus = bareRecord(executionState.busMetaByBus, {
+          runState.busMetaByBus = bareRecord(runState.busMetaByBus, {
             [msg.busId]: msg.meta,
           });
         }
@@ -809,22 +812,22 @@
       }
       if (msg.kind === 'followStatus') {
         followMode = msg.status.mode;
-        followExecutionId = msg.status.executionId;
+        followRunId = msg.status.runId;
         followPendingCount = msg.status.pendingCount;
         return;
       }
       if (msg.kind === 'followLost') {
-        // The live SSE link to this execution ended or broke. Stop
+        // The live SSE link to this run ended or broke. Stop
         // presenting the run as live (hide the Stop button) WITHOUT
         // falsely marking nodes completed: the per-node rows keep
         // their last known state, we just aren't following anymore.
-        // (execTerminal is the run actually finishing; this is the
+        // (runTerminal is the run actually finishing; this is the
         // link dying with the run possibly still in flight.)
-        executionState.isRunning = false;
+        runState.isRunning = false;
         toast.warning(
           msg.reason === 'error'
-            ? 'Lost the live connection to this execution. Re-open it to reconnect.'
-            : 'The live execution stream ended. Re-open the execution to reconnect.',
+            ? 'Lost the live connection to this run. Re-open it to reconnect.'
+            : 'The live run stream ended. Re-open the run to reconnect.',
         );
         return;
       }
@@ -927,127 +930,45 @@
   // a worker, and forwards the message to the host. The host's
   // CLI runner emits progress events that drive every UI
   // transition; the webview never sets transitional flags itself.
-  function onRun(targets: string[] = []) {
+  function onRun(targets: [string, ...string[]]) {
     editorRef?.flushAllPendingSaves?.();
     send({ kind: 'runProject', targets });
   }
+  /// Whether a run of these targets would start (`weft run --check`):
+  /// its refusal, or the infra it reads, which the contextual bar holds
+  /// against the infra status to disable Run with a reason.
+  async function checkRun(targets: [string, ...string[]]): Promise<RunCheck> {
+    editorRef?.flushAllPendingSaves?.();
+    const reply = await hostRequest('runChecked', (requestId) => ({ kind: 'checkRun', requestId, targets }));
+    return reply.check;
+  }
 
-  // The run spec dialog's round trips: resolve through the host (the
-  // parse server runs the dispatcher's own resolver), list the specs
-  // in `examples/`, run or save one, branch to a run's version.
-  let specs = $state<import('../run-spec').RunSpec[]>([]);
-  async function resolveSpec(spec: import('../run-spec').RunSpec, seeded: boolean): Promise<import('../run-spec').ResolveSpecResponse> {
-    const reply = await hostRequest('specResolved', (requestId) => ({ kind: 'resolveSpec', requestId, spec, seeded }));
-    return reply.result;
-  }
-  function onRunSpec(spec: import('../run-spec').RunSpec, seeded = false) {
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'runSpec', spec, seeded });
-  }
-  function onSaveSpec(spec: import('../run-spec').RunSpec) {
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'saveSpec', spec });
-  }
-  function onRunSpecFile(name: string) {
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'runSpecFile', name });
-  }
-  function onListSpecs() {
-    send({ kind: 'listSpecs' });
-  }
+  /// Put the files on disk onto a run's version (the version banner).
   function onBranchTo(reference: string) {
     send({ kind: 'branchTo', reference });
   }
   // Stop is generic now: the host inspects the bar's current
   // state and either kills the spawned CLI process group
-  // (cli_running) or POSTs /executions/{executionId}/cancel
-  // (execution_running). One verb, state-aware behavior.
+  // (cli_running) or POSTs /runs/{runId}/cancel
+  // (run_running). One verb, state-aware behavior.
   function onStop() { send({ kind: 'stopAction' }); }
   function onDismissError() { send({ kind: 'dismissError' }); }
-  function onActivate() {
+  /// A lifecycle verb on the selected triggers or infra. Turning on,
+  /// resyncing, starting and upgrading build from the source, so the
+  /// pending edits are flushed first.
+  function onLifecycle(action: LifecycleAction) {
     editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'activateProject' });
+    send({ kind: 'lifecycle', action });
   }
-  // ─── The shared deactivation picker ─────────────────────────
-  // One picker for every verb that takes live triggers down: the
-  // standalone Deactivate, and the infra verbs on an ACTIVE project
-  // (stop / terminate / upgrade auto-deactivate first, per the state
-  // model). The picker lives HERE (shared webview) so both hosts get
-  // the exact same UX; the chosen spec rides on the verb message and
-  // the host just forwards it.
-  type DeactivationIntent = 'deactivate' | TriggerChoiceIntent;
-  let deactivationIntent = $state<DeactivationIntent | undefined>(undefined);
-  const PICKER_TITLES: Record<DeactivationIntent, string> = {
-    deactivate: 'Deactivate',
-    resync: 'Resync',
-    infraStop: 'Stop infra',
-    infraTerminate: 'Terminate infra',
-    infraUpgrade: 'Upgrade infra',
-  };
-  function onDeactivationSpecChosen(spec: DeactivationSpec) {
-    const intent = deactivationIntent;
-    deactivationIntent = undefined;
-    if (!intent) return;
-    editorRef?.flushAllPendingSaves?.();
-    switch (intent) {
-      case 'deactivate': send({ kind: 'deactivateProject', spec }); break;
-      case 'resync': send({ kind: 'resyncProject', spec }); break;
-      case 'infraStop': send({ kind: 'infraStop', deactivation: spec }); break;
-      case 'infraTerminate': send({ kind: 'infraTerminate', deactivation: spec }); break;
-      case 'infraUpgrade': send({ kind: 'infraUpgrade', deactivation: spec }); break;
-    }
-  }
-
-  function onDeactivate() { deactivationIntent = 'deactivate'; }
   function onCancelActivate() { send({ kind: 'cancelActivate' }); }
   function onCancelBuild() { send({ kind: 'cancelBuild' }); }
   function onCancelInfra() { send({ kind: 'infraCancel' }); }
-  function onReactivate() {
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'reactivateProject' });
-  }
-  function onCancelRunning() { send({ kind: 'cancelRunning' }); }
-  function onResumeActive() {
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'resumeActive' });
-  }
-  function onResync() {
-    // Resync deactivates first, and the user picks how (same shared
-    // picker as Deactivate). The dispatcher offers it only while some
-    // trigger is on, the program's or an instance's (an instance's can be on
-    // while the program's own are off, so the project status is no
-    // guide here), which means the choice is always needed.
-    deactivationIntent = 'resync';
-  }
   // A resync that stopped is taken up again with the take-down choice it
-  // was started with, so no picker opens, and never as a new resync.
+  // was started with, and never as a new resync.
   function onResumeResync() { send({ kind: 'resumeResync' }); }
-  function onStartInfra() {
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'infraStart' });
-  }
-  // The infra verbs go without a choice: only the dispatcher knows
-  // whether a trigger is on (the program's or an instance's), and when one
-  // is, the host answers `needsTriggerChoice` and the picker opens.
-  function onStopInfra() {
-    send({ kind: 'infraStop' });
-  }
-  function onTerminateInfra() {
-    send({ kind: 'infraTerminate' });
-  }
-  function onInfraNodeStop(node: string) {
-    send({ kind: 'infraNodeStop', node });
-  }
-  function onInfraNodeTerminate(node: string) {
-    send({ kind: 'infraNodeTerminate', node });
-  }
-  function onUpgradeInfra() {
-    editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'infraUpgrade' });
-  }
 
   // The context handed to the panel slots. Getters (not a snapshot) so each read
-  // is reactive: a slot consumer that reads `ctx.activeSource` / `ctx.executionState`
+  // is reactive: a slot consumer that reads `ctx.activeSource` / `ctx.runState`
   // re-renders when those change, while the object identity stays stable. `send`
   // / `onMessage` are the editor's own host channel, exposed verbatim so a panel
   // can drive the system however it wants.
@@ -1057,7 +978,7 @@
     get activeFileName() { return navFileName; },
     get navDepth() { return navDepth; },
     get callPath() { return callPath; },
-    get executionState() { return shownExecutionState; },
+    get runState() { return shownRunState; },
     get error() { return error; },
     get diagnostics() { return diagnostics; },
     editActiveSource(source: string) { send({ kind: 'editActiveSource', source }); },
@@ -1125,7 +1046,7 @@
         <div class="relative min-w-0 flex-1">
           <GraphToolbar
             mode={followMode}
-            executionId={followExecutionId}
+            runId={followRunId}
             pendingCount={followPendingCount}
             notPainted={runNotPainted}
             onSetMode={(mode) => send({ kind: 'followSetMode', mode })}
@@ -1146,7 +1067,7 @@
                    than inside a node's inspector: there is one caller per
                    run and the exchange is the same whichever node you
                    open. Nothing is drawn for a run that had no caller. -->
-              {#if shownExecutionState.callerLog.length > 0}
+              {#if shownRunState.callerLog.length > 0}
                 <button
                   type="button"
                   onclick={() => (callerPanelOpen = !callerPanelOpen)}
@@ -1162,10 +1083,10 @@
               {/if}
             {/snippet}
           </GraphToolbar>
-          {#if callerPanelOpen && shownExecutionState.callerLog.length > 0}
+          {#if callerPanelOpen && shownRunState.callerLog.length > 0}
             <div class="absolute top-24 left-3 z-30 pointer-events-auto">
               <CallerPanel
-                events={shownExecutionState.callerLog}
+                events={shownRunState.callerLog}
                 onClose={() => (callerPanelOpen = false)}
               />
             </div>
@@ -1210,54 +1131,24 @@
       onSwitchInstall={(install) => send({ kind: 'switchInstall', install })}
       {autoOrganizeOnMount}
       {onRun}
-      {specs}
-      {resolveSpec}
-      {onRunSpec}
-      {onSaveSpec}
-      {onRunSpecFile}
-      {onListSpecs}
       {onBranchTo}
       {onStop}
       {onDismissError}
       onOpenLocation={(location) => send({ kind: 'openSource', location })}
-      {onActivate}
       {onCancelActivate}
       {onCancelBuild}
       {onCancelInfra}
-      {onDeactivate}
-      {onReactivate}
-      {onCancelRunning}
-      {onResumeActive}
-      {onResync}
       {onResumeResync}
-      {onStartInfra}
-      {onStopInfra}
-      {onTerminateInfra}
-      {onInfraNodeStop}
-      {onInfraNodeTerminate}
-      {onUpgradeInfra}
+      {onLifecycle}
+      {checkRun}
       {actionBarState}
-      drift={statusSnapshot}
-      infraNodes={statusSnapshot?.infraNodes}
+      status={statusSnapshot}
       {hasInfraInGraph}
       {hasTriggersInGraph}
-      executionState={shownExecutionState}
+      runState={shownRunState}
       {displayByNode}
     />
     </svelte:boundary>
-    {/key}
-    <!-- Keyed on the intent so each OPEN remounts the picker fresh at its
-         defaults. Without this, the picker is mounted once and only toggled open,
-         so a previously-chosen destructive selection (e.g. Wipe, which cancels
-         runs and drops signals) would persist into the next, unrelated open and a
-         trusting Confirm would wipe when the user meant a gentle stop. -->
-    {#key deactivationIntent}
-      <DeactivationPicker
-        open={deactivationIntent !== undefined}
-        title={deactivationIntent ? PICKER_TITLES[deactivationIntent] : ''}
-        onConfirm={onDeactivationSpecChosen}
-        onCancel={() => (deactivationIntent = undefined)}
-      />
     {/key}
         </div>
         {#if rightPanel}{@render rightPanel(editorContext)}{/if}

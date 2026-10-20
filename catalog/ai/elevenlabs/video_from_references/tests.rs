@@ -122,7 +122,7 @@ async fn clip_through_an_asset(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn styles_refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let paint = rig.store_file("watercolor.png", "image/png", b"watercolor".to_vec());
     let err = rig
         .run(
@@ -131,7 +131,7 @@ async fn styles_refused(rig: FakeRig) -> WeftResult<()> {
         )
         .await
         .failure()?;
-    assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `error` wired: {err}");
+    assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {err}");
     assert!(err.contains("`styles`"), "{err}");
     assert!(err.contains("bytedance-seedance-v2"), "the error names the model: {err}");
     assert!(rig.requests().is_empty(), "nothing is uploaded or sent");
@@ -149,9 +149,9 @@ async fn failed(rig: FakeRig) -> WeftResult<()> {
 
 async fn failed_caught(rig: FakeRig) -> WeftResult<()> {
     fails(&rig, "video", "r4", "timeout", "Timed out while processing.");
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig.run(&ElevenLabsVideoFromReferencesNode, inputs(&rig, json!({}))).await.ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("timeout"), "{error}");
     assert!(error.contains("Timed out while processing."), "{error}");
     assert!(!outcome.outputs.contains_key("video"), "a caught failure emits no video");

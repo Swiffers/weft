@@ -16,8 +16,8 @@ use weft_broker_client::lifecycle_command::{
     pending_supervisor_command,
 };
 use weft_broker_client::protocol::{
-    HealthProtocolState, InfraLifecycleVerb, LifecycleOutcome, ProjectStatus,
-    SupervisorCommandCompleteRequest, SupervisorCommandRow, SupervisorProject,
+    HealthCommandEnding, HealthRuleState, InfraLifecycleVerb, LifecycleOutcome, ProjectStatus, QueuedHealthCommand,
+    SupervisorCommandCompleteRequest, SupervisorCommandRow, SupervisorHealthStateResponse, SupervisorProject,
     SupervisorSetHealthStateRequest, SupervisorSetStatusRequest, SupervisorSetWaitingRequest,
     SupervisorSyncOwnershipRequest, SupervisorSyncOwnershipResponse, SUPERVISOR_GIVE_UP_AFTER,
 };
@@ -351,7 +351,7 @@ async fn record_troubles(
         alerts = alerts.and(
             gave_up(&mut **tx, Callee::Infra(trouble.project_id), None, &trouble.error)
                 .await
-                .context("write down what a health protocol gave up on")?,
+                .context("write down what a health rule gave up on")?,
         );
     }
     Ok(alerts)
@@ -487,7 +487,9 @@ where
 /// the supervisors have to look at that nothing announces, for the
 /// supervisor bound at `replica_param` whose host holds the projects
 /// bound at `held_param`: a command waiting on a project no lease covers
-/// (now), a unit's health window ending, a health protocol's retry, a
+/// (now), a unit's health window ending, a health rule's retry, the
+/// deadline of a command a health rule queued (its ending asks for a look
+/// itself; the deadline is for one that never ends), a
 /// failed pass's retry (once no lease covers the project: its holder
 /// looks anyway; and only while the project is ownable: nothing claims
 /// one that is not, so its retry stays set until the project is ownable
@@ -510,7 +512,7 @@ fn supervisor_due(replica_param: &str, held_param: &str, listed_param: &str) -> 
         "SELECT d.project_id, d.at FROM ( \
              SELECT c.project_id, EXTRACT(EPOCH FROM NOW())::BIGINT \
                FROM infra_lifecycle_command c \
-              WHERE {pending_c} AND c.drain_by_unix IS NULL \
+              WHERE {pending_c} AND NOT c.drains \
                 AND NOT {leased} \
                 AND NOT EXISTS (SELECT 1 FROM infra_lifecycle_command o \
                                  WHERE {pending_o} AND o.project_id = c.project_id \
@@ -524,8 +526,11 @@ fn supervisor_due(replica_param: &str, held_param: &str, listed_param: &str) -> 
                FROM infra_node n CROSS JOIN LATERAL jsonb_each(n.units_json) AS u \
               WHERE u.value->>'status' IN ('running', 'flaky') \
            UNION ALL \
-             SELECT h.project_id, h.next_retry_at_unix FROM infra_health_protocol h \
+             SELECT h.project_id, h.next_retry_at_unix FROM infra_health_rule h \
               WHERE h.gave_up_at_unix IS NULL AND h.next_retry_at_unix IS NOT NULL \
+           UNION ALL \
+             SELECT h.project_id, h.queued_deadline_unix FROM infra_health_rule h \
+              WHERE h.queued_deadline_unix IS NOT NULL \
            UNION ALL \
              SELECT l.project_id, GREATEST(l.retry_at_unix, ( \
                         SELECT MAX(io.leased_until_unix) + 1 FROM infra_owner io \
@@ -568,7 +573,7 @@ where
     let sql = format!(
         "SELECT p.id AS project_id, p.tenant_id, \
                 a.status, a.accepting_fires, a.fires_visible_to_consumers, a.fires_deadline_unix, \
-                a.drain_deadline_unix, a.went_down_with, a.went_down_at_unix, a.activating_execution_id \
+                a.went_down_with, a.went_down_by_command, a.activating_run_id \
          FROM infra_owner io \
          JOIN project p ON p.id = io.project_id \
          LEFT JOIN trigger_activation a ON a.project_id = p.id \
@@ -598,20 +603,12 @@ where
             accepting_fires: r.try_get("accepting_fires").context("decode accepting_fires")?,
             fires_visible_to_consumers: r.try_get("fires_visible_to_consumers").context("decode visibility")?,
             fires_deadline_unix: r.try_get("fires_deadline_unix").context("decode deadline")?,
-            drain_deadline_unix: r.try_get("drain_deadline_unix").context("decode drain deadline")?,
-            went_down: match (
-                r.try_get::<Option<String>, _>("went_down_with").context("decode went_down_with")?,
-                r.try_get::<Option<i64>, _>("went_down_at_unix").context("decode went_down_at_unix")?,
-            ) {
-                (None, None) => None,
-                (Some(cause), Some(at_unix)) => Some(weft_broker_client::activation::WentDown {
-                    with: weft_broker_client::activation::DownWith::parse(&cause)
-                        .with_context(|| format!("trigger_activation.went_down_with='{cause}' is not a known cause"))?,
-                    at_unix,
-                }),
-                (cause, at) => anyhow::bail!("trigger_activation.went_down_with={cause:?} and went_down_at_unix={at:?} must be set together"),
-            },
-            activating_execution_id: r.try_get("activating_execution_id").context("decode activating_execution_id")?,
+            went_down: weft_broker_client::activation::WentDown::of_columns(
+                r.try_get::<Option<String>, _>("went_down_with").context("decode went_down_with")?.as_deref(),
+                r.try_get::<Option<i64>, _>("went_down_by_command").context("decode went_down_by_command")?,
+            )
+            .map_err(anyhow::Error::msg)?,
+            activating_run_id: r.try_get("activating_run_id").context("decode activating_run_id")?,
         };
         projects.last_mut().expect("pushed above").2.push(lifecycle);
     }
@@ -623,9 +620,9 @@ where
                 project_id,
                 tenant_id,
                 status: aggregate.status,
-                health_parked: lifecycles
+                health_down: lifecycles
                     .iter()
-                    .any(weft_broker_client::activation::ActivationLifecycle::parked_by_health),
+                    .any(weft_broker_client::activation::ActivationLifecycle::down_by_health),
             }
         })
         .collect())
@@ -658,7 +655,7 @@ where
 /// Only the supervisor's verbs: `deactivate` and `reactivate` are the
 /// dispatcher's, claimed by dispatchers under their own
 /// `claimed_by_replica` lease. A stop or terminate still waiting for the
-/// running work it reaches (`drain_by_unix`) is the dispatcher's until
+/// running work it reaches (`drains`) is the dispatcher's until
 /// that wait is over; it still holds back the younger commands that
 /// overlap it.
 ///
@@ -682,7 +679,7 @@ pub async fn claim_next(
              UPDATE infra_lifecycle_command c \
              SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, outcome = $4, outcome_message = $5 \
              WHERE {pending} \
-               AND c.drain_by_unix IS NULL \
+               AND NOT c.drains \
                AND {owns} \
                AND {claimable} \
                AND c.runs >= $3 \
@@ -693,7 +690,7 @@ pub async fn claim_next(
              WHERE id = ( \
                  SELECT c.id FROM infra_lifecycle_command c \
                  WHERE {pending} \
-                   AND c.drain_by_unix IS NULL \
+                   AND NOT c.drains \
                    AND {owns} \
                    AND {claimable} \
                    AND c.runs < $3 \
@@ -752,40 +749,58 @@ fn gave_up_message() -> String {
     )
 }
 
-/// What each of `project_id`'s health protocols did
-/// (`infra_health_protocol`). A protocol that gave up comes back armed
-/// once a person's infra command touched the project since, or a person
-/// asked for a look since (`infra_health_look.asked_at_unix`): its failures
-/// and its give-up are cleared (what it acted on is kept), and the
-/// supervisor's next write of the state stores that.
-pub async fn health_state(pool: &PgPool, project_id: uuid::Uuid) -> anyhow::Result<Vec<HealthProtocolState>> {
+/// Where each health rule of `project_id`'s copies stands
+/// (`infra_health_rule`), and how the commands they queued ended. A rule
+/// that gave up comes back armed once a person's infra command touched
+/// the project since, or a person asked for a look since
+/// (`infra_health_look.asked_at_unix`): its failures and its give-up are
+/// cleared (whether it fired, the command it queued and what it took
+/// down are kept), and the supervisor's next write of the state stores
+/// that.
+pub async fn health_state(pool: &PgPool, project_id: uuid::Uuid) -> anyhow::Result<SupervisorHealthStateResponse> {
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT h.protocol, h.acted_json, h.consecutive_failures, h.next_retry_at_unix, \
-                h.gave_up_at_unix, h.gave_up_seen, h.last_error, \
+        "SELECT h.node_id, h.instance_id, h.rule, h.fired, h.consecutive_failures, h.next_retry_at_unix, \
+                h.gave_up_at_unix, h.gave_up_seen, h.last_error, h.queued_command, h.queued_deadline_unix, h.took_down, \
                 (EXISTS (SELECT 1 FROM infra_lifecycle_command c \
                           WHERE c.project_id = h.project_id AND c.issued_at_unix >= h.gave_up_at_unix \
                             AND c.verb IN ('apply', 'stop', 'terminate', 'upgrade')) \
                  OR EXISTS (SELECT 1 FROM infra_health_look l \
                              WHERE l.project_id = h.project_id AND l.asked_at_unix >= h.gave_up_at_unix)) AS touched \
-         FROM infra_health_protocol h WHERE h.project_id = $1 ORDER BY h.protocol",
+         FROM infra_health_rule h WHERE h.project_id = $1 ORDER BY h.node_id, h.instance_id NULLS FIRST, h.rule",
     )
     .bind(project_id)
     .fetch_all(pool)
     .await
-    .context("read the health protocols' state")?;
-    rows.iter()
+    .context("read the health rules' state")?;
+    let rules = rows
+        .iter()
         .map(|r| {
-            let protocol: String = r.try_get("protocol")?;
-            let acted: Option<serde_json::Value> = r.try_get("acted_json")?;
-            let acted = acted
-                .map(serde_json::from_value)
+            let rule: String = r.try_get("rule")?;
+            let node_id: String = r.try_get("node_id")?;
+            let instance = r
+                .try_get::<Option<String>, _>("instance_id")?
+                .map(weft_core::instance::InstanceId::new)
                 .transpose()
-                .with_context(|| format!("infra_health_protocol.acted_json of '{protocol}' does not decode"))?;
+                .map_err(|e| anyhow::anyhow!("infra_health_rule.instance_id of '{rule}' on '{node_id}': {e}"))?;
+            let copy = weft_broker_client::protocol::InfraCopy { node_id, instance };
+            let queued = match (r.try_get::<Option<i64>, _>("queued_command")?, r.try_get::<Option<i64>, _>("queued_deadline_unix")?) {
+                (Some(command), Some(deadline_unix)) => Some(QueuedHealthCommand { command, deadline_unix }),
+                (None, None) => None,
+                (command, deadline) => anyhow::bail!(
+                    "infra_health_rule '{rule}' on '{}' has queued_command {command:?} and queued_deadline_unix {deadline:?}: both or neither",
+                    copy.node_id
+                ),
+            };
+            let fired: bool = r.try_get("fired")?;
+            let took_down: bool = r.try_get("took_down")?;
             if r.try_get::<bool, _>("touched")? {
-                return Ok(HealthProtocolState {
-                    protocol,
-                    acted,
+                return Ok(HealthRuleState {
+                    copy,
+                    rule,
+                    fired,
+                    queued,
+                    took_down,
                     consecutive_failures: 0,
                     next_retry_at_unix: None,
                     gave_up_at_unix: None,
@@ -794,25 +809,52 @@ pub async fn health_state(pool: &PgPool, project_id: uuid::Uuid) -> anyhow::Resu
                 });
             }
             let failures: i32 = r.try_get("consecutive_failures")?;
-            Ok(HealthProtocolState {
+            Ok(HealthRuleState {
                 consecutive_failures: u32::try_from(failures)
-                    .with_context(|| format!("infra_health_protocol.consecutive_failures of '{protocol}' is {failures}"))?,
-                protocol,
-                acted,
+                    .with_context(|| format!("infra_health_rule.consecutive_failures of '{rule}' is {failures}"))?,
+                copy,
+                rule,
+                fired,
+                queued,
+                took_down,
                 next_retry_at_unix: r.try_get("next_retry_at_unix")?,
                 gave_up_at_unix: r.try_get("gave_up_at_unix")?,
                 gave_up_seen: r.try_get("gave_up_seen")?,
                 last_error: r.try_get("last_error")?,
             })
         })
-        .collect()
+        .collect::<anyhow::Result<Vec<HealthRuleState>>>()?;
+    let queued: Vec<i64> = rules.iter().filter_map(|r| r.queued.map(|q| q.command)).collect();
+    let ended = match queued.is_empty() {
+        true => Vec::new(),
+        false => sqlx::query(
+            "SELECT id, outcome, outcome_message FROM infra_lifecycle_command \
+             WHERE id = ANY($1) AND completed_at_unix IS NOT NULL ORDER BY id",
+        )
+        .bind(&queued)
+        .fetch_all(pool)
+        .await
+        .context("read how the health rules' commands ended")?
+        .iter()
+        .map(|r| {
+            let command: i64 = r.try_get("id")?;
+            let outcome: Option<String> = r.try_get("outcome")?;
+            let outcome = outcome
+                .as_deref()
+                .and_then(LifecycleOutcome::parse)
+                .ok_or_else(|| anyhow::anyhow!("infra_lifecycle_command {command} completed with outcome {outcome:?}"))?;
+            Ok(HealthCommandEnding { command, outcome, message: r.try_get("outcome_message")? })
+        })
+        .collect::<anyhow::Result<Vec<HealthCommandEnding>>>()?,
+    };
+    Ok(SupervisorHealthStateResponse { rules, ended })
 }
 
-/// Replace a project's health protocol state with `req.protocols` (a
-/// protocol not listed has none left), for the supervisor holding its
-/// lease. The lease row is read `FOR SHARE` first in the same
-/// transaction, so a takeover waits for the write and a displaced
-/// supervisor writes nothing.
+/// Replace a project's health rules' state with `req.rules` (a rule on a
+/// copy not listed has none left), for the supervisor holding its lease.
+/// The lease row is read `FOR SHARE` first in the same transaction, so a
+/// takeover waits for the write and a displaced supervisor writes
+/// nothing.
 pub async fn set_health_state(pool: &PgPool, req: &SupervisorSetHealthStateRequest) -> anyhow::Result<FencedWrite> {
     let mut tx = pool.begin().await?;
     let owns: bool = sqlx::query_scalar(
@@ -827,39 +869,37 @@ pub async fn set_health_state(pool: &PgPool, req: &SupervisorSetHealthStateReque
     if !owns {
         return Ok(FencedWrite::Displaced);
     }
-    let names: Vec<&str> = req.protocols.iter().map(|p| p.protocol.as_str()).collect();
-    sqlx::query("DELETE FROM infra_health_protocol WHERE project_id = $1 AND NOT (protocol = ANY($2))")
+    sqlx::query("DELETE FROM infra_health_rule WHERE project_id = $1")
         .bind(req.project_id)
-        .bind(&names)
         .execute(&mut *tx)
         .await
-        .context("drop the health protocols a project has no state for")?;
-    for p in &req.protocols {
-        let acted = p.acted.as_ref().map(serde_json::to_value).transpose()?;
-        let failures = i32::try_from(p.consecutive_failures).context("a protocol's failures fit an INTEGER")?;
+        .context("drop the project's health rules' state before writing it again")?;
+    for r in &req.rules {
+        let failures = i32::try_from(r.consecutive_failures).context("a rule's failures fit an INTEGER")?;
         sqlx::query(
-            "INSERT INTO infra_health_protocol \
-                 (project_id, protocol, acted_json, consecutive_failures, next_retry_at_unix, \
-                  gave_up_at_unix, gave_up_seen, last_error) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-             ON CONFLICT (project_id, protocol) DO UPDATE SET \
-                 acted_json = EXCLUDED.acted_json, consecutive_failures = EXCLUDED.consecutive_failures, \
-                 next_retry_at_unix = EXCLUDED.next_retry_at_unix, gave_up_at_unix = EXCLUDED.gave_up_at_unix, \
-                 gave_up_seen = EXCLUDED.gave_up_seen, last_error = EXCLUDED.last_error",
+            "INSERT INTO infra_health_rule \
+                 (project_id, node_id, instance_id, rule, fired, consecutive_failures, next_retry_at_unix, \
+                  gave_up_at_unix, gave_up_seen, last_error, queued_command, queued_deadline_unix, took_down) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(req.project_id)
-        .bind(&p.protocol)
-        .bind(acted)
+        .bind(&r.copy.node_id)
+        .bind(r.copy.instance.as_ref().map(|i| i.as_str()))
+        .bind(&r.rule)
+        .bind(r.fired)
         .bind(failures)
-        .bind(p.next_retry_at_unix)
-        .bind(p.gave_up_at_unix)
-        .bind(&p.gave_up_seen)
-        .bind(&p.last_error)
+        .bind(r.next_retry_at_unix)
+        .bind(r.gave_up_at_unix)
+        .bind(&r.gave_up_seen)
+        .bind(&r.last_error)
+        .bind(r.queued.map(|q| q.command))
+        .bind(r.queued.map(|q| q.deadline_unix))
+        .bind(r.took_down)
         .execute(&mut *tx)
         .await
-        .with_context(|| format!("write health protocol '{}'", p.protocol))?;
+        .with_context(|| format!("write health rule '{}' on '{}'", r.rule, r.copy.node_id))?;
     }
-    tx.commit().await.context("commit the health protocols' state")?;
+    tx.commit().await.context("commit the health rules' state")?;
     Ok(FencedWrite::Applied)
 }
 
@@ -901,6 +941,9 @@ pub struct IssuedCommand<'a> {
     pub copies: &'a weft_core::instance::Copies,
     pub verb: InfraLifecycleVerb,
     pub spec_json: Option<&'a serde_json::Value>,
+    /// An apply's place hash in the build its setup ran, stamped on the
+    /// copy as the apply succeeds (`infra_lifecycle_command.source_hash`).
+    pub source_hash: Option<&'a str>,
     pub issued_by_replica: &'a str,
 }
 
@@ -926,8 +969,8 @@ pub async fn issue_command(pool: &PgPool, cmd: &IssuedCommand<'_>) -> anyhow::Re
     sqlx::query_scalar(
         "INSERT INTO infra_lifecycle_command \
          (tenant_id, project_id, node_id, verb, \
-          spec_json, issued_by_replica, issued_at_unix, instance_id, every_copy) \
-         SELECT $1, p.id, $3, $4, $5, $6, EXTRACT(EPOCH FROM NOW())::BIGINT, $7, $8 \
+          spec_json, issued_by_replica, issued_at_unix, instance_id, every_copy, source_hash) \
+         SELECT $1, p.id, $3, $4, $5, $6, EXTRACT(EPOCH FROM NOW())::BIGINT, $7, $8, $9 \
          FROM project p WHERE p.id = $2 \
          FOR KEY SHARE OF p \
          ON CONFLICT (project_id, node_id, instance_id) \
@@ -943,9 +986,34 @@ pub async fn issue_command(pool: &PgPool, cmd: &IssuedCommand<'_>) -> anyhow::Re
     .bind(cmd.issued_by_replica)
     .bind(instance_id)
     .bind(every_copy)
+    .bind(cmd.source_hash)
     .fetch_optional(pool)
     .await
     .context("issue infra_lifecycle_command")
+}
+
+/// The hash of the infra at `place` in the build run `run_id` of
+/// `project_id` runs (`project_definition.infra_places` of the program its
+/// cut was cut from, `run.cut_from`): what an apply that run issues stamps on the
+/// copy. `None` when the run runs no registered program (a node test) or
+/// its build named no hash for the place: the copy then reads as behind
+/// until an apply stamps one.
+pub async fn place_hash_of_run(pool: &PgPool, project_id: uuid::Uuid, run_id: weft_core::RunId, place: &str) -> anyhow::Result<Option<String>> {
+    let found: Option<(uuid::Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT r.run_id, p.infra_places ->> $3 FROM run r \
+         LEFT JOIN project_definition p ON p.project_id = r.project_id AND p.definition_hash = COALESCE(r.cut_from, r.definition_hash) \
+         WHERE r.run_id = $1 AND r.project_id = $2",
+    )
+    .bind(run_id)
+    .bind(project_id)
+    .bind(place)
+    .fetch_optional(pool)
+    .await
+    .context("the place hash of an infra setup's build")?;
+    let Some((_, hash)) = found else {
+        anyhow::bail!("run {run_id} of project {project_id} applies infra, and no such run is on record");
+    };
+    Ok(hash)
 }
 
 /// Record one infra event; its id, or `None` when the project row is
@@ -1234,7 +1302,9 @@ pub async fn set_waiting(pool: &PgPool, req: &SupervisorSetWaitingRequest) -> an
 /// "exactly the current owner, exactly once": a second completion, or
 /// one for a command deleted with its project, is Gone. An ending written
 /// clears the project's commands [`claim_next`] gave up from `weft status`:
-/// endings are being written again. A NUL byte in the error, which a
+/// endings are being written again. An apply that succeeded stamps its
+/// copy with the place hash it was issued with, in the same statement:
+/// what tells the copy behind the source later. A NUL byte in the error, which a
 /// Postgres text column refuses, is dropped, so the ending is written.
 pub async fn complete_command(
     pool: &PgPool,
@@ -1257,9 +1327,14 @@ pub async fn complete_command(
              WHERE id = $3 \
                AND completed_at_unix IS NULL \
                AND {owns} \
-             RETURNING project_id \
+             RETURNING project_id, node_id, instance_id, verb, source_hash \
          ), cleared AS ( \
              DELETE FROM unanswered_call WHERE callee IN (SELECT {key} FROM done) \
+         ), stamped AS ( \
+             UPDATE infra_node n SET source_hash = d.source_hash FROM done d \
+             WHERE $1 = 'succeeded' AND d.verb = 'apply' AND d.source_hash IS NOT NULL \
+               AND n.project_id = d.project_id AND n.node_id = d.node_id \
+               AND n.instance_id IS NOT DISTINCT FROM d.instance_id \
          ) \
          SELECT COUNT(*) FROM done",
         owns = owns_project_predicate("$4", "project_id"),

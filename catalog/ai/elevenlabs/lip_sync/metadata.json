@@ -43,7 +43,7 @@
       "description": "Creatify Aurora, the only lip-sync model ElevenLabs's API serves.",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "creatify-aurora"
         ]
@@ -56,7 +56,7 @@
       "description": "Leave empty for 720p.",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "480p",
           "720p"
@@ -95,9 +95,6 @@
       "description": "The generated video, kept for 30 days after it was last read."
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "display": {
     "kind": "media",
     "output": "video"

@@ -1,5 +1,5 @@
 //! SlackDownloadFile: pull a Slack-hosted file (an F... id, e.g. from
-//! the file-shared trigger) into execution storage and emit the
+//! the file-shared trigger) into run storage and emit the
 //! stored-file reference. `files.info` names the private download URL;
 //! fetching it needs the connection's bearer, so the authenticated
 //! client streams it and storage takes the body chunk by chunk.
@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use weft::node::NodeOutput;
 use weft::storage::StorageScope;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::api;
 
@@ -26,7 +26,7 @@ impl Node for SlackDownloadFileNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let file_id: String = ctx.inputs.get("fileId")?;
         let client = ctx.client(&access).await?;
@@ -53,7 +53,7 @@ impl Node for SlackDownloadFileNode {
         // storage (bounded memory, whatever the file size).
         let resp = client.get(&url).send().await.node_err("slack: fetch file bytes")?;
         let stored = ctx
-            .storage(StorageScope::Execution)
+            .storage(StorageScope::Run)
             .put_response(
                 resp,
                 "slack: download the file",

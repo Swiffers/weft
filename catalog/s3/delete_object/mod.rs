@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use weft::access::client::checked_send;
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::s3;
 
@@ -21,7 +21,7 @@ impl Node for S3DeleteObjectNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let bucket: String = ctx.inputs.get("bucket")?;
         let key: String = ctx.inputs.get("key")?;

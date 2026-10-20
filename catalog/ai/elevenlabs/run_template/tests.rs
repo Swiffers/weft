@@ -100,7 +100,7 @@ fn values() -> WeftResult<()> {
     // asset named by the file's key.
     let mut reference = |file: FileHandle| -> WeftResult<Value> {
         match file {
-            FileHandle::Key(key) => Ok(json!({ "type": "asset", "asset_id": key })),
+            FileHandle::Key { key, .. } => Ok(json!({ "type": "asset", "asset_id": key })),
             other => panic!("a key-backed file: {other:?}"),
         }
     };
@@ -448,8 +448,8 @@ async fn missing_port(rig: FakeRig) -> WeftResult<()> {
     template_has(&rig, vec![product_shot("ver_1", true)]);
     rig.input_type("prompt", ty("String"));
     rig.output_type("product_still", ty("Image"));
-    // A program mistake: `error` being wired does not catch it.
-    rig.wire_output("error");
+    // A program mistake: `_error` being wired does not catch it.
+    rig.wire_output("_error");
     let err = rig
         .run(&ElevenLabsRunTemplateNode, inputs(&rig, json!({ "prompt": "a corgi" })))
         .await
@@ -569,10 +569,10 @@ async fn failed_caught(rig: FakeRig) -> WeftResult<()> {
             "error_message": "Timed out while processing.",
         } }),
     );
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let given = product_shot_ports(&rig);
     let outcome = rig.run(&ElevenLabsRunTemplateNode, given).await.ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("product_still: timeout"), "{error}");
     assert!(!outcome.outputs.contains_key("product_still"), "a caught failure emits no still");
     Ok(())

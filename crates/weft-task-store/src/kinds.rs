@@ -23,15 +23,22 @@ weft_core::wire_enum! {
         /// goes, and the listener lets go of it, so nobody is still asked to
         /// answer it. Producer = worker (via broker).
         WithdrawSignal = "withdraw_signal",
+        /// Send the last call of a wait whose run was cancelled
+        /// (`weft_core::signal::listener_protocol::CancelCallRequest`, the
+        /// payload as it is), through the listener. Producer = the
+        /// dispatcher's cancel, in the transaction that takes the wait
+        /// down, so a cancel never loses its call to a crash; no caller of
+        /// the broker may enqueue it. Deduplicated on [`cancel_call_key`].
+        CancelCall = "cancel_call",
         /// An answer to a waiting run that a listener picked up (a timer's
         /// tick, an event on a connection it holds), already processed by its
         /// kind. Producer = listener (via broker), which never opens an HTTP
         /// connection to the dispatcher, so the trust seam stays at the
         /// broker.
         FireSignal = "fire_signal",
-        /// Stop every live execution of a project carrying a tag, on behalf
-        /// of one of its executions (`ctx.stop_tagged`). Producer = the
-        /// broker's `/v1/execution/stop_tagged` handler, which resolves the
+        /// Stop every live run of a project carrying a tag, on behalf
+        /// of one of its runs (`ctx.stop_tagged`). Producer = the
+        /// broker's `/v1/run/stop_tagged` handler, which resolves the
         /// ordering anchor at enqueue time; consumer = the dispatcher's
         /// executor, which cancels each match through the one cancel path.
         /// Rides the task table so the stop survives the asking worker dying
@@ -51,7 +58,28 @@ weft_core::wire_enum! {
         /// Producer = the dispatcher's own resync request, in the transaction
         /// that writes the plan down; no caller of the broker may enqueue it.
         Resync = "resync",
+        /// Wait for the runs a person's deactivate left going to end
+        /// (`TakeDownWaitPayload`), apart from the request, which a
+        /// person follows in short looks however long it takes. Producer
+        /// = the dispatcher's own deactivate; no caller of the broker may
+        /// enqueue it.
+        TakeDownWait = "take_down_wait",
+        /// Wait for what `weft rm` cancelled to be over
+        /// (`RemovalWaitPayload`): the last calls of its cancelled runs
+        /// gone out, and, before its history is erased, every run ended.
+        /// Apart from the request, which a person follows in short looks.
+        /// Producer = the dispatcher's own quiesce; no caller of the broker
+        /// may enqueue it.
+        RemovalWait = "removal_wait",
     }
+}
+
+/// The dedup key of the [`TaskKind::CancelCall`] of the wait `token`: one
+/// per wait, so a cancel that runs twice queues its call once. The
+/// broker finds the call's project by it while the call is out.
+// SYNC: cancel_call_key <-> crates/weft-broker/src/held_signals.rs cancel_call_project
+pub fn cancel_call_key(token: &str) -> String {
+    format!("cancel_call:{token}")
 }
 
 /// Payload for `TaskKind::FireSignal`: an answer to a waiting run a
@@ -62,7 +90,7 @@ weft_core::wire_enum! {
 pub struct FireSignalPayload {
     pub token: String,
     /// The run the answer resolves.
-    pub execution_id: weft_core::ExecutionId,
+    pub run_id: weft_core::RunId,
     /// The answer, as the kind made it of the event.
     pub value: serde_json::Value,
     /// The holder a held connection picked the answer up under. The
@@ -73,11 +101,11 @@ pub struct FireSignalPayload {
 }
 
 /// Payload for `TaskKind::WithdrawSignal`: the wait `token` of run
-/// `execution_id`, given up. The broker takes it only when the wait is
+/// `run_id`, given up. The broker takes it only when the wait is
 /// that run's.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WithdrawSignalPayload {
-    pub execution_id: weft_core::ExecutionId,
+    pub run_id: weft_core::RunId,
     pub token: String,
 }
 
@@ -113,8 +141,26 @@ pub struct ResyncPayload {
     pub driver: uuid::Uuid,
 }
 
-/// Payload for `TaskKind::StopTagged`: "stop every live execution of
-/// `project_id` carrying `tag`, asked by execution `by`". The broker
+/// Payload for `TaskKind::TakeDownWait`: the activations a deactivate
+/// took down, by owner, and their entry tokens as they stood before it (it
+/// may have deleted their signals): what the wait counts at the workers'
+/// door.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TakeDownWaitPayload {
+    pub triggers: Vec<weft_core::activation::OwnerTriggers>,
+    pub tokens: Vec<String>,
+}
+
+/// Payload for `TaskKind::RemovalWait`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalWaitPayload {
+    /// Wait for every run of the project to end too, not only for their
+    /// last calls: what erasing its history needs.
+    pub every_run: bool,
+}
+
+/// Payload for `TaskKind::StopTagged`: "stop every live run of
+/// `project_id` carrying `tag`, asked by run `by`". The broker
 /// builds it when the worker calls `ctx.stop_tagged`, resolving
 /// `before_seq` THEN (synchronously with the node's call), so a stop
 /// that executes late can never reach a sibling that tagged itself
@@ -123,11 +169,11 @@ pub struct ResyncPayload {
 pub struct StopTaggedPayload {
     pub project_id: uuid::Uuid,
     pub tag: String,
-    /// The execution that asked. Excluded from the targets under
+    /// The run that asked. Excluded from the targets under
     /// `StopSelf::Keep`, named as the canceller on every stopped run.
-    pub by: weft_core::ExecutionId,
-    /// Only executions whose tag row has a sequence below this are
-    /// stopped. `None` means every live execution carrying the tag
+    pub by: weft_core::RunId,
+    /// Only runs whose tag row has a sequence below this are
+    /// stopped. `None` means every live run carrying the tag
     /// (the `Include` shape: no ordering, the whole batch goes).
     pub before_seq: Option<i64>,
     pub stop_self: weft_core::StopSelf,
@@ -184,13 +230,13 @@ mod tests {
     fn an_answer_round_trips() {
         let payload = FireSignalPayload {
             token: "t".into(),
-            execution_id: uuid::Uuid::from_u128(2),
+            run_id: uuid::Uuid::from_u128(2),
             value: serde_json::json!({ "approved": true }),
             held_by: None,
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert!(json.get("held_by").is_none());
         let back: FireSignalPayload = serde_json::from_value(json).unwrap();
-        assert_eq!((back.execution_id, back.value), (payload.execution_id, payload.value));
+        assert_eq!((back.run_id, back.value), (payload.run_id, payload.value));
     }
 }

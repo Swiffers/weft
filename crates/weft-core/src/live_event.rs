@@ -1,21 +1,22 @@
 //! What the dispatcher tells a client happened: one [`DispatcherEvent`]
 //! per thing, with its delivery identity ([`IdentifiedEvent`]). The live
 //! stream (`/events/project/{id}`) and a run's replay
-//! (`/executions/{id}/replay`) answer the same rows, and every Rust
+//! (`/runs/{id}/replay`) answer the same rows, and every Rust
 //! reader (the CLI's `weft events`, `weft logs`, `weft follow`) decodes
 //! them through these types.
 
 use serde::{Deserialize, Serialize};
 
 use crate::frames::LoopFrames;
-use crate::ExecutionId;
+use crate::RunId;
 
 /// An event and its delivery identity. A run's recorded events take theirs
 /// from their place in its record (the row's `seq`, the event's index in
 /// it), so replay and live delivery identify the same event without
 /// comparing timestamps or payload contents.
-// SYNC: IdentifiedEvent.event_id <-> extension-vscode/src/execFollower.ts DispatcherEvent
+// SYNC: IdentifiedEvent.event_id <-> extension-vscode/src/runFollower.ts DispatcherEvent
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IdentifiedEvent<T> {
     pub event_id: String,
     #[serde(flatten)]
@@ -48,19 +49,20 @@ pub type LiveEvent = IdentifiedEvent<DispatcherEvent>;
 // Every event projected from a journal row carries that row's `at_unix`
 // (the journal's own stamp), so a replay renders when each thing happened
 // rather than when it was read.
-// SYNC: DispatcherEvent <-> extension-vscode/src/execFollower.ts DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
+// SYNC: DispatcherEvent <-> extension-vscode/src/runFollower.ts DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum DispatcherEvent {
-    /// `subgraph` is the node set the run is held to (`None` for the
-    /// whole graph): the graph paints every other node as not in this
-    /// run. `seed` names the run this one inherits from and what it
-    /// re-ran, for the run's banner. `phase` says what the execution
+    /// `subgraph` is every place the run's program runs (its cut of the
+    /// project, `crate::project::cut`; a place that stands in for itself
+    /// is not among them): the graph paints every other node as not in
+    /// this run. `None` when the run's program could not be read. `seed` names the run this one inherits from and what it
+    /// re-ran, for the run's banner. `phase` says what the run
     /// is for: a run of the graph (`fire`), or the setup an `infra
     /// start` or an activation runs, which the editor shows as that verb
     /// working rather than as a run to stop.
-    ExecutionStarted {
-        execution_id: ExecutionId,
+    RunStarted {
+        run_id: RunId,
         entry_node: String,
         phase: crate::context::Phase,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,31 +76,40 @@ pub enum DispatcherEvent {
         instance: Option<crate::instance::InstanceId>,
         at_unix: u64,
     },
-    ExecutionCompleted { execution_id: ExecutionId, project_id: uuid::Uuid, outputs: serde_json::Value, at_unix: u64 },
-    ExecutionFailed { execution_id: ExecutionId, project_id: uuid::Uuid, error: String, at_unix: u64 },
+    RunCompleted { run_id: RunId, project_id: uuid::Uuid, outputs: serde_json::Value, at_unix: u64 },
+    RunFailed { run_id: RunId, project_id: uuid::Uuid, error: String, at_unix: u64 },
     /// `cause` is the structured who-or-what behind the cancel (`reason`
     /// is its text). `None` only for a journal row written before the
     /// cause existed; skipped on the wire when absent so the TS peers'
     /// optional (`cause?`) types match reality instead of decoding null.
-    ExecutionCancelled {
-        execution_id: ExecutionId,
+    RunCancelled {
+        run_id: RunId,
         project_id: uuid::Uuid,
         reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        cause: Option<crate::exec::CancelCause>,
+        cause: Option<crate::run::CancelCause>,
         at_unix: u64,
     },
-    /// The run tagged itself (`ctx.tag_execution`); the inspector shows
+    /// The run tagged itself (`ctx.tag_run`); the inspector shows
     /// the tags on the run. `tags` is this call's list, not the run's
     /// cumulative set.
-    ExecutionTagged { execution_id: ExecutionId, project_id: uuid::Uuid, tags: Vec<String>, at_unix: u64 },
+    RunTagged { run_id: RunId, project_id: uuid::Uuid, tags: Vec<String>, at_unix: u64 },
     /// The run was erased (`weft clean`, a prune, the editor's delete):
     /// its journal, its storage and the wake signals it was parked on
     /// are gone. Rides NOTIFY rather than the journal, since the
     /// journal is what just went; every client drops the run from its
     /// lists and re-reads the project's verbs, because a run parked on
     /// a question counted as preserved state until now.
-    ExecutionDeleted { execution_id: ExecutionId, project_id: uuid::Uuid },
+    RunDeleted { run_id: RunId, project_id: uuid::Uuid },
+    /// The run parked: every firing still open waits on a signal (a
+    /// person, an outside job, a timer), and no worker drives it until an
+    /// answer comes. Its listing reads `waiting_for_input` from here on.
+    /// Rides NOTIFY like `RunDeleted`: parking writes no record row
+    /// (`weft_broker::door::let_go` publishes it in the transaction that
+    /// parks the run). A run's replay ends with it when the run is parked
+    /// at the time of the read, which is where it stands rather than a
+    /// moment of its history.
+    RunParked { run_id: RunId, project_id: uuid::Uuid },
     /// Every node event carries `inherited_from` when the firing was
     /// not this run's own but taken from the run it was seeded from
     /// (`weft run --seed`): the row is the seed's, painted here so the
@@ -106,54 +117,68 @@ pub enum DispatcherEvent {
     /// the wire for the run's own firings. `provided_ports` on a start
     /// names input ports receiving supplied values; absent when none.
     NodeStarted {
-        execution_id: ExecutionId,
+        run_id: RunId,
         node: String,
         frames: LoopFrames,
         input: serde_json::Value,
         closed_ports: Vec<String>,
+        // SYNC: input origins <-> extension-vscode/src/runFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts NodeFiringEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeFiring
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         provided_ports: Vec<String>,
-        // SYNC: input origins <-> extension-vscode/src/execFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts NodeExecEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeExecution
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        backup_ports: Vec<String>,
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-        inherited_ports: std::collections::BTreeMap<String, ExecutionId>,
+        inherited_ports: std::collections::BTreeMap<String, RunId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        inherited_from: Option<ExecutionId>,
+        inherited_from: Option<RunId>,
         project_id: uuid::Uuid,
         at_unix: u64,
     },
-    NodeSuspended { execution_id: ExecutionId, node: String, frames: LoopFrames, token: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
+    NodeSuspended { run_id: RunId, node: String, frames: LoopFrames, token: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
     /// `token`: the wait the firing resumed from, `None` for a resume no
     /// wait drove (a boundary fired again). How that wait ended is its
     /// [`Self::WaitEnded`].
-    NodeResumed { execution_id: ExecutionId, node: String, frames: LoopFrames, token: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
+    NodeResumed { run_id: RunId, node: String, frames: LoopFrames, token: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
     /// A wait of the firing at `node` and `frames` ended, the first ending
     /// on record: its answer, a person skipping it, or the run giving it
     /// up. Its own event because a wait the run holds in its worker never
     /// suspends or resumes the firing, so `NodeSuspended` and `NodeResumed`
     /// see only the waits that paused the run.
-    WaitEnded { execution_id: ExecutionId, node: String, frames: LoopFrames, token: String, ended: crate::primitive::AwaitEnd, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
-    NodeCancelled { execution_id: ExecutionId, node: String, frames: LoopFrames, reason: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
-    NodeCompleted { execution_id: ExecutionId, node: String, frames: LoopFrames, output: serde_json::Value, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
-    NodeFailed { execution_id: ExecutionId, node: String, frames: LoopFrames, error: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
+    WaitEnded { run_id: RunId, node: String, frames: LoopFrames, token: String, ended: crate::primitive::AwaitEnd, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
+    NodeCancelled { run_id: RunId, node: String, frames: LoopFrames, reason: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
+    NodeCompleted { run_id: RunId, node: String, frames: LoopFrames, output: serde_json::Value, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
+    NodeFailed { run_id: RunId, node: String, frames: LoopFrames, error: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
     /// `reason` says WHY: the author's `_should_flow` said no, or an
     /// input the node needed never arrived. A decision and a consequence
     /// look identical on the graph without it.
     /// `None` only for a journal row written before the field existed
     /// (the UI renders "reason not recorded"); every live writer sends
     /// `Some`.
-    NodeSkipped { execution_id: ExecutionId, node: String, frames: LoopFrames, closed_ports: Vec<String>, reason: Option<crate::exec::skip::SkipReason>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
+    NodeSkipped { run_id: RunId, node: String, frames: LoopFrames, closed_ports: Vec<String>, reason: Option<crate::run::skip::SkipReason>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
+    /// A copy of a scope (a group, a call site, an included body, at
+    /// `frames`) was decided: it opened, or it did not run and why
+    /// (`crate::run::scope`). The graph paints a group from these, per
+    /// copy. A copy inside one that did not run is decided with it.
+    // SYNC: ScopeDecided <-> extension-vscode/src/runFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts ScopeDecidedEvent
+    ScopeDecided {
+        run_id: RunId,
+        project_id: uuid::Uuid,
+        scope: String,
+        frames: LoopFrames,
+        #[serde(flatten)]
+        state: crate::run::scope::ScopeState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inherited_from: Option<RunId>,
+        at_unix: u64,
+    },
     /// A loop instance was created at `parent_frames`. The inspector
     /// uses this to render a "Loop opened" marker at the loop's box.
-    // SYNC: LoopInstantiated <-> extension-vscode/src/execFollower.ts loop_instantiated, packages/weft-graph/src/protocol.ts LoopInspectorEvent 'instantiated'
+    // SYNC: LoopInstantiated <-> extension-vscode/src/runFollower.ts loop_instantiated, packages/weft-graph/src/protocol.ts LoopInspectorEvent 'instantiated'
     LoopInstantiated {
-        execution_id: ExecutionId,
+        run_id: RunId,
         project_id: uuid::Uuid,
         group_id: String,
         parent_frames: LoopFrames,
         /// Effective iteration CAP; `None` for an uncapped loop (a
-        /// done-driven or stream-driven loop with no `max_iters`),
+        /// done-driven or stream-driven loop with no `maxIters`),
         /// whose iteration count is unknowable up front.
         iter_cap: Option<u32>,
         parallel: bool,
@@ -162,7 +187,7 @@ pub enum DispatcherEvent {
     /// An iteration of the loop launched. Inspector renders an
     /// iteration marker at body_frames.
     LoopIterationLaunched {
-        execution_id: ExecutionId,
+        run_id: RunId,
         project_id: uuid::Uuid,
         group_id: String,
         parent_frames: LoopFrames,
@@ -175,7 +200,7 @@ pub enum DispatcherEvent {
     /// (a normal pulse) and the per-iteration body activity, not the
     /// LoopOut firing's raw write map.
     LoopOutFired {
-        execution_id: ExecutionId,
+        run_id: RunId,
         project_id: uuid::Uuid,
         group_id: String,
         parent_frames: LoopFrames,
@@ -185,7 +210,7 @@ pub enum DispatcherEvent {
     },
     /// The loop terminated outward and emitted its outer outputs.
     LoopTerminated {
-        execution_id: ExecutionId,
+        run_id: RunId,
         project_id: uuid::Uuid,
         group_id: String,
         parent_frames: LoopFrames,
@@ -196,10 +221,10 @@ pub enum DispatcherEvent {
     /// the exact firing (`node_id` + `frames`). `amount_usd` `None` = the
     /// meter could not resolve the figure (an honest unknown).
     CostReported {
-        execution_id: ExecutionId,
-        // SYNC: CostReported <-> extension-vscode/src/execFollower.ts DispatcherEvent cost_reported, packages/weft-graph/src/protocol.ts execCost
+        run_id: RunId,
+        // SYNC: CostReported <-> extension-vscode/src/runFollower.ts DispatcherEvent cost_reported, packages/weft-graph/src/protocol.ts runCost
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        inherited_from: Option<ExecutionId>,
+        inherited_from: Option<RunId>,
         project_id: uuid::Uuid,
         node_id: String,
         frames: LoopFrames,
@@ -217,10 +242,10 @@ pub enum DispatcherEvent {
     /// `FileEdited`): the inspector lists it on that firing's "Files
     /// edited" card. `inherited_from` as on [`Self::CostReported`].
     FileEdited {
-        execution_id: ExecutionId,
-        // SYNC: FileEdited <-> extension-vscode/src/execFollower.ts DispatcherEvent file_edited, packages/weft-graph/src/protocol.ts execFileEdit
+        run_id: RunId,
+        // SYNC: FileEdited <-> extension-vscode/src/runFollower.ts DispatcherEvent file_edited, packages/weft-graph/src/protocol.ts execFileEdit
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        inherited_from: Option<ExecutionId>,
+        inherited_from: Option<RunId>,
         project_id: uuid::Uuid,
         node_id: String,
         frames: LoopFrames,
@@ -252,18 +277,13 @@ pub enum DispatcherEvent {
     /// Supervisor finished terminating an infra node; the
     /// `infra_node` row has been deleted.
     InfraTerminated { project_id: uuid::Uuid, node_id: String },
-    /// Supervisor couldn't parse the project's
-    /// `health_protocols_json`. The user's config is broken; the
-    /// supervisor fell back to defaults. Surfaced as a banner in
-    /// the action bar so the user sees their config didn't take.
-    InfraConfigError { project_id: uuid::Uuid, error: String },
     /// A bus participant came online. `bus_id` is the channel's uuid
     /// (same one embedded in the bus marker), so the inspector groups
     /// multiple buses cleanly. `offset` is the bus-local position used
     /// to tiebreak same-second entries. `at_unix` is the journal's
     /// stamp so replay renders honest timestamps, not "now".
     BusJoined {
-        execution_id: ExecutionId,
+        run_id: RunId,
         project_id: uuid::Uuid,
         bus_id: String,
         offset: u64,
@@ -273,7 +293,7 @@ pub enum DispatcherEvent {
     /// A bus participant dropped. Pairs with `BusJoined` for the same
     /// `(bus_id, name)`.
     BusLeft {
-        execution_id: ExecutionId,
+        run_id: RunId,
         project_id: uuid::Uuid,
         bus_id: String,
         offset: u64,
@@ -287,9 +307,9 @@ pub enum DispatcherEvent {
     /// per sender/kind) are the whole story. The inspector unpacks
     /// `messages` into its per-message log and renders a summary line
     /// for a window that carries only totals.
-    // SYNC: BusWindow <-> crates/weft-journal/src/events.rs BusWindow, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window', extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window'
+    // SYNC: BusWindow <-> crates/weft-journal/src/events.rs BusWindow, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window', extension-vscode/src/runFollower.ts DispatcherEvent 'bus_window'
     BusWindow {
-        execution_id: ExecutionId,
+        run_id: RunId,
         project_id: uuid::Uuid,
         bus_id: String,
         first_offset: u64,
@@ -298,19 +318,22 @@ pub enum DispatcherEvent {
         totals: Vec<crate::bus::BusWindowTotal>,
         at_unix: u64,
     },
-    /// The bus was closed. Inspector renders an explicit
-    /// `* the bus closed here` marker; replay cursors stop here.
+    /// The bus was closed, and how it ended. Inspector renders an
+    /// explicit `* the bus closed here` marker, or where it failed and
+    /// why; replay cursors stop here.
+    // SYNC: BusClosed <-> crates/weft-journal/src/events.rs BusClosed, packages/weft-graph/src/protocol.ts BusInspectorEvent 'closed', extension-vscode/src/runFollower.ts DispatcherEvent 'bus_closed'
     BusClosed {
-        execution_id: ExecutionId,
+        run_id: RunId,
         project_id: uuid::Uuid,
         bus_id: String,
         offset: u64,
+        end: crate::bus::StreamEnd,
         at_unix: u64,
     },
-    /// A live caller attached to this execution. First event in the
+    /// A live caller attached to this run. First event in the
     /// caller stream; the inspector opens a "caller" panel on the run.
     CallerConnected {
-        execution_id: ExecutionId,
+        run_id: RunId,
         project_id: uuid::Uuid,
         offset: u64,
         protocol: String,
@@ -319,31 +342,41 @@ pub enum DispatcherEvent {
     /// What the conversation said during one window, both directions in
     /// one row, the same shape and clock as a bus window. A message
     /// whose content was not kept still appears carrying its size.
-    // SYNC: CallerWindow <-> crates/weft-journal/src/events.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_window'
+    /// `dropped` names the program's messages the caller never received
+    /// (it read too slowly), possibly ones of an earlier window
+    /// ([`crate::stream_journal::aggregate_caller_window`]).
+    // SYNC: CallerWindow <-> crates/weft-journal/src/events.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window', extension-vscode/src/runFollower.ts DispatcherEvent 'caller_window'
     CallerWindow {
-        execution_id: ExecutionId,
+        run_id: RunId,
         project_id: uuid::Uuid,
         first_offset: u64,
         last_offset: u64,
         messages: Vec<crate::stream_journal::WindowedCallerMessage>,
         totals: Vec<crate::stream_journal::CallerWindowTotal>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dropped: Vec<u64>,
         at_unix: u64,
     },
     /// A node error surfaced to the caller.
     CallerErrored {
-        execution_id: ExecutionId,
+        run_id: RunId,
         project_id: uuid::Uuid,
         offset: u64,
         message: String,
         at_unix: u64,
     },
     /// The caller is gone (response complete OR disconnected). Last
-    /// event in the caller stream; replay cursors stop here.
+    /// event in the caller stream; replay cursors stop here. `dropped`
+    /// names the program's messages still waiting to go out when the
+    /// exchange ended, which the caller never received.
+    // SYNC: CallerDisconnected <-> crates/weft-journal/src/events.rs CallerDisconnected, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'disconnected', extension-vscode/src/runFollower.ts DispatcherEvent 'caller_disconnected'
     CallerDisconnected {
-        execution_id: ExecutionId,
+        run_id: RunId,
         project_id: uuid::Uuid,
         offset: u64,
         reason: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dropped: Vec<u64>,
         at_unix: u64,
     },
     /// Graph-level participation: a node was wired to a bus. Derived
@@ -354,7 +387,7 @@ pub enum DispatcherEvent {
     /// encodes the bus's mode) so the inspector can render a mode
     /// badge in the panel header without a separate journal event.
     BusParticipant {
-        execution_id: ExecutionId,
+        run_id: RunId,
         project_id: uuid::Uuid,
         bus_id: String,
         node_id: String,
@@ -366,7 +399,7 @@ pub enum DispatcherEvent {
     /// line. Not alarming by design: corrupt rows are a real but
     /// rare event the user only investigates if they look.
     JournalCorruption {
-        execution_id: ExecutionId,
+        run_id: RunId,
         project_id: uuid::Uuid,
         site: crate::primitive::CorruptionSite,
         reason: String,
@@ -376,12 +409,13 @@ pub enum DispatcherEvent {
 impl DispatcherEvent {
     pub fn project_id(&self) -> uuid::Uuid {
         match self {
-            Self::ExecutionStarted { project_id, .. }
-            | Self::ExecutionCompleted { project_id, .. }
-            | Self::ExecutionFailed { project_id, .. }
-            | Self::ExecutionCancelled { project_id, .. }
-            | Self::ExecutionTagged { project_id, .. }
-            | Self::ExecutionDeleted { project_id, .. }
+            Self::RunStarted { project_id, .. }
+            | Self::RunCompleted { project_id, .. }
+            | Self::RunFailed { project_id, .. }
+            | Self::RunCancelled { project_id, .. }
+            | Self::RunTagged { project_id, .. }
+            | Self::RunDeleted { project_id, .. }
+            | Self::RunParked { project_id, .. }
             | Self::NodeStarted { project_id, .. }
             | Self::NodeSuspended { project_id, .. }
             | Self::NodeResumed { project_id, .. }
@@ -390,6 +424,7 @@ impl DispatcherEvent {
             | Self::NodeCompleted { project_id, .. }
             | Self::NodeFailed { project_id, .. }
             | Self::NodeSkipped { project_id, .. }
+            | Self::ScopeDecided { project_id, .. }
             | Self::LoopInstantiated { project_id, .. }
             | Self::LoopIterationLaunched { project_id, .. }
             | Self::LoopOutFired { project_id, .. }
@@ -405,7 +440,6 @@ impl DispatcherEvent {
             | Self::InfraFlaky { project_id, .. }
             | Self::InfraRecovered { project_id, .. }
             | Self::InfraTerminated { project_id, .. }
-            | Self::InfraConfigError { project_id, .. }
             | Self::BusJoined { project_id, .. }
             | Self::BusLeft { project_id, .. }
             | Self::BusWindow { project_id, .. }
@@ -419,11 +453,12 @@ impl DispatcherEvent {
         }
     }
 
-    /// The loop and call frames of the one firing this event is about
-    /// (a node's lifecycle, a cost or a file edit at that firing); `None`
-    /// for an event about the run, the project, a loop as a whole, or
-    /// anything else that is not one firing.
-    pub fn firing_frames(&self) -> Option<&LoopFrames> {
+    /// The loop and call frames of the one place this event is about: a
+    /// firing (a node's lifecycle, a cost or a file edit at that firing)
+    /// or a scope's copy being decided; `None` for an event about the
+    /// run, the project, a loop as a whole, or anything else that is not
+    /// one place.
+    pub fn place_frames(&self) -> Option<&LoopFrames> {
         match self {
             Self::NodeStarted { frames, .. }
             | Self::NodeSuspended { frames, .. }
@@ -434,13 +469,15 @@ impl DispatcherEvent {
             | Self::NodeFailed { frames, .. }
             | Self::NodeSkipped { frames, .. }
             | Self::CostReported { frames, .. }
-            | Self::FileEdited { frames, .. } => Some(frames),
-            Self::ExecutionStarted { .. }
-            | Self::ExecutionCompleted { .. }
-            | Self::ExecutionFailed { .. }
-            | Self::ExecutionCancelled { .. }
-            | Self::ExecutionTagged { .. }
-            | Self::ExecutionDeleted { .. }
+            | Self::FileEdited { frames, .. }
+            | Self::ScopeDecided { frames, .. } => Some(frames),
+            Self::RunStarted { .. }
+            | Self::RunCompleted { .. }
+            | Self::RunFailed { .. }
+            | Self::RunCancelled { .. }
+            | Self::RunTagged { .. }
+            | Self::RunDeleted { .. }
+            | Self::RunParked { .. }
             | Self::LoopInstantiated { .. }
             | Self::LoopIterationLaunched { .. }
             | Self::LoopOutFired { .. }
@@ -454,7 +491,6 @@ impl DispatcherEvent {
             | Self::InfraFlaky { .. }
             | Self::InfraRecovered { .. }
             | Self::InfraTerminated { .. }
-            | Self::InfraConfigError { .. }
             | Self::BusJoined { .. }
             | Self::BusLeft { .. }
             | Self::BusWindow { .. }
@@ -468,47 +504,49 @@ impl DispatcherEvent {
         }
     }
 
-    /// Whether this event ends its execution (a cancel is an end too).
-    // SYNC: DispatcherEvent::is_execution_terminal <-> crates/weft-journal/src/events.rs ExecEvent::is_execution_terminal, crates/weft-journal/src/events.rs EXECUTION_TERMINAL_KINDS_SQL
-    pub fn is_execution_terminal(&self) -> bool {
+    /// Whether this event ends its run (a cancel is an end too).
+    // SYNC: DispatcherEvent::is_run_terminal <-> crates/weft-journal/src/events.rs RunEvent::is_run_terminal, crates/weft-journal/src/events.rs RUN_TERMINAL_KINDS_SQL
+    pub fn is_run_terminal(&self) -> bool {
         matches!(
             self,
-            Self::ExecutionCompleted { .. } | Self::ExecutionFailed { .. } | Self::ExecutionCancelled { .. }
+            Self::RunCompleted { .. } | Self::RunFailed { .. } | Self::RunCancelled { .. }
         )
     }
 
-    pub fn execution_id(&self) -> Option<ExecutionId> {
+    pub fn run_id(&self) -> Option<RunId> {
         match self {
-            Self::ExecutionStarted { execution_id, .. }
-            | Self::ExecutionCompleted { execution_id, .. }
-            | Self::ExecutionFailed { execution_id, .. }
-            | Self::ExecutionCancelled { execution_id, .. }
-            | Self::ExecutionTagged { execution_id, .. }
-            | Self::ExecutionDeleted { execution_id, .. }
-            | Self::NodeStarted { execution_id, .. }
-            | Self::NodeSuspended { execution_id, .. }
-            | Self::NodeResumed { execution_id, .. }
-            | Self::WaitEnded { execution_id, .. }
-            | Self::NodeCancelled { execution_id, .. }
-            | Self::NodeCompleted { execution_id, .. }
-            | Self::NodeFailed { execution_id, .. }
-            | Self::NodeSkipped { execution_id, .. }
-            | Self::LoopInstantiated { execution_id, .. }
-            | Self::LoopIterationLaunched { execution_id, .. }
-            | Self::LoopOutFired { execution_id, .. }
-            | Self::LoopTerminated { execution_id, .. }
-            | Self::CostReported { execution_id, .. }
-            | Self::FileEdited { execution_id, .. }
-            | Self::BusJoined { execution_id, .. }
-            | Self::BusLeft { execution_id, .. }
-            | Self::BusWindow { execution_id, .. }
-            | Self::BusClosed { execution_id, .. }
-            | Self::BusParticipant { execution_id, .. }
-            | Self::CallerConnected { execution_id, .. }
-            | Self::CallerWindow { execution_id, .. }
-            | Self::CallerErrored { execution_id, .. }
-            | Self::CallerDisconnected { execution_id, .. }
-            | Self::JournalCorruption { execution_id, .. } => Some(*execution_id),
+            Self::RunStarted { run_id, .. }
+            | Self::RunCompleted { run_id, .. }
+            | Self::RunFailed { run_id, .. }
+            | Self::RunCancelled { run_id, .. }
+            | Self::RunTagged { run_id, .. }
+            | Self::RunDeleted { run_id, .. }
+            | Self::RunParked { run_id, .. }
+            | Self::NodeStarted { run_id, .. }
+            | Self::NodeSuspended { run_id, .. }
+            | Self::NodeResumed { run_id, .. }
+            | Self::WaitEnded { run_id, .. }
+            | Self::NodeCancelled { run_id, .. }
+            | Self::NodeCompleted { run_id, .. }
+            | Self::NodeFailed { run_id, .. }
+            | Self::NodeSkipped { run_id, .. }
+            | Self::ScopeDecided { run_id, .. }
+            | Self::LoopInstantiated { run_id, .. }
+            | Self::LoopIterationLaunched { run_id, .. }
+            | Self::LoopOutFired { run_id, .. }
+            | Self::LoopTerminated { run_id, .. }
+            | Self::CostReported { run_id, .. }
+            | Self::FileEdited { run_id, .. }
+            | Self::BusJoined { run_id, .. }
+            | Self::BusLeft { run_id, .. }
+            | Self::BusWindow { run_id, .. }
+            | Self::BusClosed { run_id, .. }
+            | Self::BusParticipant { run_id, .. }
+            | Self::CallerConnected { run_id, .. }
+            | Self::CallerWindow { run_id, .. }
+            | Self::CallerErrored { run_id, .. }
+            | Self::CallerDisconnected { run_id, .. }
+            | Self::JournalCorruption { run_id, .. } => Some(*run_id),
             Self::TriggerUrlChanged { .. }
             | Self::ProjectRegistered { .. }
             | Self::ProjectActivated { .. }
@@ -517,8 +555,7 @@ impl DispatcherEvent {
             | Self::InfraStatusChanged { .. }
             | Self::InfraFlaky { .. }
             | Self::InfraRecovered { .. }
-            | Self::InfraTerminated { .. }
-            | Self::InfraConfigError { .. } => None,
+            | Self::InfraTerminated { .. } => None,
         }
     }
 }
@@ -528,9 +565,37 @@ mod identity_tests {
     use super::*;
 
     #[test]
+    fn a_started_run_names_its_fields_in_camel_case_under_a_snake_case_kind() {
+        let event = DispatcherEvent::RunStarted {
+            run_id: uuid::Uuid::nil(),
+            entry_node: "hook".into(),
+            phase: crate::context::Phase::Fire,
+            subgraph: None,
+            seed: None,
+            project_id: uuid::Uuid::from_u128(1),
+            instance: None,
+            at_unix: 5,
+        };
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "kind": "run_started",
+                "runId": "00000000-0000-0000-0000-000000000000",
+                "entryNode": "hook",
+                "phase": "fire",
+                "projectId": "00000000-0000-0000-0000-000000000001",
+                "atUnix": 5,
+            })
+        );
+        let back = serde_json::to_value(serde_json::from_value::<DispatcherEvent>(wire.clone()).unwrap()).unwrap();
+        assert_eq!(back, wire);
+    }
+
+    #[test]
     fn identities_survive_projection_and_wire_round_trips() {
-        let event = DispatcherEvent::ExecutionCompleted {
-            execution_id: uuid::Uuid::nil(), project_id: uuid::Uuid::from_u128(0x100),
+        let event = DispatcherEvent::RunCompleted {
+            run_id: uuid::Uuid::nil(), project_id: uuid::Uuid::from_u128(0x100),
             outputs: serde_json::json!({}), at_unix: 1,
         };
         let record = IdentifiedEvent::recorded(42, 3, event);
@@ -539,8 +604,8 @@ mod identity_tests {
         let replay = record.project(|event| vec![event.clone(), event]);
         assert_eq!(serde_json::to_value(&projected).unwrap(), serde_json::to_value(replay).unwrap());
         let json = serde_json::to_value(&projected[0]).unwrap();
-        assert_eq!(json["event_id"], "journal:42:3:0");
-        assert_eq!(json["kind"], "execution_completed");
+        assert_eq!(json["eventId"], "journal:42:3:0");
+        assert_eq!(json["kind"], "run_completed");
         let decoded: LiveEvent = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.event_id, projected[0].event_id);
         let distinct = IdentifiedEvent::recorded(42, 4, decoded.event).project(|event| vec![event]);

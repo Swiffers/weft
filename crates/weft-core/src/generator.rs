@@ -25,7 +25,7 @@
 //! Every waiting pull registers with the engine's shared wait tracker
 //! (`crate::liveness`), the same one bus waits use, so a consumer
 //! parked on a pull participates in deadlock detection instead of
-//! hanging the execution.
+//! hanging the run.
 
 use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
@@ -228,7 +228,7 @@ impl GeneratorFeed {
     pub fn push(&self, pulse_id: Uuid, value: Arc<Value>) -> WeftResult<()> {
         let mut st = self.lock();
         st.buf.push(pulse_id, value).map_err(|e| {
-            WeftError::NodeExecution(format!(
+            WeftError::NodeFailed(format!(
                 "stream '{}': {e}; engine ordering bug",
                 self.port
             ))
@@ -313,7 +313,7 @@ fn evaluate_pull(feed: &GeneratorFeed) -> Option<WeftResult<PulledItem>> {
     }
     match st.buf.end() {
         Some(StreamEnd::Finished) => Some(Ok(None)),
-        Some(StreamEnd::Failed { error }) => Some(Err(WeftError::NodeExecution(format!(
+        Some(StreamEnd::Failed { error }) => Some(Err(WeftError::NodeFailed(format!(
             "stream '{}' failed upstream: {error}",
             feed.port
         )))),
@@ -439,9 +439,9 @@ impl<'de, T> serde::Deserialize<'de> for Generator<T> {
 // serde, so the live feed cannot ride in the bag itself. The bag holds
 // a marker carrying a fresh uuid; the engine registers the feed under
 // that uuid for exactly the consuming firing's lifetime and removes it
-// at the firing's terminal. Process-wide (not per-execution) because a
-// `Deserialize` impl has no execution context to reach; the uuid keys
-// are globally unique so executions can never collide. Entries are
+// at the firing's terminal. Process-wide (not per-run) because a
+// `Deserialize` impl has no run context to reach; the uuid keys
+// are globally unique so runs can never collide. Entries are
 // `Weak`: the feed's real owner is the engine's stream runtime, so a
 // registration that outlives its feed (a missed unregister on some
 // teardown path) self-heals into "not live" instead of pinning the

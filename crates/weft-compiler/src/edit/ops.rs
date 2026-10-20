@@ -161,6 +161,10 @@ fn validate_ident(what: &str, s: &str) -> Result<(), EditError> {
 /// heredoc that closes on a later fence in the user's own source would reparse
 /// that source as a value). Only "does this parse as a type" rejects those.
 fn validate_port_type(what: &str, ty: &str) -> Result<(), EditError> {
+    // The empty spelling is a port written with no type (the bare name).
+    if ty.is_empty() {
+        return Ok(());
+    }
     // The STRUCTURAL gate runs on every spelling, parseable or not: a
     // legal weft type can still be one the header lexer cannot carry
     // (it nests on `[...]` and `{...}` only, so a parenthesized union
@@ -170,8 +174,8 @@ fn validate_port_type(what: &str, ty: &str) -> Result<(), EditError> {
     if weft_core::WeftType::parse(ty).is_some() {
         return Ok(());
     }
-    // The parser deliberately KEEPS an unknown type in a header (as a
-    // recoverable `MustOverride` with a squiggle naming it), so a declared
+    // The parser deliberately KEEPS an unknown type in a header (typed
+    // with the port's own variable, with a squiggle naming it), so a declared
     // spelling that does not parse must round-trip through here unchanged:
     // refusing it would block every ports gesture on a node whose header
     // holds a typo, and dropping it would erase the author's text. Only a
@@ -1047,7 +1051,7 @@ fn set_config(
         // error, never a port value. Every other port is written as a
         // `g.key = value` statement, and on an include alias, which has
         // no braces, the gate is too.
-        if !weft_core::exec::skip::is_gate_port(key) || matches!(decl, Decl::Include(_)) {
+        if !weft_core::run::skip::is_gate_port(key) || matches!(decl, Decl::Include(_)) {
             // Only a DECLARED in-port may be written as `g.key = value`:
             // anything else would emit source the compiler then rejects.
             // Loop knobs (`over`, `parallel`, ...) are not ports and ride
@@ -1253,11 +1257,11 @@ fn set_label(view: &FileView, node_id: &str, label: Option<&str>) -> Result<(), 
     // A `_label` field is only valid on a Node (an inline node included:
     // its label is just a body field). The merged group/loop lowering
     // rejects a label field in a container body as a compile error, so
-    // a setLabel targeting a Group/Loop would author an uncompilable
+    // a set_label targeting a Group/Loop would author an uncompilable
     // file. Fail at edit time with the honest kind error instead
-    // (containers are renamed via renameGroup / renameLoop).
+    // (containers are renamed via rename_group / rename_loop).
     if !matches!(decl, Decl::Node(_) | Decl::InlineNode(_)) {
-        return Err(kind_mismatch("setLabel", node_id, "Node", &decl));
+        return Err(kind_mismatch("set_label", node_id, "Node", &decl));
     }
     match label.filter(|l| !l.is_empty()) {
         Some(l) => set_or_insert_field(&decl, "_label", &format_string(l)?),
@@ -1282,7 +1286,7 @@ fn set_per_instance(view: &FileView, node_id: &str, on: bool) -> Result<(), Edit
                  first, then mark it per instance"
             )));
         }
-        other => return Err(kind_mismatch("setPerInstance", node_id, "Node", other)),
+        other => return Err(kind_mismatch("set_per_instance", node_id, "Node", other)),
     }
     let existing: Vec<SyntaxNode> = decl
         .body()
@@ -1854,7 +1858,7 @@ fn set_value_form(
 }
 
 /// Set or insert a loop config field (`parallel: true`, `over: [...]`,
-/// `carry: [...]`, `max_iters: 100`, `trim_on_mismatch: false`). The
+/// `carry: [...]`, `maxIters: 100`, `trimOnMismatch: false`). The
 /// value is a pre-formatted source token. Replaces in place if present.
 fn set_loop_config(view: &FileView, loop_id: &str, key: &str, value: &str) -> Result<(), EditError> {
     let lp = resolve_loop(view, loop_id)?;
@@ -2281,9 +2285,8 @@ impl ContainerKind {
 /// Rename a container (Group or Loop). The two cases share the same
 /// mechanics: rewrite the header's leading IDENT token, then rewrite
 /// every endpoint that resolved to this decl (in any scope). The body
-/// and the lowered LoopIn/LoopOut / Passthrough boundary ids are
-/// reconstructed on the next re-flatten, so renaming the source-level
-/// label is sufficient.
+/// and a loop's lowered LoopIn/LoopOut ids are reconstructed on the next
+/// re-flatten, so renaming the source-level label is sufficient.
 ///
 /// `id` is the container's SCOPED id (e.g. `Outer.Inner`), the same
 /// scoped-id contract `MoveGroupScope` uses, so it is identified
@@ -2423,7 +2426,7 @@ fn reject_uncontained_value(value: &str) -> Result<(), EditError> {
     // part of a multi-line JSON object value, which the grammar parses in
     // every value position (one-liner bodies and connection lines included:
     // the parser assembles the brace-run across lines; pinned by
-    // tests/parser_multiline_object.rs). Only a newline at brace depth 0
+    // tests/integration/parser_multiline_object.rs). Only a newline at brace depth 0
     // splits the VALUE itself across lines and breaks out.
     let mut brace_depth: i32 = 0;
     for t in &toks {
@@ -2544,7 +2547,7 @@ fn check_scope_meaning(
                     None if suffix.starts_with('.') => {
                         if parent.is_empty() { suffix[1..].to_string() } else { format!("{parent}{suffix}") }
                     }
-                    None => continue, // the removed container's own boundary nodes
+                    None => continue, // a removed loop's own boundary nodes
                 }
             }
             _ => node.id.clone(),
@@ -2558,7 +2561,8 @@ fn check_scope_meaning(
         let next_ports: std::collections::HashMap<_, _> = port_contracts(next)
             .map(|(side, port)| ((side, port.name.as_str()), port)).collect();
         for (side, port) in port_contracts(node) {
-                if port.port_type == weft_core::WeftType::MustOverride { continue; }
+                let port_side = if side == "input" { weft_core::weft_type::PortSide::Input } else { weft_core::weft_type::PortSide::Output };
+                if port.is_untyped(port_side) { continue; }
                 if !next_ports.get(&(side, port.name.as_str()))
                     .is_some_and(|new| new.port_type == port.port_type && new.required == port.required) {
                     return Err(EditError::InvalidArgument(format!(
@@ -2803,7 +2807,7 @@ fn update_container_ports(
     // can't be named by any parent leg, so the parent-scope sweep is skipped;
     // its `self.<port>` body wiring is still swept.
     detach_dangling_port_connections(&decl, decl.local_id().as_deref(), inputs, outputs);
-    rewrite_port_header(&decl, inputs, outputs)
+    rewrite_port_header(&decl, inputs, outputs, ParamScope::WholeSurface)
 }
 
 /// Rewrite a NODE's DECLARED port surface (see `EditOp::UpdateNodePorts`):
@@ -2885,7 +2889,7 @@ fn update_node_ports(
             }
         }
     }
-    rewrite_port_header(&decl, inputs, outputs)
+    rewrite_port_header(&decl, inputs, outputs, ParamScope::PartOfTheSurface)
 }
 
 /// Both halves of every port sig are written into the decl's HEADER, which is
@@ -2913,14 +2917,72 @@ fn validate_port_sigs(inputs: &[PortSig], outputs: &[PortSig]) -> Result<(), Edi
     Ok(())
 }
 
+/// Whether a header's ports are every port its type parameters can
+/// bound: a group's or loop's are, a node's are only the ones it adds or
+/// restates (its type's own ports live in the catalog, which the editor
+/// does not hold).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParamScope {
+    WholeSurface,
+    PartOfTheSurface,
+}
+
 /// Rebuild the decl with `id = Type` + the new signature as its header,
-/// preserving the body verbatim.
-fn rewrite_port_header(decl: &Decl, inputs: &[PortSig], outputs: &[PortSig]) -> Result<(), EditError> {
+/// preserving the body verbatim. On a header that is its whole port
+/// surface, a type parameter no port uses any more is dropped with the
+/// port that used it (the build refuses an unused one).
+fn rewrite_port_header(decl: &Decl, inputs: &[PortSig], outputs: &[PortSig], scope: ParamScope) -> Result<(), EditError> {
     let header = decl_header_text(decl);
-    // head = `id = Type` (everything up to the first `(` or `->`).
+    // head = `id = Type[T: ...]` (everything up to the first `(` or `->`
+    // outside the brackets).
     let (head, _) = split_header_head(&header);
-    let new_header = format!("{}{}", head.trim_end(), build_signature(inputs, outputs));
+    let head = match scope {
+        ParamScope::WholeSurface => drop_unused_type_params(head.trim_end(), inputs, outputs),
+        ParamScope::PartOfTheSurface => head.trim_end().to_string(),
+    };
+    let new_header = format!("{head}{}", build_signature(inputs, outputs));
     rebuild_decl(decl, &new_header)
+}
+
+/// `head` (`id = Group[T: Media, T2: List[T]]`) without the type
+/// parameters no port in the new signature uses, keeping one another
+/// kept parameter's bound names. A list that does not parse is left as
+/// written: the build names what is wrong with it.
+fn drop_unused_type_params(head: &str, inputs: &[PortSig], outputs: &[PortSig]) -> String {
+    use weft_core::weft_type::{TypeParam, WeftType};
+    let Some(open) = head.find('[') else { return head.to_string() };
+    // Each entry as written, with what it declares: a kept entry is put
+    // back exactly as the author wrote it.
+    let Ok(written) = TypeParam::written_entries(&head[open..]) else { return head.to_string() };
+    let Ok(entries) = written
+        .iter()
+        .map(|entry| TypeParam::parse_list(&format!("[{entry}]")).map(|mut one| (one.remove(0), *entry)))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return head.to_string();
+    };
+    let mut used = std::collections::BTreeSet::new();
+    for port in inputs.iter().chain(outputs) {
+        if let Ok(ty) = WeftType::try_parse(&port.port_type) {
+            ty.collect_type_vars(&mut used);
+        }
+    }
+    loop {
+        let before = used.len();
+        let reached: Vec<&TypeParam> = entries.iter().map(|(p, _)| p).filter(|p| used.contains(&p.name)).collect();
+        for param in reached {
+            param.bound.collect_type_vars(&mut used);
+        }
+        if used.len() == before {
+            break;
+        }
+    }
+    let kept: Vec<&str> = entries.iter().filter(|(p, _)| used.contains(&p.name)).map(|(_, entry)| *entry).collect();
+    if kept.len() == entries.len() {
+        return head.to_string();
+    }
+    let base = head[..open].trim_end();
+    if kept.is_empty() { base.to_string() } else { format!("{base}[{}]", kept.join(", ")) }
 }
 
 /// Detach the parent-scope CONNECTION lines around `decl` that `doomed`
@@ -3092,7 +3154,7 @@ fn header_in_port_names(decl: &Decl) -> Vec<String> {
             }
             let text = el.to_string();
             let text = text.trim().trim_end_matches(',').trim();
-            if let Ok(port) = crate::weft_compiler::try_parse_port_decl(text) {
+            if let Ok(port) = crate::weft_compiler::try_parse_port_decl(text, weft_core::weft_type::PortSide::Input) {
                 bucket.push(port.name);
             }
         }
@@ -3109,20 +3171,36 @@ fn header_in_port_names(decl: &Decl) -> Vec<String> {
 /// ends at whichever of the first `(` or the first `->` comes first (a
 /// signature can open with `->` when there are no in-ports).
 fn split_header_head(header: &str) -> (String, String) {
-    let cut = [header.find('('), header.find("->")]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or(header.len());
+    // The head keeps its `[T: ...]` type parameters, whose bounds may
+    // carry a `(` of their own (`[T: (Image | Video)]`), so only a `(` or
+    // `->` outside the brackets ends it.
+    let mut depth = 0usize;
+    let mut cut = header.len();
+    for (i, c) in header.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            '(' if depth == 0 => {
+                cut = i;
+                break;
+            }
+            '-' if depth == 0 && header[i..].starts_with("->") => {
+                cut = i;
+                break;
+            }
+            _ => {}
+        }
+    }
     (header[..cut].to_string(), header[cut..].to_string())
 }
 
 /// Build a `(in) -> (out)` signature string from port sigs.
 fn build_signature(inputs: &[PortSig], outputs: &[PortSig]) -> String {
+    // An empty type is a port written with no type: the bare name.
     let fmt = |p: &PortSig| {
         let ty = p.port_type.as_str();
         let opt = if p.required { "" } else { "?" };
-        format!("{}{opt}: {ty}", p.name)
+        if ty.is_empty() { format!("{}{opt}", p.name) } else { format!("{}{opt}: {ty}", p.name) }
     };
     let ins: Vec<String> = inputs.iter().map(fmt).collect();
     let outs: Vec<String> = outputs.iter().map(fmt).collect();

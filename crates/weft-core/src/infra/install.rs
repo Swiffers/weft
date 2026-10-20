@@ -237,15 +237,28 @@ impl Install {
     /// when `image_ref` is one of any install's local image names
     /// ([`Self::local_image_ref`]); `None` for any other image.
     pub fn tag_of_local_image(image_ref: &str) -> Option<&str> {
-        let tag = match image_ref.strip_prefix(LOCAL_IMAGE_REGISTRY).and_then(|r| r.strip_prefix("/weft-")) {
+        Self::split_local_image(image_ref).map(|(_, tag)| tag)
+    }
+
+    /// The named install whose local image name `image_ref` is
+    /// ([`Self::local_image_ref`]): the image is that install's to remove.
+    /// `None` for any other image, the default install's names included
+    /// (they are bare tags, which say nothing of whose they are).
+    pub fn owner_of_local_image(image_ref: &str) -> Option<Self> {
+        Self::split_local_image(image_ref).and_then(|(owner, _)| owner)
+    }
+
+    /// A local image name split into the named install it belongs to (none
+    /// for a bare one) and its tag.
+    fn split_local_image(image_ref: &str) -> Option<(Option<Self>, &str)> {
+        let (owner, tag) = match image_ref.strip_prefix(LOCAL_IMAGE_REGISTRY).and_then(|r| r.strip_prefix("/weft-")) {
             Some(rest) => {
                 let (name, tag) = rest.split_once('/')?;
-                Self::named(name).ok()?;
-                tag
+                (Some(Self::named(name).ok()?), tag)
             }
-            None => image_ref,
+            None => (None, image_ref),
         };
-        (!tag.contains('/') && tag.contains(':')).then_some(tag)
+        (!tag.contains('/') && tag.contains(':')).then_some((owner, tag))
     }
 }
 
@@ -384,7 +397,8 @@ pub fn data_dir() -> std::path::PathBuf {
 // spell it out:
 // SYNC: INSTALL_ENV <-> extension-vscode/src/localInstall.ts (installName), setup.sh,
 //       scripts/run-e2e.sh, scripts/run-node-tests.sh, scripts/lib/checkout-install.sh
-//       (weft_which), scripts/remove-worktree.sh
+//       (weft_which), scripts/remove-worktree.sh, .github/workflows/install-gcp.yml
+//       (build the runtime's images)
 pub const INSTALL_ENV: &str = "WEFT_INSTALL";
 
 /// The label key naming the install a resource belongs to.
@@ -418,7 +432,10 @@ mod tests {
         assert_eq!(Install::tag_of_local_image("localhost/weft-cell7/weft-worker:ab"), Some("weft-worker:ab"));
         for other in ["localhost/other/weft-worker:ab", "ghcr.io/x/weft-worker:ab", "evil/weft-worker:ab", "weft-worker", "localhost/weft-Bad/weft-worker:ab"] {
             assert_eq!(Install::tag_of_local_image(other), None, "{other}");
+            assert_eq!(Install::owner_of_local_image(other), None, "{other}");
         }
+        assert_eq!(Install::owner_of_local_image("localhost/weft-cell7/weft-infra-mini_service:ab"), Some(c));
+        assert_eq!(Install::owner_of_local_image("weft-worker:ab"), None, "the default install's names are bare");
     }
 
     #[test]

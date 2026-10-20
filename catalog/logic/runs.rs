@@ -3,12 +3,12 @@
 //! reach the same runs for the same inputs.
 
 use weft::context::RunQuery;
-use weft::{ExecutionContext, WeftError, WeftResult};
+use weft::{RunContext, WeftError, WeftResult};
 
 /// `ctx.runs()` narrowed by every filter input the node was given. An
 /// empty text input narrows nothing. The tag is read the way `TagRun`
 /// writes it, so the same value finds the runs `TagRun` tagged with it.
-pub fn runs_from_inputs(ctx: &ExecutionContext) -> WeftResult<RunQuery<'_>> {
+pub fn runs_from_inputs(ctx: &RunContext) -> WeftResult<RunQuery<'_>> {
     let text = |name: &str| -> WeftResult<Option<String>> {
         Ok(ctx.inputs.opt::<String>(name)?.filter(|s| !s.trim().is_empty()))
     };

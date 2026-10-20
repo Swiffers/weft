@@ -1,5 +1,5 @@
 //! Provider-side event subscriptions: the rows behind
-//! `route_by: subscription` services, and the declared subscribe /
+//! `routeBy: subscription` services, and the declared subscribe /
 //! renew / unsubscribe calls that keep them alive.
 //!
 //! One subscription serves one registered signal. Weft mints the id
@@ -73,13 +73,6 @@ pub struct EnsureSubscription {
     /// subscription's `params`).
     #[serde(default)]
     pub params: BTreeMap<String, String>,
-    /// The public address the provider should post to, resolved by
-    /// the caller from its deployment configuration. `None` = this
-    /// weft has no address the internet can reach; a topic that must
-    /// TELL the provider where to send then refuses with the teaching
-    /// error, while a topic the provider pushes to an
-    /// operator-configured address needs nothing from us.
-    pub receiver_url: Option<String>,
 }
 
 /// The answer: when the provider will stop sending (`None` = never),
@@ -98,11 +91,22 @@ pub struct EnsuredSubscription {
 /// Idempotent per (signal, healthy subscription): the serving loop
 /// calls it at spawn and again at each renewal wake without tracking
 /// which case it is in.
-pub async fn ensure_subscription(
+///
+/// `receiver_url` reads the public address the provider should post to,
+/// from the caller's deployment configuration, and is called only right
+/// before a subscribe call. `None` = this weft has no address the
+/// internet can reach; a topic that must TELL the provider where to
+/// send then refuses with the teaching error.
+pub async fn ensure_subscription<F, Fut>(
     pool: &PgPool,
     locks: &PgPool,
     req: &EnsureSubscription,
-) -> anyhow::Result<EnsuredSubscription> {
+    receiver_url: F,
+) -> anyhow::Result<EnsuredSubscription>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Option<String>>>,
+{
     let source = resolve_event_source(pool, &req.tenant, crate::GrantUser::of(req.for_instance.as_ref()), req.access_id, &req.service, &[]).await?;
     let Some(topic) = source.events.get(&req.topic) else {
         return Err(AccessError::Invalid(format!(
@@ -122,10 +126,6 @@ pub async fn ensure_subscription(
         // The provider pushes without being asked (an app-level
         // events URL); nothing to keep alive.
         return Ok(EnsuredSubscription { expires_at: None });
-    };
-
-    let Some(receiver_url) = req.receiver_url.as_deref() else {
-        return Err(AccessError::Invalid(no_public_url_error(&req.service)).into());
     };
 
     // One change to this signal's subscriptions at a time, held to the
@@ -149,12 +149,15 @@ pub async fn ensure_subscription(
         // is a NEW provider-side channel (the surveyed providers have no
         // extend verb), and reusing the token would make the old channel
         // and the new one indistinguishable.
+        let Some(receiver_url) = receiver_url().await? else {
+            return Err(AccessError::Invalid(no_public_url_error(&req.service)).into());
+        };
         let minted_id = uuid::Uuid::new_v4().to_string();
         let minted_token = mint_token();
         let mut values = call_values(&source.values, &source.recipe_values, &req.params)?;
         values.insert(MINTED_ID.to_string(), minted_id.clone());
         values.insert(MINTED_TOKEN.to_string(), minted_token.clone());
-        values.insert(RECEIVER_URL.to_string(), receiver_url.to_string());
+        values.insert(RECEIVER_URL.to_string(), receiver_url);
 
         let resp = run_connect_call(&req.service, &calls.subscribe, &values).await?;
         apply_captures(&calls.subscribe.captures, &resp, &mut values)?;
@@ -287,7 +290,7 @@ pub async fn drop_subscriptions_for_signal(
     .await
 }
 
-/// The subscription a push names, for `route_by: subscription`
+/// The subscription a push names, for `routeBy: subscription`
 /// routing. Keyed by the minted id (an unguessable UUID weft minted;
 /// the token check on top of it is the verification) AND the
 /// endpoint's service + topic, so a push replayed at another
@@ -408,9 +411,11 @@ fn row_to_subscription(
 /// reach, as it is switched on or, on, as its subscription is made
 /// again (the signal then stops until it is registered again): states
 /// the need, the risk-accepting fix and the way back for either case,
-/// and the door to the full explanation. A trigger already on refuses
-/// `weft activate`; `weft resync` registers its signals again. The doc
-/// path is stable on purpose; the editor renders it as a link.
+/// and the door to the full explanation. A trigger already on is left
+/// alone by `weft activate`, and `weft resync` moves only a trigger that
+/// is behind its build, so one that is on is set up again by turning it
+/// off and on. The doc path is stable on purpose; the editor renders it
+/// as a link.
 // SYNC: no_public_url_error <-> docs/src/connections/events.md (the section
 //       '"This trigger needs your weft to be reachable..."')
 pub fn no_public_url_error(service: &str) -> String {
@@ -418,7 +423,8 @@ pub fn no_public_url_error(service: &str) -> String {
         "this trigger needs '{service}' to deliver events TO your weft, which requires \
          your weft to be reachable from the internet, and it is not. If you accept \
          making its public trigger surface reachable, rerun `./setup.sh --public-url`, \
-         then `weft activate` (or `weft resync`, when the trigger is already on); \
+         then `weft activate`, or, when the trigger is already on, turn it off and on again \
+         (`weft deactivate --trigger <name>`, then `weft activate --trigger <name>`); \
          or use a connection that supports dialing out (your own \
          provider app), where the service offers one. \
          See https://weavemindai.github.io/weft/connections/events.html"
@@ -561,15 +567,15 @@ mod tests {
     #[test]
     fn params_never_replace_stored_or_minted_values() {
         let auth = BTreeMap::from([("token".to_string(), "t1".to_string())]);
-        let recipe = BTreeMap::from([("app_token".to_string(), "xapp".to_string())]);
+        let recipe = BTreeMap::from([("appToken".to_string(), "xapp".to_string())]);
 
         let fresh = BTreeMap::from([("target".to_string(), "file-9".to_string())]);
         let v = call_values(&auth, &recipe, &fresh).unwrap();
         assert_eq!(v["token"], "t1");
-        assert_eq!(v["app_token"], "xapp");
+        assert_eq!(v["appToken"], "xapp");
         assert_eq!(v["target"], "file-9");
 
-        for stolen in ["token", "app_token", MINTED_TOKEN] {
+        for stolen in ["token", "appToken", MINTED_TOKEN] {
             let params = BTreeMap::from([(stolen.to_string(), "override".to_string())]);
             let err = call_values(&auth, &recipe, &params).unwrap_err().to_string();
             assert!(err.contains(stolen), "{err}");

@@ -112,18 +112,23 @@ COPY crates ./crates
 #     separately and stays a cached layer while the lock holds.
 #
 # `{{target_cache_key}}` is substituted by the staging step
-# (`build::stage_builder_base_context`) with a hash of Cargo.lock +
-# rust-toolchain.toml: a lock or toolchain change starts a FRESH cache
-# instead of inheriting the old one. Without the key, the cache (and
-# therefore the baked layer, since the whole cache is copied in)
-# accumulates every dependency version and toolchain ever built:
-# cargo never removes superseded artifacts, so the image would grow
-# without bound across months of iteration. Inside one key, the package
-# crates are the part that churns (every node edit is a new slot), so
-# the same sweep a project build runs (`weft-cache-gc.sh`, emitted into
-# the crate) drops the slots no base build has linked for 30 days
-# before the cache is copied into the layer; `{{worker_binary}}` is the
-# top crate's binary name it keeps.
+# (`build::stage_builder_base_context_at`) with
+# `build::install_cache_key`: the install it is built for, then a hash
+# of rust-toolchain.toml. The install, because cargo goes by modification
+# times: a cache shared with another branch's install on this machine
+# would hand this base that branch's newer artifacts for the engine
+# crates; an install's caches go with it (`weft daemon remove`,
+# `weft clean --images --all`). The toolchain, because a new one makes
+# every artifact dead weight. The lock is NOT in the key: a dependency
+# bump keeps the cache and recompiles only what it moved.
+#
+# What bounds the cache instead (and therefore the baked layer, since the
+# whole cache is copied in): cargo never removes superseded artifacts, so
+# after the build the sweep (`weft-cache-gc.sh this-build`, emitted into
+# the crate) drops every unit this build did not use, read off cargo's
+# JSON messages: older dependency versions, engine artifacts of an older
+# lock, package slots the stdlib moved past. The cache, and the image,
+# hold exactly one build of the stock worker.
 #
 # The registry cache id is the base's own, NOT shared with per-project
 # worker builds: both sides mount `sharing=locked`, so a shared id
@@ -144,12 +149,13 @@ COPY .weft-warmup /work
 COPY project-nodes /weft/project-nodes
 COPY worker-builder-base-split.sh /usr/local/bin/weft-split-artifacts
 {{build_env_lines}}
+# SYNC: weft-builder-base-target- <-> crates/weft-compiler/src/build.rs (BUILDER_BASE_CACHE_MOUNT_ID_PREFIX)
 RUN --mount=type=cache,id=weft-builder-base-cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=weft-builder-base-target-{{target_cache_key}},target=/cache/target,sharing=locked \
     cp /weft/Cargo.lock /work/Cargo.lock \
     && cd /work \
-    && CARGO_TARGET_DIR=/cache/target cargo build --release \
-    && ( sh /work/weft-cache-gc.sh /cache/target/release 30 /work {{worker_binary}} \
+    && CARGO_TARGET_DIR=/cache/target cargo build --release --message-format=json-render-diagnostics > /tmp/cargo-messages.json \
+    && ( sh /work/weft-cache-gc.sh this-build /cache/target/release /tmp/cargo-messages.json \
          || echo 'weft: the compile cache sweep failed; the build is unaffected' >&2 ) \
     && sh /usr/local/bin/weft-split-artifacts /cache/target /out \
     && cp /work/Cargo.lock /out/worker.Cargo.lock \

@@ -38,7 +38,7 @@
     {
       "when": {
         "kind": "not",
-        "of": { "kind": "input_names", "port": "values", "names": { "field": { "instance_filled": true } } }
+        "of": { "kind": "input_names", "port": "values", "names": { "field": { "instanceFilled": true } } }
       },
       "then": {
         "message": "SetInstanceValues '{id}' gives {names} in `values`, which is no field this program writes `@instance_filled`. Key each value by `node.field` the way the program writes it (`read.spreadsheet`, or `one.read.spreadsheet` inside an included file), naming a field written `@instance_filled`.",
@@ -50,7 +50,7 @@
     {
       "when": {
         "kind": "not",
-        "of": { "kind": "input_names", "port": "clear", "names": { "field": { "instance_filled": true } } }
+        "of": { "kind": "input_names", "port": "clear", "names": { "field": { "instanceFilled": true } } }
       },
       "then": {
         "message": "SetInstanceValues '{id}' clears {names}, which is no field this program writes `@instance_filled`. Name each as `node.field` the way the program writes it (`read.spreadsheet`, or `one.read.spreadsheet` inside an included file), naming a field written `@instance_filled`.",

@@ -1,6 +1,9 @@
-//! `weft infra env <node> --into <file> --set NAME=Label ... [--as NAME]`:
-//! write what an infra node's card shows into an env file, every name in
-//! one go, a secret without its value ever passing through a screen.
+//! `weft infra env <node> --into <file> --set NAME=Label ... [--as NAME]
+//! [--door NAME=endpoint ...]`: write what an infra node's card shows, and
+//! the whole address (host and port) its doors answer at, into an env
+//! file, every name in one go, a secret without its value ever passing
+//! through a screen. A door's port may change when the infra restarts or
+//! is upgraded; running this again writes the new address.
 //!
 //! Generic over nodes: the card is whatever the node's display (`/live`)
 //! serves. `--set NAME=Label` takes the item under that label, whatever
@@ -25,6 +28,9 @@ pub struct EnvArgs {
     pub set: Vec<String>,
     /// The name for the card's only secret.
     pub secret_as: Option<String>,
+    /// `NAME=endpoint` pairs, as typed: the address of the node's door
+    /// for that endpoint.
+    pub doors: Vec<String>,
     pub instance: Option<weft_core::instance::InstanceId>,
 }
 
@@ -35,11 +41,14 @@ enum Want {
     Label(String),
     /// The card's only secret.
     OnlySecret,
+    /// The address (host and port) of the node's door for this endpoint,
+    /// as `weft infra list-doors` lists it.
+    Door(String),
 }
 
 /// Every `(NAME, what it takes)` the command line asks for, names
 /// checked and none asked twice.
-fn wanted(set: &[String], secret_as: Option<&str>) -> Result<Vec<(String, Want)>> {
+fn wanted(set: &[String], doors: &[String], secret_as: Option<&str>) -> Result<Vec<(String, Want)>> {
     let mut out: Vec<(String, Want)> = Vec::new();
     for pair in set {
         let Some((name, label)) = pair.split_once('=') else {
@@ -47,11 +56,20 @@ fn wanted(set: &[String], secret_as: Option<&str>) -> Result<Vec<(String, Want)>
         };
         out.push((name.trim().to_string(), Want::Label(label.trim().to_string())));
     }
+    for pair in doors {
+        let Some((name, endpoint)) = pair.split_once('=') else {
+            bail!("--door '{pair}' names no door: write it NAME=endpoint, e.g. DATABASE_ADDRESS=pg (`weft infra list-doors` lists them)");
+        };
+        out.push((name.trim().to_string(), Want::Door(endpoint.trim().to_string())));
+    }
     if let Some(name) = secret_as {
         out.push((name.to_string(), Want::OnlySecret));
     }
     if out.is_empty() {
-        bail!("nothing to write: name what goes in with --set NAME=Label (repeatable), or --as NAME for the card's only secret");
+        bail!(
+            "nothing to write: name what goes in with --set NAME=Label or --door NAME=endpoint (both repeatable), \
+             or --as NAME for the card's only secret"
+        );
     }
     for (i, (name, _)) in out.iter().enumerate() {
         check_env_name(name)?;
@@ -112,6 +130,24 @@ fn pick<'a>(feed: &'a LiveFeed, want: &Want) -> Result<Pick<'a>> {
                 many => bail!("the node shows several secrets; name each with --set NAME=Label ({})", labels(many)),
             }
         }
+        Want::Door(_) => unreachable!("a door's address is read off the doors, not the card"),
+    }
+}
+
+/// The address the door for `endpoint` of the copy at `place` (`instance`
+/// `None`: the shared one) answers at, read off the project's doors.
+fn door_address(doors: &weft_core::infra::wire::DoorsResponse, place: &str, instance: Option<&weft_core::instance::InstanceId>, endpoint: &str) -> Result<String> {
+    let mine = |copy: &weft_core::infra::wire::CopyRef| copy.node == place && copy.instance.as_ref() == instance;
+    if let Some(door) = doors.doors.iter().find(|d| mine(&d.copy) && d.endpoint == endpoint) {
+        return Ok(door.address.clone());
+    }
+    if doors.applying.iter().any(mine) {
+        bail!("{place} is still being applied, so its doors are not open yet; run this again once it is up");
+    }
+    let has: Vec<String> = doors.doors.iter().filter(|d| mine(&d.copy)).map(|d| format!("'{}'", d.endpoint)).collect();
+    match has.is_empty() {
+        true => bail!("{place} has no door open (is it running? `weft infra status` says)"),
+        false => bail!("{place} has no door for '{endpoint}'; it has {}", has.join(", ")),
     }
 }
 
@@ -242,13 +278,27 @@ fn write_env(path: &Path, pairs: &[(String, String)]) -> Result<()> {
 }
 
 pub async fn run(ctx: Ctx, args: EnvArgs) -> Result<()> {
-    let wanted = wanted(&args.set, args.secret_as.as_deref())?;
+    let wanted = wanted(&args.set, &args.doors, args.secret_as.as_deref())?;
     let path = target(&args.into)?;
     let card = Card::open(&ctx, &args.node, args.instance.as_ref()).await?;
     let feed = card.read().await?;
+    let doors = match wanted.iter().any(|(_, want)| matches!(want, Want::Door(_))) {
+        true => {
+            let (client, project_id, _) = super::resolve_project(&ctx)?;
+            let answer = client.get_json(&format!("/projects/{project_id}/infra/doors")).await?;
+            Some(serde_json::from_value::<weft_core::infra::wire::DoorsResponse>(answer).context("read the project's doors")?)
+        }
+        false => None,
+    };
     let mut pairs = Vec::new();
     let mut written = Vec::new();
     for (name, want) in &wanted {
+        if let (Want::Door(endpoint), Some(doors)) = (want, &doors) {
+            let address = door_address(doors, &card.place, args.instance.as_ref(), endpoint)?;
+            written.push((name.clone(), Some(address.clone())));
+            pairs.push((name.clone(), address));
+            continue;
+        }
         let item = match pick(&feed, want)? {
             Pick::Value(item) => item,
             Pick::HandedOver(item, action) => bail!("{}", handed_over(&card.place, item, action, ctx.on())),
@@ -344,18 +394,39 @@ mod tests {
     fn the_command_line_is_read_into_names_and_items() {
         let set = vec!["DATABASE_USER=User".to_string(), "DB_PW = Password".to_string()];
         assert_eq!(
-            wanted(&set, Some("PG")).unwrap(),
+            wanted(&set, &["DATABASE_ADDRESS=pg".to_string()], Some("PG")).unwrap(),
             vec![
                 ("DATABASE_USER".to_string(), label("User")),
                 ("DB_PW".to_string(), label("Password")),
+                ("DATABASE_ADDRESS".to_string(), Want::Door("pg".into())),
                 ("PG".to_string(), Want::OnlySecret),
             ]
         );
-        assert!(wanted(&[], None).unwrap_err().to_string().contains("--set NAME=Label"));
-        assert!(wanted(&["USER".to_string()], None).unwrap_err().to_string().contains("NAME=Label"));
-        assert!(wanted(&["1X=User".to_string()], None).is_err());
-        let twice = wanted(&["PG=User".to_string()], Some("PG")).unwrap_err().to_string();
+        assert!(wanted(&[], &[], None).unwrap_err().to_string().contains("--set NAME=Label"));
+        assert!(wanted(&["USER".to_string()], &[], None).unwrap_err().to_string().contains("NAME=Label"));
+        assert!(wanted(&[], &["ADDR".to_string()], None).unwrap_err().to_string().contains("NAME=endpoint"));
+        assert!(wanted(&["1X=User".to_string()], &[], None).is_err());
+        let twice = wanted(&["PG=User".to_string()], &[], Some("PG")).unwrap_err().to_string();
         assert!(twice.contains("twice"), "{twice}");
+    }
+
+    /// A door's whole address is written for the copy named; one still
+    /// being applied, or one with no such door, is refused saying which.
+    #[test]
+    fn a_door_is_written_as_its_whole_address() {
+        use weft_core::infra::wire::{CopyRef, Door, DoorsResponse};
+        let ann = weft_core::instance::InstanceId::new("ann").unwrap();
+        let doors = DoorsResponse {
+            doors: vec![
+                Door { copy: CopyRef { node: "db".into(), instance: None }, endpoint: "pg".into(), address: "127.0.0.1:40123".into() },
+                Door { copy: CopyRef { node: "db".into(), instance: Some(ann.clone()) }, endpoint: "pg".into(), address: "127.0.0.1:40124".into() },
+            ],
+            applying: vec![CopyRef { node: "cache".into(), instance: None }],
+        };
+        assert_eq!(door_address(&doors, "db", None, "pg").unwrap(), "127.0.0.1:40123");
+        assert_eq!(door_address(&doors, "db", Some(&ann), "pg").unwrap(), "127.0.0.1:40124");
+        assert!(door_address(&doors, "db", None, "http").unwrap_err().to_string().contains("it has 'pg'"));
+        assert!(door_address(&doors, "cache", None, "redis").unwrap_err().to_string().contains("still being applied"));
     }
 
     #[test]

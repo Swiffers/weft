@@ -9,7 +9,7 @@ use weft::infra::{
     Container, ContainerPort, Endpoint, EndpointTarget, Expose, Image, InfraSpec, Limits, Probe, Protocol, Unit,
 };
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
+use weft::{RunContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct DisplayServiceNode;
@@ -49,7 +49,7 @@ impl Node for DisplayServiceNode {
         })
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         ctx.pulse_downstream(NodeOutput::new().set("status", "ready")).await
     }
 }

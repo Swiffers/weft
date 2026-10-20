@@ -1,0 +1,73 @@
+{
+  "type": "AnthropicAccess",
+  "label": "Anthropic Access",
+  "description": "Connect Anthropic's API with your own API key, and wire `access` into every Anthropic Model node: one access for however many models.",
+  "tags": [
+    "ai",
+    "provider",
+    "access",
+    "credentials"
+  ],
+  "icon": "KeyRound",
+  "color": "#6b6b99",
+  "service": {
+    "service": "anthropic",
+    "label": "Anthropic",
+    "doors": ["own"],
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "key",
+          "label": "API key",
+          "placeholder": "sk-ant-..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "x-api-key",
+        "value": "{key}"
+      },
+      {
+        "kind": "header",
+        "name": "anthropic-version",
+        "value": "2023-06-01"
+      }
+    ],
+    "test": {
+      "url": "https://api.anthropic.com/v1/models"
+    },
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    },
+    "ownPage": {
+      "guide": {
+        "link": "https://console.anthropic.com/settings/keys",
+        "steps": [
+          "Open console.anthropic.com, Settings > API Keys, and create an API key.",
+          "Paste it below and name the connection."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "description": "Wire into Anthropic Model nodes' `access` input."
+    }
+  ]
+}

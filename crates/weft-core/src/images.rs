@@ -17,6 +17,7 @@ pub struct PruneRequest {
 /// answer missing one is a dispatcher the CLI does not match, never an
 /// empty list.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PruneReport {
     pub removed: Vec<String>,
     /// Images a container still runs from (a removed project's unit

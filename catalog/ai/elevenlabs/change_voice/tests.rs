@@ -189,13 +189,13 @@ async fn voice_id_encoded(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let audio = rig.store_file("take.mp3", "audio/mpeg", b"original".to_vec());
     let err = rig
         .run(&ElevenLabsChangeVoiceNode, inputs(&rig, audio, json!({ "fileFormat": "pcm_s16le_16" })))
         .await
         .failure()?;
-    assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `error` wired: {err}");
+    assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {err}");
     assert!(err.contains("typed 'audio/mpeg'"), "{err}");
     assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");
     Ok(())

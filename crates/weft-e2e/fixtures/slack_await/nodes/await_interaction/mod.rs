@@ -9,14 +9,14 @@ use async_trait::async_trait;
 
 use weft::node::NodeOutput;
 use weft::signal::{Predicate, PredicateOp, ProviderEvents};
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct AwaitInteractionNode;
 
 #[async_trait]
 impl Node for AwaitInteractionNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let click = ctx
             .await_signal(ProviderEvents::new(

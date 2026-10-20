@@ -1,5 +1,5 @@
 <script lang="ts">
-	/// One port's value in the execution inspector: a card carrying the
+	/// One port's value in the run inspector: a card carrying the
 	/// port name, what the value is, a copy button, and the value
 	/// itself. Same card shape as `FileCard`, so a file port and a data
 	/// port read as the same kind of thing.
@@ -34,7 +34,7 @@
 		/// out and says so, with nothing to expand or copy.
 		closed?: boolean;
 		/// Where the value came from when it did not travel a wire in
-		/// this run (a backup, a supplied output, the seed run). Shown
+		/// this run (a value given to the run, the seed run). Shown
 		/// in the header beside the value's type.
 		note?: string;
 	} = $props();

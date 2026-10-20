@@ -12,7 +12,7 @@
 //! compiled id behind a place is never stored here. The supervisor
 //! writes status transitions as it executes a claimed
 //! `infra_lifecycle_command`, and writes runtime events (Flaky /
-//! Recovered) and may flip status as part of that execution.
+//! Recovered) and may flip status as part of that run.
 //!
 //! Workers read `endpoints_json` through the broker's
 //! `/v1/infra/endpoint_url` endpoint, which answers from
@@ -91,6 +91,11 @@ pub struct InfraNodeRow {
     /// When the apply under way began; cleared when it leaves
     /// provisioning.
     pub provisioning_since_unix: Option<i64>,
+    /// The hash of its place's infra in the build its last apply came
+    /// from (`weft_core::builds::BuiltProgram::infra_places`): a copy whose
+    /// place hashes otherwise in the source now is behind it. `None` for a
+    /// copy no apply of a build that named them has landed on.
+    pub source_hash: Option<String>,
 }
 
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
@@ -139,7 +144,17 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- to value: what its infra setup sent out on them, or the
             -- infra pushed since. A run that reads only these does not
             -- run the node.
-            baked_json          JSONB NOT NULL DEFAULT '{}'::jsonb
+            baked_json          JSONB NOT NULL DEFAULT '{}'::jsonb,
+            -- The hash of its place's infra in the build its last apply
+            -- came from (`BuiltProgram::infra_places`), copied from the
+            -- apply command as it lands: what tells whether it is behind
+            -- the source.
+            source_hash         TEXT,
+            -- The health rules its node wrote (`InfraSpec::health_rules`,
+            -- a JSON array), which the supervisor's health loop runs on
+            -- the copy. NULL: the node wrote none, so it runs the
+            -- built-in ones. Stamped at apply.
+            health_rules_json   JSONB
         )"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_infra_node_copy
              ON infra_node(project_id, node_id, instance_id) NULLS NOT DISTINCT"#,
@@ -181,7 +196,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 const ROW_COLUMNS: &str = "project_id, node_id, instance_id, copy_id, status, \
      failure_stage, failure_message, applied_spec_hash, \
      applied_at_unix, endpoints_json, install_endpoints_json, public_paths_json, doors_json, keep_disks_json, units_json, notes_json, \
-     waiting_on, provisioning_since_unix";
+     waiting_on, provisioning_since_unix, source_hash";
 
 /// Read one copy's row. Returns None when the row doesn't exist (no
 /// infra was ever applied for this copy).
@@ -281,7 +296,7 @@ pub struct PendingOp {
     /// The setup run behind a start, when a setup run is what it is (a
     /// stop of the copy cancels it, so its applies never land after the
     /// stop).
-    pub setup: Option<weft_core::ExecutionId>,
+    pub setup: Option<weft_core::RunId>,
     /// When it was asked for (unix seconds): a command's
     /// `issued_at_unix`, a setup run's `started_at`. The change it makes
     /// counts its progress from it.
@@ -354,16 +369,16 @@ impl PendingOps {
     }
 
     /// The setup runs bringing this copy up.
-    pub fn setups_starting(&self, node: &str, instance: Option<&weft_core::instance::InstanceId>) -> Vec<weft_core::ExecutionId> {
-        let mut execution_ids: Vec<weft_core::ExecutionId> = self
+    pub fn setups_starting(&self, node: &str, instance: Option<&weft_core::instance::InstanceId>) -> Vec<weft_core::RunId> {
+        let mut run_ids: Vec<weft_core::RunId> = self
             .ops
             .iter()
             .filter(|op| op.node.as_deref() == Some(node) && op.copies.admits(instance))
             .filter_map(|op| op.setup)
             .collect();
-        execution_ids.sort();
-        execution_ids.dedup();
-        execution_ids
+        run_ids.sort();
+        run_ids.dedup();
+        run_ids
     }
 
     /// Every copy with no row that a start is bringing up, as
@@ -530,28 +545,29 @@ pub async fn pending_ops(
         ops.push(PendingOp { kind, node, copies, order: id, setup: None, asked_unix: issued_at_unix });
     }
     // A setup run that has not ended brings up the infra places its
-    // selection holds, for its instance.
+    // program (its cut of the project) runs, for its instance.
     let infra: std::collections::BTreeSet<String> = weft_core::project::infra_place_spellings(project);
-    /// execution_id, instance_id, started_at, selection.
-    type SetupRow =
-        (weft_core::ExecutionId, Option<String>, i64, Option<sqlx::types::Json<weft_core::project::selection::RunSelection>>);
+    /// run_id, instance_id, started_at, the program it runs.
+    type SetupRow = (weft_core::RunId, Option<String>, i64, Option<String>);
     let setups: Vec<SetupRow> = sqlx::query_as(
-        "SELECT r.execution_id, r.instance_id, r.started_at, s.selection FROM run r \
-         LEFT JOIN run_selection s ON s.digest = r.selection \
+        "SELECT r.run_id, r.instance_id, r.started_at, d.project_json FROM run r \
+         LEFT JOIN project_definition d ON d.project_id = r.project_id AND d.definition_hash = r.definition_hash \
          WHERE r.project_id = $1 AND r.phase = 'infra_setup' AND r.state <> 'ended'",
     )
     .bind(project_id)
     .fetch_all(pool)
     .await?;
-    for (execution_id, instance, started_at, subgraph) in setups {
+    for (run_id, instance, started_at, program) in setups {
         let instance = instance
             .map(weft_core::instance::InstanceId::new)
             .transpose()
-            .map_err(|e| anyhow::anyhow!("infra setup {execution_id} instance: {e}"))?;
-        let Some(sqlx::types::Json(subgraph)) = subgraph else {
-            anyhow::bail!("infra setup {execution_id} was born without its selection; it cannot say what it brings up");
+            .map_err(|e| anyhow::anyhow!("infra setup {run_id} instance: {e}"))?;
+        let Some(program) = program else {
+            anyhow::bail!("infra setup {run_id} names a program its project does not keep; it cannot say what it brings up");
         };
-        for place in &subgraph.nodes {
+        let program: weft_core::ProjectDefinition = serde_json::from_str(&program)
+            .map_err(|e| anyhow::anyhow!("infra setup {run_id}'s program does not read: {e}"))?;
+        for place in weft_core::project::places::running_places(&program) {
             let spelled = weft_core::project::address_of(project, &place.id, &place.path);
             if infra.contains(&spelled) {
                 ops.push(PendingOp {
@@ -559,7 +575,7 @@ pub async fn pending_ops(
                     node: Some(spelled),
                     copies: weft_core::instance::Copies::of(instance.clone()),
                     order: i64::MAX,
-                    setup: Some(execution_id),
+                    setup: Some(run_id),
                     asked_unix: started_at,
                 });
             }
@@ -666,6 +682,7 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
         notes,
         waiting: row.try_get("waiting_on")?,
         provisioning_since_unix: row.try_get("provisioning_since_unix")?,
+        source_hash: row.try_get("source_hash")?,
     })
 }
 
@@ -840,6 +857,7 @@ mod tests {
             notes: Vec::new(),
             waiting: waiting.map(str::to_string),
             provisioning_since_unix: since,
+            source_hash: None,
         }
     }
 

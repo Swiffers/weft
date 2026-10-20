@@ -1,0 +1,48 @@
+{
+  "type": "GetNodeState",
+  "label": "Get node state",
+  "description": "Read where one node of a run stands: its status, the last answer its wait saw while it waits (an outside job's status, for a progress bar), or its error. Store the run's id with GetRunId when it starts, then read it from any later run. A node inside a loop cannot be read (it fires once per iteration); read the loop instead.",
+  "tags": [
+    "flow",
+    "runs",
+    "status",
+    "progress"
+  ],
+  "icon": "Activity",
+  "color": "#6366f1",
+  "inputs": [
+    {
+      "name": "runId",
+      "type": "String",
+      "required": true,
+      "description": "The run to read, by the id GetRunId gave it."
+    },
+    {
+      "name": "node",
+      "type": "String",
+      "required": true,
+      "description": "The node to read, spelled the way `weft run --from` takes it: `render`, `work.render` inside a group, or `one.render` inside the file the site `one` includes. A loop can be named; a node inside one cannot."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "state",
+      "type": "{ status: String, live?: String, liveTooLarge?: Number, error?: String }",
+      "description": "`{ status, live?, liveTooLarge?, error? }`. `status` is one of `pending` (it has not fired in this run yet), `running`, `waiting` (on a signal: an outside job, a person, a timer), `completed`, `failed`, `skipped`, or `cancelled` (the run was cancelled before it finished). `live` is there while it waits and its wait has seen an answer: the raw text of the last one (for example the last poll of an outside job's status), for your program to parse. `liveTooLarge` stands in for `live` when that answer was too large for the wait to keep (over 64 KiB): its size in bytes. `error` is the raw error text when it failed."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": { "kind": "input_names", "port": "node", "names": { "state": {} } }
+      },
+      "then": {
+        "message": "GetNodeState '{id}' names {names} in `node`, which has no state a run can tell: no node or loop of this program has that name, it is a group (name a node inside it), or it is a node inside a loop, which fires once per iteration (name the loop instead). Spell a node the way `weft run --from` takes it: `render`, `work.render` inside a group, or `one.render` inside an included file.",
+        "level": "structural",
+        "severity": "error",
+        "port": "node"
+      }
+    }
+  ]
+}

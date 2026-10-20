@@ -37,8 +37,8 @@
             "label": "name",
             "value": "id",
             "page": {
-              "cursor_param": "pageToken",
-              "cursor_path": "nextPageToken"
+              "cursorParam": "pageToken",
+              "cursorPath": "nextPageToken"
             }
           },
           {
@@ -48,7 +48,7 @@
             "grants": [
               "https://www.googleapis.com/auth/drive.file"
             ],
-            "mime_types": []
+            "mimeTypes": []
           },
           {
             "kind": "from_url",
@@ -66,7 +66,7 @@
       "description": "Google-native files only: export mime type. Empty = PDF for Docs/Slides, CSV for Sheets.",
       "widget": {
         "kind": "select",
-        "free_text": true,
+        "freeText": true,
         "options": [
           "application/pdf",
           "text/csv",
@@ -84,7 +84,8 @@
   "outputs": [
     {
       "name": "file",
-      "type": "File"
+      "type": "File",
+      "narrowable": true
     },
     {
       "name": "filename",
@@ -98,8 +99,5 @@
       "name": "sizeBytes",
       "type": "Number"
     }
-  ],
-  "features": {
-    "catchErrors": true
-  }
+  ]
 }

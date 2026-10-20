@@ -210,6 +210,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     let mut internal = Router::new();
     let mut public = Router::new();
     let mut outside: Option<Router> = None;
+    let mut network: Option<Router> = None;
     let mut loops: Vec<(CoreRole, Loops)> = Vec::new();
     let mut after_bind: Vec<futures::future::BoxFuture<'static, anyhow::Result<()>>> = Vec::new();
     let mut holding: Option<weft_listener::ListenerState> = None;
@@ -237,8 +238,10 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 credentials: Arc::new(weft_broker::credential::FileCredentialSource::from_env()),
                 app_provider: Arc::new(weft_broker::app_provider::FileAppProvider::from_env()),
                 public_base_url: config.public_url.clone(),
-                internet_url: config.internet_url.clone(),
+                internet: config.internet_address(),
+                own_base_url: config.own_base_url().to_string(),
                 object_store_public_internet: config.object_store.public_internet(),
+                slot_key: weft_core::storage::slot::SlotKey::of(&install_secret()?),
                 line_max_age: platform::line_max_age(&config, serverless),
                 dispatcher_alarm: (config.roles.of(CoreRole::Dispatcher) == Placement::Serverless).then(|| parts.alarm.clone()),
                 // The broker books the supervisor's next pass when it
@@ -291,6 +294,9 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
         if let PlatformConfig::Local(local) = &config.platform {
             if local.listen.outside.is_some() {
                 outside = Some(weft_dispatcher::api::outside_router(state.clone()));
+            }
+            if local.listen.network.is_some() {
+                network = Some(weft_dispatcher::api::network_router(state.clone()));
             }
         }
         let api = weft_dispatcher::api::router(state.clone(), weft_dispatcher::app::cors_for(config.auth));
@@ -383,7 +389,8 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
 
     // Where the loops run: for the life of the process, or once per tick.
     // A role that scales to zero also runs one pass as its process starts,
-    // for what came due while no process of it was up.
+    // for what came due while no process of it was up, and to give each
+    // loop that gave up one more try (`weft_task_store::drain::Pass::Start`).
     let mut first_passes: Vec<server::Tick> = Vec::new();
     let limits = if serverless {
         Some(platform::serverless_limits(&config).context("this install's platform places no role serverless")?)
@@ -392,9 +399,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     };
     for (role, l) in loops {
         if let Some(limits) = limits {
-            let run: Arc<
-                dyn Fn(weft_task_store::drain::TickBody) -> futures::future::BoxFuture<'static, Result<(), weft_task_store::drain::PassFailed>> + Send + Sync,
-            > = match l {
+            let run: server::PassRun = match l {
                 // When each loop is due lives in the database, shared by
                 // every instance of the role, since a tick may land on any.
                 Loops::Drain(loops) => {
@@ -428,16 +433,16 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                     // write made while the watch is quiet would be
                     // announced to nobody.
                     let listen = signals.clone();
-                    Arc::new(move |call| {
+                    Arc::new(move |call, pass| {
                         let (loops, booking, listen) = (loops.clone(), booking.clone(), listen.clone());
                         Box::pin(async move {
-                            weft_task_store::drain::drain_due(&booking, &loops, &call, limits.tick_slice, listen.as_deref()).await
+                            weft_task_store::drain::drain_due(&booking, &loops, &call, pass, limits.tick_slice, listen.as_deref()).await
                         })
                     })
                 }
                 // The supervisor's one pass covers everything it does; its
                 // next look is booked by the broker it reports to.
-                Loops::Supervisor(state) => Arc::new(move |_call| {
+                Loops::Supervisor(state) => Arc::new(move |_call, _pass| {
                     let state = state.clone();
                     Box::pin(async move {
                         weft_infra_supervisor::tick(&state).await;
@@ -516,7 +521,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             let app = public.merge(internal);
             for t in first_passes {
                 tokio::spawn(async move {
-                    if let Err(e) = t.pass(weft_task_store::drain::TickBody::default()).await {
+                    if let Err(e) = t.pass(weft_task_store::drain::TickBody::default(), weft_task_store::drain::Pass::Start).await {
                         tracing::error!(
                             target: "weft_runtime", role = %t.role, error = %format!("{e:#}"),
                             "the first pass failed; what it left runs at its loops' next wake or ring"
@@ -552,6 +557,12 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             let mut servers = vec![tokio::spawn(server::serve(internal_listener, internal)), tokio::spawn(server::serve(public_listener, front))];
             if let (Some(addr), Some(app)) = (local.listen.outside, outside) {
                 let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind the outside port {addr}"))?;
+                servers.push(tokio::spawn(server::serve(listener, app)));
+            }
+            if let (Some(addr), Some(app)) = (local.listen.network, network) {
+                let listener = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("bind the outside doors on the network address {addr} (WEFT_NETWORK_ADDRESS: is it an address of this machine?)"))?;
                 servers.push(tokio::spawn(server::serve(listener, app)));
             }
             tokio::spawn(async move {

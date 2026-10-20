@@ -1,7 +1,7 @@
 {
   "type": "FetchPage",
   "label": "Fetch Page",
-  "description": "Fetch one URL as clean markdown (JavaScript rendered, boilerplate stripped), ready for an LLM step. Uses Firecrawl.",
+  "description": "Fetch one URL as clean markdown (JavaScript rendered, boilerplate stripped), ready for an LLM node. Uses Firecrawl. The markdown is cut at `maxChars` (50,000 by default), and shorter if it would still weigh more than the 100 KB a wire carries; `truncated` says when it was cut.",
   "tags": [
     "web",
     "scrape"
@@ -27,6 +27,18 @@
       "default": true,
       "label": "Main content only",
       "description": "Strip navigation, footers, and boilerplate."
+    },
+    {
+      "name": "maxChars",
+      "type": "Number",
+      "default": 50000,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
+      "label": "Max characters",
+      "description": "The most characters of markdown to keep; the rest of the page is cut off and `truncated` is true. Whatever you set, the markdown is also cut to fit the 100 KB a wire carries."
     }
   ],
   "outputs": [
@@ -37,11 +49,13 @@
     {
       "name": "title",
       "type": "String"
+    },
+    {
+      "name": "truncated",
+      "type": "Boolean",
+      "description": "True when the page's markdown was longer than `maxChars` or than a wire carries, so `markdown` holds only its start."
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "validate": [
     {
       "when": {

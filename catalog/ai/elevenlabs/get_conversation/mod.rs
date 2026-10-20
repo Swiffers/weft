@@ -1,6 +1,6 @@
 //! ElevenLabsGetConversation: read an agent conversation: waits for
 //! it to finish by default, parked without holding a worker (a call
-//! takes as long as it takes; no deadline, cancelling the execution
+//! takes as long as it takes; no deadline, cancelling the run
 //! cancels the wait), then emits the transcript as a stored JSON file,
 //! the analysis (the summary, the outcome, the data collection and
 //! criteria results), the call's length and cost, and optionally the
@@ -14,7 +14,7 @@ use weft::access::client::get_json;
 use weft::node::NodeOutput;
 use weft::signal::{PollEndpoint, Predicate};
 use weft::storage::{KeepTtl, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::elevenlabs::{store_json, API};
 
@@ -31,7 +31,7 @@ impl Node for ElevenLabsGetConversationNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let conversation: String = ctx.inputs.get("conversationId")?;
         let wait: bool = ctx.inputs.get("waitUntilDone")?;
@@ -155,7 +155,7 @@ impl Node for ElevenLabsGetConversationNode {
                 .await
                 .node_err("download the call audio from ElevenLabs")?;
             let stored = ctx
-                .storage(StorageScope::Execution)
+                .storage(StorageScope::Run)
                 .put_response(
                     resp,
                     "download the call audio from ElevenLabs",

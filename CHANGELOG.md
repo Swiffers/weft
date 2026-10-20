@@ -3,6 +3,301 @@
 What changed between versions of weft that you need to know about when you
 update. To update, pull and run `./setup.sh` again.
 
+## 2026-10-20 (0.2.270)
+
+**This release wipes your install's database, so connect your services again
+afterwards. Your projects then need changes: an execution is now a run, every
+name follows one casing rule, and several nodes and CLI flags changed. Work
+through the lists below in order.**
+
+When you run `./setup.sh`, it finds that your install's database was built
+before this release and asks before wiping it. Your run history, versions,
+stored connections, tokens and instance values go, with the install's stored
+files and its projects' running infra. Your project folders stay, and `weft run` registers
+them again. Other installs on the machine are not touched until you run
+`./setup.sh` in their checkout. If there is no terminal to ask on, run
+`./setup.sh --yes`. If you answer no, nothing is installed. If you only want the
+CLI (`--no-daemon`, or `--cli` without `--daemon`), that is refused on such a
+database, since it would put the new CLI in front of the old runtime.
+
+If you run weft on Google Cloud, `./setup.sh` cannot wipe that database, and
+the runtime refuses to start on one built before this release. Put the address
+of an empty database in the `WEFT_DATABASE_URL` secret (and
+`WEFT_DATABASE_LISTEN_URL`, if you use it), then merge upstream into your fork
+and run the install workflow again, which also lets the files bucket answer
+range requests and page uploads. Then run `./setup.sh` in your weft checkout
+on that same commit, so your CLI matches the install. Everything else the
+install kept went with the old database: operator keys apart from the first
+one, tokens, domains, frontends, and every project's registration. So log in
+again with the first operator key (go and read [run the
+workflow](docs/src/running/cloud.md#run-the-workflow)), add your domains and
+frontends again, run `weft target export <target> --github` in each project,
+and run `weft infra start --on <target>` and `weft activate --on <target>` in
+each one once.
+
+What to rename in your projects and files (each is refused, mostly with an
+error naming the new spelling, until you do):
+
+- In the CLI, `weft executions` is `weft runs`, and every `<execution-id>`
+  argument is a run id.
+- If a program wires a node's `error` output, rename it `_error`. Every node
+  has `_error` now: wired, the node's failure comes out on it and the run goes
+  on; unwired, the failure fails the run. For what goes there and what does
+  not, go and read [when a node fails](docs/src/language/how-a-program-runs.md#when-a-node-fails).
+- `AnthropicProvider`, `OpenAIProvider` and `OpenRouterProvider` are each two
+  nodes now: an Access node holding the connection (`openrouter =
+  OpenRouterAccess`) and a Model node taking its `access` and a `model`
+  (`OpenRouterModel { access: openrouter.access, model: "z-ai/glm-5.3"
+  }.provider`). One Access feeds every Model of that service.
+- `parseJson` is gone from `LlmInference`, whose `response` is now always
+  text. If you want parsed JSON, use `LlmInferenceJson`, and declare the shape
+  you expect on it (`LlmInferenceJson -> (response: Verdict)`): an answer that
+  does not fit fails the node. Go and read [saying what a broad output
+  holds](docs/src/language/types.md#saying-what-a-broad-output-holds).
+- `LlmModerate` takes `access` (an OpenAI Access node's) in place of
+  `provider`.
+- A `Route` gives the request's body whole on one `body` output. If you
+  declared body fields as outputs (`Route -> (body: JsonDict, photo: File)`),
+  declare them inside `body` (`Route -> (body: { photo: File })`) and read
+  `post.body.photo`. Every other output you add must be a capture of the
+  path, typed `String`: the `params` output is gone, so for `cards/{id}` you
+  declare `-> (id: String)`. A body that does not fit the type you declared,
+  or carries a key it does not name, is answered `400` (end the type with `..`
+  to take extra keys). Go and read [answering on a
+  URL](docs/src/language/triggers-and-routes.md#answering-on-a-url).
+- `FetchToStorage`, `KeepFile` and `TextToFile` take `ttlDays` (it was
+  `ttl_days`), and a loop's settings are `maxIters` and `trimOnMismatch`.
+- `MustOverride` is gone. Where you typed a port with it, write a type
+  variable (`T`) and the port takes what is wired to it.
+- A `?` on an input the node requires is a compile error, and a node whose
+  wired inputs all carry `?` is refused with `run-undecided` until you gate it
+  with `_should_flow`, drop one `?`, or add `@require_one_of`.
+- A group port that feeds a wired input inside must be connected, even when
+  that input has a default (`required-port-unmet`).
+- `DeactivateTriggers`, `StopInfra` and `TerminateInfra` lose `triggers` and
+  `graceMinutes` and take `door`, `doorForMinutes` and `held` instead, with the
+  same meaning as the CLI flags below.
+- These nodes now hand back their result in a different form:
+  - `S3ListObjects` reads one page (it read every page): wire `lastKey` into
+    the next call's `startAfter` while `hasMore` is true.
+    `GoogleDriveListFiles` and `GoogleCalendarListEvents` page the same way
+    with `nextPageToken` and `pageToken`, 25 by default, and
+    `GoogleSheetsRead` and `GoogleSheetsLookup` with `offset`, `maxRows` and
+    `nextOffset`.
+  - `CrawlSite`'s `pages` is one stored file, a JSON line per page, and
+    `MistralParseDocument`'s `markdown` and `pages` are files too.
+  - `GmailGet`, `GmailNewEmail` and `FetchPage` cut a long text and say so on
+    `bodyTruncated` or `truncated`.
+  - `WebSearch`'s `results`, `GoogleCalendarListEvents`' `events`,
+    `S3ListObjects`' `objects` and `InstanceCosts`' `records` are typed
+    records, so reading a field they do not declare is refused when you build.
+- A saved `examples/<name>.json` that uses an old spelling (`frozen_from`,
+  `gave_up`, `keep_for`) is refused, and the error names each new spelling.
+- In `access-apps.json` (on a cloud install, the `WEFT_ACCESS_APPS` secret),
+  `auth_url` is `authUrl`, `token_url` is `tokenUrl`, and under `events`,
+  `signing_secret` is `signingSecret`, `public_key` is `publicKey` and
+  `push_email` is `pushEmail`; the `_setup_events` note is `_setupEvents`.
+  `client_id` and `client_secret` keep OAuth's spelling. Until the file is
+  renamed, its shared connections stop working, and the error names each old
+  key, where it is, and its new spelling.
+- Run `weft tangle update` in each project, so its assistant learns all of
+  this.
+
+What to change in the nodes you wrote:
+
+- In a node's `metadata.json`, every key is camelCase: `requires_infra` is
+  `requiresInfra`, `free_text` is `freeText`, and so on. For the copy of the
+  standard nodes under `nodes/base_catalog`, run `weft catalog update` in the
+  project. A node using one of these keys fails to load, and the error says
+  what to do:
+  - `features.catchErrors`: remove it, since every node has `_error`. A node
+    that declares an output called `_error` is refused.
+  - `features.optionalCustomInputs` is `features.join`.
+  - `requiredWhenWired`: remove it. Any optional input is required once wired
+    now (below).
+- If your node declared a `journalEphemeral` input so its users choose how its
+  bus is recorded, remove it and set `features.journalSettings`, which gives
+  the node `journalEphemeral` and `journalWindowMs` (read with
+  `ctx.journal_policy()`). Without it, the input is an ordinary one and the bus
+  keeps the default. A trigger with `liveConnection` gets both already, and
+  declaring them there is refused.
+- `MustOverride` is gone here too: type the port with a variable, and if you
+  want to limit what it may be, give it a bound under `typeParams`. Go and
+  read [typeParams](docs/src/nodes/metadata.md#typeparams).
+- In Rust, `ExecutionContext` is `RunContext`, `ctx.execution_id` is
+  `ctx.run_id`, and `ctx.tag_execution` is `ctx.tag_run`.
+- On a storage handle, `presign`, `public_link`, `caller_link` and
+  `external_url` are gone. Use `internal_link` for code inside the install,
+  `external_link` for anything outside it (both answer `{ url, public }`), and
+  `external_file` to send a file to a service. A file input no longer comes
+  with a link already made. Go and read [handing a file
+  out](docs/src/nodes/storage.md#handing-a-file-out).
+- In an `ExecPython` script, a file's `url` is gone: fetch the bytes from
+  `photo['internalUrl']`, and hand another service `photo['externalUrl']`
+  when `photo['public']` is true.
+- A package's `build.rs` now runs for the package's own library crate. Its
+  `cargo:rustc-link-arg` lines no longer reach the worker binary, so name a
+  native library with `rustc-link-lib` and `rustc-link-search` instead, and a
+  `[build-dependencies]` section in a package with no `build.rs` at its root
+  fails the build. Go and read [a build script](docs/src/nodes/packaging.md#a-build-script).
+- A bus ends finished only when the node's body returned `Ok`; any other end
+  closes it failed, and its readers are told. If your node opens a bus later
+  than it starts, use `ctx.pending_bus`.
+
+What to change in your commands and scripts:
+
+- `weft deactivate`, `weft resync` and `weft infra stop`, `terminate` and
+  `upgrade` no longer take `--mode`, `--grace`, `--running-policy` or
+  `--drain-timeout`. Each answers three questions instead: `--door
+  take|hide|refuse` (with `--door-for <minutes>`), `--held keep|drop` and
+  `--running wait|cancel`. `--mode park` is `--door take`, `--mode hibernate
+  --grace 30` is `--door hide --door-for 30`, and `--mode wipe` is `--door
+  refuse --held drop --running cancel`. `--running wait` has no cap any more,
+  so `--drain-timeout` has nothing to replace it. Go and read [taking triggers
+  down](docs/src/running/lifecycles.md#taking-triggers-down-three-questions).
+- `weft activate`, `weft bake` and `weft infra start` no longer take
+  `--running-policy` or `--drain-timeout`: drop them.
+- They never ask now, and with no flags they lose nothing: what arrives is
+  held, what was held is kept, and the command waits for the runs going to
+  finish. Before, off a terminal `weft deactivate` and `weft resync` wiped
+  everything and cancelled the runs, so if a script relied on that, pass
+  `--door refuse --held drop --running cancel`.
+- `weft activate --reactivate-choice` is `--held run|drop`:
+  `execute_parked_keep_suspended` is `--held run`, the default, which releases
+  what the triggers held while they were down, paced at half each trigger's
+  limits, and `wipe_all` is `--held drop`, which deletes it and cancels the
+  runs paused on it. `keep_suspended_only` has no equivalent.
+- A plain `weft resync` now moves only the program's own triggers. If you
+  want every instance's too, as it did before, pass `--all`.
+- `weft infra upgrade` now replaces only the infra that is running, and
+  starts nothing that is stopped. If you want stopped infra up too, run `weft
+  infra start` first.
+- `weft cancel-running` is gone. A take-down that waits on runs now carries on
+  on the install: Ctrl+C stops following it, and `weft stop <run>` ends one run
+  now.
+- `weft infra node-stop <node>` is `weft infra stop --infra <node>`, and
+  `node-terminate` is `weft infra terminate --infra <node>`.
+- `weft run` exits `10` when the run it follows fails or is cancelled, and
+  `0` only when it completed.
+- In `weft run --from node='{...}'`, a port you hand a value now takes that
+  value and no wire into it runs. Before, the value was only a backup, and a
+  wire's value won.
+- If a script reads a route's failure: a caller whose run ends before
+  answering now gets `{"error": "Something went wrong", "runId": "..."}`, not
+  the reason. Every answer carries the run's id in a `Weft-Run-Id` header, and
+  `weft logs <run id>` shows the reason. Go and read [when a run ends before
+  it answers](docs/src/language/triggers-and-routes.md#when-a-run-ends-before-it-answers).
+- If a script reads weft's JSON (`--json`, the API), the fields are
+  camelCase now: `runId`, not `execution_id`. Values from a fixed list stay
+  snake_case (`waiting_for_input`).
+- If a project deploys with the workflow `weft ci add` wrote, run `weft ci
+  add --cloud gcp` in it again and commit the new
+  `.github/workflows/deploy.yml`: the old one passes `--mode park` and
+  `--reactivate-choice`, so it fails. If you edited the file, weft leaves it
+  alone and says so: move your changes out, delete it, run the command, and
+  put them back. The new workflow runs `weft infra upgrade --all`, then `weft
+  resync --all`, and never turns anything on, so before a project's first
+  deploy run `weft infra start --on <target>` and `weft activate --on
+  <target>` once by hand. Go and read [deploy the
+  frontend](docs/src/running/cloud.md#deploy-the-frontend).
+
+What behaves differently with no error to tell you:
+
+- An optional input that is wired now waits for its value, and the node skips
+  if that wire closes. If you want the node to run without it, write `?` on
+  it where you use the node (`SlackSendMessage(threadTs?: String)`). Go
+  and read [optional and required
+  inputs](docs/src/language/syntax.md#optional-and-required-inputs).
+- A group, or an included file, opens on the first value that reaches it
+  instead of waiting for all its inputs, so a node inside that nothing feeds
+  starts at once. With no gate, it skips when every wire into it closes with
+  nothing on it. Go and read [when a group
+  starts](docs/src/language/groups.md#when-a-group-starts).
+- An LLM call sends only the settings you set. Before, an unset temperature
+  went out as `0.7`, and an unset reasoning as a request for none. Now the
+  provider's own defaults apply, so a model that reasons by default reasons.
+  Set `reasoning: false` on `LlmParams` if you want it off.
+- When an infra copy turns `flaky`, the health check takes down the triggers
+  whose runs reach it, holding what arrives and cancelling the runs that
+  reach it, and brings them back once it is healthy. If you want other rules,
+  write them on the node's `InfraSpec`. Go and read [when a unit stops being
+  ready](docs/src/nodes/infrastructure.md#when-a-unit-stops-being-ready).
+- A json `Socket` with no type declared on `inbound` takes only JSON objects.
+  Any other message is answered `{"error": "..."}` and the session goes on.
+- Every file link is a download now: opened in a tab, it saves the file under
+  its name, while an `<img>`, `<video>` or `<audio>` tag still shows it.
+- In the editor, the Specs menu, **Run from a spec…**, **Run from here…** and
+  **Run this group** are gone. For starting partway in, one group, or a saved
+  example, use `weft run --from`, `--group` or the example's name. Go and read
+  [run part of the graph](docs/src/build/the-graph.md#run-part-of-the-graph).
+
+What is new:
+
+- One bottom bar in the editor: select boxes and **RUN N TARGETS** runs them,
+  greyed out with weft's reason when the run cannot start. Select a trigger or
+  an infra node and the bar offers its own buttons. `weft run --check` gives
+  the same answer in a terminal.
+- `weft wait <run>` waits for a run to end and says how in its exit code.
+  `weft node-state <run> <node>` and the `GetNodeState` node read where one
+  node of a run stands, and `GetRunId` gives a node its own run's id. `weft instances` lists a project's
+  instances. Go and read [waiting on a run](docs/src/running/cli.md#waiting-on-a-run).
+- A visitor of your site can upload a file of any size through an upload slot
+  (the `UploadSlot` node, `upload_slot` on a storage handle in Rust,
+  `uploadFile` in `@weft/connect`).
+  Go and read [a file from a page's
+  visitor](docs/src/nodes/storage.md#a-file-from-a-pages-visitor).
+- A file link stays the same for a while, so a page that asks again keeps its
+  video playing, and it answers range requests, so a video seeks. The
+  `LinkOptions` node sets how long links to a file live, `DeleteFile` deletes
+  one, and `Reply` can answer a file with a redirect (`answerAs: "redirect"`).
+- `Route` and `Socket` take `whenCallerIsSlow` and `whenChunkFails`, and
+  `journalWindowMs` beside `journalEphemeral`. Go and read [slow
+  callers and messages that cannot be
+  made](docs/src/language/triggers-and-routes.md#slow-callers-and-messages-that-cannot-be-made).
+- A `.weft` file that does not compile, or a node package that does not
+  compile, no longer stops everything: a command refuses only when what it
+  needs uses the broken part, and names it. The worker is built without a
+  package that fails. Go and read [when a package does not
+  compile](docs/src/nodes/packaging.md#when-a-package-does-not-compile).
+- Editing a file while a command builds no longer fails it.
+- Each trigger runs its own cut of the program, and `weft resync` moves only
+  the triggers whose cut or code changed.
+  `--all` reaches the program's triggers and every instance's at once.
+- The `Computer` package gives a program a desktop, a terminal and a browser
+  in one container, with a node per action; include its agent loop with
+  `@include("__catalog/base_catalog/computer/agent.weft")`. `TextPreview` shows the start and end of a long
+  text.
+- If you want phones and other devices on your network to open your install
+  and its file links, start it with `WEFT_NETWORK_ADDRESS` set to this
+  machine's address on that network; go and read [devices on your own
+  network](docs/src/build/public-address.md#devices-on-your-own-network).
+- `weft infra env --door` writes where an infra node answers into an env
+  file.
+- ElevenLabs images and videos are priced, and `InstanceCosts` takes a `run`
+  and counts the calls it has no price for.
+- A new named install takes its ports from 15000 to 32767; one that exists
+  keeps its ports.
+- The compiler warns `not-camel-case` on a node, group or port name you
+  chose that is not camelCase, with the spelling to use. The program still
+  runs.
+
+If you work on weft itself:
+
+- Integration tests live in one binary per crate: add a test as a module in
+  `tests/integration/`, or in `tests/db/` if it needs Postgres. The
+  `db-tests` feature is gone; `scripts/run-db-tests.sh` runs those through
+  nextest's `db` profile.
+- If you add a dependency or change its features, run `cargo hakari generate
+  && cargo hakari manage-deps`. CI fails if `crates/weft-workspace-hack` is out
+  of date.
+- If you want only the tests your change can break, keep `--workspace` and
+  filter: `cargo nextest run --workspace -E 'rdeps(weft-compiler)'`. Building
+  with `-p` compiles a second copy of weft's crates. Go and read
+  [tests](CONTRIBUTING.md#tests).
+- `./setup.sh` never wipes `target/`: past 30 GB it drops incremental
+  directories, then executables a newer build replaced. Removing an install
+  removes its images.
+
 ## 2026-10-13 (0.2.269)
 
 **Each branch of a checkout can now run its own install. If your checkout is
@@ -338,7 +633,7 @@ reads every error shape those four read.
 **On Google Cloud, a run waiting on a person lets the database sleep.**
 
 A run that cannot pause (a route still answering its caller, a trigger with
-`recorded: false`, a live stream between steps) keeps its question in its
+`recorded: false`, a live stream between nodes) keeps its question in its
 worker while it waits. Until now that kept the database awake for the whole
 wait. Now nothing touches the database until the answer or a cancel arrives:
 the answer reaches the worker through a news topic weft creates in your
@@ -369,18 +664,18 @@ headers".
 
 **A program built before this version needs one rebuild.**
 
-How a waiting step receives its answer changed, so a worker built before this
-version fails when a waiting step gets its answer. Resync each program once:
+How a waiting node receives its answer changed, so a worker built before this
+version fails when a waiting node gets its answer. Resync each program once:
 `weft resync` if its triggers are on, `weft build` otherwise. Either one
 builds the worker again on this version of weft and moves the program to it.
 
-**Skipping a question ends the step that asked it.**
+**Skipping a question ends the node that asked it.**
 
 When a person skips a waiting question (Skip in the browser extension, or
-`POST /signal/{token}/skip`), the step that asked now ends skipped: its
-outputs close and the steps reading them skip too. It used to answer the
+`POST /signal/{token}/skip`), the node that asked now ends skipped: its
+outputs close and the nodes reading them skip too. It used to answer the
 question with null, so if your program reads a null answer as "skipped", it
-now sees the step skipped instead. Skipping a trigger is refused with a `409`;
+now sees the node skipped instead. Skipping a trigger is refused with a `409`;
 it used to fire the trigger.
 
 **A Google connection can hold Gmail alone.**
@@ -511,13 +806,13 @@ or `WEFT_POSTGRES_PORT`). Weft saves the ports it runs on in
 the CLI and the VS Code extension find it there.
 `WEFT_SEAWEED_PORT` moves the object store, and is read on every run.
 
-**A step the worker was running is never run again by itself.**
+**A node the worker was running is never run again by itself.**
 
-If a worker went away while a step was running, the next worker used to run
-that step again from the top, so an email, a post or a paid call could happen
-twice. Now it fails the step instead, saying the worker went away and the step
-was not run again. Check what the step did, then re-run from there with
-`weft run --seed`, which reuses every step that completed. A step that was
+If a worker went away while a node was running, the next worker used to run
+that node again from the top, so an email, a post or a paid call could happen
+twice. Now it fails the node instead, saying the worker went away and the node
+was not run again. Check what the node did, then re-run from there with
+`weft run --seed`, which reuses every node that completed. A node that was
 waiting on an answer still carries on when the answer comes, as before.
 
 **Nodes that catch their failures say so with `catchErrors`.**
@@ -536,13 +831,13 @@ have a `history` input or output. If a program wires `history`, wire
 `historyFile` instead: each call adds its turn to that one file and passes the
 same file on. If a call gets no file and its `historyFile` output is wired, it
 starts a new one. The graph shows each change to the file under "Files
-edited" on the step that made it.
+edited" on the node that made it.
 
 **A node changes a stored file with `edit`.**
 
 `ctx.storage(scope).edit(&file, |old| ...)` changes a file in place without
 losing another write's change. `replace` still overwrites.
 `replace_stream` is gone. Every stored file value now carries a `version`. A
-seeded run that would reuse a step whose file was edited since is refused,
-naming the step, the port and the file, and offering `--emit` or
+seeded run that would reuse a node whose file was edited since is refused,
+naming the node, the port and the file, and offering `--emit` or
 `--seed-before`.

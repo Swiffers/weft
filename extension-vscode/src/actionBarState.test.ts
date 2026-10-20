@@ -10,53 +10,39 @@ import {
   ACTIVITY_LINE_CAP,
   type ActionAvailability,
 } from '../../packages/weft-graph/src/protocol';
-import type { RunningExecution } from '../../packages/weft-graph/src/status';
+import { emptyActionAvailability, type GoingRun } from '../../packages/weft-graph/src/status';
 
 /// The running entries a status fetch names, all runs of the graph.
-function runs(...executionIds: string[]): RunningExecution[] {
-  return executionIds.map((executionId) => ({ execution_id: executionId, phase: 'fire' as const }));
+function runs(...runIds: string[]): GoingRun[] {
+  return runIds.map((runId) => ({ runId: runId, phase: 'fire' as const }));
 }
 
 function snapshot(): ActionAvailability {
-  return {
-    availableActions: ['run'],
-    binaryDrift: false,
-    definitionDrift: false,
-    infraDrift: false,
-    projectStatus: 'active',
-    transition: 'none',
-    orphanedInfra: false,
-    mode: 'active',
-    runningCount: 0,
-    triggersOff: [],
-    infraRollup: 'none',
-    infraNodes: [],
-    preservation: { parked: 0, suspended: 0 },
-  };
+  return { ...emptyActionAvailability(), availableActions: ['run'], projectStatus: 'active' };
 }
 
 describe('the running set follows the status fetch', () => {
-  it('a refresh that no longer lists the pending execution ends the Stop', () => {
+  it('a refresh that no longer lists the pending run ends the Stop', () => {
     const store = new ActionBarStore();
     store.setPinnedProject('p');
     store.pushStatus('p', snapshot(), runs('c1'));
-    expect(store.watchedRunningExecutionId('p')).toBe('c1');
+    expect(store.watchedRunningRunId('p')).toBe('c1');
     store.setPending('p', 'run', 'Cancelling...', 'c1');
     expect(store.current().overlay.kind).toBe('pending');
     // The terminal event was lost; the next fetch says nothing runs.
     store.pushStatus('p', snapshot(), runs());
     expect(store.current().overlay.kind).toBe('idle');
-    expect(store.watchedRunningExecutionId('p')).toBeUndefined();
+    expect(store.watchedRunningRunId('p')).toBeUndefined();
   });
 
-  it('a refresh replaces the set and keeps the order of executions it still lists', () => {
+  it('a refresh replaces the set and keeps the order of runs it still lists', () => {
     const store = new ActionBarStore();
     store.setPinnedProject('p');
-    store.markExecutionStarted('p', 'old', 'fire');
-    store.markExecutionStarted('p', 'new', 'fire');
+    store.markRunStarted('p', 'old', 'fire');
+    store.markRunStarted('p', 'new', 'fire');
     // Between fetches the set is built from arriving events, so the
     // last one added is genuinely the newest.
-    expect(store.watchedRunningExecutionId('p')).toBe('new');
+    expect(store.watchedRunningRunId('p')).toBe('new');
     // `old` finished (event lost); `born` started while the stream was
     // down and is the newest, so the dispatcher lists it last.
     store.pushStatus('p', snapshot(), runs('new', 'born'));
@@ -65,21 +51,21 @@ describe('the running set follows the status fetch', () => {
     // here and `born` was not: taking the fetch's order wholesale is
     // what makes this right, where keeping the known ones in place
     // would have answered `new`.
-    expect(store.watchedRunningExecutionId('p')).toBe('born');
-    store.markExecutionFinished('p', 'born');
-    expect(store.watchedRunningExecutionId('p')).toBe('new');
+    expect(store.watchedRunningRunId('p')).toBe('born');
+    store.markRunFinished('p', 'born');
+    expect(store.watchedRunningRunId('p')).toBe('new');
     store.pushStatus('p', snapshot(), runs());
-    expect(store.watchedRunningExecutionId('p')).toBeUndefined();
+    expect(store.watchedRunningRunId('p')).toBeUndefined();
   });
 
-  it('a pending Stop on an execution the fetch still lists keeps waiting', () => {
+  it('a pending Stop on a run the fetch still lists keeps waiting', () => {
     const store = new ActionBarStore();
     store.setPinnedProject('p');
     store.pushStatus('p', snapshot(), runs('c1'));
     store.setPending('p', 'run', 'Cancelling...', 'c1');
     store.pushStatus('p', snapshot(), runs('c1'));
     expect(store.current().overlay.kind).toBe('pending');
-    store.markExecutionFinished('p', 'c1');
+    store.markRunFinished('p', 'c1');
     expect(store.current().overlay.kind).toBe('idle');
   });
 });
@@ -88,15 +74,15 @@ describe('which running run the bar acts on follows the follow mode', () => {
   it('following acts on the newest, locked on its own run, off on none', () => {
     const store = new ActionBarStore();
     store.setPinnedProject('p');
-    store.markExecutionStarted('p', 'old', 'fire');
-    store.markExecutionStarted('p', 'new', 'fire');
+    store.markRunStarted('p', 'old', 'fire');
+    store.markRunStarted('p', 'new', 'fire');
     store.setFollow('p', 'following', 'new');
-    expect(store.watchedRunningExecutionId('p')).toBe('new');
+    expect(store.watchedRunningRunId('p')).toBe('new');
     store.setFollow('p', 'locked', 'old');
-    expect(store.watchedRunningExecutionId('p')).toBe('old');
+    expect(store.watchedRunningRunId('p')).toBe('old');
     // Off shows no run, so there is no run on screen for Stop to stop.
     store.setFollow('p', 'off', undefined);
-    expect(store.watchedRunningExecutionId('p')).toBeUndefined();
+    expect(store.watchedRunningRunId('p')).toBeUndefined();
   });
 });
 
@@ -104,11 +90,11 @@ describe('a setup is its verb working, never a run to stop', () => {
   it('an infra setup started elsewhere lights the infra slot, not Stop', () => {
     const store = new ActionBarStore();
     store.setPinnedProject('p');
-    store.markExecutionStarted('p', 'infra', 'infra_setup');
-    expect(store.watchedRunningExecutionId('p')).toBeUndefined();
+    store.markRunStarted('p', 'infra', 'infra_setup');
+    expect(store.watchedRunningRunId('p')).toBeUndefined();
     expect(store.current().overlay.kind).toBe('idle');
     expect(store.current().infraSetup).toBe(true);
-    store.markExecutionFinished('p', 'infra');
+    store.markRunFinished('p', 'infra');
     expect(store.current().infraSetup).toBe(false);
   });
 
@@ -116,10 +102,10 @@ describe('a setup is its verb working, never a run to stop', () => {
     const store = new ActionBarStore();
     store.setPinnedProject('p');
     store.pushStatus('p', snapshot(), [
-      { execution_id: 'run', phase: 'fire' },
-      { execution_id: 'arm', phase: 'trigger_setup' },
+      { runId: 'run', phase: 'fire' },
+      { runId: 'arm', phase: 'trigger_setup' },
     ]);
-    expect(store.watchedRunningExecutionId('p')).toBe('run');
+    expect(store.watchedRunningRunId('p')).toBe('run');
     // An activation's setup is shown by the project's own `activating`
     // status, never as an infra setup or a run.
     expect(store.current().infraSetup).toBe(false);
@@ -184,10 +170,10 @@ describe('the terminal output the bar carries', () => {
     const store = pinnedStore();
     store.cliStart(PROJECT, 'activate');
     store.cliStart(PROJECT, 'run');
-    store.cliEvent(PROJECT, { ts_unix: 0, verb: 'activate', phase: 'complete' });
+    store.cliEvent(PROJECT, { tsUnix: 0, verb: 'activate', phase: 'complete' });
     expect(store.current().overlay.kind).toBe('cli_running');
     store.cliEvent(PROJECT, {
-      ts_unix: 0,
+      tsUnix: 0,
       verb: 'activate',
       phase: 'error',
       detail: { message: 'too late' },
@@ -195,7 +181,7 @@ describe('the terminal output the bar carries', () => {
     expect(store.current().error).toBeUndefined();
     expect(store.current().overlay).toMatchObject({ kind: 'cli_running', verb: 'run' });
     // The running verb's own completion still lands.
-    store.cliEvent(PROJECT, { ts_unix: 0, verb: 'run', phase: 'complete' });
+    store.cliEvent(PROJECT, { tsUnix: 0, verb: 'run', phase: 'complete' });
     expect(store.current().overlay.kind).toBe('idle');
   });
 
@@ -211,7 +197,7 @@ describe('the terminal output the bar carries', () => {
     const store = pinnedStore();
     store.cliStart(PROJECT, 'activate');
     store.cliLog(PROJECT, 'activate', 'Compiling weft-core\n');
-    store.cliEvent(PROJECT, { ts_unix: 0, verb: 'activate', phase: 'complete' });
+    store.cliEvent(PROJECT, { tsUnix: 0, verb: 'activate', phase: 'complete' });
     expect(store.current().activity).toBeUndefined();
   });
 
@@ -220,7 +206,7 @@ describe('the terminal output the bar carries', () => {
     store.cliStart(PROJECT, 'activate');
     store.cliLog(PROJECT, 'activate', 'error[E0432]: unresolved import\n');
     store.cliEvent(PROJECT, {
-      ts_unix: 0,
+      tsUnix: 0,
       verb: 'activate',
       phase: 'error',
       detail: { message: 'the worker image did not build' },

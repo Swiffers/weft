@@ -397,6 +397,14 @@ pub trait KindHandler: Send + Sync {
     fn live(&self, ctx: &LiveCtx<'_>) -> LiveFeed {
         LiveFeed::new(address_items(ctx))
     }
+
+    /// For a run's wait: what it kept of the last answer it saw from
+    /// outside (a poll of a job's status), for a reader that parses it
+    /// itself (`GetNodeState`'s `live`). Read off the signal as it stands
+    /// now. Default: a kind with no answer to keep.
+    fn last_answer(&self, _sig: &RegisteredSignal) -> Option<weft_core::signal::listener_protocol::LastAnswer> {
+        None
+    }
 }
 
 inventory::collect!(&'static dyn KindHandler);
@@ -424,10 +432,10 @@ pub struct SignalIdentity {
     pub token: String,
     pub tenant_id: String,
     pub node_id: String,
-    /// True iff this is a mid-execution resume (HumanQuery, etc).
+    /// True iff this is a mid-run resume (HumanQuery, etc).
     pub is_resume: bool,
-    /// Execution of the suspended execution to resume. Set iff `is_resume`.
-    pub execution_id: Option<weft_core::ExecutionId>,
+    /// Run of the suspended run to resume. Set iff `is_resume`.
+    pub run_id: Option<weft_core::RunId>,
     pub spec: SignalSpec,
 }
 
@@ -461,7 +469,7 @@ pub async fn prepare_signal(
     prior_kind_state: Option<&Value>,
     asked_at_unix_ms: i64,
 ) -> Result<Prepared> {
-    let SignalIdentity { token, tenant_id, node_id, is_resume, execution_id, spec } = identity;
+    let SignalIdentity { token, tenant_id, node_id, is_resume, run_id, spec } = identity;
     let handler = handler_or_err(&spec.kind)?;
     // A resume wait fed by broad account-routed pushes must pin
     // itself with a predicate (its minted correlation id): with none,
@@ -477,6 +485,15 @@ pub async fn prepare_signal(
     if is_resume {
         handler.check_resume(&spec)?;
     }
+    // A last call is sent when a run is cancelled while it waits; an entry
+    // trigger has no run to cancel, so it would never go.
+    if !is_resume && spec.on_cancel.is_some() {
+        anyhow::bail!(
+            "a '{}' entry trigger carries a last call on cancel, which only a run's wait can send; \
+             wait with `ctx.await_signal_with_cancel` instead",
+            spec.kind,
+        );
+    }
     let routing = handler.compute_routing(&spec)?;
     let computed = handler.compute_initial_state(&spec, prior_kind_state, asked_at_unix_ms, is_resume)?;
     // Settling may look at the signal's connection, through the broker,
@@ -490,7 +507,7 @@ pub async fn prepare_signal(
         node_id,
         tenant_id,
         is_resume,
-        execution_id,
+        run_id,
         task: None,
         kind_state: Some(kind_state.clone()),
         routing: routing.clone(),
@@ -574,7 +591,7 @@ pub async fn bring_up(state: &crate::ListenerState, row: weft_broker_client::pro
                     node_id: row.node_id,
                     tenant_id: row.tenant_id,
                     is_resume: row.is_resume,
-                    execution_id: row.execution_id,
+                    run_id: row.run_id,
                     task: Some(Arc::new(TaskGuard::new(task))),
                     kind_state: None,
                     routing,
@@ -636,7 +653,7 @@ pub async fn unregister(
         node_id: String::new(),
         tenant_id: req.tenant_id,
         is_resume: false,
-        execution_id: None,
+        run_id: None,
         task: None,
         kind_state: Some(req.kind_state),
         routing: SignalRouting {
@@ -1019,8 +1036,9 @@ pub async fn held_attempt_failed(
 /// alarm gives it. A failure on the last of them gives the signal up,
 /// once, with why, shown on its node, and answers the wake as handled
 /// (`Ok(Some(why))`): it stays stopped until it is registered again,
-/// which a resync of its project (`weft resync`) does, and, for one that
-/// signs in through a connection, reconnecting that connection. The why
+/// which turning its trigger off and on does, as does a resync moving it
+/// onto a new build, and, for one that signs in through a connection,
+/// reconnecting that connection. The why
 /// tells a wake that failed to act from one that acted and could not set
 /// the wake after it ([`NextWakeNotSet`]). A failure on an earlier one is
 /// `Err`, which the alarm delivers again.
@@ -1220,7 +1238,7 @@ fn now_unix_ms() -> i64 {
 }
 
 /// Process one stateless fire. Resume signals route to the
-/// suspended execution regardless of kind; entry signals delegate to
+/// suspended run regardless of kind; entry signals delegate to
 /// the kind's `process_entry`. A signal with no held row drops the fire,
 /// saying why.
 pub async fn process(state: &crate::ListenerState, token: &str, payload: Value) -> Result<ProcessOutcome> {
@@ -1244,10 +1262,10 @@ pub async fn process_in(
     if signal.is_resume {
         // The signal table holds no wait without its run (a check on the
         // row), so a held one without it is a broken invariant.
-        let execution_id = signal.execution_id.ok_or_else(|| anyhow::anyhow!("the wait {token} names no run"))?;
+        let run_id = signal.run_id.ok_or_else(|| anyhow::anyhow!("the wait {token} names no run"))?;
         return Ok(ProcessOutcome {
             value: payload,
-            target: ProcessTarget::Resume { execution_id },
+            target: ProcessTarget::Resume { run_id },
         });
     }
 
@@ -1323,6 +1341,65 @@ fn match_held(push: &PushEvent, held: &[(String, RegisteredSignal)]) -> Vec<Matc
 /// The listener serves this on `POST /live`, and what comes back is the
 /// same shape an infra node's container serves on its own `/live`, so
 /// whoever reads a node's display draws one thing whichever produced it.
+/// The raw last answer `sig` saw, by its kind's rule
+/// ([`KindHandler::last_answer`]); `None` for a kind this listener does
+/// not know, whose display says so.
+pub fn last_answer(sig: &RegisteredSignal) -> Option<weft_core::signal::listener_protocol::LastAnswer> {
+    lookup(&sig.spec.kind).and_then(|handler| handler.last_answer(sig))
+}
+
+/// Send the last call of a wait whose run was cancelled
+/// (`weft_core::signal::cancel_call`), once, as the wait's connection, to
+/// the address the listener reaches it at (an infra endpoint's included).
+/// The wait's row is gone: everything comes with the request, and nothing
+/// fetched for it is kept past the call. An error says why the call did
+/// not go through, a refusal naming the status and what the service said.
+pub async fn cancel_call(state: &crate::ListenerState, req: weft_core::signal::listener_protocol::CancelCallRequest) -> Result<()> {
+    let call = req.spec.on_cancel.clone().ok_or_else(|| anyhow::anyhow!("the wait {} carries no last call", req.token))?;
+    call.validate().map_err(|e| anyhow::anyhow!(e))?;
+    let ctx = spawn_ctx(state, &req.token, crate::reach::UNREGISTERED, &req.tenant_id, req.for_instance.clone(), &req.spec, false, Arc::default());
+    let sent = send_cancel_call(&call, &req.spec.access, &ctx).await;
+    state.reach.forget(&req.token);
+    sent
+}
+
+/// How long a last call may take before it counts as not having gone
+/// through.
+const CANCEL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn send_cancel_call(
+    call: &weft_core::signal::CancelCall,
+    access: &Option<weft_core::primitive::AccessRef>,
+    ctx: &SpawnCtx,
+) -> Result<()> {
+    use anyhow::Context;
+    use weft_core::signal::CancelMethod;
+    let (client, _) = crate::listener_access::client_for(access, ctx).await?;
+    let url = crate::infra_address::for_listener(&call.url, ctx).await?;
+    let request = match call.method {
+        CancelMethod::Post => client.post(&url),
+        CancelMethod::Put => client.put(&url),
+        CancelMethod::Patch => client.patch(&url),
+        CancelMethod::Delete => client.delete(&url),
+    };
+    let request = match &call.body {
+        Some(body) => request.json(body),
+        None => request,
+    };
+    // Bounded, unlike a poll: a cancel is one short call of weft's own, and
+    // one that never answers would hold its task, and the dispatcher
+    // sending it, for good.
+    let request = request.timeout(CANCEL_CALL_TIMEOUT);
+    let what = format!("{} {}", call.method.as_http(), call.url);
+    let resp = request.send().await.with_context(|| format!("the last call {what} did not reach the service"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_else(|e| format!("<body read failed: {e}>"));
+        anyhow::bail!("the service refused the last call {what}: {status}: {body}");
+    }
+    Ok(())
+}
+
 pub fn compute_live(ctx: &LiveCtx<'_>) -> LiveFeed {
     match lookup(&ctx.sig.spec.kind) {
         Some(handler) => handler.live(ctx),
@@ -1571,11 +1648,12 @@ mod tests {
                 match_predicates: Vec::new(),
                 limits: Default::default(),
                 settings: Default::default(),
+                on_cancel: None,
             },
             node_id: "ask".into(),
             tenant_id: "t".into(),
             is_resume: false,
-            execution_id: None,
+            run_id: None,
             task: None,
             kind_state: None,
             routing: SignalRouting { surface, auth, auth_config },
@@ -1796,11 +1874,12 @@ mod tests {
                 match_predicates: predicates,
                 limits: Default::default(),
                 settings: Default::default(),
+                on_cancel: None,
             },
             node_id: "n1".into(),
             tenant_id: "t1".into(),
             is_resume: false,
-            execution_id: None,
+            run_id: None,
             task: None,
             kind_state: None,
             routing: SignalRouting {

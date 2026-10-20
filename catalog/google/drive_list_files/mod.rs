@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct GoogleDriveListFilesNode;
@@ -21,39 +21,31 @@ impl Node for GoogleDriveListFilesNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let query: String = ctx.inputs.get_or("query", String::new())?;
-        // `pageSize` declares a metadata default, so the bag always
-        // holds a value.
-        let page_size: f64 = ctx.inputs.get("pageSize")?;
+        let page_size = super::api::page_size(&ctx.inputs, "pageSize")?;
+        let page_token: String = ctx.inputs.get_or("pageToken", String::new())?;
 
         let drive = ctx.client(&access).await?;
-        // Drive may answer FEWER than pageSize per page even when more
-        // match, so honoring the cap takes paging until it fills (or
-        // the listing ends), never trusting one page.
-        let wanted = page_size as usize;
+        // One Drive page per call. Drive may answer fewer than
+        // `pageSize` even when more match; `hasMore` says so either way.
         let mut base = format!(
-            "{}/files?pageSize={}&fields=nextPageToken,files(id,name,mimeType)",
+            "{}/files?pageSize={page_size}&fields=nextPageToken,files(id,name,mimeType)",
             super::drive::API,
-            page_size as u64,
         );
         if !query.trim().is_empty() {
             base.push_str(&format!("&q={}", urlencoding::encode(query.trim())));
         }
-        let mut files: Vec<Value> = Vec::new();
-        weft::access::client::cursor_paged(
-            super::api::paging("/files", "narrow `query`, or lower `pageSize`"),
-            "list the files",
-            || drive.get(&base),
-            Ok,
-            |page| {
-                files.extend_from_slice(page);
-                Ok((files.len() >= wanted).then_some(()))
-            },
+        let page =
+            super::api::list_page(&drive, &base, "files", &page_token, Value::clone, "list the files", "pageSize")
+                .await?;
+        ctx.pulse_downstream(
+            NodeOutput::new()
+                .set("files", Value::Array(page.items))
+                .set("hasMore", page.next_page_token.is_some())
+                .set("nextPageToken", page.next_page_token.unwrap_or_default()),
         )
-        .await?;
-        files.truncate(wanted);
-        ctx.pulse_downstream(NodeOutput::new().set("files", Value::Array(files))).await
+        .await
     }
 }

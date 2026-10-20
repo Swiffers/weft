@@ -1,12 +1,12 @@
-# A mid-flow human approval that RESUMES a suspended execution. A HumanQuery's
+# A mid-flow human approval that RESUMES a suspended run. A HumanQuery's
 # answer is a resume signal, which only dispatches on an ACTIVE project, and a
 # project needs an entry trigger to be activatable. The entry here is a plain
-# on-demand trigger (TestSseTrigger): a pushed event starts a fresh execution
+# on-demand trigger (TestSseTrigger): a pushed event starts a fresh run
 # that hits HumanQuery and suspends. This fixture asserts the RESUME form's
 # enumeration + answer; entry-trigger FORM enumeration is covered separately by
 # the human_trigger_enum fixture, so the entry here is a non-form trigger.
 #
-# The rig: activate -> push an event to start an execution -> wait for the
+# The rig: activate -> push an event to start a run -> wait for the
 # HumanQuery form -> answer it (approve) -> assert the approval (true) reached
 # Debug.
 #
@@ -30,4 +30,4 @@ review = HumanQuery {
 review.context = start.value
 
 out = Debug
-out.data = review.decision_approved
+out.data = review.decisionApproved

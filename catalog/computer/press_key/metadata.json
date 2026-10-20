@@ -1,0 +1,33 @@
+{
+  "type": "PressKey",
+  "label": "Press key",
+  "description": "Press a key or a combination on the computer's keyboard: `args` is `{ keys, repeat, holdSecs }`. `keys` are xdotool key names, a combination joined by + (`Return`, `ctrl+s`, `alt+Tab`), several separated by spaces to press one after the other; `repeat` presses them that many times, 1 to 100 (optional); `holdSecs` holds them down that many seconds instead, up to 300 (optional).",
+  "tags": [
+    "computer",
+    "keyboard",
+    "key",
+    "shortcut"
+  ],
+  "icon": "Keyboard",
+  "inputs": [
+    {
+      "name": "computer",
+      "type": "Infra",
+      "required": true,
+      "description": "The `computer` output of the Computer node to act on."
+    },
+    {
+      "name": "args",
+      "type": "KeyArgs",
+      "required": true,
+      "description": "The keys, in the shape the node's description gives. RouteComputerCall's `key` port hands it over from a model's tool call; written by hand, it is a record literal."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "result",
+      "type": "String",
+      "description": "What happened, in a sentence a model can read back as the tool's result."
+    }
+  ]
+}

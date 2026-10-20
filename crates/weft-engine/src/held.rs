@@ -55,46 +55,56 @@ type SavedValues = std::collections::BTreeMap<String, serde_json::Value>;
 
 impl HeldInfra {
     pub fn new(inner: Arc<dyn InfraReader>, link: &BrokerLink) -> Arc<Self> {
-        let addresses = HeldCopy::following(link.subscribe(), INFRA_STATUS_CHANNEL, KEPT, everything, |_| true);
+        let addresses = HeldCopy::following(link.subscribe(), INFRA_STATUS_CHANNEL, KEPT, everything, worth_keeping);
         let saved = HeldCopy::following(link.subscribe(), INFRA_STATUS_CHANNEL, KEPT, everything, |_| true);
         Arc::new(Self { inner, addresses, saved })
     }
+}
+
+/// Whether an address can be kept until the broker says it changed. One
+/// with a `public_url` cannot: the broker builds that from the install's
+/// live internet address, and a quick tunnel can reopen under a new
+/// hostname with no notice down the line, so a kept copy would hand out a
+/// dead address. A public endpoint is rare and its read is one request, so
+/// it is read every time.
+fn worth_keeping(address: &Option<EndpointAddress>) -> bool {
+    address.as_ref().is_none_or(|address| address.public_url.is_none())
 }
 
 #[async_trait]
 impl InfraReader for HeldInfra {
     async fn endpoint_address(
         &self,
-        execution_id: weft_core::ExecutionId,
+        run_id: weft_core::RunId,
         run_instance: Option<&InstanceId>,
         infra: &InfraHandle,
     ) -> anyhow::Result<Option<EndpointAddress>> {
         // A handle naming another instance's copy is the broker's to
         // refuse, every time.
         if infra.instance().is_some() && infra.instance() != run_instance {
-            return self.inner.endpoint_address(execution_id, run_instance, infra).await;
+            return self.inner.endpoint_address(run_id, run_instance, infra).await;
         }
         let address = self
             .addresses
-            .get_or_load(infra.clone(), || self.inner.endpoint_address(execution_id, run_instance, infra))
+            .get_or_load(infra.clone(), || self.inner.endpoint_address(run_id, run_instance, infra))
             .await?;
         Ok((*address).clone())
     }
 
     async fn baked_outputs(
         &self,
-        execution_id: weft_core::ExecutionId,
+        run_id: weft_core::RunId,
         run_instance: Option<&InstanceId>,
         place: &str,
         copy: Option<&InstanceId>,
     ) -> anyhow::Result<std::collections::BTreeMap<String, serde_json::Value>> {
         // Another instance's copy is the broker's to refuse, every time.
         if copy.is_some() && copy != run_instance {
-            return self.inner.baked_outputs(execution_id, run_instance, place, copy).await;
+            return self.inner.baked_outputs(run_id, run_instance, place, copy).await;
         }
         let saved = self
             .saved
-            .get_or_load((place.to_string(), copy.cloned()), || self.inner.baked_outputs(execution_id, run_instance, place, copy))
+            .get_or_load((place.to_string(), copy.cloned()), || self.inner.baked_outputs(run_id, run_instance, place, copy))
             .await?;
         Ok((*saved).clone())
     }
@@ -249,26 +259,28 @@ mod tests {
     use tokio::sync::broadcast;
     use weft_task_store::pg_signal::{Heard, Subscription};
 
-    /// Counts the reads that reached it.
+    /// Counts the reads that reached it, and answers every address with
+    /// `address`.
     struct Counting {
         reads: AtomicUsize,
+        address: Option<EndpointAddress>,
     }
 
     #[async_trait]
     impl InfraReader for Counting {
         async fn endpoint_address(
             &self,
-            _execution_id: weft_core::ExecutionId,
+            _run_id: weft_core::RunId,
             _run_instance: Option<&InstanceId>,
             _infra: &InfraHandle,
         ) -> anyhow::Result<Option<EndpointAddress>> {
             self.reads.fetch_add(1, Ordering::SeqCst);
-            Ok(None)
+            Ok(self.address.clone())
         }
 
         async fn baked_outputs(
             &self,
-            _execution_id: weft_core::ExecutionId,
+            _run_id: weft_core::RunId,
             _run_instance: Option<&InstanceId>,
             _place: &str,
             _copy: Option<&InstanceId>,
@@ -283,7 +295,7 @@ mod tests {
         let listening = Arc::new(AtomicBool::new(true));
         let saved_rx = tx.subscribe();
         let addresses =
-            HeldCopy::following(Subscription::with_listening(rx, listening.clone()), INFRA_STATUS_CHANNEL, KEPT, everything, |_| true);
+            HeldCopy::following(Subscription::with_listening(rx, listening.clone()), INFRA_STATUS_CHANNEL, KEPT, everything, worth_keeping);
         let saved = HeldCopy::following(Subscription::with_listening(saved_rx, listening), INFRA_STATUS_CHANNEL, KEPT, everything, |_| true);
         (HeldInfra { inner, addresses, saved }, tx)
     }
@@ -293,9 +305,9 @@ mod tests {
     /// the broker refuses it.
     #[tokio::test]
     async fn an_address_is_kept_until_its_project_says_it_changed() {
-        let counting = Arc::new(Counting { reads: AtomicUsize::new(0) });
+        let counting = Arc::new(Counting { reads: AtomicUsize::new(0), address: None });
         let (held, changes) = held_over(counting.clone());
-        let run = weft_core::ExecutionId::new_v4();
+        let run = weft_core::RunId::new_v4();
         let shared = InfraHandle::new("db", "sql", None);
         held.endpoint_address(run, None, &shared).await.unwrap();
         held.endpoint_address(run, None, &shared).await.unwrap();
@@ -320,6 +332,35 @@ mod tests {
         held.endpoint_address(run, Some(&ann), &anns).await.unwrap();
         held.endpoint_address(run, Some(&ann), &anns).await.unwrap();
         assert_eq!(counting.reads.load(Ordering::SeqCst), 5, "the run's own instance's copy is kept");
+
+        let private = Arc::new(Counting {
+            reads: AtomicUsize::new(0),
+            address: Some(EndpointAddress { url: "http://db:5432".into(), public_url: None }),
+        });
+        let (held, _changes) = held_over(private.clone());
+        held.endpoint_address(run, None, &shared).await.unwrap();
+        held.endpoint_address(run, None, &shared).await.unwrap();
+        assert_eq!(private.reads.load(Ordering::SeqCst), 1, "an address with no public url is kept");
+    }
+
+    /// An address carrying a public url is read from the broker every
+    /// time: the install's internet address behind it can move with no
+    /// notice.
+    #[tokio::test]
+    async fn an_address_with_a_public_url_is_read_every_time() {
+        let public = Arc::new(Counting {
+            reads: AtomicUsize::new(0),
+            address: Some(EndpointAddress {
+                url: "http://hook:8080".into(),
+                public_url: Some("https://quick.trycloudflare.com/infra/p/c/hook".into()),
+            }),
+        });
+        let (held, _changes) = held_over(public.clone());
+        let run = weft_core::RunId::new_v4();
+        let hook = InfraHandle::new("hook", "http", None);
+        held.endpoint_address(run, None, &hook).await.unwrap();
+        held.endpoint_address(run, None, &hook).await.unwrap();
+        assert_eq!(public.reads.load(Ordering::SeqCst), 2);
     }
 
     /// Counts what reached it, and answers a resolve kept or not as told.
@@ -382,7 +423,7 @@ mod tests {
 
     fn resolve() -> ResolveConnectionRequest {
         ResolveConnectionRequest {
-            execution_id: uuid::Uuid::nil(),
+            run_id: uuid::Uuid::nil(),
             node_id: "n".into(),
             frames: Default::default(),
             node_type: "T".into(),
@@ -430,7 +471,7 @@ mod tests {
         }))
         .unwrap();
         let publish = |password: &str| PublishAccessRequest {
-            execution_id: uuid::Uuid::nil(),
+            run_id: uuid::Uuid::nil(),
             node_id: "db".into(),
             service: "postgres".into(),
             spec: spec.clone(),

@@ -34,12 +34,12 @@ async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
 
 async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     refuse_the_download(&rig);
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig
         .run(&FetchToStorageNode, json!({ "url": "https://cdn.example/files/gone.pdf" }))
         .await
         .ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("404"), "{error}");
     for port in ["file", "sizeBytes", "mimeType"] {
         assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");
@@ -48,7 +48,7 @@ async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn mistake_wired(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig
         .run(
             &FetchToStorageNode,
@@ -60,12 +60,12 @@ async fn mistake_wired(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// `ttl_days` reads as on every storage node: an execution file given
+/// `ttlDays` reads as on every storage node: a run file given
 /// one outlives its run for that long.
 async fn ttl_keeps_a_run_file(rig: FakeRig) -> WeftResult<()> {
     rig.respond_raw("GET", "/files/logo.png", 200, "image/png", b"PNG!".to_vec());
     let outcome = rig
-        .run(&FetchToStorageNode, json!({ "url": "https://cdn.example/files/logo.png", "ttl_days": 2 }))
+        .run(&FetchToStorageNode, json!({ "url": "https://cdn.example/files/logo.png", "ttlDays": 2 }))
         .await
         .ok()?;
     let key = weft::storage::StoredFile::from_value(&outcome.outputs["file"])?.key;

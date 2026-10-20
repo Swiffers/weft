@@ -1,7 +1,7 @@
 {
   "type": "GmailNewEmail",
   "label": "Gmail: On New Email",
-  "description": "Fires once per new Gmail message matching a search query (e.g. 'label:inbox -from:me', 'has:attachment invoice'), carrying the decomposed message with attachments. Starts from the mailbox as it is at activation; older mail never replays. Each poll reads up to 500 messages, so a burst larger than that within one interval fires only its newest 500.",
+  "description": "Fires once per new Gmail message matching a search query (e.g. 'label:inbox -from:me', 'has:attachment invoice'), carrying the decomposed message with attachments. Starts from the mailbox as it is at activation; older mail never replays. Each poll reads up to 500 messages, so a burst larger than that within one interval fires only its newest 500. The body is cut at `maxBodyChars` (50,000 by default), and shorter if it would still weigh more than the 100 KB a wire carries; `bodyTruncated` says when.",
   "tags": [
     "google",
     "gmail",
@@ -41,6 +41,18 @@
       "type": "Boolean",
       "default": true,
       "label": "Download attachments"
+    },
+    {
+      "name": "maxBodyChars",
+      "type": "Number",
+      "default": 50000,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
+      "label": "Max body characters",
+      "description": "The most characters of the body to keep; the rest is cut off and `bodyTruncated` is true. Whatever you set, the body is also cut to fit the 100 KB a wire carries."
     }
   ],
   "outputs": [
@@ -73,6 +85,11 @@
       "type": "Boolean"
     },
     {
+      "name": "bodyTruncated",
+      "type": "Boolean",
+      "description": "True when the body was longer than `maxBodyChars` or than a wire carries, so `body` holds only its start (an HTML body cut there is no longer whole HTML)."
+    },
+    {
       "name": "threadId",
       "type": "String"
     },
@@ -86,7 +103,8 @@
     },
     {
       "name": "attachments",
-      "type": "List[File]"
+      "type": "List[File]",
+      "narrowable": true
     }
   ],
   "firesWith": {

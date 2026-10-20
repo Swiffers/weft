@@ -48,8 +48,8 @@ pub struct ConnectOpts {
     #[arg(long, group = "action")]
     pub disconnect: bool,
     /// Delete a stored connection for good (its id, from --list). Every
-    /// pick in the current project pointing at it is cleared; another
-    /// project's node fails loudly at run with a reconnect message.
+    /// pick and instance value pointing at it, in every project, goes
+    /// with it, so those nodes ask for a connection again.
     #[arg(long, group = "action", conflicts_with = "node")]
     pub forget: Option<Uuid>,
     /// Carry every connection and value the install keeps for the node at
@@ -563,7 +563,7 @@ async fn instance_connect(
     install: String,
     on: Option<String>,
 ) -> Result<()> {
-    let step = target.spelling();
+    let node = target.spelling();
     let cx = Connecting {
         client: door,
         project_id,
@@ -577,26 +577,26 @@ async fn instance_connect(
     };
     if !matches!(target.picked, Pick::InstanceFilled) {
         bail!(
-            "'{step}' takes the author's connection, not each instance's; write `{}: @instance_filled` on it \
+            "'{node}' takes the author's connection, not each instance's; write `{}: @instance_filled` on it \
              to have each instance connect its own",
             target.input
         );
     }
     if opts.disconnect {
-        let clear = weft_core::run_spec::InstanceFieldRef { step: step.clone(), field: target.input.clone() };
+        let clear = weft_core::run_spec::InstanceFieldRef { node: node.clone(), field: target.input.clone() };
         let body = weft_core::instance_door::ValuesRequest { set: Vec::new(), clear: vec![clear] };
         door.put_json("/instance/values", &serde_json::to_value(body)?).await?;
         if json {
-            println!("{}", serde_json::json!({ "node": step, "instance": instance, "picked": Value::Null }));
+            println!("{}", serde_json::json!({ "node": node, "instance": instance, "picked": Value::Null }));
         } else {
-            println!("'{step}' now has no connection picked for instance '{instance}'.");
+            println!("'{node}' now has no connection picked for instance '{instance}'.");
         }
         return Ok(());
     }
     let grants = list_grants(door, Doorway::Instance, Some(&target.spec.service)).await?;
     if opts.list {
         if json {
-            println!("{}", serde_json::json!({ "node": step, "instance": instance, "connections": grants }));
+            println!("{}", serde_json::json!({ "node": node, "instance": instance, "connections": grants }));
         } else if grants.is_empty() {
             println!("instance '{instance}' has no {label} connection yet; connect one with --door own (or shared).");
         } else {
@@ -618,7 +618,7 @@ async fn instance_connect(
             "/instance/values",
             &serde_json::to_value(weft_core::instance_door::ValuesRequest {
                 set: vec![weft_core::run_spec::InstanceValueInput {
-                    step: step.clone(),
+                    node: node.clone(),
                     field: target.input.clone(),
                     value: serde_json::json!({ "id": grant.id }),
                 }],
@@ -630,17 +630,17 @@ async fn instance_connect(
             format!(
                 "the connection is stored as {}; pick it with `{}`",
                 grant.id,
-                cx.weft(&format!("connect --instance {instance} --node {step} --grant {}", grant.id))
+                cx.weft(&format!("connect --instance {instance} --node {node} --grant {}", grant.id))
             )
         })?;
     let rearmed = serde_json::from_value::<weft_core::instance_door::ValuesChanged>(changed)
         .context("read the dispatcher's answer to the change; upgrade the dispatcher or this CLI so the versions match")?
         .rearmed;
     if json {
-        println!("{}", serde_json::json!({ "node": step, "instance": instance, "picked": grant.id, "rearmed": rearmed }));
+        println!("{}", serde_json::json!({ "node": node, "instance": instance, "picked": grant.id, "rearmed": rearmed }));
     } else {
         println!(
-            "'{step}' now uses {} for instance '{instance}'.",
+            "'{node}' now uses {} for instance '{instance}'.",
             grant.identity.clone().unwrap_or_else(|| grant.id.to_string())
         );
         if !rearmed.is_empty() {
@@ -736,10 +736,10 @@ async fn picks_pointing_at(ctx: &Ctx, id: Uuid) -> Result<Vec<String>> {
     let Some(project) = ctx.project_here().context(unknowable)? else { return Ok(Vec::new()) };
     let stored = install_picks(&ctx.client()?,project.id()).await.context(unknowable)?;
     let mut pointing = Vec::new();
-    for (step, fields) in stored {
+    for (node, fields) in stored {
         for (field, handle) in &fields {
-            if picked_handle(&step, field, handle)?.id == id {
-                pointing.push(step.clone());
+            if picked_handle(&node, field, handle)?.id == id {
+                pointing.push(node.clone());
                 break;
             }
         }
@@ -747,13 +747,13 @@ async fn picks_pointing_at(ctx: &Ctx, id: Uuid) -> Result<Vec<String>> {
     Ok(pointing)
 }
 
-/// The connection an install's pick at `step.field` names. One the CLI
+/// The connection an install's pick at `node.field` names. One the CLI
 /// cannot read is an error naming the place, never "not connected".
-fn picked_handle(step: &str, field: &str, handle: &Value) -> Result<PickedHandle> {
+fn picked_handle(node: &str, field: &str, handle: &Value) -> Result<PickedHandle> {
     parse_picked(handle).with_context(|| {
         format!(
-            "the install's pick for '{step}.{field}' is not a connection this CLI can read ({handle}); \
-             upgrade the CLI or the install so the versions match, or connect '{step}' again"
+            "the install's pick for '{node}.{field}' is not a connection this CLI can read ({handle}); \
+             upgrade the CLI or the install so the versions match, or connect '{node}' again"
         )
     })
 }
@@ -773,9 +773,9 @@ fn with_install_picks(targets: &mut [AccessTarget], stored: &weft_core::picks::P
         if matches!(target.picked, Pick::InstanceFilled | Pick::WrittenInSource) {
             continue;
         }
-        let step = target.spelling();
-        target.picked = match stored.get(&step).and_then(|fields| fields.get(&target.input)) {
-            Some(handle) => Pick::Handle(picked_handle(&step, &target.input, handle)?),
+        let node = target.spelling();
+        target.picked = match stored.get(&node).and_then(|fields| fields.get(&target.input)) {
+            Some(handle) => Pick::Handle(picked_handle(&node, &target.input, handle)?),
             None => Pick::None,
         };
     }
@@ -837,7 +837,7 @@ struct OtherNode {
 ///
 /// The flattening is the LENIENT one (lex, parse, includes inlined, no
 /// enrich and no validation), because connecting is what you do to a
-/// program that is not wired up yet: an unmet `MustOverride` or a
+/// program that is not wired up yet: an unresolved type variable or a
 /// mis-typed literal leaves the node list whole, and the places come
 /// from the node list alone. A parse error is refused the way the file
 /// walk refuses one, naming the file and the line.
@@ -875,7 +875,8 @@ fn discover(
     }
     let mut out = Vec::new();
     let mut visited: std::collections::BTreeSet<std::path::PathBuf> = Default::default();
-    collect_targets(&project.main_weft(), &root, &program, catalog, &mut out, others, &mut visited)?;
+    let entry = read_through_compiler(&root, &root.join(weft_compiler::project::SRC_DIR), weft_compiler::project::ENTRY_FILE, "the entry file")?;
+    collect_targets(entry, &root, &program, catalog, &mut out, others, &mut visited)?;
     Ok((out, program))
 }
 
@@ -884,7 +885,7 @@ fn discover(
 /// A file reached again is one file already collected, so nothing is
 /// added: its every name came from `program` the first time.
 fn collect_targets(
-    file: &std::path::Path,
+    file: weft_compiler::ResolvedFile,
     root: &std::path::Path,
     program: &weft_core::ProjectDefinition,
     catalog: &weft_catalog::FsCatalog,
@@ -892,14 +893,10 @@ fn collect_targets(
     others: &mut Vec<OtherNode>,
     visited: &mut std::collections::BTreeSet<std::path::PathBuf>,
 ) -> Result<()> {
-    let canonical = file
-        .canonicalize()
-        .with_context(|| format!("resolve {}", file.display()))?;
+    let weft_compiler::ResolvedFile { identity: canonical, content: source } = file;
     if !visited.insert(canonical.clone()) {
         return Ok(());
     }
-    let source = std::fs::read_to_string(&canonical)
-        .with_context(|| format!("read {}", canonical.display()))?;
     // The ids this parse hands out have to be the ones `program` keys
     // its places by, or `spellings_of` finds nothing. An included file's
     // nodes are keyed under the file's body id on both sides; the entry
@@ -923,7 +920,7 @@ fn collect_targets(
     // The lenient parse answers even on broken source, with a PARTIAL
     // node list; operating on that (and rewriting the file from it)
     // would silently work on half the project. Refuse on PARSE errors
-    // only: type-level diagnostics (an unresolved MustOverride in a
+    // only: type-level diagnostics (an unresolved type variable in a
     // subgraph viewed standalone, a mis-typed literal) leave the node
     // list complete and the editor edits such files freely.
     if let Some(first) = diagnostics.iter().find(|d| {
@@ -986,9 +983,25 @@ fn collect_targets(
         });
     }
     for path in includes {
-        collect_targets(&base.join(&path), root, program, catalog, out, others, visited)?;
+        collect_targets(read_through_compiler(root, &base, &path, "@include")?, root, program, catalog, out, others, visited)?;
     }
     Ok(())
+}
+
+/// Read the file a program names from `base`, through the compiler's own
+/// resolution, so the walk reaches exactly the file the build includes
+/// (a `__catalog/` path included) and refuses what the build refuses.
+/// `what` names the file in a refusal (`@include`, the entry file).
+fn read_through_compiler(
+    root: &std::path::Path,
+    base: &std::path::Path,
+    path: &str,
+    what: &str,
+) -> Result<weft_compiler::ResolvedFile> {
+    use weft_compiler::FileReader as _;
+    weft_compiler::DiskFileReader
+        .resolve_and_read(root, base, std::path::Path::new(path))
+        .map_err(|e| anyhow::anyhow!("{what}: {e}"))
 }
 
 /// Parse a picker config value into the handle it must be.
@@ -1016,7 +1029,7 @@ fn parse_picked(v: &Value) -> Result<PickedHandle> {
 /// through, because the id it is keyed by carries the file's PATH and
 /// the language calls that spelling unspellable on purpose.
 fn spellings_of(program: &weft_core::ProjectDefinition, id: &str) -> Result<Vec<String>> {
-    let spellings: Vec<String> = weft_core::project::selection::every_place(program)
+    let spellings: Vec<String> = weft_core::project::places::every_place(program)
         .into_iter()
         .filter(|place| place.id == id)
         .map(|place| weft_core::project::address_of(program, &place.id, &place.path))
@@ -1073,7 +1086,7 @@ fn describe_target(t: &AccessTarget) -> String {
 
 /// Any node of the project, found by the name a person types, the same
 /// way `weft connect --node` finds an access node.
-pub(crate) struct Step {
+pub(crate) struct ResolvedNode {
     /// The compiled id, the key into `program`.
     pub(crate) node: String,
     /// The name the person asked by (the file qualifier dropped).
@@ -1084,11 +1097,11 @@ pub(crate) struct Step {
     pub(crate) program: weft_core::ProjectDefinition,
 }
 
-pub(crate) fn resolve_step(
+pub(crate) fn resolve_any_node(
     project: &weft_compiler::project::Project,
     catalog: &weft_catalog::FsCatalog,
     name: &str,
-) -> Result<Step> {
+) -> Result<ResolvedNode> {
     let (targets, program) = discover(project, catalog, &mut Vec::new())?;
     let (node, _) = super::resolve_node(project, &program, name)?;
     let node_type = program
@@ -1096,8 +1109,8 @@ pub(crate) fn resolve_step(
         .iter()
         .find(|n| n.id == node)
         .map(|n| n.node_type.clone())
-        .context("the resolved step is missing from the program")?;
-    Ok(Step { node, spelling: super::unqualified(name).to_string(), node_type, targets, program })
+        .context("the resolved node is missing from the program")?;
+    Ok(ResolvedNode { node, spelling: super::unqualified(name).to_string(), node_type, targets, program })
 }
 
 fn choose_target(
@@ -1293,7 +1306,7 @@ impl Connecting<'_> {
     async fn pick_grant(&self, g: &GrantSummary) -> Result<Vec<String>> {
         let body = ChangePicks {
             set: vec![PickInput {
-                step: self.target.spelling(),
+                node: self.target.spelling(),
                 field: self.target.input.clone(),
                 connection: g.id,
                 service: self.target.spec.service.clone(),
@@ -1326,7 +1339,7 @@ impl Connecting<'_> {
     async fn clear_pick(&self) -> Result<()> {
         let body = ChangePicks {
             set: Vec::new(),
-            clear: vec![InstanceFieldRef { step: self.target.spelling(), field: self.target.input.clone() }],
+            clear: vec![InstanceFieldRef { node: self.target.spelling(), field: self.target.input.clone() }],
         };
         self.write_picks(&body).await?;
         if !self.json {
@@ -2295,28 +2308,25 @@ mod tests {
 
     /// The shape an include compiles to: the file `src/sweep.weft` is
     /// one body, keyed by its path, and each `@include` of it is a call
-    /// site; a node inside it is keyed under the file's path.
+    /// site (both groups, neither a node); a node inside it is keyed
+    /// under the file's path.
     fn program_including_sweep(sites: &[&str]) -> weft_core::ProjectDefinition {
-        let node = |id: &str, scope: &[&str], boundary: serde_json::Value| {
+        let node = |id: &str, scope: &[&str]| {
             serde_json::json!({
                 "id": id, "nodeType": "T", "config": {}, "position": { "x": 0.0, "y": 0.0 },
-                "inputs": [], "outputs": [], "scope": scope, "groupBoundary": boundary,
+                "inputs": [], "outputs": [], "scope": scope,
             })
         };
-        let mut nodes = vec![
-            node("db", &[], serde_json::Value::Null),
-            node("@src:sweep__in", &[], serde_json::json!({ "groupId": "@src:sweep", "role": "In" })),
-            node("@src:sweep.key", &["@src:sweep"], serde_json::Value::Null),
-            node("@src:sweep.inner.key", &["@src:sweep", "@src:sweep.inner"], serde_json::Value::Null),
-            node("@src:sweep__out", &[], serde_json::json!({ "groupId": "@src:sweep", "role": "Out" })),
+        let nodes = vec![
+            node("db", &[]),
+            node("@src:sweep.key", &["@src:sweep"]),
+            node("@src:sweep.inner.key", &["@src:sweep", "@src:sweep.inner"]),
         ];
         let mut groups = vec![
             serde_json::json!({ "id": "@src:sweep", "kind": "body", "nodeIds": ["@src:sweep.key"] }),
             serde_json::json!({ "id": "@src:sweep.inner", "kind": "group", "nodeIds": ["@src:sweep.inner.key"] }),
         ];
         for site in sites {
-            nodes.push(node(&format!("{site}__in"), &[], serde_json::json!({ "groupId": site, "role": "In" })));
-            nodes.push(node(&format!("{site}__out"), &[], serde_json::json!({ "groupId": site, "role": "Out" })));
             groups.push(serde_json::json!({ "id": site, "kind": "call", "body": "@src:sweep", "nodeIds": [] }));
         }
         serde_json::from_value(serde_json::json!({

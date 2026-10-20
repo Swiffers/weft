@@ -52,11 +52,6 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             -- not picked, or a hand-over that kept failing. Not retried on
             -- a timer: what it waits on hands it over.
             waits_for TEXT,
-            -- Read by nothing: the instance refusal the previous release
-            -- wrote where `waits_for` is now (its migration carries each
-            -- into `waits_for`), which its replicas still write while an
-            -- upgrade rolls out. The release after this one drops it.
-            instance_gap JSONB,
             -- How many hand-overs in a row failed (`Turn::next`).
             failures INTEGER NOT NULL DEFAULT 0,
             -- An answer to a waiting run, rather than an event of an entry.
@@ -69,10 +64,10 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             -- for. Its worker takes it; if the worker lets go of the run
             -- first, the letting go writes it into the run's record
             -- (`weft_journal::record::resolve_handed_in`).
-            execution_id UUID,
+            run_id UUID,
             PRIMARY KEY (token, seq)
         )"#,
-        r#"CREATE INDEX IF NOT EXISTS parked_fire_handed ON parked_fire (execution_id) WHERE execution_id IS NOT NULL"#,
+        r#"CREATE INDEX IF NOT EXISTS parked_fire_handed ON parked_fire (run_id) WHERE run_id IS NOT NULL"#,
         // Wake the drain when an event is parked, so a trigger that is
         // already back takes it at once instead of on the drain's next look,
         // and a run's worker when an answer is handed to it. Through the
@@ -90,12 +85,12 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             DECLARE
                 v_project UUID;
             BEGIN
-                IF NEW.execution_id IS NULL THEN
+                IF NEW.run_id IS NULL THEN
                     PERFORM weft_announce('weft_parked_fire', (SELECT s.project_id FROM signal s WHERE s.token = NEW.token)::text);
                 ELSE
-                    SELECT r.project_id INTO v_project FROM run r WHERE r.execution_id = NEW.execution_id;
-                    PERFORM weft_announce('weft_parked_fire', v_project::text || ' ' || NEW.execution_id::text);
-                    PERFORM weft_tell(v_project, NEW.execution_id, 'answer');
+                    SELECT r.project_id INTO v_project FROM run r WHERE r.run_id = NEW.run_id;
+                    PERFORM weft_announce('weft_parked_fire', v_project::text || ' ' || NEW.run_id::text);
+                    PERFORM weft_tell(v_project, NEW.run_id, 'answer');
                 END IF;
                 RETURN NULL;
             END;
@@ -111,7 +106,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         // stays: its run's worker takes it.
         r#"CREATE OR REPLACE FUNCTION parked_fire_drop_with_signal() RETURNS trigger AS $$
             BEGIN
-                DELETE FROM parked_fire WHERE token = OLD.token AND execution_id IS NULL;
+                DELETE FROM parked_fire WHERE token = OLD.token AND run_id IS NULL;
                 RETURN NULL;
             END;
             $$ LANGUAGE plpgsql"#,
@@ -212,11 +207,7 @@ impl Turn {
 }
 
 /// An event as it waits in its trigger's queue: what [`park`] writes.
-/// Read through [`WaitingWire`], so a park from a worker built by the
-/// previous release (whose program keeps running until it is built again)
-/// is taken too.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(from = "WaitingWire")]
 pub struct Waiting {
     /// The event's identity: the run it starts is
     /// `weft_core::door_fire::run_of_fire(fire_id)`, so an event handed
@@ -242,33 +233,6 @@ pub struct Waiting {
     /// value: `payload` is then null and unread. Always false for an
     /// entry's event.
     pub skipped: bool,
-}
-
-/// [`Waiting`] as a worker sends it. A worker of the previous release
-/// sends neither `waits_for` nor `failures`, and says an event waits on
-/// its instance with `instance_gap` (the refusal, naming each field).
-#[derive(Deserialize)]
-struct WaitingWire {
-    fire_id: uuid::Uuid,
-    payload: Value,
-    caller: Option<String>,
-    attempts: u32,
-    not_before: i64,
-    #[serde(default)]
-    waits_for: Option<WaitsFor>,
-    #[serde(default)]
-    instance_gap: Option<String>,
-    #[serde(default)]
-    failures: u32,
-    skipped: bool,
-}
-
-impl From<WaitingWire> for Waiting {
-    fn from(wire: WaitingWire) -> Self {
-        let WaitingWire { fire_id, payload, caller, attempts, not_before, waits_for, instance_gap, failures, skipped } = wire;
-        let waits_for = waits_for.or_else(|| instance_gap.and_then(|gap| WaitsFor::new(WaitsOn::Instance, &gap)));
-        Waiting { fire_id, payload, caller, attempts, not_before, waits_for, failures, skipped }
-    }
 }
 
 impl Waiting {
@@ -500,21 +464,21 @@ pub async fn restamp_in(tx: &mut sqlx::PgConnection, head: &Head, turn: &Turn) -
     Ok(())
 }
 
-/// Hand `answer`, the answer to the wait `token` of run `execution_id`,
+/// Hand `answer`, the answer to the wait `token` of run `run_id`,
 /// which a worker drives, to that worker, on the caller's transaction:
 /// nobody but a run's worker writes the record of a run it drives. The
 /// wait's signal is consumed by the caller in the same transaction, so it
 /// is answered once.
-pub async fn hand_answer_in(tx: &mut sqlx::PgConnection, token: &str, execution_id: weft_core::ExecutionId, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<()> {
+pub async fn hand_answer_in(tx: &mut sqlx::PgConnection, token: &str, run_id: weft_core::RunId, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<()> {
     let (value, skipped) = answer_row(answer);
     sqlx::query(
-        "INSERT INTO parked_fire (token, fire_id, payload, attempts, not_before, is_resume, execution_id, skipped) \
+        "INSERT INTO parked_fire (token, fire_id, payload, attempts, not_before, is_resume, run_id, skipped) \
          VALUES ($1, $2, $3, 0, 0, TRUE, $4, $5)",
     )
     .bind(token)
     .bind(uuid::Uuid::new_v4())
     .bind(value)
-    .bind(execution_id)
+    .bind(run_id)
     .bind(skipped)
     .execute(&mut *tx)
     .await?;
@@ -522,23 +486,23 @@ pub async fn hand_answer_in(tx: &mut sqlx::PgConnection, token: &str, execution_
 }
 
 /// THE answers handed to runs ([`hand_answer_in`]), as a SQL `SELECT` of
-/// `(execution_id, token, payload, skipped, seq)` for the runs the SQL
+/// `(run_id, token, payload, skipped, seq)` for the runs the SQL
 /// expression `runs` names (an id, or a subquery of ids). Read oldest first
 /// (`ORDER BY seq`), each answer decoded with [`stored_answer`]. Every
 /// reader of a run's answers ([`answers_for`], the broker's recheck of a
 /// worker's runs) reads them through here.
 pub fn handed_answers_sql(runs: &str) -> String {
-    format!("SELECT p.execution_id, p.token, p.payload, p.skipped, p.seq FROM parked_fire p WHERE p.execution_id IN ({runs})")
+    format!("SELECT p.run_id, p.token, p.payload, p.skipped, p.seq FROM parked_fire p WHERE p.run_id IN ({runs})")
 }
 
-/// The answers handed to run `execution_id` ([`handed_answers_sql`]),
+/// The answers handed to run `run_id` ([`handed_answers_sql`]),
 /// oldest first: what the worker driving the run takes. They go once the
 /// run's record holds them (`weft_record_batch` deletes the answers a
 /// batch resolves).
-pub async fn answers_for<'e, E: sqlx::PgExecutor<'e>>(executor: E, execution_id: weft_core::ExecutionId) -> anyhow::Result<Vec<(String, weft_core::primitive::WaitAnswer)>> {
-    let rows: Vec<(weft_core::ExecutionId, String, Value, bool, i64)> =
+pub async fn answers_for<'e, E: sqlx::PgExecutor<'e>>(executor: E, run_id: weft_core::RunId) -> anyhow::Result<Vec<(String, weft_core::primitive::WaitAnswer)>> {
+    let rows: Vec<(weft_core::RunId, String, Value, bool, i64)> =
         sqlx::query_as(&format!("{} ORDER BY seq", handed_answers_sql("$1")))
-            .bind(execution_id)
+            .bind(run_id)
             .fetch_all(executor)
             .await?;
     Ok(rows.into_iter().map(|(_, token, payload, skipped, _)| (token, stored_answer(payload, skipped))).collect())
@@ -653,22 +617,5 @@ mod park_backoff_tests {
         let wire = serde_json::to_value(&now).unwrap();
         assert_eq!(wire["waits_for"], serde_json::json!("picks: pick a connection"));
         assert_eq!(serde_json::from_value::<Waiting>(wire).unwrap(), now);
-    }
-
-    /// A worker of the previous release parks without `waits_for` and
-    /// `failures`, and says an event waits on its instance with
-    /// `instance_gap`: its park is taken, waiting on that instance.
-    #[test]
-    fn a_park_from_the_previous_release_is_taken() {
-        let old = serde_json::json!({
-            "fire_id": uuid::Uuid::nil(), "payload": null, "caller": null, "attempts": 2, "not_before": 7,
-            "instance_gap": "instance 'ada' at 'answer': 'key' is not filled", "skipped": false,
-        });
-        let read = serde_json::from_value::<Waiting>(old.clone()).unwrap();
-        assert_eq!((read.attempts, read.not_before, read.failures), (2, 7, 0));
-        assert_eq!(read.waits_for, WaitsFor::new(WaitsOn::Instance, "instance 'ada' at 'answer': 'key' is not filled"));
-        let mut clocked = old;
-        clocked["instance_gap"] = Value::Null;
-        assert_eq!(serde_json::from_value::<Waiting>(clocked).unwrap().waits_for, None);
     }
 }

@@ -1,13 +1,13 @@
 //! The platform layer: a host-side, test-only window into what the SYSTEM does
-//! underneath a running program (which worker drives an execution, what the
-//! runtime wrote in its log), plus the one lever a test needs to drive it:
-//! faking a worker crash.
+//! underneath a running program (which worker drives a run, what the
+//! runtime wrote in its log), plus the levers a test needs to drive it:
+//! faking a worker crash, and deleting a build's image.
 //!
 //! ## Why this reaches behind the public API
 //!
 //! The program layer (the rest of this crate) asserts through the dispatcher's
 //! public HTTP API, exactly as the outside world does. But platform facts
-//! (which worker replica owns an execution, what a run stored) are NOT on that
+//! (which worker replica owns a run, what a run stored) are NOT on that
 //! surface, by design: exposing them would add privileged endpoints to the
 //! shipped system for a need only tests have. So the platform layer reaches
 //! BEHIND the API, the way an operator of a local install can: it reads the
@@ -66,53 +66,30 @@ impl Platform {
         Ok(Self { pool, install })
     }
 
-    /// How many live PUBLIC RELAY file links point at one run's files: its
-    /// execution's own (`<tenant>/exec/<execution_id>/...`) and its project's
-    /// (`<tenant>/project/<project>/...`, and the tenant's assets the project
-    /// references, `<tenant>/asset/<sha256>`).
-    /// A minted relay link (a media slot externalized as
-    /// `<base>/public/files/<token>`) leaves one row until it expires, so a
-    /// test that just externalized media can tell which path it took: rows
-    /// appeared = relay links; none = inline bytes (or the direct-bucket
-    /// path, which a local install never has). Only this run's, so a test
-    /// running beside it never changes the answer.
-    pub async fn public_file_link_count_for(&self, execution_id: &Uuid, project: &Uuid) -> Result<i64> {
-        sqlx::query_scalar(
-            "SELECT count(*) FROM public_file_link \
-             WHERE key LIKE '%/' || $1 || '/%' OR key LIKE '%/' || $2 || '/%' \
-                OR key IN (SELECT key FROM asset_reference WHERE project_id = $2)",
-        )
-        .bind(execution_id.to_string())
-        .bind(project.to_string())
-        .fetch_one(&self.pool)
-        .await
-        .context("count public file links")
-    }
-
     /// The replica that wrote the last row of a run's record: for an ended
     /// run, the worker that ended it (`run.owner` is cleared once a run
     /// ends). None for a run nothing wrote yet.
-    pub async fn execution_writer(&self, execution_id: &Uuid) -> Result<Option<String>> {
-        sqlx::query_scalar("SELECT writer FROM run_log WHERE execution_id = $1 ORDER BY seq DESC LIMIT 1")
-            .bind(execution_id)
+    pub async fn run_writer(&self, run_id: &Uuid) -> Result<Option<String>> {
+        sqlx::query_scalar("SELECT writer FROM run_log WHERE run_id = $1 ORDER BY seq DESC LIMIT 1")
+            .bind(run_id)
             .fetch_optional(&self.pool)
             .await
             .context("read the writer of a run's record")
     }
 
-    /// How many IN-FLIGHT (pending) runtime-file uploads exist under an execution's
-    /// exec scope. The runtime-file key is `<tenant>/exec/<execution_id>/<id>`, and a
+    /// How many IN-FLIGHT (pending) runtime-file uploads exist under a run's
+    /// run scope. The runtime-file key is `<tenant>/run/<run_id>/<id>`, and a
     /// begin reserves a 'pending' row that only flips 'active' at complete, so
     /// this counts uploads that were started but never finished. An interrupted
     /// upload that cleaned up correctly leaves ZERO: the abort deleted the row
     /// (and freed its quota reservation).
-    pub async fn runtime_pending_uploads_for_execution_id(&self, execution_id: &Uuid) -> Result<i64> {
-        let pattern = format!("%/exec/{execution_id}/%");
+    pub async fn runtime_pending_uploads_for_run_id(&self, run_id: &Uuid) -> Result<i64> {
+        let pattern = format!("%/run/{run_id}/%");
         sqlx::query_scalar("SELECT COUNT(*) FROM runtime_file WHERE key LIKE $1 AND status = 'pending'")
             .bind(pattern)
             .fetch_one(&self.pool)
             .await
-            .context("count pending runtime uploads for execution")
+            .context("count pending runtime uploads for run")
     }
 
     /// A tenant's CHARGED runtime-storage bytes: an ACTIVE file counts by its
@@ -131,15 +108,15 @@ impl Platform {
         Ok(bytes.unwrap_or(0))
     }
 
-    /// The tenant an execution's runtime-file rows belong to, or `None` if the
-    /// execution stored nothing.
-    pub async fn runtime_tenant_for_execution_id(&self, execution_id: &Uuid) -> Result<Option<String>> {
-        let pattern = format!("%/exec/{execution_id}/%");
+    /// The tenant a run's runtime-file rows belong to, or `None` if the
+    /// run stored nothing.
+    pub async fn runtime_tenant_for_run_id(&self, run_id: &Uuid) -> Result<Option<String>> {
+        let pattern = format!("%/run/{run_id}/%");
         sqlx::query_scalar("SELECT tenant_id FROM runtime_file WHERE key LIKE $1 LIMIT 1")
             .bind(pattern)
             .fetch_optional(&self.pool)
             .await
-            .context("read tenant for execution's runtime files")
+            .context("read tenant for run's runtime files")
     }
 
     /// The worker containers running `project_id`'s program right now.
@@ -167,6 +144,49 @@ impl Platform {
             .context("docker ps")?;
         anyhow::ensure!(out.status.success(), "docker ps failed: {}", String::from_utf8_lossy(&out.stderr));
         Ok(String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).filter(|l| !l.is_empty()).collect())
+    }
+
+    /// The images the worker containers of `project_id` run, as the local
+    /// platform labelled them when it started each (the ref it ran).
+    pub async fn worker_images(&self, project_id: &Uuid) -> Result<Vec<String>> {
+        use weft_platform_local::docker::labels;
+        let mut images = Vec::new();
+        for name in self.workers_for_project(project_id).await? {
+            let out = tokio::process::Command::new("docker")
+                .args(["inspect", "--format", &format!("{{{{index .Config.Labels \"{}\"}}}}", labels::IMAGE), &name])
+                .output()
+                .await
+                .with_context(|| format!("docker inspect {name}"))?;
+            anyhow::ensure!(out.status.success(), "docker inspect {name} failed: {}", String::from_utf8_lossy(&out.stderr));
+            images.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        }
+        images.sort();
+        images.dedup();
+        Ok(images)
+    }
+
+    /// The build a run runs on: the binary hash its worker image is
+    /// tagged with.
+    pub async fn run_binary_hash(&self, run_id: &Uuid) -> Result<String> {
+        let hash: Option<String> = sqlx::query_scalar("SELECT binary_hash FROM run WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_one(&self.pool)
+            .await
+            .context("read the build a run runs on")?;
+        hash.ok_or_else(|| anyhow::anyhow!("run {run_id} names no build"))
+    }
+
+    /// Delete the image `image` from this machine, the way a cleanup
+    /// outside weft does (`docker rmi`), so no worker of it can start
+    /// again.
+    pub async fn remove_image(&self, image: &str) -> Result<()> {
+        let out = tokio::process::Command::new("docker")
+            .args(["rmi", "--force", image])
+            .output()
+            .await
+            .with_context(|| format!("docker rmi --force {image}"))?;
+        anyhow::ensure!(out.status.success(), "docker rmi --force {image} failed: {}", String::from_utf8_lossy(&out.stderr));
+        Ok(())
     }
 
     /// Fake a worker crash: remove every worker container of `project_id`

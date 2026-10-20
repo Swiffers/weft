@@ -7,13 +7,13 @@
 // the parsed instance first (the compiler mirrors the catalog's
 // metadata onto every node it parses), and the catalog template only
 // when the instance says nothing (a node added in the editor and not
-// yet parsed). The host reads the parse the same way before it starts
-// a poller (`graphView.ts syncDisplayPollers`), so the two cannot
-// disagree about which nodes get a display.
-// SYNC: role precedence <-> extension-vscode/src/graphView.ts syncDisplayPollers
+// yet parsed). The host reads the parse the same way before it asks
+// for displays (`displayRoutes.ts displayRoutesOf`), so the two cannot
+// disagree about where a node's display comes from.
+// SYNC: role precedence <-> extension-vscode/src/displayRoutes.ts
 
 import { NODE_TYPE_CONFIG } from '../nodes';
-import type { IncludedContents, PerInstance } from '../../../protocol';
+import type { IncludedContents, NodeFeedState, PerInstance } from '../../../protocol';
 
 /// Minimal NodeInstance shape this module reads. Avoids importing
 /// the full type from `../types` so this file stays focused.
@@ -50,12 +50,12 @@ export function canBePerInstance(node: RoleNodeShape): boolean {
 /// in the graph at all. So "can this project be activated" and "does this
 /// project need its infra up" have to count through includes, which is
 /// what `includeContents` is for. Get this wrong and a project whose only
-/// trigger sits in an included file shows no Activate button.
+/// trigger sits in an included file is never offered Turn on.
 ///
 /// Only SHARED nodes count: a `@per_instance` node's copies each belong
 /// to one instance, armed and started by the program for it, so the
-/// action bar's Activate and Start infra have nothing to act on for it
-/// (an included file's contents already leave such nodes out).
+/// context bar's Turn on and Start have nothing to act on for it (an
+/// included file's contents already leave such nodes out).
 type ProjectRoleNode = RoleNodeShape & {
   requiresInfra?: boolean;
   perInstance?: PerInstance;
@@ -89,6 +89,19 @@ export function projectHasTriggers(nodes: readonly ProjectRoleNode[]): boolean {
 export function nodeHasDisplay(node: RoleNodeShape): boolean {
   if (nodeRequiresInfra(node)) return nodeServesLive(node);
   return nodeIsTrigger(node);
+}
+
+/// What this node's body panel shows, given the display the host last
+/// sent for it (`feed`, undefined when none came).
+///
+/// A node with a display of its own (`nodeHasDisplay`) shows every state
+/// of it, `absent` included: that one names the button that brings the
+/// display back. Any other node shows a display only while one of its
+/// waits in the followed run has one (a polled job's last answer), and
+/// `absent` means the wait is over, so it shows nothing.
+export function bodyFeedOf(node: RoleNodeShape, feed: NodeFeedState | undefined): NodeFeedState | undefined {
+  if (nodeHasDisplay(node)) return feed;
+  return feed?.state === 'absent' ? undefined : feed;
 }
 
 /// Does this node's container serve `/live`, per its metadata?

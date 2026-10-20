@@ -5,9 +5,9 @@ The runtime has four roles, each with one job.
 | | What it does | What it never does |
 |---|---|---|
 | **Worker** | Runs your compiled program | Touch Postgres: it goes through the broker |
-| **Dispatcher** | Decides what runs, and answers every request about a project or a run | Run your step code |
-| **Listener** | Holds the timers, the open sockets and the subscriptions | Run your step code, or know which project it serves |
-| **Supervisor** | Creates and watches the machines and containers your program asked for | Run your step code, or change a project's infrastructure while another supervisor is changing it |
+| **Dispatcher** | Decides what runs, and answers every request about a project or a run | Run your node code |
+| **Listener** | Holds the timers, the open sockets and the subscriptions | Run your node code, or know which project it serves |
+| **Supervisor** | Creates and watches the machines and containers your program asked for | Run your node code, or change a project's infrastructure while another supervisor is changing it |
 
 The dispatcher, listener and supervisor, together with the broker, are parts of one
 binary, `weft-runtime`, and on your machine one `weft-runtime` process runs
@@ -105,7 +105,7 @@ project's worker settings (`weft workers set` or `reset`), every run still
 queued is handed out at once, with its tries forgotten.
 
 If a trigger starts a fast run and its worker dies straight away, the run may
-never show up in `weft executions`, because a fast run's record trails a few
+never show up in `weft runs`, because a fast run's record trails a few
 milliseconds behind it and may not have reached the database yet.
 
 ## Where a call goes
@@ -139,13 +139,13 @@ asks for a credential or the call carries an instance token (which names the
 [instance](instances.md) the call is for), nothing reaches the database before
 the run starts.
 
-If a route's trigger is parked, hibernating within its grace window, or still
-being set up, the worker answers `503` with a `Retry-After` at once, so a client that retries
-gets through once the trigger is on. When a new version of the program
-replaces the worker, on your machine the port stays closed while the old
-worker hands its runs back or ends them (10 seconds at most, then it is
-killed) and the new one starts. A caller
-arriving then is refused, as with any server restarting.
+If a route's trigger is down, however it was taken down, or still being set
+up, the worker answers `503` with a `Retry-After` at once, so a client that retries
+gets through once the trigger is on. When a new version of the program takes
+over, on your machine its worker takes the project's port only once the old
+worker has nothing left running: the old one is then told to stop, killed 10
+seconds later if it has not, and the new one starts. A caller arriving in
+that moment is refused, as with any server restarting.
 
 If a route still belongs to another version of the program than the one at
 the project's address (a new version is taking over), the call gets the same
@@ -158,7 +158,10 @@ When a timer fires or a subscription delivers something, the listener holding
 it hands the event straight to the worker of its project, through the same
 door callers use: the worker checks whether the trigger takes work now and
 the trigger's limits, and works out what the run reads. If the trigger is
-parked, it is past its limits, or what the run reads is not ready (its
+down and set to hold what arrives (for those settings, go and read [taking
+triggers down](lifecycles.md#taking-triggers-down-three-questions)), if it is
+past its limits, or if what the run
+reads is not ready (its
 infrastructure is down, its instance has not given a value it needs), the
 event waits in the trigger's queue, and the dispatcher hands it over again
 once it can run. Otherwise the
@@ -202,11 +205,11 @@ your machine none of these four does anything: there is no Cloud Run sending
 calls or starting copies, and weft puts no CPU or memory limit on a worker.
 
 On a cloud install, if a run keeps working after its caller has gone (a Route
-with `outlivesCaller` that replies and carries on), the steps it was running
+with `outlivesCaller` that replies and carries on), the nodes it was running
 when the caller left finish on that copy, and the rest of the run moves under
 a call weft holds open (for how, go and read [how a run is
 kept](../language/triggers-and-routes.md#how-a-run-is-kept)). Cloud Run
-throttles the CPU the moment the answer goes out, so if those last steps are
+throttles the CPU the moment the answer goes out, so if those last nodes are
 heavy, turn on `weft workers set --cpu-always-allocated true`. With it, the
 copy is billed for as long as it is up.
 
@@ -318,7 +321,11 @@ If a piece of background work itself fails on a cloud install, weft books
 it again 1 second later, then 5, then 20. If the fourth try
 fails too, it stops trying and writes the error to `weft status`, under
 `waiting on weft:`. It runs again the next time weft writes work for it,
-and the line goes once a try works. Each failed try still answers Cloud
+and once more each time a copy of its service starts, and the line goes
+once a try works. That last one is for a fresh install, where Google takes
+a minute or two to apply the permissions the install was just given: work
+that failed in that window runs again the next time something wakes the
+service. Each failed try still answers Cloud
 Tasks' call as handled, so the queue does not call it again on its own.
 Cloud Tasks only retries a call whose failure could not even be written
 down, because the database did not answer. On your machine a failed piece
@@ -402,9 +409,12 @@ retried.
 If you want a stopped or given-up trigger back, fix what stopped it and
 register it again. If it was its connection, reconnecting that connection is
 enough: weft brings back every trigger that uses it, the ones that keep a
-connection open included. If it was anything else, a setup error for
-instance, run `weft resync` once it is fixed. `weft activate` does not bring
-it back, because the trigger still counts as on.
+connection open included. If it was anything else (say, a setup error),
+fix the cause and register it again: if `weft status` then shows
+the trigger as behind, `weft resync` does that; if not, run `weft deactivate
+--trigger <name>` and then `weft activate --trigger <name>`. `weft activate`
+alone does not bring it back, even with `--trigger`, because the trigger
+still counts as on.
 
 A trigger that acts as one of your connections keeps that connection's
 credentials for as long as it is registered. If you reconnect the
@@ -448,11 +458,12 @@ free, and asks for a look when how the unit stands changes (a container
 stopped, a check started failing or passing again), and Compute Engine's own
 record of a machine stopping or failing asks too. Once something is not fine,
 the supervisor's next look is booked for the exact moment it needs one, such
-as when a unit that stopped being ready would count as flaky. What the
-supervisor does about an unhealthy unit (restart it, take down the triggers
-that read it) is called a health protocol. If one fails, it is tried again
-after 5 and then 10 seconds. At the third failure the supervisor gives up on
-it and `weft status` lists it under `waiting on weft:`. It tries again once
+as when a unit that stopped being ready would count as flaky. The node's
+health rules decide what the supervisor does about an unhealthy unit; with
+none written, it takes down the triggers that depend on it and brings
+them back once it is healthy again. If a rule's action fails, it is tried
+again after 5 and then 10 seconds. At the third failure the supervisor gives
+up on it and `weft status` lists it under `waiting on weft:`. It tries again once
 the units report a change, once they are all healthy, once you start, stop,
 upgrade or terminate the project's infra, or once you run `weft infra look`.
 
@@ -567,7 +578,7 @@ before it pauses, so a new worker picks it up when the wait ends. That
 exception does not hold while a caller is still on the line and the route
 leaves `outlivesCaller` off, or while a bus between its nodes is open: such a
 run holds its worker instead of pausing. Nobody can
-tell which of a fast run's steps ran after the last row that reached the
+tell which of a fast run's nodes ran after the last row that reached the
 database, and running it again could repeat them, so a fast run whose worker
 died ends cancelled and is not run again, with this reason: `the worker running this run went away; a fast run lives in its
 worker's memory, so it is not run again (make its trigger durable for a run
@@ -613,20 +624,20 @@ first wait would have given up.
 
 In that same check, a durable run whose worker died is queued again, and the
 dispatcher hands it to another worker at once, which carries it on from its
-record. A step that had started but not finished is failed on the new worker
-rather than run again, apart from some steps of pure nodes. For which ones,
-and what to do about a failed step, go and read [surviving a
-restart](../nodes/durable-execution.md#when-the-worker-dies-mid-step).
+record. A node that had started but not finished is failed on the new worker
+rather than run again, apart from some pure nodes. For which ones,
+and what to do about a failed node, go and read [surviving a
+restart](../nodes/durable-execution.md#when-the-worker-dies-mid-run).
 
 On a cloud install, when Cloud Run replaces a worker or scales one away, it
 sends the worker `SIGTERM`, the signal that asks a process to stop on its own,
 and kills it 10 seconds later. Every run on the worker then leaves it if it
 can:
 
-- A run that can pause starts no new step. Once the steps it is running have
+- A run that can pause starts no new node. Once the nodes it is running have
   ended, its record is written whole and it is handed back, so another worker
-  carries it on straight away. A step still running 5 seconds after the
-  `SIGTERM` is stopped where it is, and the next worker fails that step, the
+  carries it on straight away. A node still running 5 seconds after the
+  `SIGTERM` is stopped where it is, and the next worker fails that node, the
   same as if the worker had died. If its caller is still on the line (a route
   with `outlivesCaller` on), the run carries on with nobody there, and the
   caller hears `the copy of the program serving this request is stopping, so
@@ -634,7 +645,7 @@ can:
 - Three kinds of run cannot pause: an unrecorded run, a run tied to the caller
   still on the line (a route without `outlivesCaller`), and a run with a bus
   open, since a bus lives in its worker's memory alone. Each keeps running,
-  starting new steps as usual, until the platform stops the process. If it has
+  starting new nodes as usual, until the platform stops the process. If it has
   not ended by then, that is the same as its worker dying: a fast run ends
   cancelled, and a durable one is carried on by another worker. An unrecorded
   run that nothing had written down yet leaves no trace.

@@ -1,7 +1,7 @@
 # Measuring what a call costs
 
 A node never states a cost. It never totals anything, never carries a running
-figure between steps, and never works out whose spend a call was.
+figure from one call to the next, and never works out whose spend a call was.
 
 A **meter** does that, once per provider, wrapped around the client your node
 already uses. All the care lives in one place so a node author can be careless:
@@ -73,8 +73,8 @@ A credential. It gets a signed side-channel for its own follow-up queries and
 nothing else, which is what lets one meter work identically on a pasted key and
 on a sign-in.
 
-Each record also says whose credential paid. For what each value means and how
-to read one instance's costs, go and read
+Each record also says whose credential paid. For what each value means, go and
+read
 [who paid for a call](../running/instances.md#who-paid-for-a-call).
 
 ## Where the number surfaces
@@ -85,6 +85,114 @@ happens.
 
 This is weft's own record of what it observed, not the provider's bill. They
 should agree, and when they do not, the provider is right.
+
+## Reading it from a program
+
+If your program needs the numbers (to bill somebody, or to stop spending), the
+`InstanceCosts` node reads them for one instance. Give it `instance`, and
+narrow it if you want with `run` (a run id, the one `GetRunId` gives),
+`service`, `node`, `paidBy` (whose credential paid: `platform` for the runtime's
+credit, `author` for your own connection, `instance` for the instance's own) or `since` (unix seconds). It answers with three
+outputs: `records`, one entry per call; `totalUsd`, the
+sum; and `unpricedCalls`, how many of those calls have no known price. `totalUsd` adds up only the known ones, so it is the whole cost
+only when `unpricedCalls` is `0`.
+
+## Capping what one instance spends
+
+weft puts no cap on spending. If you want one, check the total before the paid
+node and gate that node on the answer:
+
+```weft
+question = Route -> (body: { text: String }) { path: "ask", method: "POST" }
+openrouter = OpenRouterAccess
+model = OpenRouterModel { access: openrouter.access, model: "z-ai/glm-5.3" }
+
+ask = Group(text: String, provider: LlmProvider) -> (answer: String) {
+  # Answer only while this instance has spent less than five dollars in all
+  who = CurrentInstance
+  spent = InstanceCosts { instance: who.instance }
+  budget = Switch {
+    value: spent.totalUsd
+    cases: [
+      { "kind": "lt", "value": 5, "port": "underCap" },
+      { "kind": "otherwise", "port": "overCap" }
+    ]
+  }
+
+  answer = LlmInference {
+    _should_flow: budget.underCap
+    prompt: self.text
+    provider: self.provider
+  }
+  self.answer = answer.response
+
+  refuse = Close {
+    _should_flow: budget.overCap
+    status: 402
+    reason: "the budget is spent"
+  }
+}
+ask._should_flow = question.fired
+ask.text = question.body.text
+ask.provider = model.provider
+
+reply = Reply { body: ask.answer }
+```
+
+Each caller sends its instance token (minted with `weft token mint
+--instance`) in the `Weft-Instance-Token` header. A
+call without one is for no instance, so `who` fires `nobody`, which nothing
+here is wired to: the run ends without answering, and the caller gets a `500`
+saying `Something went wrong`. If you want a clear refusal instead, gate a
+`Close` on `who.nobody`. For the other ways a call becomes an
+instance's, go and read [programs with instances](../running/instances.md).
+
+The check can let a little through. A call's cost is written down when its
+answer ends, and a job the provider runs in the background is written down
+when a read of the job says it finished. So a call still going is not in the total
+yet. And two runs of the same instance that check at the same moment both see
+the same total, both pass, and together can go over.
+
+## A provider that states no price
+
+ElevenLabs is the example today. Its image and video generations (`flows/image`, `flows/video`) come
+back with no cost in any answer. weft prices them from the request instead:
+the model, the settings that change its price, and how many images or seconds
+of video it asks for. That is what ElevenLabs bills these by, so the request
+holds the whole bill. The rates are ElevenLabs' own pricing table, captured by
+hand on 2026-10-16 for the account tier `grant_tier_2_2025_07_23`. If
+ElevenLabs changes its prices, the rates to update are in
+`crates/weft-providers/src/providers/elevenlabs_prices.json`.
+
+| Model | What moves the price | At its defaults |
+|---|---|---|
+| `gemini-2.5-flash-image` | Nothing | 4.98¢ per image |
+| `gemini-3-pro-image` | `resolution` (default `1K`) | 24.12¢ per image |
+| `gemini-3.1-flash-image` | `resolution` (default `1K`) | 8.04¢ per image |
+| `gemini-3.1-flash-lite-image` | `resolution` (default `1K`) | 4.08¢ per image |
+| `bytedance-seedream-5-lite` | Nothing | 4.2¢ per image |
+| `bytedance-seedream-5-pro` | `resolution` (default `2K`) | 16.2¢ per image |
+| `gpt-image-1` | `quality` (default `medium`), `aspect_ratio` (default `1:1`) | 6.84¢ per image |
+| `gpt-image-1.5` | `quality` (default `medium`), `aspect_ratio` (default `1:1`) | 5.88¢ per image |
+| `gpt-image-2` | `quality` (default `medium`) | 6.48¢ per image |
+| `gpt-image-2.5-sunburst`, `gpt-image-2.5-flare` | `quality` (default `high`) | 6.68¢ per image |
+| `veo-3.1-generate-001` | `resolution` (only `4K` changes it, default `720p`), `generate_audio` (default on) | 48¢ per second |
+| `veo-3.1-fast-generate-001` | the same | 18¢ per second |
+| `bytedance-seedance-v2` | `resolution` (default `720p`), `aspect_ratio` (default `16:9`) | 36.29¢ per second |
+| `bytedance-seedance-v2-fast` | the same | 29.04¢ per second |
+| `bytedance-seedance-v2-mini` | the same | 18.14¢ per second |
+| `bytedance-seedance-v2.5` | the same, except that with a `start_frame` the frame decides the aspect, and the table has no rate for that | 55.46¢ per second |
+
+A video costs its rate times `duration_secs`, which is 8 by default on Veo and
+5 on Seedance.
+
+Any other model, a setting the table has no rate for, or a video whose length
+the request does not say (a lip-sync video lasts as long as its audio) is
+written down as an unknown price, never at the nearest rate. Starting a
+generation only queues it, and ElevenLabs does not charge for one that fails.
+So the price is written down when your node reads the job back and finds it
+`completed`, and a `failed` one is written down at $0. If the run ends before
+the job is read back, its price is written down as unknown.
 
 ## Writing one
 

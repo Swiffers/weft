@@ -118,7 +118,7 @@ impl FormSchema {
         }
         match crate::storage::FileHandle::from_value(value).map_err(|e| e.to_string())? {
             crate::storage::FileHandle::Url { .. } => Ok(None),
-            crate::storage::FileHandle::Key(_) => crate::storage::StoredFile::from_value(value)
+            crate::storage::FileHandle::Key { .. } => crate::storage::StoredFile::from_value(value)
                 .map(Some)
                 .map_err(|e| format!("form field '{field_key}' carries an unreadable file: {e}")),
         }
@@ -143,16 +143,17 @@ fn is_file_marker(value: &Value) -> bool {
 fn consumer_file_value(value: &Value) -> Result<Value, String> {
     if is_file_marker(value) {
         return match crate::storage::FileHandle::from_value(value).map_err(|e| e.to_string())? {
-            // SYNC: the four consumer file keys <-> crates/weft-dispatcher/src/api/signal.rs (SignalFileLink), extension-browser/src/lib/api.ts (TaskFileLink, isStoredFileValue)
+            // SYNC: the consumer file keys <-> crates/weft-dispatcher/src/api/signal.rs (SignalFileLink), extension-browser/src/lib/api.ts (TaskFileLink, isStoredFileValue)
             crate::storage::FileHandle::Url { url, mime_type, filename, size_bytes } => {
                 Ok(serde_json::json!({
                     "url": url,
+                    "public": true,
                     "mimeType": mime_type,
                     "sizeBytes": size_bytes,
                     "filename": filename,
                 }))
             }
-            crate::storage::FileHandle::Key(_) => {
+            crate::storage::FileHandle::Key { .. } => {
                 let file = crate::storage::StoredFile::from_value(value).map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({
                     "mimeType": file.mime_type,
@@ -304,7 +305,7 @@ mod consumer_tests {
         let schema = FormSchema { fields: vec![field("pic", stored), field("web", remote), field("note", json!("plain"))] };
         let shown = schema.for_consumer().expect("every value reads");
         assert_eq!(shown.fields[0].value, Some(json!({ "mimeType": "image/png", "sizeBytes": 7, "filename": "cat.png" })));
-        assert_eq!(shown.fields[1].value, Some(json!({ "url": "https://x/cat.png", "mimeType": "image/png", "sizeBytes": 9, "filename": "cat.png" })));
+        assert_eq!(shown.fields[1].value, Some(json!({ "url": "https://x/cat.png", "public": true, "mimeType": "image/png", "sizeBytes": 9, "filename": "cat.png" })));
         assert_eq!(shown.fields[2].value, Some(json!("plain")));
         assert_eq!(
             schema.stored_file("pic").unwrap().map(|f| f.key),

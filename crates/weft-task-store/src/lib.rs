@@ -52,9 +52,9 @@ pub mod worker_door;
 pub use schema_guard::{apply_groups, Migration, SchemaGroup};
 
 pub use executor::{dispatcher_picker_loop, TaskExecutor, TaskRegistry};
-pub use kinds::{FireSignalPayload, ResyncPayload, RunNodeTestPayload, StopTaggedPayload, TaskKind, WithdrawSignalPayload};
+pub use kinds::{FireSignalPayload, RemovalWaitPayload, ResyncPayload, RunNodeTestPayload, StopTaggedPayload, TakeDownWaitPayload, TaskKind, WithdrawSignalPayload};
 pub use tasks::{
     claim_duration_secs, claim_heartbeat_interval, claim_next, complete, enqueue, enqueue_dedup, fail, heartbeat, Claim,
     DedupOutcome, NewTask, Task, TaskOutcome, TaskStatus, TERMINAL_RETENTION_SECS,
 };
-pub use traits::{InfraReader, PostgresInfraReader, PostgresTaskStoreClient, TaskStoreClient};
+pub use traits::{InfraReader, PostgresInfraReader, PostgresTaskStoreClient, StoredEndpoint, TaskStoreClient};

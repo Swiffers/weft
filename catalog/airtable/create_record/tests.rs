@@ -103,12 +103,12 @@ async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
 
 async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     refuse_the_record(&rig);
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let outcome = rig
         .run(&AirtableCreateRecordNode, record_inputs(&rig, "tblTable1"))
         .await
         .ok()?;
-    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    let error = outcome.output("_error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("Unknown field name"), "{error}");
     for port in ["recordId", "record"] {
         assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");
@@ -117,9 +117,9 @@ async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
 }
 
 /// A table id with a `/` is a mistake in the program, never a value
-/// for `error`.
+/// for `_error`.
 async fn bad_id_wired(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
+    rig.wire_output("_error");
     let err = rig
         .run(&AirtableCreateRecordNode, record_inputs(&rig, "tbl/../x"))
         .await

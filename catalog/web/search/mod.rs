@@ -1,12 +1,16 @@
 //! WebSearch: search the web through Exa (semantic + keyword,
 //! auto-picked per query) and emit results with their page text, the
-//! shape an LLM step consumes directly.
+//! shape an LLM node consumes directly.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftError, WeftResult};
+
+use weft::storage::MAX_WIRE_VALUE_BYTES;
+
+use super::wire::fit_texts;
 
 #[cfg(feature = "node-tests")]
 mod tests;
@@ -21,7 +25,7 @@ impl Node for WebSearchNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let query: String = ctx.inputs.get("query")?;
         let num_results: f64 = ctx.inputs.get("numResults")?;
@@ -39,7 +43,17 @@ impl Node for WebSearchNode {
             // emitted results carry a bounded amount of text whatever
             // the pages weigh: a wire carries at most 100 KB, and ten
             // long articles uncapped would fail the run on a day the
-            // news happened to be long.
+            // news happened to be long. Settings whose texts could not
+            // fit even one byte a character are refused before the paid
+            // search.
+            if num_results * max_text_chars > MAX_WIRE_VALUE_BYTES as f64 {
+                return Err(WeftError::Input(format!(
+                    "`numResults` {num_results} times `maxTextChars` {max_text_chars} is more text than the {} KB \
+                     a wire carries; lower one of them so the two multiplied are at most {}",
+                    MAX_WIRE_VALUE_BYTES / 1024,
+                    MAX_WIRE_VALUE_BYTES
+                )));
+            }
             body["contents"] = json!({ "text": { "maxCharacters": max_text_chars as u64 } });
         }
         if !domains.is_empty() {
@@ -55,7 +69,7 @@ impl Node for WebSearchNode {
         )
         .await?;
 
-        let results: Vec<Value> = answer["results"]
+        let mut results: Vec<Value> = answer["results"]
             .as_array()
             .into_iter()
             .flatten()
@@ -68,6 +82,15 @@ impl Node for WebSearchNode {
                 })
             })
             .collect();
+        // A page text of a script that takes several bytes a character
+        // weighs more than its count of characters: the longest texts
+        // are shortened further until the results fit a wire.
+        fit_texts(&mut results, "text").map_err(|fixed| {
+            weft::node_error(format!(
+                "the results weigh {} without any page text; lower `numResults`",
+                weft::storage::wire_weight_said(fixed)
+            ))
+        })?;
         let count = results.len() as f64;
         ctx.pulse_downstream(
             NodeOutput::new().set("results", json!(results)).set("count", count),

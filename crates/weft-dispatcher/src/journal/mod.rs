@@ -17,16 +17,17 @@ pub mod fake;
 pub use fake::FakeJournal;
 
 use weft_core::signal_token::TokenKind;
-use weft_journal::ExecEvent;
+use weft_journal::RunEvent;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft_core::program::{ExecutionPage, ExecutionSummary};
-use weft_core::ExecutionId;
+use weft_core::program::{RunPage, RunSummary};
+use weft_core::RunId;
 
 /// A successful setup, independent of whether its listeners are armed.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TriggerBake {
     pub project_id: uuid::Uuid,
     /// Whose triggers these are: the setup run's instance, `None` for the
@@ -35,7 +36,7 @@ pub struct TriggerBake {
     pub instance: Option<weft_core::instance::InstanceId>,
     pub source_version: String,
     pub program: weft_core::project::hash::ProgramIdentity,
-    pub execution_id: ExecutionId,
+    pub run_id: RunId,
     pub captured: std::collections::BTreeMap<String, TriggerCapture>,
     /// The triggers this setup set out to capture (spelled). A setup of
     /// some triggers replaces what an earlier one captured for THOSE (one
@@ -71,7 +72,7 @@ impl TriggerBake {
 
     pub fn summary(&self) -> weft_core::run_spec::BakeSummary {
         weft_core::run_spec::BakeSummary { program: self.program.clone(), captured: self.captured.keys().cloned().collect(),
-            execution_id: self.execution_id, at_unix: self.at_unix }
+            run_id: self.run_id, at_unix: self.at_unix }
     }
 
     /// Only a successful setup can replace saved settings. A closed group gate
@@ -79,31 +80,33 @@ impl TriggerBake {
     /// `program` is the setup's program identity, read from the project's
     /// stored code for the binary its birth names
     /// (`ProjectStore::program_identity`): the birth carries only the two
-    /// hashes, which must be this identity's.
-    pub fn from_events(events: &[ExecEvent], program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<Option<Self>> {
-        let Some(ExecEvent::ExecutionStarted { execution_id, project_id, binary_hash, definition_hash, source_version: Some(source_version),
+    /// hashes, which must be this identity's (a setup runs a cut of the
+    /// program, so its program is the one it was cut from).
+    pub fn from_events(events: &[RunEvent], program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<Option<Self>> {
+        let Some(RunEvent::RunStarted { run_id, project_id, binary_hash, definition_hash, cut_from, source_version: Some(source_version),
             phase: weft_core::context::Phase::TriggerSetup, instance, .. }) = events.first() else {
             anyhow::bail!("trigger setup has no original program or source identity");
         };
-        anyhow::ensure!(definition_hash.as_ref() == Some(&program.definition_hash) && binary_hash.as_ref() == Some(&program.binary_hash),
-            "trigger setup {execution_id} has conflicting program identities");
-        anyhow::ensure!(events.iter().all(|event| event.execution_id() == *execution_id),
-            "trigger setup {execution_id} contains another run's history");
-        let Some(terminal) = events.iter().find(|event| event.is_execution_terminal()) else {
-            anyhow::bail!("trigger setup {execution_id} has not finished");
+        let registered = cut_from.as_ref().or(definition_hash.as_ref());
+        anyhow::ensure!(registered == Some(&program.definition_hash) && binary_hash.as_ref() == Some(&program.binary_hash),
+            "trigger setup {run_id} has conflicting program identities");
+        anyhow::ensure!(events.iter().all(|event| event.run_id() == *run_id),
+            "trigger setup {run_id} contains another run's history");
+        let Some(terminal) = events.iter().find(|event| event.is_run_terminal()) else {
+            anyhow::bail!("trigger setup {run_id} has not finished");
         };
-        let ExecEvent::ExecutionCompleted { at_unix, .. } = terminal else { return Ok(None); };
+        let RunEvent::RunCompleted { at_unix, .. } = terminal else { return Ok(None); };
         let mut captured = std::collections::BTreeMap::new();
-        for event in events.iter().take_while(|event| !event.is_execution_terminal()) {
-            if let ExecEvent::TriggerCaptured { execution_id: captured_execution_id, node_id, spec, port_snapshot, .. } = event {
-                anyhow::ensure!(captured_execution_id == execution_id && port_snapshot.is_object(), "invalid trigger capture in setup {execution_id}");
+        for event in events.iter().take_while(|event| !event.is_run_terminal()) {
+            if let RunEvent::TriggerCaptured { run_id: captured_run_id, node_id, spec, port_snapshot, .. } = event {
+                anyhow::ensure!(captured_run_id == run_id && port_snapshot.is_object(), "invalid trigger capture in setup {run_id}");
                 weft_core::signal::validate_spec(spec).map_err(anyhow::Error::msg)?;
                 anyhow::ensure!(captured.insert(node_id.clone(), TriggerCapture {
                     spec: spec.clone(), ports: port_snapshot.clone(),
-                }).is_none(), "trigger '{node_id}' captured twice in setup {execution_id}");
+                }).is_none(), "trigger '{node_id}' captured twice in setup {run_id}");
             }
         }
-        Ok(Some(Self { project_id: *project_id, instance: instance.clone(), program: program.clone(), execution_id: *execution_id,
+        Ok(Some(Self { project_id: *project_id, instance: instance.clone(), program: program.clone(), run_id: *run_id,
             source_version: source_version.clone(),
             captured, targets: Default::default(), at_unix: *at_unix }))
     }
@@ -111,11 +114,11 @@ impl TriggerBake {
 
 #[async_trait]
 pub trait Journal: Send + Sync {
-    async fn is_trigger_setup_pending(&self, execution_id: ExecutionId) -> anyhow::Result<bool>;
+    async fn is_trigger_setup_pending(&self, run_id: RunId) -> anyhow::Result<bool>;
 
     /// Publish one complete setup and release its birth-time ownership atomically.
     /// A failed/cancelled setup releases ownership without replacing any bake.
-    async fn finish_trigger_setup(&self, execution_id: ExecutionId, bake: Option<&TriggerBake>) -> anyhow::Result<()>;
+    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&TriggerBake>) -> anyhow::Result<()>;
 
     /// The bakes of one owner's triggers: the shared ones for `None`, an
     /// instance's for `Some`.
@@ -123,7 +126,7 @@ pub trait Journal: Send + Sync {
 
     // ----- The record -------------------------------------------------
 
-    /// Write `events` into the record of `execution_id`, a run nobody
+    /// Write `events` into the record of `run_id`, a run nobody
     /// drives, after its last row, and move it as `then` says (an ending
     /// in `events` ends it). Its row is locked for the write, the one
     /// serialization point of a run every writer but its owner goes
@@ -132,8 +135,8 @@ pub trait Journal: Send + Sync {
     /// (`weft_journal::record::Appended`).
     async fn append(
         &self,
-        execution_id: ExecutionId,
-        events: &[ExecEvent],
+        run_id: RunId,
+        events: &[RunEvent],
         then: weft_journal::record::Then,
     ) -> anyhow::Result<weft_journal::record::Appended>;
 
@@ -143,15 +146,15 @@ pub trait Journal: Send + Sync {
     /// one required read; [`Journal::events_log`] is derived from it.
     async fn events_log_lossy(
         &self,
-        execution_id: ExecutionId,
-    ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<ExecEvent>>, Vec<String>)>;
+        run_id: RunId,
+    ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<RunEvent>>, Vec<String>)>;
 
     /// The same record for STATE-REBUILDING (a cancel's per-node rows, a
     /// setup's bake): a row that no longer decodes fails the WHOLE read,
     /// naming the run and `weft clean`, because a fold over a partial
     /// record rebuilds a state that never existed.
-    async fn events_log(&self, execution_id: ExecutionId) -> anyhow::Result<Vec<ExecEvent>> {
-        let (events, bad) = self.events_log_lossy(execution_id).await?;
+    async fn events_log(&self, run_id: RunId) -> anyhow::Result<Vec<RunEvent>> {
+        let (events, bad) = self.events_log_lossy(run_id).await?;
         match bad.into_iter().next() {
             Some(reason) => Err(anyhow::Error::msg(reason)),
             None => Ok(events.into_iter().map(|record| record.event).collect()),
@@ -159,7 +162,7 @@ pub trait Journal: Send + Sync {
     }
 
     /// Queue a run the dispatcher starts (`weft run`, a setup run) for a
-    /// worker to claim: its row, its record's first row, its selection and
+    /// worker to claim: its row, its record's first row, its cut program and
     /// its version count, and delivery woken, in one transaction. A trigger
     /// setup is recorded as in flight, and one an activation asked for
     /// (`for_activation`: the activation is the setup's own run) is queued
@@ -173,7 +176,7 @@ pub trait Journal: Send + Sync {
     /// (`run.cancel_requested`, announced to its worker on `weft_cancel`
     /// in the same transaction), and its worker writes its ending. A run
     /// nobody drives (parked, queued) is ended here: `NodeCancelled` per
-    /// open node, then `ExecutionCancelled`, after its last row. A run that
+    /// open node, then `RunCancelled`, after its last row. A run that
     /// ended already, or that has no row, only loses its signals.
     ///
     /// The listener still holds the stripped signals in RAM: the caller
@@ -181,25 +184,27 @@ pub trait Journal: Send + Sync {
     /// `program` is the run's definition (the per-node cancels come off
     /// the fold); `None` for a run with no program, which has no nodes to
     /// cancel.
-    async fn cancel_execution(
+    async fn cancel_run(
         &self,
-        execution_id: ExecutionId,
+        run_id: RunId,
         program: Option<&weft_core::ProjectDefinition>,
-        cause: &weft_core::exec::CancelCause,
+        cause: &weft_core::run::CancelCause,
     ) -> anyhow::Result<CancelWrite>;
 
-    /// Let go of `execution_id` when it is running and its owner stopped
+    /// Let go of `run_id` when it is running and its owner stopped
     /// holding it (`weft_task_store::run_held_until_sql!`) before
     /// `lapsed_before` (unix seconds): its owner is cleared
     /// and its epoch raised, so a late batch from the old owner is
-    /// refused. A durable run is queued again, carried on from its record
-    /// by the next worker that claims it; a fast run lived in its worker's
-    /// memory and ends, cancelled for `CancelCause::fast_run_lost`, its
-    /// per-node cancels folded with `program`. All under the run's row
-    /// lock, in one transaction.
+    /// refused. A run asked to stop (`run.cancel_requested`) ends here,
+    /// cancelled for what asked, its per-node cancels folded with
+    /// `program`. Otherwise a durable run is queued again, carried on from
+    /// its record by the next worker that claims it; a fast run lived in
+    /// its worker's memory and ends, cancelled for
+    /// `CancelCause::fast_run_lost`, folded the same way. All under the
+    /// run's row lock, in one transaction.
     async fn let_go_of_lost(
         &self,
-        execution_id: ExecutionId,
+        run_id: RunId,
         lapsed_before: i64,
         program: Option<&weft_core::ProjectDefinition>,
     ) -> anyhow::Result<Lost>;
@@ -248,7 +253,7 @@ pub trait Journal: Send + Sync {
     /// Who a run belongs to, read from its `run` row: every field in one
     /// lookup, because they are one fact about one row and reading them
     /// apart is how they drift. `None` if the run is unknown.
-    async fn execution_owner(&self, execution_id: ExecutionId) -> anyhow::Result<Option<ExecutionOwner>>;
+    async fn run_owner(&self, run_id: RunId) -> anyhow::Result<Option<RunOwner>>;
 
     /// The LAST `limit` log lines of a run, oldest first: every event
     /// `LogEntry::from_event` projects (node log lines and the failures
@@ -259,40 +264,40 @@ pub trait Journal: Send + Sync {
     /// `events_log_lossy`: a row that no longer decodes is an `error` line
     /// naming it and `weft clean` (`LogEntry::corrupt_row`), so the lines
     /// that survive still read.
-    async fn logs_for(&self, execution_id: ExecutionId, limit: u32) -> anyhow::Result<Vec<LogEntry>>;
+    async fn logs_for(&self, run_id: RunId, limit: u32) -> anyhow::Result<Vec<LogEntry>>;
 
     /// A page of `tenant`'s runs, newest first, matching `query`'s filters
     /// with limit/offset paging, plus the total matching count. Scoping is
     /// in the query (`run.tenant_id`), so one tenant never sees another's
     /// runs or their count; every filter stays inside that wall.
-    async fn list_executions(
+    async fn list_runs(
         &self,
         tenant: &str,
-        query: &ExecutionQuery,
-    ) -> anyhow::Result<ExecutionPage>;
+        query: &RunListQuery,
+    ) -> anyhow::Result<RunPage>;
 
     /// The summary of one run, from its row. `None` for an unknown run.
     /// The caller authorizes the run against the tenant separately; this
     /// is the pure read.
-    async fn execution_summary(
+    async fn run_summary(
         &self,
-        execution_id: ExecutionId,
-    ) -> anyhow::Result<Option<ExecutionSummary>>;
+        run_id: RunId,
+    ) -> anyhow::Result<Option<RunSummary>>;
 
-    /// The summaries of `execution_ids`, by id, in ONE read: what `weft
+    /// The summaries of `run_ids`, by id, in ONE read: what `weft
     /// tree` and the editor's version sidebar read a status per run started
     /// by hand from. A run not on record is left out.
-    async fn execution_summaries(
+    async fn run_summaries(
         &self,
-        execution_ids: &[ExecutionId],
-    ) -> anyhow::Result<std::collections::HashMap<ExecutionId, ExecutionSummary>>;
+        run_ids: &[RunId],
+    ) -> anyhow::Result<std::collections::HashMap<RunId, RunSummary>>;
 
-    /// Every execution of `tenant`'s that starts with `prefix`
+    /// Every run of `tenant`'s that starts with `prefix`
     /// (the first characters of a uuid, as a person types them). At most
     /// two come back: the caller only needs to know whether the prefix
-    /// names one execution, none, or several. Node-test executions never
+    /// names one run, none, or several. Node-test runs never
     /// match, the way they never list.
-    async fn execution_ids_with_prefix(&self, tenant: &str, prefix: &str) -> anyhow::Result<Vec<ExecutionId>>;
+    async fn run_ids_with_prefix(&self, tenant: &str, prefix: &str) -> anyhow::Result<Vec<RunId>>;
 
     /// Every run of `project_id` going right now (queued for a worker, or
     /// being driven), each with its phase (a run, or the setup an `infra
@@ -304,28 +309,28 @@ pub trait Journal: Send + Sync {
     /// editor's action bar follows "the latest run" and the wire
     /// carries no other way to tell which that is, so the order is part
     /// of the contract rather than an accident of the query. Ties break
-    /// on the execution, so the answer is stable across calls.
-    async fn going_execution_ids_for_project(
+    /// on the run, so the answer is stable across calls.
+    async fn going_run_ids_for_project(
         &self,
         project_id: uuid::Uuid,
-    ) -> anyhow::Result<Vec<(ExecutionId, weft_core::context::Phase)>>;
+    ) -> anyhow::Result<Vec<(RunId, weft_core::context::Phase)>>;
 
     /// Every run of `project_id` that ended or is parked on a wait: the
     /// runs that write nothing until something answers them.
-    async fn settled_execution_ids_for_project(
+    async fn settled_run_ids_for_project(
         &self,
         project_id: uuid::Uuid,
-    ) -> anyhow::Result<std::collections::HashSet<ExecutionId>>;
+    ) -> anyhow::Result<std::collections::HashSet<RunId>>;
 
     /// Every live run of `project_id` carrying `tag`, with the sequence its
     /// tag row got, oldest tag first. The read behind `ctx.stop_tagged`; the ordering and
     /// self rules are applied on top by the pure
     /// `weft_journal::tags::select_stop_targets`.
-    async fn live_tagged_executions(
+    async fn live_tagged_runs(
         &self,
         project_id: uuid::Uuid,
         tag: &str,
-    ) -> anyhow::Result<Vec<weft_journal::tags::TaggedExecution>>;
+    ) -> anyhow::Result<Vec<weft_journal::tags::TaggedRun>>;
 
     // ----- Signal registry (durable replacement for in-RAM tracker) ----
 
@@ -374,20 +379,20 @@ pub trait Journal: Send + Sync {
         tokens: &[String],
     ) -> anyhow::Result<Vec<SignalRegistration>>;
 
-    /// Delete the wait `token` of run `execution_id`, given up by its run,
+    /// Delete the wait `token` of run `run_id`, given up by its run,
     /// and return it for the listener to let go of. A token that is no
     /// wait of that run (an entry trigger, another run's wait, a wait
     /// already answered) is left alone: `None`.
-    async fn signal_withdraw(&self, execution_id: ExecutionId, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
+    async fn signal_withdraw(&self, run_id: RunId, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
 
-    /// The RESUME registrations of one execution: what that execution is
+    /// The RESUME registrations of one run: what that run is
     /// parked on.
     ///
     /// Every poll of a parked run and every `weft wake` asks this. Asked
     /// as "every signal of the project, then filter", it read every
     /// registration the project has, with its kind state, its port
     /// snapshot and its consumer payload, to answer with three fields.
-    async fn signal_list_for_execution_id(&self, execution_id: ExecutionId) -> anyhow::Result<Vec<SignalRegistration>>;
+    async fn signal_list_for_run_id(&self, run_id: RunId) -> anyhow::Result<Vec<SignalRegistration>>;
 
     /// All signals currently registered for a project.
     async fn signal_list_for_project(
@@ -395,15 +400,17 @@ pub trait Journal: Send + Sync {
         project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<SignalRegistration>>;
 
-    /// All signals tied to one execution (resume signals).
-    /// Used on cancel to unregister everything that was waiting.
-    async fn signal_remove_for_execution_id(
+    /// Take every signal tied to one run (its waits) down, for the
+    /// listener to let go of; a run that ended cancelled has each wait's
+    /// last call queued with them, as `cancel_run` does. Used once a run
+    /// that held waits has ended.
+    async fn signal_remove_for_run_id(
         &self,
-        execution_id: ExecutionId,
+        run_id: RunId,
     ) -> anyhow::Result<Vec<SignalRegistration>>;
 
     /// All signals tied to a project. Used by deactivate sweeps
-    /// after execution-by-execution cancel has run.
+    /// after run-by-run cancel has run.
     async fn signal_remove_for_project(
         &self,
         project_id: uuid::Uuid,
@@ -417,7 +424,7 @@ pub trait Journal: Send + Sync {
     /// with it: a listener process still holds each one in RAM and keeps
     /// answering for a run that no longer exists until the caller
     /// unregisters it there (`unregister_many`), the way a cancel does.
-    async fn delete_execution(&self, execution_id: ExecutionId) -> anyhow::Result<Vec<SignalRegistration>>;
+    async fn delete_run(&self, run_id: RunId) -> anyhow::Result<Vec<SignalRegistration>>;
 
     /// Erase up to `limit` ended runs whose time to be kept ran out before
     /// `now` (unix seconds), oldest first, with everything of theirs (the
@@ -446,15 +453,15 @@ pub struct SignalRegistration {
     pub activation_trigger: Option<String>,
     pub source_version: Option<String>,
     /// Setup whose completed capture armed this entry; absent for suspensions.
-    pub setup_execution_id: Option<ExecutionId>,
+    pub setup_run_id: Option<RunId>,
     /// The code armed with these settings. Rebaking cannot retarget a listener.
     pub program: Option<weft_core::project::hash::ProgramIdentity>,
     pub token: String,
     pub tenant_id: String,
     pub project_id: uuid::Uuid,
-    /// `Some(execution_id)` for resume (suspension) signals; `None` for
+    /// `Some(run_id)` for resume (suspension) signals; `None` for
     /// entry signals registered during trigger setup.
-    pub execution_id: Option<ExecutionId>,
+    pub run_id: Option<RunId>,
     /// The PLACE this registration was made at, spelled the way a
     /// person writes the node: `door`, or `one.door` for the `door`
     /// inside the file the site `one` includes. A file called from two
@@ -558,15 +565,35 @@ impl SignalRegistration {
         serde_json::from_str(&self.spec_json).map_err(|e| anyhow::anyhow!("signal {} spec: {e}", self.token))
     }
 
-    /// Compute the public URL for this signal given a dispatcher base
-    /// URL. The route depends on the surface AND, for public entries,
+    /// The last call this wait sends now that its run was cancelled
+    /// (`weft_core::signal::cancel_call`), ready for the listener, or
+    /// `None` when it carries none. `Err` when its spec cannot be read, so
+    /// whether it carries one is unknown.
+    pub fn cancel_call(&self) -> anyhow::Result<Option<weft_core::signal::listener_protocol::CancelCallRequest>> {
+        let spec = self.spec()?;
+        if spec.on_cancel.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(weft_core::signal::listener_protocol::CancelCallRequest {
+            token: self.token.clone(),
+            tenant_id: self.tenant_id.clone(),
+            for_instance: self
+                .instance
+                .clone()
+                .map(|instance| weft_core::instance::InstanceScope { project_id: self.project_id, instance }),
+            spec,
+        }))
+    }
+
+    /// The path, on the install's outside base, a caller reaches this
+    /// signal at ([`crate::state::ExternalBase::url`] puts it on the
+    /// base). The route depends on the surface AND, for public entries,
     /// whether it is a LIVE connection (served only at `/connect/...`,
-    /// which starts an execution and hands the caller to the gateway)
+    /// which starts a run and hands the caller to the gateway)
     /// or a plain public fire (served at the bare `/<mount_path>`
-    /// catch-all). TaskCallback → `<base>/signal/<token>`. Returns None
+    /// catch-all). TaskCallback → `/signal/<token>`. Returns None
     /// for surface kinds with no public URL.
-    pub fn public_url(&self, dispatcher_base: &str) -> Option<String> {
-        let base = dispatcher_base.trim_end_matches('/');
+    pub fn public_path(&self) -> Option<String> {
         match self.surface_kind.as_str() {
             "public_entry" => {
                 let path = self.mount_path.as_deref().unwrap_or("");
@@ -597,13 +624,9 @@ impl SignalRegistration {
                     }
                 };
                 let prefix = if is_live { "connect/" } else { "" };
-                if path.is_empty() {
-                    Some(format!("{base}/{prefix}"))
-                } else {
-                    Some(format!("{base}/{prefix}{path}"))
-                }
+                Some(format!("/{prefix}{path}"))
             }
-            "task_callback" => Some(format!("{base}/signal/{}", self.token)),
+            "task_callback" => Some(format!("/signal/{}", self.token)),
             _ => None,
         }
     }
@@ -622,7 +645,7 @@ impl SignalRegistration {
 /// project id rides along for attribution (which project's event stream
 /// a replay belongs on) and may name a project that no longer exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecutionOwner {
+pub struct RunOwner {
     pub project_id: uuid::Uuid,
     pub tenant: String,
     /// Who the run is for (`run.instance_id`).
@@ -637,11 +660,23 @@ pub struct ExecutionOwner {
     /// hash, which may have moved since). `None` for a run of no program
     /// (a node test).
     pub definition_hash: Option<String>,
+    /// The registered program it was cut from (`run.cut_from`), for a run
+    /// of a cut: [`Self::registered_hash`].
+    pub cut_from: Option<String>,
     /// The worker binary it runs on (`run.binary_hash`); `None` for a run
     /// of no program.
     pub binary_hash: Option<String>,
     /// The version of the project's source it ran (`run.source_version`).
     pub source_version: Option<String>,
+}
+
+impl RunOwner {
+    /// The registered program the run's program is: the one it was cut
+    /// from, or its own. What its triggers arm and its results are held
+    /// against. `None` for a run of no program.
+    pub fn registered_hash(&self) -> Option<&String> {
+        self.cut_from.as_ref().or(self.definition_hash.as_ref())
+    }
 }
 
 /// What became of an answer to a wait (`Journal::answer`).
@@ -664,11 +699,11 @@ pub enum Lost {
     NotLost,
     /// A durable run, queued again.
     Requeued,
-    /// A fast run, ended.
+    /// A fast run, or one asked to stop, ended.
     Ended,
 }
 
-/// What `Journal::cancel_execution` committed.
+/// What `Journal::cancel_run` committed.
 #[derive(Debug, Default)]
 pub struct CancelWrite {
     /// The wake signals stripped, for the listener's in-RAM unregister.
@@ -679,27 +714,30 @@ pub struct CancelWrite {
     /// The run nobody drove was ended here, with this many per-node cancel
     /// rows; `None` when nothing was ended here.
     pub node_cancellations: Option<usize>,
+    /// How many of `removed` carried a last call, queued for the listener
+    /// to send in the same commit (`weft_task_store::TaskKind::CancelCall`).
+    pub cancel_calls: usize,
 }
 
-/// The query for a page of a tenant's executions: pagination plus optional
+/// The query for a page of a tenant's runs: pagination plus optional
 /// filters. `project_id` narrows to one project; `started_after`/`started_before`
 /// (unix seconds, inclusive/exclusive respectively) narrow by start time so the
-/// website can retrieve executions around a specific date. Filtering + paging
+/// website can retrieve runs around a specific date. Filtering + paging
 /// happen in SQL so a tenant with a huge history never truncates blindly; every
 /// filter stays inside the tenant wall.
 #[derive(Debug, Clone, Default)]
-pub struct ExecutionQuery {
+pub struct RunListQuery {
     pub limit: u32,
     pub offset: u32,
     pub project_id: Option<uuid::Uuid>,
     pub started_after: Option<u64>,
     pub started_before: Option<u64>,
-    /// Only runs of this phase (the `execution.phase` column):
+    /// Only runs of this phase (the `run.phase` column):
     /// `Fire` hides the activate / resync / infra-start runs so a
     /// listing answers "what did my triggers actually do".
     pub phase: Option<weft_core::context::Phase>,
     /// Only runs whose ENTRY NODE is this one: the node whose firing
-    /// started the run, as the `execution_started` event recorded it.
+    /// started the run, as the `run_started` event recorded it.
     /// The filter that lets a person find their own run in a project
     /// that is answering thousands: everything else about a run
     /// (project, phase, when) is shared by every run beside it.
@@ -709,7 +747,7 @@ pub struct ExecutionQuery {
     pub status: Option<weft_core::program::RunStatus>,
     /// Only runs for this instance.
     pub instance: Option<weft_core::instance::InstanceId>,
-    /// Only runs carrying this tag (`ctx.tag_execution`).
+    /// Only runs carrying this tag (`ctx.tag_run`).
     pub tag: Option<String>,
     /// Only finished runs in which this node fired (it started at least
     /// once), spelled the way the record names it, once their search entry
@@ -720,11 +758,11 @@ pub struct ExecutionQuery {
     /// (`crate::search_index`).
     pub search: Option<String>,
     /// Keyset cursor: only runs strictly after this `(started_at,
-    /// execution)` in the listing's order (newest first, then execution
+    /// run)` in the listing's order (newest first, then run
     /// descending). A walk that hands each page's last run back here
     /// reaches every run exactly once, whatever it deletes or changes
     /// behind itself. `total` ignores it.
-    pub below: Option<(u64, ExecutionId)>,
+    pub below: Option<(u64, RunId)>,
 }
 
 /// A hashed bearer credential. A `Caller` token is used by external
@@ -829,7 +867,7 @@ impl SignalToken {
 /// ones and is `None` for a run-level line.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
-    pub inherited_from: Option<ExecutionId>,
+    pub inherited_from: Option<RunId>,
     pub at_unix: u64,
     pub level: String,
     pub node: Option<String>,
@@ -899,7 +937,7 @@ impl LogEntry {
     /// place the journal-to-log projection lives, shared by the
     /// Postgres and fake journals so `weft logs` reads the same thing
     /// against both.
-    pub fn from_event(event: &ExecEvent) -> Option<LogEntry> {
+    pub fn from_event(event: &RunEvent) -> Option<LogEntry> {
         // `KINDS` is the one gate: a kind the list carries and the match
         // does not is a bug the tests pin (`every_listed_kind_projects`),
         // never a quiet `None`.
@@ -907,7 +945,7 @@ impl LogEntry {
             return None;
         }
         Some(match event {
-            ExecEvent::LogLine { node_id, frames, level, message, at_unix, at_unix_ms, seq, .. } => {
+            RunEvent::LogLine { node_id, frames, level, message, at_unix, at_unix_ms, seq, .. } => {
                 LogEntry {
                     at_unix: *at_unix,
                     inherited_from: None,
@@ -921,7 +959,7 @@ impl LogEntry {
                     seq: *seq,
                 }
             }
-            ExecEvent::NodeFailed { node_id, frames, error, at_unix, .. } => LogEntry {
+            RunEvent::NodeFailed { node_id, frames, error, at_unix, .. } => LogEntry {
                 inherited_from: None,
                 at_unix: *at_unix,
                 level: "error".into(),
@@ -931,7 +969,7 @@ impl LogEntry {
                 written_at_ms: Self::end_of_second_ms(*at_unix),
                 seq: None,
             },
-            ExecEvent::NodeCancelled { node_id, frames, reason, at_unix, .. } => LogEntry {
+            RunEvent::NodeCancelled { node_id, frames, reason, at_unix, .. } => LogEntry {
                 inherited_from: None,
                 at_unix: *at_unix,
                 level: "warn".into(),
@@ -941,23 +979,23 @@ impl LogEntry {
                 written_at_ms: Self::end_of_second_ms(*at_unix),
                 seq: None,
             },
-            ExecEvent::ExecutionFailed { error, at_unix, .. } => LogEntry {
+            RunEvent::RunFailed { error, at_unix, .. } => LogEntry {
                 inherited_from: None,
                 at_unix: *at_unix,
                 level: "error".into(),
                 node: None,
                 frames: Vec::new(),
-                message: format!("execution failed: {error}"),
+                message: format!("run failed: {error}"),
                 written_at_ms: Self::end_of_second_ms(*at_unix),
                 seq: None,
             },
-            ExecEvent::ExecutionCancelled { reason, at_unix, .. } => LogEntry {
+            RunEvent::RunCancelled { reason, at_unix, .. } => LogEntry {
                 inherited_from: None,
                 at_unix: *at_unix,
                 level: "warn".into(),
                 node: None,
                 frames: Vec::new(),
-                message: format!("execution cancelled: {reason}"),
+                message: format!("run cancelled: {reason}"),
                 written_at_ms: Self::end_of_second_ms(*at_unix),
                 seq: None,
             },
@@ -973,8 +1011,8 @@ impl LogEntry {
         "log_line",
         "node_failed",
         "node_cancelled",
-        "execution_failed",
-        "execution_cancelled",
+        "run_failed",
+        "run_cancelled",
     ];
 }
 
@@ -982,18 +1020,18 @@ impl LogEntry {
 mod bake_tests {
     use super::*;
 
-    fn completed() -> Vec<ExecEvent> {
-        let execution_id = ExecutionId::new_v4();
+    fn completed() -> Vec<RunEvent> {
+        let run_id = RunId::new_v4();
         vec![
-            ExecEvent::ExecutionStarted {
-                execution_id, project_id: uuid::Uuid::from_u128(0x100), entry_node: "trigger".into(),
+            RunEvent::RunStarted { given: Default::default(),
+                run_id, project_id: uuid::Uuid::from_u128(0x100), entry_node: "trigger".into(),
                 phase: weft_core::context::Phase::TriggerSetup,
                 definition_hash: Some("graph".into()),
                 binary_hash: Some("binary".into()),
-                source_version: Some("source".into()), run_kind: weft_core::exec::RunKind::Execution, selection: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
+                source_version: Some("source".into()), run_kind: weft_core::run::RunKind::Project, cut_from: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
                 settings: weft_core::run_settings::RunSettings::bookkeeping(),
             },
-            ExecEvent::ExecutionCompleted { execution_id, at_unix: 2 },
+            RunEvent::RunCompleted { run_id, at_unix: 2 },
         ]
     }
 
@@ -1010,19 +1048,32 @@ mod bake_tests {
         assert!(bake.captured.is_empty());
         assert!(TriggerBake::from_events(&rows[..1], &program()).is_err());
         let mut failed = rows;
-        failed[1] = ExecEvent::ExecutionCancelled {
-            execution_id: bake.execution_id, reason: "cancelled".into(), cause: Some(weft_core::exec::CancelCause::User), at_unix: 2,
+        failed[1] = RunEvent::RunCancelled {
+            run_id: bake.run_id, reason: "cancelled".into(), cause: Some(weft_core::run::CancelCause::User), at_unix: 2,
         };
         assert!(TriggerBake::from_events(&failed, &program()).unwrap().is_none());
+    }
+
+    /// A setup runs a cut of the program: its birth names the cut, and the
+    /// program it was cut from is the one its bake is for.
+    #[test]
+    fn a_setup_of_a_cut_bakes_for_the_program_it_was_cut_from() {
+        let mut rows = completed();
+        if let RunEvent::RunStarted { definition_hash, cut_from, .. } = &mut rows[0] {
+            *definition_hash = Some("the cut".into());
+            *cut_from = Some("graph".into());
+        }
+        let bake = TriggerBake::from_events(&rows, &program()).unwrap().unwrap();
+        assert_eq!(bake.program.definition_hash, "graph");
     }
 
     #[test]
     fn bake_refuses_mixed_run_history_and_conflicting_program_identity() {
         let mut rows = completed();
-        rows[1] = ExecEvent::ExecutionCompleted { execution_id: ExecutionId::new_v4(), at_unix: 2 };
+        rows[1] = RunEvent::RunCompleted { run_id: RunId::new_v4(), at_unix: 2 };
         assert!(TriggerBake::from_events(&rows, &program()).unwrap_err().to_string().contains("another run"));
         let mut rows = completed();
-        if let ExecEvent::ExecutionStarted { definition_hash, .. } = &mut rows[0] {
+        if let RunEvent::RunStarted { definition_hash, .. } = &mut rows[0] {
             *definition_hash = Some("another graph".into());
         }
         assert!(TriggerBake::from_events(&rows, &program()).unwrap_err().to_string().contains("conflicting program"));
@@ -1032,13 +1083,13 @@ mod bake_tests {
 #[cfg(test)]
 mod log_entry_tests {
     use super::LogEntry;
-    use weft_journal::ExecEvent;
+    use weft_journal::RunEvent;
 
-    fn sample_events() -> Vec<ExecEvent> {
-        let execution_id = weft_core::ExecutionId::new_v4();
+    fn sample_events() -> Vec<RunEvent> {
+        let run_id = weft_core::RunId::new_v4();
         vec![
-            ExecEvent::LogLine {
-                execution_id,
+            RunEvent::LogLine {
+                run_id,
                 node_id: "greet".into(),
                 frames: Default::default(),
                 level: "info".into(),
@@ -1047,30 +1098,30 @@ mod log_entry_tests {
                 at_unix_ms: Some(1_000),
                 seq: Some(0),
             },
-            ExecEvent::NodeFailed {
-                execution_id,
+            RunEvent::NodeFailed {
+                run_id,
                 node_id: "llm".into(),
                 frames: Default::default(),
                 error: "boom".into(),
                 at_unix: 2,
                 gave_up_wait: false,
             },
-            ExecEvent::NodeCancelled {
-                execution_id,
+            RunEvent::NodeCancelled {
+                run_id,
                 node_id: "llm".into(),
                 frames: Default::default(),
                 reason: "stopped".into(),
                 at_unix: 3,
             },
-            ExecEvent::ExecutionFailed { execution_id, error: "stuck".into(), at_unix: 5 },
-            ExecEvent::ExecutionCancelled {
-                execution_id,
+            RunEvent::RunFailed { run_id, error: "stuck".into(), at_unix: 5 },
+            RunEvent::RunCancelled {
+                run_id,
                 reason: "by hand".into(),
                 cause: None,
                 at_unix: 6,
             },
-            ExecEvent::ExecutionCompleted { execution_id, at_unix: 7 },
-            ExecEvent::ExecutionTagged { execution_id, tags: vec!["t".into()], at_unix: 8 },
+            RunEvent::RunCompleted { run_id, at_unix: 7 },
+            RunEvent::RunTagged { run_id, tags: vec!["t".into()], at_unix: 8 },
         ]
     }
 
@@ -1123,9 +1174,9 @@ mod log_entry_tests {
     /// carried likewise.
     #[test]
     fn lines_read_in_the_order_they_were_written() {
-        let execution_id = weft_core::ExecutionId::new_v4();
-        let line = |node: &str, seq: u64, at_ms: Option<u64>, at_unix: u64| ExecEvent::LogLine {
-            execution_id,
+        let run_id = weft_core::RunId::new_v4();
+        let line = |node: &str, seq: u64, at_ms: Option<u64>, at_unix: u64| RunEvent::LogLine {
+            run_id,
             node_id: node.into(),
             frames: Default::default(),
             level: "info".into(),
@@ -1134,8 +1185,8 @@ mod log_entry_tests {
             at_unix_ms: at_ms,
             seq: Some(seq),
         };
-        let failed = ExecEvent::NodeFailed {
-            execution_id,
+        let failed = RunEvent::NodeFailed {
+            run_id,
             node_id: "a".into(),
             frames: Default::default(),
             error: "boom".into(),

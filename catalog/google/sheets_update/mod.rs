@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
 use super::sheets::{header_for_row, row_to_cells, tab_title, values_url};
 
@@ -24,7 +24,7 @@ impl Node for GoogleSheetsUpdateNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         /// Google Sheets tops out at ten million cells per spreadsheet,
         /// so no addressable row is anywhere near this.
         const MAX_SHEET_ROW: f64 = 10_000_000.0;

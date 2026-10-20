@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { buildSpecMap, entryForSource, entryPortCollisions, hasValue, isEmptyChoiceSet, port, type PortEntryDef, type PortSpec, type SpecField } from './port-specs';
 import { isValidFieldKey } from './port-specs';
+import { ERROR_PORT } from '../../../protocol';
 
-// A field key becomes a weft PORT NAME (`{key}_approved`, ...), and the parser
+// A field key becomes a weft PORT NAME (`{key}Approved`, ...), and the parser
 // only accepts port names matching `[A-Za-z_][A-Za-z0-9_]*`. This guards the
 // add-field form's key gate so a punctuation/space key can never emit an
 // unparseable port (the `what_do_you_want?` -> `String?` bug).
@@ -28,7 +29,7 @@ describe('entryPortCollisions', () => {
 		keyField: 'key',
 		label: 'Approve / reject',
 		addsInputs: [],
-		addsOutputs: [port('{key}_approved', 'Boolean'), port('{key}_rejected', 'Boolean')],
+		addsOutputs: [port('{key}Approved', 'Boolean'), port('{key}Rejected', 'Boolean')],
 	};
 	const specMap = buildSpecMap([approve]);
 	const entry = (key: string): PortEntryDef => ({ kind: 'approve_reject', key });
@@ -48,15 +49,15 @@ describe('entryPortCollisions', () => {
 		const list = [entry('send'), entry('escalate')];
 		const others = list.filter((_, i) => i !== 0);
 		expect(entryPortCollisions(entry('escalate'), others, specMap, noReserved)).toEqual([
-			'escalate_approved',
-			'escalate_rejected',
+			'escalateApproved',
+			'escalateRejected',
 		]);
 	});
 
 	it('catches an added entry taking an existing name', () => {
 		expect(entryPortCollisions(entry('send'), [entry('send')], specMap, noReserved)).toEqual([
-			'send_approved',
-			'send_rejected',
+			'sendApproved',
+			'sendRejected',
 		]);
 	});
 
@@ -64,8 +65,8 @@ describe('entryPortCollisions', () => {
 		// The catalog's own ports and the instance's declared header
 		// ports are reserved per side, matching the compiler's
 		// duplicate-port rule: an input and an output may share a name.
-		const reserved = { inputs: ['send_approved'], outputs: ['send_rejected'] };
-		expect(entryPortCollisions(entry('send'), [], specMap, reserved)).toEqual(['send_rejected']);
+		const reserved = { inputs: ['sendApproved'], outputs: ['sendRejected'] };
+		expect(entryPortCollisions(entry('send'), [], specMap, reserved)).toEqual(['sendRejected']);
 	});
 
 	it('_should_flow is reserved on the input side of every node', () => {
@@ -79,6 +80,19 @@ describe('entryPortCollisions', () => {
 		const map = buildSpecMap([flow]);
 		const bad: PortEntryDef = { kind: 'flow', key: '_should_flow' };
 		expect(entryPortCollisions(bad, [], map, noReserved)).toEqual(['_should_flow']);
+	});
+
+	it('_error is reserved on the output side of every node', () => {
+		const out: PortSpec = {
+			kind: 'out',
+			keyField: 'key',
+			label: 'Out',
+			addsInputs: [],
+			addsOutputs: [port('{key}', 'String')],
+		};
+		const map = buildSpecMap([out]);
+		const bad: PortEntryDef = { kind: 'out', key: ERROR_PORT };
+		expect(entryPortCollisions(bad, [], map, noReserved)).toEqual([ERROR_PORT]);
 	});
 });
 
@@ -155,7 +169,7 @@ describe('isEmptyChoiceSet', () => {
 		[field.key]: value,
 	});
 	it('flags an empty list only where the list is the choice set', () => {
-		const valueList = { key: 'value', label: 'Values', shape: 'valueList' } as SpecField;
+		const valueList = { key: 'value', label: 'Values', shape: 'value_list' } as SpecField;
 		const typedList = {
 			key: 'options',
 			label: 'Options',

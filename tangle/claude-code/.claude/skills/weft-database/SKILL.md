@@ -83,12 +83,12 @@ are settings of the compute in the Neon console (**Branches**, the compute,
 Neon's free plan gives a project 100 CU-hours a month, which at 0.25 CU is
 about 400 hours awake. The database sleeps 5 minutes after the last thing that
 used it, and an idle install wakes nothing: weft books a wake-up only for a
-moment something is actually due (a hibernation ending, a queued event's
-retry), and its services hold no busy connection to the database once quiet.
-The database stays asleep through a run waiting on a person or on a caller
-who says nothing (though the worker holding that caller stays up), through
-a hibernation window, and while infrastructure runs fine (a machine reports
-only when its state changes). It also stays asleep while a trigger keeps a
+moment something is actually due (a queued event's retry, or the moment a
+trigger taken down with a time limit starts refusing what arrives), and its
+services hold no busy connection to the database once quiet. The database
+stays asleep through a run waiting on a person or on a caller who says
+nothing (though the worker holding that caller stays up), and while
+infrastructure runs fine (a machine reports only when its state changes). It also stays asleep while a trigger keeps a
 connection open: its holder hears changes over Pub/Sub and proves
 it is alive with a Cloud Tasks check every 60 seconds, none of which
 touches the database. The holder still costs its Cloud Run worker pool

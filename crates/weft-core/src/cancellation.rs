@@ -1,4 +1,4 @@
-//! Cancellation primitive for executions and the nodes they run.
+//! Cancellation primitive for runs and the nodes they run.
 //!
 //! `Arc<Notify>` alone has a fire-and-forget semantic: a `notify_waiters()`
 //! call only wakes futures that are *currently* awaiting `notified()`.
@@ -17,8 +17,8 @@
 //! pipelines) and `cancelled()` inside `tokio::select!` arms to race
 //! it against work futures.
 //!
-//! The flag also remembers WHY, when the canceller says: an execution's
-//! flag is flipped by the worker acting on a `cancel_execution` task, by
+//! The flag also remembers WHY, when the canceller says: a run's
+//! flag is flipped by the worker acting on a `cancel_run` task, by
 //! the process shutting down, or by a live caller dropping, and the terminal
 //! event the driver writes afterwards has to name that cause. The first
 //! cause to land is the one kept: a run cancelled twice for two reasons
@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
-use crate::exec::CancelCause;
+use crate::run::CancelCause;
 
 #[derive(Debug, Default)]
 pub struct CancellationFlag {
@@ -62,8 +62,8 @@ impl CancellationFlag {
         self.notify.notify_waiters();
     }
 
-    /// Mark cancelled, recording why. The one door: every cancel of an
-    /// execution's flag goes through here, so the driver's terminal
+    /// Mark cancelled, recording why. The one door: every cancel of a
+    /// run's flag goes through here, so the driver's terminal
     /// write can say what happened instead of guessing. The first
     /// cause recorded wins; a later one is ignored (the run was already
     /// cancelled for the first reason).

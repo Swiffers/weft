@@ -6,7 +6,8 @@
 		Undo2, Redo2, Copy, Trash2, CheckSquare, Maximize2, LayoutDashboard,
 	} from '@lucide/svelte';
 	import type { Component } from 'svelte';
-	
+	import { outputRows } from "../../utils/input-field";
+
 	let {
 		open = $bindable(false),
 		onAddNode,
@@ -51,7 +52,7 @@
 	);
 	
 	// VS Code embedding: save/run/export/import are handled by the
-	// extension (Ctrl+S writes the document, execution is an editor
+	// extension (Ctrl+S writes the document, run is an editor
 	// command). We keep only actions that map to the webview itself.
 	const actions: { id: string; label: string; icon: Component; shortcut?: string }[] = [
 		// No "Add Group" action: Group is a node type, so it already appears in
@@ -61,6 +62,7 @@
 		{ id: "duplicate", label: "Duplicate Selected", icon: Copy, shortcut: "Ctrl+D" },
 		{ id: "delete", label: "Delete Selected", icon: Trash2, shortcut: "Del" },
 		{ id: "selectAll", label: "Select All Nodes", icon: CheckSquare, shortcut: "Ctrl+A" },
+		{ id: "selectTriggers", label: "Select All Triggers", icon: CheckSquare },
 		{ id: "fitView", label: "Fit View", icon: Maximize2 },
 		{ id: "autoOrganize", label: "Auto Organize Layout", icon: LayoutDashboard },
 	];
@@ -324,6 +326,7 @@
 		<!-- Preview Panel (only shows when a node is selected) -->
 		{#if previewedItem}
 			{@const PreviewIcon = previewedItem.config.icon}
+			{@const previewOutputs = outputRows(previewedItem.config.defaultOutputs)}
 			<div class="w-64 bg-popover border rounded-xl shadow-2xl p-4 self-start">
 				<div class="flex items-center gap-3 mb-3">
 					<span class="w-6 h-6 flex items-center justify-center">{#if PreviewIcon}<PreviewIcon size={20} />{/if}</span>
@@ -350,11 +353,11 @@
 				{/if}
 				
 				<!-- Outputs -->
-				{#if previewedItem.config.defaultOutputs.length > 0}
+				{#if previewOutputs.length > 0}
 					<div class="mb-2">
 						<div class="text-xs font-medium text-blue-600 mb-1">Outputs</div>
 						<div class="flex flex-wrap gap-1">
-							{#each previewedItem.config.defaultOutputs as output}
+							{#each previewOutputs as output}
 								<span class="text-xs px-1.5 py-0.5 bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 rounded">
 									{output.name}
 								</span>

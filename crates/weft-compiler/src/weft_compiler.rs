@@ -2,8 +2,10 @@
 //!
 //! The compiler:
 //! 1. Parses Weft syntax (nodes, groups, connections with assignment syntax)
-//! 2. Flattens groups by injecting Passthrough nodes at group boundaries
-//! 3. Produces a flat ProjectDefinition ready for execution
+//! 2. Flattens groups: their members join the program with the group in
+//!    their scope, and the lines through a group's ports are joined into
+//!    wires end to end (`crate::wires`); a loop gets its two boundaries
+//! 3. Produces a flat ProjectDefinition ready for run
 //!
 //! This is a pure function: `&str -> Result<ProjectDefinition, Vec<CompileError>>`
 
@@ -24,7 +26,7 @@ pub(crate) use weft_core::is_rust_identifier as is_bare_ident;
 
 use weft_core::node::NodeFeatures;
 use weft_core::project::{
-    ConfigFieldSpan, Edge, GroupBoundary, GroupBoundaryRole, InputDefinition, NodeDefinition,
+    ConfigFieldSpan, GroupBoundary, GroupBoundaryRole, InputDefinition, NodeDefinition,
     PortDefinition, Position, ProjectDefinition, Span,
 };
 use weft_core::weft_type::WeftType;
@@ -41,12 +43,35 @@ pub struct CompileError {
     /// a parse error inside an `@include`d file keeps its own
     /// coordinates and names its file here. None = the compiled source.
     pub file: Option<String>,
+    /// The nodes and groups the error breaks, by id
+    /// (`weft_core::node::Diagnostic::subjects`): set on what an included
+    /// file that does not compile leaves behind, so the program around it
+    /// still compiles. Empty for an error in the entry file, which is
+    /// about the program as a whole.
+    pub subjects: Vec<String>,
 }
 
 impl CompileError {
     /// An error anchored to a span (the normal case: the offending token/node).
     pub fn at(span: Span, message: impl Into<String>) -> Self {
-        Self { span, message: message.into(), file: None }
+        Self { span, message: message.into(), file: None, subjects: Vec::new() }
+    }
+
+    /// The parts this error breaks ([`Self::subjects`]). Fills only when
+    /// unset, like [`Self::in_file`]: an error a deeper include already
+    /// pinned to its own placeholder keeps it.
+    pub fn about(mut self, subject: &str) -> Self {
+        if self.subjects.is_empty() {
+            self.subjects.push(subject.to_string());
+        }
+        self
+    }
+
+    /// The finding this error is, for a caller that reports diagnostics.
+    pub fn diagnostic(&self, code: &str) -> weft_core::node::Diagnostic {
+        weft_core::node::Diagnostic::at(self.span, weft_core::node::Severity::Error, code, self.message.clone())
+            .in_file(self.file.as_deref())
+            .about(self.subjects.iter().cloned())
     }
 
     /// Stamp the file the span lives in. Fills only when unset, so an
@@ -89,21 +114,20 @@ pub(crate) struct ParsedPort {
     /// Never set on a user-declared port; never set on a non-loop group.
     synthesized_from_carry: bool,
     /// A non-fatal type error: the port was declared with an invalid / unknown
-    /// type. The port is KEPT (as `MustOverride`, rendered red) so it doesn't
-    /// vanish; this carries the diagnostic the caller records as a squiggle.
-    /// `None` for a well-typed port.
+    /// type. The port is KEPT (typed with its own variable, `T__in__x`) so it
+    /// doesn't vanish; this carries the diagnostic the caller records as a
+    /// squiggle. `None` for a well-typed port.
     type_error: Option<String>,
     /// The VERBATIM type annotation the source header spells (no `?`), which
     /// becomes the port's `declared_type`. Never a re-print of the parsed
     /// type: re-printing expands a registry alias (`Thing` becomes
-    /// `Thing={...}`) and turns an unparseable annotation into the
-    /// `MustOverride` placeholder, and the editor writes the header back from
-    /// this, so a re-print would overwrite what the author typed. The one
-    /// deliberate exception: a declared port with NO annotation (`(x)`) is
-    /// stamped with the default type's spelling, so a header rewrite
-    /// canonicalizes it to `x: MustOverride` (same parse, made explicit)
-    /// rather than dropping it as undeclared. `None` only for a port no
-    /// header line declares (a carry-synthesized ghost).
+    /// `Thing={...}`) and turns an unparseable annotation into the port's
+    /// own variable, and the editor writes the header back from this, so a
+    /// re-print would overwrite what the author typed. A declared port with
+    /// NO annotation (`(x)`) is stamped with the empty spelling, which a
+    /// header rewrite writes back as the bare name, rather than dropping it
+    /// as undeclared. `None` only for a port no header line declares (a
+    /// carry-synthesized ghost).
     type_text: Option<String>,
 }
 
@@ -116,6 +140,9 @@ struct ParsedNode {
     parent_id: Option<String>,
     in_ports: Vec<ParsedPort>,
     out_ports: Vec<ParsedPort>,
+    /// `[T: Media]` written after the node's type name: bounds on the
+    /// type variables its header ports use.
+    type_params: Vec<weft_core::weft_type::TypeParam>,
     one_of_required: Vec<Vec<String>>,
     /// The body says `@per_instance`: this node exists once per instance.
     per_instance: bool,
@@ -177,12 +204,15 @@ struct ParsedConnection {
     /// The file the span lives in, when a full-mode `@include` spliced
     /// this connection out of another file. None = the compiled source.
     source_file: Option<String>,
+    /// The end is the group's own port seen from inside (`self.x`): the
+    /// id is then the group's. Set by `rescope_endpoint`.
+    source_inner: bool,
+    target_inner: bool,
 }
 
-/// What kind of grouping construct this is. Determines the boundary
-/// node types emitted by `flatten_group` (`Passthrough` for groups,
-/// `LoopIn` / `LoopOut` for loops), and whether `loop_config` ships
-/// onto the boundary nodes.
+/// What kind of grouping construct this is. A loop gets its two boundary
+/// nodes from `flatten_group` (`LoopIn` / `LoopOut`), with `loop_config`
+/// on them; a group gets none (it runs as a scope, `weft_core::run::scope`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GroupKind {
     Group,
@@ -215,13 +245,17 @@ struct ParsedGroup {
     kind: GroupKind,
     in_ports: Vec<ParsedPort>,
     out_ports: Vec<ParsedPort>,
+    /// `[T: Media]` written after `Group` / `Loop`: bounds on the type
+    /// variables its ports use. Both boundary nodes carry them, and the
+    /// two share their variables.
+    type_params: Vec<weft_core::weft_type::TypeParam>,
     nodes: Vec<ParsedNode>,
     connections: Vec<ParsedConnection>,
     child_groups: Vec<ParsedGroup>,
     anonymous: bool,
     includes: Vec<ParsedInclude>,
-    /// Loop-only config block: `parallel`, `over`, `carry`, `max_iters`,
-    /// `trim_on_mismatch`. None for regular groups.
+    /// Loop-only config block: `parallel`, `over`, `carry`, `maxIters`,
+    /// `trimOnMismatch`. None for regular groups.
     loop_config: Option<serde_json::Map<String, serde_json::Value>>,
     /// Source spans of the loop's config fields (`parallel`, `over`, ...).
     /// The validate pass uses these so a diagnostic like `parallel-with-carry`
@@ -238,9 +272,9 @@ struct ParsedGroup {
     description: Option<String>,
     /// LITERALS written on this container's interface ports: `g.x = "hi"`
     /// from outside, or `_should_flow: false` in the braces. They land on
-    /// the In boundary node, which is the node those ports belong to, and
-    /// the runtime reads them exactly as it reads a node's own. A wired
-    /// value is an ordinary edge and rides in `connections` instead.
+    /// the group's definition (a loop's on its `LoopIn`), and the runtime
+    /// sends them when the group opens. A wired value is an ordinary edge
+    /// and rides in `connections` instead.
     port_literals: serde_json::Map<String, serde_json::Value>,
     /// Where each `port_literals` entry was written, and in WHICH FORM
     /// (a braces field or a `g.x = ...` statement). An edit rewrites the
@@ -317,8 +351,10 @@ pub(crate) struct ParsedInclude {
 /// required parameter prevents the "forgot to overwrite a random UUID"
 /// class of bug.
 ///
-/// Groups are flattened: each group produces two Passthrough nodes
-/// ({groupId}__in and {groupId}__out) with edges rewired accordingly.
+/// Groups are flattened: a group's members join the program with the group
+/// in their scope, and the lines through its ports are joined into wires
+/// end to end (`crate::wires`). A loop also gets its two boundary nodes,
+/// `{loopId}__in` and `{loopId}__out`.
 pub fn compile(
     source: &str,
     project_id: Uuid,
@@ -395,10 +431,12 @@ pub fn compile_lenient(
 
     // Flatten the partial state into a project. flatten builds from whatever
     // the parser produced and never fails.
-    let mut project = flatten(state, bodies, project_id);
-    // Flattening gives every literal one owning node, including group inputs
-    // and include-call arguments. Resolve them once here, using each field's
-    // recorded source file rather than whichever include was visited last.
+    let mut project = flatten(state, bodies, project_id, &mut errors);
+    // After flattening, a literal sits on the node it fills, or on the
+    // group whose port it is written on (`GroupDefinition.port_literals`:
+    // a group's inputs and an include site's arguments). Resolve them once
+    // here, using each field's recorded source file rather than whichever
+    // include was visited last.
     crate::file_ref::resolve_project_file_refs(&mut project, &fs, &mut errors);
     (project, errors)
 }
@@ -468,21 +506,18 @@ fn parse_checked(
 
 // ─── Include resolution ───────────────────────────────────────────────────────
 
-/// Internal node type for an opaque `@include` block in Interface mode. The
-/// editor renders it as an expandable group that navigates into the file.
-pub const INCLUDE_NODE_TYPE: &str = "IncludedGroup";
+/// Internal node type for an opaque `@include` block: in Interface mode the
+/// block the editor renders as an expandable group that navigates into the
+/// file, in Full mode the placeholder an included file that does not
+/// compile leaves ([`broken_include`]).
+pub const INCLUDE_NODE_TYPE: &str = weft_core::project::INCLUDED_GROUP_TYPE;
 
-/// Compose a flattened edge id from its endpoints. The single definition of the
-/// edge-id shape, used by `parsed_to_edge` at flatten.
-fn edge_id(source: &str, source_handle: &str, target: &str, target_handle: &str) -> String {
-    format!("e-{source}-{source_handle}-{target}-{target_handle}")
-}
 
-/// The display label for a group's boundary Passthrough. Single definition of
-/// the shape, used at flatten. The group reads as a person reads it
+/// The display label for one of a loop's two boundaries. Single definition
+/// of the shape, used at flatten. The loop reads as a person reads it
 /// (`crate::source_name::display_name`), never as its id: an included
 /// file's body id is its path, which no surface shows.
-fn boundary_label(group_id: &str, role: weft_core::project::GroupBoundaryRole) -> String {
+fn loop_boundary_label(group_id: &str, role: weft_core::project::GroupBoundaryRole) -> String {
     let suffix = match role {
         weft_core::project::GroupBoundaryRole::In => "in",
         weft_core::project::GroupBoundaryRole::Out => "out",
@@ -517,25 +552,11 @@ fn resolve_includes(
     bodies: &mut Bodies,
     errors: &mut Vec<CompileError>,
 ) {
-    let includes = std::mem::take(&mut state.includes);
-    for inc in includes {
-        if fs.base.is_none() {
-            errors.push(CompileError::at(inc.span, format!("@include(\"{}\") cannot be resolved outside a project", inc.path)));
-            continue;
-        }
-        match resolve_one_include(&inc, fs, mode, in_progress, bodies) {
-            Ok(IncludeResult::Site(mut site)) => {
-                // Root-level fills need no stamping: an unstamped span
-                // already means "the compiled source", which is exactly
-                // where these are written.
-                apply_pending_literals(&inc, &mut site, errors);
-                state.groups.push(*site);
-            }
-            Ok(IncludeResult::Node(mut node)) => {
-                apply_pending_literals_to_node(&inc, &mut node, errors);
-                state.nodes.push(*node);
-            }
-            Err(errs) => errors.extend(errs),
+    for inc in std::mem::take(&mut state.includes) {
+        match place_include(&inc, None, fs, mode, in_progress, bodies, errors) {
+            Some(IncludeResult::Site(site)) => state.groups.push(*site),
+            Some(IncludeResult::Node(node)) => state.nodes.push(*node),
+            None => {}
         }
     }
     // Resolve includes nested inside group bodies, anywhere in the tree.
@@ -555,55 +576,101 @@ fn resolve_group_includes(
     bodies: &mut Bodies,
     errors: &mut Vec<CompileError>,
 ) {
-    let includes = std::mem::take(&mut group.includes);
-    for inc in includes {
-        if fs.base.is_none() {
-            errors.push(CompileError::at(inc.span, format!("@include(\"{}\") cannot be resolved outside a project", inc.path)));
-            continue;
-        }
-        match resolve_one_include(&inc, fs, mode, in_progress, bodies) {
-            Ok(IncludeResult::Site(mut g)) => {
-                apply_pending_literals(&inc, &mut g, errors);
-                // The site is written in THIS group's file (the body it
-                // calls carries its own): a diagnostic on the `@include`
-                // line names the file the line is in.
-                if g.source_file.is_none() {
-                    g.source_file = group.source_file.clone();
-                }
-                // The fills just landed with the INCLUDING file's spans
-                // (this group's file); the included group's own spans were
-                // already stamped with its file, so only the fresh
-                // (file-less) entries take this one.
-                if let Some(pf) = &group.source_file {
-                    for s in g.port_literal_spans.values_mut() {
-                        if s.source_file.is_none() {
-                            s.source_file = Some(pf.clone());
-                        }
-                    }
-                }
-                group.child_groups.push(*g);
-            }
-            Ok(IncludeResult::Node(mut n)) => {
-                apply_pending_literals_to_node(&inc, &mut n, errors);
-                // The opaque interface node is a member of this group (its id
-                // is already scoped `group.child`); set parent_id so flatten
-                // assigns it the group's scope, like any other child node.
-                // Without this its scope is empty and edges from siblings trip
-                // the scope-reachability check.
-                n.parent_id = Some(group.id.clone());
-                // An interface-mode opaque node's span is the `@include`
-                // line, which is written in THIS group's file.
-                if n.source_file.is_none() {
-                    n.source_file = group.source_file.clone();
-                }
-                group.nodes.push(*n);
-            }
-            Err(errs) => errors.extend(errs),
+    for inc in std::mem::take(&mut group.includes) {
+        let within = Within { group: &group.id, file: group.source_file.as_deref() };
+        match place_include(&inc, Some(within), fs, mode, in_progress, bodies, errors) {
+            Some(IncludeResult::Site(site)) => group.child_groups.push(*site),
+            Some(IncludeResult::Node(node)) => group.nodes.push(*node),
+            None => {}
         }
     }
     for child in &mut group.child_groups {
         resolve_group_includes(child, fs, mode, in_progress, bodies, errors);
     }
+}
+
+/// The group an `@include` is written in, and that group's file (`None`
+/// for the compiled source itself).
+#[derive(Clone, Copy)]
+struct Within<'a> {
+    group: &'a str,
+    file: Option<&'a str>,
+}
+
+/// Resolve one `@include` written at the top level (`within` is `None`) or
+/// inside a group, and hand back what goes where it was written: the call
+/// site, the opaque node, or, for a full-mode include whose file does not
+/// compile, the placeholder [`broken_include`] leaves. Every error the
+/// include itself raises lands in `errors`, naming the file it is written
+/// in; a value written on a port the site does not have breaks only the
+/// site. `None` when nothing goes there (an interface-mode include that
+/// did not resolve, an include outside any project).
+fn place_include(
+    inc: &ParsedInclude,
+    within: Option<Within<'_>>,
+    fs: &CompileFs,
+    mode: IncludeMode,
+    in_progress: &mut Vec<std::path::PathBuf>,
+    bodies: &mut Bodies,
+    errors: &mut Vec<CompileError>,
+) -> Option<IncludeResult> {
+    if fs.base.is_none() {
+        errors.push(CompileError::at(inc.span, format!("@include(\"{}\") cannot be resolved outside a project", inc.path)));
+        return None;
+    }
+    let file = within.and_then(|w| w.file);
+    match resolve_one_include(inc, fs, mode, in_progress, bodies, errors) {
+        Ok(IncludeResult::Site(mut site)) => {
+            let mut fills = Vec::new();
+            apply_pending_literals(inc, &mut site, &mut fills);
+            errors.extend(fills.into_iter().map(|e| e.in_file(file).about(&site.id)));
+            // The site is written in the including file (the body it calls
+            // carries its own): a diagnostic on the `@include` line names
+            // the file the line is in. The fills just landed with that
+            // file's spans; the included group's own spans were already
+            // stamped with its file, so only the fresh (file-less) entries
+            // take this one. At the top level nothing is stamped: an
+            // unstamped span already means "the compiled source".
+            if let Some(file) = file {
+                site.source_file.get_or_insert_with(|| file.to_string());
+                for span in site.port_literal_spans.values_mut() {
+                    span.source_file.get_or_insert_with(|| file.to_string());
+                }
+            }
+            Some(IncludeResult::Site(site))
+        }
+        Ok(IncludeResult::Node(mut node)) => {
+            apply_pending_literals_to_node(inc, &mut node, errors);
+            Some(IncludeResult::Node(Box::new(member_of(*node, within))))
+        }
+        Err(errs) => match mode {
+            IncludeMode::Full => {
+                let (node, errs) = broken_include(inc, errs);
+                errors.extend(errs.into_iter().map(|e| e.in_file(file)));
+                Some(IncludeResult::Node(Box::new(member_of(node, within))))
+            }
+            IncludeMode::Interface => {
+                errors.extend(errs);
+                None
+            }
+        },
+    }
+}
+
+/// An include's node (the opaque interface node, or the placeholder of one
+/// that does not compile) as a member of the group it is written in: its
+/// id is already scoped `group.child`, and `parent_id` gives it the group's
+/// scope at flatten, like any other child node (without it, edges from
+/// siblings trip the scope-reachability check). Its span is the `@include`
+/// line, which is written in that group's file.
+fn member_of(mut node: ParsedNode, within: Option<Within<'_>>) -> ParsedNode {
+    if let Some(within) = within {
+        node.parent_id = Some(within.group.to_string());
+        if node.source_file.is_none() {
+            node.source_file = within.file.map(str::to_string);
+        }
+    }
+    node
 }
 
 /// Land an alias's pending port values on the group the include resolved
@@ -624,7 +691,7 @@ fn apply_pending_literals(
 /// config fields. Its keys are the file's signature ports, never a node's
 /// config vocabulary, so a port called `label` is filled like any other,
 /// and a name outside the signature is refused here exactly as the build's
-/// full mode refuses it on the call site's boundary.
+/// full mode refuses it on the call site.
 fn apply_pending_literals_to_node(
     inc: &ParsedInclude,
     node: &mut ParsedNode,
@@ -639,6 +706,38 @@ fn apply_pending_literals_to_node(
             node.config_spans.insert(k, ConfigFieldSpan::connection(fill.span));
         }
     }
+}
+
+/// What a full-mode `@include` whose file does not compile leaves in the
+/// program: a placeholder node at the site's id, of the opaque include type
+/// the editor's interface parse uses, with the file's path and no port, and
+/// the file's errors pinned to it. The program around it compiles; a cut
+/// that keeps the placeholder is refused with those errors
+/// (`weft_core::project::Broken`), and one that does not never notices. A
+/// line written against one of the site's ports finds no such port on the
+/// placeholder, which breaks the line's two ends the same way.
+fn broken_include(inc: &ParsedInclude, errs: Vec<CompileError>) -> (ParsedNode, Vec<CompileError>) {
+    let node = ParsedNode {
+        id: inc.alias.clone(),
+        node_type: INCLUDE_NODE_TYPE.to_string(),
+        label: None,
+        config: serde_json::Map::new(),
+        parent_id: None,
+        in_ports: Vec::new(),
+        out_ports: Vec::new(),
+        type_params: Vec::new(),
+        one_of_required: Vec::new(),
+        per_instance: false,
+        span: Some(inc.span),
+        header_span: Some(inc.span),
+        config_spans: Default::default(),
+        optional_ports: Default::default(),
+        include_path: Some(inc.path.clone()),
+        include_contents: None,
+        source_file: None,
+    };
+    let errs = errs.into_iter().map(|e| e.about(&inc.alias)).collect();
+    (node, errs)
 }
 
 enum IncludeResult {
@@ -701,12 +800,16 @@ fn is_one_anonymous_group(sub: &ParseState) -> bool {
         && sub.groups[0].anonymous
 }
 
+/// `errors` takes what the file's OWN includes leave behind when they do
+/// not compile (each pinned to the placeholder it leaves in the body, see
+/// [`broken_include`]); the `Err` is this include's own failure.
 fn resolve_one_include(
     inc: &ParsedInclude,
     fs: &CompileFs,
     mode: IncludeMode,
     in_progress: &mut Vec<std::path::PathBuf>,
     bodies: &mut Bodies,
+    errors: &mut Vec<CompileError>,
 ) -> Result<IncludeResult, Vec<CompileError>> {
     // A problem with the INCLUDE ITSELF (unresolvable path, cycle, wrong
     // file shape) anchors on the `@include` line here; an error INSIDE
@@ -798,6 +901,7 @@ fn resolve_one_include(
                     .map(|mut p| { p.type_text = None; p }).collect(),
                 out_ports: group.out_ports.iter().cloned()
                     .map(|mut p| { p.type_text = None; p }).collect(),
+                type_params: group.type_params.clone(),
                 one_of_required: Vec::new(),
                 per_instance: false,
                 span: Some(inc.span),
@@ -837,19 +941,13 @@ fn resolve_one_include(
                 let mut errs = Vec::new();
                 resolve_group_includes(&mut group, &included_fs, mode, in_progress, bodies, &mut errs);
                 in_progress.pop();
-                if !errs.is_empty() {
-                    // The file did not compile, so it is not registered: a
-                    // later site of it reports the same errors instead of
-                    // finding an id with no body behind it.
-                    bodies.paths.remove(&body_id);
-                    // Nested include errors already stamped with their own
-                    // file keep it; an unstamped one is about THIS file's
-                    // compiled source, which is the included file.
-                    return Err(errs
-                        .into_iter()
-                        .map(|e| e.in_file(Some(&canonical.to_string_lossy())))
-                        .collect());
-                }
+                // What a nested include left behind is pinned to the
+                // placeholder it left in this body (and a value on one of
+                // its sites' ports to that site): the body compiles around
+                // it, and only the places that need it are broken. An error
+                // already stamped with its own file keeps it; an unstamped
+                // one is about this body's file.
+                errors.extend(errs.into_iter().map(|e| e.in_file(Some(&canonical.to_string_lossy()))));
                 // A body is a shared definition, not the root of a
                 // standalone component: clear the flag so it cannot trip
                 // the component-validation rule (which treats a top-level
@@ -868,6 +966,7 @@ fn resolve_one_include(
                 kind: GroupKind::Call { body: body_id },
                 in_ports: body.in_ports.clone(),
                 out_ports: body.out_ports.clone(),
+                type_params: body.type_params.clone(),
                 nodes: Vec::new(),
                 connections: Vec::new(),
                 child_groups: Vec::new(),
@@ -895,7 +994,7 @@ fn resolve_one_include(
 /// trigger or only infra node lives in one had no Activate button and no
 /// infra controls.
 ///
-/// Types, not roles: `requires_infra` and `has_trigger` come back FALSE
+/// Types, not roles: `requiresInfra` and `has_trigger` come back FALSE
 /// from here whatever the file holds, because deciding what a type means
 /// takes the catalog and the parser has none. `enrich` settles them from
 /// the types (`enrich::enrich_collecting`), so between parse and enrich
@@ -1342,7 +1441,7 @@ fn container_port_declared(
     span: Span,
     errors: &mut Vec<CompileError>,
 ) -> bool {
-    if in_ports.iter().any(|p| p.name == port) || weft_core::exec::skip::is_gate_port(port) {
+    if in_ports.iter().any(|p| p.name == port) || weft_core::run::skip::is_gate_port(port) {
         return true;
     }
     errors.push(CompileError::at(
@@ -1356,8 +1455,8 @@ fn container_port_declared(
 }
 
 /// Apply a recognized literal fill to a CONTAINER's interface port
-/// (`g.x = "hi"`, `g._should_flow = false`). The value lands on the group's
-/// In boundary node, whose ports these are. A key naming no such port
+/// (`g.x = "hi"`, `g._should_flow = false`). The value lands on the group,
+/// whose ports these are. A key naming no such port
 /// pushes its own error here; either way the fill is consumed.
 fn apply_container_literal_fill(
     fill: &LiteralFill,
@@ -1524,11 +1623,11 @@ fn dup_span(header_span: Option<Span>, full_span: Option<Span>) -> Span {
 /// the LANGUAGE owns, pushing a loud error and returning false. The single home
 /// for reserved-name rejection, shared by `lower_node`/`lower_group`/
 /// `lower_include` so they can't drift. Reserved:
-///   - `self` (the boundary keyword), `Group`/`Passthrough` (type keywords);
+///   - `self` (the group's own ports), the type keywords;
 ///   - any id containing `__`: the compiler synthesizes ids with `__` as the
-///     separator (`{group}__in`/`__out` boundary passthroughs, `{host}__{field}`
+///     separator (`{loop}__in`/`__out` loop boundaries, `{host}__{field}`
 ///     inline-expr anon nodes). Letting a user take a `__` name makes those
-///     collide at flatten (`foo__in` vs group `foo`'s `__in`) into a silent
+///     collide at flatten (`foo__in` vs loop `foo`'s `__in`) into a silent
 ///     duplicate id. Reserving the separator makes the collision impossible.
 fn reject_reserved_local(local_id: &str, span: Span, errors: &mut Vec<CompileError>) -> bool {
     if !is_reserved_local(local_id) {
@@ -1542,7 +1641,7 @@ fn reject_reserved_local(local_id: &str, span: Span, errors: &mut Vec<CompileErr
     } else if is_reserved_type_keyword(local_id) {
         format!("'{local_id}' is a reserved type keyword and cannot be used as a node or group name")
     } else {
-        format!("'{local_id}' uses '__', which is reserved for compiler-generated ids (group boundaries, inline expressions); pick a name without a double underscore")
+        format!("'{local_id}' uses '__', which is reserved for compiler-generated ids (loop boundaries, inline expressions); pick a name without a double underscore")
     };
     errors.push(CompileError::at(span, msg));
     false
@@ -1558,12 +1657,12 @@ fn reject_reserved_local(local_id: &str, span: Span, errors: &mut Vec<CompileErr
 /// vocabulary, not as a config key the parser stores.
 // SYNC: RESERVED_CONFIG_KEYS <-> docs/src/language/syntax.md (Reserved keys),
 // packages/weft-syntax/weft.tmLanguage.json, packages/weft-syntax/highlight-weft.js,
-// crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)
+// crates/weft-compiler/tests/integration/highlighting_vocabulary.rs (the word-list alarm)
 pub const RESERVED_CONFIG_KEYS: &[&str] = &[
     "_label",
     weft_core::tag::TAGS_CONFIG_KEY,
-    weft_core::exec::skip::SHOULD_FLOW_PORT,
-    weft_core::exec::skip::SHOULD_NOT_FLOW_PORT,
+    weft_core::run::skip::SHOULD_FLOW_PORT,
+    weft_core::run::skip::SHOULD_NOT_FLOW_PORT,
 ];
 
 /// The canonical list of type names the language reserves. The SINGLE
@@ -1573,9 +1672,13 @@ pub const RESERVED_CONFIG_KEYS: &[&str] = &[
 /// type, append it here and every consumer picks it up.
 // SYNC: RESERVED_TYPE_KEYWORDS <-> packages/weft-syntax/weft.tmLanguage.json,
 // packages/weft-syntax/highlight-weft.js,
-// crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)
-pub const RESERVED_TYPE_KEYWORDS: &[&str] =
-    &["Group", weft_core::project::boundary_types::PASSTHROUGH, "Loop", weft_core::project::boundary_types::LOOP_IN, weft_core::project::boundary_types::LOOP_OUT];
+// crates/weft-compiler/tests/integration/highlighting_vocabulary.rs (the word-list alarm)
+pub const RESERVED_TYPE_KEYWORDS: &[&str] = &[
+    weft_core::project::own_types::GROUP,
+    weft_core::project::own_types::LOOP,
+    weft_core::project::boundary_types::LOOP_IN,
+    weft_core::project::boundary_types::LOOP_OUT,
+];
 
 /// True iff `name` is one of the language's reserved type keywords.
 pub fn is_reserved_type_keyword(name: &str) -> bool {
@@ -1599,7 +1702,7 @@ pub fn is_reserved_local(id: &str) -> bool {
 /// and the compiler cannot drift on the list.
 // SYNC: RESERVED_WORDS <-> packages/weft-syntax/weft.tmLanguage.json,
 // packages/weft-syntax/highlight-weft.js,
-// crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)
+// crates/weft-compiler/tests/integration/highlighting_vocabulary.rs (the word-list alarm)
 pub const RESERVED_WORDS: &[&str] = &["self", "true", "false", "type"];
 
 /// The header IDENT (the decl's local id) and the type name, from a HEADER node.
@@ -1652,9 +1755,14 @@ fn lower_port_sig(
                 }
                 // The culprit is this port decl, not the whole header.
                 let span = li.span_of(&n);
-                match try_parse_port_decl(text) {
+                let side = if direction == "out" {
+                    weft_core::weft_type::PortSide::Output
+                } else {
+                    weft_core::weft_type::PortSide::Input
+                };
+                match try_parse_port_decl(text, side) {
                     Ok(mut p) => {
-                        // A bad / unknown port TYPE is kept (as MustOverride, red in
+                        // A bad / unknown port TYPE is kept (typed with its own variable, in
                         // the editor) but still surfaced as a squiggle, so the port
                         // never silently vanishes from the canvas.
                         if let Some(type_err) = &p.type_error {
@@ -1780,6 +1888,41 @@ pub(crate) fn read_loop_port_list_vetted(
         .unwrap_or_default()
 }
 
+/// The `[T: Media]` type parameters written on a HEADER (or an inline
+/// expression, which carries its signatures directly). Empty when none
+/// are written; a malformed list is reported on its brackets and lowers
+/// to none. `ports` is the whole port list when the header holds it (a
+/// group's, a loop's), and every parameter must bound a variable one of
+/// them uses; a node's own type adds ports of its own, so enrich asks
+/// that question for a node once it knows them (`None` here).
+fn lower_type_params(
+    owner: &crate::cst::SyntaxNode,
+    ports: Option<(&[ParsedPort], &[ParsedPort])>,
+    li: &LineIndex,
+    errors: &mut Vec<CompileError>,
+) -> Vec<weft_core::weft_type::TypeParam> {
+    use weft_core::weft_type::TypeParam;
+    let Some(params) = owner.children().find(|n| n.kind() == crate::cst::SyntaxKind::TYPE_PARAMS) else {
+        return Vec::new();
+    };
+    let span = li.span_of(&params);
+    let checked = TypeParam::parse_list(&params.to_string()).and_then(|parsed| {
+        TypeParam::check_declarations(&parsed)?;
+        if let Some((in_ports, out_ports)) = ports {
+            let mut used = std::collections::BTreeSet::new();
+            for port in in_ports.iter().chain(out_ports) {
+                port.port_type.collect_type_vars(&mut used);
+            }
+            TypeParam::check_used(&parsed, &used)?;
+        }
+        Ok(parsed)
+    });
+    checked.unwrap_or_else(|why| {
+        errors.push(CompileError::at(span, why));
+        Vec::new()
+    })
+}
+
 /// Read the input/output port signatures off a HEADER,
 /// returning (in_ports, out_ports, one_of_required).
 fn lower_header_ports(
@@ -1831,12 +1974,9 @@ fn lower_node(
     if !reject_reserved_local(&local_id, header_span, errors) {
         return None;
     }
-    if node_type == weft_core::project::boundary_types::PASSTHROUGH {
-        errors.push(CompileError::at(header_span, "'Passthrough' is a compiler-internal node type and cannot be used directly. Passthrough nodes are emitted automatically when a group is flattened."));
-        return None;
-    }
     let id = scoped(parent, &local_id);
     let (in_ports, out_ports, one_of_required) = lower_header_ports(header.syntax(), li, errors);
+    let type_params = lower_type_params(header.syntax(), None, li, errors);
 
     let mut body_out = LoweredBody::default();
     let mut one_of_required = one_of_required;
@@ -1856,6 +1996,7 @@ fn lower_node(
         parent_id: parent.map(|p| p.to_string()),
         in_ports,
         out_ports,
+        type_params,
         one_of_required,
         per_instance: body_out.per_instance,
         span: Some(li.span_of(n.syntax())),
@@ -1990,6 +2131,8 @@ fn lower_config_field(
                         target_port: key.clone(),
                         span: Some(span),
                         source_file: None,
+                        source_inner: false,
+                        target_inner: false,
                     });
                     return;
                 }
@@ -2062,10 +2205,6 @@ fn lower_inline_expr(
         errors.push(CompileError::at(span, "Groups cannot be inlined"));
         return;
     }
-    if node_type == weft_core::project::boundary_types::PASSTHROUGH {
-        errors.push(CompileError::at(span, "'Passthrough' is a compiler-internal node type and cannot be used directly."));
-        return;
-    }
 
     // RAW id (`host_local__field`); `lower_group` scopes it to `g.host__field`
     // in the same pass that rescopes the edge endpoints, so node id and edge
@@ -2075,6 +2214,7 @@ fn lower_inline_expr(
     // Ports: the inline expr's PORT_SIG_IN / PORT_SIG_OUT live directly under
     // the INLINE_EXPR (no HEADER sub-node), so read them off the node itself.
     let (in_ports, out_ports, one_of_required) = lower_header_ports(inline_node, li, errors);
+    let type_params = lower_type_params(inline_node, None, li, errors);
 
     // Body config (recurses for nested inline exprs via lower_config_body). The
     // nested host is THIS anon node (raw `anon_id`), and it shares this node's
@@ -2105,6 +2245,7 @@ fn lower_inline_expr(
         parent_id: parent_id.map(|s| s.to_string()),
         in_ports,
         out_ports,
+        type_params,
         one_of_required,
         per_instance: body_out.per_instance,
         span: Some(li.span_of(inline_node)),
@@ -2124,6 +2265,8 @@ fn lower_inline_expr(
         target_port: field_key.to_string(),
         span: Some(li.span_of(inline_node)),
         source_file: None,
+        source_inner: false,
+        target_inner: false,
     });
 }
 
@@ -2330,7 +2473,7 @@ fn parse_label_value(value: &str, span: Span, errors: &mut Vec<CompileError>) ->
 }
 
 /// Lower a CONNECTION CST node into a ParsedConnection. Endpoints are kept as
-/// written; group-internal rescoping (`self` -> boundary, local child -> scoped)
+/// written; group-internal rescoping (`self` -> the group, local child -> scoped)
 /// is applied by `lower_group` after the group's children are known.
 /// `group_scope` is the enclosing GROUP's scoped id (None at the file root),
 /// passed to `lower_inline_expr` as the synthesized anon node's scope (its
@@ -2396,6 +2539,8 @@ fn lower_connection(
         target_port: t_port,
         span: Some(li.span_of(conn)),
         source_file: None,
+        source_inner: false,
+        target_inner: false,
     })
 }
 
@@ -2428,7 +2573,7 @@ fn lower_group(
     // Diagnostics point at the HEADER (where the user wrote the decl), not the
     // decl-node start which includes leading comment/blank-line trivia.
     let header_span = li.span_of(header.syntax());
-    // Reserved names (`self`, `Group`/`Passthrough`, the `__` compiler-id
+    // Reserved names (`self`, `Group`/`Loop`, the `__` compiler-id
     // separator) rejected loudly, mirroring the node path via the shared gate.
     // The anonymous case (empty local) skips the gate: it takes `source_id`
     // below, which `derive_id` already guarantees is a clean bare identifier
@@ -2468,6 +2613,7 @@ fn lower_group(
     let id = scoped(parent, &local_id);
     let (in_ports, out_ports, one_of_required) = lower_header_ports(header.syntax(), li, errors);
     refuse_scope_one_of("group", &id, &one_of_required, header_span, errors);
+    let type_params = lower_type_params(header.syntax(), Some((&in_ports, &out_ports)), li, errors);
 
     let mut group = ParsedGroup {
         id: id.clone(),
@@ -2475,6 +2621,7 @@ fn lower_group(
         source_file: None,
         in_ports: Vec::new(),
         out_ports,
+        type_params,
         nodes: Vec::new(),
         connections: Vec::new(),
         child_groups: Vec::new(),
@@ -2515,6 +2662,7 @@ fn lower_loop(
     let id = scoped(parent, &local_id);
     let (in_ports, out_ports, one_of_required) = lower_header_ports(header.syntax(), li, errors);
     refuse_scope_one_of("loop", &id, &one_of_required, header_span, errors);
+    let type_params = lower_type_params(header.syntax(), Some((&in_ports, &out_ports)), li, errors);
 
     let mut group = ParsedGroup {
         id: id.clone(),
@@ -2522,6 +2670,7 @@ fn lower_loop(
         source_file: None,
         in_ports: Vec::new(),
         out_ports,
+        type_params,
         nodes: Vec::new(),
         connections: Vec::new(),
         child_groups: Vec::new(),
@@ -2624,7 +2773,7 @@ fn lower_grouplike_body_in_scope(
             K::CONFIG_FIELD => {
                 // ONE path for both kinds. Parse the field with the shared
                 // helper, then place it: `_should_flow` belongs to the
-                // boundary NODE (it decides whether the subgraph runs at
+                // group's gate (it decides whether the subgraph runs at
                 // all), a loop's own knobs belong to its config, and a
                 // plain group has nowhere else to put a field.
                 let noun = group.kind.noun();
@@ -2636,12 +2785,12 @@ fn lower_grouplike_body_in_scope(
                 // an edge targeting this group, plus any inline node it
                 // synthesized. That edge is exactly what the outside form
                 // would have produced, so it joins the group's own
-                // connections and gets rescoped to the In boundary with
+                // connections and gets rescoped to the group's gate with
                 // every other endpoint.
                 let wired_flow = tmp_inline
                     .connections
                     .iter()
-                    .any(|c| weft_core::exec::skip::is_gate_port(&c.target_port));
+                    .any(|c| weft_core::run::skip::is_gate_port(&c.target_port));
                 if wired_flow {
                     group.nodes.extend(std::mem::take(&mut tmp_inline.nodes));
                     group.connections.extend(std::mem::take(&mut tmp_inline.connections));
@@ -2682,7 +2831,7 @@ fn lower_grouplike_body_in_scope(
                         ));
                         continue;
                     }
-                    if weft_core::exec::skip::is_gate_port(key.as_str()) {
+                    if weft_core::run::skip::is_gate_port(key.as_str()) {
                         group.port_literal_spans
                             .insert(key.clone(), ConfigFieldSpan::inline(field_span));
                         group.port_literals.insert(key, value);
@@ -2733,7 +2882,7 @@ fn lower_grouplike_body_in_scope(
                     // `port_literal_spans` above; a loop-config span for
                     // it would show the editor a knob with no value.
                     if matches!(group.kind, GroupKind::Loop)
-                        && !weft_core::exec::skip::is_gate_port(key.as_str())
+                        && !weft_core::run::skip::is_gate_port(key.as_str())
                     {
                         group.loop_config_spans.insert(key, span);
                     }
@@ -2839,11 +2988,10 @@ fn lower_grouplike_body_in_scope(
                 in_ports.push(ParsedPort {
                     name: out.name,
                     // The carry input mirrors the carry OUTPUT's
-                    // optionality: an optional carry (`acc: Number?`) seeds
-                    // the first iteration from its type's zero value when
-                    // unwired (the engine fills it), so its input must be
-                    // optional too or the LoopIn would never become ready.
-                    // A required carry still demands an explicit seed.
+                    // optionality, and an output is never optional, so a
+                    // carry no input line declares demands a seed. The
+                    // engine's zero seed is for one declared `acc?: T`
+                    // that nothing inside requires.
                     required: out.required,
                     port_type: out.port_type,
                     synthesized_from_carry: true,
@@ -2910,11 +3058,11 @@ fn lower_grouplike_body_in_scope(
     group.connections.extend(conn_inline.connections);
 
     // Rescope group-internal connection ENDPOINTS (the node ids were just
-    // scoped by `prefix_node_ids`): `self` -> the group's `__in`/`__out`
-    // boundary; a LOCAL-child ref -> `{group}.child` (this also re-prefixes a
-    // raw anon endpoint like `b__in` to `g.b__in`, matching its node);
-    // anything else is an outer/root ref, left as-is. flatten then rewires
-    // passthroughs.
+    // scoped by `prefix_node_ids`): `self` -> the group's own port seen from
+    // inside; a LOCAL-child ref -> `{group}.child` (this also re-prefixes a
+    // raw anon endpoint like `b__x` to `g.b__x`, matching its node);
+    // anything else is an outer/root ref, left as-is. flatten then joins
+    // the lines through the group's ports into wires (`crate::wires`).
     let local_children: std::collections::HashSet<String> = group
         .nodes
         .iter()
@@ -2923,8 +3071,8 @@ fn lower_grouplike_body_in_scope(
         .chain(group.includes.iter().map(|x| local_of(&x.alias)))
         .collect();
     for conn in &mut group.connections {
-        conn.source_id = rescope_endpoint(&conn.source_id, &id, &local_children, true);
-        conn.target_id = rescope_endpoint(&conn.target_id, &id, &local_children, false);
+        (conn.source_id, conn.source_inner) = rescope_endpoint(&conn.source_id, &id, &local_children);
+        (conn.target_id, conn.target_inner) = rescope_endpoint(&conn.target_id, &id, &local_children);
     }
 }
 
@@ -2943,26 +3091,26 @@ fn prefix_node_ids(nodes: &mut [ParsedNode], group_id: &str) {
     }
 }
 
-/// Rescope a group-internal connection endpoint id. `self` becomes the group's
-/// boundary passthrough (`__in` for a source, `__out` for a target); a local
-/// child ref (by its head segment) is prefixed with the group id; an outer ref
-/// is left unchanged. The two-probe rule (immediate-child-else-bare) the editor
-/// must mirror when validating an edge endpoint.
+/// Rescope a group-internal connection endpoint id, answering whether it is
+/// the group's own port seen from inside. `self` becomes the group's id,
+/// seen from inside; a local child ref (by its head segment) is prefixed
+/// with the group id; an outer ref is left unchanged. The two-probe rule
+/// (immediate-child-else-bare) the editor must mirror when validating an
+/// edge endpoint.
 /// SYNC: rescope_endpoint <-> crates/weft-compiler/src/edit/ops.rs require_endpoint, crates/weft-compiler/src/cst/nodes.rs endpoint_resolves_to, packages/weft-graph/src/webview/lib/projection/apply.ts resolveEndpoint
 fn rescope_endpoint(
     endpoint: &str,
     group_id: &str,
     local_children: &std::collections::HashSet<String>,
-    is_source: bool,
-) -> String {
+) -> (String, bool) {
     if endpoint == "self" {
-        return format!("{group_id}__{}", if is_source { "in" } else { "out" });
+        return (group_id.to_string(), true);
     }
     let head = endpoint.split('.').next().unwrap_or(endpoint);
     if local_children.contains(head) {
-        format!("{group_id}.{endpoint}")
+        (format!("{group_id}.{endpoint}"), false)
     } else {
-        endpoint.to_string()
+        (endpoint.to_string(), false)
     }
 }
 
@@ -3052,7 +3200,7 @@ fn scoped(parent: Option<&str>, local: &str) -> String {
 /// `name?: Type` (optional). The `?` sits on the NAME, the one place it
 /// means "may be absent" everywhere in the language (a record field
 /// spells it the same way); `name: Type?` is refused naming the spelling.
-pub(crate) fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
+pub(crate) fn try_parse_port_decl(trimmed: &str, side: weft_core::weft_type::PortSide) -> Result<ParsedPort, String> {
     let s = trimmed.trim();
     let rest = s;
     let (name, port_type, optional, type_text) = if let Some(colon_pos) = rest.find(':') {
@@ -3069,40 +3217,38 @@ pub(crate) fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
             ));
         }
 
-        match WeftType::parse(type_str) {
-            Some(pt) => (name, pt, optional, Some(type_str.to_string())),
-            // An invalid / unknown type is RECOVERABLE: keep the port (with the
-            // `MustOverride` placeholder, which the editor renders red as
-            // "needs a type") and surface the bad type as a diagnostic, rather
-            // than dropping the port so it silently vanishes from the canvas.
-            // Mirrors the same keep-and-flag rule enrich applies to a custom port
-            // left at `MustOverride`. The error text rides on the returned port
-            // via `type_error` so the caller records the squiggle.
-            None => return Ok(ParsedPort {
+        match WeftType::try_parse(type_str) {
+            Ok(pt) => (name, pt, optional, Some(type_str.to_string())),
+            // An invalid / unknown type is RECOVERABLE: keep the port (typed
+            // with its own variable, as an untyped port is) and surface the
+            // bad type as a diagnostic, rather than dropping the port so it
+            // silently vanishes from the canvas. The error text rides on the
+            // returned port via `type_error` so the caller records the
+            // squiggle.
+            Err(why) => return Ok(ParsedPort {
                 name: name.to_string(),
-                port_type: WeftType::MustOverride,
+                port_type: WeftType::port_var(side, name),
                 required: !optional,
                 synthesized_from_carry: false,
-                type_error: Some(format!("Invalid port type '{}' on port '{}'", type_str, name)),
+                type_error: Some(format!("Invalid port type '{type_str}' on port '{name}': {why}")),
                 // The unparseable annotation stays the declared spelling:
                 // the editor rewrites headers from it, and stamping the
-                // placeholder here would overwrite the author's typo (and
-                // the squiggle pointing at it) on the next ports gesture.
+                // port's variable here would overwrite the author's typo
+                // (and the squiggle pointing at it) on the next ports gesture.
                 type_text: Some(type_str.to_string()),
             }),
         }
     } else {
-        // No type annotation. The name is validated once, by the
-        // shared check below, the same as the typed branch's. The
-        // header still DECLARES the port, so it gets a declared
-        // spelling (the default type's), or the editor's next ports
-        // gesture would treat it as catalog-provided and drop it.
+        // No type annotation: the port takes its type from what is wired
+        // to it, through its own variable. The name is validated once, by
+        // the shared check below, the same as the typed branch's. The
+        // header still DECLARES the port, so it gets a declared spelling
+        // (the empty one, written back as the bare name), or the editor's
+        // next ports gesture would treat it as catalog-provided and drop it.
         let name = rest.trim();
         let optional = name.ends_with('?');
         let name = if optional { name[..name.len() - 1].trim() } else { name };
-        let default = WeftType::default();
-        let text = default.wire_string();
-        (name, default, optional, Some(text))
+        (name, WeftType::port_var(side, name), optional, Some(String::new()))
     };
 
     // Validate port name
@@ -3519,9 +3665,9 @@ fn unescape(s: &str) -> String {
 
 // ─── Flattener ──────────────────────────────────────────────────────────────
 
-fn flatten(state: ParseState, bodies: Bodies, project_id: Uuid) -> ProjectDefinition {
+fn flatten(state: ParseState, bodies: Bodies, project_id: Uuid, errors: &mut Vec<CompileError>) -> ProjectDefinition {
     let mut nodes: Vec<NodeDefinition> = Vec::new();
-    let mut edges: Vec<Edge> = Vec::new();
+    let mut connections: Vec<&ParsedConnection> = Vec::new();
 
     let now = chrono::Utc::now();
 
@@ -3529,11 +3675,7 @@ fn flatten(state: ParseState, bodies: Bodies, project_id: Uuid) -> ProjectDefini
     for pn in &state.nodes {
         nodes.push(parsed_to_node_def(pn));
     }
-
-    // Add top-level connections
-    for pc in &state.connections {
-        edges.push(parsed_to_edge(pc));
-    }
+    connections.extend(&state.connections);
 
     // Collect the structured group tree BEFORE flattening so the
     // GroupDefinitions capture the pre-flatten shape (which node ids
@@ -3543,41 +3685,34 @@ fn flatten(state: ParseState, bodies: Bodies, project_id: Uuid) -> ProjectDefini
         collect_group_definitions(group, None, &mut groups);
     }
 
-    // Flatten each group (recursively handles nested groups)
+    // Every group's members (and a loop's two boundaries), and the lines
+    // written inside it. Every included file's body once, beside the
+    // program's own groups: a top-level scope of its own whose members run
+    // under a call frame.
+    let mut kinds: std::collections::BTreeMap<String, GroupKind> = std::collections::BTreeMap::new();
+    let mut scopes: Vec<crate::wires::Scope> = Vec::new();
     for group in &state.groups {
-        flatten_group(group, &mut nodes, &mut edges);
+        flatten_group(group, &mut nodes, &mut connections, &mut kinds, &mut scopes);
     }
-
-    // Every included file's body, once, beside the program's own groups:
-    // a top-level scope of its own whose members run under a call frame.
     for body in &bodies.groups {
         collect_group_definitions(body, None, &mut groups);
-        flatten_group(body, &mut nodes, &mut edges);
+        flatten_group(body, &mut nodes, &mut connections, &mut kinds, &mut scopes);
     }
 
-    // Deduplicate nodes by id, then edges. A node-id collision is already a loud
-    // parse error (`Duplicate id`) that aborts the strict build, but the lenient
-    // render path (`compile_lenient`) always returns a project, so without this
-    // it would hand the renderer two `NodeDefinition`s with one id (a broken
-    // contract for anything keyed by id, e.g. two `g.c__in` from an alias clashing
-    // with a same-named group). Keep the first; the diagnostic already tells the
-    // user to fix the source.
+    // Deduplicate nodes by id. A node-id collision is already a loud parse
+    // error (`Duplicate id`) that aborts the strict build, but the lenient
+    // render path (`compile_lenient`) always returns a project, so without
+    // this it would hand the renderer two `NodeDefinition`s with one id (a
+    // broken contract for anything keyed by id). Keep the first; the
+    // diagnostic already tells the user to fix the source.
     {
         let mut seen = std::collections::HashSet::new();
         nodes.retain(|n| seen.insert(n.id.clone()));
     }
-    {
-        let mut seen = std::collections::HashSet::new();
-        edges.retain(|e| {
-            let key = (
-                e.source.clone(),
-                e.source_handle.clone().unwrap_or_default(),
-                e.target.clone(),
-                e.target_handle.clone().unwrap_or_default(),
-            );
-            seen.insert(key)
-        });
-    }
+
+    // The lines joined into wires end to end (`crate::wires`).
+    let legs: Vec<crate::wires::Leg> = connections.iter().map(|pc| leg_of(pc, &kinds)).collect();
+    let edges = crate::wires::join(&legs, &scopes, errors);
 
     ProjectDefinition {
         id: project_id,
@@ -3587,6 +3722,40 @@ fn flatten(state: ParseState, bodies: Bodies, project_id: Uuid) -> ProjectDefini
         created_at: now,
         updated_at: now,
         defaults: Default::default(),
+        given: Default::default(),
+        broken: Vec::new(),
+    }
+}
+
+/// A line's two ends, resolved: a node, a group's port from outside or from
+/// inside, or a loop's port, which is its `LoopIn` (where a value enters)
+/// or its `LoopOut` (where a value leaves).
+fn leg_of(pc: &ParsedConnection, kinds: &std::collections::BTreeMap<String, GroupKind>) -> crate::wires::Leg {
+    use crate::wires::End;
+    let is_loop = |id: &str| kinds.get(id) == Some(&GroupKind::Loop);
+    let is_group = |id: &str| kinds.get(id).is_some_and(|kind| kind != &GroupKind::Loop);
+    let source = match (pc.source_inner, pc.source_id.as_str()) {
+        (true, id) if is_loop(id) => End::Node(weft_core::project::loop_in_id(id)),
+        (true, id) => End::Inner(id.to_string()),
+        (false, id) if is_loop(id) => End::Node(weft_core::project::loop_out_id(id)),
+        (false, id) if is_group(id) => End::Outer(id.to_string()),
+        (false, id) => End::Node(id.to_string()),
+    };
+    let target = match (pc.target_inner, pc.target_id.as_str()) {
+        (true, id) if is_loop(id) => End::Node(weft_core::project::loop_out_id(id)),
+        (true, id) => End::Inner(id.to_string()),
+        (false, id) if is_loop(id) => End::Node(weft_core::project::loop_in_id(id)),
+        (false, id) if is_group(id) => End::Outer(id.to_string()),
+        (false, id) => End::Node(id.to_string()),
+    };
+    crate::wires::Leg {
+        source,
+        source_port: pc.source_port.clone(),
+        target,
+        target_port: pc.target_port.clone(),
+        path: pc.source_path.clone(),
+        span: pc.span,
+        source_file: pc.source_file.clone(),
     }
 }
 
@@ -3638,7 +3807,7 @@ fn collect_group_definitions(
 
     let kind = match &group.kind {
         GroupKind::Group => weft_core::GroupKind::Group,
-        GroupKind::Call { body } => weft_core::GroupKind::Call { body: body.clone() },
+        GroupKind::Call { body } => weft_core::GroupKind::Call { body: body.clone(), runs: None },
         GroupKind::Body => weft_core::GroupKind::Body,
         GroupKind::Loop => weft_core::GroupKind::Loop {
             loop_config: serde_json::Value::Object(
@@ -3669,6 +3838,13 @@ fn collect_group_definitions(
         description: group.description.clone(),
         port_literals: group.port_literals.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         port_literal_spans: group.port_literal_spans.clone(),
+        // A `@file` / `@asset` literal on a port is resolved with the
+        // program's other file references (`crate::file_ref`).
+        file_refs: Default::default(),
+        // A loop's bounds sit on its two boundaries, which carry its ports.
+        type_params: if matches!(group.kind, GroupKind::Loop) { Vec::new() } else { group.type_params.clone() },
+        // Resolved per place by enrich.
+        place_types: Vec::new(),
     });
 
     for child in &group.child_groups {
@@ -3688,28 +3864,50 @@ fn build_scope_chain(group_id: &str) -> Vec<String> {
     chain
 }
 
-fn flatten_group(
-    group: &ParsedGroup,
+/// Flatten one group: its members into `nodes`, the lines written inside
+/// it into `connections`, its kind into `kinds`, and, for a group that is
+/// not a loop, what joining wires through it needs into `scopes`. A loop
+/// also gets its two boundary nodes, `LoopIn` and `LoopOut`, which its
+/// iterations run through; no other kind of group is a node.
+fn flatten_group<'a>(
+    group: &'a ParsedGroup,
     nodes: &mut Vec<NodeDefinition>,
-    edges: &mut Vec<Edge>,
+    connections: &mut Vec<&'a ParsedConnection>,
+    kinds: &mut std::collections::BTreeMap<String, GroupKind>,
+    scopes: &mut Vec<crate::wires::Scope>,
 ) {
+    kinds.insert(group.id.clone(), group.kind.clone());
+    if group.kind == GroupKind::Loop {
+        push_loop_boundaries(group, nodes);
+    } else {
+        scopes.push(crate::wires::Scope {
+            id: group.id.clone(),
+            calls: match &group.kind { GroupKind::Call { body } => Some(body.clone()), _ => None },
+            is_body: group.kind == GroupKind::Body,
+            in_ports: group.in_ports.iter().map(|p| p.name.clone()).collect(),
+            out_ports: group.out_ports.iter().map(|p| p.name.clone()).collect(),
+        });
+    }
+
+    for pn in &group.nodes {
+        nodes.push(parsed_to_node_def(pn));
+    }
+    connections.extend(&group.connections);
+    for child in &group.child_groups {
+        flatten_group(child, nodes, connections, kinds, scopes);
+    }
+}
+
+/// A loop's two boundary nodes: `LoopIn`, which takes the loop's inputs
+/// (and its gate) and launches each iteration, and `LoopOut`, which
+/// gathers what each iteration writes and sends the loop's outputs.
+fn push_loop_boundaries(group: &ParsedGroup, nodes: &mut Vec<NodeDefinition>) {
     let internal_scope = build_scope_chain(&group.id);
     let boundary_scope = if internal_scope.len() > 1 {
         internal_scope[..internal_scope.len() - 1].to_vec()
     } else {
         vec![]
     };
-
-    let (in_type, out_type) = {
-        use weft_core::project::boundary_types as bt;
-        match &group.kind {
-            GroupKind::Group => (bt::PASSTHROUGH, bt::PASSTHROUGH),
-            GroupKind::Loop => (bt::LOOP_IN, bt::LOOP_OUT),
-            GroupKind::Call { .. } => (bt::CALL_IN, bt::CALL_OUT),
-            GroupKind::Body => (bt::INCLUDE_IN, bt::INCLUDE_OUT),
-        }
-    };
-
     // Loop-only: parse `over` / `carry` to derive the boundary port shapes.
     // For a Loop:
     //   - LoopIn.inputs (outer-in) mirror the user's input signature as
@@ -3725,14 +3923,8 @@ fn flatten_group(
     //     gather ports (the user-declared List[T | Null]) and the final
     //     carry value for carry ports (T).
     //
-    // For a Group, all four sides mirror the user's declared types.
-    let (loop_over, loop_carry): (Vec<String>, Vec<String>) = match &group.kind {
-        GroupKind::Loop => (
-            read_loop_port_list_vetted(group.loop_config.as_ref(), "over"),
-            read_loop_port_list_vetted(group.loop_config.as_ref(), "carry"),
-        ),
-        GroupKind::Group | GroupKind::Call { .. } | GroupKind::Body => (Vec::new(), Vec::new()),
-    };
+    let loop_over = read_loop_port_list_vetted(group.loop_config.as_ref(), "over");
+    let loop_carry = read_loop_port_list_vetted(group.loop_config.as_ref(), "carry");
 
     let elem_type = |ty: &weft_core::weft_type::WeftType| -> weft_core::weft_type::WeftType {
         // `over` on a stream: the body's per-iteration port carries
@@ -3746,17 +3938,13 @@ fn flatten_group(
         }
     };
 
-    let in_pt_id = weft_core::project::boundary_in_id(&group.id);
-    // A closed group input is not a reason to skip the group: it reaches
-    // the inside as a closure, and whichever node needs it skips there,
-    // so the In boundary holds every group port as optional. A loop is
-    // different for the ports it iterates or threads: with no list to
-    // walk, or no seed to carry, there is no iteration to launch.
+    let in_pt_id = weft_core::project::loop_in_id(&group.id);
+    // A closed loop input is no reason to skip the loop: it reaches the
+    // inside as a closure, and whichever node needs it skips there, except
+    // for the ports it iterates or threads: with no list to walk, or no
+    // seed to carry, there is no iteration to launch.
     let mut in_pt_inputs: Vec<InputDefinition> = group.in_ports.iter().map(|p| {
-        let boundary_required = match &group.kind {
-            GroupKind::Group | GroupKind::Call { .. } | GroupKind::Body => false,
-            GroupKind::Loop => p.required && (loop_over.contains(&p.name) || loop_carry.contains(&p.name)),
-        };
+        let boundary_required = p.required && (loop_over.contains(&p.name) || loop_carry.contains(&p.name));
         InputDefinition::from_wire_port(PortDefinition {
             name: p.name.clone(),
             port_type: p.port_type.clone(),
@@ -3769,45 +3957,44 @@ fn flatten_group(
             // field's contract. Only NODE decl ports carry one.
             declared_type: None,
         })
+        .with_optional(!boundary_required)
     }).collect();
-    // A group or loop takes `_should_flow` like any node, on its IN
-    // boundary: a closure or a `false` there skips the boundary, and the
-    // skip cascades through every child, so guarding a subgraph is the
-    // same one line as guarding a node. Enrich gives every catalog node
-    // this port; boundary nodes are built here instead, so it is added
-    // here. The Out boundary never takes one: it forwards whatever
-    // reached it, and a group that did not run has nothing to forward.
+    // A loop takes `_should_flow` like any node, on its `LoopIn`: a
+    // closure or a `false` there skips it, and everything inside the loop
+    // with it. Enrich gives every catalog node this port; a loop's
+    // boundaries are built here instead, so it is added here. `LoopOut`
+    // never takes one: it gathers whatever reached it.
     in_pt_inputs.push(InputDefinition::from_wire_port(PortDefinition {
-        name: weft_core::exec::skip::SHOULD_FLOW_PORT.to_string(),
+        name: weft_core::run::skip::SHOULD_FLOW_PORT.to_string(),
         // Its OWN type variable, never a `T` the group's ports might
         // also use.
-        port_type: weft_core::weft_type::WeftType::type_var("T__should_flow"),
+        port_type: weft_core::weft_type::WeftType::port_var(weft_core::weft_type::PortSide::Input, weft_core::run::skip::SHOULD_FLOW_PORT),
         required: false,
         description: Some(
-            "Whether this group runs. A `false` value or a closed input skips it, and everything inside it closes in turn."
+            "Whether this loop runs. A `false` value or a closed input skips it, and everything inside it closes in turn."
                 .to_string(),
         ),
         synthesized_from_carry: false,
         declared_type: None,
-    }));
+    }).with_optional(true));
     // The same gate read the other way round, on the same boundary: a
-    // whole subgraph that runs when the thing wired here did NOT happen.
-    // Both spellings exist on every node, so they exist here too, or a
-    // group would be the one thing in the language that cannot be gated
-    // on an absence.
+    // whole loop that runs when the thing wired here did NOT happen. Both
+    // spellings exist on every node, so they exist here too, or a loop
+    // would be the one thing in the language that cannot be gated on an
+    // absence.
     in_pt_inputs.push(InputDefinition::from_wire_port(PortDefinition {
-        name: weft_core::exec::skip::SHOULD_NOT_FLOW_PORT.to_string(),
-        port_type: weft_core::weft_type::WeftType::type_var("T__should_not_flow"),
+        name: weft_core::run::skip::SHOULD_NOT_FLOW_PORT.to_string(),
+        port_type: weft_core::weft_type::WeftType::port_var(weft_core::weft_type::PortSide::Input, weft_core::run::skip::SHOULD_NOT_FLOW_PORT),
         required: false,
         description: Some(
-            "Whether this group runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it."
+            "Whether this loop runs, read the other way round. A value here skips it; a CLOSED input (the thing never happened) is what runs it."
                 .to_string(),
         ),
         synthesized_from_carry: false,
         declared_type: None,
-    }));
+    }).with_optional(true));
     let mut in_pt_outputs: Vec<PortDefinition> = group.in_ports.iter().map(|p| {
-        let ty = if matches!(group.kind, GroupKind::Loop) && loop_over.contains(&p.name) {
+        let ty = if loop_over.contains(&p.name) {
             elem_type(&p.port_type)
         } else {
             p.port_type.clone()
@@ -3822,12 +4009,12 @@ fn flatten_group(
             declared_type: None,
         }
     }).collect();
-    // Implicit `self.index: Number` for loops. If the user declared a
+    // Implicit `self.index: Number`. If the user declared a
     // port named `index` validate already emitted a reserved-name
     // diagnostic; skip pushing the implicit one rather than producing a
     // structurally duplicate port that downstream port-by-name lookups
     // would silently disambiguate.
-    if matches!(group.kind, GroupKind::Loop) && !in_pt_outputs.iter().any(|p| p.name == "index") {
+    if !in_pt_outputs.iter().any(|p| p.name == "index") {
         in_pt_outputs.push(PortDefinition {
             name: "index".to_string(),
             port_type: weft_core::weft_type::WeftType::primitive(weft_core::weft_type::WeftPrimitive::Number),
@@ -3843,7 +4030,7 @@ fn flatten_group(
     // engine reads it without a separate registry. parentId is kept so
     // the existing webview rendering doesn't break.
     let mut in_cfg = serde_json::json!({"parentId": group.id});
-    if let (GroupKind::Loop, Some(lc)) = (&group.kind, &group.loop_config) {
+    if let Some(lc) = &group.loop_config {
         if let Some(obj) = in_cfg.as_object_mut() {
             for (k, v) in lc {
                 obj.insert(k.clone(), v.clone());
@@ -3851,27 +4038,23 @@ fn flatten_group(
             // `parallel` defaults to false (sequential): materialized
             // HERE so the flattened config always carries one explicit
             // value and the runtime never holds its own default. The
-            // other knobs default by absence (`max_iters` = no cap,
+            // other knobs default by absence (`maxIters` = no cap,
             // `over`/`carry` = empty).
             obj.entry("parallel")
                 .or_insert(serde_json::Value::Bool(false));
         }
     }
-    let loop_spans: std::collections::BTreeMap<String, ConfigFieldSpan> =
-        if matches!(group.kind, GroupKind::Loop) {
-            group.loop_config_spans.clone()
-        } else {
-            Default::default()
-        };
     nodes.push(NodeDefinition {
         id: in_pt_id.clone(),
-        node_type: in_type.to_string(),
-        label: Some(boundary_label(&group.id, weft_core::project::GroupBoundaryRole::In)),
+        node_type: weft_core::project::boundary_types::LOOP_IN.to_string(),
+        label: Some(loop_boundary_label(&group.id, weft_core::project::GroupBoundaryRole::In)),
         config: in_cfg,
         position: Position { x: 0.0, y: 0.0 },
         inputs: in_pt_inputs,
         outputs: in_pt_outputs,
         features: in_features,
+        type_params: group.type_params.clone(),
+        place_types: Vec::new(),
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::In }),
         requires_infra: false, per_instance: None,
@@ -3881,15 +4064,15 @@ fn flatten_group(
         instance_service: None,
         instance_rules: None,
         span: None,
-        // The group's header is where a diagnostic about either
+        // The loop's header is where a diagnostic about either
         // boundary points: the boundaries are the header's two
         // halves, and their own ids appear nowhere in the source.
         header_span: group.header_span,
-        config_spans: loop_spans,
+        config_spans: group.loop_config_spans.clone(),
         optional_ports: Default::default(),
-        // Literals written on the container's interface ports. Enrich never
-        // sees a boundary node, so what it would normally move onto the port
-        // is placed here.
+        // Literals written on the loop's interface ports. Enrich never sees
+        // a boundary node, so what it would normally move onto the port is
+        // placed here.
         port_literals: group.port_literals.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         port_literal_spans: group.port_literal_spans.clone(),
         file_refs: Default::default(),
@@ -3903,20 +4086,16 @@ fn flatten_group(
         source_file: group.source_file.clone(),
     });
 
-    let out_pt_id = weft_core::project::boundary_out_id(&group.id);
+    let out_pt_id = weft_core::project::loop_out_id(&group.id);
     let mut out_pt_inputs: Vec<InputDefinition> = group.out_ports.iter().map(|p| {
-        let (ty, required) = if matches!(group.kind, GroupKind::Loop) {
-            if loop_carry.contains(&p.name) {
-                // Carry-write port: T (engine reads optional/closed at runtime).
-                (p.port_type.clone(), false)
-            } else {
-                // Gather-write port: the element under List[T | Null] is what
-                // the body writes per iteration; the engine substitutes null
-                // on closure.
-                (elem_type(&p.port_type), false)
-            }
-        } else {
+        let (ty, required) = if loop_carry.contains(&p.name) {
+            // Carry-write port: T (engine reads optional/closed at runtime).
             (p.port_type.clone(), false)
+        } else {
+            // Gather-write port: the element under List[T | Null] is what
+            // the body writes per iteration; the engine substitutes null
+            // on closure.
+            (elem_type(&p.port_type), false)
         };
         InputDefinition::from_wire_port(PortDefinition {
             name: p.name.clone(),
@@ -3926,11 +4105,12 @@ fn flatten_group(
             synthesized_from_carry: false,
             declared_type: None,
         })
+        .with_optional(!required)
     }).collect();
-    // Implicit `self.done: Boolean` for loops. Skip if the user declared a
+    // Implicit `self.done: Boolean`. Skip if the user declared a
     // port named `done` (validate reports the reserved-name collision);
     // a duplicate port would silently shadow at the next port-by-name lookup.
-    if matches!(group.kind, GroupKind::Loop) && !out_pt_inputs.iter().any(|p| p.name == "done") {
+    if !out_pt_inputs.iter().any(|p| p.name == "done") {
         out_pt_inputs.push(InputDefinition::from_wire_port(PortDefinition {
             name: "done".to_string(),
             port_type: weft_core::weft_type::WeftType::primitive(weft_core::weft_type::WeftPrimitive::Boolean),
@@ -3938,7 +4118,7 @@ fn flatten_group(
             description: None,
             synthesized_from_carry: false,
             declared_type: None,
-        }));
+        }).with_optional(true));
     }
     let out_pt_outputs: Vec<PortDefinition> = group.out_ports.iter().map(|p| PortDefinition {
         name: p.name.clone(),
@@ -3951,19 +4131,21 @@ fn flatten_group(
     }).collect();
 
     // The OUT boundary carries only the parent pointer. Loop config
-    // (parallel, over, carry, max_iters, trim_on_mismatch) is authoritative
+    // (parallel, over, carry, maxIters, trimOnMismatch) is authoritative
     // on LoopIn; mirroring it on LoopOut would create two sources of truth
     // for the same fields.
     let out_cfg = serde_json::json!({"parentId": group.id});
     nodes.push(NodeDefinition {
         id: out_pt_id.clone(),
-        node_type: out_type.to_string(),
-        label: Some(boundary_label(&group.id, weft_core::project::GroupBoundaryRole::Out)),
+        node_type: weft_core::project::boundary_types::LOOP_OUT.to_string(),
+        label: Some(loop_boundary_label(&group.id, weft_core::project::GroupBoundaryRole::Out)),
         config: out_cfg,
         position: Position { x: 0.0, y: 0.0 },
         inputs: out_pt_inputs,
         outputs: out_pt_outputs,
         features: NodeFeatures::default(),
+        type_params: group.type_params.clone(),
+        place_types: Vec::new(),
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::Out }),
         requires_infra: false, per_instance: None,
@@ -3983,58 +4165,6 @@ fn flatten_group(
         include_contents: None,
         source_file: group.source_file.clone(),
     });
-
-    // 3. Add internal nodes
-    for pn in &group.nodes {
-        nodes.push(parsed_to_node_def(pn));
-    }
-
-    // 4. Add internal connections
-    for pc in &group.connections {
-        edges.push(parsed_to_edge(pc));
-    }
-
-    // 5. Rewrite edges that reference the group ID directly
-    for edge in edges.iter_mut() {
-        if edge.target == group.id {
-            edge.target = in_pt_id.clone();
-        }
-        if edge.source == group.id {
-            edge.source = out_pt_id.clone();
-        }
-    }
-
-    // 5b. A call site's wires to its body: every input the site takes
-    // goes to the body's In, every output the body makes comes back to
-    // the site's Out. The body's In is wired from EVERY site that calls
-    // it and its Out to every site; the call frame a site's In pushes is
-    // what keeps the calls apart, and the frame is what picks the site a
-    // result returns to (`weft_core::exec::postprocess::frames_across`).
-    if let GroupKind::Call { body } = &group.kind {
-        let body_in = weft_core::project::boundary_in_id(body);
-        let body_out = weft_core::project::boundary_out_id(body);
-        let wire = |source: &str, port: &str, target: &str| Edge {
-            id: edge_id(source, port, target, port),
-            source: source.to_string(),
-            target: target.to_string(),
-            source_handle: Some(port.to_string()),
-            target_handle: Some(port.to_string()),
-            path: Vec::new(),
-            span: None,
-            source_file: None,
-        };
-        for p in &group.in_ports {
-            edges.push(wire(&in_pt_id, &p.name, &body_in));
-        }
-        for p in &group.out_ports {
-            edges.push(wire(&body_out, &p.name, &out_pt_id));
-        }
-    }
-
-    // 6. Recursively flatten child groups
-    for child in &group.child_groups {
-        flatten_group(child, nodes, edges);
-    }
 }
 
 fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
@@ -4056,6 +4186,8 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
             // the parsed type (see `ParsedPort::type_text`).
             declared_type: p.type_text.clone(),
         })
+        // The header's `?`: runs without it even when its wire closed.
+        .with_optional(!p.required)
     }).collect();
     let outputs = pn.out_ports.iter().map(|p| PortDefinition {
         name: p.name.clone(),
@@ -4082,6 +4214,8 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         inputs,
         outputs,
         features,
+        type_params: pn.type_params.clone(),
+        place_types: Vec::new(),
         scope,
         group_boundary: None,
         requires_infra: false,
@@ -4105,19 +4239,6 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         include_path: pn.include_path.clone(),
         include_contents: pn.include_contents.clone(),
         source_file: pn.source_file.clone(),
-    }
-}
-
-fn parsed_to_edge(pc: &ParsedConnection) -> Edge {
-    Edge {
-        id: edge_id(&pc.source_id, &pc.source_port, &pc.target_id, &pc.target_port),
-        source: pc.source_id.clone(),
-        target: pc.target_id.clone(),
-        source_handle: Some(pc.source_port.clone()),
-        target_handle: Some(pc.target_port.clone()),
-        path: pc.source_path.clone(),
-        span: pc.span,
-        source_file: pc.source_file.clone(),
     }
 }
 

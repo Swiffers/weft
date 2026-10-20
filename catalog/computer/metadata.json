@@ -1,0 +1,15 @@
+{
+  "icon": "Monitor",
+  "color": "#3a6ea5",
+  "types": {
+    "ZoomArgs": "{ region: List[Number] }",
+    "ClickArgs": "{ x?: Number, y?: Number, button?: String, count?: Number, modifiers?: String }",
+    "DragArgs": "{ path: List[{ x: Number, y: Number }], button?: String, modifiers?: String }",
+    "MoveArgs": "{ x: Number, y: Number, modifiers?: String }",
+    "MouseButtonArgs": "{ action: String, button?: String }",
+    "ScrollArgs": "{ x?: Number, y?: Number, direction: String, amount?: Number, modifiers?: String }",
+    "TypeArgs": "{ text: String }",
+    "KeyArgs": "{ keys: String, repeat?: Number, holdSecs?: Number }",
+    "CommandArgs": "{ command?: String, restart?: Boolean, timeoutSecs?: Number }"
+  }
+}

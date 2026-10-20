@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{node_bail, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{node_bail, RunContext, Node, NodeManifest, WeftResult};
 
 use super::lifecycle::instance;
 
@@ -22,7 +22,7 @@ impl Node for MintInstanceTokenNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let hours: f64 = ctx.inputs.get("expiresInHours")?;
         // The token's life is counted in whole seconds, so the hours
         // round to the nearest one (1.1 hours is 3960.0000000000005

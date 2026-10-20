@@ -1,7 +1,7 @@
 //! Live caller connection: the node-facing surface for a held connection
 //! to an outside caller (see `crate::signal::live_connection`).
 //!
-//! Two execution worlds exist. The DURABLE world (`ctx.await_signal`) is
+//! Two run worlds exist. The DURABLE world (`ctx.await_signal`) is
 //! a disconnected wait: the worker parks, dies, journals, and a fresh
 //! worker resumes later. The LIVE world (this module) is a caller
 //! attached over a held connection for the life of the request/session;
@@ -18,7 +18,7 @@
 //!   engine wires one onto the `ContextHandle` for runs that have a live
 //!   connection; runs without one expose `None`.
 //! - [`CallerHandle`] is the ergonomic author-facing wrapper
-//!   `ExecutionContext::caller()` returns. Talk methods are
+//!   `RunContext::caller()` returns. Talk methods are
 //!   protocol-specific (an HTTP handle has no `receive`), so the wrapper
 //!   is an enum over the two protocol shapes: the interface is honest
 //!   about what each protocol can do.
@@ -56,6 +56,7 @@ use crate::signal::{Backpressure, DataType, ErrorMode, LiveConnectionConfig, Pro
 /// route pattern's captures for it (`{"room": "room7"}`); `caller` is
 /// the identity the auth gate established (`None` on an open route).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LiveRequest {
     /// Absent reads as empty rather than refusing, so a trigger whose
     /// method is fixed by the protocol can leave it out of what it
@@ -75,12 +76,9 @@ pub struct LiveRequest {
     pub caller: Option<Value>,
     /// The address the caller reached this install at (its request's own
     /// `Host` / `X-Forwarded-*`, [`crate::net::request_base_url`]),
-    /// stated by the birth that read the caller's request. What a link
-    /// this caller will fetch is built on (a route's answer carrying a
-    /// file): a browser on the loopback port gets a loopback link, one
-    /// on the tunnel a tunnel link. `None` for a run no real request
-    /// started (`weft run --fire`), whose links fall back to the
-    /// install's configured address.
+    /// stated by the birth that read the caller's request: plain
+    /// information about the request, like its headers. `None` for a run
+    /// no real request started (`weft run --fire`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
 }
@@ -242,17 +240,17 @@ impl ResponseHead {
         self.header("content-type").map(|v| v.split(';').next().unwrap_or("").trim().to_ascii_lowercase())
     }
 
-    /// The bytes that tell a reader of this body the program failed,
-    /// once the status line is already out: in the body's own framing,
-    /// so a reader parsing it gets the error as an item it can read.
-    /// JSON lines get one line `{"error": "...", "status": 504}`, the
-    /// status being the one the answer would have had, had it not started
-    /// (`500` the program failed, `504` a time limit, `503` stopped);
-    /// server-sent events an `error` event, anything else a text line
-    /// `[error] ...`. Each starts on a fresh line, since the last item may
-    /// not have ended one (a blank line is skipped by a JSON-lines or SSE
-    /// reader).
-    pub fn in_band_error(&self, message: &str, status: u16) -> Vec<u8> {
+    /// The bytes that tell a reader of this body the run failed, once
+    /// the status line is already out: in the body's own framing, so a
+    /// reader parsing it gets the error as an item it can read. JSON
+    /// lines get one line `{"error": "...", "runId": "...", "status":
+    /// 504}`, the status being the one the answer would have had, had it
+    /// not started (`500` the program failed, `504` a time limit, `503`
+    /// stopped); server-sent events an `error` event whose data is the
+    /// failure as JSON; anything else a text line `[error] ...`. Each
+    /// starts on a fresh line, since the last item may not have ended
+    /// one (a blank line is skipped by a JSON-lines or SSE reader).
+    pub fn in_band_error(&self, failure: &PlainFailure, status: u16) -> Vec<u8> {
         const JSON_LINES: &[&str] = &[
             "application/x-ndjson",
             "application/ndjson",
@@ -264,19 +262,15 @@ impl ResponseHead {
         let essence = self.content_type_essence();
         match essence.as_deref() {
             Some(ct) if JSON_LINES.contains(&ct) => {
-                format!("\n{}\n", serde_json::json!({ "error": message, "status": status })).into_bytes()
+                let mut line = serde_json::to_value(failure).expect("a plain failure serializes");
+                line["status"] = serde_json::json!(status);
+                format!("\n{line}\n").into_bytes()
             }
             Some("text/event-stream") => {
-                let mut out = String::from("\nevent: error\n");
-                for line in message.split('\n') {
-                    out.push_str("data: ");
-                    out.push_str(line);
-                    out.push('\n');
-                }
-                out.push('\n');
-                out.into_bytes()
+                let data = serde_json::to_string(failure).expect("a plain failure serializes");
+                format!("\nevent: error\ndata: {data}\n\n").into_bytes()
             }
-            _ => format!("\n[error] {message}").into_bytes(),
+            _ => format!("\n[error] {}", failure.line()).into_bytes(),
         }
     }
 
@@ -364,7 +358,7 @@ impl CallerRuntimeConfig {
             max_session_secs: cfg.max_session_secs,
             outlives_caller: cfg.outlives_caller,
             inbound_window: cfg.window.unwrap_or(DEFAULT_INBOUND_WINDOW),
-            journal: cfg.journal_policy(),
+            journal: cfg.journal,
         }
     }
 }
@@ -379,9 +373,9 @@ pub const DEFAULT_INBOUND_WINDOW: usize = 64;
 /// outlives its caller keeps running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectAction {
-    /// Cancel THIS execution (via the per-execution cancel-by-execution
+    /// Cancel THIS run (via the per-run cancel-by-run
     /// path). Never the process, which multiplexes many runs.
-    CancelExecution,
+    CancelRun,
     /// Keep running to completion; further sends to the caller go into
     /// the void.
     ContinueIntoVoid,
@@ -393,7 +387,7 @@ pub fn resolve_disconnect(outlives_caller: bool) -> DisconnectAction {
     if outlives_caller {
         DisconnectAction::ContinueIntoVoid
     } else {
-        DisconnectAction::CancelExecution
+        DisconnectAction::CancelRun
     }
 }
 
@@ -520,8 +514,50 @@ pub fn try_send_head(wire_started: bool) -> Result<(), CallerError> {
     }
 }
 
+/// What a run's caller is told when the run failed without answering
+/// it: that it failed, and the run's id. Never the failure itself: its
+/// node paths, file names and a provider's words are the run owner's to
+/// read, and the id is how the owner opens it (`weft logs <id>`, the
+/// graph); opening a run needs the owner's credential, so the id is safe
+/// to hand out. The run's record keeps the whole message.
+// SYNC: PlainFailure <-> packages/weft-connect/src/server/passthrough.ts PlainFailure
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlainFailure {
+    pub error: &'static str,
+    pub run_id: crate::RunId,
+}
+
+/// The words of every [`PlainFailure`], and what the per-instance runs
+/// list shows for a failed run.
+pub const PLAIN_FAILURE: &str = "Something went wrong";
+
+impl PlainFailure {
+    pub fn of(run_id: crate::RunId) -> Self {
+        Self { error: PLAIN_FAILURE, run_id }
+    }
+
+    /// The failure as a JSON body, what a caller gets before the first
+    /// byte.
+    pub fn body(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("a plain failure serializes")
+    }
+
+    /// The failure as one line of text: a text stream's error line, a
+    /// socket's close reason.
+    pub fn line(&self) -> String {
+        format!("{} (run {})", self.error, self.run_id)
+    }
+}
+
+/// The header every answer of a route's run carries, success or failure:
+/// the run's id, so a caller can name the run it got.
+// SYNC: RUN_ID_HEADER <-> packages/weft-connect/src/server/passthrough.ts RUN_ID_HEADER
+pub const RUN_ID_HEADER: &str = "Weft-Run-Id";
+
 /// Why a run whose HTTP caller never heard a word ended badly: every path
-/// to its answer closed. Said to the caller and recorded on the run.
+/// to its answer closed. Recorded on the run; the caller hears the plain
+/// failure ([`PlainFailure`]).
 pub const NO_ANSWER: &str = "the run ended without answering: every path to its Reply (or Stream, or Close) \
      was skipped, usually because a value it waited on never arrived";
 
@@ -558,7 +594,7 @@ pub enum InboundMessage {
 ///     calls, scripts inbound messages.
 ///
 /// All methods take `&self`: a connection is shared (`Arc`) across the
-/// concurrently-running nodes of one execution, which talk to the caller
+/// concurrently-running nodes of one run, which talk to the caller
 /// in parallel. Interior mutability lives in the impl.
 #[async_trait]
 pub trait CallerConnection: Send + Sync {
@@ -635,6 +671,20 @@ pub trait CallerConnection: Send + Sync {
         close: Option<CloseReason>,
     ) -> Result<(), CallerError>;
 
+    /// End the exchange as failed, `message` saying why: a real error
+    /// status (`500`) while nothing went out yet, the body framing's
+    /// error marker after ([`ResponseHead::in_band_error`]), a `1011`
+    /// close on a socket. The caller reads the plain failure and the
+    /// run's id ([`PlainFailure`]); `message` goes on the run's record,
+    /// where its owner reads it. Terminal; first terminal wins.
+    async fn fail(&self, message: &str) -> Result<(), CallerError>;
+
+    /// A chunk a node could not make was skipped (the trigger's
+    /// `whenChunkFails` is `drop_chunk`, see [`ErrorMode`]): `why` goes
+    /// on the exchange's record and the exchange goes on. Not a terminal
+    /// and nothing toward the wire.
+    fn chunk_dropped(&self, why: &str);
+
     /// WebSocket only: await the next inbound message at `cursor` (the
     /// reader's next absolute offset to read over the windowed inbound log),
     /// advancing it on success. Inbound is BROADCAST: every reader has its
@@ -647,7 +697,7 @@ pub trait CallerConnection: Send + Sync {
     /// user-controlled wait. It ends only on a message, a disconnect
     /// (`Disconnected`), or the session cap firing (which disconnects).
     /// The wait is `node`'s, registered with the run's `liveness` like any
-    /// in-process wait ([`crate::liveness::wait_on`]): a run whose steps all
+    /// in-process wait ([`crate::liveness::wait_on`]): a run whose running nodes all
     /// wait on their caller is waiting on the outside, never stuck.
     /// `Err(WrongProtocol)` on HTTP.
     async fn receive(
@@ -728,7 +778,7 @@ pub enum CallerHandle {
 
 impl CallerHandle {
     /// Build the protocol-correct wrapper from a connection. Internal:
-    /// `ExecutionContext::caller()` calls this.
+    /// `RunContext::caller()` calls this.
     pub fn from_connection(conn: Arc<dyn CallerConnection>) -> Self {
         match conn.config().protocol {
             Protocol::Http => CallerHandle::Http(HttpCaller { conn }),
@@ -748,7 +798,7 @@ impl CallerHandle {
 
     /// The handle whose reads are `node`'s waits, registered with the
     /// run's `liveness` (see [`CallerConnection::receive`]). Internal:
-    /// `ExecutionContext::caller()` hands each firing its own.
+    /// `RunContext::caller()` hands each firing its own.
     pub fn waited_by(self, liveness: std::sync::Weak<dyn crate::liveness::WaitLiveness>, node: crate::liveness::FiringLocation) -> Self {
         match self {
             CallerHandle::Websocket(ws) => CallerHandle::Websocket(WsCaller { waiter: Waiter { liveness, node: Some(node) }, ..ws }),
@@ -777,6 +827,36 @@ impl CallerHandle {
             CallerHandle::Http(h) => &h.conn,
             CallerHandle::Websocket(h) => &h.conn,
         }
+    }
+}
+
+/// What the exchange's record says before why, when a chunk a node could
+/// not make was skipped ([`CallerConnection::chunk_dropped`]), so a
+/// skipped chunk reads as a skip and never as the exchange failing.
+pub const CHUNK_DROPPED: &str = "a chunk was dropped and the exchange went on (whenChunkFails is drop_chunk)";
+
+/// What a node does with a chunk it tried to make, per the trigger's
+/// `whenChunkFails` ([`ErrorMode`]): a made chunk comes back to send; a
+/// failure comes back as the error under `surface`, for the node to
+/// return (which fails the exchange the way any node failure does), and
+/// is skipped under `drop_chunk`, on the exchange's record, with `None`
+/// telling the node to go on with the next one.
+///
+/// Only an outcome of the work is ever skipped, the same failures a
+/// program may catch on `_error` ([`crate::context::catchable_message`]):
+/// a cancel, a suspension or a mistake in the program's own shape always
+/// comes back, in every mode.
+fn drop_or_fail<T>(conn: &Arc<dyn CallerConnection>, made: WeftResult<T>) -> WeftResult<Option<T>> {
+    match made {
+        Ok(chunk) => Ok(Some(chunk)),
+        Err(e) if conn.config().error_mode == ErrorMode::DropChunk => match crate::context::catchable_message(&e) {
+            Some(why) => {
+                conn.chunk_dropped(&why);
+                Ok(None)
+            }
+            None => Err(e),
+        },
+        Err(e) => Err(e),
     }
 }
 
@@ -829,6 +909,17 @@ impl HttpCaller {
         self.conn.send_chunk(Some(head), chunk).await.map_err(Into::into)
     }
 
+    /// A chunk this node tried to make for the stream, through the
+    /// trigger's `whenChunkFails`: `Ok(Some(chunk))` to write,
+    /// `Ok(None)` when making it failed and the route skips such a chunk
+    /// (on the exchange's record; go on with the next one), and the
+    /// failure itself when the route tells its caller, for the node to
+    /// return. For a streamed piece only: a one-shot answer is the whole
+    /// answer, and a failure to make it is the node's failure.
+    pub fn drop_or_fail<T>(&self, made: WeftResult<T>) -> WeftResult<Option<T>> {
+        drop_or_fail(&self.conn, made)
+    }
+
     /// One-shot response: a final body with no prior streaming, under
     /// a `200` head with a content type matching the body's shape.
     /// Terminal; first terminal wins.
@@ -851,6 +942,13 @@ impl HttpCaller {
     /// nothing to say). Terminal; only valid as the first outbound item.
     pub async fn close_with(&self, head: ResponseHead) -> WeftResult<()> {
         self.conn.terminate(Some(head), None, None).await.map_err(Into::into)
+    }
+
+    /// End the response as failed ([`CallerConnection::fail`]): what a
+    /// node answering from something that broke off says, instead of
+    /// ending a cut answer as if it were whole. Terminal.
+    pub async fn fail(&self, message: &str) -> WeftResult<()> {
+        self.conn.fail(message).await.map_err(Into::into)
     }
 }
 
@@ -894,6 +992,15 @@ impl WsCaller {
     /// Send a message (non-terminal). Concurrent sends interleave.
     pub async fn send(&self, msg: OutboundChunk) -> WeftResult<()> {
         self.conn.send_chunk(None, msg).await.map_err(Into::into)
+    }
+
+    /// A message this node tried to make, through the trigger's
+    /// `whenChunkFails`: `Ok(Some(msg))` to send, `Ok(None)` when making
+    /// it failed and the socket skips such a message (on the exchange's
+    /// record; the session goes on), and the failure itself when the
+    /// socket tells its caller, for the node to return.
+    pub fn drop_or_fail<T>(&self, made: WeftResult<T>) -> WeftResult<Option<T>> {
+        drop_or_fail(&self.conn, made)
     }
 
     /// Await the next inbound message on this handle's built-in cursor
@@ -943,6 +1050,12 @@ impl WsCaller {
     /// Terminal; first terminal wins.
     pub async fn close_with(&self, close: CloseReason) -> WeftResult<()> {
         self.conn.terminate(None, None, Some(close)).await.map_err(Into::into)
+    }
+
+    /// Close the session as failed ([`CallerConnection::fail`]): a `1011`
+    /// close. Terminal.
+    pub async fn fail(&self, message: &str) -> WeftResult<()> {
+        self.conn.fail(message).await.map_err(Into::into)
     }
 
     // ----- cursor positioning (mirrors the bus) -------------------------
@@ -1071,6 +1184,8 @@ pub enum CallerCall {
     Receive,
     Request(OutboundChunk),
     HttpRequest,
+    Fail { message: String },
+    ChunkDropped { why: String },
 }
 
 /// Hand-rolled fake `CallerConnection` for contract tests. Records every
@@ -1210,7 +1325,7 @@ impl FakeCallerConnection {
     fn disconnected_outcome(&self) -> Result<(), CallerError> {
         match resolve_disconnect(self.config.outlives_caller) {
             DisconnectAction::ContinueIntoVoid => Ok(()),
-            DisconnectAction::CancelExecution => Err(CallerError::Disconnected),
+            DisconnectAction::CancelRun => Err(CallerError::Disconnected),
         }
     }
 }
@@ -1278,6 +1393,19 @@ impl CallerConnection for FakeCallerConnection {
         Self::commit_head(&mut g, &head)?;
         g.terminated = true;
         Ok(())
+    }
+
+    async fn fail(&self, message: &str) -> Result<(), CallerError> {
+        let mut g = self.inner.lock().expect("fake caller poisoned");
+        g.calls.push(CallerCall::Fail { message: message.to_string() });
+        try_terminate(g.terminated)?;
+        g.terminated = true;
+        g.wire_started = true;
+        Ok(())
+    }
+
+    fn chunk_dropped(&self, why: &str) {
+        self.record(CallerCall::ChunkDropped { why: why.to_string() });
     }
 
     async fn receive(
@@ -1414,22 +1542,37 @@ mod tests {
 
     #[test]
     fn in_band_error_speaks_the_body_framing() {
+        let run_id = uuid::Uuid::from_u128(7);
+        let failure = PlainFailure::of(run_id);
         let head = |ct: &str| ResponseHead::new(200).with_header("Content-Type", ct);
-        let line = head("application/x-ndjson; charset=utf-8").in_band_error("the model \"failed\"", 500);
+        let line = head("application/x-ndjson; charset=utf-8").in_band_error(&failure, 500);
         let text = String::from_utf8(line).unwrap();
         assert!(text.starts_with('\n') && text.ends_with('\n'), "{text:?}");
         let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
-        assert_eq!(parsed, serde_json::json!({ "error": "the model \"failed\"", "status": 500 }));
+        assert_eq!(parsed, serde_json::json!({ "error": PLAIN_FAILURE, "runId": run_id, "status": 500 }));
         for ct in ["application/ndjson", "application/jsonl", "APPLICATION/X-JSONLINES"] {
-            let text = String::from_utf8(head(ct).in_band_error("boom", 504)).unwrap();
-            assert_eq!(text, "\n{\"error\":\"boom\",\"status\":504}\n", "{ct}");
+            let text = String::from_utf8(head(ct).in_band_error(&failure, 504)).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+            assert_eq!(parsed["status"], 504, "{ct}");
         }
         assert_eq!(
-            String::from_utf8(head("text/event-stream").in_band_error("a\nb", 503)).unwrap(),
-            "\nevent: error\ndata: a\ndata: b\n\n",
+            String::from_utf8(head("text/event-stream").in_band_error(&failure, 503)).unwrap(),
+            format!("\nevent: error\ndata: {{\"error\":\"{PLAIN_FAILURE}\",\"runId\":\"{run_id}\"}}\n\n"),
         );
-        assert_eq!(head("text/plain; charset=utf-8").in_band_error("boom", 500), b"\n[error] boom");
-        assert_eq!(ResponseHead::new(200).in_band_error("boom", 500), b"\n[error] boom", "no content type is text");
+        let text_line = format!("\n[error] {PLAIN_FAILURE} (run {run_id})").into_bytes();
+        assert_eq!(head("text/plain; charset=utf-8").in_band_error(&failure, 500), text_line);
+        assert_eq!(ResponseHead::new(200).in_band_error(&failure, 500), text_line, "no content type is text");
+    }
+
+    /// The plain failure's wire shape: the words and the run's id,
+    /// nothing else.
+    #[test]
+    fn a_plain_failure_carries_the_words_and_the_run_id() {
+        let run_id = uuid::Uuid::from_u128(9);
+        let body: serde_json::Value = serde_json::from_slice(&PlainFailure::of(run_id).body()).unwrap();
+        assert_eq!(body, serde_json::json!({ "error": "Something went wrong", "runId": run_id.to_string() }));
+        assert_eq!(PlainFailure::of(run_id).line(), format!("Something went wrong (run {run_id})"));
+        assert_eq!(RUN_ID_HEADER, "Weft-Run-Id");
     }
 
     #[test]
@@ -1464,8 +1607,7 @@ mod tests {
             data_type: DataType::Text,
             backpressure: Backpressure::DropNewest,
             error_mode: ErrorMode::DropChunk,
-            journal_mode: crate::signal::JournalMode::Journaled,
-            journal_window_secs: None,
+            journal: crate::stream_journal::JournalPolicy::default(),
             window: None,
         };
         let rc = CallerRuntimeConfig::from_config(&cfg, Protocol::Websocket);
@@ -1514,7 +1656,7 @@ mod tests {
     fn who_owns_the_run_decides_what_a_disconnect_does() {
         assert_eq!(
             resolve_disconnect(false),
-            DisconnectAction::CancelExecution,
+            DisconnectAction::CancelRun,
             "a tied run ends with its caller"
         );
         assert_eq!(
@@ -1522,6 +1664,30 @@ mod tests {
             DisconnectAction::ContinueIntoVoid,
             "a run that outlives its caller carries on, writing into the void"
         );
+    }
+
+    /// `drop_or_fail` reads the trigger's `whenChunkFails`: a made chunk
+    /// comes back to send in either mode; a failure to make one is skipped
+    /// (and said to the connection) under `drop_chunk` and handed back
+    /// under `surface`. A cancel or a mistake in the program's own shape is
+    /// never skipped: those are not a chunk going wrong.
+    #[test]
+    fn a_chunk_that_cannot_be_made_is_dropped_or_handed_back_per_the_trigger() {
+        use crate::error::WeftError;
+        let tolerant = FakeCallerConnection::connected(CallerRuntimeConfig { error_mode: ErrorMode::DropChunk, ..ws_cfg() });
+        let CallerHandle::Websocket(ws) = CallerHandle::from_connection(tolerant.clone()) else { unreachable!() };
+        assert_eq!(ws.drop_or_fail(Ok(1)).unwrap(), Some(1));
+        assert_eq!(ws.drop_or_fail::<i32>(Err(crate::node_error("no frame"))).unwrap(), None);
+        assert!(matches!(ws.drop_or_fail::<i32>(Err(WeftError::Cancelled)), Err(WeftError::Cancelled)));
+        assert!(matches!(ws.drop_or_fail::<i32>(Err(WeftError::Input("bad".into()))), Err(WeftError::Input(_))));
+        assert_eq!(tolerant.calls(), vec![CallerCall::ChunkDropped { why: "no frame".into() }], "only the real failure was skipped");
+
+        let strict = FakeCallerConnection::connected(http_cfg());
+        let CallerHandle::Http(http) = CallerHandle::from_connection(strict.clone()) else { unreachable!() };
+        assert_eq!(http.drop_or_fail(Ok("a")).unwrap(), Some("a"));
+        let back = http.drop_or_fail::<i32>(Err(crate::node_error("no frame"))).expect_err("surface hands it back");
+        assert!(matches!(back, WeftError::NodeFailed(ref m) if m == "no frame"), "{back:?}");
+        assert!(strict.calls().is_empty(), "nothing was skipped: {:?}", strict.calls());
     }
 
     #[tokio::test]
@@ -1625,7 +1791,7 @@ mod tests {
         req.base_url = Some("http://127.0.0.1:14111".into());
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["method"], "GET");
-        assert_eq!(v["base_url"], "http://127.0.0.1:14111");
+        assert_eq!(v["baseUrl"], "http://127.0.0.1:14111");
         assert!(v.get("params").is_none(), "empty maps are omitted on the wire");
         assert_eq!(serde_json::from_value::<LiveRequest>(v).unwrap(), req);
 

@@ -29,7 +29,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -50,7 +50,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -216,9 +216,6 @@
       "type": "Number"
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "display": {
     "kind": "media",
     "output": "file"

@@ -1,14 +1,19 @@
 # What the compiler refuses
 
-Every compiler finding carries a slug naming the rule, and a message naming the
-fix. The slug is the stable part, so this page lists all of them.
+Every compiler finding carries a message saying what went wrong, usually with
+the fix, and a slug naming the rule. The editor shows the slug beside the
+message, and `weft validate` puts it under `code`. The slug stays the same when
+the wording of a message changes, so look yours up here.
 
-Everything here is checked when you build, with one exception: `rule-runtime`
-is only checked by `weft validate` and by the editor just before you Run,
-Activate or Resync. That is deliberate, so a half-wired sketch with no
-credentials connected still builds while you work on it.
+Everything here is checked when you build, except `rule-runtime`, which is
+only checked by `weft validate` and by the editor just before you Run, Activate
+or Resync, so a half-wired sketch whose provider has no model named yet still
+builds while you work on it.
 
-Almost everything is an error. The three warnings are marked.
+A row marked (warning) is reported and the build goes on, unless the row says
+otherwise. Every row with no mark is an error, except `rule-structural` and
+`rule-runtime`, which take whatever severity the node's own rule sets:
+`error`, `warning`, `info` or `hint`.
 
 ## Before the rest can run
 
@@ -16,7 +21,7 @@ Almost everything is an error. The three warnings are marked.
 |---|---|---|
 | `parse` | The source did not parse | Read the message; it names the span and the syntax that failed |
 | `enrich` | A node's ports could not be worked out: a bad type, or a custom port on a node that does not take them | Fix the port declaration on the node named |
-| `unknown-type` (warning) | A node names a type the catalog does not have | Check the spelling, or add the node under `nodes/`. If a folder has a `metadata.json` and no `mod.rs`, the message says so |
+| `unknown-type` (warning) | A node names a type the catalog does not have. A warning in the editor; when you build, in `weft validate`, and in the editor's check before you Run, Activate or Resync, the same node is an `enrich` error | Check the spelling, or add the node under `nodes/`, or next to the module that uses it under `src/`. If the node is there but failed to load, or its folder has a `metadata.json` and no `mod.rs`, the message says so and why |
 
 `parse` and `enrich` are buckets: they carry the underlying message rather than
 a slug per cause.
@@ -34,11 +39,11 @@ a slug per cause.
 | `scope-reachability` | A wire crosses a group or loop boundary without going through its ports | Route it through the group's own ports |
 | `deref-path` | The dotted path on a wire cannot be read off the source's type | Fix the path, or change the source type |
 | `type-mismatch` | The source's type does not fit the target's | Change one side, or cast. The message suggests a cast where one exists |
-| `must-override-unmet` | A connected port is still `MustOverride` | Declare a real type in the source |
 | `unresolved-typevar` | A connected port still has a type variable nothing pinned down | Connect it to something concrete, or declare the type |
+| `type-bound` | A type variable limited to some types got another one: a `String` into a group declared `Group[T: Media]`, or into `KeepFile`, which takes only a file | Connect a value of a type the limit takes; the message names the limit and what you connected |
 | `cast-not-allowed` | A cast node's two ports are a pair the conversion table does not allow | Pick types the table allows |
 | `graph-cycle` | The wires form a cycle | Iterate with a Loop, or exchange feedback over a bus |
-| `required-port-unmet` | A required input has no wire, no written value and no default. On a group, loop or included file: a port nothing outside connects, whose value a step inside cannot run without (a required input, or the last possible member of a `@require_one_of` set) | Give it one of the three; for a group port, connect or write it from outside |
+| `required-port-unmet` | A required input has no wire, no written value and no default. On a group, loop or included file: a port nothing outside connects, whose value a node inside cannot run without (a required input, or the last possible member of a `@require_one_of` set) | Give it one of the three; for a group port, connect or write it from outside |
 
 ## Values you wrote
 
@@ -48,12 +53,14 @@ a slug per cause.
 | `input-accepts` | The port does not take this kind of driver: a wire on a literal-only port, a written value on a wire-only port | Use the one it takes; the message lists them |
 | `gate-not-boolean` | A written `_should_flow` or `_should_not_flow` is not a Boolean | Write `true` or `false`, or wire it |
 | `literal-out-of-range` | A written number is outside the input's `min` and `max`, or off its whole-number step | Write a value inside the declared range |
-| `literal-not-an-option` | A written value is not one of the input's dropdown `options` (for a multiselect, one item is not). A dropdown marked `free_text` never raises it | Write one of the options; the message lists them |
+| `literal-not-an-option` | A written value is not one of the input's dropdown `options` (for a multiselect, one item is not). A dropdown marked `freeText` never raises it | Write one of the options; the message lists them |
 | `value-on-output` | You wrote a value for an output port | Remove it. Outputs are filled by the node, and you read them with `node.port` |
 | `undeclared-port-no-custom` | A key names no input, on a node that does not take added inputs | Fix the key, or use a node with `canAddInputPorts` |
 | `config-null-literal` (warning) | A key is written `key: null`, which does nothing | Leave the key out and let the default apply |
 | `require-one-of-unknown-port` | `@require_one_of(...)` names a port the node does not have | Fix it; the message lists the real inputs |
 | `require-one-of-unmet` | None of the ports in a `@require_one_of` group is driven | Drive at least one |
+| `placeholder-not-an-input` | A query or template you wrote names a placeholder (`$userId` in a Postgres query, `{{name}}` in a `Format` template) that is not an input of the node | Declare the input (`PostgresExecuteQuery(userId: String)`), or fix the placeholder; the message suggests a close input, lists the inputs you added, or, if you added none, shows how to declare one |
+| `input-not-a-placeholder` | You added an input to a node that takes a query or template, and the text never uses it | Use it in the text, or drop the input |
 
 ## Names and shape
 
@@ -63,8 +70,9 @@ a slug per cause.
 | `duplicate-port` | A node has two ports of the same name on one side | Rename one |
 | `reserved-name` | A node or group is named after a node type, so `name.port` would read as an inline node | Rename it |
 | `two-gates` | A node carries both `_should_flow` and `_should_not_flow` | Keep the one that says what you mean |
-| `no-required-skip` (warning) | A node has inputs but none is required, so it runs even when everything upstream is null | Mark one required, or add `@require_one_of` |
+| `run-undecided` | Every input wired into a node is declared with `?`, so nothing says when it runs | Gate it with `_should_flow`, drop the `?` from the input it cannot do without, or add `@require_one_of` |
 | `level-too-large` (warning) | One level of the graph holds more than fifteen items | Group the nodes that cooperate on one job. Nesting a group costs nothing at run time |
+| `not-camel-case` (warning) | A name you chose in the program is not camelCase | Rename it to camelCase. The message gives the spelling when it can work one out. For which names are checked, go and read [Spelling a name](syntax.md#spelling-a-name) |
 
 ## Ports that come from a list
 
@@ -87,10 +95,10 @@ or a switch's cases.
 
 | Slug | What it found | What to do |
 |---|---|---|
-| `loop-unknown-config-field` | A key that is not `parallel`, `over`, `carry`, `max_iters` or `trim_on_mismatch` | Fix the name |
+| `loop-unknown-config-field` | A key that is not `parallel`, `over`, `carry`, `maxIters` or `trimOnMismatch` | Fix the name |
 | `loop-parallel-not-boolean` | `parallel` is not `true` or `false` | Write one of them |
-| `loop-max-iters-not-integer` | `max_iters` is not a whole number of zero or more | Write one |
-| `loop-trim-not-boolean` | `trim_on_mismatch` is not a boolean | Write `true` or `false` |
+| `loop-max-iters-not-integer` | `maxIters` is not a whole number of zero or more | Write one |
+| `loop-trim-not-boolean` | `trimOnMismatch` is not a boolean | Write `true` or `false` |
 | `loop-over-unknown-port` | `over` names an input that does not exist | Fix the name |
 | `over-not-a-list` | An `over` port is neither `List[T]` nor `Generator[T]` | Declare it as one |
 | `loop-carry-unknown-port` | `carry` names an output that does not exist | Fix the name |
@@ -99,7 +107,7 @@ or a switch's cases.
 | `parallel-with-carry` | `parallel: true` with carry ports. Carrying means each turn feeds the next, which is sequential | Drop the carry, or drop the parallel |
 | `parallel-without-over` | `parallel: true` with nothing to spread out | Give it a non-empty `over` |
 | `parallel-with-done` | A parallel loop writes `self.done` | Remove it, or make the loop sequential |
-| `loop-unbounded-no-termination` | A sequential loop with no `over`, no `max_iters`, and no `self.done`. Nothing would ever stop it | Iterate a list, cap the count, or wire `self.done` |
+| `loop-unbounded-no-termination` | A sequential loop with no `over`, no `maxIters`, and no `self.done`. Nothing would ever stop it | Iterate a list, cap the count, or wire `self.done` |
 | `gather-output-must-be-nullable` | A gather output is not `List[T \| Null]`. An iteration that failed leaves an empty slot | Declare it `List[T \| Null]` |
 | `reserved-port-name` | A loop boundary declares `index` or `done`, which the language owns | Rename the port |
 | `loop-boundary-unpaired` | A `LoopIn` without its `LoopOut`, or the reverse | This one is a compiler bug, not yours. Please report it |
@@ -123,14 +131,21 @@ or a switch's cases.
 | Slug | What it found | What to do |
 |---|---|---|
 | `run-settings` | A trigger's `durable`, `recorded` or `outlivesCaller` is not `true` or `false`, or it is durable or outlives its caller and is not recorded | Write `true` or `false`; turn `recorded` back on, or the other one off |
-| `trigger-into-trigger` | A trigger is wired into another trigger | Remove the wire. A trigger's inputs are frozen at setup, so another trigger's output could never reach it |
-| `trigger-into-infra` | An infra node sits downstream of a trigger | Remove the wire. Provisioning happens before any event exists |
-| `trigger-in-loop` | A trigger inside a loop body | Move it out. A trigger registers once and fires outside any iteration |
-| `infra-in-loop` | An infra node inside a loop body | Move it out. Infra is provisioned once for the project, not once per item |
+| `trigger-into-trigger` | A trigger is wired into another trigger | Remove the wire |
+| `trigger-into-infra` | An infra node sits downstream of a trigger | Remove the wire |
+| `trigger-in-loop` | A trigger inside a loop body | Move it out of the loop |
+| `infra-in-loop` | An infra node inside a loop body | Move it out of the loop |
 | `route-path-missing` | A node claiming a public address has none, or an empty one | Give it a path, like `hooks/stripe` or `chat/{room}` |
 | `route-path-invalid` | The path is not a servable pattern | The message says what is wrong |
 | `route-method-unknown` | That is not an HTTP method | Fix it |
+| `route-capture-shadows-output` | A path captures a name that is also one of the node's own outputs (`cards/{body}` on a `Route`), so the capture could never be read | Rename the capture |
+| `route-output-not-a-capture` | An output added to a `Route` names no capture of its path, or is not typed `String` | Add `{name}` to the path or remove the port, and type every capture `String` |
 | `route-overlap` | Two nodes claim addresses one call could reach, and neither is more specific | Make one spell out what the other captures, or change a path or a method |
+
+For why a trigger cannot be wired into another trigger or have an infra node
+after it, go and read [what a trigger cannot do](triggers-and-routes.md#what-a-trigger-cannot-do).
+For why neither a trigger nor an infra node can sit inside a loop, go and read
+[what cannot go in a loop](loops.md#what-cannot-go-in-one).
 
 ## Instances
 
@@ -138,6 +153,7 @@ or a switch's cases.
 |---|---|---|
 | `per-instance-ineligible` | `@per_instance` on a node that runs no container of its own. Only an infra node can carry it | Remove it; for a value each instance gets (its connection included), write `@instance_filled` on the field |
 | `instance-filled-wired` | An `@instance_filled` field also has a wire into it | Remove the wire, or the marker |
+| `instance-filled-place-types` | An `@instance_filled` field of a node in an included file takes a different type at each place the file is included, and one instance's value cannot be both | Declare the field's type on the node |
 | `instance-filled-boundary` | `@instance_filled` on a group's or included file's own port | Write it on the input of the node inside that reads the value |
 | `instance-filled-not-an-input` | `@instance_filled` on a key that is not one of the node's inputs | Put it on an input |
 
@@ -154,10 +170,7 @@ For what `@per_instance` and `@instance_filled` do, go and read [Programs with i
 | Slug | What it found | What to do |
 |---|---|---|
 | `rule-structural` | A rule the node's own author wrote, checked on every build | Whatever its message says |
-| `rule-runtime` | The same, but only checked by `weft validate` and just before you run | Fill what the message names. A step with no connection picked is not one of these: the install refuses that run when it starts, naming `weft connect` |
-
-Both take their severity from the rule, so either can be an error, a warning, a
-note or a hint.
+| `rule-runtime` | The same, but only checked at the moments listed at the top of this page | Fill what the message names. A node with no connection picked is not one of these: the install refuses the run when it starts, and the message gives the command that picks one, `weft connect --node <node>` |
 
 ## Things that have no slug
 

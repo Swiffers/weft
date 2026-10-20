@@ -59,7 +59,7 @@ export interface FormSchema {
 export interface PendingTask {
   /// Per-signal token. Identifies the signal end-to-end:
   /// fire = `POST /signal/{token}`, cancel = `DELETE /signal/{token}`.
-  /// Replaces the v1 `executionId` field (the dispatcher's `execution_id`
+  /// Replaces the v1 `runId` field (the dispatcher's `run_id`
   /// is no longer surfaced to consumers; signal token alone is
   /// sufficient routing).
   token: string;
@@ -79,7 +79,7 @@ export interface PendingTask {
   formSchema?: FormSchema;
   /// TRIGGER (false) vs RESUME task (true). A trigger is an entry point: it
   /// stays listed while the project is active and can be fired repeatedly to
-  /// START a run. A resume is a one-shot reply to a paused execution: it
+  /// START a run. A resume is a one-shot reply to a paused run: it
   /// disappears once answered. The list groups on this. Stamped by the
   /// dispatcher's enumeration; absent on very old payloads (treated as a
   /// resume task, the historical behavior).
@@ -362,9 +362,12 @@ export async function fetchPendingTasks(
 /// place.
 /// Scoped like the listing: the api token as bearer, the task one it
 /// lists, the field one the form declares.
-// SYNC: TaskFileLink <-> crates/weft-dispatcher/src/api/signal.rs (SignalFileLink), crates/weft-core/src/signal/form.rs (consumer_file_value, whose URL-backed arm publishes the same four keys)
+// SYNC: TaskFileLink <-> crates/weft-dispatcher/src/api/signal.rs (SignalFileLink), crates/weft-core/src/signal/form.rs (consumer_file_value, whose URL-backed arm publishes the same keys)
 export interface TaskFileLink {
   url: string;
+  /// Whether the open internet opens `url` (false: only this machine, or
+  /// its network, reaches the install it points at).
+  public: boolean;
   mimeType: string;
   sizeBytes: number;
   filename: string;
@@ -446,9 +449,9 @@ export async function submitTask(
   }
 }
 
-/// Skip ONE task: decline the question. The step that asked ends
+/// Skip ONE task: decline the question. The node that asked ends
 /// skipped, its outputs close and what reads them skips; sibling lanes
-/// of the same execution keep going. Auth: signal token alone (knowing
+/// of the same run keep going. Auth: signal token alone (knowing
 /// it = permission).
 export async function skipTask(task: PendingTask): Promise<void> {
   const tokenConfig = task._tokenConfig;
@@ -462,8 +465,8 @@ export async function skipTask(task: PendingTask): Promise<void> {
 }
 
 /// Cancel the WHOLE RUN this task belongs to. Every sibling task
-/// of the same execution dies (5 parallel HumanQueries → all 5
-/// dropped). Worker stops, NodeCancelled + ExecutionFailed
+/// of the same run dies (5 parallel HumanQueries → all 5
+/// dropped). Worker stops, NodeCancelled + RunFailed
 /// journaled. The user can still inspect the run in the journal
 /// afterward to debug why they cancelled.
 ///
@@ -485,11 +488,11 @@ export async function cancelRun(task: PendingTask): Promise<void> {
 }
 
 /// Clear all visible tasks for one api_token. Cancels every
-/// distinct execution this token sees (one cancel per execution, not
+/// distinct run this token sees (one cancel per run, not
 /// per task). Same scope rule as cancelRun: token must be
 /// ≥ project-scoped.
 export async function clearAll(token: ApiToken): Promise<{
-  executionsCancelled: number;
+  runsCancelled: number;
   entrySignalsDropped: number;
 }> {
   const url = `${token.dispatcherUrl}/signal-token/signals`;
@@ -502,12 +505,12 @@ export async function clearAll(token: ApiToken): Promise<{
     throw new Error(`HTTP ${resp.status}: ${text}`);
   }
   const body = (await resp.json()) as {
-    execution_ids_cancelled?: number;
-    entry_signals_dropped?: number;
+    runIdsCancelled?: number;
+    entrySignalsDropped?: number;
   };
   return {
-    executionsCancelled: body.execution_ids_cancelled ?? 0,
-    entrySignalsDropped: body.entry_signals_dropped ?? 0,
+    runsCancelled: body.runIdsCancelled ?? 0,
+    entrySignalsDropped: body.entrySignalsDropped ?? 0,
   };
 }
 

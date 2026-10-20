@@ -28,7 +28,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -37,8 +37,8 @@
             "label": "name",
             "value": "agent_id",
             "page": {
-              "cursor_param": "cursor",
-              "cursor_path": "next_cursor"
+              "cursorParam": "cursor",
+              "cursorPath": "next_cursor"
             }
           }
         ]
@@ -53,7 +53,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -106,7 +106,7 @@
       "widget": {
         "kind": "remote_select",
         "access": "account",
-        "free_text": true,
+        "freeText": true,
         "sources": [
           {
             "kind": "list",
@@ -187,9 +187,6 @@
       "description": "The call's SIP id, on a call from a SIP trunk number."
     }
   ],
-  "features": {
-    "catchErrors": true
-  },
   "validate": [
     {
       "when": {

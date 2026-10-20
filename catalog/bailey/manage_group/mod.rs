@@ -11,7 +11,7 @@ use serde_json::json;
 
 use weft::infra::InfraHandle;
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
+use weft::{RunContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BaileyManageGroupNode;
@@ -30,7 +30,7 @@ fn bridge_call(
     participants: &[String],
 ) -> WeftResult<(&'static str, serde_json::Value)> {
     // Every refusal here is the program's own settings missing a value
-    // its action needs, so none is catchable on `error`.
+    // its action needs, so none is catchable on `_error`.
     let mistake = WeftError::Input;
     let need_group =
         || group_id.map(str::to_string).ok_or_else(|| mistake(format!("'{action}' needs groupId")));
@@ -73,7 +73,7 @@ impl Node for BaileyManageGroupNode {
         tests::tests()
     }
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    async fn run(&self, ctx: RunContext) -> WeftResult<()> {
         let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let action: String = ctx.inputs.get("action")?;
         let group_id: Option<String> = ctx.inputs.opt("groupId")?;

@@ -6,21 +6,14 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Gates the Layer-3 DB tests (tests/*.rs) that need a real
-# Postgres via `#[sqlx::test]` + $DATABASE_URL. OFF by default so
-# `cargo test --workspace` is green on any machine without Postgres;
-# `scripts/run-db-tests.sh` runs them (CI's `db` job runs that same script
-# against a Postgres service).
-db-tests = ["dep:chrono", "serve"]
 # The middleware that keeps a process's watch listening while it answers
 # a request (`pg_signal::keep_listening`), for the processes that serve.
 serve = ["dep:axum", "dep:http-body"]
 
 [dependencies]
 # Only for stamping a generated migration's file name with the date it was
-# written; see `schema_guard::file_per_group`, which is db-tests-only, so
-# production builds never link it.
-chrono = { workspace = true, optional = true }
+# written (`schema_guard::file_per_group`).
+chrono = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true, optional = true }
 http-body = { version = "1", optional = true }
@@ -37,8 +30,13 @@ uuid = { workspace = true }
 weft-core = { workspace = true }
 # What the outbox tells news through (`announce::tell_news_through`).
 weft-platform-traits = { workspace = true }
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [dev-dependencies]
+# The tests drive `pg_signal::keep_listening`, which is behind `serve`. A
+# dev-dependency on the crate itself turns it on for every test build, so
+# the ordinary run and the database run build the same library.
+weft-task-store = { path = ".", features = ["serve"] }
 # Driving `pg_signal::keep_listening` in the database tests (`oneshot`).
 tower = { workspace = true, features = ["util"] }
 # `test-util` enables tokio's paused virtual clock (start_paused +
@@ -48,12 +46,12 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 # `#[sqlx::test]` (macros + migrate features) spins up a fresh isolated
 # Postgres database per test against $DATABASE_URL and drops it after, for
 # the Layer-3 DB-logic tests (claims, reruns, signals, terminal waits,
-# the schema guard). These tests are skipped when no DATABASE_URL is set
-# (CI provides one).
+# the schema guard). Only nextest's `db` profile runs them
+# (`scripts/run-db-tests.sh`), since without a DATABASE_URL they fail.
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "macros", "migrate"] }
 # The fake alarm the booking tests read the wakes set and cancelled from.
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
-# Counting the alert lines a stuck failure logs (tests/unanswered.rs).
+# Counting the alert lines a stuck failure logs (tests/db/unanswered.rs).
 tracing-subscriber = { workspace = true }
 
 [lints]

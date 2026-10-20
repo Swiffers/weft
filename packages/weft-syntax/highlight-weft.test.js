@@ -1,5 +1,5 @@
 // What each piece of weft source turns into on the page. The Rust side
-// (`crates/weft-compiler/tests/highlighting_vocabulary.rs`) checks that the
+// (`crates/weft-compiler/tests/integration/highlighting_vocabulary.rs`) checks that the
 // grammars know every reserved word; this checks that they paint it.
 import { describe, expect, it } from 'vitest';
 import hljs from 'highlight.js/lib/core';

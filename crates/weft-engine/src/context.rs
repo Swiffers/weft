@@ -34,11 +34,11 @@ use weft_core::error::{WeftError, WeftResult};
 use weft_core::node::NodeOutput;
 use weft_core::primitive::SignalSpec;
 use weft_core::weft_type::WeftType;
-use weft_core::ExecutionId;
+use weft_core::RunId;
 
 use crate::now_unix;
 use crate::wait_tracker::{DeliveryGate, WaitTracker};
-use weft_journal::{ExecEvent, JournalClient};
+use weft_journal::{RunEvent, JournalClient};
 
 use weft_task_store::tasks as task_store;
 use weft_task_store::{InfraReader, TaskKind, TaskStoreClient};
@@ -77,10 +77,10 @@ pub struct EngineClients {
     /// supervisor via the `infra_lifecycle_command` table.
     pub infra_state: Arc<dyn InfraStateClient>,
     /// Broker client for fetching the project's `ProjectDefinition`
-    /// at execution claim time. The worker no longer carries the
+    /// at run claim time. The worker no longer carries the
     /// definition baked into the binary; it asks the broker, keyed
     /// by `(project_id, definition_hash)`. The worker caches across
-    /// executions by hash so consecutive runs of the same shape pay
+    /// runs by hash so consecutive runs of the same shape pay
     /// only one round trip per shape.
     pub project: Arc<dyn ProjectClient>,
     /// Clock the engine uses for every time-related decision
@@ -96,9 +96,9 @@ pub struct EngineClients {
     /// The connection surface (`ctx.open` resolve/release). Production:
     /// the broker-backed client; tests inject a fake.
     pub access_broker: Arc<dyn AccessBroker>,
-    /// Steering other runs (`ctx.tag_execution` / `ctx.stop_tagged`).
+    /// Steering other runs (`ctx.tag_run` / `ctx.stop_tagged`).
     /// Production: the broker-backed client; tests inject a fake.
-    pub steering: Arc<dyn ExecutionSteeringClient>,
+    pub steering: Arc<dyn RunSteeringClient>,
     /// Charges opened by a call whose amount only a later response
     /// states, held process-wide until that response lands.
     pub open_charges: Arc<crate::metering::OpenCharges>,
@@ -252,7 +252,7 @@ impl EngineClients {
         let broker_access: Arc<dyn AccessBroker> = weft_broker_client::BrokerAccessClient::new(link.clone());
         let broker_storage: Arc<dyn crate::storage::WorkerStorageOps> =
             crate::storage::WorkerStorage::new(link.base_url().to_string(), link.token().clone());
-        let steering: Arc<dyn ExecutionSteeringClient> = weft_broker_client::BrokerExecutionClient::new(link.clone());
+        let steering: Arc<dyn RunSteeringClient> = weft_broker_client::BrokerSteeringClient::new(link.clone());
         Ok(Self {
             shared: weft_core::shared::Shared::new(settings.shared_idle),
             runs: weft_broker_client::BrokerRunClient::new(link.clone()),
@@ -305,7 +305,7 @@ pub(crate) fn io_runtime() -> anyhow::Result<tokio::runtime::Handle> {
 #[derive(Debug, Clone)]
 pub enum RunTold {
     /// An answer was handed to this run: it reads its own.
-    Answered(ExecutionId),
+    Answered(RunId),
     /// The line may have missed some, and the one read for every run the
     /// worker drives found these answers: each run takes its own.
     Rechecked(Arc<Vec<weft_broker_client::protocol::RunAnswerOf>>),
@@ -322,15 +322,15 @@ pub fn run_told() -> tokio::sync::broadcast::Sender<RunTold> {
 /// worker against a fake.
 #[async_trait]
 pub trait RunClient: Send + Sync {
-    /// Claim queued run `execution_id`: it is this worker's, under a
+    /// Claim queued run `run_id`: it is this worker's, under a
     /// raised epoch. `None` when it is not queued.
-    async fn claim(&self, execution_id: ExecutionId) -> anyhow::Result<Option<weft_journal::record::Claimed>>;
-    /// This worker no longer drives `execution_id`, its whole record
+    async fn claim(&self, run_id: RunId) -> anyhow::Result<Option<weft_journal::record::Claimed>>;
+    /// This worker no longer drives `run_id`, its whole record
     /// written, for `why`.
-    async fn let_go(&self, execution_id: ExecutionId, why: weft_broker_client::protocol::LetGo) -> anyhow::Result<()>;
-    /// The answers waiting for `execution_id`'s waits, but the waits in
+    async fn let_go(&self, run_id: RunId, why: weft_broker_client::protocol::LetGo) -> anyhow::Result<()>;
+    /// The answers waiting for `run_id`'s waits, but the waits in
     /// `taken`, read once.
-    async fn answers(&self, execution_id: ExecutionId, taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>>;
+    async fn answers(&self, run_id: RunId, taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>>;
     /// The cancels and the answers waiting for every run this worker
     /// drives, in one read.
     async fn rechecked(&self) -> anyhow::Result<weft_broker_client::protocol::RunRecheckedResponse>;
@@ -338,14 +338,14 @@ pub trait RunClient: Send + Sync {
 
 #[async_trait]
 impl RunClient for weft_broker_client::BrokerRunClient {
-    async fn claim(&self, execution_id: ExecutionId) -> anyhow::Result<Option<weft_journal::record::Claimed>> {
-        weft_broker_client::BrokerRunClient::claim(self, execution_id).await
+    async fn claim(&self, run_id: RunId) -> anyhow::Result<Option<weft_journal::record::Claimed>> {
+        weft_broker_client::BrokerRunClient::claim(self, run_id).await
     }
-    async fn let_go(&self, execution_id: ExecutionId, why: weft_broker_client::protocol::LetGo) -> anyhow::Result<()> {
-        weft_broker_client::BrokerRunClient::let_go(self, execution_id, why).await
+    async fn let_go(&self, run_id: RunId, why: weft_broker_client::protocol::LetGo) -> anyhow::Result<()> {
+        weft_broker_client::BrokerRunClient::let_go(self, run_id, why).await
     }
-    async fn answers(&self, execution_id: ExecutionId, taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
-        weft_broker_client::BrokerRunClient::answers(self, execution_id, taken).await
+    async fn answers(&self, run_id: RunId, taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
+        weft_broker_client::BrokerRunClient::answers(self, run_id, taken).await
     }
     async fn rechecked(&self) -> anyhow::Result<weft_broker_client::protocol::RunRecheckedResponse> {
         weft_broker_client::BrokerRunClient::rechecked(self).await
@@ -362,27 +362,27 @@ pub struct RunRecord {
     pub costs: Arc<crate::metering::PendingCostRecords>,
 }
 
-/// Trait surface over `BrokerExecutionClient` so tests can inject a
+/// Trait surface over `BrokerSteeringClient` so tests can inject a
 /// recording fake. Production has one impl: the broker-backed client;
 /// both calls are worker-only, and the broker checks the run is the
 /// asking worker's.
 #[async_trait]
-pub trait ExecutionSteeringClient: Send + Sync {
-    /// Tag `execution_id` with `tags`, synchronously (the rows exist on
+pub trait RunSteeringClient: Send + Sync {
+    /// Tag `run_id` with `tags`, synchronously (the rows exist on
     /// return).
-    async fn tag_execution(&self, execution_id: ExecutionId, tags: Vec<String>) -> anyhow::Result<()>;
-    /// Queue a stop of every live sibling of `execution_id` carrying `tag`.
-    /// `true` when the stop reaches `execution_id` itself.
-    async fn stop_tagged(&self, execution_id: ExecutionId, tag: String, stop_self: weft_core::StopSelf) -> anyhow::Result<bool>;
+    async fn tag_run(&self, run_id: RunId, tags: Vec<String>) -> anyhow::Result<()>;
+    /// Queue a stop of every live sibling of `run_id` carrying `tag`.
+    /// `true` when the stop reaches `run_id` itself.
+    async fn stop_tagged(&self, run_id: RunId, tag: String, stop_self: weft_core::StopSelf) -> anyhow::Result<bool>;
 }
 
 #[async_trait]
-impl ExecutionSteeringClient for weft_broker_client::BrokerExecutionClient {
-    async fn tag_execution(&self, execution_id: ExecutionId, tags: Vec<String>) -> anyhow::Result<()> {
-        <weft_broker_client::BrokerExecutionClient>::tag_execution(self, execution_id, tags).await
+impl RunSteeringClient for weft_broker_client::BrokerSteeringClient {
+    async fn tag_run(&self, run_id: RunId, tags: Vec<String>) -> anyhow::Result<()> {
+        <weft_broker_client::BrokerSteeringClient>::tag_run(self, run_id, tags).await
     }
-    async fn stop_tagged(&self, execution_id: ExecutionId, tag: String, stop_self: weft_core::StopSelf) -> anyhow::Result<bool> {
-        Ok(<weft_broker_client::BrokerExecutionClient>::stop_tagged(self, execution_id, tag, stop_self).await?.stops_asker)
+    async fn stop_tagged(&self, run_id: RunId, tag: String, stop_self: weft_core::StopSelf) -> anyhow::Result<bool> {
+        Ok(<weft_broker_client::BrokerSteeringClient>::stop_tagged(self, run_id, tag, stop_self).await?.stops_asker)
     }
 }
 
@@ -443,12 +443,15 @@ impl ProjectClient for weft_broker_client::BrokerProjectClient {
 /// just hands off the spec and waits.
 #[async_trait]
 pub trait InfraStateClient: Send + Sync {
+    /// Issue the apply of `spec_json` for the copy at `node_id` that the
+    /// infra setup `run_id` makes; the command's id.
     async fn enqueue_apply(
         &self,
         project_id: uuid::Uuid,
         node_id: &str,
         instance: Option<&weft_core::instance::InstanceId>,
         spec_json: serde_json::Value,
+        run_id: RunId,
     ) -> anyhow::Result<i64>;
 
     /// The command's state, once it completed or `wait` passed.
@@ -462,11 +465,11 @@ pub trait InfraStateClient: Send + Sync {
     /// Save `values` as what the copy of the infra node at `place`
     /// (spelled; `copy` `None` for the shared one) holds for its baked
     /// outputs (`weft_core::infra::bake`): what the infra setup
-    /// `execution_id` sent out on them, written over what it held port by
+    /// `run_id` sent out on them, written over what it held port by
     /// port (a port it sent nothing on keeps its value).
     async fn save_bake(
         &self,
-        execution_id: ExecutionId,
+        run_id: RunId,
         place: &str,
         copy: Option<&weft_core::instance::InstanceId>,
         values: std::collections::BTreeMap<String, serde_json::Value>,
@@ -481,8 +484,9 @@ impl InfraStateClient for weft_broker_client::client::BrokerInfraStateClient {
         node_id: &str,
         instance: Option<&weft_core::instance::InstanceId>,
         spec_json: serde_json::Value,
+        run_id: RunId,
     ) -> anyhow::Result<i64> {
-        self.enqueue_apply(project_id, node_id, instance, spec_json).await
+        self.enqueue_apply(project_id, node_id, instance, spec_json, run_id).await
     }
     async fn wait_apply(
         &self,
@@ -494,12 +498,12 @@ impl InfraStateClient for weft_broker_client::client::BrokerInfraStateClient {
     }
     async fn save_bake(
         &self,
-        execution_id: ExecutionId,
+        run_id: RunId,
         place: &str,
         copy: Option<&weft_core::instance::InstanceId>,
         values: std::collections::BTreeMap<String, serde_json::Value>,
     ) -> anyhow::Result<()> {
-        self.save_bake(execution_id, place, copy, values).await
+        self.save_bake(run_id, place, copy, values).await
     }
 }
 
@@ -741,7 +745,7 @@ fn published_connection(
     }
 }
 
-/// Per-execution bus state: the registry that resolves markers to live
+/// Per-run bus state: the registry that resolves markers to live
 /// channels, plus the list of buses the engine knows about. The dead-
 /// end policy is one line: if the loop is stuck (drained, no waiters,
 /// tasks still alive) AND any bus is live, close every bus. Each
@@ -755,19 +759,19 @@ fn published_connection(
 /// engine's stuck-detector still needs the wake-up so it can know
 /// "every in-flight task is blocked on a bus right now" and close.
 pub struct BusCoordinator {
-    /// Single source of truth for every bus minted this execution.
+    /// Single source of truth for every bus minted this run.
     /// Holds the strong `Arc<BusInner>` per bus (so the pump's Weak
     /// always upgrades and the bus stays pinned long enough to be
     /// drained); doubles as the marker-lookup table. Released by
     /// `shutdown()` AFTER the final drain has been acked.
     registry: BusRegistry,
-    /// The execution's shared in-process wait tracker. The bus is one
+    /// The run's shared in-process wait tracker. The bus is one
     /// wait source among several (generator pulls and emission-delivery
     /// waits register here too); the tracker owns the per-node liveness
     /// map and `deadlock_provable`, so the drive loop's stuck-check has
     /// ONE picture of every parked task. See `crate::wait_tracker`.
     waits: Arc<WaitTracker>,
-    /// Per-execution journal-pump wake. Buses signal this after every
+    /// Per-run journal-pump wake. Buses signal this after every
     /// append (via `Weak<Notify>` they hold). The pump task awaits it
     /// and drains every live bus's unjournaled tail.
     journal_pump_notify: Arc<tokio::sync::Notify>,
@@ -793,7 +797,7 @@ pub struct BusCoordinator {
 /// A run's bus pump ([`run_bus_journal_task`]): started by the run's first
 /// bus, so a run that mints none never has one.
 struct BusPump {
-    execution_id: ExecutionId,
+    run_id: RunId,
     journal: Arc<dyn JournalClient>,
     replica: String,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -801,8 +805,8 @@ struct BusPump {
 
 impl BusCoordinator {
     /// A coordinator whose buses nothing records (a node test's rig; a
-    /// test that runs the pump itself). `waits` is the execution's shared
-    /// wait tracker, owned by the execution (the bus is just one of its
+    /// test that runs the pump itself). `waits` is the run's shared
+    /// wait tracker, owned by the run (the bus is just one of its
     /// clients).
     #[cfg(any(test, feature = "node-tests"))]
     pub fn new(waits: Arc<WaitTracker>) -> Arc<Self> {
@@ -811,8 +815,8 @@ impl BusCoordinator {
 
     /// The coordinator of a run whose buses go on its record through
     /// `journal`: the pump starts with the run's first bus.
-    pub fn recorded(waits: Arc<WaitTracker>, execution_id: ExecutionId, journal: Arc<dyn JournalClient>, replica: String) -> Arc<Self> {
-        Self::with_pump(waits, Some(BusPump { execution_id, journal, replica, task: Mutex::new(None) }))
+    pub fn recorded(waits: Arc<WaitTracker>, run_id: RunId, journal: Arc<dyn JournalClient>, replica: String) -> Arc<Self> {
+        Self::with_pump(waits, Some(BusPump { run_id, journal, replica, task: Mutex::new(None) }))
     }
 
     fn with_pump(waits: Arc<WaitTracker>, pump: Option<BusPump>) -> Arc<Self> {
@@ -834,32 +838,32 @@ impl BusCoordinator {
         if task.is_none() {
             *task = Some(tokio::spawn(run_bus_journal_task(
                 Arc::downgrade(self),
-                pump.execution_id,
+                pump.run_id,
                 pump.journal.clone(),
                 pump.replica.clone(),
             )));
         }
     }
 
-    /// Handle on the per-execution drain-complete notify. Cloned by
+    /// Handle on the per-run drain-complete notify. Cloned by
     /// the pump to fire after every drain pass.
     pub fn drain_complete_notify(&self) -> Arc<tokio::sync::Notify> {
         self.drain_complete_notify.clone()
     }
 
     /// Mint a fresh bus with the provided options and register it,
-    /// attributed to the minting node execution `node` (whose identity
+    /// attributed to the minting firing `node` (whose identity
     /// keys its wait liveness). The registry pins the `Arc<BusInner>`
-    /// (so the pump's `Weak` always upgrades while the execution is
+    /// (so the pump's `Weak` always upgrades while the run is
     /// live); the bus's engine hooks (the shared wait tracker + the
     /// journal-pump notify) are `Weak` on purpose so the coordinator
-    /// drops naturally at execution end; once gone, the bus's hooks
+    /// drops naturally at run end; once gone, the bus's hooks
     /// no-op. Errors on an invalid `window`.
     pub fn new_bus(
         self: &Arc<Self>,
         opts: BusOptions,
         node: FiringLocation,
-    ) -> Result<BusHandle, &'static str> {
+    ) -> Result<BusHandle, String> {
         let weak = Arc::downgrade(&self.waits) as std::sync::Weak<dyn WaitLiveness>;
         let pump_notify_weak = Arc::downgrade(&self.journal_pump_notify);
         let bus = BusHandle::create_with_engine(opts, weak, pump_notify_weak, Some(node))?;
@@ -868,7 +872,7 @@ impl BusCoordinator {
         Ok(bus)
     }
 
-    /// Handle on the per-execution journal-pump wake-up. The pump task
+    /// Handle on the per-run journal-pump wake-up. The pump task
     /// awaits this notify; buses fire it after every append (via
     /// their `Weak<Notify>`).
     pub fn journal_pump_notify(&self) -> Arc<tokio::sync::Notify> {
@@ -889,8 +893,8 @@ impl BusCoordinator {
         self.registry.live_bus_weaks()
     }
 
-    /// Look up a Bus marker JSON value in this execution's registry,
-    /// attributed to the resolving node execution `node` (whose identity
+    /// Look up a Bus marker JSON value in this run's registry,
+    /// attributed to the resolving firing `node` (whose identity
     /// keys its own bus liveness).
     pub fn lookup_bus(
         &self,
@@ -907,12 +911,13 @@ impl BusCoordinator {
         self.registry.live_bus_arcs().iter().any(|b| !b.is_closed())
     }
 
-    /// Close every live bus (appends a `Closed` log entry to each).
-    /// Does NOT release the registry's `Arc<BusInner>` refs: the pump
-    /// still needs to journal the `Closed` entries.
-    pub fn close_all(&self) {
+    /// Close every live bus still open as `end` (appends a `Closed` log
+    /// entry to each; a bus already ended keeps its end). Does NOT
+    /// release the registry's `Arc<BusInner>` refs: the pump still
+    /// needs to journal the `Closed` entries.
+    pub fn close_all(&self, end: weft_core::bus::StreamEnd) {
         for b in self.registry.live_bus_arcs() {
-            b.close();
+            b.close(end.clone());
         }
         self.journal_pump_notify.notify_waiters();
     }
@@ -945,14 +950,14 @@ impl BusCoordinator {
     ///      no one will fire again.
     ///   5. For a recorded run, wait for its pump to end.
     pub async fn shutdown(&self) {
-        let pump = self.pump.as_ref().map(|pump| (pump.execution_id, pump.task.lock().expect("bus pump poisoned").take()));
+        let pump = self.pump.as_ref().map(|pump| (pump.run_id, pump.task.lock().expect("bus pump poisoned").take()));
         if let Some((_, None)) = pump {
             // A recorded run whose pump never started minted no bus:
             // there is nothing to hand over.
             self.pump_should_exit.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
-        self.close_all();
+        self.close_all(run_ended_with_bus_open());
         let drain = self.drain_complete_notify.clone();
         loop {
             // Arm the wake BEFORE the predicate check so a drain pass
@@ -975,17 +980,24 @@ impl BusCoordinator {
         self.pump_should_exit
             .store(true, std::sync::atomic::Ordering::Release);
         self.journal_pump_notify.notify_waiters();
-        if let Some((execution_id, Some(task))) = pump {
+        if let Some((run_id, Some(task))) = pump {
             if let Err(e) = task.await {
                 tracing::error!(
-                    target: "weft_engine::execution_driver",
-                    %execution_id,
+                    target: "weft_engine::run_driver",
+                    %run_id,
                     error = %e,
-                    "bus journal task ended abnormally; bus replay for this execution is degraded"
+                    "bus journal task ended abnormally; bus replay for this run is degraded"
                 );
             }
         }
     }
+}
+
+/// The end of a bus still open when its run ends. Every bus a body holds
+/// ends with that body, so one left open here outlived whoever held it
+/// (a body that never ended, a cancel): its stream did not complete.
+fn run_ended_with_bus_open() -> weft_core::bus::StreamEnd {
+    weft_core::bus::StreamEnd::Failed { error: "the run ended before this bus did".into() }
 }
 
 impl Drop for BusCoordinator {
@@ -1005,7 +1017,7 @@ impl Drop for BusCoordinator {
     /// extra `close()` calls are idempotent no-ops.
     fn drop(&mut self) {
         for b in self.registry.live_bus_arcs() {
-            b.close();
+            b.close(run_ended_with_bus_open());
         }
         self.pump_should_exit
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1018,16 +1030,16 @@ impl Drop for BusCoordinator {
 // the bus shares it with every other in-process wait source
 // (generator pulls, emission-delivery waits).
 
-/// Bus-journal pump. One task per execution, started by its first bus
+/// Bus-journal pump. One task per run, started by its first bus
 /// ([`BusCoordinator::recorded`]) and shut down after the drive,
-/// whether the drive ended in an outcome or an error. Awaits the per-execution
+/// whether the drive ended in an outcome or an error. Awaits the per-run
 /// notify; on every wake, walks every live bus, drains its
 /// unjournaled tail, ships the entries to the journal, and ack-bumps
 /// the per-bus `journaled_through` cursor.
 ///
 /// Failure handling: a journal write error sets the bus's
 /// `journal_degraded` flag (the NEXT `send` returns
-/// `SendError::JournalDegraded(reason)`). The execution keeps running;
+/// `SendError::JournalDegraded(reason)`). The run keeps running;
 /// the in-RAM bus log is unaffected; the inspector's replay tail is
 /// truncated for the lost range.
 ///
@@ -1040,13 +1052,13 @@ impl Drop for BusCoordinator {
 /// the prior `Weak::upgrade()` shape had.
 pub async fn run_bus_journal_task(
     coordinator: std::sync::Weak<BusCoordinator>,
-    execution_id: ExecutionId,
+    run_id: RunId,
     journal: Arc<dyn JournalClient>,
     replica: String,
 ) {
-    // Hold owned Arcs on both per-execution notifies so we keep
+    // Hold owned Arcs on both per-run notifies so we keep
     // operating even if `coordinator.upgrade()` starts returning None
-    // for a tick (a torn-down execution that lost its Arc but still
+    // for a tick (a torn-down run that lost its Arc but still
     // has buses we need to drain).
     let (pump_wake, drain_done) = match coordinator.upgrade() {
         Some(c) => (c.journal_pump_notify(), c.drain_complete_notify()),
@@ -1079,7 +1091,7 @@ pub async fn run_bus_journal_task(
         };
         drain_buses(
             &known_buses,
-            execution_id,
+            run_id,
             journal.as_ref(),
             &replica,
             &mut windows,
@@ -1136,7 +1148,7 @@ struct PumpBusState {
 /// the pump can run a final drain after the coordinator has dropped.
 async fn drain_buses(
     buses: &[std::sync::Weak<BusInner>],
-    execution_id: ExecutionId,
+    run_id: RunId,
     journal: &dyn JournalClient,
     replica: &str,
     windows: &mut HashMap<uuid::Uuid, PumpBusState>,
@@ -1156,11 +1168,11 @@ async fn drain_buses(
             }
             match &entry.kind {
                 BusEntryKind::Message { payload_byte_size, .. } => {
-                    let policy = journal_policy(&inner);
+                    let policy = inner.journal();
                     let weighs = policy.kept_at_most(*payload_byte_size);
                     let state = windows.entry(bus_id).or_insert_with(|| PumpBusState {
                         entries: Vec::new(),
-                        deadline: tokio::time::Instant::now() + inner.journal_window(),
+                        deadline: tokio::time::Instant::now() + policy.window,
                         kept_bound: 0,
                         buffered_through: entry.offset,
                     });
@@ -1173,7 +1185,7 @@ async fn drain_buses(
                     // next window rather than overflowing this one.
                     if policy.row_is_full(state.kept_bound, weighs)
                         && matches!(
-                            write_open_window(&inner, execution_id, &bus_id_str, journal, replica, state)
+                            write_open_window(&inner, run_id, &bus_id_str, journal, replica, state)
                                 .await,
                             WindowWrite::Degraded
                         )
@@ -1182,7 +1194,7 @@ async fn drain_buses(
                     }
                     if state.entries.is_empty() {
                         state.deadline =
-                            tokio::time::Instant::now() + inner.journal_window();
+                            tokio::time::Instant::now() + policy.window;
                     }
                     state.buffered_through = entry.offset + 1;
                     state.kept_bound += weighs;
@@ -1193,17 +1205,17 @@ async fn drain_buses(
                 // stream never reorders against the bus log.
                 BusEntryKind::Joined { .. }
                 | BusEntryKind::Left { .. }
-                | BusEntryKind::Closed => {
+                | BusEntryKind::Closed { .. } => {
                     if let Some(state) = windows.get_mut(&bus_id) {
                         if matches!(
-                            write_open_window(&inner, execution_id, &bus_id_str, journal, replica, state)
+                            write_open_window(&inner, run_id, &bus_id_str, journal, replica, state)
                                 .await,
                             WindowWrite::Degraded
                         ) {
                             break 'entries;
                         }
                     }
-                    let ev = membership_event(execution_id, &bus_id_str, &entry);
+                    let ev = membership_event(run_id, &bus_id_str, &entry);
                     if let Err(e) = journal.record_event(&ev, Some(replica)).await {
                         tracing::error!(
                             target: "weft_engine::bus",
@@ -1228,7 +1240,7 @@ async fn drain_buses(
         // drain, so nothing stays buffered past shutdown/close).
         if let Some(state) = windows.get_mut(&bus_id) {
             if flush_all || state.deadline <= tokio::time::Instant::now() {
-                let _ = write_open_window(&inner, execution_id, &bus_id_str, journal, replica, state)
+                let _ = write_open_window(&inner, run_id, &bus_id_str, journal, replica, state)
                     .await;
             }
         }
@@ -1262,18 +1274,18 @@ enum WindowWrite {
 /// Write `state`'s open window as one `BusWindow` row for `inner`.
 async fn write_open_window(
     inner: &Arc<BusInner>,
-    execution_id: ExecutionId,
+    run_id: RunId,
     bus_id_str: &str,
     journal: &dyn JournalClient,
     replica: &str,
     state: &mut PumpBusState,
 ) -> WindowWrite {
-    let Some(aggregate) = weft_core::bus::aggregate_window(&state.entries, &journal_policy(inner))
+    let Some(aggregate) = weft_core::bus::aggregate_window(&state.entries, &inner.journal())
     else {
         return WindowWrite::UpToDate;
     };
-    let ev = ExecEvent::BusWindow {
-        execution_id,
+    let ev = RunEvent::BusWindow {
+        run_id,
         bus_id: bus_id_str.to_string(),
         first_offset: aggregate.first_offset,
         last_offset: aggregate.last_offset,
@@ -1301,42 +1313,31 @@ async fn write_open_window(
     WindowWrite::UpToDate
 }
 
-/// How this bus reaches the journal: its window, whether it keeps
-/// content at all, and the two size bounds. Built in ONE place so the
-/// pump's decision to close a window early and the fold's decision on
-/// what to keep cannot come from two different policies.
-fn journal_policy(inner: &Arc<BusInner>) -> weft_core::stream_journal::JournalPolicy {
-    weft_core::stream_journal::JournalPolicy {
-        window: inner.journal_window(),
-        ephemeral: inner.ephemeral(),
-        ..Default::default()
-    }
-}
-
-/// Project one membership `BusEntry` to its `ExecEvent` shape. Message
+/// Project one membership `BusEntry` to its `RunEvent` shape. Message
 /// entries never come through here (they ride window rows).
-fn membership_event(execution_id: ExecutionId, bus_id: &str, entry: &BusEntry) -> ExecEvent {
+fn membership_event(run_id: RunId, bus_id: &str, entry: &BusEntry) -> RunEvent {
     let at_unix = entry.at_unix;
     let offset = entry.offset;
     match &entry.kind {
-        BusEntryKind::Joined { name } => ExecEvent::BusJoined {
-            execution_id,
+        BusEntryKind::Joined { name } => RunEvent::BusJoined {
+            run_id,
             bus_id: bus_id.to_string(),
             offset,
             name: name.clone(),
             at_unix,
         },
-        BusEntryKind::Left { name } => ExecEvent::BusLeft {
-            execution_id,
+        BusEntryKind::Left { name } => RunEvent::BusLeft {
+            run_id,
             bus_id: bus_id.to_string(),
             offset,
             name: name.clone(),
             at_unix,
         },
-        BusEntryKind::Closed => ExecEvent::BusClosed {
-            execution_id,
+        BusEntryKind::Closed { end } => RunEvent::BusClosed {
+            run_id,
             bus_id: bus_id.to_string(),
             offset,
+            end: end.clone(),
             at_unix,
         },
         BusEntryKind::Message { .. } => {
@@ -1350,13 +1351,13 @@ fn membership_event(execution_id: ExecutionId, bus_id: &str, entry: &BusEntry) -
 /// loop turns it into downstream pulses at the firing's frame stack. The
 /// node task keeps running after sending. Bus values are plain JSON
 /// markers inside the value variant; the live channels live in the
-/// per-execution `BusRegistry` on `BusCoordinator` and never ride on
+/// per-run `BusRegistry` on `BusCoordinator` and never ride on
 /// `EmitMsg`.
 pub struct EmitMsg {
     /// The emitting firing's identity.
     pub loc: FiringLocation,
     /// The emission's id, derived from its place
-    /// (`weft_core::exec::emission`): the pulse ids and the journal
+    /// (`weft_core::run::emission`): the pulse ids and the journal
     /// rows carry it.
     pub id: uuid::Uuid,
     pub kind: EmitKind,
@@ -1401,7 +1402,7 @@ pub enum TaskMsg {
     Terminal {
         /// The terminating firing's identity.
         loc: FiringLocation,
-        execution_id: ExecutionId,
+        run_id: RunId,
         outcome: NodeTaskOutcome,
     },
 }
@@ -1413,17 +1414,17 @@ pub enum NodeTaskOutcome {
     /// its baked outputs (`weft_core::infra::bake`), read for a node that
     /// has any: each one the body emitted nothing on carries it.
     Completed { saved: std::collections::BTreeMap<String, serde_json::Value> },
-    /// The step failed. `message` is what the run's failure reads;
-    /// `catchable` is what the step's `error` output carries if the
+    /// The firing failed. `message` is what the run's failure reads;
+    /// `catchable` is what the node's `_error` output carries if the
     /// failure is caught (`weft_core::context::catchable_message`),
-    /// `None` for a failure that never is. `gave_up_wait`: the step
+    /// `None` for a failure that never is. `gave_up_wait`: the firing
     /// failed on a wait it gave up (`WeftError::WaitGaveUp`), a time
     /// limit its run's caller hears as one.
     Failed { message: String, catchable: Option<String>, gave_up_wait: bool },
-    /// The step ended skipped, for `reason`: what it waited on was
+    /// The firing ended skipped, for `reason`: what it waited on was
     /// skipped by a person (`WeftError::WaitSkipped`). Every output it
     /// did not emit closes, as for any skip.
-    Skipped(weft_core::exec::skip::SkipReason),
+    Skipped(weft_core::run::skip::SkipReason),
     /// The node called `await_signal` and is now waiting on a fired
     /// wake signal (carries the suspension token).
     Waiting(String),
@@ -1452,20 +1453,11 @@ pub(crate) const TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// often a still-running one says so.
 const INFRA_APPLY_REPORT_EVERY: Duration = Duration::from_secs(30);
 
-/// The runtime output-type gate: a node may only emit on a port a value
-/// its declared type accepts (`WeftType::accepts_runtime_value`: a
-/// declared named/record shape validates the value against its
-/// contract, everything else infers and compares structurally; an
-/// unresolved declared type accepts anything).
-fn type_accepts(declared: &WeftType, value: &Value) -> bool {
-    declared.accepts_runtime_value(value)
-}
-
 /// Journal write for teardown paths that cannot propagate errors: a
 /// failure is logged. Through a `DriveJournal` the write is only handed
 /// over, so a failure here means the drive was already poisoned or its
 /// sending task is gone; the run stops on the poison itself.
-pub async fn record_from_replica(journal: &dyn JournalClient, event: ExecEvent, replica: &str) {
+pub async fn record_from_replica(journal: &dyn JournalClient, event: RunEvent, replica: &str) {
     if let Err(e) = journal.record_event(&event, Some(replica)).await {
         tracing::error!(target: "weft_engine::journal", error = %e, "a journal write on a teardown path failed");
     }
@@ -1486,7 +1478,7 @@ struct PortClaims {
     /// and errors loud).
     ended_streams: HashSet<String>,
     /// What the firing sent before it paused: the ports its record
-    /// mentions (`NodeExecution::mentioned_ports`), each with the value
+    /// mentions (`NodeFiring::mentioned_ports`), each with the value
     /// the run's fold holds for it (`None` for a close). The body
     /// replays from the top on resume, and its emission on one of these
     /// again sends nothing, the first value standing.
@@ -1501,8 +1493,8 @@ struct PortClaims {
 
 pub struct RunnerHandle {
     project_id: uuid::Uuid,
-    execution_id: ExecutionId,
-    /// How the run is kept (its `ExecutionStarted`'s settings): whether it
+    run_id: RunId,
+    /// How the run is kept (its `RunStarted`'s settings): whether it
     /// can pause, and how long a wait it cannot pause on holds.
     settings: weft_core::run_settings::RunSettings,
     /// The run runs no program (a node test's): no worker could pick it
@@ -1518,16 +1510,16 @@ pub struct RunnerHandle {
     /// Which copies of its infra the run's program declares: an `Infra`
     /// handle another node shared resolves only to one of these.
     declared_infra: Arc<weft_core::project::DeclaredInfra>,
-    /// The node declares `features.catchErrors`, so its `error` output
-    /// is the runtime's to fill (`ContextHandle::catches_errors`).
-    catch_errors: bool,
+    /// The buses this firing ends when its body does
+    /// (`weft_core::bus::FiringBuses`, ended by [`Self::end_body`]).
+    buses: weft_core::bus::FiringBuses,
     /// The node's baked outputs (`weft_core::infra::bake`), and what the
     /// body emitted on them this firing: what an infra setup saves.
     baked_outputs: std::collections::BTreeSet<String>,
     baked_emitted: std::sync::Mutex<std::collections::BTreeMap<String, serde_json::Value>>,
     /// The infra nodes whose infra setup made a connection this firing
     /// opened (`ResolveConnectionResponse::published_by`): what a failure
-    /// of the step names the way out for.
+    /// of the firing names the way out for.
     infra_made: std::sync::Mutex<std::collections::BTreeSet<String>>,
     node_id: String,
     /// The PLACE this firing runs at, spelled the way a person writes
@@ -1557,7 +1549,7 @@ pub struct RunnerHandle {
     published_service: Option<weft_core::AccessSpec>,
     /// This worker's replica id, stamped on every journal write; the
     /// broker takes a write only from the replica that owns the
-    /// execution's claim.
+    /// run's claim.
     worker_replica: String,
     /// Tenant id stamped on every task this handle enqueues.
     tenant_id: String,
@@ -1578,19 +1570,19 @@ pub struct RunnerHandle {
     /// node body (single Future polling).
     awaited_sequence: Mutex<std::collections::VecDeque<weft_core::primitive::AwaitedEntry>>,
     /// 0-based ordinal of the NEXT `await_signal` or `ctx.run` call
-    /// within this (node, frames) execution. Increments on every call.
+    /// within this (node, frames) run. Increments on every call.
     /// Combined with the per-(node, frames) sequence above, it
     /// determines whether the call replays or registers fresh, and it
-    /// is the last part of a wait's identity (execution, node, frames,
+    /// is the last part of a wait's identity (run, node, frames,
     /// call index), so two calls that share the rest must never share
-    /// it. A firing starts its own at 0, because one execution fires a
+    /// it. A firing starts its own at 0, because one run fires a
     /// node once per frames; a live node test, which fires its node
-    /// once per `rig.run` under one execution and one node id, hands
+    /// once per `rig.run` under one run and one node id, hands
     /// every handle it mints the same one
     /// ([`Self::with_call_numbering`]).
     next_call_index: Arc<AtomicU32>,
     /// 0-based ordinal of the NEXT log line within this (node, frames):
-    /// its place among its firing's lines (`ExecEvent::LogLine::seq`).
+    /// its place among its firing's lines (`RunEvent::LogLine::seq`).
     /// Separate counter from `next_call_index` so log lines don't shift
     /// the replay alignment of `await_signal` / `run_step`.
     next_side_effect_index: AtomicU32,
@@ -1617,7 +1609,7 @@ pub struct RunnerHandle {
     /// (each emission is one item of the stream) but still recorded
     /// here, so the no-wait-after-a-stream-started guard sees yields.
     /// The once-only rule is not weakened by the exemption: it
-    /// exists because a second pulse at one `(execution_id, frames)` key has
+    /// exists because a second pulse at one `(run_id, frames)` key has
     /// no identity a waiting consumer could reconcile, and a generator
     /// consumer never reconciles: it fires once and pulls items in
     /// arrival order.
@@ -1645,12 +1637,12 @@ pub struct RunnerHandle {
     /// the body from the top, and the already-pulled stream cannot be
     /// replayed (the producer's items were consumed live).
     has_generator_input: bool,
-    /// The execution's shared wait tracker: this firing's delivery
+    /// The run's shared wait tracker: this firing's delivery
     /// waits register here (its bus waits and generator pulls reach
     /// the same tracker through their own sources).
     waits: Arc<WaitTracker>,
-    /// Per-execution bus coordinator. Owns the `BusRegistry`, the
-    /// source of truth for which buses are live this execution.
+    /// Per-run bus coordinator. Owns the `BusRegistry`, the
+    /// source of truth for which buses are live this run.
     bus_coordinator: Arc<BusCoordinator>,
     /// Output ports this node declares in its metadata, name -> declared
     /// type. Used by `pulse_downstream` / `close_port` to reject emits on
@@ -1670,12 +1662,12 @@ pub struct RunnerHandle {
     /// trigger; `None` for every other dispatch (regular pulse-driven
     /// firings, manual-run roots without a payload, setup-phase runs).
     wake_payload: Option<Value>,
-    /// Live caller connection for this EXECUTION. A cheap `Arc` clone of
-    /// the one connection the loop driver holds for the execution, threaded
+    /// Live caller connection for this RUN. A cheap `Arc` clone of
+    /// the one connection the loop driver holds for the run, threaded
     /// into every firing's handle so any node can reach the caller via
     /// `ctx.caller()`. `None` for durable runs and for any worker that
-    /// did not receive a `live_connection` request. Per-execution, not
-    /// per-firing: all firings of one execution share the one caller.
+    /// did not receive a `live_connection` request. Per-run, not
+    /// per-firing: all firings of one run share the one caller.
     caller_connection: Option<Arc<dyn weft_core::caller::CallerConnection>>,
     /// The grant id and resolved value map of the RUNTIME-OWNED (`Ours`)
     /// connections this firing opened (`ctx.open`), released by the
@@ -1699,7 +1691,7 @@ impl RunnerHandle {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         project_id: uuid::Uuid,
-        execution_id: ExecutionId,
+        run_id: RunId,
         node_id: String,
         place: String,
         node_type: String,
@@ -1719,13 +1711,13 @@ impl RunnerHandle {
     ) -> Self {
         Self {
             project_id,
-            execution_id,
+            run_id,
             settings: weft_core::run_settings::RunSettings::default(),
             without_program: false,
             per_instance: None,
             run_instance: None,
             declared_infra: Arc::new(weft_core::project::DeclaredInfra::default()),
-            catch_errors: false,
+            buses: Default::default(),
             baked_outputs: Default::default(),
             baked_emitted: Default::default(),
             infra_made: Default::default(),
@@ -1809,7 +1801,7 @@ impl RunnerHandle {
         let mut failures = Vec::new();
         for (grant, values) in opened {
             let req = weft_broker_client::protocol::ReleaseConnectionRequest {
-                execution_id: self.execution_id,
+                run_id: self.run_id,
                 values,
             };
             if let Err(e) = self.clients.access_broker.release_connection(&req).await {
@@ -1843,8 +1835,8 @@ impl RunnerHandle {
         self
     }
 
-    /// Wire the execution's live caller connection. Called by the loop
-    /// driver for every firing of an execution that has a caller attached, so
+    /// Wire the run's live caller connection. Called by the loop
+    /// driver for every firing of a run that has a caller attached, so
     /// `ctx.caller()` resolves on any node. Left `None` otherwise.
     pub fn with_caller_connection(
         mut self,
@@ -1855,7 +1847,7 @@ impl RunnerHandle {
     }
 
     /// How the run this firing belongs to is kept, stamped by the loop
-    /// driver from the run's `ExecutionStarted`.
+    /// driver from the run's `RunStarted`.
     pub fn with_settings(mut self, settings: weft_core::run_settings::RunSettings) -> Self {
         self.settings = settings;
         self
@@ -1871,7 +1863,7 @@ impl RunnerHandle {
     /// Number this handle's `await_signal` and `ctx.run` calls on
     /// `numbering`, shared with the other handles of a live node test
     /// (see `next_call_index`): each `rig.run` is a firing of the same
-    /// node under the same execution, so a second run's first wait
+    /// node under the same run, so a second run's first wait
     /// carries on from the first run's numbering instead of taking its
     /// identity, and with it its answer.
     #[cfg(feature = "node-tests")]
@@ -1897,13 +1889,6 @@ impl RunnerHandle {
     /// infra, never one another node shared.
     pub fn with_declared_infra(mut self, declared_infra: Arc<weft_core::project::DeclaredInfra>) -> Self {
         self.declared_infra = declared_infra;
-        self
-    }
-
-    /// Whether this node declares `features.catchErrors` (from its
-    /// definition).
-    pub fn with_catch_errors(mut self, catch_errors: bool) -> Self {
-        self.catch_errors = catch_errors;
         self
     }
 
@@ -1936,7 +1921,7 @@ impl RunnerHandle {
         }
         let nodes: Vec<&str> = made.iter().map(String::as_str).collect();
         format!(
-            "{failure}\n(this step used a connection the infra of {} made; if its values changed where weft could not see, \
+            "{failure}\n(this node used a connection the infra of {} made; if its values changed where weft could not see, \
              such as a password reset whose report never arrived, `weft infra rebake {}` makes it again)",
             nodes.join(", "),
             nodes[0],
@@ -1957,7 +1942,7 @@ impl RunnerHandle {
                 err = &mut cancelled => return err,
                 _ = breadcrumb.tick() => tracing::warn!(
                     target: "weft_engine::context",
-                    execution_id = %self.execution_id,
+                    run_id = %self.run_id,
                     node = %self.node_id,
                     what,
                     "this run asked to be stopped with the rest and is waiting for its own stop to \
@@ -1996,15 +1981,17 @@ impl RunnerHandle {
     /// with a clone of its ctx) is refused, because the firing it would
     /// belong to is no longer running. Taken under the claims lock every
     /// emission sends under, so an emission is either on the channel
-    /// before the firing's terminal or refused.
-    pub fn end_body(&self) {
+    /// before the firing's terminal or refused. The buses the body held
+    /// end with `end`, how it returned (`weft_core::bus::body_end`).
+    pub fn end_body(&self, end: weft_core::bus::StreamEnd) {
         self.lock_port_claims().body_returned = true;
+        self.buses.end(end);
     }
 
     /// The refusal for anything done through this handle after its body
     /// returned (see [`Self::end_body`]).
     fn outlived(&self, what: &str) -> WeftError {
-        WeftError::NodeExecution(format!(
+        WeftError::NodeFailed(format!(
             "node '{}' {what} after its body returned or paused on a wait; a firing owns only \
              what is done while its body runs, so a task spawned with a clone of ctx has to \
              finish before the body returns or waits",
@@ -2022,7 +2009,7 @@ impl RunnerHandle {
     fn check_declared_outputs(&self, ports: &[String]) -> WeftResult<()> {
         for port_name in ports {
             if !self.declared_outputs.contains_key(port_name) {
-                return Err(WeftError::NodeExecution(format!(
+                return Err(WeftError::NodeFailed(format!(
                     "node '{}' tried to emit on undeclared output port '{}'. \
                      Declare it in metadata.json's outputs list, or correct \
                      the port name in the node body.",
@@ -2054,14 +2041,14 @@ impl RunnerHandle {
     fn claim(&self, claims: &mut PortClaims, ports: &[String]) -> WeftResult<()> {
         for port_name in ports {
             if claims.ended_streams.contains(port_name) {
-                return Err(WeftError::NodeExecution(format!(
+                return Err(WeftError::NodeFailed(format!(
                     "node '{}' yielded on stream port '{}' after closing it; a close \
                      ends the stream, nothing can follow it.",
                     self.place, port_name
                 )));
             }
             if claims.mentioned.contains(port_name) && !self.is_generator_output(port_name) {
-                return Err(WeftError::NodeExecution(format!(
+                return Err(WeftError::NodeFailed(format!(
                     "node '{}' touched port '{}' twice in one firing. \
                      Each output port can be emitted or closed AT MOST ONCE per \
                      firing; release ports incrementally (e.g. a bus marker early, \
@@ -2109,7 +2096,7 @@ impl RunnerHandle {
                 }
                 if self.is_generator_output(&port) {
                     if !claims.ended_streams.insert(port.clone()) {
-                        return Err(WeftError::NodeExecution(format!(
+                        return Err(WeftError::NodeFailed(format!(
                             "node '{}' closed stream port '{}' twice; a stream ends once.",
                             self.place, port
                         )));
@@ -2133,9 +2120,9 @@ impl RunnerHandle {
             EmitKind::Values(output) if output.outputs.keys().any(|port| self.is_generator_output(port)) => {
                 let item = claims.stream_items;
                 claims.stream_items += 1;
-                weft_core::exec::emission::stream_emission(&self.node_id, &self.node_frames, item)
+                weft_core::run::emission::stream_emission(&self.node_id, &self.node_frames, item)
             }
-            _ => weft_core::exec::emission::body_emission(&self.node_id, &self.node_frames),
+            _ => weft_core::run::emission::body_emission(&self.node_id, &self.node_frames),
         };
         self.send_emission(id, kind, delivery)?;
         Ok(true)
@@ -2198,7 +2185,7 @@ impl RunnerHandle {
                 self.record
                     .journal
                     .record_event(
-                        &ExecEvent::wait_answered(self.execution_id, token, answer.clone(), now_unix()),
+                        &RunEvent::wait_answered(self.run_id, token, answer.clone(), now_unix()),
                         Some(&self.worker_replica),
                     )
                     .await
@@ -2215,8 +2202,8 @@ impl RunnerHandle {
         self.record
             .journal
             .record_event(
-                &ExecEvent::SuspensionGaveUp {
-                    execution_id: self.execution_id,
+                &RunEvent::SuspensionGaveUp {
+                    run_id: self.run_id,
                     token: token.clone(),
                     error: error.to_string(),
                     at_unix: now_unix(),
@@ -2231,9 +2218,9 @@ impl RunnerHandle {
                 kind: TaskKind::WithdrawSignal,
                 project_id: None,
                 dedup_key: Some(format!("withdraw/{token}")),
-                execution_id: Some(self.execution_id),
+                run_id: Some(self.run_id),
                 tenant_id: self.tenant_id.clone(),
-                payload: serde_json::to_value(weft_task_store::WithdrawSignalPayload { execution_id: self.execution_id, token })
+                payload: serde_json::to_value(weft_task_store::WithdrawSignalPayload { run_id: self.run_id, token })
                     .map_err(|e| WeftError::Suspension(format!("{error}; and withdrawing it failed: {e}")))?,
             })
             .await
@@ -2293,7 +2280,7 @@ impl RunnerHandle {
 pub async fn ship_node_lifecycle(
     journal: &dyn JournalClient,
     replica: &str,
-    execution_id: ExecutionId,
+    run_id: RunId,
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
     resume_token: Option<&str>,
@@ -2304,16 +2291,16 @@ pub async fn ship_node_lifecycle(
         "ship_node_lifecycle: resume_token passed with is_resume=false"
     );
     let event = if is_resume {
-        ExecEvent::NodeResumed {
-            execution_id,
+        RunEvent::NodeResumed {
+            run_id,
             node_id: node_id.to_string(),
             frames: frames.clone(),
             token: resume_token.map(str::to_string),
             at_unix: now_unix(),
         }
     } else {
-        ExecEvent::NodeStarted {
-            execution_id,
+        RunEvent::NodeStarted {
+            run_id,
             node_id: node_id.to_string(),
             frames: frames.clone(),
             at_unix: now_unix(),
@@ -2325,15 +2312,15 @@ pub async fn ship_node_lifecycle(
 pub async fn ship_node_suspended(
     journal: &dyn JournalClient,
     replica: &str,
-    execution_id: ExecutionId,
+    run_id: RunId,
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
     token: &str,
 ) {
     record_from_replica(
         journal,
-        ExecEvent::NodeSuspended {
-            execution_id,
+        RunEvent::NodeSuspended {
+            run_id,
             node_id: node_id.to_string(),
             frames: frames.clone(),
             token: token.to_string(),
@@ -2350,14 +2337,14 @@ pub async fn ship_node_suspended(
 pub async fn ship_node_completed(
     journal: &dyn JournalClient,
     replica: &str,
-    execution_id: ExecutionId,
+    run_id: RunId,
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
 ) {
     record_from_replica(
         journal,
-        ExecEvent::NodeCompleted {
-            execution_id,
+        RunEvent::NodeCompleted {
+            run_id,
             node_id: node_id.to_string(),
             frames: frames.clone(),
             at_unix: now_unix(),
@@ -2370,7 +2357,7 @@ pub async fn ship_node_completed(
 pub async fn ship_node_failed(
     journal: &dyn JournalClient,
     replica: &str,
-    execution_id: ExecutionId,
+    run_id: RunId,
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
     error: &str,
@@ -2378,8 +2365,8 @@ pub async fn ship_node_failed(
 ) {
     record_from_replica(
         journal,
-        ExecEvent::NodeFailed {
-            execution_id,
+        RunEvent::NodeFailed {
+            run_id,
             node_id: node_id.to_string(),
             frames: frames.clone(),
             error: error.to_string(),
@@ -2394,15 +2381,15 @@ pub async fn ship_node_failed(
 pub async fn ship_node_skipped(
     journal: &dyn JournalClient,
     replica: &str,
-    execution_id: ExecutionId,
+    run_id: RunId,
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
-    reason: &weft_core::exec::skip::SkipReason,
+    reason: &weft_core::run::skip::SkipReason,
 ) {
     record_from_replica(
         journal,
-        ExecEvent::NodeSkipped {
-            execution_id,
+        RunEvent::NodeSkipped {
+            run_id,
             node_id: node_id.to_string(),
             frames: frames.clone(),
             reason: reason.clone(),
@@ -2420,23 +2407,22 @@ pub async fn ship_node_skipped(
 pub async fn ship_port_emissions(
     journal: &dyn JournalClient,
     replica: &str,
-    execution_id: ExecutionId,
+    run_id: RunId,
     emission_id: uuid::Uuid,
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
-    bag: &weft_core::exec::OutputBag,
+    bag: &weft_core::run::OutputBag,
 ) {
     for (port, value) in bag {
         record_from_replica(
             journal,
-            ExecEvent::PortEmitted {
-                execution_id,
+            RunEvent::PortEmitted {
+                run_id,
                 emission_id,
                 node_id: node_id.to_string(),
                 frames: frames.clone(),
                 port: port.clone(),
                 value: value.clone(),
-                provided: false,
                 at_unix: now_unix(),
             },
             replica,
@@ -2450,19 +2436,18 @@ pub async fn ship_port_emissions(
 pub async fn ship_port_closed(
     journal: &dyn JournalClient,
     replica: &str,
-    execution_id: ExecutionId,
+    run_id: RunId,
     emission_id: uuid::Uuid,
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
     port: &str,
 ) {
-    let event = ExecEvent::PortClosed {
-        execution_id,
+    let event = RunEvent::PortClosed {
+        run_id,
         emission_id,
         node_id: node_id.to_string(),
         frames: frames.clone(),
         port: port.to_string(),
-        provided: false,
         at_unix: now_unix(),
     };
     record_from_replica(journal, event, replica).await;
@@ -2503,7 +2488,7 @@ impl ContextHandle for RunnerHandle {
                 return Err(self.outlived("waited"));
             }
             if claims.mentioned.iter().chain(claims.sent_before_pause.keys()).any(|port| self.is_generator_output(port)) {
-                return Err(WeftError::NodeExecution(
+                return Err(WeftError::NodeFailed(
                     weft_core::context::streamed_then_await_signal_error(&self.place),
                 ));
             }
@@ -2512,7 +2497,7 @@ impl ContextHandle for RunnerHandle {
         // replays the body from the top, and the items its earlier
         // pulls consumed were delivered live and cannot be replayed.
         if self.has_generator_input {
-            return Err(WeftError::NodeExecution(
+            return Err(WeftError::NodeFailed(
                 weft_core::context::stream_consumer_await_signal_error(&self.place),
             ));
         }
@@ -2532,7 +2517,7 @@ impl ContextHandle for RunnerHandle {
         // own SuspensionRegistered, with the right ordinal, below.
         let reply = enqueue_register_signal_task(
             self.clients.tasks.as_ref(),
-            self.execution_id,
+            self.run_id,
             &self.node_id,
             &self.node_frames,
             &spec,
@@ -2553,8 +2538,8 @@ impl ContextHandle for RunnerHandle {
         self.record
             .journal
             .record_event(
-                &ExecEvent::SuspensionRegistered {
-                    execution_id: self.execution_id,
+                &RunEvent::SuspensionRegistered {
+                    run_id: self.run_id,
                     node_id: self.node_id.clone(),
                     frames: self.node_frames.clone(),
                     token: token.clone(),
@@ -2569,7 +2554,7 @@ impl ContextHandle for RunnerHandle {
         tracing::info!(
             target: "weft_engine::suspend",
             node = %self.node_id,
-            execution_id = %self.execution_id,
+            run_id = %self.run_id,
             call_index = call_index,
             token = %token,
             "await_signal: registered",
@@ -2597,8 +2582,8 @@ impl ContextHandle for RunnerHandle {
         // run_step and run_record agree on the index explicitly
         // rather than via a shared counter both sides read.
         self.record.journal.record_event(
-            &ExecEvent::RunOutput {
-                execution_id: self.execution_id,
+            &RunEvent::RunOutput {
+                run_id: self.run_id,
                 node_id: self.node_id.clone(),
                 frames: self.node_frames.clone(),
                 call_index,
@@ -2609,7 +2594,7 @@ impl ContextHandle for RunnerHandle {
             Some(&self.worker_replica),
         )
         .await
-        .map_err(|error| WeftError::NodeExecution(format!(
+        .map_err(|error| WeftError::NodeFailed(format!(
             "could not save result of '{name}' for node '{}': {error}. \
              The action may already have happened; inspect this run before repeating it.",
             self.place,
@@ -2628,7 +2613,7 @@ impl ContextHandle for RunnerHandle {
     ) -> WeftResult<Value> {
         self.clients
             .storage
-            .put(self.execution_id, scope, identity, mime_type, filename, keep, declared_size, data)
+            .put(self.run_id, scope, identity, mime_type, filename, keep, declared_size, data)
             .await
     }
 
@@ -2646,7 +2631,7 @@ impl ContextHandle for RunnerHandle {
         // WhatsApp, say). The begin's already-stored answer remains the
         // race-safe backstop for two fetches landing at once.
         if let Some(identity) = identity {
-            if let Some(meta) = self.clients.storage.find(self.execution_id, scope, identity).await? {
+            if let Some(meta) = self.clients.storage.find(self.run_id, scope, identity).await? {
                 return Ok(weft_core::storage::StoredFile::from(&meta).to_value());
             }
         }
@@ -2656,11 +2641,11 @@ impl ContextHandle for RunnerHandle {
             .get(url)
             .send()
             .await
-            .map_err(|e| WeftError::NodeExecution(format!("fetch {url}: {e}")))?;
+            .map_err(|e| WeftError::NodeFailed(format!("fetch {url}: {e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(WeftError::NodeExecution(format!(
+            return Err(WeftError::NodeFailed(format!(
                 "fetch {url} returned {status}: {}",
                 weft_core::truncate_user_string(&body, 512)
             )));
@@ -2692,7 +2677,7 @@ impl ContextHandle for RunnerHandle {
         );
         self.clients
             .storage
-            .put(self.execution_id, scope, identity, &mime, &name, keep, declared_size, stream)
+            .put(self.run_id, scope, identity, &mime, &name, keep, declared_size, stream)
             .await
     }
 
@@ -2701,7 +2686,7 @@ impl ContextHandle for RunnerHandle {
         key: &str,
         range: Option<weft_core::storage::ByteRange>,
     ) -> WeftResult<(weft_core::storage::StoredFileMeta, weft_core::storage::ByteStream)> {
-        self.clients.storage.get(self.execution_id, key, range).await
+        self.clients.storage.get(self.run_id, key, range).await
     }
 
     async fn storage_get_url(
@@ -2720,7 +2705,7 @@ impl ContextHandle for RunnerHandle {
         if let Some(r) = range {
             let header = match r.end {
                 Some(e) if e < r.start => {
-                    return Err(WeftError::NodeExecution(format!(
+                    return Err(WeftError::NodeFailed(format!(
                         "invalid byte range: end {e} precedes start {}",
                         r.start
                     )));
@@ -2749,11 +2734,11 @@ impl ContextHandle for RunnerHandle {
         let resp = req
             .send()
             .await
-            .map_err(|e| WeftError::NodeExecution(format!("fetch {url}: {e}")))?;
+            .map_err(|e| WeftError::NodeFailed(format!("fetch {url}: {e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(WeftError::NodeExecution(format!(
+            return Err(WeftError::NodeFailed(format!(
                 "fetch {url} returned {status}: {}",
                 weft_core::truncate_user_string(&body, 512)
             )));
@@ -2787,14 +2772,14 @@ impl ContextHandle for RunnerHandle {
     }
 
     async fn storage_delete(&self, key: &str) -> WeftResult<()> {
-        self.clients.storage.delete(self.execution_id, key).await
+        self.clients.storage.delete(self.run_id, key).await
     }
 
     async fn storage_list(
         &self,
         scope: &weft_core::storage::StorageScope,
     ) -> WeftResult<Vec<weft_core::storage::StoredFileMeta>> {
-        self.clients.storage.list(self.execution_id, scope).await
+        self.clients.storage.list(self.run_id, scope).await
     }
 
     async fn storage_replace(
@@ -2804,7 +2789,7 @@ impl ContextHandle for RunnerHandle {
         data: weft_core::storage::ByteStream,
         declared_size: Option<u64>,
     ) -> WeftResult<weft_core::storage::ReplaceOutcome> {
-        self.clients.storage.replace(self.execution_id, key, expected_version, declared_size, data).await
+        self.clients.storage.replace(self.run_id, key, expected_version, declared_size, data).await
     }
 
     async fn record_file_edit(&self, edit: weft_core::storage::FileEdit) -> WeftResult<()> {
@@ -2813,8 +2798,8 @@ impl ContextHandle for RunnerHandle {
         }
         record_from_replica(
             self.record.journal.as_ref(),
-            ExecEvent::FileEdited {
-                execution_id: self.execution_id,
+            RunEvent::FileEdited {
+                run_id: self.run_id,
                 node_id: self.node_id.clone(),
                 frames: self.node_frames.clone(),
                 edit,
@@ -2831,15 +2816,34 @@ impl ContextHandle for RunnerHandle {
         key: &str,
         ttl: weft_core::storage::KeepTtl,
     ) -> WeftResult<()> {
-        self.clients.storage.keep(self.execution_id, key, ttl).await
+        self.clients.storage.keep(self.run_id, key, ttl).await
     }
 
-    async fn storage_presign(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<String> {
-        self.clients.storage.presign(self.execution_id, key, ttl_secs).await
+    async fn storage_link(
+        &self,
+        key: &str,
+        ttl_secs: Option<u64>,
+        reach: weft_core::storage::LinkReach,
+    ) -> WeftResult<weft_core::storage::LinkAnswer> {
+        self.clients.storage.link(self.run_id, key, ttl_secs, reach).await
     }
 
-    async fn storage_public_link(&self, key: &str, ttl_secs: Option<u64>, reach: weft_core::storage::LinkReach) -> WeftResult<Option<String>> {
-        self.clients.storage.public_link(self.execution_id, key, ttl_secs, reach).await
+    async fn storage_copy(
+        &self,
+        scope: &weft_core::storage::StorageScope,
+        identity: Option<&str>,
+        key: &str,
+        keep: Option<weft_core::storage::KeepTtl>,
+    ) -> WeftResult<Value> {
+        self.clients.storage.copy(self.run_id, key, scope, identity, keep).await
+    }
+
+    async fn storage_upload_slot(&self, request: &weft_core::storage::slot::UploadSlotRequest) -> WeftResult<String> {
+        self.clients.storage.upload_slot(self.run_id, request).await
+    }
+
+    async fn storage_claim_uploads(&self, claims: &[(&str, &weft_core::weft_type::WeftType)]) -> WeftResult<Vec<Value>> {
+        self.clients.storage.claim_uploads(self.run_id, claims).await
     }
 
     fn own_infra(
@@ -2888,7 +2892,7 @@ impl ContextHandle for RunnerHandle {
         let endpoint = self
             .clients
             .infra
-            .endpoint_address(self.execution_id, self.run_instance.as_ref(), infra)
+            .endpoint_address(self.run_id, self.run_instance.as_ref(), infra)
             .await
             .map_err(|e| WeftError::Config(format!("infra_node lookup: {e}")))?;
         let address = endpoint.ok_or_else(|| {
@@ -2967,12 +2971,12 @@ impl ContextHandle for RunnerHandle {
     /// register_signal task and waits for the dispatcher to ack.
     /// Worker keeps executing; the signal stays armed and
     /// persistent until the project is deactivated. Each external
-    /// fire spawns a fresh execution at the worker's door instead of
+    /// fire spawns a fresh run at the worker's door instead of
     /// resuming this firing.
     /// Distinct from await_signal: no suspend-then-resume cycle.
     async fn register_signal(&self, spec: SignalSpec, port_snapshot: Value) -> WeftResult<()> {
         // Entry triggers are one-shot per node per TriggerSetup.
-        // The dedup key for this enqueue is `(execution, node, frames,
+        // The dedup key for this enqueue is `(run, node, frames,
         // is_resume=false, call_index=0)`; a second call from the
         // same node body would collide and silently drop the
         // second trigger. Catch that loudly here so the offending
@@ -2987,7 +2991,7 @@ impl ContextHandle for RunnerHandle {
         }
         let reply = enqueue_register_signal_task(
             self.clients.tasks.as_ref(),
-            self.execution_id,
+            self.run_id,
             &self.node_id,
             &self.node_frames,
             &spec,
@@ -3005,7 +3009,7 @@ impl ContextHandle for RunnerHandle {
         self.record
             .journal
             .record_event(
-                &ExecEvent::TriggerCaptured { execution_id: self.execution_id, node_id, spec, port_snapshot, at_unix: now_unix() },
+                &RunEvent::TriggerCaptured { run_id: self.run_id, node_id, spec, port_snapshot, at_unix: now_unix() },
                 Some(&self.worker_replica),
             )
             .await
@@ -3013,7 +3017,7 @@ impl ContextHandle for RunnerHandle {
         tracing::info!(
             target: "weft_engine::register",
             node = %self.node_id,
-            execution_id = %self.execution_id,
+            run_id = %self.run_id,
             "register_signal: captured"
         );
         Ok(())
@@ -3030,7 +3034,7 @@ impl ContextHandle for RunnerHandle {
         // placement that call brought up, and the connection list names
         // it the way a person writes that call.
         let req = weft_broker_client::protocol::PublishAccessRequest {
-            execution_id: self.execution_id,
+            run_id: self.run_id,
             node_id: self.place.clone(),
             service: service.clone(),
             spec,
@@ -3039,7 +3043,7 @@ impl ContextHandle for RunnerHandle {
             per_instance: self.per_instance.is_some(),
         };
         let resp = self.clients.access_broker.publish_access(&req, self.run_instance.as_ref()).await.map_err(|e| {
-            WeftError::NodeExecution(format!("publish the '{service}' connection: {e:#}"))
+            WeftError::NodeFailed(format!("publish the '{service}' connection: {e:#}"))
         })?;
         Ok(weft_core::access::Access::new(
             resp.connection.connection_id,
@@ -3051,14 +3055,14 @@ impl ContextHandle for RunnerHandle {
     async fn published_access(&self) -> WeftResult<Option<weft_core::access::Access>> {
         let service = self.published_spec()?.service.clone();
         let req = weft_broker_client::protocol::PublishedAccessRequest {
-            execution_id: self.execution_id,
+            run_id: self.run_id,
             // By place, the key `publish_access` wrote under.
             node_id: self.place.clone(),
             service: service.clone(),
             per_instance: self.per_instance.is_some(),
         };
         let resp = self.clients.access_broker.published_access(&req, self.run_instance.as_ref()).await.map_err(|e| {
-            WeftError::NodeExecution(format!(
+            WeftError::NodeFailed(format!(
                 "look up the '{service}' connection this node published: {e:#}"
             ))
         })?;
@@ -3074,7 +3078,7 @@ impl ContextHandle for RunnerHandle {
     ) -> WeftResult<weft_core::access::OpenedConnection> {
         let service = access.service().to_string();
         let req = weft_broker_client::protocol::ResolveConnectionRequest {
-            execution_id: self.execution_id,
+            run_id: self.run_id,
             node_id: self.node_id.clone(),
             frames: self.node_frames.clone(),
             node_type: self.node_type.clone(),
@@ -3085,7 +3089,7 @@ impl ContextHandle for RunnerHandle {
             expected_duration_secs: window.as_secs(),
         };
         let resp = self.clients.access_broker.resolve_connection(&req, self.run_instance.as_ref()).await.map_err(|e| {
-            WeftError::NodeExecution(format!("open the '{service}' connection: {e:#}"))
+            WeftError::NodeFailed(format!("open the '{service}' connection: {e:#}"))
         })?;
         // Remember the lease so the loop driver releases it when this
         // node's body finishes (`close_opened_accesses`). Only an
@@ -3104,7 +3108,7 @@ impl ContextHandle for RunnerHandle {
 
         let steps = weft_core::access::client::resolve_steps(&resp.auth, &resp.values)
             .map_err(|e| {
-                WeftError::NodeExecution(format!(
+                WeftError::NodeFailed(format!(
                     "the '{service}' connection's auth steps do not resolve: {e}"
                 ))
             })?;
@@ -3114,7 +3118,7 @@ impl ContextHandle for RunnerHandle {
             replica: self.worker_replica.clone(),
             pending: self.record.costs.clone(),
             open_charges: self.clients.open_charges.clone(),
-            execution_id: self.execution_id,
+            run_id: self.run_id,
             node_id: self.node_id.clone(),
             frames: self.node_frames.clone(),
             service: service.clone(),
@@ -3154,7 +3158,7 @@ impl ContextHandle for RunnerHandle {
         };
         tracing::info!(
             target: "weft_engine::node",
-            execution_id = %self.execution_id,
+            run_id = %self.run_id,
             level = level_str,
             "{message}"
         );
@@ -3162,8 +3166,8 @@ impl ContextHandle for RunnerHandle {
         self.record
             .journal
             .record_event(
-                &ExecEvent::LogLine {
-                    execution_id: self.execution_id,
+                &RunEvent::LogLine {
+                    run_id: self.run_id,
                     node_id: self.node_id.clone(),
                     frames: self.node_frames.clone(),
                     level: level_str.to_string(),
@@ -3180,9 +3184,9 @@ impl ContextHandle for RunnerHandle {
 
     /// Synchronous through the broker (the tag rows exist on return),
     /// and safe to re-run: the broker's insert keeps an existing
-    /// (execution, tag) row, so a body replayed after a durable wait
+    /// (run, tag) row, so a body replayed after a durable wait
     /// re-tags onto the same state. Not journaled through `ctx.run` for that reason.
-    async fn tag_execution(&self, tags: Vec<String>) -> WeftResult<()> {
+    async fn tag_run(&self, tags: Vec<String>) -> WeftResult<()> {
         // A tag is a row in the journal about this run, and an
         // unrecorded run writes none: it is not listed, and a stop by
         // tag selects only recorded runs.
@@ -3200,16 +3204,16 @@ impl ContextHandle for RunnerHandle {
         self.record
             .journal
             .record_event(
-                &ExecEvent::ExecutionTagged { execution_id: self.execution_id, tags: tags.clone(), at_unix: now_unix() },
+                &RunEvent::RunTagged { run_id: self.run_id, tags: tags.clone(), at_unix: now_unix() },
                 Some(&self.worker_replica),
             )
             .await
-            .map_err(|e| WeftError::Config(format!("tag_execution: record the tag: {e:#}")))?;
+            .map_err(|e| WeftError::Config(format!("tag_run: record the tag: {e:#}")))?;
         self.clients
             .steering
-            .tag_execution(self.execution_id, tags)
+            .tag_run(self.run_id, tags)
             .await
-            .map_err(|e| WeftError::Config(format!("tag_execution: {e}")))
+            .map_err(|e| WeftError::Config(format!("tag_run: {e}")))
     }
 
     /// Queues the stop through the broker, which anchors the ordering
@@ -3224,7 +3228,7 @@ impl ContextHandle for RunnerHandle {
         let stops_self = self
             .clients
             .steering
-            .stop_tagged(self.execution_id, tag, stop_self)
+            .stop_tagged(self.run_id, tag, stop_self)
             .await
             .map_err(|e| WeftError::Config(format!("stop_tagged: {e}")))?;
         if !stops_self {
@@ -3249,22 +3253,22 @@ impl ContextHandle for RunnerHandle {
     ) -> WeftResult<Value> {
         let name = call.journal_name();
         let frames = frames_dedup_key(&self.node_frames)
-            .map_err(|e| WeftError::NodeExecution(format!("{name}: frames: {e}")))?;
-        let payload = weft_core::program::ProgramCallPayload { by: self.execution_id, stop_self, call };
+            .map_err(|e| WeftError::NodeFailed(format!("{name}: frames: {e}")))?;
+        let payload = weft_core::program::ProgramCallPayload { by: self.run_id, stop_self, call };
         let id = self
             .clients
             .tasks
             .enqueue_dedup(task_store::NewTask {
                 kind: TaskKind::ProgramCall,
                 project_id: Some(self.project_id),
-                dedup_key: Some(format!("program_call/{}/{}/{frames}/{call_index}", self.execution_id, self.node_id)),
-                execution_id: Some(self.execution_id),
+                dedup_key: Some(format!("program_call/{}/{}/{frames}/{call_index}", self.run_id, self.node_id)),
+                run_id: Some(self.run_id),
                 tenant_id: self.tenant_id.clone(),
                 payload: serde_json::to_value(&payload)
-                    .map_err(|e| WeftError::NodeExecution(format!("{name}: {e}")))?,
+                    .map_err(|e| WeftError::NodeFailed(format!("{name}: {e}")))?,
             })
             .await
-            .map_err(|e| WeftError::NodeExecution(format!("{name}: {e:#}")))?
+            .map_err(|e| WeftError::NodeFailed(format!("{name}: {e:#}")))?
             .id();
         let cancelled = self.cancellation.cancelled_err();
         tokio::pin!(cancelled);
@@ -3272,28 +3276,28 @@ impl ContextHandle for RunnerHandle {
             let outcome = tokio::select! {
                 err = &mut cancelled => return Err(err),
                 outcome = self.clients.tasks.wait_for_terminal(id, TASK_WAIT_TIMEOUT) => outcome
-                    .map_err(|e| WeftError::NodeExecution(format!("{name}: {e:#}")))?,
+                    .map_err(|e| WeftError::NodeFailed(format!("{name}: {e:#}")))?,
             };
             match outcome.status {
                 task_store::TaskStatus::Complete => {
                     let answer: weft_core::program::ProgramCallOutcome = serde_json::from_value(
                         outcome.result.unwrap_or(Value::Null),
                     )
-                    .map_err(|e| WeftError::NodeExecution(format!("{name}: unreadable answer: {e}")))?;
+                    .map_err(|e| WeftError::NodeFailed(format!("{name}: unreadable answer: {e}")))?;
                     if answer.stops_asker {
                         return Err(self.wait_for_own_stop(name).await);
                     }
                     return Ok(answer.value);
                 }
                 task_store::TaskStatus::Failed => {
-                    return Err(WeftError::NodeExecution(format!(
+                    return Err(WeftError::NodeFailed(format!(
                         "{name}: {}",
                         outcome.error.unwrap_or_else(|| "the call failed".into())
                     )))
                 }
                 task_store::TaskStatus::Pending | task_store::TaskStatus::Claimed => tracing::info!(
                     target: "weft_engine::context",
-                    execution_id = %self.execution_id,
+                    run_id = %self.run_id,
                     node = %self.node_id,
                     call = name,
                     "still waiting for the program call's answer"
@@ -3313,14 +3317,14 @@ impl ContextHandle for RunnerHandle {
             .access_broker
             .mint_instance_token(&weft_broker_client::protocol::ProgramMintInstanceTokenRequest {
                 id,
-                execution_id: self.execution_id,
+                run_id: self.run_id,
                 instance: instance.clone(),
                 expires_in_secs,
                 displays,
                 name: Some(format!("minted by {}", self.place)),
             })
             .await
-            .map_err(|e| WeftError::NodeExecution(format!("mint an instance token: {e:#}")))
+            .map_err(|e| WeftError::NodeFailed(format!("mint an instance token: {e:#}")))
     }
 
     fn cancellation(&self) -> Arc<CancellationFlag> {
@@ -3339,8 +3343,8 @@ impl ContextHandle for RunnerHandle {
         &self.wired_outputs
     }
 
-    fn catches_errors(&self) -> bool {
-        self.catch_errors
+    fn firing_buses(&self) -> &weft_core::bus::FiringBuses {
+        &self.buses
     }
 
     /// Fire downstream. Each output port the node mentions in
@@ -3383,32 +3387,27 @@ impl ContextHandle for RunnerHandle {
             // A wire carries values, never bytes: a value over the cap
             // fails the call outright, naming where the bytes belong.
             weft_core::storage::check_wire_value(&self.place, &port, &value)
-                .map_err(WeftError::NodeExecution)?;
-            match self.declared_outputs.get(&port).map(|d| (d, d.as_generator())) {
-                Some((_, Some(element))) if !type_accepts(element, &value) => {
-                    return Err(WeftError::NodeExecution(format!(
-                        "node '{}' yielded a value on stream port '{}' that the element \
-                         type '{}' does not accept (got {})",
-                        self.place,
-                        port,
-                        element,
-                        WeftType::infer(&value),
-                    )));
-                }
-                Some((declared, None)) if !type_accepts(declared, &value) => {
-                    return Err(WeftError::NodeExecution(format!(
-                        "node '{}' emitted a value on port '{}' that its declared type '{}' \
-                         does not accept (got {})",
-                        self.place,
-                        port,
-                        declared,
-                        WeftType::infer(&value),
-                    )));
-                }
-                _ => {
+                .map_err(WeftError::NodeFailed)?;
+            let (declared, what) = match self.declared_outputs.get(&port) {
+                Some(declared) => match declared.as_generator() {
+                    Some(element) => (element, "yielded a value on stream port"),
+                    None => (declared, "emitted a value on port"),
+                },
+                None => {
                     kept.outputs.insert(port, value);
+                    continue;
                 }
-            }
+            };
+            // An open record drops the keys it does not declare here, so
+            // what flows on carries only what the port says it holds.
+            let value = declared.conform_value(value).map_err(|why| {
+                WeftError::NodeFailed(format!(
+                    "node '{}' {what} '{port}' that its declared type '{declared}' does not \
+                     accept: {why}",
+                    self.place,
+                ))
+            })?;
+            kept.outputs.insert(port, value);
         }
 
         // The call is now known to proceed: claim every touched port
@@ -3424,7 +3423,7 @@ impl ContextHandle for RunnerHandle {
         // until this was taken"; reporting success over a handoff that
         // never happened would be a silent no-op, so fail loud instead.
         if kept.outputs.is_empty() {
-            return Err(WeftError::NodeExecution(format!(
+            return Err(WeftError::NodeFailed(format!(
                 "node '{}' called yield_downstream but nothing was emitted (the output \
                  was empty); there is nothing whose delivery could be awaited",
                 self.place
@@ -3442,14 +3441,14 @@ impl ContextHandle for RunnerHandle {
 
     fn set_max_buffered_items(&self, port: &str, items: usize) -> WeftResult<()> {
         if !self.is_generator_output(port) {
-            return Err(WeftError::NodeExecution(format!(
+            return Err(WeftError::NodeFailed(format!(
                 "node '{}' called set_max_buffered_items on '{port}', which is not a \
                  Generator output it declares",
                 self.place
             )));
         }
         if items == 0 {
-            return Err(WeftError::NodeExecution(format!(
+            return Err(WeftError::NodeFailed(format!(
                 "node '{}': set_max_buffered_items(0) on '{port}'; a cap of 0 could never \
                  accept even the first item",
                 self.place
@@ -3515,7 +3514,7 @@ impl ContextHandle for RunnerHandle {
 
 async fn enqueue_register_signal_task(
     tasks: &dyn TaskStoreClient,
-    execution_id: ExecutionId,
+    run_id: RunId,
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
     spec: &SignalSpec,
@@ -3526,7 +3525,7 @@ async fn enqueue_register_signal_task(
 ) -> anyhow::Result<weft_core::primitive::RegisterSignalResult> {
     // Task-level dedup so retries (network blip, supervisor
     // reconnect) converge on the same token. `is_resume` is in the
-    // key because the same (execution, node, frames, call_index) tuple can
+    // key because the same (run, node, frames, call_index) tuple can
     // be reused across a resume + an entry-trigger registration on
     // the same node body (e.g. a node that awaits its own webhook).
     // Separate from the journal-level dedup the dispatcher's
@@ -3536,10 +3535,10 @@ async fn enqueue_register_signal_task(
     let frames_key = frames_dedup_key(frames)?;
     let dedup_key = format!(
         "{}/{}/{}/{}/{}",
-        execution_id, node_id, frames_key, is_resume, call_index,
+        run_id, node_id, frames_key, is_resume, call_index,
     );
     let payload = serde_json::json!({
-        "execution_id": execution_id.to_string(),
+        "run_id": run_id.to_string(),
         "node_id": node_id,
         "frames": frames,
         "spec": spec,
@@ -3555,7 +3554,7 @@ async fn enqueue_register_signal_task(
             kind: TaskKind::RegisterSignal,
             project_id: None,
             dedup_key: Some(dedup_key),
-            execution_id: Some(execution_id),
+            run_id: Some(run_id),
             tenant_id: tenant_id.to_string(),
             payload,
         })
@@ -3610,7 +3609,7 @@ const ENDPOINT_WAITING_BREADCRUMB: std::time::Duration = std::time::Duration::fr
 /// pull, a database initialising its files. Putting a bound on that
 /// would fail somebody's node for having a slow first boot. The wait
 /// says where it has got to every so often, and ends the moment the
-/// execution is cancelled, which is what `weft stop` and Ctrl+C do.
+/// run is cancelled, which is what `weft stop` and Ctrl+C do.
 async fn wait_until_routable(
     url: &str,
     name: &str,
@@ -3647,13 +3646,13 @@ async fn wait_until_routable(
             endpoint = %name,
             address = %address,
             last_error = %last,
-            "gave up waiting for this node's own service: the execution was cancelled"
+            "gave up waiting for this node's own service: the run was cancelled"
         );
         WeftError::Cancelled
     })
 }
 
-/// Try `dial` until it succeeds or the execution is cancelled,
+/// Try `dial` until it succeeds or the run is cancelled,
 /// resting on the clock in between and saying where it has got to
 /// every so often.
 ///
@@ -3716,60 +3715,81 @@ fn http_client() -> &'static reqwest::Client {
 
 #[cfg(test)]
 mod type_check_tests {
-    use super::type_accepts;
+    use serde_json::Value;
     use weft_core::storage::StoredFile;
     use weft_core::weft_type::{FileKind, WeftType};
 
     fn image_value() -> serde_json::Value {
         StoredFile {
-            key: "exec/c/img".into(),
+            key: "run/c/img".into(),
             mime_type: "image/png".into(),
             size_bytes: 10,
             filename: "x.png".into(),
             version: weft_core::storage::FIRST_FILE_VERSION,
+            link_secs: None,
         }
         .to_value()
     }
 
     fn video_value() -> serde_json::Value {
         StoredFile {
-            key: "exec/c/vid".into(),
+            key: "run/c/vid".into(),
             mime_type: "video/mp4".into(),
             size_bytes: 10,
             filename: "x.mp4".into(),
             version: weft_core::storage::FIRST_FILE_VERSION,
+            link_secs: None,
         }
         .to_value()
+    }
+
+    fn accepts(declared: &WeftType, value: Value) -> bool {
+        declared.conform_value(value).is_ok()
     }
 
     #[test]
     fn declared_file_accepts_any_stored_file() {
         let file = WeftType::file();
-        assert!(type_accepts(&file, &image_value()));
-        assert!(type_accepts(&file, &video_value()));
+        assert!(accepts(&file, image_value()));
+        assert!(accepts(&file, video_value()));
     }
 
     #[test]
     fn narrowed_image_accepts_image_rejects_video() {
         // The File port narrowed to Image: an image flows, a video does not.
         let image = WeftType::primitive(weft_core::weft_type::WeftPrimitive::Image);
-        assert!(type_accepts(&image, &image_value()));
-        assert!(!type_accepts(&image, &video_value()), "a video on an Image port is refused");
+        assert!(accepts(&image, image_value()));
+        assert!(!accepts(&image, video_value()), "a video on an Image port is refused");
     }
 
     #[test]
     fn primitive_mismatch_is_rejected() {
         let number = WeftType::primitive(weft_core::weft_type::WeftPrimitive::Number);
-        assert!(type_accepts(&number, &serde_json::json!(42)));
-        assert!(!type_accepts(&number, &serde_json::json!("not a number")));
+        assert!(accepts(&number, serde_json::json!(42)));
+        assert!(!accepts(&number, serde_json::json!("not a number")));
     }
 
     #[test]
     fn unresolved_declared_accepts_anything() {
-        // A TypeVar / MustOverride port has no concrete contract yet, so the
-        // gate must not reject (is_compatible short-circuits on unresolved).
-        assert!(type_accepts(&WeftType::MustOverride, &video_value()));
-        assert!(type_accepts(&WeftType::type_var("T"), &serde_json::json!("anything")));
+        // A TypeVar port has no concrete contract yet, so the gate must
+        // not reject (is_compatible short-circuits on unresolved).
+        assert!(accepts(&WeftType::type_var("T"), video_value()));
+        assert!(accepts(&WeftType::type_var("T"), serde_json::json!("anything")));
+    }
+
+    /// A narrowed output holds the value to the declared shape: a
+    /// missing field fails naming it, an open record's extra key is
+    /// dropped on the way out.
+    #[test]
+    fn a_declared_record_names_the_missing_field_and_an_open_one_drops_extras() {
+        let verdict = WeftType::parse("{ label: String, score: Number }").expect("type");
+        let why = verdict.conform_value(serde_json::json!({ "label": "ok" })).unwrap_err();
+        assert!(why.contains("missing required field \"score\""), "{why}");
+        let open = WeftType::parse("{ label: String, .. }").expect("type");
+        assert_eq!(
+            open.conform_value(serde_json::json!({ "label": "ok", "extra": 1 })),
+            Ok(serde_json::json!({ "label": "ok" })),
+        );
     }
 
     // Touch FileKind so the import is used even if the helpers change.
@@ -3842,7 +3862,7 @@ mod replay_tests {
         let ctx = ctx_over(handle);
         let result = ctx.run("request-id", || async { Ok(serde_json::json!("saved-id")) }).await.unwrap();
         let events = journal.events.lock().unwrap();
-        assert!(matches!(events.as_slice(), [ExecEvent::RunOutput { name, value, call_index: 0, .. }]
+        assert!(matches!(events.as_slice(), [RunEvent::RunOutput { name, value, call_index: 0, .. }]
             if name == "request-id" && *value == result));
     }
 
@@ -3872,15 +3892,15 @@ mod replay_tests {
         )
     }
 
-    fn ctx_over(handle: RunnerHandle) -> weft_core::ExecutionContext {
+    fn ctx_over(handle: RunnerHandle) -> weft_core::RunContext {
         ctx_over_arc(Arc::new(handle))
     }
 
     /// `ctx_over` with the caller keeping a concrete `Arc<RunnerHandle>`
     /// (the same shape the loop driver uses to call
     /// `close_opened_accesses` after the body).
-    fn ctx_over_arc(handle: Arc<RunnerHandle>) -> weft_core::ExecutionContext {
-        weft_core::ExecutionContext::new(
+    fn ctx_over_arc(handle: Arc<RunnerHandle>) -> weft_core::RunContext {
+        weft_core::RunContext::new(
             uuid::Uuid::nil(),
             "node-x".into(),
             "TestNode".into(),
@@ -4039,8 +4059,8 @@ mod replay_tests {
     /// worker's `RunnerHandle` and once through the live-test rig's
     /// handle, over identical fake brokers, and asserts the resolve
     /// request the broker sees is worker-shaped and IDENTICAL in every
-    /// security-carrying field (execution, tenant is not on the wire but the
-    /// execution maps to it broker-side, project, service, connection id,
+    /// security-carrying field (run, tenant is not on the wire but the
+    /// run maps to it broker-side, project, service, connection id,
     /// declared permissions/values). If someone ever gives the test path
     /// a reduced handle, a raw key, or a broker bypass, the two requests
     /// diverge and this fails.
@@ -4051,7 +4071,7 @@ mod replay_tests {
     #[tokio::test]
     async fn a_live_test_resolves_credentials_exactly_like_a_worker() {
         use weft_core::node::{Node, NodeManifest, NodeMetadata};
-        use weft_core::ExecutionContext;
+        use weft_core::RunContext;
 
         // A node whose whole body is "open the declared connection":
         // the one act whose plumbing we are pinning.
@@ -4087,7 +4107,7 @@ mod replay_tests {
 
         #[async_trait::async_trait]
         impl Node for OpensConnection {
-            async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            async fn run(&self, ctx: RunContext) -> WeftResult<()> {
                 ctx.client(&scoped_access()).await?;
                 Ok(())
             }
@@ -4104,10 +4124,10 @@ mod replay_tests {
         // (1) The WORKER path: a plain RunnerHandle opens the connection.
         let worker_broker = make_broker();
         let worker_clients = test_clients(worker_broker.clone());
-        let execution_id = uuid::Uuid::from_u128(0xC0);
+        let run_id = uuid::Uuid::from_u128(0xC0);
         let worker_handle = Arc::new(RunnerHandle::new(
             uuid::Uuid::from_u128(0x108),
-            execution_id,
+            run_id,
             "node-x".into(),
             "node-x".into(),
             "OpensConnection".into(),
@@ -4138,7 +4158,7 @@ mod replay_tests {
             "test-instance-1".into(),
             "tenant-1".into(),
             uuid::Uuid::from_u128(0x108),
-            execution_id,
+            run_id,
             "OpensConnection".into(),
             None,
         )
@@ -4155,10 +4175,10 @@ mod replay_tests {
         assert_eq!(w.len(), 1, "worker resolves once");
         assert_eq!(t.len(), 1, "test resolves once");
         let (w, t) = (&w[0], &t[0]);
-        // The execution is the whole scope: the broker resolves the
-        // tenant and the project from it, so a matching execution IS a
+        // The run is the whole scope: the broker resolves the
+        // tenant and the project from it, so a matching run IS a
         // matching project.
-        assert_eq!(w.execution_id, t.execution_id, "same execution -> same broker tenant/owner gate");
+        assert_eq!(w.run_id, t.run_id, "same run -> same broker tenant/owner gate");
         assert_eq!(w.service, t.service, "same service");
         assert_eq!(w.connection_id, t.connection_id, "same grant");
         assert_eq!(
@@ -4178,7 +4198,7 @@ mod replay_tests {
 
         let file = handle
             .storage_put(
-                &StorageScope::Execution,
+                &StorageScope::Run,
                 None,
                 weft_core::storage::bytes_stream(bytes::Bytes::from_static(b"payload")),
                 "audio/ogg",
@@ -4191,7 +4211,7 @@ mod replay_tests {
         let stored = StoredFile::from_value(&file).expect("self-describing value");
         // Keys are tenant-anchored now (`<tenant>/<scope>/...`); the fake
         // worker storage is seeded as tenant `t1`.
-        assert!(stored.key.starts_with("t1/exec/c1/"), "{}", stored.key);
+        assert!(stored.key.starts_with("t1/run/c1/"), "{}", stored.key);
         assert_eq!(stored.size_bytes, 7);
 
         let (meta, stream) = handle.storage_get(&stored.key, None).await.expect("get");
@@ -4199,10 +4219,10 @@ mod replay_tests {
         let bytes = weft_core::storage::collect_stream(stream).await.unwrap();
         assert_eq!(&bytes[..], b"payload");
 
-        // The wall: another execution's exec key (under the same tenant) is denied.
-        let err = match handle.storage_get("t1/exec/OTHER/f0", None).await {
+        // The wall: another run's run key (under the same tenant) is denied.
+        let err = match handle.storage_get("t1/run/OTHER/f0", None).await {
             Err(e) => e,
-            Ok(_) => panic!("cross-execution get must be denied"),
+            Ok(_) => panic!("cross-run get must be denied"),
         };
         assert!(err.to_string().contains("denied"), "{err}");
 
@@ -4212,9 +4232,13 @@ mod replay_tests {
         handle.storage_keep(&stored.key, KeepTtl::Default).await.expect("keep");
         assert!(handle.storage_get(&stored.key, None).await.is_ok(), "kept file still readable");
 
-        // Presign mints a (bucket) URL for an owned file.
-        let url = handle.storage_presign(&stored.key, Some(60)).await.expect("presign");
-        assert!(url.starts_with("http") && url.contains(&stored.key), "{url}");
+        // A link to an owned file, for node code and for the outside.
+        let inside = handle.storage_link(&stored.key, Some(60), weft_core::storage::LinkReach::Internal).await.expect("link");
+        assert!(inside.link.url.starts_with("http") && inside.link.url.contains(&stored.key), "{}", inside.link.url);
+        let outside = handle.storage_link(&stored.key, None, weft_core::storage::LinkReach::External).await.expect("link");
+        assert!(!outside.link.public, "the fake install is reached by nobody outside");
+        // The link comes with the file's record.
+        assert_eq!(outside.file.filename, "clip.ogg");
     }
 
     /// An identified put is idempotent within its scope: the second put
@@ -4248,14 +4272,14 @@ mod replay_tests {
         let again = put(&handle, StorageScope::Project, Some("whatsapp:m1"), b"second-would-be").await;
         assert_eq!(again.key, first.key, "the same source is the same file");
         assert_eq!(again.size_bytes, 5, "the bytes already stored, not the new ones");
-        let elsewhere = put(&handle, StorageScope::Execution, Some("whatsapp:m1"), b"first").await;
+        let elsewhere = put(&handle, StorageScope::Run, Some("whatsapp:m1"), b"first").await;
         assert_ne!(elsewhere.key, first.key, "an identity is scoped");
         let anonymous = put(&handle, StorageScope::Project, None, b"first").await;
         assert_ne!(anonymous.key, first.key, "no identity, no sharing");
     }
 
     /// A url-backed file value routes by its handle in every storage
-    /// verb: presign hands the URL back as-is (it already IS a URL an
+    /// verb: a link to it is the URL as-is (it already IS a URL an
     /// external service can fetch); delete/keep are bucket-only and
     /// error loud naming the URL.
     #[tokio::test]
@@ -4265,9 +4289,10 @@ mod replay_tests {
         let ty = weft_core::WeftType::parse("Image").unwrap();
         let url_value = weft_core::storage::url_file_value("https://x/pic.png", &ty);
         let url_file = weft_core::storage::FileHandle::from_value(&url_value).unwrap();
-        let storage = ctx.storage(StorageScope::Execution);
+        let storage = ctx.storage(StorageScope::Run);
 
-        assert_eq!(storage.presign(&url_file, None).await.unwrap(), "https://x/pic.png");
+        assert_eq!(storage.external_link(&url_file).await.unwrap().url, "https://x/pic.png");
+        assert_eq!(storage.internal_link(&url_file).await.unwrap().url, "https://x/pic.png");
 
         let err = storage.keep(&url_file, KeepTtl::Default).await.unwrap_err();
         assert!(err.to_string().contains("external URL"), "{err}");
@@ -4275,15 +4300,15 @@ mod replay_tests {
         assert!(err.to_string().contains("external URL"), "{err}");
     }
 
-    /// `copy` streams a run's file into the handle's scope: the copy is
-    /// a NEW key under the project prefix, carries the source's bytes,
+    /// `copy` puts a run's file into the handle's scope: the copy is a
+    /// NEW key under the project prefix, carries the source's bytes,
     /// mime, filename and size, and the source stays where it was.
     #[tokio::test]
-    async fn copy_streams_an_execution_file_into_the_project_scope() {
+    async fn a_copy_puts_a_run_file_into_the_project_scope() {
         use weft_core::storage::{FileHandle, StorageScope, StoredFile};
         let ctx = ctx_over(handle_with_sequence(vec![]));
         let original = ctx
-            .storage(StorageScope::Execution)
+            .storage(StorageScope::Run)
             .put(bytes::Bytes::from_static(b"PNG!"), "image/png", "upload.png", None)
             .await
             .expect("put");
@@ -4293,13 +4318,13 @@ mod replay_tests {
         let copied = StoredFile::from_value(&project.copy(&source, None).await.expect("copy")).unwrap();
         let source_file = StoredFile::from_value(&original).unwrap();
         assert_ne!(copied.key, source_file.key, "a copy is a new file");
-        assert!(source_file.key.contains("/exec/"), "{}", source_file.key);
+        assert!(source_file.key.contains("/run/"), "{}", source_file.key);
         assert!(copied.key.contains("/project/"), "the copy lives in the project scope: {}", copied.key);
         assert_eq!(copied.mime_type, "image/png");
         assert_eq!(copied.filename, "upload.png");
         assert_eq!(copied.size_bytes, 4);
 
-        let (meta, bytes) = project.get_bytes(&FileHandle::Key(copied.key.clone())).await.expect("read the copy");
+        let (meta, bytes) = project.get_bytes(&FileHandle::key(copied.key.clone())).await.expect("read the copy");
         assert_eq!(&bytes[..], b"PNG!");
         assert!(!meta.keep, "a project file carries no keep flag");
         let (_, still_there) = project.get_bytes(&source).await.expect("the source is untouched");
@@ -4378,8 +4403,8 @@ mod replay_tests {
             .expect_err("should fail on kind mismatch");
         let msg = format!("{err}");
         assert!(
-            matches!(err, WeftError::NodeExecution(_)),
-            "expected NodeExecution variant, got: {err:?}"
+            matches!(err, WeftError::NodeFailed(_)),
+            "expected NodeFiring variant, got: {err:?}"
         );
         assert!(
             msg.contains("non-deterministic bodies are not safe to replay"),
@@ -4532,7 +4557,7 @@ mod replay_tests {
         handle.waits.held().answer("tok-pending", weft_core::primitive::WaitAnswer::Given { value: serde_json::json!("approved") });
         assert_eq!(waiting.await.unwrap().expect("the answer"), serde_json::json!("approved"));
         let events = journal.events.lock().unwrap();
-        assert!(matches!(events.as_slice(), [ExecEvent::SuspensionResolved { token, value, .. }]
+        assert!(matches!(events.as_slice(), [RunEvent::SuspensionResolved { token, value, .. }]
             if token == "tok-pending" && *value == serde_json::json!("approved")), "{events:?}");
     }
 
@@ -4617,6 +4642,7 @@ pub async fn apply_via_supervisor(
     place: &str,
     instance: Option<&weft_core::instance::InstanceId>,
     spec: &weft_core::infra::InfraSpec,
+    run_id: RunId,
 ) -> anyhow::Result<()> {
     // `place` is the node spelled the way a person writes it (`one.db`
     // inside the file the site `one` includes), which is what the
@@ -4624,7 +4650,7 @@ pub async fn apply_via_supervisor(
     // are keyed by: a file included twice is provisioned twice.
     let spec_json = serde_json::to_value(spec)?;
     let cmd_id = infra_state
-        .enqueue_apply(project_id, place, instance, spec_json)
+        .enqueue_apply(project_id, place, instance, spec_json, run_id)
         .await?;
     let started = clock.now();
     loop {
@@ -4691,6 +4717,7 @@ mod infra_apply_tests {
             _: &str,
             _: Option<&weft_core::instance::InstanceId>,
             _: Value,
+            _: RunId,
         ) -> anyhow::Result<i64> {
             Ok(42)
         }
@@ -4702,7 +4729,7 @@ mod infra_apply_tests {
         }
         async fn save_bake(
             &self,
-            _: ExecutionId,
+            _: RunId,
             _: &str,
             _: Option<&weft_core::instance::InstanceId>,
             _: std::collections::BTreeMap<String, Value>,
@@ -4719,7 +4746,7 @@ mod infra_apply_tests {
             InfraWaitApplyResponse { completed: false, outcome: None, outcome_message: None },
             InfraWaitApplyResponse { completed: true, outcome: Some(LifecycleOutcome::Succeeded), outcome_message: None },
         ])) };
-        apply_via_supervisor(&state, clock.as_ref(), uuid::Uuid::nil(), "database", None, &Default::default()).await.unwrap();
+        apply_via_supervisor(&state, clock.as_ref(), uuid::Uuid::nil(), "database", None, &Default::default(), RunId::nil()).await.unwrap();
         assert!(clock.elapsed() >= Duration::from_secs(3 * 3600));
         assert!(state.responses.lock().unwrap().is_empty());
     }
@@ -4730,7 +4757,7 @@ mod infra_apply_tests {
         let state = ApplyState { clock: clock.clone(), responses: std::sync::Mutex::new(VecDeque::from([
             InfraWaitApplyResponse { completed: true, outcome: Some(LifecycleOutcome::Failed), outcome_message: Some("image cannot start".into()) },
         ])) };
-        let error = apply_via_supervisor(&state, clock.as_ref(), uuid::Uuid::nil(), "database", None, &Default::default()).await.unwrap_err();
+        let error = apply_via_supervisor(&state, clock.as_ref(), uuid::Uuid::nil(), "database", None, &Default::default(), RunId::nil()).await.unwrap_err();
         assert!(error.to_string().contains("image cannot start"));
     }
 }
@@ -4739,7 +4766,7 @@ mod infra_apply_tests {
 //                       Layer-3 tests: bus journal pump
 // =====================================================================
 //
-// These exercise the per-execution `BusCoordinator` + `run_bus_journal_task`
+// These exercise the per-run `BusCoordinator` + `run_bus_journal_task`
 // against a faked `JournalClient`. They prove the four original failure
 // modes the redesign was for cannot recur:
 //   1. `live_buses` does not leak (Weak refs drop after close).
@@ -4756,14 +4783,14 @@ pub(crate) mod test_journal {
     use super::*;
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
-    use weft_journal::ExecEvent;
+    use weft_journal::RunEvent;
 
     /// The engine rig's fake clients (`engine_test_rig::clients`), with
     /// `access_broker` as their connection desk.
     pub(crate) fn test_clients(access_broker: Arc<FakeAccessBroker>) -> EngineClients {
         EngineClients {
             access_broker,
-            ..crate::execution_driver::engine_test_rig::clients(Arc::new(crate::execution_driver::engine_test_rig::MemJournal::default()))
+            ..crate::run_driver::engine_test_rig::clients(Arc::new(crate::run_driver::engine_test_rig::MemJournal::default()))
         }
     }
 
@@ -4777,12 +4804,12 @@ pub(crate) mod test_journal {
     /// rejects that many following writes before accepting them again.
     #[derive(Default)]
     pub(crate) struct CaptureJournal {
-        pub(crate) events: StdMutex<Vec<ExecEvent>>,
+        pub(crate) events: StdMutex<Vec<RunEvent>>,
         pub(crate) fail_count: StdMutex<usize>,
     }
     #[async_trait]
     impl weft_journal::JournalClient for CaptureJournal {
-        async fn record_event(&self, event: &ExecEvent, _instance: Option<&str>) -> anyhow::Result<()> {
+        async fn record_event(&self, event: &RunEvent, _instance: Option<&str>) -> anyhow::Result<()> {
             {
                 let mut fc = self.fail_count.lock().unwrap();
                 if *fc > 0 {
@@ -4794,7 +4821,7 @@ pub(crate) mod test_journal {
             Ok(())
         }
         /// Captures are for asserting writes; nothing reads them back.
-        async fn events_for_execution_id(&self, _execution_id: ExecutionId) -> anyhow::Result<Vec<ExecEvent>> {
+        async fn events_for_run_id(&self, _run_id: RunId) -> anyhow::Result<Vec<RunEvent>> {
             unreachable!("a capture is never read back")
         }
     }
@@ -4809,11 +4836,11 @@ mod bus_pump_tests {
     fn spawn_pump(
         coordinator: &Arc<BusCoordinator>,
         journal: Arc<CaptureJournal>,
-        execution_id: ExecutionId,
+        run_id: RunId,
     ) -> tokio::task::JoinHandle<()> {
         let weak = Arc::downgrade(coordinator);
         let journal_dyn: Arc<dyn weft_journal::JournalClient> = journal;
-        tokio::spawn(run_bus_journal_task(weak, execution_id, journal_dyn, "instance".into()))
+        tokio::spawn(run_bus_journal_task(weak, run_id, journal_dyn, "instance".into()))
     }
 
     /// Test helper: thin wrapper around `coord.new_bus` so tests have
@@ -4827,7 +4854,7 @@ mod bus_pump_tests {
             .expect("test BusOptions cannot fail")
     }
 
-    /// Test helper: mint a bus attributed to a specific node execution
+    /// Test helper: mint a bus attributed to a specific firing
     /// at root frames, so liveness tests can drive distinct participants.
     fn new_bus_for(coord: &Arc<BusCoordinator>, node_id: &str) -> BusHandle {
         coord
@@ -4908,8 +4935,8 @@ mod bus_pump_tests {
         drop(bus);
         tokio::time::timeout(std::time::Duration::from_secs(2), coord.shutdown()).await.expect("the pump drains and ends");
         let events = journal.events.lock().unwrap();
-        assert!(events.iter().any(|e| matches!(e, ExecEvent::BusJoined { .. })), "{events:?}");
-        assert!(events.iter().any(|e| matches!(e, ExecEvent::BusClosed { .. })), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, RunEvent::BusJoined { .. })), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, RunEvent::BusClosed { .. })), "{events:?}");
     }
 
     /// The pump journals BusJoined / BusWindow / BusClosed in offset
@@ -4918,10 +4945,10 @@ mod bus_pump_tests {
     /// carried in the marker JSON itself.
     #[tokio::test]
     async fn pump_journals_full_lifecycle_in_offset_order() {
-        let execution_id = uuid::Uuid::new_v4();
+        let run_id = uuid::Uuid::new_v4();
         let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
         let journal = Arc::new(CaptureJournal::default());
-        let pump = spawn_pump(&coord, journal.clone(), execution_id);
+        let pump = spawn_pump(&coord, journal.clone(), run_id);
 
         let mut bus = new_bus(&coord, BusOptions::default());
         bus.register("alice").unwrap();
@@ -4945,17 +4972,17 @@ mod bus_pump_tests {
         let mut last_offset: i64 = -1;
         for ev in &events {
             match ev {
-                ExecEvent::BusJoined { offset, .. } => {
+                RunEvent::BusJoined { offset, .. } => {
                     joined += 1;
                     assert!(*offset as i64 > last_offset);
                     last_offset = *offset as i64;
                 }
-                ExecEvent::BusWindow { first_offset, last_offset: lo, .. } => {
+                RunEvent::BusWindow { first_offset, last_offset: lo, .. } => {
                     messages += 1;
                     assert!(*first_offset as i64 > last_offset);
                     last_offset = *lo as i64;
                 }
-                ExecEvent::BusClosed { offset, .. } => {
+                RunEvent::BusClosed { offset, .. } => {
                     closed += 1;
                     assert!(*offset as i64 > last_offset);
                     last_offset = *offset as i64;
@@ -4979,15 +5006,18 @@ mod bus_pump_tests {
         runs: 32,
         worker_threads: 4,
         async fn body() {
-            let execution_id = uuid::Uuid::new_v4();
+            let run_id = uuid::Uuid::new_v4();
             let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
             let journal = Arc::new(CaptureJournal::default());
-            let pump = spawn_pump(&coord, journal.clone(), execution_id);
+            let pump = spawn_pump(&coord, journal.clone(), run_id);
 
             let mut bus = new_bus(
                 &coord,
                 BusOptions {
-                    journal_window: Some(std::time::Duration::from_millis(50)),
+                    journal: weft_core::stream_journal::JournalPolicy {
+                        window: weft_core::stream_journal::MIN_JOURNAL_WINDOW,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
             );
@@ -5002,14 +5032,14 @@ mod bus_pump_tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|e| matches!(e, ExecEvent::BusWindow { .. }))
+                    .any(|e| matches!(e, RunEvent::BusWindow { .. }))
             })
             .await;
             let events = journal.events.lock().unwrap().clone();
             let (messages, totals) = events
                 .iter()
                 .find_map(|e| match e {
-                    ExecEvent::BusWindow { messages, totals, .. } => {
+                    RunEvent::BusWindow { messages, totals, .. } => {
                         Some((messages.clone(), totals.clone()))
                     }
                     _ => None,
@@ -5029,16 +5059,70 @@ mod bus_pump_tests {
         }
     );
 
+    /// A bus keeps the journal window it was opened with: two messages a
+    /// few short windows apart land in rows of their own, where the
+    /// default one-second window would have put them in one row.
+    #[tokio::test(start_paused = true)]
+    async fn a_bus_keeps_the_journal_window_it_was_opened_with() {
+        let rows_of = |window: std::time::Duration| async move {
+            let run_id = uuid::Uuid::new_v4();
+            let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
+            let journal = Arc::new(CaptureJournal::default());
+            let pump = spawn_pump(&coord, journal.clone(), run_id);
+            let opts = BusOptions {
+                journal: weft_core::stream_journal::JournalPolicy { window, ..Default::default() },
+                ..Default::default()
+            };
+            let mut bus = new_bus(&coord, opts);
+            bus.register("mic").unwrap();
+            bus.send("frame", serde_json::json!(1)).unwrap();
+            tokio::time::sleep(weft_core::stream_journal::MIN_JOURNAL_WINDOW * 3).await;
+            bus.send("frame", serde_json::json!(2)).unwrap();
+            bus.close();
+            drop(bus);
+            shutdown_and_join(coord, pump).await;
+            let rows: Vec<usize> = journal
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    RunEvent::BusWindow { messages, .. } => Some(messages.len()),
+                    _ => None,
+                })
+                .collect();
+            rows
+        };
+        assert_eq!(rows_of(weft_core::stream_journal::MIN_JOURNAL_WINDOW).await, [1, 1], "a short window, a row each");
+        assert_eq!(rows_of(weft_core::stream_journal::DEFAULT_JOURNAL_WINDOW).await, [2], "the default, one row for both");
+    }
+
+    /// A journal window out of range is refused when the bus is opened,
+    /// naming the range.
+    #[tokio::test]
+    async fn a_journal_window_out_of_range_is_refused_at_open() {
+        let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
+        let opts = BusOptions {
+            journal: weft_core::stream_journal::JournalPolicy {
+                window: std::time::Duration::from_millis(10),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let why = coord.new_bus(opts, FiringLocation::new("test-node", Vec::new())).expect_err("too short a window");
+        assert!(why.contains("between 100 and 60000 ms"), "{why}");
+    }
+
     /// On a journal write failure, the affected bus is marked
     /// `journal_degraded`; the next `send` returns
     /// `SendError::JournalDegraded`. The pump's next SUCCESSFUL batch
     /// clears the flag on its own, after which sends return `Ok`.
     #[tokio::test]
     async fn pump_failure_surfaces_journal_degraded_on_next_send() {
-        let execution_id = uuid::Uuid::new_v4();
+        let run_id = uuid::Uuid::new_v4();
         let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
         let journal = Arc::new(CaptureJournal::default());
-        let pump = spawn_pump(&coord, journal.clone(), execution_id);
+        let pump = spawn_pump(&coord, journal.clone(), run_id);
 
         let mut bus = new_bus(&coord, BusOptions::default());
         bus.register("alice").unwrap();
@@ -5082,15 +5166,15 @@ mod bus_pump_tests {
         runs: 32,
         worker_threads: 4,
         async fn body() {
-            let execution_id = uuid::Uuid::new_v4();
+            let run_id = uuid::Uuid::new_v4();
             let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
             let journal = Arc::new(CaptureJournal::default());
-            let pump = spawn_pump(&coord, journal.clone(), execution_id);
+            let pump = spawn_pump(&coord, journal.clone(), run_id);
 
             let mut bus = new_bus(
                 &coord,
                 BusOptions {
-                    ephemeral: true,
+                    journal: weft_core::stream_journal::JournalPolicy::ephemeral(),
                     window: Some(4),
                     ..Default::default()
                 },
@@ -5109,7 +5193,7 @@ mod bus_pump_tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|e| matches!(e, ExecEvent::BusClosed { .. }))
+                    .any(|e| matches!(e, RunEvent::BusClosed { .. }))
             })
             .await;
 
@@ -5119,7 +5203,7 @@ mod bus_pump_tests {
             let (messages, totals) = events
                 .iter()
                 .find_map(|e| match e {
-                    ExecEvent::BusWindow { messages, totals, .. } => {
+                    RunEvent::BusWindow { messages, totals, .. } => {
                         Some((messages.clone(), totals.clone()))
                     }
                     _ => None,
@@ -5139,10 +5223,10 @@ mod bus_pump_tests {
     /// the no-leak property: a fully-closed bus is freed.
     #[tokio::test]
     async fn weak_only_registry_collects_bus_when_handles_drop() {
-        let execution_id = uuid::Uuid::new_v4();
+        let run_id = uuid::Uuid::new_v4();
         let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
         let journal = Arc::new(CaptureJournal::default());
-        let pump = spawn_pump(&coord, journal.clone(), execution_id);
+        let pump = spawn_pump(&coord, journal.clone(), run_id);
 
         let weak_after_drop = {
             let bus = new_bus(&coord, BusOptions::default());
@@ -5176,10 +5260,10 @@ mod bus_pump_tests {
     /// return None.
     #[tokio::test]
     async fn pump_exits_when_coordinator_dropped_without_shutdown() {
-        let execution_id = uuid::Uuid::new_v4();
+        let run_id = uuid::Uuid::new_v4();
         let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
         let journal = Arc::new(CaptureJournal::default());
-        let pump = spawn_pump(&coord, journal.clone(), execution_id);
+        let pump = spawn_pump(&coord, journal.clone(), run_id);
         // Briefly let the pump start its first iteration so it has
         // observed the live coordinator at least once.
         tokio::task::yield_now().await;
@@ -5205,7 +5289,7 @@ mod bus_pump_tests {
     // same hooks the wait loops fire via WaitGuard.
     // ───────────────────────────────────────────────────────────────
 
-    /// The execution-owned tracker plus a coordinator wired to it,
+    /// The run-owned tracker plus a coordinator wired to it,
     /// mirroring the driver's construction order.
     fn coord_with_tracker() -> (Arc<crate::wait_tracker::WaitTracker>, Arc<BusCoordinator>) {
         let waits = crate::wait_tracker::WaitTracker::new();
@@ -5292,7 +5376,7 @@ mod bus_pump_tests {
         let (waits, coord) = coord_with_tracker();
         let mut bus = new_bus_for(&coord, "a");
         bus.register("a").unwrap();
-        coord.close_all();
+        coord.close_all(weft_core::bus::StreamEnd::Finished);
         // No liveness entry was ever created (the node never entered a
         // wait), and dropping the registered handle on a closed bus must
         // not panic.
@@ -5409,11 +5493,11 @@ mod endpoint_tests {
         assert_eq!(attempts.load(Ordering::SeqCst), slow + 1);
     }
 
-    /// Stopping the execution ends the wait. That is the way out of a
+    /// Stopping the run ends the wait. That is the way out of a
     /// workload that never comes up, and why not having a deadline is
     /// safe rather than a hang.
     #[tokio::test]
-    async fn cancelling_the_execution_ends_the_wait() {
+    async fn cancelling_the_run_ends_the_wait() {
         let clock = FakeClock::new();
         let cancel = Arc::new(CancellationFlag::new());
         let armed = cancel.clone();
@@ -5427,7 +5511,7 @@ mod endpoint_tests {
             |_| {
                 // Cancelled while the very first attempt is in flight,
                 // exactly as `weft stop` would.
-                armed.cancel_because(weft_core::exec::CancelCause::User);
+                armed.cancel_because(weft_core::run::CancelCause::User);
                 attempts.fetch_add(1, Ordering::SeqCst);
                 async { Err("connection refused".to_string()) }
             },

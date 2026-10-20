@@ -36,8 +36,8 @@
             "label": "name",
             "value": "id",
             "page": {
-              "cursor_param": "cursor",
-              "cursor_path": "response_metadata.next_cursor"
+              "cursorParam": "cursor",
+              "cursorPath": "response_metadata.next_cursor"
             }
           },
           {
@@ -67,8 +67,8 @@
             "label": "name",
             "value": "id",
             "page": {
-              "cursor_param": "cursor",
-              "cursor_path": "response_metadata.next_cursor"
+              "cursorParam": "cursor",
+              "cursorPath": "response_metadata.next_cursor"
             }
           }
         ]
@@ -132,7 +132,6 @@
     }
   ],
   "features": {
-    "catchErrors": true,
     "oneOfRequired": [
       [
         "channel",

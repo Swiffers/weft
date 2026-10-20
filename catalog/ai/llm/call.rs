@@ -1,12 +1,15 @@
-//! The shared inference plumbing behind `LlmInference` and `LlmStream`.
+//! The shared inference plumbing behind `LlmInference`,
+//! `LlmInferenceJson` and `LlmStream`.
 //!
-//! Both nodes make the same call and differ only in transport (buffered
-//! vs deltas on a bus), so everything else lives here: reading the
-//! wired `LlmProvider` object into a minillmlib generator over the
+//! The three nodes make the same call and differ only in transport
+//! (buffered vs deltas on a bus) and in what they hand out on
+//! `response` (the text, or the text parsed as JSON and held to the
+//! type the program declared), so everything else lives here: reading
+//! the wired `LlmProvider` object into a minillmlib generator over the
 //! opened connection's client, reading the wired params object into
 //! completion parameters, assembling the conversation in stored form,
-//! externalizing it at the call boundary, and internalizing the reply
-//! back into stored form.
+//! externalizing it at the call boundary, the buffered call itself, and
+//! internalizing the reply back into stored form.
 //!
 //! The paid-call surface is unchanged from the shape the docs describe:
 //! open the connection (`ctx.open`, one resolve, one lease for THIS
@@ -15,15 +18,15 @@
 //! hold no cost bookkeeping at all.
 
 use minillmlib::{
-    ChatNode, CompletionParameters, GeneratorInfo, Message, MiniLLMError, NodeCompletionParameters,
-    ProviderSettings, ReasoningConfig, ToolChoice, ToolDefinition,
+    ChatNode, CompletionParameters, CompletionResponse, GeneratorInfo, Message, MiniLLMError,
+    NodeCompletionParameters, OpenRouterRouting, Reasoning, ToolChoice, ToolDefinition,
 };
 use serde_json::Value;
 
 use weft::node::NodeOutput;
 use weft::storage::media::{ExternalizePolicy, MediaForm};
 use weft::storage::{FileHandle, StorageScope};
-use weft::{ExecutionContext, NodeErrExt, WeftError, WeftResult};
+use weft::{RunContext, NodeErrExt, WeftError, WeftResult};
 
 use super::chat;
 
@@ -56,26 +59,33 @@ pub struct LlmCall {
     /// closing the connection). Decides whether a missing finish
     /// reason is proof of truncation.
     announces_finish: bool,
-    /// Reasoning is off (the default): a provider refusing the call is
-    /// then most likely refusing to switch reasoning off, and the
-    /// error says what to change.
+    /// Reasoning was set off: a provider refusing the call is then most
+    /// likely refusing to switch reasoning off, and the error says what
+    /// to change.
     reasoning_off: bool,
 }
 
 impl LlmCall {
-    /// The error a failed call surfaces. With reasoning off, a provider
+    /// Whether `response` is a whole reply ([`ensure_reply_substance`]):
+    /// what [`finish`] checks first, and what a streaming call checks
+    /// before telling its readers the stream finished.
+    pub fn ensure_whole(&self, response: &minillmlib::CompletionResponse) -> WeftResult<()> {
+        ensure_reply_substance(response, self.announces_finish)
+    }
+
+    /// The error a failed call surfaces. With reasoning set off, a provider
     /// REFUSING the request (a client error: 4xx other than 408 and 429,
     /// which are transient) whose message is about reasoning is told in
     /// the author's terms: the model always reasons, so the switch has to
     /// go on. That is a settings mistake (`Config`), which fails the run
-    /// even with `error` wired: retrying cannot help, the params must
+    /// even with `_error` wired: retrying cannot help, the params must
     /// change. Every other failure (a timeout, an overload, a 5xx whose
     /// text happens to say "reason") stays a catchable node failure.
     pub fn call_error(&self, err: MiniLLMError) -> WeftError {
         if self.reasoning_off && refuses_reasoning_off(&err) {
             return WeftError::Config(format!(
                 "llm: {err}. This model always reasons; set `reasoning: true` on its params \
-                 (low effort unless you pick one)"
+                 (the provider's lowest effort unless you pick one)"
             ));
         }
         weft::node_error(format!("llm: {err}"))
@@ -83,11 +93,12 @@ impl LlmCall {
 }
 
 /// Whether `err` is the provider refusing the request over reasoning:
-/// an API error carrying a client status (the lib unwraps to the last
-/// attempt when it retried) whose provider message names reasoning.
+/// an API error carrying a client status whose provider message names
+/// reasoning. The raw stream every node starts is one request (the
+/// lib's retry loop is not on that path), so the error is the
+/// provider's own answer.
 fn refuses_reasoning_off(err: &MiniLLMError) -> bool {
     match err {
-        MiniLLMError::MaxRetriesExceeded(last) => refuses_reasoning_off(last),
         MiniLLMError::Api { status, message } => {
             (400..500).contains(status)
                 && *status != 408
@@ -101,7 +112,7 @@ fn refuses_reasoning_off(err: &MiniLLMError) -> bool {
 /// Read the node's shared inputs (`provider`, `params`, `historyFile`,
 /// `prompt`, `media`, `tools`, `toolChoice`) into one ready-to-send
 /// call. Fails loudly on a provider object no provider node built.
-pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
+pub async fn assemble(ctx: &RunContext) -> WeftResult<LlmCall> {
     // The `provider` input carries ONE `LlmProvider` object (the wired
     // provider node's output: which service, which model, and the
     // connection to spend). THIS node interprets it.
@@ -128,15 +139,6 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
     // here ALL auth is the connection's, so the generator's own auth is
     // cleared explicitly rather than relied on to be overridden.
     generator = generator.with_auth(minillmlib::Auth::None);
-    // The generator's own defaults fill every parameter the call leaves
-    // unset, and the lib's carries a `maxTokens`. weft sends one only
-    // when the author wrote it, so the provider's default applies
-    // otherwise (the native Anthropic wire, which requires the field,
-    // fills it itself).
-    generator = generator.with_default_params(CompletionParameters {
-        max_tokens: None,
-        ..CompletionParameters::default()
-    });
 
     // The connection: every provider node embeds the picked Access
     // marker in the object it emits; only a custom endpoint may run
@@ -157,42 +159,39 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
         }
         None => {
             return Err(WeftError::Input(
-                "the wired LlmProvider object carries no connection; pick one on the provider node"
+                "the wired LlmProvider object carries no connection; wire the service's Access node into its Model node"
                     .to_string(),
             ))
         }
     };
 
     // The `params` input carries ONE plain object (the wired LlmParams
-    // node's output); absent = every setting at its default. The lib
-    // takes the flat camelCase fields directly and skips keys it
-    // doesn't know. `reasoning` is the params node's own shape (a bool
-    // plus `reasoningEffort`), so it is removed before the lib sees the
+    // node's output); absent = every setting unset. The lib takes the
+    // flat camelCase fields directly, skips keys it doesn't know, and
+    // sends only what is set, so an unwritten setting is the provider's
+    // own default (a wire that requires `maxTokens`, the native
+    // Anthropic one, fills the model's largest output itself).
+    // `reasoning` is the params node's own shape (an optional bool plus
+    // `reasoningEffort`), so it is removed before the lib sees the
     // object.
     let params = ctx.inputs.nested("params")?;
-    let reasoning: bool = params.get_or("reasoning", false)?;
+    let reasoning: Option<bool> = params.opt("reasoning")?;
     let mut fields = params.object()?.clone();
     fields.remove("reasoning");
-    let wrote_max_tokens = fields.contains_key("maxTokens");
     let mut cp: CompletionParameters =
         serde_json::from_value(Value::Object(fields))
             .map_err(|e| WeftError::Input(format!("completion parameters: {e}")))?;
-    // The lib fills a `maxTokens` of its own for an absent key; weft
-    // sends one only when the author wrote it, so the provider's own
-    // default applies otherwise (a wire that requires the field, the
-    // native Anthropic one, fills it itself).
-    if !wrote_max_tokens {
-        cp.max_tokens = None;
-    }
     let effort: Option<String> = params.opt("reasoningEffort")?;
-    cp = cp.with_reasoning(reasoning_config(reasoning, effort.as_deref()));
-    let reasoning_off = !reasoning;
+    if let Some(reasoning) = reasoning_config(reasoning, effort.as_deref()) {
+        cp = cp.with_reasoning(reasoning);
+    }
+    let reasoning_off = reasoning == Some(false);
 
     // OpenRouter routing rides the provider object (it is a fact of
     // WHERE the call is served, not of how the model samples); the lib
     // attaches it under the request's `provider` key and other wires
     // ignore it.
-    let mut routing = ProviderSettings::new();
+    let mut routing = OpenRouterRouting::new();
     if let Some(pin) = provider.opt::<String>("servingProvider")? {
         routing = routing.with_order(vec![pin]);
     }
@@ -243,7 +242,7 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
     let system_prompt: String = params.get_or("systemPrompt", String::new())?;
     prepare_conversation(&mut stored, &system_prompt)?;
     let prompt: Option<String> = ctx.inputs.opt("prompt")?;
-    let media: Vec<Value> = ctx.inputs.list("media")?;
+    let media = chat::media_input(ctx)?;
     let mut new_turn = 0;
     if prompt.is_some() || !media.is_empty() {
         stored.push(chat::stored_message("user", prompt.as_deref().unwrap_or(""), &media, None)?);
@@ -293,7 +292,7 @@ fn prepare_conversation(conversation: &mut Vec<Value>, system_prompt: &str) -> W
 /// deserializes straight into minillmlib messages because the shapes
 /// are identical apart from the media slots. Returns the conversation
 /// leaf the completion runs on.
-pub async fn to_wire(ctx: &ExecutionContext, llm: &LlmCall) -> WeftResult<ChatNode> {
+pub async fn to_wire(ctx: &RunContext, llm: &LlmCall) -> WeftResult<ChatNode> {
     let mut request = llm.stored.clone();
     // A tool call left without its answer (a run stopped between the
     // call and its result, or another run sharing the file still mid
@@ -336,15 +335,40 @@ pub async fn to_wire(ctx: &ExecutionContext, llm: &LlmCall) -> WeftResult<ChatNo
     Ok(leaf)
 }
 
-/// Everything both nodes do once the reply is in hand, in one place:
-/// reject a reply with no substance or no finish reason, append the
-/// assistant message and internalize the conversation back into stored
-/// form (any raw reply media becomes storage references; everything
-/// already stored passes through untouched), and set the shared
-/// output ports (the conversation, and `toolCalls` only when the model
-/// actually called tools, so a downstream tool branch stays
-/// structurally dead on a plain reply). The caller sets its own
-/// `response` port on the returned output.
+/// The buffered call: assemble it, send it, and hand back the call with
+/// the model's whole reply. It streams internally so a Stop lands
+/// mid-generation instead of after it; on cancel, dropping the stream
+/// is all the wrap-up there is (the metered client resolves the
+/// interrupted call's real cost on its own).
+pub async fn complete(ctx: &RunContext) -> WeftResult<(LlmCall, CompletionResponse)> {
+    let llm = assemble(ctx).await?;
+    let leaf = to_wire(ctx, &llm).await?;
+    let stream = leaf
+        .complete_streaming(&llm.generator, Some(&llm.params))
+        .await
+        .map_err(|e| llm.call_error(e))?;
+    let cancelled = ctx.cancellation();
+    let response = tokio::select! {
+        collected = stream.collect() => collected.map_err(|e| llm.call_error(e))?,
+        err = cancelled.cancelled_err() => return Err(err),
+    };
+    Ok((llm, response))
+}
+
+/// Everything the nodes do once the reply is in hand, in one place:
+/// reject a reply with no substance or no finish reason, ask the node
+/// for its `response` value (`answer`: `None` leaves the port unset),
+/// append the assistant message and internalize the conversation back
+/// into stored form (any raw reply media becomes storage references;
+/// everything already stored passes through untouched), and set the
+/// output ports (`response`, the conversation, and `toolCalls` only
+/// when the model actually called tools, so a downstream tool branch
+/// stays structurally dead on a plain reply).
+///
+/// `answer` runs BEFORE anything is written: a node that refuses the
+/// reply (an answer that is not the JSON the program declared) fails
+/// there, and the conversation file stays exactly as it was, so a
+/// retry sends the model the same conversation again.
 ///
 /// The conversation is kept in a file, never on a wire: this call's
 /// turn (its user message and the reply) is added to the end of the
@@ -354,15 +378,18 @@ pub async fn to_wire(ctx: &ExecutionContext, llm: &LlmCall) -> WeftResult<ChatNo
 /// conversation file holding this turn, kept past the run; unwired, the call
 /// is a one-shot and keeps nothing.
 pub async fn finish(
-    ctx: &ExecutionContext,
+    ctx: &RunContext,
     llm: LlmCall,
-    response: &minillmlib::CompletionResponse,
-    output: NodeOutput,
+    response: &CompletionResponse,
+    answer: impl FnOnce(&CompletionResponse) -> WeftResult<Option<Value>>,
 ) -> WeftResult<NodeOutput> {
-    ensure_reply_substance(response, llm.announces_finish)?;
+    llm.ensure_whole(response)?;
+    let mut output = NodeOutput::new();
+    if let Some(value) = answer(response)? {
+        output = output.set("response", value);
+    }
     let assistant = serde_json::to_value(response.to_assistant_message())
         .node_err("serializing the assistant message")?;
-    let mut output = output;
     if llm.history_file.is_some() || ctx.is_output_wired("historyFile") {
         let mut turn = llm.stored[llm.stored.len() - llm.new_turn..].to_vec();
         turn.push(assistant);
@@ -388,18 +415,27 @@ pub async fn finish(
     Ok(output)
 }
 
-/// What the `reasoning` checkbox sends, in its two states. Off (the
-/// default) sends effort `none`, the lib's spelling for "off", which
-/// every wire translates so that a model that is off stays off and one
-/// that cannot switch off refuses the request loudly; that refusal is
-/// the answer (see [`LlmCall::call_error`]). On sends the chosen
-/// effort, `low` when none was picked: the checkbox IS the intent to
-/// reason, and the cheap, fast effort is the one you get without
-/// asking for more. There is no third state: a model never runs at a
-/// default nobody wrote down.
-pub fn reasoning_config(reasoning: bool, effort: Option<&str>) -> ReasoningConfig {
-    let effort = if reasoning { effort.unwrap_or("low") } else { "none" };
-    ReasoningConfig { effort: Some(effort.to_string()), max_tokens: None, exclude: None }
+/// The `response` of a node that hands the reply out as text (the
+/// [`finish`] answer of LlmInference and LlmStream): the reply's text,
+/// empty on a turn that only called tools.
+pub fn reply_text(reply: &CompletionResponse) -> WeftResult<Option<Value>> {
+    Ok(Some(Value::String(reply.content.clone())))
+}
+
+/// What the `reasoning` setting sends, in its three states. Unset (the
+/// default) sends nothing, so the provider's own default applies, as for
+/// every other setting. Off asks for no reasoning, which every wire
+/// translates into its own "off", so a model that is off stays off and
+/// one that cannot switch off refuses the request loudly; that refusal is
+/// the answer (see [`LlmCall::call_error`]). On sends the chosen effort as
+/// written, or the provider's lowest effort when none was picked: on IS
+/// the intent to reason, and the cheapest effort is the one you get
+/// without asking for more.
+pub fn reasoning_config(reasoning: Option<bool>, effort: Option<&str>) -> Option<Reasoning> {
+    match reasoning? {
+        false => Some(Reasoning::Off),
+        true => Some(Reasoning::On(effort.map(str::to_string))),
+    }
 }
 
 /// A reply with neither text, nor tool calls, nor media answered
@@ -413,7 +449,7 @@ pub fn reasoning_config(reasoning: bool, effort: Option<&str>) -> ReasoningConfi
 /// OpenAI-compatible server may end a complete reply by just closing,
 /// so absence proves nothing there and is accepted.)
 fn ensure_reply_substance(
-    response: &minillmlib::CompletionResponse,
+    response: &CompletionResponse,
     announces_finish: bool,
 ) -> WeftResult<()> {
     if response.content.trim().is_empty()

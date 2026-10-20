@@ -7,6 +7,8 @@ use serde_json::{json, Value};
 use weft::{fixture_spec_like, FakeRig, LiveRig, NodeManifest, NodeTest, WeftResult};
 
 use super::{parse_csv_cells, GoogleSheetsReadNode};
+use weft::storage::{wire_weight, MAX_WIRE_VALUE_BYTES};
+
 use super::super::sheets::rows_from_cells;
 
 pub fn tests() -> Vec<NodeTest> {
@@ -33,6 +35,9 @@ pub fn tests() -> Vec<NodeTest> {
             Ok(())
         }),
         NodeTest::fake("signed_in_read_emits_header_keyed_rows", signed_in_read),
+        NodeTest::fake("a_tab_comes_a_page_at_a_time", paged_read),
+        NodeTest::fake("a_page_size_below_one_is_refused", zero_max_rows),
+        NodeTest::fake("a_page_stops_early_at_what_a_wire_carries", heavy_rows_read),
         NodeTest::fake("no_tab_reads_the_first_tab_whatever_its_id", first_tab),
         NodeTest::live("one_real_signed_in_read", "google", live_read).with_fixture(
             // The node's own spreadsheet input, picker widget and all.
@@ -73,6 +78,69 @@ async fn signed_in_read(rig: FakeRig) -> WeftResult<()> {
         .await
         .ok()?;
     assert_eq!(outcome.outputs["rows"], json!([{ "name": "ada", "age": "36" }]));
+    assert_eq!(outcome.outputs["nextOffset"], json!(1.0));
+    assert_eq!(outcome.outputs["hasMore"], json!(false), "one page holds the whole tab");
+    Ok(())
+}
+
+/// A tab of three data rows, read two at a time.
+fn three_rows(rig: &FakeRig, cell: &str) {
+    rig.respond(
+        "GET",
+        "/v4/spreadsheets/sheet-1?fields=sheets.properties",
+        json!({ "sheets": [{ "properties": { "sheetId": 0, "title": "People" } }] }),
+    );
+    rig.respond(
+        "GET",
+        "/v4/spreadsheets/sheet-1/values/%27People%27",
+        json!({ "values": [["name"], [format!("a{cell}")], [format!("b{cell}")], [format!("c{cell}")]] }),
+    );
+}
+
+async fn paged_read(rig: FakeRig) -> WeftResult<()> {
+    three_rows(&rig, "");
+    let read = |offset: u64| {
+        rig.run(
+            &GoogleSheetsReadNode,
+            json!({ "account": rig.access("google"), "spreadsheet": "sheet-1", "offset": offset, "maxRows": 2 }),
+        )
+    };
+    let first = read(0).await.ok()?;
+    assert_eq!(first.outputs["rows"], json!([{ "name": "a" }, { "name": "b" }]));
+    assert_eq!(first.outputs["nextOffset"], json!(2.0));
+    assert_eq!(first.outputs["hasMore"], json!(true));
+
+    let second = read(2).await.ok()?;
+    assert_eq!(second.outputs["rows"], json!([{ "name": "c" }]));
+    assert_eq!(second.outputs["nextOffset"], json!(3.0));
+    assert_eq!(second.outputs["hasMore"], json!(false));
+    Ok(())
+}
+
+/// A page of 0 rows would hand back the same `nextOffset` forever.
+async fn zero_max_rows(rig: FakeRig) -> WeftResult<()> {
+    let err = rig
+        .run(
+            &GoogleSheetsReadNode,
+            json!({ "account": rig.access("google"), "spreadsheet": "sheet-1", "maxRows": 0 }),
+        )
+        .await
+        .failure()?;
+    assert!(err.starts_with("config error") && err.contains("`maxRows`"), "{err}");
+    assert!(rig.requests().is_empty(), "nothing is read");
+    Ok(())
+}
+
+async fn heavy_rows_read(rig: FakeRig) -> WeftResult<()> {
+    three_rows(&rig, &"x".repeat(40 * 1024));
+    let outcome = rig
+        .run(&GoogleSheetsReadNode, json!({ "account": rig.access("google"), "spreadsheet": "sheet-1" }))
+        .await
+        .ok()?;
+    assert_eq!(outcome.output("rows")?.as_array().expect("rows").len(), 2, "two 40 KB rows fill a wire");
+    assert!(wire_weight(outcome.output("rows")?) <= MAX_WIRE_VALUE_BYTES);
+    assert_eq!(outcome.outputs["nextOffset"], json!(2.0));
+    assert_eq!(outcome.outputs["hasMore"], json!(true));
     Ok(())
 }
 

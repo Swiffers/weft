@@ -118,6 +118,11 @@ fn a_name_on_an_input_is_held_to_the_programs_nodes() {
     assert!(!fires_on(&program(Some(instance_filled_literal(None))), &names), "unknown yet");
     let infra = rule(json!({ "kind": "not", "of": { "kind": "input_names", "port": "cron", "names": { "node": { "role": "infra" } } } }));
     assert!(fires_on(&program(Some(json!("n"))), &infra), "`n` has no infra");
+    // A place whose state a run tells: the node outside every loop is
+    // one, a name nobody wrote is not.
+    let state = rule(json!({ "kind": "not", "of": { "kind": "input_names", "port": "cron", "names": { "state": {} } } }));
+    assert!(!fires_on(&program(Some(json!("n"))), &state), "`n` is a node outside every loop");
+    assert!(fires_on(&program(Some(json!("ghost"))), &state));
 }
 
 /// A `node.field` written on an input (list items, or an object's keys)
@@ -127,7 +132,7 @@ fn a_name_on_an_input_is_held_to_the_programs_nodes() {
 fn a_field_named_on_an_input_is_held_to_the_programs_fields() {
     let field = |filled: Option<bool>| {
         let named = match filled {
-            Some(b) => json!({ "field": { "instance_filled": b } }),
+            Some(b) => json!({ "field": { "instanceFilled": b } }),
             None => json!({ "field": {} }),
         };
         let when = json!({ "kind": "not", "of": { "kind": "input_names", "port": "cron", "names": named } });
@@ -158,7 +163,7 @@ fn a_field_an_instance_fills_is_one_written_instance_filled() {
     m.port_literals.clear();
     m.port_literals.insert("model".into(), instance_filled_literal(None));
     p.nodes.push(m);
-    let when = |b: bool| json!({ "kind": "not", "of": { "kind": "input_names", "port": "cron", "names": { "field": { "instance_filled": b } } } });
+    let when = |b: bool| json!({ "kind": "not", "of": { "kind": "input_names", "port": "cron", "names": { "field": { "instanceFilled": b } } } });
     assert!(!fires_on(&p, &rule(when(true))));
     assert!(fires_on(&p, &rule(when(false))));
 }

@@ -4,26 +4,33 @@ A loop runs what is inside it once per item of a list, or until the body says
 stop.
 
 ```weft
-grade = Loop(cards: List[JsonDict], rubric: String) -> (scores: List[Number | Null]) {
+grade = Loop(cards: List[JsonDict], rubric: String, provider: LlmProvider) -> (scores: List[Number | Null]) {
   over: ["cards"]
 
-  mark = LlmInference -> (response: String) {
-    prompt: self.rubric
-    ...
+  ask = Format(card: JsonDict, rubric: String) {
+    template: "{{rubric}}\n\nThe card: {{card}}\n\nAnswer with one number."
+    card: self.cards
+    rubric: self.rubric
+  }
+  mark = LlmInference {
+    prompt: ask.text
+    provider: self.provider
   }
   self.scores = Cast { value: mark.response }.value
 }
 grade.cards = pull.rows
+grade.rubric = "Score this flashcard from 0 to 10 for clarity."
+grade.provider = model.provider
 ```
 
-Like a group, a loop is gone before anything runs. The compiler turns it into a
-pair of boundary nodes and the runtime drives the iterations.
+Unlike a group, a loop becomes nodes: the compiler turns it into a `LoopIn` and
+a `LoopOut`, and the runtime drives the iterations between them.
 
 ## The five settings
 
 They go in the body as ordinary lines. Anything else starting with a letter is
 a node, and anything else that looks like a setting is a hard error, because a
-typo like `max_itres: 10` silently running your loop uncapped is exactly what
+typo like `maxItres: 10` silently running your loop uncapped is exactly what
 the language refuses to allow.
 
 | Setting | Default | What it does |
@@ -31,8 +38,8 @@ the language refuses to allow.
 | `over: ["cards"]` | `[]` | Which inputs to iterate. Each has to be a `List[T]` or a `Generator[T]` |
 | `carry: ["total"]` | `[]` | Values threaded from one iteration to the next |
 | `parallel: true` | `false` | Launch every iteration at once, rather than one at a time |
-| `max_iters: 50` | no cap | A hard limit. `0` is legal and means no iterations |
-| `trim_on_mismatch: false` | `true` | With several `over` lists of different lengths: trim to the shortest, or fail |
+| `maxIters: 50` | no cap | A hard limit. `0` is legal and means no iterations |
+| `trimOnMismatch: false` | `true` | With several `over` lists of different lengths: trim to the shortest, or fail |
 
 ## The four kinds of port
 
@@ -45,17 +52,28 @@ Which kind a port is depends on where it is and whether you named it.
 | **Gathered**, any output not in `carry` | `List[T \| Null]`, one slot per iteration | You write one `T` per iteration |
 | **Carried**, named in `carry` | The seed goes in, the final value comes out | The running value in, the new one out |
 
-A gathered output **has** to allow null, because an iteration that failed
-leaves an empty slot. That is the `gather-output-must-be-nullable` error.
+A gathered output **has** to allow null, because an iteration that sends
+nothing on it (it failed, or a branch inside it was not taken) leaves a null
+in its slot. If you declare it without `| Null`, the build stops with
+`gather-output-must-be-nullable`.
 
 The list that comes out is built for every gathered port, even one that no
 iteration ever wrote, because a port that produces nothing at all would leave
 whatever is downstream waiting forever.
 
 A carried value that an iteration does not write keeps what it had, as long as
-nothing broke: a branch not taken or a gate that said no is fine. If you do
-not wire a seed, it starts at the zero for its type: `0` for a number, `""` for
-a string, `[]` for a list.
+nothing broke: a branch not taken or a gate that said no is fine.
+
+A carried value needs a seed from outside, wired or written
+(`myLoop.total = 0` for a loop named `myLoop`); without one, the build fails
+with `required input 'myLoop.total' has no driver`. The one case it can go
+without: you declare it among the loop's inputs with a `?` (`total?: Number`)
+and nothing inside wires it into an input written without `?`. Then it
+starts at the zero for its type: `0` for a number, `""` for a string, `false`
+for a boolean, `[]` for a list, `{}` for a dict, and null for a type with no
+empty value, such as a `File` or an `Image`. A seed that is wired but arrives
+as null starts at the zero too, and for a type like `Number | Null` that zero
+is `0`, not null.
 
 ## Two implicit ports
 
@@ -86,7 +104,7 @@ last one wrote.
 ## How a loop ends
 
 - It runs out of items in `over`.
-- It hits `max_iters`.
+- It hits `maxIters`.
 - The body writes `self.done = true`, on a sequential loop.
 - A carried value is lost to a failure, and then the loop fails (see below).
 
@@ -95,7 +113,7 @@ A sequential loop with none of those is the
 left to run forever.
 
 With several `over` lists of different lengths, the default trims to the
-shortest. Set `trim_on_mismatch: false` and a mismatch fails the run instead,
+shortest. Set `trimOnMismatch: false` and a mismatch fails the run instead,
 naming the lengths.
 
 ## When an iteration fails
@@ -108,16 +126,16 @@ what a null means.
 If the failure means a carried value never got written, the loop stops there
 and fails. The next iteration would start from the same value and meet the
 same failure: an agent loop whose model call broke would otherwise pay for
-the same doomed call up to `max_iters` times, then hand on a stale history as
-if all went well. The loop's step fails with
+the same doomed call up to `maxIters` times, then hand on a stale history as
+if all went well. The loop fails with
 
 ```
 loop 'agent' stopped at iteration 4: its carried value 'history' could not be updated because 'ask' failed: <the error>
 ```
 
-where `ask` is the step that actually broke, even when other steps between it
+where `ask` is the node that actually broke, even when other nodes between it
 and the loop's end skipped because of it. Everything reading the loop's outputs
-sees a failure, the same as for any failed step, and `ask` shows as failed in
+sees a failure, the same as for any failed node, and `ask` shows as failed in
 that iteration too.
 
 A carried value that closed with no failure behind it, because a branch was not
@@ -132,5 +150,9 @@ per-iteration one is not a thing.
 
 ## Cutting a run inside one
 
-You cannot. `weft run --target` stops at a loop's edge and brings the whole
-loop along, because half an iteration is not a state the runtime has.
+You cannot start or end a run inside a loop. A run that reaches a loop takes
+the whole loop along, because a node inside a loop runs once per iteration,
+and starting or stopping at it would not say which iteration you mean. If you name a
+node inside a loop as a start or an end (`--from`, `--emit`, `--target`,
+`--before`), the run is refused: `cannot cut at 'grade.mark' inside loop
+'grade'; select the whole loop`.

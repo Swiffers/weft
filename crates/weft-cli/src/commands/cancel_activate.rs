@@ -1,7 +1,7 @@
 //! `weft cancel-activate [project]`. Cancel an in-flight `activate`:
 //! the dispatcher cancels the setup run of each trigger still
-//! activating, and those triggers land down (parked with what they kept,
-//! wiped when they kept nothing). With no `--trigger` and no `--instance`,
+//! activating, and those triggers land down (their door taking what
+//! arrives when they kept work, refusing when they kept nothing). With no `--trigger` and no `--instance`,
 //! a resync the project holds, under way or stopped, is given up too, and
 //! the answer names the triggers it had taken down and not brought back,
 //! which stay down.
@@ -35,7 +35,7 @@ async fn run_inner(
     let answer: weft_core::activation::CancelActivateResponse = serde_json::from_value(answer).map_err(|e| {
         anyhow::anyhow!("cancel-activate: the dispatcher's answer does not read as one ({e}); upgrade the dispatcher or this CLI so the versions match")
     })?;
-    progress.dispatcher_call_done(serde_json::json!({ "project_id": id, "resync_given_up": answer.resync_given_up }));
+    progress.dispatcher_call_done(serde_json::json!({ "projectId": id, "resyncGivenUp": answer.resync_given_up }));
     progress.complete(&said(&id, answer.resync_given_up.as_deref()));
     Ok(())
 }
@@ -46,16 +46,10 @@ fn said(id: &str, resync_given_up: Option<&[weft_core::activation::OwnerTriggers
     match resync_given_up {
         None => format!("cancel-activate issued for {id}"),
         Some([]) => format!("gave up the resync of {id}; it had brought back every trigger it took down"),
-        Some(left) => {
-            let down: Vec<String> = left
-                .iter()
-                .map(|owner| format!("{} ({})", weft_core::deactivation::whose_triggers(&owner.owner), owner.triggers.join(", ")))
-                .collect();
-            format!(
-                "gave up the resync of {id}; these triggers it took down stay down: {}. `weft activate` turns them on",
-                down.join("; ")
-            )
-        }
+        Some(left) => format!(
+            "gave up the resync of {id}; these triggers it took down stay down: {}. `weft activate` turns them on",
+            weft_core::activation::OwnerTriggers::list_words(left)
+        ),
     }
 }
 
@@ -73,7 +67,7 @@ mod tests {
         let left = [OwnerTriggers { owner: Owner::Shared, triggers: vec!["feed".into(), "door".into()] }];
         assert_eq!(
             said("p", Some(&left)),
-            "gave up the resync of p; these triggers it took down stay down: the program's triggers (feed, door). `weft activate` turns them on"
+            "gave up the resync of p; these triggers it took down stay down: 'feed', 'door'. `weft activate` turns them on"
         );
     }
 }

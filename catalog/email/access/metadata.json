@@ -29,35 +29,35 @@
           "placeholder": "For Gmail/Outlook: an app password, not the account password"
         },
         {
-          "name": "imap_host",
+          "name": "imapHost",
           "label": "Incoming server (IMAP)",
           "secret": false,
           "optional": true,
           "placeholder": "imap.gmail.com (leave empty if you only send)"
         },
         {
-          "name": "imap_port",
+          "name": "imapPort",
           "label": "Incoming port",
           "secret": false,
           "optional": true,
           "placeholder": "993"
         },
         {
-          "name": "smtp_host",
+          "name": "smtpHost",
           "label": "Outgoing server (SMTP)",
           "secret": false,
           "optional": true,
           "placeholder": "smtp.gmail.com (leave empty if you only receive)"
         },
         {
-          "name": "smtp_port",
+          "name": "smtpPort",
           "label": "Outgoing port",
           "secret": false,
           "optional": true,
           "placeholder": "465, or 587"
         },
         {
-          "name": "send_as",
+          "name": "sendAs",
           "label": "Send as",
           "secret": false,
           "optional": true,
@@ -69,15 +69,15 @@
       {
         "label": "receive mail",
         "fields": [
-          "imap_host",
-          "imap_port"
+          "imapHost",
+          "imapPort"
         ]
       },
       {
         "label": "send mail",
         "fields": [
-          "smtp_host",
-          "smtp_port"
+          "smtpHost",
+          "smtpPort"
         ]
       }
     ]

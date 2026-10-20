@@ -170,7 +170,7 @@ Upgrading weft on the cloud is merging upstream into the fork
 user's CLI from that commit (`./setup.sh --cli`). Each program on it with
 infrastructure then needs `weft infra upgrade --on prod`, through the
 deployer: the new weft builds each piece's image anew, and `weft status --on
-prod` shows `infra: source has changed` until it is done. A program's deploy
+prod` marks each infra node `behind the source` until it is done. A program's deploy
 workflow needs nothing: it asks the install which weft it runs on every run.
 Sizing (how many triggers
 one holder takes, a holder's CPU and memory, how many builds run at once,

@@ -7,11 +7,14 @@
 //! database, and the row is written only when the cursor moves or the
 //! polls start failing, fail long enough to say so loudly, or work again.
 //!
-//! As an entry trigger every fire starts a fresh execution. As a parked
+//! As an entry trigger every fire starts a fresh run. As a parked
 //! run's wait (`await_signal`, a node waiting for an outside job to
 //! finish) the first poll runs at once, so a job already done resumes
 //! the run without waiting an interval, and the first answer that passes
 //! the signal's filter resumes it; after that the signal polls no more.
+//! Meanwhile the wait keeps the raw last answer it read, written to the
+//! row only when it changed, which the waiting node shows and a reader
+//! of its state parses (`KindHandler::last_answer`).
 //! Delta mode is refused there: its first poll primes silently, which
 //! would swallow the very answer the run waits for.
 
@@ -22,7 +25,7 @@ use tracing::warn;
 use weft_core::primitive::{SignalAuth, SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{PollEndpoint, Signal};
 
-use weft_core::signal::listener_protocol::{ProcessOutcome, ProcessTarget};
+use weft_core::signal::listener_protocol::{LastAnswer, ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 
 use async_trait::async_trait;
@@ -139,11 +142,26 @@ impl KindHandler for PollEndpointHandler {
         // The status is read off the row (`sig.kind_state`), since each
         // poll may have run on another copy of the listener.
         match sig.kind_state.as_ref().map(PollState::read) {
-            Some(Ok(state)) => items.push(LiveItem::text("State", state.status_line())),
+            Some(Ok(state)) => {
+                items.push(LiveItem::text("State", state.status_line()));
+                match &state.answer {
+                    Some(LastAnswer::Kept(text)) => items.push(LiveItem::text("Last answer", text.clone())),
+                    Some(LastAnswer::TooLarge(bytes)) => items.push(LiveItem::text(
+                        "Last answer",
+                        format!("{bytes} bytes, more than the {ANSWER_KEPT_BYTES} bytes a wait keeps of it"),
+                    )),
+                    None => {}
+                }
+            }
             Some(Err(e)) => items.push(LiveItem::text("State", format!("{e:#}"))),
             None => {}
         }
         LiveFeed::new(items)
+    }
+
+    /// What the wait kept of its last poll's answer.
+    fn last_answer(&self, sig: &RegisteredSignal) -> Option<LastAnswer> {
+        PollState::read(sig.kind_state.as_ref()?).ok()?.answer
     }
 
     fn render(&self, _token: &str, _sig: &RegisteredSignal) -> Result<Option<Value>> {
@@ -185,6 +203,24 @@ struct PollState {
     /// the run, so there is nothing left to poll for.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     resumed: bool,
+    /// A run's wait only: the raw body its last successful poll read,
+    /// kept through the failures after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    answer: Option<LastAnswer>,
+}
+
+/// The most of a wait's last answer kept on its row, in bytes: a status
+/// answer is small, and one that embeds its results would ride every
+/// wake and every write of the row.
+const ANSWER_KEPT_BYTES: usize = 64 * 1024;
+
+/// What a wait keeps of the body its last poll read: the body itself, or
+/// its size past [`ANSWER_KEPT_BYTES`].
+fn last_answer_of(body: &str) -> LastAnswer {
+    match body.len() <= ANSWER_KEPT_BYTES {
+        true => LastAnswer::Kept(body.to_string()),
+        false => LastAnswer::TooLarge(body.len() as u64),
+    }
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -214,13 +250,16 @@ impl PollState {
 }
 
 /// Whether going from `before` to `next` is worth writing to the row: the
-/// cursor or the wait moved, or the polls went from working to failing,
-/// to the streak worth an error ([`POLL_FAILURE_ESCALATION`]), or back. A
-/// failure more in a streak is not: the running count rides with the
-/// wakes.
+/// cursor or the wait moved, a wait's answer changed, or the polls went
+/// from working to failing, to the streak worth an error
+/// ([`POLL_FAILURE_ESCALATION`]), or back. A failure more in a streak is
+/// not: the running count rides with the wakes.
 fn worth_writing(before: &PollState, next: &PollState) -> bool {
     let at = |s: &PollState| (s.consecutive_failures > 0, s.consecutive_failures >= POLL_FAILURE_ESCALATION);
-    (&before.delta, before.first_poll_at_ms, before.resumed) != (&next.delta, next.first_poll_at_ms, next.resumed) || at(before) != at(next)
+    fn moved(s: &PollState) -> (&Option<Value>, Option<i64>, bool, &Option<LastAnswer>) {
+        (&s.delta, s.first_poll_at_ms, s.resumed, &s.answer)
+    }
+    moved(before) != moved(next) || at(before) != at(next)
 }
 
 /// What [`store`] did.
@@ -295,6 +334,7 @@ async fn poll_once(
             delta: before.delta.clone(),
             consecutive_failures: streak,
             last_failure: Some(format!("{what}: {detail}")),
+            answer: before.answer.clone(),
             ..PollState::default()
         }
     };
@@ -358,6 +398,7 @@ async fn poll_once(
             // replay cursor; the delivery outcome is already logged by
             // the fire path. A run's wait is answered by the first fire
             // that went out; one that did not keeps it polling.
+            let kept = is_resume.then(|| last_answer_of(&body));
             let answer = super::event_source::coerce_text_payload(body);
             let carried = weft_core::signal::poll_endpoint::carried(&answer, &poll.carry);
             let outcome = ctx.fire.fire_judged(&answer, carried, "poll_endpoint").await;
@@ -365,7 +406,7 @@ async fn poll_once(
                 return Ok(gone(ctx));
             }
             let resumed = is_resume && outcome == crate::event_context::FireOutcome::Fired;
-            break 'poll PollState { resumed, ..PollState::default() };
+            break 'poll PollState { resumed, answer: kept, ..PollState::default() };
         };
 
         // Delta mode: fire once per NEW item, then persist the advanced

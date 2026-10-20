@@ -57,6 +57,13 @@ pub struct Frontend {
     /// Where visitors reach it, once the install knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Where its server passes the install's doors on to its visitors
+    /// (`https://shop.example/weft`, the site's `weftPassThrough` mount),
+    /// when it does: a link to a stored file the project hands out goes
+    /// through here, so a visitor fetches it from the site they are on.
+    /// At most one frontend of a project has one.
+    #[serde(default, rename = "visitorAddress", skip_serializing_if = "Option::is_none")]
+    pub visitor_address: Option<String>,
     /// The caller token it calls the install with (its id; the value is
     /// shown once, when it is made), once one is in place. A frontend the
     /// install hosts has none until its deploy workflow puts the first in
@@ -87,6 +94,17 @@ pub struct AddFrontendRequest {
     pub host: FrontendHost,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<Repository>,
+    /// See [`Frontend::visitor_address`].
+    #[serde(default, rename = "visitorAddress", skip_serializing_if = "Option::is_none")]
+    pub visitor_address: Option<String>,
+}
+
+/// `PUT /projects/{id}/frontends/{name}/visitor-address`: set where the
+/// frontend passes the install's doors on to its visitors, or clear it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisitorAddressRequest {
+    #[serde(default, rename = "visitorAddress")]
+    pub visitor_address: Option<String>,
 }
 
 /// What making a frontend answers: the frontend, and, for one running
@@ -114,6 +132,9 @@ impl AddFrontendRequest {
     /// Refuse what no install could make, naming the setting.
     pub fn validate(&self) -> Result<(), String> {
         check_name(&self.name)?;
+        if let Some(address) = &self.visitor_address {
+            check_visitor_address(address)?;
+        }
         match (self.host, &self.repo) {
             (FrontendHost::CloudRun, None) => Err(format!(
                 "frontend '{}' runs on the install's cloud, so it needs the GitHub repository that deploys it (--repo owner/name)",
@@ -146,6 +167,26 @@ pub fn check_name(name: &str) -> Result<(), String> {
     }
 }
 
+/// A visitor address: an http(s) address with a host, and nothing past its
+/// path (no query, fragment or sign-in in it), the address a site's
+/// pass-through is mounted at.
+pub fn check_visitor_address(address: &str) -> Result<(), String> {
+    let refused = || {
+        format!(
+            "'{address}' is not a visitor address: it is the http(s) address the site's server passes weft's doors on \
+             at, like https://shop.example/weft"
+        )
+    };
+    let (scheme, rest) = address.split_once("://").ok_or_else(refused)?;
+    let host = rest.split('/').next().unwrap_or("");
+    let fine = matches!(scheme, "http" | "https")
+        && !host.is_empty()
+        && !host.contains('@')
+        && !rest.contains(['?', '#'])
+        && !rest.chars().any(|c| c.is_whitespace() || c.is_control());
+    if fine { Ok(()) } else { Err(refused()) }
+}
+
 /// A GitHub repository as `owner/name`.
 pub fn check_repo(repo: &str) -> Result<(), String> {
     let mut parts = repo.split('/');
@@ -164,7 +205,24 @@ mod tests {
     use super::*;
 
     fn ask(host: FrontendHost, repo: Option<&str>) -> AddFrontendRequest {
-        AddFrontendRequest { name: "shop".into(), host, repo: repo.map(|name| Repository { name: name.into(), id: 7 }) }
+        AddFrontendRequest {
+            name: "shop".into(),
+            host,
+            repo: repo.map(|name| Repository { name: name.into(), id: 7 }),
+            visitor_address: None,
+        }
+    }
+
+    #[test]
+    fn a_visitor_address_is_where_a_site_mounts_the_doors() {
+        for good in ["https://shop.example/weft", "http://127.0.0.1:5173/weft", "https://shop.example"] {
+            assert!(check_visitor_address(good).is_ok(), "{good}");
+        }
+        for bad in ["shop.example/weft", "ftp://x.example", "https://u:p@x.example", "https://x.example/?q", "https:///weft", "https://x.example/a b"] {
+            assert!(check_visitor_address(bad).is_err(), "{bad}");
+        }
+        let with = AddFrontendRequest { visitor_address: Some("weft".into()), ..ask(FrontendHost::External, None) };
+        assert!(with.validate().unwrap_err().contains("visitor address"));
     }
 
     #[test]

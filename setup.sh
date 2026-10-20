@@ -40,8 +40,9 @@
 #     never touched),
 #   - a --cli install (the default includes it) bounds the two local
 #     build caches: the BuildKit cache to 20GB (LRU) and the workspace
-#     target/ (WEFT_TARGET_CAP_GB, default 15G; under the cap the
-#     incremental cache is untouched),
+#     target/ (WEFT_TARGET_CAP_GB, default 30G; over it, the incremental
+#     dirs and the superseded executables go, and the tree is never
+#     wiped),
 #   - after the daemon refresh, `weft clean --images --build-plane`
 #     drops the builder bases and node-test images no install on this
 #     machine still records using, and `weft clean --images --all`
@@ -82,8 +83,8 @@
 #
 # Questions:
 #   --yes         answer yes to what an install asks before it wipes
-#                 something (run history stored in a shape this version
-#                 cannot read, an older weft on this machine), for
+#                 something (an older weft on this machine, or this
+#                 install's database from before runs were renamed), for
 #                 scripts and machines with no terminal.
 #
 # Escape hatch:
@@ -607,6 +608,10 @@ if [[ "${run_log}" != /dev/null ]] && [[ "$(wc -l < "${run_log}")" -gt 400 ]]; t
   tail -n 400 "${run_log}" > "${run_log}.tmp" 2>/dev/null && mv "${run_log}.tmp" "${run_log}" 2>/dev/null || rm -f "${run_log}.tmp"
 fi
 current_section="(argument parsing)"
+# Whether this run has started changing the install (its binaries, its
+# daemon, its extensions): until then a failure leaves the install as it
+# was, and the exit line says so.
+install_touched=0
 # The exit code arrives as $1: a composite trap (`cleanup; log_run_exit`)
 # would otherwise have $? read the CLEANUP's status and journal a died
 # run as `DONE ok`.
@@ -628,9 +633,11 @@ log_run_exit() {
       "$(date '+%Y-%m-%d %H:%M:%S')" "${code}" "${current_section}" >> "${run_log}"
     local journal_note=""
     [[ "${run_log}" != /dev/null ]] && journal_note=" (journal: ${run_log})"
-    printf '  %s%s%s this run FAILED in %s%s%s; the install is incomplete%s\n' \
+    local state_note="the install is incomplete"
+    [[ ${install_touched} -eq 0 ]] && state_note="nothing was installed"
+    printf '  %s%s%s this run FAILED in %s%s%s; %s%s\n' \
       "${C_RED}" "${SYM_FAIL}" "${C_RESET}" "${C_BOLD}" "${current_section}" "${C_RESET}" \
-      "${journal_note}" >&2
+      "${state_note}" "${journal_note}" >&2
     if [[ ${#bump_pending_notes[@]} -gt 0 ]]; then
       local n
       for n in "${bump_pending_notes[@]}"; do
@@ -986,6 +993,7 @@ fi
 
 if [[ -n "${write_migration}" ]]; then
   section "migration"
+  install_touched=1
   # Everything this run's shape needs, named up front instead of a
   # bare command-not-found mid-run: cargo (the schema generator
   # compiles from source) and docker (the throwaway
@@ -1026,7 +1034,7 @@ if [[ -n "${write_migration}" ]]; then
   # re-run.
   # SYNC: the example name <-> crates/weft-runtime/Cargo.toml ([[example]] schema_migration)
   run_schema_migration() {
-    (cd "${here}" && cargo run -q -p weft-runtime --features db-tests --example schema_migration \
+    (cd "${here}" && cargo run -q -p weft-runtime --example schema_migration \
       -- "${write_migration}" ${release_flag} ${migration_renames[@]+"${migration_renames[@]}"})
   }
   if ! with_build_slot run_schema_migration; then
@@ -1283,6 +1291,7 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
 
   if [[ $do_uninstall -eq 1 ]]; then
     section "Uninstall"
+    install_touched=1
     hint "${C_DIM}preserving data; pass --purge to wipe everything${C_RESET}"
 
     # 1. Stop weft's runtime, then take it off the service manager so
@@ -1384,6 +1393,7 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
 
   if [[ $do_purge -eq 1 ]]; then
     section "Purge"
+    install_touched=1
     hint "${C_DIM}true clean slate; next install pays a full rebuild cost${C_RESET}"
 
     # A purge with the docker CLI present but the daemon down cannot do
@@ -1580,6 +1590,7 @@ if [[ $build_cli -eq 1 || $refresh_daemon -eq 1 ]] && weft_old_install_present; 
       exit 1
     fi
   fi
+  install_touched=1
   "${here}/scripts/scrub-old-install.sh" --yes || { fail "the wipe did not finish; see above, then run ./setup.sh again"; exit 1; }
   ok "the older weft is gone; installing this one"
 fi
@@ -1641,52 +1652,92 @@ if [[ $build_cli -eq 1 ]]; then
   #     build adds entries; nothing prunes them).
   # (The anonymous-volume reap is NOT here: it runs on every install
   # regardless of flags, in its own section above.)
-  # The target/ bound is a cap, not a wipe: under the cap nothing is
-  # touched and rebuilds stay fast. Over it, the incremental dirs go
-  # FIRST and the cap is re-measured, because they are the cheapest
-  # thing in there to lose (they only speed up rebuilding a crate you
-  # just edited, and they were the single biggest line item at 9.6G in
-  # a 22G tree) while deps/ is what makes a rebuild fast at all. Only
-  # if that is not enough does the whole tree go and the build runs
-  # cold.
-  # The cap measures the WHOLE of target/ (debug + release + tmp); a
-  # full debug build of this workspace with line-tables-only debuginfo
-  # plus the db-test and e2e binaries sits well under the default, so
-  # it only trips on real accumulation, never on a routine tree (a cap
-  # under the working size would wipe on every install).
+  # The target/ bound is a cap, and it never wipes the tree: a wiped
+  # tree makes the build that follows run cold. Under the cap nothing is
+  # touched. Over it, two things go, cheapest first, re-measuring after
+  # each:
+  #   1. the incremental dirs: they only speed up rebuilding a crate you
+  #      just edited, and they are the biggest line item (27G of a 57G
+  #      tree, measured), while deps/ is what makes a rebuild fast at all;
+  #   2. the superseded linked executables (test binaries above all): cargo
+  #      keeps every one it ever linked, one per hash, so an edit that
+  #      relinks a test binary leaves the old one behind for good. Of the
+  #      executables in a deps/ dir sharing a name, the newest stays and
+  #      the rest go with their dep-info, debug info and fingerprint. The
+  #      worst a wrong pick costs is a relink (an older one can still be
+  #      live, for another feature set): cargo rebuilds any unit whose
+  #      output or fingerprint is missing.
+  # Still over after both: said loudly, and left alone.
+  # The cap measures the WHOLE of target/ (debug + release + tmp). A
+  # routine tree, the whole workspace's tests, clippy and this script's
+  # release build, measured about 22G (18G debug, half of it incremental,
+  # and 4G release), so the default leaves room for a few edits' worth of
+  # superseded builds before anything is trimmed.
   # Override with WEFT_TARGET_CAP_GB.
-  target_cap_gb="${WEFT_TARGET_CAP_GB:-15}"
+  target_cap_gb="${WEFT_TARGET_CAP_GB:-30}"
   if [[ ! "${target_cap_gb}" =~ ^[0-9]+$ ]]; then
     fail "WEFT_TARGET_CAP_GB must be a whole number of gigabytes, got '${target_cap_gb}'"
     exit 1
   fi
+  # -L: a target/ symlinked onto a scratch disk (a normal cargo setup, and
+  # the case where the cap matters most) measures as 0 without it. -sk
+  # (POSIX kilobytes; GNU-only -BG never works on macOS, which would
+  # silently disable the cap there forever). Prints nothing on an
+  # unreadable measurement, which skips the cap (trimming on an unreadable
+  # measurement is the dangerous direction).
+  target_size_gb() {
+    local kb
+    kb="$(du -sk -L "${here}/target" 2>/dev/null | tail -n1 | cut -f1)" || true
+    if [[ "${kb}" =~ ^[0-9]+$ ]]; then
+      echo "$((kb / 1024 / 1024))"
+    fi
+  }
+  over_target_cap() {
+    [[ "${target_gb}" =~ ^[0-9]+$ && "${target_gb}" -gt "${target_cap_gb}" ]]
+  }
   if [[ -d "${here}/target" ]]; then
-    # -L: a target/ symlinked onto a scratch disk (a normal cargo
-    # setup, and the case where the cap matters most) measures as 0
-    # without it. -sk (POSIX kilobytes; GNU-only -BG never works on
-    # macOS, which would silently disable the cap there forever). A
-    # non-numeric measurement skips the cap (wiping on an unreadable
-    # measurement is the dangerous direction).
-    target_kb="$(du -sk -L "${here}/target" 2>/dev/null | tail -n1 | cut -f1)"
-    target_gb=""
-    [[ "${target_kb}" =~ ^[0-9]+$ ]] && target_gb="$((target_kb / 1024 / 1024))"
+    target_gb="$(target_size_gb)"
     if [[ ! "${target_gb}" =~ ^[0-9]+$ ]]; then
       warn "could not measure target/; skipping the size cap"
-    elif [[ "${target_gb}" -gt "${target_cap_gb}" ]]; then
+    elif over_target_cap; then
       warn "target/ is ${target_gb}G (cap ${target_cap_gb}G); trimming before the build"
       for inc in "${here}"/target/*/incremental; do
         [[ -d "${inc}" ]] || continue
         remove_dir_reporting "${inc}" "${C_DIM}${inc#"${here}"/}${C_RESET}" \
           "" "; the cap may stay exceeded"
       done
-      target_kb="$(du -sk -L "${here}/target" 2>/dev/null | tail -n1 | cut -f1)"
-      target_gb=""
-      [[ "${target_kb}" =~ ^[0-9]+$ ]] && target_gb="$((target_kb / 1024 / 1024))"
-      if [[ "${target_gb}" =~ ^[0-9]+$ && "${target_gb}" -gt "${target_cap_gb}" ]]; then
-        warn "still ${target_gb}G after dropping the incremental caches; clearing target/"
-        remove_dir_reporting "${here}/target" "${C_DIM}target/${C_RESET}" \
-          " ${C_DIM}(this build runs cold; the cap is WEFT_TARGET_CAP_GB)${C_RESET}" \
-          "; the cap stays exceeded"
+      target_gb="$(target_size_gb)"
+      if over_target_cap; then
+        dropped=0
+        for deps_dir in "${here}"/target/*/deps; do
+          [[ -d "${deps_dir}" ]] || continue
+          fingerprint_dir="${deps_dir%/deps}/.fingerprint"
+          # Newest first, so the first of each name is the one that stays.
+          # A linked executable is a file with the execute bit and no
+          # extension, named `<name>-<16 hex>` (the hash every file of its
+          # unit carries, its fingerprint dir included); a library has an
+          # extension (.rlib, .so, .dylib), even an executable one.
+          seen=" "
+          while IFS= read -r entry; do
+            case "${entry}" in *.*) continue ;; esac
+            [[ -f "${deps_dir}/${entry}" && -x "${deps_dir}/${entry}" ]] || continue
+            unit_hash="${entry##*-}"
+            [[ "${unit_hash}" =~ ^[0-9a-f]{16}$ ]] || continue
+            unit_name="${entry%-*}"
+            case "${seen}" in
+              *" ${unit_name} "*) ;;
+              *) seen="${seen}${unit_name} "; continue ;;
+            esac
+            rm -rf "${deps_dir:?}/${entry}" "${deps_dir:?}/${entry}".* "${fingerprint_dir:?}"/*-"${unit_hash}"
+            dropped=$((dropped + 1))
+          done < <(ls -t "${deps_dir}")
+        done
+        target_gb="$(target_size_gb)"
+        ok "removed ${dropped} superseded executables from target/ (now ${target_gb:-?}G)"
+      fi
+      if over_target_cap; then
+        warn "target/ is still ${target_gb}G, over the ${target_cap_gb}G cap, after dropping the incremental dirs and the superseded executables; it is left as it is so this build stays warm"
+        hint "to clear it by hand: ${C_BOLD}cargo clean${C_RESET}${C_DIM} in ${here} (the next build then runs cold), or raise WEFT_TARGET_CAP_GB"
       fi
     fi
   fi
@@ -1775,11 +1826,15 @@ fi
 # into it, so a refused run has touched nothing installed. Only the
 # default install gets the extensions: a branch's editor is
 # scripts/dev-editor.sh, and every editor keeps the default install's.
+# A branch's run that would have built the editor prepares its sources
+# instead, for the checks (see "the editor's sources" below).
+prepare_editor_sources=0
 if [[ $on_default_install -eq 0 ]]; then
   if [[ $do_bump -eq 1 ]]; then
     fail "--bump builds the extensions to release them, and install ${install_env} (picked by ${install_picked_by}) builds no extension; bump in the package folder instead: ${C_BOLD}pnpm version patch --no-git-tag-version${C_RESET}"
     exit 1
   fi
+  prepare_editor_sources=$build_vscode
   if [[ $build_vscode -eq 1 || $build_browser -eq 1 ]]; then
     hint "install ${install_env} (picked by ${install_picked_by}) gets no VS Code or browser extension (your editor keeps the default install's); to try this checkout's editor, run ${C_BOLD}scripts/dev-editor.sh${C_RESET}"
     build_vscode=0
@@ -1811,6 +1866,55 @@ if [[ $build_browser -eq 1 ]]; then
   fi
 fi
 fail_on_missing_tools "Extensions"
+
+# ---- a database from before runs were renamed --------------------------
+#
+# A database from before runs were renamed cannot be carried forward: the
+# runtime refuses to boot on one, and the CLI this run installs cannot
+# talk to the runtime still serving it. So the question is asked here,
+# before anything is installed, and a no leaves the install exactly as it
+# was; the wipe itself waits for the daemon step, which stops the old
+# runtime first. A run that installs the CLI without refreshing the
+# daemon is refused instead: it would put that CLI in front of the old
+# runtime.
+# SYNC: resource names <-> crates/weft-core/src/infra/install.rs (resource_prefix)
+wipe_stale_db=0
+if [[ $build_cli -eq 1 || $refresh_daemon -eq 1 ]] && command -v docker >/dev/null 2>&1; then
+  if [[ "${install_env}" == "default" ]]; then install_prefix="weft"; else install_prefix="weft-${install_env}"; fi
+  pg_container="${install_prefix}-postgres"
+  if ! stale_db="$(weft_database_before_runs "${pg_container}")"; then
+    fail "could not read the database in ${pg_container} to check its age; see docker, then run ./setup.sh again"
+    exit 1
+  fi
+  if [[ "${stale_db}" == "yes" ]]; then
+    section "A database from before runs were renamed"
+    if [[ $refresh_daemon -eq 0 ]]; then
+      fail "this install's database (${install_env}) was built by a weft from before runs were renamed, and this run installs a CLI that cannot talk to it without refreshing the daemon; nothing installed. Run ./setup.sh without --no-daemon (or with --daemon) to wipe and rebuild it"
+      exit 1
+    fi
+    warn "this install's database (${install_env}) was built by a weft from before runs were renamed,"
+    warn "and this version cannot carry it forward. It is going to be wiped: the projects on your"
+    warn "disk are not touched, but their run history, versions, stored connections, stored files"
+    warn "and running infra are."
+    if [[ $assume_yes -eq 0 ]]; then
+      if [[ ! -t 0 ]]; then
+        fail "no terminal to ask on; nothing wiped and nothing installed; run ./setup.sh --yes to wipe it and install"
+        exit 1
+      fi
+      # End of input (Ctrl-D) is a no.
+      read -r -p "  Do you want to proceed? [Y/n] " answer || answer=n
+      if [[ -n "${answer}" && "${answer}" != "y" && "${answer}" != "Y" ]]; then
+        hint "nothing wiped and nothing installed; run ./setup.sh again when you are ready"
+        exit 1
+      fi
+    fi
+    wipe_stale_db=1
+  fi
+fi
+
+# Every check that can refuse this run without touching the install is
+# above; from here on it changes the install.
+install_touched=1
 
 # What the other scripts and the development editor read to find this
 # checkout's install, once it is in place: after the daemon start when
@@ -1957,47 +2061,6 @@ if [[ $refresh_daemon -eq 0 && -x "${installed_bin}" ]]; then
   record_checkout_install
 fi
 
-# ---- run history in a shape this version cannot read --------------------
-#
-# Runs are stored as a row each (`run`) and their records (`run_log`); the
-# shape before it (`exec_event`) is not carried over: the migration that
-# brings the database forward drops it. So an install whose database still
-# holds it says what goes and asks first, then wipes it before the daemon
-# refresh runs that migration. Only the default install can be that old:
-# a branch's install is made by this version. (A `--migration --release`
-# earlier in this run cannot run it either: the generator refuses a live
-# database in neither the shape before its release nor the shape after.)
-if [[ $refresh_daemon -eq 1 && $on_default_install -eq 1 ]] && command -v docker >/dev/null 2>&1; then
-  if ! old_run_history="$(weft_old_run_history)"; then
-    fail "could not reach the install's Postgres (the weft-postgres container) to check how it stores runs; see: docker logs weft-postgres"
-    exit 1
-  fi
-  if [[ "${old_run_history}" == "yes" ]]; then
-    section "Run history"
-    warn "This upgrade changes how weft stores past runs, and the runs already"
-    warn "stored cannot be carried over. Upgrading wipes:"
-    warn "  - every past run, its events, logs and search entries"
-    warn "  - events waiting for a parked trigger"
-    warn "It keeps everything else: your projects and their code, their settings,"
-    warn "connections, installs, infra and its data."
-    if [[ $assume_yes -eq 0 ]]; then
-      if [[ ! -t 0 ]]; then
-        fail "no terminal to ask on; run ./setup.sh --yes to wipe the run history and upgrade"
-        exit 1
-      fi
-      # End of input (Ctrl-D) is a no: under set -e a failed read would
-      # otherwise end the run without a word.
-      read -r -p "  Wipe the run history and upgrade? [y/N] " answer || answer=n
-      if [[ "${answer}" != "y" && "${answer}" != "Y" ]]; then
-        hint "nothing changed; run ./setup.sh again when you are ready (--yes answers this for you)"
-        exit 1
-      fi
-    fi
-    weft_wipe_old_run_history || { fail "the run history could not be wiped; nothing changed (it is one transaction); see above"; exit 1; }
-    ok "the run history is wiped; upgrading"
-  fi
-fi
-
 # ---- daemon refresh / start ------------------------------------------
 #
 # One verb whether weft is running or not: `weft daemon start` brings the
@@ -2017,6 +2080,18 @@ if [[ $refresh_daemon -eq 1 ]]; then
     # the same one from this checkout, and saying so keeps every child
     # it starts on it too.
     install_env_cmd=(env WEFT_REPO_ROOT="${here}" WEFT_INSTALL="${install_env}" "${installed_bin}")
+
+    # The database from before runs were renamed, agreed to above before
+    # anything was installed: wiped now, with everything only it gave a
+    # meaning to (its stored files, its projects' workers and infra), and
+    # the start below builds a fresh one. Only this install's: its config,
+    # its keys and every other install stay as they are.
+    if [[ $wipe_stale_db -eq 1 ]]; then
+      "${install_env_cmd[@]}" daemon stop >/dev/null 2>&1 || true
+      weft_wipe_database "${pg_container}" "${install_dir}" "${install_env}" "${install_prefix}" || { fail "the database of ${install_env} could not be removed; see above, then run ./setup.sh again"; exit 1; }
+      ok "the old database of ${install_env} is gone; starting on a fresh one"
+    fi
+
     # In the build slot: a start whose runtime or builder-base image
     # moved compiles it (cargo, inside docker), as heavy as the CLI build.
     spin_passthrough "weft daemon start" \
@@ -2096,6 +2171,30 @@ fi
 if [[ -n "${public_url}" && ( $is_full_install -eq 0 || $on_default_install -eq 0 ) ]]; then
   # Only a full install on main prints the summary block, so say it here.
   hint "public surface: ${C_BOLD}${public_url}${C_RESET}${C_DIM} (event pushes, signal fire links, file share links, OAuth callback)"
+fi
+
+# ---- the editor's sources, on a branch --------------------------------
+#
+# A branch's install gets no editor (scripts/dev-editor.sh runs one from
+# source when you want to try it), but the checks every change to the
+# editor or the graph runs (`pnpm run compile`, `svelte-check`, the
+# packages' tests) need the extension's dependencies installed and the
+# shared packages borrowing them: the same wiring CI does
+# (`borrow-packages`) and dev-editor.sh does. Without it every check in a
+# fresh worktree fails on missing modules in files nobody touched.
+if [[ $prepare_editor_sources -eq 1 ]]; then
+  section "Editor sources"
+  ext_dir="${here}/extension-vscode"
+  if ! command -v pnpm >/dev/null 2>&1; then
+    warn "pnpm is not on PATH, so the editor's checks (pnpm run compile, svelte-check) cannot run in this checkout; install it with ${C_BOLD}npm i -g pnpm${C_RESET} and run ./setup.sh again"
+  else
+    weft_vscode_link_borrowers "${ext_dir}"
+    if [[ ! -d "${ext_dir}/node_modules" || "${ext_dir}/package.json" -nt "${ext_dir}/node_modules" || "${ext_dir}/pnpm-lock.yaml" -nt "${ext_dir}/node_modules" ]]; then
+      spin_passthrough "pnpm install (extension-vscode)" pnpm -C "${ext_dir}" install --prefer-offline \
+        || { fail "the editor's dependencies did not install; see above, then run ./setup.sh again"; exit 1; }
+    fi
+    ok "the editor's sources are ready for their checks"
+  fi
 fi
 
 # ---- VS Code extension -----------------------------------------------

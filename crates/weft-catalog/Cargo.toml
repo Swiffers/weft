@@ -13,12 +13,13 @@ toml = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 # The chat-types mirror test: the catalog's declared ChatHistory shape
 # must accept what minillmlib actually serializes.
-minillmlib = "0.5.11"
+minillmlib = "0.6.0"
 
 [lints]
 workspace = true

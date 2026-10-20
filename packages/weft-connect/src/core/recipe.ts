@@ -18,7 +18,7 @@ export function ownFields(spec: AccessSpecWire): CredentialFieldWire[] {
 		return [
 			{ name: 'client_id', label: 'Client ID', secret: false },
 			{ name: 'client_secret', label: 'Client secret', secret: true },
-			...(acq.registration_fields ?? []),
+			...(acq.registrationFields ?? []),
 		];
 	}
 	// Runtime acquisition spends the runtime's own credential: the user
@@ -31,7 +31,7 @@ export function ownFields(spec: AccessSpecWire): CredentialFieldWire[] {
 // permissions' labels, mirroring the Rust generation.
 // SYNC: guideSteps <-> crates/weft-core/src/access/spec.rs AccessSpec::guide_steps
 export function guideSteps(spec: AccessSpecWire, ticked: string[]): string[] {
-	const steps = spec.own_page?.guide?.steps ?? [];
+	const steps = spec.ownPage?.guide?.steps ?? [];
 	const requested = requestedPermissions(spec, ticked);
 	const labels = (spec.permissions ?? [])
 		.filter((p) => requested.includes(p.id))
@@ -46,7 +46,7 @@ export function guideSteps(spec: AccessSpecWire, ticked: string[]): string[] {
 // the Rust generation.
 // SYNC: guideLink <-> crates/weft-core/src/access/spec.rs AccessSpec::guide_link
 export function guideLink(spec: AccessSpecWire, ticked: string[]): string | undefined {
-	const link = spec.own_page?.guide?.link;
+	const link = spec.ownPage?.guide?.link;
 	if (!link) return undefined;
 	// encodeURIComponent leaves !'()* bare; the Rust side encodes
 	// everything outside RFC 3986 unreserved. Encode them too so the
@@ -64,7 +64,7 @@ export function guideLink(spec: AccessSpecWire, ticked: string[]): string | unde
 // SYNC: defaultPermissions <-> crates/weft-core/src/access/spec.rs AccessSpec::default_permissions
 export function defaultPermissions(spec: AccessSpecWire): string[] {
 	return (spec.permissions ?? [])
-		.filter((p) => p.default && !p.own_only)
+		.filter((p) => p.default && !p.ownOnly)
 		.map((p) => p.id);
 }
 
@@ -73,7 +73,7 @@ export function defaultPermissions(spec: AccessSpecWire): string[] {
 // (those surface as their own tutorial sections instead).
 // SYNC: tickablePermissions <-> crates/weft-core/src/access/spec.rs AccessSpec::tickable_permissions
 export function tickablePermissions(spec: AccessSpecWire) {
-	return (spec.permissions ?? []).filter((p) => !p.always && !p.own_only);
+	return (spec.permissions ?? []).filter((p) => !p.always && !p.ownOnly);
 }
 
 // What a consent asks for when `ticked` is ticked: the permissions asked
@@ -117,11 +117,11 @@ export function permissionSummary(spec: AccessSpecWire, ids: string[]): string {
 // permissions in plain words, the runtime's key when the row is the
 // platform's, the whole credential for a permissionless one.
 export function canDo(spec: AccessSpecWire, c: GrantSummary): string {
-	if (c.owner === 'platform' && !c.has_credential) return "NO KEY BEHIND IT (the runtime's own key is not configured)";
+	if (c.owner === 'platform' && !c.hasCredential) return "NO KEY BEHIND IT (the runtime's own key is not configured)";
 	if (c.owner === 'platform') return 'uses your credits';
 	if (c.scopes.length === 0) return 'full access of its credential';
 	const text = permissionSummary(spec, c.scopes);
-	return c.permissions_verified ? text : `${text} (claimed)`;
+	return c.permissionsVerified ? text : `${text} (claimed)`;
 }
 
 // The own door's app for a CONSENT service: the pasted fields (id,

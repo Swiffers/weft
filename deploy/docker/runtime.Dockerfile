@@ -33,11 +33,30 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 # sharing=locked: two builds of this image at once (a second `weft daemon
-# start`) must not run cargo in one target dir together.
+# start`) must not run cargo in one target dir together. The target dir
+# is the install's own (`WEFT_TARGET_CACHE`,
+# `weft_compiler::build::install_cache_key`: the install, then a hash of
+# the toolchain pin): cargo judges a crate fresh by its sources'
+# modification times, so a dir shared with another branch's install hands
+# this one that branch's newer artifacts. The lock is not in the key, so a
+# dependency bump recompiles only what it moved.
+#
+# What bounds the cache instead: cargo never removes a superseded
+# artifact, so after the build the sweep drops every unit this build did
+# not use (`weft-cache-gc.sh this-build`, reading the units off cargo's
+# JSON messages). The cache stays one build of weft-runtime, however many
+# locks it has seen.
+# SYNC: WEFT_TARGET_CACHE, weft-cargo-target-runtime- <-> crates/weft-cli/src/images.rs (TARGET_CACHE_ARG, RUNTIME_CACHE_MOUNT_ID_PREFIX)
+# SYNC: the sweep's path <-> crates/weft-compiler/src/hash.rs (CACHE_GC_SCRIPT_PATH)
+ARG WEFT_TARGET_CACHE
+RUN test -n "$WEFT_TARGET_CACHE" || { echo "WEFT_TARGET_CACHE is not set: build this image through weft (weft daemon start, weft build-images)" >&2; exit 1; }
 RUN --mount=type=cache,id=weft-cargo-registry,target=/root/.cargo/registry,sharing=locked \
-    --mount=type=cache,id=weft-cargo-target-runtime,target=/build/target,sharing=locked \
-    cargo build --release -p weft-runtime --bin weft-runtime \
-    && cp /build/target/release/weft-runtime /usr/local/bin/
+    --mount=type=cache,id=weft-cargo-target-runtime-${WEFT_TARGET_CACHE},target=/build/target,sharing=locked \
+    cargo build --release -p weft-runtime --bin weft-runtime --message-format=json-render-diagnostics > /tmp/cargo-messages.json \
+    && cp /build/target/release/weft-runtime /usr/local/bin/ \
+    && ( sh /build/crates/weft-compiler/src/weft-cache-gc.sh this-build /build/target/release /tmp/cargo-messages.json \
+         || echo 'weft: the compile cache sweep failed; the build is unaffected' >&2 ) \
+    && rm -f /tmp/cargo-messages.json
 
 # A downloaded artifact loses its executable bit, so the copy sets it.
 FROM scratch AS prebuilt

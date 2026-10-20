@@ -1,0 +1,23 @@
+{
+  "type": "GetRunId",
+  "label": "Get run id",
+  "description": "This run's id. Store it beside your own data to find the run again later: GetNodeState reads where one of its nodes stands, and InstanceCosts narrows its costs to it.",
+  "tags": [
+    "flow",
+    "runs",
+    "identity"
+  ],
+  "icon": "Fingerprint",
+  "color": "#6366f1",
+  "inputs": [],
+  "outputs": [
+    {
+      "name": "runId",
+      "type": "String",
+      "description": "This run's id."
+    }
+  ],
+  "features": {
+    "pure": true
+  }
+}

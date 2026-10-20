@@ -1,0 +1,83 @@
+{
+  "type": "UploadSlot",
+  "label": "Upload Slot",
+  "description": "Let a page's visitor upload one file of any size straight to storage. Emits `slot`, a plain string to hand the page: the page sends the file with `uploadFile(slot, file)` from `@weft/connect` (in parts, resuming after a dropped connection, never through a route), then calls a Route with the slot in a field declared as a file type (`{ video: \"weft-upload:...\" }`), and that Route receives the stored file. A slot uploads one file, received once, and works for `minutes`: an upload nobody received by then goes. No Keep File is needed afterwards.",
+  "tags": [
+    "storage",
+    "upload",
+    "file",
+    "visitor",
+    "browser",
+    "large file",
+    "resumable"
+  ],
+  "icon": "Upload",
+  "color": "#8b5cf6",
+  "inputs": [
+    {
+      "name": "maxMb",
+      "type": "Number",
+      "required": true,
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 1
+      },
+      "label": "Largest file (MB)",
+      "description": "The most the file may weigh, in megabytes (1 MB = 1048576 bytes); a bigger one is refused before anything is sent."
+    },
+    {
+      "name": "types",
+      "type": "String",
+      "default": "File",
+      "label": "Accepts",
+      "description": "The file type the upload must be, written as a weft type: `Video`, `Image | Video`, `Audio`, `File` for any. Checked against the file's first bytes once it landed."
+    },
+    {
+      "name": "minutes",
+      "type": "Number",
+      "default": 60,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 10080,
+        "step": 1
+      },
+      "label": "Works for (minutes)",
+      "description": "How long the slot works, from now: the upload and the Route receiving it both happen before it ends. At most 7 days (10080)."
+    },
+    {
+      "name": "scope",
+      "type": "String",
+      "default": "project",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "project",
+          "instance",
+          "run"
+        ]
+      },
+      "label": "Store in",
+      "description": "`project`: every later run can read the file. `instance`: this run's instance's files. `run`: the run that receives it, swept when that run ends."
+    },
+    {
+      "name": "ttlDays",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 1
+      },
+      "label": "Keep for (days, 0 = forever)",
+      "description": "How long the received file lives since its last access; 0 never expires. Empty: a project or instance file lives until deleted, a run file goes with its run."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "slot",
+      "type": "String",
+      "description": "The slot (`weft-upload:...`), safe to hand to the page."
+    }
+  ]
+}

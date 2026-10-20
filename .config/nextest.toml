@@ -14,3 +14,11 @@ default-filter = "not (binary(db) | test(/(^|::)db_tests::/))"
 
 [profile.db]
 default-filter = "binary(db) | test(/(^|::)db_tests::/)"
+
+# The node-test sweep builds a whole second workspace (every stdlib
+# package's test binary) before it runs anything. On a CI runner with no
+# cache that compile alone passes five minutes, so this one test gets a
+# longer limit; a hang still shows as a failure, just later.
+[[profile.default.overrides]]
+filter = "test(node_test_sweep)"
+slow-timeout = { period = "60s", terminate-after = 15 }

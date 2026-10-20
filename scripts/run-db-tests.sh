@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Run the suites that need a real Postgres, against a throwaway one.
 #
-# These tests are behind the `db-tests` feature, off by default, so a plain
-# `cargo test` never builds them. They read $DATABASE_URL and create their own
-# randomly named database per test, dropping it afterwards.
+# These tests compile in every test build, and nextest's `db` profile is what
+# picks them (`.config/nextest.toml`): each crate's `db` test binary, and any
+# `db_tests` module inside a library. A plain `cargo nextest run` leaves them
+# out. They read $DATABASE_URL and create their own randomly named database
+# per test, dropping it afterwards.
 #
 # Why a container rather than the Postgres weft runs: these tests create and
 # drop databases on whatever server they are pointed at, and the one your local
@@ -14,11 +16,11 @@
 #   scripts/run-db-tests.sh weft-broker     # just this crate
 #   scripts/run-db-tests.sh weft-dispatcher an_upgraded_database
 #                                           # and just tests matching a name
-#                                           # (a filter matches TEST NAMES,
-#                                           # not file names; matching none
-#                                           # fails loudly)
+#                                           # (a plain substring of the test's
+#                                           # name, `<file>::<test>`; matching
+#                                           # none fails loudly)
 #   scripts/run-db-tests.sh weft-dispatcher test_name db_lifecycle
-#                                           # compile and run only this test file
+#                                           # and only the tests in this file
 #
 # Set DATABASE_URL yourself and the script uses that server instead of
 # starting a container, which is what CI does.
@@ -78,22 +80,24 @@ echo "running against $DATABASE_URL"
 # nextest runs every test of every test binary side by side (cargo test
 # runs the binaries one after another). Each test makes its own database,
 # so nothing they share needs them in order.
-# Every crate is BUILT every time, with the same features, and the crate,
-# file and name narrow only what RUNS: building one crate alone unifies
-# its dependencies' features differently, and cargo would rebuild them
-# each time a run switched between one crate and all of them.
-nextest_args=()
-for crate in "${ALL_CRATES[@]}"; do
-  nextest_args+=(-p "$crate" --features "$crate/db-tests")
-done
+# The whole workspace is BUILT every time, and the crate, file and name
+# narrow only what RUNS: a build of some crates alone turns on different
+# features of the crates under them (a `test-helpers` one crate's tests
+# ask for, `serve` on the task store), so cargo would compile a second
+# copy of most of the workspace instead of reusing the one every other
+# test run builds. The `db` profile adds the rest of the selection: only
+# the database tests.
+nextest_args=(--profile db --workspace)
 selection=""
 for crate in "${CRATES[@]}"; do
   selection="${selection:+$selection | }package($crate)"
 done
 selection="($selection)"
-[ -n "$test_target" ] && selection="$selection & binary(=$test_target)"
-# A filter is a plain substring of TEST NAMES (`~`, nextest's contains
-# matcher), not a regex and not a file name. nextest refuses a run in
+# Each file is a module of its crate's `db` binary, so its tests are the
+# ones whose name starts with `<file>::`.
+[ -n "$test_target" ] && selection="$selection & test(/^${test_target}::/)"
+# A filter is a plain substring of test names (`~`, nextest's contains
+# matcher), not a regex; a name is `<file>::<test>`. nextest refuses a run in
 # which no test matched, so a filter that selects nothing fails loudly
 # instead of reporting green on a suite where nothing executed.
 [ -n "$filter" ] && selection="$selection & test(~$filter)"

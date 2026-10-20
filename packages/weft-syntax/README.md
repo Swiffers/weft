@@ -47,7 +47,7 @@ markdown injection is the one exception: it only says where a weft block
 starts and ends, then hands the body to `weft.tmLanguage.json`.
 
 The vocabulary half of that is checked:
-`crates/weft-compiler/tests/highlighting_vocabulary.rs` fails, naming the
+`crates/weft-compiler/tests/integration/highlighting_vocabulary.rs` fails, naming the
 word, when the compiler knows a reserved type or a primitive that a grammar
 does not. What each piece of source actually turns into is checked here, in
 `highlight-weft.test.js` (`pnpm test`).

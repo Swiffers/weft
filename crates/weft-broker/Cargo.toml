@@ -40,13 +40,7 @@ url = { workspace = true }
 getrandom = "0.2"
 parking_lot = { workspace = true }
 bytes = { workspace = true }
-
-[features]
-# Layer-3 contract tests of the runtime-file plane against a real Postgres.
-# Gated like the other db-backed test suites so a plain `cargo test` stays
-# pure-function fast; `scripts/run-db-tests.sh` runs them (CI's `db` job
-# runs that same script against a Postgres service).
-db-tests = ["weft-task-store/db-tests"]
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

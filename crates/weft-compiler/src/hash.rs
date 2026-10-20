@@ -132,6 +132,13 @@ mod fs_hashes {
     /// holding an image built by the old rule.
     pub const BUILDER_BASE_SPLIT_SCRIPT: &str = "deploy/docker/worker-builder-base-split.sh";
 
+    /// The compile-cache sweep (`worker_image::CACHE_GC_SCRIPT`, compiled
+    /// in from this file). Hashed with the split script for the same
+    /// reason: the builder base runs it before baking its cache, so it
+    /// decides what the image holds.
+    // SYNC: CACHE_GC_SCRIPT_PATH <-> the include_str! of worker_image::CACHE_GC_SCRIPT
+    pub const CACHE_GC_SCRIPT_PATH: &str = "crates/weft-compiler/src/weft-cache-gc.sh";
+
     /// Fold the worker build environment into `hasher`: the worker crate
     /// closure (`codegen::worker_workspace_crates`, the ONLY workspace
     /// crates a worker build links), the workspace manifests + toolchain
@@ -159,7 +166,7 @@ mod fs_hashes {
         for rel in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
             hash_path(hasher, rel, &weft_root.join(rel))?;
         }
-        for rel in [BUILDER_BASE_DOCKERFILE, BUILDER_BASE_SPLIT_SCRIPT] {
+        for rel in [BUILDER_BASE_DOCKERFILE, BUILDER_BASE_SPLIT_SCRIPT, CACHE_GC_SCRIPT_PATH] {
             hash_path(hasher, rel, &weft_root.join(rel))?;
         }
         Ok(())

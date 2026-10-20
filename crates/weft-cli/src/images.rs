@@ -280,6 +280,8 @@ pub async fn ensure_builder_base_at(image_ref: &str, rebuild: bool) -> Result<()
             let ctx = weft_compiler::build::stage_builder_base_context(&root, &install)
                 .map_err(|e| anyhow::anyhow!("stage builder-base context: {e}"))?;
             docker_build(image_ref, &ctx.join("Dockerfile"), &ctx, &[], &[], &[]).await?;
+            let cache = weft_compiler::build::install_cache_key(&root, &install).map_err(|e| anyhow::anyhow!("the builder base's compile cache key: {e}"))?;
+            drop_superseded_install_build_caches(&install, &cache).await;
         }
     }
     // Builder-base images are large (~1GB+: debian + rustup +
@@ -390,7 +392,9 @@ pub async fn ensure_runtime_image(image_ref: &str, rebuild: bool, prebuilt: Opti
     let Some(binary) = prebuilt else {
         let install = weft_core::infra::Install::from_env().map_err(anyhow::Error::msg)?;
         let cache = weft_compiler::build::install_cache_key(&root, &install).map_err(|e| anyhow::anyhow!("the runtime's compile cache key: {e}"))?;
-        return docker_build(image_ref, &dockerfile, &root, &[], &[format!("{TARGET_CACHE_ARG}={cache}")], &[]).await;
+        docker_build(image_ref, &dockerfile, &root, &[], &[format!("{TARGET_CACHE_ARG}={cache}")], &[]).await?;
+        drop_superseded_install_build_caches(&install, &cache).await;
+        return Ok(());
     };
     // Its own context holding only the binary, under the name the
     // Dockerfile copies, whatever the file was called on disk.
@@ -613,6 +617,9 @@ pub async fn worker_compile_caches() -> Result<Vec<CompileCacheRecord>> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallCacheRecord {
     pub id: String,
+    /// Its whole key (`weft_compiler::build::install_cache_key`), empty
+    /// for the runtime's mount from before it had one.
+    pub key: String,
     /// The label of the install it is for (`default`, or its name);
     /// `None` for a mount from before each install had caches of its own.
     pub install: Option<String>,
@@ -628,11 +635,16 @@ pub async fn install_build_caches() -> Result<Vec<InstallCacheRecord>> {
 }
 
 /// Drop every cache mount compiling weft's own crates for `install`
-/// ([`install_build_caches`]): the caches of an install being taken off
-/// this machine. Each failure is said, and the call fails naming them all.
-pub async fn drop_install_build_caches(install: &weft_core::infra::Install) -> Result<()> {
+/// ([`install_build_caches`]) but those under the key `current`: with
+/// none, the caches of an install being taken off this machine; with its
+/// current key, the ones its builds left under a key they no longer use
+/// (the toolchain moved), which no build mounts again. Each failure is
+/// said, and the call fails naming them all.
+pub async fn drop_install_build_caches(install: &weft_core::infra::Install, current: Option<&str>) -> Result<()> {
     let mut failures = Vec::new();
-    for cache in install_build_caches().await?.iter().filter(|c| c.install.as_deref() == Some(install.label_value())) {
+    let caches = install_build_caches().await?;
+    let dead = caches.iter().filter(|c| c.install.as_deref() == Some(install.label_value()) && Some(c.key.as_str()) != current);
+    for cache in dead {
         if !cache.reclaimable {
             failures.push(format!("a build mounts the compile cache {} right now; run this again once it ends", cache.id));
             continue;
@@ -644,6 +656,16 @@ pub async fn drop_install_build_caches(install: &weft_core::infra::Install) -> R
     }
     anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
+}
+
+/// After a build compiled in `install`'s cache under `key`: drop the
+/// caches its builds left under an older key ([`drop_install_build_caches`]).
+/// Nothing ever mounts those again, and nothing else drops them while the
+/// install stays on the machine. A failure is said and the build stands.
+async fn drop_superseded_install_build_caches(install: &weft_core::infra::Install, key: &str) {
+    if let Err(error) = drop_install_build_caches(install, Some(key)).await {
+        eprintln!("could not drop the compile caches install '{}' left under an older key: {error:#}", install.label_value());
+    }
 }
 
 /// `docker buildx du --verbose`: every BuildKit record on this host.
@@ -744,6 +766,7 @@ fn install_caches_in(du_verbose: &str) -> Vec<InstallCacheRecord> {
         .chain(base)
         .map(|(record, key)| InstallCacheRecord {
             install: weft_compiler::build::install_of_cache_key(key).map(str::to_string),
+            key: key.to_string(),
             id: record.id,
             size: record.size,
             reclaimable: record.reclaimable,
@@ -1041,9 +1064,188 @@ pub fn host_images_matching(listing: &str, condemn: impl Fn(&str, &str) -> bool)
         .collect()
 }
 
+/// Every host image (narrowed by docker's `filters`, `label=k=v` and
+/// the like) as one `repo:tag` line, the listing the host-side matcher
+/// reads.
+pub(crate) async fn host_image_listing(filters: &[String]) -> anyhow::Result<String> {
+    let mut images = docker();
+    images.arg("images");
+    for filter in filters {
+        images.args(["--filter", filter]);
+    }
+    let listing = images
+        .args(["--format", "{{.Repository}}:{{.Tag}}"])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        listing.status.success(),
+        "docker images exited {}: {}",
+        listing.status,
+        String::from_utf8_lossy(&listing.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&listing.stdout).into_owned())
+}
+
+/// What one removal pass did with its condemned refs. `already_gone`
+/// is a ref a concurrent clean reclaimed between our listing and the
+/// delete; `in_use` is a ref the runtime refused to drop because a
+/// container still runs it (kept; the next clean gets it).
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Reclaimed {
+    pub(crate) removed: usize,
+    pub(crate) already_gone: usize,
+    pub(crate) in_use: usize,
+}
+
+impl Reclaimed {
+    /// The one report line every host sweep prints, so the report sites
+    /// cannot drift in wording: "removed N <what>", then only the
+    /// tails that happened.
+    pub(crate) fn report(&self, what: &str) -> String {
+        let mut line = format!("removed {} {what}", self.removed);
+        if self.already_gone > 0 {
+            line.push_str(&format!(", {} already reclaimed", self.already_gone));
+        }
+        if self.in_use > 0 {
+            line.push_str(&format!(", {} still in use (kept)", self.in_use));
+        }
+        line
+    }
+}
+
+/// Remove host docker images one by one: a tag a concurrent clean already reclaimed is a
+/// success, and a tag docker refuses to drop because a container still
+/// uses it is kept, both detected by observing presence rather than
+/// parsing error prose. No `-f`: force would untag a live container's
+/// image anyway and strand its restart. "Absent" is only a verdict
+/// while the daemon still answers.
+pub(crate) async fn reclaim_host_images(images: &[String]) -> anyhow::Result<Reclaimed> {
+    let mut done = Reclaimed::default();
+    for image in images {
+        let out = docker().args(["rmi", image]).output().await?;
+        if out.status.success() {
+            done.removed += 1;
+            continue;
+        }
+        let present = docker()
+            .args(["image", "inspect", image])
+            .output()
+            .await?
+            .status
+            .success();
+        if present {
+            println!("kept {image}: {}", String::from_utf8_lossy(&out.stderr).trim());
+            done.in_use += 1;
+            continue;
+        }
+        let daemon_up = docker()
+            .args(["version", "--format", "{{.Server.Version}}"])
+            .output()
+            .await?
+            .status
+            .success();
+        if daemon_up {
+            done.already_gone += 1;
+            continue;
+        }
+        anyhow::bail!(
+            "docker stopped answering while removing {image}; check the daemon \
+             and rerun `weft clean --images`"
+        );
+    }
+    Ok(done)
+}
+
+/// The images in `listing` (one `repo:tag` per line) a named install
+/// holds under its own names (`Install::local_image_ref`,
+/// `localhost/weft-<name>/<repo>:<tag>`) whose install `owned` picks.
+/// Removing such a name never takes the image from another install: that
+/// one holds a name of its own on it, and Docker deletes an image with
+/// its last name. A line with no tag (`<none>`) names nothing to remove.
+pub fn images_owned_by(listing: &str, owned: impl Fn(&weft_core::infra::Install) -> bool) -> Vec<String> {
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|full| !full.ends_with(":<none>"))
+        .filter(|full| weft_core::infra::Install::owner_of_local_image(full).is_some_and(|owner| owned(&owner)))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Remove every image `install` holds under its own names
+/// ([`images_owned_by`]): the images of an install being taken off this
+/// machine (its worker and infra images, and its names on the shared
+/// ones). Its containers must be gone first, or Docker keeps what they
+/// run.
+pub async fn remove_install_images(install: &weft_core::infra::Install) -> Result<()> {
+    let listing = host_image_listing(&[]).await?;
+    let images = images_owned_by(&listing, |owner| owner == install);
+    if images.is_empty() {
+        return Ok(());
+    }
+    let done = reclaim_host_images(&images).await?;
+    println!("{}", done.report(&format!("image(s) of install '{}'", install.label_value())));
+    anyhow::ensure!(
+        done.in_use == 0,
+        "{} image(s) of install '{}' are still in use by a container; remove it and run this again",
+        done.in_use,
+        install.label_value()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An install's images are the ones under its own local names, worker
+    /// and infra alike, and its names on the shared images; never another
+    /// install's, never the default install's bare names, never a
+    /// registry's, never an untagged line. Read off `docker images
+    /// --format '{{.Repository}}:{{.Tag}}'` as a host printed it.
+    #[test]
+    fn an_installs_images_are_the_ones_under_its_own_names() {
+        let listing = "\
+localhost/weft-e2e1a2b3c/weft-worker:9f8e7d6c5b4a3921
+localhost/weft-e2e1a2b3c/weft-infra-mini_service:0011aabb
+localhost/weft-e2e1a2b3c/weft-runtime:deployhash
+localhost/weft-e2e1a2b3c/weft-worker:<none>
+localhost/weft-deploy/weft-worker:9f8e7d6c5b4a3921
+localhost/weft-Bad/weft-worker:x
+localhost/other/weft-worker:x
+weft-worker:9f8e7d6c5b4a3921
+weft-infra-mini_service:0011aabb
+ghcr.io/weavemindai/weft-runtime:deployhash
+<none>:<none>
+";
+        let gone = weft_core::infra::Install::named("e2e1a2b3c").unwrap();
+        assert_eq!(
+            images_owned_by(listing, |owner| owner == &gone),
+            vec![
+                "localhost/weft-e2e1a2b3c/weft-worker:9f8e7d6c5b4a3921".to_string(),
+                "localhost/weft-e2e1a2b3c/weft-infra-mini_service:0011aabb".to_string(),
+                "localhost/weft-e2e1a2b3c/weft-runtime:deployhash".to_string(),
+            ]
+        );
+        // A machine-wide sweep: every install still here keeps its own.
+        let here = [weft_core::infra::Install::default_install(), weft_core::infra::Install::named("deploy").unwrap()];
+        assert_eq!(images_owned_by(listing, |owner| !here.contains(owner)), images_owned_by(listing, |owner| owner == &gone));
+        assert!(images_owned_by(listing, |owner| owner.name() == Some("deploy")).len() == 1);
+    }
+
+    /// One report line per sweep: the count always, each tail only
+    /// when it happened.
+    #[test]
+    fn reclaim_report_names_only_what_happened() {
+        let plain = Reclaimed { removed: 2, already_gone: 0, in_use: 0 };
+        assert_eq!(plain.report("stale infra image(s)"), "removed 2 stale infra image(s)");
+        let busy = Reclaimed { removed: 1, already_gone: 1, in_use: 3 };
+        assert_eq!(
+            busy.report("stale worker image(s)"),
+            "removed 1 stale worker image(s), 1 already reclaimed, 3 still in use (kept)"
+        );
+    }
+
 
     /// Records as `docker buildx du --verbose` printed them on a host that
     /// had built workers under two cache keys, one of them in compile
@@ -1089,12 +1291,13 @@ mod tests {
             record("w1", "weft-worker-target-9af3f2c5f9da6eaa-2", true),
         ]
         .join("\n");
-        let read: Vec<(String, Option<String>, bool)> = install_caches_in(&du).into_iter().map(|c| (c.id, c.install, c.reclaimable)).collect();
+        let read: Vec<(String, String, Option<String>, bool)> =
+            install_caches_in(&du).into_iter().map(|c| (c.id, c.key, c.install, c.reclaimable)).collect();
         assert_eq!(read, vec![
-            ("r1".to_string(), Some("gcpfixe0499b".to_string()), false),
-            ("r2".to_string(), None, true),
-            ("b1".to_string(), Some("default".to_string()), true),
-            ("b2".to_string(), None, true),
+            ("r1".to_string(), "gcpfixe0499b-0011223344556677".to_string(), Some("gcpfixe0499b".to_string()), false),
+            ("r2".to_string(), String::new(), None, true),
+            ("b1".to_string(), "default-0011223344556677".to_string(), Some("default".to_string()), true),
+            ("b2".to_string(), "0011223344556677".to_string(), None, true),
         ]);
     }
 

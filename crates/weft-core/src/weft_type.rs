@@ -64,7 +64,7 @@ macro_rules! define_primitives {
 /// cannot name a type after any of them.
 // SYNC: the type vocabulary (this list + define_primitives! below) <->
 // packages/weft-syntax/weft.tmLanguage.json, packages/weft-syntax/highlight-weft.js,
-// crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm),
+// crates/weft-compiler/tests/integration/highlighting_vocabulary.rs (the word-list alarm),
 // packages/weft-graph/src/protocol.ts CONTAINER_AND_SPECIAL_TYPES
 pub const CONTAINER_AND_SPECIAL_TYPES: &[&str] =
     &["List", "Dict", "JsonDict", "Bus", "Access", "Infra", "Generator"];

@@ -4,7 +4,7 @@
 //! container serves on `/live`, and that a trigger's signal kind
 //! serves through the listener. Two doors reach the same feed, and
 //! they authorize differently, so only an e2e proves they agree. The
-//! rig reads a TRIGGER's display through both; `tests/infra.rs` covers
+//! rig reads a TRIGGER's display through both; `tests/e2e/infra.rs` covers
 //! the other half of the token door, an infra node with nothing to
 //! show:
 //!

@@ -700,6 +700,8 @@ pub async fn clean(
 ///   4. With `--all` only: the worker compile caches no install uses.
 ///   5. With `--all` only: the caches that compiled weft's own crates for
 ///      an install no longer on this machine.
+///   6. With `--all` only: the images an install no longer on this
+///      machine held under its own names.
 async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     // The scope, settled BEFORE any layer runs: a scoped clean that cannot
     // name its project must delete nothing, not run the global layers and
@@ -734,6 +736,7 @@ async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
         }
         layer("unused compile caches", unused_compile_cache_sweep(&data).await);
         layer("compile caches of removed installs", removed_install_cache_sweep(&data).await);
+        layer("images of removed installs", removed_install_image_sweep(&data).await);
     }
     // The compile cache every worker build shares is not an image, but it
     // is disk, so it is never invisible. Reading its size is not a reclaim:
@@ -886,7 +889,7 @@ async fn unused_image_sweep(data_dir: &std::path::Path, kind: SharedImages) -> a
         }
         crate::image_refs::Kept::Only(kept) => kept,
     };
-    let listing = host_image_listing(&[]).await?;
+    let listing = crate::images::host_image_listing(&[]).await?;
     let kept_refs: Vec<&str> = kept.iter().map(String::as_str).collect();
     let stale = match kind {
         SharedImages::BuilderBase => crate::images::host_images_matching(
@@ -899,7 +902,7 @@ async fn unused_image_sweep(data_dir: &std::path::Path, kind: SharedImages) -> a
             let mut built_on_kept = String::new();
             for base in kept_refs {
                 let (_, tag) = crate::images::ref_repo_tag(base)?;
-                built_on_kept.push_str(&host_image_listing(&[format!("label={}={tag}", crate::images::NODE_TEST_BASE_LABEL)]).await?);
+                built_on_kept.push_str(&crate::images::host_image_listing(&[format!("label={}={tag}", crate::images::NODE_TEST_BASE_LABEL)]).await?);
             }
             crate::images::stale_node_test_images(&listing, &built_on_kept)
         }
@@ -908,100 +911,8 @@ async fn unused_image_sweep(data_dir: &std::path::Path, kind: SharedImages) -> a
         println!("no unused {}s", kind.what());
         return Ok(());
     }
-    println!("{}", reclaim_host_images(&stale).await?.report(&format!("unused {}(s)", kind.what())));
+    println!("{}", crate::images::reclaim_host_images(&stale).await?.report(&format!("unused {}(s)", kind.what())));
     Ok(())
-}
-
-/// Every host image (narrowed by docker's `filters`, `label=k=v` and
-/// the like) as one `repo:tag` line, the listing the host-side matcher
-/// reads.
-async fn host_image_listing(filters: &[String]) -> anyhow::Result<String> {
-    let mut images = crate::images::docker();
-    images.arg("images");
-    for filter in filters {
-        images.args(["--filter", filter]);
-    }
-    let listing = images
-        .args(["--format", "{{.Repository}}:{{.Tag}}"])
-        .output()
-        .await?;
-    anyhow::ensure!(
-        listing.status.success(),
-        "docker images exited {}: {}",
-        listing.status,
-        String::from_utf8_lossy(&listing.stderr).trim()
-    );
-    Ok(String::from_utf8_lossy(&listing.stdout).into_owned())
-}
-
-/// What one removal pass did with its condemned refs. `already_gone`
-/// is a ref a concurrent clean reclaimed between our listing and the
-/// delete; `in_use` is a ref the runtime refused to drop because a
-/// container still runs it (kept; the next clean gets it).
-#[derive(Debug, Default, PartialEq)]
-struct Reclaimed {
-    removed: usize,
-    already_gone: usize,
-    in_use: usize,
-}
-
-impl Reclaimed {
-    /// The one report line every host sweep prints, so the report sites
-    /// cannot drift in wording: "removed N <what>", then only the
-    /// tails that happened.
-    fn report(&self, what: &str) -> String {
-        let mut line = format!("removed {} {what}", self.removed);
-        if self.already_gone > 0 {
-            line.push_str(&format!(", {} already reclaimed", self.already_gone));
-        }
-        if self.in_use > 0 {
-            line.push_str(&format!(", {} still in use (kept)", self.in_use));
-        }
-        line
-    }
-}
-
-/// Remove host docker images one by one: a tag a concurrent clean already reclaimed is a
-/// success, and a tag docker refuses to drop because a container still
-/// uses it is kept, both detected by observing presence rather than
-/// parsing error prose. No `-f`: force would untag a live container's
-/// image anyway and strand its restart. "Absent" is only a verdict
-/// while the daemon still answers.
-async fn reclaim_host_images(images: &[String]) -> anyhow::Result<Reclaimed> {
-    let mut done = Reclaimed::default();
-    for image in images {
-        let out = crate::images::docker().args(["rmi", image]).output().await?;
-        if out.status.success() {
-            done.removed += 1;
-            continue;
-        }
-        let present = crate::images::docker()
-            .args(["image", "inspect", image])
-            .output()
-            .await?
-            .status
-            .success();
-        if present {
-            println!("kept {image}: {}", String::from_utf8_lossy(&out.stderr).trim());
-            done.in_use += 1;
-            continue;
-        }
-        let daemon_up = crate::images::docker()
-            .args(["version", "--format", "{{.Server.Version}}"])
-            .output()
-            .await?
-            .status
-            .success();
-        if daemon_up {
-            done.already_gone += 1;
-            continue;
-        }
-        anyhow::bail!(
-            "docker stopped answering while removing {image}; check the daemon \
-             and rerun `weft clean --images`"
-        );
-    }
-    Ok(done)
 }
 
 /// What the two compile caches on this host take on disk and how to
@@ -1122,6 +1033,25 @@ async fn removed_install_cache_sweep(data_dir: &std::path::Path) -> anyhow::Resu
     Ok(())
 }
 
+/// Layer 6 (`--all` only): the images a named install no longer on this
+/// machine held under its own names (`localhost/weft-<name>/...`).
+/// `weft daemon remove` removes an install's as it goes; this takes what
+/// an install removed otherwise left (by an older weft, or by hand).
+async fn removed_install_image_sweep(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    // The images first: an install's folder exists before its first image
+    // does, so every install owning an image in this listing is found by
+    // the look at the installs after it, however new.
+    let listing = crate::images::host_image_listing(&[]).await?;
+    let installs: Vec<weft_core::infra::Install> = super::daemon::Install::every_on(data_dir)?.into_iter().map(|i| i.id).collect();
+    let stale = crate::images::images_owned_by(&listing, |owner| !installs.contains(owner));
+    if stale.is_empty() {
+        println!("no images of removed installs");
+        return Ok(());
+    }
+    println!("{}", crate::images::reclaim_host_images(&stale).await?.report("image(s) of removed installs"));
+    Ok(())
+}
+
 /// Which lane a compile cache's record names, in words: its number, or
 /// that the record has none or names something else.
 fn compile_cache_lane(cache: &crate::images::CompileCacheRecord) -> String {
@@ -1154,7 +1084,7 @@ async fn clean_build_cache() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{event_line, EventsFilter, Reclaimed};
+    use super::{event_line, EventsFilter};
     use serde_json::json;
 
     /// One replay row, typed and as it reads on the wire, from the fields
@@ -1374,19 +1304,6 @@ mod tests {
         assert!(event_line(&suspended, false).contains("token=a44e5cad"));
         let iteration = json!({"kind": "loop_iteration_launched", "node": "run__in", "index": 7, "atUnix": 5u64});
         assert!(event_line(&iteration, false).contains("index=7"));
-    }
-
-    /// One report line per sweep: the count always, each tail only
-    /// when it happened.
-    #[test]
-    fn reclaim_report_names_only_what_happened() {
-        let plain = Reclaimed { removed: 2, already_gone: 0, in_use: 0 };
-        assert_eq!(plain.report("stale infra image(s)"), "removed 2 stale infra image(s)");
-        let busy = Reclaimed { removed: 1, already_gone: 1, in_use: 3 };
-        assert_eq!(
-            busy.report("stale worker image(s)"),
-            "removed 1 stale worker image(s), 1 already reclaimed, 3 still in use (kept)"
-        );
     }
 }
 

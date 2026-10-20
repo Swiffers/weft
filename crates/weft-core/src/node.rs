@@ -352,7 +352,7 @@ pub struct NodeMetadata {
     /// learns what to send. The load refuses it on a node that is not a
     /// trigger, and refuses a type it cannot read. Nothing makes a
     /// trigger declare one: the repo test
-    /// `weft-compiler/tests/fires_with.rs` holds the shipped triggers to
+    /// `weft-compiler/tests/integration/fires_with.rs` holds the shipped triggers to
     /// it; a third-party trigger may leave it out.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub fires_with: std::collections::BTreeMap<String, String>,
@@ -532,7 +532,7 @@ pub fn fire_payload_type(
 /// provider's events, the authoritative list is the service's topic
 /// (`AccessSpec.events.<topic>.fields`): a named event carries those
 /// keys and no others, minus any the raw event did not have. The repo
-/// test `weft-compiler/tests/fires_with.rs` holds every shipped trigger
+/// test `weft-compiler/tests/integration/fires_with.rs` holds every shipped trigger
 /// to that list, so a forgotten field fails there rather than in front
 /// of a user.
 ///

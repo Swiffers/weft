@@ -38,12 +38,12 @@ const THIRD_PARTY_TYPES: &[(&str, &str)] = &[
     (
         "ChatMessage",
         "mirrors minillmlib's message serde field for field (`tool_call_id`, `tool_calls`, \
-         `cache_breakpoint`); `tests/chat_types.rs` holds the two together",
+         `cache_breakpoint`); `tests/integration/chat_types.rs` holds the two together",
     ),
     (
         "ChatContentPart",
         "mirrors minillmlib's content-part serde, itself the OpenAI wire shape (`image_url`, \
-         `input_audio`, `duration_secs`); `tests/chat_types.rs` holds the two together",
+         `input_audio`, `duration_secs`); `tests/integration/chat_types.rs` holds the two together",
     ),
 ];
 

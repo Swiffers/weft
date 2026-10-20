@@ -5,14 +5,6 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-# Gates the Layer-3 DB tests that need a real Postgres via `#[sqlx::test]`
-# + $DATABASE_URL. OFF by default so `cargo test --workspace` is green on
-# any machine without Postgres.
-# Gates this crate's own Postgres-backed tests; nothing here uses the
-# task-store's migration-generator APIs, so no feature propagation.
-db-tests = []
-
 [dependencies]
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -42,6 +34,7 @@ jsonwebtoken = { workspace = true }
 rand = "0.8"
 # At-rest sealing of stored credential material (crypt.rs).
 aes-gcm = { workspace = true }
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [dev-dependencies]
 weft-core = { workspace = true }

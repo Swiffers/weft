@@ -22,6 +22,7 @@ members = [
     "crates/weft-assets",
     "crates/weft-providers",
     "crates/weft-e2e",
+    "crates/weft-workspace-hack",
 ]
 
 [workspace.lints.clippy]

@@ -188,7 +188,7 @@ export function formatConfigValue(value: unknown): string {
   }
   // Objects / arrays: compact when small, pretty multi-line when large. Pure
   // STYLE, not correctness: the grammar parses both forms in every value
-  // position (pinned by crates/weft-compiler/tests/parser_multiline_object.rs)
+  // position (pinned by crates/weft-compiler/tests/integration/parser_multiline_object.rs)
   // and the structured editor accepts both (its containment gate admits
   // newlines inside a balanced brace-run). The proxy keeps a small value (a
   // two-key marker, a short list) on one readable line and lets a big one (a

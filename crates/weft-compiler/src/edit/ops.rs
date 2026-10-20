@@ -2426,7 +2426,7 @@ fn reject_uncontained_value(value: &str) -> Result<(), EditError> {
     // part of a multi-line JSON object value, which the grammar parses in
     // every value position (one-liner bodies and connection lines included:
     // the parser assembles the brace-run across lines; pinned by
-    // tests/parser_multiline_object.rs). Only a newline at brace depth 0
+    // tests/integration/parser_multiline_object.rs). Only a newline at brace depth 0
     // splits the VALUE itself across lines and breaks out.
     let mut brace_depth: i32 = 0;
     for t in &toks {

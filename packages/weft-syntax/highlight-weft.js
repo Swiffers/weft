@@ -11,7 +11,7 @@
  *       crates/weft-compiler/src/weft_compiler.rs RESERVED_CONFIG_KEYS +
  *       RESERVED_WORDS + RESERVED_TYPE_KEYWORDS,
  *       crates/weft-core/src/weft_type.rs (the type vocabulary),
- *       crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)
+ *       crates/weft-compiler/tests/integration/highlighting_vocabulary.rs (the word-list alarm)
  *
  * Drop it in a page that already has highlight.js and it installs itself. Or
  * import it and call `install(hljs)` yourself, which is what a page needs when

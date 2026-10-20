@@ -563,11 +563,32 @@ pub fn stage_worker_workspace(weft_root: &Path, dest: &Path) -> CompileResult<()
             }
         }
     }
+    stage_empty_workspace_hack(dest)?;
     write_scoped_workspace_manifest(weft_root, dest, &closure)?;
     let lock_src = weft_root.join("Cargo.lock");
     let lock_dst = dest.join("Cargo.lock");
     std::fs::copy(&lock_src, &lock_dst).map_err(CompileError::Io)?;
     mirror_mtime(&lock_src, &lock_dst);
+    Ok(())
+}
+
+/// Write the empty stand-in for [`codegen::WORKSPACE_HACK_CRATE`] at
+/// `dest/crates/`: same name and version, no dependencies, so the closure
+/// crates' path dependency on it resolves and the worker compiles none of
+/// the workspace's feature union. Each file is dated from its content
+/// (`package_source_mtime`): a fresh wall-clock date on every staging would
+/// make cargo rebuild it, and with it every engine crate above it.
+fn stage_empty_workspace_hack(dest: &Path) -> CompileResult<()> {
+    let dir = dest.join("crates").join(codegen::WORKSPACE_HACK_CRATE);
+    std::fs::create_dir_all(dir.join("src")).map_err(CompileError::Io)?;
+    let manifest = format!(
+        "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n",
+        codegen::WORKSPACE_HACK_CRATE
+    );
+    for (path, content) in [(dir.join("Cargo.toml"), manifest.as_str()), (dir.join("src").join("lib.rs"), "")] {
+        std::fs::write(&path, content).map_err(CompileError::Io)?;
+        stamp_mtime(&path, package_source_mtime(content.as_bytes()));
+    }
     Ok(())
 }
 
@@ -688,10 +709,9 @@ pub fn stage_builder_base_context(weft_root: &Path, install: &weft_core::infra::
 ///
 /// The Dockerfile is RENDERED, not copied: `{{target_cache_key}}` becomes
 /// [`install_cache_key`] for `install`, so another branch's install never
-/// shares the compile cache and a dependency or toolchain change starts a
-/// fresh one instead of inheriting (and baking into the image) every
-/// artifact ever built; `{{worker_binary}}` names the binary
-/// the cache sweep keeps; `{{install_build_system_packages}}` and
+/// shares the compile cache and a toolchain change starts a fresh one (the
+/// sweep after the build keeps the cache, and so the image, to what that
+/// build used, whatever the lock did); `{{install_build_system_packages}}` and
 /// `{{build_env_lines}}` are what the stdlib packages need to compile
 /// (`StockProject::builder_stage`), the same lines a project's builder stage
 /// would carry, which is why a project FROMing the base installs only what
@@ -732,15 +752,13 @@ pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path, install: &wef
     let mut rendered = std::fs::read_to_string(&template_path).map_err(CompileError::Io)?;
     for (token, value) in [
         ("{{target_cache_key}}", install_cache_key(weft_root, install)?),
-        ("{{worker_binary}}", sanitize_crate_name(WORKER_CRATE_NAME)),
         ("{{install_build_system_packages}}", install_packages),
         ("{{build_env_lines}}", env_lines),
     ] {
         if !rendered.contains(token) {
             return Err(CompileError::Build(format!(
                 "{} lost its {token} token; the base would stop keying its compile cache \
-                 on the install, lock and toolchain, stop sweeping it, or stop installing what the \
-                 stock worker compiles with",
+                 on the install and toolchain, or stop installing what the stock worker compiles with",
                 template_path.display()
             )));
         }
@@ -770,7 +788,7 @@ pub const BUILDER_BASE_CACHE_MOUNT_ID_PREFIX: &str = "weft-builder-base-target-"
 
 /// The key of a compile cache that builds weft's own crates (the builder
 /// base's, the runtime image's) for `install`: its label (`default`, or
-/// its name), then a short hash of `Cargo.lock` and `rust-toolchain.toml`,
+/// its name), then a short hash of `rust-toolchain.toml`,
 /// `<install>-<hash>`.
 ///
 /// The install, because cargo tells a crate's sources changed by their
@@ -781,18 +799,17 @@ pub const BUILDER_BASE_CACHE_MOUNT_ID_PREFIX: &str = "weft-builder-base-target-"
 /// Each branch has an install of its own, built from its one checkout, so
 /// the install is the cache's owner too: `weft daemon remove` drops its
 /// caches, and `weft clean --images --all` those of installs no longer on
-/// the machine ([`install_of_cache_key`]). The lock and the toolchain,
-/// because their change makes everything cached dead weight (new
-/// dependency versions, new toolchain). Source edits keep the key, so they
-/// stay incremental.
+/// the machine ([`install_of_cache_key`]). The toolchain, because its
+/// change makes everything cached dead weight. NOT the lock: a dependency
+/// bump keeps the cache and recompiles only what it moved, and what bounds
+/// the cache is the sweep each of the two builds runs after compiling
+/// (`worker_image::CACHE_GC_SCRIPT`, `this-build`), which drops every unit
+/// that build did not use. Source edits keep the key too, so they stay
+/// incremental.
 pub fn install_cache_key(weft_root: &Path, install: &weft_core::infra::Install) -> CompileResult<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    for rel in ["Cargo.lock", "rust-toolchain.toml"] {
-        hasher.update(
-            std::fs::read(weft_root.join(rel)).map_err(CompileError::Io)?,
-        );
-    }
+    hasher.update(std::fs::read(weft_root.join("rust-toolchain.toml")).map_err(CompileError::Io)?);
     let hash: String = hasher.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect();
     Ok(format!("{}-{hash}", install.label_value()))
 }
@@ -1212,9 +1229,10 @@ pub fn build_project_catalog(project_root: &Path) -> CompileResult<FsCatalog> {
 mod tests {
     use super::sanitize_crate_name;
 
-    /// Two installs on the same lock and toolchain never share a compile
-    /// cache, and each key says whose it is; an install keeps its cache
-    /// across source edits, and moves to a fresh one when its lock does.
+    /// Two installs on the same toolchain never share a compile cache, and
+    /// each key says whose it is; an install keeps its cache across source
+    /// edits and dependency bumps, and moves to a fresh one when its
+    /// toolchain does.
     #[test]
     fn each_install_compiles_in_a_cache_of_its_own() {
         use weft_core::infra::Install;
@@ -1231,7 +1249,9 @@ mod tests {
         std::fs::write(checkout.path().join("lib.rs"), "fn edited() {}").unwrap();
         assert_eq!(key(&deploy), before, "a source edit keeps the cache");
         std::fs::write(checkout.path().join("Cargo.lock"), "bumped").unwrap();
-        assert_ne!(key(&deploy), before, "a dependency change starts a fresh one");
+        assert_eq!(key(&deploy), before, "a dependency bump keeps the cache too");
+        std::fs::write(checkout.path().join("rust-toolchain.toml"), "[toolchain]\nchannel = \"1.95.0\"\n").unwrap();
+        assert_ne!(key(&deploy), before, "a toolchain change starts a fresh one");
     }
 
     /// A platform starts the node-test image with no arguments, so the
@@ -1261,6 +1281,25 @@ mod tests {
             let at = date(content);
             assert!(at >= start && at < std::time::SystemTime::now(), "a date in the past");
         }
+    }
+
+    /// A worker build gets an empty `weft-workspace-hack`: the real one turns
+    /// on every feature the CLI and the dispatcher use, which a worker would
+    /// then compile. The engine crates still name it, so the stand-in must
+    /// be there, dated from its content so cargo keeps reusing what sits
+    /// above it.
+    #[test]
+    fn a_worker_build_gets_an_empty_workspace_hack() {
+        let weft_root = super::resolve_weft_root().expect("resolve weft root");
+        let dir = tempfile::tempdir().unwrap();
+        super::stage_worker_workspace(&weft_root, dir.path()).expect("stage");
+        let hack = dir.path().join("crates").join(crate::codegen::WORKSPACE_HACK_CRATE);
+        let manifest = std::fs::read_to_string(hack.join("Cargo.toml")).unwrap();
+        assert!(!manifest.contains("[dependencies]"), "{manifest}");
+        assert!(manifest.contains("name = \"weft-workspace-hack\""), "{manifest}");
+        assert_eq!(std::fs::read_to_string(hack.join("src/lib.rs")).unwrap(), "");
+        let dated = std::fs::metadata(hack.join("src/lib.rs")).unwrap().modified().unwrap();
+        assert_eq!(dated, super::package_source_mtime(b""));
     }
 
     /// The builder base compiles the STOCK WORKER: the staged context
@@ -1300,7 +1339,10 @@ mod tests {
         }
         let dockerfile = std::fs::read_to_string(ctx.join("Dockerfile")).unwrap();
         assert!(!dockerfile.contains("{{"), "every token rendered: {dockerfile}");
-        assert!(dockerfile.contains(&format!("/work {}", sanitize_crate_name(super::WORKER_CRATE_NAME))));
+        assert!(
+            dockerfile.contains("weft-cache-gc.sh this-build /cache/target/release /tmp/cargo-messages.json"),
+            "the base keeps its cache to what its build used: {dockerfile}"
+        );
         assert!(dockerfile.contains("COPY project-nodes /weft/project-nodes"));
     }
 

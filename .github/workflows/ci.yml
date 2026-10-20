@@ -73,7 +73,9 @@ jobs:
           shared-key: workspace
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # No compile-time query macros anywhere, so the workspace suite needs no
-      # database. The tests that do want one are behind the `db-tests` feature.
+      # database. The tests that do want one compile here too, and nextest's
+      # default profile leaves them out (`.config/nextest.toml`); the `db`
+      # job below runs them.
       # Under cargo-nextest, as developers run it: each test in its own
       # process, which tests that set the process's env vars rely on.
       - run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
@@ -134,6 +136,20 @@ jobs:
       # connect-a-credential diagnostics a fresh checkout produces.
       - run: scripts/validate-examples.sh
 
+  # `crates/weft-workspace-hack` (`.config/hakari.toml`) must match the
+  # workspace's dependencies, and every member must depend on it, or narrow
+  # builds go back to compiling their own copy of each dependency.
+  workspace-hack:
+    name: workspace-hack up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - run: cargo install cargo-hakari --version 0.9.39 --locked
+      - run: cargo hakari generate --diff
+      - run: cargo hakari manage-deps --dry-run
+      - run: cargo hakari verify
+
   # The install's Terraform, checked against the provider versions it
   # allows: an argument the provider does not know fails here instead of
   # in every install. No backend and no credentials: validate reads only
@@ -157,7 +173,7 @@ jobs:
   # skip the ruleset would wait on.
   rust:
     name: cargo test + clippy
-    needs: [test, doc, clippy, parse-only, examples, terraform]
+    needs: [test, doc, clippy, parse-only, examples, workspace-hack, terraform]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     env:
@@ -167,6 +183,9 @@ jobs:
           jq -e 'all(.[]; .result == "success")' <<< "$NEEDS" >/dev/null \
             || { jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS"; exit 1; }
 
+  # The job's name is one the main ruleset requires, so it stays as it is
+  # although the tests are now picked by nextest's `db` profile, not by a
+  # cargo feature.
   db:
     name: cargo test --features db-tests
     runs-on: ubuntu-latest

@@ -562,7 +562,9 @@ fn workers_through_sql(project_expr: &str, last_ms_expr: &str) -> String {
 /// [`workers_through_sql`]), for a test whose schema has no journal: every
 /// write of a failure reads them.
 // SYNC: these columns <-> crates/weft-dispatcher/src/journal/postgres.rs (run)
-#[cfg(any(test, feature = "db-tests"))]
+// Built in every build, hidden: the database tests of the crates above
+// this one call it too, and a test-only switch here would rebuild them all.
+#[doc(hidden)]
 pub async fn judged_run_columns(pool: &PgPool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE run (run_id UUID PRIMARY KEY, project_id UUID NOT NULL, state TEXT NOT NULL, started_at BIGINT NOT NULL, \

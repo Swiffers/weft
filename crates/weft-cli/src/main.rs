@@ -848,7 +848,10 @@ enum Cmd {
     ///   (default)         journal cleanup (runs older than --keep-days)
     ///   <UUID>            one run
     ///   --images          unreferenced worker images for the cwd project
-    ///                     (use --all to span every project)
+    ///                     (use --all to span every project, and to drop
+    ///                     the shared images and compile caches no install
+    ///                     on this machine uses, and everything installs
+    ///                     no longer on it left behind)
     ///   --images --build-plane
     ///                     the builder bases and node-test images no
     ///                     install on this machine uses
@@ -1431,8 +1434,8 @@ enum DaemonAction {
     /// the infra keep running.
     Stop,
     /// Take a NAMED install off this machine, leaving nothing of it: its
-    /// projects, its workers and infra, its database, its bucket, its
-    /// binaries. A named install lives beside the default one with ports
+    /// projects, its workers and infra, its images, its compile caches,
+    /// its database, its bucket, its binaries. A named install lives beside the default one with ports
     /// and files of its own: a branch checkout's (run this from that
     /// checkout), or one `WEFT_INSTALL=<name>` names, like a test cell
     /// (`WEFT_INSTALL=<name> weft daemon start` brings one up; add

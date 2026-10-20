@@ -1770,7 +1770,10 @@ async fn remove(install: &Install) -> Result<()> {
     delete_bucket(&install.bucket()).await?;
     // The caches its images compiled weft's crates in, which no other
     // install builds in (`weft_compiler::build::install_cache_key`).
-    crate::images::drop_install_build_caches(&install.id).await?;
+    crate::images::drop_install_build_caches(&install.id, None).await?;
+    // The images it holds under its own names, now that nothing of it
+    // runs them (`Install::local_image_ref`).
+    crate::images::remove_install_images(&install.id).await?;
     // Postgres owned its files as its own user.
     if install.postgres_dir().exists() {
         let out = run_in_alpine(&install.dir, "/d", "rm -rf /d/postgres-data").await?;

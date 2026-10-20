@@ -27,6 +27,7 @@ http = "1"
 # The ElevenLabs session observer reads the session URL's query (audio
 # format, add-on flags): the negotiated parameters price the bytes.
 url = { workspace = true }
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

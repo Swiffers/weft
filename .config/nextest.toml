@@ -1,5 +1,16 @@
 # A test that runs past five minutes is stuck, not slow: nextest stops it
 # and reports it failed, so a hang shows up as a failure naming the test
 # instead of a run that never ends.
+#
+# The tests that need a real Postgres compile in every test build and are
+# told apart here by name: a crate's integration binary called `db`, or a
+# module called `db_tests` inside a library. A plain run leaves them out;
+# `--profile db` (what `scripts/run-db-tests.sh` runs) runs only them. So
+# switching between the two rebuilds nothing.
+# SYNC: the `db` profile <-> scripts/run-db-tests.sh (`--profile db`)
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
+default-filter = "not (binary(db) | test(/(^|::)db_tests::/))"
+
+[profile.db]
+default-filter = "binary(db) | test(/(^|::)db_tests::/)"

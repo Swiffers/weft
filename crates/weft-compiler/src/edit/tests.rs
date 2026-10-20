@@ -366,7 +366,7 @@ fn set_config_compact_object_into_one_liner_bodies() {
 fn set_config_writes_a_multiline_object_value_everywhere() {
     // A MULTI-LINE `{`-object value is contained (its newlines live inside the
     // balanced brace-run) and the grammar parses it in EVERY value position
-    // (pinned by tests/parser_multiline_object.rs), so the editor accepts it:
+    // (pinned by tests/integration/parser_multiline_object.rs), so the editor accepts it:
     // bodyless node, one-liner body, and connection-origin field alike. This is
     // the form the webview emits for LARGE objects (a stored-file marker); the
     // historical failure mode was the gate refusing it and the FileDrop field

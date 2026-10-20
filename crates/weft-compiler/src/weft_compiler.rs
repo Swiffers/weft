@@ -1657,7 +1657,7 @@ fn reject_reserved_local(local_id: &str, span: Span, errors: &mut Vec<CompileErr
 /// vocabulary, not as a config key the parser stores.
 // SYNC: RESERVED_CONFIG_KEYS <-> docs/src/language/syntax.md (Reserved keys),
 // packages/weft-syntax/weft.tmLanguage.json, packages/weft-syntax/highlight-weft.js,
-// crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)
+// crates/weft-compiler/tests/integration/highlighting_vocabulary.rs (the word-list alarm)
 pub const RESERVED_CONFIG_KEYS: &[&str] = &[
     "_label",
     weft_core::tag::TAGS_CONFIG_KEY,
@@ -1672,7 +1672,7 @@ pub const RESERVED_CONFIG_KEYS: &[&str] = &[
 /// type, append it here and every consumer picks it up.
 // SYNC: RESERVED_TYPE_KEYWORDS <-> packages/weft-syntax/weft.tmLanguage.json,
 // packages/weft-syntax/highlight-weft.js,
-// crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)
+// crates/weft-compiler/tests/integration/highlighting_vocabulary.rs (the word-list alarm)
 pub const RESERVED_TYPE_KEYWORDS: &[&str] = &[
     weft_core::project::own_types::GROUP,
     weft_core::project::own_types::LOOP,
@@ -1702,7 +1702,7 @@ pub fn is_reserved_local(id: &str) -> bool {
 /// and the compiler cannot drift on the list.
 // SYNC: RESERVED_WORDS <-> packages/weft-syntax/weft.tmLanguage.json,
 // packages/weft-syntax/highlight-weft.js,
-// crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)
+// crates/weft-compiler/tests/integration/highlighting_vocabulary.rs (the word-list alarm)
 pub const RESERVED_WORDS: &[&str] = &["self", "true", "false", "type"];
 
 /// The header IDENT (the decl's local id) and the type name, from a HEADER node.

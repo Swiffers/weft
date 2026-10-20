@@ -1,0 +1,23 @@
+# `cargo hakari` keeps `crates/weft-workspace-hack` in step with the
+# workspace: one crate every member depends on, which turns on, for each
+# third-party dependency, the union of the features any member asks for.
+# Without it cargo resolves features per command, so `-p weft-core` and
+# `-p weft-dispatcher` compiled their own copies of tokio, sqlx and the rest
+# (eight tokio builds sat side by side in one target/), and every narrow
+# test run recompiled the dependency tree. After changing a dependency, run
+# `cargo hakari generate && cargo hakari manage-deps`; CI checks both.
+# The worker build never sees this crate: its staging swaps in an empty one
+# (`weft_compiler::build::stage_worker_workspace`).
+
+hakari-package = "weft-workspace-hack"
+dep-format-version = "4"
+resolver = "2"
+
+# Where weft is built: developers on Linux and macOS, the release workflow's
+# two Linux architectures.
+platforms = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]

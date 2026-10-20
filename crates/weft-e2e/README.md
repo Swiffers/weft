@@ -22,7 +22,7 @@ scripts/run-e2e.sh --clean                  # only remove what failed runs kept
 The runner tests the install of the checkout you run it from: the default
 install on `main`, the branch's own install anywhere else (what `weft daemon
 which` names). It brings that install to current code once (`setup.sh --cli
---daemon`), builds every test binary once, then runs every TEST on its own,
+--daemon`), builds the one test binary once, then runs every TEST on its own,
 side by side, longest first (by how long each took last time). Everything a
 run keeps lives in the install's own folder, under `e2e/` (for the default
 install, `~/.local/share/weft/e2e/`): each test's output lands in
@@ -135,7 +135,10 @@ a test to tolerate the wrong state.
 
 ## Add a test
 
-Add `tests/<area>.rs` (the runner discovers it; no list to update). Shape:
+Add `tests/e2e/<area>.rs` and a `mod <area>;` line in `tests/e2e/main.rs`
+(every e2e test is one binary, each file a module of it; the runner asks the
+binary for its tests, so there is no other list to update). Its tests are
+named `<area>::<test>`. Shape:
 
 ```rust
 #![cfg(feature = "e2e")]

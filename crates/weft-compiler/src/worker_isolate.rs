@@ -3,7 +3,7 @@
 //!
 //! Emitted by codegen as a standalone package beside the worker crate
 //! (`codegen::write_isolation`) and run by the image build in the crate's
-//! directory: `weft-isolate <isolate.json> <left-out.json>`. Every package
+//! directory: `weft-isolate <isolate.json> <left-out.json> <cargo messages>`. Every package
 //! crate is an optional dependency of the worker behind a feature of its
 //! own, all of them on by default, and carries its package's build script
 //! and build-dependencies itself, so:
@@ -24,6 +24,10 @@
 //!    `left-out.json`, which the worker's registry embeds.
 //! 3. It builds the worker again with only the kept packages' features.
 //!
+//! Every JSON message cargo writes in either build is appended to the
+//! messages file, which is how the compile-cache sweep after the build
+//! (`worker_image::CACHE_GC_SCRIPT`) knows every unit the build used.
+//!
 //! A failure in the worker crate itself or in a crate it depends on other
 //! than through a package (the engine) fails the build: leaving packages
 //! out cannot fix it. Depends only on serde and serde_json, so it compiles
@@ -32,7 +36,7 @@
 //! candidate type codegen writes and for its tests.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, ExitCode, Stdio};
 
 use serde::{Deserialize, Serialize};
@@ -152,9 +156,14 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [candidates_path, record_path] = args.as_slice() else {
-        return Err("usage: weft-isolate <isolate.json> <left-out.json>".into());
+    let [candidates_path, record_path, messages_path] = args.as_slice() else {
+        return Err("usage: weft-isolate <isolate.json> <left-out.json> <cargo messages>".into());
     };
+    let mut messages = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(messages_path)
+        .map_err(|e| format!("open {messages_path}: {e}"))?;
     let candidates: Candidates = serde_json::from_slice(
         &std::fs::read(candidates_path).map_err(|e| format!("read {candidates_path}: {e}"))?,
     )
@@ -173,7 +182,12 @@ fn run() -> Result<ExitCode, String> {
     let script_failures = std::thread::spawn(move || {
         read_script_failures(BufReader::new(stderr).lines().map_while(Result::ok), &mut |line| eprintln!("{line}"))
     });
-    let mut report = read_messages(BufReader::new(stdout).lines().map_while(Result::ok), &mut |text| eprint!("{text}"));
+    let lines = BufReader::new(stdout).lines().map_while(Result::ok).inspect(|line| {
+        // The sweep only bounds the cache: a message it misses costs a
+        // recompile later, never this build.
+        let _ = writeln!(messages, "{line}");
+    });
+    let mut report = read_messages(lines, &mut |text| eprint!("{text}"));
     report.script_failures = script_failures.join().map_err(|_| "reading cargo's errors failed")?;
     let status = first.wait().map_err(|e| format!("wait for cargo: {e}"))?;
     if status.success() {
@@ -204,7 +218,8 @@ fn run() -> Result<ExitCode, String> {
     write_record(&fit_record(&decision.left_out, RECORD_LIMIT)?)?;
 
     let mut second = Command::new("cargo");
-    second.args(["build", "--release", "--no-default-features"]);
+    second.args(["build", "--release", "--no-default-features", "--message-format=json-render-diagnostics"]);
+    second.stdout(messages);
     if !decision.healthy.is_empty() {
         second.arg("--features").arg(decision.healthy.join(","));
     }

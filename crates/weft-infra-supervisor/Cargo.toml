@@ -34,6 +34,7 @@ uuid = { workspace = true }
 # Mutex doesn't poison and won't deadlock at compile-time if a
 # future refactor accidentally holds it across .await.
 parking_lot = { workspace = true, optional = true }
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [dev-dependencies]
 weft-infra-supervisor = { path = ".", features = ["test-helpers"] }

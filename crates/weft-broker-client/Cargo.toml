@@ -29,6 +29,7 @@ futures = { workspace = true }
 axum = { workspace = true, optional = true }
 tower = { workspace = true, features = ["util"], optional = true }
 bytes = { workspace = true, optional = true }
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [features]
 line-server = ["dep:axum", "dep:tower", "dep:bytes"]

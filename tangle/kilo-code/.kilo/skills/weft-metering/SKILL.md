@@ -337,4 +337,4 @@ Each measured call prints a `cost_reported` line carrying `service=` and `amount
 
 `observe_session` prices a long-lived socket that accrues as it goes. If your meter classifies any route `BillableSession`, implement it; the default refuses every session on that route. For it, the full trait, and what a [meter] must do before weft ships it, go and read [Measuring what a call costs](https://weavemindai.github.io/weft/connections/meters.html).
 
-Every snippet on this page is compiled in weft's own `crates/weft-providers/tests/skill_example_meter.rs`, and all but `priceable` are exercised there too. If you change one here, you change it there.
+Every snippet on this page is compiled in weft's own `crates/weft-providers/tests/integration/skill_example_meter.rs`, and all but `priceable` are exercised there too. If you change one here, you change it there.

@@ -64,6 +64,7 @@ parking_lot = { workspace = true }
 # would change every binary that links the engine, tests included.
 tikv-jemallocator = { workspace = true }
 pprof = { workspace = true }
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [features]
 test-helpers = []

@@ -154,6 +154,13 @@ through `stress_test!`
 (`crates/weft-core/src/test_support.rs`). You need `futures` as a
 dev-dependency in the crate you call it from.
 
+If you add a dependency to a crate or change its features, run
+`cargo hakari generate && cargo hakari manage-deps` before you open the PR
+(install it once with `cargo install cargo-hakari --locked`). It updates
+`crates/weft-workspace-hack`, which turns on the same features of each
+dependency for every crate, so testing one crate reuses what another already
+compiled instead of compiling its own copy. CI fails if it is out of date.
+
 ## Writing a node for the standard catalogue
 
 If you want a first contribution, this is a good one. A node is a folder with
@@ -297,7 +304,7 @@ keeps snake_case fields. A name a third party defines keeps its spelling (an
 OAuth parameter like `client_id`, a provider's field).
 
 If you add a node to the catalog, or add or rename any name in a node's
-`metadata.json`, run `cargo nextest run -p weft-catalog`. If any name is off,
+`metadata.json`, run `cargo nextest run --workspace -E 'package(weft-catalog)'`. If any name is off,
 the `casing` test fails and lists every one with its node and file, and with
 the spelling to use whenever one can be worked out. If you write a key
 weft renamed in its old snake_case spelling (`requires_infra` instead of
@@ -385,8 +392,9 @@ tells you. It builds one database from every table group's `CREATE TABLE`s
 and another by replaying the released migrations, then names whatever
 differs.
 
-These tests are behind the `db-tests` feature, off by default, so a plain
-`cargo test` never builds them.
+These tests live in each crate's `db` test binary. A plain `cargo nextest run`
+builds them and leaves them out; the script runs them through nextest's `db`
+profile (`.config/nextest.toml`).
 
 ## The browser extension
 

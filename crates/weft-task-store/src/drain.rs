@@ -1222,8 +1222,11 @@ mod plan_tests {
     }
 }
 
-#[cfg(all(test, feature = "db-tests"))]
-mod drain_due_tests {
+// These tests need a real Postgres. A module named `db_tests` is how
+// `.config/nextest.toml` finds database tests inside a library: the
+// default profile leaves them out, the `db` profile runs them.
+#[cfg(test)]
+mod db_tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;

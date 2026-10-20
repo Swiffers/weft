@@ -209,7 +209,7 @@ impl HoldQuery {
 pub mod project;
 pub mod domains;
 // `pub` (not `pub(crate)`) like `project` above: `cancel_terminal_events`
-// is exercised by the db-test rig in `tests/db_tags.rs` against a real
+// is exercised by the db-test rig in `tests/db/db_tags.rs` against a real
 // Postgres.
 pub mod run;
 mod events;
@@ -219,7 +219,7 @@ pub(crate) mod infra;
 mod display;
 // `pub` (not `pub(crate)`) like `project` above: the parked-fire queue
 // helpers (`append_parked_fire` and siblings) are the dispatcher's
-// correctness-critical SQL that the db-test rig in `tests/db_lifecycle.rs`
+// correctness-critical SQL that the db-test rig in `tests/db/db_lifecycle.rs`
 // exercises against a real Postgres.
 pub mod signal;
 pub mod access;

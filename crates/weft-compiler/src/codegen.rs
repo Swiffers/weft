@@ -892,14 +892,29 @@ pub fn fixed_worker_deps() -> BTreeMap<String, toml::Value> {
 /// carries a path. Dev-dependencies are deliberately excluded: cargo ignores
 /// the dev-dependencies of a path dependency, so they never reach a worker
 /// build. Returned sorted for deterministic hashing / staging.
+///
+/// [`WORKSPACE_HACK_CRATE`] is left out although every closure crate depends
+/// on it: the worker build gets an empty stand-in for it
+/// (`build::stage_worker_workspace`), so the real one is neither staged nor
+/// hashed.
 pub fn worker_workspace_crates(weft_root: &Path) -> CompileResult<Vec<String>> {
     let seeds: Vec<String> = fixed_worker_deps()
         .values()
         .filter_map(|spec| spec.get("path").and_then(|v| v.as_str()))
         .filter_map(crate_dir_name)
         .collect();
-    workspace_crate_closure(weft_root, &seeds)
+    let mut closure = workspace_crate_closure(weft_root, &seeds)?;
+    closure.retain(|name| name != WORKSPACE_HACK_CRATE);
+    Ok(closure)
 }
+
+/// The crate `cargo hakari` keeps (`.config/hakari.toml`): it turns on, for
+/// each third-party dependency, the union of the features any workspace
+/// member asks for, so every build on a developer's machine shares one
+/// compiled copy of each dependency. A worker must not compile that union
+/// (it would pull in the CLI's and the dispatcher's dependencies), so its
+/// build gets an empty crate of the same name instead.
+pub const WORKSPACE_HACK_CRATE: &str = "weft-workspace-hack";
 
 /// Closure of local path dependencies reachable from `seeds` (crate DIR names
 /// under `<weft_root>/crates/`), resolved by reading the real crate manifests.

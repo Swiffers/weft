@@ -225,7 +225,7 @@ pub async fn run_loop(
 ) -> Result<()> {
     loop {
         if let Err(e) = tick(&state).await {
-            tracing::warn!(error = %e, "health tick failed");
+            tracing::warn!(target: "weft_infra_supervisor::health", error = %e, "health tick failed");
         }
         let next_tick = state.clock.sleep(state.health_interval);
         tokio::pin!(next_tick);
@@ -237,7 +237,7 @@ pub async fn run_loop(
                         anyhow::anyhow!("the ownership loop is gone; the health loop cannot follow what this supervisor owns")
                     })?;
                     if let Err(e) = on_ownership_change(&state, &change).await {
-                        tracing::warn!(error = %e, "health tick after a claim failed");
+                        tracing::warn!(target: "weft_infra_supervisor::health", error = %e, "health tick after a claim failed");
                     }
                 }
                 _ = &mut next_tick => break,
@@ -418,6 +418,7 @@ async fn tick_project(
                     .await?;
                 if !outcome.is_applied() {
                     tracing::debug!(
+                        target: "weft_infra_supervisor::health",
                         project_id = %project.project_id,
                         node_id = %n.node_id,
                         unit = %unit,
@@ -459,7 +460,7 @@ async fn tick_project(
             rules: rows.into_values().collect(),
         };
         if !state.broker.set_health_state(&req).await?.is_applied() {
-            tracing::info!(project_id = %project.project_id, "the project's lease moved; its health rules' state is the new owner's");
+            tracing::info!(target: "weft_infra_supervisor::health", project_id = %project.project_id, "the project's lease moved; its health rules' state is the new owner's");
         }
     }
     Ok(look)
@@ -567,7 +568,7 @@ async fn act(
         }
     }
     let names = fire.rules.iter().map(|(on, _)| format!("'{}' on {}", on.rule, copy_name(&on.copy))).collect::<Vec<_>>().join(", ");
-    tracing::info!(project_id = %project.project_id, rules = %names, "health rules hold; firing their action");
+    tracing::info!(target: "weft_infra_supervisor::health", project_id = %project.project_id, rules = %names, "health rules hold; firing their action");
     // A copy whose take-down took something down, or is queued, keeps
     // its readers down when a bring-back runs.
     let took_down: BTreeSet<InfraCopy> = rows
@@ -643,7 +644,7 @@ fn failed(project: Uuid, on: &RuleOn, row: &mut HealthRuleState, error: &str, se
         Some(delay) => {
             let delay = delay.as_secs() as i64;
             row.next_retry_at_unix = Some(now + delay);
-            tracing::warn!(project_id = %project, rule = %on.rule, node_id = %on.copy.node_id, %error, retry_in_secs = delay, "a health rule's action failed; it tries again");
+            tracing::warn!(target: "weft_infra_supervisor::health", project_id = %project, rule = %on.rule, node_id = %on.copy.node_id, %error, retry_in_secs = delay, "a health rule's action failed; it tries again");
             None
         }
     }

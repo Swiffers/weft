@@ -17,8 +17,8 @@ use weft_core::instance::Owner;
 use weft_core::run_spec::RunSpec;
 use weft_core::ProjectDefinition;
 use weft_dispatcher::activation_store::{ActivationLifecycle, ActivationStoreOps, PostgresActivationStore, SignalsGoing};
-use weft_dispatcher::journal::postgres::PostgresJournal;
-use weft_dispatcher::journal::Journal;
+use weft_dispatcher::store::postgres::PostgresStore;
+use weft_dispatcher::store::RunStore;
 use weft_core::versions::Head;
 use weft_dispatcher::versions::{version_id, PostgresVersionStore, VersionRow, VersionStoreOps};
 use weft_journal::record::{Queued, Then};
@@ -26,13 +26,13 @@ use weft_journal::RunEvent;
 
 const TENANT: &str = "tenant-1";
 
-async fn setup(pool: &PgPool) -> (PostgresJournal, weft_dispatcher::ProjectStore, PostgresVersionStore) {
+async fn setup(pool: &PgPool) -> (PostgresStore, weft_dispatcher::ProjectStore, PostgresVersionStore) {
     weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
-    let journal = PostgresJournal::from_pool(pool.clone());
+    let store = PostgresStore::from_pool(pool.clone());
     let projects: weft_dispatcher::ProjectStore =
         std::sync::Arc::new(weft_dispatcher::PostgresProjectStore::new(pool.clone()));
     let versions = PostgresVersionStore::new(pool.clone());
-    (journal, projects, versions)
+    (store, projects, versions)
 }
 
 fn rig_project(id: Uuid) -> ProjectDefinition {
@@ -64,7 +64,7 @@ fn version(project: Uuid, m: &BTreeMap<String, String>, parent: Option<&str>, la
 /// Start a run of `project` by hand, from `version`, the way `weft run`
 /// queues one: what the tree shows of it rides its row.
 async fn start_run(
-    journal: &PostgresJournal,
+    store: &PostgresStore,
     project: Uuid,
     version: &str,
     seed: Option<Uuid>,
@@ -86,7 +86,7 @@ async fn start_run(
         events: std::slice::from_ref(&birth), tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
         watch_end: false, stale: &stale, spec: spec.as_ref(), example: None, program: None,
     };
-    assert!(journal.queue_run(queued, false).await.unwrap());
+    assert!(store.queue_run(queued, false).await.unwrap());
     run_id
 }
 
@@ -117,16 +117,16 @@ async fn identical_code_is_one_version(pool: PgPool) {
 /// started by hand (a trigger's) is counted on its version, never listed.
 #[sqlx::test]
 async fn runs_round_trip_and_list_in_recording_order(pool: PgPool) {
-    let (journal, projects, versions) = setup(&pool).await;
+    let (store, projects, versions) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
     let m = manifest(&[("main.weft", "aaa")]);
     let v = version(project, &m, None, None, 1);
     versions.upsert_version(&v).await.unwrap();
     let spec = RunSpec { name: "angry".into(), from: [("classify".into(), Default::default())].into(), ..Default::default() };
-    let seed = start_run(&journal, project, &v.id, None, Some(&RunSpec::default()), 5).await;
-    let child = start_run(&journal, project, &v.id, Some(seed), Some(&spec), 5).await;
-    start_run(&journal, project, &v.id, None, None, 6).await;
+    let seed = start_run(&store, project, &v.id, None, Some(&RunSpec::default()), 5).await;
+    let child = start_run(&store, project, &v.id, Some(seed), Some(&spec), 5).await;
+    start_run(&store, project, &v.id, None, None, 6).await;
     let rows = versions.runs(project).await.unwrap();
     assert_eq!(rows.iter().map(|r| r.run_id).collect::<Vec<_>>(), vec![seed, child], "in the order they were started");
     assert_eq!(rows[1].version_id, v.id);
@@ -196,21 +196,21 @@ async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool:
 /// it keeps its version and loses the run pointer.
 #[sqlx::test]
 async fn cleaning_a_run_erases_it_and_clears_head_run(pool: PgPool) {
-    let (journal, projects, versions) = setup(&pool).await;
+    let (store, projects, versions) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
     let m = manifest(&[("main.weft", "aaa")]);
     let v = version(project, &m, None, None, 1);
     versions.upsert_version(&v).await.unwrap();
-    let run_id = start_run(&journal, project, &v.id, None, Some(&RunSpec::default()), 5).await;
+    let run_id = start_run(&store, project, &v.id, None, Some(&RunSpec::default()), 5).await;
     versions.move_head(project, &Head::default(), Some(&v.id), Some(run_id)).await.unwrap();
     // The order `clean_run` uses.
     versions.forget_head_run(run_id).await.unwrap();
-    journal.delete_run(run_id).await.unwrap();
+    store.delete_run(run_id).await.unwrap();
     assert!(versions.run(run_id).await.unwrap().is_none(), "the run is gone");
     // Idempotent, which is what makes the retry safe.
     versions.forget_head_run(run_id).await.unwrap();
-    journal.delete_run(run_id).await.unwrap();
+    store.delete_run(run_id).await.unwrap();
     let head = versions.head(project).await.unwrap();
     assert_eq!(head.head_version.as_deref(), Some(v.id.as_str()));
     assert_eq!(head.head_run, None);
@@ -224,17 +224,17 @@ async fn cleaning_a_run_erases_it_and_clears_head_run(pool: PgPool) {
 /// registered again inherited a tree it never made).
 #[sqlx::test]
 async fn deleting_versions_takes_their_runs_out_of_the_tree(pool: PgPool) {
-    let (journal, projects, versions) = setup(&pool).await;
+    let (store, projects, versions) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
     let root = version(project, &manifest(&[("main.weft", "1")]), None, None, 1);
     let child = version(project, &manifest(&[("main.weft", "2")]), Some(&root.id), None, 2);
     versions.upsert_version(&root).await.unwrap();
     versions.upsert_version(&child).await.unwrap();
-    let r1 = start_run(&journal, project, &root.id, None, Some(&RunSpec::default()), 3).await;
-    let r2 = start_run(&journal, project, &child.id, None, Some(&RunSpec::default()), 4).await;
+    let r1 = start_run(&store, project, &root.id, None, Some(&RunSpec::default()), 3).await;
+    let r2 = start_run(&store, project, &child.id, None, Some(&RunSpec::default()), 4).await;
     for run in [r1, r2] {
-        let written = journal.append(run, &[RunEvent::RunCompleted { run_id: run, at_unix: 5 }], Then::Stays).await.unwrap();
+        let written = store.append(run, &[RunEvent::RunCompleted { run_id: run, at_unix: 5 }], Then::Stays).await.unwrap();
         assert!(matches!(written, weft_journal::record::Appended::At(_)));
     }
     versions.delete_versions(project, std::slice::from_ref(&child.id)).await.unwrap();
@@ -250,7 +250,7 @@ async fn deleting_versions_takes_their_runs_out_of_the_tree(pool: PgPool) {
 /// newest run across them.
 #[sqlx::test]
 async fn trigger_runs_sum_the_lanes_and_name_the_newest_run(pool: PgPool) {
-    let (_journal, _projects, versions) = setup(&pool).await;
+    let (_store, _projects, versions) = setup(&pool).await;
     let project = Uuid::new_v4();
     let older = Uuid::now_v7();
     let newer = Uuid::now_v7();

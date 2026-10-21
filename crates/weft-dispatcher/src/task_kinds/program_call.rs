@@ -168,7 +168,7 @@ pub(crate) async fn run_call(
         }
         ProgramCall::TokensRevoke { instance, id } => {
             let tenant = owner().await?;
-            let revoked = crate::journal::postgres::revoke_instance_tokens(&state.pg_pool, tenant.as_str(), project_id, instance, *id)
+            let revoked = crate::store::postgres::revoke_instance_tokens(&state.pg_pool, tenant.as_str(), project_id, instance, *id)
                 .await
                 .map_err(internal("revoke tokens"))?;
             answered(serde_json::to_value(TokensRevoked { revoked }).map_err(internal("answer"))?)
@@ -437,7 +437,7 @@ async fn asker_matches_filter(
     filter: &weft_core::program::RunFilter,
     asker: RunId,
 ) -> Result<bool, CallError> {
-    let Some(run) = state.journal.run_summary(asker).await.map_err(internal("the asking run"))? else {
+    let Some(run) = state.runs.run_summary(asker).await.map_err(internal("the asking run"))? else {
         return Ok(false);
     };
     let now = crate::lease::now_unix() as u64;
@@ -568,7 +568,7 @@ pub(crate) async fn instances(
     let connections = weft_access_store::instance_connection_counts(&state.pg_pool, tenant.as_str(), project_id)
         .await
         .map_err(internal("instance connections"))?;
-    let tokens = crate::journal::postgres::instance_token_counts(
+    let tokens = crate::store::postgres::instance_token_counts(
         &state.pg_pool,
         tenant.as_str(),
         project_id,

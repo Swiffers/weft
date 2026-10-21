@@ -2,13 +2,14 @@
 //! `src/main.weft`, the nodes under `nodes/` and `src/`) into a flat `ProjectDefinition` and the
 //! docker build contexts of the images that run it.
 //!
-//! Pipeline, as `weft run` / `weft build` drive it:
+//! Pipeline, as the dispatcher drives it when it builds a version
+//! (`weft_dispatcher::build`, from the project files the CLI uploaded):
 //! 1. `Project::load` reads `weft.toml` (and refuses a program still at
 //!    the project root instead of `src/`).
-//! 2. `weft_compiler::compile` parses `src/main.weft` into the lossless
-//!    CST and lowers it, resolves `@include` (the build compiles each
-//!    included file once, as one shared body group, and each use of it
-//!    is a call site group naming that body; the editor's `Interface`
+//! 2. `weft_compiler::compile_lenient` parses `src/main.weft` into the
+//!    lossless CST and lowers it, resolves `@include` (the build compiles
+//!    each included file once, as one shared body group, and each use of
+//!    it is a call site group naming that body; the editor's `Interface`
 //!    mode leaves one opaque node), then flattens: a group's members join
 //!    the program with the group in their scope, the lines through its
 //!    ports are joined into wires end to end (`wires`), and a loop gets a
@@ -16,8 +17,9 @@
 //!    `ProjectDefinition` of nodes, wires and the groups as scopes.
 //!    `@file` / `@asset` values resolve last, on that flat graph; a
 //!    file-typed `@asset` stays a marker for the build's asset sync.
-//!    (`compile_lenient` is the same pipeline for the editor, collecting
-//!    errors instead of aborting.)
+//!    Every error is collected, never an abort: the build's
+//!    `compile_program` turns the ones about some parts into broken
+//!    parts, the editor's `parse_only` renders around them.
 //! 3. `enrich` fills each node's ports and features from its catalog
 //!    metadata, materializes config-derived and custom ports, and
 //!    resolves TypeVars.
@@ -26,20 +28,22 @@
 //!    each node's declarative rules). `Structural` gates the build;
 //!    `Runtime` adds the rules a sketch may leave open (a provider with
 //!    no model named yet).
-//! 5. The CLI resolves file-typed `@asset` markers into stored files
-//!    (`weft-assets`), then `build_plan::plan_build_from` computes the
-//!    three hashes (`hash`: binary, definition, infra) and stages every
+//! 5. The dispatcher resolves file-typed `@asset` markers into stored
+//!    files, then `build_plan::plan_build_from` computes the three hashes
+//!    (binary and infra in `hash`; the definition hash is weft-core's
+//!    `compute_definition_hash`, re-exported there) and stages every
 //!    image: `build::build_project` validates the resolved definition,
 //!    `codegen::emit` writes the worker cargo crate (one crate per
 //!    referenced node package, plus the registry and `main.rs`; the
 //!    definition itself is never baked in, a worker fetches it from the
 //!    broker by `definition_hash`), and `worker_image::emit` writes its
 //!    Dockerfile; `image_set` lists each infra node's own images.
-//! 6. The CLI builds every planned image not already present with
-//!    docker. The worker's `cargo build` runs inside its docker build,
-//!    never on the host, through `weft-isolate` (`worker_isolate`): a
-//!    node package that does not compile is left out of the worker and
-//!    named in a record the image keeps, instead of failing the image.
+//! 6. The platform's builder (a local `docker build`, a Cloud Build on
+//!    GCP) builds every planned image not already present. The worker's
+//!    `cargo build` runs inside its docker build, never on the host,
+//!    through `weft-isolate` (`worker_isolate`): a node package that does
+//!    not compile is left out of the worker and named in a record the
+//!    image keeps, instead of failing the image.
 
 pub mod project;
 pub mod source_name;
@@ -51,8 +55,8 @@ pub mod file_reader;
 pub mod file_ref;
 pub mod enrich;
 pub mod validate;
-// Project source / drift hashing. `compute_definition_hash` is pure
-// (no filesystem) and always available
+// Project source / drift hashing. `compute_definition_hash` (weft-core's,
+// re-exported here) is pure (no filesystem) and always available
 // (the browser WASM build computes `definition_hash` for live preview);
 // the filesystem-bound hashes (binary / infra / image / builder-base,
 // the workspace walks, and the enriched-project loader) are gated behind
@@ -70,7 +74,6 @@ pub mod worker_image;
 // codegen writes and for its tests; its `main` and the logic only `main`
 // reaches run in the image, never in this crate.
 #[cfg(feature = "build")]
-#[allow(dead_code)]
 pub(crate) mod worker_isolate;
 #[cfg(feature = "build")]
 pub mod build;
@@ -84,9 +87,6 @@ pub mod image_set;
 #[cfg(feature = "build")]
 pub mod build_plan;
 pub mod error;
-
-pub use error::{CompileError as ProjectError, CompileResult};
-pub use weft_compiler::{compile as compile_source, CompileError as SourceError};
 
 use uuid::Uuid;
 use weft_core::{MetadataCatalog, ProjectDefinition};
@@ -129,7 +129,7 @@ pub fn flatten_lenient(
     project_id: Uuid,
     fs: CompileFs,
     catalog: &dyn MetadataCatalog,
-) -> (ProjectDefinition, Vec<weft_compiler::CompileError>) {
+) -> (ProjectDefinition, Vec<weft_compiler::SourceError>) {
     // The build compiles the entry file with no source id, so this does
     // too: the ids it hands out are the ones the build keys nodes by.
     catalog.type_registry().scoped(|| {
@@ -185,7 +185,7 @@ fn parse_only_inner(
         // A loop's two boundary nodes are the compiler's, with no catalog
         // entry by design; flagging them painted phantom line-0 "unknown
         // node type 'LoopIn'" warnings on every project with a loop.
-        if enrich::is_lowering_builtin(&node.node_type) {
+        if weft_core::project::boundary_types::is_boundary(&node.node_type) {
             continue;
         }
         if catalog.lookup(&node.node_type).is_none() {
@@ -213,10 +213,8 @@ fn parse_only_inner(
 
 /// Strict sibling of `parse_only`: the full pipeline (lex + parse +
 /// flatten, strict enrich, validate) collecting structured diagnostics
-/// instead of aborting. This is the single home for the
-/// error-to-`Diagnostic` mapping; every strict caller (the editor's
-/// `weft validate`, and `compile_checked` below for build/hash) goes
-/// through it, so the four paths can't drift.
+/// instead of aborting. Every strict caller (the editor's `weft
+/// validate`, the e2e fixture check) goes through it.
 ///
 /// `mode` selects how much validation runs: `Structural` (graph shape)
 /// or `Runtime` (also the rules a sketch may leave open, like a provider
@@ -226,9 +224,8 @@ fn parse_only_inner(
 /// validate` want `Runtime`.
 ///
 /// Never aborts: a parse failure returns an empty project plus the
-/// parse diagnostics, mirroring `parse_only`, so a caller that only
-/// wants diagnostics (the editor) gets them uniformly. Callers that
-/// must abort on errors use `compile_checked`.
+/// parse diagnostics, so a caller that only wants diagnostics (the
+/// editor) gets them uniformly.
 pub fn compile_strict(
     source: &str,
     project_id: Uuid,
@@ -240,83 +237,22 @@ pub fn compile_strict(
     // Same registry activation as `parse_only`: one table for source
     // parsing, enrichment, and validation.
     catalog.type_registry().scoped(|| {
-        let (project, mut diagnostics) =
-            compile_and_enrich(source, project_id, fs, catalog, source_name);
+        let (mut project, parse_errors) =
+            weft_compiler::compile_lenient(source, project_id, fs, weft_compiler::IncludeMode::Full, source_name);
+        // A source that does not parse leaves a partial program, and the
+        // later stages would only add findings about the gap.
+        if !parse_errors.is_empty() {
+            return (empty_project(project_id), parse_errors.iter().map(|e| e.diagnostic("parse")).collect());
+        }
+        // Strict enrich: one Error diagnostic PER failure, at the offending
+        // node's span (so the editor squiggles the exact line).
+        let mut diagnostics: Vec<Diagnostic> = enrich::enrich_collecting(&mut project, catalog, enrich::EnrichPolicy::Strict)
+            .into_iter()
+            .map(|e| e.diagnostic())
+            .collect();
         diagnostics.extend(validate::validate_with_mode(&project, catalog, mode));
         (project, diagnostics)
     })
-}
-
-/// Compile + strict enrich + validate, aborting if any `Error`-severity
-/// diagnostic fires. The shape the build path wants: a clean validated
-/// `ProjectDefinition` or one loud error. Layered on `compile_strict`
-/// so there is exactly one pipeline; this only adds "errors abort".
-pub fn compile_checked(
-    source: &str,
-    project_id: Uuid,
-    fs: CompileFs,
-    catalog: &dyn MetadataCatalog,
-    mode: validate::ValidationMode,
-) -> CompileResult<ProjectDefinition> {
-    // Build path: the ENTRY file, which may hold no anonymous root (`None`
-    // is what makes the compiler refuse one there).
-    let (project, diagnostics) = compile_strict(source, project_id, fs, catalog, mode, None);
-    bail_on_errors(diagnostics)?;
-    Ok(project)
-}
-
-/// The shared front half of every strict pipeline: lex + parse +
-/// flatten, then strict enrich, collecting failures as `Error`
-/// diagnostics rather than aborting. The single home for the
-/// parse/enrich error-to-`Diagnostic` mapping. A parse failure yields
-/// an empty project (mirrors `parse_only`) so the shape is uniform;
-/// callers decide whether to abort (`bail_on_errors`) or surface.
-fn compile_and_enrich(
-    source: &str,
-    project_id: Uuid,
-    fs: CompileFs,
-    catalog: &dyn MetadataCatalog,
-    source_name: Option<&str>,
-) -> (ProjectDefinition, Vec<Diagnostic>) {
-    // Parsing and enrichment both resolve declared type names, so the
-    // catalog's registry is activated HERE, at the shared front half,
-    // rather than trusting every public entry to remember the wrap
-    // (an entry that once forgot it failed custom types only at build
-    // time). The scope
-    // is a re-entrant stack, so `compile_strict`'s outer scope (which
-    // also covers validation) nests harmlessly.
-    catalog.type_registry().scoped(|| compile_and_enrich_inner(source, project_id, fs, catalog, source_name))
-}
-
-fn compile_and_enrich_inner(
-    source: &str,
-    project_id: Uuid,
-    fs: CompileFs,
-    catalog: &dyn MetadataCatalog,
-    source_name: Option<&str>,
-) -> (ProjectDefinition, Vec<Diagnostic>) {
-    let mut diagnostics = Vec::new();
-    let mut project = match weft_compiler::compile_with_mode(
-        source,
-        project_id,
-        fs,
-        weft_compiler::IncludeMode::Full,
-        source_name,
-    ) {
-        Ok(p) => p,
-        Err(errors) => {
-            for e in errors {
-                diagnostics.push(e.diagnostic("parse"));
-            }
-            return (empty_project(project_id), diagnostics);
-        }
-    };
-    // Strict enrich: one Error diagnostic PER failure, at the offending node's
-    // span (so the editor squiggles the exact line), not a single span-less blob.
-    for e in enrich::enrich_collecting(&mut project, catalog, enrich::EnrichPolicy::Strict) {
-        diagnostics.push(e.diagnostic());
-    }
-    (project, diagnostics)
 }
 
 /// The program a command builds and runs from: the whole pipeline (lex +
@@ -413,7 +349,7 @@ fn hiding_nodes(project: &ProjectDefinition, catalog: &dyn MetadataCatalog) -> s
         .iter()
         .filter(|node| {
             node.include_path.is_some()
-                || (!weft_compiler::is_reserved_type_keyword(&node.node_type) && catalog.lookup(&node.node_type).is_none())
+                || (!weft_core::project::own_types::is_own(&node.node_type) && catalog.lookup(&node.node_type).is_none())
         })
         .map(|node| node.id.clone())
         .collect()
@@ -470,11 +406,11 @@ pub fn render_diagnostic(d: &Diagnostic) -> String {
 }
 
 /// Turn an `Error`-severity diagnostic set into a single loud
-/// `CompileError`; `Ok(())` when only warnings (or nothing) remain.
-/// One place so every aborting entry formats failures identically.
-pub(crate) fn bail_on_errors(diagnostics: Vec<Diagnostic>) -> CompileResult<()> {
+/// [`error::BuildError::Validate`]; `Ok(())` when only warnings (or
+/// nothing) remain. The build's gate (`build::build_project`) aborts on it.
+pub(crate) fn bail_on_errors(diagnostics: Vec<Diagnostic>) -> error::BuildResult<()> {
     if diagnostics.iter().any(|d| matches!(d.severity, Severity::Error)) {
-        Err(error::CompileError::Validate(render_diagnostics(&diagnostics)))
+        Err(error::BuildError::Validate(render_diagnostics(&diagnostics)))
     } else {
         Ok(())
     }

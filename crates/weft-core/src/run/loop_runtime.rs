@@ -1269,8 +1269,9 @@ pub fn launch_iteration(
     // hangs (mislabeled Stuck). The generic termination-time sweep skips
     // loop boundaries, so the per-iteration analogue lives here, scoped
     // to this iteration's own frame stack so it can't touch the outward
-    // ports. A plain Group already gets this via its Passthrough sweep;
-    // loops must not break the skip cascade. An outer input that arrived
+    // ports. A group needs no such sweep: it is no node, so a closed
+    // input reaches the inside along the joined wire itself. An outer
+    // input that arrived
     // as a FAILED closure closes inside with its error, first, so the
     // sweep leaves it alone: a failure reaches the body as a failure.
     crate::run::postprocess::close_failed_then_unmentioned_downstream(

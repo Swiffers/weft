@@ -302,7 +302,7 @@ async fn in_flight_run_ids(
     project: uuid::Uuid,
 ) -> Result<std::collections::HashSet<RunId>, ApiError> {
     Ok(state
-        .journal
+        .runs
         .going_run_ids_for_project(project)
         .await
         .map_err(|e| internal("runs going", e))?
@@ -317,7 +317,7 @@ async fn settled_run_ids(
     state: &DispatcherState,
     project: uuid::Uuid,
 ) -> Result<std::collections::HashSet<RunId>, ApiError> {
-    state.journal.settled_run_ids_for_project(project).await.map_err(|e| internal("settled runs", e))
+    state.runs.settled_run_ids_for_project(project).await.map_err(|e| internal("settled runs", e))
 }
 
 /// The seed run folded: the complete results it holds, by place (its
@@ -540,7 +540,7 @@ pub async fn run(
     let bakes = if spec.fire.is_some() {
         // An instance's trigger was baked with that instance's values: the
         // fire replays the instance's bake.
-        state.journal.trigger_bakes(id, spec.instance.as_ref()).await.map_err(|error| internal("read trigger bakes", error))?
+        state.bakes.trigger_bakes(id, spec.instance.as_ref()).await.map_err(|error| internal("read trigger bakes", error))?
     } else { Vec::new() };
     // A fired CALLER trigger (a Route) gets a stand-in caller: there is
     // no socket coming, so the run serves the body the author typed and
@@ -853,7 +853,7 @@ pub async fn trigger_bakes(
     axum::extract::Query(query): axum::extract::Query<BakesQuery>,
 ) -> Result<Json<Vec<weft_core::run_spec::BakeSummary>>, ApiError> {
     authorize_project(&state, &caller.0, id).await?;
-    let bakes = state.journal.trigger_bakes(id, query.instance.as_ref()).await.map_err(|error| internal("read trigger bakes", error))?;
+    let bakes = state.bakes.trigger_bakes(id, query.instance.as_ref()).await.map_err(|error| internal("read trigger bakes", error))?;
     Ok(Json(bakes.iter().map(|bake| bake.summary()).collect()))
 }
 
@@ -915,7 +915,7 @@ pub async fn tree(
     // `weft tree` and every refresh of the editor's version sidebar.
     let run_ids: Vec<RunId> = runs.iter().map(|r| r.run_id).collect();
     let mut summaries = state
-        .journal
+        .runs
         .run_summaries(&run_ids)
         .await
         .map_err(|e| internal("run summaries", e))?;

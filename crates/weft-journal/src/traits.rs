@@ -2,7 +2,7 @@
 //! finished run's record is read back. On a worker the events go to the
 //! run's writer lane (`weft_engine::journal_writer`), and a record is read
 //! through the broker; the dispatcher has its own, wider surface
-//! (`weft_dispatcher::journal::Journal`).
+//! (`weft_dispatcher::store::RunStore`).
 
 use async_trait::async_trait;
 
@@ -88,19 +88,3 @@ pub enum BatchError {
     Unanswered(anyhow::Error),
 }
 
-/// The no-write implementation: every write vanishes, every read answers
-/// empty. For runtimes that drive a node body OUTSIDE a run (a node
-/// self-test has no record to fold), and for tests exercising code that
-/// only incidentally holds a journal client.
-pub struct NoopJournal;
-
-#[async_trait]
-impl JournalClient for NoopJournal {
-    async fn record_event(&self, _event: &RunEvent, _replica: Option<&str>) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn events_for_run_id(&self, _run_id: weft_core::RunId) -> anyhow::Result<Vec<RunEvent>> {
-        Ok(Vec::new())
-    }
-}

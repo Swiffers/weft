@@ -237,7 +237,7 @@ pub async fn run(
 
 /// What `--node <name>` answers for a name the language owns rather
 /// than the catalog: what it is, and where it is explained. Every
-/// reserved type keyword has an answer (a test holds that), plus
+/// type name weft owns (`own_types`) has an answer (a test holds that), plus
 /// `Include`, which is written `@include(...)` but is what someone
 /// looking for "the include node" asks for.
 fn language_construct(name: &str) -> Option<String> {
@@ -248,6 +248,11 @@ fn language_construct(name: &str) -> Option<String> {
         weft_core::project::boundary_types::LOOP_IN | weft_core::project::boundary_types::LOOP_OUT => (
             "a node the compiler makes out of a loop; you never write it",
             "docs/src/language/how-a-program-runs.md",
+        ),
+        weft_core::project::INCLUDED_GROUP_TYPE => (
+            "the block an include shows when its file is not opened up, or stands in for an \
+             included file that does not compile; you never write it",
+            "docs/src/language/files-and-reuse.md",
         ),
         _ => return None,
     };
@@ -265,7 +270,7 @@ mod tests {
     /// never "unknown node type".
     #[test]
     fn a_language_construct_is_named_as_one() {
-        for name in weft_compiler::weft_compiler::RESERVED_TYPE_KEYWORDS.iter().chain(&["Include"]) {
+        for name in weft_core::project::own_types::ALL.iter().chain(&["Include"]) {
             let answer = language_construct(name).unwrap_or_else(|| panic!("{name} has no answer"));
             assert!(answer.contains("part of the weft language"), "{answer}");
             assert!(answer.contains("docs/src/language/"), "{answer}");

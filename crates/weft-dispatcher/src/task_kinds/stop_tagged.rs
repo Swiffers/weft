@@ -53,7 +53,7 @@ pub async fn stop_tagged(
     before_seq: Option<i64>,
     stop_self: weft_core::StopSelf,
 ) -> Result<Vec<weft_core::RunId>> {
-    let live = state.journal.live_tagged_runs(project_id, tag).await?;
+    let live = state.runs.live_tagged_runs(project_id, tag).await?;
     let targets = weft_journal::tags::select_stop_targets(&live, by, before_seq, stop_self);
     tracing::info!(
         target: "weft_dispatcher::stop_tagged",

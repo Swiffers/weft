@@ -455,7 +455,7 @@ impl DisplayReader for StateReader {
 #[async_trait]
 impl WaitReader for StateReader {
     async fn waits(&self, run: weft_core::RunId) -> Result<Vec<WaitAt>, String> {
-        let signals = self.0.journal.signal_list_for_run_id(run).await.map_err(|e| format!("the run's waits: {e:#}"))?;
+        let signals = self.0.registrations.signal_list_for_run_id(run).await.map_err(|e| format!("the run's waits: {e:#}"))?;
         // The configured base, as for a trigger's display: the address is
         // handed on to whoever answers the wait. Read only once a wait has
         // an outside address.

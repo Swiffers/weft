@@ -291,7 +291,7 @@ fn display_at<'a>(
 ///
 /// The tenant is checked separately, before the project is read at all.
 fn token_reaches_display(
-    token: &crate::journal::SignalToken,
+    token: &crate::store::SignalToken,
     project_id: &uuid::Uuid,
     address: &str,
 ) -> bool {
@@ -312,7 +312,7 @@ fn token_reaches_display(
 /// is the token, the tenant and the fetches; this is the rule. `None`
 /// is every miss, which the door answers with its one 404.
 fn display_for_token(
-    token: &crate::journal::SignalToken,
+    token: &crate::store::SignalToken,
     project_id: &uuid::Uuid,
     project: &weft_core::project::ProjectDefinition,
     address: &str,
@@ -497,7 +497,7 @@ fn display_kind(node: &weft_core::project::NodeDefinition) -> Option<DisplayKind
 async fn display_token(
     state: &DispatcherState,
     headers: &HeaderMap,
-) -> Result<crate::journal::SignalToken, (StatusCode, String)> {
+) -> Result<crate::store::SignalToken, (StatusCode, String)> {
     let token = crate::api::signal::token_from_bearer(state, headers).await?;
     if !token.reaches_displays() {
         return Err((
@@ -568,7 +568,7 @@ async fn resolve(
 mod scope_tests {
     use super::{displays_of, split_grant};
     use weft_core::live::display_grant;
-    use crate::journal::SignalToken;
+    use crate::store::SignalToken;
     use weft_core::project::ProjectDefinition;
 
     fn project_a() -> uuid::Uuid {

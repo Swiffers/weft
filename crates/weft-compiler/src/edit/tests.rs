@@ -685,10 +685,10 @@ fn move_into_current_scope_is_a_noop_not_a_self_collision() {
     // nesting depth >= 2 the guard misfired and the no-op move ran destructively,
     // see `move_into_current_scope_depth2_is_a_clean_noop` below.)
     let nested = apply(
-        "MyGroup_2 = Group() -> () {\n  MyGroup = Group() -> () {\n    debug_4 = Debug {}\n  }\n}\n",
-        vec![EditOp::MoveGroupScope { group: "MyGroup_2.MyGroup".into(), target_group: Some("MyGroup_2".into()) }],
+        "myGroup2 = Group() -> () {\n  myGroup = Group() -> () {\n    debug4 = Debug {}\n  }\n}\n",
+        vec![EditOp::MoveGroupScope { group: "myGroup2.myGroup".into(), target_group: Some("myGroup2".into()) }],
     );
-    assert_eq!(nested, "MyGroup_2 = Group() -> () {\n  MyGroup = Group() -> () {\n    debug_4 = Debug {}\n  }\n}\n", "no-op move leaves source unchanged: {nested:?}");
+    assert_eq!(nested, "myGroup2 = Group() -> () {\n  myGroup = Group() -> () {\n    debug4 = Debug {}\n  }\n}\n", "no-op move leaves source unchanged: {nested:?}");
     parse_ok(&nested);
 
     let root = apply(
@@ -713,26 +713,26 @@ fn move_into_current_scope_is_a_noop_not_a_self_collision() {
 fn move_into_current_scope_depth2_is_a_clean_noop() {
     // Regression for the depth-2 corruption: a node TWO levels deep, "moved" into
     // the scope it already lives in (target = the SCOPED id of its current parent).
-    // The old bare-label op compared "MyGroup" (bare) against "MyGroup_2.MyGroup"
+    // The old bare-label op compared "myGroup" (bare) against "myGroup2.myGroup"
     // (scoped parent), never matched, and the no-op move ran, mangling indentation
     // and braces. With scoped-id targets the no-op guard matches exactly: unchanged.
-    let src = "MyGroup_2 = Group() -> () {\n  MyGroup = Group() -> () {\n    debug_4 = Debug {}\n  }\n}\n";
-    let out = apply(src, vec![EditOp::MoveNodeScope { node: "MyGroup_2.MyGroup.debug_4".into(), target_group: Some("MyGroup_2.MyGroup".into()) }]);
+    let src = "myGroup2 = Group() -> () {\n  myGroup = Group() -> () {\n    debug4 = Debug {}\n  }\n}\n";
+    let out = apply(src, vec![EditOp::MoveNodeScope { node: "myGroup2.myGroup.debug4".into(), target_group: Some("myGroup2.myGroup".into()) }]);
     assert_eq!(out, src, "depth-2 no-op must leave source byte-identical (no indent/brace corruption): {out:?}");
     parse_ok(&out);
 }
 
 #[test]
 fn move_node_out_one_level_at_depth2() {
-    // A real depth-2 move: debug_4 from MyGroup_2.MyGroup out to MyGroup_2 (target
-    // = the scoped id of MyGroup_2). Confirms the scoped-target contract relocates
+    // A real depth-2 move: debug4 from myGroup2.myGroup out to myGroup2 (target
+    // = the scoped id of myGroup2). Confirms the scoped-target contract relocates
     // correctly, not just no-ops.
-    let src = "MyGroup_2 = Group() -> () {\n  MyGroup = Group() -> () {\n    debug_4 = Debug {}\n  }\n}\n";
-    let out = apply(src, vec![EditOp::MoveNodeScope { node: "MyGroup_2.MyGroup.debug_4".into(), target_group: Some("MyGroup_2".into()) }]);
+    let src = "myGroup2 = Group() -> () {\n  myGroup = Group() -> () {\n    debug4 = Debug {}\n  }\n}\n";
+    let out = apply(src, vec![EditOp::MoveNodeScope { node: "myGroup2.myGroup.debug4".into(), target_group: Some("myGroup2".into()) }]);
     parse_ok(&out);
     let p = structure(&out);
-    assert!(p.nodes.iter().any(|n| n.id == "MyGroup_2.debug_4"), "debug_4 moved up to MyGroup_2: {out}");
-    assert!(!p.nodes.iter().any(|n| n.id == "MyGroup_2.MyGroup.debug_4"), "no longer in inner group: {out}");
+    assert!(p.nodes.iter().any(|n| n.id == "myGroup2.debug4"), "debug4 moved up to myGroup2: {out}");
+    assert!(!p.nodes.iter().any(|n| n.id == "myGroup2.myGroup.debug4"), "no longer in inner group: {out}");
 }
 
 #[test]
@@ -822,7 +822,7 @@ fn update_node_ports_drops_connections_on_removed_ports() {
     // Deleting a port must take its wires with it: a leftover
     // `x.y = n.removed` fails validation on the next build (the exact bug:
     // deleting the python node's `stop` output left
-    // `self.done = exec_python_1.stop` behind). For a NODE the removal is
+    // `self.done = execPython1.stop` behind). For a NODE the removal is
     // EXPLICIT (`removed_outputs`): the header is not the whole surface,
     // so absence from the signature alone must not kill a wire.
     let src = "n = Text() -> (kept: String, removed: String)\nd = Debug { }\nd.data = n.removed\nd2 = Debug { }\nd2.data = n.kept\n";
@@ -857,7 +857,7 @@ fn update_node_ports_drops_every_fanout_wire_of_a_removed_output() {
 
 #[test]
 fn update_node_ports_drops_incoming_connection_on_removed_input() {
-    let src = "src_1 = Text() -> (value: String)\nn = Text(a: String, b: String)\nn.a = src_1.value\nn.b = src_1.value\n";
+    let src = "src1 = Text() -> (value: String)\nn = Text(a: String, b: String)\nn.a = src1.value\nn.b = src1.value\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
         inputs: vec![PortSig { name: "a".into(), required: true, port_type: ("String".into()) }],
@@ -866,7 +866,7 @@ fn update_node_ports_drops_incoming_connection_on_removed_input() {
         removed_outputs: vec![],
     }]);
     assert!(!out.contains("n.b ="), "incoming wire on the removed input must die: {out}");
-    assert!(out.contains("n.a = src_1.value"), "kept input's wire survives: {out}");
+    assert!(out.contains("n.a = src1.value"), "kept input's wire survives: {out}");
     parse_ok(&out);
 }
 
@@ -875,7 +875,7 @@ fn update_node_ports_drops_body_driver_on_removed_input() {
     // A wire can live INSIDE the node's braces (`b: src.value`); the
     // parent-scope sweep never sees it, and left behind it re-creates
     // the port through the config key on the next enrich.
-    let src = "src_1 = Text() -> (value: String)\nn = Text(a: String, b: String) {\n  b: src_1.value\n}\n";
+    let src = "src1 = Text() -> (value: String)\nn = Text(a: String, b: String) {\n  b: src1.value\n}\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
         inputs: vec![PortSig { name: "a".into(), required: true, port_type: ("String".into()) }],
@@ -883,8 +883,8 @@ fn update_node_ports_drops_body_driver_on_removed_input() {
         removed_inputs: vec!["b".into()],
         removed_outputs: vec![],
     }]);
-    assert!(!out.contains("src_1.value") || !out.contains("b:"), "body driver on the removed input must die: {out}");
-    assert!(!out.contains("b: src_1.value"), "body driver line gone: {out}");
+    assert!(!out.contains("src1.value") || !out.contains("b:"), "body driver on the removed input must die: {out}");
+    assert!(!out.contains("b: src1.value"), "body driver line gone: {out}");
     parse_ok(&out);
 }
 
@@ -1045,13 +1045,13 @@ fn update_node_ports_removes_a_config_created_port() {
     // `notes` exists only through its config key (no header entry); the
     // removal sweeps its wires and is legal, the key's own line dies
     // through the editor's paired RemoveConfig.
-    let src = "src_1 = Text() -> (value: String)\nn = Text {\n  notes: \"x\"\n}\nd = Debug { }\nd.data = src_1.value\nn.notes = src_1.value\n";
+    let src = "src1 = Text() -> (value: String)\nn = Text {\n  notes: \"x\"\n}\nd = Debug { }\nd.data = src1.value\nn.notes = src1.value\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
         inputs: vec![], outputs: vec![],
         removed_inputs: vec!["notes".into()], removed_outputs: vec![],
     }]);
-    assert!(!out.contains("n.notes = src_1.value"), "the wire dies: {out}");
+    assert!(!out.contains("n.notes = src1.value"), "the wire dies: {out}");
     parse_ok(&out);
 }
 
@@ -1386,12 +1386,12 @@ fn set_config_never_destroys_an_inline_expression() {
     let (out, _) = apply_edits(src, "Untitled",
         &[EditOp::SetConfig { node: "b".into(), key: "data".into(), value: "\"lit\"".into(), form: None }]).expect("set config");
     parse_ok(&out);
-    assert!(out.contains("b_data = Upper { text: \"hi\" }"), "the subgraph survives, de-inlined: {out}");
+    assert!(out.contains("bData = Upper { text: \"hi\" }"), "the subgraph survives, de-inlined: {out}");
     assert!(compiled_edges(&out).is_empty(), "the literal replaced the wire: {out}");
     let (out2, _) = apply_edits(src, "Untitled",
         &[EditOp::RemoveConfig { node: "b".into(), key: "data".into(), form: None }]).expect("remove config");
     parse_ok(&out2);
-    assert!(out2.contains("b_data = Upper { text: \"hi\" }"), "the subgraph survives, de-inlined: {out2}");
+    assert!(out2.contains("bData = Upper { text: \"hi\" }"), "the subgraph survives, de-inlined: {out2}");
     assert!(compiled_edges(&out2).is_empty(), "the driver is dropped: {out2}");
 }
 
@@ -2195,8 +2195,10 @@ fn set_label_escapes_triple_backtick_value() {
     }])
     .expect("inner fence encodes");
     assert!(out.contains("\\```"), "escaped fence in source: {out}");
-    let project = crate::weft_compiler::compile(&out, uuid::Uuid::nil(), crate::CompileFs::none())
-        .expect("edited source parses");
+    let (project, errors) = crate::weft_compiler::compile_lenient(
+        &out, uuid::Uuid::nil(), crate::CompileFs::none(), crate::weft_compiler::IncludeMode::Full, None,
+    );
+    assert!(errors.is_empty(), "edited source parses: {errors:?}");
     let n = project.nodes.iter().find(|n| n.id == "n").expect("node");
     assert_eq!(n.label.as_deref(), Some("a\n```\nb"), "label round-trips verbatim");
 
@@ -2223,8 +2225,10 @@ fn heredoc_content_is_verbatim() {
         form: None,
     }])
     .expect("edit applies");
-    let project = crate::weft_compiler::compile(&out, uuid::Uuid::nil(), crate::CompileFs::none())
-        .expect("edited source parses");
+    let (project, errors) = crate::weft_compiler::compile_lenient(
+        &out, uuid::Uuid::nil(), crate::CompileFs::none(), crate::weft_compiler::IncludeMode::Full, None,
+    );
+    assert!(errors.is_empty(), "edited source parses: {errors:?}");
     let n = project.nodes.iter().find(|n| n.id == "n").expect("node");
     assert_eq!(
         n.config.get("value").and_then(|v| v.as_str()),
@@ -2276,7 +2280,7 @@ fn set_config_over_a_oneliner_inline_extracts_then_sets() {
     let out = apply("g = Template { template: Upper { text: \"hi\" }.out }\n",
         vec![EditOp::SetConfig { node: "g".into(), key: "template".into(), value: "\"plain\"".into(), form: None }]);
     parse_ok(&out);
-    assert!(out.contains("g_template = Upper { text: \"hi\" }"), "old driver extracted: {out}");
+    assert!(out.contains("gTemplate = Upper { text: \"hi\" }"), "old driver extracted: {out}");
     assert_eq!(compiled_config(&out, "g", "template"), Some(serde_json::json!("plain")), "{out}");
 }
 
@@ -2749,16 +2753,16 @@ fn set_config_node_same_key_twice_in_batch() {
 fn end_to_end_recover_broken_loop_file() {
     // The broken file Quentin saw: duplicate over/carry from a pre-fix
     // race. A single set_config per key collapses its duplicates.
-    let src = "MyLoop = Loop(test?) {\n  parallel: true\n  over: []\n  over: []\n  carry: []\n  carry: [\n  \"test\"\n]\n  carry: [\n  \"test\"\n]\n}\n";
+    let src = "myLoop = Loop(test?) {\n  parallel: true\n  over: []\n  over: []\n  carry: []\n  carry: [\n  \"test\"\n]\n  carry: [\n  \"test\"\n]\n}\n";
     let out = apply(src, vec![
-        EditOp::SetLoopConfig { loop_id: "MyLoop".into(), key: "carry".into(), value: "[\n  \"test\"\n]".into() },
+        EditOp::SetLoopConfig { loop_id: "myLoop".into(), key: "carry".into(), value: "[\n  \"test\"\n]".into() },
     ]);
     parse_ok(&out);
     assert_eq!(out.matches("carry:").count(), 1, "carry collapsed: {out}");
     // over still duplicated until the user edits it; the next edit on over
     // collapses those too.
     let out2 = apply(&out, vec![
-        EditOp::SetLoopConfig { loop_id: "MyLoop".into(), key: "over".into(), value: "[]".into() },
+        EditOp::SetLoopConfig { loop_id: "myLoop".into(), key: "over".into(), value: "[]".into() },
     ]);
     parse_ok(&out2);
     assert_eq!(out2.matches("over:").count(), 1, "over collapsed: {out2}");
@@ -2770,15 +2774,15 @@ fn set_config_does_not_accumulate_blank_lines() {
     // between the previous decl's last token and the new one, never more.
     // Without the explicit-layout helper, every iteration leaked an extra
     // blank line into the body (snippet trailing + body trailing).
-    let src0 = "MyLoop = Loop() -> () {\n  parallel: true\n}\n";
+    let src0 = "myLoop = Loop() -> () {\n  parallel: true\n}\n";
     let src1 = apply(src0, vec![
-        EditOp::SetLoopConfig { loop_id: "MyLoop".into(), key: "over".into(), value: "[\n  \"test\"\n]".into() },
+        EditOp::SetLoopConfig { loop_id: "myLoop".into(), key: "over".into(), value: "[\n  \"test\"\n]".into() },
     ]);
     let src2 = apply(&src1, vec![
-        EditOp::SetLoopConfig { loop_id: "MyLoop".into(), key: "carry".into(), value: "[]".into() },
+        EditOp::SetLoopConfig { loop_id: "myLoop".into(), key: "carry".into(), value: "[]".into() },
     ]);
     let src3 = apply(&src2, vec![
-        EditOp::SetLoopConfig { loop_id: "MyLoop".into(), key: "over".into(), value: "[\n  \"test2\"\n]".into() },
+        EditOp::SetLoopConfig { loop_id: "myLoop".into(), key: "over".into(), value: "[\n  \"test2\"\n]".into() },
     ]);
     parse_ok(&src3);
     // No three-in-a-row newlines: that pattern is the symptom of a leaked
@@ -2794,10 +2798,10 @@ fn set_config_does_not_accumulate_blank_lines() {
 fn update_ports_inside_loop_body_keeps_layout() {
     // Editing a port on a decl that lives inside a loop body must not touch
     // the surrounding decls or the loop's config layout.
-    let src = "MyLoop = Loop(numbers?: List[Number]) -> () {\n  carry: []\n  over: [\"numbers\"]\n  exec_python_1 = ExecPython() {}\n}\n\nrange_1 = Range {\n  from: \"0\"\n}\nMyLoop.numbers = range_1.values\n";
+    let src = "myLoop = Loop(numbers?: List[Number]) -> () {\n  carry: []\n  over: [\"numbers\"]\n  execPython1 = ExecPython() {}\n}\n\nrange1 = Range {\n  from: \"0\"\n}\nmyLoop.numbers = range1.values\n";
     let out = apply(src, vec![
         EditOp::UpdateNodePorts {
-            node: "MyLoop.exec_python_1".into(),
+            node: "myLoop.execPython1".into(),
             inputs: vec![
                 crate::edit::PortSig { name: "number".into(), required: false, port_type: ("".into()) },
             ],
@@ -2807,8 +2811,8 @@ fn update_ports_inside_loop_body_keeps_layout() {
         },
     ]);
     parse_ok(&out);
-    assert!(out.contains("\n  exec_python_1 = ExecPython(number?) {}"), "2-space indent preserved: {out}");
-    assert!(out.ends_with("MyLoop.numbers = range_1.values\n"), "trailing connection intact: {out}");
+    assert!(out.contains("\n  execPython1 = ExecPython(number?) {}"), "2-space indent preserved: {out}");
+    assert!(out.ends_with("myLoop.numbers = range1.values\n"), "trailing connection intact: {out}");
 }
 
 #[test]
@@ -2818,11 +2822,11 @@ fn update_ports_at_root_does_not_glue_onto_preceding_connection() {
     // whole decl (including that token) on a port edit; if the replacement
     // doesn't re-inject the newline, the new decl glues onto the previous
     // CONNECTION line. Quentin saw this produce
-    // `MyLoop.numbers = range_1.valuesexec_python_1 = ExecPython...`.
-    let src = "MyLoop = Loop() -> () {\n  parallel: true\n}\n\nrange_1 = Range {\n  from: \"0\"\n}\nMyLoop.numbers = range_1.values\nexec_python_1 = ExecPython() {}\n";
+    // `myLoop.numbers = range1.valuesexecPython1 = ExecPython...`.
+    let src = "myLoop = Loop() -> () {\n  parallel: true\n}\n\nrange1 = Range {\n  from: \"0\"\n}\nmyLoop.numbers = range1.values\nexecPython1 = ExecPython() {}\n";
     let out = apply(src, vec![
         EditOp::UpdateNodePorts {
-            node: "exec_python_1".into(),
+            node: "execPython1".into(),
             inputs: vec![
                 crate::edit::PortSig { name: "test".into(), required: false, port_type: ("".into()) },
             ],
@@ -2832,8 +2836,8 @@ fn update_ports_at_root_does_not_glue_onto_preceding_connection() {
         },
     ]);
     parse_ok(&out);
-    assert!(!out.contains("range_1.valuesexec_python"), "no glue: {out}");
-    assert!(out.contains("range_1.values\nexec_python_1"), "newline kept between connection and decl: {out}");
+    assert!(!out.contains("range1.valuesexec_python"), "no glue: {out}");
+    assert!(out.contains("range1.values\nexecPython1"), "newline kept between connection and decl: {out}");
 }
 
 #[test]
@@ -2841,10 +2845,10 @@ fn update_ports_does_not_double_indent() {
     // Bug repro: rebuild_decl used to prepend the decl's current
     // leading_indent AND keep the leading-WS sibling token, doubling the
     // indent on every edit (a 2-space child would become 4, then 8...).
-    let src = "MyLoop = Loop() -> () {\n  parallel: true\n  exec_python_1 = ExecPython() {}\n}\n";
+    let src = "myLoop = Loop() -> () {\n  parallel: true\n  execPython1 = ExecPython() {}\n}\n";
     let out = apply(src, vec![
         EditOp::UpdateNodePorts {
-            node: "MyLoop.exec_python_1".into(),
+            node: "myLoop.execPython1".into(),
             inputs: vec![
                 crate::edit::PortSig { name: "test".into(), required: false, port_type: ("".into()) },
             ],
@@ -2854,13 +2858,13 @@ fn update_ports_does_not_double_indent() {
         },
     ]);
     parse_ok(&out);
-    assert!(out.contains("\n  exec_python_1 = ExecPython(test"), "still 2-space: {out}");
-    assert!(!out.contains("\n    exec_python_1 = ExecPython(test"), "no 4-space drift: {out}");
+    assert!(out.contains("\n  execPython1 = ExecPython(test"), "still 2-space: {out}");
+    assert!(!out.contains("\n    execPython1 = ExecPython(test"), "no 4-space drift: {out}");
 
     // Edit again. The indent must remain 2-space.
     let out2 = apply(&out, vec![
         EditOp::UpdateNodePorts {
-            node: "MyLoop.exec_python_1".into(),
+            node: "myLoop.execPython1".into(),
             inputs: vec![
                 crate::edit::PortSig { name: "again".into(), required: false, port_type: ("".into()) },
             ],
@@ -2870,21 +2874,21 @@ fn update_ports_does_not_double_indent() {
         },
     ]);
     parse_ok(&out2);
-    assert!(out2.contains("\n  exec_python_1 = ExecPython(again"), "still 2-space after second edit: {out2}");
-    assert!(!out2.contains("\n    exec_python_1"), "no drift on repeat: {out2}");
+    assert!(out2.contains("\n  execPython1 = ExecPython(again"), "still 2-space after second edit: {out2}");
+    assert!(!out2.contains("\n    execPython1"), "no drift on repeat: {out2}");
 }
 
 #[test]
 fn move_scope_into_loop_uses_body_indent() {
-    let src = "MyLoop = Loop(numbers?: List[Number]) -> () {\n  parallel: true\n}\nexec_python_1 = ExecPython() {}\n";
+    let src = "myLoop = Loop(numbers?: List[Number]) -> () {\n  parallel: true\n}\nexecPython1 = ExecPython() {}\n";
     let out = apply(src, vec![
         EditOp::MoveNodeScope {
-            node: "exec_python_1".into(),
-            target_group: Some("MyLoop".into()),
+            node: "execPython1".into(),
+            target_group: Some("myLoop".into()),
         },
     ]);
     parse_ok(&out);
-    assert!(out.contains("\n  exec_python_1 = ExecPython"), "moved decl gets 2-space indent: {out}");
+    assert!(out.contains("\n  execPython1 = ExecPython"), "moved decl gets 2-space indent: {out}");
 }
 
 #[test]
@@ -2892,15 +2896,15 @@ fn move_scope_into_loop_with_multiline_carry_field() {
     // The body's last child before `}` is a multi-line JSON value. The
     // helper that finds the body's content indent must read the body's
     // first field, not the JSON value's closing line.
-    let src = "MyLoop = Loop(numbers?: List[Number]) -> () {\n  carry: [\n  \"acc\"\n]\n  over: [\n  \"numbers\"\n]\n}\nexec_python_1 = ExecPython() {}\n";
+    let src = "myLoop = Loop(numbers?: List[Number]) -> () {\n  carry: [\n  \"acc\"\n]\n  over: [\n  \"numbers\"\n]\n}\nexecPython1 = ExecPython() {}\n";
     let out = apply(src, vec![
         EditOp::MoveNodeScope {
-            node: "exec_python_1".into(),
-            target_group: Some("MyLoop".into()),
+            node: "execPython1".into(),
+            target_group: Some("myLoop".into()),
         },
     ]);
     parse_ok(&out);
-    assert!(out.contains("\n  exec_python_1 = ExecPython"), "moved decl gets body's 2-space indent: {out}");
+    assert!(out.contains("\n  execPython1 = ExecPython"), "moved decl gets body's 2-space indent: {out}");
 }
 
 #[test]
@@ -3084,12 +3088,12 @@ fn wiring_an_inline_node_de_inlines_it_with_the_wire_kept() {
         target: "c".into(), target_port: "input".into(), scope_group: None, path: vec![],
     }]);
     parse_ok(&out);
-    assert!(out.contains("a_data = Text"), "extracted named node: {out}");
-    assert!(out.contains("data: a_data.value"), "the host wire became explicit: {out}");
-    assert!(out.contains("c.input = a_data.value"), "the new edge exists: {out}");
+    assert!(out.contains("aData = Text"), "extracted named node: {out}");
+    assert!(out.contains("data: aData.value"), "the host wire became explicit: {out}");
+    assert!(out.contains("c.input = aData.value"), "the new edge exists: {out}");
     let edges = compiled_edges(&out);
-    assert!(edges.contains(&("a_data".into(), "a".into())), "host wire survives: {edges:?}");
-    assert!(edges.contains(&("a_data".into(), "c".into())), "new edge exists: {edges:?}");
+    assert!(edges.contains(&("aData".into(), "a".into())), "host wire survives: {edges:?}");
+    assert!(edges.contains(&("aData".into(), "c".into())), "new edge exists: {edges:?}");
 }
 
 #[test]
@@ -3191,8 +3195,8 @@ fn remove_node_on_a_middle_inline_extracts_its_children() {
     // Z survives as a named node with its config intact.
     assert!(out.contains("= Z {"), "the nested child was extracted, not deleted: {out}");
     let nodes = compiled_node_ids(&out);
-    assert!(nodes.iter().any(|n| n == "a_data_v_w"), "extracted orphan exists: {nodes:?}");
-    assert_eq!(compiled_config(&out, "a_data_v_w", "u"), Some(serde_json::json!("1")));
+    assert!(nodes.iter().any(|n| n == "aDataVW"), "extracted orphan exists: {nodes:?}");
+    assert_eq!(compiled_config(&out, "aDataVW", "u"), Some(serde_json::json!("1")));
 }
 
 #[test]
@@ -3221,7 +3225,7 @@ fn inline_groups_are_rejected_by_compile_and_removable_by_edit() {
         None,
     );
     assert!(
-        errors.iter().any(|e| e.message.contains("Groups cannot be inlined")),
+        errors.iter().any(|e| e.message.contains("a Group cannot be written inline")),
         "{errors:?}"
     );
 
@@ -3267,9 +3271,9 @@ fn removing_the_synthesized_wire_extracts_the_inline_as_an_orphan() {
         target: "a".into(), target_port: "data".into(), scope_group: None,
     }]);
     parse_ok(&out);
-    assert!(out.contains("a_data = Text"), "orphan extracted: {out}");
+    assert!(out.contains("aData = Text"), "orphan extracted: {out}");
     assert!(compiled_edges(&out).is_empty(), "the wire is gone: {out}");
-    assert_eq!(compiled_config(&out, "a_data", "value"), Some(serde_json::json!("x")));
+    assert_eq!(compiled_config(&out, "aData", "value"), Some(serde_json::json!("x")));
 
     // Braces form: same semantics.
     let src = "a = Debug {\n  data: Text { value: \"x\" }.value\n}\n";
@@ -3278,7 +3282,7 @@ fn removing_the_synthesized_wire_extracts_the_inline_as_an_orphan() {
         target: "a".into(), target_port: "data".into(), scope_group: None,
     }]);
     parse_ok(&out);
-    assert!(out.contains("a_data = Text"), "orphan extracted: {out}");
+    assert!(out.contains("aData = Text"), "orphan extracted: {out}");
     assert!(compiled_edges(&out).is_empty(), "the wire is gone: {out}");
 }
 
@@ -3302,10 +3306,10 @@ fn replacing_an_inline_driver_with_an_edge_extracts_it_as_an_orphan() {
         target: "a".into(), target_port: "data".into(), scope_group: None, path: vec![],
     }]);
     parse_ok(&out);
-    assert!(out.contains("a_data = Old"), "old driver survives as an orphan: {out}");
+    assert!(out.contains("aData = Old"), "old driver survives as an orphan: {out}");
     let edges = compiled_edges(&out);
     assert!(edges.contains(&("t".into(), "a".into())), "{edges:?}");
-    assert!(!edges.iter().any(|(s, _)| s == "a_data"), "old driver is unwired: {edges:?}");
+    assert!(!edges.iter().any(|(s, _)| s == "aData"), "old driver is unwired: {edges:?}");
 }
 
 #[test]
@@ -3328,8 +3332,8 @@ fn set_config_over_an_inline_driven_key_extracts_the_old_driver() {
         node: "a".into(), key: "data".into(), value: "\"literal\"".into(), form: None,
     }]);
     parse_ok(&out);
-    assert!(out.contains("a_data = Text"), "old driver survives as an orphan: {out}");
-    assert_eq!(compiled_config(&out, "a_data", "value"), Some(serde_json::json!("x")));
+    assert!(out.contains("aData = Text"), "old driver survives as an orphan: {out}");
+    assert_eq!(compiled_config(&out, "aData", "value"), Some(serde_json::json!("x")));
     // The literal now drives the input (it lands in the compiled
     // definition on the host).
     let (project, _) = crate::weft_compiler::compile_lenient(
@@ -3349,12 +3353,12 @@ fn removing_a_host_extracts_its_inline_drivers_as_orphans() {
     let out = apply(src, vec![EditOp::RemoveNode { node: "a".into() }]);
     parse_ok(&out);
     assert!(!out.contains("a = Sink"), "{out}");
-    assert!(out.contains("a_x = One"), "braces inline driver extracted: {out}");
-    assert!(out.contains("a_z = Two"), "statement inline driver extracted: {out}");
+    assert!(out.contains("aX = One"), "braces inline driver extracted: {out}");
+    assert!(out.contains("aZ = Two"), "statement inline driver extracted: {out}");
     assert!(out.contains("t = Text"), "plain neighbor survives: {out}");
     assert!(compiled_edges(&out).is_empty(), "every wire died with the node: {out}");
-    assert_eq!(compiled_config(&out, "a_x", "v"), Some(serde_json::json!("1")));
-    assert_eq!(compiled_config(&out, "a_z", "w"), Some(serde_json::json!("2")));
+    assert_eq!(compiled_config(&out, "aX", "v"), Some(serde_json::json!("1")));
+    assert_eq!(compiled_config(&out, "aZ", "w"), Some(serde_json::json!("2")));
 }
 
 #[test]
@@ -3413,7 +3417,7 @@ fn removing_a_host_clears_a_self_reference_inside_its_own_inline_driver() {
     parse_ok(&out);
     assert!(!out.contains("a.value"), "no dangling reference to the removed host: {out}");
     let nodes = compiled_node_ids(&out);
-    assert!(nodes.iter().any(|n| n == "a_data"), "the driver survives as an orphan: {nodes:?}\n{out}");
+    assert!(nodes.iter().any(|n| n == "aData"), "the driver survives as an orphan: {nodes:?}\n{out}");
     assert!(!nodes.iter().any(|n| n == "a"), "{nodes:?}");
     assert!(
         compiled_edges(&out).iter().all(|(s, t)| s != "a" && t != "a"),
@@ -3430,7 +3434,7 @@ fn extraction_inside_a_group_stays_in_the_group() {
     }]);
     parse_ok(&out);
     let nodes = compiled_node_ids(&out);
-    assert!(nodes.iter().any(|n| n == "g.b_data"), "orphan lives INSIDE the group: {nodes:?}\n{out}");
+    assert!(nodes.iter().any(|n| n == "g.bData"), "orphan lives INSIDE the group: {nodes:?}\n{out}");
 }
 
 #[test]
@@ -3444,9 +3448,9 @@ fn updating_ports_on_an_inline_de_inlines_it() {
         removed_outputs: vec![],
     }]);
     parse_ok(&out);
-    assert!(out.contains("a_data = Custom"), "{out}");
+    assert!(out.contains("aData = Custom"), "{out}");
     assert!(out.contains("-> (o: String)"), "signature written: {out}");
-    assert!(compiled_edges(&out).contains(&("a_data".into(), "a".into())), "wire kept: {out}");
+    assert!(compiled_edges(&out).contains(&("aData".into(), "a".into())), "wire kept: {out}");
 }
 #[test]
 fn set_config_on_a_bodyless_decl_keeps_its_leading_newlines() {
@@ -3454,22 +3458,22 @@ fn set_config_on_a_bodyless_decl_keeps_its_leading_newlines() {
     // statement as its own leading trivia. Synthesizing a body rebuilds
     // the whole decl, so that trivia must be re-emitted verbatim; the
     // historical failure fused the decl onto the line above
-    // (`debug_1.data = n.rowsgoogle_access_1 = GoogleAccess {`),
+    // (`debug1.data = n.rowsgoogleAccess1 = GoogleAccess {`),
     // corrupting the source. Exactly the connect gesture's shape: a
     // bodyless access node, mid-file, receiving its connection handle.
-    let src = "google_sheets_read_1 = GoogleSheetsRead\n\ndebug_1 = Debug {}\ndebug_1.data = google_sheets_read_1.rows\n\ngoogle_access_1 = GoogleAccess\ngoogle_sheets_read_1.account = google_access_1.access\n";
+    let src = "googleSheetsRead1 = GoogleSheetsRead\n\ndebug1 = Debug {}\ndebug1.data = googleSheetsRead1.rows\n\ngoogleAccess1 = GoogleAccess\ngoogleSheetsRead1.account = googleAccess1.access\n";
     let value = "{\n  \"id\": \"6a46700e\",\n  \"identity\": \"admin@weavemind.ai\"\n}";
     let ops = vec![EditOp::SetConfig {
-        node: "google_access_1".into(),
+        node: "googleAccess1".into(),
         key: "account".into(),
         value: value.into(),
         form: None,
     }];
     let out = apply(src, ops.clone());
     parse_ok(&out);
-    assert!(!out.contains("rowsgoogle_access_1"), "newline eaten: {out}");
+    assert!(!out.contains("rowsgoogleAccess1"), "newline eaten: {out}");
     assert!(
-        out.contains("google_sheets_read_1.rows\n\ngoogle_access_1 = GoogleAccess {"),
+        out.contains("googleSheetsRead1.rows\n\ngoogleAccess1 = GoogleAccess {"),
         "the blank line between statements survives: {out}"
     );
     assert_reversible(src, ops);

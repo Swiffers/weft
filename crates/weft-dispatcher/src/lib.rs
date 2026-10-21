@@ -1,7 +1,12 @@
 //! The weft dispatcher role.
 //!
 //! Owns:
-//! - Event routing (webhook URLs, form URLs, cron, infra events).
+//! - Event routing: the install's public door (`door`), and every event
+//!   that comes through it (a call at a webhook or form URL, a provider's
+//!   push), which the listener says what it is and the dispatcher hands to
+//!   its entry's worker door or its waiting run (`api::signal`). A timer
+//!   (a cron) is not routed here: the platform's alarm wakes the listener,
+//!   which hands its fire over itself (`weft_listener::fire_sink`).
 //! - Handing runs to the project's workers (`delivery`, through
 //!   the platform's `Runner`).
 //! - Infrastructure orchestration: the `infra_lifecycle_command` table the
@@ -40,7 +45,6 @@ pub mod infra_bake;
 pub mod infra_door;
 pub mod infra_node;
 pub mod infra_owner;
-pub mod journal;
 pub mod lapses;
 pub mod lease;
 pub mod lifecycle_claimer;
@@ -62,6 +66,7 @@ pub mod reclaim;
 pub mod retention;
 pub mod search_index;
 pub mod state;
+pub mod store;
 pub mod broker_admin;
 pub mod role_client;
 pub mod storage;
@@ -86,6 +91,4 @@ pub use events::{DispatcherEvent, EventBus};
 pub use project_store::{
     PostgresProjectStore, ProjectStatus as StoreStatus, ProjectStore, ProjectStoreOps,
 };
-#[cfg(any(test, feature = "test-helpers"))]
-pub use project_store::FakeProjectStore;
 pub use state::DispatcherState;

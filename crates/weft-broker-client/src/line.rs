@@ -1,6 +1,7 @@
-//! The line: one WebSocket from a process to the broker, kept open for
-//! the life of the process, that every JSON call of every broker client
-//! of that process travels on, and that the broker pushes news down.
+//! The line: one WebSocket from a process to the broker, open while the
+//! process has something to ask or hear (it closes when idle, see below),
+//! that every JSON call of every broker client of that process travels
+//! on, and that the broker pushes news down.
 //!
 //! A call used to be an HTTPS request of its own, and a call the broker
 //! holds open until something happens (a cancel, new journal rows, a task
@@ -37,8 +38,8 @@
 //! missed and that `Following` is no recheck: nobody looks again, and the
 //! replacement reads nothing from the database. The exception is a first
 //! line that had stopped hearing: its gap is looked at once a line hears
-//! again, and a recheck it still sends while it retires is passed on. A worker replaces its line
-//! while it works; a worker whose runs only wait lets nothing open a line
+//! again, and a recheck it still sends while it retires is passed on. A
+//! worker replaces its line while it works; a worker whose runs only wait lets nothing open a line
 //! (the broker copy it lands on may have to read who it is), and stops
 //! before the cut instead.
 //!
@@ -245,14 +246,14 @@ pub const LINE_CHANNELS: &[&str] = &[INFRA_STATUS_CHANNEL, ACCESS_CHANNEL, CANCE
 /// entry armed, re-armed or taken down, or how its activation stands (the
 /// signal, project and activation groups' triggers). The dispatchers read
 /// the tenant's routes again (`weft_dispatcher::held`); it rides no line.
-// SYNC: ROUTES_CHANNEL <-> crates/weft-dispatcher/src/journal/postgres.rs (routes_notify_tenant), crates/weft-dispatcher/src/activation_store.rs (trigger_activation_routes_notify)
+// SYNC: ROUTES_CHANNEL <-> crates/weft-dispatcher/src/store/postgres.rs (routes_notify_tenant), crates/weft-dispatcher/src/activation_store.rs (trigger_activation_routes_notify)
 pub const ROUTES_CHANNEL: &str = "weft_routes";
 
 /// Announced with a project's id when one of its triggers changes: armed,
 /// re-armed or taken down, its holder changed, or how its activation stands
 /// (the signal and activation groups' triggers). Its workers read
 /// the project's triggers again (`/v1/door/triggers`).
-// SYNC: TRIGGERS_CHANNEL <-> crates/weft-dispatcher/src/journal/postgres.rs (triggers_notify_project), crates/weft-dispatcher/src/activation_store.rs (trigger_activation_triggers_notify)
+// SYNC: TRIGGERS_CHANNEL <-> crates/weft-dispatcher/src/store/postgres.rs (triggers_notify_project), crates/weft-dispatcher/src/activation_store.rs (trigger_activation_triggers_notify)
 pub const TRIGGERS_CHANNEL: &str = "weft_triggers";
 
 /// Announced with a project's id when one of its infra copies comes,

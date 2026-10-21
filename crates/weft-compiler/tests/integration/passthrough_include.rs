@@ -1,7 +1,7 @@
 //! Layer-3: an included file whose output only passes its input on
 //! (`self.y = self.x`, no node inside), used once and used twice in a
 //! chain. The compiler is real; the program index is what a run reads.
-use weft_compiler::weft_compiler::compile;
+use crate::rig::compile;
 use weft_compiler::CompileFs;
 use weft_core::frames::Located;
 use weft_core::project::graph::ProjectGraph;

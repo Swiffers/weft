@@ -60,7 +60,7 @@ pub fn escapes_root(relative: &Path) -> String {
 ///
 /// `base` is the directory the reference is relative to (the referencing file's
 /// own directory). The error is a human-facing string the caller wraps in a
-/// `CompileError` at the field's span: no error type, because every backing's
+/// `SourceError` at the field's span: no error type, because every backing's
 /// failure ("escapes the root", "not found", "is not valid UTF-8") is just a
 /// message pointed at a source line.
 pub trait FileReader {

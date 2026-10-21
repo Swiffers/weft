@@ -9,7 +9,7 @@
  * SYNC: weft highlighting <-> packages/weft-syntax/weft.tmLanguage.json,
  *       crates/weft-compiler/src/cst/lexer.rs (the token rules),
  *       crates/weft-compiler/src/weft_compiler.rs RESERVED_CONFIG_KEYS +
- *       RESERVED_WORDS + RESERVED_TYPE_KEYWORDS,
+ *       RESERVED_WORDS, crates/weft-core/src/project.rs own_types::ALL,
  *       crates/weft-core/src/weft_type.rs (the type vocabulary),
  *       crates/weft-compiler/tests/integration/highlighting_vocabulary.rs (the word-list alarm)
  *
@@ -69,7 +69,7 @@
         // The port half of `node.port`.
         { className: 'symbol', begin: '(?<=\\.)' + IDENT },
 
-        { className: 'keyword', begin: '\\b(Group|Loop|LoopIn|LoopOut|self|type)\\b' },
+        { className: 'keyword', begin: '\\b(Group|Loop|LoopIn|LoopOut|IncludedGroup|self|type)\\b' },
 
         {
           className: 'type',

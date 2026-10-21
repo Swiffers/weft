@@ -20,7 +20,7 @@ pub mod unrecorded;
 pub use events::{redacted, RunEvent, Seed};
 pub use fold::{fold_to_snapshot, unpriced_charges_closed, unpriced_cost, ChargeBook, EndedWait, FiringView, Fold, FoldEffects, OpenedCharge};
 pub use seed::{fold_seeded, seed_chain, LiveFold, SeedChain};
-pub use traits::{BatchError, JournalClient, JournalRow, NoopJournal, Position, RecordClient};
+pub use traits::{BatchError, JournalClient, JournalRow, Position, RecordClient};
 
 /// The channel a run's new rows are announced on (by the broker after a
 /// batch of records commits, at most every few milliseconds; by the

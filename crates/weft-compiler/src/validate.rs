@@ -1,10 +1,8 @@
 //! Graph validation. Runs after enrichment. Emits structured
 //! Diagnostic objects (errors + warnings) for the IDE's Problems
-//! panel and for the full compile pipeline.
-//!
-//! Ported from v1's weft-parser.ts validation passes; line ranges
-//! for each rule documented at the helper function that implements
-//! it.
+//! panel and for the full compile pipeline. Each rule is documented at
+//! the helper function that implements it, under the diagnostic code it
+//! emits.
 
 use weft_core::rules::{has_incoming_edge, literal_fills};
 use weft_core::node::{
@@ -1303,8 +1301,6 @@ fn cfg_push(
 /// same-scope dups at parse time, but scope-aware dups may still
 /// collide post-flatten due to inline expressions, group renames, or
 /// bad manual input).
-///
-/// v1 ref: weft-parser.ts:4089-4090
 fn check_duplicates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     let mut seen: std::collections::HashMap<&str, usize> = Default::default();
     for node in &project.nodes {
@@ -1604,8 +1600,6 @@ fn end_name(project: &ProjectDefinition, end: &LineEnd) -> String {
 /// unknown-source-node / unknown-target-node: edges must reference
 /// nodes (or groups, for a wire starting at a group's port or landing on
 /// its gate) that actually exist in the project.
-///
-/// v1 ref: weft-parser.ts:4467-4470
 fn check_edge_node_refs(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     let ids: std::collections::HashSet<&str> =
         project.nodes.iter().map(|n| n.id.as_str()).chain(project.groups.iter().map(|g| g.id.as_str())).collect();
@@ -1652,11 +1646,9 @@ fn check_edge_node_refs(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 /// scope reaches through a group's wall without its port. A loop's two
 /// boundary nodes stand for its ports on both sides, so a line to one of
 /// them is the loop's own business (`check_loop_config`).
-///
-/// v1 ref: weft-parser.ts:4492-4495
 fn check_scope_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     let loop_boundary = |end: &LineEnd| matches!(end, LineEnd::Node { id, .. }
-        if project.nodes.iter().any(|n| n.id == *id && crate::enrich::is_lowering_builtin(&n.node_type)));
+        if project.nodes.iter().any(|n| n.id == *id && weft_core::project::boundary_types::is_boundary(&n.node_type)));
     for line in lines(project) {
         if loop_boundary(&line.from) || loop_boundary(&line.to) {
             continue;
@@ -1770,8 +1762,6 @@ fn author_name_by_id<'a>(project: &'a ProjectDefinition, id: &'a str) -> &'a str
 /// duplicate-input-port (1:1 rule): what a line lands on (a node's input,
 /// a group's input from outside, a group's output from inside) has at
 /// most one line into it.
-///
-/// v1 ref: weft-parser.ts:4502-4518 (resolution) + `didYouMean` helper
 fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     use weft_core::project::CrossingSide;
     let by_id: std::collections::HashMap<&str, &weft_core::project::NodeDefinition> =
@@ -2399,9 +2389,6 @@ fn starts_at_group_constant(project: &ProjectDefinition, wire: &weft_core::proje
 ///   `_should_not_flow`) that is not a Boolean.
 /// undeclared-port-no-custom: node doesn't support canAddInputPorts
 ///   but config has a key not matching any declared input.
-///
-/// v1 refs: 3428-3470 (required + require_one_of), 3502-3506
-/// (wired-only), 4313-4319 (undeclared-no-custom).
 fn check_port_coverage(
     project: &ProjectDefinition,
     catalog: &dyn MetadataCatalog,
@@ -2772,10 +2759,10 @@ fn check_port_coverage(
         }
     }
 
-    // Note: literal-to-output-port from the v1 audit is enforced at
-    // parse time: a `node.port = "literal"` line is lowered to a config
-    // field on the node (not an edge), which the port checks reject when
-    // the target port is output-only. No extra check needed at validate.
+    // A literal written on an output port needs no check of its own:
+    // lowering turns a `node.port = "literal"` line into a config field
+    // on the node (not an edge), which the port checks reject when the
+    // target port is output-only.
 }
 
 /// The entries a node derives its ports from (a form's `fields`, a
@@ -3863,12 +3850,7 @@ fn check_name_casing(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
     for group in &project.groups {
         let file = group.source_file.as_deref();
         let span = group.header_span.unwrap_or_default();
-        let what = match group.kind {
-            weft_core::project::GroupKind::Group => "group",
-            weft_core::project::GroupKind::Loop { .. } => "loop",
-            weft_core::project::GroupKind::Call { .. } => "include",
-            weft_core::project::GroupKind::Body => "included file",
-        };
+        let what = group.kind.noun();
         let mut seen = Vec::new();
         if !group.anonymous && !matches!(group.kind, weft_core::project::GroupKind::Body) {
             warn(d, &group.id, file, span, &mut seen, what, local(&group.id));

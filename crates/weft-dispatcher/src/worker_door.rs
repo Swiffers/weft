@@ -31,7 +31,7 @@ pub(crate) use lost_run;
 
 /// Let go of the runs whose owner went away ([`lost_run!`]): a run asked
 /// to stop ends, else a durable run is queued again, a fast run ends
-/// (`crate::journal::Journal::let_go_of_lost`). Each run is taken under
+/// (`crate::store::RunStore::let_go_of_lost`). Each run is taken under
 /// its own row lock, so a batch its old owner sends meanwhile and this
 /// sweep never write the run at once, and the epoch this raises refuses
 /// whichever of that owner's batches comes after. A worker whose runs only
@@ -81,11 +81,11 @@ async fn let_go_of(
             false => crate::api::run::program_for_cancel(state, run_id).await,
         };
         let let_go = match program {
-            Ok(program) => state.journal.let_go_of_lost(run_id, lapsed_before, program.as_deref()).await,
+            Ok(program) => state.runs.let_go_of_lost(run_id, lapsed_before, program.as_deref()).await,
             Err(e) => Err(e),
         };
         match let_go {
-            Ok(crate::journal::Lost::NotLost) => {}
+            Ok(crate::store::Lost::NotLost) => {}
             Ok(lost) => tracing::warn!(target: "weft_dispatcher::worker_door", %run_id, ?lost, "a run whose worker went away was let go of"),
             Err(e) => {
                 tracing::warn!(

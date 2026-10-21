@@ -3,7 +3,7 @@
 //! The compiler is real; the cut is the program the run runs.
 use std::collections::BTreeSet;
 
-use weft_compiler::weft_compiler::compile;
+use crate::rig::compile;
 use weft_compiler::CompileFs;
 use weft_core::frames::{Frame, Located};
 use weft_core::project::cut::{self, SelectionBounds};

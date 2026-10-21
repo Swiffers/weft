@@ -49,8 +49,9 @@ pub(crate) static WAKE_ON: &[WakeOn] = &[
 /// The channel that says a project's workers may take its runs again, with
 /// the project as the payload: a worker's lease coming alive while the
 /// project has queued runs whose tries stopped ([`UNREACHED_TO_STOP`]). A
-/// trigger on `worker_lease` in the journal's schema sends it.
-// SYNC: WORKERS_BACK_CHANNEL <-> 'weft_workers_back' in worker_lease_workers_back_notify (crate::journal::postgres::GROUP)
+/// trigger on `worker_lease` in the run group's schema
+/// (`crate::store::postgres::GROUP`) sends it.
+// SYNC: WORKERS_BACK_CHANNEL <-> 'weft_workers_back' in worker_lease_workers_back_notify (crate::store::postgres::GROUP)
 pub const WORKERS_BACK_CHANNEL: &str = "weft_workers_back";
 
 /// How long a run handed to a worker stays out of the queue for it to
@@ -80,14 +81,8 @@ pub const REFUSALS_TO_END: i16 = RETRY_WAITS.len() as i16 + 1;
 /// queued, untaken, until something that can fix it happens (a worker of
 /// its project comes alive, a build of the project registers, its worker
 /// levers change), each of which starts its tries again.
-// SYNC: UNREACHED_TO_STOP <-> the 3 in worker_lease_workers_back_notify (crate::journal::postgres::GROUP)
+// SYNC: UNREACHED_TO_STOP <-> the 3 in worker_lease_workers_back_notify (crate::store::postgres::GROUP)
 pub const UNREACHED_TO_STOP: i16 = RETRY_WAITS.len() as i16 + 1;
-
-/// How often a machine's process looks anyway: 30 seconds at this
-/// install's pace.
-fn safety() -> Duration {
-    weft_core::time_scale::scaled(Duration::from_secs(30))
-}
 
 /// One queued run taken for delivery.
 #[derive(Debug, sqlx::FromRow)]
@@ -101,7 +96,7 @@ pub struct Delivery {
 }
 
 pub fn drain_loop(state: DispatcherState) -> DrainLoop {
-    DrainLoop::new("delivery", "hand queued runs to workers", WAKE_ON, safety(), move || {
+    DrainLoop::new("delivery", "hand queued runs to workers", WAKE_ON, weft_task_store::drain::SAFETY_POLL_INTERVAL, move || {
         let state = state.clone();
         async move {
             let now = crate::lease::now_unix();

@@ -13,7 +13,7 @@
 //
 // A single follower tracks a single run at a time. Switching
 // follows (the user picks a different past run in the
-// sidebar) disposes the current EventSource and spins a new one.
+// sidebar) closes the current event stream and opens a new one.
 //
 // While the person is away from a remote install (see `presence.ts`)
 // the stream is closed, and coming back opens the same run

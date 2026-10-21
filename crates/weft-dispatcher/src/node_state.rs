@@ -29,7 +29,7 @@ type ReadError = (StatusCode, String);
 /// run `run_id` of `project_id`. A run of another project is no run here.
 pub async fn read(state: &DispatcherState, project_id: uuid::Uuid, run_id: RunId, spelled: &str) -> Result<NodeState, ReadError> {
     let internal = |what: &'static str| move |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
-    let owner = state.journal.run_owner(run_id).await.map_err(internal("the run's row"))?;
+    let owner = state.runs.run_owner(run_id).await.map_err(internal("the run's row"))?;
     if owner.as_ref().is_none_or(|owner| owner.project_id != project_id) {
         return Err((StatusCode::NOT_FOUND, format!("there is no run {run_id} in this project")));
     }

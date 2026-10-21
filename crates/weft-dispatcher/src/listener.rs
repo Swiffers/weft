@@ -128,7 +128,7 @@ impl ListenerClient {
         &self,
         token: &str,
         mode: weft_core::signal::listener_protocol::StartMode,
-        replaced: Option<&crate::journal::SignalRegistration>,
+        replaced: Option<&crate::store::SignalRegistration>,
     ) -> Result<()> {
         let replaced = match replaced {
             Some(row) => Some(weft_core::signal::listener_protocol::ReplacedSignal {
@@ -164,7 +164,7 @@ impl ListenerClient {
 
     /// Tell the listener `sig`'s row is gone, with what it needs to tear
     /// down what the signal arranged outside.
-    pub async fn unregister(&self, sig: &crate::journal::SignalRegistration) -> Result<()> {
+    pub async fn unregister(&self, sig: &crate::store::SignalRegistration) -> Result<()> {
         Self::ok(self.post("/unregister", &Self::unregister_request(sig, false)?).await?, "/unregister").await?;
         Ok(())
     }
@@ -179,7 +179,7 @@ impl ListenerClient {
     /// error the listener may have stopped it before the answer was lost,
     /// unless it answered that it does not know the row's kind (503),
     /// which it says before touching anything.
-    pub async fn unregister_replaced(&self, sig: &crate::journal::SignalRegistration) -> Result<bool> {
+    pub async fn unregister_replaced(&self, sig: &crate::store::SignalRegistration) -> Result<bool> {
         let resp = self.post("/unregister", &Self::unregister_request(sig, true)?).await?;
         if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
             let why = resp.text().await.unwrap_or_else(|e| format!("<body read failed: {e}>"));
@@ -195,7 +195,7 @@ impl ListenerClient {
     }
 
     fn unregister_request(
-        sig: &crate::journal::SignalRegistration,
+        sig: &crate::store::SignalRegistration,
         reused: bool,
     ) -> Result<weft_core::signal::listener_protocol::UnregisterRequest> {
         Ok(weft_core::signal::listener_protocol::UnregisterRequest {
@@ -215,7 +215,7 @@ impl ListenerClient {
     /// brings them back). A failure is logged: the
     /// durable row is the truth, and a listener that kept a stale entry
     /// finds the row gone the next time it is asked about the token.
-    pub async fn unregister_many(&self, signals: &[crate::journal::SignalRegistration]) {
+    pub async fn unregister_many(&self, signals: &[crate::store::SignalRegistration]) {
         for sig in signals {
             if let Err(e) = self.unregister(sig).await {
                 tracing::warn!(
@@ -276,7 +276,7 @@ const LET_GO_AT_ONCE: usize = 16;
 pub async fn let_go_of_stopped(
     pool: &sqlx::PgPool,
     listener: &ListenerClient,
-    signals: &[crate::journal::SignalRegistration],
+    signals: &[crate::store::SignalRegistration],
 ) -> Result<Vec<(String, String)>> {
     use futures::StreamExt;
     if signals.is_empty() {
@@ -348,9 +348,9 @@ pub async fn let_go_of_stopped(
 /// ([`let_go_of_stopped`] answered the ones it `kept`, with why), in
 /// `signal.let_go_failed`: one it kept, and whose trigger still takes no
 /// work, is marked, to be asked again
-/// (`crate::journal::postgres::signals_kept_after_let_go` reads them back);
+/// (`crate::store::postgres::signals_kept_after_let_go` reads them back);
 /// the rest are cleared.
-pub async fn note_let_go(pool: &sqlx::PgPool, signals: &[crate::journal::SignalRegistration], kept: &[(String, String)]) -> Result<()> {
+pub async fn note_let_go(pool: &sqlx::PgPool, signals: &[crate::store::SignalRegistration], kept: &[(String, String)]) -> Result<()> {
     let tokens: Vec<&str> = signals.iter().map(|s| s.token.as_str()).collect();
     let why: Vec<Option<&str>> =
         signals.iter().map(|s| kept.iter().find(|(token, _)| token == &s.token).map(|(_, why)| why.as_str())).collect();

@@ -1,9 +1,10 @@
 //! Concrete task-kind executors. Each module here defines one
-//! `TaskExecutor` impl plus the typed payload struct producers
-//! serialize into the task's JSON payload.
+//! `TaskExecutor` impl for one `weft_task_store::TaskKind`.
 //!
-//! The kind name lives in this module's `KIND` constant so producers
-//! enqueue with the same string the registry uses to look up the
+//! The kinds and their payloads live in `weft_task_store::kinds`, so a
+//! producer in another crate (the listener's `FireSignal`, a broker
+//! caller) enqueues the same `TaskKind` and payload type the executor
+//! here reads; `crate::app::task_registry` maps every kind to its
 //! executor.
 
 pub mod cancel_call;
@@ -17,9 +18,8 @@ pub mod stop_tagged;
 pub mod take_down_wait;
 pub mod withdraw_signal;
 
-// Only the executor unit structs are re-exported because main.rs
-// instantiates them when wiring the registry. Concrete payload /
-// result types are imported directly by their producers.
+// Only the executor unit structs are re-exported, for
+// `crate::app::task_registry` to wire into the registry.
 pub use cancel_call::CancelCallExecutor;
 pub use fire_signal::FireSignalExecutor;
 pub use program_call::ProgramCallExecutor;

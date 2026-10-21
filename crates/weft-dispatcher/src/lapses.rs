@@ -69,14 +69,12 @@ pub struct RepairFailed {
 /// A worker's lease coming alive wakes the loop.
 pub(crate) static WAKE_ON: &[WakeOn] = &[WakeOn::any(weft_task_store::worker_door::LEASE_ALIVE_CHANNEL)];
 
-/// How often a machine's process looks anyway: 15 seconds at this
-/// install's pace.
-fn safety() -> Duration {
-    weft_core::time_scale::scaled(Duration::from_secs(15))
-}
+/// How often a machine's process looks anyway, in real time
+/// (`DrainLoop::new` runs it at this install's pace).
+const SAFETY: Duration = Duration::from_secs(15);
 
 pub fn drain_loop(state: DispatcherState) -> DrainLoop {
-    DrainLoop::new(LAPSES, "notice work whose holder went away", WAKE_ON, safety(), move || {
+    DrainLoop::new(LAPSES, "notice work whose holder went away", WAKE_ON, SAFETY, move || {
         let state = state.clone();
         async move { look(&state).await }
     })

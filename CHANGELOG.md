@@ -3,6 +3,27 @@
 What changed between versions of weft that you need to know about when you
 update. To update, pull and run `./setup.sh` again.
 
+## 2026-10-21 (0.2.271)
+
+Every project's worker is rebuilt once, the first time it starts after this
+update: a fix changed how a program's code is fingerprinted. That fix is for
+an `@include` whose file does not compile. Re-running part of such a program
+from frozen values used to fail with `missing implementation
+'IncludedGroup'`; it now runs.
+
+If you wrote a node of type `LoopIn`, `LoopOut` or `IncludedGroup` by hand, or
+named a node or group `IncludedGroup`, the compiler now refuses it. Those are
+the nodes weft makes itself, at a loop's edge and where an include sits, and
+the message says what to write instead: a `Loop`, or `name =
+@include("file.weft")`.
+
+In the editor, a node you add, paste or duplicate is named after its type with
+no number first (`text`, then `text2`), and every name it makes up is
+camelCase, the same as the compiler expects.
+
+`weft resync`, `weft deactivate` and `weft rm` follow their task with a new request, so
+update the CLI and the runtime together, which `./setup.sh` does.
+
 ## 2026-10-21 (5eafc84b)
 
 If you are on a Mac, `weft test-node` works again. Since 2026-09-19 it failed

@@ -151,7 +151,7 @@ crate::wire_enum! {
     /// taken on the outside-caller doors, so a frontend's leaked token can
     /// never administer the install and an admin key is never pasted into
     /// a frontend.
-    /// SYNC: kind column values <-> the CHECK on signal_token.kind in crates/weft-dispatcher/src/journal/postgres.rs GROUP
+    /// SYNC: kind column values <-> the CHECK on signal_token.kind in crates/weft-dispatcher/src/store/postgres.rs GROUP
     pub enum TokenKind {
         /// An outside caller's scoped credential: signals, displays.
         Caller = "caller",

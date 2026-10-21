@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use crate::authenticator::Authenticator;
 use crate::events::EventBus;
-use crate::journal::Journal;
 use crate::listener::ListenerClient;
 use crate::project_store::ProjectStore;
+use crate::store::{BakeStore, RunStore, SignalStore, TokenStore};
 use crate::tenant::TenantRouter;
 
 /// Top-level dispatcher state. Shared across HTTP handlers via
@@ -15,11 +15,18 @@ pub struct DispatcherState {
     /// builds it takes. Minted at boot; a sibling replica (another copy
     /// of the dispatcher) has its own.
     pub replica: String,
-    pub journal: Arc<dyn Journal>,
-    /// Direct Postgres pool handle. Owned here (not threaded through
-    /// Journal) so lease management, EventBus pub/sub, and other
-    /// DB-backed primitives can share connections without extending the
-    /// Journal trait into a kitchen sink.
+    /// The runs: their rows and records (`crate::store`).
+    pub runs: Arc<dyn RunStore>,
+    /// The signals: what wakes a trigger, what a parked run waits on.
+    pub registrations: Arc<dyn SignalStore>,
+    /// The callers' tokens.
+    pub tokens: Arc<dyn TokenStore>,
+    /// The trigger setups and what each captured.
+    pub bakes: Arc<dyn BakeStore>,
+    /// Direct Postgres pool handle. Owned here (not threaded through the
+    /// stores) so lease management, EventBus pub/sub, and other
+    /// DB-backed primitives can share connections without growing a
+    /// store into a kitchen sink.
     pub pg_pool: sqlx::PgPool,
     /// Connections used ONLY to hold a project's transition lock.
     ///

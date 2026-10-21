@@ -805,7 +805,7 @@ pub(crate) async fn start_queued_run_with(
         program: Some(program),
     };
     let inserted = state
-        .journal
+        .runs
         .queue_run(queued, queue_as.for_activation)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("start run: {e:#}")))?;
@@ -1481,7 +1481,7 @@ pub async fn status(
     let snapshot = gather_action_snapshot(&state, id, &project, &desired).await?;
     let (infra, instance_infra) = infra_entries(&project, &snapshot.infra, &snapshot.activations, &desired);
     let waiting = crate::api::signal::waiting_fires(&state.pg_pool, id).await.map_err(internal("waiting fires"))?;
-    let held = crate::journal::postgres::held_by_activation(&state.pg_pool, id).await.map_err(internal("held work"))?;
+    let held = crate::store::postgres::held_by_activation(&state.pg_pool, id).await.map_err(internal("held work"))?;
     let has_infra = snapshot.has_infra;
     let has_triggers = snapshot.has_triggers;
     let infra_rollup = snapshot.infra_rollup.clone();
@@ -1490,7 +1490,7 @@ pub async fn status(
     // program's own runs (from SQL, not capped at a fetched window), the
     // set `weft tree` lists, and the first row is the latest for the
     // `last_*` fields. The runs that set it up are counted beside them.
-    let runs_of = |phase: Option<weft_core::context::Phase>| crate::journal::RunListQuery {
+    let runs_of = |phase: Option<weft_core::context::Phase>| crate::store::RunListQuery {
         limit: 1,
         offset: 0,
         project_id: Some(id),
@@ -1507,13 +1507,13 @@ pub async fn status(
     };
     let (program_runs, every_run) = (runs_of(Some(weft_core::context::Phase::Fire)), runs_of(None));
     let (runs, every) = tokio::try_join!(
-        state.journal.list_runs(caller.0.as_str(), &program_runs),
-        state.journal.list_runs(caller.0.as_str(), &every_run),
+        state.runs.list_runs(caller.0.as_str(), &program_runs),
+        state.runs.list_runs(caller.0.as_str(), &every_run),
     )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list runs: {e}")))?;
     let last = runs.runs.first();
     let running = state
-        .journal
+        .runs
         .going_run_ids_for_project(id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("runs going: {e}")))?;
@@ -2626,7 +2626,7 @@ pub async fn bake(
 /// by id or not).
 #[derive(Debug, serde::Serialize)]
 pub struct BakeAnswer {
-    baked: Vec<crate::journal::TriggerBake>,
+    baked: Vec<crate::store::TriggerBake>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     broken: Vec<weft_core::project::Broken>,
 }
@@ -3327,7 +3327,7 @@ async fn activate_owner(
         .map_err(ActivateError::Refused)?;
     // What they hold as they come on, for the answer: read under the
     // claim, before the window drops any of it.
-    let held_now = crate::journal::postgres::held_on(&state.pg_pool, id, keys)
+    let held_now = crate::store::postgres::held_on(&state.pg_pool, id, keys)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("held work: {e:#}")))?;
     // Won the claim: broadcast it (other tabs' screens flip to "turning
@@ -3452,7 +3452,7 @@ async fn orphan_entry_tokens(
         .map(|place| weft_core::project::address_of(project, &place.id, &place.path))
         .collect();
     Ok(state
-        .journal
+        .registrations
         .signal_list_for_project(project_id)
         .await?
         .into_iter()
@@ -3470,7 +3470,7 @@ async fn drop_orphan_entry_rows(
     activation: uuid::Uuid,
 ) -> anyhow::Result<()> {
     let mut tx = activation_write(state, project_id, activation).await?;
-    let removed = crate::journal::postgres::remove_signals(&mut *tx, orphans).await?;
+    let removed = crate::store::postgres::remove_signals(&mut *tx, orphans).await?;
     tx.commit().await?;
     state.listener.unregister_many(&removed).await;
     Ok(())
@@ -3491,7 +3491,7 @@ async fn take_back_arms(
     msg: String,
 ) -> ActivateWindowError {
     let status = StatusCode::INTERNAL_SERVER_ERROR;
-    match crate::task_kinds::register_signal::disarm(state.journal.as_ref(), &state.listener, armed).await {
+    match crate::task_kinds::register_signal::disarm(state.registrations.as_ref(), &state.listener, armed).await {
         Ok(()) => ActivateWindowError { status, msg, rollback: ActivateRollback::Restore },
         Err(undo) => {
             let fate = match if_not_put_back {
@@ -3540,7 +3540,7 @@ async fn drop_held(
     let internal = |what: &str, e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
     if held == ReleaseHeld::Drop {
         let mut tx = activation_write(state, project_id, activation).await.map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
-        crate::journal::postgres::drop_held_arrivals(&mut *tx, project_id, keys).await.map_err(|e| internal("drop the held arrivals", e))?;
+        crate::store::postgres::drop_held_arrivals(&mut *tx, project_id, keys).await.map_err(|e| internal("drop the held arrivals", e))?;
         tx.commit().await.map_err(|e| internal("drop the held arrivals", e.into()))?;
         // A run started by hand and another trigger's runs are not this
         // activation's to touch.
@@ -3554,7 +3554,7 @@ async fn drop_held(
             .collect();
         crate::api::run::cancel_run_ids(state, &paused).await.map_err(|e| internal("cancel the paused runs", e))?;
     }
-    Ok(!crate::journal::postgres::activation_signals(&state.pg_pool, project_id, keys)
+    Ok(!crate::store::postgres::activation_signals(&state.pg_pool, project_id, keys)
         .await
         .map_err(|e| internal("activation signals", e))?
         .is_empty())
@@ -3912,23 +3912,10 @@ pub async fn resume_resync(
     Ok(Json(ResyncAnswer::UnderWay { task }))
 }
 
-/// How long one look of [`follow`] waits at most for the task to end
-/// before answering that it goes on: well under any request limit in
-/// front of an install, so following never rests on one long request.
-const FOLLOW_LOOK_MAX_SECS: u64 = 25;
-
-/// `?waitSecs=<n>` of [`follow`].
-#[derive(Debug, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FollowQuery {
-    #[serde(default)]
-    pub wait_secs: Option<u64>,
-}
-
-/// `GET /projects/{id}/follow/{task}?waitSecs=<n>`: one look at a task a
+/// `GET /projects/{id}/follow/{task}?wait_ms=<n>`: one look at a task a
 /// person follows (a resync, a deactivate's wait for its runs): it waits
-/// at most `n` seconds (at most [`FOLLOW_LOOK_MAX_SECS`]) for the task to
-/// end, then answers that it goes on, or what it ended with
+/// at most `n` milliseconds (never past [`super::HoldQuery`]'s cap) for the
+/// task to end, then answers that it goes on, or what it ended with
 /// ([`weft_core::deactivation::Following`]). A resync that stopped is
 /// answered as the refusal it stopped with: the triggers it had not
 /// brought back down, the project held for it until `weft resync
@@ -3939,11 +3926,11 @@ pub async fn follow(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path((id, task)): Path<(uuid::Uuid, uuid::Uuid)>,
-    axum::extract::Query(query): axum::extract::Query<FollowQuery>,
+    axum::extract::Query(hold): axum::extract::Query<super::HoldQuery>,
 ) -> Result<Json<weft_core::deactivation::Following>, StatusError> {
     authorize_project(&state, &caller.0, id).await?;
     let internal = |what: &str, e: String| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e}"));
-    let look = std::time::Duration::from_secs(query.wait_secs.unwrap_or(FOLLOW_LOOK_MAX_SECS).min(FOLLOW_LOOK_MAX_SECS));
+    let look = hold.hold();
     let outcome = weft_task_store::terminal::wait_for_terminal_in_project(&state.pg_pool, &state.signals, task, id, look)
         .await
         .map_err(|e| internal("follow the task", format!("{e:#}")))?
@@ -4056,7 +4043,7 @@ pub(crate) async fn resync_take_down_owner(
         .filter(|build| Some(build) != binary_hash.as_ref() && !plan.old_builds.contains(build))
         .collect();
     let still_on_keys: Vec<weft_core::activation::ActivationKey> = still_on.iter().map(|a| a.key.clone()).collect();
-    let tokens: Vec<String> = crate::journal::postgres::entry_tokens(&state.pg_pool, id, &still_on_keys)
+    let tokens: Vec<String> = crate::store::postgres::entry_tokens(&state.pg_pool, id, &still_on_keys)
         .await
         .map_err(internal("the triggers' entry tokens"))?
         .into_iter()
@@ -4187,7 +4174,7 @@ async fn move_paused_runs(
         let fire = weft_core::run_spec::compute_trigger_fire(registered, &key.trigger, &serde_json::Value::Null, None, &saved)
             .map_err(|why| anyhow::anyhow!("the cut of trigger {key}: {why}"))?;
         let program = weft_journal::record::RunsProgram::of(&identity.definition_hash, id, &fire.program)?;
-        moved += crate::journal::postgres::move_paused_runs(&state.pg_pool, &paused, &program, &identity.binary_hash, &source_version).await?;
+        moved += crate::store::postgres::move_paused_runs(&state.pg_pool, &paused, &program, &identity.binary_hash, &source_version).await?;
     }
     Ok(moved)
 }
@@ -4432,7 +4419,7 @@ async fn run_trigger_setup(
     // place of what is stored (a store re-arming the triggers that read
     // it); nothing for every other setup.
     overlay: Option<&weft_core::instance::ValueChanges>,
-) -> Result<crate::journal::TriggerBake, (StatusCode, String)> {
+) -> Result<crate::store::TriggerBake, (StatusCode, String)> {
     let run_id = activation.unwrap_or_else(weft_core::new_run_id);
     let places = key_places(project, keys);
     let (cut, kicks) = setup_cut(project, &places)
@@ -4595,15 +4582,15 @@ async fn run_trigger_setup(
             }
         }
     }
-    let events = state.journal.events_log(run_id).await
+    let events = state.runs.events_log(run_id).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read trigger setup: {error:#}")))?;
     let program = state.run_program_identity(&events).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))?;
-    let mut bake = crate::journal::TriggerBake::from_events(&events, &program)
+    let mut bake = crate::store::TriggerBake::from_events(&events, &program)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| (StatusCode::CONFLICT, "trigger setup did not complete successfully".into()))?;
     bake.targets = keys.iter().map(|key| key.trigger.clone()).collect();
-    state.journal.finish_trigger_setup(run_id, Some(&bake)).await
+    state.bakes.finish_trigger_setup(run_id, Some(&bake)).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("publish trigger bake: {error:#}")))?;
     Ok(bake)
 }
@@ -4616,7 +4603,7 @@ async fn collect_listener_urls(
     project_id: uuid::Uuid,
     keys: &[weft_core::activation::ActivationKey],
 ) -> anyhow::Result<Vec<ActivationUrl>> {
-    let signals = crate::journal::postgres::activation_signals(&state.pg_pool, project_id, keys).await?;
+    let signals = crate::store::postgres::activation_signals(&state.pg_pool, project_id, keys).await?;
     // Read only once a signal has an outside address, so a project
     // with none (cron only) activates while the tunnel is down.
     let base = state.external_base();

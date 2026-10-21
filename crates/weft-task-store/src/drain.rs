@@ -87,7 +87,8 @@ use crate::unanswered::{self, Callee};
 /// design (a reconnecting listener can lose some, though it says so with a
 /// recheck), so this only catches what slipped past; 30s of delay on a
 /// lost one is acceptable, and a tighter tick would hammer the DB for
-/// nothing.
+/// nothing. In real time, like every loop's safety interval
+/// ([`DrainLoop::new`] scales it).
 pub const SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How long a loop's row in `role_loop_due` stays once no pass of this
@@ -164,16 +165,23 @@ pub struct DrainLoop {
     /// The other loops of the role that book this one's looks
     /// ([`Booking::book_sooner`]), for a loop no write wakes.
     pub booked_by: &'static [&'static str],
+    /// How often a local install's process looks anyway, at this install's
+    /// pace (see [`DrainLoop::new`]).
     pub safety: Duration,
     pub drain: Arc<dyn Fn() -> futures::future::BoxFuture<'static, Result<DrainStep>> + Send + Sync>,
 }
 
 impl DrainLoop {
+    /// `safety` is given in real time, and the loop runs it at this
+    /// install's pace (`weft_core::time_scale::scaled`): a loop's safety
+    /// interval is always the runtime's own housekeeping, so it is scaled
+    /// here, once, for every loop.
     pub fn new<F, Fut>(name: &'static str, label: &'static str, wake_on: &'static [WakeOn], safety: Duration, drain: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<DrainStep>> + Send + 'static,
     {
+        let safety = weft_core::time_scale::scaled(safety);
         Self { name, label, wake_on, booked_by: &[], safety, drain: Arc::new(move || Box::pin(drain())) }
     }
 

@@ -1,7 +1,8 @@
-//! In-memory `Journal` implementation for tests. Mirrors the Postgres
-//! semantics: a `run` row per run, its record, and the signal and token
-//! tables. Compiled only under `cfg(test)` and behind the `test-helpers`
-//! feature so dependent crates can pull it in for their own tests.
+//! In-memory implementation of the four stores for tests. Mirrors the
+//! Postgres semantics: a `run` row per run, its record, and the signal and
+//! token tables. Compiled only under `cfg(test)` and behind the
+//! `test-helpers` feature so dependent crates can pull it in for their own
+//! tests.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -12,7 +13,10 @@ use weft_core::RunId;
 
 use weft_journal::record::{Appended, Queued, Then};
 use weft_journal::RunEvent;
-use crate::journal::{RunOwner, RunListQuery, Journal, LogEntry, SignalRegistration, SignalToken};
+use crate::store::{
+    Answered, BakeStore, CancelWrite, LogEntry, Lost, RunListQuery, RunOwner, RunStore, SignalRegistration, SignalStore,
+    SignalToken, TokenStore,
+};
 use weft_core::program::{RunPage, RunSummary, RunStatus};
 
 #[derive(Default)]
@@ -47,12 +51,15 @@ struct FakeState {
     cancel_calls: Vec<weft_core::signal::listener_protocol::CancelCallRequest>,
 }
 
+/// [`RunStore`], [`SignalStore`], [`TokenStore`] and [`BakeStore`] over
+/// one in-memory state, which their writes share the way the Postgres
+/// tables share transactions.
 #[derive(Default)]
-pub struct FakeJournal {
+pub struct FakeStore {
     inner: Mutex<FakeState>,
 }
 
-/// One `run` row's mirror, the columns the journal reads.
+/// One `run` row's mirror, the columns the stores read.
 #[derive(Clone)]
 struct RunRow {
     project_id: uuid::Uuid,
@@ -77,7 +84,7 @@ struct RunRow {
     skipped: u64,
 }
 
-impl FakeJournal {
+impl FakeStore {
     pub fn new() -> Self {
         Self::default()
     }
@@ -270,7 +277,7 @@ fn note(row: &mut RunRow, events: &[RunEvent]) {
 /// past `from`'s: what Postgres's `signal_insert` refresh and
 /// `signal_restore` write. The row's identity (tenant, project, instance,
 /// run, node, is_resume, activation_trigger) stays as it is.
-// SYNC: copy_refreshed <-> journal/postgres.rs SIGNAL_REFRESHED_COLUMNS
+// SYNC: copy_refreshed <-> store/postgres.rs SIGNAL_REFRESHED_COLUMNS
 fn copy_refreshed(row: &mut SignalRegistration, from: &SignalRegistration) {
     row.spec_json = from.spec_json.clone();
     row.program = from.program.clone();
@@ -300,7 +307,7 @@ fn next_generation() -> i64 {
 }
 
 #[async_trait]
-impl Journal for FakeJournal {
+impl BakeStore for FakeStore {
     async fn is_trigger_setup_pending(&self, run_id: RunId) -> anyhow::Result<bool> {
         Ok(self.inner.lock().unwrap().trigger_setups.contains_key(&run_id))
     }
@@ -327,7 +334,10 @@ impl Journal for FakeJournal {
         Ok(self.inner.lock().unwrap().trigger_bakes.values()
             .filter(|bake| bake.project_id == project_id && bake.instance.as_ref() == instance).cloned().collect())
     }
+}
 
+#[async_trait]
+impl RunStore for FakeStore {
     async fn append(&self, run_id: RunId, events: &[RunEvent], then: Then) -> anyhow::Result<Appended> {
         let mut g = self.inner.lock().unwrap();
         let Some(row) = g.runs.get_mut(&run_id) else { return Ok(Appended::Missing) };
@@ -386,10 +396,10 @@ impl Journal for FakeJournal {
         run_id: RunId,
         _program: Option<&weft_core::ProjectDefinition>,
         cause: &weft_core::run::CancelCause,
-    ) -> anyhow::Result<crate::journal::CancelWrite> {
+    ) -> anyhow::Result<CancelWrite> {
         let mut g = self.inner.lock().unwrap();
         let (removed, cancel_calls) = remove_run_waits(&mut g, run_id, true);
-        let mut write = crate::journal::CancelWrite { removed, cancel_calls, ..Default::default() };
+        let mut write = CancelWrite { removed, cancel_calls, ..Default::default() };
         let Some(row) = g.runs.get_mut(&run_id) else { return Ok(write) };
         match (row.state, row.owner.is_some()) {
             ("ended", _) => {}
@@ -411,8 +421,7 @@ impl Journal for FakeJournal {
         run_id: RunId,
         _lapsed_before: i64,
         _program: Option<&weft_core::ProjectDefinition>,
-    ) -> anyhow::Result<crate::journal::Lost> {
-        use crate::journal::Lost;
+    ) -> anyhow::Result<Lost> {
         let mut g = self.inner.lock().unwrap();
         let Some(row) = g.runs.get_mut(&run_id) else { return Ok(Lost::NotLost) };
         if row.state != "running" || row.owner.is_none() {
@@ -430,78 +439,6 @@ impl Journal for FakeJournal {
         }
         end_unowned(&mut g, run_id, &weft_core::run::CancelCause::fast_run_lost())?;
         Ok(Lost::Ended)
-    }
-
-    /// An answer reaches its run as Postgres's does: written into the
-    /// record of a run nobody drives (queued to carry on), handed to the
-    /// worker of a run one drives ([`Self::handed`]).
-    async fn answer(&self, token: &str, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<crate::journal::Answered> {
-        use crate::journal::Answered;
-        let mut g = self.inner.lock().unwrap();
-        let Some(consumed) = g.signals.get(token).filter(|s| s.is_resume).cloned() else { return Ok(Answered::Gone) };
-        g.signals.remove(token);
-        let Some(run_id) = consumed.run_id else { return Ok(Answered::Gone) };
-        let Some(row) = g.runs.get_mut(&run_id).filter(|row| row.state != "ended") else { return Ok(Answered::RunEnded { consumed }) };
-        if row.owner.is_some() {
-            g.handed.entry(run_id).or_default().push((token.to_string(), answer.clone()));
-            return Ok(Answered::Reached { consumed });
-        }
-        row.state = "queued";
-        g.events.push(RunEvent::wait_answered(run_id, token.to_string(), answer.clone(), 0));
-        Ok(Answered::Reached { consumed })
-    }
-
-    async fn mint_signal_token(&self, tok: &SignalToken) -> anyhow::Result<()> {
-        self.inner
-            .lock()
-            .unwrap()
-            .signal_tokens
-            .insert(tok.token_hash.clone(), tok.clone());
-        Ok(())
-    }
-
-    async fn get_signal_token(&self, token_hash: &str) -> anyhow::Result<Option<SignalToken>> {
-        Ok(self.inner.lock().unwrap().signal_tokens.get(token_hash).cloned())
-    }
-
-    async fn seed_operator_token(&self, tok: &SignalToken) -> anyhow::Result<bool> {
-        let mut g = self.inner.lock().unwrap();
-        let held = g
-            .signal_tokens
-            .values()
-            .any(|t| t.tenant_id == tok.tenant_id && t.kind == weft_core::signal_token::TokenKind::Operator);
-        if held || g.signal_tokens.contains_key(&tok.token_hash) {
-            return Ok(false);
-        }
-        g.signal_tokens.insert(tok.token_hash.clone(), tok.clone());
-        Ok(true)
-    }
-
-    async fn list_signal_tokens(&self, tenant: &str) -> anyhow::Result<Vec<SignalToken>> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .signal_tokens
-            .values()
-            .filter(|tok| tok.tenant_id == tenant)
-            .cloned()
-            .collect())
-    }
-
-    async fn revoke_signal_token(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<bool> {
-        let mut g = self.inner.lock().unwrap();
-        let keys: Vec<String> = g
-            .signal_tokens
-            .iter()
-            .filter(|(_, tok)| tok.tenant_id == tenant && tok.id == id)
-            .map(|(k, _)| k.clone())
-            .collect();
-        let removed = !keys.is_empty();
-        for k in keys {
-            g.signal_tokens.remove(&k);
-        }
-        Ok(removed)
     }
 
     async fn run_owner(&self, run_id: RunId) -> anyhow::Result<Option<RunOwner>> {
@@ -535,7 +472,7 @@ impl Journal for FakeJournal {
     async fn list_runs(&self, tenant: &str, query: &RunListQuery) -> anyhow::Result<RunPage> {
         // The words of a run are Postgres's full-text search, which a fake
         // would only imitate: `search` is tested against Postgres.
-        assert!(query.search.is_none(), "the listing's `search` is tested against Postgres, not the fake journal");
+        assert!(query.search.is_none(), "the listing's `search` is tested against Postgres, not the fake store");
         let g = self.inner.lock().unwrap();
         let mut all: Vec<RunSummary> = g
             .runs
@@ -624,7 +561,7 @@ impl Journal for FakeJournal {
         let mut g = self.inner.lock().unwrap();
         g.trigger_setups.remove(&run_id);
         g.events.retain(|e| e.run_id() != run_id);
-        // Resume rows only, exactly as `PostgresJournal` does.
+        // Resume rows only, exactly as `PostgresStore` does.
         let keys: Vec<String> =
             g.signals.iter().filter(|(_, s)| s.run_id == Some(run_id) && s.is_resume).map(|(k, _)| k.clone()).collect();
         let removed = keys.into_iter().filter_map(|k| g.signals.remove(&k)).collect();
@@ -660,6 +597,27 @@ impl Journal for FakeJournal {
             .collect();
         out.sort_by_key(|t| t.seq);
         Ok(out)
+    }
+}
+
+#[async_trait]
+impl SignalStore for FakeStore {
+    /// An answer reaches its run as Postgres's does: written into the
+    /// record of a run nobody drives (queued to carry on), handed to the
+    /// worker of a run one drives (the state's `handed`).
+    async fn answer(&self, token: &str, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<Answered> {
+        let mut g = self.inner.lock().unwrap();
+        let Some(consumed) = g.signals.get(token).filter(|s| s.is_resume).cloned() else { return Ok(Answered::Gone) };
+        g.signals.remove(token);
+        let Some(run_id) = consumed.run_id else { return Ok(Answered::Gone) };
+        let Some(row) = g.runs.get_mut(&run_id).filter(|row| row.state != "ended") else { return Ok(Answered::RunEnded { consumed }) };
+        if row.owner.is_some() {
+            g.handed.entry(run_id).or_default().push((token.to_string(), answer.clone()));
+            return Ok(Answered::Reached { consumed });
+        }
+        row.state = "queued";
+        g.events.push(RunEvent::wait_answered(run_id, token.to_string(), answer.clone(), 0));
+        Ok(Answered::Reached { consumed })
     }
 
     async fn signal_insert(&self, sig: &SignalRegistration) -> anyhow::Result<super::SignalWrite> {
@@ -826,6 +784,62 @@ impl Journal for FakeJournal {
     }
 }
 
+#[async_trait]
+impl TokenStore for FakeStore {
+    async fn mint_signal_token(&self, tok: &SignalToken) -> anyhow::Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .signal_tokens
+            .insert(tok.token_hash.clone(), tok.clone());
+        Ok(())
+    }
+
+    async fn get_signal_token(&self, token_hash: &str) -> anyhow::Result<Option<SignalToken>> {
+        Ok(self.inner.lock().unwrap().signal_tokens.get(token_hash).cloned())
+    }
+
+    async fn seed_operator_token(&self, tok: &SignalToken) -> anyhow::Result<bool> {
+        let mut g = self.inner.lock().unwrap();
+        let held = g
+            .signal_tokens
+            .values()
+            .any(|t| t.tenant_id == tok.tenant_id && t.kind == weft_core::signal_token::TokenKind::Operator);
+        if held || g.signal_tokens.contains_key(&tok.token_hash) {
+            return Ok(false);
+        }
+        g.signal_tokens.insert(tok.token_hash.clone(), tok.clone());
+        Ok(true)
+    }
+
+    async fn list_signal_tokens(&self, tenant: &str) -> anyhow::Result<Vec<SignalToken>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .signal_tokens
+            .values()
+            .filter(|tok| tok.tenant_id == tenant)
+            .cloned()
+            .collect())
+    }
+
+    async fn revoke_signal_token(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<bool> {
+        let mut g = self.inner.lock().unwrap();
+        let keys: Vec<String> = g
+            .signal_tokens
+            .iter()
+            .filter(|(_, tok)| tok.tenant_id == tenant && tok.id == id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let removed = !keys.is_empty();
+        for k in keys {
+            g.signal_tokens.remove(&k);
+        }
+        Ok(removed)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -873,7 +887,7 @@ pub(crate) mod tests {
     /// record, and a second answer finds the wait gone.
     #[tokio::test]
     async fn an_answer_consumes_its_wait_once() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         j.set_project_tenant(PROJECT, "t");
         let run = uuid::Uuid::new_v4();
         j.record_event(&started(run, PROJECT)).await.unwrap();
@@ -882,17 +896,17 @@ pub(crate) mod tests {
         resume.is_resume = true;
         resume.run_id = Some(run);
         j.signal_insert(&resume).await.unwrap();
-        let crate::journal::Answered::Reached { consumed } = j.answer("tok-r", &weft_core::primitive::WaitAnswer::Given { value: serde_json::json!("yes") }).await.unwrap() else {
+        let crate::store::Answered::Reached { consumed } = j.answer("tok-r", &weft_core::primitive::WaitAnswer::Given { value: serde_json::json!("yes") }).await.unwrap() else {
             panic!("the wait is answered")
         };
         assert_eq!(consumed.token, "tok-r");
         assert!(j.signal_get("tok-r").await.unwrap().is_none(), "single use");
         assert_eq!(j.inner.lock().unwrap().runs[&run].state, "queued");
-        assert!(matches!(j.answer("tok-r", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), crate::journal::Answered::Gone));
+        assert!(matches!(j.answer("tok-r", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), crate::store::Answered::Gone));
 
         // An entry row is never answered this way.
         j.signal_insert(&registration("tok-e")).await.unwrap();
-        assert!(matches!(j.answer("tok-e", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), crate::journal::Answered::Gone));
+        assert!(matches!(j.answer("tok-e", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), crate::store::Answered::Gone));
         assert!(j.signal_get("tok-e").await.unwrap().is_some(), "entry rows stay");
     }
 
@@ -903,7 +917,7 @@ pub(crate) mod tests {
     /// entry signal is not the run's and stays.
     #[tokio::test]
     async fn delete_run_hands_back_the_resume_signals_it_removed() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         j.set_project_tenant(PROJECT, "t");
         let run = weft_core::RunId::new_v4();
         j.record_event(&started(run, PROJECT)).await.unwrap();
@@ -927,8 +941,8 @@ pub(crate) mod tests {
     /// claim) finds the row moved.
     #[tokio::test]
     async fn signal_insert_is_a_compare_and_set_on_the_kind_state_version() {
-        use crate::journal::SignalWrite;
-        let j = FakeJournal::new();
+        use crate::store::SignalWrite;
+        let j = FakeStore::new();
         let mut first = registration("tok-1");
         first.kind_state = serde_json::json!({ "cursor": 10 });
         first.kind_state_seq = 0;
@@ -957,7 +971,7 @@ pub(crate) mod tests {
     /// exactly like the Postgres `kind = 'project'` filter.
     #[tokio::test]
     async fn node_test_run_ids_stay_out_of_lifecycle_reads() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         j.set_project_tenant(PROJECT, "t");
         let run = weft_core::RunId::new_v4();
         let test = weft_core::RunId::new_v4();
@@ -999,7 +1013,7 @@ pub(crate) mod tests {
     /// settled.
     #[tokio::test]
     async fn going_and_settled_runs_split_the_project() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         j.set_project_tenant(PROJECT, "t");
         let done = uuid::Uuid::new_v4();
         let live = uuid::Uuid::new_v4();
@@ -1018,7 +1032,7 @@ pub(crate) mod tests {
     /// when it was born, and an unknown run has none.
     #[tokio::test]
     async fn run_owner_reads_the_seeded_row() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         let run_id = weft_core::RunId::new_v4();
         j.set_project_tenant(PROJECT, "tenant-x");
         j.record_event(&started(run_id, PROJECT)).await.unwrap();
@@ -1083,27 +1097,27 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn trigger_bake_publication_is_owned_atomic_and_retained_after_clean() {
-        let journal = FakeJournal::new();
+        let store = FakeStore::new();
         let first = RunId::new_v4();
         let bake = super::super::TriggerBake::from_events(&setup_events(first, serde_json::json!({"x":1})), &setup_program()).unwrap().unwrap();
-        journal.inner.lock().unwrap().trigger_setups.insert(first, PROJECT);
-        journal.finish_trigger_setup(first, Some(&bake)).await.unwrap();
-        assert!(!journal.is_trigger_setup_pending(first).await.unwrap());
-        assert!(journal.signal_list_for_project(PROJECT).await.unwrap().is_empty());
+        store.inner.lock().unwrap().trigger_setups.insert(first, PROJECT);
+        store.finish_trigger_setup(first, Some(&bake)).await.unwrap();
+        assert!(!store.is_trigger_setup_pending(first).await.unwrap());
+        assert!(store.signal_list_for_project(PROJECT).await.unwrap().is_empty());
         let second = RunId::new_v4();
-        journal.inner.lock().unwrap().trigger_setups.insert(second, PROJECT);
-        journal.finish_trigger_setup(second, None).await.unwrap();
-        assert_eq!(journal.trigger_bakes(PROJECT, None).await.unwrap()[0].run_id, first);
-        assert!(journal.trigger_bakes(OTHER_PROJECT, None).await.unwrap().is_empty());
+        store.inner.lock().unwrap().trigger_setups.insert(second, PROJECT);
+        store.finish_trigger_setup(second, None).await.unwrap();
+        assert_eq!(store.trigger_bakes(PROJECT, None).await.unwrap()[0].run_id, first);
+        assert!(store.trigger_bakes(OTHER_PROJECT, None).await.unwrap().is_empty());
         let mut refresh = bake.clone();
         refresh.run_id = second;
         refresh.targets = refresh.captured.keys().cloned().collect();
         refresh.captured.clear();
-        journal.inner.lock().unwrap().trigger_setups.insert(second, PROJECT);
-        journal.finish_trigger_setup(second, Some(&refresh)).await.unwrap();
-        journal.finish_trigger_setup(first, Some(&bake)).await.unwrap();
-        journal.delete_run(second).await.unwrap();
-        let saved = journal.trigger_bakes(PROJECT, None).await.unwrap();
+        store.inner.lock().unwrap().trigger_setups.insert(second, PROJECT);
+        store.finish_trigger_setup(second, Some(&refresh)).await.unwrap();
+        store.finish_trigger_setup(first, Some(&bake)).await.unwrap();
+        store.delete_run(second).await.unwrap();
+        let saved = store.trigger_bakes(PROJECT, None).await.unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].run_id, second);
         assert!(saved[0].captured.is_empty(), "a skipped target cannot keep its old registration");
@@ -1112,7 +1126,7 @@ pub(crate) mod tests {
     /// `run_summary` reads one run's row and says how it ended.
     #[tokio::test]
     async fn run_summary_is_a_direct_point_lookup() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         let c = weft_core::RunId::new_v4();
         j.set_project_tenant(PROJECT, "t");
         j.record_event(&started_at(c, PROJECT, 100)).await.unwrap();
@@ -1132,7 +1146,7 @@ pub(crate) mod tests {
     /// wall.
     #[tokio::test]
     async fn list_runs_pages_and_filters() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         j.set_project_tenant(PROJECT_A, "t");
         j.set_project_tenant(PROJECT_B, "t");
         j.set_project_tenant(PROJECT_C, "t2");
@@ -1190,7 +1204,7 @@ pub(crate) mod tests {
     /// thing that tells one run from the thousands beside it.
     #[tokio::test]
     async fn list_runs_filters_by_entry_node() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         j.set_project_tenant(PROJECT, "t");
         let mine = weft_core::RunId::new_v4();
         let noise = weft_core::RunId::new_v4();
@@ -1224,7 +1238,7 @@ pub(crate) mod tests {
     /// to answer both shapes.
     #[tokio::test]
     async fn list_runs_filters_by_status() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         j.set_project_tenant(PROJECT, "t");
         let broke = weft_core::RunId::new_v4();
         let fine = weft_core::RunId::new_v4();
@@ -1263,7 +1277,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_status_filter_reaches_runs_as_the_listing_reads_them() {
         use weft_core::program::RunStatus;
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         j.set_project_tenant(PROJECT, "t");
         let (going, parked, done) = (RunId::new_v4(), RunId::new_v4(), RunId::new_v4());
         for run_id in [going, parked, done] {
@@ -1293,7 +1307,7 @@ pub(crate) mod tests {
     /// started in the same second.
     #[tokio::test]
     async fn a_keyset_walk_reaches_every_run_once_while_the_walked_ones_leave_the_filter() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         j.set_project_tenant(PROJECT, "t");
         let runs: Vec<weft_core::RunId> = (0..5).map(|_| weft_core::RunId::new_v4()).collect();
         for run_id in &runs {
@@ -1322,7 +1336,7 @@ pub(crate) mod tests {
     /// so a listing can say which is which.
     #[tokio::test]
     async fn list_runs_filters_by_phase() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         j.set_project_tenant(PROJECT, "t");
         let fire = weft_core::RunId::new_v4();
         let setup = weft_core::RunId::new_v4();
@@ -1363,13 +1377,13 @@ pub(crate) mod tests {
         assert_eq!(fires.runs[0].run_id, fire);
     }
 
-    /// A program's `ctx.runs()` filter reads as one journal query for
+    /// A program's `ctx.runs()` filter reads as one store query for
     /// clean, list and count alike: "older than" keeps a run started
     /// exactly that long ago, a count asks for no rows and still gets the
     /// total, and a run started after the question is never reached.
     #[tokio::test]
     async fn a_run_filter_reads_the_same_for_every_door() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         j.set_project_tenant(PROJECT, "t");
         let old = weft_core::RunId::new_v4();
         let edge = weft_core::RunId::new_v4();

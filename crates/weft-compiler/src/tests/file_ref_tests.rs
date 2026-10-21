@@ -528,6 +528,28 @@ mod markers_in_a_list {
     }
 }
 
+/// The entry file `source` lowered with every `@include` inlined
+/// (`compile_lenient`), or every error it lowered with.
+fn compile(
+    source: &str,
+    project_id: uuid::Uuid,
+    fs: crate::file_reader::CompileFs,
+) -> Result<weft_core::project::ProjectDefinition, Vec<crate::weft_compiler::SourceError>> {
+    compile_with_mode(source, project_id, fs, crate::weft_compiler::IncludeMode::Full, None)
+}
+
+/// [`compile`] under the include mode the test names.
+fn compile_with_mode(
+    source: &str,
+    project_id: uuid::Uuid,
+    fs: crate::file_reader::CompileFs,
+    mode: crate::weft_compiler::IncludeMode,
+    source_name: Option<&str>,
+) -> Result<weft_core::project::ProjectDefinition, Vec<crate::weft_compiler::SourceError>> {
+    let (project, errors) = crate::weft_compiler::compile_lenient(source, project_id, fs, mode, source_name);
+    if errors.is_empty() { Ok(project) } else { Err(errors) }
+}
+
 /// A `@file` inside a list resolves like one standing alone: its content
 /// replaces it. Nothing may leave a raw marker in a value the runtime
 /// would then receive as text.
@@ -536,7 +558,7 @@ fn a_file_marker_inside_a_list_resolves() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "first").unwrap();
     std::fs::write(dir.path().join("b.txt"), "second").unwrap();
-    let project = crate::weft_compiler::compile(
+    let project = compile(
         "n = LlmParams { stop: [@file(\"a.txt\"), @file(\"b.txt\")] }",
         uuid::Uuid::nil(), crate::file_reader::CompileFs::disk(dir.path()),
     ).unwrap();
@@ -552,7 +574,7 @@ fn file_markers_keep_scoped_types_after_the_source_scope_ends() {
     let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::from([
         (std::path::PathBuf::from("/project/a.txt"), "local text".into()),
     ]));
-    let project = crate::weft_compiler::compile(
+    let project = compile(
         r#"type TextAlias = String
 n = Text { value: @file("a.txt", TextAlias) }
 g = Group(input: String) {
@@ -586,7 +608,7 @@ fn include_arguments_and_body_files_resolve_from_the_project_root() {
         (std::path::PathBuf::from("/project/components/box.weft"), "Group(input: String) {\n n = Text { value: @file(\"input.txt\") }\n}".into()),
     ]));
     for mode in [crate::weft_compiler::IncludeMode::Full, crate::weft_compiler::IncludeMode::Interface] {
-        let project = crate::weft_compiler::compile_with_mode(
+        let project = compile_with_mode(
             "type CallerText = String\nbox = @include(\"components/box.weft\")\nbox.input = @file(\"input.txt\", CallerText)\n",
             uuid::Uuid::nil(), crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project"))),
             mode, None,
@@ -614,7 +636,7 @@ fn a_deferred_asset_in_an_included_file_keeps_its_root_spelling() {
     let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::from([
         (std::path::PathBuf::from("/project/components/box.weft"), "Group {\n n = Text { value: @asset(\"pics/a.png\", Image) }\n}".into()),
     ]));
-    let project = crate::weft_compiler::compile_with_mode(
+    let project = compile_with_mode(
         "box = @include(\"components/box.weft\")\n",
         uuid::Uuid::nil(), crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project"))),
         crate::weft_compiler::IncludeMode::Full, None,
@@ -634,14 +656,14 @@ fn an_included_ref_reads_from_the_root_and_a_climb_above_it_is_refused() {
         (std::path::PathBuf::from("/project/components/bad.weft"), "Group {\n n = Text { value: @file(\"../etc/passwd\") }\n}".into()),
     ]));
     let fs = crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project")));
-    let project = crate::weft_compiler::compile_with_mode(
+    let project = compile_with_mode(
         "box = @include(\"components/box.weft\")\n", uuid::Uuid::nil(), fs,
         crate::weft_compiler::IncludeMode::Full, None,
     ).unwrap();
     let body = project.nodes.iter().find(|n| n.id == "@components:box.n").unwrap();
     assert_eq!(body.config["value"], serde_json::json!("shared"));
     assert_eq!(body.file_refs["value"].path, "shared.txt");
-    let errs = crate::weft_compiler::compile_with_mode(
+    let errs = compile_with_mode(
         "box = @include(\"components/bad.weft\")\n", uuid::Uuid::nil(), fs,
         crate::weft_compiler::IncludeMode::Full, None,
     ).unwrap_err();
@@ -661,7 +683,7 @@ fn a_deferred_asset_outside_the_root_keeps_its_absolute_spelling() {
             "Group {\n n = Text { value: @asset(\"/shared/logo.png\", Image) }\n}".into(),
         ),
     ]));
-    let project = crate::weft_compiler::compile_with_mode(
+    let project = compile_with_mode(
         "box = @include(\"components/box.weft\")\n",
         uuid::Uuid::nil(),
         crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project"))),
@@ -683,7 +705,7 @@ fn a_deferred_asset_outside_the_root_keeps_its_absolute_spelling() {
 fn a_tilde_path_expands_to_the_home_directory() {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from).expect("HOME is set in the test environment");
     let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::new());
-    let project = crate::weft_compiler::compile_with_mode(
+    let project = compile_with_mode(
         "n = Text { value: @asset(\"~/pics/logo.png\", Image) }\n",
         uuid::Uuid::nil(),
         crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project"))),
@@ -714,7 +736,7 @@ fn a_program_includes_a_stdlib_file_through_the_catalog_prefix() {
     ]));
     let fs = crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project")))
         .anchored_at(Some(std::path::Path::new("/project/src")));
-    let project = crate::weft_compiler::compile(
+    let project = compile(
         "agent = @include(\"__catalog/base_catalog/computer/agent.weft\")\nown = @include(\"__catalog/my_pkg/x.weft\")\n",
         uuid::Uuid::nil(),
         fs,
@@ -736,7 +758,7 @@ fn a_file_marker_through_the_catalog_prefix_may_not_leave_nodes() {
     let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::from([
         (std::path::PathBuf::from("/project/src/secret.txt"), "not for you".into()),
     ]));
-    let errs = crate::weft_compiler::compile(
+    let errs = compile(
         "n = Text { value: @file(\"__catalog/../src/secret.txt\") }\n",
         uuid::Uuid::nil(),
         crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project"))),
@@ -762,7 +784,7 @@ fn a_catalog_include_compiles_from_disk() {
     std::fs::write(root.join("nodes/my_pkg/flows/outer.weft"), "Group {\n inner = @include(\"inner.weft\")\n}").unwrap();
     std::fs::write(root.join("nodes/my_pkg/flows/inner.weft"), "Group {\n m = Text { value: @file(\"__catalog/my_pkg/note.md\") }\n}").unwrap();
     std::fs::write(root.join("nodes/my_pkg/note.md"), "hello").unwrap();
-    let project = crate::weft_compiler::compile(
+    let project = compile(
         "outer = @include(\"__catalog/my_pkg/flows/outer.weft\")\n",
         uuid::Uuid::nil(),
         crate::file_reader::CompileFs::disk(&root).anchored_at(Some(&root.join("src"))),

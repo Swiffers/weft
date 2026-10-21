@@ -163,13 +163,13 @@ pub async fn tick(state: &SupervisorState) -> Pass {
     let _pass = state.pass.lock().await;
     let mut ownership = ownership::Ownership::default();
     match ownership::claim(state, &mut ownership).await {
-        Err(e) => tracing::error!(error = %format!("{e:#}"), "the supervisor could not sync its ownership; it looks again at the next wake"),
+        Err(e) => tracing::error!(target: "weft_infra_supervisor", error = %format!("{e:#}"), "the supervisor could not sync its ownership; it looks again at the next wake"),
         Ok((_, held)) => {
             let (changes, ownership_changed) = tokio::sync::mpsc::unbounded_channel();
             tokio::select! {
                 emptied = act(state, held, ownership_changed) => ownership.emptied(&emptied),
                 renewing = ownership::keep_renewing(state.clone(), ownership.clone(), vec![changes]) => {
-                    tracing::error!(result = ?renewing, "the supervisor's ownership renewal ended mid-pass");
+                    tracing::error!(target: "weft_infra_supervisor", result = ?renewing, "the supervisor's ownership renewal ended mid-pass");
                 }
             }
         }
@@ -177,7 +177,7 @@ pub async fn tick(state: &SupervisorState) -> Pass {
     match ownership::end(state, ownership.held_projects()).await {
         Ok(pass) => pass,
         Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "the supervisor could not give its leases back; they lapse on their own");
+            tracing::error!(target: "weft_infra_supervisor", error = %format!("{e:#}"), "the supervisor could not give its leases back; they lapse on their own");
             Pass::default()
         }
     }
@@ -208,17 +208,17 @@ async fn act(
         Ok(copies) => ownership::sweep_gone_copies(state, copies).await,
         Err(e) => {
             let error = format!("could not list what the host holds to delete what its gone copies left: {e:#}");
-            tracing::error!(error, "the supervisor's pass sweeps nothing; a later pass tries again");
+            tracing::error!(target: "weft_infra_supervisor", error, "the supervisor's pass sweeps nothing; a later pass tries again");
             state.health.lock().await.all_troubled(health::Step::Sweep, &error);
             Vec::new()
         }
     };
     if let Err(e) = lifecycle::drain(state.clone(), &mut ownership_changed).await {
-        tracing::error!(error = %format!("{e:#}"), "the supervisor's commands stopped mid-pass");
+        tracing::error!(target: "weft_infra_supervisor", error = %format!("{e:#}"), "the supervisor's commands stopped mid-pass");
     }
     if let Err(e) = health::tick(state).await {
         let error = format!("could not read what it owns to look at its health: {e:#}");
-        tracing::error!(error, "the supervisor's pass looks at nothing; a later pass tries again");
+        tracing::error!(target: "weft_infra_supervisor", error, "the supervisor's pass looks at nothing; a later pass tries again");
         state.health.lock().await.all_troubled(health::Step::Look, &error);
     }
     emptied
@@ -242,7 +242,7 @@ where
     loop {
         match step().await {
             Err(e) if weft_broker_client::client::broker_unavailable(&e) && state.clock.now() - started < PATIENCE => {
-                tracing::warn!(error = %format!("{e:#}"), retry_in_ms = wait.as_millis() as u64, "the broker could not answer; asking again");
+                tracing::warn!(target: "weft_infra_supervisor", error = %format!("{e:#}"), retry_in_ms = wait.as_millis() as u64, "the broker could not answer; asking again");
                 state.clock.sleep(wait).await;
                 wait = (wait * 2).min(Duration::from_secs(4));
             }
@@ -259,7 +259,7 @@ where
 /// failed is not reported settled by its pass, unless the step comes
 /// right within it (`HealthRegistry::untroubled`).
 pub(crate) async fn failed(state: &SupervisorState, project: uuid::Uuid, step: health::Step, error: &str) {
-    tracing::error!(project_id = %project, error, "the supervisor could not get through the project's infra; a later pass tries again");
+    tracing::error!(target: "weft_infra_supervisor", project_id = %project, error, "the supervisor could not get through the project's infra; a later pass tries again");
     state.health.lock().await.troubled(project, step, error);
 }
 
@@ -269,6 +269,6 @@ pub(crate) async fn failed(state: &SupervisorState, project: uuid::Uuid, step: h
 /// look or command, or what the machines report changing, does
 /// (`SupervisorSyncOwnershipRequest::gave_up`).
 pub(crate) async fn give_up(state: &SupervisorState, project: uuid::Uuid, error: &str) {
-    tracing::error!(project_id = %project, error, "a health rule gave up on the project's infra; a look asked for it, or its next change, tries again");
+    tracing::error!(target: "weft_infra_supervisor", project_id = %project, error, "a health rule gave up on the project's infra; a look asked for it, or its next change, tries again");
     state.health.lock().await.troubled(project, health::Step::Rule, error);
 }

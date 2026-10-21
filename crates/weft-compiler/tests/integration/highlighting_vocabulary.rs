@@ -19,9 +19,8 @@
 
 use std::collections::BTreeSet;
 
-use weft_compiler::weft_compiler::{
-    RESERVED_CONFIG_KEYS, RESERVED_TYPE_KEYWORDS, RESERVED_WORDS,
-};
+use weft_compiler::weft_compiler::{RESERVED_CONFIG_KEYS, RESERVED_WORDS};
+use weft_core::project::own_types;
 use weft_core::weft_type::{WeftPrimitive, WeftType, CONTAINER_AND_SPECIAL_TYPES};
 
 /// Read one grammar file out of `packages/weft-syntax/`.
@@ -32,11 +31,11 @@ fn grammar(file: &str) -> String {
         .unwrap_or_else(|e| panic!("cannot read the weft grammar at {}: {e}", path.display()))
 }
 
-/// Every word both grammars have to list: the reserved type keywords, the
+/// Every word both grammars have to list: the type names weft owns, the
 /// reserved config keys, the whole type vocabulary a port signature can
 /// mention, and the bare reserved words (`self`, the boolean literals).
 fn vocabulary() -> BTreeSet<String> {
-    RESERVED_TYPE_KEYWORDS
+    own_types::ALL
         .iter()
         .chain(RESERVED_CONFIG_KEYS.iter())
         .chain(RESERVED_WORDS.iter())

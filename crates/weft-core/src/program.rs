@@ -333,7 +333,7 @@ impl InstanceHoldings {
 crate::wire_enum! {
     /// Where a run stands, as a filter asks for it: each word is the
     /// [`RunSummary::status`] a run reads in a listing.
-    // SYNC: RunStatus <-> crates/weft-dispatcher/src/journal/postgres.rs list_runs (status clause), extension-vscode/src/sidebar/runSearch.ts STATUSES, extension-vscode/src/sidebar/runs.ts RunStatus
+    // SYNC: RunStatus <-> crates/weft-dispatcher/src/store/postgres.rs list_runs (status clause), extension-vscode/src/sidebar/runSearch.ts STATUSES, extension-vscode/src/sidebar/runs.ts RunStatus
     pub enum RunStatus {
         /// Not ended: no terminal event yet. A run parked on a wait has
         /// not ended either, so it is here too.

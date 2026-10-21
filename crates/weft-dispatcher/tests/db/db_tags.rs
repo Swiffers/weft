@@ -6,7 +6,7 @@
 //! its own crate); what this rig proves is the SQL underneath it: the
 //! BIGSERIAL order, the (run, tag) idempotency, the live filter, the
 //! project wall, the row's life ending with the journal's, and the
-//! one-transaction cancel (`Journal::cancel_run`) that a tag
+//! one-transaction cancel (`RunStore::cancel_run`) that a tag
 //! stop and the stop button both end in.
 //!
 //! Same rig as `db_lifecycle.rs`: `#[sqlx::test]` hands each test a fresh
@@ -18,20 +18,20 @@ use uuid::Uuid;
 
 use weft_core::run::CancelCause;
 use weft_core::{ProjectDefinition, StopSelf};
-use weft_dispatcher::journal::postgres::PostgresJournal;
-use weft_dispatcher::journal::{Journal, SignalRegistration};
+use weft_dispatcher::store::postgres::PostgresStore;
+use weft_dispatcher::store::{RunStore, SignalRegistration, SignalStore, TokenStore};
 use weft_journal::tags::{live_tagged_runs, max_tag_seq, select_stop_targets, tag_run_in, tag_seq};
 use weft_journal::record::{Queued, Then};
 use weft_journal::RunEvent;
 
 const TENANT: &str = "tenant-1";
 
-async fn setup(pool: &PgPool) -> (PostgresJournal, weft_dispatcher::ProjectStore) {
+async fn setup(pool: &PgPool) -> (PostgresStore, weft_dispatcher::ProjectStore) {
     weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
-    let journal = PostgresJournal::from_pool(pool.clone());
+    let store = PostgresStore::from_pool(pool.clone());
     let projects: weft_dispatcher::ProjectStore =
         std::sync::Arc::new(weft_dispatcher::PostgresProjectStore::new(pool.clone()));
-    (journal, projects)
+    (store, projects)
 }
 
 /// The program every run here runs: one node, `wait`, the one a
@@ -61,7 +61,7 @@ async fn seed_project(projects: &weft_dispatcher::ProjectStore, id: Uuid) {
 /// `run_kind` starts another kind instead (a node test runs no program),
 /// which the live read must never select no matter what it carries.
 async fn start_run(
-    journal: &PostgresJournal,
+    store: &PostgresStore,
     project: Uuid,
     run_kind: weft_core::run::RunKind,
 ) -> weft_core::RunId {
@@ -84,13 +84,13 @@ async fn start_run(
         events: std::slice::from_ref(&birth), tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
         watch_end: false, stale: &[], spec: None, example: None, program: None,
     };
-    assert!(journal.queue_run(queued, false).await.expect("queue the run"));
+    assert!(store.queue_run(queued, false).await.expect("queue the run"));
     run_id
 }
 
 /// Write `events` into the record of a run nobody drives.
-async fn write(journal: &PostgresJournal, run_id: weft_core::RunId, events: &[RunEvent]) {
-    let written = journal.append(run_id, events, Then::Stays).await.expect("write the run's record");
+async fn write(store: &PostgresStore, run_id: weft_core::RunId, events: &[RunEvent]) {
+    let written = store.append(run_id, events, Then::Stays).await.expect("write the run's record");
     assert!(matches!(written, weft_journal::record::Appended::At(_)), "{written:?}");
 }
 
@@ -113,11 +113,11 @@ async fn tag(pool: &PgPool, run_id: weft_core::RunId, tags: &[&str], at: u64) {
 /// re-tag keeps its place.
 #[sqlx::test]
 async fn tag_rows_are_ordered_by_write_and_idempotent(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
-    let first = start_run(&journal, project, weft_core::run::RunKind::Project).await;
-    let second = start_run(&journal, project, weft_core::run::RunKind::Project).await;
+    let first = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let second = start_run(&store, project, weft_core::run::RunKind::Project).await;
 
     tag(&pool, first, &["user_7"], 10).await;
     tag(&pool, second, &["user_7", "batch_a"], 11).await;
@@ -132,10 +132,10 @@ async fn tag_rows_are_ordered_by_write_and_idempotent(pool: PgPool) {
     assert!(max_tag_seq(&pool).await.unwrap() >= s2);
 
     // The summaries carry the tags in claim order.
-    let summary = journal.run_summary(second).await.unwrap().expect("summary");
+    let summary = store.run_summary(second).await.unwrap().expect("summary");
     assert_eq!(summary.tags, vec!["user_7".to_string(), "batch_a".to_string()]);
-    let page = journal
-        .list_runs(TENANT, &weft_dispatcher::journal::RunListQuery { limit: 10, ..Default::default() })
+    let page = store
+        .list_runs(TENANT, &weft_dispatcher::store::RunListQuery { limit: 10, ..Default::default() })
         .await
         .unwrap();
     let listed_first = page.runs.iter().find(|s| s.run_id == first).expect("listed");
@@ -148,24 +148,24 @@ async fn tag_rows_are_ordered_by_write_and_idempotent(pool: PgPool) {
 /// "keep me" runs alive.
 #[sqlx::test]
 async fn live_tagged_read_respects_the_project_wall_and_terminals(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     let other_project = Uuid::new_v4();
     seed_project(&projects, project).await;
     seed_project(&projects, other_project).await;
 
-    let a = start_run(&journal, project, weft_core::run::RunKind::Project).await;
-    let b = start_run(&journal, project, weft_core::run::RunKind::Project).await;
-    let done = start_run(&journal, project, weft_core::run::RunKind::Project).await;
-    let elsewhere = start_run(&journal, other_project, weft_core::run::RunKind::Project).await;
+    let a = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let b = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let done = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let elsewhere = start_run(&store, other_project, weft_core::run::RunKind::Project).await;
     // Same project, same tag, but a node-test run: never selectable.
-    let probe = start_run(&journal, project, weft_core::run::RunKind::NodeTest).await;
+    let probe = start_run(&store, project, weft_core::run::RunKind::NodeTest).await;
     tag(&pool, a, &["user_7"], 1).await;
     tag(&pool, done, &["user_7"], 2).await;
     tag(&pool, elsewhere, &["user_7"], 3).await;
     tag(&pool, b, &["user_7"], 4).await;
     tag(&pool, probe, &["user_7"], 5).await;
-    write(&journal, done, &[RunEvent::RunCompleted { run_id: done, at_unix: 5 }]).await;
+    write(&store, done, &[RunEvent::RunCompleted { run_id: done, at_unix: 5 }]).await;
 
     let live = live_tagged_runs(&pool, project, "user_7").await.unwrap();
     let run_ids: Vec<_> = live.iter().map(|t| t.run_id).collect();
@@ -184,28 +184,28 @@ async fn live_tagged_read_respects_the_project_wall_and_terminals(pool: PgPool) 
     // "we are all busted" from a takes both.
     assert_eq!(select_stop_targets(&live, a, None, StopSelf::Include), vec![a, b]);
 
-    // The dispatcher's Journal trait reads the same rows.
-    let via_trait = journal.live_tagged_runs(project, "user_7").await.unwrap();
+    // The dispatcher's RunStore trait reads the same rows.
+    let via_trait = store.live_tagged_runs(project, "user_7").await.unwrap();
     assert_eq!(via_trait, live);
 }
 
 /// A tag stop's terminal names who asked and which tag matched, on the
 /// run row and on every per-node cancel it writes; and `weft
-/// clean` takes the tag rows with the journal.
+/// clean` takes the tag rows with the store.
 #[sqlx::test]
 async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
-    let victim = start_run(&journal, project, weft_core::run::RunKind::Project).await;
-    let by = start_run(&journal, project, weft_core::run::RunKind::Project).await;
+    let victim = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let by = start_run(&store, project, weft_core::run::RunKind::Project).await;
     tag(&pool, victim, &["user_7"], 1).await;
-    write(&journal, victim, &[RunEvent::NodeStarted { run_id: victim, node_id: "wait".into(), frames: vec![], at_unix: 2 }]).await;
+    write(&store, victim, &[RunEvent::NodeStarted { run_id: victim, node_id: "wait".into(), frames: vec![], at_unix: 2 }]).await;
 
     // The run is parked on a form: a resume signal whose wake the
     // cancel must erase in the same step that ends the run.
     park_run(&pool, victim).await;
-    journal
+    store
         .signal_insert(
             &resume_signal("form-victim", project, victim)
         )
@@ -214,13 +214,13 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
 
     let cause = CancelCause::Run { by, tag: Some("user_7".into()) };
     let program = rig_project(project);
-    let write = journal.cancel_run(victim, Some(&program), &cause).await.unwrap();
+    let write = store.cancel_run(victim, Some(&program), &cause).await.unwrap();
     assert_eq!(write.removed.len(), 1, "the parked run's form is gone: {write:?}");
     assert_eq!(write.removed[0].token, "form-victim");
     assert_eq!(write.node_cancellations, Some(1), "{write:?}");
     assert!(!write.requested, "no worker drives a parked run: it is ended here");
-    assert!(journal.signal_get("form-victim").await.unwrap().is_none());
-    let after = journal.events_log(victim).await.unwrap();
+    assert!(store.signal_get("form-victim").await.unwrap().is_none());
+    let after = store.events_log(victim).await.unwrap();
     let node_cancel = after
         .iter()
         .find_map(|e| match e {
@@ -238,18 +238,18 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
         .expect("terminal written");
     assert_eq!(terminal, (cause.to_string(), Some(cause.clone())));
     assert_eq!(
-        journal.run_summary(victim).await.unwrap().unwrap().status.as_str(),
+        store.run_summary(victim).await.unwrap().unwrap().status.as_str(),
         "cancelled"
     );
     // Terminal now: out of the live set.
     assert!(live_tagged_runs(&pool, project, "user_7").await.unwrap().is_empty());
 
     // A second cancel finds the terminal and writes nothing new.
-    let again = journal.cancel_run(victim, Some(&program), &CancelCause::User).await.unwrap();
+    let again = store.cancel_run(victim, Some(&program), &CancelCause::User).await.unwrap();
     assert!(again.removed.is_empty() && again.node_cancellations.is_none(), "{again:?}");
-    assert_eq!(journal.events_log(victim).await.unwrap().len(), after.len());
+    assert_eq!(store.events_log(victim).await.unwrap().len(), after.len());
 
-    journal.delete_run(victim).await.unwrap();
+    store.delete_run(victim).await.unwrap();
     assert_eq!(tag_seq(&pool, victim, "user_7").await.unwrap(), None, "tag rows go with the journal");
 }
 
@@ -259,28 +259,28 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
 /// wait, since a wait is registered only for a run whose row exists.
 #[sqlx::test]
 async fn cancel_leaves_a_finished_run_alone_and_strips_an_unstarted_run_id(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
 
-    let done = start_run(&journal, project, weft_core::run::RunKind::Project).await;
-    write(&journal, done, &[RunEvent::RunCompleted { run_id: done, at_unix: 5 }]).await;
-    let before = journal.events_log(done).await.unwrap();
+    let done = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    write(&store, done, &[RunEvent::RunCompleted { run_id: done, at_unix: 5 }]).await;
+    let before = store.events_log(done).await.unwrap();
     let program = rig_project(project);
-    let write = journal.cancel_run(done, Some(&program), &CancelCause::User).await.unwrap();
+    let write = store.cancel_run(done, Some(&program), &CancelCause::User).await.unwrap();
     assert!(write.removed.is_empty() && write.node_cancellations.is_none() && !write.requested, "{write:?}");
-    assert_eq!(journal.events_log(done).await.unwrap().len(), before.len(), "a finished run keeps its terminal");
-    assert_eq!(journal.run_summary(done).await.unwrap().unwrap().status.as_str(), "completed");
+    assert_eq!(store.events_log(done).await.unwrap().len(), before.len(), "a finished run keeps its terminal");
+    assert_eq!(store.run_summary(done).await.unwrap().unwrap().status.as_str(), "completed");
 
     // Never started: no wait can be registered for it, and its cancel
     // opens no record.
     let ghost = weft_core::new_run_id();
-    let refused = journal.signal_insert(&resume_signal("form-ghost", project, ghost)).await.expect_err("no run row");
+    let refused = store.signal_insert(&resume_signal("form-ghost", project, ghost)).await.expect_err("no run row");
     assert!(refused.to_string().contains("has no record"), "{refused:#}");
-    let write = journal.cancel_run(ghost, None, &CancelCause::User).await.unwrap();
+    let write = store.cancel_run(ghost, None, &CancelCause::User).await.unwrap();
     assert!(write.removed.is_empty(), "{write:?}");
     assert!(write.node_cancellations.is_none() && !write.requested, "{write:?}");
-    assert!(journal.events_log(ghost).await.unwrap().is_empty());
+    assert!(store.events_log(ghost).await.unwrap().is_empty());
 }
 
 /// The listing's status filter: a run parked on a wait is
@@ -289,21 +289,21 @@ async fn cancel_leaves_a_finished_run_alone_and_strips_an_unstarted_run_id(pool:
 #[sqlx::test]
 async fn the_status_filter_finds_a_parked_run_under_waiting_and_running(pool: PgPool) {
     use weft_core::program::RunStatus;
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
-    let parked = start_run(&journal, project, weft_core::run::RunKind::Project).await;
-    let plain = start_run(&journal, project, weft_core::run::RunKind::Project).await;
-    let ended = start_run(&journal, project, weft_core::run::RunKind::Project).await;
+    let parked = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let plain = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let ended = start_run(&store, project, weft_core::run::RunKind::Project).await;
     park_run(&pool, parked).await;
-    write(&journal, ended, &[RunEvent::RunCompleted { run_id: ended, at_unix: 2 }]).await;
+    write(&store, ended, &[RunEvent::RunCompleted { run_id: ended, at_unix: 2 }]).await;
 
     let listed = |status: RunStatus| {
-        let journal = &journal;
+        let store = &store;
         async move {
-            let query = weft_dispatcher::journal::RunListQuery { limit: 10, status: Some(status), ..Default::default() };
+            let query = weft_dispatcher::store::RunListQuery { limit: 10, status: Some(status), ..Default::default() };
             let mut ids: Vec<_> =
-                journal.list_runs(TENANT, &query).await.unwrap().runs.into_iter().map(|s| s.run_id).collect();
+                store.list_runs(TENANT, &query).await.unwrap().runs.into_iter().map(|s| s.run_id).collect();
             ids.sort();
             ids
         }
@@ -322,26 +322,26 @@ async fn the_status_filter_finds_a_parked_run_under_waiting_and_running(pool: Pg
 #[sqlx::test]
 async fn a_damaged_record_lists_from_its_row_and_reads_what_decodes(pool: PgPool) {
     use weft_core::program::RunStatus;
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
-    let damaged = start_run(&journal, project, weft_core::run::RunKind::Project).await;
-    write(&journal, damaged, &[RunEvent::NodeStarted { run_id: damaged, node_id: "wait".into(), frames: vec![], at_unix: 2 }]).await;
+    let damaged = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    write(&store, damaged, &[RunEvent::NodeStarted { run_id: damaged, node_id: "wait".into(), frames: vec![], at_unix: 2 }]).await;
     sqlx::query("UPDATE run_log SET events = '\\x00' WHERE run_id = $1 AND seq = 0")
         .bind(damaged)
         .execute(&pool)
         .await
         .unwrap();
 
-    let query = weft_dispatcher::journal::RunListQuery { limit: 10, status: Some(RunStatus::Running), ..Default::default() };
-    let running = journal.list_runs(TENANT, &query).await.unwrap();
+    let query = weft_dispatcher::store::RunListQuery { limit: 10, status: Some(RunStatus::Running), ..Default::default() };
+    let running = store.list_runs(TENANT, &query).await.unwrap();
     assert_eq!(running.total, 1, "{running:?}");
     assert_eq!(running.runs[0].status, RunStatus::Running);
 
-    let (shown, bad) = journal.events_log_lossy(damaged).await.unwrap();
+    let (shown, bad) = store.events_log_lossy(damaged).await.unwrap();
     assert!(matches!(shown.iter().map(|row| &row.event).collect::<Vec<_>>()[..], [RunEvent::NodeStarted { .. }]), "{shown:?}");
     assert_eq!(bad.len(), 1);
-    assert!(journal.events_log(damaged).await.is_err(), "a fold never runs over part of a record");
+    assert!(store.events_log(damaged).await.is_err(), "a fold never runs over part of a record");
 }
 
 /// A resume (form) signal parked on `run_id`.
@@ -381,8 +381,8 @@ fn resume_signal(token: &str, project_id: Uuid, run_id: weft_core::RunId) -> Sig
 #[sqlx::test]
 async fn an_instance_token_is_one_project_and_expires(pool: PgPool) {
     use weft_core::instance::InstanceId;
-    use weft_dispatcher::journal::SignalToken;
-    let (journal, _) = setup(&pool).await;
+    use weft_dispatcher::store::SignalToken;
+    let (store, _) = setup(&pool).await;
     let project = Uuid::new_v4();
     let ada = InstanceId::new("ada").unwrap();
     let token = |hash: &str, instance: Option<&InstanceId>, projects: Vec<Uuid>, expires_at: Option<u64>| SignalToken {
@@ -400,33 +400,33 @@ async fn an_instance_token_is_one_project_and_expires(pool: PgPool) {
         expires_at,
         kind: weft_core::signal_token::TokenKind::Caller,
     };
-    let err = journal.mint_signal_token(&token("h1", Some(&ada), vec![], Some(10))).await.unwrap_err();
+    let err = store.mint_signal_token(&token("h1", Some(&ada), vec![], Some(10))).await.unwrap_err();
     assert!(format!("{err:#}").contains("signal_token_instance_has_one_project"), "{err:#}");
-    let err = journal.mint_signal_token(&token("h2", Some(&ada), vec![project], None)).await.unwrap_err();
+    let err = store.mint_signal_token(&token("h2", Some(&ada), vec![project], None)).await.unwrap_err();
     assert!(format!("{err:#}").contains("signal_token_instance_expires"), "{err:#}");
     let operator_instance = SignalToken {
         kind: weft_core::signal_token::TokenKind::Operator,
         ..token("h3", Some(&ada), vec![project], Some(10))
     };
-    let err = journal.mint_signal_token(&operator_instance).await.unwrap_err();
+    let err = store.mint_signal_token(&operator_instance).await.unwrap_err();
     assert!(format!("{err:#}").contains("signal_token_operator_is_nobody"), "{err:#}");
 
-    journal.mint_signal_token(&token("ada-1", Some(&ada), vec![project], Some(10))).await.unwrap();
-    journal.mint_signal_token(&token("ada-2", Some(&ada), vec![project], Some(20))).await.unwrap();
+    store.mint_signal_token(&token("ada-1", Some(&ada), vec![project], Some(10))).await.unwrap();
+    store.mint_signal_token(&token("ada-2", Some(&ada), vec![project], Some(20))).await.unwrap();
     let bob = InstanceId::new("bob").unwrap();
-    journal.mint_signal_token(&token("bob-1", Some(&bob), vec![project], Some(10))).await.unwrap();
-    journal.mint_signal_token(&token("author", None, vec![project], None)).await.unwrap();
-    let read = journal.get_signal_token("ada-1").await.unwrap().expect("stored");
+    store.mint_signal_token(&token("bob-1", Some(&bob), vec![project], Some(10))).await.unwrap();
+    store.mint_signal_token(&token("author", None, vec![project], None)).await.unwrap();
+    let read = store.get_signal_token("ada-1").await.unwrap().expect("stored");
     assert_eq!((read.instance.as_ref(), read.expires_at), (Some(&ada), Some(10)));
     assert!(read.expired(10) && !read.expired(9));
 
     let other_project = Uuid::new_v4();
-    let revoke = weft_dispatcher::journal::postgres::revoke_instance_tokens;
+    let revoke = weft_dispatcher::store::postgres::revoke_instance_tokens;
     assert_eq!(revoke(&pool, TENANT, other_project, &ada, None).await.unwrap(), 0);
     assert_eq!(revoke(&pool, "tenant-2", project, &ada, None).await.unwrap(), 0);
     assert_eq!(revoke(&pool, TENANT, project, &ada, Some(read.id)).await.unwrap(), 1);
     assert_eq!(revoke(&pool, TENANT, project, &ada, None).await.unwrap(), 1);
-    let left: Vec<String> = journal.list_signal_tokens(TENANT).await.unwrap().into_iter().map(|t| t.token_hash).collect();
+    let left: Vec<String> = store.list_signal_tokens(TENANT).await.unwrap().into_iter().map(|t| t.token_hash).collect();
     assert_eq!(left.len(), 2, "{left:?}");
     assert!(left.contains(&"bob-1".to_string()) && left.contains(&"author".to_string()));
 }
@@ -439,11 +439,11 @@ async fn an_instance_token_is_one_project_and_expires(pool: PgPool) {
 #[sqlx::test]
 async fn runs_are_found_by_a_node_they_ran_and_by_what_went_through_them(pool: PgPool) {
     use std::sync::Arc;
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
     let ran = |run_id, value: &'static str| {
-        let journal = &journal;
+        let store = &store;
         async move {
             let events = [
                 RunEvent::NodeStarted { run_id, node_id: "wait".into(), frames: vec![], at_unix: 1 },
@@ -457,30 +457,30 @@ async fn runs_are_found_by_a_node_they_ran_and_by_what_went_through_them(pool: P
                     at_unix: 2,
                 },
             ];
-            write(journal, run_id, &events).await;
+            write(store, run_id, &events).await;
         }
     };
-    let ada = start_run(&journal, project, weft_core::run::RunKind::Project).await;
-    let bob = start_run(&journal, project, weft_core::run::RunKind::Project).await;
-    let idle = start_run(&journal, project, weft_core::run::RunKind::Project).await;
-    let going = start_run(&journal, project, weft_core::run::RunKind::Project).await;
+    let ada = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let bob = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let idle = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let going = start_run(&store, project, weft_core::run::RunKind::Project).await;
     ran(ada, "ada@example.com").await;
     ran(bob, "bob@example.com").await;
     ran(going, "ada@example.com").await;
     for finished in [ada, bob, idle] {
-        write(&journal, finished, &[RunEvent::RunCompleted { run_id: finished, at_unix: 3 }]).await;
+        write(&store, finished, &[RunEvent::RunCompleted { run_id: finished, at_unix: 3 }]).await;
     }
 
     let listed = |node: Option<&'static str>, search: Option<&'static str>| {
-        let journal = &journal;
+        let store = &store;
         async move {
-            let query = weft_dispatcher::journal::RunListQuery {
+            let query = weft_dispatcher::store::RunListQuery {
                 limit: 10,
                 node: node.map(Into::into),
                 search: search.map(Into::into),
                 ..Default::default()
             };
-            let page = journal.list_runs(TENANT, &query).await.unwrap();
+            let page = store.list_runs(TENANT, &query).await.unwrap();
             let mut ids: Vec<_> = page.runs.into_iter().map(|s| s.run_id).collect();
             assert_eq!(page.total, ids.len() as u64, "the count agrees with the list");
             ids.sort();

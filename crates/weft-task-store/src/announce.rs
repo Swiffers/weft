@@ -617,7 +617,7 @@ fn pieces(rows: Vec<NewsRow>) -> Vec<(i64, Option<RunNews>)> {
 }
 
 /// The kind a row of [`NEWS_TABLE`] names.
-// SYNC: kind_named <-> the kinds in weft_news (GROUP), crates/weft-task-store/src/parked_fires.rs (parked_fire_notify), crates/weft-dispatcher/src/journal/postgres.rs (cancel_run)
+// SYNC: kind_named <-> the kinds in weft_news (GROUP), crates/weft-task-store/src/parked_fires.rs (parked_fire_notify), crates/weft-dispatcher/src/store/postgres.rs (cancel_run)
 fn kind_named(kind: &str) -> Option<NewsKind> {
     match kind {
         "answer" => Some(NewsKind::Answer),

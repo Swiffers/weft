@@ -33,18 +33,16 @@ const BETWEEN_ROUNDS: Duration = Duration::from_secs(1);
 /// A run ending that may come due before the look booked.
 pub(crate) static WAKE_ON: &[WakeOn] = &[WakeOn::any(weft_journal::RETENTION_CHANNEL)];
 
-/// How often a machine's process looks anyway: once a minute, at this
-/// install's pace (`weft_core::time_scale`).
-fn every() -> Duration {
-    weft_core::time_scale::scaled(Duration::from_secs(60))
-}
+/// How often a machine's process looks anyway: once a minute in real
+/// time (`DrainLoop::new` runs it at this install's pace).
+const EVERY: Duration = Duration::from_secs(60);
 
 pub fn drain_loop(state: DispatcherState) -> DrainLoop {
-    DrainLoop::new("retention", "erase runs past their keep", WAKE_ON, every(), move || {
+    DrainLoop::new("retention", "erase runs past their keep", WAKE_ON, EVERY, move || {
         let state = state.clone();
         async move {
             let now = crate::lease::now_unix();
-            let (erased, removed) = state.journal.erase_expired(now, ROUND).await?;
+            let (erased, removed) = state.runs.erase_expired(now, ROUND).await?;
             state.listener.unregister_many(&removed).await;
             if erased > 0 {
                 tracing::info!(target: "weft_dispatcher::retention", erased, "erased runs kept long enough");
@@ -53,7 +51,7 @@ pub fn drain_loop(state: DispatcherState) -> DrainLoop {
                 return Ok(DrainStep::RetryIn(BETWEEN_ROUNDS));
             }
             // A run is erased once its keep is past, so a second after it.
-            Ok(match state.journal.next_expiry().await? {
+            Ok(match state.runs.next_expiry().await? {
                 Some(at) => DrainStep::RetryIn(Duration::from_secs((at + 1 - now).max(1).unsigned_abs())),
                 None => DrainStep::Done,
             })

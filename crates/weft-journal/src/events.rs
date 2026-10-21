@@ -325,10 +325,11 @@ pub enum RunEvent {
     /// taken item as Pending beside a terminal consumer record (which
     /// would re-dispatch the consumer, a double run).
     ///
-    /// TODO: every stream item costs one `PortEmitted` + one of these
-    /// (a journal write each); a multi-million-item stream needs
-    /// windowed writes (the bus already batches its appends this way)
-    /// before that volume is real.
+    /// TODO: every stream item costs two rows, its `PortEmitted` and one
+    /// of these. The worker's writer already sends many rows as one write
+    /// (`weft_engine::journal_writer`), so the cost is rows, not writes:
+    /// a multi-million-item stream needs consumption windowed into fewer
+    /// rows before that volume is real.
     PulsesConsumed {
         #[serde(skip)]
         run_id: RunId,

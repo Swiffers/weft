@@ -302,10 +302,15 @@ pub async fn unserve(pool: &PgPool, hosting: &dyn DomainHosting, stored: &[Domai
 /// `weft domain add` of a stored domain tries again.
 const DOOR_TRIES: i32 = 3;
 
+/// How soon the door is put on the stored domains again after one
+/// refusal, in real time: also the loop's safety interval.
+const DOOR_RETRY_FIRST: Duration = Duration::from_secs(300);
+
 /// How soon the door is put on the stored domains again after the
-/// platform refused `refusals` times in a row: five minutes, doubling.
+/// platform refused `refusals` times in a row, at this install's pace:
+/// [`DOOR_RETRY_FIRST`], doubling.
 fn door_retry(refusals: i32) -> Duration {
-    let first = weft_core::time_scale::scaled(Duration::from_secs(300));
+    let first = weft_core::time_scale::scaled(DOOR_RETRY_FIRST);
     let doublings = u32::try_from(refusals.saturating_sub(1).clamp(0, DOOR_TRIES)).unwrap_or(0);
     first.saturating_mul(1 << doublings)
 }
@@ -318,7 +323,7 @@ fn door_retry(refusals: i32) -> Duration {
 /// in a row.
 pub fn drain_loop(state: &DispatcherState) -> DrainLoop {
     let state = state.clone();
-    DrainLoop::new("domains_door", "set up the door in front of the install's domains", ON_DOMAINS, door_retry(1), move || {
+    DrainLoop::new("domains_door", "set up the door in front of the install's domains", ON_DOMAINS, DOOR_RETRY_FIRST, move || {
         let state = state.clone();
         async move {
             let key = crate::lease::advisory_key(crate::lease::DOMAINS_DOMAIN, "install");

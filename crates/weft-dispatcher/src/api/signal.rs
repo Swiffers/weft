@@ -250,7 +250,11 @@ pub(crate) async fn take_event(
         .process(token, &payload)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listener dispatch: {e:#}")))?;
-    match outcome.target {
+    let target = outcome
+        .target
+        .for_signal(token, routing.is_resume)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match target {
         ProcessTarget::Resume { .. } => Ok(answer_run(state, token, routing, weft_core::primitive::WaitAnswer::Given { value: outcome.value }).await?),
         ProcessTarget::Entry => {
             let fire = weft_core::door_fire::DoorFire {
@@ -289,7 +293,7 @@ pub(crate) async fn take_event(
 /// `weft wake`, a parked answer drained): `value` is already the kind's.
 /// Its run's trigger decides, by the rule `weft_core::arrival` states:
 ///
-/// - **Live**: it reaches its run now (`Journal::answer`).
+/// - **Live**: it reaches its run now (`SignalStore::answer`).
 /// - **Wait**: it waits in the wait's queue (one answer per wait), and the
 ///   parked-fire drain hands it over once the trigger is back.
 /// - **Refused**: 410 Gone; the trigger takes no work any more.
@@ -301,19 +305,19 @@ pub(crate) async fn answer_run(
 ) -> Result<StatusCode, (StatusCode, String)> {
     match routing.standing().arrival(crate::lease::now_unix()) {
         weft_core::arrival::Arrival::Live => {
-            let answered = state.journal.answer(token, &answer).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("answer: {e:#}")))?;
+            let answered = state.registrations.answer(token, &answer).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("answer: {e:#}")))?;
             match answered {
-                crate::journal::Answered::Reached { consumed } => {
+                crate::store::Answered::Reached { consumed } => {
                     // The row is gone now, so the listener only learns of
                     // it from here.
                     state.listener.unregister_many(&[consumed]).await;
                     Ok(StatusCode::OK)
                 }
-                crate::journal::Answered::RunEnded { consumed } => {
+                crate::store::Answered::RunEnded { consumed } => {
                     state.listener.unregister_many(&[consumed]).await;
                     Err((StatusCode::GONE, "the run this answers has ended".into()))
                 }
-                crate::journal::Answered::Gone => {
+                crate::store::Answered::Gone => {
                     Err((StatusCode::CONFLICT, "suspension already answered; duplicate submission ignored".into()))
                 }
             }
@@ -485,14 +489,14 @@ pub(crate) async fn fire_entry(state: &DispatcherState, routing: &FireGateInfo, 
 /// leave the system half-deleted.
 pub(crate) async fn delete_signals(
     state: &DispatcherState,
-    signals: &[crate::journal::SignalRegistration],
+    signals: &[crate::store::SignalRegistration],
 ) -> Result<(), (StatusCode, String)> {
     if signals.is_empty() {
         return Ok(());
     }
     let tokens: Vec<String> = signals.iter().map(|s| s.token.clone()).collect();
     let deleted = state
-        .journal
+        .registrations
         .signal_remove_many(&tokens)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal_remove_many: {e}")))?;
@@ -528,7 +532,7 @@ pub async fn cancel_signal(
     let scope = require_scoped_signal_token(&state, &scoping_token).await?;
 
     let row = state
-        .journal
+        .registrations
         .signal_get(&signal_token)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal_get: {e}")))?
@@ -691,7 +695,7 @@ const SIGNAL_FILE_LINK_TTL_SECS: u64 = 3600;
 /// tenant's assets. A file of another project or run is not the form's to show.
 fn file_belongs_to_signal(
     parsed: &weft_core::storage::key::ParsedKey,
-    sig: &crate::journal::SignalRegistration,
+    sig: &crate::store::SignalRegistration,
 ) -> bool {
     use weft_core::storage::key::KeyScope;
     if parsed.tenant != sig.tenant_id {
@@ -806,7 +810,7 @@ pub async fn clear_all_signals(
     // signal of the same run, so cancelling once per run is
     // both correct AND avoids duplicate work on parallel HumanQueries.
     let mut run_ids: std::collections::BTreeSet<weft_core::RunId> = Default::default();
-    let mut entry_signals: Vec<crate::journal::SignalRegistration> = Vec::new();
+    let mut entry_signals: Vec<crate::store::SignalRegistration> = Vec::new();
     for s in visible {
         match s.run_id {
             Some(c) => {
@@ -868,7 +872,7 @@ async fn require_scoped_signal_token(
 ) -> Result<TokenScope, (StatusCode, String)> {
     let hash = weft_core::signal_token::token_hash(token);
     let row = state
-        .journal
+        .tokens
         .get_signal_token(&hash)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal_token: {e}")))?
@@ -890,13 +894,13 @@ async fn require_scoped_signal_token(
 pub(crate) async fn token_from_bearer(
     state: &DispatcherState,
     headers: &HeaderMap,
-) -> Result<crate::journal::SignalToken, (StatusCode, String)> {
+) -> Result<crate::store::SignalToken, (StatusCode, String)> {
     let presented = bearer_token(headers)?;
     Ok(require_scoped_signal_token(state, &presented).await?.row)
 }
 
 struct TokenScope {
-    row: crate::journal::SignalToken,
+    row: crate::store::SignalToken,
 }
 
 impl TokenScope {
@@ -905,7 +909,7 @@ impl TokenScope {
     /// answered as "not found" (indistinguishable from a nonexistent token),
     /// never as a distinct "forbidden" that would leak the token's existence on
     /// another account.
-    fn same_tenant(&self, sig: &crate::journal::SignalRegistration) -> bool {
+    fn same_tenant(&self, sig: &crate::store::SignalRegistration) -> bool {
         sig.tenant_id == self.row.tenant_id
     }
 
@@ -917,7 +921,7 @@ impl TokenScope {
     /// Rule (within the tenant): covered project AND no tag restriction. Empty
     /// allowed_tags = "I see everything in the projects I'm allowed in." A
     /// tag-scoped token can only skip its own visible signals, never cancel.
-    fn can_cancel_within_tenant(&self, sig: &crate::journal::SignalRegistration) -> bool {
+    fn can_cancel_within_tenant(&self, sig: &crate::store::SignalRegistration) -> bool {
         if !self.row.allowed_tags.is_empty() {
             return false;
         }
@@ -942,7 +946,7 @@ impl TokenScope {
     async fn visible_signals(
         &self,
         state: &DispatcherState,
-    ) -> anyhow::Result<Vec<crate::journal::SignalRegistration>> {
+    ) -> anyhow::Result<Vec<crate::store::SignalRegistration>> {
         signals_visible_to(
             &state.pg_pool,
             &self.row.tenant_id,
@@ -966,12 +970,12 @@ pub async fn signals_visible_to(
     projects: &[uuid::Uuid],
     tags: &[String],
     instance: Option<&weft_core::instance::InstanceId>,
-) -> anyhow::Result<Vec<crate::journal::SignalRegistration>> {
-    // One decoder for a signal row, shared with the journal
+) -> anyhow::Result<Vec<crate::store::SignalRegistration>> {
+    // One decoder for a signal row, shared with `PostgresStore`
     // (`row_to_signal`): the SELECT differs (a join and the consumer
     // filters), the columns and the decoding must not.
-    let rows = sqlx::query_as::<_, crate::journal::postgres::SignalRow>(&format!(
-        concat!("SELECT ", crate::journal::postgres::signal_columns!("s."), " \
+    let rows = sqlx::query_as::<_, crate::store::postgres::SignalRow>(&format!(
+        concat!("SELECT ", crate::store::postgres::signal_columns!("s."), " \
          FROM signal s {join} \
          WHERE COALESCE(a.fires_visible_to_consumers, TRUE) = TRUE \
            AND s.tenant_id = $1 \
@@ -992,7 +996,7 @@ pub async fn signals_visible_to(
     .fetch_all(pool)
     .await
     .context("signals_visible_to (the consumer listing): read a signal row")?;
-    rows.into_iter().map(crate::journal::postgres::row_to_signal).collect()
+    rows.into_iter().map(crate::store::postgres::row_to_signal).collect()
 }
 
 // ---------- PublicEntry catch-all + inspector display/action -----------
@@ -1338,10 +1342,10 @@ pub(crate) async fn signal_live_at(
     // The entry registered at this place for this copy, read once: it carries the
     // token the listener is asked by, and the address the caller is
     // shown. A resume row of the same node is another registration
-    // entirely (a display is what a TRIGGER shows), and the journal
-    // never answers with one here.
+    // entirely (a display is what a TRIGGER shows), and
+    // `SignalStore::signal_entry_at` never answers with one.
     let entry = state
-        .journal
+        .registrations
         .signal_entry_at(id, node, instance)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal row: {e}")))?
@@ -1470,7 +1474,7 @@ mod route_lookup_tests {
 
 #[cfg(test)]
 mod public_path_tests {
-    use crate::journal::SignalRegistration;
+    use crate::store::SignalRegistration;
 
     fn fresh(surface: &str, mount: Option<&str>) -> SignalRegistration {
         SignalRegistration {
@@ -1564,7 +1568,7 @@ mod public_path_tests {
 #[cfg(test)]
 mod can_cancel_tests {
     use super::TokenScope;
-    use crate::journal::{SignalRegistration, SignalToken};
+    use crate::store::{SignalRegistration, SignalToken};
 
     fn token(tenant: &str, projects: Vec<uuid::Uuid>, tags: Vec<String>) -> TokenScope {
         TokenScope {
@@ -1700,7 +1704,7 @@ mod can_cancel_tests {
 #[cfg(test)]
 mod signal_file_scope_tests {
     use super::file_belongs_to_signal;
-    use crate::journal::SignalRegistration;
+    use crate::store::SignalRegistration;
     use weft_core::storage::key::parse_key;
 
     fn signal(run_id: Option<&str>) -> SignalRegistration {

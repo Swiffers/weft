@@ -23,7 +23,7 @@ pub const NEWS_CHANNELS: &[&str] = &[weft_task_store::parked_fires::PARKED_FIRE_
 
 /// What the database announces for `news`: an answer handed to a run as a
 /// parked fire naming the run, a cancel as a cancel naming it.
-// SYNC: the payloads <-> crates/weft-task-store/src/parked_fires.rs (parked_fire_notify), crates/weft-dispatcher/src/journal/postgres.rs (cancel_run)
+// SYNC: the payloads <-> crates/weft-task-store/src/parked_fires.rs (parked_fire_notify), crates/weft-dispatcher/src/store/postgres.rs (cancel_run)
 fn as_announced(news: RunNews) -> (&'static str, String) {
     let channel = match news.kind {
         NewsKind::Answer => weft_task_store::parked_fires::PARKED_FIRE_CHANNEL,

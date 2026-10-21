@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
-  "$comment": "SYNC: weft highlighting <-> packages/weft-syntax/highlight-weft.js, crates/weft-compiler/src/cst/lexer.rs (the token rules), crates/weft-compiler/src/weft_compiler.rs RESERVED_CONFIG_KEYS + RESERVED_WORDS + RESERVED_TYPE_KEYWORDS, crates/weft-core/src/weft_type.rs (the type vocabulary), crates/weft-compiler/tests/integration/highlighting_vocabulary.rs (the word-list alarm)",
+  "$comment": "SYNC: weft highlighting <-> packages/weft-syntax/highlight-weft.js, crates/weft-compiler/src/cst/lexer.rs (the token rules), crates/weft-compiler/src/weft_compiler.rs RESERVED_CONFIG_KEYS + RESERVED_WORDS, crates/weft-core/src/project.rs own_types::ALL,crates/weft-core/src/weft_type.rs (the type vocabulary), crates/weft-compiler/tests/integration/highlighting_vocabulary.rs (the word-list alarm)",
   "name": "Weft",
   "scopeName": "source.weft",
   "fileTypes": [
@@ -140,7 +140,7 @@
     },
     "reserved-type": {
       "name": "keyword.control.weft",
-      "match": "\\b(Group|Loop|LoopIn|LoopOut|type)\\b"
+      "match": "\\b(Group|Loop|LoopIn|LoopOut|IncludedGroup|type)\\b"
     },
     "builtin-type": {
       "name": "support.type.weft",

@@ -234,7 +234,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
         if !payload.is_resume {
             core_signal::validate_spec(&payload.spec).map_err(anyhow::Error::msg)?;
             let run_id = payload.run_id;
-            let owner = state.journal.run_owner(run_id).await?.context("entry capture has no run")?;
+            let owner = state.runs.run_owner(run_id).await?.context("entry capture has no run")?;
             anyhow::ensure!(
                 owner.phase == weft_core::context::Phase::TriggerSetup && owner.binary_hash.is_some(),
                 "entry capture requires a trigger-setup run with a pinned program"
@@ -272,7 +272,7 @@ impl RegisterSignalExecutor {
         // Resolve tenant + project_id. Token reuse for entry rows keeps the
         // registration stable across reactivates; resume rows always mint
         // fresh.
-        let Some(owner) = state.journal.run_owner(run_id).await? else {
+        let Some(owner) = state.runs.run_owner(run_id).await? else {
             anyhow::bail!("no run row for run {run_id}")
         };
         let project_id = owner.project_id;
@@ -360,7 +360,7 @@ impl RegisterSignalExecutor {
             let (token, prior, holds) = loop {
                 round += 1;
                 let (token, prior) =
-                    read_prior(state.journal.as_ref(), resume_token.as_deref(), project_id, &place, instance.as_ref()).await?;
+                    read_prior(state.registrations.as_ref(), resume_token.as_deref(), project_id, &place, instance.as_ref()).await?;
                 let prior_seq = prior.as_ref().map_or(0, |row| row.kind_state_seq);
                 // A resume starts its kind state afresh; an entry carries
                 // its row's forward (a feed cursor keeps its place).
@@ -387,8 +387,8 @@ impl RegisterSignalExecutor {
 
                 let holds = prepared.holds;
                 let written = state
-                    .journal
-                    .signal_insert(&crate::journal::SignalRegistration {
+                    .registrations
+                    .signal_insert(&crate::store::SignalRegistration {
                         instance: instance.clone(),
                         // An entry signal is its own trigger's; a wait is the
                         // activation's of the trigger that fired its run (none
@@ -421,9 +421,9 @@ impl RegisterSignalExecutor {
                     })
                     .await?;
                 match written {
-                    crate::journal::SignalWrite::Written => break (token, prior, holds),
-                    crate::journal::SignalWrite::StateMoved if round < ROUNDS => continue,
-                    crate::journal::SignalWrite::StateMoved => anyhow::bail!(
+                    crate::store::SignalWrite::Written => break (token, prior, holds),
+                    crate::store::SignalWrite::StateMoved if round < ROUNDS => continue,
+                    crate::store::SignalWrite::StateMoved => anyhow::bail!(
                         "signal {token}'s state moved under each of {ROUNDS} registrations in a row: \
                          its wakes keep claiming it while it is being registered"
                     ),
@@ -479,7 +479,7 @@ impl RegisterSignalExecutor {
                 // `undo_registration`). A replaced row it was told to stop
                 // is brought back up.
                 let restart = if replaced_stopped { Restart::Yes } else { Restart::No };
-                undo_arm(state.journal.as_ref(), &state.listener, &token, undo, restart).await.map_err(|undo_err| {
+                undo_arm(state.registrations.as_ref(), &state.listener, &token, undo, restart).await.map_err(|undo_err| {
                     anyhow::anyhow!(
                         "signal {token} could not start ({e:#}), and undoing its registration failed too, \
                          so its row may not match what the listener runs until the trigger is \
@@ -509,7 +509,7 @@ pub(crate) enum ArmUndo {
     Created,
     /// This row was there (an entry's reused token, a resume's retry):
     /// taking the arm back writes it again.
-    Replaced(Box<crate::journal::SignalRegistration>),
+    Replaced(Box<crate::store::SignalRegistration>),
 }
 
 /// Whether taking an arm back has the listener run the restored row.
@@ -527,16 +527,16 @@ enum Restart {
 /// production; a recorder in unit tests, which have no listener.
 #[async_trait]
 pub(crate) trait SignalHolder: Send + Sync {
-    async fn start(&self, token: &str, mode: StartMode, replaced: Option<&crate::journal::SignalRegistration>) -> Result<()>;
-    async fn unregister_many(&self, signals: &[crate::journal::SignalRegistration]);
+    async fn start(&self, token: &str, mode: StartMode, replaced: Option<&crate::store::SignalRegistration>) -> Result<()>;
+    async fn unregister_many(&self, signals: &[crate::store::SignalRegistration]);
 }
 
 #[async_trait]
 impl SignalHolder for crate::listener::ListenerClient {
-    async fn start(&self, token: &str, mode: StartMode, replaced: Option<&crate::journal::SignalRegistration>) -> Result<()> {
+    async fn start(&self, token: &str, mode: StartMode, replaced: Option<&crate::store::SignalRegistration>) -> Result<()> {
         crate::listener::ListenerClient::start(self, token, mode, replaced).await
     }
-    async fn unregister_many(&self, signals: &[crate::journal::SignalRegistration]) {
+    async fn unregister_many(&self, signals: &[crate::store::SignalRegistration]) {
         crate::listener::ListenerClient::unregister_many(self, signals).await
     }
 }
@@ -548,13 +548,13 @@ impl SignalHolder for crate::listener::ListenerClient {
 /// attempted even after one fails, and the failures come back together,
 /// naming each signal the listener did not confirm it runs again.
 pub(crate) async fn disarm(
-    journal: &dyn crate::journal::Journal,
+    registrations: &dyn crate::store::SignalStore,
     listener: &dyn SignalHolder,
     armed: Vec<Armed>,
 ) -> Result<()> {
     let mut failed = Vec::new();
     for Armed { token, undo } in armed.into_iter().rev() {
-        if let Err(e) = undo_arm(journal, listener, &token, undo, Restart::Yes).await {
+        if let Err(e) = undo_arm(registrations, listener, &token, undo, Restart::Yes).await {
             failed.push(format!("signal {token}: {e:#}"));
         }
     }
@@ -563,7 +563,7 @@ pub(crate) async fn disarm(
 }
 
 async fn undo_arm(
-    journal: &dyn crate::journal::Journal,
+    registrations: &dyn crate::store::SignalStore,
     listener: &dyn SignalHolder,
     token: &str,
     undo: ArmUndo,
@@ -573,7 +573,7 @@ async fn undo_arm(
         ArmUndo::Created => None,
         ArmUndo::Replaced(prior) => Some(*prior),
     };
-    match undo_registration(journal, token, prior, restart).await? {
+    match undo_registration(registrations, token, prior, restart).await? {
         Undone::Removed(removed) => listener.unregister_many(&removed).await,
         // A put-back: whatever the listener runs under the token came from
         // the replacement, so it is replaced (and its wakes cancelled); the
@@ -594,16 +594,16 @@ async fn undo_arm(
 /// when a retry finds one, is the one it replaces. An entry reuses the
 /// token of the row already armed at its place; with none it mints one.
 async fn read_prior(
-    journal: &dyn crate::journal::Journal,
+    registrations: &dyn crate::store::SignalStore,
     resume_token: Option<&str>,
     project_id: uuid::Uuid,
     place: &str,
     instance: Option<&weft_core::instance::InstanceId>,
-) -> Result<(String, Option<crate::journal::SignalRegistration>)> {
+) -> Result<(String, Option<crate::store::SignalRegistration>)> {
     if let Some(token) = resume_token {
-        return Ok((token.to_string(), journal.signal_get(token).await?));
+        return Ok((token.to_string(), registrations.signal_get(token).await?));
     }
-    Ok(match journal.signal_entry_at(project_id, place, instance).await? {
+    Ok(match registrations.signal_entry_at(project_id, place, instance).await? {
         Some(row) => (row.token.clone(), Some(row)),
         None => (uuid::Uuid::new_v4().to_string(), None),
     })
@@ -614,12 +614,12 @@ async fn read_prior(
 enum Undone {
     /// The row was this registration's own and is gone; the listener
     /// is to forget these.
-    Removed(Vec<crate::journal::SignalRegistration>),
+    Removed(Vec<crate::store::SignalRegistration>),
     /// The row existed before (an entry's reused token, a resume's
     /// retry) and is back to it. `rerun` when the listener has to bring
     /// the restored row up again to match it (see [`undo_registration`]):
     /// the replacement it runs instead, as it last read.
-    Restored { rerun: Option<Box<crate::journal::SignalRegistration>> },
+    Restored { rerun: Option<Box<crate::store::SignalRegistration>> },
 }
 
 /// Undo a registration whose row is written. `prior` is the row it
@@ -642,27 +642,27 @@ enum Undone {
 /// state asks for). With `Restart::No` and nothing moved, the listener
 /// still runs exactly the prior row.
 async fn undo_registration(
-    journal: &dyn crate::journal::Journal,
+    registrations: &dyn crate::store::SignalStore,
     token: &str,
-    prior: Option<crate::journal::SignalRegistration>,
+    prior: Option<crate::store::SignalRegistration>,
     restart: Restart,
 ) -> Result<Undone> {
     let Some(prior) = prior else {
-        return Ok(Undone::Removed(journal.signal_remove_many(&[token.to_string()]).await?));
+        return Ok(Undone::Removed(registrations.signal_remove_many(&[token.to_string()]).await?));
     };
     // The row this registration wrote sits one past the version it read.
     let written_seq = prior.kind_state_seq + 1;
     const ROUNDS: usize = 5;
     for _ in 0..ROUNDS {
-        let current = journal
+        let current = registrations
             .signal_get(token)
             .await?
             .with_context(|| format!("signal {token}'s row vanished before it could be put back"))?;
         let rerun = restart == Restart::Yes || current.kind_state_seq != written_seq;
-        let restored = crate::journal::SignalRegistration { kind_state_seq: current.kind_state_seq, ..prior.clone() };
-        match journal.signal_restore(&restored).await? {
-            crate::journal::SignalWrite::Written => return Ok(Undone::Restored { rerun: rerun.then(|| Box::new(current)) }),
-            crate::journal::SignalWrite::StateMoved => continue,
+        let restored = crate::store::SignalRegistration { kind_state_seq: current.kind_state_seq, ..prior.clone() };
+        match registrations.signal_restore(&restored).await? {
+            crate::store::SignalWrite::Written => return Ok(Undone::Restored { rerun: rerun.then(|| Box::new(current)) }),
+            crate::store::SignalWrite::StateMoved => continue,
         }
     }
     anyhow::bail!("signal {token}'s state moved under each of {ROUNDS} attempts to put its row back")
@@ -923,8 +923,8 @@ mod tests {
     }
 
     use super::{read_prior, undo_registration, Restart, StartMode, Undone};
-    use crate::journal::fake::tests::registration;
-    use crate::journal::{FakeJournal, Journal, SignalWrite};
+    use crate::store::fake::tests::registration;
+    use crate::store::{FakeStore, SignalStore, SignalWrite};
 
     const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(0x100);
 
@@ -933,7 +933,7 @@ mod tests {
     /// token and names that row as the one it replaces.
     #[tokio::test]
     async fn an_entry_reuses_the_armed_row_and_a_fresh_place_mints() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         let (minted, prior) = read_prior(&j, None, PROJECT, "n", None).await.unwrap();
         assert!(prior.is_none());
         let mut row = registration(&minted);
@@ -950,7 +950,7 @@ mod tests {
     /// listener to forget.
     #[tokio::test]
     async fn undoing_a_created_row_removes_it() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         j.signal_insert(&registration("tok")).await.unwrap();
         let Undone::Removed(removed) = undo_registration(&j, "tok", None, Restart::No).await.unwrap() else {
             panic!("a created row is removed");
@@ -963,7 +963,7 @@ mod tests {
     /// the listener still runs, at a new version.
     #[tokio::test]
     async fn undoing_a_replaced_row_puts_it_back() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         let mut live = registration("tok");
         live.spec_json = r#"{"old":true}"#.into();
         live.mount_path = Some("/t/old".into());
@@ -994,7 +994,7 @@ mod tests {
     /// the listener runs the prior row again so its wake follows it.
     #[tokio::test]
     async fn a_restore_drops_a_wake_claim_made_for_the_spec_that_never_started() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         let mut live = registration("tok");
         live.kind_state = serde_json::json!({ "next_at": 100 });
         j.signal_insert(&live).await.unwrap();
@@ -1023,7 +1023,7 @@ mod tests {
     /// with the rest of it.
     #[tokio::test]
     async fn a_restore_after_the_replacement_ran_drops_its_claims() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         let mut live = registration("tok");
         live.kind_state = serde_json::json!({ "next_at": 100 });
         j.signal_insert(&live).await.unwrap();
@@ -1058,12 +1058,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SignalHolder for Recorder {
-        async fn start(&self, token: &str, mode: StartMode, replaced: Option<&crate::journal::SignalRegistration>) -> anyhow::Result<()> {
+        async fn start(&self, token: &str, mode: StartMode, replaced: Option<&crate::store::SignalRegistration>) -> anyhow::Result<()> {
             anyhow::ensure!(!self.refuse.iter().any(|t| t == token), "refused {token}");
             self.started.lock().unwrap().push((token.to_string(), mode, replaced.map(|r| r.spec_json.clone())));
             Ok(())
         }
-        async fn unregister_many(&self, signals: &[crate::journal::SignalRegistration]) {
+        async fn unregister_many(&self, signals: &[crate::store::SignalRegistration]) {
             self.forgotten.lock().unwrap().extend(signals.iter().map(|s| s.token.clone()));
         }
     }
@@ -1075,7 +1075,7 @@ mod tests {
     /// were, and the listener is told to run the first one's prior row again.
     #[tokio::test]
     async fn a_rearm_that_fails_midway_leaves_every_trigger_as_it_was() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         let mut priors = Vec::new();
         for (i, tok) in ["t1", "t2", "t3"].into_iter().enumerate() {
             let mut live = registration(tok);
@@ -1085,7 +1085,7 @@ mod tests {
             j.signal_insert(&live).await.unwrap();
             priors.push(j.signal_get(tok).await.unwrap().unwrap());
         }
-        let rearm = |prior: &crate::journal::SignalRegistration| {
+        let rearm = |prior: &crate::store::SignalRegistration| {
             let mut next = prior.clone();
             next.spec_json = r#"{"new":true}"#.into();
             next.kind_state = serde_json::json!({ "cursor": 0 });
@@ -1124,7 +1124,7 @@ mod tests {
     /// are still put back.
     #[tokio::test]
     async fn disarm_takes_back_every_arm_and_names_the_ones_it_could_not() {
-        let j = FakeJournal::new();
+        let j = FakeStore::new();
         let mut live = registration("old");
         live.node_id = "a".into();
         j.signal_insert(&live).await.unwrap();

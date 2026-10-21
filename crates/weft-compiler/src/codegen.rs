@@ -67,7 +67,7 @@ use weft_catalog::FsCatalog;
 use weft_core::builds::NodeSet;
 use weft_core::ProjectDefinition;
 
-use crate::error::{CompileError, CompileResult};
+use crate::error::{BuildError, BuildResult};
 
 /// Emit the full cargo crate. Writes every file listed in the module
 /// docstring. Returns the crate root (`build::build_project` stages it
@@ -79,16 +79,16 @@ pub fn emit(
     catalog: &FsCatalog,
     crate_name: &str,
     node_set: NodeSet,
-) -> CompileResult<PathBuf> {
+) -> BuildResult<PathBuf> {
     let crate_root = target_root.to_path_buf();
     // A pure function of its inputs: wipe any previous emission so a
     // renamed package or dropped node never leaves stale files in the
     // crate (the staged docker context would faithfully copy them).
     if crate_root.exists() {
-        std::fs::remove_dir_all(&crate_root).map_err(CompileError::Io)?;
+        std::fs::remove_dir_all(&crate_root).map_err(BuildError::Io)?;
     }
     let src_dir = crate_root.join("src");
-    std::fs::create_dir_all(&src_dir).map_err(CompileError::Io)?;
+    std::fs::create_dir_all(&src_dir).map_err(BuildError::Io)?;
 
     // Runtime-resolvable workspace root (honors `WEFT_REPO_ROOT`), NOT the raw
     // compile-time `CARGO_MANIFEST_DIR`: when the compile happens inside a built
@@ -160,11 +160,11 @@ pub enum EmitPaths {
 impl EmitPaths {
     /// The `#[path = "..."]` string for a real source file under one of
     /// the project's node roots.
-    fn include_path(&self, abs: &Path) -> CompileResult<String> {
+    fn include_path(&self, abs: &Path) -> BuildResult<String> {
         match self {
             EmitPaths::Container { project_root } => {
                 let rel = abs.strip_prefix(project_root).map_err(|_| {
-                    CompileError::Build(format!(
+                    BuildError::Build(format!(
                         "source file {} is not under the project root {}",
                         abs.display(),
                         project_root.display()
@@ -216,11 +216,11 @@ struct PackageEmit<'a> {
 fn group_by_package<'a>(
     catalog: &'a FsCatalog,
     referenced: &BTreeSet<String>,
-) -> CompileResult<Vec<PackageEmit<'a>>> {
+) -> BuildResult<Vec<PackageEmit<'a>>> {
     let mut by_key: BTreeMap<std::path::PathBuf, Vec<String>> = BTreeMap::new();
     for node_type in referenced {
         let Some(pkg) = catalog.package_of(node_type) else {
-            return Err(CompileError::Build(format!(
+            return Err(BuildError::Build(format!(
                 "node '{node_type}' not found in catalog"
             )));
         };
@@ -274,8 +274,8 @@ pub fn node_types_for(
 }
 
 /// The set of CATALOG node types this project references, sorted.
-/// Runtime-internal built-in node types (LoopIn, LoopOut) are
-/// excluded: they live in the engine, not the
+/// The type names weft gives its own nodes (`own_types`: LoopIn, LoopOut,
+/// the include placeholder) are excluded: they live in the engine, not the
 /// catalog, and the codegen / hash / docker passes that consume this
 /// set would otherwise fail to resolve them. Exposed so callers
 /// outside codegen (e.g. Dockerfile emission) walk the same set
@@ -285,7 +285,7 @@ pub fn collect_node_types(project: &ProjectDefinition) -> BTreeSet<String> {
         .nodes
         .iter()
         .map(|n| n.node_type.clone())
-        .filter(|t| !crate::weft_compiler::is_reserved_type_keyword(t))
+        .filter(|t| !weft_core::project::own_types::is_own(t))
         .collect()
 }
 
@@ -302,7 +302,7 @@ fn write_worker_cargo_toml(
     packages: &[PackageEmit<'_>],
     crate_dirs: &BTreeMap<String, String>,
     crate_name: &str,
-) -> CompileResult<()> {
+) -> BuildResult<()> {
     let package_name = crate::build::sanitize_crate_name(crate_name);
 
     let mut deps = fixed_worker_deps();
@@ -355,7 +355,7 @@ path = "src/main.rs"
         features = features_fragment,
         deps = deps_fragment,
     );
-    std::fs::write(crate_root.join("Cargo.toml"), contents).map_err(CompileError::Io)?;
+    std::fs::write(crate_root.join("Cargo.toml"), contents).map_err(BuildError::Io)?;
     Ok(())
 }
 
@@ -387,7 +387,7 @@ fn write_package_crates(
     catalog: &FsCatalog,
     packages: &[PackageEmit<'_>],
     paths: &EmitPaths,
-) -> CompileResult<BTreeMap<String, String>> {
+) -> BuildResult<BTreeMap<String, String>> {
     let mut dirs = BTreeMap::new();
     for pkg in packages {
         let cargo_toml = render_package_cargo_toml(catalog, pkg, paths)?;
@@ -399,9 +399,9 @@ fn write_package_crates(
         );
         let pkg_dir = crate_root.join(&dir_name);
         let pkg_src = pkg_dir.join("src");
-        std::fs::create_dir_all(&pkg_src).map_err(CompileError::Io)?;
-        std::fs::write(pkg_dir.join("Cargo.toml"), &cargo_toml).map_err(CompileError::Io)?;
-        std::fs::write(pkg_src.join("lib.rs"), &lib_rs).map_err(CompileError::Io)?;
+        std::fs::create_dir_all(&pkg_src).map_err(BuildError::Io)?;
+        std::fs::write(pkg_dir.join("Cargo.toml"), &cargo_toml).map_err(BuildError::Io)?;
+        std::fs::write(pkg_src.join("lib.rs"), &lib_rs).map_err(BuildError::Io)?;
         // Dated like the staged sources it includes (see
         // `build::package_source_mtime`): written at wall-clock time it
         // would be newer than every cached rlib, and every package would
@@ -421,12 +421,12 @@ fn package_crate_slot(
     pkg: &PackageEmit<'_>,
     cargo_toml: &str,
     lib_rs: &str,
-) -> CompileResult<String> {
+) -> BuildResult<String> {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"weft-package-crate-v1\n");
     crate::hash::hash_package_root(&mut hasher, &pkg.module_ident, &pkg.package.root)
-        .map_err(|e| CompileError::Build(format!("hash package {}: {e}", pkg.package.name)))?;
+        .map_err(|e| BuildError::Build(format!("hash package {}: {e}", pkg.package.name)))?;
     hasher.update(b"Cargo.toml:\n");
     hasher.update(cargo_toml.as_bytes());
     hasher.update(b"\nlib.rs:\n");
@@ -448,12 +448,12 @@ fn package_build_script(
     catalog: &FsCatalog,
     pkg: &PackageEmit<'_>,
     paths: &EmitPaths,
-) -> CompileResult<(String, String)> {
+) -> BuildResult<(String, String)> {
     let mut build_deps: BTreeMap<String, toml::Value> = BTreeMap::new();
     for node_type in &pkg.node_types {
         let node_deps = catalog
             .deps(node_type)
-            .map_err(|e| CompileError::Build(format!("deps for '{node_type}': {e}")))?;
+            .map_err(|e| BuildError::Build(format!("deps for '{node_type}': {e}")))?;
         let Some(node_deps) = node_deps else { continue };
         for (name, value) in node_deps.build_dependencies {
             add_dep(
@@ -468,7 +468,7 @@ fn package_build_script(
     let script = pkg.package.root.join("build.rs");
     if !script.is_file() {
         if let Some(name) = build_deps.keys().next() {
-            return Err(CompileError::Build(format!(
+            return Err(BuildError::Build(format!(
                 "a deps.toml in package '{}' declares build-dependency '{name}' but the \
                  package ships no build.rs at its root; build-dependencies exist only \
                  for a package build script",
@@ -492,7 +492,7 @@ fn render_package_cargo_toml(
     catalog: &FsCatalog,
     pkg: &PackageEmit<'_>,
     paths: &EmitPaths,
-) -> CompileResult<String> {
+) -> BuildResult<String> {
     // Runtime essentials shared with the worker, plus the workspace
     // surface every node body uses. `paths` places the weft crates
     // (`../../weft/...` inside a build container, the real checkout
@@ -533,7 +533,7 @@ fn render_package_cargo_toml(
     for node_type in &pkg.node_types {
         let node_deps = catalog
             .deps(node_type)
-            .map_err(|e| CompileError::Build(format!("deps for '{node_type}': {e}")))?;
+            .map_err(|e| BuildError::Build(format!("deps for '{node_type}': {e}")))?;
         let Some(node_deps) = node_deps else { continue };
         for (name, value) in node_deps.dependencies {
             add_dep(&mut deps, &pkg.package.name, name, value, &format!("node {node_type}"))?;
@@ -585,7 +585,7 @@ fn render_package_lib_rs(
     catalog: &FsCatalog,
     pkg: &PackageEmit<'_>,
     paths: &EmitPaths,
-) -> CompileResult<String> {
+) -> BuildResult<String> {
     let mut body = String::new();
     body.push_str(&format!(
         "//! Package crate for `{}`. Emitted by codegen; do not edit.\n\n",
@@ -596,7 +596,7 @@ fn render_package_lib_rs(
             .file_stem()
             .and_then(|s| s.to_str())
             .ok_or_else(|| {
-                CompileError::Build(format!(
+                BuildError::Build(format!(
                     "package {} has shared file with no stem: {}",
                     pkg.package.name,
                     shared_path.display()
@@ -650,24 +650,24 @@ enum PackageGating {
 /// the helper compiles once per lane. Content never hides behind an old
 /// date: the build rewrites the record whenever it leaves something out,
 /// and the helper's package is named by its content ([`isolate_dir_name`]).
-fn write_image_build_files(crate_root: &Path, candidates: crate::worker_isolate::Candidates) -> CompileResult<()> {
+fn write_image_build_files(crate_root: &Path, candidates: crate::worker_isolate::Candidates) -> BuildResult<()> {
     std::fs::write(
         crate_root.join(crate::worker_image::CACHE_GC_SCRIPT_NAME),
         crate::worker_image::CACHE_GC_SCRIPT,
     )
-    .map_err(CompileError::Io)?;
+    .map_err(BuildError::Io)?;
     let candidates = serde_json::to_string_pretty(&candidates)
-        .map_err(|e| CompileError::Build(format!("write {ISOLATE_CANDIDATES_FILE}: {e}")))?;
-    std::fs::write(crate_root.join(ISOLATE_CANDIDATES_FILE), candidates).map_err(CompileError::Io)?;
+        .map_err(|e| BuildError::Build(format!("write {ISOLATE_CANDIDATES_FILE}: {e}")))?;
+    std::fs::write(crate_root.join(ISOLATE_CANDIDATES_FILE), candidates).map_err(BuildError::Io)?;
     let record = crate_root.join(LEFT_OUT_RECORD_FILE);
-    std::fs::write(&record, EMPTY_LEFT_OUT_RECORD).map_err(CompileError::Io)?;
+    std::fs::write(&record, EMPTY_LEFT_OUT_RECORD).map_err(BuildError::Io)?;
 
     let helper = crate_root.join(isolate_dir_name());
-    std::fs::create_dir_all(helper.join("src")).map_err(CompileError::Io)?;
-    std::fs::write(helper.join("Cargo.toml"), isolate_cargo_toml(&isolate_dir_name())).map_err(CompileError::Io)?;
-    std::fs::write(helper.join("src").join("main.rs"), ISOLATE_SOURCE).map_err(CompileError::Io)?;
+    std::fs::create_dir_all(helper.join("src")).map_err(BuildError::Io)?;
+    std::fs::write(helper.join("Cargo.toml"), isolate_cargo_toml(&isolate_dir_name())).map_err(BuildError::Io)?;
+    std::fs::write(helper.join("src").join("main.rs"), ISOLATE_SOURCE).map_err(BuildError::Io)?;
     for file in [record, helper.join("Cargo.toml"), helper.join("src").join("main.rs")] {
-        let content = std::fs::read(&file).map_err(CompileError::Io)?;
+        let content = std::fs::read(&file).map_err(BuildError::Io)?;
         crate::build::stamp_mtime(&file, crate::build::package_source_mtime(&content));
     }
     Ok(())
@@ -745,10 +745,10 @@ pub fn isolate_dir_name() -> String {
 /// worker compiles on the exact toolchain the rest of the system uses.
 /// Fails loud if the root pin is missing: a worker built on the wrong
 /// toolchain would fail confusingly deep in the node compile instead.
-fn write_rust_toolchain(crate_root: &Path, weft_root: &Path) -> Result<(), CompileError> {
+fn write_rust_toolchain(crate_root: &Path, weft_root: &Path) -> Result<(), BuildError> {
     let pin = std::fs::read_to_string(weft_root.join("rust-toolchain.toml"))
-        .map_err(|e| CompileError::Build(format!("read rust-toolchain.toml: {e}")))?;
-    std::fs::write(crate_root.join("rust-toolchain.toml"), pin).map_err(CompileError::Io)?;
+        .map_err(|e| BuildError::Build(format!("read rust-toolchain.toml: {e}")))?;
+    std::fs::write(crate_root.join("rust-toolchain.toml"), pin).map_err(BuildError::Io)?;
     Ok(())
 }
 
@@ -897,7 +897,7 @@ pub fn fixed_worker_deps() -> BTreeMap<String, toml::Value> {
 /// on it: the worker build gets an empty stand-in for it
 /// (`build::stage_worker_workspace`), so the real one is neither staged nor
 /// hashed.
-pub fn worker_workspace_crates(weft_root: &Path) -> CompileResult<Vec<String>> {
+pub fn worker_workspace_crates(weft_root: &Path) -> BuildResult<Vec<String>> {
     let seeds: Vec<String> = fixed_worker_deps()
         .values()
         .filter_map(|spec| spec.get("path").and_then(|v| v.as_str()))
@@ -925,7 +925,7 @@ pub const WORKSPACE_HACK_CRATE: &str = "weft-workspace-hack";
 pub fn workspace_crate_closure(
     weft_root: &Path,
     seeds: &[String],
-) -> CompileResult<Vec<String>> {
+) -> BuildResult<Vec<String>> {
     let root_manifest = parse_manifest(&weft_root.join("Cargo.toml"))?;
     // Dependency NAME -> crate DIR name, from the root manifest's
     // `[workspace.dependencies]` path entries, for `workspace = true` deps.
@@ -984,12 +984,12 @@ fn crate_dir_name(path: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn parse_manifest(path: &Path) -> CompileResult<toml::Value> {
+fn parse_manifest(path: &Path) -> BuildResult<toml::Value> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
-        CompileError::Build(format!("read manifest {}: {e}", path.display()))
+        BuildError::Build(format!("read manifest {}: {e}", path.display()))
     })?;
     raw.parse::<toml::Value>()
-        .map_err(|e| CompileError::Build(format!("parse manifest {}: {e}", path.display())))
+        .map_err(|e| BuildError::Build(format!("parse manifest {}: {e}", path.display())))
 }
 
 /// `[dependencies]` + `[build-dependencies]` tables of a crate manifest,
@@ -1031,11 +1031,11 @@ fn add_dep(
     name: String,
     value: toml::Value,
     source: &str,
-) -> CompileResult<()> {
+) -> BuildResult<()> {
     match deps.remove(&name) {
         Some(existing) => {
             let merged = merge_dep_specs(&existing, &value).map_err(|conflict| {
-                CompileError::Build(format!(
+                BuildError::Build(format!(
                     "package '{pkg_name}': {source} declares {name} = {}, which conflicts with \
                      the already-resolved {name} = {} ({conflict}); align the specs in deps.toml",
                     toml_inline(&value),
@@ -1149,7 +1149,7 @@ fn write_registry_rs(
     src_dir: &Path,
     packages: &[PackageEmit<'_>],
     gating: PackageGating,
-) -> CompileResult<()> {
+) -> BuildResult<()> {
     let gate = |pkg: &PackageEmit<'_>, indent: &str| match gating {
         PackageGating::Features => format!("{indent}#[cfg(feature = \"{}\")]\n", pkg.module_ident),
         PackageGating::Always => String::new(),
@@ -1218,7 +1218,7 @@ fn write_registry_rs(
     body.push_str("}\n\n");
     body.push_str("pub static PROJECT_CATALOG: ProjectCatalog = ProjectCatalog;\n");
 
-    std::fs::write(src_dir.join("registry.rs"), body).map_err(CompileError::Io)?;
+    std::fs::write(src_dir.join("registry.rs"), body).map_err(BuildError::Io)?;
     Ok(())
 }
 
@@ -1248,8 +1248,8 @@ fn baked_type_decls(catalog: &FsCatalog) -> String {
         .collect()
 }
 
-fn write_main_rs(src_dir: &Path, catalog: &FsCatalog) -> CompileResult<()> {
-    std::fs::write(src_dir.join("main.rs"), worker_main_source(&baked_type_decls(catalog))).map_err(CompileError::Io)?;
+fn write_main_rs(src_dir: &Path, catalog: &FsCatalog) -> BuildResult<()> {
+    std::fs::write(src_dir.join("main.rs"), worker_main_source(&baked_type_decls(catalog))).map_err(BuildError::Io)?;
     Ok(())
 }
 
@@ -1455,8 +1455,8 @@ const STANDALONE_WORKSPACE_HEADER: &str = "\
 /// `members` is what THIS run emitted, not every package in the
 /// project, which is what keeps a broken sibling harmless: a package
 /// nobody targeted is not a member, so it cannot fail the resolve.
-pub fn emit_test_workspace(root: &Path, members: &[String]) -> CompileResult<()> {
-    std::fs::create_dir_all(root).map_err(CompileError::Io)?;
+pub fn emit_test_workspace(root: &Path, members: &[String]) -> BuildResult<()> {
+    std::fs::create_dir_all(root).map_err(BuildError::Io)?;
     let weft_root = crate::build::resolve_weft_root()?;
     write_rust_toolchain(root, &weft_root)?;
     // Seed the Cargo.lock so the build resolves the versions the weft
@@ -1470,7 +1470,7 @@ pub fn emit_test_workspace(root: &Path, members: &[String]) -> CompileResult<()>
     // `cp /weft/Cargo.lock`.
     let lock_src = weft_root.join("Cargo.lock");
     std::fs::copy(&lock_src, root.join("Cargo.lock")).map_err(|e| {
-        CompileError::Build(format!("seed Cargo.lock from {}: {e}", lock_src.display()))
+        BuildError::Build(format!("seed Cargo.lock from {}: {e}", lock_src.display()))
     })?;
     let member_list = members
         .iter()
@@ -1487,7 +1487,7 @@ pub fn emit_test_workspace(root: &Path, members: &[String]) -> CompileResult<()>
          \n\
          {DEV_PROFILE_BLOCK}"
     );
-    std::fs::write(root.join("Cargo.toml"), contents).map_err(CompileError::Io)?;
+    std::fs::write(root.join("Cargo.toml"), contents).map_err(BuildError::Io)?;
     Ok(())
 }
 
@@ -1515,11 +1515,11 @@ pub fn emit_test_crate(
     catalog: &FsCatalog,
     package_name: &str,
     paths: &EmitPaths,
-) -> CompileResult<TestCrate> {
+) -> BuildResult<TestCrate> {
     let Some(package) = catalog.packages().find(|p| p.name == package_name) else {
         let mut known: Vec<&str> = catalog.packages().map(|p| p.name.as_str()).collect();
         known.sort();
-        return Err(CompileError::Build(format!(
+        return Err(BuildError::Build(format!(
             "no package named '{package_name}' in this project (nodes/ or src/) (known: {})",
             known.join(", ")
         )));
@@ -1537,10 +1537,10 @@ pub fn emit_test_crate(
     // can never leave stale files (an old Cargo.toml, an orphaned
     // package dir) inside the crate cargo compiles.
     if target_root.exists() {
-        std::fs::remove_dir_all(target_root).map_err(CompileError::Io)?;
+        std::fs::remove_dir_all(target_root).map_err(BuildError::Io)?;
     }
     let src_dir = target_root.join("src");
-    std::fs::create_dir_all(&src_dir).map_err(CompileError::Io)?;
+    std::fs::create_dir_all(&src_dir).map_err(BuildError::Io)?;
     // The container path builds ONE crate inside its own image, so it
     // carries its own workspace and toolchain pin. The local path is a
     // MEMBER of the shared workspace `emit_test_workspace` writes (see
@@ -1605,7 +1605,7 @@ path = "src/main.rs"
         deps = deps_fragment,
         workspace_block = if standalone { STANDALONE_WORKSPACE_HEADER } else { "" },
     );
-    std::fs::write(target_root.join("Cargo.toml"), cargo_toml).map_err(CompileError::Io)?;
+    std::fs::write(target_root.join("Cargo.toml"), cargo_toml).map_err(BuildError::Io)?;
 
     write_registry_rs(&src_dir, std::slice::from_ref(&pkg), PackageGating::Always)?;
 
@@ -1631,7 +1631,7 @@ fn main() -> std::process::ExitCode {{
 }}
 "#,
     );
-    std::fs::write(src_dir.join("main.rs"), main_rs).map_err(CompileError::Io)?;
+    std::fs::write(src_dir.join("main.rs"), main_rs).map_err(BuildError::Io)?;
 
     Ok(TestCrate {
         crate_root: target_root.to_path_buf(),
@@ -1865,6 +1865,6 @@ mod tests {
         deps.insert("tokio".into(), tbl(r#""1""#));
         let err = add_dep(&mut deps, "pkg", "tokio".into(), tbl(r#""2""#), "node Bar")
             .expect_err("version conflict is a hard error");
-        assert!(matches!(err, super::CompileError::Build(_)));
+        assert!(matches!(err, super::BuildError::Build(_)));
     }
 }

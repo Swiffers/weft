@@ -39,7 +39,7 @@ Build the recovery path when it's worth it (high value, plausible failure) and s
 
 ## Tooling
 
-**Wait on conditions, never timers.** To wait for a long task (build, deploy, rollout), block on the actual condition returning the instant it flips: `until <check>; do sleep 5; done`, in the foreground with a generous timeout. Never `sleep <N>` then check, never hand-rolled re-polls.
+**Long commands follow "Never wait on a long command" in `.kilo/agent/working-partner.md`.** Background them, keep working, never `sleep` or a poll loop, no single wait over 5 minutes, and investigate whatever runs longer than it should.
 
 **pnpm, not npm.** The projects are pnpm-based.
 

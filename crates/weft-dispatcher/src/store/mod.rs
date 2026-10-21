@@ -1,20 +1,30 @@
-//! The dispatcher's side of the run record. A run's whole life is its
-//! `run` row and its record (`run_log`, `weft_journal::record`): the
-//! worker that drives a run writes both, and the dispatcher reads them
-//! (the listing, a summary, the inspector's replay, logs) and writes only
-//! a run nobody drives (a run it queues, the ending of a parked or queued
-//! run it cancels, an answer to a parked run).
+//! The dispatcher's stores over the run and signal tables, one trait per
+//! concern:
 //!
-//! Beside the record, the tables of what is not a run: signals (what wakes
-//! a trigger or answers a wait), signal tokens, trigger setups and their
-//! bakes.
+//! - [`RunStore`]: the runs (`run`, `run_log`, `run_tag`). A run's whole
+//!   life is its `run` row and its record (`run_log`,
+//!   `weft_journal::record`): the worker that drives a run writes both,
+//!   and the dispatcher reads them (the listing, a summary, the
+//!   inspector's replay, logs) and writes only a run nobody drives (a run
+//!   it queues, the ending of a parked or queued run it cancels).
+//! - [`SignalStore`]: the signals (`signal`), what wakes a trigger or
+//!   answers a wait, and the answer to a wait.
+//! - [`TokenStore`]: the callers' tokens (`signal_token`).
+//! - [`BakeStore`]: the trigger setups and their bakes (`trigger_setup`,
+//!   `trigger_bake`).
+//!
+//! An action that writes across tables in one transaction sits with the
+//! store whose action it is: a cancel strips the run's signals, and an
+//! answer writes the run it reaches. [`postgres::PostgresStore`] and
+//! [`fake::FakeStore`] each implement all four over one shared state, for
+//! exactly that reason.
 
 pub mod postgres;
 
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod fake;
 #[cfg(any(test, feature = "test-helpers"))]
-pub use fake::FakeJournal;
+pub use fake::FakeStore;
 
 use weft_core::signal_token::TokenKind;
 use weft_journal::RunEvent;
@@ -112,18 +122,9 @@ impl TriggerBake {
     }
 }
 
+/// The runs: their rows (`run`, `run_tag`) and their records (`run_log`).
 #[async_trait]
-pub trait Journal: Send + Sync {
-    async fn is_trigger_setup_pending(&self, run_id: RunId) -> anyhow::Result<bool>;
-
-    /// Publish one complete setup and release its birth-time ownership atomically.
-    /// A failed/cancelled setup releases ownership without replacing any bake.
-    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&TriggerBake>) -> anyhow::Result<()>;
-
-    /// The bakes of one owner's triggers: the shared ones for `None`, an
-    /// instance's for `Some`.
-    async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Vec<TriggerBake>>;
-
+pub trait RunStore: Send + Sync {
     // ----- The record -------------------------------------------------
 
     /// Write `events` into the record of `run_id`, a run nobody
@@ -143,7 +144,7 @@ pub trait Journal: Send + Sync {
     /// A run's whole record for DISPLAY: a row that does not decode comes
     /// back as its error text instead of failing the read, so the
     /// inspector renders what exists and names the rows it cannot. The
-    /// one required read; [`Journal::events_log`] is derived from it.
+    /// one required read; [`RunStore::events_log`] is derived from it.
     async fn events_log_lossy(
         &self,
         run_id: RunId,
@@ -208,39 +209,6 @@ pub trait Journal: Send + Sync {
         lapsed_before: i64,
         program: Option<&weft_core::ProjectDefinition>,
     ) -> anyhow::Result<Lost>;
-
-    /// Answer the wait `token` with `answer` (`answer_in`, on a
-    /// transaction of its own).
-    async fn answer(&self, token: &str, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<Answered>;
-
-    /// Persist a signal token (token-scoped enumeration credential).
-    /// Record a freshly minted signal token. The api layer generates the token
-    /// VALUE and hands the journal only its at-rest form (`token_hash` +
-    /// display `recognizer` + metadata + scope vectors); the raw value is
-    /// never stored. Empty scope vector = wildcard for that dimension.
-    async fn mint_signal_token(&self, token: &SignalToken) -> anyhow::Result<()>;
-
-    /// Read the full token row (scope vectors included) by the sha256 hex of
-    /// the PRESENTED credential. Used by the token-scoped signal handlers.
-    async fn get_signal_token(&self, token_hash: &str) -> anyhow::Result<Option<SignalToken>>;
-
-    /// List the signal tokens owned by `tenant` (scoped in the query, so one
-    /// tenant never sees another's tokens). Rows carry no secret: only the
-    /// hash + recognizer + metadata.
-    async fn list_signal_tokens(&self, tenant: &str) -> anyhow::Result<Vec<SignalToken>>;
-
-    /// Delete a signal token by its id, scoped to `tenant`: only the owning
-    /// tenant can revoke it. Returns true iff a row was actually removed (a
-    /// wrong-tenant id matches nothing, same as a missing one, so revoke
-    /// can't probe other tenants' tokens).
-    async fn revoke_signal_token(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<bool>;
-
-    /// Record `token` (an operator key) only when its tenant holds no
-    /// operator key at all, in one statement, so replicas booting at
-    /// once record it once. The install's bootstrap key: re-seeded after
-    /// every operator key is revoked, never beside a live one. Returns
-    /// whether it was recorded.
-    async fn seed_operator_token(&self, token: &SignalToken) -> anyhow::Result<bool>;
 
     // ----- What the run rows say -----------------------------------------
     //
@@ -332,7 +300,37 @@ pub trait Journal: Send + Sync {
         tag: &str,
     ) -> anyhow::Result<Vec<weft_journal::tags::TaggedRun>>;
 
-    // ----- Signal registry (durable replacement for in-RAM tracker) ----
+    // ----- Administrative ---------------------------------------------
+
+    /// Delete all data of a run. Called only by `weft clean`.
+    ///
+    /// Answers the resume signals the run was parked on, which went
+    /// with it: a listener process still holds each one in RAM and keeps
+    /// answering for a run that no longer exists until the caller
+    /// unregisters it there (`unregister_many`), the way a cancel does.
+    async fn delete_run(&self, run_id: RunId) -> anyhow::Result<Vec<SignalRegistration>>;
+
+    /// Erase up to `limit` ended runs whose time to be kept ran out before
+    /// `now` (unix seconds), oldest first, with everything of theirs (the
+    /// same one list a `weft clean` erases). Answers how many, and the
+    /// resume signals that went with them for the listener to let go of.
+    /// A parked or queued run has no end, so it is never erased.
+    async fn erase_expired(&self, now: i64, limit: i64) -> anyhow::Result<(usize, Vec<SignalRegistration>)>;
+
+    /// The earliest moment (unix seconds) a run [`Self::erase_expired`]
+    /// would erase runs out of its keep, `None` with none: the same runs,
+    /// so a run it must leave (a flagged one) never makes it look in a
+    /// loop.
+    async fn next_expiry(&self) -> anyhow::Result<Option<i64>>;
+}
+
+/// The signals (`signal`): what wakes a trigger, and what a parked run
+/// waits on.
+#[async_trait]
+pub trait SignalStore: Send + Sync {
+    /// Answer the wait `token` with `answer` (`answer_in`, on a
+    /// transaction of its own).
+    async fn answer(&self, token: &str, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<Answered>;
 
     /// Insert a signal registration (or refresh an entry's row in place
     /// on reactivate). The caller mints the token. A compare-and-set on
@@ -415,29 +413,55 @@ pub trait Journal: Send + Sync {
         &self,
         project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<SignalRegistration>>;
+}
 
-    // ----- Administrative ---------------------------------------------
+/// The callers' tokens (`signal_token`): the install's operator keys and
+/// the scoped tokens a caller reaches signals and displays with.
+#[async_trait]
+pub trait TokenStore: Send + Sync {
+    /// Record a freshly minted signal token. The api layer generates the token
+    /// VALUE and hands the store only its at-rest form (`token_hash` +
+    /// display `recognizer` + metadata + scope vectors); the raw value is
+    /// never stored. Empty scope vector = wildcard for that dimension.
+    async fn mint_signal_token(&self, token: &SignalToken) -> anyhow::Result<()>;
 
-    /// Delete all data of a run. Called only by `weft clean`.
-    ///
-    /// Answers the resume signals the run was parked on, which went
-    /// with it: a listener process still holds each one in RAM and keeps
-    /// answering for a run that no longer exists until the caller
-    /// unregisters it there (`unregister_many`), the way a cancel does.
-    async fn delete_run(&self, run_id: RunId) -> anyhow::Result<Vec<SignalRegistration>>;
+    /// Read the full token row (scope vectors included) by the sha256 hex of
+    /// the PRESENTED credential. Used by the token-scoped signal handlers.
+    async fn get_signal_token(&self, token_hash: &str) -> anyhow::Result<Option<SignalToken>>;
 
-    /// Erase up to `limit` ended runs whose time to be kept ran out before
-    /// `now` (unix seconds), oldest first, with everything of theirs (the
-    /// same one list a `weft clean` erases). Answers how many, and the
-    /// resume signals that went with them for the listener to let go of.
-    /// A parked or queued run has no end, so it is never erased.
-    async fn erase_expired(&self, now: i64, limit: i64) -> anyhow::Result<(usize, Vec<SignalRegistration>)>;
+    /// List the signal tokens owned by `tenant` (scoped in the query, so one
+    /// tenant never sees another's tokens). Rows carry no secret: only the
+    /// hash + recognizer + metadata.
+    async fn list_signal_tokens(&self, tenant: &str) -> anyhow::Result<Vec<SignalToken>>;
 
-    /// The earliest moment (unix seconds) a run [`Self::erase_expired`]
-    /// would erase runs out of its keep, `None` with none: the same runs,
-    /// so a run it must leave (a flagged one) never makes it look in a
-    /// loop.
-    async fn next_expiry(&self) -> anyhow::Result<Option<i64>>;
+    /// Delete a signal token by its id, scoped to `tenant`: only the owning
+    /// tenant can revoke it. Returns true iff a row was actually removed (a
+    /// wrong-tenant id matches nothing, same as a missing one, so revoke
+    /// can't probe other tenants' tokens).
+    async fn revoke_signal_token(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<bool>;
+
+    /// Record `token` (an operator key) only when its tenant holds no
+    /// operator key at all, in one statement, so replicas booting at
+    /// once record it once. The install's bootstrap key: re-seeded after
+    /// every operator key is revoked, never beside a live one. Returns
+    /// whether it was recorded.
+    async fn seed_operator_token(&self, token: &SignalToken) -> anyhow::Result<bool>;
+}
+
+/// The trigger setups (`trigger_setup`, which setup runs are in flight)
+/// and what each finished one captured (`trigger_bake`).
+#[async_trait]
+pub trait BakeStore: Send + Sync {
+    /// Whether `run_id` is a trigger setup still in flight.
+    async fn is_trigger_setup_pending(&self, run_id: RunId) -> anyhow::Result<bool>;
+
+    /// Publish one complete setup and release its birth-time ownership atomically.
+    /// A failed/cancelled setup releases ownership without replacing any bake.
+    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&TriggerBake>) -> anyhow::Result<()>;
+
+    /// The bakes of one owner's triggers: the shared ones for `None`, an
+    /// instance's for `Some`.
+    async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Vec<TriggerBake>>;
 }
 
 /// Durable replacement for the in-RAM `SignalTracker` row.
@@ -547,7 +571,7 @@ pub struct SignalRegistration {
     pub generation: i64,
 }
 
-/// What a [`Journal::signal_insert`] did.
+/// What a [`SignalStore::signal_insert`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalWrite {
     /// The row is written, its kind state at a new version.
@@ -615,7 +639,7 @@ impl SignalRegistration {
                     Ok(spec) => weft_core::signal::caller_protocol(&spec.kind).is_some(),
                     Err(error) => {
                         tracing::error!(
-                            target: "weft_dispatcher::journal",
+                            target: "weft_dispatcher::store",
                             token = %self.token,
                             %error,
                             "signal row has an unreadable spec; its public address cannot be told"
@@ -679,7 +703,7 @@ impl RunOwner {
     }
 }
 
-/// What became of an answer to a wait (`Journal::answer`).
+/// What became of an answer to a wait (`SignalStore::answer`).
 #[derive(Debug)]
 pub enum Answered {
     /// It reached its run: written into its record (the run is queued to
@@ -692,7 +716,7 @@ pub enum Answered {
     Gone,
 }
 
-/// What `Journal::let_go_of_lost` did with a run.
+/// What `RunStore::let_go_of_lost` did with a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lost {
     /// Its owner is alive (or it is not running any more): left as it is.
@@ -703,7 +727,7 @@ pub enum Lost {
     Ended,
 }
 
-/// What `Journal::cancel_run` committed.
+/// What `RunStore::cancel_run` committed.
 #[derive(Debug, Default)]
 pub struct CancelWrite {
     /// The wake signals stripped, for the listener's in-RAM unregister.
@@ -898,7 +922,7 @@ impl LogEntry {
     }
 
     /// The last `limit` lines in written order: THE `logs_for` answer,
-    /// the same code for both journals, so what a fake-backed test pins is
+    /// the same code for both stores, so what a fake-backed test pins is
     /// what the real read does. The cut is made after the sort, so it is
     /// the last lines the run wrote.
     pub fn tail(entries: Vec<LogEntry>, limit: u32) -> Vec<LogEntry> {
@@ -935,7 +959,7 @@ impl LogEntry {
     /// The log line a journal event projects to, or `None` for an
     /// event that is not log-worthy (a pulse, a completion). The ONE
     /// place the journal-to-log projection lives, shared by the
-    /// Postgres and fake journals so `weft logs` reads the same thing
+    /// Postgres and fake stores so `weft logs` reads the same thing
     /// against both.
     pub fn from_event(event: &RunEvent) -> Option<LogEntry> {
         // `KINDS` is the one gate: a kind the list carries and the match

@@ -58,7 +58,7 @@ pub async fn display_stream(
     let run = match query.get("run").filter(|run| !run.is_empty()) {
         Some(run) => {
             let run: weft_core::RunId = run.parse().map_err(|_| (StatusCode::BAD_REQUEST, format!("run={run} is not a run id")))?;
-            let owner = state.journal.run_owner(run).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the run's row: {e:#}")))?;
+            let owner = state.runs.run_owner(run).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the run's row: {e:#}")))?;
             if owner.is_none_or(|owner| owner.project_id != project) {
                 return Err((StatusCode::NOT_FOUND, format!("there is no run {run} in this project")));
             }
@@ -125,7 +125,7 @@ pub async fn run_stream(
     // subscribe to the project's bus but filter
     // for this run.
     //
-    // A bad run string is 400; a journal lookup failure is 500;
+    // A bad run string is 400; a run store lookup failure is 500;
     // an unknown run (no run row) is 404. The pre-Result
     // shape papered over all three with empty-string project_id,
     // which silently routed events into a phantom bucket.
@@ -135,7 +135,7 @@ pub async fn run_stream(
     // Resolve + tenant-gate in the ONE place that owns "who owns this
     // run": an unknown or cross-tenant run is 404 either way,
     // and the project id rides back for the stream's attribution.
-    let project_id = crate::authenticator::authorize_run(&*state.journal, &caller.0, target_run_id)
+    let project_id = crate::authenticator::authorize_run(&*state.runs, &caller.0, target_run_id)
         .await
         .map_err(|(s, _)| s)?
         .project_id;

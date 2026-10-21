@@ -45,10 +45,8 @@ pub(crate) static ON_INFRA_RETURNS: &[WakeOn] = &[
 ];
 
 /// Safety tick of the reapers that are woken by a write: 60 seconds in
-/// real time, at this install's pace (`weft_core::time_scale`).
-fn woken_reaper_safety() -> Duration {
-    weft_core::time_scale::scaled(Duration::from_secs(60))
-}
+/// real time (`DrainLoop::new` runs it at this install's pace).
+const WOKEN_REAPER_SAFETY: Duration = Duration::from_secs(60);
 
 /// Every reaper, as the loops the dispatcher runs.
 pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
@@ -92,7 +90,7 @@ pub(crate) const DOOR_WINDOWS: &str = "door_windows";
 /// taking work lets go of its front. Then sleep until the next window
 /// ends, or until an activation changes.
 async fn close_door_windows(state: DispatcherState) -> anyhow::Result<DrainStep> {
-    let let_go = |signals: Vec<crate::journal::SignalRegistration>| {
+    let let_go = |signals: Vec<crate::store::SignalRegistration>| {
         let state = state.clone();
         async move { crate::listener::let_go_of_stopped(&state.pg_pool, &state.listener, &signals).await }
     };
@@ -120,10 +118,10 @@ async fn close_door_windows(state: DispatcherState) -> anyhow::Result<DrainStep>
 /// projects whose windows ended.
 pub async fn close_door_windows_over<F, Fut>(pool: &sqlx::PgPool, let_go: F) -> anyhow::Result<Vec<uuid::Uuid>>
 where
-    F: Fn(Vec<crate::journal::SignalRegistration>) -> Fut,
+    F: Fn(Vec<crate::store::SignalRegistration>) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<Vec<(String, String)>>>,
 {
-    let again = crate::journal::postgres::signals_kept_after_let_go(pool).await?;
+    let again = crate::store::postgres::signals_kept_after_let_go(pool).await?;
     if !again.is_empty() {
         let kept = let_go(again.clone()).await?;
         crate::listener::note_let_go(pool, &again, &kept).await?;
@@ -134,7 +132,7 @@ where
     }
     let mut ended_in = Vec::new();
     for (project_id, keys) in by_project {
-        let signals = crate::journal::postgres::activation_signals(pool, project_id, &keys).await?;
+        let signals = crate::store::postgres::activation_signals(pool, project_id, &keys).await?;
         let kept = let_go(signals.clone()).await?;
         crate::listener::note_let_go(pool, &signals, &kept).await?;
         let ended = crate::activation_store::close_door_windows(pool, project_id, &keys).await?;
@@ -174,14 +172,14 @@ const DOOR_WINDOWS_LABEL: &str = "close the doors whose window passed";
 
 /// A sweep that runs on its interval alone (a machine's only). `interval`
 /// is given in real time and runs at this install's pace
-/// (`weft_core::time_scale`).
+/// (`DrainLoop::new` scales it).
 fn timed<F, Fut>(state: &DispatcherState, interval: Duration, name: &'static str, label: &'static str, sweep: F) -> DrainLoop
 where
     F: Fn(DispatcherState) -> Fut + Send + Sync + Clone + 'static,
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 {
     let state = state.clone();
-    DrainLoop::new(name, label, NOTHING, weft_core::time_scale::scaled(interval), move || {
+    DrainLoop::new(name, label, NOTHING, interval, move || {
         let state = state.clone();
         let sweep = sweep.clone();
         async move {
@@ -199,7 +197,7 @@ where
     Fut: std::future::Future<Output = anyhow::Result<DrainStep>> + Send + 'static,
 {
     let state = state.clone();
-    DrainLoop::new(name, label, wake_on, woken_reaper_safety(), move || {
+    DrainLoop::new(name, label, wake_on, WOKEN_REAPER_SAFETY, move || {
         let state = state.clone();
         let sweep = sweep.clone();
         async move {

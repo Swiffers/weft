@@ -17,7 +17,7 @@ use weft_platform_traits::CoreRole;
 use weft_task_store::drain::{DrainLoop, WakeOn};
 
 use crate::authenticator::local_authenticator;
-use crate::journal::postgres::PostgresJournal;
+use crate::store::postgres::PostgresStore;
 use crate::listener::ListenerClient;
 use crate::role_client::RoleClient;
 use crate::reclaim::{default_reclaimer, ProjectReclaimer};
@@ -25,8 +25,8 @@ use crate::tenant;
 use crate::DispatcherState;
 
 /// Every schema group the dispatcher owns, in dependency order: each group
-/// after the ones whose tables its DDL names (the groups the journal's
-/// triggers sit on come before it). Its part of the install's one schema
+/// after the ones whose tables its DDL names (the groups the run and
+/// signal tables' triggers sit on come before theirs). Its part of the install's one schema
 /// list (`weft_runtime::schema::groups()`), which the boot applies in one
 /// guarded pass and the migration generator and the agreement test build
 /// from; a test of the dispatcher's own SQL applies just this part.
@@ -34,15 +34,15 @@ pub static DISPATCHER_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     // What the writes a run makes announce, sent in batches: every
     // trigger on a run's path writes to it.
     &weft_task_store::announce::GROUP,
-    // Before the journal: a trigger of the journal's on `access_grant`
+    // Before the stores' group: a trigger of theirs on `access_grant`
     // marks the signals acting as a connection that changed.
     &weft_access_store::GROUP,
     // Which worker processes are alive, and what their doors counted.
-    // Before the journal: a trigger of the journal's on `worker_lease`
+    // Before the stores' group: a trigger of theirs on `worker_lease`
     // wakes the delivery when a worker of a project whose runs could not
     // reach one comes alive.
     &weft_task_store::worker_door::GROUP,
-    &crate::journal::postgres::GROUP,
+    &crate::store::postgres::GROUP,
     // The exclusive infra ownership leases.
     &crate::infra_owner::GROUP,
     // How many holders the platform's pool was last set to run.
@@ -52,7 +52,7 @@ pub static DISPATCHER_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     &crate::infra_event::GROUP,
     &crate::infra_lifecycle_command::GROUP,
     // The events waiting for a parked trigger, one row each (their notify
-    // trigger reads `signal`, so after the journal's group).
+    // trigger reads `signal`, so after the stores' group).
     &weft_task_store::parked_fires::GROUP,
     // The durable terminate-sweep queue (no FK; the dispatcher owns it and
     // the reaper drains it by asking the broker to sweep a terminated
@@ -194,7 +194,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         signals.require(channel)?;
     }
     info!("dispatcher replica: {replica}");
-    let journal = PostgresJournal::from_pool(pool.clone());
+    let store = Arc::new(PostgresStore::from_pool(pool.clone()));
     let projects: crate::ProjectStore = Arc::new(crate::PostgresProjectStore::new(pool.clone()));
     let activations: crate::activation_store::ActivationStore =
         Arc::new(crate::activation_store::PostgresActivationStore::new(pool.clone()));
@@ -227,7 +227,10 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         .expect("a default reqwest client builds");
     Ok(DispatcherState {
         replica: replica.clone(),
-        journal: Arc::new(journal),
+        runs: store.clone(),
+        registrations: store.clone(),
+        tokens: store.clone(),
+        bakes: store,
         pg_pool: pool,
         lock_pool,
         signals,
@@ -326,7 +329,8 @@ pub fn task_registry() -> crate::task_executor::TaskRegistry {
 
 /// The dispatcher's background loops: its task picker, the delivery of
 /// queued runs to workers, the lifecycle claimer, what runs' endings leave
-/// to do, the drains, the look at lapsed holds, retention and the reapers. The runtime runs them where the dispatcher is placed (see
+/// to do, the drains, the look at lapsed holds, retention and the reapers.
+/// The runtime runs them where the dispatcher is placed (see
 /// `weft_task_store::drain`).
 pub fn drain_loops(state: &DispatcherState, registry: crate::task_executor::TaskRegistry) -> anyhow::Result<Vec<DrainLoop>> {
     let picker_store = Arc::new(
@@ -463,7 +467,7 @@ where
 }
 
 /// Record the install's bootstrap operator key (`WEFT_BOOTSTRAP_OPERATOR_KEY`)
-/// unless an operator key already exists (see `Journal::seed_operator_token`).
+/// unless an operator key already exists (see `TokenStore::seed_operator_token`).
 /// Only a shared install has one.
 pub async fn seed_bootstrap_operator_key(state: &DispatcherState, key: &str) -> anyhow::Result<()> {
     use weft_core::signal_token as names;
@@ -472,7 +476,7 @@ pub async fn seed_bootstrap_operator_key(state: &DispatcherState, key: &str) -> 
         !key.is_empty(),
         "WEFT_BOOTSTRAP_OPERATOR_KEY is empty: a shared install needs its first operator key"
     );
-    let token = crate::journal::SignalToken {
+    let token = crate::store::SignalToken {
         id: uuid::Uuid::new_v4(),
         kind: weft_core::signal_token::TokenKind::Operator,
         token_hash: names::token_hash(key),
@@ -487,7 +491,7 @@ pub async fn seed_bootstrap_operator_key(state: &DispatcherState, key: &str) -> 
         instance: None,
         expires_at: None,
     };
-    if state.journal.seed_operator_token(&token).await.context("seed the bootstrap operator key")? {
+    if state.tokens.seed_operator_token(&token).await.context("seed the bootstrap operator key")? {
         info!("recorded the install's bootstrap operator key ({})", token.recognizer);
     }
     Ok(())

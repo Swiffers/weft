@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 use weft_core::run_settings::{KeepFor, Keeping, RunSettings};
-use weft_dispatcher::journal::{Journal, Lost};
+use weft_dispatcher::store::{Lost, RunStore};
 use weft_journal::frame::{Batch, BatchHead, RunHead};
 use weft_journal::record::{record_batch, Born, Fate, Written};
 use weft_journal::RunEvent;
@@ -385,10 +385,10 @@ async fn driven_by_a_dead_worker(pool: &PgPool, run: weft_core::RunId) {
 #[sqlx::test]
 async fn a_late_batch_after_the_lost_sweep_is_refused(pool: PgPool) {
     schema(&pool).await;
-    let journal = weft_dispatcher::journal::postgres::PostgresJournal::from_pool(pool.clone());
+    let store = weft_dispatcher::store::postgres::PostgresStore::from_pool(pool.clone());
     let run = weft_core::new_run_id();
     driven_by_a_dead_worker(&pool, run).await;
-    assert_eq!(journal.let_go_of_lost(run, i64::MAX, None).await.unwrap(), Lost::Requeued);
+    assert_eq!(store.let_go_of_lost(run, i64::MAX, None).await.unwrap(), Lost::Requeued);
     assert_eq!(send(&pool, "w1", "w1:0", &[part(run, 1, 1, vec![vec![started(run, "late")]])]).await, [Fate::Refused]);
     assert_eq!(row(&pool, run).await, ("queued".into(), None, 2, 0, 0));
 }
@@ -399,12 +399,12 @@ async fn a_late_batch_after_the_lost_sweep_is_refused(pool: PgPool) {
 #[sqlx::test]
 async fn a_late_batch_before_the_lost_sweep_goes_in_and_the_sweep_follows(pool: PgPool) {
     schema(&pool).await;
-    let journal = weft_dispatcher::journal::postgres::PostgresJournal::from_pool(pool.clone());
+    let store = weft_dispatcher::store::postgres::PostgresStore::from_pool(pool.clone());
     let run = weft_core::new_run_id();
     driven_by_a_dead_worker(&pool, run).await;
     let mut open = pool.begin().await.unwrap();
     assert_eq!(send_on(&mut open, "w1", "w1:0", &[part(run, 1, 1, vec![vec![started(run, "late")]])]).await, [Fate::Accepted]);
-    let sweep = tokio::spawn(async move { journal.let_go_of_lost(run, i64::MAX, None).await.unwrap() });
+    let sweep = tokio::spawn(async move { store.let_go_of_lost(run, i64::MAX, None).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!sweep.is_finished(), "the sweep waits for the batch holding the run's row");
     open.commit().await.unwrap();

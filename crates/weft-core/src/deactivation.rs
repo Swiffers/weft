@@ -84,7 +84,7 @@ pub enum ResyncAnswer {
 }
 
 /// What one look at a task a person follows answers
-/// (`GET /projects/{id}/follow/{task}?waitSecs=<n>`): still going after
+/// (`GET /projects/{id}/follow/{task}?wait_ms=<n>`): still going after
 /// waiting at most that long, or what it ended with. One that failed is
 /// answered as the refusal it ended with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

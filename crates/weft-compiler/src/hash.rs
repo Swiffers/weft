@@ -278,11 +278,12 @@ mod fs_hashes {
         hash_image_recipe(&mut shared, project)?;
         hash_type_registry(&mut shared, catalog);
         // Fingerprints describe the compiled worker, whose type set can be
-        // wider than this graph. Built-in boundaries (a group's, a loop's,
-        // a call site's and a body's halves) always ship in the engine.
+        // wider than this graph. The types weft gives its own nodes (a
+        // loop's two boundaries, the placeholder a broken include leaves)
+        // always ship in the engine, and a program identity has to answer
+        // for every node type its graph holds.
         let mut types = crate::codegen::node_types_for(definition, catalog, node_set);
-        types.extend(crate::weft_compiler::RESERVED_TYPE_KEYWORDS.iter().map(|t| (*t).to_string()));
-        types.extend(weft_core::project::boundary_types::ALL.iter().map(|t| (*t).to_string()));
+        types.extend(weft_core::project::own_types::ALL.iter().map(|t| (*t).to_string()));
         let mut packages: std::collections::BTreeMap<Vec<PathBuf>, SourceHash> = std::collections::BTreeMap::new();
         let mut result = std::collections::BTreeMap::new();
         for node_type in types {
@@ -824,7 +825,13 @@ mod fs_hashes {
                 let before = implementation_hashes(&empty, &project, root, &catalog, set).unwrap();
                 let after = implementation_hashes(&looped, &project, root, &catalog, set).unwrap();
                 assert_eq!(before, after, "adding a built-in boundary does not change the worker's implementation map");
-                assert!(before.contains_key("LoopIn") && before.contains_key("LoopOut"));
+                // Every type weft gives its own nodes, the placeholder a
+                // broken include leaves among them: a program holding one
+                // must still answer for its implementation when a seeded
+                // run slices it (`ProgramIdentity::slice_hashes`).
+                for own in weft_core::project::own_types::ALL {
+                    assert!(before.contains_key(*own), "{own}");
+                }
                 if matches!(set, weft_core::builds::NodeSet::Full) { assert!(before.contains_key("Text")); }
             }
         }

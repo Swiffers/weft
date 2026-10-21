@@ -110,9 +110,10 @@ async fn follow(state: SupervisorState, mut ownership: Ownership, changes: Vec<U
                             sweep_gone_copies(&state, copies).await;
                         });
                     }
-                    (Ok(_), false) => tracing::debug!("the last sweep of gone copies still runs; this tick sweeps nothing"),
+                    (Ok(_), false) => tracing::debug!(target: "weft_infra_supervisor::ownership", "the last sweep of gone copies still runs; this tick sweeps nothing"),
                     // Every tick lists again, so nothing is written down.
                     (Err(e), _) => tracing::error!(
+                        target: "weft_infra_supervisor::ownership",
                         error = %format!("{e:#}"),
                         "listing what the host holds failed; its gone copies are swept at the next tick"
                     ),
@@ -129,7 +130,7 @@ async fn follow(state: SupervisorState, mut ownership: Ownership, changes: Vec<U
                 }
             }
             Ok(None) => {}
-            Err(e) => tracing::warn!(error = %e, "ownership tick failed"),
+            Err(e) => tracing::warn!(target: "weft_infra_supervisor::ownership", error = %e, "ownership tick failed"),
         }
         wait_for_next_tick(&state).await;
     }
@@ -173,6 +174,7 @@ pub(crate) async fn claim(state: &SupervisorState, ownership: &mut Ownership) ->
 async fn renew(state: &SupervisorState, ownership: &mut Ownership, syncing: Syncing) -> Result<Option<OwnershipChange>> {
     let synced = sync(state, ownership.held_projects.as_deref(), syncing).await?;
     tracing::debug!(
+        target: "weft_infra_supervisor::ownership",
         replica = %state.replica,
         owned = synced.owned.len(),
         claimed = synced.claimed.len(),
@@ -319,7 +321,7 @@ pub async fn sweep_gone_copies(state: &SupervisorState, copies: Vec<NodeRef>) ->
     let mut emptied = Vec::new();
     for (project, copies) in by_project {
         let Some(_project) = state.project_locks.try_alone(project) else {
-            tracing::debug!(project_id = %project, "a lifecycle command holds the project; its gone copies wait for the next tick");
+            tracing::debug!(target: "weft_infra_supervisor::ownership", project_id = %project, "a lifecycle command holds the project; its gone copies wait for the next tick");
             continue;
         };
         match sweep_project(state, project, &copies).await {
@@ -340,7 +342,7 @@ pub async fn sweep_gone_copies(state: &SupervisorState, copies: Vec<NodeRef>) ->
 /// it deleted every copy in `copies`.
 async fn sweep_project(state: &SupervisorState, project: Uuid, copies: &[NodeRef]) -> Result<bool> {
     let Some(gone) = crate::patiently(state, || state.broker.gone_copies(&state.replica, project, copies)).await? else {
-        tracing::debug!(project_id = %project, "another supervisor holds the project's lease; its copies are its to sweep");
+        tracing::debug!(target: "weft_infra_supervisor::ownership", project_id = %project, "another supervisor holds the project's lease; its copies are its to sweep");
         return Ok(false);
     };
     let mut failed = Vec::new();
@@ -348,13 +350,14 @@ async fn sweep_project(state: &SupervisorState, project: Uuid, copies: &[NodeRef
     for copy in copies.iter().filter(|c| gone.contains(&c.copy_id)) {
         match crate::patiently(state, || state.broker.gone_copies(&state.replica, project, std::slice::from_ref(copy))).await? {
             None => {
-                tracing::info!(project_id = %project, "the project's lease moved mid-sweep; leaving its copies to the new owner");
+                tracing::info!(target: "weft_infra_supervisor::ownership", project_id = %project, "the project's lease moved mid-sweep; leaving its copies to the new owner");
                 break;
             }
             Some(still) if still.is_empty() => continue,
             Some(_) => {}
         }
         tracing::info!(
+            target: "weft_infra_supervisor::ownership",
             project_id = %copy.project,
             node = %copy.node,
             copy_id = %copy.copy_id,

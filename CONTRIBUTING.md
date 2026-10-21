@@ -67,10 +67,12 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo check -p weft-compiler --no-default-features             # the parse-only build
 scripts/validate-examples.sh                                   # every project in examples/ still compiles
 pnpm -C packages/weft-graph test                               # the graph renderer
+pnpm -C packages/weft-connect test                             # connecting an account
 pnpm -C packages/weft-syntax test                              # the .weft grammar and highlighter
 pnpm -C extension-vscode test                                  # the VS Code extension
 pnpm -C extension-vscode run compile                           # its type check, webview included
 node --test catalog/bailey/bridge/images/bridge/src/*.test.js  # the WhatsApp bridge
+node --test tangle/kilo-code/tests/*.test.ts                   # Kilo Code's Tangle plugin (Node 23.6 or later)
 pnpm -C extension-browser exec tsc --noEmit                    # the browser extension's type check
 pnpm -C extension-browser check                                # and its Svelte check
 ```

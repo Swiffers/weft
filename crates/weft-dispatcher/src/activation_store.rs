@@ -92,7 +92,7 @@ pub enum LifecycleWrite {
         /// deleted the signals): what a wait for their runs counts at the
         /// door (`crate::drain`).
         tokens: Vec<String>,
-        unlisten: Vec<crate::journal::SignalRegistration>,
+        unlisten: Vec<crate::store::SignalRegistration>,
         held: weft_core::projects::HeldWork,
         /// The commands it issued ([`DownCause::Infra`]), first issued first.
         commands: Vec<i64>,
@@ -241,12 +241,12 @@ pub trait ActivationStoreOps: Send + Sync {
         to: &ActivationLifecycle,
         remove_entries: bool,
         values: Option<&ValuesStore<'_>>,
-    ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>>;
+    ) -> anyhow::Result<Option<Vec<crate::store::SignalRegistration>>>;
 
     /// End the activation `run_id` names that nobody will finish (a
     /// person cancelled it, or its driver died). When its triggers kept work
     /// (events held on them, runs of theirs paused:
-    /// `crate::journal::postgres::held_on`), they land down with their door
+    /// `crate::store::postgres::held_on`), they land down with their door
     /// taking and every signal kept, so that work waits for their next
     /// activation; otherwise their door refuses and their entry rows go.
     /// Decided and written in one transaction under the activation's rows.
@@ -255,7 +255,7 @@ pub trait ActivationStoreOps: Send + Sync {
         &self,
         project_id: uuid::Uuid,
         run_id: uuid::Uuid,
-    ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>>;
+    ) -> anyhow::Result<Option<Vec<crate::store::SignalRegistration>>>;
 
     /// Put the activations `run_id` claimed back as they were before the
     /// claim (`previous`, what [`Self::try_begin_activating`] answered):
@@ -412,7 +412,7 @@ async fn end_activating_in(
     to: &ActivationLifecycle,
     remove_entries: bool,
     values: Option<&ValuesStore<'_>>,
-) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
+) -> anyhow::Result<Option<Vec<crate::store::SignalRegistration>>> {
     let owned = "project_id = $1 AND activating_run_id = $2 AND status = 'activating'";
     // With their entry rows going, an instance's rows go too ([`Forget`]);
     // the rest move to `to`.
@@ -459,7 +459,7 @@ async fn end_activating_in(
     let removed = match remove_entries {
         true => {
             let keys = owned_keys(ended)?;
-            crate::journal::postgres::remove_entry_signals(&mut *tx, project_id, &keys).await?
+            crate::store::postgres::remove_entry_signals(&mut *tx, project_id, &keys).await?
         }
         false => Vec::new(),
     };
@@ -530,7 +530,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // signal with no activation reads as active), so each wakes the
         // holder sizing too, and the door-window sweep (`crate::reaper`),
         // which then knows when the next window ends. The
-        // function is the journal group's, which applies first.
+        // function is the run group's (`crate::store::postgres::GROUP`),
+        // which applies first.
         r#"DROP TRIGGER IF EXISTS trigger_activation_held_on_status ON trigger_activation"#,
         r#"CREATE TRIGGER trigger_activation_held_on_status
             AFTER UPDATE OF status, accepting_fires, fires_deadline_unix ON trigger_activation
@@ -702,7 +703,7 @@ fn claimable(keys:&[ActivationKey], before: &[Activation], expect: Option<Projec
 /// `COALESCE(instance_id, '')`; an instance id is never empty). Every
 /// statement keyed by activations unnests these: the activation rows
 /// here, and the signals and runs they govern
-/// (`crate::journal::postgres`).
+/// (`crate::store::postgres`).
 pub(crate) fn key_arrays(keys: &[ActivationKey]) -> (Vec<String>, Vec<String>) {
     keys.iter()
         .map(|k| (k.trigger.clone(), k.instance().map(|m| m.as_str().to_string()).unwrap_or_default()))
@@ -865,7 +866,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         to: &ActivationLifecycle,
         remove_entries: bool,
         values: Option<&ValuesStore<'_>>,
-    ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
+    ) -> anyhow::Result<Option<Vec<crate::store::SignalRegistration>>> {
         let mut tx = self.pool.begin().await?;
         let ended = end_activating_in(&mut tx, project_id, run_id, to, remove_entries, values).await?;
         tx.commit().await?;
@@ -876,7 +877,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         &self,
         project_id: uuid::Uuid,
         run_id: uuid::Uuid,
-    ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
+    ) -> anyhow::Result<Option<Vec<crate::store::SignalRegistration>>> {
         let mut tx = self.pool.begin().await?;
         let owned: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT trigger, instance_id FROM trigger_activation \
@@ -890,7 +891,7 @@ impl ActivationStoreOps for PostgresActivationStore {
             return Ok(None);
         }
         let keys = owned_keys(owned)?;
-        let kept = crate::journal::postgres::held_on(&mut *tx, project_id, &keys).await?;
+        let kept = crate::store::postgres::held_on(&mut *tx, project_id, &keys).await?;
         let ended = match kept.is_empty() {
             false => end_activating_in(&mut tx, project_id, run_id, &ActivationLifecycle::holding(), false, None).await?,
             true => end_activating_in(&mut tx, project_id, run_id, &ActivationLifecycle::refused(), true, None).await?,
@@ -1057,7 +1058,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         let keys = keys.as_slice();
         // Their entry tokens, read before anything of them goes: what a wait
         // for the runs they fired counts at the workers' door.
-        let tokens = crate::journal::postgres::entry_tokens(&mut *tx, project_id, keys).await?;
+        let tokens = crate::store::postgres::entry_tokens(&mut *tx, project_id, keys).await?;
         // The mark, and an infra verb's commands with it: claimable only
         // once the triggers reading their copies are down.
         let (went_down, commands) = match cause {
@@ -1074,7 +1075,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         held_project.decided(&mut tx, project_id, keys).await?;
         // What they hold, as it stands before anything of it goes: what the
         // take-down says it kept or dropped.
-        let held = crate::journal::postgres::held_on(&mut *tx, project_id, keys).await?;
+        let held = crate::store::postgres::held_on(&mut *tx, project_id, keys).await?;
         let forgotten: Vec<ActivationKey> = keys.iter().filter(|k| forget.forgets(k)).cloned().collect();
         if !forgotten.is_empty() {
             let (triggers, instances) = key_arrays(&forgotten);
@@ -1110,13 +1111,13 @@ impl ActivationStoreOps for PostgresActivationStore {
         let unlisten = match signals {
             SignalsGoing::Kept => Vec::new(),
             SignalsGoing::HeldArrivals => {
-                crate::journal::postgres::drop_held_arrivals(&mut *tx, project_id, keys).await?;
+                crate::store::postgres::drop_held_arrivals(&mut *tx, project_id, keys).await?;
                 Vec::new()
             }
             SignalsGoing::Project { except } => {
-                crate::journal::postgres::remove_project_signals_except(&mut *tx, project_id, except).await?
+                crate::store::postgres::remove_project_signals_except(&mut *tx, project_id, except).await?
             }
-            SignalsGoing::Activations => crate::journal::postgres::remove_entry_signals(&mut *tx, project_id, keys).await?,
+            SignalsGoing::Activations => crate::store::postgres::remove_entry_signals(&mut *tx, project_id, keys).await?,
         };
         tx.commit().await?;
         Ok(LifecycleWrite::Applied { keys: keys.to_vec(), tokens, unlisten, held, commands })
@@ -1245,7 +1246,7 @@ impl ActivationStoreOps for FakeActivationStore {
         to: &ActivationLifecycle,
         remove_entries: bool,
         values: Option<&ValuesStore<'_>>,
-    ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
+    ) -> anyhow::Result<Option<Vec<crate::store::SignalRegistration>>> {
         if values.is_some() {
             anyhow::bail!("the fake activation store cannot store a re-arm's change; that takes Postgres");
         }
@@ -1273,7 +1274,7 @@ impl ActivationStoreOps for FakeActivationStore {
         &self,
         project_id: uuid::Uuid,
         run_id: uuid::Uuid,
-    ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
+    ) -> anyhow::Result<Option<Vec<crate::store::SignalRegistration>>> {
         // The fake keeps no signals, so no trigger kept any work.
         self.end_activating(project_id, run_id, &ActivationLifecycle::refused(), true, None).await
     }
@@ -1372,7 +1373,7 @@ impl ActivationStoreOps for FakeActivationStore {
                 }
             }
         }
-        // The signals live in the journal's tables, which this fake does
+        // The signals live in the `SignalStore`'s tables, which this fake does
         // not hold (the same as `end_activating`'s), so nothing is held.
         Ok(LifecycleWrite::Applied { keys, tokens: Vec::new(), unlisten: Vec::new(), held: Default::default(), commands: Vec::new() })
     }

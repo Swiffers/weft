@@ -266,7 +266,7 @@ pub fn micro_usd(usd: f64) -> i64 {
 /// The columns a run's row is born with, read off its birth (its
 /// `RunStarted`), with how long it is kept once it ended, resolved
 /// against its project's default.
-// SYNC: Born's fields <-> weft_record_batch's `p_born` (crates/weft-dispatcher/src/journal/postgres.rs)
+// SYNC: Born's fields <-> weft_record_batch's `p_born` (crates/weft-dispatcher/src/store/postgres.rs)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Born {
     pub project_id: uuid::Uuid,

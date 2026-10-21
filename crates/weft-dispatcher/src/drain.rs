@@ -232,7 +232,7 @@ impl Reached {
         let activations = state.activations.list(scope.project_id).await?;
         let keys: Vec<weft_core::activation::ActivationKey> =
             crate::infra_reach::activations_reached(reach, &activations, &project).into_iter().map(|a| a.key.clone()).collect();
-        let mut tokens = crate::journal::postgres::entry_tokens(&state.pg_pool, scope.project_id, &keys).await?;
+        let mut tokens = crate::store::postgres::entry_tokens(&state.pg_pool, scope.project_id, &keys).await?;
         tokens.extend(taken_down.iter().cloned());
         tokens.sort();
         tokens.dedup();

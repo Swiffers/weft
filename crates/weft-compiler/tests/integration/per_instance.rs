@@ -2,9 +2,8 @@
 //! may stand, and the slice the compiler grows from them along the wires.
 
 use weft_catalog::{stdlib_root, FsCatalog};
-use weft_compiler::enrich::enrich;
 use weft_compiler::validate::validate;
-use weft_compiler::weft_compiler::compile;
+use crate::rig::{compile, enrich};
 use weft_compiler::CompileFs;
 use weft_core::instance::PerInstance;
 

@@ -21,14 +21,14 @@
 //! group inputs and include arguments all have an owning node and field span.
 //! The pass reads each file relative to the source that wrote its reference,
 //! casts the bytes via `WeftType::cast_text`, and replaces the value. A bad
-//! path, a malformed marker, or a failed cast becomes a `CompileError`
+//! path, a malformed marker, or a failed cast becomes a `SourceError`
 //! pointing at the field's source line.
 
 use weft_core::project::{FileMarker, FileRef};
 use weft_core::WeftType;
 
 use crate::file_reader::CompileFs;
-use crate::weft_compiler::CompileError;
+use crate::weft_compiler::SourceError;
 
 /// Recognize and parse a `@file("path"[, Type])` or `@asset("path"[, Type])`
 /// marker from a raw value string. Returns `None` if the string is neither
@@ -548,7 +548,7 @@ fn spell_from_root(mut file_ref: FileRef, home: Option<&std::path::Path>) -> Res
 pub(crate) fn resolve_project_file_refs(
     project: &mut weft_core::project::ProjectDefinition,
     root_fs: &CompileFs,
-    errors: &mut Vec<CompileError>,
+    errors: &mut Vec<SourceError>,
 ) {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     for node in &mut project.nodes {
@@ -574,7 +574,7 @@ pub(crate) fn resolve_project_file_refs(
             Ok(_) => {}
             // A file that is not there breaks the node that reads it, and
             // only that node.
-            Err(msg) => errors.push(CompileError::at(span, msg).in_file(source_file).about(&part)),
+            Err(msg) => errors.push(SourceError::at(span, msg).in_file(source_file).about(&part)),
         });
       }
     }
@@ -594,7 +594,7 @@ pub(crate) fn resolve_project_file_refs(
                     group.file_refs.insert(key.clone(), file_ref);
                 }
                 Ok(_) => {}
-                Err(msg) => errors.push(CompileError::at(span, msg).in_file(source_file).about(&group.id)),
+                Err(msg) => errors.push(SourceError::at(span, msg).in_file(source_file).about(&group.id)),
             });
         }
     }

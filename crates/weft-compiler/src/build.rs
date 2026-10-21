@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::codegen;
-use crate::error::{CompileError, CompileResult};
+use crate::error::{BuildError, BuildResult};
 use crate::project::Project;
 use crate::worker_image;
 use weft_catalog::FsCatalog;
@@ -92,26 +92,26 @@ impl StockProject {
     /// What the builder base installs and exports to compile this
     /// worker: the stdlib packages' build-stage system packages and
     /// `[build.env]`.
-    pub fn builder_stage(&self) -> CompileResult<worker_image::BuilderStage> {
+    pub fn builder_stage(&self) -> BuildResult<worker_image::BuilderStage> {
         worker_image::BuilderStage::for_nodes(&self.catalog, &self.node_types(), self.project.root.as_path())
     }
 
-    pub fn materialize() -> CompileResult<Self> {
-        let dir = tempfile::tempdir().map_err(CompileError::Io)?;
+    pub fn materialize() -> BuildResult<Self> {
+        let dir = tempfile::tempdir().map_err(BuildError::Io)?;
         for (rel, bytes) in crate::project::scaffold_files("standard-worker", uuid::Uuid::nil())? {
             let path = dir.path().join(rel);
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(CompileError::Io)?;
+                std::fs::create_dir_all(parent).map_err(BuildError::Io)?;
             }
-            std::fs::write(path, bytes).map_err(CompileError::Io)?;
+            std::fs::write(path, bytes).map_err(BuildError::Io)?;
         }
-        std::fs::create_dir_all(dir.path().join("nodes")).map_err(CompileError::Io)?;
-        let stdlib = weft_catalog::stdlib_root().map_err(CompileError::Build)?;
+        std::fs::create_dir_all(dir.path().join("nodes")).map_err(BuildError::Io)?;
+        let stdlib = weft_catalog::stdlib_root().map_err(BuildError::Build)?;
         std::os::unix::fs::symlink(&stdlib, crate::project::base_catalog_dir(dir.path()))
-            .map_err(CompileError::Io)?;
+            .map_err(BuildError::Io)?;
         let project = Project::load(dir.path())?;
         let (definition, catalog) = crate::hash::load_program(&project)
-            .map_err(|e| CompileError::Build(format!("compile the stock project: {e}")))?;
+            .map_err(|e| BuildError::Build(format!("compile the stock project: {e}")))?;
         Ok(Self { _dir: dir, project, definition, catalog })
     }
 }
@@ -122,7 +122,7 @@ impl StockProject {
 /// ready so such a project's first run compiles nothing, and never
 /// reclaims it. Computed once per process: asking compiles the stock
 /// program and walks the whole catalog.
-pub fn standard_worker_hash() -> CompileResult<String> {
+pub fn standard_worker_hash() -> BuildResult<String> {
     static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     if let Some(known) = HASH.get() {
         return Ok(known.clone());
@@ -130,7 +130,7 @@ pub fn standard_worker_hash() -> CompileResult<String> {
     let stock = StockProject::materialize()?;
     let root = resolve_weft_root()?;
     let hash = crate::hash::compute_binary_hash(&stock.definition, &stock.project, &root, &stock.catalog, weft_core::builds::NodeSet::Full)
-        .map_err(|e| CompileError::Build(format!("compute the standard worker's hash: {e}")))?;
+        .map_err(|e| BuildError::Build(format!("compute the standard worker's hash: {e}")))?;
     Ok(HASH.get_or_init(|| hash).clone())
 }
 
@@ -164,13 +164,13 @@ pub fn build_project(
     catalog: &FsCatalog,
     bases: &worker_image::BaseImages,
     node_set: weft_core::builds::NodeSet,
-) -> CompileResult<StagedImageBuild> {
+) -> BuildResult<StagedImageBuild> {
     let project_root = project.root.as_path();
     // What does not compile is already in the definition as broken parts
     // (`crate::compile_program`), and the build goes on around them: a
     // part a run needs is refused when the run is cut. Anything else is a
     // definition changed since its check.
-    let root = project_root.canonicalize().map_err(CompileError::Io)?;
+    let root = project_root.canonicalize().map_err(BuildError::Io)?;
     crate::bail_on_errors(crate::unsettled(definition, catalog, Some(&root)))?;
     // Project identity arrives with each run, never in the worker image.
     let crate_name = WORKER_CRATE_NAME;
@@ -191,9 +191,9 @@ pub fn build_project(
     )?;
     let dockerfile_path = project_root.join(".weft/target/Dockerfile.worker");
     if let Some(parent) = dockerfile_path.parent() {
-        std::fs::create_dir_all(parent).map_err(CompileError::Io)?;
+        std::fs::create_dir_all(parent).map_err(BuildError::Io)?;
     }
-    std::fs::write(&dockerfile_path, &dockerfile_summary.body).map_err(CompileError::Io)?;
+    std::fs::write(&dockerfile_path, &dockerfile_summary.body).map_err(BuildError::Io)?;
 
     let weft_root = resolve_weft_root()?;
     // The pre-built builder base bakes `/weft/` (the engine workspace)
@@ -215,7 +215,7 @@ pub fn build_project(
 
     let content_hash =
         crate::hash::compute_binary_hash(definition, project, &weft_root, catalog, node_set)
-            .map_err(|e| CompileError::Build(format!("compute binary hash: {e}")))?;
+            .map_err(|e| BuildError::Build(format!("compute binary hash: {e}")))?;
 
     Ok(StagedImageBuild::new(build_context, content_hash, &dockerfile_summary))
 }
@@ -257,14 +257,14 @@ fn stage_build_context(
     catalog: &FsCatalog,
     referenced_nodes: &BTreeSet<String>,
     stage_weft: bool,
-) -> CompileResult<PathBuf> {
+) -> BuildResult<PathBuf> {
     let ctx = ctx.to_path_buf();
     if ctx.exists() {
-        std::fs::remove_dir_all(&ctx).map_err(CompileError::Io)?;
+        std::fs::remove_dir_all(&ctx).map_err(BuildError::Io)?;
     }
-    std::fs::create_dir_all(&ctx).map_err(CompileError::Io)?;
+    std::fs::create_dir_all(&ctx).map_err(BuildError::Io)?;
 
-    std::fs::copy(dockerfile_path, ctx.join("Dockerfile")).map_err(CompileError::Io)?;
+    std::fs::copy(dockerfile_path, ctx.join("Dockerfile")).map_err(BuildError::Io)?;
 
     // `build/` = generated cargo crate. Copy target excluded; it
     // doesn't exist on the host anymore (no host cargo build), but
@@ -298,10 +298,10 @@ fn stage_project_nodes(
     catalog: &FsCatalog,
     referenced_nodes: &BTreeSet<String>,
     dest: &Path,
-) -> CompileResult<()> {
+) -> BuildResult<()> {
     for root in catalog.package_roots_for(referenced_nodes) {
         let rel = root.strip_prefix(project_root).map_err(|_| {
-            CompileError::Build(format!(
+            BuildError::Build(format!(
                 "package root {} is not under the project root {}",
                 root.display(),
                 project_root.display()
@@ -373,7 +373,7 @@ pub fn build_test_artifact(
     catalog: &FsCatalog,
     package_name: &str,
     bases: &worker_image::BaseImages,
-) -> CompileResult<StagedImageBuild> {
+) -> BuildResult<StagedImageBuild> {
     let project_root = project.root.as_path();
     let weft_root = resolve_weft_root()?;
 
@@ -409,9 +409,9 @@ pub fn build_test_artifact(
         .join("target")
         .join(format!("Dockerfile.node-tests.{stem}"));
     if let Some(parent) = dockerfile_path.parent() {
-        std::fs::create_dir_all(parent).map_err(CompileError::Io)?;
+        std::fs::create_dir_all(parent).map_err(BuildError::Io)?;
     }
-    std::fs::write(&dockerfile_path, test_server_dockerfile(&dockerfile_summary.body)).map_err(CompileError::Io)?;
+    std::fs::write(&dockerfile_path, test_server_dockerfile(&dockerfile_summary.body)).map_err(BuildError::Io)?;
 
     let stage_weft = dockerfile_summary.builder_base.is_none();
     let build_context = stage_build_context(
@@ -456,11 +456,11 @@ pub fn node_test_content_hash(
     project: &Project,
     catalog: &FsCatalog,
     package_name: &str,
-) -> CompileResult<crate::hash::SourceHash> {
+) -> BuildResult<crate::hash::SourceHash> {
     let weft_root = resolve_weft_root()?;
     let package_root = package_root(catalog, package_name)?;
     crate::hash::compute_node_test_hash(&package_root, project, &weft_root, catalog)
-        .map_err(|e| CompileError::Build(format!("compute node-test hash: {e}")))
+        .map_err(|e| BuildError::Build(format!("compute node-test hash: {e}")))
 }
 
 /// Content hash of everything that can change a package's node-test
@@ -477,7 +477,7 @@ pub fn node_test_cache_hash(
     project: &Project,
     catalog: &FsCatalog,
     package_name: &str,
-) -> CompileResult<crate::hash::SourceHash> {
+) -> BuildResult<crate::hash::SourceHash> {
     let weft_root = resolve_weft_root()?;
     let package_root = package_root(catalog, package_name)?;
     crate::hash::compute_node_test_outcome_hash(
@@ -485,18 +485,18 @@ pub fn node_test_cache_hash(
         &[project.root.as_path(), weft_root.as_path()],
         catalog,
     )
-    .map_err(|e| CompileError::Build(format!("compute node-test cache hash: {e}")))
+    .map_err(|e| BuildError::Build(format!("compute node-test cache hash: {e}")))
 }
 
 /// The filesystem root of `package_name`, or a loud error naming the
 /// project's nodes/ as the place it was looked for.
-fn package_root(catalog: &FsCatalog, package_name: &str) -> CompileResult<PathBuf> {
+fn package_root(catalog: &FsCatalog, package_name: &str) -> BuildResult<PathBuf> {
     catalog
         .packages()
         .find(|p| p.name == package_name)
         .map(|p| p.root.clone())
         .ok_or_else(|| {
-            CompileError::Build(format!("no package named '{package_name}' in this project (nodes/ or src/)"))
+            BuildError::Build(format!("no package named '{package_name}' in this project (nodes/ or src/)"))
         })
 }
 
@@ -511,10 +511,10 @@ fn package_root(catalog: &FsCatalog, package_name: &str) -> CompileResult<PathBu
 /// (`stage_worker_workspace`) and the hasher (`hash::hash_worker_build_env`)
 /// iterate, so staged and hashed bytes stay equal by construction. Sorted
 /// for deterministic hashing.
-pub fn worker_crate_entries(crate_dir: &Path) -> CompileResult<Vec<(String, PathBuf)>> {
+pub fn worker_crate_entries(crate_dir: &Path) -> BuildResult<Vec<(String, PathBuf)>> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(crate_dir).map_err(CompileError::Io)? {
-        let entry = entry.map_err(CompileError::Io)?;
+    for entry in std::fs::read_dir(crate_dir).map_err(BuildError::Io)? {
+        let entry = entry.map_err(BuildError::Io)?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name == "tests" || weft_catalog::is_node_tree_excluded(&name) {
             continue;
@@ -523,7 +523,7 @@ pub fn worker_crate_entries(crate_dir: &Path) -> CompileResult<Vec<(String, Path
         // stager and the hasher alike (this enumerator is both), so
         // staged and hashed bytes stay equal. Unlike a user's node
         // tree, weft's own crates never legitimately hold one.
-        if entry.file_type().map_err(CompileError::Io)?.is_symlink() {
+        if entry.file_type().map_err(BuildError::Io)?.is_symlink() {
             continue;
         }
         out.push((name, entry.path()));
@@ -545,12 +545,12 @@ pub fn worker_crate_entries(crate_dir: &Path) -> CompileResult<Vec<(String, Path
 /// `copy_dir_filtered`) so cargo's fingerprint inside the container sees
 /// unchanged files as unchanged; the generated manifest + copied lock get the
 /// SOURCE files' mtimes stamped for the same reason.
-pub fn stage_worker_workspace(weft_root: &Path, dest: &Path) -> CompileResult<()> {
-    std::fs::create_dir_all(dest).map_err(CompileError::Io)?;
+pub fn stage_worker_workspace(weft_root: &Path, dest: &Path) -> BuildResult<()> {
+    std::fs::create_dir_all(dest).map_err(BuildError::Io)?;
     let closure = codegen::worker_workspace_crates(weft_root)?;
     for name in &closure {
         let crate_dest = dest.join("crates").join(name);
-        std::fs::create_dir_all(&crate_dest).map_err(CompileError::Io)?;
+        std::fs::create_dir_all(&crate_dest).map_err(BuildError::Io)?;
         for (entry_name, entry_path) in
             worker_crate_entries(&weft_root.join("crates").join(name))?
         {
@@ -558,7 +558,7 @@ pub fn stage_worker_workspace(weft_root: &Path, dest: &Path) -> CompileResult<()
             if entry_path.is_dir() {
                 copy_dir_filtered(&entry_path, &to, &weft_catalog::is_node_tree_excluded)?;
             } else if entry_path.is_file() {
-                std::fs::copy(&entry_path, &to).map_err(CompileError::Io)?;
+                std::fs::copy(&entry_path, &to).map_err(BuildError::Io)?;
                 mirror_mtime(&entry_path, &to);
             }
         }
@@ -567,7 +567,7 @@ pub fn stage_worker_workspace(weft_root: &Path, dest: &Path) -> CompileResult<()
     write_scoped_workspace_manifest(weft_root, dest, &closure)?;
     let lock_src = weft_root.join("Cargo.lock");
     let lock_dst = dest.join("Cargo.lock");
-    std::fs::copy(&lock_src, &lock_dst).map_err(CompileError::Io)?;
+    std::fs::copy(&lock_src, &lock_dst).map_err(BuildError::Io)?;
     mirror_mtime(&lock_src, &lock_dst);
     Ok(())
 }
@@ -578,15 +578,15 @@ pub fn stage_worker_workspace(weft_root: &Path, dest: &Path) -> CompileResult<()
 /// the workspace's feature union. Each file is dated from its content
 /// (`package_source_mtime`): a fresh wall-clock date on every staging would
 /// make cargo rebuild it, and with it every engine crate above it.
-fn stage_empty_workspace_hack(dest: &Path) -> CompileResult<()> {
+fn stage_empty_workspace_hack(dest: &Path) -> BuildResult<()> {
     let dir = dest.join("crates").join(codegen::WORKSPACE_HACK_CRATE);
-    std::fs::create_dir_all(dir.join("src")).map_err(CompileError::Io)?;
+    std::fs::create_dir_all(dir.join("src")).map_err(BuildError::Io)?;
     let manifest = format!(
         "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n",
         codegen::WORKSPACE_HACK_CRATE
     );
     for (path, content) in [(dir.join("Cargo.toml"), manifest.as_str()), (dir.join("src").join("lib.rs"), "")] {
-        std::fs::write(&path, content).map_err(CompileError::Io)?;
+        std::fs::write(&path, content).map_err(BuildError::Io)?;
         stamp_mtime(&path, package_source_mtime(content.as_bytes()));
     }
     Ok(())
@@ -603,17 +603,17 @@ fn write_scoped_workspace_manifest(
     weft_root: &Path,
     dest: &Path,
     crates: &[String],
-) -> CompileResult<()> {
+) -> BuildResult<()> {
     let src = weft_root.join("Cargo.toml");
-    let raw = std::fs::read_to_string(&src).map_err(CompileError::Io)?;
+    let raw = std::fs::read_to_string(&src).map_err(BuildError::Io)?;
     let mut manifest: toml::Value = raw
         .parse()
-        .map_err(|e| CompileError::Build(format!("parse {}: {e}", src.display())))?;
+        .map_err(|e| BuildError::Build(format!("parse {}: {e}", src.display())))?;
     let workspace = manifest
         .get_mut("workspace")
         .and_then(|w| w.as_table_mut())
         .ok_or_else(|| {
-            CompileError::Build(format!("{} has no [workspace] table", src.display()))
+            BuildError::Build(format!("{} has no [workspace] table", src.display()))
         })?;
     workspace.insert(
         "members".into(),
@@ -625,9 +625,9 @@ fn write_scoped_workspace_manifest(
         ),
     );
     let body = toml::to_string_pretty(&manifest)
-        .map_err(|e| CompileError::Build(format!("serialize scoped workspace manifest: {e}")))?;
+        .map_err(|e| BuildError::Build(format!("serialize scoped workspace manifest: {e}")))?;
     let dst = dest.join("Cargo.toml");
-    std::fs::write(&dst, body).map_err(CompileError::Io)?;
+    std::fs::write(&dst, body).map_err(BuildError::Io)?;
     mirror_mtime(&src, &dst);
     Ok(())
 }
@@ -669,7 +669,7 @@ pub(crate) fn stamp_mtime(dst: &Path, modified: std::time::SystemTime) {
 
 /// Stage the builder-base docker build CONTEXT into
 /// `<weft_root>/.weft-base-context/` (see [`stage_builder_base_context_at`]).
-pub fn stage_builder_base_context(weft_root: &Path, install: &weft_core::infra::Install) -> CompileResult<PathBuf> {
+pub fn stage_builder_base_context(weft_root: &Path, install: &weft_core::infra::Install) -> BuildResult<PathBuf> {
     stage_builder_base_context_at(weft_root, &weft_root.join(worker_image::BASE_CONTEXT_DIR), install)
 }
 
@@ -725,14 +725,14 @@ pub fn stage_builder_base_context(weft_root: &Path, install: &weft_core::infra::
 /// context and the baked image. Callers only invoke this when the
 /// content-addressed base tag is absent, so the staging cost is paid exactly
 /// once per base rebuild.
-pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path, install: &weft_core::infra::Install) -> CompileResult<PathBuf> {
+pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path, install: &weft_core::infra::Install) -> BuildResult<PathBuf> {
     if ctx.exists() {
-        std::fs::remove_dir_all(ctx).map_err(CompileError::Io)?;
+        std::fs::remove_dir_all(ctx).map_err(BuildError::Io)?;
     }
     stage_worker_workspace(weft_root, ctx)?;
     let toolchain_src = weft_root.join("rust-toolchain.toml");
     let toolchain_dst = ctx.join("rust-toolchain.toml");
-    std::fs::copy(&toolchain_src, &toolchain_dst).map_err(CompileError::Io)?;
+    std::fs::copy(&toolchain_src, &toolchain_dst).map_err(BuildError::Io)?;
     mirror_mtime(&toolchain_src, &toolchain_dst);
 
     let stock = StockProject::materialize()?;
@@ -749,14 +749,14 @@ pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path, install: &wef
 
     let (install_packages, env_lines) = stock.builder_stage()?.render();
     let template_path = weft_root.join(crate::hash::BUILDER_BASE_DOCKERFILE);
-    let mut rendered = std::fs::read_to_string(&template_path).map_err(CompileError::Io)?;
+    let mut rendered = std::fs::read_to_string(&template_path).map_err(BuildError::Io)?;
     for (token, value) in [
         ("{{target_cache_key}}", install_cache_key(weft_root, install)?),
         ("{{install_build_system_packages}}", install_packages),
         ("{{build_env_lines}}", env_lines),
     ] {
         if !rendered.contains(token) {
-            return Err(CompileError::Build(format!(
+            return Err(BuildError::Build(format!(
                 "{} lost its {token} token; the base would stop keying its compile cache \
                  on the install and toolchain, or stop installing what the stock worker compiles with",
                 template_path.display()
@@ -764,7 +764,7 @@ pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path, install: &wef
         }
         rendered = rendered.replace(token, &value);
     }
-    std::fs::write(ctx.join("Dockerfile"), rendered).map_err(CompileError::Io)?;
+    std::fs::write(ctx.join("Dockerfile"), rendered).map_err(BuildError::Io)?;
 
     // The artifact split the Dockerfile runs. Copied rather than
     // rendered (it takes its paths as arguments), and covered by the
@@ -776,7 +776,7 @@ pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path, install: &wef
         weft_root.join(crate::hash::BUILDER_BASE_SPLIT_SCRIPT),
         ctx.join(split_name),
     )
-    .map_err(CompileError::Io)?;
+    .map_err(BuildError::Io)?;
     Ok(ctx.to_path_buf())
 }
 
@@ -806,10 +806,10 @@ pub const BUILDER_BASE_CACHE_MOUNT_ID_PREFIX: &str = "weft-builder-base-target-"
 /// (`worker_image::CACHE_GC_SCRIPT`, `this-build`), which drops every unit
 /// that build did not use. Source edits keep the key too, so they stay
 /// incremental.
-pub fn install_cache_key(weft_root: &Path, install: &weft_core::infra::Install) -> CompileResult<String> {
+pub fn install_cache_key(weft_root: &Path, install: &weft_core::infra::Install) -> BuildResult<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(std::fs::read(weft_root.join("rust-toolchain.toml")).map_err(CompileError::Io)?);
+    hasher.update(std::fs::read(weft_root.join("rust-toolchain.toml")).map_err(BuildError::Io)?);
     let hash: String = hasher.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect();
     Ok(format!("{}-{hash}", install.label_value()))
 }
@@ -835,7 +835,7 @@ pub fn install_of_cache_key(key: &str) -> Option<&str> {
 /// staged files are dated by their content instead
 /// ([`package_source_mtime`], through [`copy_dir_dated`]).
 /// `exclude` names the entries left out, at any depth.
-pub fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &dyn Fn(&str) -> bool) -> CompileResult<()> {
+pub fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &dyn Fn(&str) -> bool) -> BuildResult<()> {
     copy_dir_dated(src, dst, exclude, FileDates::Mirrored)
 }
 
@@ -850,7 +850,7 @@ enum FileDates {
 }
 
 /// [`copy_dir_filtered`], each file dated as `dates` says.
-fn copy_dir_dated(src: &Path, dst: &Path, exclude: &dyn Fn(&str) -> bool, dates: FileDates) -> CompileResult<()> {
+fn copy_dir_dated(src: &Path, dst: &Path, exclude: &dyn Fn(&str) -> bool, dates: FileDates) -> BuildResult<()> {
     copy_dir_filtered_inner(src, dst, exclude, dates, &mut Default::default())
 }
 
@@ -864,8 +864,8 @@ fn copy_dir_filtered_inner(
     exclude: &dyn Fn(&str) -> bool,
     dates: FileDates,
     chain: &mut Vec<PathBuf>,
-) -> CompileResult<()> {
-    let canon = weft_catalog::guard_node_tree_cycle(src, chain).map_err(CompileError::Io)?;
+) -> BuildResult<()> {
+    let canon = weft_catalog::guard_node_tree_cycle(src, chain).map_err(BuildError::Io)?;
     chain.push(canon);
     let result = copy_dir_filtered_entries(src, dst, exclude, dates, chain);
     chain.pop();
@@ -878,10 +878,10 @@ fn copy_dir_filtered_entries(
     exclude: &dyn Fn(&str) -> bool,
     dates: FileDates,
     chain: &mut Vec<PathBuf>,
-) -> CompileResult<()> {
-    std::fs::create_dir_all(dst).map_err(CompileError::Io)?;
-    for entry in std::fs::read_dir(src).map_err(CompileError::Io)? {
-        let entry = entry.map_err(CompileError::Io)?;
+) -> BuildResult<()> {
+    std::fs::create_dir_all(dst).map_err(BuildError::Io)?;
+    for entry in std::fs::read_dir(src).map_err(BuildError::Io)? {
+        let entry = entry.map_err(BuildError::Io)?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if exclude(&name_str) {
@@ -889,22 +889,22 @@ fn copy_dir_filtered_entries(
         }
         let from = entry.path();
         let to = dst.join(&name);
-        let kind = weft_catalog::node_tree_entry_kind(&from).map_err(CompileError::Io)?;
+        let kind = weft_catalog::node_tree_entry_kind(&from).map_err(BuildError::Io)?;
         if kind == weft_catalog::NodeTreeEntryKind::Dir {
             copy_dir_filtered_inner(&from, &to, exclude, dates, chain)?;
         } else {
             match dates {
                 FileDates::Mirrored => {
-                    std::fs::copy(&from, &to).map_err(CompileError::Io)?;
+                    std::fs::copy(&from, &to).map_err(BuildError::Io)?;
                     mirror_mtime(&from, &to);
                 }
                 FileDates::FromContent => {
                     // Read once, for the copy and its date alike; the
                     // mode goes along as `fs::copy` would take it.
-                    let content = std::fs::read(&from).map_err(CompileError::Io)?;
-                    std::fs::write(&to, &content).map_err(CompileError::Io)?;
-                    let mode = std::fs::metadata(&from).map_err(CompileError::Io)?.permissions();
-                    std::fs::set_permissions(&to, mode).map_err(CompileError::Io)?;
+                    let content = std::fs::read(&from).map_err(BuildError::Io)?;
+                    std::fs::write(&to, &content).map_err(BuildError::Io)?;
+                    let mode = std::fs::metadata(&from).map_err(BuildError::Io)?.permissions();
+                    std::fs::set_permissions(&to, mode).map_err(BuildError::Io)?;
                     stamp_mtime(&to, package_source_mtime(&content));
                 }
             }
@@ -919,8 +919,8 @@ fn copy_dir_filtered_entries(
 /// independent copies; a drift would have the stdlib seed and the
 /// build context disagree). Public so the CLI's hash + docker-build
 /// paths share one resolver.
-pub fn resolve_weft_root() -> CompileResult<PathBuf> {
-    weft_catalog::weft_repo_root().map_err(CompileError::Build)
+pub fn resolve_weft_root() -> BuildResult<PathBuf> {
+    weft_catalog::weft_repo_root().map_err(BuildError::Build)
 }
 
 /// The repository segment for content-addressed worker images. No project id:
@@ -1053,7 +1053,7 @@ pub fn prepare_test_workspace(
     catalog: &FsCatalog,
     packages: &[String],
     dirs: &TestBuildDirs,
-) -> CompileResult<TestWorkspace> {
+) -> BuildResult<TestWorkspace> {
     let weft_root = resolve_weft_root()?;
     let mut crates = BTreeMap::new();
     let mut members = Vec::new();
@@ -1066,7 +1066,7 @@ pub fn prepare_test_workspace(
             package,
             &codegen::EmitPaths::Local { weft_root: weft_root.clone() },
         )
-        .map_err(|e| CompileError::Build(format!("emit test crate for '{package}': {e}")))?;
+        .map_err(|e| BuildError::Build(format!("emit test crate for '{package}': {e}")))?;
         crates.insert(package.clone(), test_crate);
         members.push(member);
     }
@@ -1099,7 +1099,7 @@ pub fn prepare_test_workspace(
 /// configured default target triple or profile would move them).
 pub fn build_node_test_binaries(
     workspace: &TestWorkspace,
-) -> CompileResult<BTreeMap<String, PathBuf>> {
+) -> BuildResult<BTreeMap<String, PathBuf>> {
     if workspace.crates.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -1111,13 +1111,13 @@ pub fn build_node_test_binaries(
         .stderr(std::process::Stdio::inherit())
         .output()
         .map_err(|e| {
-            CompileError::Build(format!(
+            BuildError::Build(format!(
                 "run cargo (is a Rust toolchain installed? local test runs compile \
                  on the host): {e}"
             ))
         })?;
     if !out.status.success() {
-        return Err(CompileError::Build(
+        return Err(BuildError::Build(
             "the node-test build failed (see cargo's output above for which package \
              and why)"
                 .to_string(),
@@ -1151,7 +1151,7 @@ pub fn build_node_test_binaries(
             .find(|(name, _)| *name == test_crate.binary_name || *name == want)
             .map(|(_, path)| path.clone());
         let Some(path) = found else {
-            return Err(CompileError::Build(format!(
+            return Err(BuildError::Build(format!(
                 "cargo built package '{package}' but reported no executable named \
                  '{}'; the emitted test crate's binary target is missing",
                 test_crate.binary_name
@@ -1211,10 +1211,10 @@ pub fn drop_built_binary(binary: &Path) {
 /// nothing reaches into the weft installation at build time. A node or
 /// package that fails to load is left out and recorded
 /// (`FsCatalog::problems`); a program that names it is told why.
-pub fn build_project_catalog(project_root: &Path) -> CompileResult<FsCatalog> {
+pub fn build_project_catalog(project_root: &Path) -> BuildResult<FsCatalog> {
     let roots = crate::project::node_roots(project_root);
     FsCatalog::discover_roots(&roots.iter().map(|r| r.as_path()).collect::<Vec<_>>())
-        .map_err(|e| CompileError::Enrich(format!("catalog: {e}")))
+        .map_err(|e| BuildError::Enrich(format!("catalog: {e}")))
 }
 
 #[cfg(test)]

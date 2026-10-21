@@ -10,7 +10,7 @@
 // If the child dies unexpectedly, every pending request rejects and the next
 // request respawns it: a dead server surfaces loudly (the caller's catch posts
 // a parseError) and self-heals, it never silently stops editor feedback.
-// The spawned BINARY is watched too: a `weft install` while a window is open
+// The spawned BINARY is watched too: a `./setup.sh` while a window is open
 // would otherwise leave a warm server speaking the previous wire shape (the
 // webview reads fields the old server never emits), so a binary change kills
 // the child and the next request respawns on the new one.
@@ -237,7 +237,7 @@ export class ParseServer {
   }
 
   /** Watch the `weft` binary the child was spawned from; when it changes (a
-   *  `weft install` while this window is open), kill the child so the next
+   *  `./setup.sh` while this window is open), kill the child so the next
    *  request respawns on the NEW binary. Without this the warm server keeps
    *  answering in the previous wire shape and the webview silently renders
    *  holes (fields the old server never emits). Watch failure (binary not

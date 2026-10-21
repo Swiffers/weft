@@ -3,9 +3,8 @@
 //! of its triggers are listening is the activation store's
 //! (`activation_store`).
 //!
-//! Default impl is Postgres-backed (`PostgresProjectStore`), so
-//! every dispatcher reads/writes the same `project` table.
-//! Tests use `FakeProjectStore` (in-memory HashMap).
+//! Its one implementation is Postgres-backed (`PostgresProjectStore`),
+//! so every dispatcher reads and writes the same `project` table.
 
 use std::sync::Arc;
 
@@ -13,11 +12,6 @@ use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 
 use weft_core::ProjectDefinition;
-
-#[cfg(any(test, feature = "test-helpers"))]
-use std::collections::HashMap;
-#[cfg(any(test, feature = "test-helpers"))]
-use tokio::sync::RwLock;
 
 /// The complete per-node infra image-tag map: `node_id -> { image_name ->
 /// image_ref }`. Written atomically alongside the running hashes by the
@@ -29,9 +23,6 @@ use tokio::sync::RwLock;
 pub type InfraImageTags =
     std::collections::BTreeMap<String, std::collections::HashMap<String, String>>;
 
-/// Backing store for project metadata. Implementations:
-/// - `PostgresProjectStore` (production)
-/// - `FakeProjectStore` (tests, behind `test-helpers`).
 /// What a registered worker binary carries for its project: the
 /// implementation fingerprints of its node types, and the node packages its
 /// build left out because they did not compile, with where that build's
@@ -53,6 +44,8 @@ pub struct RunningProgram {
     pub worker_log: Option<String>,
 }
 
+/// Backing store for project metadata, implemented by
+/// `PostgresProjectStore`.
 #[async_trait]
 pub trait ProjectStoreOps: Send + Sync {
     /// Atomic register-and-hash-advance. Wraps every write of the
@@ -155,7 +148,7 @@ pub trait ProjectStoreOps: Send + Sync {
     /// the listener to let go of once this committed; `Ok(None)` = no such
     /// row (caller decides whether to 404). `Err` = DB failure, and
     /// nothing was removed.
-    async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>>;
+    async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<Option<Vec<crate::store::SignalRegistration>>>;
     async fn project(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectDefinition>>;
 
     /// Read the stored binary hash. `Ok(None)` if never set
@@ -611,7 +604,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_project_api_port ON project(api_port) WHERE api_port IS NOT NULL",
         // A project coming or going changes how its tenant's routes read
         // (a route whose project is gone is inactive); the function is the
-        // journal group's, which applies first.
+        // run group's (`crate::store::postgres::GROUP`), which applies first.
         r#"DROP TRIGGER IF EXISTS project_routes_on_row ON project"#,
         r#"CREATE TRIGGER project_routes_on_row
             AFTER INSERT OR DELETE ON project
@@ -1008,7 +1001,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(marked.rows_affected() > 0)
     }
 
-    async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
+    async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<Option<Vec<crate::store::SignalRegistration>>> {
         let mut tx = self.pool.begin().await?;
         let res = sqlx::query("DELETE FROM project WHERE id = $1")
             .bind(id)
@@ -1024,7 +1017,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         // removing, and none is born after this commits
         // (`weft_record_batch`, `weft_journal::record::insert_queued_in`
         // refuse both), so none outlives the project.
-        let (erased, mut signals) = crate::journal::postgres::erase_project_runs(&mut tx, id).await?;
+        let (erased, mut signals) = crate::store::postgres::erase_project_runs(&mut tx, id).await?;
         tracing::info!(target: "weft_dispatcher::project", project_id = %id, runs = erased, "erasing the project's runs");
         // What the project's runs needed and its triggers ran on: nothing
         // reads them any more. Work queued for it goes too, a task being
@@ -1037,7 +1030,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         // out with whatever of what they need is still there when they are
         // sent (an author's connection stays; an instance's goes with the
         // project right after this, and a call sent later fails, logged).
-        signals.extend(crate::journal::postgres::remove_project_signals(&mut *tx, id).await?);
+        signals.extend(crate::store::postgres::remove_project_signals(&mut *tx, id).await?);
         sqlx::query("DELETE FROM task WHERE project_id = $1 AND kind <> $2")
             .bind(id)
             .bind(weft_task_store::TaskKind::CancelCall.as_str())
@@ -1070,7 +1063,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         // picks and tokens reach nothing once the project is gone, and
         // nobody could list them to delete them.
         weft_access_store::forget_project_access(&mut tx, id).await?;
-        crate::journal::postgres::revoke_project_instance_tokens(&mut *tx, id).await?;
+        crate::store::postgres::revoke_project_instance_tokens(&mut *tx, id).await?;
         tx.commit().await?;
         Ok(Some(signals))
     }
@@ -1471,537 +1464,3 @@ impl ProjectStoreOps for PostgresProjectStore {
 // Canonical wall-clock helper lives in `crate::lease::now_unix`.
 // All UNIX-timestamp readers across the dispatcher route through
 // that one function.
-
-#[cfg(any(test, feature = "test-helpers"))]
-pub struct FakeProjectStore {
-    sources: RwLock<HashMap<uuid::Uuid, weft_core::project::hash::Manifest>>,
-    inner: RwLock<HashMap<uuid::Uuid, (String, ProjectDefinition)>>,
-    binary_hashes: RwLock<HashMap<uuid::Uuid, String>>,
-    code: RwLock<HashMap<(uuid::Uuid, String), ProgramCode>>,
-    definition_hashes: RwLock<HashMap<uuid::Uuid, String>>,
-    infra_hashes: RwLock<HashMap<uuid::Uuid, String>>,
-    /// Mirror of `infra_image_tags_json`, what the last build registered.
-    infra_image_tags: RwLock<HashMap<uuid::Uuid, InfraImageTags>>,
-    /// In-memory mirror of the `project_definition` history table:
-    /// keyed by `(project_id, definition_hash)`, value is the
-    /// `project_json` registered under that hash.
-    definition_versions: RwLock<HashMap<(uuid::Uuid, String), String>>,
-    /// Mirror of `project_definition.infra_places`, by the same key.
-    infra_places: RwLock<HashMap<(uuid::Uuid, String), std::collections::BTreeMap<String, String>>>,
-    tenants: RwLock<HashMap<uuid::Uuid, String>>,
-    /// Free-text project description, mirroring the `project.description`
-    /// column. A separate map (like `tenants` / `has_infra`) so the `inner`
-    /// tuple's many destructure sites stay untouched.
-    descriptions: RwLock<HashMap<uuid::Uuid, String>>,
-    has_infra: RwLock<HashMap<uuid::Uuid, bool>>,
-    worker_overrides: RwLock<HashMap<uuid::Uuid, weft_platform_traits::WorkerOverrides>>,
-    /// Mirror of the `transition` + `transition_heartbeat_unix`
-    /// columns. Missing entry = (None, 0), matching the column
-    /// defaults on a fresh row.
-    transitions: RwLock<HashMap<uuid::Uuid, (ProjectTransition, i64)>>,
-    /// Mirror of `resync`; missing = NULL. The fake holds no task queue
-    /// (it lives in Postgres), so a resync here is driven by nobody.
-    resyncs: RwLock<HashMap<uuid::Uuid, crate::task_kinds::resync::ResyncPlan>>,
-    /// Mirror of `build_asks`.
-    build_asks: RwLock<HashMap<uuid::Uuid, i64>>,
-    /// Mirror of `project.removing`: the projects marked.
-    removing: RwLock<std::collections::HashSet<uuid::Uuid>>,
-}
-
-#[cfg(any(test, feature = "test-helpers"))]
-impl FakeProjectStore {
-    pub fn new() -> Self {
-        Self {
-            sources: RwLock::new(HashMap::new()),
-            inner: RwLock::new(HashMap::new()),
-            binary_hashes: RwLock::new(HashMap::new()),
-            code: RwLock::new(HashMap::new()),
-            definition_hashes: RwLock::new(HashMap::new()),
-            infra_hashes: RwLock::new(HashMap::new()),
-            infra_image_tags: RwLock::new(HashMap::new()),
-            definition_versions: RwLock::new(HashMap::new()),
-            infra_places: RwLock::new(HashMap::new()),
-            tenants: RwLock::new(HashMap::new()),
-            descriptions: RwLock::new(HashMap::new()),
-            has_infra: RwLock::new(HashMap::new()),
-            worker_overrides: RwLock::new(HashMap::new()),
-            transitions: RwLock::new(HashMap::new()),
-            resyncs: RwLock::new(HashMap::new()),
-            build_asks: RwLock::new(HashMap::new()),
-            removing: RwLock::new(std::collections::HashSet::new()),
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-helpers"))]
-impl Default for FakeProjectStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(any(test, feature = "test-helpers"))]
-#[async_trait]
-impl ProjectStoreOps for FakeProjectStore {
-    async fn register_with_hashes(
-        &self,
-        project: ProjectDefinition,
-        name: &str,
-        description: &str,
-        tenant_id: &str,
-        binary_hash: Option<&str>,
-        definition_hash: Option<&str>,
-        infra_hash: Option<&str>,
-        infra_image_tags: Option<&InfraImageTags>,
-        code: Option<&ProgramCode>,
-        source: Option<&weft_core::project::hash::Manifest>,
-        // The fake holds no version builds (they live in Postgres): a
-        // registration always lands.
-        _settles: Option<&crate::build::waiting::Settles<'_>>,
-        infra_places: Option<&std::collections::BTreeMap<String, String>>,
-    ) -> anyhow::Result<Option<StoredProjectSummary>> {
-        let id = project.id;
-        let name_owned = name.to_string();
-        let description_owned = description.to_string();
-        // Cross-tenant collision guard, mirroring the Postgres conflict arm's
-        // `WHERE project.tenant_id = EXCLUDED.tenant_id`: a re-register may only
-        // touch a row already owned by the same tenant, so one tenant cannot
-        // seize another's project id. Checked before any mutation.
-        if let Some(existing) = self.tenants.read().await.get(&id) {
-            if existing != tenant_id {
-                anyhow::bail!(
-                    "project {id} already exists under a different tenant; \
-                     register refused (cross-tenant id collision)"
-                );
-            }
-        }
-        if self.removing.read().await.contains(&id) {
-            return Err(ProjectRemoving.into());
-        }
-        // Compute before `project` is moved into `inner`. Re-derived on
-        // every register so a re-register that adds/drops infra updates
-        // it, mirroring the Postgres conflict arm.
-        let has_infra = weft_core::has_infra(&project);
-        // Serialize for the history row before moving `project`.
-        if let Some(code) = code {
-            let binary = binary_hash.ok_or_else(|| anyhow::anyhow!("implementation fingerprints require a worker binary hash"))?;
-            let mut stored = self.code.write().await;
-            let key = (id, binary.to_string());
-            anyhow::ensure!(stored.get(&key).is_none_or(|old| old.implementations == code.implementations), "worker hash {binary} already has different implementation fingerprints");
-            stored.insert(key, code.clone());
-        }
-        let project_json = serde_json::to_string(&project)?;
-        self.inner.write().await.insert(id, (name_owned.clone(), project));
-        self.tenants.write().await.insert(id, tenant_id.to_string());
-        self.descriptions.write().await.insert(id, description_owned.clone());
-        self.has_infra.write().await.insert(id, has_infra);
-        if let Some(h) = binary_hash {
-            self.binary_hashes.write().await.insert(id, h.to_string());
-        }
-        if let Some(h) = definition_hash {
-            // Record history row first, then advance the pointer.
-            // The fake cannot truly atomicize the five `RwLock` writes
-            // (they're independent locks taken in sequence); the
-            // ordering invariant is preserved so a fold in any test
-            // sees the history row before the pointer, matching the
-            // production Postgres transaction's visibility, but a
-            // panic mid-sequence would leave partial state. Tests
-            // that need true atomicity should exercise the Postgres
-            // path directly.
-            self.definition_versions
-                .write()
-                .await
-                .insert((id, h.to_string()), project_json.clone());
-            self.definition_hashes.write().await.insert(id, h.to_string());
-            if let Some(places) = infra_places {
-                self.infra_places.write().await.insert((id, h.to_string()), places.clone());
-            }
-        }
-        if let Some(h) = infra_hash {
-            self.infra_hashes.write().await.insert(id, h.to_string());
-        }
-        if let Some(tags) = infra_image_tags {
-            self.infra_image_tags.write().await.insert(id, tags.clone());
-        }
-        if binary_hash.is_some() || definition_hash.is_some() {
-            let mut sources = self.sources.write().await;
-            match source {
-                Some(source) => { sources.insert(id, source.clone()); }
-                None => { sources.remove(&id); }
-            }
-        }
-        Ok(Some(StoredProjectSummary {
-            id,
-            name: name_owned,
-            description: description_owned,
-            removing: false,
-        }))
-    }
-
-    async fn running_program(&self, id: uuid::Uuid) -> anyhow::Result<Option<RunningProgram>> {
-        let Some(binary_hash) = self.binary_hashes.read().await.get(&id).cloned() else { return Ok(None) };
-        let Some(definition_hash) = self.definition_hashes.read().await.get(&id).cloned() else { return Ok(None) };
-        let Some(code) = self.code.read().await.get(&(id, binary_hash.clone())).cloned() else { return Ok(None) };
-        Ok(Some(RunningProgram {
-            identity: weft_core::project::hash::ProgramIdentity { definition_hash, binary_hash, implementations: code.implementations },
-            left_out: code.left_out,
-            worker_log: code.worker_log,
-        }))
-    }
-
-    async fn program_identity(
-        &self,
-        id: uuid::Uuid,
-        definition_hash: &str,
-        binary_hash: &str,
-    ) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>> {
-        Ok(self.code.read().await.get(&(id, binary_hash.to_string())).cloned().map(|code| {
-            weft_core::project::hash::ProgramIdentity {
-                definition_hash: definition_hash.to_string(),
-                binary_hash: binary_hash.to_string(),
-                implementations: code.implementations,
-            }
-        }))
-    }
-
-    async fn program_source(&self, id: uuid::Uuid, program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<weft_core::project::hash::Manifest> {
-        anyhow::ensure!(self.running_program_identity(id).await?.as_ref() == Some(program), "project changed during preparation; register the project and retry");
-        self.sources.read().await.get(&id).cloned().ok_or_else(|| anyhow::anyhow!("project sources are missing; register the project and retry"))
-    }
-
-    async fn tenant_for(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
-        Ok(self.tenants.read().await.get(&id).cloned())
-    }
-
-    async fn list(&self, tenant: &str) -> anyhow::Result<Vec<StoredProjectSummary>> {
-        let tenants = self.tenants.read().await;
-        let descriptions = self.descriptions.read().await;
-        let removing = self.removing.read().await;
-        Ok(self
-            .inner
-            .read()
-            .await
-            .iter()
-            .filter(|(id, _)| tenants.get(id).map(|t| t == tenant).unwrap_or(false))
-            .map(|(id, (name, _))| StoredProjectSummary {
-                id: *id,
-                name: name.clone(),
-                description: descriptions.get(id).cloned().unwrap_or_default(),
-                removing: removing.contains(id),
-            })
-            .collect())
-    }
-
-    async fn get(&self, id: uuid::Uuid) -> anyhow::Result<Option<StoredProjectSummary>> {
-        let descriptions = self.descriptions.read().await;
-        let removing = self.removing.read().await.contains(&id);
-        Ok(self
-            .inner
-            .read()
-            .await
-            .get(&id)
-            .map(|(name, _)| StoredProjectSummary {
-                id,
-                name: name.clone(),
-                description: descriptions.get(&id).cloned().unwrap_or_default(),
-                removing,
-            }))
-    }
-
-    async fn mark_removing(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
-        // The fake bears no runs (they live in the journal); the mark
-        // holds back registrations and activations, as the row's does.
-        if !self.inner.read().await.contains_key(&id) {
-            return Ok(false);
-        }
-        self.removing.write().await.insert(id);
-        Ok(true)
-    }
-
-    async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
-        // Mirror the Postgres removal: removing a project clears every
-        // per-id side-map (binary/definition/infra hashes, recorded
-        // programs, tenants, has_infra, transitions). Without this the
-        // fake diverges from production: a test that re-registers under
-        // the same id, or asserts cleanup, would see ghost state
-        // Postgres does not have. It keeps no signals.
-        let was_present = self.inner.write().await.remove(&id).is_some();
-        self.definition_versions.write().await.retain(|(project, _), _| *project != id);
-        self.sources.write().await.remove(&id);
-        self.binary_hashes.write().await.remove(&id);
-        self.definition_hashes.write().await.remove(&id);
-        self.infra_hashes.write().await.remove(&id);
-        self.tenants.write().await.remove(&id);
-        self.has_infra.write().await.remove(&id);
-        self.worker_overrides.write().await.remove(&id);
-        self.transitions.write().await.remove(&id);
-        self.resyncs.write().await.remove(&id);
-        self.build_asks.write().await.remove(&id);
-        self.removing.write().await.remove(&id);
-        Ok(was_present.then(Vec::new))
-    }
-
-    async fn project(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectDefinition>> {
-        Ok(self
-            .inner
-            .read()
-            .await
-            .get(&id)
-            .map(|(_, project)| project.clone()))
-    }
-
-
-    async fn running_binary_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
-        Ok(self.binary_hashes.read().await.get(&id).cloned())
-    }
-
-    async fn running_definition_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
-        Ok(self.definition_hashes.read().await.get(&id).cloned())
-    }
-
-    async fn definition_for_hash(
-        &self,
-        id: uuid::Uuid,
-        hash: &str,
-    ) -> anyhow::Result<Option<String>> {
-        Ok(self
-            .definition_versions
-            .read()
-            .await
-            .get(&(id, hash.to_string()))
-            .cloned())
-    }
-
-    async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
-        Ok(self.infra_hashes.read().await.get(&id).cloned())
-    }
-
-    async fn infra_places(&self, id: uuid::Uuid, definition_hash: &str) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
-        Ok(self.infra_places.read().await.get(&(id, definition_hash.to_string())).cloned().unwrap_or_default())
-    }
-
-    async fn running_infra_image_tags(&self, id: uuid::Uuid) -> anyhow::Result<Option<InfraImageTags>> {
-        if !self.inner.read().await.contains_key(&id) {
-            return Ok(None);
-        }
-        Ok(Some(self.infra_image_tags.read().await.get(&id).cloned().unwrap_or_default()))
-    }
-
-    async fn next_build_ask(&self, id: uuid::Uuid) -> anyhow::Result<i64> {
-        anyhow::ensure!(self.inner.read().await.contains_key(&id), "no project {id} to take a build ask of");
-        let mut asks = self.build_asks.write().await;
-        let ask = asks.entry(id).or_insert(0);
-        *ask += 1;
-        Ok(*ask)
-    }
-
-    async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>> {
-        if !self.inner.read().await.contains_key(&id) {
-            return Ok(None);
-        }
-        Ok(Some(
-            self.transitions
-                .read()
-                .await
-                .get(&id)
-                .map(|(t, _)| *t)
-                .unwrap_or(ProjectTransition::None),
-        ))
-    }
-
-    async fn try_begin_building(&self, id: uuid::Uuid, stale_before: i64) -> anyhow::Result<bool> {
-        // The half of the guard that reads activations lives in
-        // Postgres (a build refuses while one is mid-flip); the fake
-        // project store holds no activations, so it guards the build
-        // axis alone.
-        let mut transitions = self.transitions.write().await;
-        if !self.inner.read().await.contains_key(&id) {
-            return Ok(false);
-        }
-        let entry = transitions.entry(id).or_insert((ProjectTransition::None, 0));
-        // A resync holds it while its plan is written down.
-        let resync_over = entry.0 == ProjectTransition::Resyncing && !self.resyncs.read().await.contains_key(&id);
-        let at_rest = entry.0 == ProjectTransition::None
-            || (entry.0 == ProjectTransition::Building && entry.1 < stale_before)
-            || resync_over;
-        if !at_rest {
-            return Ok(false);
-        }
-        *entry = (ProjectTransition::Building, crate::lease::now_unix());
-        Ok(true)
-    }
-
-    async fn try_begin_resyncing(
-        &self,
-        id: uuid::Uuid,
-        plan: &crate::task_kinds::resync::ResyncPlan,
-        _task: weft_task_store::tasks::NewTask,
-    ) -> anyhow::Result<Option<uuid::Uuid>> {
-        // As `try_begin_building`, the fake guards the transition alone,
-        // and enqueues nothing (the task queue lives in Postgres).
-        let mut transitions = self.transitions.write().await;
-        if !self.inner.read().await.contains_key(&id) {
-            return Ok(None);
-        }
-        let entry = transitions.entry(id).or_insert((ProjectTransition::None, 0));
-        if entry.0 != ProjectTransition::None {
-            return Ok(None);
-        }
-        *entry = (ProjectTransition::Resyncing, 0);
-        self.resyncs.write().await.insert(id, plan.clone());
-        Ok(Some(uuid::Uuid::now_v7()))
-    }
-
-    async fn resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::ResyncState>> {
-        if self.transition(id).await? != Some(ProjectTransition::Resyncing) {
-            return Ok(None);
-        }
-        Ok(self
-            .resyncs
-            .read()
-            .await
-            .get(&id)
-            .map(|plan| crate::task_kinds::resync::ResyncState { plan: plan.clone(), driven: false }))
-    }
-
-    async fn drive(&self, id: uuid::Uuid, driver: uuid::Uuid) -> anyhow::Result<Option<(crate::task_kinds::resync::ResyncPlan, bool)>> {
-        let under_way = self.transition(id).await? == Some(ProjectTransition::Resyncing);
-        Ok(self
-            .resyncs
-            .read()
-            .await
-            .get(&id)
-            .filter(|plan| plan.driver == driver && plan.given_up.is_none())
-            .map(|plan| (plan.clone(), under_way)))
-    }
-
-    async fn write_resync(&self, id: uuid::Uuid, plan: &crate::task_kinds::resync::ResyncPlan) -> anyhow::Result<bool> {
-        if self.transition(id).await? != Some(ProjectTransition::Resyncing) {
-            return Ok(false);
-        }
-        Ok(self.resyncs.write().await.get_mut(&id).filter(|held| held.driver == plan.driver).map(|held| *held = plan.clone()).is_some())
-    }
-
-    async fn resume_resync(&self, id: uuid::Uuid, _tenant: &str) -> anyhow::Result<Option<uuid::Uuid>> {
-        if self.transition(id).await? != Some(ProjectTransition::Resyncing) {
-            return Ok(None);
-        }
-        Ok(self.resyncs.write().await.get_mut(&id).map(|plan| {
-            if plan.stopped.take().is_some() {
-                plan.driver = uuid::Uuid::now_v7();
-            }
-            uuid::Uuid::now_v7()
-        }))
-    }
-
-    async fn stopped_resyncs(&self) -> anyhow::Result<Vec<(uuid::Uuid, crate::task_kinds::resync::ResyncPlan)>> {
-        let transitions = self.transitions.read().await;
-        Ok(self
-            .resyncs
-            .read()
-            .await
-            .iter()
-            .filter(|(id, plan)| plan.stopped.is_some() && transitions.get(id).map(|t| t.0) == Some(ProjectTransition::Resyncing))
-            .map(|(id, plan)| (*id, plan.clone()))
-            .collect())
-    }
-
-    async fn end_resync(&self, id: uuid::Uuid, driver: uuid::Uuid) -> anyhow::Result<bool> {
-        if self.drive(id, driver).await?.is_none_or(|(_, under_way)| !under_way) {
-            return Ok(false);
-        }
-        self.transitions.write().await.insert(id, (ProjectTransition::None, 0));
-        Ok(true)
-    }
-
-    /// The fake holds no activation rows: every trigger the plan took down
-    /// counts as left down.
-    async fn give_up_resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::ResyncPlan>> {
-        if self.transition(id).await? != Some(ProjectTransition::Resyncing) {
-            return Ok(None);
-        }
-        let given = self.resyncs.write().await.get_mut(&id).map(|plan| {
-            plan.given_up = Some(crate::task_kinds::resync::GivenUp {
-                at_unix: crate::lease::now_unix(),
-                left_down: crate::task_kinds::resync::left_down(plan, &[]),
-            });
-            plan.clone()
-        });
-        if given.is_some() {
-            self.transitions.write().await.insert(id, (ProjectTransition::None, 0));
-        }
-        Ok(given)
-    }
-
-    async fn given_up_resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::GivenUp>> {
-        Ok(self.resyncs.read().await.get(&id).and_then(|plan| plan.given_up.clone()))
-    }
-
-    async fn request_cancel_build(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
-        let mut transitions = self.transitions.write().await;
-        match transitions.get_mut(&id) {
-            Some(entry) if entry.0.is_building() => {
-                entry.0 = ProjectTransition::CancellingBuild;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    async fn release_driver(&self, id: uuid::Uuid) -> anyhow::Result<()> {
-        if let Some(entry) = self.transitions.write().await.get_mut(&id) {
-            if entry.0 != ProjectTransition::None {
-                entry.1 = 0;
-            }
-        }
-        Ok(())
-    }
-
-    async fn settle_transition(&self, project: Option<uuid::Uuid>, stale_before: i64) -> anyhow::Result<Vec<uuid::Uuid>> {
-        // The fake project store sees no version builds (they live in
-        // Postgres), so a build nothing drives is at rest, and a resync
-        // once its plan is forgotten.
-        let mut settled = Vec::new();
-        let resyncs = self.resyncs.read().await;
-        for (id, entry) in self.transitions.write().await.iter_mut() {
-            let stays = match entry.0 {
-                ProjectTransition::None => true,
-                ProjectTransition::Resyncing => resyncs.contains_key(id),
-                ProjectTransition::Building | ProjectTransition::CancellingBuild => entry.1 >= stale_before,
-            };
-            if !stays && project.is_none_or(|p| p == *id) {
-                entry.0 = ProjectTransition::None;
-                settled.push(*id);
-            }
-        }
-        Ok(settled)
-    }
-
-    async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()> {
-        // As the real store: only a transition still driven.
-        if let Some(entry) = self.transitions.write().await.get_mut(&id) {
-            if entry.0 != ProjectTransition::None && entry.1 > 0 {
-                entry.1 = crate::lease::now_unix();
-            }
-        }
-        Ok(())
-    }
-
-    async fn project_has_infra(&self, id: uuid::Uuid) -> anyhow::Result<Option<bool>> {
-        Ok(self.has_infra.read().await.get(&id).copied())
-    }
-
-    async fn worker_overrides(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_platform_traits::WorkerOverrides>> {
-        if !self.inner.read().await.contains_key(&id) {
-            return Ok(None);
-        }
-        Ok(Some(self.worker_overrides.read().await.get(&id).cloned().unwrap_or_default()))
-    }
-
-    async fn set_worker_overrides(&self, id: uuid::Uuid, overrides: &weft_platform_traits::WorkerOverrides) -> anyhow::Result<()> {
-        anyhow::ensure!(self.inner.read().await.contains_key(&id), "no project {id}");
-        self.worker_overrides.write().await.insert(id, overrides.clone());
-        Ok(())
-    }
-
-}

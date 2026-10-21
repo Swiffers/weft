@@ -4,7 +4,7 @@
 //! and on whether the run is refused for an input left with nothing.
 use std::collections::BTreeMap;
 
-use weft_compiler::weft_compiler::compile;
+use crate::rig::{compile, enrich};
 use weft_compiler::CompileFs;
 use weft_core::frames::Located;
 use weft_core::run_spec::{refuse_unfed, resolve_spec, RunSpec};
@@ -45,7 +45,7 @@ fn program() -> weft_core::ProjectDefinition {
     std::fs::write(dir.path().join("hear.weft"), HEAR).unwrap();
     let mut project = compile(MAIN, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
     let catalog = weft_catalog::FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
-    weft_compiler::enrich::enrich(&mut project, &catalog).expect("enrich");
+    enrich(&mut project, &catalog).expect("enrich");
     project
 }
 
@@ -158,7 +158,7 @@ d = Debug { data: use.o }
 ";
     let mut project = compile(src, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     let catalog = weft_catalog::FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
-    weft_compiler::enrich::enrich(&mut project, &catalog).expect("enrich");
+    enrich(&mut project, &catalog).expect("enrich");
     let spec = RunSpec { from: starts(&["use"]), feed: vec!["use".into()], target: vec!["use".into()], ..RunSpec::whole("x") };
     let resolved = resolve_spec(&spec, &project, &Default::default()).expect("the loop comes whole, so the cut is allowed");
     for fed in ["outer.inner.w", "l.e"] {
@@ -185,7 +185,7 @@ d = Debug { data: note.o }
 ";
     let mut project = compile(src, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     let catalog = weft_catalog::FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
-    weft_compiler::enrich::enrich(&mut project, &catalog).expect("enrich");
+    enrich(&mut project, &catalog).expect("enrich");
     let handed = |ports: serde_json::Value| -> BTreeMap<String, serde_json::Value> { serde_json::from_value(ports).unwrap() };
 
     for spec in [
@@ -212,7 +212,7 @@ d = Debug { data: note.o }
 fn enriched(src: &str) -> weft_core::ProjectDefinition {
     let mut project = compile(src, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     let catalog = weft_catalog::FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
-    weft_compiler::enrich::enrich(&mut project, &catalog).expect("enrich");
+    enrich(&mut project, &catalog).expect("enrich");
     project
 }
 

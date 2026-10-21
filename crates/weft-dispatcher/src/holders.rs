@@ -21,7 +21,7 @@ use crate::state::DispatcherState;
 /// `trigger_activation` table's): a trigger switched on, taken down with
 /// its door refusing, or past its door's window changes which signals are
 /// held without a write to their rows.
-// SYNC: HELD_SIGNALS_CHANNEL <-> crates/weft-dispatcher/src/journal/postgres.rs (signal_held_notify)
+// SYNC: HELD_SIGNALS_CHANNEL <-> crates/weft-dispatcher/src/store/postgres.rs (signal_held_notify)
 pub const HELD_SIGNALS_CHANNEL: &str = "weft_held_signals";
 
 pub(crate) static ON_HELD_SIGNALS: &[WakeOn] = &[WakeOn::any(HELD_SIGNALS_CHANNEL)];
@@ -36,7 +36,7 @@ pub(crate) const HOLDER_ACCESS: &str = "holder_access";
 /// said it stops being good, and is fetched again before it.
 /// [`crate::held::ACCESS_CHANNEL`] announces every write to a connection,
 /// a refresh included, for the copies that keep its row.
-// SYNC: ACCESS_REMADE_CHANNEL <-> crates/weft-dispatcher/src/journal/postgres.rs (signal_access_stale)
+// SYNC: ACCESS_REMADE_CHANNEL <-> crates/weft-dispatcher/src/store/postgres.rs (signal_access_stale)
 pub const ACCESS_REMADE_CHANNEL: &str = "weft_access_remade";
 
 pub(crate) static ON_ACCESS: &[WakeOn] = &[WakeOn::any(ACCESS_REMADE_CHANNEL)];
@@ -155,7 +155,7 @@ pub fn access_loop(state: &DispatcherState) -> DrainLoop {
 /// gives up on the node); one that cannot be reached fails the pass, and
 /// the mark stays for the next.
 pub async fn reregister_stale_access(state: &DispatcherState) -> anyhow::Result<()> {
-    use crate::journal::postgres::{access_taken_afresh, reregister_for_access, signals_with_stale_access};
+    use crate::store::postgres::{access_taken_afresh, reregister_for_access, signals_with_stale_access};
     for stale in signals_with_stale_access(&state.pg_pool).await? {
         let Some(fresh) = reregister_for_access(&state.pg_pool, &stale).await? else { continue };
         let started = state.listener.start(&fresh.token, weft_core::signal::listener_protocol::StartMode::Restore, Some(&stale)).await;

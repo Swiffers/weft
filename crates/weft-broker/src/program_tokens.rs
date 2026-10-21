@@ -68,7 +68,7 @@ pub struct InstanceTokenRow<'a> {
 /// value, the old one dead): a replayed run mints under the id it
 /// journaled. `false` when the id names any other token, and nothing was
 /// written.
-// SYNC: signal_token insert <-> crates/weft-dispatcher/src/journal/postgres.rs (mint_signal_token, revoke_instance_tokens)
+// SYNC: signal_token insert <-> crates/weft-dispatcher/src/store/postgres.rs (mint_signal_token, revoke_instance_tokens)
 pub async fn store_instance_token(pool: &sqlx::PgPool, row: &InstanceTokenRow<'_>, value: &str) -> anyhow::Result<bool> {
     let written = sqlx::query(
         "INSERT INTO signal_token \

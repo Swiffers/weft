@@ -278,6 +278,18 @@ pub enum GroupKind {
     Body,
 }
 
+impl GroupKind {
+    /// The word a diagnostic calls this container.
+    pub fn noun(&self) -> &'static str {
+        match self {
+            GroupKind::Group => "group",
+            GroupKind::Loop { .. } => "loop",
+            GroupKind::Call { .. } => "include",
+            GroupKind::Body => "included file",
+        }
+    }
+}
+
 /// The node types of a loop's two boundaries, the only boundaries the
 /// compiler mints: a loop's iterations run through them. One place for
 /// the names, so the engine, the journal fold and the compiler cannot
@@ -285,10 +297,6 @@ pub enum GroupKind {
 pub mod boundary_types {
     pub const LOOP_IN: &str = "LoopIn";
     pub const LOOP_OUT: &str = "LoopOut";
-
-    /// Every boundary type the engine ships, for whatever has to name
-    /// them all (the worker's implementation map).
-    pub const ALL: &[&str] = &[LOOP_IN, LOOP_OUT];
 
     /// Any boundary type at all.
     pub fn is_boundary(node_type: &str) -> bool {
@@ -304,9 +312,14 @@ pub const INCLUDED_GROUP_TYPE: &str = "IncludedGroup";
 
 /// The type names weft gives its own nodes and scopes: the language's
 /// `Group` and `Loop`, a loop's two boundaries, and the opaque include.
-/// No catalog may declare one (`weft_catalog` refuses it, naming the
-/// file), so nothing a project wrote is ever mistaken for the
-/// compiler's.
+/// The one list of names the language reserves: no catalog may declare
+/// one (`weft_catalog` refuses it, naming the file), no program may name
+/// a node or group one (`weft_compiler::weft_compiler::is_reserved_local`),
+/// and the editor cannot add a plain node of one, so nothing a project
+/// wrote is ever mistaken for the compiler's.
+// SYNC: own_types::ALL <-> packages/weft-syntax/weft.tmLanguage.json,
+// packages/weft-syntax/highlight-weft.js,
+// crates/weft-compiler/tests/integration/highlighting_vocabulary.rs (the word-list alarm)
 pub mod own_types {
     pub const GROUP: &str = "Group";
     pub const LOOP: &str = "Loop";

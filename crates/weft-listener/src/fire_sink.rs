@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 
 use weft_broker_client::BrokerSignalClient;
 use weft_core::door_fire::{DoorFire, Fired};
+use weft_core::signal::listener_protocol::ProcessTarget;
 use weft_task_store::tasks::NewTask;
 use weft_task_store::{TaskKind, TaskStoreClient};
 
@@ -143,21 +144,15 @@ impl FireSignalSink {
         // The kind's own work on the event, done once here: the dispatcher
         // hands what it made over without asking again.
         let processed = crate::kinds::process_in(&self.registry, &self.signals, token, payload).await?;
-        let payload = match (processed.target, target.is_resume) {
-            (weft_core::signal::listener_protocol::ProcessTarget::Drop { reason }, _) => {
+        let payload = match processed.target.for_signal(token, target.is_resume)? {
+            ProcessTarget::Drop { reason } => {
                 tracing::debug!(target: "weft_listener::fire_sink", %token, ?reason, "the kind dropped the event");
                 return Ok(Delivered::Taken);
             }
-            (weft_core::signal::listener_protocol::ProcessTarget::Resume { run_id }, true) => {
+            ProcessTarget::Resume { run_id } => {
                 return self.enqueue_answer(token, tenant_id, held_by, run_id, processed.value, fire_id).await;
             }
-            (weft_core::signal::listener_protocol::ProcessTarget::Entry, false) => processed.value,
-            (weft_core::signal::listener_protocol::ProcessTarget::Resume { .. }, false) => {
-                anyhow::bail!("signal {token} is an entry, and its kind made an answer to a waiting run of its event")
-            }
-            (weft_core::signal::listener_protocol::ProcessTarget::Entry, true) => {
-                anyhow::bail!("signal {token} is a run's wait, and its kind made an entry's event of its answer")
-            }
+            ProcessTarget::Entry => processed.value,
         };
         let fire = DoorFire { token: token.to_string(), fire_id, payload, caller: None, held_by: held_by.map(str::to_string), attempts: 0, released: false };
         let unreached = match target.address.as_deref() {

@@ -1,5 +1,6 @@
 use weft_compiler::weft_compiler::*;
 use weft_compiler::CompileFs;
+use crate::rig::compile;
 use weft_core::project::{CrossingSide, Edge, ProjectDefinition};
 
 /// The one wire from `source` to `target`.
@@ -318,6 +319,22 @@ fn a_reserved_type_keyword_as_a_name_errors_on_its_declaration_line() {
     let reserved = errors.iter().find(|e| e.message.contains("reserved type keyword"));
     assert!(reserved.is_some(), "expected a reserved-keyword error, got {errors:?}");
     assert_eq!(reserved.unwrap().line(), 1, "error must point at the declaration line");
+}
+
+#[test]
+fn a_program_cannot_write_a_node_of_weft_s_own_types() {
+    // `LoopIn`, `LoopOut` and `IncludedGroup` only ever come from the
+    // compiler; written by hand, as a declaration or inline, each is refused
+    // with what to write instead.
+    for (source, says) in [
+        ("x = LoopIn {}\n", "declare a Loop"),
+        ("x = LoopOut {}\n", "declare a Loop"),
+        ("x = IncludedGroup {}\n", "@include"),
+        ("t = Text { value: LoopIn {}.value }\n", "declare a Loop"),
+    ] {
+        let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
+        assert!(errors.iter().any(|e| e.message.contains("cannot be written") && e.message.contains(says)), "{source}: {errors:?}");
+    }
 }
 
 #[test]
@@ -2105,7 +2122,7 @@ fn a_file_that_does_not_parse_is_a_placeholder_at_each_site() {
     );
     for site in ["a", "b"] {
         let node = project.nodes.iter().find(|n| n.id == site).unwrap_or_else(|| panic!("a placeholder at {site}"));
-        assert_eq!(node.node_type, INCLUDE_NODE_TYPE);
+        assert_eq!(node.node_type, weft_core::project::INCLUDED_GROUP_TYPE);
         assert!(errs.iter().any(|e| e.subjects == [site] && e.file.as_deref().is_some_and(|f| f.ends_with("draft.weft"))), "{errs:?}");
     }
     assert!(errs.iter().all(|e| !e.subjects.is_empty()), "nothing is the program's as a whole: {errs:?}");
@@ -2189,7 +2206,9 @@ fn include_with_nested_group_scopes_under_the_body() {
 
 #[test]
 fn include_interface_emits_opaque_node() {
-    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode, INCLUDE_NODE_TYPE};
+    use crate::rig::compile_with_mode;
+    use weft_compiler::weft_compiler::IncludeMode;
+    use weft_core::project::INCLUDED_GROUP_TYPE;
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("cleaner.weft"), CLEANER_WEFT).unwrap();
 
@@ -2200,7 +2219,7 @@ c = @include("cleaner.weft")
     let project = compile_with_mode(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path()), IncludeMode::Interface, None)
         .expect("compile");
     let c = project.nodes.iter().find(|n| n.id == "c").expect("opaque include node");
-    assert_eq!(c.node_type, INCLUDE_NODE_TYPE);
+    assert_eq!(c.node_type, INCLUDED_GROUP_TYPE);
     assert_eq!(c.include_path.as_deref(), Some("cleaner.weft"));
     assert!(c.inputs.iter().any(|p| p.name == "raw"));
     assert!(c.outputs.iter().any(|p| p.name == "cleaned"));
@@ -2221,7 +2240,8 @@ c = @include("cleaner.weft")
 /// passed through so the editor can watch them.
 #[test]
 fn include_interface_reaches_through_nested_includes() {
-    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    use crate::rig::compile_with_mode;
+    use weft_compiler::weft_compiler::IncludeMode;
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("lib")).unwrap();
     // deep.weft holds the thing that matters; mid.weft only points at it.
@@ -2266,7 +2286,8 @@ fn include_interface_reaches_through_nested_includes() {
 /// file once instead of recursing until the stack ends.
 #[test]
 fn include_interface_contents_stop_at_a_cycle() {
-    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    use crate::rig::compile_with_mode;
+    use weft_compiler::weft_compiler::IncludeMode;
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("a.weft"),
@@ -2301,7 +2322,8 @@ fn include_inside_group_interface_scopes_opaque_node() {
     // Regression: an @include inside a group body, in interface mode, becomes
     // an opaque node that must be scoped to the group. Otherwise a sibling
     // edge into its port trips the scope-reachability check (compile errors).
-    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    use crate::rig::compile_with_mode;
+    use weft_compiler::weft_compiler::IncludeMode;
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("inner.weft"), CLEANER_WEFT).unwrap();
     let source = r#"
@@ -2325,7 +2347,8 @@ fn anonymous_root_takes_source_id_at_every_depth() {
     // id must reach EVERY id-bearing field at EVERY nesting depth, with no
     // sentinel and no rename pass: the root group, its boundary passthroughs,
     // nested child groups (whose label defaults to their id), and edge ids.
-    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    use crate::rig::compile_with_mode;
+    use weft_compiler::weft_compiler::IncludeMode;
     let source = r#"
 Group(raw: String) -> (cleaned: String) {
     strip = Text { value: "x" }

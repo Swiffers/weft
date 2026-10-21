@@ -8,7 +8,7 @@
 //! `$DATABASE_URL`, creates a random DB, drops it after). The schema is
 //! the REAL migration path in production order: one pass over the
 //! dispatcher's groups
-//! (`app::DISPATCHER_GROUPS`), then the journal and store wrap the pool,
+//! (`app::DISPATCHER_GROUPS`), then the run store and project store wrap the pool,
 //! the way a booting dispatcher does.
 
 use serde_json::json;
@@ -27,21 +27,21 @@ use weft_dispatcher::parked_drain::{due_tokens, next_due};
 use weft_journal::record::{Queued, Then};
 use weft_journal::RunEvent;
 use weft_task_store::parked_fires::{park, ParkAppend, ParkRefusal, Waiting};
-use weft_dispatcher::journal::postgres::PostgresJournal;
-use weft_dispatcher::journal::{Journal, SignalRegistration};
+use weft_dispatcher::store::postgres::PostgresStore;
+use weft_dispatcher::store::{BakeStore, RunStore, SignalRegistration, SignalStore, TokenStore};
 use weft_dispatcher::versions::VersionStoreOps;
 
 const TENANT: &str = "tenant-1";
 
 /// The real boot-time migration path: the dispatcher's groups in
-/// dependency order, in one pass. Returns the journal + the project store, the two handles the
+/// dependency order, in one pass. Returns the run store + the project store, the two handles the
 /// SQL under test goes through.
-async fn setup(pool: &PgPool) -> (PostgresJournal, weft_dispatcher::ProjectStore) {
+async fn setup(pool: &PgPool) -> (PostgresStore, weft_dispatcher::ProjectStore) {
     weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
-    let journal = PostgresJournal::from_pool(pool.clone());
+    let store = PostgresStore::from_pool(pool.clone());
     let projects: weft_dispatcher::ProjectStore =
         std::sync::Arc::new(weft_dispatcher::PostgresProjectStore::new(pool.clone()));
-    (journal, projects)
+    (store, projects)
 }
 
 /// A minimal, empty-but-valid project definition for `id`.
@@ -91,24 +91,24 @@ fn birth(run_id: weft_core::RunId, project_id: Uuid, phase: weft_core::context::
 
 /// Queue the run `events` start (`events[0]` its birth), the way the
 /// dispatcher starts a run by hand or a setup run.
-async fn queue(journal: &PostgresJournal, events: &[RunEvent], for_activation: bool) -> anyhow::Result<bool> {
-    journal.queue_run(Queued {
+async fn queue(store: &PostgresStore, events: &[RunEvent], for_activation: bool) -> anyhow::Result<bool> {
+    store.queue_run(Queued {
         events, tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT, watch_end: false,
         stale: &[], spec: None, example: None, program: None,
     }, for_activation).await
 }
 
 /// A fire run of `project_id`, queued.
-async fn queued_run(journal: &PostgresJournal, project_id: Uuid) -> weft_core::RunId {
+async fn queued_run(store: &PostgresStore, project_id: Uuid) -> weft_core::RunId {
     let run_id = weft_core::new_run_id();
-    assert!(queue(journal, &[birth(run_id, project_id, weft_core::context::Phase::Fire, "bin-A")], false).await.unwrap());
+    assert!(queue(store, &[birth(run_id, project_id, weft_core::context::Phase::Fire, "bin-A")], false).await.unwrap());
     run_id
 }
 
 /// End run `run_id`, which nobody drives, completed.
-async fn complete(journal: &PostgresJournal, run_id: weft_core::RunId) -> RunEvent {
+async fn complete(store: &PostgresStore, run_id: weft_core::RunId) -> RunEvent {
     let completed = RunEvent::RunCompleted { run_id, at_unix: 2 };
-    let written = journal.append(run_id, std::slice::from_ref(&completed), Then::Stays).await.unwrap();
+    let written = store.append(run_id, std::slice::from_ref(&completed), Then::Stays).await.unwrap();
     assert!(matches!(written, weft_journal::record::Appended::At(_)), "{written:?}");
     completed
 }
@@ -164,13 +164,13 @@ fn entry_signal(token: &str, project_id: Uuid) -> SignalRegistration {
 /// answer.
 #[sqlx::test]
 async fn a_queued_run_keeps_the_image_it_was_born_on(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let run_id = weft_core::new_run_id();
     let start = birth(run_id, id, weft_core::context::Phase::Fire, "bin-A");
     seed_project(&projects, id, "bin-B").await;
-    assert!(queue(&journal, &[start], false).await.unwrap());
+    assert!(queue(&store, &[start], false).await.unwrap());
     assert_eq!(run_column::<String>(&pool, "binary_hash", run_id).await.as_deref(), Some("bin-A"));
     assert_eq!(run_column::<String>(&pool, "state", run_id).await.as_deref(), Some("queued"));
 }
@@ -211,7 +211,7 @@ fn trigger_setup_birth(id: Uuid, run_id: Uuid) -> RunEvent {
 
 #[sqlx::test]
 async fn pruning_a_source_waits_for_setup_and_removes_its_unused_bake(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let versions = weft_dispatcher::versions::PostgresVersionStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
@@ -219,14 +219,14 @@ async fn pruning_a_source_waits_for_setup_and_removes_its_unused_bake(pool: PgPo
         .bind(id).execute(&pool).await.unwrap();
     let run_id = Uuid::new_v4();
     let birth = trigger_setup_birth(id, run_id);
-    queue(&journal, std::slice::from_ref(&birth), false).await.unwrap();
+    queue(&store, std::slice::from_ref(&birth), false).await.unwrap();
     assert!(versions.delete_versions(id, &["source".into()]).await.is_err());
-    let complete = complete(&journal, run_id).await;
+    let complete = complete(&store, run_id).await;
     assert!(versions.delete_versions(id, &["source".into()]).await.is_err(), "publication still owns this source");
-    let bake = weft_dispatcher::journal::TriggerBake::from_events(&[birth, complete], &setup_program()).unwrap().unwrap();
-    journal.finish_trigger_setup(run_id, Some(&bake)).await.unwrap();
+    let bake = weft_dispatcher::store::TriggerBake::from_events(&[birth, complete], &setup_program()).unwrap().unwrap();
+    store.finish_trigger_setup(run_id, Some(&bake)).await.unwrap();
     versions.delete_versions(id, &["source".into()]).await.unwrap();
-    assert!(journal.trigger_bakes(id, None).await.unwrap().is_empty());
+    assert!(store.trigger_bakes(id, None).await.unwrap().is_empty());
     assert!(versions.version(id, "source").await.unwrap().is_none());
 }
 
@@ -244,7 +244,7 @@ fn governed_entry(token: &str, project_id: Uuid, setup: Uuid) -> SignalRegistrat
 
 #[sqlx::test]
 async fn a_rearm_claim_refuses_a_trigger_that_left_active(pool: PgPool) {
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
@@ -264,7 +264,7 @@ async fn a_rearm_claim_refuses_a_trigger_that_left_active(pool: PgPool) {
 
 #[sqlx::test]
 async fn an_instances_wipe_takes_its_row_and_its_signals_in_one_write(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
@@ -274,7 +274,7 @@ async fn an_instances_wipe_takes_its_row_and_its_signals_in_one_write(pool: PgPo
     assert!(activations.try_begin_activating(id, std::slice::from_ref(&ada_key), setup_run_id, None, None).await.unwrap().is_ok());
     let mut entry = governed_entry("ada-wiped-entry", id, setup_run_id);
     entry.instance = Some(ada.clone());
-    journal.signal_insert(&entry).await.unwrap();
+    store.signal_insert(&entry).await.unwrap();
     activations.end_activating(id, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
 
     let written = activations
@@ -285,7 +285,7 @@ async fn an_instances_wipe_takes_its_row_and_its_signals_in_one_write(pool: PgPo
     assert_eq!(unlisten.iter().map(|s| s.token.as_str()).collect::<Vec<_>>(), vec!["ada-wiped-entry"],
         "the signals are handed back for the listener cleanup");
     assert!(activations.list(id).await.unwrap().is_empty(), "the instance's wiped row is gone");
-    assert!(journal.signal_get("ada-wiped-entry").await.unwrap().is_none(), "and its signal went with it");
+    assert!(store.signal_get("ada-wiped-entry").await.unwrap().is_none(), "and its signal went with it");
 }
 
 /// A park keeps the signals and leaves them listening: what they hear
@@ -293,13 +293,13 @@ async fn an_instances_wipe_takes_its_row_and_its_signals_in_one_write(pool: PgPo
 /// for the listener to let go of.
 #[sqlx::test]
 async fn a_park_keeps_its_signals_listening(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let setup_run_id = Uuid::new_v4();
     assert!(activations.try_begin_activating(id, &[feed_key()], setup_run_id, None, None).await.unwrap().is_ok());
-    journal.signal_insert(&governed_entry("parked-entry", id, setup_run_id)).await.unwrap();
+    store.signal_insert(&governed_entry("parked-entry", id, setup_run_id)).await.unwrap();
     activations.end_activating(id, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
 
     let written = activations
@@ -308,7 +308,7 @@ async fn a_park_keeps_its_signals_listening(pool: PgPool) {
         .unwrap();
     let LifecycleWrite::Applied { unlisten, .. } = written else { panic!("applied: {written:?}") };
     assert!(unlisten.is_empty(), "a parked trigger goes on listening: {unlisten:?}");
-    assert!(journal.signal_get("parked-entry").await.unwrap().is_some(), "and its signal stays stored");
+    assert!(store.signal_get("parked-entry").await.unwrap().is_some(), "and its signal stays stored");
 }
 
 /// An infra take-down issues its commands in the write that takes the
@@ -319,7 +319,7 @@ async fn a_park_keeps_its_signals_listening(pool: PgPool) {
 #[sqlx::test]
 async fn an_infra_take_down_issues_its_commands_with_the_triggers(pool: PgPool) {
     use weft_dispatcher::infra_lifecycle_command::{TakeDownCommands, TakeDownWork, Teardown, UpgradeWork};
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
@@ -407,10 +407,10 @@ async fn an_infra_take_down_issues_its_commands_with_the_triggers(pool: PgPool) 
 }
 
 /// The feed switched on with one entry signal, `token`.
-async fn activate_with_entry(activations: &PostgresActivationStore, journal: &PostgresJournal, id: Uuid, token: &str) {
+async fn activate_with_entry(activations: &PostgresActivationStore, store: &PostgresStore, id: Uuid, token: &str) {
     let setup_run_id = Uuid::new_v4();
     assert!(activations.try_begin_activating(id, &[feed_key()], setup_run_id, None, None).await.unwrap().is_ok());
-    journal.signal_insert(&governed_entry(token, id, setup_run_id)).await.unwrap();
+    store.signal_insert(&governed_entry(token, id, setup_run_id)).await.unwrap();
     activations.end_activating(id, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
 }
 
@@ -421,11 +421,11 @@ async fn activate_with_entry(activations: &PostgresActivationStore, journal: &Po
 #[sqlx::test]
 async fn a_take_down_keeps_the_tokens_its_wait_counts(pool: PgPool) {
     use weft_dispatcher::infra_lifecycle_command::{TakeDownCommands, TakeDownWork, Teardown};
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    activate_with_entry(&activations, &journal, id, "door-token").await;
+    activate_with_entry(&activations, &store, id, "door-token").await;
     let written = activations
         .set_lifecycle_guarded(id, &[feed_key()], &ActivationLifecycle::refused(), SignalsGoing::Activations, Forget::Nothing, DownCause::Person, None)
         .await
@@ -433,9 +433,9 @@ async fn a_take_down_keeps_the_tokens_its_wait_counts(pool: PgPool) {
     let LifecycleWrite::Applied { tokens, unlisten, .. } = written else { panic!("applied: {written:?}") };
     assert_eq!(tokens, vec!["door-token".to_string()]);
     assert_eq!(unlisten.len(), 1, "the signal itself went");
-    assert!(journal.signal_get("door-token").await.unwrap().is_none());
+    assert!(store.signal_get("door-token").await.unwrap().is_none());
 
-    activate_with_entry(&activations, &journal, id, "next-token").await;
+    activate_with_entry(&activations, &store, id, "next-token").await;
     let stop = TakeDownCommands {
         tenant_id: TENANT.into(),
         issued_by_replica: "disp-1".into(),
@@ -450,7 +450,7 @@ async fn a_take_down_keeps_the_tokens_its_wait_counts(pool: PgPool) {
         sqlx::query_scalar("SELECT waits_on_tokens FROM infra_lifecycle_command WHERE id = $1").bind(commands[0]).fetch_one(&pool).await.unwrap();
     assert_eq!(kept, vec!["next-token".to_string()], "the stop's wait counts the trigger it took down");
 
-    activate_with_entry(&activations, &journal, id, "upgrade-token").await;
+    activate_with_entry(&activations, &store, id, "upgrade-token").await;
     let upgrade = TakeDownCommands {
         tenant_id: TENANT.into(),
         issued_by_replica: "disp-1".into(),
@@ -497,7 +497,7 @@ fn hidden_until(deadline_unix: i64) -> ActivationLifecycle {
 #[sqlx::test]
 async fn a_door_stops_taking_work_once_its_window_ends(pool: PgPool) {
     use weft_dispatcher::activation_store::{close_door_windows, door_windows_over, next_door_window_end};
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
@@ -536,14 +536,14 @@ async fn a_door_stops_taking_work_once_its_window_ends(pool: PgPool) {
 async fn a_refused_let_go_still_ends_the_window_and_is_written_down(pool: PgPool) {
     use weft_dispatcher::activation_store::{door_windows_over, next_door_window_end};
     use weft_dispatcher::reaper::close_door_windows_over;
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let (key, later) = (feed_key(), ActivationKey::new("reads", Owner::Shared));
     let setup_run_id = Uuid::new_v4();
     assert!(activations.try_begin_activating(id, &[key.clone(), later.clone()], setup_run_id, None, None).await.unwrap().is_ok());
-    journal.signal_insert(&governed_entry("tok-feed", id, setup_run_id)).await.unwrap();
+    store.signal_insert(&governed_entry("tok-feed", id, setup_run_id)).await.unwrap();
     activations.end_activating(id, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     let window_over = hidden_until(100);
     activations.set_lifecycle_guarded(id, std::slice::from_ref(&key), &window_over, SignalsGoing::Kept, Forget::Nothing, DownCause::Person, None).await.unwrap();
@@ -586,7 +586,7 @@ async fn a_refused_let_go_still_ends_the_window_and_is_written_down(pool: PgPool
 
 #[sqlx::test]
 async fn activation_cleanup_cannot_finish_or_wipe_a_newer_activation(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
@@ -594,18 +594,18 @@ async fn activation_cleanup_cannot_finish_or_wipe_a_newer_activation(pool: PgPoo
     assert!(activations.try_begin_activating(id, &[feed_key()], first, None, None).await.unwrap().is_ok());
     assert!(matches!(activations.try_begin_activating(id, &[feed_key()], Uuid::new_v4(), None, None).await.unwrap(),
         Err(weft_dispatcher::activation_store::ClaimRefused::Claimed)), "one activation of a trigger at a time");
-    journal.signal_insert(&governed_entry("old-entry", id, first)).await.unwrap();
+    store.signal_insert(&governed_entry("old-entry", id, first)).await.unwrap();
     let removed = activations.end_activating(id, first, &ActivationLifecycle::refused(), true, None).await.unwrap().unwrap();
     assert_eq!(removed.len(), 1);
     assert_eq!(removed[0].token, "old-entry");
-    assert!(journal.signal_get("old-entry").await.unwrap().is_none());
-    assert!(queue(&journal, &[trigger_setup_birth(id, first)], true).await.is_err(),
+    assert!(store.signal_get("old-entry").await.unwrap().is_none());
+    assert!(queue(&store, &[trigger_setup_birth(id, first)], true).await.is_err(),
         "a cancelled activation cannot later start its setup");
-    assert!(journal.events_log(first).await.unwrap().is_empty());
+    assert!(store.events_log(first).await.unwrap().is_empty());
 
     let second = Uuid::new_v4();
     assert!(activations.try_begin_activating(id, &[feed_key()], second, None, None).await.unwrap().is_ok());
-    journal.signal_insert(&governed_entry("new-entry", id, second)).await.unwrap();
+    store.signal_insert(&governed_entry("new-entry", id, second)).await.unwrap();
     let program = weft_core::project::hash::ProgramIdentity {
         definition_hash: "def-2".into(), binary_hash: "bin-A".into(), implementations: Default::default(),
     };
@@ -614,7 +614,7 @@ async fn activation_cleanup_cannot_finish_or_wipe_a_newer_activation(pool: PgPoo
     assert!(activations.record_activation_source(id, second, &program, "second-source", &Default::default()).await.unwrap());
     for to in [ActivationLifecycle::refused(), ActivationLifecycle::active()] {
         assert!(activations.end_activating(id, first, &to, true, None).await.unwrap().is_none());
-        assert!(journal.signal_get("new-entry").await.unwrap().is_some());
+        assert!(store.signal_get("new-entry").await.unwrap().is_some());
         let row = activations.list(id).await.unwrap().remove(0);
         assert_eq!(row.lifecycle.activating_run_id, Some(second));
         assert_eq!(row.source_version.as_deref(), Some("second-source"));
@@ -631,7 +631,7 @@ async fn activation_cleanup_cannot_finish_or_wipe_a_newer_activation(pool: PgPoo
 #[sqlx::test]
 async fn a_triggers_cut_is_recorded_kept_while_down_and_restored(pool: PgPool) {
     use weft_dispatcher::activation_store::RecordedCut;
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
@@ -673,15 +673,15 @@ async fn a_triggers_cut_is_recorded_kept_while_down_and_restored(pool: PgPool) {
 /// events dropped when a take-down drops what is held, its signals kept.
 #[sqlx::test]
 async fn the_work_held_on_a_trigger_is_counted_moved_and_dropped(pool: PgPool) {
-    use weft_dispatcher::journal::postgres::{drop_held_arrivals, held_by_activation, held_on, move_paused_runs};
-    let (journal, projects) = setup(&pool).await;
+    use weft_dispatcher::store::postgres::{drop_held_arrivals, held_by_activation, held_on, move_paused_runs};
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    seed_parked_signal(&journal, "feed-tok", id).await;
+    seed_parked_signal(&store, "feed-tok", id).await;
     let feed = ActivationKey::new("trigger-feed-tok", Owner::Shared);
     let other = ActivationKey::new("other", Owner::Shared);
     assert!(matches!(park(&pool, "feed-tok", &parked(0, 0), None).await.unwrap(), ParkAppend::Parked));
-    let paused = queued_run(&journal, id).await;
+    let paused = queued_run(&store, id).await;
     sqlx::query("UPDATE run SET state = 'parked', fired_by = 'trigger-feed-tok' WHERE run_id = $1")
         .bind(paused)
         .execute(&pool)
@@ -697,12 +697,12 @@ async fn the_work_held_on_a_trigger_is_counted_moved_and_dropped(pool: PgPool) {
     assert_eq!(run_column::<String>(&pool, "binary_hash", paused).await.as_deref(), Some("bin-B"));
     assert_eq!(run_column::<String>(&pool, "source_version", paused).await.as_deref(), Some("v2"));
     assert_eq!(move_paused_runs(&pool, &[paused], &program, "bin-B", "v2").await.unwrap(), 0, "a run on the build already is not moved again");
-    let ended = queued_run(&journal, id).await;
+    let ended = queued_run(&store, id).await;
     assert_eq!(move_paused_runs(&pool, &[ended], &program, "bin-B", "v2").await.unwrap(), 0, "only a paused run moves");
 
     assert_eq!(drop_held_arrivals(&pool, id, std::slice::from_ref(&feed)).await.unwrap(), 1);
     assert_eq!(held_on(&pool, id, std::slice::from_ref(&feed)).await.unwrap().arrivals, 0);
-    assert!(journal.signal_get("feed-tok").await.unwrap().is_some(), "the signal stays");
+    assert!(store.signal_get("feed-tok").await.unwrap().is_some(), "the signal stays");
 }
 
 /// Each owner's copy of a trigger is its own activation: an instance's
@@ -710,7 +710,7 @@ async fn the_work_held_on_a_trigger_is_counted_moved_and_dropped(pool: PgPool) {
 /// instance's, and taking one down removes only the signals it governs.
 #[sqlx::test]
 async fn an_instances_activation_is_its_own_row(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
@@ -734,11 +734,11 @@ async fn an_instances_activation_is_its_own_row(pool: PgPool) {
     let mut wrong = ada_entry.clone();
     wrong.token = "wrong".into();
     wrong.setup_run_id = Some(bob_setup);
-    assert!(journal.signal_insert(&wrong).await.is_err(), "bob's setup cannot arm ada's trigger");
-    journal.signal_insert(&ada_entry).await.unwrap();
+    assert!(store.signal_insert(&wrong).await.is_err(), "bob's setup cannot arm ada's trigger");
+    store.signal_insert(&ada_entry).await.unwrap();
     let mut bob_entry = governed_entry("bob-entry", id, bob_setup);
     bob_entry.instance = Some(bob.clone());
-    journal.signal_insert(&bob_entry).await.unwrap();
+    store.signal_insert(&bob_entry).await.unwrap();
 
     for setup in [shared_setup, ada_setup, bob_setup] {
         activations.end_activating(id, setup, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
@@ -760,7 +760,7 @@ async fn an_instances_activation_is_its_own_row(pool: PgPool) {
     assert!(matches!(&refused, LifecycleWrite::Rejected { blocker } if blocker.contains("instance 'bob'")), "{refused:?}");
     let removed = activations.end_activating(id, begun, &ActivationLifecycle::refused(), true, None).await.unwrap().unwrap();
     assert_eq!(removed.iter().map(|s| s.token.as_str()).collect::<Vec<_>>(), vec!["bob-entry"]);
-    assert!(journal.signal_get("ada-entry").await.unwrap().is_some(), "ada's signal is ada's activation's to remove");
+    assert!(store.signal_get("ada-entry").await.unwrap().is_some(), "ada's signal is ada's activation's to remove");
 }
 
 /// An instance's activation cancelled (or reaped) mid-way lands wiped, so
@@ -768,7 +768,7 @@ async fn an_instances_activation_is_its_own_row(pool: PgPool) {
 /// the shared one cancelled the same way keeps its row, inactive.
 #[sqlx::test]
 async fn a_cancelled_instances_activation_leaves_no_row(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
@@ -779,8 +779,8 @@ async fn a_cancelled_instances_activation_leaves_no_row(pool: PgPool) {
     assert!(activations.try_begin_activating(id, &[feed_key(), ada_key.clone()], setup_run_id, None, None).await.unwrap().is_ok());
     let mut ada_entry = governed_entry("ada-entry", id, setup_run_id);
     ada_entry.instance = Some(ada.clone());
-    journal.signal_insert(&ada_entry).await.unwrap();
-    journal.signal_insert(&governed_entry("shared-entry", id, setup_run_id)).await.unwrap();
+    store.signal_insert(&ada_entry).await.unwrap();
+    store.signal_insert(&governed_entry("shared-entry", id, setup_run_id)).await.unwrap();
 
     let mut removed: Vec<String> = activations
         .end_activating(id, setup_run_id, &ActivationLifecycle::refused(), true, None)
@@ -804,7 +804,7 @@ async fn a_cancelled_instances_activation_leaves_no_row(pool: PgPool) {
 /// triggers.
 #[sqlx::test]
 async fn a_rearm_stores_its_values_as_it_lands(pool: PgPool) {
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
@@ -834,7 +834,7 @@ async fn a_rearm_stores_its_values_as_it_lands(pool: PgPool) {
 /// keeps its own. The instance activates again from nothing.
 #[sqlx::test]
 async fn a_refused_instances_row_is_forgotten(pool: PgPool) {
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
@@ -874,7 +874,7 @@ async fn a_refused_instances_row_is_forgotten(pool: PgPool) {
 
 #[sqlx::test]
 async fn trigger_bake_ownership_publication_and_project_cleanup(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
@@ -882,35 +882,35 @@ async fn trigger_bake_ownership_publication_and_project_cleanup(pool: PgPool) {
         .bind(id).execute(&pool).await.unwrap();
     let first = Uuid::new_v4();
     let birth = trigger_setup_birth(id, first);
-    queue(&journal, std::slice::from_ref(&birth), false).await.unwrap();
-    let complete = complete(&journal, first).await;
-    let bake = weft_dispatcher::journal::TriggerBake::from_events(&[birth, complete], &setup_program()).unwrap().unwrap();
-    journal.finish_trigger_setup(first, Some(&bake)).await.unwrap();
+    queue(&store, std::slice::from_ref(&birth), false).await.unwrap();
+    let complete = complete(&store, first).await;
+    let bake = weft_dispatcher::store::TriggerBake::from_events(&[birth, complete], &setup_program()).unwrap().unwrap();
+    store.finish_trigger_setup(first, Some(&bake)).await.unwrap();
 
     let second = Uuid::new_v4();
     assert!(activations.try_begin_activating(id, &[feed_key()], second, None, None).await.unwrap().is_ok());
-    assert!(queue(&journal, &[trigger_setup_birth(id, Uuid::new_v4())], true).await.is_err(),
+    assert!(queue(&store, &[trigger_setup_birth(id, Uuid::new_v4())], true).await.is_err(),
         "a setup no activation is setting up is never born as one");
-    queue(&journal, &[trigger_setup_birth(id, second)], true).await.unwrap();
+    queue(&store, &[trigger_setup_birth(id, second)], true).await.unwrap();
     let mut entry = governed_entry("baked-entry", id, first);
     entry.program = Some(bake.program.clone());
     entry.source_version = Some(bake.source_version.clone());
-    assert!(journal.signal_insert(&entry).await.is_err(), "a setup that owns no activation cannot arm");
+    assert!(store.signal_insert(&entry).await.is_err(), "a setup that owns no activation cannot arm");
     entry.setup_run_id = Some(second);
-    journal.signal_insert(&entry).await.unwrap();
-    let armed = journal.signal_get("baked-entry").await.unwrap().unwrap();
+    store.signal_insert(&entry).await.unwrap();
+    let armed = store.signal_get("baked-entry").await.unwrap().unwrap();
     assert_eq!(armed.program, entry.program);
     assert_eq!(armed.source_version, entry.source_version);
     assert_eq!(armed.setup_run_id, Some(second));
     activations.end_activating(id, second, &ActivationLifecycle::active(), false, None).await.unwrap();
-    assert!(journal.signal_insert(&entry).await.is_err(), "no late registration after activation ends");
-    journal.finish_trigger_setup(second, None).await.unwrap();
-    assert_eq!(journal.trigger_bakes(id, None).await.unwrap()[0].run_id, first);
-    journal.delete_run(first).await.unwrap();
-    assert_eq!(journal.trigger_bakes(id, None).await.unwrap()[0].run_id, first);
-    assert!(journal.trigger_bakes(Uuid::new_v4(), None).await.unwrap().is_empty());
+    assert!(store.signal_insert(&entry).await.is_err(), "no late registration after activation ends");
+    store.finish_trigger_setup(second, None).await.unwrap();
+    assert_eq!(store.trigger_bakes(id, None).await.unwrap()[0].run_id, first);
+    store.delete_run(first).await.unwrap();
+    assert_eq!(store.trigger_bakes(id, None).await.unwrap()[0].run_id, first);
+    assert!(store.trigger_bakes(Uuid::new_v4(), None).await.unwrap().is_empty());
     projects.remove(id).await.unwrap();
-    assert!(journal.trigger_bakes(id, None).await.unwrap().is_empty());
+    assert!(store.trigger_bakes(id, None).await.unwrap().is_empty());
 }
 
 /// How many rows of `table` belong to run `run_id`.
@@ -928,10 +928,10 @@ async fn rows_of(pool: &PgPool, table: &str, run_id: weft_core::RunId) -> i64 {
 /// retried start) writes nothing twice.
 #[sqlx::test]
 async fn queueing_a_run_is_atomic_and_happens_once(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let missing = Uuid::new_v4();
     let lost = weft_core::new_run_id();
-    let err = queue(&journal, &[birth(lost, missing, weft_core::context::Phase::Fire, "bin-A")], false).await.unwrap_err();
+    let err = queue(&store, &[birth(lost, missing, weft_core::context::Phase::Fire, "bin-A")], false).await.unwrap_err();
     assert!(format!("{err:#}").contains("has no row"), "{err:?}");
     assert_eq!((rows_of(&pool, "run", lost).await, rows_of(&pool, "run_log", lost).await), (0, 0), "a refused start leaves nothing");
 
@@ -942,11 +942,11 @@ async fn queueing_a_run_is_atomic_and_happens_once(pool: PgPool) {
     let kick = RunEvent::NodeKicked {
         run_id, node_id: "entry".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 1,
     };
-    assert!(queue(&journal, &[start.clone(), kick.clone()], false).await.unwrap());
+    assert!(queue(&store, &[start.clone(), kick.clone()], false).await.unwrap());
     assert_eq!((rows_of(&pool, "run", run_id).await, rows_of(&pool, "run_log", run_id).await), (1, 1),
         "the birth and its kicks are the record's first row");
-    assert_eq!(journal.events_log(run_id).await.unwrap().len(), 2);
-    assert!(!queue(&journal, &[start, kick], false).await.unwrap(), "a retried start finds its run");
+    assert_eq!(store.events_log(run_id).await.unwrap().len(), 2);
+    assert!(!queue(&store, &[start, kick], false).await.unwrap(), "a retried start finds its run");
     assert_eq!(rows_of(&pool, "run_log", run_id).await, 1, "and writes nothing twice");
 
     // A run of a cut is queued with the cut, kept with the project's
@@ -968,9 +968,9 @@ async fn queueing_a_run_is_atomic_and_happens_once(pool: PgPool) {
         born
     };
     let queue_cut = |events: Vec<RunEvent>, program: weft_journal::record::RunsProgram| {
-        let journal = &journal;
+        let store = &store;
         async move {
-            journal.queue_run(Queued {
+            store.queue_run(Queued {
                 events: &events, tenant: TENANT,
                 keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT, watch_end: false,
                 stale: &[], spec: None, example: None, program: Some(&program),
@@ -1040,13 +1040,13 @@ async fn claim(pool: &PgPool, run_id: weft_core::RunId, project_id: Uuid, owner:
 #[sqlx::test]
 async fn the_drain_counts_what_workers_drive_and_the_runs_queued_or_driven(pool: PgPool) {
     use weft_dispatcher::drain::{going, AtTheDoor};
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let (tok, other) = (AtTheDoor::Tokens(vec!["tok".to_string()]), AtTheDoor::Tokens(vec!["other".to_string()]));
     assert_eq!(going(&pool, id, &AtTheDoor::Every, &[]).await.unwrap(), 0);
 
-    let run = queued_run(&journal, id).await;
+    let run = queued_run(&store, id).await;
     let runs = [run];
     assert_eq!(going(&pool, id, &AtTheDoor::Every, &runs).await.unwrap(), 1, "queued for a worker");
     claim(&pool, run, id, "worker-a").await;
@@ -1077,9 +1077,9 @@ async fn the_drain_counts_what_workers_drive_and_the_runs_queued_or_driven(pool:
 /// written.
 #[sqlx::test]
 async fn a_lost_run_is_queued_again_when_durable_and_ended_when_fast_or_asked_to_stop(pool: PgPool) {
-    use weft_dispatcher::journal::Lost;
+    use weft_dispatcher::store::Lost;
     use weft_core::run_settings::{Keeping, RunSettings};
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let start = |keeping: Keeping| {
@@ -1092,39 +1092,39 @@ async fn a_lost_run_is_queued_again_when_durable_and_ended_when_fast_or_asked_to
     };
     let now = weft_dispatcher::lease::now_unix();
     let (durable, started) = start(Keeping::Durable);
-    queue(&journal, &[started], false).await.unwrap();
+    queue(&store, &[started], false).await.unwrap();
     claim(&pool, durable, id, "worker-a").await;
     let epoch: i32 = run_column(&pool, "epoch", durable).await.unwrap();
 
     seed_worker(&pool, "worker-a", id, "bin-A", json!({}), true).await;
-    assert_eq!(journal.let_go_of_lost(durable, now, None).await.unwrap(), Lost::NotLost, "its owner is alive");
+    assert_eq!(store.let_go_of_lost(durable, now, None).await.unwrap(), Lost::NotLost, "its owner is alive");
     seed_worker(&pool, "worker-a", id, "bin-A", json!({}), false).await;
-    assert_eq!(journal.let_go_of_lost(durable, now, None).await.unwrap(), Lost::NotLost, "within its claim's grace");
+    assert_eq!(store.let_go_of_lost(durable, now, None).await.unwrap(), Lost::NotLost, "within its claim's grace");
     let past_grace = weft_journal::record::delivered_until(now) + 5;
-    assert_eq!(journal.let_go_of_lost(durable, past_grace, None).await.unwrap(), Lost::Requeued);
+    assert_eq!(store.let_go_of_lost(durable, past_grace, None).await.unwrap(), Lost::Requeued);
     assert_eq!(run_column::<String>(&pool, "state", durable).await.as_deref(), Some("queued"));
     assert_eq!(run_column::<Option<String>>(&pool, "owner", durable).await, Some(None));
     assert!(run_column::<i32>(&pool, "epoch", durable).await.unwrap() > epoch, "a late batch of the old owner is refused");
 
     let (fast, started) = start(Keeping::Fast);
-    queue(&journal, &[started], false).await.unwrap();
+    queue(&store, &[started], false).await.unwrap();
     claim(&pool, fast, id, "worker-a").await;
-    assert_eq!(journal.let_go_of_lost(fast, past_grace, None).await.unwrap(), Lost::Ended);
+    assert_eq!(store.let_go_of_lost(fast, past_grace, None).await.unwrap(), Lost::Ended);
     assert_eq!(run_column::<String>(&pool, "state", fast).await.as_deref(), Some("ended"));
-    assert!(matches!(journal.events_log(fast).await.unwrap().last(), Some(RunEvent::RunCancelled { .. })));
-    assert_eq!(journal.let_go_of_lost(fast, past_grace, None).await.unwrap(), Lost::NotLost, "an ended run is not lost");
+    assert!(matches!(store.events_log(fast).await.unwrap().last(), Some(RunEvent::RunCancelled { .. })));
+    assert_eq!(store.let_go_of_lost(fast, past_grace, None).await.unwrap(), Lost::NotLost, "an ended run is not lost");
 
     // A durable run asked to stop while its worker drove it ends when that
     // worker goes away, for what asked: queued again, it would only start a
     // worker to read the cancel off its claim.
     let (stopped, started) = start(Keeping::Durable);
-    queue(&journal, &[started], false).await.unwrap();
+    queue(&store, &[started], false).await.unwrap();
     claim(&pool, stopped, id, "worker-a").await;
-    journal.cancel_run(stopped, None, &weft_core::run::CancelCause::User).await.unwrap();
-    assert_eq!(journal.let_go_of_lost(stopped, past_grace, None).await.unwrap(), Lost::Ended);
+    store.cancel_run(stopped, None, &weft_core::run::CancelCause::User).await.unwrap();
+    assert_eq!(store.let_go_of_lost(stopped, past_grace, None).await.unwrap(), Lost::Ended);
     assert_eq!(run_column::<String>(&pool, "state", stopped).await.as_deref(), Some("ended"));
     assert!(matches!(
-        journal.events_log(stopped).await.unwrap().last(),
+        store.events_log(stopped).await.unwrap().last(),
         Some(RunEvent::RunCancelled { cause: Some(weft_core::run::CancelCause::User), .. })
     ));
 }
@@ -1138,14 +1138,14 @@ async fn a_lost_run_is_queued_again_when_durable_and_ended_when_fast_or_asked_to
 /// passed with the worker gone, its run is lost.
 #[sqlx::test]
 async fn a_vouching_workers_runs_are_its_own_until_its_vouch_passes(pool: PgPool) {
-    use weft_dispatcher::journal::Lost;
+    use weft_dispatcher::store::Lost;
     use weft_task_store::runs::in_flight;
     use weft_task_store::worker_door::lease_until;
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let now = weft_dispatcher::lease::now_unix();
-    let run = queued_run(&journal, id).await;
+    let run = queued_run(&store, id).await;
     claim(&pool, run, id, "worker-a").await;
     let tick = |replica: &'static str, vouch: Option<i64>| {
         let pool = pool.clone();
@@ -1170,7 +1170,7 @@ async fn a_vouching_workers_runs_are_its_own_until_its_vouch_passes(pool: PgPool
     assert_eq!(tick("worker-a", Some(now + 600)).await, 1);
     assert_eq!(tick("worker-b", None).await, 2, "the vouching copy still counts");
     assert!(in_flight(&pool, run).await.unwrap(), "vouched: still worked on");
-    assert_eq!(journal.let_go_of_lost(run, now + 500, None).await.unwrap(), Lost::NotLost, "its own until its vouch passes");
+    assert_eq!(store.let_go_of_lost(run, now + 500, None).await.unwrap(), Lost::NotLost, "its own until its vouch passes");
     sqlx::query("DELETE FROM worker_lease WHERE replica = 'worker-b'").execute(&pool).await.unwrap();
     let margin = weft_task_store::worker_door::WORKER_LEASE_SECS;
     let earliest = |at: i64| {
@@ -1180,14 +1180,14 @@ async fn a_vouching_workers_runs_are_its_own_until_its_vouch_passes(pool: PgPool
     let grace: i64 = run_column(&pool, "delivered_until", run).await.expect("claimed with a grace");
     assert!(grace < now + 600, "the vouch outlives the claim's grace");
     assert_eq!(earliest(now).await, Some(now + 600 + margin), "once the vouch could lapse, not at the grace's end");
-    assert_eq!(journal.let_go_of_lost(run, now + 700, None).await.unwrap(), Lost::Ended, "its vouch passed and its worker gone: lost");
+    assert_eq!(store.let_go_of_lost(run, now + 700, None).await.unwrap(), Lost::Ended, "its vouch passed and its worker gone: lost");
 }
 
 /// A cancel asked of a run a worker drives, and an answer handed to one,
 /// wake this process's news teller once they commit, which tells them.
 #[sqlx::test]
 async fn a_cancel_and_a_handed_answer_are_told_as_news(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let bus = std::sync::Arc::new(weft_platform_traits::FakeNews::default());
@@ -1204,14 +1204,14 @@ async fn a_cancel_and_a_handed_answer_are_told_as_news(pool: PgPool) {
             .unwrap_or_else(|_| panic!("{kind:?} of {run} told"));
         }
     };
-    let answered = queued_run(&journal, id).await;
+    let answered = queued_run(&store, id).await;
     claim(&pool, answered, id, "worker-a").await;
-    seed_wait(&journal, "tok-told", id, answered).await;
-    assert!(matches!(journal.answer("tok-told", &weft_core::primitive::WaitAnswer::Given { value: json!(1) }).await.unwrap(), weft_dispatcher::journal::Answered::Reached { .. }));
+    seed_wait(&store, "tok-told", id, answered).await;
+    assert!(matches!(store.answer("tok-told", &weft_core::primitive::WaitAnswer::Given { value: json!(1) }).await.unwrap(), weft_dispatcher::store::Answered::Reached { .. }));
     told(weft_platform_traits::NewsKind::Answer, answered).await;
-    let cancelled = queued_run(&journal, id).await;
+    let cancelled = queued_run(&store, id).await;
     claim(&pool, cancelled, id, "worker-a").await;
-    assert!(journal.cancel_run(cancelled, None, &weft_core::run::CancelCause::User).await.unwrap().requested);
+    assert!(store.cancel_run(cancelled, None, &weft_core::run::CancelCause::User).await.unwrap().requested);
     told(weft_platform_traits::NewsKind::Cancel, cancelled).await;
 }
 
@@ -1219,22 +1219,22 @@ async fn a_cancel_and_a_handed_answer_are_told_as_news(pool: PgPool) {
 /// run a worker drives is asked to stop, and its worker writes the ending.
 #[sqlx::test]
 async fn a_cancel_ends_a_waiting_run_and_asks_a_driven_one_to_stop(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let cause = weft_core::run::CancelCause::User;
 
-    let waiting = queued_run(&journal, id).await;
+    let waiting = queued_run(&store, id).await;
     sqlx::query("UPDATE run SET state = 'parked' WHERE run_id = $1").bind(waiting).execute(&pool).await.unwrap();
-    let written = journal.cancel_run(waiting, None, &cause).await.unwrap();
+    let written = store.cancel_run(waiting, None, &cause).await.unwrap();
     assert!(!written.requested);
     assert_eq!(written.node_cancellations, Some(0));
     assert_eq!(run_column::<String>(&pool, "state", waiting).await.as_deref(), Some("ended"));
-    assert!(matches!(journal.events_log(waiting).await.unwrap().last(), Some(RunEvent::RunCancelled { .. })));
+    assert!(matches!(store.events_log(waiting).await.unwrap().last(), Some(RunEvent::RunCancelled { .. })));
 
-    let driven = queued_run(&journal, id).await;
+    let driven = queued_run(&store, id).await;
     claim(&pool, driven, id, "worker-a").await;
-    let written = journal.cancel_run(driven, None, &cause).await.unwrap();
+    let written = store.cancel_run(driven, None, &cause).await.unwrap();
     assert!(written.requested, "its worker is asked");
     assert_eq!(news_of(&pool, driven).await, vec![(id, "cancel".to_string())], "and the install's news says so, with the write");
     assert!(news_of(&pool, waiting).await.is_empty(), "a run nobody drives makes no news");
@@ -1242,7 +1242,7 @@ async fn a_cancel_ends_a_waiting_run_and_asks_a_driven_one_to_stop(pool: PgPool)
     assert_eq!(run_column::<String>(&pool, "state", driven).await.as_deref(), Some("running"), "its worker ends it");
     let asked: Option<serde_json::Value> = run_column(&pool, "cancel_requested", driven).await;
     assert!(asked.is_some());
-    assert_eq!(journal.events_log(driven).await.unwrap().len(), 1, "nothing written into a record its worker writes");
+    assert_eq!(store.events_log(driven).await.unwrap().len(), 1, "nothing written into a record its worker writes");
 }
 
 /// A cancel queues the last call of each wait that carries one, in its own
@@ -1251,12 +1251,12 @@ async fn a_cancel_ends_a_waiting_run_and_asks_a_driven_one_to_stop(pool: PgPool)
 /// that carries no call.
 #[sqlx::test]
 async fn a_cancel_queues_the_last_call_of_each_wait_that_carries_one(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    let run = queued_run(&journal, id).await;
+    let run = queued_run(&store, id).await;
     sqlx::query("UPDATE run SET state = 'parked' WHERE run_id = $1").bind(run).execute(&pool).await.unwrap();
-    seed_wait(&journal, "tok-plain", id, run).await;
+    seed_wait(&store, "tok-plain", id, run).await;
     let mut calling = entry_signal("tok-calling", id);
     calling.node_id = "render".into();
     calling.is_resume = true;
@@ -1264,9 +1264,9 @@ async fn a_cancel_queues_the_last_call_of_each_wait_that_carries_one(pool: PgPoo
     let mut spec = weft_core::primitive::SignalSpec::of_kind("poll_endpoint", json!({ "url": "https://queue.example/requests/7/status" }));
     spec.on_cancel = Some(weft_core::signal::CancelCall::put("https://queue.example/requests/7/cancel"));
     calling.spec_json = serde_json::to_string(&spec).unwrap();
-    journal.signal_insert(&calling).await.expect("seed the wait with a last call");
+    store.signal_insert(&calling).await.expect("seed the wait with a last call");
 
-    let written = journal.cancel_run(run, None, &weft_core::run::CancelCause::User).await.unwrap();
+    let written = store.cancel_run(run, None, &weft_core::run::CancelCause::User).await.unwrap();
     assert_eq!((written.removed.len(), written.cancel_calls), (2, 1));
     let tasks: Vec<(String, Option<String>, Option<Uuid>, serde_json::Value)> =
         sqlx::query_as("SELECT kind, dedup_key, run_id, payload FROM task WHERE kind = 'cancel_call'").fetch_all(&pool).await.unwrap();
@@ -1278,26 +1278,26 @@ async fn a_cancel_queues_the_last_call_of_each_wait_that_carries_one(pool: PgPoo
     assert_eq!(call.token, "tok-calling");
     assert_eq!(call.spec.on_cancel, Some(weft_core::signal::CancelCall::put("https://queue.example/requests/7/cancel")));
 
-    let again = journal.cancel_run(run, None, &weft_core::run::CancelCause::User).await.unwrap();
+    let again = store.cancel_run(run, None, &weft_core::run::CancelCause::User).await.unwrap();
     assert_eq!((again.removed.len(), again.cancel_calls), (0, 0), "the waits went with the first cancel");
 
     // A run a worker drives, asked to cancel while one of its nodes was
     // still registering its wait: the wait lands after the cancel, and
     // the removal at the run's ending sends its call all the same.
-    let driven = queued_run(&journal, id).await;
+    let driven = queued_run(&store, id).await;
     claim(&pool, driven, id, "worker-a").await;
-    assert!(journal.cancel_run(driven, None, &weft_core::run::CancelCause::User).await.unwrap().requested);
+    assert!(store.cancel_run(driven, None, &weft_core::run::CancelCause::User).await.unwrap().requested);
     let mut late = calling.clone();
     late.token = "tok-late".into();
     late.run_id = Some(driven);
-    journal.signal_insert(&late).await.expect("a wait registered after the cancel");
+    store.signal_insert(&late).await.expect("a wait registered after the cancel");
     // Its worker saw the cancel and ended the run so.
     sqlx::query("UPDATE run SET state = 'ended', outcome = 'cancelled', owner = NULL WHERE run_id = $1").bind(driven).execute(&pool).await.unwrap();
     // As `run_ends` calls it: holding the run's row in a transaction of its
     // own, so the removal must not wait on that row.
     let mut holding = pool.begin().await.unwrap();
     weft_journal::record::lock_in(&mut holding, driven).await.unwrap();
-    let removed = tokio::time::timeout(std::time::Duration::from_secs(10), journal.signal_remove_for_run_id(driven))
+    let removed = tokio::time::timeout(std::time::Duration::from_secs(10), store.signal_remove_for_run_id(driven))
         .await
         .expect("the removal never waits on the run's row")
         .unwrap();
@@ -1309,30 +1309,30 @@ async fn a_cancel_queues_the_last_call_of_each_wait_that_carries_one(pool: PgPoo
 
     // A run that ended any other way takes its waits down without a call,
     // even one asked to cancel that finished before its worker saw it.
-    let finished = queued_run(&journal, id).await;
+    let finished = queued_run(&store, id).await;
     let mut kept = calling.clone();
     kept.token = "tok-kept".into();
     kept.run_id = Some(finished);
-    journal.signal_insert(&kept).await.expect("a wait of a run that ends on its own");
+    store.signal_insert(&kept).await.expect("a wait of a run that ends on its own");
     sqlx::query("UPDATE run SET state = 'ended', outcome = 'completed', cancel_requested = '\"user\"'::jsonb WHERE run_id = $1")
         .bind(finished)
         .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(journal.signal_remove_for_run_id(finished).await.unwrap().len(), 1);
+    assert_eq!(store.signal_remove_for_run_id(finished).await.unwrap().len(), 1);
     let none: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE kind = 'cancel_call' AND run_id = $1").bind(finished).fetch_one(&pool).await.unwrap();
     assert_eq!(none, 0);
 
     // Removing the project cuts short a run whose worker never wrote the
     // cancel: its wait goes with the project, and its call is queued and
     // kept with it.
-    let cut = queued_run(&journal, id).await;
+    let cut = queued_run(&store, id).await;
     claim(&pool, cut, id, "worker-b").await;
-    assert!(journal.cancel_run(cut, None, &weft_core::run::CancelCause::User).await.unwrap().requested);
+    assert!(store.cancel_run(cut, None, &weft_core::run::CancelCause::User).await.unwrap().requested);
     let mut stranded = calling.clone();
     stranded.token = "tok-stranded".into();
     stranded.run_id = Some(cut);
-    journal.signal_insert(&stranded).await.expect("a wait registered after the cancel");
+    store.signal_insert(&stranded).await.expect("a wait registered after the cancel");
     projects.remove(id).await.unwrap().expect("the project was there");
     let kept: Vec<Option<String>> = sqlx::query_scalar("SELECT dedup_key FROM task WHERE kind = 'cancel_call' ORDER BY dedup_key")
         .fetch_all(&pool)
@@ -1348,10 +1348,10 @@ async fn a_cancel_queues_the_last_call_of_each_wait_that_carries_one(pool: PgPoo
 /// closing it, before the ending, in the same write.
 #[sqlx::test]
 async fn a_cancel_books_a_parked_runs_open_charge_unknown(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    let run = queued_run(&journal, id).await;
+    let run = queued_run(&store, id).await;
     let opened = RunEvent::ChargeOpened {
         run_id: run,
         node_id: "dub".into(),
@@ -1362,13 +1362,13 @@ async fn a_cancel_books_a_parked_runs_open_charge_unknown(pool: PgPool) {
         origin: weft_core::CredentialOwner::Platform,
         at_unix: 2,
     };
-    let written = journal.append(run, std::slice::from_ref(&opened), Then::Stays).await.unwrap();
+    let written = store.append(run, std::slice::from_ref(&opened), Then::Stays).await.unwrap();
     assert!(matches!(written, weft_journal::record::Appended::At(_)), "{written:?}");
     sqlx::query("UPDATE run SET state = 'parked' WHERE run_id = $1").bind(run).execute(&pool).await.unwrap();
 
-    let written = journal.cancel_run(run, None, &weft_core::run::CancelCause::User).await.unwrap();
+    let written = store.cancel_run(run, None, &weft_core::run::CancelCause::User).await.unwrap();
     assert_eq!(written.node_cancellations, Some(0));
-    let events = journal.events_log(run).await.unwrap();
+    let events = store.events_log(run).await.unwrap();
     let costs: Vec<&RunEvent> = events.iter().filter(|event| matches!(event, RunEvent::CostReported { .. })).collect();
     assert_eq!(costs.len(), 1, "{events:?}");
     assert!(
@@ -1387,18 +1387,18 @@ async fn a_cancel_books_a_parked_runs_open_charge_unknown(pool: PgPool) {
 #[sqlx::test]
 async fn an_ending_with_work_left_is_found_without_its_announcement(pool: PgPool) {
     use weft_dispatcher::run_ends::{clear_flags, take_flagged};
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let run_id = weft_core::new_run_id();
     let started = birth(run_id, id, weft_core::context::Phase::Fire, "bin-A");
-    assert!(journal.queue_run(Queued {
+    assert!(store.queue_run(Queued {
         events: std::slice::from_ref(&started), tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
         watch_end: true, stale: &[], spec: None, example: None, program: None,
     }, false).await.unwrap());
-    let quiet = queued_run(&journal, id).await;
-    complete(&journal, run_id).await;
-    complete(&journal, quiet).await;
+    let quiet = queued_run(&store, id).await;
+    complete(&store, run_id).await;
+    complete(&store, quiet).await;
 
     let mut one = pool.begin().await.unwrap();
     let found = take_flagged(&mut one, run_id).await.unwrap().expect("the watched ending is flagged");
@@ -1418,17 +1418,17 @@ async fn an_ending_with_work_left_is_found_without_its_announcement(pool: PgPool
 /// old.
 #[sqlx::test]
 async fn retention_erases_ended_runs_past_their_keep_and_never_a_waiting_one(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    let ended = queued_run(&journal, id).await;
-    complete(&journal, ended).await;
-    let parked = queued_run(&journal, id).await;
+    let ended = queued_run(&store, id).await;
+    complete(&store, ended).await;
+    let parked = queued_run(&store, id).await;
     sqlx::query("UPDATE run SET state = 'parked', started_at = 0 WHERE run_id = $1").bind(parked).execute(&pool).await.unwrap();
     let keep_until: i64 = run_column(&pool, "keep_until", ended).await.expect("an ended run has its keep");
 
-    assert_eq!(journal.erase_expired(keep_until, 100).await.unwrap().0, 0, "kept until its keep runs out");
-    assert_eq!(journal.erase_expired(i64::MAX, 100).await.unwrap().0, 1);
+    assert_eq!(store.erase_expired(keep_until, 100).await.unwrap().0, 0, "kept until its keep runs out");
+    assert_eq!(store.erase_expired(i64::MAX, 100).await.unwrap().0, 1);
     assert_eq!((rows_of(&pool, "run", ended).await, rows_of(&pool, "run_log", ended).await), (0, 0));
     assert_eq!(rows_of(&pool, "run", parked).await, 1, "a parked run is never erased");
 }
@@ -1449,7 +1449,7 @@ async fn retention_erases_ended_runs_past_their_keep_and_never_a_waiting_one(poo
 async fn referenced_images_cover_projects_runs_workers_maps_and_unit_refs(
     pool: PgPool,
 ) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let plain = Uuid::new_v4();
     seed_project(&projects, plain, "hash-current").await;
     // A second project whose committed infra sync recorded two nodes'
@@ -1513,9 +1513,9 @@ async fn referenced_images_cover_projects_runs_workers_maps_and_unit_refs(
     // started on, so its image stays; a finished run's does not.
     for (hash, finished) in [("hash-waiting-run", false), ("hash-finished-run", true)] {
         let run_id = weft_core::new_run_id();
-        queue(&journal, &[birth(run_id, plain, weft_core::context::Phase::Fire, hash)], false).await.unwrap();
+        queue(&store, &[birth(run_id, plain, weft_core::context::Phase::Fire, hash)], false).await.unwrap();
         if finished {
-            complete(&journal, run_id).await;
+            complete(&store, run_id).await;
         }
     }
 
@@ -1561,23 +1561,23 @@ fn parked(attempts: u32, not_before: i64) -> Waiting {
 /// Seed one signal row for `token`. Entry rows are keyed by
 /// `(project_id, node_id)`, so the node id is derived from the token:
 /// many tokens per project, no collisions.
-async fn seed_parked_signal(journal: &PostgresJournal, token: &str, project: Uuid) {
+async fn seed_parked_signal(store: &PostgresStore, token: &str, project: Uuid) {
     let mut sig = entry_signal(token, project);
     sig.node_id = format!("trigger-{token}");
     sig.activation_trigger = Some(sig.node_id.clone());
-    journal
+    store
         .signal_insert(&sig)
         .await
         .expect("seed signal row");
 }
 
 /// A wait `token` of run `run_id`.
-async fn seed_wait(journal: &PostgresJournal, token: &str, project: Uuid, run_id: weft_core::RunId) {
+async fn seed_wait(store: &PostgresStore, token: &str, project: Uuid, run_id: weft_core::RunId) {
     let mut wait = entry_signal(token, project);
     wait.node_id = format!("wait-{token}");
     wait.is_resume = true;
     wait.run_id = Some(run_id);
-    journal.signal_insert(&wait).await.expect("seed the wait");
+    store.signal_insert(&wait).await.expect("seed the wait");
 }
 
 /// An answer reaches its run once: a run nobody drives gets it in its
@@ -1587,31 +1587,31 @@ async fn seed_wait(journal: &PostgresJournal, token: &str, project: Uuid, run_id
 /// nothing, and an entry's token is never a wait.
 #[sqlx::test]
 async fn an_answer_reaches_its_run_once(pool: PgPool) {
-    use weft_dispatcher::journal::Answered;
-    let (journal, projects) = setup(&pool).await;
+    use weft_dispatcher::store::Answered;
+    let (store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
-    seed_parked_signal(&journal, "tok-entry", project).await;
-    assert!(matches!(journal.answer("tok-entry", &weft_core::primitive::WaitAnswer::Given { value: json!(1) }).await.unwrap(), Answered::Gone), "an entry is not a wait");
+    seed_parked_signal(&store, "tok-entry", project).await;
+    assert!(matches!(store.answer("tok-entry", &weft_core::primitive::WaitAnswer::Given { value: json!(1) }).await.unwrap(), Answered::Gone), "an entry is not a wait");
 
-    let parked_run = queued_run(&journal, project).await;
+    let parked_run = queued_run(&store, project).await;
     sqlx::query("UPDATE run SET state = 'parked' WHERE run_id = $1").bind(parked_run).execute(&pool).await.unwrap();
-    seed_wait(&journal, "tok-parked", project, parked_run).await;
-    let Answered::Reached { consumed } = journal.answer("tok-parked", &weft_core::primitive::WaitAnswer::Given { value: json!("yes") }).await.unwrap() else { panic!("reached") };
+    seed_wait(&store, "tok-parked", project, parked_run).await;
+    let Answered::Reached { consumed } = store.answer("tok-parked", &weft_core::primitive::WaitAnswer::Given { value: json!("yes") }).await.unwrap() else { panic!("reached") };
     assert_eq!(consumed.token, "tok-parked");
-    assert!(journal.signal_get("tok-parked").await.unwrap().is_none(), "answered once");
+    assert!(store.signal_get("tok-parked").await.unwrap().is_none(), "answered once");
     assert_eq!(run_column::<String>(&pool, "state", parked_run).await.as_deref(), Some("queued"), "queued to carry on");
-    assert!(matches!(journal.events_log(parked_run).await.unwrap().last(),
+    assert!(matches!(store.events_log(parked_run).await.unwrap().last(),
         Some(RunEvent::SuspensionResolved { token, value, .. }) if token == "tok-parked" && value == &json!("yes")));
-    assert!(matches!(journal.answer("tok-parked", &weft_core::primitive::WaitAnswer::Given { value: json!("again") }).await.unwrap(), Answered::Gone));
+    assert!(matches!(store.answer("tok-parked", &weft_core::primitive::WaitAnswer::Given { value: json!("again") }).await.unwrap(), Answered::Gone));
 
-    let driven = queued_run(&journal, project).await;
+    let driven = queued_run(&store, project).await;
     claim(&pool, driven, project, "worker-a").await;
-    seed_wait(&journal, "tok-driven", project, driven).await;
+    seed_wait(&store, "tok-driven", project, driven).await;
     static CHANNELS: &[&str] = &[weft_task_store::parked_fires::PARKED_FIRE_CHANNEL];
     let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.unwrap();
     let mut heard = watch.subscribe();
-    assert!(matches!(journal.answer("tok-driven", &weft_core::primitive::WaitAnswer::Given { value: json!(2) }).await.unwrap(), Answered::Reached { .. }));
+    assert!(matches!(store.answer("tok-driven", &weft_core::primitive::WaitAnswer::Given { value: json!(2) }).await.unwrap(), Answered::Reached { .. }));
     assert_eq!(news_of(&pool, driven).await, vec![(project, "answer".to_string())], "the install's news says it was handed, with the write");
     assert!(news_of(&pool, parked_run).await.is_empty(), "an answer written into a record makes no news");
     let named = weft_task_store::runs::run_payload(project, driven);
@@ -1620,7 +1620,7 @@ async fn an_answer_reaches_its_run_once(pool: PgPool) {
         heard.woken_before(deadline, |c, p| c == weft_task_store::parked_fires::PARKED_FIRE_CHANNEL && p == named).await.unwrap(),
         "the database announces the answer handed, naming its run"
     );
-    assert_eq!(journal.events_log(driven).await.unwrap().len(), 1, "nothing written into a record its worker writes");
+    assert_eq!(store.events_log(driven).await.unwrap().len(), 1, "nothing written into a record its worker writes");
     assert_eq!(
         weft_task_store::parked_fires::answers_for(&pool, driven).await.unwrap(),
         vec![("tok-driven".to_string(), weft_core::primitive::WaitAnswer::Given { value: json!(2) })]
@@ -1629,46 +1629,46 @@ async fn an_answer_reaches_its_run_once(pool: PgPool) {
     // A skip is an answer of its own kind, never a value: written as such
     // into a parked run's record, and handed as such to a driven run's
     // worker.
-    let skipped_run = queued_run(&journal, project).await;
+    let skipped_run = queued_run(&store, project).await;
     sqlx::query("UPDATE run SET state = 'parked' WHERE run_id = $1").bind(skipped_run).execute(&pool).await.unwrap();
-    seed_wait(&journal, "tok-skipped", project, skipped_run).await;
-    assert!(matches!(journal.answer("tok-skipped", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), Answered::Reached { .. }));
-    assert!(matches!(journal.events_log(skipped_run).await.unwrap().last(),
+    seed_wait(&store, "tok-skipped", project, skipped_run).await;
+    assert!(matches!(store.answer("tok-skipped", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), Answered::Reached { .. }));
+    assert!(matches!(store.events_log(skipped_run).await.unwrap().last(),
         Some(RunEvent::SuspensionSkipped { token, .. }) if token == "tok-skipped"));
-    seed_wait(&journal, "tok-driven-skipped", project, driven).await;
-    assert!(matches!(journal.answer("tok-driven-skipped", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), Answered::Reached { .. }));
+    seed_wait(&store, "tok-driven-skipped", project, driven).await;
+    assert!(matches!(store.answer("tok-driven-skipped", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), Answered::Reached { .. }));
     assert_eq!(
         weft_task_store::parked_fires::answers_for(&pool, driven).await.unwrap().last(),
         Some(&("tok-driven-skipped".to_string(), weft_core::primitive::WaitAnswer::Skipped))
     );
 
-    let ended = queued_run(&journal, project).await;
-    seed_wait(&journal, "tok-ended", project, ended).await;
-    complete(&journal, ended).await;
-    assert!(matches!(journal.answer("tok-ended", &weft_core::primitive::WaitAnswer::Given { value: json!(3) }).await.unwrap(), Answered::RunEnded { .. }));
-    assert!(journal.signal_get("tok-ended").await.unwrap().is_none());
+    let ended = queued_run(&store, project).await;
+    seed_wait(&store, "tok-ended", project, ended).await;
+    complete(&store, ended).await;
+    assert!(matches!(store.answer("tok-ended", &weft_core::primitive::WaitAnswer::Given { value: json!(3) }).await.unwrap(), Answered::RunEnded { .. }));
+    assert!(store.signal_get("tok-ended").await.unwrap().is_none());
 
     // An answer queued while the run's trigger was not live is the wait's
     // one answer: a later one finds the wait answered, and the queued one
     // stays for the drain to hand over.
-    let queued_for = queued_run(&journal, project).await;
+    let queued_for = queued_run(&store, project).await;
     sqlx::query("UPDATE run SET state = 'parked' WHERE run_id = $1").bind(queued_for).execute(&pool).await.unwrap();
-    seed_wait(&journal, "tok-queued", project, queued_for).await;
+    seed_wait(&store, "tok-queued", project, queued_for).await;
     assert_eq!(park(&pool, "tok-queued", &parked(0, 0), None).await.unwrap(), ParkAppend::Parked);
-    assert!(matches!(journal.answer("tok-queued", &weft_core::primitive::WaitAnswer::Given { value: json!("second") }).await.unwrap(), Answered::Gone));
-    assert!(journal.signal_get("tok-queued").await.unwrap().is_some(), "the queued answer still has its wait");
+    assert!(matches!(store.answer("tok-queued", &weft_core::primitive::WaitAnswer::Given { value: json!("second") }).await.unwrap(), Answered::Gone));
+    assert!(store.signal_get("tok-queued").await.unwrap().is_some(), "the queued answer still has its wait");
 }
 
-/// The consumer listing decodes the same row shape as every journal
+/// The consumer listing decodes the same row shape as every signal store
 /// read, so a column added to the row reaches this query too: one
 /// visible entry signal lists, with its node (a trigger with no
 /// activation row yet is visible).
 #[sqlx::test]
 async fn the_consumer_listing_reads_the_whole_signal_row(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
-    seed_parked_signal(&journal, "tok-entry", project).await;
+    seed_parked_signal(&store, "tok-entry", project).await;
 
     let listed = signals_visible_to(&pool, TENANT, &[], &[], None).await.expect("listing decodes");
     assert_eq!(listed.len(), 1, "{listed:?}");
@@ -1685,12 +1685,12 @@ async fn the_consumer_listing_reads_the_whole_signal_row(pool: PgPool) {
 /// queue along.
 #[sqlx::test]
 async fn a_park_names_its_refusal(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
-    seed_parked_signal(&journal, "tok-entry", project).await;
-    let waiting_run = queued_run(&journal, project).await;
-    seed_wait(&journal, "tok-resume", project, waiting_run).await;
+    seed_parked_signal(&store, "tok-entry", project).await;
+    let waiting_run = queued_run(&store, project).await;
+    seed_wait(&store, "tok-resume", project, waiting_run).await;
 
     let first = parked(0, 0);
     assert_eq!(park(&pool, "tok-entry", &first, None).await.unwrap(), ParkAppend::Parked);
@@ -1719,7 +1719,7 @@ async fn a_park_names_its_refusal(pool: PgPool) {
     .expect("fill the queue to the cap");
     assert_eq!(park(&pool, "tok-entry", &parked(0, 0), None).await.unwrap(), ParkAppend::Refused(ParkRefusal::QueueFull));
 
-    journal.signal_remove_many(&["tok-entry".to_string()]).await.unwrap();
+    store.signal_remove_many(&["tok-entry".to_string()]).await.unwrap();
     let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM parked_fire WHERE token = 'tok-entry'").fetch_one(&pool).await.unwrap();
     assert_eq!(left, 0, "a signal going takes its queue along");
     assert_eq!(
@@ -1734,7 +1734,7 @@ async fn a_park_names_its_refusal(pool: PgPool) {
 /// whole token (FIFO: a later event may not overtake it).
 #[sqlx::test]
 async fn the_sweep_selects_only_due_heads_on_active_triggers(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let active = Uuid::new_v4();
     let inactive = Uuid::new_v4();
     seed_project(&projects, active, "bin-A").await;
@@ -1753,12 +1753,12 @@ async fn the_sweep_selects_only_due_heads_on_active_triggers(pool: PgPool) {
     }
 
     let now = weft_dispatcher::lease::now_unix();
-    seed_parked_signal(&journal, "tok-due", active).await;
+    seed_parked_signal(&store, "tok-due", active).await;
     park(&pool, "tok-due", &parked(0, now - 10), None).await.unwrap();
-    seed_parked_signal(&journal, "tok-later", active).await;
+    seed_parked_signal(&store, "tok-later", active).await;
     park(&pool, "tok-later", &parked(3, now + 300), None).await.unwrap();
     park(&pool, "tok-later", &parked(0, now - 10), None).await.unwrap();
-    seed_parked_signal(&journal, "tok-inactive", inactive).await;
+    seed_parked_signal(&store, "tok-inactive", inactive).await;
     park(&pool, "tok-inactive", &parked(0, now - 10), None).await.unwrap();
 
     assert_eq!(due_tokens(&pool, now).await.unwrap(), ["tok-due"],
@@ -1772,10 +1772,10 @@ async fn the_sweep_selects_only_due_heads_on_active_triggers(pool: PgPool) {
 #[sqlx::test]
 async fn two_drains_never_take_one_head_and_events_leave_in_order(pool: PgPool) {
     use weft_task_store::parked_fires::{remove_in, restamp_in, take_head};
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
-    seed_parked_signal(&journal, "tok", project).await;
+    seed_parked_signal(&store, "tok", project).await;
     let (first, second) = (parked(0, 0), parked(0, 0));
     park(&pool, "tok", &first, None).await.unwrap();
     park(&pool, "tok", &second, None).await.unwrap();
@@ -1810,11 +1810,11 @@ async fn two_drains_never_take_one_head_and_events_leave_in_order(pool: PgPool) 
 /// the latest reason.
 #[sqlx::test]
 async fn fires_waiting_on_an_instance_value_wait_for_the_instance(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
-    seed_parked_signal(&journal, "tok-ada", project).await;
-    seed_parked_signal(&journal, "tok-timer", project).await;
+    seed_parked_signal(&store, "tok-ada", project).await;
+    seed_parked_signal(&store, "tok-timer", project).await;
     sqlx::query("UPDATE signal SET instance_id = 'ada' WHERE token = 'tok-ada'")
         .execute(&pool)
         .await
@@ -1850,11 +1850,11 @@ async fn fires_waiting_on_an_instance_value_wait_for_the_instance(pool: PgPool) 
 async fn a_failing_event_stops_its_queue_until_something_may_have_fixed_it(pool: PgPool) {
     use weft_dispatcher::parked_drain::tokens_waiting_on;
     use weft_task_store::parked_fires::{restamp_in, take_head, take_head_now, waiting, Turn};
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
-    seed_parked_signal(&journal, "tok-fail", project).await;
-    seed_parked_signal(&journal, "tok-infra", project).await;
+    seed_parked_signal(&store, "tok-fail", project).await;
+    seed_parked_signal(&store, "tok-infra", project).await;
     let failed = waiting(Uuid::new_v4(), json!({}), None, 0, WaitsOn::Failure, "the worker could not be reached");
     park(&pool, "tok-fail", &failed, None).await.unwrap();
     park(&pool, "tok-fail", &parked(0, 0), None).await.unwrap();
@@ -1897,7 +1897,7 @@ async fn copies_read_with_the_commands_under_way(pool: PgPool) {
     use weft_broker::lifecycle_writes::{issue_command, IssuedCommand};
     use weft_dispatcher::infra_lifecycle_command::{issue_lifecycle, InfraLifecycleVerb, Teardown};
     use weft_dispatcher::infra_node::{observe, InfraNodeStatus};
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
     for (node, instance, status) in [("bridge", Some("ada"), "stopped"), ("db", None, "running"), ("cache", None, "running")] {
@@ -1952,7 +1952,7 @@ async fn a_starting_copy_counts_from_its_request(pool: PgPool) {
     use weft_broker::lifecycle_writes::{issue_command, IssuedCommand};
     use weft_dispatcher::infra_lifecycle_command::InfraLifecycleVerb;
     use weft_dispatcher::infra_node::observe;
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
     sqlx::query("INSERT INTO infra_node (project_id, node_id, instance_id, copy_id, status) VALUES ($1, 'bridge', 'ada', 'inst', 'stopped')")
@@ -2012,7 +2012,7 @@ async fn a_starting_copy_counts_from_its_request(pool: PgPool) {
 async fn only_work_on_the_shared_copies_holds_the_program_back(pool: PgPool) {
     use weft_dispatcher::infra_lifecycle_command::{any_in_flight, issue_lifecycle, Teardown};
     use weft_core::instance::Copies;
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
     let stop = |copies: Copies| {
@@ -2046,7 +2046,7 @@ async fn only_work_on_the_shared_copies_holds_the_program_back(pool: PgPool) {
 /// as never activated rather than as wiped.
 #[sqlx::test]
 async fn a_failed_activation_puts_the_triggers_back_as_the_claim_found_them(pool: PgPool) {
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
@@ -2103,15 +2103,15 @@ async fn footprint(pool: &PgPool, run_id: weft_core::RunId) -> i64 {
 /// nobody runs twice, reachable by nothing.
 #[sqlx::test]
 async fn removing_a_projects_runs_frees_every_table_they_touched(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let doomed = Uuid::new_v4();
     let neighbour = Uuid::new_v4();
     seed_project(&projects, doomed, "bin-A").await;
     seed_project(&projects, neighbour, "bin-A").await;
 
-    let first = queued_run(&journal, doomed).await;
-    let second = queued_run(&journal, doomed).await;
-    let survivor = queued_run(&journal, neighbour).await;
+    let first = queued_run(&store, doomed).await;
+    let second = queued_run(&store, doomed).await;
+    let survivor = queued_run(&store, neighbour).await;
 
     // Everything else a run leaves behind, on the first run.
     let mut tx = pool.begin().await.unwrap();
@@ -2164,7 +2164,7 @@ async fn removing_a_projects_runs_frees_every_table_they_touched(pool: PgPool) {
 
     // A run started for it from now on finds no project.
     let late = weft_core::new_run_id();
-    let refused = queue(&journal, &[birth(late, doomed, weft_core::context::Phase::Fire, "bin-A")], false).await;
+    let refused = queue(&store, &[birth(late, doomed, weft_core::context::Phase::Fire, "bin-A")], false).await;
     let why = format!("{:#}", refused.unwrap_err());
     assert!(why.contains("has no row"), "a late start is refused: {why}");
     assert_eq!(footprint(&pool, late).await, 0);
@@ -2178,7 +2178,7 @@ async fn removing_a_projects_runs_frees_every_table_they_touched(pool: PgPool) {
 /// nothing.
 #[sqlx::test]
 async fn removing_a_project_takes_everything_kept_under_it(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let live = Uuid::from_u128(1);
     let removed = Uuid::from_u128(2);
     seed_project(&projects, live, "bin").await;
@@ -2205,8 +2205,8 @@ async fn removing_a_project_takes_everything_kept_under_it(pool: PgPool) {
     queue(removed, "b").await;
     queue(removed, "claimed").await;
     sqlx::query("UPDATE task SET status = 'claimed' WHERE dedup_key = 'claimed'").execute(&pool).await.unwrap();
-    journal.signal_insert(&entry_signal("live-entry", live)).await.unwrap();
-    journal.signal_insert(&entry_signal("gone-entry", removed)).await.unwrap();
+    store.signal_insert(&entry_signal("live-entry", live)).await.unwrap();
+    store.signal_insert(&entry_signal("gone-entry", removed)).await.unwrap();
     for (project, replica) in [(live, "sup-live"), (removed, "sup-gone")] {
         sqlx::query(
             "INSERT INTO infra_owner (project_id, supervisor_replica, tenant_id, leased_until_unix) VALUES ($1, $2, $3, $4)",
@@ -2241,7 +2241,7 @@ async fn removing_a_project_takes_everything_kept_under_it(pool: PgPool) {
     let tasks: Vec<(Uuid, String)> =
         sqlx::query_as("SELECT project_id, dedup_key FROM task ORDER BY dedup_key").fetch_all(&pool).await.unwrap();
     assert_eq!(tasks, vec![(live, "a".to_string())], "its work went, the claimed one too");
-    assert!(journal.signal_get("live-entry").await.unwrap().is_some());
+    assert!(store.signal_get("live-entry").await.unwrap().is_some());
     assert_eq!(programs(removed).await, 0);
     assert!(programs(live).await > 0);
     let leases: Vec<Uuid> = sqlx::query_scalar("SELECT project_id FROM infra_owner").fetch_all(&pool).await.unwrap();
@@ -2259,7 +2259,7 @@ async fn removing_a_project_takes_everything_kept_under_it(pool: PgPool) {
 async fn a_project_being_removed_has_no_run_born(pool: PgPool) {
     use weft_journal::frame::{Batch, BatchHead, RunHead};
     use weft_journal::record::{Born, Fate, Written};
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let (doomed, kept) = (Uuid::from_u128(1), Uuid::from_u128(2));
     seed_project(&projects, doomed, "bin").await;
     seed_project(&projects, kept, "bin").await;
@@ -2272,11 +2272,11 @@ async fn a_project_being_removed_has_no_run_born(pool: PgPool) {
         .expect_err("a project being removed is not registered over");
     assert!(weft_dispatcher::project_store::ProjectRemoving::is(&registered), "{registered:#}");
 
-    let refused = queue(&journal, &[birth(weft_core::new_run_id(), doomed, weft_core::context::Phase::Fire, "bin")], false)
+    let refused = queue(&store, &[birth(weft_core::new_run_id(), doomed, weft_core::context::Phase::Fire, "bin")], false)
         .await
         .expect_err("a queued run of a project being removed is refused");
     assert!(refused.to_string().contains("is being removed"), "{refused}");
-    queued_run(&journal, kept).await;
+    queued_run(&store, kept).await;
 
     let bear = |project: Uuid| {
         let pool = pool.clone();
@@ -2313,7 +2313,7 @@ async fn a_project_being_removed_has_no_run_born(pool: PgPool) {
 /// them once it is gone. The author's own connections stay theirs.
 #[sqlx::test]
 async fn removing_a_project_takes_what_its_instances_had(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let grant = |instance: Option<&'static str>| {
@@ -2336,7 +2336,7 @@ async fn removing_a_project_takes_what_its_instances_had(pool: PgPool) {
          VALUES ($1, $2, 'ada', 'post', 'account', '{}', $3), ($1, $2, 'ada', 'digest', 'cron', '\"0 0 3 * * *\"', NULL)",
     )
     .bind(TENANT).bind(id).bind(adas).execute(&pool).await.expect("values");
-    let token = |hash: &str, instance: Option<InstanceId>, expires_at: Option<u64>| weft_dispatcher::journal::SignalToken {
+    let token = |hash: &str, instance: Option<InstanceId>, expires_at: Option<u64>| weft_dispatcher::store::SignalToken {
         id: Uuid::new_v4(),
         token_hash: hash.into(),
         recognizer: "wft-test-...".into(),
@@ -2351,16 +2351,16 @@ async fn removing_a_project_takes_what_its_instances_had(pool: PgPool) {
         expires_at,
         kind: weft_core::signal_token::TokenKind::Caller,
     };
-    journal.mint_signal_token(&token("ada-token", Some(InstanceId::new("ada").unwrap()), Some(10))).await.unwrap();
-    journal.mint_signal_token(&token("author-token", None, None)).await.unwrap();
+    store.mint_signal_token(&token("ada-token", Some(InstanceId::new("ada").unwrap()), Some(10))).await.unwrap();
+    store.mint_signal_token(&token("author-token", None, None)).await.unwrap();
 
     projects.remove(id).await.unwrap();
     let grants: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM access_grant").fetch_all(&pool).await.unwrap();
     assert_eq!(grants, vec![authors], "the author's connection stays theirs");
     let values: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM instance_value").fetch_one(&pool).await.unwrap();
     assert_eq!(values, 0, "an instance's values go with the project, connections or not");
-    assert!(journal.get_signal_token("ada-token").await.unwrap().is_none());
-    assert!(journal.get_signal_token("author-token").await.unwrap().is_some(), "the author revokes their own tokens");
+    assert!(store.get_signal_token("ada-token").await.unwrap().is_none());
+    assert!(store.get_signal_token("author-token").await.unwrap().is_some(), "the author revokes their own tokens");
 }
 
 /// Taking a whole project down removes every signal it has, entry
@@ -2368,17 +2368,17 @@ async fn removing_a_project_takes_what_its_instances_had(pool: PgPool) {
 /// the run it is told to spare.
 #[sqlx::test]
 async fn a_whole_project_take_down_removes_its_entry_signals(pool: PgPool) {
-    use weft_dispatcher::journal::postgres::remove_project_signals_except;
-    let (journal, projects) = setup(&pool).await;
+    use weft_dispatcher::store::postgres::remove_project_signals_except;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    let spared = queued_run(&journal, id).await;
+    let spared = queued_run(&store, id).await;
     let mut wait = entry_signal("spared-wait", id);
     wait.is_resume = true;
     wait.run_id = Some(spared);
     wait.node_id = "ask".into();
-    journal.signal_insert(&entry_signal("entry", id)).await.unwrap();
-    journal.signal_insert(&wait).await.unwrap();
+    store.signal_insert(&entry_signal("entry", id)).await.unwrap();
+    store.signal_insert(&wait).await.unwrap();
 
     let removed = remove_project_signals_except(&pool, id, Some(spared)).await.unwrap();
     assert_eq!(removed.iter().map(|s| s.token.as_str()).collect::<Vec<_>>(), vec!["entry"]);
@@ -2391,7 +2391,7 @@ async fn a_whole_project_take_down_removes_its_entry_signals(pool: PgPool) {
 /// instance's registration, and the shared read sees none of them.
 #[sqlx::test]
 async fn an_entry_is_read_for_its_own_instance(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     for (token, instance) in [("tok-a", "alice"), ("tok-b", "bob")] {
@@ -2399,14 +2399,14 @@ async fn an_entry_is_read_for_its_own_instance(pool: PgPool) {
             instance: Some(weft_core::instance::InstanceId::new(instance).unwrap()),
             ..entry_signal(token, id)
         };
-        journal.signal_insert(&signal).await.expect("insert an instance's entry");
+        store.signal_insert(&signal).await.expect("insert an instance's entry");
     }
     for (token, instance) in [("tok-a", "alice"), ("tok-b", "bob")] {
         let instance = weft_core::instance::InstanceId::new(instance).unwrap();
-        let entry = journal.signal_entry_at(id, "feed", Some(&instance)).await.unwrap().expect("its entry");
+        let entry = store.signal_entry_at(id, "feed", Some(&instance)).await.unwrap().expect("its entry");
         assert_eq!(entry.token, token);
     }
-    assert!(journal.signal_entry_at(id, "feed", None).await.unwrap().is_none(), "no shared copy exists");
+    assert!(store.signal_entry_at(id, "feed", None).await.unwrap().is_none(), "no shared copy exists");
 }
 
 async fn seed_dispatcher_command(pool: &PgPool, project_id: Uuid, verb: &str) -> i64 {
@@ -2441,7 +2441,7 @@ async fn complete_command(pool: &PgPool, id: i64) {
 async fn a_trigger_down_with_its_infra_reads_the_commands_since(pool: PgPool) {
     use weft_broker::lifecycle_writes::{issue_command, IssuedCommand};
     use weft_dispatcher::infra_lifecycle_command::{issue_lifecycle, since_take_down, InfraLifecycleVerb, SinceTakeDown, Teardown};
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
     let shared = weft_core::instance::Copies::Shared;
@@ -2526,7 +2526,7 @@ async fn a_trigger_down_with_its_infra_reads_the_commands_since(pool: PgPool) {
 async fn a_drains_claim_lasts_to_its_next_look_and_a_cancel_is_announced(pool: PgPool) {
     use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL};
     use weft_dispatcher::lifecycle_claimer::{claim_one, CommandClaim};
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let command = seed_dispatcher_command(&pool, id, "deactivate").await;
@@ -2557,7 +2557,7 @@ async fn a_drains_claim_lasts_to_its_next_look_and_a_cancel_is_announced(pool: P
 /// hears the flag, completes it with what it really did.
 #[sqlx::test]
 async fn cancelling_a_claimed_supervisor_command_leaves_it_pending_for_the_supervisor(pool: PgPool) {
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let running = seed_dispatcher_command(&pool, id, "stop").await;
@@ -2590,7 +2590,7 @@ async fn cancelling_a_claimed_supervisor_command_leaves_it_pending_for_the_super
 /// row no longer the caller's.
 #[sqlx::test]
 async fn a_changed_connection_marks_its_signals_for_registering_again(pool: PgPool) {
-    use weft_dispatcher::journal::postgres::{access_taken_afresh, reregister_for_access, signals_with_stale_access};
+    use weft_dispatcher::store::postgres::{access_taken_afresh, reregister_for_access, signals_with_stale_access};
     setup(&pool).await;
     let (project, grant) = (Uuid::new_v4(), Uuid::new_v4());
     sqlx::query("INSERT INTO access_grant (id, tenant_id, service, spec_json, values_sealed) VALUES ($1, $2, 'svc', '{}', 'sealed')")
@@ -2713,7 +2713,7 @@ async fn asking_for_a_look_wakes_the_supervisor_for_the_project(pool: PgPool) {
 async fn health_verbs_of_a_project_are_claimed_in_order(pool: PgPool) {
     use weft_dispatcher::infra_lifecycle_command::InfraLifecycleVerb;
     use weft_dispatcher::lifecycle_claimer::claim_one;
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
     let park = seed_dispatcher_command(&pool, project, "deactivate").await;
@@ -2738,7 +2738,7 @@ async fn health_verbs_of_a_project_are_claimed_in_order(pool: PgPool) {
 #[sqlx::test]
 async fn a_health_command_that_ends_asks_for_exactly_one_look(pool: PgPool) {
     use weft_broker_client::lifecycle_command::{look_payload, INFRA_COMMAND_CHANNEL};
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
     let take_down = seed_dispatcher_command(&pool, project, "deactivate").await;
@@ -2780,7 +2780,7 @@ async fn a_health_command_that_ends_asks_for_exactly_one_look(pool: PgPool) {
 #[sqlx::test]
 async fn a_second_upgrade_of_the_same_copies_is_refused(pool: PgPool) {
     use weft_dispatcher::infra_lifecycle_command::{Issued, TakeDownCommands, TakeDownWork, UpgradeWork};
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
     let work = UpgradeWork {
@@ -2832,20 +2832,20 @@ fn entry_at(token: &str, project_id: Uuid) -> SignalRegistration {
 /// the row now reads.
 #[sqlx::test]
 async fn a_rewritten_held_row_lets_its_holder_go(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    journal.signal_insert(&held_signal("sse", id, 0)).await.unwrap();
-    let first = journal.signal_get("sse").await.unwrap().unwrap().generation;
+    store.signal_insert(&held_signal("sse", id, 0)).await.unwrap();
+    let first = store.signal_get("sse").await.unwrap().unwrap().generation;
     sqlx::query("UPDATE signal SET held_by = 'h1', serving = '{\"status\":\"up\"}', held_failed = 'gave up' WHERE token = 'sse'")
         .execute(&pool)
         .await
         .unwrap();
-    journal.signal_insert(&held_signal("sse", id, 1)).await.unwrap();
+    store.signal_insert(&held_signal("sse", id, 1)).await.unwrap();
     let (held_by, serving, held_failed, holds): (Option<String>, Option<serde_json::Value>, Option<String>, bool) =
         sqlx::query_as("SELECT held_by, serving, held_failed, holds FROM signal WHERE token = 'sse'").fetch_one(&pool).await.unwrap();
     assert_eq!((held_by, serving, held_failed, holds), (None, None, None, true), "a rewrite is let go of and tried again");
-    let second = journal.signal_get("sse").await.unwrap().unwrap().generation;
+    let second = store.signal_get("sse").await.unwrap().unwrap().generation;
     assert!(second > first, "a rewrite is a new registration: {first} then {second}");
 }
 
@@ -2853,13 +2853,13 @@ async fn a_rewritten_held_row_lets_its_holder_go(pool: PgPool) {
 /// activation's and a signal that holds nothing do not count.
 #[sqlx::test]
 async fn the_holders_count_the_held_rows_of_live_activations(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     assert_eq!(weft_dispatcher::holders::held_count(&pool).await.unwrap(), 0);
-    journal.signal_insert(&held_signal("one", id, 0)).await.unwrap();
-    journal.signal_insert(&held_signal("two", id, 0)).await.unwrap();
-    journal.signal_insert(&entry_at("form", id)).await.unwrap();
+    store.signal_insert(&held_signal("one", id, 0)).await.unwrap();
+    store.signal_insert(&held_signal("two", id, 0)).await.unwrap();
+    store.signal_insert(&entry_at("form", id)).await.unwrap();
     assert_eq!(weft_dispatcher::holders::held_count(&pool).await.unwrap(), 2);
     sqlx::query(
         "INSERT INTO trigger_activation (project_id, trigger, status, accepting_fires, fires_visible_to_consumers, updated_at) \
@@ -2892,7 +2892,7 @@ async fn the_holders_are_sized_to_the_held_signals(pool: PgPool) {
     use std::sync::atomic::AtomicBool;
     use weft_dispatcher::holders::size;
     use weft_task_store::drain::DrainStep;
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let (holders, here) = (weft_platform_traits::FakeHolderPool::default(), AtomicBool::new(false));
@@ -2902,10 +2902,10 @@ async fn the_holders_are_sized_to_the_held_signals(pool: PgPool) {
     size(&pool, &holders, &news, 2, &here).await.unwrap();
     assert_eq!(*holders.sizes.lock(), vec![0], "set to none already: not asked again");
     for t in ["a", "b", "c"] {
-        journal.signal_insert(&held_signal(t, id, 0)).await.unwrap();
+        store.signal_insert(&held_signal(t, id, 0)).await.unwrap();
     }
     assert_eq!(size(&pool, &holders, &news, 2, &here).await.unwrap(), DrainStep::Done);
-    journal.signal_insert(&held_signal("d", id, 0)).await.unwrap();
+    store.signal_insert(&held_signal("d", id, 0)).await.unwrap();
     let (sibling, there) = (weft_platform_traits::FakeHolderPool::default(), AtomicBool::new(false));
     size(&pool, &sibling, &news, 2, &there).await.unwrap();
     assert_eq!(*sibling.sizes.lock(), vec![2], "a replica just started sets the pool to the count written, as it may have drifted");
@@ -2913,7 +2913,7 @@ async fn the_holders_are_sized_to_the_held_signals(pool: PgPool) {
     assert_eq!(*sibling.sizes.lock(), vec![2], "and then trusts it");
     size(&pool, &holders, &news, 2, &here).await.unwrap();
     assert_eq!(*holders.sizes.lock(), vec![0, 2], "four signals still need the two holders the other replica set");
-    journal.signal_remove_many(&["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]).await.unwrap();
+    store.signal_remove_many(&["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]).await.unwrap();
     size(&pool, &holders, &news, 2, &here).await.unwrap();
     assert_eq!(*holders.sizes.lock(), vec![0, 2, 0]);
     assert_eq!(
@@ -2929,7 +2929,7 @@ async fn the_holders_are_sized_to_the_held_signals(pool: PgPool) {
 #[sqlx::test]
 async fn a_held_row_coming_or_going_wakes_the_holder_sizing(pool: PgPool) {
     use weft_dispatcher::holders::HELD_SIGNALS_CHANNEL;
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     static CHANNELS: &[&str] = &[HELD_SIGNALS_CHANNEL];
@@ -2939,9 +2939,9 @@ async fn a_held_row_coming_or_going_wakes_the_holder_sizing(pool: PgPool) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         heard.woken_before(deadline, |c, _| c == HELD_SIGNALS_CHANNEL).await.unwrap()
     }
-    journal.signal_insert(&entry_at("form", id)).await.unwrap();
+    store.signal_insert(&entry_at("form", id)).await.unwrap();
     assert!(!woken(&mut heard).await, "a signal that holds nothing is silent");
-    journal.signal_insert(&held_signal("sse", id, 0)).await.unwrap();
+    store.signal_insert(&held_signal("sse", id, 0)).await.unwrap();
     assert!(woken(&mut heard).await, "a held one coming");
     sqlx::query("UPDATE signal SET held_by = 'h1' WHERE token = 'sse'").execute(&pool).await.unwrap();
     assert!(!woken(&mut heard).await, "a holder taking it changes no holder's work");
@@ -2949,7 +2949,7 @@ async fn a_held_row_coming_or_going_wakes_the_holder_sizing(pool: PgPool) {
     assert!(woken(&mut heard).await, "its holder letting go (or its check going off) frees it for another");
     sqlx::query("UPDATE signal SET held_failed = 'misconfigured' WHERE token = 'sse'").execute(&pool).await.unwrap();
     assert!(woken(&mut heard).await, "a give-up takes it out of the held set");
-    journal.signal_remove_many(&["sse".to_string()]).await.unwrap();
+    store.signal_remove_many(&["sse".to_string()]).await.unwrap();
     assert!(woken(&mut heard).await, "and going");
     sqlx::query(
         "INSERT INTO trigger_activation (project_id, trigger, status, accepting_fires, fires_visible_to_consumers, updated_at) \
@@ -2974,7 +2974,7 @@ async fn a_held_row_coming_or_going_wakes_the_holder_sizing(pool: PgPool) {
 #[sqlx::test]
 async fn the_held_rows_announce_their_changes(pool: PgPool) {
     use weft_dispatcher::held::{INFRA_STATUS_CHANNEL, ROUTES_CHANNEL, WORKER_SETTINGS_CHANNEL};
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     static CHANNELS: &[&str] = &[ROUTES_CHANNEL, WORKER_SETTINGS_CHANNEL, INFRA_STATUS_CHANNEL];
@@ -2986,14 +2986,14 @@ async fn the_held_rows_announce_their_changes(pool: PgPool) {
     }
     let project = id.to_string();
 
-    journal.signal_insert(&entry_at("callback", id)).await.unwrap();
+    store.signal_insert(&entry_at("callback", id)).await.unwrap();
     assert!(!heard_on(&mut heard, ROUTES_CHANNEL, TENANT).await, "a signal that is no public entry is silent");
     let route = SignalRegistration {
         surface_kind: "public_entry".into(),
         mount_path: Some(format!("/{TENANT}/{id}/notes")),
         ..entry_at("route", id)
     };
-    journal.signal_insert(&route).await.unwrap();
+    store.signal_insert(&route).await.unwrap();
     assert!(heard_on(&mut heard, ROUTES_CHANNEL, TENANT).await, "a public entry coming names its tenant");
     sqlx::query(
         "INSERT INTO trigger_activation (project_id, trigger, status, accepting_fires, fires_visible_to_consumers, updated_at) \
@@ -3006,7 +3006,7 @@ async fn the_held_rows_announce_their_changes(pool: PgPool) {
     assert!(heard_on(&mut heard, ROUTES_CHANNEL, TENANT).await, "an activation coming");
     sqlx::query("UPDATE trigger_activation SET status = 'inactive' WHERE project_id = $1").bind(id).execute(&pool).await.unwrap();
     assert!(heard_on(&mut heard, ROUTES_CHANNEL, TENANT).await, "an activation taken down");
-    journal.signal_remove_many(&["route".to_string()]).await.unwrap();
+    store.signal_remove_many(&["route".to_string()]).await.unwrap();
     assert!(heard_on(&mut heard, ROUTES_CHANNEL, TENANT).await, "a public entry going");
 
     sqlx::query("UPDATE project SET worker_settings_json = '{\"minInstances\": 1}'::jsonb WHERE id = $1")
@@ -3042,7 +3042,7 @@ async fn the_held_rows_announce_their_changes(pool: PgPool) {
 /// not hand weft, or a copy that is gone, is refused and writes nothing.
 #[sqlx::test]
 async fn what_an_infra_says_changed_is_written_where_its_node_put_it(pool: PgPool) {
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
     sqlx::query(
@@ -3123,20 +3123,20 @@ async fn what_an_infra_says_changed_is_written_where_its_node_put_it(pool: PgPoo
 /// The `lapses` loop looks at the stale heartbeat only then.
 #[sqlx::test]
 async fn an_activation_whose_setup_run_goes_is_not_stuck(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let setup_run = weft_core::new_run_id();
     assert!(activations.try_begin_activating(id, &[feed_key()], setup_run, None, None).await.unwrap().is_ok());
-    assert!(queue(&journal, &[birth(setup_run, id, weft_core::context::Phase::TriggerSetup, "bin-A")], true).await.unwrap());
+    assert!(queue(&store, &[birth(setup_run, id, weft_core::context::Phase::TriggerSetup, "bin-A")], true).await.unwrap());
     sqlx::query("UPDATE run SET state = 'parked' WHERE run_id = $1").bind(setup_run).execute(&pool).await.unwrap();
     sqlx::query("UPDATE trigger_activation SET heartbeat_unix = 0").execute(&pool).await.unwrap();
     let now = weft_dispatcher::lease::now_unix();
     assert!(activations.list_stuck(now).await.unwrap().is_empty(), "its setup run waits on a person");
     assert_eq!(weft_dispatcher::lapses::earliest_lapse(&pool, now).await.unwrap(), None, "and nothing is looked at for it");
 
-    complete(&journal, setup_run).await;
+    complete(&store, setup_run).await;
     let stuck = activations.list_stuck(now).await.unwrap();
     assert_eq!(stuck.iter().map(|s| s.run_id).collect::<Vec<_>>(), vec![setup_run], "no run goes and nobody drives it");
 }
@@ -3146,7 +3146,7 @@ async fn an_activation_whose_setup_run_goes_is_not_stuck(pool: PgPool) {
 /// and once the run ended a claim's length ago the `lapses` loop looks.
 #[sqlx::test]
 async fn a_resting_task_claim_lapses_only_after_its_run_ended(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let task = weft_task_store::tasks::enqueue(
@@ -3179,7 +3179,7 @@ async fn a_resting_task_claim_lapses_only_after_its_run_ended(pool: PgPool) {
     let lapse = claim_lapse().await.expect("a renewed claim lapses");
     assert!(lapse > weft_dispatcher::lease::now_unix());
 
-    let run = queued_run(&journal, id).await;
+    let run = queued_run(&store, id).await;
     assert!(weft_task_store::tasks::rest_claim(&pool, task, "disp-1", run).await.unwrap());
     assert_eq!(claim_lapse().await, None, "a resting claim has no lapse");
     assert!(weft_task_store::tasks::heartbeat(&pool, task, "disp-1").await.unwrap(), "still ours");
@@ -3187,7 +3187,7 @@ async fn a_resting_task_claim_lapses_only_after_its_run_ended(pool: PgPool) {
     let now = weft_dispatcher::lease::now_unix();
     assert_eq!(weft_dispatcher::lapses::earliest_lapse(&pool, now).await.unwrap(), None, "its run goes");
 
-    complete(&journal, run).await;
+    complete(&store, run).await;
     let ended = now;
     sqlx::query("UPDATE run SET ended_at = $2 WHERE run_id = $1").bind(run).bind(ended).execute(&pool).await.unwrap();
     let at = weft_dispatcher::lapses::earliest_lapse(&pool, now).await.unwrap().expect("its run ended");
@@ -3203,10 +3203,10 @@ async fn a_resting_task_claim_lapses_only_after_its_run_ended(pool: PgPool) {
 #[sqlx::test]
 async fn a_run_refused_three_times_ends_with_why(pool: PgPool) {
     use weft_dispatcher::delivery::{refused, refused_cause, starting_wait_secs, wait_for_worker, RefusedBy, REFUSALS_TO_END, RETRY_WAITS};
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    let run = queued_run(&journal, id).await;
+    let run = queued_run(&store, id).await;
     let now = weft_dispatcher::lease::now_unix();
 
     wait_for_worker(&pool, run).await.unwrap();
@@ -3221,7 +3221,7 @@ async fn a_run_refused_three_times_ends_with_why(pool: PgPool) {
     }
     assert_eq!(refused(&pool, run).await.unwrap(), Some(REFUSALS_TO_END), "the refusal that ends it");
     // What the delivery then does, through `cancel_run_id`.
-    journal.cancel_run(run, None, &refused_cause(RefusedBy::Worker, "the worker answered 500")).await.unwrap();
+    store.cancel_run(run, None, &refused_cause(RefusedBy::Worker, "the worker answered 500")).await.unwrap();
     assert_eq!(run_column::<String>(&pool, "state", run).await.as_deref(), Some("ended"));
     let cause: serde_json::Value = run_column(&pool, "cancel_cause", run).await.unwrap();
     assert!(cause.to_string().contains("its worker refused it 3 times: the worker answered 500"), "{cause}");
@@ -3236,13 +3236,13 @@ async fn a_run_refused_three_times_ends_with_why(pool: PgPool) {
 #[sqlx::test]
 async fn new_worker_levers_hand_the_refused_runs_out_again(pool: PgPool) {
     use weft_dispatcher::delivery::{refused, unreached};
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let (id, other) = (Uuid::new_v4(), Uuid::new_v4());
     seed_project(&projects, id, "bin-A").await;
     seed_project(&projects, other, "bin-A").await;
-    let run = queued_run(&journal, id).await;
-    let handed = queued_run(&journal, id).await;
-    let elsewhere = queued_run(&journal, other).await;
+    let run = queued_run(&store, id).await;
+    let handed = queued_run(&store, id).await;
+    let elsewhere = queued_run(&store, other).await;
     for refused_run in [run, run, elsewhere] {
         refused(&pool, refused_run).await.unwrap();
     }
@@ -3272,10 +3272,10 @@ async fn new_worker_levers_hand_the_refused_runs_out_again(pool: PgPool) {
 #[sqlx::test]
 async fn a_run_whose_workers_cannot_be_reached_waits_for_what_can_fix_it(pool: PgPool) {
     use weft_dispatcher::delivery::{next_hand_out, take, unreached, RETRY_WAITS, UNREACHED_TO_STOP};
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    let run = queued_run(&journal, id).await;
+    let run = queued_run(&store, id).await;
     let now = weft_dispatcher::lease::now_unix();
     for (n, wait) in RETRY_WAITS.iter().enumerate() {
         assert_eq!(unreached(&pool, run).await.unwrap(), Some(n as i16 + 1));
@@ -3358,11 +3358,11 @@ async fn a_run_whose_workers_cannot_be_reached_waits_for_what_can_fix_it(pool: P
 async fn a_run_its_workers_keep_answering_busy_is_tried_again_with_a_growing_pause(pool: PgPool) {
     use weft_dispatcher::delivery::{busy, busy_wait_cap_secs, busy_wait_secs, next_hand_out};
     use weft_task_store::unanswered::{failed, Callee};
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    let run = queued_run(&journal, id).await;
-    let calm = queued_run(&journal, id).await;
+    let run = queued_run(&store, id).await;
+    let calm = queued_run(&store, id).await;
     let now = weft_dispatcher::lease::now_unix();
     let paused = |pool: PgPool, by: i64| async move {
         let until: i64 = run_column(&pool, "delivered_until", run).await.unwrap();
@@ -3397,7 +3397,7 @@ async fn a_run_its_workers_keep_answering_busy_is_tried_again_with_a_growing_pau
     // busy leaves it, so does the claim of a busy run while another still
     // waits on them answering busy, and the claim of the last clears it
     // and its stretch.
-    let also = queued_run(&journal, id).await;
+    let also = queued_run(&store, id).await;
     busy(&pool, also).await.unwrap().expect("queued");
     failed(&pool, Callee::Workers(id), None, "this project's worker has answered busy for 60 minutes").await.unwrap().log();
     let written = || {
@@ -3421,7 +3421,7 @@ async fn a_run_its_workers_keep_answering_busy_is_tried_again_with_a_growing_pau
 
     // Changing the project's worker levers tries its queued runs afresh,
     // and what was written of its workers goes with those tries.
-    let waiting = queued_run(&journal, id).await;
+    let waiting = queued_run(&store, id).await;
     busy(&pool, waiting).await.unwrap().expect("queued");
     failed(&pool, Callee::Workers(id), None, "this project's worker has answered busy for 60 minutes").await.unwrap().log();
     projects.set_worker_overrides(id, &weft_platform_traits::WorkerOverrides::default()).await.unwrap();
@@ -3432,30 +3432,30 @@ async fn a_run_its_workers_keep_answering_busy_is_tried_again_with_a_growing_pau
     // A busy run that goes without reaching a worker, cancelled or
     // erased, takes what was written of its workers with it, as a claim's
     // does.
-    let cancelled = queued_run(&journal, id).await;
+    let cancelled = queued_run(&store, id).await;
     busy(&pool, cancelled).await.unwrap().expect("queued");
     failed(&pool, Callee::Workers(id), None, "this project's worker has answered busy for 60 minutes").await.unwrap().log();
-    journal.cancel_run(cancelled, None, &weft_core::run::CancelCause::User).await.unwrap();
+    store.cancel_run(cancelled, None, &weft_core::run::CancelCause::User).await.unwrap();
     assert_eq!(run_column::<Option<i64>>(&pool, "busy_since", cancelled).await, Some(None), "an ended run has no stretch");
     assert_eq!(written().await, 0, "a cancelled busy run clears it");
-    let erased = queued_run(&journal, id).await;
+    let erased = queued_run(&store, id).await;
     busy(&pool, erased).await.unwrap().expect("queued");
     failed(&pool, Callee::Workers(id), None, "this project's worker has answered busy for 60 minutes").await.unwrap().log();
-    journal.delete_run(erased).await.unwrap();
+    store.delete_run(erased).await.unwrap();
     assert_eq!(written().await, 0, "an erased busy run clears it");
 
     // One record holds every failure of the project's workers: a busy run
     // going leaves it while a run they could not be reached with, or one
     // they refused, still waits, and the last of those reaching a worker
     // clears it.
-    let gone = queued_run(&journal, id).await;
-    let unreached_run = queued_run(&journal, id).await;
+    let gone = queued_run(&store, id).await;
+    let unreached_run = queued_run(&store, id).await;
     busy(&pool, gone).await.unwrap().expect("queued");
     weft_dispatcher::delivery::unreached(&pool, unreached_run).await.unwrap().expect("queued");
     failed(&pool, Callee::Workers(id), None, "connection refused").await.unwrap().log();
-    journal.cancel_run(gone, None, &weft_core::run::CancelCause::User).await.unwrap();
+    store.cancel_run(gone, None, &weft_core::run::CancelCause::User).await.unwrap();
     assert_eq!(written().await, 1, "the run they could not be reached with still waits: its failure stays");
-    let refused_run = queued_run(&journal, id).await;
+    let refused_run = queued_run(&store, id).await;
     weft_dispatcher::delivery::refused(&pool, refused_run).await.unwrap().expect("queued");
     claim(&pool, unreached_run, id, "worker-a").await;
     assert_eq!(written().await, 1, "the run they refused still waits");
@@ -3466,7 +3466,7 @@ async fn a_run_its_workers_keep_answering_busy_is_tried_again_with_a_growing_pau
     // project came alive) no longer counts its failures, yet it reaching a
     // worker still clears what was written of them.
     use weft_dispatcher::delivery::{take, UNREACHED_TO_STOP};
-    let back = queued_run(&journal, id).await;
+    let back = queued_run(&store, id).await;
     for _ in 0..UNREACHED_TO_STOP {
         weft_dispatcher::delivery::unreached(&pool, back).await.unwrap().expect("queued");
     }
@@ -3501,13 +3501,13 @@ async fn a_run_its_workers_keep_answering_busy_is_tried_again_with_a_growing_pau
 #[sqlx::test]
 async fn a_drain_hears_its_runs_end_and_looks_at_a_vouch_end(pool: PgPool) {
     use weft_dispatcher::drain::{mark_watched, workers_look};
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    let queued = queued_run(&journal, id).await;
-    let parked = queued_run(&journal, id).await;
+    let queued = queued_run(&store, id).await;
+    let parked = queued_run(&store, id).await;
     sqlx::query("UPDATE run SET state = 'parked' WHERE run_id = $1").bind(parked).execute(&pool).await.unwrap();
-    let driven = queued_run(&journal, id).await;
+    let driven = queued_run(&store, id).await;
     claim(&pool, driven, id, "worker-a").await;
 
     let runs = [queued, parked, driven];
@@ -3530,7 +3530,7 @@ async fn a_drain_hears_its_runs_end_and_looks_at_a_vouch_end(pool: PgPool) {
     assert_eq!(workers_look(&pool, id, &weft_dispatcher::drain::AtTheDoor::Every, &runs).await.unwrap(), Some(vouch), "then one look, at the vouch's end, the grace outlived");
 
     let mut flagged = pool.begin().await.unwrap();
-    complete(&journal, queued).await;
+    complete(&store, queued).await;
     assert!(weft_dispatcher::run_ends::take_flagged(&mut flagged, queued).await.unwrap().is_some(), "its ending has somebody to tell");
 }
 
@@ -3539,18 +3539,18 @@ async fn a_drain_hears_its_runs_end_and_looks_at_a_vouch_end(pool: PgPool) {
 /// makes retention look in a loop.
 #[sqlx::test]
 async fn retention_looks_next_at_the_earliest_erasable_keep(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    assert_eq!(journal.next_expiry().await.unwrap(), None);
-    let ended = queued_run(&journal, id).await;
-    complete(&journal, ended).await;
+    assert_eq!(store.next_expiry().await.unwrap(), None);
+    let ended = queued_run(&store, id).await;
+    complete(&store, ended).await;
     sqlx::query("UPDATE run SET keep_until = 120 WHERE run_id = $1").bind(ended).execute(&pool).await.unwrap();
-    assert_eq!(journal.next_expiry().await.unwrap(), Some(120));
-    let flagged = queued_run(&journal, id).await;
-    complete(&journal, flagged).await;
+    assert_eq!(store.next_expiry().await.unwrap(), Some(120));
+    let flagged = queued_run(&store, id).await;
+    complete(&store, flagged).await;
     sqlx::query("UPDATE run SET keep_until = 0, watch_end = TRUE WHERE run_id = $1").bind(flagged).execute(&pool).await.unwrap();
-    assert_eq!(journal.next_expiry().await.unwrap(), Some(120), "the flagged run waits for its ending to be handled");
+    assert_eq!(store.next_expiry().await.unwrap(), Some(120), "the flagged run waits for its ending to be handled");
 }
 
 /// A resync holds the project's transition from before its take-down to
@@ -3570,7 +3570,7 @@ async fn retention_looks_next_at_the_earliest_erasable_keep(pool: PgPool) {
 async fn a_resync_keeps_builds_and_other_activations_out_until_it_lets_go(pool: PgPool) {
     use weft_dispatcher::activation_store::ClaimRefused;
     use weft_dispatcher::task_kinds::resync::{task, ResyncOwner, ResyncPlan, Stopped};
-    let (_journal, projects) = setup(&pool).await;
+    let (_store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
@@ -3728,21 +3728,21 @@ async fn a_resync_keeps_builds_and_other_activations_out_until_it_lets_go(pool: 
 /// nothing there ends.
 #[sqlx::test]
 async fn a_failed_reactivation_keeps_what_the_park_kept(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let first = Uuid::new_v4();
     activations.try_begin_activating(id, &[feed_key()], first, None, None).await.unwrap().expect("claim");
-    journal.signal_insert(&governed_entry("kept-entry", id, first)).await.unwrap();
+    store.signal_insert(&governed_entry("kept-entry", id, first)).await.unwrap();
     activations.end_activating(id, first, &ActivationLifecycle::active(), false, None).await.unwrap().expect("active");
-    let waiting_run = queued_run(&journal, id).await;
+    let waiting_run = queued_run(&store, id).await;
     let mut wait = entry_signal("kept-wait", id);
     wait.node_id = "ask".into();
     wait.is_resume = true;
     wait.run_id = Some(waiting_run);
     wait.activation_trigger = Some("feed".into());
-    journal.signal_insert(&wait).await.unwrap();
+    store.signal_insert(&wait).await.unwrap();
     activations.set_lifecycle_guarded(id, &[feed_key()], &ActivationLifecycle::holding(), SignalsGoing::Kept, Forget::Nothing, DownCause::Person, None).await.unwrap();
     assert_eq!(park(&pool, "kept-entry", &parked(0, 0), None).await.unwrap(), ParkAppend::Parked);
     assert_eq!(park(&pool, "kept-wait", &parked(0, 0), None).await.unwrap(), ParkAppend::Parked);
@@ -3759,7 +3759,7 @@ async fn a_failed_reactivation_keeps_what_the_park_kept(pool: PgPool) {
     let after = activations.list(id).await.unwrap();
     assert_eq!(after[0].lifecycle.mode().as_str(), "take", "the trigger is down again, its door taking");
     for token in ["kept-entry", "kept-wait"] {
-        assert!(journal.signal_get(token).await.unwrap().is_some(), "{token} kept");
+        assert!(store.signal_get(token).await.unwrap().is_some(), "{token} kept");
         assert_eq!(parked_on(token).await, 1, "and what waits on {token} too");
     }
 
@@ -3771,7 +3771,7 @@ async fn a_failed_reactivation_keeps_what_the_park_kept(pool: PgPool) {
         .unwrap()
         .expect("owned");
     assert_eq!(removed.iter().map(|s| s.token.as_str()).collect::<Vec<_>>(), ["kept-entry"], "only the entry row goes");
-    assert!(journal.signal_get("kept-wait").await.unwrap().is_some(), "the run's wait stays");
+    assert!(store.signal_get("kept-wait").await.unwrap().is_some(), "the run's wait stays");
     assert_eq!(parked_on("kept-wait").await, 1, "with the answer sent to it");
 }
 
@@ -3780,13 +3780,13 @@ async fn a_failed_reactivation_keeps_what_the_park_kept(pool: PgPool) {
 /// waits on it; over triggers that kept none, it wipes them.
 #[sqlx::test]
 async fn an_unfinished_activation_keeps_what_its_triggers_kept(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+    let (store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     let first = Uuid::new_v4();
     activations.try_begin_activating(id, &[feed_key()], first, None, None).await.unwrap().expect("claim");
-    journal.signal_insert(&governed_entry("kept-entry", id, first)).await.unwrap();
+    store.signal_insert(&governed_entry("kept-entry", id, first)).await.unwrap();
     activations.end_activating(id, first, &ActivationLifecycle::active(), false, None).await.unwrap().expect("active");
     activations.set_lifecycle_guarded(id, &[feed_key()], &ActivationLifecycle::holding(), SignalsGoing::Kept, Forget::Nothing, DownCause::Person, None).await.unwrap();
     assert_eq!(park(&pool, "kept-entry", &parked(0, 0), None).await.unwrap(), ParkAppend::Parked);

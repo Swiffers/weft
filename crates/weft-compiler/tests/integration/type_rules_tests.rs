@@ -10,7 +10,8 @@ use weft_catalog::{stdlib_root, FsCatalog};
 use weft_compiler::enrich::enrich_collecting;
 use weft_compiler::enrich::EnrichPolicy;
 use weft_compiler::validate::validate;
-use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+use weft_compiler::weft_compiler::IncludeMode;
+use crate::rig::compile_with_mode;
 use weft_compiler::{CompileFs, Diagnostic};
 use weft_core::weft_type::WeftType;
 

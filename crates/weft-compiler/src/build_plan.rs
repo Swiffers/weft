@@ -20,7 +20,7 @@
 //! ref stops matching, so it rebuilds; change nothing and every ref is present, so
 //! nothing rebuilds. There is no separate stamp to keep in sync.
 
-use crate::error::CompileResult;
+use crate::error::BuildResult;
 use crate::image_set::{self, InfraImage};
 use crate::project::Project;
 
@@ -117,7 +117,7 @@ pub fn plan_build_from(
     bases: &crate::worker_image::BaseImages,
     tags: &dyn TagPolicy,
     node_set: weft_core::builds::NodeSet,
-) -> CompileResult<BuildPlan> {
+) -> BuildResult<BuildPlan> {
     let weft_root = crate::build::resolve_weft_root()?;
     let implementations = crate::hash::implementation_hashes(definition, project, &weft_root, catalog, node_set)?;
 

@@ -291,7 +291,7 @@ pub async fn take_down(
     // could not let go of is marked for the door-windows loop to tell it
     // again.
     if take_down.door == Door::Refuse && matches!(signals, SignalsGoing::Kept) && !keys.is_empty() {
-        let kept = crate::journal::postgres::activation_signals(&state.pg_pool, project_id, &keys)
+        let kept = crate::store::postgres::activation_signals(&state.pg_pool, project_id, &keys)
             .await
             .map_err(|e| internal("the signals to let go of", e))?;
         let refused = crate::listener::let_go_of_stopped(&state.pg_pool, &state.listener, &kept)

@@ -503,14 +503,20 @@ mod tests {
             std::fs::write(dir.path().join(name), text).unwrap();
         }
         let catalog = weft_catalog::FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
-        weft_compiler::compile_checked(
+        let (definition, diagnostics) = weft_compiler::compile_strict(
             source,
             uuid::Uuid::new_v4(),
             weft_compiler::CompileFs::disk(dir.path()),
             &catalog,
             weft_compiler::validate::ValidationMode::Structural,
-        )
-        .expect("compiles")
+            None,
+        );
+        assert!(
+            !diagnostics.iter().any(|d| matches!(d.severity, weft_compiler::Severity::Error)),
+            "compiles: {}",
+            weft_compiler::render_diagnostics(&diagnostics)
+        );
+        definition
     }
 
     fn checked(definition: &weft_core::ProjectDefinition, targets: &[&str]) -> serde_json::Value {
@@ -533,8 +539,8 @@ mod tests {
     /// itself, spelled by its site, and only the site the run reaches.
     #[test]
     fn a_check_names_the_infra_a_run_reads() {
-        let direct = compiled("postgres_database_1 = PostgresDatabase\ndebug_1 = Debug\ndebug_1.data = postgres_database_1.access\n", &[]);
-        assert_eq!(checked(&direct, &["debug_1"]), serde_json::json!({ "ok": true, "infraRead": [{ "node": "postgres_database_1" }] }));
+        let direct = compiled("postgresDatabase1 = PostgresDatabase\ndebug1 = Debug\ndebug1.data = postgresDatabase1.access\n", &[]);
+        assert_eq!(checked(&direct, &["debug1"]), serde_json::json!({ "ok": true, "infraRead": [{ "node": "postgresDatabase1" }] }));
 
         let store = "Group() -> (conn: Access) {\n  db = PostgresDatabase\n  self.conn = db.access\n}\n";
         let included = compiled(

@@ -12,4 +12,5 @@ mod db_lifecycle;
 mod db_project_ports;
 mod db_proxy;
 mod db_tags;
+mod db_tenant_isolation;
 mod db_versions;

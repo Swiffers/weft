@@ -2,9 +2,8 @@
 //! weft source, enriches strictly, then asserts on the diagnostics.
 
 use weft_catalog::{stdlib_root, FsCatalog};
-use weft_compiler::enrich::enrich;
 use weft_compiler::validate::validate;
-use weft_compiler::weft_compiler::compile;
+use crate::rig::{compile, enrich};
 use weft_compiler::{CompileFs, Diagnostic, Severity};
 
 fn catalog() -> FsCatalog {
@@ -18,7 +17,8 @@ fn catalog() -> FsCatalog {
 const COMPONENT: Option<&str> = Some("Component");
 
 fn parse_enrich(source: &str) -> weft_core::ProjectDefinition {
-    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    use crate::rig::compile_with_mode;
+    use weft_compiler::weft_compiler::IncludeMode;
     let mut project = compile_with_mode(source, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Full, COMPONENT)
         .expect("compile ok");
     enrich(&mut project, &catalog()).expect("enrich ok");
@@ -540,7 +540,8 @@ fn a_durable_trigger_that_is_not_recorded_is_refused() {
 /// declares the type of its `response`.
 #[test]
 fn llm_inference_takes_no_added_output_ports() {
-    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    use crate::rig::compile_with_mode;
+    use weft_compiler::weft_compiler::IncludeMode;
     let mut project = compile_with_mode(
         "n = LlmInference -> (verdict: String) { prompt: \"judge\" }\n",
         uuid::Uuid::new_v4(),
@@ -559,11 +560,11 @@ fn llm_inference_takes_no_added_output_ports() {
 
 // ─── Loop validate tests ────────────────────────────────────────────────────
 
-fn parse_enrich_lenient(source: &str) -> (weft_core::ProjectDefinition, Vec<weft_compiler::weft_compiler::CompileError>) {
+fn parse_enrich_lenient(source: &str) -> (weft_core::ProjectDefinition, Vec<weft_compiler::weft_compiler::SourceError>) {
     use weft_compiler::weft_compiler::{compile_lenient, IncludeMode};
     let (mut project, errs) = compile_lenient(source, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, COMPONENT);
     // Use lenient enrich so an unknown type doesn't bail before validate runs.
-    let _ = weft_compiler::enrich::enrich_with_policy(&mut project, &catalog(), weft_compiler::enrich::EnrichPolicy::Lenient);
+    let _ = weft_compiler::enrich::enrich_collecting(&mut project, &catalog(), weft_compiler::enrich::EnrichPolicy::Lenient);
     (project, errs)
 }
 
@@ -1425,7 +1426,7 @@ q = HumanQuery(fields: List[JsonDict]) { title: "t" }
     )
     .expect("compile ok");
     let err = enrich(&mut project, &catalog()).expect_err("a compiler-read input as a port must fail enrich");
-    let msg = format!("{err}");
+    let msg = err;
     assert!(msg.contains("read by the compiler"), "{msg}");
 }
 
@@ -1526,31 +1527,30 @@ count.items = py.b
 sink = Debug
 sink.data = count.n
 "#;
-    let result = weft_compiler::compile_checked(
-        wired,
-        uuid::Uuid::new_v4(),
-        CompileFs::none(),
-        &catalog(),
-        weft_compiler::validate::ValidationMode::Structural,
-    );
-    assert!(result.is_ok(), "a wired List[T] must resolve: {:?}", result.err());
+    let errors = |source: &str| -> Vec<Diagnostic> {
+        let (_, diagnostics) = weft_compiler::compile_strict(
+            source,
+            uuid::Uuid::new_v4(),
+            CompileFs::none(),
+            &catalog(),
+            weft_compiler::validate::ValidationMode::Structural,
+            None,
+        );
+        diagnostics.into_iter().filter(|d| matches!(d.severity, Severity::Error)).collect()
+    };
+    let wired_errors = errors(wired);
+    assert!(wired_errors.is_empty(), "a wired List[T] must resolve: {wired_errors:?}");
 
     let unwired = r#"
 make = ExecPython() -> (items: List[T]) { code: "return {'items': []}" }
 sink = Debug
 sink.data = make.items
 "#;
-    let err = weft_compiler::compile_checked(
-        unwired,
-        uuid::Uuid::new_v4(),
-        CompileFs::none(),
-        &catalog(),
-        weft_compiler::validate::ValidationMode::Structural,
-    )
-    .expect_err("an unwired List[T] port must be refused");
+    let refused = errors(unwired);
+    assert!(!refused.is_empty(), "an unwired List[T] port must be refused");
     // Nothing binds `T`: the output stays `List[T]`, and the wire out of
     // it is refused.
-    let err = format!("{err:?}");
+    let err = weft_compiler::render_diagnostics(&refused);
     assert!(err.contains("source port 'make.items' type 'List[T]' unresolved"), "{err}");
 }
 
@@ -2649,7 +2649,8 @@ fn an_access_nodes_connection_is_picked_on_the_install() {
 /// fix and the page that explains it.
 #[test]
 fn a_connection_written_in_the_source_is_refused() {
-    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    use crate::rig::compile_with_mode;
+    use weft_compiler::weft_compiler::IncludeMode;
     let mut project = compile_with_mode(
         "ws = SlackAccess { account: {\"id\":\"g-1\",\"identity\":\"q\"} }\n",
         uuid::Uuid::new_v4(),
@@ -2665,7 +2666,8 @@ fn a_connection_written_in_the_source_is_refused() {
 
 #[test]
 fn an_instances_fallback_connection_is_refused() {
-    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    use crate::rig::compile_with_mode;
+    use weft_compiler::weft_compiler::IncludeMode;
     let mut project = compile_with_mode(
         "ws = SlackAccess { account: @instance_filled({\"id\":\"g-1\",\"identity\":\"q\"}) }\n",
         uuid::Uuid::new_v4(),
@@ -4903,7 +4905,8 @@ fn a_component_root_input_is_the_include_sites_to_connect() {
 
     // A component that itself includes a file: that file's body sits at
     // the top level beside the root and leaves it a component.
-    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    use crate::rig::compile_with_mode;
+    use weft_compiler::weft_compiler::IncludeMode;
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("echo.weft"), "Group(v: String) -> (out: String) {\n  self.out = self.v\n}\n").unwrap();
     let nesting = "Group(chat: String) -> (out: String) {\n  e = @include(\"echo.weft\")\n  f = Format(y: String) { template: \"{{y}}\", y: self.chat }\n  e.v = f.text\n  self.out = e.out\n}\n";
@@ -5228,7 +5231,8 @@ fn a_node_types_own_snake_case_input_is_the_catalogs_warning_not_the_programs() 
         catalog.warnings()
     );
 
-    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    use crate::rig::compile_with_mode;
+    use weft_compiler::weft_compiler::IncludeMode;
     let source = r#"
 first = Shout { user_name: "ada" }
 second = Shout(user_name: String) -> (out: String) { user_name: "bob" }

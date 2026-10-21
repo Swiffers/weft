@@ -18,7 +18,7 @@
 /** The listing's query parameters a search stands for, or why it does not read. */
 export type RunSearch = { params: Record<string, string> } | { error: string };
 
-// SYNC: STATUSES <-> crates/weft-core/src/program.rs RunStatus, crates/weft-dispatcher/src/journal/postgres.rs list_runs (status clause)
+// SYNC: STATUSES <-> crates/weft-core/src/program.rs RunStatus, crates/weft-dispatcher/src/store/postgres.rs list_runs (status clause)
 const STATUSES = ['running', 'waiting_for_input', 'completed', 'failed', 'cancelled'];
 
 const UNITS: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 };

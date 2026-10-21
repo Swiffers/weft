@@ -344,14 +344,14 @@ pub fn emit_port_closure(
     Ok(())
 }
 
-/// A boundary's closure sweep: first close, WITH its error, every
-/// output whose same-named input arrived as a failed closure
+/// A loop's `LoopIn` closure sweep, run by each iteration's launch
+/// (`loop_runtime`): first close, WITH its error, every inside output
+/// whose same-named outer input arrived as a failed closure
 /// (`closed_failures`, from the firing input), then close everything
 /// else the firing did not mention plainly. The one place a boundary
-/// forwards a failure as a failure, shared by the group passthrough and
-/// the loop's per-iteration launch so the two cannot drift: a port the
-/// node does not declare as an output, or one the firing mentioned, is
-/// left to the plain sweep's own rules.
+/// forwards a failure as a failure: a port the node does not declare as
+/// an output, or one the firing mentioned, is left to the plain sweep's
+/// own rules.
 #[allow(clippy::too_many_arguments)]
 pub fn close_failed_then_unmentioned_downstream(
     node_id: &str,

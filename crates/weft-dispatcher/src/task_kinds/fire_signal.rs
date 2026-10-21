@@ -84,7 +84,7 @@ impl TaskExecutor<DispatcherState> for FireSignalExecutor {
 /// work (it holds it again if a reactivation lands meanwhile). A row gone
 /// was let go of by whatever removed it.
 async fn let_go_of_it(state: &DispatcherState, token: &str) -> Result<()> {
-    if let Some(signal) = state.journal.signal_get(token).await? {
+    if let Some(signal) = state.registrations.signal_get(token).await? {
         // What it could not let go of is marked on its row, and the
         // door-windows loop tells the listener again; so does its next fire.
         let signals = std::slice::from_ref(&signal);

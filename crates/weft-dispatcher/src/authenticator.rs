@@ -30,7 +30,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use crate::journal::Journal;
+use crate::store::{RunStore, TokenStore};
 use weft_core::signal_token::TokenKind;
 use crate::state::DispatcherState;
 use crate::tenant::TenantId;
@@ -71,7 +71,7 @@ pub struct Caller {
 /// hashed credentials; an authenticator that needs none ignores it.
 #[async_trait::async_trait]
 pub trait Authenticator: Send + Sync {
-    async fn authenticate(&self, headers: &HeaderMap, tokens: &dyn Journal) -> Result<Caller, AuthError>;
+    async fn authenticate(&self, headers: &HeaderMap, tokens: &dyn TokenStore) -> Result<Caller, AuthError>;
 }
 
 /// The local install's authenticator: every request is tenant `local`, the
@@ -80,7 +80,7 @@ pub struct LocalAuthenticator;
 
 #[async_trait::async_trait]
 impl Authenticator for LocalAuthenticator {
-    async fn authenticate(&self, _headers: &HeaderMap, _tokens: &dyn Journal) -> Result<Caller, AuthError> {
+    async fn authenticate(&self, _headers: &HeaderMap, _tokens: &dyn TokenStore) -> Result<Caller, AuthError> {
         Ok(Caller { tenant: TenantId::local(), control_plane: true })
     }
 }
@@ -98,7 +98,7 @@ pub struct OperatorKeyAuthenticator {
 
 #[async_trait::async_trait]
 impl Authenticator for OperatorKeyAuthenticator {
-    async fn authenticate(&self, headers: &HeaderMap, tokens: &dyn Journal) -> Result<Caller, AuthError> {
+    async fn authenticate(&self, headers: &HeaderMap, tokens: &dyn TokenStore) -> Result<Caller, AuthError> {
         let presented = bearer(headers)?;
         let hash = weft_core::signal_token::token_hash(presented);
         let row = tokens
@@ -114,7 +114,7 @@ impl Authenticator for OperatorKeyAuthenticator {
 /// The rule [`OperatorKeyAuthenticator`] applies to a found row, apart so it
 /// is testable without a store: an operator key of this install's tenant.
 /// A caller token (a frontend's) is refused here whatever its scope.
-fn check_operator(row: &crate::journal::SignalToken, tenant: &TenantId, now: u64) -> Result<(), AuthError> {
+fn check_operator(row: &crate::store::SignalToken, tenant: &TenantId, now: u64) -> Result<(), AuthError> {
     if row.kind != TokenKind::Operator {
         return Err(AuthError::Invalid("a caller token cannot administer the install".into()));
     }
@@ -148,7 +148,7 @@ pub async fn require_caller(
     mut request: Request,
     next: Next,
 ) -> Response {
-    match state.authenticator.authenticate(request.headers(), &*state.journal).await {
+    match state.authenticator.authenticate(request.headers(), &*state.tokens).await {
         Ok(caller) => {
             request.extensions_mut().insert(caller);
             next.run(request).await
@@ -253,7 +253,7 @@ pub async fn authorize_project(
 /// handlers need next.
 ///
 /// Deliberately NOT `authorize_project` on the run's project: a
-/// run outlives its project (the journal is the record of what
+/// run outlives its project (its record is the record of what
 /// ran, and `weft rm` takes only the project), so asking the project
 /// store made every run of a removed project un-replayable and
 /// UNDELETABLE, with `weft clean` (the documented way to remove them)
@@ -264,15 +264,15 @@ pub async fn authorize_project(
 /// A run with no `run` row is `NOT_FOUND`, the same
 /// answer as a cross-tenant run, so neither leaks the other's
 /// existence.
-/// Takes the JOURNAL, not the whole state: the run's own row is
+/// Takes the RUN STORE, not the whole state: the run's own row is
 /// the only thing this consults, and saying so in the signature is
 /// what keeps a future edit from reaching for the project store again.
 pub async fn authorize_run(
-    journal: &dyn crate::journal::Journal,
+    runs: &dyn RunStore,
     caller: &TenantId,
     run_id: weft_core::RunId,
-) -> Result<crate::journal::RunOwner, (StatusCode, String)> {
-    let owner = match journal.run_owner(run_id).await {
+) -> Result<crate::store::RunOwner, (StatusCode, String)> {
+    let owner = match runs.run_owner(run_id).await {
         Ok(Some(o)) => o,
         Ok(None) => return Err((StatusCode::NOT_FOUND, "not found".to_string())),
         Err(e) => {
@@ -291,7 +291,7 @@ pub async fn authorize_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::journal::SignalToken;
+    use crate::store::SignalToken;
 
     fn row(kind: TokenKind, tenant: &str) -> SignalToken {
         SignalToken {
@@ -335,25 +335,25 @@ mod tests {
 
     #[tokio::test]
     async fn local_answers_local_for_any_request() {
-        let journal = crate::journal::fake::FakeJournal::default();
+        let tokens = crate::store::FakeStore::default();
         let mut h = HeaderMap::new();
         h.insert("authorization", "Bearer whatever".parse().unwrap());
-        let caller = LocalAuthenticator.authenticate(&h, &journal).await.unwrap();
+        let caller = LocalAuthenticator.authenticate(&h, &tokens).await.unwrap();
         assert_eq!(caller, Caller { tenant: TenantId::local(), control_plane: true });
     }
 
     #[tokio::test]
     async fn an_operator_key_authenticates_until_revoked() {
-        let journal = crate::journal::fake::FakeJournal::default();
+        let tokens = crate::store::FakeStore::default();
         let key = weft_core::signal_token::generate_token();
         let mut minted = row(TokenKind::Operator, "local");
         minted.token_hash = weft_core::signal_token::token_hash(&key);
-        journal.mint_signal_token(&minted).await.unwrap();
+        tokens.mint_signal_token(&minted).await.unwrap();
         let auth = OperatorKeyAuthenticator { tenant: TenantId::local() };
         let mut h = HeaderMap::new();
         h.insert("authorization", format!("Bearer {key}").parse().unwrap());
-        assert!(auth.authenticate(&h, &journal).await.is_ok());
-        assert!(journal.revoke_signal_token(minted.id, "local").await.unwrap());
-        assert!(auth.authenticate(&h, &journal).await.is_err(), "revocation is immediate");
+        assert!(auth.authenticate(&h, &tokens).await.is_ok());
+        assert!(tokens.revoke_signal_token(minted.id, "local").await.unwrap());
+        assert!(auth.authenticate(&h, &tokens).await.is_err(), "revocation is immediate");
     }
 }

@@ -15,7 +15,7 @@ use weft_core::run::CancelCause;
 use weft_core::RunId;
 
 use crate::authenticator::{authorize_run, authorize_project, CallerTenant};
-use crate::journal::RunListQuery;
+use crate::store::RunListQuery;
 use weft_core::program::{DeletedRun, RunDetail, RunPage, ParkedWait, ResolvedRun};
 use crate::events::DispatcherEvent;
 use crate::state::DispatcherState;
@@ -41,7 +41,7 @@ pub async fn resolve_run_id(
         ));
     }
     let matches = state
-        .journal
+        .runs
         .run_ids_with_prefix(caller.0.as_str(), &prefix)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("run_ids_with_prefix: {e}")))?;
@@ -77,13 +77,13 @@ pub async fn cancel(
     let run_id: RunId = run_id_str
         .parse()
         .map_err(|e: uuid::Error| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    authorize_run(&*state.journal, &caller.0, run_id).await?;
+    authorize_run(&*state.runs, &caller.0, run_id).await?;
     // A run that already ended has nothing to cancel: said so, with
     // its status, instead of a silent no-op the caller would wait on
     // forever (the editor's Stop once sat on "Cancelling..." for a run
     // that had finished an hour before).
     if let Some(summary) = state
-        .journal
+        .runs
         .run_summary(run_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("run summary: {e}")))?
@@ -156,7 +156,7 @@ pub async fn cancel_run_ids(
 /// (`weft stop`, the sweeps, a sibling run's `stop_tagged`, a drain at its
 /// deadline) goes through here and says why.
 ///
-/// The durable part is ONE transaction (`Journal::cancel_run`),
+/// The durable part is ONE transaction (`RunStore::cancel_run`),
 /// under the run's row lock: its wake signals go, and then
 ///
 ///   - a run a worker drives gets its `cancel_requested` set and the
@@ -190,7 +190,7 @@ pub async fn cancel_run_id(
     // has no nodes to cancel, and a program that cannot be found is no
     // reason to leave the run running: the terminal lands anyway.
     let program = program_for_cancel(state, run_id).await?;
-    let write = state.journal.cancel_run(run_id, program.as_deref(), cause).await?;
+    let write = state.runs.cancel_run(run_id, program.as_deref(), cause).await?;
     state.listener.unregister_many(&write.removed).await;
     tracing::info!(
         target: "weft_dispatcher::cancel",
@@ -330,14 +330,14 @@ pub async fn get(
     Path(run_id_str): Path<String>,
 ) -> Result<Json<RunDetail>, StatusCode> {
     let run_id: RunId = run_id_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    authorize_run(&*state.journal, &caller.0, run_id)
+    authorize_run(&*state.runs, &caller.0, run_id)
         .await
         .map_err(|(s, _)| s)?;
     // Direct point-lookup by run (authorization above already proved the
     // caller owns it), so a run older than any list window still
     // resolves instead of 404ing.
     let summary = state
-        .journal
+        .runs
         .run_summary(run_id)
         .await
         .map_err(failed("read the run's summary"))?
@@ -358,11 +358,11 @@ pub async fn get(
 /// The waits of `run_id`, from the resume-signal rows that make it
 /// `waiting_for_input`, in registration order.
 async fn parked_waits(state: &DispatcherState, run_id: RunId) -> anyhow::Result<Vec<ParkedWait>> {
-    let signals = state.journal.signal_list_for_run_id(run_id).await?;
+    let signals = state.registrations.signal_list_for_run_id(run_id).await?;
     waits_of(&signals, run_id)
 }
 
-fn waits_of(signals: &[crate::journal::SignalRegistration], run_id: RunId) -> anyhow::Result<Vec<ParkedWait>> {
+fn waits_of(signals: &[crate::store::SignalRegistration], run_id: RunId) -> anyhow::Result<Vec<ParkedWait>> {
     signals
         .iter()
         .filter(|s| s.is_resume && s.run_id == Some(run_id))
@@ -374,7 +374,7 @@ fn waits_of(signals: &[crate::journal::SignalRegistration], run_id: RunId) -> an
 }
 
 /// How many log lines one read returns, and the ceiling on asking for
-/// more. The journal answers with the TAIL, so the default holds the
+/// more. `RunStore::logs_for` answers with the TAIL, so the default holds the
 /// end of a long run, which is where a run goes wrong. A `limit`
 /// outside `1..=MAX` is refused, not quietly moved: a caller who
 /// asked for more than the ceiling would otherwise read a cut log as
@@ -397,7 +397,7 @@ pub async fn list_logs(
     let run_id: RunId = run_id_str
         .parse()
         .map_err(|_| (StatusCode::BAD_REQUEST, format!("'{run_id_str}' is not a run id (a uuid)")))?;
-    authorize_run(&*state.journal, &caller.0, run_id).await?;
+    authorize_run(&*state.runs, &caller.0, run_id).await?;
     let limit = params.limit.unwrap_or(DEFAULT_LOG_LINES);
     if !(1..=MAX_LOG_LINES).contains(&limit) {
         return Err((
@@ -431,7 +431,7 @@ pub async fn outputs(
     Path(run_id_str): Path<String>,
 ) -> Result<Json<weft_core::run_spec::Expected>, (StatusCode, String)> {
     let run_id: RunId = run_id_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad run".into()))?;
-    let owner = authorize_run(&*state.journal, &caller.0, run_id).await?;
+    let owner = authorize_run(&*state.runs, &caller.0, run_id).await?;
     let sources = crate::projection::reconstruct_run(&state, run_id).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read output history: {error:#}")))?;
     let fold = &sources[&run_id];
@@ -479,7 +479,7 @@ pub async fn node_state(
     Path((run_id_str, node)): Path<(String, String)>,
 ) -> Result<Json<weft_core::program::NodeState>, (StatusCode, String)> {
     let run_id: RunId = run_id_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, format!("'{run_id_str}' is not a run id")))?;
-    let project_id = authorize_run(&*state.journal, &caller.0, run_id).await?.project_id;
+    let project_id = authorize_run(&*state.runs, &caller.0, run_id).await?.project_id;
     Ok(Json(crate::node_state::read(&state, project_id, run_id, &node).await?))
 }
 
@@ -498,7 +498,7 @@ pub async fn replay(
     // run is 404, and the resolved project rides back for the
     // replay's event attribution.
     let project_id =
-        authorize_run(&*state.journal, &caller.0, run_id).await.map_err(|(s, _)| s)?.project_id;
+        authorize_run(&*state.runs, &caller.0, run_id).await.map_err(|(s, _)| s)?.project_id;
     // The full record, folded over the run's program through the SAME
     // projection the live view runs (`crate::live_view`), so replay and
     // live cannot drift; bus and caller events ride along.
@@ -506,7 +506,7 @@ pub async fn replay(
     // that no longer decodes lands below as its own JournalCorruption
     // entry, naming `weft clean`, instead of taking the response down.
     let (raw_events, unreadable_rows) =
-        state.journal.events_log_lossy(run_id).await.map_err(|e| {
+        state.runs.events_log_lossy(run_id).await.map_err(|e| {
             tracing::error!(
                 target: "weft_dispatcher::api",
                 %run_id, error = %e,
@@ -565,7 +565,7 @@ pub async fn replay(
     // A run parked now says so after its history: parking writes no
     // record row, and a reader that takes the history before the live
     // events (`weft wait --waiting-for-input`) learns here that it waits.
-    let summary = state.journal.run_summary(run_id).await.map_err(|e| {
+    let summary = state.runs.run_summary(run_id).await.map_err(|e| {
         tracing::error!(target: "weft_dispatcher::api", %run_id, error = %e, "replay: reading the run's status failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -651,7 +651,7 @@ pub async fn list_runs(
         below,
     };
     let page = state
-        .journal
+        .runs
         .list_runs(caller.0.as_str(), &query)
         .await
         .map_err(failed("list runs"))?;
@@ -687,7 +687,7 @@ pub async fn latest_for_project(
         below: None,
     };
     let page = state
-        .journal
+        .runs
         .list_runs(caller.0.as_str(), &query)
         .await
         .map_err(failed("list runs"))?;
@@ -715,7 +715,7 @@ pub async fn wake(
     let run_id: RunId = run_id_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad run".to_string()))?;
     // Authorization only: the run's own waits are read below, and the
     // wall this crosses is the caller's tenancy, not the project id.
-    authorize_run(&*state.journal, &caller.0, run_id).await?;
+    authorize_run(&*state.runs, &caller.0, run_id).await?;
     let waits = parked_waits(&state, run_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signals: {e}")))?;
@@ -796,7 +796,7 @@ pub(crate) async fn clean_runs(
     let mut swept_projects: std::collections::BTreeSet<uuid::Uuid> = Default::default();
     loop {
         let page = state
-            .journal
+            .runs
             .list_runs(
                 tenant.as_str(),
                 &RunListQuery { below, ..query.clone() },
@@ -844,7 +844,7 @@ pub(crate) async fn clean_runs(
     Ok(outcome)
 }
 
-/// THE reading of a [`weft_core::program::RunFilter`] as a journal query,
+/// THE reading of a [`weft_core::program::RunFilter`] as a run store query,
 /// shared by every door that takes one (clean, list, count), so they
 /// reach the same runs. Its upper start bound is fixed at `now`: a run
 /// that starts after the question is never part of the answer, and
@@ -887,7 +887,7 @@ pub(crate) async fn list_project_runs(
     }
     let query = run_query(Some(project), filter, limit, crate::lease::now_unix() as u64);
     let page = state
-        .journal
+        .runs
         .list_runs(tenant.as_str(), &query)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list runs: {e:#}")))?;
@@ -903,7 +903,7 @@ pub(crate) async fn count_runs(
 ) -> Result<u64, (StatusCode, String)> {
     let query = run_query(Some(project), filter, 0, crate::lease::now_unix() as u64);
     let page = state
-        .journal
+        .runs
         .list_runs(tenant.as_str(), &query)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("count runs: {e:#}")))?;
@@ -957,7 +957,7 @@ pub(crate) async fn clean_run(
     // under, so the wipe below addresses the same bytes the run
     // created even for a project that has since been removed (asking
     // the project store for the tenant would fail exactly there).
-    let owner = authorize_run(&*state.journal, caller, run_id).await?;
+    let owner = authorize_run(&*state.runs, caller, run_id).await?;
     // Wipe the run's storage folder (kept survivors included:
     // `weft clean <run_id>` IS the explicit removal verb for them)
     // BEFORE the journal rows go, while the run's row still exists.
@@ -986,7 +986,7 @@ pub(crate) async fn clean_run(
         (StatusCode::INTERNAL_SERVER_ERROR, "could not move head off this run; nothing was deleted, retry".to_string())
     })?;
     let removed = state
-        .journal
+        .runs
         .delete_run(run_id)
         .await
         .map_err(|e| (failed("delete the run")(e), "could not delete the run's journal; retry".to_string()))?;
@@ -1008,8 +1008,8 @@ pub(crate) async fn clean_run(
 mod waits_tests {
     use super::*;
 
-    fn signal(token: &str, run_id: Option<RunId>, node: &str, is_resume: bool, kind: &str) -> crate::journal::SignalRegistration {
-        crate::journal::SignalRegistration {
+    fn signal(token: &str, run_id: Option<RunId>, node: &str, is_resume: bool, kind: &str) -> crate::store::SignalRegistration {
+        crate::store::SignalRegistration {
             instance: None,
             activation_trigger: None,
             source_version: None,

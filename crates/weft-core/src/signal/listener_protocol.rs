@@ -14,10 +14,12 @@
 //! - listener owns kind-specific state (timer schedules, SSE
 //!   connections, held sockets). A signal that keeps a connection open
 //!   between fires is held by a holder (the listener's code where
-//!   something stays up), which claims its row. When a held event fires,
-//!   the listener enqueues a `FireSignal` task via the broker; the
-//!   dispatcher's task picker drives it through the same routing as
-//!   a stateless fire.
+//!   something stays up), which claims its row. When an event the
+//!   listener raises itself fires (a timer's tick, an event on a held
+//!   connection), the listener routes it the way the dispatcher routes
+//!   a `/process` outcome: an entry's event straight to its project's
+//!   worker door, an answer to a waiting run as a `FireSignal` task
+//!   through the broker, which the dispatcher's task picker runs.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -344,27 +346,40 @@ pub struct MatchPushResponse {
     pub matched: Vec<MatchedPush>,
 }
 
-/// Outcome of one stateless fire's listener-side processing. Two
-/// orthogonal facts in one shape:
+/// What a signal's kind made of one event, from the listener's
+/// `/process` (an event that reached the install's doors) or from the
+/// listener's own fires (a timer's tick, an event on a held connection).
+/// Two orthogonal facts in one shape:
 ///
-///   - `value`: what the listener computed from the payload. Today
-///     most kinds echo the raw payload; future kinds may validate
-///     against a schema, decorate with metadata, or shape across a
-///     multi-step protocol. The dispatcher writes this verbatim
-///     into the journal.
+///   - `value`: what the kind computed from the payload (most kinds
+///     echo it). Whoever acts on the outcome hands it on unchanged: as
+///     the fire's payload at an entry's worker door, or as the answer a
+///     waiting run receives.
 ///
-///   - `target`: where the dispatcher should route this fire. This
-///     is kind-unaware: every kind picks one of the same three
-///     targets. New routing targets land without touching any kind
-///     module; new kinds land without touching dispatcher routing.
+///   - `target`: where the event goes. This is kind-unaware: every kind
+///     picks one of the same three targets, so new kinds land without
+///     touching the dispatcher's routing.
 ///
-/// Splitting these matches the architecture: dispatcher is pure
-/// transport (it reads `target` and acts), listener is the
-/// kind-aware processor (it computes `value` from payload).
+/// The dispatcher is pure transport (it reads `target` and acts); the
+/// listener is the kind-aware processor (it computes `value`). Both read
+/// `target` through [`ProcessTarget::for_signal`], so both refuse the same
+/// shapes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessOutcome {
     pub value: Value,
     pub target: ProcessTarget,
+}
+
+/// A kind's target that does not fit its signal: an answer to a waiting
+/// run made from an entry's event, or an entry's event made from a wait's
+/// answer. The signal row says which the signal is (`is_resume`), and the
+/// kind contradicted it, so the event goes nowhere.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MisroutedEvent {
+    #[error("signal {token} is an entry, and its kind made an answer to a waiting run of its event")]
+    AnswerFromEntry { token: String },
+    #[error("signal {token} is a run's wait, and its kind made an entry's event of its answer")]
+    EntryFromWait { token: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,6 +399,21 @@ pub enum ProcessTarget {
     /// is for ops logging only; the dispatcher treats every Drop the
     /// same.
     Drop { reason: Option<String> },
+}
+
+impl ProcessTarget {
+    /// This target, checked against the signal it was made for: `token`'s
+    /// row says whether it is a run's wait (`is_resume`). A wait's event can
+    /// only answer its run and an entry's can only start one; either may be
+    /// dropped. The one place that decides it, for the dispatcher acting on
+    /// `/process` and the listener acting on its own fires alike.
+    pub fn for_signal(self, token: &str, is_resume: bool) -> Result<Self, MisroutedEvent> {
+        match (&self, is_resume) {
+            (Self::Resume { .. }, false) => Err(MisroutedEvent::AnswerFromEntry { token: token.to_string() }),
+            (Self::Entry, true) => Err(MisroutedEvent::EntryFromWait { token: token.to_string() }),
+            (Self::Resume { .. }, true) | (Self::Entry, false) | (Self::Drop { .. }, _) => Ok(self),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -479,5 +509,19 @@ mod tests {
             let back: ProcessTarget = serde_json::from_str(&json).unwrap();
             assert_eq!(format!("{back:?}"), format!("{target:?}"));
         }
+    }
+
+    /// A wait's event only answers its run, an entry's only starts one,
+    /// and either may be dropped; the other two shapes are refused.
+    #[test]
+    fn a_target_must_fit_its_signal() {
+        let resume = || ProcessTarget::Resume { run_id: uuid::Uuid::nil() };
+        let drop = || ProcessTarget::Drop { reason: None };
+        assert!(matches!(resume().for_signal("t", true), Ok(ProcessTarget::Resume { .. })));
+        assert!(matches!(ProcessTarget::Entry.for_signal("t", false), Ok(ProcessTarget::Entry)));
+        assert!(matches!(drop().for_signal("t", true), Ok(ProcessTarget::Drop { .. })));
+        assert!(matches!(drop().for_signal("t", false), Ok(ProcessTarget::Drop { .. })));
+        assert_eq!(resume().for_signal("t", false).unwrap_err(), MisroutedEvent::AnswerFromEntry { token: "t".into() });
+        assert_eq!(ProcessTarget::Entry.for_signal("t", true).unwrap_err(), MisroutedEvent::EntryFromWait { token: "t".into() });
     }
 }

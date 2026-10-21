@@ -67,7 +67,7 @@ pub(crate) async fn drain_activations(
     project_id: uuid::Uuid,
     keys: &[weft_core::activation::ActivationKey],
 ) -> anyhow::Result<()> {
-    let tokens: Vec<String> = crate::journal::postgres::activation_signals(&state.pg_pool, project_id, keys)
+    let tokens: Vec<String> = crate::store::postgres::activation_signals(&state.pg_pool, project_id, keys)
         .await?
         .into_iter()
         .map(|signal| signal.token)
@@ -289,11 +289,11 @@ async fn hand_answer(
             weft_task_store::parked_fires::remove_in(&mut tx, head).await?;
             (None, false)
         }
-        weft_core::arrival::Arrival::Live => match crate::journal::postgres::answer_in(&mut tx, &head.token, &head.waiting.answer(), crate::journal::postgres::AnswerFrom::Queue).await? {
+        weft_core::arrival::Arrival::Live => match crate::store::postgres::answer_in(&mut tx, &head.token, &head.waiting.answer(), crate::store::postgres::AnswerFrom::Queue).await? {
             // The wait's signal went, and its queue with it.
-            crate::journal::Answered::Reached { consumed } => (Some(consumed), true),
-            crate::journal::Answered::RunEnded { consumed } => (Some(consumed), false),
-            crate::journal::Answered::Gone => {
+            crate::store::Answered::Reached { consumed } => (Some(consumed), true),
+            crate::store::Answered::RunEnded { consumed } => (Some(consumed), false),
+            crate::store::Answered::Gone => {
                 weft_task_store::parked_fires::remove_in(&mut tx, head).await?;
                 (None, false)
             }

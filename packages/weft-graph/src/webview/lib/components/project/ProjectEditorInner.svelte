@@ -19,6 +19,7 @@
 	import { containerStatus } from "../../utils/container-status";
 	import { clampZoom, isOnScreen, zoomAfterCollapse, zoomAfterExpand, zoomAround, zoomFrame, MAX_ZOOM, MIN_ZOOM, ZOOM_ANIMATION_MS } from "../../utils/group-zoom";
 	import { derefKeys, derefType } from '../../utils/deref-menu';
+	import { camelCase } from '../../utils/node-id';
 	import { loopInId, loopOutId } from "../../../host-bridge";
 	import { scopeFirings, copyFrames, withinFrames, credentialOwner, type ScopeBox } from "../../utils/scope-firings";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
@@ -3382,27 +3383,24 @@
 		const isGroup = type === 'Group';
 		const isLoop = type === 'Loop';
 		const isContainer = isGroup || isLoop;
-		// A container is declared in source by its label (`MyGroup = Group()...`
-		// or `MyLoop = Loop()...`), so the label IS its node id once parsed.
+		// A container is declared in source by its label (`myGroup = Group()...`
+		// or `myLoop = Loop()...`), so the label IS its node id once parsed.
 		// Seed names from a safe default, NOT the type's display label:
-		// "Group" / "Loop" are reserved type keywords. "MyGroup" / "MyLoop"
-		// are valid, non-reserved starting points.
-		// New top-level node: collision-safe id, via the SAME minting helpers
+		// "Group" / "Loop" are reserved type keywords. "myGroup" / "myLoop"
+		// are valid, non-reserved, camelCase starting points.
+		// New top-level node: collision-safe id, via the SAME minting helper
 		// duplicate uses (root scope = parentId undefined).
 		const taken = new Set(fold.project.nodes.map(n => n.id));
-		const containerLabel = isContainer
-			? freshScopedLabel(isLoop ? 'MyLoop' : 'MyGroup', undefined, taken).label
-			: null;
-		const id = isContainer ? containerLabel! : freshScopedNodeId(type, undefined, taken).localId;
+		const id = freshScopedName(isContainer ? (isLoop ? 'myLoop' : 'myGroup') : type, undefined, taken).name;
 		const pos = contextMenuFlowPos ?? getViewportCenter();
 		contextMenuFlowPos = null;
 		// Select the new node; the structural rebuild marks it selected by id.
 		nodes = nodes.map(n => (n.selected ? { ...n, selected: false } : n));
 		selectedNodeId = id;
 		const op: EditOp = isLoop
-			? { op: 'add_loop', label: containerLabel!, parentGroup: null }
+			? { op: 'add_loop', label: id, parentGroup: null }
 			: isGroup
-				? { op: 'add_group', label: containerLabel!, parentGroup: null }
+				? { op: 'add_group', label: id, parentGroup: null }
 				: { op: 'add_node', id, nodeType: type, parentGroup: null };
 		// A connection drag dropped on empty canvas opened this menu: finish
 		// the gesture by wiring the picked node to the drag's origin in the
@@ -3454,7 +3452,7 @@
 				// false, over/carry to empty lists.
 				const w = isLoop ? 600 : 500;
 				const h = isLoop ? 500 : 350;
-				return updateLayoutEntry(layout, containerLabel!, pos.x, pos.y, w, h, true);
+				return updateLayoutEntry(layout, id, pos.x, pos.y, w, h, true);
 			}
 			return updateLayoutEntry(layout, id, pos.x, pos.y);
 		});
@@ -4001,28 +3999,20 @@
 		deleteNodes([nodeId]);
 	}
 
-	/** A fresh local id of `nodeType`'s shape, unique against existing scoped
-	 *  ids AND `taken` (ids minted earlier in the same batch). The new id is
-	 *  scoped under `parentId` so the duplicate lands as a SIBLING of its
-	 *  original. Mutates `taken`. */
-	function freshScopedNodeId(nodeType: string, parentId: string | undefined, taken: Set<string>): { localId: string; scopedId: string } {
-		const snake = nodeType.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
-		let i = 1;
-		let scoped = scopedLayoutKey(`${snake}_${i}`, parentId);
-		while (taken.has(scoped)) { i++; scoped = scopedLayoutKey(`${snake}_${i}`, parentId); }
-		taken.add(scoped);
-		return { localId: `${snake}_${i}`, scopedId: scoped };
-	}
-
-	/** A fresh container label unique against existing scoped ids AND `taken`,
-	 *  scoped under `parentId` (so the duplicate is a sibling). Mutates `taken`. */
-	function freshScopedLabel(base: string, parentId: string | undefined, taken: Set<string>): { label: string; scopedId: string } {
-		let candidate = base;
+	/** A fresh name for a node or container, spelled the way every name in a
+	 *  program is (camelCase: `HttpRequest` -> `httpRequest`), unique against
+	 *  existing scoped ids AND `taken` (names minted earlier in the same
+	 *  batch): `base`, else `base2`, `base3`... It is scoped under `parentId`,
+	 *  so a duplicate lands as a SIBLING of its original. Mutates `taken`. */
+	// SYNC: freshScopedName <-> crates/weft-compiler/src/edit/ops.rs (fresh_local)
+	function freshScopedName(base: string, parentId: string | undefined, taken: Set<string>): { name: string; scopedId: string } {
+		const spelled = camelCase(base);
+		let candidate = spelled;
 		let scoped = scopedLayoutKey(candidate, parentId);
 		let i = 2;
-		while (taken.has(scoped)) { candidate = `${base}_${i}`; scoped = scopedLayoutKey(candidate, parentId); i++; }
+		while (taken.has(scoped)) { candidate = `${spelled}${i}`; scoped = scopedLayoutKey(candidate, parentId); i++; }
 		taken.add(scoped);
-		return { label: candidate, scopedId: scoped };
+		return { name: candidate, scopedId: scoped };
 	}
 
 	function duplicateNode(nodeId: string) {
@@ -4099,8 +4089,8 @@
 				const config = orig.data.config as Record<string, unknown> | undefined;
 
 				if (isContainer) {
-					const base = (orig.data.label as string) || (isLoop ? 'MyLoop' : 'MyGroup');
-					const { label, scopedId } = freshScopedLabel(base, parentId, taken);
+					const base = (orig.data.label as string) || (isLoop ? 'myLoop' : 'myGroup');
+					const { name: label, scopedId } = freshScopedName(base, parentId, taken);
 					newIds.push(scopedId);
 					const cfg = config as Record<string, number> | undefined;
 					ops.push(isLoop
@@ -4131,7 +4121,7 @@
 					copyPortLiterals(orig, scopedId, nodeType);
 					layoutWrites.push((layout) => updateLayoutEntry(layout, scopedId, newPos.x, newPos.y, cfg?.width, cfg?.height));
 				} else {
-					const { localId, scopedId } = freshScopedNodeId(nodeType, parentId, taken);
+					const { name: localId, scopedId } = freshScopedName(nodeType, parentId, taken);
 					newIds.push(scopedId);
 					ops.push({ op: 'add_node', id: localId, nodeType, parentGroup: parentId ?? null });
 					// Copy the DECLARED port surface (custom ports, type

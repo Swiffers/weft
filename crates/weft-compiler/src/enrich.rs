@@ -1,24 +1,23 @@
 //! Post-compilation enrichment. Given a parsed ProjectDefinition and
-//! a NodeCatalog, populate each NodeDefinition's inputs/outputs/features
+//! a `MetadataCatalog`, populate each NodeDefinition's inputs/outputs/features
 //! from the catalog, materialize config-derived ports, merge
 //! weft-declared custom ports for nodes with
 //! canAddInputPorts/canAddOutputPorts, and validate that every
 //! referenced node type exists.
 //!
 //! Two node-types are built-in (not catalog): `LoopIn` / `LoopOut`, a
-//! loop's boundaries. Their port shapes are written by the compiler's
-//! lowering (`push_loop_boundaries` in `weft_compiler.rs`); enrich does
-//! not consult the catalog for them (it `continue`s past these node
-//! types). A group is no node: what enrich does for its ports (cast the
-//! literals written on them) it does on the group itself.
+//! loop's boundaries. Their ports are written by the compiler's lowering
+//! (`push_loop_boundaries` in `weft_compiler.rs`), never by enrich: enrich
+//! does not consult the catalog for them (it `continue`s past these node
+//! types), and only resolves the type variables the two share, per place.
+//! A group is no node: what enrich does for its ports (cast the literals
+//! written on them) it does on the group itself.
 
 use weft_core::run::skip::{SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT};
 use weft_core::node::{derive_config_ports, materialize_auto_type_vars, MetadataCatalog, Widget, AUTO_TYPE_VAR};
 use weft_core::project::{InputDefinition, PortDefinition, ProjectDefinition, Span};
 use weft_core::node::Accepts;
 use weft_core::weft_type::WeftType;
-
-use crate::error::{CompileError, CompileResult};
 
 /// One enrich failure carrying the SOURCE SPAN of the offending node, so a
 /// diagnostic consumer (the editor's squiggles, the CLI's error lines) points
@@ -222,13 +221,6 @@ pub enum EnrichPolicy {
     Lenient,
 }
 
-/// Node-types written by the compiler's lowering (a loop's LoopIn and
-/// LoopOut). They have no catalog entry by design: enrich fills their
-/// ports itself, and diagnostics must not flag them as unknown types.
-pub fn is_lowering_builtin(node_type: &str) -> bool {
-    weft_core::project::boundary_types::is_boundary(node_type)
-}
-
 /// The message for a type the catalog does not serve: the catalog's own
 /// sentence when it saw the node (not ready yet, or failed to load),
 /// otherwise unknown.
@@ -236,29 +228,6 @@ pub fn unknown_type_message(catalog: &dyn MetadataCatalog, node_type: &str) -> S
     catalog
         .unavailable(node_type)
         .unwrap_or_else(|| format!("unknown node type: '{node_type}'"))
-}
-
-pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn MetadataCatalog) -> CompileResult<()> {
-    enrich_with_policy(project, catalog, EnrichPolicy::Strict)
-}
-
-/// String wrapper over [`enrich_collecting`]: joins the per-node errors into
-/// one `CompileError::Enrich` for callers that only want a pass/fail (no
-/// per-error spans). Diagnostic consumers call `enrich_collecting` directly to
-/// keep each error's line.
-pub fn enrich_with_policy(
-    project: &mut ProjectDefinition,
-    catalog: &dyn MetadataCatalog,
-    policy: EnrichPolicy,
-) -> CompileResult<()> {
-    let errors = enrich_collecting(project, catalog, policy);
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(CompileError::Enrich(
-            errors.into_iter().map(|e| e.message).collect::<Vec<_>>().join("; "),
-        ))
-    }
 }
 
 /// The two gate ports, which sit on EVERY node: the port that says
@@ -336,9 +305,9 @@ fn gate_inputs() -> [InputDefinition; 2] {
 }
 
 /// Enrich, returning every failure with the SOURCE SPAN of the offending node
-/// (empty vec = clean). The span-preserving core; the string-joining
-/// `enrich_with_policy` wraps it. Diagnostic-producing callers (the editor
-/// parse, the CLI) use this so each error squiggles its own line.
+/// (empty vec = clean), so each error squiggles its own line. Every
+/// pipeline in `crate` (the editor's parse, the strict compile, the build's
+/// `compile_program`) enriches through this.
 pub fn enrich_collecting(
     project: &mut ProjectDefinition,
     catalog: &dyn MetadataCatalog,
@@ -396,7 +365,7 @@ pub fn enrich_collecting(
         // as one of these built-in names is rejected loud as a corrupt
         // catalog: letting a catalog impl shadow the runtime built-in
         // would silently break loop boundaries.
-        if is_lowering_builtin(&node.node_type) {
+        if weft_core::project::boundary_types::is_boundary(&node.node_type) {
             if catalog.lookup(&node.node_type).is_some()
                 && reported_reserved.insert(node.node_type.clone())
             {
@@ -408,11 +377,11 @@ pub fn enrich_collecting(
             continue;
         }
 
-        // A catalog claiming any other reserved type keyword is also a
+        // A catalog claiming any other type name weft owns is also a
         // corrupt catalog (e.g. an entry literally named 'Group' or
-        // 'Loop'). The reserved-type set is the single source of truth
-        // for this check.
-        if crate::weft_compiler::is_reserved_type_keyword(&node.node_type) {
+        // 'Loop'). `own_types` is the single source of truth for this
+        // check.
+        if weft_core::project::own_types::is_own(&node.node_type) {
             if catalog.lookup(&node.node_type).is_some()
                 && reported_reserved.insert(node.node_type.clone())
             {

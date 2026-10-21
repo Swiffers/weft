@@ -222,7 +222,7 @@ async fn mint_token(
 
 /// Revoke `id`. One already gone is fine: a retry finds it so.
 async fn revoke_token(state: &DispatcherState, owner: &TenantId, id: uuid::Uuid) -> anyhow::Result<()> {
-    state.journal.revoke_signal_token(id, owner.as_str()).await?;
+    state.tokens.revoke_signal_token(id, owner.as_str()).await?;
     Ok(())
 }
 

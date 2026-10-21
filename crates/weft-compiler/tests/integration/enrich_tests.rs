@@ -1,8 +1,7 @@
 //! End-to-end compile + enrich tests against the stdlib catalog.
 
 use weft_catalog::{stdlib_root, FsCatalog};
-use weft_compiler::enrich::enrich;
-use weft_compiler::weft_compiler::compile;
+use crate::rig::{compile, enrich};
 use weft_compiler::CompileFs;
 
 fn catalog() -> FsCatalog {
@@ -117,7 +116,7 @@ bad = NotARealNode
 "#;
     let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     let err = enrich(&mut project, &catalog()).unwrap_err();
-    let msg = format!("{err}");
+    let msg = err;
     assert!(msg.contains("NotARealNode"), "expected NotARealNode in error, got: {msg}");
 }
 
@@ -131,7 +130,7 @@ t = Text() -> (bogus: String) { value: "hi" }
 "#;
     let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     let err = enrich(&mut project, &catalog()).unwrap_err();
-    let msg = format!("{err}");
+    let msg = err;
     assert!(
         msg.contains("does not support custom") && msg.contains("bogus"),
         "expected a loud custom-port rejection naming the port, got: {msg}"
@@ -188,7 +187,7 @@ fn a_value_on_an_output_port_is_refused_instead_of_creating_an_input() {
     for (name, src) in cases {
         let mut project = compile(src, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
         let err = enrich(&mut project, &catalog()).expect_err(name);
-        let msg = format!("{err}");
+        let msg = err;
         assert!(
             msg.contains("'o' is an output port") && msg.contains("takes no value") && msg.contains("`t.o`"),
             "{name}: {msg}"
@@ -545,7 +544,7 @@ out.data = human.testRejected
 "#;
     let mut project = compile(wrong_type, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     let err = enrich(&mut project, &catalog()).unwrap_err();
-    assert!(format!("{err}").contains("always gives it Boolean"), "type mismatch must error: {err}");
+    assert!(err.contains("always gives it Boolean"), "type mismatch must error: {err}");
 
     let unknown_port = r#"
 
@@ -558,7 +557,7 @@ out.data = human.testApproved
     let mut project = compile(unknown_port, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     let err = enrich(&mut project, &catalog()).unwrap_err();
     assert!(
-        format!("{err}").contains("custom") && format!("{err}").contains("not_a_field"),
+        err.contains("custom") && err.contains("not_a_field"),
         "a header port matching no derived port must be a custom-port error: {err}"
     );
 }
@@ -719,7 +718,7 @@ out.data = py.out
         compile(on_a_declared_key, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     let err = enrich(&mut project, &catalog()).expect_err("`code` is a declared config input");
     assert!(
-        format!("{err}").contains("not a port this node creates"),
+        err.contains("not a port this node creates"),
         "the marker is refused where it cannot apply: {err}"
     );
 }
@@ -836,7 +835,8 @@ fn a_program_naming_a_node_without_its_code_is_told_it_is_not_ready() {
 /// infra controls and let Run start with nothing provisioned.
 #[test]
 fn enrich_settles_what_an_include_holds() {
-    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    use crate::rig::compile_with_mode;
+    use weft_compiler::weft_compiler::IncludeMode;
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("front.weft"),
@@ -984,7 +984,7 @@ fn a_navigated_into_include_parses_under_the_ids_the_build_uses() {
 
     // What the BUILD registers, which is what the dispatcher's signal row
     // and the inspector's poll key on.
-    let built = weft_compiler::weft_compiler::compile(
+    let built = compile(
         "f = @include(\"lib/front.weft\")\n",
         uuid::Uuid::new_v4(),
         CompileFs::disk(dir.path()),

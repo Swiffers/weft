@@ -2,7 +2,7 @@
 //! `_should_flow` alone, the shape an API builder writes. The compiler is
 //! real; the check is on the program the fire runs: the whole group comes
 //! along with the route, and nothing behind the other route does.
-use weft_compiler::weft_compiler::compile;
+use crate::rig::{compile, enrich};
 use weft_compiler::CompileFs;
 use weft_core::run_spec::compute_trigger_fire;
 
@@ -30,7 +30,7 @@ fn program() -> weft_core::ProjectDefinition {
     std::fs::write(dir.path().join("deep.weft"), DEEP).unwrap();
     let mut project = compile(MAIN, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
     let catalog = weft_catalog::FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
-    weft_compiler::enrich::enrich(&mut project, &catalog).expect("enrich");
+    enrich(&mut project, &catalog).expect("enrich");
     project
 }
 

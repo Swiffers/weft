@@ -42,7 +42,7 @@ use std::path::Path;
 
 use weft_catalog::{BuildStage, FsCatalog, SystemManagerKey};
 
-use crate::error::{CompileError, CompileResult};
+use crate::error::{BuildError, BuildResult};
 use crate::project::WorkerBuildSection;
 
 /// Output of `emit`: the Dockerfile body ready to be written
@@ -216,7 +216,7 @@ pub fn emit(
     binary_name: &str,
     bases: &BaseImages,
     baked: &BuilderStage,
-) -> CompileResult<WorkerDockerfile> {
+) -> BuildResult<WorkerDockerfile> {
     let builder_base_ref = bases.builder.as_str();
     let base_image_str = build.base_image.clone().unwrap_or_else(|| bases.runtime.clone());
     let base = parse_base_image(&base_image_str);
@@ -244,7 +244,7 @@ pub fn emit(
         Some(rel) => {
             let path = project_root.join(rel);
             std::fs::read_to_string(&path).map_err(|e| {
-                CompileError::Build(format!(
+                BuildError::Build(format!(
                     "read custom Dockerfile template {}: {}",
                     path.display(),
                     e
@@ -274,7 +274,7 @@ pub fn emit(
     let builder = if builder_base_out.is_some() { "builder-base" } else { base.raw.as_str() };
     let weft_root = crate::build::resolve_weft_root()?;
     let worker_cache_key = crate::hash::compute_worker_cache_key(&weft_root, builder)
-        .map_err(|e| CompileError::Build(format!("worker compile cache key: {e}")))?;
+        .map_err(|e| BuildError::Build(format!("worker compile cache key: {e}")))?;
 
     let body = template
         .replace("{{base_image}}", &base.raw)
@@ -335,7 +335,7 @@ impl BuilderStage {
         catalog: &FsCatalog,
         referenced: &BTreeSet<String>,
         project_root: &Path,
-    ) -> CompileResult<Self> {
+    ) -> BuildResult<Self> {
         let base = parse_base_image(DEFAULT_BASE_IMAGE);
         Ok(Self {
             packages: collect_stage_packages(catalog, referenced, &base, BuildStage::Build)?,
@@ -362,14 +362,14 @@ fn collect_stage_packages(
     referenced: &BTreeSet<String>,
     base: &BaseImage,
     stage: BuildStage,
-) -> CompileResult<Vec<String>> {
+) -> BuildResult<Vec<String>> {
     let manager_key = base.manager.to_catalog_key();
     let mut packages: BTreeSet<String> = BTreeSet::new();
 
     for node_type in referenced {
         let Some(deps) = catalog
             .deps(node_type)
-            .map_err(|e| CompileError::Build(format!("load deps for {node_type}: {e}")))?
+            .map_err(|e| BuildError::Build(format!("load deps for {node_type}: {e}")))?
         else {
             continue;
         };
@@ -398,7 +398,7 @@ fn collect_stage_packages(
                     BuildStage::Build => "build",
                     BuildStage::Runtime => "runtime",
                 };
-                return Err(CompileError::Build(format!(
+                return Err(BuildError::Build(format!(
                     "node '{node_type}' declares [system.{stage_name}.{}] packages for {keys:?} \
                      but none matches the project's base image '{}' (distro key '{}') \
                      and no 'default' entry is set. Add `default = [...]` or \
@@ -422,7 +422,7 @@ fn collect_build_env(
     catalog: &FsCatalog,
     referenced: &BTreeSet<String>,
     project_root: &Path,
-) -> CompileResult<std::collections::BTreeMap<String, String>> {
+) -> BuildResult<std::collections::BTreeMap<String, String>> {
     let mut merged: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     let mut first_setter: std::collections::BTreeMap<String, String> =
@@ -431,7 +431,7 @@ fn collect_build_env(
     for node_type in referenced {
         let Some(deps) = catalog
             .deps(node_type)
-            .map_err(|e| CompileError::Build(format!("load deps for {node_type}: {e}")))?
+            .map_err(|e| BuildError::Build(format!("load deps for {node_type}: {e}")))?
         else {
             continue;
         };
@@ -439,7 +439,7 @@ fn collect_build_env(
             continue;
         }
         let Some(source_dir) = catalog.source_dir(node_type) else {
-            return Err(CompileError::Build(format!(
+            return Err(BuildError::Build(format!(
                 "node '{node_type}' declares [build.env] but has no source dir"
             )));
         };
@@ -450,7 +450,7 @@ fn collect_build_env(
             if let Some(existing) = merged.get(k) {
                 if existing != &resolved {
                     let other = first_setter.get(k).cloned().unwrap_or_default();
-                    return Err(CompileError::Build(format!(
+                    return Err(BuildError::Build(format!(
                         "[build.env] conflict on '{k}': '{other}' sets '{existing}', \
                          '{node_type}' sets '{resolved}'"
                     )));
@@ -472,9 +472,9 @@ fn node_catalog_path(
     node_type: &str,
     source_dir: &Path,
     project_root: &Path,
-) -> CompileResult<String> {
+) -> BuildResult<String> {
     let rel = source_dir.strip_prefix(project_root).map_err(|_| {
-        CompileError::Build(format!(
+        BuildError::Build(format!(
             "node '{node_type}' source dir {} is not under the project root {}",
             source_dir.display(),
             project_root.display()

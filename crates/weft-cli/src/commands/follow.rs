@@ -215,7 +215,7 @@ pub async fn follow_task(
     project_id: &str,
     task: uuid::Uuid,
 ) -> anyhow::Result<Value> {
-    let path = format!("/projects/{project_id}/follow/{task}?waitSecs=25");
+    let path = format!("/projects/{project_id}/follow/{task}?wait_ms=25000");
     loop {
         match client.get_json(&path).await {
             Ok(answer) => match serde_json::from_value(answer).context("read the task's state")? {

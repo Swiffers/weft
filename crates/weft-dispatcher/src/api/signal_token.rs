@@ -124,7 +124,7 @@ pub(crate) async fn mint(
         .transpose()
         .map_err(|why| (StatusCode::BAD_REQUEST, why))?;
     let token = names::generate_token();
-    let signal_token = crate::journal::SignalToken {
+    let signal_token = crate::store::SignalToken {
         id: uuid::Uuid::new_v4(),
         kind: body.kind,
         token_hash: names::token_hash(&token),
@@ -136,7 +136,7 @@ pub(crate) async fn mint(
         allowed_displays,
         all_displays: body.all_displays,
         // Stamp the mint time here (the canonical wall clock) and store it
-        // verbatim, so both the postgres and fake journals agree instead of one
+        // verbatim, so both the postgres and fake token stores agree instead of one
         // stamping now() and the other keeping a placeholder.
         created_at: now,
         instance: body.instance,
@@ -147,10 +147,10 @@ pub(crate) async fn mint(
     // does not answer leaves no token behind that nobody was handed.
     let base = state.external_base_url().await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
     state
-        .journal
+        .tokens
         .mint_signal_token(&signal_token)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tokens: {e}")))?;
     let url = token_url(&base, &token);
     Ok(MintedToken {
         id: signal_token.id,
@@ -173,10 +173,10 @@ pub async fn list_tokens(
     caller: CallerTenant,
 ) -> Result<Json<Vec<TokenSummary>>, (StatusCode, String)> {
     let tokens = state
-        .journal
+        .tokens
         .list_signal_tokens(caller.0.as_str())
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tokens: {e}")))?;
     Ok(Json(
         tokens
             .into_iter()
@@ -208,10 +208,10 @@ pub async fn revoke_token(
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     use axum::response::IntoResponse;
     let removed = state
-        .journal
+        .tokens
         .revoke_signal_token(id, caller.0.as_str())
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tokens: {e}")))?;
     if removed {
         Ok(StatusCode::NO_CONTENT.into_response())
     } else {

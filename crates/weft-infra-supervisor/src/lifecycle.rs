@@ -284,6 +284,7 @@ async fn work(
                         return true;
                     }
                     tracing::info!(
+                        target: "weft_infra_supervisor::lifecycle",
                         project_id = %b.project,
                         "this supervisor no longer owns the project; stopping its running command, the new owner runs it again"
                     );
@@ -301,7 +302,7 @@ async fn work(
                 }
                 Ok(SupervisorClaim::Cancel { commands }) => {
                     for b in busy.values().filter(|b| commands.contains(&b.command)) {
-                        tracing::info!(command_id = b.command, "a person asked to cancel the command; it stops at its next step");
+                        tracing::info!(target: "weft_infra_supervisor::lifecycle", command_id = b.command, "a person asked to cancel the command; it stops at its next step");
                         b.cancel.store(true, Ordering::SeqCst);
                     }
                 }
@@ -323,7 +324,7 @@ async fn work(
                 // running lets them finish and asks again.
                 Err(e) if until == Until::Idle && busy.is_empty() => return Err(e.context("claim a lifecycle command")),
                 Err(e) => {
-                    tracing::warn!(error = %e, "lifecycle claim failed");
+                    tracing::warn!(target: "weft_infra_supervisor::lifecycle", error = %e, "lifecycle claim failed");
                     state.clock.sleep(CLAIM_ERROR_BACKOFF).await;
                 }
             },
@@ -368,6 +369,7 @@ pub async fn tick(state: &SupervisorState, wait: Duration) -> Result<bool> {
 /// (`weft_broker::lifecycle_writes::claim_next`).
 async fn run_command(state: &SupervisorState, cmd: weft_broker_client::protocol::SupervisorCommandRow, cancel: &AtomicBool) {
     tracing::info!(
+        target: "weft_infra_supervisor::lifecycle",
         command_id = cmd.id,
         project_id = %cmd.project_id,
         node_id = ?cmd.node_id,
@@ -404,11 +406,12 @@ async fn run_command(state: &SupervisorState, cmd: weft_broker_client::protocol:
     match completed {
         Ok(weft_broker_client::WriteOutcome::Applied(_)) => state.health.lock().await.untroubled(cmd.project_id, ended),
         Ok(weft_broker_client::WriteOutcome::Displaced) => tracing::info!(
+            target: "weft_infra_supervisor::lifecycle",
             command_id = cmd.id,
             "command_complete displaced (project ownership moved); the command is left for the new owner"
         ),
         Ok(weft_broker_client::WriteOutcome::Gone) => {
-            tracing::info!(command_id = cmd.id, "command_complete: the command was already completed; no-op");
+            tracing::info!(target: "weft_infra_supervisor::lifecycle", command_id = cmd.id, "command_complete: the command was already completed; no-op");
             state.health.lock().await.untroubled(cmd.project_id, ended);
         }
         Err(e) => {
@@ -424,12 +427,14 @@ async fn run_command(state: &SupervisorState, cmd: weft_broker_client::protocol:
     if let Err(e) = result {
         if cancelled {
             tracing::info!(
+                target: "weft_infra_supervisor::lifecycle",
                 command_id = cmd.id,
                 halt = format!("{e:#}"),
                 "lifecycle command halted by user cancel; marked cancelled"
             );
         } else {
             tracing::warn!(
+                target: "weft_infra_supervisor::lifecycle",
                 command_id = cmd.id,
                 error = format!("{e:#}"),
                 "lifecycle command failed; marked complete with error"
@@ -631,6 +636,7 @@ async fn execute(
         // `infra_node` row(s), so follow-up commands have nothing left to
         // act on.
         tracing::info!(
+            target: "weft_infra_supervisor::lifecycle",
             command_id = cmd.id,
             project_id = %cmd.project_id,
             node_id = ?cmd.node_id,
@@ -658,6 +664,7 @@ async fn execute(
                 // the honest record for an orphan is its absence.
                 for orphan in seen.iter().filter(|o| o.copy_id == n.copy_id && !n.units.contains_key(&o.unit)) {
                     tracing::warn!(
+                        target: "weft_infra_supervisor::lifecycle",
                         project_id = %cmd.project_id,
                         node_id = %n.node_id,
                         unit = %orphan.unit,
@@ -696,6 +703,7 @@ async fn execute(
                         .await
                     {
                         tracing::warn!(
+                            target: "weft_infra_supervisor::lifecycle",
                             project_id = %cmd.project_id,
                             node_id = %n.node_id,
                             unit = %unit,
@@ -732,6 +740,7 @@ async fn execute(
                             // command_complete is displaced for the same
                             // reason, so the command is left for it.
                             tracing::info!(
+                                target: "weft_infra_supervisor::lifecycle",
                                 project_id = %cmd.project_id,
                                 node_id = %n.node_id,
                                 unit = %unit,
@@ -744,6 +753,7 @@ async fn execute(
                             // while the project is still ours. Nothing left
                             // to record for the node; on to the next one.
                             tracing::info!(
+                                target: "weft_infra_supervisor::lifecycle",
                                 project_id = %cmd.project_id,
                                 node_id = %n.node_id,
                                 unit = %unit,
@@ -811,6 +821,7 @@ async fn execute(
                     weft_broker_client::WriteOutcome::Applied(_) => {}
                     weft_broker_client::WriteOutcome::Displaced => {
                         tracing::info!(
+                            target: "weft_infra_supervisor::lifecycle",
                             project_id = %cmd.project_id,
                             node_id = %n.node_id,
                             "set_status(terminating) displaced (project ownership moved); aborting terminate for re-run"
@@ -818,6 +829,7 @@ async fn execute(
                         return Ok(());
                     }
                     weft_broker_client::WriteOutcome::Gone => tracing::info!(
+                        target: "weft_infra_supervisor::lifecycle",
                         project_id = %cmd.project_id,
                         node_id = %n.node_id,
                         "set_status(terminating): row gone; removing the copy anyway"
@@ -841,6 +853,7 @@ async fn execute(
                     // command uncompleted so the new owner re-runs the
                     // (idempotent) terminate.
                     tracing::info!(
+                        target: "weft_infra_supervisor::lifecycle",
                         project_id = %cmd.project_id,
                         node_id = %n.node_id,
                         "remove_node displaced (project ownership moved); aborting terminate for re-run"
@@ -998,6 +1011,7 @@ async fn execute_apply(
             weft_broker_client::WriteOutcome::Applied(_) => {}
             weft_broker_client::WriteOutcome::Displaced => {
                 tracing::info!(
+                    target: "weft_infra_supervisor::lifecycle",
                     project_id = %cmd.project_id,
                     node_id = %node_id,
                     "ownership fence displaced before finishing the prior terminate; leaving apply for the new owner"
@@ -1046,6 +1060,7 @@ async fn execute_apply(
         // Gone: the command is already completed (a node removal
         // cancelled it), so there is nothing left to apply for.
         tracing::info!(
+            target: "weft_infra_supervisor::lifecycle",
             project_id = %cmd.project_id,
             node_id = %node_id,
             outcome = ?provision_outcome,
@@ -1104,6 +1119,7 @@ async fn execute_apply(
                 .await
             {
                 tracing::warn!(
+                    target: "weft_infra_supervisor::lifecycle",
                     project_id = %cmd.project_id,
                     node_id = %node_id,
                     error = %status_err,
@@ -1149,6 +1165,7 @@ async fn execute_apply(
         // re-runs the (idempotent) apply. Gone: the command was completed
         // under us; nothing to record.
         tracing::info!(
+            target: "weft_infra_supervisor::lifecycle",
             project_id = %cmd.project_id,
             node_id = %node_id,
             outcome = ?outcome,

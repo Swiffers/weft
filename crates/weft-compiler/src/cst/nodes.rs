@@ -8,7 +8,7 @@
 //! The view's job is NARROW and deliberate: it lets the edit ops RESOLVE a
 //! target by scoped id (`grp.child`) and locate the subtree to mutate. It does
 //! NOT reproduce the flatten/`ProjectDefinition` projection: the parse-server
-//! re-parses the edited source through the existing `compile`/`flatten` path to
+//! re-parses the edited source through the existing `compile_lenient`/`flatten` path to
 //! render the graph (see `edit_envelope` in `weft-cli`). One flatten, not two.
 //!
 //! Scoped-id rule (mirrors `flatten`): a decl's scoped id is the dot-joined

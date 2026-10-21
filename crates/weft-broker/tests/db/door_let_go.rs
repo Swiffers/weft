@@ -7,7 +7,7 @@
 use sqlx::PgPool;
 use weft_broker::door::{let_go, DoorWorker};
 use weft_broker_client::protocol::LetGo;
-use weft_dispatcher::journal::Journal;
+use weft_dispatcher::store::RunStore;
 use weft_journal::RunEvent;
 
 const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(1);
@@ -53,7 +53,7 @@ async fn driven_by(pool: &PgPool, owner: &str) -> weft_core::RunId {
         settings: Default::default(),
         at_unix: 0,
     };
-    let journal = weft_dispatcher::journal::postgres::PostgresJournal::from_pool(pool.clone());
+    let store = weft_dispatcher::store::postgres::PostgresStore::from_pool(pool.clone());
     let queued = weft_journal::record::Queued {
         events: std::slice::from_ref(&birth),
         tenant: TENANT,
@@ -64,7 +64,7 @@ async fn driven_by(pool: &PgPool, owner: &str) -> weft_core::RunId {
         example: None,
         program: None,
     };
-    assert!(journal.queue_run(queued, false).await.expect("queue the run"));
+    assert!(store.queue_run(queued, false).await.expect("queue the run"));
     let mut conn = pool.acquire().await.unwrap();
     weft_journal::record::claim(&mut conn, run_id, PROJECT, owner).await.unwrap().expect("claimed");
     run_id
@@ -199,8 +199,8 @@ async fn an_answer_handed_to_a_run_that_parks_reaches_its_record(pool: PgPool) {
     tx.commit().await.unwrap();
     assert!(let_go(&pool, worker("w1"), run_id, LetGo::Parked).await.unwrap());
     assert_eq!(standing(&pool, run_id).await, ("queued".into(), None));
-    let journal = weft_dispatcher::journal::postgres::PostgresJournal::from_pool(pool.clone());
-    let events = journal.events_log(run_id).await.unwrap();
+    let store = weft_dispatcher::store::postgres::PostgresStore::from_pool(pool.clone());
+    let events = store.events_log(run_id).await.unwrap();
     assert!(
         matches!(events.last(), Some(RunEvent::SuspensionResolved { token, .. }) if token == "form"),
         "{events:?}"

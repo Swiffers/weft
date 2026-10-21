@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::{CompileError, CompileResult};
+use crate::error::{BuildError, BuildResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectManifest {
@@ -172,10 +172,10 @@ pub struct Project {
 impl Project {
     /// Load a project from `<root>/weft.toml`. Errors if the manifest
     /// is missing or malformed; use `init` to create a new project.
-    pub fn load(root: &Path) -> CompileResult<Self> {
+    pub fn load(root: &Path) -> BuildResult<Self> {
         let manifest_path = root.join("weft.toml");
         let raw = std::fs::read_to_string(&manifest_path)
-            .map_err(|e| CompileError::Project(format!("{}: {}", manifest_path.display(), e)))?;
+            .map_err(|e| BuildError::Project(format!("{}: {}", manifest_path.display(), e)))?;
         Self::from_manifest(root, &raw, &|path| path.exists())
     }
 
@@ -183,22 +183,22 @@ impl Project {
     /// project, so the manifest it compiles with is the one in the
     /// snapshot).
     #[cfg(feature = "build")]
-    pub fn load_in(root: &Path, tree: &dyn weft_catalog::SourceTree) -> CompileResult<Self> {
+    pub fn load_in(root: &Path, tree: &dyn weft_catalog::SourceTree) -> BuildResult<Self> {
         let manifest_path = root.join("weft.toml");
         let raw = tree
             .read_to_string(&manifest_path)
-            .map_err(|e| CompileError::Project(format!("{}: {}", manifest_path.display(), e)))?;
+            .map_err(|e| BuildError::Project(format!("{}: {}", manifest_path.display(), e)))?;
         Self::from_manifest(root, &raw, &|path| tree.entry_kind(path).is_ok())
     }
 
     /// The project at `root` whose `weft.toml` reads `raw`; `exists` says
     /// whether a file is there, from wherever the manifest was read.
-    fn from_manifest(root: &Path, raw: &str, exists: &dyn Fn(&Path) -> bool) -> CompileResult<Self> {
+    fn from_manifest(root: &Path, raw: &str, exists: &dyn Fn(&Path) -> bool) -> BuildResult<Self> {
         let manifest_path = root.join("weft.toml");
         let manifest: ProjectManifest = toml::from_str(raw)
-            .map_err(|e| CompileError::Project(format!("weft.toml parse: {e}")))?;
+            .map_err(|e| BuildError::Project(format!("weft.toml parse: {e}")))?;
         if manifest.dispatcher.is_some() {
-            return Err(CompileError::Project(format!(
+            return Err(BuildError::Project(format!(
                 "{} has a [dispatcher] section, which weft no longer reads: the installs a \
                  project talks to are named targets now. Delete the section; if it set a \
                  url, write it as `[targets.local]\nurl = \"...\"` for this machine's \
@@ -212,7 +212,7 @@ impl Project {
         // command that happens to act there.
         for (name, target) in &manifest.targets {
             normalize_install_url(&target.url).map_err(|e| {
-                CompileError::Project(format!("{}: target '{name}': {e}", manifest_path.display()))
+                BuildError::Project(format!("{}: target '{name}': {e}", manifest_path.display()))
             })?;
         }
         let project = Self { root: root.to_path_buf(), manifest };
@@ -222,7 +222,7 @@ impl Project {
         // missing file. Two valid places for the entry would be the
         // free-for-all the `src/` layout exists to end.
         if !exists(&project.main_weft()) && exists(&root.join(ENTRY_FILE)) {
-            return Err(CompileError::Project(format!(
+            return Err(BuildError::Project(format!(
                 "{} holds its program at the root; weft reads it from {}. \
                  Move it: `mkdir -p src && mv main.weft src/`, move any \
                  file it includes with it (an `@include` path is relative \
@@ -241,14 +241,14 @@ impl Project {
     /// exists in the target directory. Build/CLI path (it seeds the stdlib
     /// catalog), so gated behind `build`; the WASM parse build never scaffolds.
     #[cfg(feature = "build")]
-    pub fn init(root: &Path, name: &str) -> CompileResult<Self> {
+    pub fn init(root: &Path, name: &str) -> BuildResult<Self> {
         if root.join("weft.toml").exists() {
-            return Err(CompileError::Project(format!(
+            return Err(BuildError::Project(format!(
                 "{} already contains weft.toml",
                 root.display()
             )));
         }
-        std::fs::create_dir_all(root).map_err(CompileError::Io)?;
+        std::fs::create_dir_all(root).map_err(BuildError::Io)?;
 
         // The canonical starter files (weft.toml + src/main.weft). Defined ONCE in
         // `scaffold_files` so every caller of `weft new` produces byte-identical
@@ -256,13 +256,13 @@ impl Project {
         for (rel, bytes) in scaffold_files(name, Uuid::new_v4())? {
             let path = root.join(&rel);
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(CompileError::Io)?;
+                std::fs::create_dir_all(parent).map_err(BuildError::Io)?;
             }
-            std::fs::write(path, bytes).map_err(CompileError::Io)?;
+            std::fs::write(path, bytes).map_err(BuildError::Io)?;
         }
 
-        std::fs::create_dir_all(root.join(NODES_DIR)).map_err(CompileError::Io)?;
-        std::fs::create_dir_all(root.join(".weft")).map_err(CompileError::Io)?;
+        std::fs::create_dir_all(root.join(NODES_DIR)).map_err(BuildError::Io)?;
+        std::fs::create_dir_all(root.join(".weft")).map_err(BuildError::Io)?;
 
         // Seed the standard library into `nodes/base_catalog/`. From
         // here the project owns all its nodes and the build never
@@ -283,21 +283,21 @@ impl Project {
     /// (the port it saved, see `weft_core::ports::local_public_url`) when
     /// the project does not override it. An unknown name is an
     /// error naming every target the project has.
-    pub fn target_url(&self, name: &str) -> CompileResult<String> {
+    pub fn target_url(&self, name: &str) -> BuildResult<String> {
         if let Some(target) = self.manifest.targets.get(name) {
             return normalize_install_url(&target.url).map_err(|e| {
-                CompileError::Project(format!("target '{name}' in {}: {e}", self.root.join("weft.toml").display()))
+                BuildError::Project(format!("target '{name}' in {}: {e}", self.root.join("weft.toml").display()))
             });
         }
         if name == LOCAL_TARGET {
-            return weft_core::ports::local_public_url().map_err(CompileError::Project);
+            return weft_core::ports::local_public_url().map_err(BuildError::Project);
         }
         let mut known: Vec<&str> = self.manifest.targets.keys().map(String::as_str).collect();
         if !known.contains(&LOCAL_TARGET) {
             known.push(LOCAL_TARGET);
         }
         known.sort_unstable();
-        Err(CompileError::Project(format!(
+        Err(BuildError::Project(format!(
             "no target '{name}' in {}; its targets are: {}. Add one with \
              `weft target add {name} <url>`",
             self.root.join("weft.toml").display(),
@@ -340,8 +340,8 @@ impl Project {
     }
 
     /// Read and return the weft source.
-    pub fn read_main_weft(&self) -> CompileResult<String> {
-        std::fs::read_to_string(self.main_weft()).map_err(CompileError::Io)
+    pub fn read_main_weft(&self) -> BuildResult<String> {
+        std::fs::read_to_string(self.main_weft()).map_err(BuildError::Io)
     }
 
     /// Search upward from `start` for a directory containing `weft.toml` and
@@ -351,7 +351,7 @@ impl Project {
     /// to load (a malformed manifest). Only the LAST case is loud, so a caller
     /// that tolerates "no project" (the editor's lenient parse) surfaces a BROKEN
     /// manifest while still degrading gracefully on an unresolvable path.
-    pub fn find(start: &Path) -> CompileResult<Option<Self>> {
+    pub fn find(start: &Path) -> BuildResult<Option<Self>> {
         // An unresolvable start path (a phantom/unsaved buffer location) is "no
         // project", not an error: there's simply nowhere to search from.
         let Ok(start) = start.canonicalize() else { return Ok(None) };
@@ -370,8 +370,8 @@ impl Project {
     /// The one wording for "no project here", so [`Self::find`]'s
     /// callers that treat "not found" as an error cannot fork the
     /// message.
-    pub fn no_project_here(start: &Path) -> CompileError {
-        CompileError::Project(format!(
+    pub fn no_project_here(start: &Path) -> BuildError {
+        BuildError::Project(format!(
             "no weft.toml found at {} or any parent",
             start.display()
         ))
@@ -396,16 +396,16 @@ pub fn base_catalog_dir(project_root: &Path) -> PathBuf {
 /// update`. (A future registry replaces `stdlib_root()` as the source;
 /// the destination shape stays the same.)
 #[cfg(feature = "build")]
-pub fn seed_base_catalog(project_root: &Path) -> CompileResult<()> {
+pub fn seed_base_catalog(project_root: &Path) -> BuildResult<()> {
     let dest = base_catalog_dir(project_root);
     if dest.exists() {
-        std::fs::remove_dir_all(&dest).map_err(CompileError::Io)?;
+        std::fs::remove_dir_all(&dest).map_err(BuildError::Io)?;
     }
     // Same node-tree exclude the build's staging copy uses, so a seed
     // source that ever carries a build/cache dir (a `target/`, a
     // `node_modules/`) doesn't get cloned into the user's `nodes/`.
     crate::build::copy_dir_filtered(
-        &weft_catalog::stdlib_root().map_err(CompileError::Build)?,
+        &weft_catalog::stdlib_root().map_err(BuildError::Build)?,
         &dest,
         &weft_catalog::is_node_tree_excluded,
     )
@@ -447,7 +447,7 @@ pub fn node_roots(project_root: &Path) -> [PathBuf; 2] {
 /// contains" (minus the seeded catalog, which `seed_base_catalog` adds), so
 /// every caller of `weft new` produces byte-identical projects. `id` is the
 /// project id stamped into the manifest (each caller mints its own).
-pub fn scaffold_files(name: &str, id: Uuid) -> CompileResult<Vec<(String, Vec<u8>)>> {
+pub fn scaffold_files(name: &str, id: Uuid) -> BuildResult<Vec<(String, Vec<u8>)>> {
     let manifest = ProjectManifest {
         package: PackageSection {
             name: name.to_string(),
@@ -462,7 +462,7 @@ pub fn scaffold_files(name: &str, id: Uuid) -> CompileResult<Vec<(String, Vec<u8
         dispatcher: None,
     };
     let toml = toml::to_string_pretty(&manifest)
-        .map_err(|e| CompileError::Project(format!("serialize manifest: {e}")))?;
+        .map_err(|e| BuildError::Project(format!("serialize manifest: {e}")))?;
     // Minimal main.weft: a single pure graph the user can edit immediately. No
     // `# Project:` header: the project name is authoritative in `weft.toml` (and
     // the folder), so a name comment in the source would just be a stale
@@ -483,7 +483,7 @@ pub fn scaffold_files(name: &str, id: Uuid) -> CompileResult<Vec<(String, Vec<u8
 mod find_tests {
     use super::*;
 
-    fn project_with(extra: &str) -> (tempfile::TempDir, CompileResult<Project>) {
+    fn project_with(extra: &str) -> (tempfile::TempDir, BuildResult<Project>) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/main.weft"), "").unwrap();

@@ -561,7 +561,7 @@ fn workers_through_sql(project_expr: &str, last_ms_expr: &str) -> String {
 /// a project's workers' failures are judged by ([`delivery_failed_sql`],
 /// [`workers_through_sql`]), for a test whose schema has no journal: every
 /// write of a failure reads them.
-// SYNC: these columns <-> crates/weft-dispatcher/src/journal/postgres.rs (run)
+// SYNC: these columns <-> crates/weft-dispatcher/src/store/postgres.rs (run)
 // Built in every build, hidden: the database tests of the crates above
 // this one call it too, and a test-only switch here would rebuild them all.
 #[doc(hidden)]

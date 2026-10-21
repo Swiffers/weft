@@ -3819,7 +3819,7 @@ mod replay_tests {
             "TestNode".into(),
             weft_core::frames::LoopFrames::default(),
             clients,
-            test_record(Arc::new(NoopJournal)),
+            test_record(Arc::new(CaptureJournal::default())),
             None,
             "instance-1".into(),
             "tenant-1".into(),
@@ -3878,7 +3878,7 @@ mod replay_tests {
             "TestNode".into(),
             weft_core::frames::LoopFrames::default(),
             clients,
-            test_record(Arc::new(NoopJournal)),
+            test_record(Arc::new(CaptureJournal::default())),
             None,
             "instance-1".into(),
             "tenant-1".into(),
@@ -4133,7 +4133,7 @@ mod replay_tests {
             "OpensConnection".into(),
             weft_core::frames::LoopFrames::default(),
             worker_clients,
-            test_record(Arc::new(NoopJournal)),
+            test_record(Arc::new(CaptureJournal::default())),
             None,
             "worker-instance-1".into(),
             "tenant-1".into(),
@@ -4330,8 +4330,6 @@ mod replay_tests {
         let (_, still_there) = project.get_bytes(&source).await.expect("the source is untouched");
         assert_eq!(&still_there[..], b"PNG!");
     }
-
-    use weft_journal::NoopJournal;
 
     /// A catalog with no nodes: these tests never publish, and a node
     /// it cannot find declares nothing, which is the honest answer for

@@ -16,6 +16,7 @@ mod parser_multiline_object;
 mod parser_tests;
 mod passthrough_include;
 mod per_instance;
+mod rig;
 mod start_feeders;
 mod test_crate_emit;
 mod type_rules_tests;

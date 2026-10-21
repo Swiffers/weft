@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use weft_core::project::{Crossing, CrossingSide, Edge, Span};
 
-use crate::weft_compiler::CompileError;
+use crate::weft_compiler::SourceError;
 
 /// One end of a leg.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +89,7 @@ struct Arrived {
 /// from that port, so its wire exists and validate names the typo on that
 /// leg's line, and a loop of legs through group ports with no node on it
 /// is refused once, naming the group and port it loops at.
-pub(crate) fn join(legs: &[Leg], scopes: &[Scope], errors: &mut Vec<CompileError>) -> Vec<Edge> {
+pub(crate) fn join(legs: &[Leg], scopes: &[Scope], errors: &mut Vec<SourceError>) -> Vec<Edge> {
     let by_id: BTreeMap<&str, &Scope> = scopes.iter().map(|s| (s.id.as_str(), s)).collect();
     let sites_of: BTreeMap<&str, Vec<&str>> = {
         let mut sites: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
@@ -203,7 +203,7 @@ struct Joiner<'a, 'e> {
     refused: BTreeSet<Vec<Port>>,
     /// Walking only to find port loops: no wire is made.
     probing: bool,
-    errors: &'e mut Vec<CompileError>,
+    errors: &'e mut Vec<SourceError>,
 }
 
 impl Joiner<'_, '_> {
@@ -331,7 +331,7 @@ impl Joiner<'_, '_> {
             if !self.refused.insert(round) { return false; }
             let (group, port, _) = face;
             let line = via.iter().rev().find(|crossing| crossing.span.is_some());
-            self.errors.push(CompileError::at(
+            self.errors.push(SourceError::at(
                 line.and_then(|crossing| crossing.span).unwrap_or_default(),
                 format!(
                     "the wires through '{}.{port}' come back to it without passing any node: a value \

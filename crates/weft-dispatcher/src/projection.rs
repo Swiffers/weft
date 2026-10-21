@@ -753,7 +753,7 @@ pub async fn run_inheritance(
     if program.program().is_none() {
         return Ok(weft_journal::SeedChain::default());
     }
-    weft_journal::seed_chain(rows, |seed| state.journal.events_log(seed), |project_id, hash| async move {
+    weft_journal::seed_chain(rows, |seed| state.runs.events_log(seed), |project_id, hash| async move {
         state.program(project_id, &hash).await?
             .ok_or_else(|| anyhow::anyhow!("seed definition {hash} is missing from project {project_id}"))
     })
@@ -766,10 +766,10 @@ pub async fn run_logs(
     state: &crate::state::DispatcherState,
     run_id: weft_core::RunId,
     limit: u32,
-) -> anyhow::Result<Vec<crate::journal::LogEntry>> {
-    let mut logs = state.journal.logs_for(run_id, limit).await?;
+) -> anyhow::Result<Vec<crate::store::LogEntry>> {
+    let mut logs = state.runs.logs_for(run_id, limit).await?;
     let inherited = async {
-        let rows = state.journal.events_log(run_id).await?;
+        let rows = state.runs.events_log(run_id).await?;
         let Some(RunEvent::RunStarted { seed: Some(seed), .. }) = rows.first() else { return Ok(Vec::new()); };
         let program = run_program(state, run_id).await?;
         anyhow::ensure!(program.program().is_some(), "inherited logs need the run's original program");
@@ -778,14 +778,14 @@ pub async fn run_logs(
     }.await;
     match inherited {
         Ok(inherited) => logs.extend(inherited),
-        Err(error) => logs.push(crate::journal::LogEntry::corrupt_row(0, format!("cannot read inherited log history: {error:#}"))),
+        Err(error) => logs.push(crate::store::LogEntry::corrupt_row(0, format!("cannot read inherited log history: {error:#}"))),
     }
-    Ok(crate::journal::LogEntry::tail(logs, limit))
+    Ok(crate::store::LogEntry::tail(logs, limit))
 }
 
-fn inherited_logs(chain: &SeedChain, seed: &weft_journal::Seed) -> Vec<crate::journal::LogEntry> {
+fn inherited_logs(chain: &SeedChain, seed: &weft_journal::Seed) -> Vec<crate::store::LogEntry> {
     chain.ancestors.iter().flat_map(|ancestor| ancestor.rows.iter().filter_map(|event| {
-        let mut line = crate::journal::LogEntry::from_event(event)?;
+        let mut line = crate::store::LogEntry::from_event(event)?;
         if seed.origins.get(&Located::at(line.node.as_deref()?, &line.frames)) != Some(&ancestor.run_id) { return None; }
         line.inherited_from = Some(ancestor.run_id);
         Some(line)
@@ -800,7 +800,7 @@ pub async fn reconstruct_run(
     let found = run_program(state, run_id).await?;
     let program = found.program()
         .ok_or_else(|| anyhow::anyhow!("run {run_id} has no readable original program"))?;
-    let rows = state.journal.events_log(run_id).await?;
+    let rows = state.runs.events_log(run_id).await?;
     let mut chain = run_inheritance(state, &rows, &found).await.map_err(anyhow::Error::msg)?;
     chain.ancestors.push(weft_journal::seed::Ancestor { run_id, project: program, rows });
     chain.materialize()
@@ -817,18 +817,18 @@ pub async fn run_program(
     state: &crate::state::DispatcherState,
     run_id: weft_core::RunId,
 ) -> anyhow::Result<ProgramLookup> {
-    let Some(owner) = state.journal.run_owner(run_id).await? else {
+    let Some(owner) = state.runs.run_owner(run_id).await? else {
         return Ok(ProgramLookup::NoProgram);
     };
     program_of_owner(state, run_id, &owner).await
 }
 
 /// [`run_program`] for a caller that read the run's row already
-/// (`owner`, `Journal::run_owner`).
+/// (`owner`, `RunStore::run_owner`).
 pub async fn program_of_owner(
     state: &crate::state::DispatcherState,
     run_id: weft_core::RunId,
-    owner: &crate::journal::RunOwner,
+    owner: &crate::store::RunOwner,
 ) -> anyhow::Result<ProgramLookup> {
     let Some(hash) = owner.definition_hash.clone() else {
         return Ok(ProgramLookup::NoProgram);

@@ -1,4 +1,4 @@
-//! Postgres-backed journal. Multiple dispatchers share one
+//! The four stores over Postgres. Multiple dispatchers share one
 //! Postgres database; the run rows, their records and the signal tables
 //! are the durable state. Postgres is the source of truth, every
 //! dispatcher process is a stateless reader/writer.
@@ -14,10 +14,16 @@ use weft_core::RunId;
 
 use weft_journal::record::{Appended, Queued, Then};
 use weft_journal::RunEvent;
-use crate::journal::{CancelWrite, RunOwner, RunListQuery, Journal, LogEntry, SignalRegistration, SignalToken};
+use crate::store::{
+    Answered, BakeStore, CancelWrite, LogEntry, Lost, RunListQuery, RunOwner, RunStore, SignalRegistration, SignalStore,
+    SignalToken, TokenStore,
+};
 use weft_core::program::{RunPage, RunSummary, RunStatus};
 
-pub struct PostgresJournal {
+/// [`RunStore`], [`SignalStore`], [`TokenStore`] and [`BakeStore`] over
+/// one pool: their tables share transactions (a cancel strips the run's
+/// signals, an answer writes its run), so one value implements all four.
+pub struct PostgresStore {
     pool: PgPool,
 }
 
@@ -29,7 +35,7 @@ pub struct PostgresJournal {
 pub(crate) fn phase_from_column(text: &str) -> weft_core::context::Phase {
     weft_core::context::Phase::from_tag(text).unwrap_or_else(|| {
         tracing::warn!(
-            target: "weft_dispatcher::journal",
+            target: "weft_dispatcher::store",
             phase = %text,
             "run row holds an unknown phase; answered as a fire"
         );
@@ -102,7 +108,7 @@ impl SummaryRow {
     }
 }
 
-impl PostgresJournal {
+impl PostgresStore {
     /// Wrap an EXISTING pool. Pure: the schema (this crate's [`GROUP`]
     /// included) is applied once, before construction, by the boot's one
     /// schema pass.
@@ -132,8 +138,7 @@ pub(crate) async fn answer_in(
     token: &str,
     answer: &weft_core::primitive::WaitAnswer,
     from: AnswerFrom,
-) -> anyhow::Result<crate::journal::Answered> {
-    use crate::journal::Answered;
+) -> anyhow::Result<Answered> {
     let run: Option<Option<RunId>> = sqlx::query_scalar("SELECT run_id FROM signal WHERE token = $1 AND is_resume")
         .bind(token)
         .fetch_optional(&mut *tx)
@@ -214,7 +219,7 @@ async fn cancel_unowned_in(
     }
 }
 
-/// The journal's schema. Early in `app::DISPATCHER_GROUPS` (other
+/// The schema of the stores' tables. Early in `app::DISPATCHER_GROUPS` (other
 /// groups' triggers attach to its tables), after the access store, whose
 /// `access_grant` one of its triggers attaches to; applied by the boot's
 /// one schema pass, never here.
@@ -962,7 +967,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 };
 
 #[async_trait]
-impl Journal for PostgresJournal {
+impl BakeStore for PostgresStore {
     async fn is_trigger_setup_pending(&self, run_id: RunId) -> anyhow::Result<bool> {
         Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM trigger_setup WHERE run_id = $1)")
             .bind(run_id).fetch_one(&self.pool).await?)
@@ -1003,7 +1008,10 @@ impl Journal for PostgresJournal {
             .bind(project_id).bind(instance.map(|m| m.as_str())).fetch_all(&self.pool).await?;
         rows.into_iter().map(|(value,)| serde_json::from_str(&value).map_err(Into::into)).collect()
     }
+}
 
+#[async_trait]
+impl RunStore for PostgresStore {
     async fn append(&self, run_id: RunId, events: &[RunEvent], then: Then) -> anyhow::Result<Appended> {
         let mut tx = self.pool.begin().await?;
         let appended = weft_journal::record::append_unowned_in(&mut tx, run_id, events, weft_journal::record::DISPATCHER, then).await?;
@@ -1115,8 +1123,7 @@ impl Journal for PostgresJournal {
         run_id: RunId,
         lapsed_before: i64,
         program: Option<&weft_core::ProjectDefinition>,
-    ) -> anyhow::Result<crate::journal::Lost> {
-        use crate::journal::Lost;
+    ) -> anyhow::Result<Lost> {
         let mut tx = self.pool.begin().await?;
         let Some(mut locked) = weft_journal::record::lock_in(&mut tx, run_id).await? else { return Ok(Lost::NotLost) };
         if locked.owner.is_none() || locked.state != "running" {
@@ -1175,103 +1182,6 @@ impl Journal for PostgresJournal {
         tx.commit().await?;
         weft_task_store::announce::committed(&self.pool);
         Ok(lost)
-    }
-
-    async fn answer(&self, token: &str, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<crate::journal::Answered> {
-        let mut tx = self.pool.begin().await?;
-        let answered = answer_in(&mut tx, token, answer, AnswerFrom::Sender).await?;
-        tx.commit().await?;
-        weft_task_store::announce::committed(&self.pool);
-        // An answer that reached its run may have been handed to the
-        // worker driving it, which left news for that worker.
-        if matches!(answered, crate::journal::Answered::Reached { .. }) {
-            weft_task_store::announce::news_written(&self.pool);
-        }
-        Ok(answered)
-    }
-
-    async fn mint_signal_token(&self, tok: &SignalToken) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO signal_token \
-             (id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-              allowed_displays, all_displays, created_at, instance_id, expires_at, kind) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
-        )
-        .bind(tok.id)
-        .bind(&tok.token_hash)
-        .bind(&tok.recognizer)
-        .bind(&tok.tenant_id)
-        .bind(&tok.name)
-        .bind(&tok.allowed_projects)
-        .bind(&tok.allowed_tags)
-        .bind(&tok.allowed_displays)
-        .bind(tok.all_displays)
-        // Store the caller-stamped mint time verbatim (the handler set it from
-        // the canonical clock), so postgres and the fake agree.
-        .bind(tok.created_at as i64)
-        .bind(tok.instance.as_ref().map(|m| m.as_str()))
-        .bind(tok.expires_at.map(|at| at as i64))
-        .bind(tok.kind.as_str())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-
-    async fn get_signal_token(&self, token_hash: &str) -> anyhow::Result<Option<SignalToken>> {
-        let row: Option<SignalTokenRow> = sqlx::query_as(
-            "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-                    allowed_displays, all_displays, created_at, instance_id, expires_at, kind \
-             FROM signal_token WHERE token_hash = $1",
-        )
-        .bind(token_hash)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(row_to_signal_token).transpose()
-    }
-
-    async fn seed_operator_token(&self, tok: &SignalToken) -> anyhow::Result<bool> {
-        anyhow::ensure!(tok.kind == weft_core::signal_token::TokenKind::Operator, "only an operator key is seeded");
-        let res = sqlx::query(
-            "INSERT INTO signal_token \
-             (id, token_hash, recognizer, tenant_id, name, created_at, kind) \
-             SELECT $1, $2, $3, $4, $5, $6, 'operator' \
-             WHERE NOT EXISTS ( \
-                 SELECT 1 FROM signal_token WHERE tenant_id = $4 AND kind = 'operator') \
-             ON CONFLICT (token_hash) DO NOTHING",
-        )
-        .bind(tok.id)
-        .bind(&tok.token_hash)
-        .bind(&tok.recognizer)
-        .bind(&tok.tenant_id)
-        .bind(&tok.name)
-        .bind(tok.created_at as i64)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
-    async fn list_signal_tokens(&self, tenant: &str) -> anyhow::Result<Vec<SignalToken>> {
-        let rows: Vec<SignalTokenRow> = sqlx::query_as(
-            "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-                    allowed_displays, all_displays, created_at, instance_id, expires_at, kind \
-             FROM signal_token WHERE tenant_id = $1 ORDER BY created_at DESC",
-        )
-        .bind(tenant)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(row_to_signal_token).collect()
-    }
-
-    async fn revoke_signal_token(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<bool> {
-        let res = sqlx::query(
-            "DELETE FROM signal_token WHERE id = $1 AND tenant_id = $2",
-        )
-        .bind(id)
-        .bind(tenant)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
     }
 
     async fn run_owner(&self, run_id: RunId) -> anyhow::Result<Option<RunOwner>> {
@@ -1501,6 +1411,22 @@ impl Journal for PostgresJournal {
             .fetch_one(&self.pool)
             .await?)
     }
+}
+
+#[async_trait]
+impl SignalStore for PostgresStore {
+    async fn answer(&self, token: &str, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<Answered> {
+        let mut tx = self.pool.begin().await?;
+        let answered = answer_in(&mut tx, token, answer, AnswerFrom::Sender).await?;
+        tx.commit().await?;
+        weft_task_store::announce::committed(&self.pool);
+        // An answer that reached its run may have been handed to the
+        // worker driving it, which left news for that worker.
+        if matches!(answered, Answered::Reached { .. }) {
+            weft_task_store::announce::news_written(&self.pool);
+        }
+        Ok(answered)
+    }
 
     async fn signal_insert(&self, sig: &SignalRegistration) -> anyhow::Result<super::SignalWrite> {
         // Entry rows (is_resume=false) reuse the existing token
@@ -1701,6 +1627,92 @@ impl Journal for PostgresJournal {
         project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<SignalRegistration>> {
         remove_project_signals(&self.pool, project_id).await
+    }
+}
+
+#[async_trait]
+impl TokenStore for PostgresStore {
+    async fn mint_signal_token(&self, tok: &SignalToken) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO signal_token \
+             (id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
+              allowed_displays, all_displays, created_at, instance_id, expires_at, kind) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        )
+        .bind(tok.id)
+        .bind(&tok.token_hash)
+        .bind(&tok.recognizer)
+        .bind(&tok.tenant_id)
+        .bind(&tok.name)
+        .bind(&tok.allowed_projects)
+        .bind(&tok.allowed_tags)
+        .bind(&tok.allowed_displays)
+        .bind(tok.all_displays)
+        // Store the caller-stamped mint time verbatim (the handler set it from
+        // the canonical clock), so postgres and the fake agree.
+        .bind(tok.created_at as i64)
+        .bind(tok.instance.as_ref().map(|m| m.as_str()))
+        .bind(tok.expires_at.map(|at| at as i64))
+        .bind(tok.kind.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_signal_token(&self, token_hash: &str) -> anyhow::Result<Option<SignalToken>> {
+        let row: Option<SignalTokenRow> = sqlx::query_as(
+            "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
+                    allowed_displays, all_displays, created_at, instance_id, expires_at, kind \
+             FROM signal_token WHERE token_hash = $1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(row_to_signal_token).transpose()
+    }
+
+    async fn seed_operator_token(&self, tok: &SignalToken) -> anyhow::Result<bool> {
+        anyhow::ensure!(tok.kind == weft_core::signal_token::TokenKind::Operator, "only an operator key is seeded");
+        let res = sqlx::query(
+            "INSERT INTO signal_token \
+             (id, token_hash, recognizer, tenant_id, name, created_at, kind) \
+             SELECT $1, $2, $3, $4, $5, $6, 'operator' \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM signal_token WHERE tenant_id = $4 AND kind = 'operator') \
+             ON CONFLICT (token_hash) DO NOTHING",
+        )
+        .bind(tok.id)
+        .bind(&tok.token_hash)
+        .bind(&tok.recognizer)
+        .bind(&tok.tenant_id)
+        .bind(&tok.name)
+        .bind(tok.created_at as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn list_signal_tokens(&self, tenant: &str) -> anyhow::Result<Vec<SignalToken>> {
+        let rows: Vec<SignalTokenRow> = sqlx::query_as(
+            "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
+                    allowed_displays, all_displays, created_at, instance_id, expires_at, kind \
+             FROM signal_token WHERE tenant_id = $1 ORDER BY created_at DESC",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_signal_token).collect()
+    }
+
+    async fn revoke_signal_token(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<bool> {
+        let res = sqlx::query(
+            "DELETE FROM signal_token WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(id)
+        .bind(tenant)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 }
 
@@ -2102,7 +2114,7 @@ const SIGNAL_SELECT_ENTRY_AT_PLACE: &str = concat!(
 /// tenant, project, instance, run, node, is_resume, trigger) and its
 /// parked fires are never among them.
 // SYNC: SIGNAL_REFRESHED_COLUMNS <-> bind_signal_refreshed (same order)
-//       <-> journal/fake.rs `copy_refreshed`
+//       <-> store/fake.rs `copy_refreshed`
 const SIGNAL_REFRESHED_COLUMNS: [&str; 16] = [
     "spec_json",
     "program_json",
@@ -2342,7 +2354,7 @@ pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration
             Ok(v) => Some(v),
             Err(e) => {
                 tracing::error!(
-                    target: "weft_dispatcher::journal",
+                    target: "weft_dispatcher::store",
                     token = %row.token,
                     error = %e,
                     "corrupt signal.consumer_payload: this signal is missing from every \

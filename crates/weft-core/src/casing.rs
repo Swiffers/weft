@@ -96,6 +96,7 @@ fn words(name: &str, sep: char, allowed: impl Fn(char) -> bool) -> bool {
 /// capitals that a lower case letter follows (`XMLHttp` is `xml`,
 /// `http`), unless that letter is a plural's lone `s` (`userURLs` is
 /// `user`, `urls`).
+// SYNC: split_words, Casing::spell (Camel) <-> packages/weft-graph/src/webview/lib/utils/node-id.ts camelCase
 fn split_words(name: &str) -> Vec<String> {
     let chars: Vec<char> = name.chars().collect();
     let mut out: Vec<String> = Vec::new();

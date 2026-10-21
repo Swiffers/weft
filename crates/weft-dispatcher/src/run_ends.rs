@@ -6,7 +6,7 @@
 //! `run_end_unhandled` index finds:
 //!
 //! - `watch_end`: somebody waits on the run's ending. A trigger setup's
-//!   ending is baked here (`crate::journal::TriggerBake`), so an activation
+//!   ending is baked here (`crate::store::TriggerBake`), so an activation
 //!   whose request died still gets its bake;
 //! - `holds_signals`: the run ended holding resume signals. Their rows go,
 //!   and the listener is told to let go of them.
@@ -103,7 +103,7 @@ async fn handle_ending(state: &DispatcherState, ending: &Flagged) -> anyhow::Res
         finish_trigger_setup(state, ending.run_id, ending.project_id).await?;
     }
     if ending.holds_signals {
-        let removed = state.journal.signal_remove_for_run_id(ending.run_id).await?;
+        let removed = state.registrations.signal_remove_for_run_id(ending.run_id).await?;
         state.listener.unregister_many(&removed).await;
     }
     Ok(())
@@ -146,24 +146,24 @@ pub async fn clear_flags(conn: &mut sqlx::PgConnection, ending: &Flagged) -> any
 /// still waiting for its bake. A capture that cannot be read leaves the
 /// last good bake in place and says so on the project's events.
 async fn finish_trigger_setup(state: &DispatcherState, run_id: RunId, project_id: uuid::Uuid) -> anyhow::Result<()> {
-    if !state.journal.is_trigger_setup_pending(run_id).await? {
+    if !state.bakes.is_trigger_setup_pending(run_id).await? {
         return Ok(());
     }
-    let (rows, bad) = state.journal.events_log_lossy(run_id).await?;
+    let (rows, bad) = state.runs.events_log_lossy(run_id).await?;
     let capture = match bad.into_iter().next() {
         Some(reason) => Err(anyhow::Error::msg(reason)),
         None => {
             let events = rows.into_iter().map(|row| row.event).collect::<Vec<_>>();
             match state.run_program_identity(&events).await {
-                Ok(program) => crate::journal::TriggerBake::from_events(&events, &program),
+                Ok(program) => crate::store::TriggerBake::from_events(&events, &program),
                 Err(e) => Err(e),
             }
         }
     };
     match capture {
-        Ok(bake) => state.journal.finish_trigger_setup(run_id, bake.as_ref()).await,
+        Ok(bake) => state.bakes.finish_trigger_setup(run_id, bake.as_ref()).await,
         Err(error) => {
-            state.journal.finish_trigger_setup(run_id, None).await?;
+            state.bakes.finish_trigger_setup(run_id, None).await?;
             crate::live_view::publish_unreadable(
                 state,
                 run_id,

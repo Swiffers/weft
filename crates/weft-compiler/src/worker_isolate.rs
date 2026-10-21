@@ -146,6 +146,11 @@ struct Decision {
     healthy: Vec<String>,
 }
 
+// The image build runs this as its own program; weft-compiler compiles the
+// same file as a module (for `Candidates` and the tests), where nothing
+// calls `main`. Allowing it here keeps everything `main` reaches counted as
+// used, so a function nothing reaches at all still warns.
+#[allow(dead_code)]
 fn main() -> ExitCode {
     match run() {
         Ok(code) => code,

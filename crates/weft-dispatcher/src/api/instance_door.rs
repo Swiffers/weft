@@ -448,7 +448,7 @@ pub async fn runs(
     Query(q): Query<RunsQuery>,
 ) -> Result<Json<weft_core::program::RunPage>, ApiError> {
     let caller = instance_caller(&state, &headers).await?;
-    let query = crate::journal::RunListQuery {
+    let query = crate::store::RunListQuery {
         limit: q.limit.unwrap_or(50).clamp(1, 200),
         offset: q.offset.unwrap_or(0),
         project_id: Some(caller.project),
@@ -457,7 +457,7 @@ pub async fn runs(
         ..Default::default()
     };
     state
-        .journal
+        .runs
         .list_runs(&caller.tenant, &query)
         .await
         .map(|page| Json(plain_failures(page)))

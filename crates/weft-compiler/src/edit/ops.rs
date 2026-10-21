@@ -44,11 +44,11 @@ pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditEr
         AddNode { id, node_type, parent_group } => {
             // The type is written into the source too, so it is validated at the
             // door: a single identifier, and not one of the type names the
-            // language reserves (asking `is_reserved_type_keyword`, the one
-            // owner of that list, so `Group`/`Loop`/... cannot be authored as a
-            // plain node through this door).
+            // language reserves (asking `weft_core::project::own_types`, the
+            // one owner of that list, so `Group`/`Loop`/... cannot be authored
+            // as a plain node through this door).
             validate_ident("node type", node_type)?;
-            if crate::weft_compiler::is_reserved_type_keyword(node_type) {
+            if weft_core::project::own_types::is_own(node_type) {
                 return Err(EditError::InvalidArgument(format!(
                     "node type {node_type:?} is a type name the language reserves"
                 )));
@@ -657,23 +657,31 @@ fn enclosing_scope(
 }
 
 /// A fresh legal local id for an extracted inline node, derived from its
-/// anon id (`a__data` -> `a_data`; the `__` separator is reserved), with
-/// a numeric suffix until free in the scope.
+/// anon id and spelled the way a node name is (camelCase:
+/// `a__data` -> `aData`; the `__` separator is reserved), with a numeric
+/// suffix until free in the scope (`aData2`).
 fn fresh_extract_local(view: &FileView, prefix: Option<&str>, anon_local: &str) -> String {
-    let base = anon_local.replace("__", "_");
-    let mut name = base.clone();
-    let mut n = 1;
-    loop {
+    fresh_local(&weft_core::casing::Casing::Camel.spell(anon_local), |name| {
         let scoped = match prefix {
             Some(p) => format!("{p}.{name}"),
-            None => name.clone(),
+            None => name.to_string(),
         };
-        if !view.scoped_id_exists(&scoped) && !crate::weft_compiler::is_reserved_local(&name) {
-            return name;
-        }
+        view.scoped_id_exists(&scoped) || crate::weft_compiler::is_reserved_local(name)
+    })
+}
+
+/// The first of `base`, `base2`, `base3`, ... that is not `taken`. A
+/// number joins a camelCase name as one more word (`aData2`), so the
+/// result keeps the base's spelling.
+// SYNC: fresh_local <-> packages/weft-graph/src/webview/lib/components/project/ProjectEditorInner.svelte (freshScopedName)
+fn fresh_local(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    let mut name = base.to_string();
+    let mut n = 1;
+    while taken(&name) {
         n += 1;
-        name = format!("{base}_{n}");
+        name = format!("{base}{n}");
     }
+    name
 }
 
 /// Extract an inline expression into a named decl in its own scope.
@@ -2512,7 +2520,7 @@ fn value_elements(value: &str) -> Result<Vec<SyntaxElement>, EditError> {
 /// Use the compiler's actual name/type resolution for scope edits. No file I/O
 /// is needed; unresolved external files remain the same diagnostics on both
 /// sides. Reimplementing an alias resolver in the editor would drift.
-fn source_meaning(view: &FileView) -> (weft_core::project::ProjectDefinition, Vec<crate::weft_compiler::CompileError>) {
+fn source_meaning(view: &FileView) -> (weft_core::project::ProjectDefinition, Vec<crate::weft_compiler::SourceError>) {
     crate::weft_compiler::compile_lenient(
         &view.file().syntax().to_string(), uuid::Uuid::nil(),
         crate::file_reader::CompileFs::none(), crate::weft_compiler::IncludeMode::Full,
@@ -2522,7 +2530,7 @@ fn source_meaning(view: &FileView) -> (weft_core::project::ProjectDefinition, Ve
 
 fn check_scope_meaning(
     view: &FileView,
-    before: &(weft_core::project::ProjectDefinition, Vec<crate::weft_compiler::CompileError>),
+    before: &(weft_core::project::ProjectDefinition, Vec<crate::weft_compiler::SourceError>),
     from: &str,
     to: Option<&str>,
 ) -> Result<(), EditError> {
@@ -3230,5 +3238,27 @@ fn format_string(s: &str) -> Result<String, EditError> {
         Ok(format!("```\n{}\n```", s.replace("```", "\\```")))
     } else {
         Ok(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+    }
+}
+
+#[cfg(test)]
+mod minting_tests {
+    use super::fresh_local;
+    use weft_core::casing::Casing;
+
+    /// An id weft mints for a node is spelled the way a node name is, so the
+    /// compiler's own `not-camel-case` check never flags what the editor
+    /// wrote: the anon id's `__` separator becomes a word break, and a taken
+    /// name gets the first free number as one more word.
+    #[test]
+    fn a_minted_node_id_is_camel_case() {
+        let base = Casing::Camel.spell("a__data");
+        assert_eq!(base, "aData");
+        assert_eq!(Casing::Camel.spell("myNode__someKey"), "myNodeSomeKey");
+        assert_eq!(fresh_local(&base, |_| false), "aData");
+        let taken = ["aData", "aData2"];
+        let minted = fresh_local(&base, |name| taken.contains(&name));
+        assert_eq!(minted, "aData3");
+        assert!(Casing::Camel.holds(&minted), "{minted}");
     }
 }

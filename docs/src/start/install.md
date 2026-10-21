@@ -54,8 +54,8 @@ For the whole format, go and read
 ./setup.sh
 ```
 
-The installer asks no questions: the first run starts the database and pulls
-images, then sets the runtime up as a service of your user (systemd on Linux, launchd on macOS), so it comes
+On a fresh machine the installer asks no questions: the first run starts the
+database and pulls images, then sets the runtime up as a service of your user (systemd on Linux, launchd on macOS), so it comes
 back on its own after a reboot.
 
 ## Check it came up

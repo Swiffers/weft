@@ -10,15 +10,18 @@
 //! rewritten (a registration again) loses its claim, so its holder stops
 //! the old connection and the new one comes up as the row now reads.
 //!
-//! Nothing here runs on a timer. A holder looks (one broker call: say
-//! what each connection is doing when that changed, learn which are
-//! still its own, take what is free) when it starts, when it is told the
-//! held signals changed or may have missed it
+//! A holder's look runs on no timer. It looks (one broker call: say what
+//! each connection is doing when that changed, learn which are still its
+//! own, take what is free) when it starts, when it is told the held
+//! signals changed or may have missed it
 //! (`weft_platform_traits::HolderNews`), and when one of its connections
 //! changes what it says. A holder that dies is noticed by its dead man's
 //! switch (`weft_platform_traits::HolderLiveness`): it keeps one check
-//! scheduled ahead of now and pushes it further before it comes due; one
-//! that goes off frees what the holder claimed.
+//! scheduled ahead of now ([`check_ahead`]) and, on the one timer here,
+//! pushes it further every [`push_every`] ([`keep_checked`]); a check
+//! that goes off frees what the holder claimed. That timer runs only in a
+//! holder in a pool, and the pool runs none while no signal is held; a
+//! local install's one process keeps no check.
 //!
 //! A signal that ended (its row is gone, or its activation parked) stops
 //! along with what it arranged outside (a provider subscription). One

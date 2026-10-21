@@ -3,6 +3,17 @@
 What changed between versions of weft that you need to know about when you
 update. To update, pull and run `./setup.sh` again.
 
+## 2026-10-21 (5eafc84b)
+
+If you are on a Mac, `weft test-node` works again. Since 2026-09-19 it failed
+before any test ran, with `no method named set_tcp_user_timeout` in
+`weft-engine`. Nothing to do beyond `./setup.sh`.
+
+Tangle now copies a catalog node into your project's `nodes/` and changes the
+copy when the node is close to what you need but misses something (a Google
+permission, a parameter, a slightly different behavior), instead of telling
+you weft cannot do it. Run `weft tangle update` in each project to get it.
+
 ## 2026-10-20 (0.2.270)
 
 **This release wipes your install's database, so connect your services again

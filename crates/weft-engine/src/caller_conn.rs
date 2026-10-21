@@ -1595,6 +1595,12 @@ fn bound_silence(socket: &socket2::Socket, secs: u64) {
     // schedule wins, and the route's wish is honoured from there up.
     let secs = if secs > 0 { secs.max(KEEPALIVE_SCHEDULE_SECS) } else { 0 };
     let timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+    // The bound is `TCP_USER_TIMEOUT`, which only Linux and its kin
+    // have. A worker always runs on Linux, in its image; the engine is
+    // built for another system only when `weft test-node` compiles it
+    // natively on the developer's own machine (a Mac), and there the
+    // bound is skipped while the keepalive probes stay on.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "fuchsia", target_os = "cygwin"))]
     if let Err(error) = socket.set_tcp_user_timeout(timeout) {
         tracing::warn!(
             target: "weft_engine::caller_conn",
@@ -1603,6 +1609,8 @@ fn bound_silence(socket: &socket2::Socket, secs: u64) {
              the server's default"
         );
     }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "fuchsia", target_os = "cygwin")))]
+    let _ = (socket, timeout);
 }
 
 /// Serve the worker's router (its own endpoints and the connection

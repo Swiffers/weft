@@ -1,8 +1,9 @@
 # Your first program
 
 Making a project takes one command, and it has one choice in it: which AI
-assistant you use. Pass `--assistant` with your row from this table and weft
-copies Tangle into the project. Tangle is a persona that teaches your assistant
+assistant you use. If you run `weft new hello` with no flag, weft asks you,
+listing the assistants it found on your machine first. Or pass `--assistant`
+with your row from this table. Either way weft copies Tangle into the project. Tangle is a persona that teaches your assistant
 the language, and it reads the catalog on your disk rather than trusting what
 it remembers.
 
@@ -21,9 +22,12 @@ it remembers.
 | Something else | `--assistant agents`, which writes a plain `AGENTS.md` |
 | Nothing | `--assistant none` |
 
-If you use more than one, pass `--assistant` once for each. The pick is for
-this project only. If you want your next `weft new` to install the same one
-with no flag, add `--remember`, as here:
+If weft is run from a script or by an AI agent, there is nobody to ask, so it
+stops and lists these values: pass one. If you use more than one assistant,
+pass `--assistant` once for each. When weft asks, it also asks whether to keep
+your answer for later projects. A flag is for this project only, so if you
+want your next `weft new` to install the same one with no flag, add
+`--remember`, as here:
 
 ```bash
 weft new hello --assistant claude-code --remember

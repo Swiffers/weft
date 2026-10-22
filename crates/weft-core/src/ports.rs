@@ -11,8 +11,7 @@
 //! `ports.json` ([`InstallPorts`]), which is where the CLI looks for it.
 //! `WEFT_SEAWEED_PORT` moves the object store, which all installs share.
 //!
-//! SYNC: these numbers <-> setup.sh (weft_local_url, the summary),
-//! extension-vscode/src/localInstall.ts
+//! SYNC: these numbers <-> extension-vscode/src/localInstall.ts
 //! (DEFAULT_LOCAL_URL),
 //! extension-browser/src/entrypoints/popup/App.svelte (the bare-token
 //! default), and the prose that names them: docs/src/**,
@@ -64,8 +63,7 @@ pub const LOCAL_PUBLIC_URL: &str = "http://127.0.0.1:14111";
 /// Saved for every install, the default one included, so a port moved
 /// once stays moved: the address is the file's, never whatever the
 /// environment of the latest command happens to say.
-// SYNC: the file's shape <-> setup.sh (weft_local_url reads `public`),
-// extension-vscode/src/localInstall.ts (localInstallUrl reads `public`)
+// SYNC: the file's shape <-> extension-vscode/src/localInstall.ts (localInstallUrl reads `public`)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InstallPorts {
     pub public: u16,

@@ -71,7 +71,7 @@ The package is built again once its files change, so fix it and run the command 
 
 | Command | What it does |
 |---|---|
-| `weft new <name> [--assistant <who>] [--remember] [--ci <cloud>]` | Scaffolds `weft.toml`, `src/main.weft`, `nodes/`, a git repo and a `.gitignore`. `--assistant` copies Tangle into this project only, and is repeatable. `--remember` also makes that choice the default for every later `weft new` run without `--assistant`; `--assistant none --remember` clears the default, and `--assistant none` alone installs nothing and leaves it as it was. `--ci gcp` also writes the deploy workflow. If any step fails, nothing is written |
+| `weft new <name> [--assistant <who>] [--remember] [--ci <cloud>]` | Scaffolds `weft.toml`, `src/main.weft`, `nodes/`, a git repo and a `.gitignore`. `--assistant` copies Tangle into this project only, and is repeatable. If you leave it out, the default `--remember` saved is used, and with no default weft asks you to pick from a list, the assistants it found on your machine first. With nobody to ask (no terminal, or `--json`) it stops and lists the values instead. `--assistant none` is how you make a project without Tangle; `--assistant none --remember` also clears the default, so the next `weft new` asks again. It ends by printing the command that opens the project in your assistant. `--ci gcp` also writes the deploy workflow. If any step fails, nothing is written |
 | `weft catalog update` | Re-copies `nodes/base_catalog/` from the installed weft. Replaces the folder, so your edits in there go |
 | `weft tangle update [--assistant <who>]` | Re-copies Tangle. Replaces every file the template owns; anything your assistant wrote beside them stays |
 

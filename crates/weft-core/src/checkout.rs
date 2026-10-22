@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 /// root actually read: this workspace's manifests + lockfile (staged into
 /// every worker build context) and the stdlib catalog. One predicate for
 /// every place that asks, so they cannot drift on what "a checkout" means.
+// SYNC: is_weft_checkout <-> install.sh (is_weft_checkout)
 pub fn is_weft_checkout(p: &Path) -> bool {
     p.join("crates/weft-catalog").is_dir()
         && p.join("Cargo.toml").is_file()

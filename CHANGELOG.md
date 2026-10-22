@@ -3,6 +3,24 @@
 What changed between versions of weft that you need to know about when you
 update. To update, pull and run `./setup.sh` again.
 
+## 2026-10-22 (0.2.272)
+
+weft installs with one line: `curl -fsSL https://weft.weavemind.ai/install.sh | bash`
+puts it in `~/weft` and runs the installer, and running the line again updates
+it. An existing checkout keeps working as before with `./setup.sh`.
+
+`./setup.sh` no longer scrolls Docker and cargo output past you: each long step
+shows a spinner with the time so far and the last line it printed, and a step
+that fails shows the end of its output and the file holding all of it.
+`--verbose` brings the full output back.
+
+`weft new` without `--assistant` now asks which coding assistant you use (the
+ones found on your machine first) and offers to remember it, then prints the
+command that opens the project. Without a terminal to ask on, it refuses and
+names the flag; `--assistant none` is how to make a project with no Tangle.
+`--assistant none --remember` now clears your saved default instead of saving
+"none", so the next `weft new` asks again.
+
 ## 2026-10-22 (32351dec)
 
 Tangle keeps its messages short and plain while it works: a sentence or two

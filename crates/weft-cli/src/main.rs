@@ -42,32 +42,39 @@ struct Cli {
     /// bar; the readers (status, ps, runs, events, logs, files,
     /// token, stop, connect) print what the
     /// dispatcher answered; test-node prints its reports as one JSON
-    /// array. The rest (new, follow, daemon, catalog, tangle, clean)
-    /// ignore it; describe-nodes, parse and validate are JSON already.
+    /// array. new never asks under it (no assistant given and none
+    /// remembered is then an error). The rest (follow, daemon, catalog,
+    /// tangle, clean) ignore it; describe-nodes, parse and validate are
+    /// JSON already.
     #[arg(long, global = true)]
     json: bool,
 }
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Scaffold a new project (git init, main.weft, weft.toml). With
-    /// `--assistant <name>` also install the Tangle assistant persona for
-    /// that AI coding assistant, COPIED from this weft checkout's
-    /// `tangle/<name>/`, so the project keeps the version that created it
-    /// and `weft tangle update` is what refreshes it. The choice is
-    /// remembered: later runs of `weft new` install the same assistants
-    /// with no flag; `--assistant none` clears it.
+    /// Scaffold a new project (git init, main.weft, weft.toml) with the
+    /// Tangle assistant persona for the AI coding assistant you will open
+    /// it in, COPIED from this weft checkout's `tangle/<name>/`, so the
+    /// project keeps the version that created it and `weft tangle update`
+    /// is what refreshes it. The assistant comes from `--assistant`, else
+    /// the default `--remember` saved, else you are asked in the terminal
+    /// (the assistants found on this machine listed first). With no
+    /// terminal to ask in, or `--json`, it refuses: pass `--assistant`,
+    /// or `--assistant none` for a project without Tangle. Ends by
+    /// printing the command that opens the project in that assistant.
     New {
         name: String,
         /// Install the Tangle persona for this AI coding assistant
         /// (e.g. `claude-code`/`cc` or `kilo-code`/`kc`), copied from the weft
         /// checkout so the project keeps what it was created with
         /// (`weft tangle update` refreshes it). Repeatable; `none` installs
-        /// nothing. For this project only, unless `--remember`.
+        /// nothing, and is the only way to make a project without Tangle.
+        /// For this project only, unless `--remember`.
         #[arg(long = "assistant", value_name = "NAME")]
         assistants: Vec<String>,
         /// Also make the `--assistant` choice the default for future
-        /// `weft new` calls (`--assistant none --remember` clears it).
+        /// `weft new` calls (`--assistant none --remember` clears it, so
+        /// the next one asks again).
         #[arg(long, requires = "assistants")]
         remember: bool,
         /// Also write the GitHub Actions workflow that deploys the

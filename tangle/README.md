@@ -9,7 +9,11 @@ One folder here per assistant. `weft new <name> --assistant <one of them>`
 copies that folder's files into the new project, where they are the
 project's own files and get committed with it. The choice is for that
 project only; add `--remember` if you want later `weft new` runs to install
-the same folder with no flag. To move a project onto a
+the same folder with no flag. With no flag and nothing remembered, `weft new`
+asks which one in the terminal, and refuses when there is no terminal to ask
+in, so a project only goes without Tangle on `--assistant none`. Each row of
+`ASSISTANTS` in `crates/weft-cli/src/commands/new.rs` also says how to tell
+the assistant is installed and how to open a project in it. To move a project onto a
 newer Tangle, run `weft tangle update` in it.
 
 Copies rather than links, because an assistant treats a project's

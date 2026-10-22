@@ -96,6 +96,10 @@
 #                 locally too.
 #
 # Diagnostics:
+#   --verbose     show each step's output as it runs. Without it, a long
+#                 step (a build, an image pull) shows a spinner with the
+#                 last line it printed, and a failed step shows the end
+#                 of its output and the file holding all of it.
 #   An install writes a START line and a DONE/FAIL line (with the
 #   section it died in) to ~/.local/share/weft/setup-runs.log. A run
 #   refused on its arguments records only the FAIL; a --purge deletes
@@ -213,19 +217,6 @@ orig_args="$*"
 # Single source so install, version-probe, and uninstall can never drift (a
 # stale `weavemindai.` typo made --uninstall silently match nothing).
 ext_id="weavemind.weft-vscode"
-# Where this run's install answers (its API and dashboard): the public
-# port it saved in its ports.json when it started, so a port moved once
-# stays found. Before its first start, the port that start will take.
-# Only called once the install is known (install_dir, below).
-# SYNC: 14111 <-> crates/weft-core/src/ports.rs (PUBLIC, InstallPorts),
-# extension-vscode/src/localInstall.ts,
-# extension-browser/src/entrypoints/popup/App.svelte
-weft_local_url() {
-  local saved
-  saved="$(sed -n 's/.*"public":\([0-9]*\).*/\1/p' "${install_dir}/ports.json" 2>/dev/null || true)"
-  printf 'http://127.0.0.1:%s' "${saved:-${WEFT_PUBLIC_PORT:-14111}}"
-}
-
 # ---- visual library --------------------------------------------------
 #
 # Colors + symbols. Disabled when stdout isn't a TTY (CI pipelines,
@@ -277,69 +268,79 @@ step() { printf '  %s%s%s %s\n' "${C_CYAN}" "${SYM_STEP}" "${C_RESET}" "$*"; }
 hint() { printf '  %s%s %s%s\n' "${C_DIM}" "${SYM_INFO}" "$*" "${C_RESET}"; }
 warn() { printf '  %s%s%s %s\n' "${C_YELLOW}" "${SYM_WARN}" "${C_RESET}" "$*"; }
 
-# spin "label" cmd args... -- run cmd while showing a spinner. On
-# success replace the spinner with `✓ label`. On failure, replace
-# with `✗ label` and forward the captured output to stderr so the
-# user sees what went wrong. Plain echo fallback when no TTY.
+# spin_status <logfile> <width>: the last non-empty line the command
+# wrote, colours stripped and cut to <width>, for the spinner line.
+# Progress bars rewrite one line with \r, so those count as line ends.
+spin_status() {
+  tail -c 4096 "$1" 2>/dev/null \
+    | tr '\r' '\n' \
+    | sed -e $'s/\033\\[[0-9;?]*[A-Za-z]//g' -e 's/[[:space:]]\{1,\}/ /g' -e 's/^ //' \
+    | awk 'NF { last = $0 } END { print last }' \
+    | cut -c "1-$2"
+}
+
+# spin "label" cmd args... -- run cmd with its output written to a log
+# file, showing a spinner, the time so far and the last line the command
+# wrote, so a long build shows it is moving without flooding the
+# terminal. On success the line becomes `✓ label (time)` and the log is
+# deleted. On failure it becomes `✗ label`, the log's last 60 lines are
+# shown, and the log is kept and named so the whole output can be read.
+# --verbose streams the command's output instead. With no terminal, one
+# line before and one after.
 spin() {
   local label="$1"; shift
-  # One per-run mktemp log on BOTH branches: a fixed /tmp name would
-  # let two concurrent runs interleave and delete each other's output
-  # (and hand any local user a symlink-overwrite seat).
-  local logfile
-  logfile="$(mktemp -t weft-setup.XXXXXX.log)"
-  if [[ $HAS_TTY -eq 0 ]]; then
-    printf '  %s %s\n' "${SYM_STEP}" "${label}"
-    if "$@" >"${logfile}" 2>&1; then
+  if [[ $verbose -eq 1 ]]; then
+    step "${label}"
+    if "$@"; then
       ok "${label}"
-      rm -f "${logfile}"
       return 0
     else
       local rc=$?
       fail "${label}"
-      cat "${logfile}" >&2 || true
-      rm -f "${logfile}"
       return $rc
     fi
   fi
-  "$@" >"${logfile}" 2>&1 &
-  local pid=$!
-  local i=0
-  printf '  '
-  while kill -0 "${pid}" 2>/dev/null; do
-    local frame="${SP_FRAMES[$((i % ${#SP_FRAMES[@]}))]}"
-    printf '\r  %s%s%s %s' "${C_CYAN}" "${frame}" "${C_RESET}" "${label}"
-    sleep 0.08
-    i=$((i + 1))
-  done
-  if wait "${pid}"; then
-    printf '\r  %s%s%s %s\n' "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${label}"
+  # One mktemp log per call: a fixed /tmp name would let two concurrent
+  # runs interleave and delete each other's output (and hand any local
+  # user a symlink-overwrite seat).
+  local logfile started rc=0
+  logfile="$(mktemp -t weft-setup.XXXXXX.log)"
+  started=$SECONDS
+  if [[ $HAS_TTY -eq 0 ]]; then
+    printf '  %s %s\n' "${SYM_STEP}" "${label}"
+    "$@" >"${logfile}" 2>&1 || rc=$?
+  else
+    "$@" >"${logfile}" 2>&1 &
+    local pid=$! i=0 status="" cols width
+    cols="$(tput cols 2>/dev/null || echo 80)"
+    while kill -0 "${pid}" 2>/dev/null; do
+      local frame="${SP_FRAMES[$((i % ${#SP_FRAMES[@]}))]}"
+      # The status line is re-read every half second, not every frame:
+      # tail and sed per frame would cost more than the spinner shows.
+      if (( i % 6 == 0 )); then
+        width=$(( cols - ${#label} - 16 ))
+        status=""
+        (( width > 10 )) && status="$(spin_status "${logfile}" "${width}")"
+      fi
+      printf '\r\033[K  %s%s%s %s %s(%ss)%s %s%s%s' \
+        "${C_CYAN}" "${frame}" "${C_RESET}" "${label}" \
+        "${C_DIM}" "$((SECONDS - started))" "${C_RESET}" \
+        "${C_DIM}" "${status}" "${C_RESET}"
+      sleep 0.08
+      i=$((i + 1))
+    done
+    wait "${pid}" || rc=$?
+    printf '\r\033[K'
+  fi
+  if [[ $rc -eq 0 ]]; then
+    ok "${label} ${C_DIM}($((SECONDS - started))s)${C_RESET}"
     rm -f "${logfile}"
     return 0
-  else
-    local rc=$?
-    printf '\r  %s%s%s %s\n' "${C_RED}" "${SYM_FAIL}" "${C_RESET}" "${label}"
-    cat "${logfile}" >&2 || true
-    rm -f "${logfile}"
-    return $rc
   fi
-}
-
-# spin_passthrough "label" cmd args... -- like spin but lets the
-# command print its OWN output live. Used for cargo/docker where
-# users want to watch progress. Just runs the command directly,
-# bracketed by a step header and a final ✓ / ✗.
-spin_passthrough() {
-  local label="$1"; shift
-  step "${label}"
-  if "$@"; then
-    ok "${label}"
-    return 0
-  else
-    local rc=$?
-    fail "${label}"
-    return $rc
-  fi
+  fail "${label}"
+  tail -n 60 "${logfile}" >&2 || true
+  hint "the whole output is in ${logfile}"
+  return $rc
 }
 
 # Portable sha256 (GNU sha256sum on Linux, shasum on macOS), same
@@ -559,6 +560,8 @@ do_sign=1
 from_source=0
 # --yes: answer yes to every question asked before a wipe.
 assume_yes=0
+# --verbose: stream every step's output instead of the spinner.
+verbose=0
 
 # Called the first time a --<component> flag is seen. Zeroes every
 # component so subsequent flags act as opt-ins. No-op after the
@@ -693,6 +696,7 @@ while [[ $# -gt 0 ]]; do
 
     --from-source) from_source=1 ;;
     --yes)         assume_yes=1 ;;
+    --verbose)     verbose=1 ;;
 
     -h|--help)
       # The whole leading comment block, however long it grows: from
@@ -1145,7 +1149,7 @@ build_cli_from_source() {
     # Explicit, never left to `set -e`: the build slot runs this
     # function as a condition, where errexit is off, and a failed build
     # would otherwise go on to install whatever an earlier one left.
-    spin_passthrough "cargo build ${release_flag:+${release_flag} }-p weft-cli -p weft-runtime" \
+    spin "cargo build ${release_flag:+${release_flag} }-p weft-cli -p weft-runtime" \
       cargo build ${release_flag} --manifest-path "${here}/Cargo.toml" -p weft-cli -p weft-runtime \
       || return 1
     if [[ ! -x "${target_dir}/weft" || ! -x "${target_dir}/weft-runtime" ]]; then
@@ -2094,7 +2098,7 @@ if [[ $refresh_daemon -eq 1 ]]; then
 
     # In the build slot: a start whose runtime or builder-base image
     # moved compiles it (cargo, inside docker), as heavy as the CLI build.
-    spin_passthrough "weft daemon start" \
+    spin "starting weft (pulls or builds its images the first time)" \
       with_build_slot "${install_env_cmd[@]}" daemon start ${rebuild_flag} ${public_url_flag}
     record_checkout_install
 
@@ -2104,7 +2108,7 @@ if [[ $refresh_daemon -eq 1 ]]; then
     # machine records, and removes nothing of a kind while an install has
     # not recorded yet (it names that install). Warn-only: hygiene must
     # not fail the install.
-    if spin_passthrough "weft clean --images --build-plane" \
+    if spin "removing builder images nothing uses any more" \
       "${install_env_cmd[@]}" clean --images --build-plane; then
       :
     else
@@ -2133,13 +2137,12 @@ if [[ $refresh_daemon -eq 1 ]]; then
     # (a fresh image is referenced by nothing until its register lands;
     # that run fails loudly and rebuild heals), so it runs AFTER the
     # reconcile, when this window's own builds are done.
-    # Passthrough (not spin): the reclaim names what it removes, and
-    # "kept the running project's images, dropped the dead ones" is
-    # exactly the output a user updating weft wants to see.
+    # Under the spinner like every step: what it removed is in its log,
+    # and --verbose shows it as it happens.
     # No address passed: the CLI reads the port the start above just
     # saved in ports.json (a WEFT_DISPATCHER_URL the user exported still
     # reaches it through the environment).
-    if spin_passthrough "weft clean --images --all" \
+    if spin "removing weft images nothing runs any more" \
       "${install_env_cmd[@]}" clean --images --all; then
       :
     else
@@ -2190,7 +2193,7 @@ if [[ $prepare_editor_sources -eq 1 ]]; then
   else
     weft_vscode_link_borrowers "${ext_dir}"
     if [[ ! -d "${ext_dir}/node_modules" || "${ext_dir}/package.json" -nt "${ext_dir}/node_modules" || "${ext_dir}/pnpm-lock.yaml" -nt "${ext_dir}/node_modules" ]]; then
-      spin_passthrough "pnpm install (extension-vscode)" pnpm -C "${ext_dir}" install --prefer-offline \
+      spin "pnpm install (extension-vscode)" pnpm -C "${ext_dir}" install --prefer-offline \
         || { fail "the editor's dependencies did not install; see above, then run ./setup.sh again"; exit 1; }
     fi
     ok "the editor's sources are ready for their checks"
@@ -2634,62 +2637,24 @@ if [[ $build_cli -eq 1 ]]; then
       ;;
   esac
 
-  if [[ $is_full_install -eq 1 && $on_default_install -eq 1 ]]; then
-    rule="$(printf '%.0s─' $(seq 1 64))"
-    printf '\n%s%s%s\n' "${C_DIM}" "${rule}" "${C_RESET}"
-    printf '%s%s%s %s%sSetup complete.%s\n\n' "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
-
-    printf '%s%sRunning:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
-    printf '  %s%s%s weft        %s%s%s  %s(weft-runtime, kept running by your service manager)%s\n' \
-      "${C_GREEN}" "${SYM_OK}" "${C_RESET}" \
-      "${C_DIM}" "$(weft_local_url)" "${C_RESET}" \
-      "${C_DIM}" "${C_RESET}"
-    printf '  %s%s%s postgres    %sthe weft-postgres container, its files in %s/postgres-data%s\n' \
-      "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_DIM}" "${install_dir}" "${C_RESET}"
-    printf '  %s%s%s VS Code     %sinstalled (reload your window if it is open)%s\n' \
-      "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
-    if [[ -n "${public_url}" ]]; then
-      printf '  %s%s%s public URL  %s%s%s\n' \
-        "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_BOLD}" "${public_url}" "${C_RESET}"
-      printf '              %sthe doors outside callers use ONLY; the management API is never on it%s\n' \
-        "${C_DIM}" "${C_RESET}"
-      printf '              %sgive providers %s%s/events/<service>/<topic>%s%s; it changes if the tunnel restarts%s\n' \
-        "${C_DIM}" "${C_RESET}${C_BOLD}" "${public_url}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
-      printf '              %sclose it with %s./setup.sh --no-public-url%s\n' \
-        "${C_DIM}" "${C_RESET}${C_BOLD}" "${C_RESET}"
-    fi
-
-    printf '\n%s%sTry it out:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
-    printf '  %s%s%s sanity-check       %sweft daemon status%s\n' \
-      "${C_CYAN}" "${SYM_ARROW}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
-    printf '  %s%s%s scaffold + run     %sweft new my-first-weave && cd my-first-weave && weft run%s\n' \
-      "${C_CYAN}" "${SYM_ARROW}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
-    printf '  %s%s%s open dashboard     %s%s%s\n' \
-      "${C_CYAN}" "${SYM_ARROW}" "${C_RESET}" "${C_BOLD}" "$(weft_local_url)" "${C_RESET}"
-
-    printf '\n%s%sBrowser extension%s %s(HumanQuery / in-page weaves)%s\n' \
-      "${C_BOLD}" "${C_BLUE}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
-    printf '  %sbuild it once:%s     %s./setup.sh --browser --no-sign%s\n' \
-      "${C_DIM}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
-    printf '  %sthen Load unpacked %sextension-browser/build/chrome-mv3%s %svia chrome://extensions%s\n' \
-      "${C_DIM}" "${C_RESET}${C_BOLD}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
-
-    printf '\n%s%sDay-to-day:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
-    printf '  %s%s%s tail logs          %sweft daemon logs --tail 200 -f%s\n' \
-      "${C_CYAN}" "${SYM_ARROW}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
-    printf '  %s%s%s restart            %sweft daemon restart%s\n' \
-      "${C_CYAN}" "${SYM_ARROW}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
-    printf '  %s%s%s wipe everything    %s./setup.sh --uninstall --purge%s\n' \
-      "${C_CYAN}" "${SYM_ARROW}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
-    printf '%s%s%s\n' "${C_DIM}" "${rule}" "${C_RESET}"
+  # The PATH line comes first: until it is fixed, none of the commands
+  # below work.
+  if [[ $path_ok -eq 0 ]]; then
+    printf '\n%s%s%s %sweft is not on your PATH yet.%s Add this line to your shell rc, then open a new terminal:\n' \
+      "${C_YELLOW}" "${SYM_WARN}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
+    printf '    %sexport PATH="%s:$PATH"%s\n' "${C_BOLD}" "${bin_dir}" "${C_RESET}"
   fi
 
-  if [[ $path_ok -eq 1 ]]; then
-    printf '\n%s%s%s %s is on PATH. try: %sweft --help%s\n' \
-      "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${bin_dir}" "${C_BOLD}" "${C_RESET}"
-  else
-    printf '\n%s%s%s %s is NOT on your PATH; add to your shell rc:\n' \
-      "${C_YELLOW}" "${SYM_WARN}" "${C_RESET}" "${bin_dir}"
-    printf '    %sexport PATH="%s:$PATH"%s\n' "${C_BOLD}" "${bin_dir}" "${C_RESET}"
+  if [[ $is_full_install -eq 1 && $on_default_install -eq 1 ]]; then
+    printf '\n%s%s%s %sweft is installed and running.%s\n\n' \
+      "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
+    printf '  Start a project (it asks which AI assistant you use, then says how to open it):\n\n'
+    printf '    %sweft new my-project%s\n\n' "${C_BOLD}" "${C_RESET}"
+    if [[ -n "${public_url}" ]]; then
+      printf '  %sPublic address for outside callers: %s%s%s\n' \
+        "${C_DIM}" "${C_RESET}${C_BOLD}" "${public_url}" "${C_RESET}"
+    fi
+    printf '  %sCheck it: weft daemon status   Logs: weft daemon logs -f   Help: weft --help%s\n' \
+      "${C_DIM}" "${C_RESET}"
   fi
 fi

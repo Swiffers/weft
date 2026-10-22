@@ -4,7 +4,7 @@
   import { getSettings, saveSettings } from '../../lib/settings';
 
   // Where the default install answers; a bare token goes there.
-  // SYNC: 14111 <-> crates/weft-core/src/ports.rs (PUBLIC), setup.sh,
+  // SYNC: 14111 <-> crates/weft-core/src/ports.rs (PUBLIC),
   // extension-vscode/src/localInstall.ts
   const LOCAL_INSTALL_URL = 'http://127.0.0.1:14111';
   import { singleFlight } from '../../lib/single-flight';

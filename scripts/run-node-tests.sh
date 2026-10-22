@@ -163,7 +163,7 @@ PROJECT_DIR="$REPO_ROOT/target/node-tests"
 if [ ! -f "$PROJECT_DIR/weft.toml" ]; then
   echo "creating the scratch project at target/node-tests"
   mkdir -p "$REPO_ROOT/target"
-  (cd "$REPO_ROOT/target" && weft new node-tests) || exit 1
+  (cd "$REPO_ROOT/target" && weft new node-tests --assistant none) || exit 1
 else
   # Re-sync the base catalog so edits in this checkout's catalog/ are
   # what actually runs.

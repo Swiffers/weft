@@ -1157,7 +1157,7 @@ and you never run it. You write the tests in the same change as the node.
 An infra node gets no `live` test for now (a live test needs a service with
 a stored connection): its `basic` and `fake` tests cover the node's own code,
 and the container is proven inside a real program. Make a scratch project
-(`weft new` in `.scratch/node-smith/`, inside the project), copy the node in under `nodes/`, use it
+(`weft new <name> --assistant none` in `.scratch/node-smith/`, inside the project), copy the node in under `nodes/`, use it
 in `src/main.weft`, then `weft infra start`, read `weft infra status` and
 `weft infra logs`, run through it (carved with `weft run --from` / `--emit`
 / `--target`, the `weft-sdp` skill), and finish with `weft infra terminate

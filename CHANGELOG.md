@@ -3,6 +3,14 @@
 What changed between versions of weft that you need to know about when you
 update. To update, pull and run `./setup.sh` again.
 
+## 2026-10-22 (32351dec)
+
+Tangle keeps its messages short and plain while it works: a sentence or two
+on what it is doing, with no node names, SQL or file paths unless you asked
+for them, and its end-of-work report says what the program now does for you
+instead of walking through its inside. An existing project gets this with
+`weft tangle update`.
+
 ## 2026-10-21 (0.2.271)
 
 Every project's worker is rebuilt once, the first time it starts after this

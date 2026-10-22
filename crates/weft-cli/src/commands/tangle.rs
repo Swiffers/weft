@@ -9,7 +9,9 @@
 
 use anyhow::Result;
 
-use super::new::{install_tangle, resolve_assistants, tangle_installed, AssistantSpec, ASSISTANTS, FALLBACK};
+use super::new::{
+    install_tangle, known_assistants, resolve_assistants, tangle_installed, AssistantSpec, ASSISTANTS, FALLBACK,
+};
 use super::Ctx;
 
 pub async fn update(ctx: Ctx, assistants: Vec<String>) -> Result<()> {
@@ -28,16 +30,11 @@ pub async fn update(ctx: Ctx, assistants: Vec<String>) -> Result<()> {
     };
 
     if chosen.is_empty() {
-        let known = ASSISTANTS
-            .iter()
-            .map(|a| format!("{} ({})", a.dir, a.shorthand))
-            .collect::<Vec<_>>()
-            .join(", ");
         anyhow::bail!(
             "{} has no tangle to update; --assistant <name> installs it here\n     {}\n     \
              using something else? --assistant {} installs the persona as a plain AGENTS.md",
             root.display(),
-            known,
+            known_assistants(),
             FALLBACK.shorthand
         );
     }

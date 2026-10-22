@@ -1,7 +1,8 @@
 # Talking to Tangle
 
 Tangle is the weft expert that `weft new --assistant` copied into your project.
-Open the project in your assistant and it is already there. Describe what you
+Open the project in your assistant (the last lines `weft new` printed are the
+command that does it) and it is already there. Describe what you
 want in plain words and it builds it. You do not have to learn this language.
 
 ## Say what it should do, not how

@@ -10,12 +10,24 @@ If Docker is missing, the installer stops and prints the link to install it.
 
 The installer is a bash script, so on Windows run it inside WSL.
 
+## Install
+
 ```bash
-git clone https://github.com/WeaveMindAI/weft.git
-cd weft
+curl -fsSL https://weft.weavemind.ai/install.sh | bash
 ```
 
-## Put your keys in before you install
+It downloads weft into `~/weft` and runs the installer from there. To put it
+somewhere else, start the line with `WEFT_DIR=<folder>`. Leave that folder
+where it is afterwards: weft reads its standard library and its assistant
+templates from it.
+
+On a fresh machine the installer asks no questions: the first run starts the
+database and pulls images, then sets the runtime up as a service of your user (systemd on Linux, launchd on macOS), so it comes
+back on its own after a reboot. Each long step shows a spinner with the last
+line it printed; if you want to see everything as it happens, add
+`bash -s -- --verbose` in place of the final `bash`.
+
+## Put your keys in
 
 Fill in the services you expect to use often, and leave the rest alone. We
 recommend at least [OpenRouter](https://openrouter.ai/keys), because a single
@@ -27,11 +39,13 @@ stopping to ask you for anything. A service you skip asks you for a credential
 the first time you need it, which is fine for the ones you touch once.
 
 ```bash
+cd ~/weft
 cp access-apps.example.json access-apps.json
 ```
 
 Open it and edit in place, leaving the services you are not using on their
-placeholder values. weft ignores an entry it cannot use.
+placeholder values. weft ignores an entry it cannot use, and reads the file
+each time it needs a key, so a change takes effect at once.
 
 ```json
   "openrouter": [{
@@ -47,16 +61,6 @@ Slack and Google want you to register an application with that provider first,
 which is a longer job, so do those only if they are services you will live in.
 For the whole format, go and read
 [the apps file](../connections/the-apps-file.md).
-
-## Install
-
-```bash
-./setup.sh
-```
-
-On a fresh machine the installer asks no questions: the first run starts the
-database and pulls images, then sets the runtime up as a service of your user (systemd on Linux, launchd on macOS), so it comes
-back on its own after a reboot.
 
 ## Check it came up
 
@@ -76,9 +80,8 @@ is reachable from the internet, which is what you want until you need
 [a public address](../build/public-address.md).
 
 If it says `weft: unreachable at ...`, run `weft daemon logs` to see how the
-runtime's log ends (the line also names the log file), then run `./setup.sh`
-again and read the
-last block it prints. If that block has scrolled away, every run writes the
+runtime's log ends (the line also names the log file), then run the install
+line again and read the last block it prints. If that block has scrolled away, every run writes the
 same thing to `~/.local/share/weft/setup-runs.log`.
 
 Two things that can go differently.
@@ -107,10 +110,9 @@ browser extension called **Weft tasks**. Install it now, from
 and close it again. It has nothing to show you yet. You connect it to your
 runtime in [putting a person in the loop](../build/a-person-in-the-loop.md).
 
-## Now leave this folder
+## Keep your projects elsewhere
 
-Your projects do not belong inside the weft checkout. Go wherever you keep
-code:
+Your projects do not belong inside `~/weft`. Go wherever you keep code:
 
 ```bash
 cd ~/code
@@ -120,10 +122,11 @@ Then [build your first program](first-program.md).
 
 ## When you come back to this page
 
-**To change your keys**, edit `access-apps.json` in the checkout; the change takes effect at once
+**To change your keys**, edit `~/weft/access-apps.json`; the change takes effect at once
 ([the apps file](../connections/the-apps-file.md)).
 
-**To update**, pull and run `./setup.sh` again. Your projects and their history
+**To update**, run the install line again. It updates `~/weft` and runs the
+installer, the same as `git pull` and `./setup.sh` in that folder. Your projects and their history
 stay where they are. Before you do, check the
 [changelog](https://github.com/WeaveMindAI/weft/blob/main/CHANGELOG.md) for
 anything that needs you.
@@ -144,7 +147,7 @@ and so does everything only that database gave a meaning to (the files the
 install stored, and the workers and infra of its projects). Your project
 folders, the install's settings and every other install stay. Without a terminal to ask on, run `./setup.sh --yes`.
 
-**To remove it**, run `./setup.sh --uninstall`. It stops the runtime and
+**To remove it**, run `./setup.sh --uninstall` in `~/weft`. It stops the runtime and
 removes the CLI and the editor extension. Your database, stored connections
 and your programs' infrastructure stay, so a later `./setup.sh` brings
 everything back. Adding `--purge` deletes all of that too, your programs' own

@@ -152,18 +152,14 @@ forks such as Devin Desktop. We are working on a CLI-only version, support for o
 automatically, follow the manual instructions the installer prints.
 
 ```bash
-git clone https://github.com/WeaveMindAI/weft.git
-cd weft
-./setup.sh
-weft new hello --assistant claude-code --remember
-cd hello
-weft run
+curl -fsSL https://weft.weavemind.ai/install.sh | bash
+weft new hello
 ```
 
-Open `hello/main.weft` in VS Code to see the program as a graph. Open the
-same project in your coding assistant and tell Tangle what you want to build.
-Claude Code is the example here; you pick your assistant with `--assistant`, and
-`--remember` makes it the default, so your next `weft new` needs no flag.
+The first line puts weft in `~/weft` and installs it; running it again
+updates it. `weft new` asks which coding assistant you use, then prints the
+command that opens the project in it. Tell Tangle what you want to build, and
+open `src/main.weft` in VS Code to see the program as a graph.
 
 If the installer reports a missing tool, it prints where to get it. If your
 shell cannot find `weft`, use the PATH line it printed. For installation

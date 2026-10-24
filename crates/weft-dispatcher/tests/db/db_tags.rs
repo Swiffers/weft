@@ -421,7 +421,7 @@ async fn an_instance_token_is_one_project_and_expires(pool: PgPool) {
     assert!(read.expired(10) && !read.expired(9));
 
     let other_project = Uuid::new_v4();
-    let revoke = weft_dispatcher::store::postgres::revoke_instance_tokens;
+    let revoke = weft_access_store::instance_tokens::revoke;
     assert_eq!(revoke(&pool, TENANT, other_project, &ada, None).await.unwrap(), 0);
     assert_eq!(revoke(&pool, "tenant-2", project, &ada, None).await.unwrap(), 0);
     assert_eq!(revoke(&pool, TENANT, project, &ada, Some(read.id)).await.unwrap(), 1);

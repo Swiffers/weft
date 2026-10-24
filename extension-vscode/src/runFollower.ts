@@ -110,6 +110,11 @@ export type DispatcherEvent = { eventId: string } & (
   // Carries both axes; the host treats it as a status-refresh signal
   // like every other project_* event.
   | { kind: 'project_transition_changed'; projectId: string; status: string; transition: string }
+  // A working copy of the project moved: its files (a save the runtime
+  // synced, a program writing code) or its head (a stamp, a run, a
+  // switch). The editor reads the status and the version tree again.
+  // SYNC: working_copy_changed <-> crates/weft-core/src/live_event.rs DispatcherEvent::WorkingCopyChanged
+  | { kind: 'working_copy_changed'; projectId: string; workingCopy: string }
   // External-URL invalidation. Trigger nodes that mint a tenant-
   // public URL emit this when the URL changes (re-activate, new
   // mount path, etc.). UI invalidates any cached chip.
@@ -763,6 +768,7 @@ export class RunFollower implements vscode.Disposable {
       case 'project_deactivated':
       case 'project_transition_changed':
       case 'trigger_url_changed':
+      case 'working_copy_changed':
         break;
       // How a wait ended is what `weft freeze` records; the graph paints
       // the firing's own lifecycle, which the node events already carry.

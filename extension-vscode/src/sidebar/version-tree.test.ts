@@ -5,13 +5,17 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildVersionTree,
+  copyName,
+  folderDescription,
   runDescription,
+  thisCopy,
   runScopedTo,
   versionLabel,
   versionMarks,
   type VersionRun,
   type TreeJson,
   type VersionSummary,
+  type WorkingCopy,
 } from './version-tree';
 
 const version = (id: string, parent: string | null, at: number, changed: string[] = [], label: string | null = null): VersionSummary => ({
@@ -45,9 +49,31 @@ const run = (runId: string, version: string, at: number, extra: Partial<VersionR
 });
 
 const id = (n: string) => `${n}00000000`;
+
+const copy = (copyId: string, extra: Partial<WorkingCopy>): WorkingCopy => ({
+  id: copyId,
+  kind: 'folder',
+  host: 'laptop',
+  path: `/home/q/${copyId}`,
+  headVersion: null,
+  headRun: null,
+  workingVersion: id('v9'),
+  revision: 1,
+  updatedAt: 0,
+  ...extra,
+});
+
+// This folder's head is run c2 on v2, and its files changed since into
+// v3; another folder sits on v1 and the program copy on run c1.
+const mine = copy('here', { headVersion: id('v2'), headRun: id('c2'), workingVersion: id('v3') });
 const tree: TreeJson = {
-  head: { headVersion: id('v2'), headRun: id('c2'), activatedVersions: [id('v1')] },
-  diskVersion: id('v3'),
+  workingCopy: 'here',
+  workingCopies: [
+    copy('elsewhere', { host: 'desktop', path: '/srv/proj', headVersion: id('v1'), workingVersion: id('v1') }),
+    mine,
+    copy('prog', { kind: 'program', host: undefined, path: undefined, headVersion: id('v1'), headRun: id('c1'), workingVersion: id('v1') }),
+  ],
+  activatedVersions: [id('v1')],
   // In the dispatcher's order: the order they were recorded.
   versions: [version('v1', null, 1, [], 'base'), version('v2', 'v1', 2, ['main.weft']), version('v3', 'v1', 3, ['prompts/p.txt'])],
   runs: [run('c1', 'v1', 4), run('c2', 'v2', 5, { seedRunId: id('c1'), stale: ['b'] })],
@@ -129,17 +155,55 @@ describe('version tree', () => {
     expect(depth).toBe(20000);
   });
 
-  it('marks head, the version on disk, and the activated one', () => {
+  it("marks this folder's head apart from the other copies' heads", () => {
     const [root] = buildVersionTree(tree);
-    expect(versionMarks(root)).toEqual(['activated']);
-    expect(versionMarks(root.children[0])).toEqual(['HEAD']);
+    expect(versionMarks(root)).toEqual(['head of /srv/proj on desktop', 'head of program', 'activated']);
+    expect(versionMarks(root.children[0])).toEqual(['HEAD, changed since']);
     expect(versionMarks(root.children[1])).toEqual(['on disk']);
   });
 
+  it('says nothing changed when the folder holds its head', () => {
+    const clean: TreeJson = {
+      ...tree,
+      workingCopies: [{ ...mine, workingVersion: id('v2') }],
+    };
+    const [root] = buildVersionTree(clean);
+    expect(versionMarks(root.children[0])).toEqual(['HEAD']);
+    expect(versionMarks(root.children[1])).toEqual([]);
+    expect(folderDescription(thisCopy(clean))).toBe('at run c2000000 on version v2000000');
+  });
+
+  it("describes this folder's head, its changes, and a copy with no version yet", () => {
+    expect(folderDescription(mine)).toBe('at run c2000000 on version v2000000, changed since');
+    expect(folderDescription({ ...mine, headRun: null })).toBe('at version v2000000, changed since');
+    expect(folderDescription(copy('new', {}))).toBe('at no version yet, changed since');
+  });
+
+  it('names the other copies the way the tree lists them', () => {
+    expect(copyName(tree.workingCopies[0])).toBe('/srv/proj on desktop');
+    expect(copyName(tree.workingCopies[2])).toBe('program');
+    expect(copyName(copy('abcdef0123', { path: undefined }))).toBe('folder abcdef01');
+  });
+
+  it("keeps this folder's conflict copies on its working copy", () => {
+    const conflicted: TreeJson = {
+      ...tree,
+      workingCopies: [{ ...mine, conflicts: ['prompts/tone.weft-conflict-1a2b3c4d.txt'] }],
+    };
+    expect(thisCopy(conflicted).conflicts).toEqual(['prompts/tone.weft-conflict-1a2b3c4d.txt']);
+    expect(thisCopy(tree).conflicts).toBeUndefined();
+  });
+
+  it('refuses a tree that holds no working copy for this folder', () => {
+    const lost: TreeJson = { ...tree, workingCopy: 'gone' };
+    expect(() => thisCopy(lost)).toThrow(/no working copy gone/);
+    expect(() => buildVersionTree(lost)).toThrow(/no working copy gone/);
+  });
+
   it("counts a version's trigger runs among its marks", () => {
-    const fired: TreeJson = { ...tree, versions: [{ ...version('v1', null, 1), triggerRuns: 1200 }], runs: [] };
+    const fired: TreeJson = { ...tree, workingCopies: [mine], versions: [{ ...version('v1', null, 1), triggerRuns: 1200 }], runs: [] };
     expect(versionMarks(buildVersionTree(fired)[0])).toEqual(['activated', '1200 trigger runs']);
-    const once: TreeJson = { ...tree, versions: [{ ...version('v1', null, 1), triggerRuns: 1 }], runs: [] };
+    const once: TreeJson = { ...tree, workingCopies: [mine], versions: [{ ...version('v1', null, 1), triggerRuns: 1 }], runs: [] };
     expect(versionMarks(buildVersionTree(once)[0])).toEqual(['activated', '1 trigger run']);
   });
 
@@ -152,9 +216,10 @@ describe('version tree', () => {
     const [root] = buildVersionTree(tree);
     expect(versionLabel(root)).toBe('v1000000 (base) root');
     expect(versionLabel(root.children[0])).toBe('v2000000 ~main.weft');
-    expect(runDescription(root.children[0].runs[0], id('c2'))).toBe('completed  ·  seed c1000000 (1 stale)  ·  HEAD run');
+    expect(runDescription(root.children[0].runs[0], tree)).toBe('completed  ·  seed c1000000 (1 stale)  ·  HEAD run');
+    expect(runDescription(root.runs[0], tree)).toBe('completed  ·  head run of program');
     const saved = run('c5', 'v2', 6, { spec: { name: 'angry' }, example: 'angry' });
-    expect(runDescription(saved, null)).toBe('completed  ·  spec angry  ·  example angry');
+    expect(runDescription(saved, tree)).toBe('completed  ·  spec angry  ·  example angry');
   });
 
   it('knows which runs are scoped to the group the editor stands in', () => {

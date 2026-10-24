@@ -314,6 +314,18 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                     tracing::error!(target: "weft_runtime", error = %format!("{e:#}"), "could not put the projects' fronts back; the reaper looks again shortly");
                 }
             });
+            // The person's folders are on this machine, so this process
+            // keeps each one in sync with its working copy. Once the
+            // process answers, since a pass reaches the store through it.
+            let folders = Arc::new(weft_dispatcher::folder_sync::InstallFolders::new(state.clone()));
+            after_bind.push(Box::pin(async move {
+                weft_dispatcher::app::spawn_supervised("folders", async move {
+                    if let Err(e) = weft_platform_local::folders::keep_in_sync(folders, weft_platform_local::folders::QUIET).await {
+                        tracing::error!(target: "weft_runtime", error = %format!("{e:#}"), "the folder sync stopped");
+                    }
+                });
+                Ok(())
+            }));
         }
         public = public.merge(door);
     }

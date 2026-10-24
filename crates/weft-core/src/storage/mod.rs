@@ -211,19 +211,15 @@ pub fn mime_from_filename(name: &str) -> &'static str {
     }
 }
 
-/// The url-form file value for an external media ref (`@file("https://…",
-/// Image)` or the editor's paste-URL): a concrete marker whose payload's
-/// handle is the URL. The marker KIND comes from the declared type when it
-/// names a concrete file primitive (an `Image` ref is `__weft_image__`
-/// whatever the extension suggests); a union (`File`/`Media`) falls back to
-/// the extension's mime guess. Size is unknown until fetched (0, display
+/// The url-form file value for an external media ref (`@asset("https://…",
+/// Image)`, which the editor's paste-URL writes): a marker of the kind the
+/// ref declares (an `Image` ref is `__weft_image__` whatever the extension
+/// suggests; the compiler refuses a ref that leaves the kind open) whose
+/// payload's handle is the URL. Size is unknown until fetched (0, display
 /// only); the worker's fetch reports the real Content-Type at run time.
-pub fn url_file_value(url: &str, declared: &crate::weft_type::WeftType) -> Value {
+pub fn url_file_value(url: &str, kind: crate::weft_type::FileKind) -> Value {
     let filename = filename_from_url(url);
     let mime = mime_from_filename(&filename);
-    let kind = declared
-        .concrete_file_kind()
-        .unwrap_or_else(|| crate::weft_type::FileKind::from_mime(mime));
     crate::weft_type::WeftType::file_marker(
         kind,
         serde_json::json!({
@@ -1013,6 +1009,30 @@ pub struct UploadBeginResponse {
 pub struct UploadPartsRequest {
     pub key: String,
     pub parts: Vec<PartAsk>,
+    /// Who PUTs the parts, which their URLs are presigned for.
+    #[serde(default, skip_serializing_if = "PartSender::is_caller")]
+    pub sender: PartSender,
+}
+
+/// Who sends an upload's part bytes, which the store presigns the part
+/// URLs for. Left out on the wire, it is [`Self::Caller`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartSender {
+    /// Whoever sends the request, at the address its route reaches the
+    /// store from: a worker's own, a person's machine for the control
+    /// plane's routes (the CLI, the editor).
+    #[default]
+    Caller,
+    /// weft's own process (the dispatcher uploading for itself): the
+    /// control plane's routes only, refused anywhere else.
+    Runtime,
+}
+
+impl PartSender {
+    pub fn is_caller(&self) -> bool {
+        *self == Self::Caller
+    }
 }
 
 /// One part a caller is about to upload: which part of the file it is,
@@ -1083,6 +1103,9 @@ pub struct UploadCompleteRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadResumeRequest {
     pub key: String,
+    /// Who PUTs the missing parts, which their URLs are presigned for.
+    #[serde(default, skip_serializing_if = "PartSender::is_caller")]
+    pub sender: PartSender,
 }
 
 // SYNC: UploadResumeResponse <-> packages/weft-connect/src/core/upload.ts UploadResumeAnswer
@@ -1228,13 +1251,6 @@ pub struct AssetReferencesRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AssetReferencesResponse {
     pub missing: Vec<String>,
-}
-
-/// The dispatcher's answer to a publish: one warning per version that
-/// names a stored file that no longer exists, for the person to read.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AssetsPublished {
-    pub warnings: Vec<String>,
 }
 
 // The dispatcher's own `/storage/*` bodies, which the CLI sends. The
@@ -1875,6 +1891,28 @@ mod tests {
 
     // Layer 2: wire-shape round-trips for every cross-process type.
 
+    /// Who sends the parts travels as `sender`, left out for the caller
+    /// (so the CLI, the editor and workers send what they always sent)
+    /// and read back as the caller when missing.
+    #[test]
+    fn the_part_sender_round_trips_and_defaults_to_the_caller() {
+        let parts = UploadPartsRequest { key: "k".into(), parts: vec![], sender: PartSender::Runtime };
+        let v = serde_json::to_value(&parts).unwrap();
+        assert_eq!(v, json!({"key": "k", "parts": [], "sender": "runtime"}));
+        assert_eq!(serde_json::from_value::<UploadPartsRequest>(v).unwrap().sender, PartSender::Runtime);
+        let resume = UploadResumeRequest { key: "k".into(), sender: PartSender::Runtime };
+        let v = serde_json::to_value(Tenanted { tenant: "alice".into(), inner: resume }).unwrap();
+        assert_eq!(v, json!({"tenant": "alice", "key": "k", "sender": "runtime"}));
+        let back: Tenanted<UploadResumeRequest> = serde_json::from_value(v).unwrap();
+        assert_eq!(back.inner.sender, PartSender::Runtime);
+
+        let caller = UploadResumeRequest { key: "k".into(), sender: PartSender::Caller };
+        assert_eq!(serde_json::to_value(&caller).unwrap(), json!({"key": "k"}));
+        assert_eq!(serde_json::from_value::<UploadResumeRequest>(json!({"key": "k"})).unwrap().sender, PartSender::Caller);
+        assert_eq!(serde_json::from_value::<UploadPartsRequest>(json!({"key": "k", "parts": []})).unwrap().sender, PartSender::Caller);
+        assert!(serde_json::from_value::<UploadPartsRequest>(json!({"key": "k", "parts": [], "sender": "person"})).is_err());
+    }
+
     #[test]
     fn admin_upload_envelopes_round_trip() {
         let references = Tenanted {
@@ -1896,6 +1934,7 @@ mod tests {
                     PartAsk { part_number: 1, size_bytes: 5 },
                     PartAsk { part_number: 2, size_bytes: 3 },
                 ],
+                sender: PartSender::Caller,
             },
         };
         let v = serde_json::to_value(&parts).unwrap();

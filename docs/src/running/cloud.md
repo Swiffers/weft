@@ -425,10 +425,10 @@ weft infra upgrade --on prod --all
 weft resync --on prod --all          # and `weft activate --on prod` for what is off
 ```
 
-`weft branch` stops if your folder holds changes no version records yet;
-`--discard` throws those away. Unless `weft clean --images` removed them
-since, that version's images are still there from its first deploy, so
-nothing is rebuilt.
+If your folder holds changes no version records yet, `weft branch` records
+them on prod as a version first and prints the `weft branch` that brings them
+back. Unless `weft clean --images` removed them since, the old version's
+images are still there from its first deploy, so nothing is rebuilt.
 
 ### Connections
 

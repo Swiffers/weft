@@ -54,6 +54,11 @@ its worker.
 for this run. It is how a node says no rather than saying nothing. Not `null`,
 which is data.
 
+**Conflict copy.** A file the sync writes beside one of yours that changed
+both in your folder and in the install: `tone.weft-conflict-1a2b3c4d.txt`
+beside `tone.txt`. It is never compiled and never in a version; delete it
+once you have taken what you want from it.
+
 **Connection.** One account somebody connected to a service. Its credential
 lives in weft's store, sealed, and never in your program.
 
@@ -108,8 +113,8 @@ ends. A closure on one is its end rather than a skip.
 node stands for it when the program runs: it is a scope that opens or skips as
 one.
 
-**head.** The version your next checkpoint sits under, and the run a `--seed`
-inherits from.
+**head.** Where one working copy is: the version its next version is recorded under,
+and the run a `--seed` from it inherits from. Your folder has its own.
 
 **Health rules.** Rules in an infra node's `InfraSpec` saying when to take down
 the triggers that need it, because one of its containers stopped being ready,
@@ -245,8 +250,10 @@ together on one machine. Most nodes have exactly one.
 big file goes straight there, in parts that resume after a dropped connection.
 The page then sends the slot to a route instead of the file.
 
-**Version.** A saved copy of your project's files, made on every run and by
-`weft checkpoint`.
+**Version.** Your project's files at one moment, recorded whenever you do
+something with the code (a run, a build, an activate, `weft checkpoint`) and
+never on a save. Recording the same files again gives the version they
+already are.
 
 **Visitor address.** The address where a project's own site passes its
 visitors' calls on to weft (`weft frontend visitor-address`). Links to the project's stored files
@@ -262,3 +269,8 @@ trigger nobody fired, and at a node with no inputs.
 **Worker.** A container (on your machine) or Cloud Run service (on a cloud
 install) running your compiled program. For how it starts and stops, go and read
 [the worker](../running/architecture.md#the-worker).
+
+**Working copy.** The install's copy of one place a project's code is
+edited: your folder (the install keeps the two the same in both directions),
+or the program copy, which programs write into when the project
+has no folder. Each has its own head.

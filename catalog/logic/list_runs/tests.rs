@@ -36,7 +36,7 @@ async fn lists_runs(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(outcome.outputs["runs"][0]["status"], json!("waiting_for_input"));
     assert_eq!(outcome.outputs["runs"][0]["instance"], json!("ada"));
     match &rig.program_calls()[0].0 {
-        ProgramCall::RunsList { filter, limit } => {
+        ProgramCall::Runs(weft::program::runs::RunCall::List(weft::program::runs::RunList { filter, limit, .. })) => {
             assert_eq!(*limit, 1);
             assert_eq!(filter.tag.as_deref(), Some("user_7"));
             assert_eq!(filter.status, Some(RunStatus::Running));

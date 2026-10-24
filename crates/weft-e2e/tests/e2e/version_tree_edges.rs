@@ -13,8 +13,9 @@
 //!     preserved and the failure available for review;
 //!   - build output inside a node, which used to be hashed into every
 //!     version and deleted file by file on a branch back;
-//!   - two sessions checkpointing at once, where head is read and then
-//!     written and a lost update silently drops one session's version;
+//!   - two checkouts of one project checkpointing at once, each its own
+//!     working copy with its own head, where a lost update would silently
+//!     drop one session's version;
 //!   - a project id in a spelling the database does not store, which
 //!     used to authorize and then match nothing, so a cancel answered
 //!     success having done nothing.
@@ -22,7 +23,7 @@
 
 use crate::common;
 
-use common::{run_id_of, fire_until_run, graph_trigger_hold, tree_of, HOLD};
+use common::{my_copy, run_id_of, fire_until_run, graph_trigger_hold, tree_of, version_ids, HOLD};
 use serde_json::Value;
 use weft_e2e::fakes::{PollFake, SseFake};
 use weft_e2e::status::{self, STATUS_DEADLINE};
@@ -86,7 +87,7 @@ async fn a_frozen_example_with_a_failed_new_run_preserves_accepted_evidence() ->
     SettledRun::observe(project.dispatcher(), failed_run_id).await?
         .failed_with("cannot cast")?;
     let tree = tree_of(&project).await?;
-    let failed = tree["head"]["headRun"].as_str().expect("failed run recorded");
+    let failed = my_copy(&tree)?["headRun"].as_str().expect("failed run recorded");
     anyhow::ensure!(failed == failed_run_id.to_string(), "the failed run must be the recorded head run");
     let row = tree["runs"].as_array().unwrap().iter().find(|row| row["runId"] == failed).unwrap();
     anyhow::ensure!(row["listing"]["status"] == "failed", "run failure is retained: {row}");
@@ -99,8 +100,8 @@ async fn a_frozen_example_with_a_failed_new_run_preserves_accepted_evidence() ->
 
 /// A node that carries its own package has build output beside it.
 /// Covering it put thousands of files through the hash and the publish,
-/// made `weft branch` report a clean tree as dirty, and deleted them one
-/// by one on a branch back. A directory that is genuinely
+/// made a folder nobody edited read as changed, and deleted them one by
+/// one on a branch back. A directory that is genuinely
 /// somebody's source, even one called `target`, still counts: what
 /// tells the two apart is a `Cargo.toml` sitting beside it.
 #[tokio::test]
@@ -151,10 +152,13 @@ async fn build_output_inside_a_node_is_not_part_of_a_version() -> anyhow::Result
         "and the file that marks the crate is source too: {paths:?}"
     );
 
-    // A clean tree reads as clean: build output must not make `branch`
-    // think there are unsaved changes.
-    let branched = project.weft(&["branch", &version]).await?;
-    anyhow::ensure!(!branched.contains("changes since head"), "{branched}");
+    // A folder nobody edited reads as unedited: build output must not
+    // make the branch keep anything new as a version.
+    let branched: Value = serde_json::from_str(project.weft(&["branch", &version, "--json"]).await?.trim())?;
+    anyhow::ensure!(branched["saved"] == serde_json::json!(version), "nothing new to keep: {branched}");
+    let tree = tree_of(&project).await?;
+    anyhow::ensure!(version_ids(&tree) == vec![version.clone()], "the branch recorded no version: {tree}");
+    anyhow::ensure!(my_copy(&tree)?["workingVersion"] == serde_json::json!(version), "the folder is still that version: {tree}");
     // And the branch back left the build output alone.
     anyhow::ensure!(
         project.has_file("nodes/pkg/node_modules/left-pad/index.js"),
@@ -168,20 +172,19 @@ async fn build_output_inside_a_node_is_not_part_of_a_version() -> anyhow::Result
 /// Two sessions checkpointing at once, from two checkouts of one
 /// project with DIFFERENT edits.
 ///
-/// Head is read to decide a parent and written afterwards, so a lost
-/// update would drop one session's version out of the lineage the next
-/// seeded run walks, silently. Both land (the tree write holds the
-/// project's lock, so the second reads the head the first just moved),
-/// and the tree must be a CHAIN: nothing parents on a head that has
-/// moved on, and nothing dangles.
+/// Each checkout is a working copy of its own, with its own head, so the
+/// two never fight over one head: both versions land, each becomes the
+/// head of the checkout that recorded it, and every version parents on
+/// one the tree holds. A lost update would show as a checkpoint that
+/// answered a version the tree does not hold, or as a head left behind.
 /// Running both from one directory would not test this: they would agree
 /// on the same content and so on the same version.
 #[tokio::test]
 async fn two_sessions_checkpointing_at_once_leave_one_coherent_tree() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let project = Project::prepare("version_tree", disp).await?;
-    // The head the two sessions will then race to move. It is also what
-    // registers the project: nothing has run here.
+    // The version both sessions start from. It is also what registers
+    // the project and the first folder: nothing has run here.
     project.weft(&["checkpoint", "--json"]).await?;
 
     // A second checkout of the SAME project, and a different edit in
@@ -202,14 +205,10 @@ async fn two_sessions_checkpointing_at_once_leave_one_coherent_tree() -> anyhow:
         a.stdout, a.stderr, b.stdout, b.stderr
     );
 
-    // Head names a version the tree holds, and every version parents on
-    // one the tree holds too: no lineage dangles.
+    // Every version parents on one the tree holds: no lineage dangles.
     let tree = tree_of(&project).await?;
-    let head = tree["head"]["headVersion"].as_str().unwrap_or_default().to_string();
-    let versions: &[Value] = tree["versions"].as_array().map(Vec::as_slice).unwrap_or(&[]);
-    let ids: Vec<String> = versions.iter().filter_map(|v| v["id"].as_str().map(str::to_string)).collect();
-    anyhow::ensure!(ids.contains(&head), "head {head} is a version the tree holds: {ids:?}");
-    for v in versions {
+    let ids = version_ids(&tree);
+    for v in tree["versions"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
         if let Some(parent) = v["parentId"].as_str() {
             anyhow::ensure!(
                 ids.contains(&parent.to_string()),
@@ -218,43 +217,30 @@ async fn two_sessions_checkpointing_at_once_leave_one_coherent_tree() -> anyhow:
             );
         }
     }
-    // And each version is actually recorded, not just answered.
+    // Each version is actually recorded, not just answered, and each is
+    // the head of the checkout that recorded it.
     let mut landed = Vec::new();
     for out in [&a, &b] {
         let answer: Value = serde_json::from_str(out.stdout.trim())
             .map_err(|e| anyhow::anyhow!("a checkpoint answers JSON ({e}): {}", out.stdout))?;
         let version = answer["version"].as_str().ok_or_else(|| anyhow::anyhow!("a checkpoint names its version: {answer}"))?;
+        anyhow::ensure!(answer["created"] == serde_json::json!(true), "two different edits are two new versions: {answer}");
         landed.push(version.to_string());
     }
+    anyhow::ensure!(landed[0] != landed[1], "two different edits are two versions: {landed:?}");
     for version in &landed {
         anyhow::ensure!(ids.contains(version), "a checkpoint that answered {version} recorded it: {ids:?}");
     }
-
-    // The lineage, which is the whole point. The two versions must be
-    // parent and child, in the order they were written, and head must be
-    // the child: the lost update this test exists for
-    // looks exactly like two siblings, both parented on the head from
-    // before either landed, with one of them cut out of the line the next
-    // seeded run walks.
-    let parent_of = |id: &str| -> Option<String> {
-        versions
-            .iter()
-            .find(|v| v["id"].as_str() == Some(id))
-            .and_then(|v| v["parentId"].as_str().map(str::to_string))
-    };
-    let (first, second) = (&landed[0], &landed[1]);
-    let chained = parent_of(first).as_deref() == Some(second.as_str())
-        || parent_of(second).as_deref() == Some(first.as_str());
+    let first_head = my_copy(&tree)?["headVersion"].clone();
+    anyhow::ensure!(first_head == serde_json::json!(landed[0]), "the first checkout's head is its version: {tree}");
+    let other_tree: Value = serde_json::from_str(
+        weft_e2e::client::cli_ok(project.dispatcher(), &other, &["tree", "--json"]).await?.trim(),
+    )?;
+    let second_head = my_copy(&other_tree)?["headVersion"].clone();
+    anyhow::ensure!(second_head == serde_json::json!(landed[1]), "the second checkout's head is its version: {other_tree}");
     anyhow::ensure!(
-        chained,
-        "one checkpoint is the other's parent; they are siblings, which is \
-         the lost update: {first} parents on {:?}, {second} on {:?}",
-        parent_of(first),
-        parent_of(second)
-    );
-    anyhow::ensure!(
-        landed.contains(&head),
-        "head is one of the two versions: head {head}, landed {landed:?}"
+        other_tree["workingCopies"].as_array().map(Vec::len) == Some(2),
+        "two checkouts are two working copies of the project: {other_tree}"
     );
 
     project.finish().await

@@ -471,6 +471,27 @@ queues the answer to one call by its journal name (`weft.infra.copies`,
 `weft.costs.list`, ...; several queue in order), and `rig.program_calls()`
 records what the node asked for.
 
+A node can also act on another project of the same owner, with the same
+parameters and the same refusals as the CLI. `ctx.project(id)` gives every
+builder above on that project (`ctx.project(id).runs()`,
+`ctx.project(id).infra(node)`, ...), while the bare calls stay on the node's
+own project. `ctx.projects().list()` lists the owner's projects, and
+`ctx.projects().declare(name)` makes a new one. Two more reach a project's
+code and any one run:
+
+| Call | Answers |
+|---|---|
+| `ctx.project(id).code()`, or `ctx.code()` on its own project | a working copy's code: `.state()` (the working copy and its files, `path -> sha256`), `.file(path)`, `.read_text(path)`, `.write_text(path, text)`, `.remove(path)`, `.edit().text(..).stored(..).blob(path, hash)?.remove(..).expecting(hash).apply()` (every file lands or none does; `.blob` puts a file the owner already holds, by the sha256 `.state()` gave, with nothing downloaded, so copying another project's files, such as its `nodes/base_catalog/`, is one `.state()` and one `.apply()`; a hash that is no sha256 fails `.blob`, one the install does not hold refuses the write), `.checkpoint(label)`, `.switch_to(version)` / `.switch_to_run(run)` (what `weft branch` does, but `.switch_to` takes a full version id, never a label or a prefix; `.tree()` on the project gives a label's id), `.build().start()`, and `.run()` with a setter named after most `weft run` flags (`.example`, `.from`, `.emit`, `.target`, `.before`, `.group`, `.feed`, `.fire`, `.instance(id)?` (it checks the id's form), `.seed`, `.seed_run`, `.seed_until`, `.seed_before`, `.durable`, `.fast`, `.keep_for`, `.referenced`, `.root`; none for `--check`, `--save`, `--clear`, `--hold-secs` or `--detach`, and `.start()` returns once the run has started; `.example(name)` is the example name `weft run` takes), then `.start()`, which builds and starts the run. If you name no working copy with `.working_copy(id)`, it acts on the project's most recently changed folder: on a local install the files are written into that folder, and on a cloud install they reach it with the person's next `weft` command; a project with no folder uses the copy programs write into. `ctx.project(id).forget_working_copy(copy)` is `weft forget-copy`: the copy's files become a version (`saved`) and the copy is removed |
+| `ctx.run_by_id(run)` | one run of any of the owner's projects: `.stop()`, `.wake(node)`, `.logs(n)`, `.events()...read()`, `.outputs(focus)`, `.detail()`, `.node_state(node)`, `.delete()` |
+
+On its own project a program cannot start a run (every run would start the
+next, with nothing to end the chain; reach the part you want with a trigger
+instead), resync it (the resync waits for the runs on the old version to
+end, this run among them, so it would wait on itself) or remove it (the
+removal cancels every run of it, this one included, before it finishes).
+Each refusal says why. A run's refusal comes before anything is recorded as a version or built. From another project, or with `weft run`, `weft
+resync` and `weft rm`, all three work.
+
 ## The special shapes
 
 **Access node**: the whole body is `weft::access_node!(MyServiceAccessNode);`

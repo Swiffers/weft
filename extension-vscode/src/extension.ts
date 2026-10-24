@@ -32,6 +32,7 @@ import { fetchRunningSource, installAccess, listTargets, onArgs, type InstallTar
 import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/projects';
 import { RunsProvider, RunNode, VersionRunNode, VersionNode, type RunSummary } from './sidebar/runs';
 import { parseRunSearch } from './sidebar/runSearch';
+import { headPlace, thisCopy, type Switched, type TreeJson } from './sidebar/version-tree';
 import { chooseCli, runWeftJson, spawnWeft, WeftCliError } from './cli';
 import { RunFollower } from './runFollower';
 import { AutoFollowController } from './autoFollow';
@@ -197,6 +198,11 @@ export function activate(context: vscode.ExtensionContext) {
   projectStream.onEvent((ev) => {
     autoFollow.handleEvent(ev);
     runsProvider.noteEvent();
+    // On another install, which version the files on disk are is read
+    // from that install's copy of this folder, which just moved.
+    if (ev.kind === 'working_copy_changed' && pinnedProject && installOf(pinnedProject.id) !== LOCAL_INSTALL) {
+      void refreshDiskVersion(pinnedProject);
+    }
   });
   projectStream.onConnect(() => {
     void (async () => {
@@ -232,51 +238,47 @@ export function activate(context: vscode.ExtensionContext) {
     }, 500);
   }
 
-  /// Live drift detection: when the project source changes on disk,
-  /// the worker / infra the user activated could now be stale. `weft
-  /// status` hashes what is ON DISK, so the honest trigger is any
-  /// WRITE inside the pinned project, whoever made it: an editor
-  /// save, the graph view rewriting `src/main.weft` through
-  /// `workspace.fs.writeFile`, a layout write. A save listener missed
-  /// every non-editor write (VS Code drops an editor-less document
-  /// after a while, and the graph then writes via fs), so a
-  /// filesystem watcher on the pinned project owns this; a short
-  /// debounce folds a burst into one fetch. Build output churn
-  /// (`.weft/`, `target/`) is ignored: it moves no source hash.
-  let saveRefreshTimer: NodeJS.Timeout | undefined;
-  let driftWatcher: vscode.FileSystemWatcher | undefined;
-  function watchPinnedProjectForDrift(): void {
-    driftWatcher?.dispose();
-    driftWatcher = undefined;
-    const root = pinnedProject?.rootPath;
-    if (!root) return;
+  /// The pinned project's folder, watched while the graph shows it on
+  /// another install. On the local install nothing here watches it: the
+  /// runtime keeps the folder and its working copy the same as files
+  /// change, and its `working_copy_changed` event is what refreshes the
+  /// status and the tree. Nothing keeps the folder in sync with a remote
+  /// install, and its event stream never hears of a save here, so a
+  /// write inside the folder (an editor save, the graph rewriting a file,
+  /// a layout write) is what says its status and the version the files
+  /// are may have moved. A short debounce folds a burst into one read.
+  /// Build output churn (`.weft/`, `target/`) is ignored: it moves no
+  /// source hash.
+  let remoteFolderTimer: NodeJS.Timeout | undefined;
+  let remoteFolderWatcher: vscode.FileSystemWatcher | undefined;
+  function stopWatchingFolder(): void {
+    remoteFolderWatcher?.dispose();
+    remoteFolderWatcher = undefined;
+    if (remoteFolderTimer) clearTimeout(remoteFolderTimer);
+    remoteFolderTimer = undefined;
+  }
+  function watchFolderOnRemote(project: WeftProject): void {
+    stopWatchingFolder();
     const ignored = ['.weft', 'target', 'node_modules', '.git'].map(
       (d) => `${nodePath.sep}${d}${nodePath.sep}`,
     );
     const bump = (uri: vscode.Uri) => {
       if (ignored.some((i) => uri.fsPath.includes(i))) return;
-      if (saveRefreshTimer) clearTimeout(saveRefreshTimer);
-      saveRefreshTimer = setTimeout(() => {
-        saveRefreshTimer = undefined;
+      if (remoteFolderTimer) clearTimeout(remoteFolderTimer);
+      remoteFolderTimer = setTimeout(() => {
+        remoteFolderTimer = undefined;
         void refreshActionBarFromStatus();
-        // On another install, the files moving may make them that
-        // install's version or stop being it.
-        if (pinnedProject) void refreshDiskVersion(pinnedProject);
+        if (pinnedProject?.id === project.id) void refreshDiskVersion(project);
       }, 1_000);
     };
-    driftWatcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(root, '**'),
+    remoteFolderWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(project.rootPath, '**'),
     );
-    driftWatcher.onDidChange(bump);
-    driftWatcher.onDidCreate(bump);
-    driftWatcher.onDidDelete(bump);
+    remoteFolderWatcher.onDidChange(bump);
+    remoteFolderWatcher.onDidCreate(bump);
+    remoteFolderWatcher.onDidDelete(bump);
   }
-  context.subscriptions.push({
-    dispose: () => {
-      driftWatcher?.dispose();
-      if (saveRefreshTimer) clearTimeout(saveRefreshTimer);
-    },
-  });
+  context.subscriptions.push({ dispose: () => stopWatchingFolder() });
 
   graphView.setRunHandler((targets) => runPinned(targets));
   graphView.setRunCheckHandler((targets) => checkRun(targets));
@@ -296,7 +298,7 @@ export function activate(context: vscode.ExtensionContext) {
     graphView.forgetRunVersion();
   }
   graphView.setCliVerbHandler((verb, args) => runCliVerb(verb, args));
-  graphView.setTreeVerbHandler((args) => treeVerb(args));
+  graphView.setLoadVersionHandler((reference) => loadVersion(reference));
   graphView.setSwitchInstallHandler((name) => void switchInstall(name));
   graphView.setInstallLeftHandler(() => {
     if (!pinnedProject) return;
@@ -335,7 +337,6 @@ export function activate(context: vscode.ExtensionContext) {
     }
     pinnedProject = project;
     void loadInstallTargets(project);
-    watchPinnedProjectForDrift();
     runsProvider.setPinnedProject(project);
     projectStream.setProject(project.id);
     autoFollow.setProject(project.id);
@@ -374,6 +375,7 @@ export function activate(context: vscode.ExtensionContext) {
   function backToLocal(projectId: string): void {
     install = { projectId, name: LOCAL_INSTALL, version: null, diskVersion: null, root: null };
     installError = null;
+    stopWatchingFolder();
     pointAtLocal(dispatcher, cli);
   }
 
@@ -456,6 +458,7 @@ export function activate(context: vscode.ExtensionContext) {
         dispatcher.setInstall(access.url, access.operatorKey);
         install = { projectId: project.id, name, version: running.version, diskVersion: null, root: running.dir };
         await graphView.showInstall(doc, project.id, { name, root: running.dir });
+        watchFolderOnRemote(project);
         void refreshDiskVersion(project);
       }
       void refreshActionBarFromStatus();
@@ -525,9 +528,9 @@ export function activate(context: vscode.ExtensionContext) {
     const name = installOf(project.id);
     if (name === LOCAL_INSTALL) return;
     try {
-      const tree = await runWeftJson<{ diskVersion?: string | null }>([...onArgs(name), 'tree', '--json'], project.rootPath);
+      const tree = await runWeftJson<TreeJson>([...onArgs(name), 'tree', '--json'], project.rootPath);
       if (installOf(project.id) !== name) return;
-      install = { ...install, diskVersion: tree.diskVersion ?? null };
+      install = { ...install, diskVersion: thisCopy(tree).workingVersion };
       postInstallView();
     } catch (err) {
       getWeftOutputChannel().append(`weft tree: ${err instanceof Error ? err.message : String(err)}\n`);
@@ -1105,10 +1108,6 @@ export function activate(context: vscode.ExtensionContext) {
     });
   }
 
-  // Source-change drift refresh: the save listener above covers
-  // every edit once it lands on disk, which is the only state
-  // `weft status` can see.
-
   /// Shell `weft --json <args>` in `cwd` and parse stdout as NDJSON,
   /// dispatching each event to `onEvent`. Stderr streams to the
   /// Weft output channel (compile / docker progress the user can
@@ -1372,7 +1371,7 @@ export function activate(context: vscode.ExtensionContext) {
     // it ran and which one the disk is, so it can say when they differ.
     if (version !== undefined) {
       const tree = runsProvider.currentTree();
-      graphView.setRunVersion(summary.runId, version, tree?.diskVersion ?? null);
+      graphView.setRunVersion(summary.runId, version, tree ? thisCopy(tree).workingVersion : null);
     }
   }
 
@@ -1392,7 +1391,8 @@ export function activate(context: vscode.ExtensionContext) {
       await runsProvider.refresh();
       return out;
     } catch (err) {
-      void vscode.window.showErrorMessage(`weft ${args.join(' ')}: ${err instanceof Error ? err.message : String(err)}`);
+      // A CLI failure's message already names the command it ran.
+      void vscode.window.showErrorMessage(err instanceof Error ? err.message : `weft ${args.join(' ')}: ${String(err)}`);
       return undefined;
     }
   }
@@ -1402,10 +1402,26 @@ export function activate(context: vscode.ExtensionContext) {
     return n instanceof VersionNode ? n.node.version.id : n.run.runId;
   }
 
-  async function branchHere(n: VersionNode | VersionRunNode): Promise<void> {
-    const reference = treeReference(n);
-    const out = await treeVerb(['branch', reference]);
-    if (out) void vscode.window.showInformationMessage(`Weft: branched to ${reference.slice(0, 8)}; the files on disk are that version now.`);
+  /// Move this folder onto a version, or onto a run (its version, with
+  /// that run as head): `weft branch` keeps what the folder held as a
+  /// version first, then writes the target's files here. Its answer
+  /// names that kept version, which is where "Switch back" goes (none
+  /// when the folder held no file, so there is nothing to go back to).
+  async function loadVersion(reference: string): Promise<void> {
+    const out = (await treeVerb(['branch', reference])) as Switched | undefined;
+    if (!out) return;
+    void refreshActionBarFromStatus();
+    const conflicts = out.copy.conflicts ?? [];
+    const message =
+      `Weft: this folder is at ${headPlace(out.copy)} now.` +
+      (conflicts.length > 0 ? ` Conflict copies to look at: ${conflicts.join(', ')}.` : '');
+    const saved = out.saved;
+    if (typeof saved !== 'string') {
+      void vscode.window.showInformationMessage(message);
+      return;
+    }
+    const picked = await vscode.window.showInformationMessage(message, 'Switch back');
+    if (picked === 'Switch back') await loadVersion(saved);
   }
 
   async function checkpointLabel(): Promise<void> {
@@ -1429,7 +1445,8 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   async function diffWithHead(n: VersionRunNode): Promise<void> {
-    const head = runsProvider.currentTree()?.head.headRun;
+    const tree = runsProvider.currentTree();
+    const head = tree ? thisCopy(tree).headRun : null;
     if (!head) {
       void vscode.window.showInformationMessage('Weft: head has no run to diff against.');
       return;
@@ -1540,7 +1557,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('weft.searchRuns', () => searchRuns()),
     vscode.commands.registerCommand('weft.clearRunSearch', () => runsProvider.setSearch(undefined)),
     vscode.commands.registerCommand('weft.showRunsOn', () => showRunsOn()),
-    vscode.commands.registerCommand('weft.branchHere', (n: VersionNode | VersionRunNode) => branchHere(n)),
+    vscode.commands.registerCommand('weft.loadVersion', (n: VersionNode | VersionRunNode) => loadVersion(treeReference(n))),
     vscode.commands.registerCommand('weft.checkpointLabel', () => checkpointLabel()),
     vscode.commands.registerCommand('weft.pruneVersion', (n: VersionNode) => pruneVersion(n)),
     vscode.commands.registerCommand('weft.diffWithHead', (n: VersionRunNode) => diffWithHead(n)),

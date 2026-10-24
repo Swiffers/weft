@@ -1,6 +1,6 @@
-//! `weft run`: compile + register the cwd project, record the code as a
-//! version, start a run under it, stream logs until completion (or
-//! `--detach`). A run it follows to its end sets its exit code the way
+//! `weft run`: sync this folder with its working copy, have the install
+//! stamp it as a version and build it, start a run of that version, and
+//! stream logs until completion (or `--detach`). A run it follows to its end sets its exit code the way
 //! `weft wait` does (`wait::Outcome`): 0 when it completed, non-zero when
 //! it failed or was cancelled. A run it only starts exits 0.
 //!
@@ -9,16 +9,20 @@
 //! reach. The run is shaped by a spec (`weft_core::run_spec`), read
 //! from `examples/<name>.json` or built from the flags (`--from`,
 //! `--emit`, `--target`, `--before`, `--group`, `--fire`); `--save <name>` writes
-//! the flags as a spec. `--seed` reuses from head's run (or from the run
+//! the flags as a spec. The install reads the example from the version it
+//! runs and resolves every value in it there, and refuses a run that could
+//! not start before any image is built (`RunPreview`). `--seed` reuses from head's run (or from the run
 //! `--seed=<run>` names) every node whose slice of the program did not
 //! change. The whole catalog is compiled
 //! by default; `--referenced` builds only the types used by this graph.
 
 use anyhow::{bail, Context};
+use weft_core::run_flags::{apply_run_flags, spec_from_flags, RunFlags};
+use weft_core::run_spec::judge::{judge, Verdict};
 use weft_core::run_spec::{Refusal, RunSpec};
-use weft_core::versions::RunStarted;
+use weft_core::builds::RunPreview;
+use weft_core::versions::{RunShape, RunStarted, VersionRunRequest};
 
-use super::versions::{spec_from_flags, RunFlags};
 use super::Ctx;
 use crate::progress::ActionVerb;
 
@@ -150,25 +154,27 @@ async fn check(ctx: &Ctx, args: &RunArgs) -> anyhow::Result<std::process::ExitCo
 }
 
 /// [`check`]'s preparation: the program and the spec a run started now
-/// would read. A program that does not compile cannot run either; its
-/// diagnostics go to stderr, never into the one line a `--json` reader
-/// parses.
+/// would read, both from the folder as it is, compiled here: the check is
+/// offline, uploads nothing, and answers while the person edits.
 async fn prepare_check(ctx: &Ctx, args: &RunArgs) -> anyhow::Result<(weft_core::ProjectDefinition, Option<RunSpec>)> {
     seed_bounds_need_a_seed(args)?;
-    // One snapshot, as a run takes it: the example and the program it
-    // reads are the ones a run started now would.
-    let snapshot = super::snapshot::Snapshot::take(&ctx.project()?.root)?;
-    let mut spec = spec_for(ctx, args, &snapshot.then_disk())?;
-    let compiled = super::ensure::compile_snapshot(&crate::progress::Progress::new(ActionVerb::Run, false), snapshot)?;
+    let project = ctx.project()?;
+    let mut spec = spec_for(ctx, args)?;
+    let definition = match weft_compiler::hash::load_program_with_diagnostics(project) {
+        Ok((definition, _)) => definition,
+        Err(weft_compiler::hash::CompileLoadError::Read(msg)) => bail!("{msg}"),
+        Err(weft_compiler::hash::CompileLoadError::Diagnostics(diags)) => {
+            bail!("compile failed:\n{}", weft_compiler::render_diagnostics(&diags))
+        }
+    };
     if let Some(spec) = &mut spec {
-        let (client, _, _) = super::resolve_project(ctx)?;
-        super::assets::resolve_run_values(&client, &compiled.files(), spec, false).await?;
+        super::assets::resolve_run_values(&ctx.client()?, &project.root, spec).await?;
     }
-    Ok((compiled.definition.clone(), spec))
+    Ok((definition, spec))
 }
 
 /// The infra copies a run of `definition` shaped by `spec` reads, once
-/// the run is held to everything [`validate_run`] refuses.
+/// the run is held to everything [`judge_run`] refuses.
 fn infra_read(definition: &weft_core::ProjectDefinition, spec: Option<&RunSpec>, args: &RunArgs) -> anyhow::Result<Vec<InfraCopyRead>> {
     let verdict = judge_run(definition, spec, args);
     if let Some(refusal) = verdict.refusal() {
@@ -257,22 +263,67 @@ pub async fn run(ctx: Ctx, args: RunArgs) -> anyhow::Result<std::process::ExitCo
     .await
 }
 
-/// Load saved parameters, apply explicit edits, and omit accepted output
-/// evidence from the run request. Graph validation sees the final edit.
-/// A saved example is read from the command's snapshot (`files`), so the
-/// run uses the example its version holds.
-fn spec_for(ctx: &Ctx, args: &RunArgs, files: &super::snapshot::SnapshotFirst<'_>) -> anyhow::Result<Option<RunSpec>> {
+/// The spec a run of `args` starts with, as this folder holds it: the
+/// saved example edited by the flags, or the flags alone. What `--save`
+/// writes and what a check judges; a real run is shaped by the same
+/// example and flags on the install ([`run_shape`]).
+fn spec_for(ctx: &Ctx, args: &RunArgs) -> anyhow::Result<Option<RunSpec>> {
     match (&args.spec, args.flags.is_empty()) {
         (Some(name), _) => {
-            let spec = super::versions::read_spec_from(ctx.project()?, name, &|path| files.read_to_string(path))?;
-            Ok(Some(super::versions::apply_run_flags(&spec.without_expected(), &args.flags)?))
+            let spec = super::versions::read_spec(ctx.project()?, name)?;
+            Ok(Some(apply_run_flags(&spec.without_expected(), &args.flags).map_err(anyhow::Error::msg)?))
         }
         (None, true) => Ok(args.save.as_ref().map(RunSpec::whole)),
         (None, false) => {
             let name = args.save.clone().unwrap_or_else(|| "one-off".to_string());
-            Ok(Some(spec_from_flags(&name, &args.flags)?))
+            Ok(Some(spec_from_flags(&name, &args.flags).map_err(anyhow::Error::msg)?))
         }
     }
+}
+
+/// What a run of `args` asks the install to start with: the example the
+/// version holds and the flags that edit it. Once `--save` wrote the
+/// flags into the saved example, the example alone. A spec named by path
+/// (`examples/chain.json`, or absolute) is named the way the version holds
+/// it, relative to the project `root`.
+fn run_shape(root: &std::path::Path, args: &RunArgs) -> anyhow::Result<RunShape> {
+    if let Some(saved) = &args.save {
+        return Ok(RunShape { example: Some(saved.clone()), flags: RunFlags::default() });
+    }
+    let example = args.spec.as_deref().map(|name| example_in_version(root, name)).transpose()?;
+    Ok(RunShape { example, flags: args.flags.clone() })
+}
+
+/// The example `name` as the version holds it: a bare name as it is
+/// (`examples/<name>.json`), a path to a `.json` file relative to the
+/// project. A file outside the project is no file of the version.
+fn example_in_version(root: &std::path::Path, name: &str) -> anyhow::Result<String> {
+    if !name.ends_with(".json") {
+        return Ok(name.to_string());
+    }
+    let path = std::path::Path::new(name);
+    let relative = match path.strip_prefix(root) {
+        Ok(inside) => inside,
+        Err(_) if path.is_absolute() => bail!(
+            "{name} is outside the project, and a run reads its example from the project's files: \
+             move it under {}",
+            root.join("examples").display()
+        ),
+        Err(_) => path,
+    };
+    let parts: Option<Vec<&str>> = relative.components().map(|part| match part {
+        std::path::Component::Normal(part) => part.to_str(),
+        _ => None,
+    }).collect();
+    match parts {
+        Some(parts) if !parts.is_empty() => Ok(parts.join("/")),
+        _ => bail!("{name} is not a path inside the project, and a run reads its example from the project's files"),
+    }
+}
+
+/// The run a build for `args` is held to before any image is built.
+fn run_preview(shape: RunShape, args: &RunArgs) -> RunPreview {
+    RunPreview { shape, seeded: args.seed.is_some(), seed_until: args.seed_until.clone(), seed_before: args.seed_before.clone() }
 }
 
 /// `--seed-until` and `--seed-before` bound a seed: without `--seed`
@@ -290,53 +341,45 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
         Some(run) if !run.is_empty() => Some(super::resolve_run_id(ctx, run).await?.parse().context("a resolved run id")?),
         _ => None,
     };
-    // The snapshot comes first: the example this run reads, and the one it
-    // saves, are the version's.
-    let mut snapshot = super::snapshot::Snapshot::take(&ctx.project()?.root)?;
-    let mut spec = spec_for(ctx, &args, &snapshot.then_disk())?;
+    let project = ctx.project()?;
+    // Read here for what `--save` writes and what the summary says; the
+    // install reads the same example from the version, which the sync
+    // below makes of this folder.
+    let mut spec = spec_for(ctx, &args)?;
     if let (Some(name), Some(spec)) = (&args.save, &mut spec) {
         spec.name = name.clone();
     }
     if let Some(name) = &args.save {
         let spec = spec.as_ref().expect("saving constructs a run spec");
-        // Asked of the disk, which is what the write below would replace.
-        if super::versions::read_spec_if_present(ctx.project()?, name)?.is_some_and(|existing| existing.is_frozen()) {
+        if super::versions::read_spec_if_present(project, name)?.is_some_and(|existing| existing.is_frozen()) {
             bail!("example '{name}' contains accepted results; save parameters under another name, or freeze an accepted new run to replace it");
         }
-        let (path, text) = super::versions::write_spec(ctx.project()?, &RunSpec { name: name.clone(), ..spec.clone() })?;
-        snapshot.record(&path, text.into_bytes())?;
+        let path = super::versions::write_spec(project, &RunSpec { name: name.clone(), ..spec.clone() })?;
         if !ctx.json() {
             println!("saved {}", path.display());
         }
     }
-    let compiled = super::ensure::compile_snapshot(progress, snapshot)?;
-    // A `@file(...)` / `@asset(...)` in a handed value becomes the value
-    // it stands for before anything checks it, so the port-type check
-    // below judges the file, never the marker text. What was saved above
-    // keeps the markers, so an example reads its file afresh every run.
-    if let Some(spec) = &mut spec {
-        let (client, _, _) = super::resolve_project(ctx)?;
-        super::assets::resolve_run_values(&client, &compiled.files(), spec, true).await?;
-    }
-    validate_run(&compiled.definition, spec.as_ref(), &args)?;
-    let node_set = args.node_set.unwrap_or(weft_core::builds::NodeSet::Full);
-    let definition = compiled.definition.clone();
-    let handle = super::ensure::build_compiled(ctx, progress, node_set, compiled).await?;
+    let shape = run_shape(&project.root, &args)?;
+    let request = weft_core::builds::BuildRequest {
+        node_set: args.node_set.unwrap_or(weft_core::builds::NodeSet::Full),
+        root: args.root,
+        run: Some(run_preview(shape.clone(), &args)),
+        ..Default::default()
+    };
+    let handle = super::ensure::ensure_built(ctx, progress, request).await?;
     if !ctx.json() {
         println!("registered {} ({})", handle.name, handle.id);
     }
-    let example = args.save.as_ref().or(args.spec.as_ref()).and_then(|_| spec.as_ref().map(|spec| spec.name.clone()));
-    let body = weft_core::versions::VersionRunRequest {
-        manifest: handle.manifest.clone(),
+    let body = VersionRunRequest {
+        working_copy: weft_core::working_copy::WorkingCopyRef { working_copy: Some(handle.copy.id) },
+        version: handle.version.clone(),
         definition_hash: handle.definition_hash().to_string(),
         binary_hash: handle.binary_hash().to_string(),
         seed: args.seed.is_some(),
         seed_run,
         seed_until: args.seed_until.clone(),
         seed_before: args.seed_before.clone(),
-        root: args.root,
-        spec: spec.clone(),
-        example,
+        shape,
     };
     let path = format!("/projects/{}/versions/runs", handle.id);
     progress.dispatcher_call_start(&path);
@@ -366,75 +409,14 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     if args.detach || ctx.json() {
         return Ok(std::process::ExitCode::SUCCESS);
     }
-    let outcome = super::follow::follow_run_id(&handle.client, ctx.on(), &run_id.to_string(), Some(&definition)).await?;
+    let outcome = super::follow::follow_run_id(&handle.client, ctx.on(), &run_id.to_string(), Some(&handle.built.definition)).await?;
     Ok(outcome.exit_code())
 }
 
-/// What stands between a run and its start, sorted by what a reader does
-/// with it ([`judge_run`]).
-#[derive(Default)]
-struct Verdict {
-    /// The spec's resolution: `None` when there is no spec (the run is the
-    /// whole program) or when it could not be resolved (`refused` says why).
-    resolved: Option<weft_core::run_spec::Resolved>,
-    /// The inputs something in the run needs that get nothing.
-    unfed: Vec<weft_core::run_spec::Unfed>,
-    /// Every other reason it cannot start.
-    refused: Vec<String>,
-}
-
-impl Verdict {
-    /// Everything that stops the run, as the run itself refuses it.
-    fn refusal(&self) -> Option<String> {
-        let reasons: Vec<&str> = self.unfed.iter().map(|unfed| unfed.message.as_str()).chain(self.refused.iter().map(String::as_str)).collect();
-        (!reasons.is_empty()).then(|| format!("the run cannot start:\n{}", reasons.join("\n")))
-    }
-}
-
-/// Judge a run the way the dispatcher refuses one before it starts.
+/// [`judge`] over what `weft run` was asked: whether it seeds, and the
+/// bounds of the seed.
 fn judge_run(definition: &weft_core::ProjectDefinition, spec: Option<&RunSpec>, args: &RunArgs) -> Verdict {
-    let mut verdict = Verdict::default();
-    match spec {
-        Some(spec) => match weft_core::run_spec::resolve_spec(spec, definition, &Default::default()) {
-            Err(refusal) => verdict.refused.extend(refusal.errors),
-            Ok(resolved) => {
-                // A seeded run can feed a crossing from history, which only
-                // the dispatcher reads; it refuses an unfed input after that.
-                // Which instance the run is for it refuses either way.
-                if args.seed.is_none() {
-                    verdict.unfed = weft_core::run_spec::unfed(definition, &resolved, spec);
-                }
-                if let Err(refusal) = weft_core::run_spec::refuse_instanceless(&resolved.program, spec.instance.as_ref()) {
-                    verdict.refused.extend(refusal.errors);
-                }
-                verdict.resolved = Some(resolved);
-            }
-        },
-        None => {
-            if let Err(refusal) = weft_core::run_spec::refuse_instanceless(definition, None) {
-                verdict.refused.extend(refusal.errors);
-            }
-        }
-    }
-    if !args.seed_until.is_empty() || !args.seed_before.is_empty() {
-        if let Err(why) = weft_core::project::cut::walk(&weft_core::project::graph::ProjectGraph::new(definition), &weft_core::project::cut::SelectionBounds {
-            target: args.seed_until.clone(), before: args.seed_before.clone(), ..Default::default()
-        }) {
-            verdict.refused.push(why);
-        }
-    }
-    verdict
-}
-
-/// Refuse what the dispatcher would refuse before the run starts, and
-/// hand back the spec's resolution (`None` when there is no spec: the run
-/// is the whole program).
-fn validate_run(definition: &weft_core::ProjectDefinition, spec: Option<&RunSpec>, args: &RunArgs) -> anyhow::Result<Option<weft_core::run_spec::Resolved>> {
-    let verdict = judge_run(definition, spec, args);
-    if let Some(refusal) = verdict.refusal() {
-        bail!("{refusal}");
-    }
-    Ok(verdict.resolved)
+    judge(definition, spec, args.seed.is_some(), &args.seed_until, &args.seed_before)
 }
 
 /// Start the run, turning the resolver's 422 into its lines: every
@@ -442,7 +424,7 @@ fn validate_run(definition: &weft_core::ProjectDefinition, spec: Option<&RunSpec
 pub async fn start_run(
     client: &crate::client::DispatcherClient,
     path: &str,
-    body: &weft_core::versions::VersionRunRequest,
+    body: &VersionRunRequest,
 ) -> anyhow::Result<RunStarted> {
     let (status, text) = client.post_json_status(path, &serde_json::to_value(body)?).await.context("start run")?;
     match status {
@@ -585,6 +567,39 @@ mod tests {
         assert_eq!(rest["ok"], true);
         assert_eq!(rest["infraRead"], serde_json::json!([{ "node": "pg" }]));
         assert_eq!(rest["targets"].as_array().map(Vec::len), Some(2));
+    }
+
+    /// What a run asks the install to start with: the example and the
+    /// flags as given, the saved example alone once `--save` wrote the
+    /// flags into it, and a spec named by path named as the version holds it.
+    #[test]
+    fn a_run_asks_for_its_example_and_flags() {
+        let root = std::path::Path::new("/home/me/shop");
+        let flags = RunFlags { target: vec!["reply".into()], ..Default::default() };
+        let args = RunArgs { spec: Some("angry".into()), flags: flags.clone(), ..Default::default() };
+        assert_eq!(run_shape(root, &args).unwrap(), RunShape { example: Some("angry".into()), flags: flags.clone() });
+        let saved = RunArgs { save: Some("calm".into()), ..args.clone() };
+        assert_eq!(run_shape(root, &saved).unwrap(), RunShape { example: Some("calm".into()), flags: RunFlags::default() });
+        assert_eq!(run_shape(root, &RunArgs::default()).unwrap(), RunShape::default());
+        let wire = serde_json::to_value(run_shape(root, &args).unwrap()).unwrap();
+        assert_eq!(wire["example"], "angry");
+        assert!(wire.get("flags").is_some(), "{wire}");
+
+        assert_eq!(example_in_version(root, "examples/chain.json").unwrap(), "examples/chain.json");
+        assert_eq!(example_in_version(root, "/home/me/shop/examples/chain.json").unwrap(), "examples/chain.json");
+        assert!(format!("{:#}", example_in_version(root, "/tmp/chain.json").unwrap_err()).contains("outside the project"));
+        assert!(example_in_version(root, "../chain.json").is_err());
+    }
+
+    /// The build is held to the run it is for: what it starts with, and
+    /// whether a seed feeds it.
+    #[test]
+    fn a_build_for_a_run_carries_its_seed() {
+        let args = RunArgs { seed: Some(String::new()), seed_until: vec!["a".into()], ..Default::default() };
+        let preview = run_preview(RunShape::default(), &args);
+        assert!(preview.seeded);
+        assert_eq!(preview.seed_until, vec!["a"]);
+        assert!(!run_preview(RunShape::default(), &RunArgs::default()).seeded);
     }
 
     #[test]

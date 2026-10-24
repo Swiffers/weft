@@ -548,6 +548,17 @@ pub async fn announce(state: &DispatcherState, summary: &StoredProjectSummary) {
         );
     }
     state.builder.prunes.request(state, Some(summary.id));
+    // The files the build reads are the project's references now, beside
+    // every version's and working copy's.
+    if let Err((_, message)) = crate::actions::versions::publish_references(state, summary.id, &[]).await {
+        tracing::error!(
+            target: "weft_dispatcher::build",
+            project_id = %summary.id,
+            error = %message,
+            "publishing the project's asset references failed after the version registered; the next change of its \
+             files, stamp or build publishes them again"
+        );
+    }
     // A queued event a failing hand-over stopped may run on this version.
     crate::parked_drain::retry_stopped(state, summary.id).await;
     state

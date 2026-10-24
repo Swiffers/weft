@@ -347,6 +347,12 @@ something they do not cover calls the ctx directly in a node of its own:
 | `ctx.tokens().mint_for_instance(id, expires_in)` / `.instance(id).revoke()` | Instance tokens |
 | `ctx.storage(StorageScope::instance())` | The run's instance's own files |
 
+Every call in this table except `ctx.instance()` and `ctx.storage(..)`
+also works on another project of the same owner through `ctx.project(other)` (`ctx.project(other).values().instance(id).get()`). For a
+project's code and one run's calls (`ctx.code()`, `ctx.run_by_id(run)`), and
+the three things a program cannot do on its own project, go and read the
+`weft-node-authoring` skill.
+
 `start()` returns once the container is running, however long that takes
 (the run parks between looks and holds no worker), so you can activate the
 instance's triggers right after it. If the container never comes up,

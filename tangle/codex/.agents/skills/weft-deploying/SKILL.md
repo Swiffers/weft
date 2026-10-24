@@ -244,9 +244,9 @@ Every target keeps its own versions: `weft tree --on prod` lists what was
 deployed there. To roll back, put an older one's files back in the folder
 with `weft branch <id> --on prod`, then `weft infra upgrade --on prod --all`
 and `weft resync --on prod --all` (or `weft activate --on prod` if the
-program is off). Its images are already built, so nothing rebuilds. `weft branch` refuses while
-the folder holds changes no version records; `--discard` throws those
-changes away, and you pass it only when the user said to.
+program is off). Its images are already built, so nothing rebuilds. `weft branch` records
+what the folder held as a version first, and prints the `weft branch <id>`
+that comes back to it.
 
 ## The frontend on a cloud install
 

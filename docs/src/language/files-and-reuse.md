@@ -39,9 +39,10 @@ first line a `#` comment saying what it does: `weft describe-nodes --list`
 ends with every such file, spelled the way you include it, with that line
 beside it.
 
-`@asset` is the one exception to the rule that a path stays inside the project: it may name a file anywhere on your machine by an
-absolute path, or under `~`, and it is read from where it sits and uploaded
-when you build.
+`@asset` is the one exception to the rule that a path stays inside the
+project: it may name a file anywhere on your machine by an absolute path, or
+under `~`. For when that works and when it is refused, see
+[where an @asset is read](#where-an-asset-is-read).
 
 ## @file
 
@@ -83,12 +84,38 @@ or from the bytes. For text, it is the type to read the text as
 kind: `Image`, `Video`, `Audio` or `Blob`. `File` and `Media` are refused:
 each covers several kinds, and weft has to know which one the file is.
 
-It is fetched or read when you build, not when you write it, so a URL is
-resolved once into your project rather than every run.
+It is resolved when you build. If it is a URL with a text type, the build
+fetches it once and the program holds the text. If it is a URL with a file
+type, the node gets the address, and the file is fetched when the run reads it.
 
-In the editor, dropping a file onto a node picks it up in place if it has a
-path on disk, and stores it under your project's `assets/` if it arrived as
-bytes with no path.
+### Where an @asset is read
+
+The install builds from a version, so it looks for the file there first. A file the version holds
+(anything under `assets/`, `prompts/` and the other folders a
+[version](../running/versions.md#a-version) covers) is already stored with the
+version, so nothing is read off your disk or uploaded for it.
+
+If the version does not hold the file (an absolute path, `~/...`, or a project
+file outside those folders), an install on your machine reads it off your disk
+(a relative path from your project folder): with a file type it stores the
+file, and with a text type the program holds the text. A cloud install
+cannot reach your machine, so it refuses the build:
+
+```text
+assets that cannot be used:
+  @asset("/home/me/logo.png", Image): '/home/me/logo.png' is not in the version, and this install runs in the cloud, so it cannot read files off a machine: put the file in the project, under `assets/`, and name it from there
+```
+
+On an install on your machine, a program building a project that has no
+folder can still use an absolute or `~` path, but a relative one has nowhere
+to be read from, so that build is refused.
+
+`@file` in your program can only name a file the version holds, because the
+install compiles the version.
+
+In the editor, a file you choose with the file picker is used where it is,
+and a file you drag onto a node is copied into your project's `assets/` (with
+`-1`, `-2` added if the name is taken).
 
 ## @include
 

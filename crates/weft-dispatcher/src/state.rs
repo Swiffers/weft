@@ -86,6 +86,8 @@ pub struct DispatcherState {
     /// The version tree (`crate::versions`): every version a project has
     /// been, every run under one, and head.
     pub versions: crate::versions::VersionStore,
+    /// Where each project's code is being edited (`crate::working_copies`).
+    pub working_copies: crate::working_copies::WorkingCopyStore,
     pub events: EventBus,
     /// The listener role: registers signals, processes fires.
     pub listener: ListenerClient,

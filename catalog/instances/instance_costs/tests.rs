@@ -36,7 +36,7 @@ async fn totals_an_instances_costs(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(outcome.outputs["unpricedCalls"], json!(1), "the null amount is counted, so the total says it is short");
     assert_eq!(outcome.outputs["records"].as_array().map(Vec::len), Some(2));
     match &rig.program_calls()[0].0 {
-        ProgramCall::CostsList { filter } => {
+        ProgramCall::Runs(weft::program::runs::RunCall::Costs { filter }) => {
             assert_eq!(filter.instance.as_ref().map(|i| i.as_str()), Some("ada"));
             assert_eq!(filter.service.as_deref(), Some("openrouter"));
             assert_eq!(filter.paid_by, Some(PaidBy::Platform));
@@ -69,7 +69,7 @@ async fn run_filter(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(outcome.outputs["totalUsd"], json!(0.5));
     assert_eq!(outcome.outputs["unpricedCalls"], json!(0));
     match &rig.program_calls()[0].0 {
-        ProgramCall::CostsList { filter } => {
+        ProgramCall::Runs(weft::program::runs::RunCall::Costs { filter }) => {
             assert_eq!(filter.run, Some(run.parse::<RunId>().unwrap()));
             assert_eq!(filter.instance.as_ref().map(|i| i.as_str()), Some("ada"));
         }

@@ -201,6 +201,23 @@ describe('the terminal output the bar carries', () => {
     expect(store.current().activity).toBeUndefined();
   });
 
+  it('shows a compile failure that carries no diagnostics list as its message', () => {
+    // A build compiles on the install, and its failure reaches the bar
+    // as `message`, `what` and `stage` with no per-diagnostic list.
+    const store = pinnedStore();
+    store.cliStart(PROJECT, 'activate');
+    store.cliEvent(PROJECT, {
+      tsUnix: 0,
+      verb: 'activate',
+      phase: 'error',
+      detail: { message: "unknown node type 'Trimm'", what: 'Compiling the project', stage: 'compile' },
+    });
+    const details = store.current().error?.details;
+    expect(details?.stage).toBe('compile');
+    expect(details?.what).toBe('Compiling the project');
+    expect(details?.diagnostics).toEqual([{ severity: 'error', message: "unknown node type 'Trimm'" }]);
+  });
+
   it('keeps the output under the error when the verb fails', () => {
     const store = pinnedStore();
     store.cliStart(PROJECT, 'activate');

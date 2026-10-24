@@ -97,7 +97,7 @@ pub enum Following {
 /// `POST /projects/{id}/deactivate`: the take-down's answers and which
 /// activations: the named triggers (every one when none is) of the
 /// owners named (the shared ones when none is).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct DeactivateRequest {
     #[serde(flatten)]
     pub choice: TakeDownChoice,
@@ -110,7 +110,7 @@ pub struct DeactivateRequest {
 /// which: the named triggers (every one when none is) of the owners named
 /// (the shared ones when none is), of which only those on and behind the
 /// build are refreshed. They come back at once on the new build.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ResyncRequest {
     #[serde(flatten)]
     pub build: BuildHashes,

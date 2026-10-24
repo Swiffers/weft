@@ -1,841 +1,42 @@
-//! The version tree's HTTP surface: checkpoint, the run that records
-//! itself (seeded, scoped, or plain), the tree, head, activation, and
-//! prune. See `crate::versions` for the model.
-//!
-//! One start path. `run` here is THE way a run starts from the
-//! CLI or the editor: it resolves the spec (`weft_core::run_spec`),
-//! decides what a seeded run inherits (`weft_core::seeding`), journals
-//! the birth rows through `project::start_queued_run` exactly as
-//! every other start does, and records the run under its version. A
-//! plain `weft run` is this endpoint with no seed and no scope.
-
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+//! The version tree's and the working copies' HTTP surface. Each handler
+//! parses, names the caller as an operator, and calls its action
+//! (`crate::actions::versions`, `crate::actions::runs`), where every gate
+//! lives; see `crate::versions` and `crate::working_copies` for the model.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
-use serde_json::Value;
-use weft_core::run_spec::{resolve_seeded, resolve_spec, Refusal, RunSpec};
-use weft_core::frames::Located;
-use weft_core::seeding::{inheritable_nodes, seed_plan, SeedOutcome};
+use weft_core::versions::{CheckpointRequest, PruneResponse, RunStarted, RunUpdate, RunningSource, SweepResponse, VersionRunRequest, VersionTree, VersionUpsert};
+use weft_core::working_copy::{Applied, ChangeFiles, RegisterFolder, SwitchRequest, Switched, SyncReport, WorkingCopy, WorkingCopyRef, WorkingState};
 use weft_core::RunId;
 
-use crate::api::project::{coherent_definition, require_action};
+use crate::actions::{versions, Actor, Refused};
 use crate::authenticator::{authorize_project, CallerTenant};
 use crate::state::DispatcherState;
-use crate::versions::{plan_prune, resolve_seed, version_id, Manifest, SeedChoice, VersionRow};
-use weft_core::versions::{
-    manifest_diff, CheckpointRequest, Head, HeadRequest, HeadResponse, PruneResponse, RunStarted, VersionRun, RunUpdate,
-    RunningSource, SweepResponse, VersionRunRequest, VersionSummary, VersionTree, VersionUpsert,
-};
 
-type ApiError = (StatusCode, String);
-
-fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e}"))
+fn operator(caller: CallerTenant) -> Actor {
+    Actor::operator(caller.0)
 }
 
-/// Every tree write that reads head and moves it happens inside this,
-/// holding the project's transition lock.
-///
-/// The writes that do NOT are the ones that only take rows away, and
-/// they are named here because the compare-and-set inside
-/// [`move_head_or_conflict`] is the only thing standing between them and
-/// a writer in here: `weft clean` deletes one run row and clears
-/// `head_run` (`api::run`), a deactivate clears the activation pin
-/// (`api::project`), and the retirement sweep deletes rows of a project
-/// that no longer exists (`versions::retire_unused_versions`). A lost
-/// compare-and-set names those, and only those, as its cause.
-///
-/// A tree write is a read-modify-write: read head, record a version
-/// under it, move head there. Each writer spelling that itself meant
-/// three of them (checkpoint, the activation pin, the bare-version
-/// sweep) read head, wrote, and moved with nothing serialising them
-/// against `prune`, which deletes versions, or against each other. Two
-/// sessions checkpointing at once could leave head naming a version
-/// another session's prune had just deleted, and `parent_id` carries no
-/// foreign key, so nothing downstream rejected it: the branch became
-/// unreachable, and therefore unprunable, for good.
-///
-/// So the lock is the way in, not a thing to remember. The compare-and-
-/// set inside [`move_head_or_conflict`] stays as well: it costs one
-/// `WHERE` clause and it is what keeps a writer that somehow arrives
-/// without the lock from clobbering silently.
-///
-/// Keep the body SHORT: the lock is a Postgres advisory lock held in a
-/// transaction, so it holds a pooled connection while it runs. Anything
-/// expensive (a seed fold, a journal read, storage) belongs outside it,
-/// which is why `run` computes its version id (a pure hash of the
-/// manifest) and folds its seed first, then writes both rows in here.
-async fn with_tree_lock<T, F, Fut>(
-    state: &DispatcherState,
-    project: uuid::Uuid,
-    body: F,
-) -> Result<T, ApiError>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T, ApiError>>,
-{
-    // The lock reports only its own failures through `anyhow`; the
-    // body's own refusals ride through it untouched, so a CONFLICT
-    // from inside stays a CONFLICT instead of collapsing to a 500.
-    crate::lease::with_project_transition_lock(&state.lock_pool, project, || async move {
-        Ok(body().await)
-    })
-    .await
-    // Shared with every other holder of this lock, so they cannot answer
-    // the same failure differently.
-    .map_err(|e| crate::lease::lock_answer("tree lock", e))?
-}
-
-// ----- checkpoint --------------------------------------------------------
-
-/// Record the files as a version under head (no run, no build) and
-/// move head there. Identical code answers the existing version.
+/// `POST /projects/{id}/versions`: stamp a working copy into a version.
 pub async fn checkpoint(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
     Json(body): Json<CheckpointRequest>,
-) -> Result<Json<VersionUpsert>, ApiError> {
-    authorize_project(&state, &caller.0, id).await?;
-    let upsert = with_tree_lock(&state, id, || async {
-        let (upsert, head) = upsert_version(&state, id, &body.manifest, body.label.as_deref(), body.root).await?;
-        move_head_or_conflict(&state, id, &head, Some(&upsert.version), None).await?;
-        Ok(upsert)
-    })
-    .await?;
-    Ok(Json(upsert))
+) -> Result<Json<VersionUpsert>, Refused> {
+    Ok(Json(versions::checkpoint(&state, &operator(caller), id, &body).await?))
 }
 
-/// Record `manifest` as a version parented on head (or on nothing
-/// under `root`), unless the project already has it. A label is set
-/// on a new version and replaces an existing one's.
-///
-/// Reads head and writes in one breath, so it belongs inside
-/// [`with_tree_lock`]; the head it returns is what the caller then
-/// compare-and-sets against.
-async fn upsert_version(
-    state: &DispatcherState,
-    project: uuid::Uuid,
-    manifest: &Manifest,
-    label: Option<&str>,
-    root: bool,
-) -> Result<(VersionUpsert, Head), ApiError> {
-    let head = state.versions.head(project).await.map_err(|e| internal("head", e))?;
-    let upsert = commit_version(state, project, manifest, label, root, &head).await?;
-    Ok((upsert, head))
-}
-
-pub(crate) async fn record_program_source(
-    state: &DispatcherState,
-    project: uuid::Uuid,
-    program: &weft_core::project::hash::ProgramIdentity,
-) -> Result<String, ApiError> {
-    with_tree_lock(state, project, || async {
-        record_program_source_locked(state, project, program).await
-    }).await
-}
-
-/// Record the exact program while the caller holds the project transition lock.
-pub(crate) async fn record_program_source_locked(
-    state: &DispatcherState,
-    project: uuid::Uuid,
-    program: &weft_core::project::hash::ProgramIdentity,
-) -> Result<String, ApiError> {
-    let manifest = state.projects.program_source(project, program).await
-        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
-    let (version, _) = upsert_version(state, project, &manifest, None, false).await?;
-    Ok(version.version)
-}
-
-/// Write the version row itself, under a head the caller has already
-/// read. Separate from [`upsert_version`] because `run` needs the id
-/// (a pure hash of the manifest) and the head long before it may
-/// write: it folds its seed in between, which is far too slow to do
-/// while holding the tree lock, so it commits the row here at the same
-/// moment it records the run.
-async fn commit_version(
-    state: &DispatcherState,
-    project: uuid::Uuid,
-    manifest: &Manifest,
-    label: Option<&str>,
-    root: bool,
-    head: &Head,
-) -> Result<VersionUpsert, ApiError> {
-    validate_manifest(manifest)?;
-    let id = version_id(manifest);
-    let parent = if root { None } else { head.head_version.clone().filter(|h| h != &id) };
-    let row = VersionRow {
-        id: id.clone(),
-        project_id: project,
-        parent_id: parent.clone(),
-        manifest: manifest.clone(),
-        label: label.map(str::to_string),
-        created_at: crate::lease::now_unix() as u64,
-    };
-    let created = state.versions.upsert_version(&row).await.map_err(|e| internal("record version", e))?;
-    let recorded = if created {
-        None
-    } else {
-        state.versions.version(project, &id).await.map_err(|e| internal("version", e))?
-    };
-    if !created && root && recorded.as_ref().and_then(|v| v.parent_id.as_ref()).is_some() {
-        let parent = recorded.as_ref().and_then(|v| v.parent_id.clone()).unwrap_or_default();
-        return Err(root_conflict(&id, &parent));
-    }
-    if !created {
-        if let Some(label) = label {
-            state.versions.set_label(project, &id, Some(label)).await.map_err(|e| internal("label", e))?;
-        }
-    }
-    let parent = if created { parent } else { recorded.and_then(|v| v.parent_id) };
-    Ok(VersionUpsert { version: id, created, parent })
-}
-
-/// `--root` on code the project already holds.
-///
-/// A version IS its code, so this exact code is already a version, and it
-/// already has a parent: content addressed, it cannot have two. Answering
-/// the existing version instead would hand the caller the old tree when
-/// they asked for a new one.
-fn root_conflict(id: &str, parent: &str) -> ApiError {
-    (
-        StatusCode::CONFLICT,
-        format!(
-            "a version IS its code, and this exact code is already version {id}, recorded under \
-             {parent}. It cannot also be a root, so there is nothing `--root` can do here: change \
-             something and run again, or drop `--root` to record this run under the version it \
-             already has"
-        ),
-    )
-}
-
-/// Refuse a manifest that could not be stored or addressed.
-///
-/// The manifest comes from the client and its values become storage
-/// keys (`blob_keys`), so an entry carrying a `/` or a `..` would
-/// produce a key the storage surface refuses, and because the asset
-/// reference publish spans EVERY version of the project, one such row
-/// would break that project's publish from then on, durably. The gate
-/// belongs here because this is where a manifest becomes a version.
-pub(crate) fn validate_manifest(manifest: &Manifest) -> Result<(), ApiError> {
-    for (path, hash) in manifest {
-        if path.is_empty()
-            || path.starts_with('/')
-            || path.contains('\\')
-            || path.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..")
-        {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("'{}' is not a project-relative path", weft_core::truncate_user_string(path, 256)),
-            ));
-        }
-        if hash.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("'{}' carries no content hash", weft_core::truncate_user_string(path, 256)),
-            ));
-        }
-        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "'{}' names '{}', which is not a sha256",
-                    weft_core::truncate_user_string(path, 256),
-                    weft_core::truncate_user_string(hash, 128)
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Move head from where the caller read it, or refuse: a sibling process
-/// moved head in between, and every decision here (which version to
-/// parent on, which run to seed from) was made against the old one.
-async fn move_head_or_conflict(
-    state: &DispatcherState,
-    project: uuid::Uuid,
-    expected: &Head,
-    version: Option<&str>,
-    run: Option<RunId>,
-) -> Result<(), ApiError> {
-    let moved = state
-        .versions
-        .move_head(project, expected, version, run)
-        .await
-        .map_err(|e| internal("set head", e))?;
-    if !moved {
-        // Not "another session checkpointed": every tree write holds the
-        // project's lock and this compare-and-set runs inside it. Head
-        // changing under a locked call means the row itself moved on, by a
-        // `weft clean` clearing the run head named or by the project being
-        // removed. A retry helps in the first case and never in the
-        // second, so both are named.
-        return Err((
-            StatusCode::CONFLICT,
-            "head changed under this call: either the run head pointed at was cleaned, or the \
-             project was removed. Try again, and if it refuses again check `weft ps` for the \
-             project"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
-// ----- run ---------------------------------------------------------------
-
-/// What the resolver refused, as the 422 body: JSON, so the CLI prints
-/// every line and the editor makes a field per missing input.
-fn refused(refusal: &Refusal) -> ApiError {
-    crate::api::project::refusal_error(refusal)
-}
-
-/// The runs of a project that are still going: queued or being driven. A
-/// run the version tree names that has no run row is not going; it is
-/// nothing.
-async fn in_flight_run_ids(
-    state: &DispatcherState,
-    project: uuid::Uuid,
-) -> Result<std::collections::HashSet<RunId>, ApiError> {
-    Ok(state
-        .runs
-        .going_run_ids_for_project(project)
-        .await
-        .map_err(|e| internal("runs going", e))?
-        .into_iter()
-        .map(|(run_id, _)| run_id)
-        .collect())
-}
-
-/// Every settled run of a project: ended, or parked on a wait. Asked
-/// once per project, never per run.
-async fn settled_run_ids(
-    state: &DispatcherState,
-    project: uuid::Uuid,
-) -> Result<std::collections::HashSet<RunId>, ApiError> {
-    state.runs.settled_run_ids_for_project(project).await.map_err(|e| internal("settled runs", e))
-}
-
-/// The seed run folded: the complete results it holds, by place (its
-/// own, and those it reused from earlier runs, each from the run that made
-/// it), and the places that waited in it with the fingerprint of their
-/// code there.
-struct SeededFrom {
-    run_id: RunId,
-    outcomes: BTreeMap<Located, SeedOutcome>,
-    answered: BTreeMap<Located, weft_core::project::hash::SourceHash>,
-}
-
-/// The registered program a run was run against (the one its cut was cut
-/// from, or its own: `DispatcherState::registered_identity`) and that
-/// program's identity: what a seed holds the run's results against.
-async fn registered_of(
-    state: &DispatcherState,
-    project: uuid::Uuid,
-    run_id: RunId,
-    snapshot: &weft_core::primitive::RunSnapshot,
-) -> Result<(Arc<weft_core::ProjectDefinition>, weft_core::project::hash::ProgramIdentity), ApiError> {
-    let (Some(definition_hash), Some(binary_hash)) = (snapshot.definition_hash.as_deref(), snapshot.binary_hash.as_deref()) else {
-        return Err(internal("seed identity", format!("run {run_id} has no production code identity")));
-    };
-    let identity = state.registered_identity(run_id, project, definition_hash, snapshot.cut_from.as_deref(), binary_hash).await
-        .map_err(|e| internal("seed identity", e))?;
-    let hash = &identity.definition_hash;
-    let registered = state.program(project, hash).await.map_err(|e| internal("seed program", e))?
-        .ok_or_else(|| internal("seed program", format!("run {run_id} ran against program {hash}, which this project no longer records")))?;
-    Ok((registered, identity))
-}
-
-/// Fold `run_id`, a settled run of `project`, for a seed (see
-/// [`SeededFrom`]).
-async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run_id: RunId) -> Result<SeededFrom, ApiError> {
-    let sources = crate::projection::reconstruct_run(state, run_id).await.map_err(|e| internal("seed sources", e))?;
-    let fold = &sources[&run_id];
-    if fold.project().id != project {
-        return Err((StatusCode::NOT_FOUND, "seed is outside this project".into()));
-    }
-    let snapshot = fold.snapshot();
-    let outputs = fold.output_wires().map_err(|e| internal("seed outputs", e))?;
-    let live_nodes: BTreeSet<Located> = outputs.iter().filter(|wire| weft_core::weft_type::WeftType::contains_bus_handle(&wire.value))
-        .map(|wire| wire.place()).collect();
-    // Per run a result comes from: its slices over the program it was run
-    // against, and its output history.
-    let mut slices: BTreeMap<RunId, BTreeMap<Located, weft_core::project::hash::SourceHash>> = BTreeMap::new();
-    let mut histories: BTreeMap<RunId, Vec<weft_core::run_spec::OutputWire>> = BTreeMap::new();
-    let mut outcomes = BTreeMap::new();
-    for place in inheritable_nodes(fold.project(), snapshot) {
-        let origin = snapshot.inherited_origins.get(&place).copied().unwrap_or(run_id);
-        let source = sources.get(&origin).ok_or_else(|| internal("seed origin", format!("missing run {origin}")))?;
-        let (original, graph) = (source.snapshot(), source.project());
-        if let std::collections::btree_map::Entry::Vacant(slice) = slices.entry(origin) {
-            let (registered, identity) = registered_of(state, project, origin, original).await?;
-            slice.insert(identity.slice_hashes(&registered).map_err(|e| internal("seed identity", e))?);
-            histories.insert(origin, source.output_wires().map_err(|e| internal("seed outputs", e))?);
-        }
-        let declaration = graph.nodes.iter().find(|n| n.id == place.id).ok_or_else(|| internal("seed node", &place.id))?;
-        let slice_hash = slices[&origin].get(&place).ok_or_else(|| internal("seed identity", format!("run {origin} has no slice for {place}")))?.clone();
-        outcomes.insert(place.clone(), SeedOutcome {
-            origin,
-            slice_hash,
-            handed: original.given.inputs.get(&place).cloned().unwrap_or_default(),
-            gates: weft_core::seeding::gates_handed_around(&original.given, graph, &place),
-            emitted_live_handle: live_nodes.contains(&place),
-            fire: original.kicked.iter().find(|(location, kick)| Located::at(&location.node_id, &location.frames) == place && kick.firing)
-                .map(|(_, kick)| kick.payload.clone().unwrap_or(Value::Null)),
-            outputs: weft_core::seeding::sent_ports(declaration, &place, &histories[&origin]),
-        });
-    }
-    // The places that waited here and were answered, each with its code's
-    // fingerprint: what a run that runs one again replays.
-    let mut answered = BTreeMap::new();
-    let waited: BTreeSet<Located> = snapshot.awaited_sequences.iter()
-        .filter(|(_, entries)| !weft_core::primitive::answered_steps(entries).is_empty())
-        .map(|(at, _)| Located::at(&at.node_id, &at.frames))
-        .collect();
-    if !waited.is_empty() {
-        let (registered, identity) = registered_of(state, project, run_id, snapshot).await?;
-        for place in waited {
-            answered.insert(place.clone(), identity.node_hash(&registered, &place.id).map_err(|e| internal("seed answers", e))?);
-        }
-    }
-    Ok(SeededFrom { run_id, outcomes, answered })
-}
-
-/// Refuse a seed that would hand this run an output naming a stored file
-/// the file has moved on from: a reused node's saved result says what the
-/// node made, and a file edited since (by a later node, by another run)
-/// or gone no longer holds it. Only what stands in for itself here
-/// (`stand_ins`) hands this run anything; a place reused and read by
-/// nothing that runs hands it nothing. Every such output is named at
-/// once, so one refusal says everything to hand in or re-run.
-async fn refuse_moved_files(
-    state: &DispatcherState,
-    project: &weft_core::ProjectDefinition,
-    stand_ins: &BTreeMap<Located, weft_core::project::StandIn>,
-) -> Result<(), ApiError> {
-    let mut refusals = Vec::new();
-    for (place, stand_in) in stand_ins {
-        for (port, given) in &stand_in.ports {
-            let weft_core::project::GivenPort::Value { value } = given else { continue };
-            for file in weft_core::storage::stored_files_within(value) {
-                let now = match crate::storage::file_meta(state, &file.key).await {
-                    Ok(meta) => weft_core::seeding::FileNow::At(meta.version),
-                    Err(e) if e.downcast_ref::<crate::storage::StorageNotFound>().is_some() => {
-                        weft_core::seeding::FileNow::Gone
-                    }
-                    Err(e) => return Err(internal("read a reused output's file", e)),
-                };
-                let node = weft_core::project::address_of(project, &place.id, &place.path);
-                refusals.extend(weft_core::seeding::moved_file_refusal(&node, port, &file, now));
-            }
-        }
-    }
-    if refusals.is_empty() {
-        return Ok(());
-    }
-    Err((StatusCode::CONFLICT, refusals.join("\n")))
-}
-
-/// Start a run that records itself in the tree. See the module doc.
+/// `POST /projects/{id}/versions/runs`: start a run of a version.
 pub async fn run(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
     Json(body): Json<VersionRunRequest>,
-) -> Result<Json<RunStarted>, ApiError> {
-    authorize_project(&state, &caller.0, id).await?;
-    crate::maintenance::refuse_while_on(&state.pg_pool).await?;
-    require_action(&state, id, &["run"]).await?;
-    if (!body.seed_until.is_empty() || !body.seed_before.is_empty()) && !body.seed && body.seed_run.is_none() {
-        return Err((StatusCode::BAD_REQUEST, "`--seed-until` and `--seed-before` need `--seed`".into()));
-    }
-    if body.root && (body.seed || body.seed_run.is_some()) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "`--root` starts a new tree, with nothing before this run to reuse, so it cannot go with `--seed`: drop one of them".into(),
-        ));
-    }
-    let (program, project) = coherent_definition(&state, id).await?;
-    let definition_hash = program.definition_hash.clone();
-    if definition_hash != body.definition_hash {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "the project's definition moved to {definition_hash} since this run was prepared \
-                 (it registered {}); run again",
-                body.definition_hash
-            ),
-        ));
-    }
-    if program.binary_hash != body.binary_hash {
-        return Err((StatusCode::CONFLICT, "the project's implementation changed since this run was prepared; run again".into()));
-    }
-
-    // The manifest is checked here, before the expensive part, but the
-    // version ROW is written later, in the same locked breath as the
-    // run's own row: writing it up here left a window in which a
-    // concurrent `prune` deleted a version that had no runs yet
-    // (nothing marks one as being prepared), and the run then recorded
-    // against a version that no longer existed. The id needs no row to
-    // be known, it is a hash of the manifest.
-    validate_manifest(&body.manifest)?;
-    // `--root` on code the project already holds is refused HERE, before
-    // the pre-flight, because it is a mistake about the request rather than
-    // about the project's state. Left to `commit_version` at the end, a
-    // project whose infra was down answered "infra not running" to someone
-    // whose actual problem was that a version is its code and this code
-    // already has a parent.
-    if body.root {
-        let existing = state
-            .versions
-            .version(id, &version_id(&body.manifest))
-            .await
-            .map_err(|e| internal("version", e))?;
-        if let Some(parent) = existing.and_then(|v| v.parent_id) {
-            return Err(root_conflict(&version_id(&body.manifest), &parent));
-        }
-    }
-    // Head for the SEED choice. The version's parent reads head again
-    // inside the lock, where it cannot be stale.
-    let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
-    let seed_run: Option<RunId> = match (body.seed, body.seed_run) {
-        // Any settled run of the project: one a trigger started, one that
-        // failed, one of any version.
-        (_, Some(run_id)) => {
-            if !settled_run_ids(&state, id).await?.contains(&run_id) {
-                return Err((
-                    StatusCode::CONFLICT,
-                    format!("run {run_id} is not a settled run of this project (it is still going, or it is not this project's): `weft stop {run_id}` or wait, then run again"),
-                ));
-            }
-            Some(run_id)
-        }
-        (true, None) => {
-            let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
-            let runs = state.versions.runs(id).await.map_err(|e| internal("runs", e))?;
-            let settled = settled_run_ids(&state, id).await?;
-            match resolve_seed(&head, &versions, &runs, |c| settled.contains(&c)) {
-                SeedChoice::Run(run_id) => Some(run_id),
-                SeedChoice::Nothing => None,
-                SeedChoice::HeadRunning(run_id) => {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        format!("head {run_id} is still running; `weft stop {run_id}` or wait, then run again"),
-                    ));
-                }
-            }
-        }
-        _ => None,
-    };
-
-    let spec = body.spec.clone().unwrap_or_else(|| RunSpec::whole("run"));
-    // A run reads its infra's baked outputs as the dispatcher holds its
-    // copies; an infra node it reads nothing but saved values of does not
-    // run.
-    let saved = crate::api::project::saved_for_run(&state, id, &project, spec.instance.as_ref()).await?;
-    let authored = resolve_spec(&spec, &project, &saved).map_err(|r| refused(&r))?;
-    let bakes = if spec.fire.is_some() {
-        // An instance's trigger was baked with that instance's values: the
-        // fire replays the instance's bake.
-        state.bakes.trigger_bakes(id, spec.instance.as_ref()).await.map_err(|error| internal("read trigger bakes", error))?
-    } else { Vec::new() };
-    // A fired CALLER trigger (a Route) gets a stand-in caller: there is
-    // no socket coming, so the run serves the body the author typed and
-    // the program's answer goes to the journal. Without it a route's
-    // program is unrunnable offline, because the trigger and every
-    // Reply behind it ask for a caller that is not there.
-    //
-    // The trigger's signal spec comes from its BAKE, the same capture
-    // the port snapshot below comes from, so the dispatcher needs no
-    // knowledge of what a Route is: whether this trigger speaks to a
-    // caller at all is the signal kind's own declaration
-    // (`weft_core::signal::caller_protocol`).
-    let mut stand_in: Option<weft_core::primitive::SignalSpec> = None;
-    // The trigger `--fire` names, spelled: the run is that trigger's.
-    let mut fired_trigger: Option<String> = None;
-    // What the fired trigger's setup captured on its ports, which its
-    // firing kick replays.
-    let mut fired_ports: Option<Value> = None;
-    // How the run is kept: a fire starts the way its trigger says (the
-    // spec its bake captured), with what the run asks for by hand over it.
-    let mut kept_by_trigger = weft_core::run_settings::RunSettings::default();
-    for kick in authored.kicks.iter().filter(|kick| kick.firing) {
-        // A bake captures a trigger under its place (`one.door` for the
-        // `door` an include site `one` reaches), so the kick is spelled
-        // through its call frames before the lookup.
-        let address = crate::api::project::kick_place(&project, kick);
-        fired_trigger = Some(address.clone());
-        weft_core::run_spec::validate_fire_bake(&address, &program, &bakes.iter().map(|bake| bake.summary()).collect::<Vec<_>>())
-            .map_err(|refusal| refused(&refusal))?;
-        let capture = bakes.iter().find(|bake| bake.program == program)
-            .and_then(|bake| bake.captured.get(&address))
-            .expect("validated bake contains this trigger for this program");
-        fired_ports = Some(capture.ports.clone());
-        kept_by_trigger = capture.spec.settings;
-        if weft_core::signal::caller_protocol(&capture.spec.kind).is_some() {
-            let payload = spec
-                .fire
-                .as_ref()
-                .map(|(_, payload)| payload.clone())
-                .unwrap_or(serde_json::Value::Null);
-            stand_in_caller(&capture.spec, &payload, &address).map_err(|why| refused(&weft_core::run_spec::Refusal::error(why)))?;
-            stand_in = Some(capture.spec.clone());
-        }
-    }
-
-    // The infra gate (`require_run_infra`), against the program this run
-    // was cut to before any seed narrows it: a node a seed stands in for
-    // still calls the infra it was wired to. `require_action` above
-    // deliberately does not enforce the whole-graph fact (it reports it,
-    // for the bar's unaimed button), the way it leaves the trigger facts
-    // to `require_trigger_infra`.
-    crate::api::project::require_run_infra(&state, id, &authored.program, spec.instance.as_ref()).await?;
-    let settings = spec.settings.over(kept_by_trigger).map_err(|why| refused(&weft_core::run_spec::Refusal::error(why)))?;
-
-    // What the run reuses, and what it runs.
-    let mut starting_parameters = spec.clone();
-    let (mut resolved, seed) = match seed_run {
-        Some(seed_run) => {
-            let from = fold_seed(&state, id, seed_run).await?;
-            let planned = seed_plan(&project, &program, &authored, &spec, &from.outcomes, &from.answered,
-                &body.seed_until, &body.seed_before)
-                .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-            refuse_moved_files(&state, &project, &planned.stand_ins).await?;
-            starting_parameters = weft_core::seeding::starting_parameters(&project, &spec, &authored.walk, &planned, &from.outcomes)
-                .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-            let mut resolved = resolve_seeded(&spec, &project, &saved, Some(&planned)).map_err(|r| refused(&r))?;
-            resolved.warnings.extend(planned.warnings.iter().cloned());
-            let seed = weft_journal::Seed { parent: from.run_id, origins: planned.origins, answers: planned.answers };
-            (resolved, Some(seed))
-        }
-        None => (authored, None),
-    };
-    for kick in resolved.kicks.iter_mut().filter(|kick| kick.firing) {
-        kick.port_snapshot = fired_ports.clone();
-    }
-    // Against the program as it will run: a seed's history may have fed a
-    // crossing the authored cut left open. When it did not, say which run
-    // was read and why its results could not stand in, or `--seed` reads
-    // as ignored.
-    weft_core::run_spec::refuse_unrunnable(&project, &resolved, &spec).map_err(|mut refusal| {
-        if let Some(seed) = &seed {
-            refusal.errors.push(format!(
-                "--seed read run {}: a saved result stands in only for a node that run completed and whose \
-                 code has not changed since.",
-                seed.parent
-            ));
-            refusal.errors.extend(resolved.warnings.iter().filter(|w| w.starts_with("cannot seed")).cloned());
-        }
-        refused(&refusal)
-    })?;
-    // An instance's run reaching a `@instance_filled` field runs on what that
-    // instance provides there: read and checked now, refused naming every
-    // field left unfilled or filled wrong, rather than failing at the
-    // node mid-run. The run carries what was read.
-    let instance_values = match &spec.instance {
-        Some(instance) => {
-            crate::api::project::instance_values_for_run(&state, id, &resolved.program, instance, None).await?
-        }
-        None => Default::default(),
-    };
-    // The program's own connections, as this install picked them: a
-    // required one nobody picked is refused now, naming the command.
-    let picks = crate::api::project::picks_for_run(&state, id, &resolved.program).await?;
-    let run_program = crate::api::project::runs_program(&program, &resolved.program)?;
-    let stale = resolved.runs.clone();
-    let kicks = resolved.kicks.clone();
-    let run_id = weft_core::new_run_id();
-    let now = crate::lease::now_unix() as u64;
-    let birth_rows = weft_journal::birth::baked_rows(run_id, &resolved.baked, now);
-    // An empty `entry_node` is the journal's marker for a row that no
-    // longer decodes, and `weft runs` prints `?` for it. A run with
-    // nothing kicked (a seeded run of a node fed by what it reuses, a run
-    // fed by `--emit` alone) is named after a place it runs instead: this
-    // label is display only (nothing routes on it), and `stale` is a
-    // sorted set, so this is the alphabetically first place the run runs,
-    // chosen because it is stable, not because it is first in any graph
-    // order. A seeded run that reuses everything it reaches runs nothing;
-    // it says so.
-    // Named the way the program reads them (`one.strip` for a node of
-    // an included file under the site `one`).
-    let spell = |place: &Located| weft_core::project::address_of(&*project, &place.id, &place.path);
-    // Among the kicks, the first ordinary root in the program's own
-    // order (a trigger that does not fire is kicked too, and it is a
-    // poor name for a run started by hand).
-    let order = |node: &str| project.nodes.iter().position(|n| n.id == node).unwrap_or(usize::MAX);
-    let is_trigger = |node: &str| project.nodes.iter().any(|n| n.id == node && n.features.is_trigger);
-    let entry_node = kicks.iter()
-        .min_by_key(|k| (!k.firing, is_trigger(&k.node), k.frames.len(), order(&k.node)))
-        .map(|k| crate::api::project::kick_place(&project, k))
-        .or_else(|| stale.iter().next().map(spell))
-        .unwrap_or_else(|| "everything inherited".into());
-    // Recording the run and starting it happen under the project's
-    // transition lock, together.
-    //
-    // The tree row goes first: once `start_queued_run_with`
-    // returns, a real run is queued and burning worker capacity, so a
-    // failure after that point would hand the caller no run at all
-    // while the run proceeded, unreachable from `weft tree` and with
-    // nothing to hand `weft clean`.
-    //
-    // And the pair is locked because `prune` holds the same lock while
-    // it decides what to delete. Between the row and the journal a run
-    // is a row the journal has never heard of, which is exactly what
-    // prune reads as "not running": without the lock prune could
-    // delete the version out from under a run that was about to start,
-    // leaving it executing under a version that no longer exists.
-    //
-    // The section is deliberately tiny (two writes and a task enqueue,
-    // no storage and no network), because the lock is a transaction and
-    // so holds a pooled connection while it runs. Everything expensive
-    // this handler does, the seed fold above and the response below,
-    // stays outside it.
-    let stale_vec: Vec<String> = stale.iter().map(spell).collect::<BTreeSet<_>>().into_iter().collect();
-    let (version, moved) = with_tree_lock(&state, id, || async {
-        // Head is read again in here. The one read outside chose the
-        // seed, which is this run's own business; the version's PARENT
-        // has to be where head is at the moment the row is written, or
-        // a session that checkpointed in between is cut out of the
-        // lineage.
-        let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
-        let version = commit_version(&state, id, &body.manifest, None, body.root, &head).await?;
-        crate::api::project::start_queued_run_with(
-            &state,
-            &project.defaults,
-            weft_journal::birth::Birth {
-                run_id,
-                project_id: id,
-                phase: weft_core::context::Phase::Fire,
-                entry_node: &entry_node,
-                kicks: &kicks,
-                program: &run_program,
-                given: &resolved.given,
-                binary_hash: &program.binary_hash,
-                seed: seed.clone(),
-                source_version: Some(&version.version),
-                instance: spec.instance.as_ref().map(|instance| weft_journal::birth::RunFor { instance, values: &instance_values }),
-                picks: &picks,
-                fired_trigger: fired_trigger.as_deref(),
-                stand_in: stand_in.as_ref(),
-                settings,
-                at_unix: now,
-            },
-            &birth_rows,
-            crate::api::project::QueueAs {
-                stale: &stale_vec,
-                spec: Some(&starting_parameters),
-                example: body.example.as_deref(),
-                ..Default::default()
-            },
-        )
-        .await?;
-        // Head moves LAST, and a lost race is reported, never refused.
-        let moved = state
-            .versions
-            .move_head(id, &head, Some(&version.version), Some(run_id))
-            .await
-            .map_err(|e| internal("set head", e))?;
-        Ok((version, moved))
-    })
-    .await?;
-
-    // A head that would not move is reported, never refused.
-    //
-    // By this point the run is journaled, queued and recorded
-    // under its version: it is running. Answering 409 would tell the
-    // person nothing started while a real run burned worker capacity
-    // under a run they were never given, with no way to stop it. So
-    // the run stands and the answer says what happened.
-    //
-    // Another session checkpointing is NOT the cause any more: every tree
-    // write now holds this project's lock, and this compare-and-set is
-    // inside it. What is left is a `weft clean` of the run head pointed at
-    // (it clears `head_run` under no lock) or a `weft rm` landing between
-    // the two, and telling someone to `weft branch --discard` in either
-    // case would be advice about a race that did not happen.
-    let mut warnings = resolved.warnings.clone();
-    if !moved {
-        warnings.push(format!(
-            "this run started and is recorded under version {} (`weft tree` shows it), but head \
-             could not be moved to it: head changed under this call, which happens when the run \
-             head pointed at was cleaned, or when the project was removed while this was being \
-             prepared. If the project is gone, this run outlives it and `weft clean {}` is what \
-             removes it. Otherwise `weft branch {} --discard` moves head here. It needs \
-             `--discard` because head is still on the older version, so plain `weft branch` reads \
-             your files as uncommitted changes against it. `--discard` overwrites the files with \
-             this version, which is what they already are unless you have edited them since \
-             reading this.",
-            version.version,
-            &run_id.to_string()[..8],
-            &run_id.to_string()[..8],
-        ));
-    }
-
-    let ran: Vec<String> = stale_vec.clone();
-    let inherited: Vec<String> = seed.as_ref().map(|seed| seed.origins.keys().map(spell).collect::<BTreeSet<_>>().into_iter().collect()).unwrap_or_default();
-    Ok(Json(RunStarted {
-        run_id,
-        version: version.version,
-        seed: seed.map(|s| s.parent),
-        inherited,
-        ran,
-        warnings,
-    }))
-}
-
-/// What a fired caller trigger serves: the request the author typed,
-/// standing in for the socket nobody opened.
-///
-/// The payload is what the trigger's `firesWith` declares and the run
-/// spec already held it to, so the request is read straight out of it.
-/// Fields this type has no place for are left alone rather than
-/// refused: they are the trigger's, declared by it, checked against its
-/// own contract, and the node reads them off its wake.
-///
-/// Every fired caller trigger gets a stand-in, whether or not the
-/// payload carries anything to say. The difference matters more than it
-/// looks: NO stand-in means the trigger itself fails, asking to be
-/// triggered through a Route, which is the node the author is already
-/// looking at.
-/// The request a stand-in caller serves when a run is started by hand
-/// through a trigger that answers a caller: read out of the fire's
-/// payload, refused at the command when it is no request or the trigger
-/// is one nobody can stand in for. The run's birth carries the trigger's
-/// spec (`RunStarted::stand_in`), and the worker that drives it
-/// serves this request from its firing kick.
-fn stand_in_caller(
-    spec: &weft_core::primitive::SignalSpec,
-    payload: &serde_json::Value,
-    address: &str,
-) -> Result<weft_core::caller::LiveRequest, String> {
-    // Refused HERE, at the command, rather than only in the worker that
-    // would serve it: the engine keeps its own floor, but by then the
-    // person has already waited for a run to start just to be
-    // told the thing they asked for cannot happen.
-    if weft_core::signal::caller_protocol(&spec.kind) == Some(weft_core::signal::Protocol::Websocket) {
-        return Err(format!(
-            "--fire {address}: a Socket cannot be fired. Its shape is a conversation over \
-             time, and there is nothing honest to invent for the caller's next message. \
-             Point a real client at it (`weft activate` prints the URL)"
-        ));
-    }
-    // The payload travels WHOLE. The request is read out of it, and
-    // whatever else the trigger declared (a `body`, for the triggers
-    // that can carry one) stays where the author put it and reaches the
-    // node as its wake. Nothing is lifted out on the way: a body cut out
-    // here and served back through the ordinary request call would mean
-    // this tier holding a caller trigger's field name to make the
-    // impersonation work.
-    serde_json::from_value(payload.clone()).map_err(|e| {
-        format!(
-            "--fire {address}: this trigger answers a caller, so its payload is the \
-             request to serve: {e}"
-        )
-    })
+) -> Result<Json<RunStarted>, Refused> {
+    Ok(Json(crate::actions::runs::run(&state, &operator(caller), id, &body).await?))
 }
 
 /// Whose bakes a preview asks about: the shared triggers' by default.
@@ -850,135 +51,33 @@ pub async fn trigger_bakes(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
-    axum::extract::Query(query): axum::extract::Query<BakesQuery>,
-) -> Result<Json<Vec<weft_core::run_spec::BakeSummary>>, ApiError> {
+    Query(query): Query<BakesQuery>,
+) -> Result<Json<Vec<weft_core::run_spec::BakeSummary>>, Refused> {
     authorize_project(&state, &caller.0, id).await?;
-    let bakes = state.bakes.trigger_bakes(id, query.instance.as_ref()).await.map_err(|error| internal("read trigger bakes", error))?;
+    let bakes = state
+        .bakes
+        .trigger_bakes(id, query.instance.as_ref())
+        .await
+        .map_err(|error| crate::actions::internal("read trigger bakes", error))?;
     Ok(Json(bakes.iter().map(|bake| bake.summary()).collect()))
 }
 
-// ----- tree --------------------------------------------------------------
-
-/// `GET /projects/{id}/versions/running`: the files of the program the
-/// install last built (what its triggers and runs use), as a manifest the
-/// caller downloads through the storage plane like any version's. What
-/// `weft running-source` and the editor's install switch read, so a person
-/// looking at another install sees the program it holds rather than the
-/// files on their disk.
-pub async fn running(
-    State(state): State<DispatcherState>,
-    caller: CallerTenant,
-    Path(id): Path<uuid::Uuid>,
-) -> Result<Json<RunningSource>, ApiError> {
-    authorize_project(&state, &caller.0, id).await?;
-    let identity = state
-        .projects
-        .running_program_identity(id)
-        .await
-        .map_err(|e| internal("running program", e))?
-        .ok_or((StatusCode::NOT_FOUND, "this install holds no build of the project yet; `weft activate` puts one there".to_string()))?;
-    let manifest = state.projects.program_source(id, &identity).await.map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
-    Ok(Json(RunningSource { version: version_id(&manifest), manifest }))
+pub async fn running(State(state): State<DispatcherState>, caller: CallerTenant, Path(id): Path<uuid::Uuid>) -> Result<Json<RunningSource>, Refused> {
+    Ok(Json(versions::running(&state, &operator(caller), id).await?))
 }
 
-pub async fn tree(
-    State(state): State<DispatcherState>,
-    caller: CallerTenant,
-    Path(id): Path<uuid::Uuid>,
-) -> Result<Json<VersionTree>, ApiError> {
-    authorize_project(&state, &caller.0, id).await?;
-    let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
-    let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
-    let runs = state.versions.runs(id).await.map_err(|e| internal("runs", e))?;
-    let by_id: BTreeMap<&str, &VersionRow> = versions.iter().map(|v| (v.id.as_str(), v)).collect();
-    let trigger_runs = state.versions.trigger_runs(id).await.map_err(|e| internal("trigger runs", e))?;
-    let version_summaries = versions
-        .iter()
-        .map(|v| VersionSummary {
-            id: v.id.clone(),
-            parent_id: v.parent_id.clone(),
-            label: v.label.clone(),
-            created_at: v.created_at,
-            diff: v
-                .parent_id
-                .as_deref()
-                .and_then(|p| by_id.get(p))
-                .map(|p| manifest_diff(&p.manifest, &v.manifest))
-                .unwrap_or_default(),
-            manifest: v.manifest.clone(),
-            trigger_runs: trigger_runs.get(&v.id).map_or(0, |fired| fired.runs),
-            last_trigger_run: trigger_runs.get(&v.id).map(|fired| fired.last),
-        })
-        .collect();
-    // ONE read for every run's status. Asked per run, a project with a
-    // thousand runs started by hand did a thousand point lookups on every
-    // `weft tree` and every refresh of the editor's version sidebar.
-    let run_ids: Vec<RunId> = runs.iter().map(|r| r.run_id).collect();
-    let mut summaries = state
-        .runs
-        .run_summaries(&run_ids)
-        .await
-        .map_err(|e| internal("run summaries", e))?;
-    let mut run_summaries = Vec::with_capacity(runs.len());
-    for r in runs {
-        run_summaries.push(VersionRun {
-            listing: summaries.remove(&r.run_id),
-            run_id: r.run_id,
-            version_id: r.version_id,
-            definition_hash: r.definition_hash,
-            seed_run_id: r.seed_run_id,
-            stale: r.stale,
-            spec: r.spec,
-            example: r.example,
-            started_at: r.created_at,
-        });
-    }
-    Ok(Json(VersionTree { head, versions: version_summaries, runs: run_summaries }))
+pub async fn tree(State(state): State<DispatcherState>, caller: CallerTenant, Path(id): Path<uuid::Uuid>) -> Result<Json<VersionTree>, Refused> {
+    Ok(Json(versions::tree(&state, &operator(caller), id).await?))
 }
 
-// ----- head, activation, run bookkeeping ---------------------------------
-
-/// Move head: to a run (its version, with the run as the next seed) or
-/// to a bare version. Answers the manifest so `weft branch` restores
-/// the files.
-pub async fn set_head(
+/// `POST /projects/{id}/versions/switch`.
+pub async fn switch(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
-    Json(body): Json<HeadRequest>,
-) -> Result<Json<HeadResponse>, ApiError> {
-    authorize_project(&state, &caller.0, id).await?;
-    with_tree_lock(&state, id, || async {
-        // Resolve the destination under the same lock as prune and the head move.
-        // Otherwise a valid destination can disappear between its read and use.
-        let (version_id, run) = match (body.run, body.version) {
-            (Some(run_id), _) => {
-                let run = state
-                    .versions
-                    .run(run_id)
-                    .await
-                    .map_err(|e| internal("run", e))?
-                    .filter(|r| r.project_id == id)
-                    .ok_or((StatusCode::NOT_FOUND, format!("run {run_id} is not recorded in this project's tree")))?;
-                (run.version_id, Some(run_id))
-            }
-            (None, Some(version)) => (version, None),
-            (None, None) => return Err((StatusCode::BAD_REQUEST, "name a version or a run".into())),
-        };
-        let version = state
-            .versions
-            .version(id, &version_id)
-            .await
-            .map_err(|e| internal("version", e))?
-            .ok_or((StatusCode::NOT_FOUND, format!("no version {version_id} in this project")))?;
-        // `weft branch` names where head should go, so it does not depend
-        // on where head was; it still moves from the position it read, so a
-        // concurrent branch cannot be silently swallowed.
-        let expected = state.versions.head(id).await.map_err(|e| internal("head", e))?;
-        move_head_or_conflict(&state, id, &expected, Some(&version.id), run).await?;
-        Ok(Json(HeadResponse { version: version.id, run, manifest: version.manifest }))
-    })
-    .await
+    Json(body): Json<SwitchRequest>,
+) -> Result<Json<Switched>, Refused> {
+    Ok(Json(versions::switch(&state, &operator(caller), id, &body).await?))
 }
 
 /// Associate a recorded run with a saved example.
@@ -987,31 +86,11 @@ pub async fn update_run(
     caller: CallerTenant,
     Path((id, run_id)): Path<(uuid::Uuid, String)>,
     Json(body): Json<RunUpdate>,
-) -> Result<StatusCode, ApiError> {
-    authorize_project(&state, &caller.0, id).await?;
-    let run_id: RunId = run_id.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad run".into()))?;
-    // Read only to authorize the run to this project. What gets written
-    // is exactly what the caller named: the store leaves an unmentioned
-    // column alone, so two sessions writing different fields of one run
-    // cannot put back each other's stale value.
-    state
-        .versions
-        .run(run_id)
-        .await
-        .map_err(|e| internal("run", e))?
-        .filter(|r| r.project_id == id)
-        .ok_or((StatusCode::NOT_FOUND, format!("run {run_id} is not recorded in this project's tree")))?;
-    if let Some(example) = body.example {
-        state
-            .versions
-            .set_run_example(run_id, example.as_deref())
-            .await
-            .map_err(|e| internal("update run", e))?;
-    }
+) -> Result<StatusCode, Refused> {
+    let run_id: RunId = run_id.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad run".to_string()))?;
+    versions::update_run(&state, &operator(caller), id, run_id, &body).await?;
     Ok(StatusCode::NO_CONTENT)
 }
-
-// ----- prune -------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 pub struct PruneQuery {
@@ -1025,362 +104,105 @@ pub struct PruneQuery {
     pub frozen: Option<String>,
 }
 
-/// Delete a version subtree and every run under it, or (with
-/// `?plan=true`) say what that would remove. The blobs only the
-/// pruned versions held drop out of the referenced set on the next
-/// `weft` publish of asset references and expire under the storage
-/// rule; the plan lists them.
+/// `DELETE /projects/{id}/versions/{version}` (`?plan=true` only says what
+/// it would remove).
 pub async fn prune(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path((id, version)): Path<(uuid::Uuid, String)>,
     Query(query): Query<PruneQuery>,
-) -> Result<Json<PruneResponse>, ApiError> {
-    authorize_project(&state, &caller.0, id).await?;
-    // Plan and delete under the project's tree lock: without it a run
-    // started between the two lands under a version this call is about to
-    // delete, and the plan's "nothing here is still running" was true only
-    // of a snapshot. Through the shared helper like every other tree
-    // write, so a refusal in here stays a refusal instead of collapsing
-    // into a 500 (which is why this body used to smuggle its reasons out
-    // as an `Ok(Err(..))`).
-    let outcome = with_tree_lock(&state, id, || async {
-        let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
-        let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
-        let runs = state.versions.runs(id).await.map_err(|e| internal("runs", e))?;
-        let in_flight = in_flight_run_ids(&state, id).await?;
-        let frozen: Vec<String> = query
-            .frozen
-            .as_deref()
-            .map(|f| f.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
-            .unwrap_or_default();
-        let mut plan = match plan_prune(&version, &versions, &runs, &head, &frozen, |c| in_flight.contains(&c)) {
-            Ok(plan) => plan,
-            Err(r) => return Err((StatusCode::CONFLICT, r.reasons.join("\n"))),
-        };
-        let protected = state.versions.versions_in_use(id, false).await.map_err(|e| internal("source references", e))?;
-        if plan.versions.iter().any(|id| protected.contains(id)) {
-            return Err((StatusCode::CONFLICT, crate::versions::VERSIONS_IN_USE_REFUSAL.into()));
-        }
-        if let Some(source) = state.versions.registered_source(id).await.map_err(|e| internal("registered source", e))? {
-            let retained: BTreeSet<_> = source.values().collect();
-            plan.blobs.retain(|hash| !retained.contains(hash));
-        }
-        if query.plan {
-            return Ok((plan, false));
-        }
-        // The TREE first, then the journals.
-        //
-        // The order matters on a failure. Deleting journals first left
-        // version rows pointing at journals that were gone, and a run
-        // whose journal has no terminal row reads as still in flight,
-        // so every later seeded run and every later prune refused with
-        // "run X is still running", for a run that could never finish
-        // and that `weft stop` could no longer reach. Dropping the tree
-        // rows first means a failure here leaves journals nobody's tree
-        // names, which `weft clean` still reaches by run.
-        state
-            .versions
-            .delete_versions(id, &plan.versions)
-            .await
-            .map_err(|e| internal("delete versions", e))?;
-        Ok((plan, true))
-    })
-    .await?;
-    let (plan, deleted) = outcome;
-    if !deleted {
-        return Ok(Json(PruneResponse { plan, deleted }));
-    }
-
-    // The journals go OUTSIDE the lock.
-    //
-    // Their version rows are already gone, so nothing can decide
-    // anything about these runs any more and no other session needs to
-    // be held off. Cleaning inside the lock meant one prune of a large
-    // subtree held a pooled connection through a storage wipe per run,
-    // and every run start on that project queued behind it while
-    // holding a connection of its own.
-    let mut failed: Vec<String> = Vec::new();
-    for run_id in &plan.runs {
-        match crate::api::run::clean_run(&state, &caller.0, *run_id).await {
-            Ok(_) => {}
-            // A journal that is already gone is already clean: the
-            // residue an older ordering left behind (a tree row
-            // outliving its journal). Its row has just been cascaded
-            // away, so there is nothing to do and nothing to report;
-            // calling it a failure told the person to run a command
-            // that answers 404 for ever on that run.
-            Err(e) if e.status() == StatusCode::NOT_FOUND => {}
-            Err(e) => failed.push(format!("{run_id} ({}: {})", e.status(), e.message())),
-        }
-    }
-    if !failed.is_empty() {
-        return Err(internal(
-            "prune",
-            format!(
-                "the versions were pruned, but these runs' journals could not be cleaned: {}. \
-                 They are no longer in the tree; `weft clean <run_id>` removes each one.",
-                failed.join(", ")
-            ),
-        ));
-    }
-    Ok(Json(PruneResponse { plan, deleted }))
+) -> Result<Json<PruneResponse>, Refused> {
+    let frozen: Vec<String> =
+        query.frozen.as_deref().map(|f| f.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default();
+    Ok(Json(versions::prune(&state, &operator(caller), id, &version, &frozen, query.plan).await?))
 }
 
-/// Drop the versions a bulk clean left bare: no runs, no descendants,
-/// no label, not head and not activated (`versions::sweepable_versions`).
-pub async fn sweep(
+pub async fn sweep(State(state): State<DispatcherState>, caller: CallerTenant, Path(id): Path<uuid::Uuid>) -> Result<Json<SweepResponse>, Refused> {
+    Ok(Json(versions::sweep(&state, &operator(caller), id).await?))
+}
+
+// ----- working copies ----------------------------------------------------
+
+pub async fn working_copies(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
-) -> Result<Json<SweepResponse>, ApiError> {
-    authorize_project(&state, &caller.0, id).await?;
-    Ok(Json(SweepResponse { swept: sweep_bare_versions(&state, id).await? }))
+) -> Result<Json<Vec<WorkingCopy>>, Refused> {
+    Ok(Json(versions::working_copies(&state, &operator(caller), id).await?))
 }
 
-/// Drop every bare version of one project, and answer which.
-///
-/// Called by the sweep endpoint and by the removal of a single run,
-/// which is the act that makes a version bare. It lives here, on the
-/// server, rather than in whoever asked: the CLI, the editor and a
-/// prune's own per-run cleanup all delete runs, and a sweep each client
-/// has to remember is a sweep the next client forgets. Deleting the last
-/// run of a version and leaving the version behind shows it in
-/// `weft tree` with nothing under it and a status of `unknown`, for
-/// ever, with no verb that reaches it.
-pub(crate) async fn sweep_bare_versions(
-    state: &DispatcherState,
-    id: uuid::Uuid,
-) -> Result<Vec<String>, ApiError> {
-    with_tree_lock(state, id, || async {
-        let mut swept: Vec<String> = Vec::new();
-        // A sweep can free a parent: loop until nothing is bare. Head is
-        // read inside the lock and re-read each pass: a checkpoint
-        // landing mid-loop moves head onto a fresh, label-less,
-        // run-less leaf, which is exactly what this loop deletes.
-        loop {
-            let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
-            let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
-            let runs = state.versions.runs(id).await.map_err(|e| internal("runs", e))?;
-            let protected = state.versions.versions_in_use(id, true).await.map_err(|e| internal("source references", e))?;
-            let bare: Vec<_> = crate::versions::sweepable_versions(&versions, &runs, &head)
-                .into_iter().filter(|id| !protected.contains(id)).collect();
-            if bare.is_empty() {
-                break;
-            }
-            state.versions.delete_versions(id, &bare).await.map_err(|e| internal("delete versions", e))?;
-            swept.extend(bare);
-        }
-        Ok(swept)
-    })
-    .await
+/// `GET /projects/{id}/working-copies/state[?workingCopy=]`.
+pub async fn working_state(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(id): Path<uuid::Uuid>,
+    Query(wanted): Query<WorkingCopyRef>,
+) -> Result<Json<WorkingState>, Refused> {
+    Ok(Json(versions::working_state(&state, &operator(caller), id, wanted).await?))
 }
 
-/// The distinct blob keys the given manifests name: every entry is a
-/// file, so every entry names one.
-pub fn blob_keys<'a>(
-    manifests: impl Iterator<Item = (&'a str, &'a BTreeMap<String, String>)>,
-) -> anyhow::Result<Vec<String>> {
-    let mut keys: BTreeSet<String> = BTreeSet::new();
-    let scope = weft_core::storage::key::KeyScope::Asset;
-    for (version, manifest) in manifests {
-        for (path, hash) in manifest {
-            keys.insert(weft_core::storage::key::scope_key(&scope, hash).map_err(|e| {
-                // Every stored manifest passed `validate_manifest`, so
-                // this cannot happen for a row written since that gate
-                // existed. A row from before it can still be here, and
-                // dropping it silently would quietly stop keeping that
-                // blob alive until it expired: data loss with no signal.
-                // So it fails, naming the one version the person has to
-                // deal with and the verb that deals with it.
-                anyhow::anyhow!(
-                    "version {version} lists '{path}' as '{hash}', which is not a storable \
-                     address ({e}), so this project's asset references cannot be published. \
-                     `weft tree` shows where that version sits; getting rid of it is `weft \
-                     prune {version}`, which first needs head (and every activated version) off \
-                     it, every run under it settled, and any frozen example that came from it \
-                     re-frozen."
-                )
-            })?);
-        }
-    }
-    Ok(keys.into_iter().collect())
+#[derive(Debug, Deserialize)]
+pub struct FolderQuery {
+    pub host: String,
+    pub path: String,
 }
 
-#[cfg(test)]
-mod blob_key_tests {
-    use super::*;
-
-    /// A hash two versions share makes one key.
-    #[test]
-    fn blob_keys_dedupe() {
-        let (aaa, bbb) = ("a".repeat(64), "b".repeat(64));
-        let a: BTreeMap<String, String> = [("main.weft".to_string(), aaa.clone())].into_iter().collect();
-        let b: BTreeMap<String, String> =
-            [("main.weft".to_string(), aaa.clone()), ("weft.toml".to_string(), bbb.clone())].into_iter().collect();
-        let keys = blob_keys([("v1", &a), ("v2", &b)].into_iter()).expect("both are addressable");
-        assert_eq!(keys, vec![format!("asset/{aaa}"), format!("asset/{bbb}")], "one key for the shared hash");
-    }
-
-    /// A version stored while a manifest still named the installed weft
-    /// by a `weft:<version>:<catalog hash>` entry with no hash: that entry
-    /// is no file, so the publish fails naming it rather than skipping it.
-    #[test]
-    fn a_stored_entry_with_no_hash_fails_by_name() {
-        let old: BTreeMap<String, String> =
-            [("main.weft".to_string(), "a".repeat(64)), ("weft:0.5.0:cat".to_string(), String::new())].into_iter().collect();
-        let err = blob_keys([("v1", &old)].into_iter()).unwrap_err().to_string();
-        assert!(err.contains("version v1") && err.contains("weft:0.5.0:cat"), "{err}");
-    }
-
-    /// A manifest is client-supplied, and its values become storage
-    /// keys. One entry that cannot be addressed would break the asset
-    /// reference publish for every version of the project at once, so
-    /// it is refused where a manifest becomes a version.
-    #[test]
-    fn a_manifest_that_cannot_be_addressed_is_refused() {
-        let good = "a".repeat(64);
-        let ok: Manifest = [("main.weft".to_string(), good.clone()), ("nodes/base_catalog/a/mod.rs".to_string(), good.clone())]
-            .into_iter()
-            .collect();
-        validate_manifest(&ok).expect("an ordinary manifest passes");
-
-        for bad in [
-            [("main.weft".to_string(), "aaa/../../etc".to_string())],
-            [("main.weft".to_string(), "aaa".to_string())],
-            [("../escape.weft".to_string(), good.clone())],
-            [("/absolute.weft".to_string(), good.clone())],
-            [("main.weft".to_string(), String::new())],
-            [("weft:0.5.0:cat".to_string(), String::new())],
-        ] {
-            let m: Manifest = bad.into_iter().collect();
-            assert!(validate_manifest(&m).is_err(), "{m:?} must be refused");
-        }
-    }
-}
-
-#[cfg(test)]
-mod fire_snapshot_tests {
-    use super::*;
-
-    fn plan(node: &str, firing: bool) -> crate::api::project::Kick {
-        crate::api::project::Kick { node: node.to_string(), frames: Vec::new(), firing, payload: None, port_snapshot: None }
-    }
-
-    /// A fired trigger replays the ports it registered at activation,
-    /// the same snapshot a real event fire replays. Without this a
-    /// trigger whose port is wired from another node failed on that
-    /// port under `weft run --fire`, while the identical trigger fired
-    /// by a real event ran fine.
-    #[test]
-    fn the_conversion_carries_what_the_resolver_decided() {
-        // The snapshot rule itself lives in `weft_core::run_spec`
-        // (`a_registered_port_lets_the_fire_resolve`), which is where
-        // the fact is known. This only pins that the conversion to the
-        // journal's kick loses nothing on the way.
-        let mut fired = plan("ask", true);
-        fired.port_snapshot = Some(serde_json::json!({ "endpointUrl": "http://bridge:8090" }));
-        let kicks = [fired, plan("bridge", false)];
-        let ask = kicks.iter().find(|k| k.node == "ask").expect("the trigger is kicked");
-        assert_eq!(ask.port_snapshot, Some(serde_json::json!({ "endpointUrl": "http://bridge:8090" })));
-        let bridge = kicks.iter().find(|k| k.node == "bridge").expect("kicked");
-        assert_eq!(bridge.port_snapshot, None);
-    }
-
-    /// A trigger with no wired input (a timer, the common case) fires
-    /// by hand with no activation and nothing to refuse. Testing one
-    /// must never require activating the project, since that would
-    /// start the real schedule firing on its own.
-    #[test]
-    fn a_trigger_with_no_wired_input_fires_by_hand_unactivated() {
-        let project: weft_core::ProjectDefinition = serde_json::from_value(serde_json::json!({
-            "id": "00000000-0000-0000-0000-000000000000",
-            "nodes": [{
-                "id": "tick", "nodeType": "Cron", "label": null,
-                "config": {}, "position": {"x": 0, "y": 0},
-                "inputs": [{"name": "cron", "portType": "String", "required": true}],
-                "outputs": [{"name": "scheduledTime", "portType": "String", "required": true}],
-                "features": {"isTrigger": true}, "scope": [], "groupBoundary": null,
-                "requiresInfra": false,
-                "portLiterals": {"cron": "0 0 * * * *"},
-            }],
-            "edges": [],
-        }))
-        .expect("program");
-        let spec = RunSpec {
-            fire: Some(("tick".into(), serde_json::json!({ "scheduledTime": "t" }))),
-            ..RunSpec::whole("fire")
-        };
-        let resolved = resolve_spec(&spec, &project, &Default::default()).expect("the walk needs no external facts");
-        assert!(resolved.kicks.iter().any(|k| k.node == "tick" && k.firing));
-    }
-
-}
-
-#[cfg(test)]
-mod stand_in_caller_tests {
-    use super::stand_in_caller;
-    use serde_json::json;
-
-    fn route_spec() -> weft_core::primitive::SignalSpec {
-        serde_json::from_value(json!({ "kind": "route", "config": {} }))
-            .expect("a minimal signal spec")
-    }
-
-    /// A GET has no body, so the natural spelling of firing one has no
-    /// `body` key. That must still attach a caller: without one the
-    /// Route node itself fails, telling the author to trigger it
-    /// through a Route, which is the node they are already firing.
-    #[test]
-    fn a_get_with_no_body_still_gets_a_caller() {
-        let request = stand_in_caller(
-            &route_spec(),
-            &json!({ "method": "GET", "path": "cards" }),
-            "list.door",
+/// `GET /projects/{id}/working-copies/folder?host=&path=`: the folder's
+/// working copy, or a 404 marked as no working copy when it has none yet.
+pub async fn find_folder(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(id): Path<uuid::Uuid>,
+    Query(query): Query<FolderQuery>,
+) -> Result<Json<WorkingState>, axum::response::Response> {
+    use axum::response::IntoResponse;
+    match versions::find_folder(&state, &operator(caller), id, &query.host, &query.path).await.map_err(IntoResponse::into_response)? {
+        Some(found) => Ok(Json(found)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            [(weft_core::working_copy::NO_WORKING_COPY_HEADER, "1")],
+            format!("{} on {} is no working copy of this project yet", query.path, query.host),
         )
-        .expect("a request with no body is a request");
-        assert_eq!(request.method, "GET");
+            .into_response()),
     }
+}
 
-    /// A socket is a conversation over time and there is nothing
-    /// honest to invent for the caller's next message, so firing one is
-    /// refused. At the command, not after a run has started:
-    /// the worker keeps its own floor, but waiting for a run just to be
-    /// told no is a worse way to hear it.
-    #[test]
-    fn firing_a_socket_is_refused_at_the_command() {
-        let socket: weft_core::primitive::SignalSpec =
-            serde_json::from_value(json!({ "kind": "socket", "config": {} }))
-                .expect("a minimal signal spec");
-        let why = stand_in_caller(&socket, &json!({ "path": "chat" }), "chat.door")
-            .expect_err("a socket cannot be fired");
-        assert!(why.contains("Socket cannot be fired"), "{why}");
-        // And it says what to do instead, which is the whole point of
-        // refusing early.
-        assert!(why.contains("weft activate"), "{why}");
-    }
+/// `POST /projects/{id}/working-copies/folder`.
+pub async fn register_folder(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(id): Path<uuid::Uuid>,
+    Json(body): Json<RegisterFolder>,
+) -> Result<Json<WorkingState>, Refused> {
+    Ok(Json(versions::register_folder(&state, &operator(caller), id, &body).await?))
+}
 
-    /// The request is READ from the payload, never carved out of it.
-    ///
-    /// A `body` the author typed is the trigger's own declared field:
-    /// it stays in the payload, reaches the node as its wake, and the
-    /// node reads it from there. Cutting it out here and feeding it
-    /// back through the ordinary request call would mean this tier
-    /// holding a caller trigger's field name.
-    #[test]
-    fn the_payload_is_read_not_carved_up() {
-        let payload = json!({ "method": "POST", "path": "hello", "body": { "name": "ada" } });
-        let request = stand_in_caller(&route_spec(), &payload, "hello").expect("a post with a body");
-        assert_eq!(request.path, "hello");
-        assert_eq!(request.method, "POST");
-    }
+/// `POST /projects/{id}/working-copies/{wc}/sync`.
+pub async fn sync(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path((id, copy)): Path<(uuid::Uuid, uuid::Uuid)>,
+    Json(body): Json<SyncReport>,
+) -> Result<Json<Applied>, Refused> {
+    Ok(Json(versions::sync(&state, &operator(caller), id, copy, &body).await?))
+}
 
-    /// A payload that is not a request at all is refused naming the
-    /// trigger, rather than starting a run that fails inside the node.
-    #[test]
-    fn a_payload_that_is_not_a_request_is_refused_by_name() {
-        let why = stand_in_caller(&route_spec(), &json!({ "method": 7 }), "list.door")
-            .expect_err("a method that is not a string is not a request");
-        assert!(why.contains("list.door") && why.contains("request to serve"), "{why}");
-    }
+/// `DELETE /projects/{id}/working-copies/{wc}`: keep the copy's files as
+/// a version and remove it.
+pub async fn forget(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path((id, copy)): Path<(uuid::Uuid, uuid::Uuid)>,
+) -> Result<Json<weft_core::working_copy::Forgotten>, Refused> {
+    Ok(Json(versions::forget(&state, &operator(caller), id, copy).await?))
+}
+
+/// `POST /projects/{id}/working-copies/changes`.
+pub async fn change_files(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(id): Path<uuid::Uuid>,
+    Json(body): Json<ChangeFiles>,
+) -> Result<Json<Applied>, Refused> {
+    Ok(Json(versions::change_files(&state, &operator(caller), id, &body).await?))
 }

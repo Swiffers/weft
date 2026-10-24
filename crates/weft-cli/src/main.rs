@@ -82,13 +82,12 @@ enum Cmd {
         #[arg(long, value_name = "CLOUD")]
         ci: Option<commands::ci::Cloud>,
     },
-    /// Have the install build the current project (compiled there, its
-    /// images built by the install's BuildKit) and register it, without
-    /// running anything. Also how you put
-    /// back code the dispatcher no longer has: registering records the
-    /// compiled program under its own hash, which is the hash a past run
-    /// names, so unchanged files make that run readable again. It adds
-    /// nothing to the version tree; `weft checkpoint` does that.
+    /// Have the install record this folder's files as a version, build it
+    /// (compiled there, its images built by the install's BuildKit) and
+    /// register it, without running anything. Also how you put back code
+    /// the dispatcher no longer has: registering records the compiled
+    /// program under its own hash, which is the hash a past run names, so
+    /// unchanged files make that run readable again.
     Build {
         /// Compile only nodes used by the graph. By default every catalog
         /// node is compiled, so adding an unchanged node needs no rebuild.
@@ -227,7 +226,7 @@ enum Cmd {
         #[arg(long)]
         referenced: bool,
         /// Reuse every node whose slice of the program did not change (and
-        /// completed), re-running only the rest: from head's run, or from
+        /// completed), re-running only the rest: from this folder's head run, or from
         /// the run named (`--seed=<run>`: any run of the project, one a
         /// trigger started or one that failed included). A node that runs
         /// again and waited there replays the answers it was given, when
@@ -330,23 +329,45 @@ enum Cmd {
         #[arg(long, value_name = "seconds")]
         hold_secs: Option<u32>,
     },
-    /// Record the project's files as a version under head, with no run
-    /// and no build: a point to branch back to.
+    /// Record this folder's files as a version under its head, with no
+    /// run and no build: a point to branch back to.
     Checkpoint {
         label: Option<String>,
         /// Start a new tree: the version parents on nothing.
         #[arg(long)]
         root: bool,
     },
-    /// Restore a version's files and move head there. Given a run,
-    /// the version it ran, and that run becomes the one the next `--seed`
-    /// inherits from.
+    /// Move this folder to a version and write its files here. Given a
+    /// run, the version it ran, and that run becomes the one the next
+    /// `--seed` inherits from. Where the folder was is kept as a version
+    /// first, and the command says how to come back to it.
     Branch {
         /// A version id or a run id, or the start of either.
         reference: String,
-        /// Throw away uncommitted changes instead of refusing.
-        #[arg(long)]
-        discard: bool,
+        /// Move another working copy instead of this folder's: `program`
+        /// for the copy programs write into, a folder's path, or a working
+        /// copy's id (`weft tree --json` lists them).
+        #[arg(long, value_name = "copy")]
+        copy: Option<String>,
+    },
+    /// Keep a working copy's files as a version and remove the copy: a
+    /// folder that is gone, or the program copy, when its head keeps
+    /// versions from `weft prune`. Says the version its files are now.
+    ForgetCopy {
+        /// `program`, a folder's path, or a working copy's id.
+        copy: String,
+    },
+    /// Settle the conflict copies in this folder (written when a file
+    /// changed both here and in the install): keep this folder's files and
+    /// delete the copies, or put the install's in place.
+    Resolve {
+        /// The files to settle, or one of their conflict copies; none:
+        /// every conflict copy in the folder.
+        files: Vec<String>,
+        /// `folder`: keep this folder's file. `incoming`: put the install's
+        /// in its place.
+        #[arg(long, value_enum)]
+        keep: commands::resolve::Keep,
     },
     /// Write the files of the program the install holds (its last build)
     /// into a new folder; `--on <target>` reads another install's.
@@ -355,7 +376,8 @@ enum Cmd {
         dir: std::path::PathBuf,
     },
     /// The project's version tree: every version with what changed
-    /// against its parent, its runs beneath, head marked.
+    /// against its parent, its runs beneath, and every working copy (this
+    /// folder's among them) with its head marked.
     Tree,
     /// Compare what two runs put on their wires. A ref is a run (or
     /// the start of one) or `example:<name>`.
@@ -366,7 +388,7 @@ enum Cmd {
         #[arg(long)]
         full: bool,
     },
-    /// Write `examples/<name>.json` from a run (default: head's run):
+    /// Write `examples/<name>.json` from a run (default: this folder's head run):
     /// its starting parameters, the answers people gave, and outputs
     /// accepted for review. Replaces an existing example in full.
     Freeze {
@@ -2040,7 +2062,7 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
                     seed_until,
                     seed_before,
                     root,
-                    flags: commands::versions::RunFlags { from, target, before, group, feed, fire, emit, instance, clear, durable, fast, keep_for, hold_secs },
+                    flags: weft_core::run_flags::RunFlags { from, target, before, group, feed, fire, emit, instance, clear, durable, fast, keep_for, hold_secs },
                     save,
                     check,
                 },
@@ -2052,7 +2074,9 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
             return commands::wait::run(ctx, run_id, timeout, waiting_for_input).await.map(commands::wait::Outcome::exit_code);
         }
         Cmd::Checkpoint { label, root } => commands::checkpoint::run(ctx, label, root).await,
-        Cmd::Branch { reference, discard } => commands::branch::run(ctx, reference, discard).await,
+        Cmd::Branch { reference, copy } => commands::branch::run(ctx, reference, copy).await,
+        Cmd::ForgetCopy { copy } => commands::branch::forget(ctx, copy).await,
+        Cmd::Resolve { files, keep } => commands::resolve::run(ctx, files, keep).await,
         Cmd::RunningSource { dir } => commands::running_source::run(ctx, dir).await,
         Cmd::Tree => commands::tree::run(ctx).await,
         Cmd::Diff { left, right, full } => commands::diff::run(ctx, left, right, full).await,

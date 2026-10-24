@@ -1,6 +1,7 @@
 //! `weft prune <version>`: delete the version, every descendant
-//! version, and all their runs, then let their blobs go. Refuses on
-//! head's version, on any version that is (or is an ancestor of) a
+//! version, and all their runs, then let their blobs go (the install
+//! stops naming them as the project's at once). Refuses on any working
+//! copy's head version, on any version that is (or is an ancestor of) a
 //! frozen example's origin, and while any run in the subtree is not
 //! terminal. Prints what it removes before asking; `--yes` for scripts.
 
@@ -48,17 +49,6 @@ pub async fn run(ctx: Ctx, reference: String, yes: bool) -> anyhow::Result<()> {
     // are separate round trips and the subtree can move in between.
     let removed: PruneResponse = serde_json::from_value(done.clone()).context("read the prune answer")?;
     let (versions, runs, blobs) = (removed.plan.versions.len(), removed.plan.runs.len(), removed.plan.blobs.len());
-    // The freed blobs expire once the referenced set no longer names
-    // them: publish it now, from the code on disk, so they start
-    // expiring today instead of at the next build.
-    // Loudly, because the line below promises the blobs start
-    // expiring: if the project does not load, nothing was republished
-    // and that promise is false.
-    let (mut definition, _) = weft_compiler::hash::load_program(project)
-        .context("the versions were pruned, but the project does not load, so the freed blobs were not released; fix the project and run `weft build`")?;
-    for warning in super::assets::resolve_project_assets(&client, &project.root, &mut definition, true).await? {
-        eprintln!("warning: {warning}");
-    }
     if ctx.json_out(&done)? {
         return Ok(());
     }

@@ -492,8 +492,9 @@ pub struct PublishedAccessRequest {
     pub per_instance: bool,
 }
 
-/// Worker: mint an instance token for one instance of the run's own
-/// project (`ctx.tokens().mint_for_instance`). The project is the run's.
+/// Worker: mint an instance token for one instance of a project of the
+/// run's owner (`ctx.tokens().mint_for_instance`): the run's own project,
+/// or the one `project` names.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgramMintInstanceTokenRequest {
     /// The token's id, chosen by the run and journaled before this
@@ -502,6 +503,10 @@ pub struct ProgramMintInstanceTokenRequest {
     /// second one behind.
     pub id: uuid::Uuid,
     pub run_id: RunId,
+    /// The project the token acts in, one of the run's owner's; the run's
+    /// own when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<uuid::Uuid>,
     pub instance: weft_core::instance::InstanceId,
     /// How long it works, in seconds; required, a year at most.
     pub expires_in_secs: u64,

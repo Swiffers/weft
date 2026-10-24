@@ -1,17 +1,17 @@
-//! What a program may ask of its own project, beyond its own run: start,
-//! stop or read an infra copy, activate or take down triggers, read and
-//! change what an instance provides, list or forget an instance's connections,
-//! list every instance weft holds anything for, read what calls cost, clean
-//! runs, and revoke instance tokens. The ctx builders (`ctx.infra(..)`,
-//! `ctx.trigger(..)`, `ctx.triggers()`, `ctx.values()`,
-//! `ctx.connections()`, `ctx.instances()`, `ctx.costs()`, `ctx.runs()`,
-//! `ctx.tokens()`) each build one [`ProgramCall`]; the runtime carries it
-//! to the dispatcher as one durable task and hands back its answer.
+//! What a program may ask of a project, beyond its own run: everything
+//! a person can do to one from the CLI, on the server, with the same
+//! parameters and the same refusals. Each area's calls are one enum in a
+//! module here ([`infra`], [`triggers`], [`instances`], [`runs`],
+//! [`versions`]); the ctx builders (`ctx.infra(..)`, `ctx.trigger(..)`,
+//! `ctx.values()`, `ctx.runs()`, `ctx.project(..)` and the rest) each build
+//! one [`ProgramCall`]; the runtime carries it to the dispatcher as one
+//! durable task and hands back its answer.
 //!
-//! Every call is scoped to the calling run's project: the broker takes the
-//! project from the run, never from the call. Inside the project any instance
-//! may be named from any run, because the program is the author's own code;
-//! instance limits are enforced at the outside doors (an instance token, the
+//! A call names the project it acts on, or acts on the calling run's own
+//! project ([`ProgramCallPayload::project`]): a program may act on any
+//! project of the same owner. Inside a project any instance may be named
+//! from any run, because the program is the author's own code; instance
+//! limits are enforced at the outside doors (an instance token, the
 //! `Weft-Instance` header), not here.
 //!
 //! A call that takes something down carries a [`TakeDownChoice`] (what
@@ -19,125 +19,76 @@
 //! is the command's default) and a [`StopSelf`]: the calling run is never
 //! among the runs a take-down reaches, and `StopSelf::Include` stops it
 //! too, after the take-down is queued.
+//!
+//! [`TakeDownChoice`]: crate::take_down::TakeDownChoice
+//! [`StopSelf`]: crate::tag::StopSelf
+
+pub mod infra;
+pub mod instances;
+pub mod project;
+pub mod runs;
+pub mod settings;
+pub mod triggers;
+pub mod versions;
 
 use serde::{Deserialize, Serialize};
 
-use crate::activation::ActivationScope;
 use crate::instance::InstanceId;
 use crate::tag::StopSelf;
-use crate::take_down::{ReleaseHeld, TakeDownChoice};
 
-/// One call a program makes on its project.
-// SYNC: ProgramCall <-> crates/weft-dispatcher/src/task_kinds/program_call.rs (the executor's match)
+/// One call a program makes on a project, by area.
+// SYNC: ProgramCall <-> crates/weft-dispatcher/src/actions/mod.rs (`program_call`'s match)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "call", rename_all = "snake_case")]
+#[serde(tag = "area", rename_all = "snake_case")]
 pub enum ProgramCall {
-    /// Bring up a copy of an infra node: the shared one, or an instance's
-    /// copy of a node that exists once per instance. Answers once the start
-    /// is queued; `ctx.infra(..).start()` then waits on
-    /// [`ProgramCall::InfraStatus`] until it runs.
-    InfraStart { node: String, instance: Option<InstanceId> },
-    /// Scale a copy down, keeping its disk, taking down the triggers whose
-    /// cut contains it as `take_down` says.
-    InfraStop { node: String, instance: Option<InstanceId>, take_down: TakeDownChoice },
-    /// Delete a copy and its disks, keeping the ones its node lists in
-    /// `keepOnTerminate` unless `disks` says the owner is going for good.
-    InfraTerminate { node: String, instance: Option<InstanceId>, take_down: TakeDownChoice, disks: crate::infra::TerminateDisks },
-    /// Build nothing and cycle a running copy onto the registered build's
-    /// infra (a stop, then a start), taking down the triggers whose cut
-    /// contains it as `take_down` says; they come back with it.
-    InfraUpgrade { node: String, instance: Option<InstanceId>, take_down: TakeDownChoice },
-    /// One copy's state, or none when it was never started (or was
-    /// terminated).
-    InfraStatus { node: String, instance: Option<InstanceId> },
-    /// Every copy of a node that exists: the shared one and each
-    /// instance's.
-    InfraCopies { node: String },
-    /// Activate triggers: the ones `scope` names, or every trigger of its
-    /// owners, releasing or dropping what they held as `held` says.
-    TriggerActivate { scope: ActivationScope, held: ReleaseHeld },
-    /// Take triggers down.
-    TriggerDeactivate { scope: ActivationScope, take_down: TakeDownChoice },
-    /// An instance's connections.
-    ConnectionsList { instance: InstanceId },
-    /// Forget every connection of an instance (the values naming them go
-    /// with them).
-    ConnectionsForget { instance: InstanceId },
-    /// What an instance provides for the program's `@instance_filled` fields.
-    ValuesGet { instance: InstanceId },
-    /// Change what an instance provides: `set` given, `clear` forgotten, all
-    /// or none, re-arming the instance's live triggers that read them.
-    ValuesChange {
-        instance: InstanceId,
-        #[serde(default)]
-        set: Vec<crate::run_spec::InstanceValueInput>,
-        #[serde(default)]
-        clear: Vec<crate::run_spec::InstanceFieldRef>,
-    },
-    /// Forget everything an instance provides (what wiping an instance does),
-    /// re-arming its live triggers that read any of it.
-    ValuesForget { instance: InstanceId },
-    /// Every instance weft holds anything for in this project, with what it
-    /// holds ([`InstanceHoldings`]).
-    InstancesList,
-    /// What calls cost, filtered.
-    CostsList { filter: CostFilter },
-    /// Delete runs matching `filter`. Runs still going follow `running`
-    /// ([`StillGoing`]).
-    RunsClean { filter: RunFilter, running: StillGoing },
-    /// The newest runs matching `filter`, at most `limit` of them
-    /// (1 to [`MAX_RUNS_PAGE`]), with how many match in all
-    /// ([`RunPage`]).
-    RunsList { filter: RunFilter, limit: u32 },
-    /// How many runs match `filter` ([`RunsCounted`]).
-    RunsCount { filter: RunFilter },
-    /// Revoke instance tokens: every token of `instance`, or the one `id`.
-    TokensRevoke { instance: InstanceId, id: Option<uuid::Uuid> },
-    /// Where one node of a run of this project stands ([`NodeState`]),
-    /// read from that run's record. `node` is spelled the way `--from`
-    /// takes it; a node inside a loop is refused, a loop itself is read.
-    NodeState { run: crate::RunId, node: String },
+    Infra(infra::InfraCall),
+    Triggers(triggers::TriggerCall),
+    Instances(instances::InstanceCall),
+    Runs(runs::RunCall),
+    Versions(versions::VersionCall),
+    Project(project::ProjectCall),
+    Settings(settings::SettingsCall),
 }
 
 impl ProgramCall {
     /// Whether the call can take the calling run down with it, so it
     /// carries a [`StopSelf`] that matters.
     pub fn takes_down(&self) -> bool {
-        matches!(
-            self,
-            ProgramCall::InfraStop { .. }
-                | ProgramCall::InfraTerminate { .. }
-                | ProgramCall::InfraUpgrade { .. }
-                | ProgramCall::TriggerDeactivate { .. }
-                | ProgramCall::RunsClean { .. }
-        )
+        match self {
+            ProgramCall::Infra(call) => call.takes_down(),
+            ProgramCall::Triggers(call) => call.takes_down(),
+            ProgramCall::Runs(call) => call.takes_down(),
+            ProgramCall::Instances(_) | ProgramCall::Versions(_) | ProgramCall::Project(_) | ProgramCall::Settings(_) => false,
+        }
     }
 
     /// The name the call is journaled under (`ctx.run`), so a replayed
     /// run gets the recorded answer instead of asking again.
     pub fn journal_name(&self) -> &'static str {
         match self {
-            ProgramCall::InfraStart { .. } => "weft.infra.start",
-            ProgramCall::InfraStop { .. } => "weft.infra.stop",
-            ProgramCall::InfraTerminate { .. } => "weft.infra.terminate",
-            ProgramCall::InfraUpgrade { .. } => "weft.infra.upgrade",
-            ProgramCall::InfraStatus { .. } => "weft.infra.status",
-            ProgramCall::InfraCopies { .. } => "weft.infra.copies",
-            ProgramCall::TriggerActivate { .. } => "weft.triggers.activate",
-            ProgramCall::TriggerDeactivate { .. } => "weft.triggers.deactivate",
-            ProgramCall::ConnectionsList { .. } => "weft.connections.list",
-            ProgramCall::ConnectionsForget { .. } => "weft.connections.forget",
-            ProgramCall::ValuesGet { .. } => "weft.values.get",
-            ProgramCall::ValuesChange { .. } => "weft.values.change",
-            ProgramCall::ValuesForget { .. } => "weft.values.forget",
-            ProgramCall::InstancesList => "weft.instances.list",
-            ProgramCall::CostsList { .. } => "weft.costs.list",
-            ProgramCall::RunsClean { .. } => "weft.runs.clean",
-            ProgramCall::RunsList { .. } => "weft.runs.list",
-            ProgramCall::RunsCount { .. } => "weft.runs.count",
-            ProgramCall::TokensRevoke { .. } => "weft.tokens.revoke",
-            ProgramCall::NodeState { .. } => "weft.runs.node_state",
+            ProgramCall::Infra(call) => call.journal_name(),
+            ProgramCall::Triggers(call) => call.journal_name(),
+            ProgramCall::Instances(call) => call.journal_name(),
+            ProgramCall::Runs(call) => call.journal_name(),
+            ProgramCall::Versions(call) => call.journal_name(),
+            ProgramCall::Project(call) => call.journal_name(),
+            ProgramCall::Settings(call) => call.journal_name(),
         }
+    }
+
+    /// Every call's journal name, area by area: what the dispatcher's list
+    /// of actions is held to (`weft_dispatcher::actions::NAMES`).
+    pub fn journal_names() -> Vec<&'static str> {
+        [
+            infra::InfraCall::JOURNAL_NAMES,
+            triggers::TriggerCall::JOURNAL_NAMES,
+            instances::InstanceCall::JOURNAL_NAMES,
+            runs::RunCall::JOURNAL_NAMES,
+            versions::VersionCall::JOURNAL_NAMES,
+            project::ProjectCall::JOURNAL_NAMES,
+            settings::SettingsCall::JOURNAL_NAMES,
+        ]
+        .concat()
     }
 }
 
@@ -148,6 +99,10 @@ pub struct ProgramCallPayload {
     /// The calling run (its run).
     pub by: uuid::Uuid,
     pub stop_self: StopSelf,
+    /// The project the call acts on, one of the same owner's; the calling
+    /// run's own when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<uuid::Uuid>,
     pub call: ProgramCall,
 }
 
@@ -204,7 +159,7 @@ pub struct WaitingFires {
     pub reason: String,
 }
 
-/// What `ProgramCall::InfraStart` answers: a start queued, one already
+/// What `InfraCall::Start` answers: a start queued, one already
 /// under way or done, or none yet for a passing reason (a build in
 /// progress, a trigger of the copy mid-activation), which
 /// `ctx.infra(..).start()` and `.request_start()` ask again at their next
@@ -226,7 +181,7 @@ impl InfraStartAnswer {
     }
 }
 
-/// What `ProgramCall::InfraStop` and `ProgramCall::InfraTerminate`
+/// What `InfraCall::Stop` and `InfraCall::Terminate`
 /// answer: the copy was taken down by this call, it was already down (or
 /// on its way down), or there is no copy of that node for that instance,
 /// which is also what a copy terminated earlier reads as.
@@ -238,14 +193,14 @@ pub enum InfraDownAnswer {
     NoCopy,
 }
 
-/// What `ProgramCall::ConnectionsForget` answers: how many connections
+/// What `InstanceCall::ConnectionsForget` answers: how many connections
 /// went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionsForgotten {
     pub forgotten: u64,
 }
 
-/// What `ProgramCall::TokensRevoke` answers: how many tokens went.
+/// What `InstanceCall::TokensRevoke` answers: how many tokens went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokensRevoked {
     pub revoked: u64,
@@ -401,7 +356,7 @@ crate::wire_enum! {
     }
 }
 
-/// Where one node of a run stands, as `ProgramCall::NodeState` answers
+/// Where one node of a run stands, as `RunCall::NodeState` answers
 /// it, read from the run's record, so it stays readable for as long as
 /// the run is kept.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -464,7 +419,7 @@ impl From<NodeState> for NodeStateWire {
 /// runs page): a listing past it pages with a narrower filter.
 pub const MAX_RUNS_PAGE: u32 = 200;
 
-/// What `ProgramCall::RunsCount` answers: how many runs match.
+/// What `RunCall::Count` answers: how many runs match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunsCounted {
     pub total: u64,
@@ -774,9 +729,9 @@ mod tests {
         let wire = serde_json::to_value(&failed).unwrap();
         assert_eq!(wire, serde_json::json!({ "status": "failed", "error": "boom" }));
         assert_eq!(serde_json::from_value::<NodeState>(wire).unwrap(), failed);
-        let call = ProgramCall::NodeState { run: crate::RunId::from_u128(4), node: "one.render".into() };
+        let call = ProgramCall::Runs(runs::RunCall::NodeState { run: crate::RunId::from_u128(4), node: "one.render".into() });
         let wire = serde_json::to_value(&call).unwrap();
-        assert_eq!(wire["call"], "node_state");
+        assert_eq!((&wire["area"], &wire["call"]), (&serde_json::json!("runs"), &serde_json::json!("node_state")));
         assert_eq!(serde_json::from_value::<ProgramCall>(wire).unwrap(), call);
     }
 
@@ -801,13 +756,15 @@ mod tests {
 
     #[test]
     fn a_call_round_trips_under_its_tag() {
-        let call = ProgramCall::InfraStop {
+        let call = ProgramCall::Infra(infra::InfraCall::Stop {
             node: "bridge".into(),
             instance: Some(InstanceId::new("ada").unwrap()),
-            take_down: TakeDownChoice { running: Some(crate::take_down::Running::Cancel), ..Default::default() },
-        };
+            take_down: crate::take_down::TakeDownChoice { running: Some(crate::take_down::Running::Cancel), ..Default::default() },
+            force: false,
+        });
         let wire = serde_json::to_value(&call).unwrap();
-        assert_eq!(wire["call"], "infra_stop");
+        assert_eq!((&wire["area"], &wire["call"]), (&serde_json::json!("infra"), &serde_json::json!("stop")));
+        assert!(wire.get("force").is_none(), "a plain stop says nothing of force: {wire}");
         assert_eq!(wire["instance"], "ada");
         assert_eq!(wire["take_down"], serde_json::json!({ "running": "cancel" }));
         let back: ProgramCall = serde_json::from_value(wire).unwrap();
@@ -816,15 +773,30 @@ mod tests {
 
     #[test]
     fn the_instances_listing_round_trips_under_its_tag() {
-        let wire = serde_json::to_value(ProgramCall::InstancesList).unwrap();
-        assert_eq!(wire, serde_json::json!({ "call": "instances_list" }));
+        let list = ProgramCall::Instances(instances::InstanceCall::List);
+        let wire = serde_json::to_value(&list).unwrap();
+        assert_eq!(wire, serde_json::json!({ "area": "instances", "call": "list" }));
         let back: ProgramCall = serde_json::from_value(wire).unwrap();
-        assert_eq!(back, ProgramCall::InstancesList);
-        assert!(!ProgramCall::InstancesList.takes_down());
+        assert_eq!(back, list);
+        assert!(!list.takes_down());
     }
 
     fn instance(id: &str) -> InstanceId {
         InstanceId::new(id).unwrap()
+    }
+
+    /// A call on the asker's own project names no project; one on another
+    /// of the owner's names it beside the call.
+    #[test]
+    fn a_payload_names_its_project_only_when_it_is_another() {
+        let call = ProgramCall::Versions(versions::VersionCall::Tree);
+        let own = ProgramCallPayload { by: uuid::Uuid::nil(), stop_self: StopSelf::Keep, project: None, call: call.clone() };
+        let wire = serde_json::to_value(&own).unwrap();
+        assert!(wire.get("project").is_none(), "{wire}");
+        assert_eq!(wire["call"], serde_json::json!({ "area": "versions", "call": "tree" }));
+        let other = ProgramCallPayload { project: Some(uuid::Uuid::from_u128(7)), ..own };
+        let back: ProgramCallPayload = serde_json::from_value(serde_json::to_value(&other).unwrap()).unwrap();
+        assert_eq!(back, other);
     }
 
     #[test]
@@ -872,26 +844,27 @@ mod tests {
 
     #[test]
     fn only_take_downs_can_stop_the_asker() {
-        assert!(ProgramCall::InfraTerminate {
+        assert!(ProgramCall::Infra(infra::InfraCall::Terminate {
             node: "x".into(),
             instance: None,
-            take_down: TakeDownChoice::default(),
+            take_down: crate::take_down::TakeDownChoice::default(),
             disks: crate::infra::TerminateDisks::KeepListed,
-        }.takes_down());
-        assert!(!ProgramCall::InfraStart { node: "x".into(), instance: None }.takes_down());
-        assert!(!ProgramCall::ConnectionsList { instance: InstanceId::new("a").unwrap() }.takes_down());
+        })
+        .takes_down());
+        assert!(!ProgramCall::Infra(infra::InfraCall::Start { node: "x".into(), instance: None }).takes_down());
+        assert!(!ProgramCall::Instances(instances::InstanceCall::ConnectionsList { instance: InstanceId::new("a").unwrap() }).takes_down());
     }
 
     #[test]
     fn the_runs_listing_and_count_round_trip_under_their_tags() {
         let filter = RunFilter { tag: Some("draft".into()), instance: Some(instance("ada")), ..RunFilter::default() };
-        let list = ProgramCall::RunsList { filter: filter.clone(), limit: 20 };
+        let list = ProgramCall::Runs(runs::RunCall::List(runs::RunList { filter: filter.clone(), limit: 20, ..runs::RunList::default() }));
         let wire = serde_json::to_value(&list).unwrap();
-        assert_eq!(wire, serde_json::json!({ "call": "runs_list", "filter": { "tag": "draft", "instance": "ada" }, "limit": 20 }));
+        assert_eq!(wire, serde_json::json!({ "area": "runs", "call": "list", "filter": { "tag": "draft", "instance": "ada" }, "limit": 20 }));
         assert_eq!(serde_json::from_value::<ProgramCall>(wire).unwrap(), list);
-        let count = ProgramCall::RunsCount { filter };
+        let count = ProgramCall::Runs(runs::RunCall::Count { filter });
         let wire = serde_json::to_value(&count).unwrap();
-        assert_eq!(wire["call"], "runs_count");
+        assert_eq!(wire["call"], "count");
         assert_eq!(serde_json::from_value::<ProgramCall>(wire).unwrap(), count);
         assert!(!list.takes_down() && !count.takes_down());
         assert_eq!(serde_json::to_value(RunsCounted { total: 3 }).unwrap(), serde_json::json!({ "total": 3 }));

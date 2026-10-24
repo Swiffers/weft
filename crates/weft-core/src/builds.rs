@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 /// registry; downstream verbs name the build by its hashes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuiltProgram {
+    /// The version built: the files it was compiled from, as the version
+    /// tree names them.
+    pub version: String,
     pub definition: crate::ProjectDefinition,
     /// The worker image's identity.
     #[serde(rename = "binaryHash")]
@@ -178,10 +181,11 @@ pub struct BuildHashes {
 /// source was added, removed, or edited. CLI builds default to `Full`;
 /// `--referenced` selects only the graph's types.
 /// On the wire (the build request) as `"referenced"` / `"full"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeSet {
     Referenced,
+    #[default]
     Full,
 }
 
@@ -207,9 +211,21 @@ impl NodeSet {
 /// is registered or failed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildsUnderway {
+    /// The version being built.
+    pub version: String,
     /// This version build, as `GET /projects/{id}/builds/{build}` names it.
     pub build: uuid::Uuid,
     pub images: Vec<ImageBuild>,
+}
+
+/// What a build asked for from a program answers: the version registered
+/// at once, or the image builds it waits on, which `ctx` follows through
+/// `VersionCall::BuildState` until it registers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BuildAnswer {
+    Registered { program: Box<BuiltProgram> },
+    Underway { underway: BuildsUnderway },
 }
 
 /// On the 409 `POST /projects/{id}/builds` answers when another ask of
@@ -271,16 +287,58 @@ pub struct ImageBuildState {
     pub state: crate::projects::BuildStateResponse,
 }
 
-/// `POST /projects/{id}/builds`: build this version of the project.
-/// What the CLI sends and the install reads.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VersionBuildRequest {
-    /// The project's name, as its `weft.toml` says.
-    pub name: String,
-    /// The version: every covered file's hash. Every blob is already in
-    /// the tenant's assets (the CLI's snapshot put them there).
+/// `POST /projects/{id}/builds`: build the project. What is built is a
+/// working copy's files, stamped into a version first (the working copy
+/// named, or the project's default), or a version the project holds,
+/// built as it is. The install reads the version back, compiles it and
+/// resolves its `@asset`s itself: nothing the caller computed is believed.
+// SYNC: BuildRequest <-> crates/weft-core/src/context/project_calls.rs (`BuildCalls`)
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildRequest {
+    #[serde(flatten)]
+    pub working_copy: crate::working_copy::WorkingCopyRef,
+    /// Build this version as it is, stamping nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub node_set: NodeSet,
+    /// Stamp the working copy as a new tree root (`weft run --root`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub root: bool,
+    /// The run this build is for: held to the compiled program before any
+    /// image is built, so a run that could not start is refused in
+    /// seconds rather than after minutes of building.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunPreview>,
+}
+
+/// A run a build is for, as much of it as can be judged before the build
+/// registers: what it starts with, and whether a seed feeds it (a seed may
+/// feed an input nothing else does, which only the run itself can tell).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunPreview {
+    #[serde(flatten)]
+    pub shape: crate::versions::RunShape,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub seeded: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seed_until: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seed_before: Vec<String>,
+}
+
+/// One version's files and what they are compiled with (its name is its
+/// own `weft.toml`'s): what a build builds, and what a project's registered build keeps
+/// (`project.running_source` and `running_build_inputs`) so the install can
+/// build the same version again on a newer weft (the maintenance lift,
+/// `crate::maintenance`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VersionSource {
+    /// The version: every covered file's hash, every blob in the tenant's
+    /// assets.
     pub manifest: crate::project::hash::Manifest,
-    /// What the files are compiled with.
     #[serde(flatten)]
     pub inputs: BuildInputs,
 }
@@ -296,8 +354,11 @@ pub struct BuildInputs {
     /// ones the program references (`referenced`).
     #[serde(rename = "nodeSet")]
     pub node_set: NodeSet,
-    /// `@asset` resolutions the author's machine produced, by resolution
-    /// key (`FileRef::resolution_key`).
+    /// The `@asset` resolutions the version was built with, by resolution
+    /// key (`FileRef::resolution_key`): what the install resolved when it
+    /// first built it, kept so a build of the same version again resolves
+    /// nothing anew (a URL may answer otherwise, a file outside the project
+    /// may be gone).
     #[serde(default)]
     pub assets: BTreeMap<String, serde_json::Value>,
 }
@@ -311,25 +372,40 @@ impl BuildInputs {
 mod tests {
     use super::*;
 
-    /// What a build compiles its files with sits beside them on the wire,
-    /// as it always did, and reads back as the request.
+    /// What a build compiles its files with sits beside them, as the
+    /// project's registered build keeps them.
     #[test]
-    fn a_build_request_keeps_its_inputs_beside_its_files() {
-        let request = VersionBuildRequest {
-            name: "shop".into(),
+    fn a_version_source_keeps_its_inputs_beside_its_files() {
+        let source = VersionSource {
             manifest: [("main.weft".to_string(), "sha256:aa".to_string())].into(),
             inputs: BuildInputs { node_set: NodeSet::Referenced, assets: [("text:a".to_string(), serde_json::json!("x"))].into() },
         };
-        let wire = serde_json::to_value(&request).unwrap();
+        let wire = serde_json::to_value(&source).unwrap();
         assert_eq!(wire["nodeSet"], "referenced");
         assert_eq!(wire["assets"]["text:a"], "x");
-        let back: VersionBuildRequest = serde_json::from_value(wire).unwrap();
-        assert_eq!((back.name, back.manifest, back.inputs), (request.name, request.manifest, request.inputs));
+        assert_eq!(serde_json::from_value::<VersionSource>(wire).unwrap(), source);
+    }
+
+    /// A build of the default working copy says nothing but what it builds.
+    #[test]
+    fn a_build_request_names_only_what_it_asks() {
+        assert_eq!(serde_json::to_value(BuildRequest::default()).unwrap(), serde_json::json!({ "nodeSet": "full" }));
+        let request = BuildRequest {
+            working_copy: crate::working_copy::WorkingCopyRef { working_copy: Some(uuid::Uuid::nil()) },
+            root: true,
+            run: Some(RunPreview { shape: crate::versions::RunShape { example: Some("e".into()), ..Default::default() }, ..Default::default() }),
+            ..Default::default()
+        };
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["workingCopy"], "00000000-0000-0000-0000-000000000000");
+        assert_eq!(wire["run"], serde_json::json!({ "example": "e" }));
+        assert_eq!(serde_json::from_value::<BuildRequest>(wire).unwrap(), request);
     }
 
     #[test]
     fn a_built_program_round_trips_under_its_wire_names() {
         let built = BuiltProgram {
+            version: "v".into(),
             definition: serde_json::from_value(serde_json::json!({
                 "id": "00000000-0000-0000-0000-000000000001", "nodes": [], "edges": []
             }))

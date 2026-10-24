@@ -172,6 +172,16 @@ pub(crate) async fn download_bytes(client: &crate::client::DispatcherClient, key
     Ok(bytes.to_vec())
 }
 
+/// Stream the stored file `key` into `dest` (created, or emptied when it
+/// is there), resuming where a dropped transfer stopped, and answer how
+/// many bytes it holds: a file of any size never passes through memory
+/// whole. `dest` holds part of the file when this fails; the caller owns
+/// it and throws it away.
+pub(crate) async fn download_to(client: &crate::client::DispatcherClient, key: &str, dest: &std::path::Path) -> anyhow::Result<u64> {
+    let link = mint_download_url(client, key).await?;
+    download_to_tmp(&reqwest::Client::new(), client, key, &link, dest).await
+}
+
 /// Ask the install for a fresh link to one file: it checks the caller,
 /// then answers a short-lived presigned link straight to the object store,
 /// with the file's name and size. The store answers that link with the
@@ -207,7 +217,7 @@ pub async fn download(ctx: Ctx, key: String, output: Option<String>) -> anyhow::
     // destroyed the user's previous copy). The temp lives in the same directory so
     // the rename is a same-filesystem atomic move. On any error we remove it.
     let tmp_path = format!("{out_path}.{}.weft-partial", uuid::Uuid::new_v4().simple());
-    let result = download_to_tmp(&http, &client, &key, &link, &tmp_path).await;
+    let result = download_to_tmp(&http, &client, &key, &link, std::path::Path::new(&tmp_path)).await;
     match result {
         Ok(written) => {
             tokio::fs::rename(&tmp_path, &out_path)
@@ -241,7 +251,7 @@ async fn download_to_tmp(
     client: &crate::client::DispatcherClient,
     key: &str,
     first: &weft_core::storage::PresignResult,
-    tmp_path: &str,
+    tmp_path: &std::path::Path,
 ) -> anyhow::Result<u64> {
     let total = first.size_bytes;
     // The initial full-body GET (byte 0 onward). Not a HEAD: it streams the file.
@@ -253,7 +263,7 @@ async fn download_to_tmp(
     }
     let mut file = tokio::fs::File::create(tmp_path)
         .await
-        .with_context(|| format!("create {tmp_path}"))?;
+        .with_context(|| format!("create {}", tmp_path.display()))?;
 
     // Stream the first response, then resume on any drop: ask for a fresh
     // link (the last one may have expired meanwhile) and continue from the
@@ -580,7 +590,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = DispatcherClient::new(base, None);
         let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path().join("f.txt.partial").display().to_string();
+        let tmp = dir.path().join("f.txt.partial");
         let first = mint_download_url(&client, "project/p1/f0").await.unwrap();
         let result = download_to_tmp(&reqwest::Client::new(), &client, "project/p1/f0", &first, &tmp).await;
         server.abort();

@@ -372,10 +372,11 @@ pub async fn task_enqueue_dedup(
         }
     }
 
-    // A program call acts on the asking run's own project, as that run:
-    // the task names the run (its run), the project the run belongs to,
-    // and the payload's asker is that same run. Nothing else is taken on
-    // the worker's word.
+    // A program call is carried as the asking run: the task names the run,
+    // the project the run belongs to, and the payload's asker is that same
+    // run. The project it acts on is the run's own or another of the same
+    // owner, which is held here as well as by the action. Nothing else is
+    // taken on the worker's word.
     if kind == TaskKind::ProgramCall {
         let run_id = req.spec.run_id.ok_or((
             StatusCode::BAD_REQUEST,
@@ -395,6 +396,15 @@ pub async fn task_enqueue_dedup(
                 StatusCode::FORBIDDEN,
                 "a program call's asker is the run that sends it".into(),
             ));
+        }
+        if let Some(target) = payload.project {
+            // The worker is pinned to its own project, so the scope check
+            // every other resource goes through would refuse a sibling:
+            // only the owner is compared here, and the action decides the rest.
+            let owner = scope::lookup_project_tenant(&state.scope_cache, &state.pool, target).await?;
+            if owner != run.tenant {
+                return Err((StatusCode::FORBIDDEN, "a program call acts on projects of its own owner only".into()));
+            }
         }
     }
 

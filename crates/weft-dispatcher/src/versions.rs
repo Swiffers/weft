@@ -16,11 +16,12 @@
 //! costs nothing to record again, and `weft prune` reclaims what no
 //! surviving manifest of any of them names.
 //!
-//! Head is two nullable columns on the `project` row (`head_version`,
-//! `head_run`), git's HEAD and nothing more: moved by `checkpoint`,
-//! `run` and `branch`. Beside it, [`Head::activated_versions`] is read
-//! off the project's trigger activations: every version a listening
-//! trigger was set up on. No state on disk.
+//! A head belongs to each working copy (`crate::working_copies`), git's
+//! HEAD and nothing more: moved by a stamp, a run and a switch. Beside
+//! them, [`VersionStoreOps::activated_versions`] is read off the project's
+//! trigger activations: every version a listening trigger was set up on.
+//! What keeps a version from a prune or a sweep is all of those together
+//! ([`Kept`]).
 //!
 //! Every write goes through [`VersionStoreOps`]; the Postgres store
 //! runs SQL, the fake keeps maps, and the decisions (which run seeds
@@ -35,18 +36,21 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use weft_core::run_spec::RunSpec;
-use weft_core::versions::{Head, PrunePlan};
+use weft_core::versions::PrunePlan;
+use weft_core::working_copy::Head;
 use weft_core::RunId;
+
+use crate::working_copies::WorkingCopyRow;
 
 /// The `project_version` + `version_runs` tables. Canonical DDL edited in
 /// place; an existing database is carried forward by `./setup.sh
 /// --migration <name>` (the contract is `weft_task_store::schema_guard`'s
 /// header). Applied by the boot's one schema pass after
-/// `project_store::GROUP`, which owns the `project` row both tables
-/// hang off (and the head columns).
+/// `project_store::GROUP`, which owns the `project` row every table
+/// here hangs off.
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "versions",
-    tables: &["project_version", "version_runs"],
+    tables: &["project_version", "version_runs", "working_copy"],
     ddl: &[
         // project_version: one row per distinct file set a project has
         // been. `id` is the sha256 of the canonical manifest, so the
@@ -90,6 +94,40 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             last_run       UUID NOT NULL,
             PRIMARY KEY (project_id, source_version, lane)
         )"#,
+        // working_copy: one place a project's code is being edited
+        // (`crate::working_copies`). No foreign key to `project`, for the
+        // reason `project_version` has none: a project's removal drops its
+        // working copies explicitly (`ProjectStore::remove`).
+        // SYNC: the kind CHECK <-> weft_core::working_copy::WorkingCopyKind
+        r#"CREATE TABLE IF NOT EXISTS working_copy (
+            id               UUID PRIMARY KEY,
+            project_id       UUID NOT NULL,
+            kind             TEXT NOT NULL CHECK (kind IN ('folder', 'program')),
+            -- The machine and the folder, for a folder; neither for a
+            -- program's copy.
+            host             TEXT,
+            path             TEXT,
+            -- Its head: the version the next stamp parents on, and the run
+            -- the next `--seed` inherits from (NULL on a bare version).
+            head_version     TEXT,
+            head_run         UUID,
+            -- Its files as they are now, `path -> sha256`, every blob in
+            -- the tenant's assets.
+            working_manifest JSONB NOT NULL,
+            -- What the folder held, path by path, the last time a syncer
+            -- saw it and the working copy agree; `{}` for a program's copy.
+            synced           JSONB NOT NULL,
+            -- The conflict copies the last sync found in the folder.
+            conflicts        TEXT[] NOT NULL,
+            -- Bumped on every change of `working_manifest`.
+            revision         BIGINT NOT NULL,
+            created_at       BIGINT NOT NULL,
+            updated_at       BIGINT NOT NULL,
+            CHECK ((kind = 'folder') = (host IS NOT NULL AND path IS NOT NULL))
+        )"#,
+        "CREATE INDEX IF NOT EXISTS idx_working_copy_project ON working_copy(project_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_working_copy_folder ON working_copy(project_id, host, path) WHERE kind = 'folder'",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_working_copy_program ON working_copy(project_id) WHERE kind = 'program'",
     ],
     seed: &[],
     data_steps: &[],
@@ -184,34 +222,9 @@ pub trait VersionStoreOps: Send + Sync {
         example: Option<&str>,
     ) -> anyhow::Result<()>;
 
-    async fn head(&self, project: uuid::Uuid) -> anyhow::Result<Head>;
-    /// Clear head's run pointer if it names `run_id`, a run being
-    /// erased: its project keeps head's version, and the next `--seed`
-    /// walks the tree.
-    async fn forget_head_run(&self, run_id: RunId) -> anyhow::Result<()>;
-
-    /// Move head, but only if it is still where `expected` says.
-    ///
-    /// Every caller decided WHERE to move head by first reading it (a
-    /// checkpoint parents its version on head, a run seeds from head's
-    /// run), so a blind write is a lost update: two processes reading head A
-    /// both parent on A and the second overwrites the first, and that
-    /// run's version and run vanish from the lineage the next seeded
-    /// run walks. Answers false when head moved underneath.
-    ///
-    /// What the handler does with a false is its own call: `checkpoint`
-    /// and `weft branch` refuse (nothing has happened yet, so "try
-    /// again" is honest), while `run` reports it and lets the run stand,
-    /// because by the time head moves the run is already queued
-    /// and refusing would hide a live run from the person who started
-    /// it.
-    async fn move_head(
-        &self,
-        project: uuid::Uuid,
-        expected: &Head,
-        version: Option<&str>,
-        run: Option<RunId>,
-    ) -> anyhow::Result<bool>;
+    /// Every version some activation's listeners run (one per trigger and
+    /// owner at most), deduplicated, sorted. Empty while nothing listens.
+    async fn activated_versions(&self, project: uuid::Uuid) -> anyhow::Result<Vec<String>>;
 }
 
 pub type VersionStore = Arc<dyn VersionStoreOps>;
@@ -229,7 +242,7 @@ impl PostgresVersionStore {
 /// Why a version something still depends on cannot be deleted: the one
 /// wording the store's own refusal and the prune endpoint's answer.
 pub const VERSIONS_IN_USE_REFUSAL: &str =
-    "these versions still supply trigger settings or running runs; stop the runs and replace or wipe those trigger settings before pruning";
+    "these versions still supply trigger settings or running runs; `weft stop` the runs and `weft deactivate` the triggers (which wipes their settings) before pruning";
 
 /// Source versions needed by armed settings or runs not yet safely
 /// represented in the tree. Automatic sweeps also retain completed bakes.
@@ -431,14 +444,6 @@ impl VersionStoreOps for PostgresVersionStore {
         Ok(rows.into_iter().map(|(version, runs, last)| (version, TriggerRuns { runs: runs.max(0) as u64, last })).collect())
     }
 
-    async fn forget_head_run(&self, run_id: RunId) -> anyhow::Result<()> {
-        sqlx::query("UPDATE project SET head_run = NULL WHERE head_run = $1")
-            .bind(run_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     async fn set_run_example(
         &self,
         run_id: RunId,
@@ -453,62 +458,15 @@ impl VersionStoreOps for PostgresVersionStore {
         Ok(())
     }
 
-    async fn head(&self, project: uuid::Uuid) -> anyhow::Result<Head> {
-        let row: Option<(Option<String>, Option<uuid::Uuid>, Vec<String>)> = sqlx::query_as(
-            "SELECT head_version, head_run, \
-                    ARRAY(SELECT DISTINCT a.activation_version FROM trigger_activation a \
-                          WHERE a.project_id = p.id AND a.activation_version IS NOT NULL \
-                          ORDER BY 1) \
-             FROM project p WHERE id = $1",
+    async fn activated_versions(&self, project: uuid::Uuid) -> anyhow::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT activation_version FROM trigger_activation \
+             WHERE project_id = $1 AND activation_version IS NOT NULL ORDER BY 1",
         )
         .bind(project)
-        .fetch_optional(&self.pool)
-        .await?;
-        let (head_version, head_run, activated_versions) =
-            row.ok_or_else(|| anyhow::anyhow!("project {project} not found"))?;
-        Ok(Head { head_version, head_run, activated_versions })
+        .fetch_all(&self.pool)
+        .await?)
     }
-
-    async fn move_head(
-        &self,
-        project: uuid::Uuid,
-        expected: &Head,
-        version: Option<&str>,
-        run: Option<RunId>,
-    ) -> anyhow::Result<bool> {
-        // One statement, so the check and the write cannot be split by
-        // a sibling process. `IS NOT DISTINCT FROM` because both columns
-        // are nullable and NULL = NULL is not true in SQL.
-        let rows = sqlx::query(
-            "UPDATE project SET head_version = $2, head_run = $3 \
-             WHERE id = $1 \
-               AND head_version IS NOT DISTINCT FROM $4 \
-               AND head_run IS NOT DISTINCT FROM $5",
-        )
-        .bind(project)
-        .bind(version)
-        .bind(run)
-        .bind(expected.head_version.as_deref())
-        .bind(expected.head_run)
-        .execute(&self.pool)
-        .await?;
-        if rows.rows_affected() == 1 {
-            return Ok(true);
-        }
-        // Nothing moved: either head is elsewhere now, or there is no
-        // such project. Only the second is an error.
-        // `EXISTS(...)` so the value decodes as a bool: a bare
-        // `SELECT 1` is INT4, which does not decode into an i64, so
-        // this probe used to ERROR on every lost race and turn the 409
-        // it exists to produce into a 500.
-        let (exists,): (bool,) = sqlx::query_as("SELECT EXISTS(SELECT 1 FROM project WHERE id = $1)")
-            .bind(project)
-            .fetch_one(&self.pool)
-            .await?;
-        anyhow::ensure!(exists, "project {project} not found");
-        Ok(false)
-    }
-
 }
 
 /// In-memory store for layer-3 tests: plain maps, no logic.
@@ -523,9 +481,8 @@ pub struct FakeVersionStore {
     versions: std::sync::Mutex<Vec<VersionRow>>,
     runs: std::sync::Mutex<Vec<RunRow>>,
     trigger_runs: std::sync::Mutex<BTreeMap<(uuid::Uuid, String), TriggerRuns>>,
-    heads: std::sync::Mutex<BTreeMap<uuid::Uuid, Head>>,
-    /// The projects that exist, standing in for the `project` table the
-    /// head columns live on and the version FK points at.
+    activated: std::sync::Mutex<BTreeMap<uuid::Uuid, BTreeSet<String>>>,
+    /// The projects that exist, standing in for the `project` table.
     projects: std::sync::Mutex<BTreeSet<uuid::Uuid>>,
     /// Versions something still depends on: an armed trigger's settings
     /// came from one, or a live run is running one. A plain set
@@ -553,14 +510,10 @@ impl FakeVersionStore {
     }
 
     /// Say that some activation's listeners run `version`, as a
-    /// `trigger_activation` row carrying it: `head` then lists it among
-    /// `activated_versions` (deduplicated, sorted, like the real read).
+    /// `trigger_activation` row carrying it: `activated_versions` then
+    /// lists it (deduplicated, sorted, like the real read).
     pub fn mark_activated(&self, project: uuid::Uuid, version: &str) {
-        let mut heads = self.heads.lock().unwrap();
-        let activated = &mut heads.entry(project).or_default().activated_versions;
-        activated.push(version.to_string());
-        activated.sort();
-        activated.dedup();
+        self.activated.lock().unwrap().entry(project).or_default().insert(version.to_string());
     }
 
     /// A run started by hand, as its queued `run` row holds it.
@@ -577,7 +530,6 @@ impl FakeVersionStore {
     /// Register a project, as `project` holding a row for it.
     pub fn add_project(&self, project: uuid::Uuid) {
         self.projects.lock().unwrap().insert(project);
-        self.heads.lock().unwrap().entry(project).or_default();
     }
 
     /// Drop the project and its whole tree, as `weft rm` does
@@ -591,7 +543,7 @@ impl FakeVersionStore {
     /// leak it should catch.
     pub fn remove_project(&self, project: uuid::Uuid) {
         self.projects.lock().unwrap().remove(&project);
-        self.heads.lock().unwrap().remove(&project);
+        self.activated.lock().unwrap().remove(&project);
         self.versions.lock().unwrap().retain(|v| v.project_id != project);
         self.runs.lock().unwrap().retain(|r| r.project_id != project);
     }
@@ -661,15 +613,6 @@ impl VersionStoreOps for FakeVersionStore {
         Ok(None)
     }
 
-    async fn forget_head_run(&self, run_id: RunId) -> anyhow::Result<()> {
-        for head in self.heads.lock().unwrap().values_mut() {
-            if head.head_run == Some(run_id) {
-                head.head_run = None;
-            }
-        }
-        Ok(())
-    }
-
     async fn run(&self, run_id: RunId) -> anyhow::Result<Option<RunRow>> {
         Ok(self.runs.lock().unwrap().iter().find(|r| r.run_id == run_id && self.in_tree(r)).cloned())
     }
@@ -703,29 +646,10 @@ impl VersionStoreOps for FakeVersionStore {
         Ok(())
     }
 
-    async fn head(&self, project: uuid::Uuid) -> anyhow::Result<Head> {
+    async fn activated_versions(&self, project: uuid::Uuid) -> anyhow::Result<Vec<String>> {
         self.require_project(project)?;
-        Ok(self.heads.lock().unwrap().get(&project).cloned().unwrap_or_default())
+        Ok(self.activated.lock().unwrap().get(&project).map(|set| set.iter().cloned().collect()).unwrap_or_default())
     }
-
-    async fn move_head(
-        &self,
-        project: uuid::Uuid,
-        expected: &Head,
-        version: Option<&str>,
-        run: Option<RunId>,
-    ) -> anyhow::Result<bool> {
-        self.require_project(project)?;
-        let mut heads = self.heads.lock().unwrap();
-        let head = heads.entry(project).or_default();
-        if head.head_version.as_deref() != expected.head_version.as_deref() || head.head_run != expected.head_run {
-            return Ok(false);
-        }
-        head.head_version = version.map(str::to_string);
-        head.head_run = run;
-        Ok(true)
-    }
-
 }
 
 // ----- The decisions, as pure functions over the rows -----------------
@@ -821,17 +745,44 @@ pub struct PruneRefusal {
 }
 
 
-/// Plan a prune, or refuse it: head's version (branch away first), a
+/// What keeps a version from a prune and a sweep: every working copy
+/// (its head's version, and the files it holds now, which a prune never
+/// reclaims), every version some activation's listeners run, and the
+/// version of the build the project runs (a run the install starts itself,
+/// a setup run, is recorded under it).
+#[derive(Debug, Clone, Copy)]
+pub struct Kept<'a> {
+    pub copies: &'a [WorkingCopyRow],
+    pub activated: &'a [String],
+    pub running: Option<&'a str>,
+}
+
+impl Kept<'_> {
+    fn is_head(&self, version: &str) -> bool {
+        self.copies.iter().any(|c| c.head.head_version.as_deref() == Some(version))
+    }
+}
+
+/// How a reason names a working copy: its folder, or the program copy.
+pub fn copy_name(copy: &WorkingCopyRow) -> String {
+    match &copy.path {
+        Some(path) => format!("the working copy at {path}"),
+        None => "the program copy".to_string(),
+    }
+}
+
+/// Plan a prune, or refuse it: a working copy's head inside the subtree
+/// (switch it away first), an activated version (deactivate first), a
 /// version that is or is an ancestor of a frozen example's origin
-/// (unfreeze the example first), or a subtree with a run still in
-/// flight (stop or wait). `frozen_from` is every `frozen_from.version`
-/// in the project's examples; `in_flight` says whether a run is
-/// neither terminal nor suspended.
+/// (unfreeze the example first), or a subtree with a run still in flight
+/// (stop or wait). `frozen_from` is every `frozen_from.version` in the
+/// project's examples; `in_flight` says whether a run is neither terminal
+/// nor suspended. A blob any working copy holds now is never in the plan.
 pub fn plan_prune(
     root: &str,
     versions: &[VersionRow],
     runs: &[RunRow],
-    head: &Head,
+    kept: Kept<'_>,
     frozen_from: &[String],
     in_flight: impl Fn(RunId) -> bool,
 ) -> Result<PrunePlan, PruneRefusal> {
@@ -840,21 +791,28 @@ pub fn plan_prune(
         return Err(PruneRefusal { reasons: vec![format!("no version {root} in this project")] });
     }
     let doomed = subtree(versions, root);
-    if head.head_version.as_deref().is_some_and(|h| doomed.iter().any(|d| d == h)) {
-        reasons.push(format!(
-            "head is on version {}, inside the subtree; `weft branch <version>` away from it first",
-            head.head_version.as_deref().unwrap_or("")
-        ));
+    for copy in kept.copies {
+        if let Some(head) = copy.head.head_version.as_deref().filter(|h| doomed.iter().any(|d| d == h)) {
+            let named = copy.path.as_deref().unwrap_or("program");
+            reasons.push(format!(
+                "{} is on version {head}, inside the subtree; move it away first (`weft branch <version> --copy {named}`), \
+                 or, if nothing uses it any more, `weft forget-copy {named}`",
+                copy_name(copy)
+            ));
+        }
     }
-    if let Some(active) = head.activated_versions.iter().find(|a| doomed.contains(a)) {
+    if let Some(active) = kept.activated.iter().find(|a| doomed.contains(a)) {
         reasons.push(format!("version {active} is activated and inside the subtree; `weft deactivate` the triggers on it first"));
+    }
+    if let Some(running) = kept.running.filter(|r| doomed.iter().any(|d| d == r)) {
+        reasons.push(format!("version {running} is the one the project's build runs, inside the subtree; build another version first"));
     }
     for origin in frozen_from {
         let protected: Vec<String> = std::iter::once(origin.clone()).chain(ancestors(versions, origin)).collect();
         if let Some(hit) = doomed.iter().find(|d| protected.contains(d)) {
             reasons.push(format!(
                 "version {hit} is (or is an ancestor of) the origin {origin} of a frozen example; \
-                 remove the example's `frozen_from` (`weft freeze` again from another run) first"
+                 remove the example's `frozenFrom` (`weft freeze` again from another run) first"
             ));
         }
     }
@@ -871,6 +829,7 @@ pub fn plan_prune(
         .iter()
         .filter(|v| !doomed.contains(&v.id))
         .flat_map(|v| v.manifest.values().map(String::as_str))
+        .chain(kept.copies.iter().flat_map(|c| c.working.values().map(String::as_str)))
         .collect();
     let mut blobs: BTreeSet<String> = BTreeSet::new();
     for v in versions.iter().filter(|v| doomed.contains(&v.id)) {
@@ -888,13 +847,15 @@ pub fn plan_prune(
 }
 
 /// The versions a bulk clean may drop after their runs went: no runs
-/// left, no descendants, no label, and not head.
-pub fn sweepable_versions(versions: &[VersionRow], runs: &[RunRow], head: &Head) -> Vec<String> {
+/// left, no descendants, no label, not any working copy's head and not
+/// activated.
+pub fn sweepable_versions(versions: &[VersionRow], runs: &[RunRow], kept: Kept<'_>) -> Vec<String> {
     versions
         .iter()
         .filter(|v| v.label.is_none())
-        .filter(|v| head.head_version.as_deref() != Some(v.id.as_str()))
-        .filter(|v| !head.activated_versions.contains(&v.id))
+        .filter(|v| !kept.is_head(&v.id))
+        .filter(|v| !kept.activated.contains(&v.id))
+        .filter(|v| kept.running != Some(v.id.as_str()))
         .filter(|v| !runs.iter().any(|r| r.version_id == v.id))
         .filter(|v| !versions.iter().any(|c| c.parent_id.as_deref() == Some(v.id.as_str())))
         .map(|v| v.id.clone())
@@ -946,7 +907,7 @@ mod tests {
 
     #[test]
     fn the_seed_is_heads_run_when_settled_and_a_refusal_when_running() {
-        let head = Head { head_version: Some("v1".into()), head_run: Some(run_id(1)), activated_versions: vec![] };
+        let head = Head { head_version: Some("v1".into()), head_run: Some(run_id(1)) };
         assert_eq!(resolve_seed(&head, &[], &[], |_| true), SeedChoice::Run(run_id(1)));
         assert_eq!(resolve_seed(&head, &[], &[], |_| false), SeedChoice::HeadRunning(run_id(1)));
     }
@@ -955,12 +916,44 @@ mod tests {
     fn without_a_head_run_the_nearest_ancestor_with_a_settled_run_seeds() {
         let versions = vec![version("v1", None, &[], 1), version("v2", Some("v1"), &[], 2), version("v3", Some("v2"), &[], 3)];
         let runs = vec![run(1, "v1", 1), run(2, "v1", 2), run(3, "v2", 3)];
-        let head = Head { head_version: Some("v3".into()), head_run: None, activated_versions: vec![] };
+        let head = Head { head_version: Some("v3".into()), head_run: None };
         assert_eq!(resolve_seed(&head, &versions, &runs, |_| true), SeedChoice::Run(run_id(3)));
         // v2's run still running: skip to v1's newest settled.
         assert_eq!(resolve_seed(&head, &versions, &runs, |c| c != run_id(3)), SeedChoice::Run(run_id(2)));
-        let head = Head { head_version: None, head_run: None, activated_versions: vec![] };
+        let head = Head { head_version: None, head_run: None };
         assert_eq!(resolve_seed(&head, &versions, &runs, |_| true), SeedChoice::Nothing);
+    }
+
+    /// A working copy whose head is on `version`, holding `files`.
+    fn copy_on(version: &str, files: &[(&str, &str)]) -> WorkingCopyRow {
+        WorkingCopyRow {
+            id: uuid::Uuid::now_v7(),
+            project_id: uuid::Uuid::nil(),
+            kind: weft_core::working_copy::WorkingCopyKind::Folder,
+            host: Some("box".into()),
+            path: Some("/home/me/shop".into()),
+            head: Head { head_version: Some(version.into()), head_run: None },
+            working: files.iter().map(|(p, h)| (p.to_string(), h.to_string())).collect(),
+            synced: Manifest::new(),
+            conflicts: Vec::new(),
+            revision: 0,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn kept<'a>(copies: &'a [WorkingCopyRow], activated: &'a [String]) -> Kept<'a> {
+        Kept { copies, activated, running: None }
+    }
+
+    /// The version the project's build runs is neither pruned nor swept.
+    #[test]
+    fn the_running_builds_version_is_kept() {
+        let copies = [copy_on("side", &[])];
+        let kept = Kept { copies: &copies, activated: &[], running: Some("v3") };
+        let err = plan_prune("v2", &tree(), &[], kept, &[], |_| false).unwrap_err();
+        assert!(err.reasons[0].contains("build another version first"), "{err:?}");
+        assert!(sweepable_versions(&tree(), &[], kept).is_empty(), "v3, the only bare leaf, is the running build's");
     }
 
     fn tree() -> Vec<VersionRow> {
@@ -981,17 +974,20 @@ mod tests {
     }
 
     #[test]
-    fn prune_refuses_head_a_frozen_ancestor_and_an_in_flight_subtree() {
+    fn prune_refuses_any_head_a_frozen_ancestor_and_an_in_flight_subtree() {
         let runs = vec![run(1, "v2", 1), run(2, "v3", 2)];
-        let on_head = Head { head_version: Some("v3".into()), head_run: None, activated_versions: vec![] };
-        let err = plan_prune("v2", &tree(), &runs, &on_head, &[], |_| false).unwrap_err();
-        assert!(err.reasons[0].contains("weft branch"), "{:?}", err);
-        let away = Head { head_version: Some("side".into()), head_run: None, activated_versions: vec![] };
-        let err = plan_prune("v2", &tree(), &runs, &away, &["v3".into()], |_| false).unwrap_err();
+        // Any working copy's head inside the subtree stops it, not only
+        // one of them.
+        let on_head = [copy_on("side", &[]), copy_on("v3", &[])];
+        let err = plan_prune("v2", &tree(), &runs, kept(&on_head, &[]), &[], |_| false).unwrap_err();
+        assert_eq!(err.reasons.len(), 1, "{err:?}");
+        assert!(err.reasons[0].contains("/home/me/shop is on version v3") && err.reasons[0].contains("weft branch <version> --copy /home/me/shop") && err.reasons[0].contains("weft forget-copy /home/me/shop"), "{err:?}");
+        let away = [copy_on("side", &[])];
+        let err = plan_prune("v2", &tree(), &runs, kept(&away, &[]), &["v3".into()], |_| false).unwrap_err();
         assert!(err.reasons[0].contains("frozen example"), "{:?}", err);
-        let err = plan_prune("v2", &tree(), &runs, &away, &[], |c| c == run_id(2)).unwrap_err();
+        let err = plan_prune("v2", &tree(), &runs, kept(&away, &[]), &[], |c| c == run_id(2)).unwrap_err();
         assert!(err.reasons[0].contains("weft stop"), "{:?}", err);
-        assert!(plan_prune("nope", &tree(), &runs, &away, &[], |_| false).is_err());
+        assert!(plan_prune("nope", &tree(), &runs, kept(&away, &[]), &[], |_| false).is_err());
     }
 
     /// Any activation's version protects its subtree and keeps a bare
@@ -999,20 +995,26 @@ mod tests {
     /// counts as much as the shared triggers on the newest.
     #[test]
     fn every_activated_version_is_protected() {
-        let active = Head { head_version: Some("side".into()), head_run: None, activated_versions: vec!["root".into(), "v3".into()] };
-        let err = plan_prune("v2", &tree(), &[], &active, &[], |_| false).unwrap_err();
+        let copies = [copy_on("side", &[])];
+        let activated = ["root".to_string(), "v3".to_string()];
+        let err = plan_prune("v2", &tree(), &[], kept(&copies, &activated), &[], |_| false).unwrap_err();
         assert!(err.reasons[0].contains("version v3 is activated"), "{:?}", err);
-        assert!(sweepable_versions(&tree(), &[], &active).is_empty(), "v3 is the only bare leaf, and it is activated");
+        assert!(sweepable_versions(&tree(), &[], kept(&copies, &activated)).is_empty(), "v3 is the only bare leaf, and it is activated");
     }
 
     #[test]
     fn prune_removes_the_subtree_its_runs_and_the_orphaned_blobs() {
         let runs = vec![run(1, "v2", 1), run(2, "v3", 2), run(3, "side", 3)];
-        let away = Head { head_version: Some("side".into()), head_run: None, activated_versions: vec![] };
-        let plan = plan_prune("v2", &tree(), &runs, &away, &[], |_| false).unwrap();
+        let away = [copy_on("side", &[])];
+        let plan = plan_prune("v2", &tree(), &runs, kept(&away, &[]), &[], |_| false).unwrap();
         assert_eq!(plan.versions, vec!["v2", "v3"]);
         assert_eq!(plan.runs, vec![run_id(1), run_id(2)]);
         assert_eq!(plan.blobs, vec!["2", "3"], "blob 1 survives on root and side");
+        // A blob a working copy holds now is never reclaimed, whatever
+        // version it came from.
+        let holding = [copy_on("side", &[("a", "3")])];
+        let plan = plan_prune("v2", &tree(), &runs, kept(&holding, &[]), &[], |_| false).unwrap();
+        assert_eq!(plan.blobs, vec!["2"], "blob 3 is in a working copy");
     }
 
     #[test]
@@ -1020,15 +1022,18 @@ mod tests {
         let mut versions = tree();
         versions[3].label = Some("keep".into());
         let runs = vec![run(2, "v3", 2)];
-        let head = Head { head_version: Some("root".into()), head_run: None, activated_versions: vec![] };
+        let copies = [copy_on("root", &[])];
         // v2 has a descendant, v3 has a run, side is labelled, root is head.
-        assert!(sweepable_versions(&versions, &runs, &head).is_empty());
-        assert_eq!(sweepable_versions(&versions, &[], &head), vec!["v3"]);
+        assert!(sweepable_versions(&versions, &runs, kept(&copies, &[])).is_empty());
+        assert_eq!(sweepable_versions(&versions, &[], kept(&copies, &[])), vec!["v3"]);
+        // Every working copy's head is kept, not only one.
+        let two = [copy_on("root", &[]), copy_on("v3", &[])];
+        assert!(sweepable_versions(&versions, &[], kept(&two, &[])).is_empty());
     }
 
     /// A version some activation runs is kept by the sweep and refused by
-    /// a prune, read through the store's own `head` the way both
-    /// endpoints read it.
+    /// a prune, read through the store's own `activated_versions` the way
+    /// both endpoints read it.
     #[tokio::test]
     async fn an_activated_version_is_neither_swept_nor_pruned() {
         let store = FakeVersionStore::new();
@@ -1039,11 +1044,11 @@ mod tests {
         store.upsert_version(&version("bare", Some("root"), &[("main.weft", "3")], 3)).await.unwrap();
         store.mark_activated(project, "armed");
 
-        let head = store.head(project).await.unwrap();
-        assert_eq!(head.activated_versions, vec!["armed"]);
+        let activated = store.activated_versions(project).await.unwrap();
+        assert_eq!(activated, vec!["armed"]);
         let versions = store.versions(project).await.unwrap();
-        assert_eq!(sweepable_versions(&versions, &[], &head), vec!["bare"], "the activated leaf stays");
-        let refusal = plan_prune("armed", &versions, &[], &head, &[], |_| false).expect_err("activated");
+        assert_eq!(sweepable_versions(&versions, &[], kept(&[], &activated)), vec!["bare"], "the activated leaf stays");
+        let refusal = plan_prune("armed", &versions, &[], kept(&[], &activated), &[], |_| false).expect_err("activated");
         assert_eq!(refusal.reasons.len(), 1);
         assert!(refusal.reasons[0].contains("version armed is activated"), "{:?}", refusal.reasons);
     }

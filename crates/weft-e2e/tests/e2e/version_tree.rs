@@ -7,7 +7,7 @@
 //! -> out` plus a trigger program `tick -> stamp`. Five contracts:
 //!
 //!  - a plain run lands in the tree as a run under a version, and `weft
-//!    tree --json` says the files on disk are that version;
+//!    tree --json` says the folder's working copy is that version;
 //!  - `run --seed --seed-before out` re-runs `out` and takes `src` and `mid`
 //!    from the first run: their rows are painted inherited, and the run
 //!    answer names what was inherited and what ran;
@@ -21,7 +21,7 @@
 
 use crate::common;
 
-use common::{run_id_of, inherited, summary_of, tree_of, warnings_of};
+use common::{my_copy, run_id_of, inherited, summary_of, tree_of, version_ids, warnings_of};
 
 use serde_json::{json, Value};
 use weft_e2e::{ensure, project::Project, run::SettledRun};
@@ -38,12 +38,16 @@ async fn every_run_records_a_version_and_a_seeded_run_inherits_the_unchanged_nod
     settled.assert_completed("src")?.assert_completed("mid")?.assert_completed("out")?;
     assert!(!inherited(&settled, "src"), "a run from nothing inherits nothing");
 
-    // The tree holds the run under the version the disk is.
-    let tree: Value = serde_json::from_str(project.weft(&["tree", "--json"]).await?.trim())?;
+    // The tree holds the run under the version the folder's working copy is.
+    let tree = tree_of(&project).await?;
     let runs = tree["runs"].as_array().expect("runs");
     anyhow::ensure!(runs.iter().any(|r| r["runId"] == json!(first.to_string())), "the run is in the tree: {tree}");
-    anyhow::ensure!(tree["diskVersion"].is_string(), "the files on disk are a recorded version: {tree}");
-    anyhow::ensure!(tree["head"]["headRun"] == json!(first.to_string()), "head's run is the run: {tree}");
+    let copy = my_copy(&tree)?;
+    anyhow::ensure!(
+        copy["workingVersion"] == copy["headVersion"] && version_ids(&tree).iter().any(|v| copy["workingVersion"] == json!(v)),
+        "the folder's files are the recorded version head is on: {tree}"
+    );
+    anyhow::ensure!(copy["headRun"] == json!(first.to_string()), "head's run is the run: {tree}");
 
     // Seeded: `out` re-runs by name, `src` and `mid` are inherited.
     let stdout = project.weft(&["run", "--json", "--target", "out", "--seed", "--seed-before", "out"]).await?;
@@ -122,8 +126,9 @@ fn version_count(tree: &Value) -> usize {
 }
 
 /// Checkpoint, branch and prune move the tree: a label names a version,
-/// a branch restores and deletes files and moves head, a dirty tree is
-/// refused until kept or discarded, and prune refuses under head.
+/// a branch restores and deletes files and moves head, a branch away from
+/// unrecorded edits keeps them as a version first, and prune refuses
+/// under a working copy's head.
 #[tokio::test]
 async fn checkpoint_branch_and_prune_move_the_tree() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
@@ -132,14 +137,15 @@ async fn checkpoint_branch_and_prune_move_the_tree() -> anyhow::Result<()> {
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
     let first = run_id_of(&stdout)?;
     SettledRun::observe(project.dispatcher(), first).await?.completed()?;
-    let v1 = tree_of(&project).await?["head"]["headVersion"].as_str().unwrap().to_string();
+    let v1 = my_copy(&tree_of(&project).await?)?["headVersion"].as_str().unwrap().to_string();
 
-    // The code is unchanged: a checkpoint records nothing new but still
-    // moves head off the run.
+    // The code is unchanged: a checkpoint records nothing new and leaves
+    // head where it is, run included, so the next `--seed` still
+    // inherits from that run.
     let same: Value = serde_json::from_str(project.weft(&["checkpoint", "base", "--json"]).await?.trim())?;
     anyhow::ensure!(same["created"] == json!(false) && same["version"] == json!(v1), "already at v1: {same}");
     let tree = tree_of(&project).await?;
-    anyhow::ensure!(tree["head"]["headRun"].is_null(), "a checkpoint clears head's run: {tree}");
+    anyhow::ensure!(my_copy(&tree)?["headRun"] == json!(first.to_string()), "a checkpoint of unchanged code keeps head's run: {tree}");
 
     // An edit and an added file make a new version under v1, labelled.
     project.write_file("prompts/greeting.txt", "louder")?;
@@ -149,35 +155,47 @@ async fn checkpoint_branch_and_prune_move_the_tree() -> anyhow::Result<()> {
     anyhow::ensure!(loud["created"] == json!(true) && v2 != v1, "a new version: {loud}");
     let tree = tree_of(&project).await?;
     anyhow::ensure!(version_count(&tree) == 2, "two versions: {tree}");
-    anyhow::ensure!(tree["diskVersion"] == json!(v2), "the disk is v2: {tree}");
+    anyhow::ensure!(my_copy(&tree)?["workingVersion"] == json!(v2) && my_copy(&tree)?["headVersion"] == json!(v2), "the folder is v2: {tree}");
     let v2_row = tree["versions"].as_array().unwrap().iter().find(|v| v["id"] == json!(v2)).cloned().unwrap();
     anyhow::ensure!(v2_row["parentId"] == json!(v1) && v2_row["label"] == json!("loud"), "v2 under v1, labelled: {v2_row}");
     anyhow::ensure!(v2_row["diff"]["changed"] == json!(["prompts/greeting.txt"]) && v2_row["diff"]["added"] == json!(["prompts/extra.txt"]), "the diff names the files: {v2_row}");
 
-    // Unkept edits refuse a branch, naming the file; `--discard` throws them away.
+    // Unrecorded edits never block a branch: they are kept as a version
+    // under v2 first, and the run's version comes back on disk.
     project.write_file("prompts/greeting.txt", "unkept")?;
-    let refused = project.weft_refused(&["branch", &first.to_string()]).await?;
-    anyhow::ensure!(refused.contains("the tree has changes since head") && refused.contains("prompts/greeting.txt"), "{refused}");
-    project.weft(&["branch", &first.to_string(), "--discard"]).await?;
+    let switched: Value = serde_json::from_str(project.weft(&["branch", &first.to_string(), "--json"]).await?.trim())?;
+    let unkept = switched["saved"].as_str().unwrap_or_default().to_string();
+    anyhow::ensure!(!unkept.is_empty() && unkept != v1 && unkept != v2, "the edit is kept as a version of its own: {switched}");
     anyhow::ensure!(project.read_file("prompts/greeting.txt")? == "hello", "the run's version is back on disk");
     anyhow::ensure!(!project.has_file("prompts/extra.txt"), "a file the version never held is gone");
     let tree = tree_of(&project).await?;
-    anyhow::ensure!(tree["head"]["headVersion"] == json!(v1) && tree["head"]["headRun"] == json!(first.to_string()), "head is the run again: {tree}");
-    anyhow::ensure!(tree["diskVersion"] == json!(v1), "{tree}");
+    let unkept_row = tree["versions"].as_array().unwrap().iter().find(|v| v["id"] == json!(unkept)).cloned().unwrap_or_default();
+    anyhow::ensure!(unkept_row["parentId"] == json!(v2), "the kept edit parents on the version it was made on: {tree}");
+    let copy = my_copy(&tree)?;
+    anyhow::ensure!(copy["headVersion"] == json!(v1) && copy["headRun"] == json!(first.to_string()), "head is the run again: {tree}");
+    anyhow::ensure!(copy["workingVersion"] == json!(v1), "the folder is v1: {tree}");
 
-    // A label names its version too, and diskVersion is null off any version.
+    // A label names its version too, and an unrecorded edit is no version.
     project.weft(&["branch", "loud"]).await?;
     anyhow::ensure!(project.read_file("prompts/greeting.txt")? == "louder" && project.has_file("prompts/extra.txt"), "v2 restored whole");
     project.write_file("prompts/greeting.txt", "nowhere")?;
-    anyhow::ensure!(tree_of(&project).await?["diskVersion"].is_null(), "an unrecorded edit is no version");
-    project.weft(&["branch", "loud", "--discard"]).await?;
+    let tree = tree_of(&project).await?;
+    let copy = my_copy(&tree)?;
+    anyhow::ensure!(
+        copy["headVersion"] == json!(v2) && !version_ids(&tree).iter().any(|v| copy["workingVersion"] == json!(v)),
+        "an unrecorded edit is no version yet: {tree}"
+    );
+    // Branching to where head already is keeps the edit as a version too.
+    project.weft(&["branch", "loud"]).await?;
+    anyhow::ensure!(project.read_file("prompts/greeting.txt")? == "louder", "v2 is back on disk");
 
-    // Prune refuses under head, then takes the subtree once head has left.
+    // Prune refuses under a working copy's head, then takes the subtree
+    // (the kept edits with it) once head has left.
     let refused = project.weft_refused(&["prune", &v2, "--yes"]).await?;
     // The discriminating half: the ACTIVATION refusal carries "inside
     // the subtree" too, so matching only that would pass with the head
     // check deleted.
-    anyhow::ensure!(refused.contains("head is on version"), "{refused}");
+    anyhow::ensure!(refused.contains("is on version"), "{refused}");
     project.weft(&["branch", &first.to_string()]).await?;
     let pruned: Value = serde_json::from_str(project.weft(&["prune", "loud", "--yes", "--json"]).await?.trim())?;
     anyhow::ensure!(pruned["deleted"] == json!(true), "{pruned}");
@@ -191,8 +209,8 @@ async fn checkpoint_branch_and_prune_move_the_tree() -> anyhow::Result<()> {
 
 /// Seeding follows the edit: an upstream edit re-runs everything after
 /// it, a wholly reused run executes no bodies, omitting `--seed` runs everything,
-/// reuse bounds need `--seed`, and a bare head seeds from the newest
-/// settled run on its version.
+/// reuse bounds need `--seed`, and a bare head (a branch to a version)
+/// seeds from the newest settled run on its version.
 #[tokio::test]
 async fn seeding_follows_the_edit_and_a_wholly_reused_run_executes_no_bodies() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
@@ -229,8 +247,11 @@ async fn seeding_follows_the_edit_and_a_wholly_reused_run_executes_no_bodies() -
     fresh.completed()?.assert_input("out", "data", &json!("changed"))?;
     anyhow::ensure!(!inherited(&fresh, "src") && !inherited(&fresh, "mid") && !inherited(&fresh, "out"), "an unseeded run executes the chain");
 
-    // A checkpoint leaves head bare; the seed is the newest settled run on it.
-    project.weft(&["checkpoint", "--json"]).await?;
+    // A branch to the version itself leaves head bare; the seed is the
+    // newest settled run on it.
+    let version = my_copy(&tree_of(&project).await?)?["headVersion"].as_str().unwrap_or_default().to_string();
+    project.weft(&["branch", &version]).await?;
+    anyhow::ensure!(my_copy(&tree_of(&project).await?)?["headRun"].is_null(), "a branch to a version leaves head bare");
     let stdout = project.weft(&["run", "--json", "--target", "out", "--seed", "--seed-before", "out"]).await?;
     let summary = summary_of(&stdout);
     anyhow::ensure!(summary.contains(&format!("inherited from {}", &third.to_string()[..8])), "seeded from the newest run: {summary}");
@@ -473,7 +494,7 @@ async fn never_baked_triggers_refuse_and_baking_allows_fire_without_activation()
     anyhow::ensure!(refused.contains("weft bake"), "{refused}");
     project.weft(&["bake", "--json"]).await?;
     let tree = tree_of(&project).await?;
-    anyhow::ensure!(tree["head"]["activatedVersions"] == json!([]), "bake does not activate: {tree}");
+    anyhow::ensure!(tree["activatedVersions"] == json!([]), "bake does not activate: {tree}");
     let stdout = project.weft(&["run", "--json", "--fire", tick]).await?;
     let settled = SettledRun::observe(project.dispatcher(), run_id_of(&stdout)?).await?;
     settled.completed()?.assert_completed("tick")?;
@@ -521,7 +542,7 @@ async fn a_hand_fired_trigger_replays_what_activation_registered() -> anyhow::Re
 }
 
 /// Activation records the version the triggers run on without moving
-/// head, prune refuses under it, and deactivating clears it.
+/// the folder's head, prune refuses under it, and deactivating clears it.
 #[tokio::test]
 async fn activation_pins_a_version_in_the_tree() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
@@ -529,17 +550,21 @@ async fn activation_pins_a_version_in_the_tree() -> anyhow::Result<()> {
 
     project.activate().await?;
     let tree = tree_of(&project).await?;
-    let active = match tree["head"]["activatedVersions"].as_array().map(Vec::as_slice) {
+    let active = match tree["activatedVersions"].as_array().map(Vec::as_slice) {
         Some([one]) => one.as_str().map(str::to_string),
         _ => None,
     };
-    anyhow::ensure!(active.is_some() && tree["head"]["headVersion"].is_null(), "activation pins the version, head stays: {tree}");
+    anyhow::ensure!(active.is_some(), "activation pins the version: {tree}");
+    // Activation builds from a stamp of the folder, so head is on that
+    // version, and no run moved it there.
+    let copy = my_copy(&tree)?;
+    anyhow::ensure!(copy["headVersion"] == json!(active) && copy["headRun"].is_null(), "head is the activated version with no run: {tree}");
     anyhow::ensure!(tree["versions"].as_array().unwrap().iter().any(|v| v["id"] == json!(active)), "the version is in the tree: {tree}");
     let refused = project.weft_refused(&["prune", active.as_deref().unwrap(), "--yes"]).await?;
     anyhow::ensure!(refused.contains("is activated and inside the subtree"), "{refused}");
     project.weft(&["deactivate", "--door", "refuse", "--held", "drop", "--running", "cancel"]).await?;
     let tree = tree_of(&project).await?;
-    anyhow::ensure!(tree["head"]["activatedVersions"] == json!([]), "deactivate clears it: {tree}");
+    anyhow::ensure!(tree["activatedVersions"] == json!([]), "deactivate clears it: {tree}");
 
     project.finish().await
 }

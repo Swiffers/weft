@@ -27,7 +27,7 @@
 //! `weft maintenance off` ([`off`]) runs the lift as a task of its own
 //! (`crate::task_kinds::maintenance_lift`): project by project, the
 //! project is built again on this weft from the request its running build
-//! came from (`ProjectStoreOps::running_build_request`) and registered,
+//! came from (`ProjectStoreOps::running_build`) and registered,
 //! the recorded copies are started on that build and waited for, then the
 //! marked triggers are brought back on it ([`ProjectLift::steps`]), each
 //! record and mark going as what it names comes back. A project whose
@@ -590,15 +590,16 @@ pub(crate) async fn lift(state: &DispatcherState, tenant: &str) -> anyhow::Resul
     Ok(report)
 }
 
-/// Build project `id` of `tenant` again on this weft, from the request its
-/// running build came from, and register it, through the same path a build
-/// request takes (`crate::api::project::build_and_register`), waiting for
-/// its images when they build. `false` when it failed, said in `lifted`.
+/// Build project `id` of `tenant` again on this weft, from the version its
+/// running build came from and the resolutions it was built with, and
+/// register it, through the same path a build takes
+/// (`crate::actions::build::build_and_register`), waiting for its images
+/// when they build. `false` when it failed, said in `lifted`.
 /// A project with no stored request (its build an older weft registered)
 /// is not built, said in `lifted`, and comes back on the build it has.
 async fn rebuild(state: &DispatcherState, tenant: &str, id: uuid::Uuid, lifted: &mut ProjectLifted) -> anyhow::Result<bool> {
-    use crate::api::project::Built;
-    let Some(request) = state.projects.running_build_request(id).await? else {
+    use crate::actions::build::Built;
+    let Some(source) = state.projects.running_build(id).await? else {
         lifted.skipped.push(
             "building it again on this weft: its running build is one an older weft registered, which kept nothing to build \
              it again from, so it comes back on that build; run `weft resync` in its folder to build it on this weft"
@@ -607,7 +608,8 @@ async fn rebuild(state: &DispatcherState, tenant: &str, id: uuid::Uuid, lifted: 
         return Ok(true);
     };
     let tenant = crate::tenant::TenantId(tenant.to_string());
-    let ended = match crate::api::project::build_and_register(state, id, &tenant, &request).await {
+    let kept = crate::build::Kept(&source.inputs.assets);
+    let ended = match crate::actions::build::build_and_register(state, id, &tenant, &source, &kept).await {
         Ok(Built::Registered(_)) => None,
         Ok(Built::Underway(underway)) => {
             let ended = crate::build::waiting::wait_ended(state, id, underway.build).await?;

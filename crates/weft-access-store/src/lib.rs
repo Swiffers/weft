@@ -17,6 +17,7 @@
 
 mod crypt;
 mod flows;
+pub mod instance_tokens;
 mod picks;
 mod resolve;
 mod subscriptions;

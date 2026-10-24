@@ -33,7 +33,7 @@
 //! again, and neither does the standard library the install preloads.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Seek};
+use std::io::Read;
 
 use anyhow::{bail, Context, Result};
 use futures::{StreamExt, TryStreamExt};
@@ -43,8 +43,9 @@ use weft_core::storage::{FileHandle, StoredFile};
 use weft_core::storage::key::{parse_key, KeyScope};
 use weft_core::storage::media::{classify_media_slot, media_slots, MediaSlotContent};
 
-pub trait AssetReader: Read + Seek + Send {}
-impl<T: Read + Seek + Send> AssetReader for T {}
+pub mod sync;
+pub mod tree;
+pub mod upload;
 
 /// Where the project's files live. Paths are as written in an `@asset`
 /// ref: project-relative, or absolute/outside where the source allows
@@ -52,16 +53,9 @@ impl<T: Read + Seek + Send> AssetReader for T {}
 pub trait AssetSource: Send + Sync {
     /// A streaming reader over the file: one forward pass, bounded
     /// memory, no promise about what a second open sees. Hashing reads
-    /// this way.
+    /// this way, and so does an upload, which the store holds to the hash
+    /// the first read recorded.
     fn open(&self, path: &str) -> Result<Box<dyn Read + Send>>;
-    /// A reader over bytes that cannot change under the caller, which
-    /// [`publish_hashed`] verifies against the recorded hash and then
-    /// rewinds and uploads. Only the files that are about to be stored
-    /// are opened this way, because a disk source pays for it with a
-    /// private copy of the file: a new asset is read once to hash it, once
-    /// to copy it, once to verify the copy and once to upload it. An asset
-    /// the store already holds is only ever read once.
-    fn snapshot(&self, path: &str) -> Result<Box<dyn AssetReader>>;
 }
 
 /// The tenant's assets in runtime storage: one file per content, whichever
@@ -75,8 +69,11 @@ pub trait AssetStore: Send + Sync {
     /// for an already-ACTIVE identical hash (same content = same asset),
     /// and MUST error for anything else.
     ///
-    /// The bytes are a verified snapshot. Return their stored key whether
-    /// this call uploads them or another publisher already completed them.
+    /// The bytes are a stream read once, which may have changed since
+    /// `hash` was taken: the store MUST refuse to store bytes that do not
+    /// hash to `hash` ([`upload::ContentStore`] says the file changed).
+    /// Return their stored key whether this call uploads them or another
+    /// publisher already completed them.
     async fn upload(
         &self,
         hash: &str,
@@ -208,11 +205,9 @@ pub fn hash_files(paths: &[String], source: &dyn AssetSource) -> Result<Vec<Hash
 /// every publisher shares (an `@asset` sync, a version snapshot): diff
 /// against what the store already holds, upload only the missing
 /// content, never delete an existing file (a paused run may still
-/// need an earlier version). Each missing file is uploaded from a
-/// snapshot verified against its recorded hash first: parts are stored
-/// by number under a key that is the content's hash, so bytes that do
-/// not match must never reach a part another publisher of the same
-/// content may be writing too.
+/// need an earlier version). Each missing file is streamed from the
+/// source again, and the store refuses it when the bytes no longer hash
+/// to what was recorded ([`AssetStore::upload`]).
 pub async fn publish_hashed(
     hashed: &[HashedFile],
     source: &dyn AssetSource,
@@ -223,9 +218,8 @@ pub async fn publish_hashed(
     let existing = store.held(&hashes).await.context("ask which contents are already stored")?;
 
     // 2. Upload each missing content once (two paths with identical
-    //    bytes share one upload), up to UPLOADS_IN_FLIGHT at a time. Each
-    //    upload verifies its snapshot against the earlier hash, then
-    //    rewinds and sends those exact bytes. Record every key.
+    //    bytes share one upload), up to UPLOADS_IN_FLIGHT at a time.
+    //    Record every key.
     let mut keys: BTreeMap<String, String> = BTreeMap::new();
     let mut missing: BTreeMap<&str, &HashedFile> = BTreeMap::new();
     for file in hashed {
@@ -238,38 +232,36 @@ pub async fn publish_hashed(
             }
         }
     }
-    let uploaded: Vec<(String, String)> = futures::stream::iter(missing.into_values())
-        .map(|HashedFile { path, hash, size, mime }| async move {
-            let mut reader = source
-                .snapshot(path)
-                .with_context(|| format!("snapshot {path} for upload"))?;
-            let (actual_hash, actual_size) = hash_reader(&mut reader)?;
-            anyhow::ensure!(actual_hash == *hash && actual_size == *size,
-                "{path} changed while it was being published; rerun the command");
-            reader.rewind().with_context(|| format!("rewind verified snapshot of {path}"))?;
-            // An upload cut off on the way loses nothing: the store keeps
-            // the parts that landed, and the next try resumes after them.
-            // A refusal is the store's answer, and is not asked again.
-            let mut tries = 1;
-            let key = loop {
-                match store.upload(hash, mime, path, *size, reader.as_mut()).await {
-                    Ok(key) => break key,
-                    Err(e) if tries < UPLOAD_TRIES && store.interrupted(&e) => {
-                        tracing::warn!(target: "weft_assets", %path, error = %format!("{e:#}"), tries, "an upload failed; trying it again");
-                        tokio::time::sleep(std::time::Duration::from_secs(tries as u64)).await;
-                        tries += 1;
-                        reader.rewind().with_context(|| format!("rewind verified snapshot of {path}"))?;
-                    }
-                    Err(e) => return Err(e.context(format!("upload {path} ({tries} tries)"))),
-                }
-            };
-            Ok::<_, anyhow::Error>((hash.clone(), key))
-        })
-        .buffer_unordered(UPLOADS_IN_FLIGHT)
-        .try_collect()
-        .await?;
+    // The futures are made up front (they run only when polled): a stream
+    // that maps through a closure here is not provably `Send` to a caller
+    // that needs it to be (an axum handler of the install, which uploads
+    // through this too).
+    let uploads: Vec<_> = missing.into_values().map(|file| upload_one(file, source, store)).collect();
+    let uploaded: Vec<(String, String)> = futures::stream::iter(uploads).buffer_unordered(UPLOADS_IN_FLIGHT).try_collect().await?;
     keys.extend(uploaded);
     Ok(keys)
+}
+
+/// One upload of [`publish_hashed`]: `(hash, key)`. An upload cut off on
+/// the way loses nothing: the store keeps the parts that landed, and the
+/// next try opens the file again and resumes after them. A refusal is the
+/// store's answer, and is not asked again.
+async fn upload_one(file: &HashedFile, source: &dyn AssetSource, store: &dyn AssetStore) -> Result<(String, String)> {
+    let HashedFile { path, hash, size, mime } = file;
+    let mut tries = 1;
+    let key = loop {
+        let mut reader = source.open(path).with_context(|| format!("open {path} for upload"))?;
+        match store.upload(hash, mime, path, *size, reader.as_mut()).await {
+            Ok(key) => break key,
+            Err(e) if tries < UPLOAD_TRIES && store.interrupted(&e) => {
+                tracing::warn!(target: "weft_assets", %path, error = %format!("{e:#}"), tries, "an upload failed; trying it again");
+                tokio::time::sleep(std::time::Duration::from_secs(tries as u64)).await;
+                tries += 1;
+            }
+            Err(e) => return Err(e.context(format!("upload {path} ({tries} tries)"))),
+        }
+    };
+    Ok((hash.clone(), key))
 }
 
 /// How many times [`publish_hashed`] sends one file before it gives up.
@@ -359,7 +351,7 @@ pub async fn sync_assets(
         );
     }
 
-    // 2. The shared content-addressed core verifies and uploads missing content.
+    // 2. The shared content-addressed core uploads missing content.
     let files: Vec<HashedFile> = hashed.iter().map(|(_, h)| h.clone()).collect();
     let keys = publish_hashed(&files, source, store).await?;
 

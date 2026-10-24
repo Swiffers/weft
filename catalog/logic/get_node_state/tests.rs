@@ -41,7 +41,7 @@ async fn passes_on(rig: FakeRig, answer: Value) -> WeftResult<()> {
     assert_eq!(outcome.outputs["state"], answer);
     let calls = rig.program_calls();
     assert_eq!(calls.len(), 1);
-    let (ProgramCall::NodeState { run, node }, StopSelf::Keep) = &calls[0] else {
+    let (ProgramCall::Runs(weft::program::runs::RunCall::NodeState { run, node }), StopSelf::Keep) = &calls[0] else {
         panic!("unexpected call {:?}", calls[0]);
     };
     assert_eq!(*run, RUN.parse::<RunId>().unwrap());

@@ -40,7 +40,7 @@ async fn already_down(rig: FakeRig) -> WeftResult<()> {
 async fn defaults(rig: FakeRig) -> WeftResult<()> {
     rig.run(&StopInfraNode, json!({ "node": "bridge", "instance": "ada" })).await.ok()?;
     match &rig.program_calls()[0] {
-        (ProgramCall::InfraStop { node, instance, take_down }, StopSelf::Keep) => {
+        (ProgramCall::Infra(weft::program::infra::InfraCall::Stop { node, instance, take_down, .. }), StopSelf::Keep) => {
             assert_eq!(node, "bridge");
             assert_eq!(instance.as_ref().unwrap().as_str(), "ada");
             assert_eq!((take_down.door, take_down.door_for_minutes), (Some(Door::Take), None));
@@ -54,7 +54,7 @@ async fn defaults(rig: FakeRig) -> WeftResult<()> {
 async fn the_programs_own(rig: FakeRig) -> WeftResult<()> {
     let out = rig.run(&StopInfraNode, json!({ "node": "pg" })).await.ok()?;
     match &rig.program_calls()[0] {
-        (ProgramCall::InfraStop { node, instance, .. }, StopSelf::Keep) => {
+        (ProgramCall::Infra(weft::program::infra::InfraCall::Stop { node, instance, .. }), StopSelf::Keep) => {
             assert_eq!(node, "pg");
             assert!(instance.is_none(), "the program's own copy");
         }
@@ -72,7 +72,7 @@ async fn choices(rig: FakeRig) -> WeftResult<()> {
     .await
     .ok()?;
     match &rig.program_calls()[0] {
-        (ProgramCall::InfraStop { take_down, .. }, StopSelf::Include) => {
+        (ProgramCall::Infra(weft::program::infra::InfraCall::Stop { take_down, .. }), StopSelf::Include) => {
             assert_eq!((take_down.door, take_down.door_for_minutes), (Some(Door::Hide), Some(30)));
             assert_eq!((take_down.held, take_down.running), (Some(Held::Drop), Some(Running::Cancel)));
         }

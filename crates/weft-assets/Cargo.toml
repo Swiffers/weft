@@ -8,13 +8,18 @@ weft-core = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [dev-dependencies]
+uuid = { workspace = true }
+axum = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 
 [lints]

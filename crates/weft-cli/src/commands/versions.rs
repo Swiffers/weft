@@ -1,242 +1,21 @@
-//! What the version-tree verbs share: the snapshot of a project's files,
-//! the run spec on disk, the tree as the dispatcher answers it, and the
-//! pure comparison of two runs' wires. The verbs themselves are one
-//! file each (`checkpoint`, `branch`, `tree`, `diff`, `freeze`,
-//! `examples`, `prune`, `wake`); what a command reads and publishes as a
-//! version is `snapshot::Snapshot`, over the files [`covers`] names.
-//!
-//! A snapshot covers the files that make the program: every `*.weft`
-//! (an `@include`d file is program text), `weft.toml`, `src/**` (the
-//! compiler's second node root: a node beside the code is source like
-//! any other), `nodes/**` (the standard library under
-//! `nodes/base_catalog/` included: it is the project's own, edited or
-//! left out as the project chose), `prompts/**`, `scripts/**`, `sql/**`,
-//! `assets/**`, and `examples/**` (a branch back restores the examples
-//! that existed then). NOT `layouts/`: a canvas drag is not a version,
-//! for the same reason the definition hash ignores it. The blobs go
-//! through `weft_assets::publish_hashed` into the tenant's assets
-//! (`snapshot::Snapshot::publish`), so a
-//! file identical to one any version of any of the tenant's projects held
-//! (or the standard library the install preloads) costs nothing.
+//! What the version-tree verbs share: the run spec on disk, the tree as
+//! the dispatcher answers it, and the pure comparison of two runs'
+//! wires. The verbs themselves are one file each (`checkpoint`,
+//! `branch`, `tree`, `diff`, `freeze`, `examples`, `prune`, `wake`). A
+//! version is made by the install, from the working copy this folder is
+//! kept in sync with (`copy::this_copy`).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use weft_compiler::project::Project;
 use weft_core::versions::{VersionRun, VersionSummary, VersionTree};
 use weft_core::live_event::{DispatcherEvent, LiveEvent};
-use weft_core::run_spec::{Expected, ExpectedWire, PortValues, RunSpec};
+use weft_core::run_spec::{Expected, ExpectedWire, RunSpec};
 
 use crate::client::DispatcherClient;
-
-pub use weft_core::project::hash::Manifest;
-
-/// Whether a project-relative path (forward slashes) is part of a
-/// version. The one rule; the walk and the dirty check both read it.
-pub fn covers(rel: &str) -> bool {
-    let first = rel.split('/').next().unwrap_or("");
-    // A HIDDEN top-level entry is tooling, never a version's files:
-    // `.weft` and `.git`, and equally `.github`, `.vscode`, `.idea`,
-    // `.gitignore`, `.env`. Said as one rule about the whole entry,
-    // hidden files included, for two reasons. The prefix spellings it
-    // replaces each covered one name and let the next one through
-    // (`.git/` did not exclude `.github/x.weft`, so the rule and the
-    // walk disagreed about a folder real projects have). And asking it
-    // only of folders let `.weft` itself back in through the
-    // `ends_with(".weft")` rule below, and made the same directory
-    // answer differently spelled with and without its trailing slash.
-    if first.starts_with('.') {
-        return false;
-    }
-    if rel.starts_with("target/") || rel.starts_with("layouts/") {
-        return false;
-    }
-    // `node_modules` is never source, at any depth: a node that carries
-    // a JS package has its own, and an ordinary `pnpm install` inside a
-    // node used to put thousands of files through the hash, the
-    // publish and `weft branch`'s dirty check, with a branch back
-    // deleting them one by one. The name is npm's, so nothing else is
-    // called that.
-    //
-    // `target` is excluded at the ROOT only, just above: the project
-    // root is where weft's own build puts a Cargo workspace, so a
-    // top-level `target/` is build output every time. Deeper down it is
-    // an ordinary word, and a node package, a prompts folder or a
-    // scripts folder may legitimately be called it, so it is NOT
-    // excluded by name there: silently dropping source from a version
-    // loses it on a branch back. The walk tells the two apart, because
-    // it can see whether a `Cargo.toml` sits beside the directory.
-    if rel.split('/').any(|seg| seg == "node_modules") {
-        return false;
-    }
-    // What Python writes beside a module it imported is never source
-    // (`weft_catalog::is_python_cache`).
-    if rel.split('/').any(weft_catalog::is_python_cache) {
-        return false;
-    }
-    if rel.ends_with(".weft") || rel == "weft.toml" {
-        return true;
-    }
-    matches!(first, "src" | "nodes" | "prompts" | "scripts" | "sql" | "assets" | "examples")
-}
-
-/// Every covered file under `root`, project-relative with forward
-/// slashes, sorted.
-pub fn covered_paths(root: &Path) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    walk(root, root, &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        let raw = path.strip_prefix(root).expect("under root");
-        let Some(rel) = raw.to_str() else {
-            // A path whose bytes are not UTF-8 cannot be a manifest key.
-            // `to_string_lossy` would have spelled it with replacement
-            // characters, and that spelling decides what is IN the
-            // version: the file would be published under a name that is
-            // not its name, read as both added and removed by every
-            // dirty check (the disk name never equals the lossy one), and
-            // restored beside the original rather than over it.
-            //
-            // Refused by name, but only when a version would actually
-            // take it. Such a name in a folder no version reads is not
-            // this command's business, and failing every snapshot over a
-            // file that would never be recorded is worse than passing it
-            // over.
-            let lossy = raw.to_string_lossy().replace('\\', "/");
-            let wanted = if path.is_dir() { !prunes_whole_tree(&lossy) } else { covers(&lossy) };
-            if wanted {
-                anyhow::bail!(
-                    "'{}' is not a name weft can record in a version (its bytes are not UTF-8); \
-                     rename it, or move it out of the project",
-                    path.display()
-                );
-            }
-            continue;
-        };
-        let rel = rel.replace('\\', "/");
-        let is_symlink = entry.file_type()?.is_symlink();
-        // `is_dir` FOLLOWS a symlink, so this has to be asked before any
-        // question about what the entry is.
-        if path.is_dir() && !is_symlink {
-            // Prune whole trees the rule never covers, so a large
-            // `.weft/target` is never walked.
-            let cargo_output = is_cargo_output(&path);
-            // Pruning asks `covers` about the directory as a path, so
-            // the two cannot disagree: spelled out again here, `.weft`
-            // without its slash also pruned a folder called
-            // `.weft-notes` that `covers` would have included, and only
-            // the walk's opinion reaches the disk. The one thing `covers`
-            // cannot answer is `cargo_output`, which is a fact about
-            // what sits next to the directory rather than about its path.
-            if !(cargo_output || prunes_whole_tree(&rel)) {
-                walk(root, &path, out)?;
-            }
-        } else if is_symlink {
-            // A link where a version's own file or folder would be is
-            // refused by name. Followed, a link pointing at a folder above
-            // it is an endless walk (a stack overflow, with no message),
-            // and one pointing OUT of the project pulls somebody else's
-            // files in under a path inside it, which `weft branch` would
-            // later write back THROUGH.
-            //
-            // A link anywhere else is nobody's business here, and most
-            // links in a project are exactly that: a symlinked `README.md`
-            // or `docker-compose.yml` at the root is ordinary, and no
-            // version would ever take it. So the question asked matches
-            // what the link IS. `path.is_dir()` follows the link, which is
-            // safe to ASK (it recurses nothing) and is the only way to know
-            // which of the two questions applies.
-            let refuse = if path.is_dir() { !prunes_whole_tree(&rel) } else { covers(&rel) };
-            if refuse {
-                anyhow::bail!(
-                    "'{rel}' is a symlink, and a version is the files themselves: a link can \
-                     point out of the project or back at a folder above it, and branching back \
-                     would write through it. Replace it with the file, or move it out of the \
-                     project"
-                );
-            }
-        } else if covers(&rel) {
-            out.push(rel);
-        }
-    }
-    Ok(())
-}
-
-/// Whether the directory at `dir` is Cargo's build output: a `target/`
-/// with a `Cargo.toml` beside it. A fact about the disk, not the path,
-/// which is why the pure [`covers`] cannot make this call and the walk
-/// does.
-fn is_cargo_output(dir: &Path) -> bool {
-    dir.file_name().is_some_and(|name| name == "target") && dir.parent().is_some_and(|parent| parent.join("Cargo.toml").is_file())
-}
-
-/// Whether the walk takes the file at `rel` (project-relative, forward
-/// slashes) into a version: [`covers`] says so, and no folder on its way
-/// is Cargo's build output. The one answer to "is this a version's file"
-/// for a path the walk did not list itself.
-pub fn walk_takes(root: &Path, rel: &str) -> bool {
-    if !covers(rel) {
-        return false;
-    }
-    let mut dir = root.to_path_buf();
-    let mut parts: Vec<&str> = rel.split('/').collect();
-    parts.pop();
-    parts.into_iter().all(|part| {
-        dir.push(part);
-        !is_cargo_output(&dir)
-    })
-}
-
-/// Whether a DIRECTORY holds nothing a version covers, so the walk can
-/// skip it whole.
-///
-/// Asks [`covers`] rather than restating it: a path under this directory
-/// can only be covered if the directory itself could be, and the two
-/// spellings drifting apart is how a folder ends up silently in or out
-/// of a version.
-fn prunes_whole_tree(rel: &str) -> bool {
-    // A directory's own path is not a file path, so `covers` is asked
-    // about a file inside it. `.weft` is covered nowhere; `nodes` is
-    // covered only through its contents.
-    !covers(&format!("{rel}/x.weft")) && !covers(&format!("{rel}/x"))
-}
-
-/// The manifest of the project at `root` as it is on disk, without
-/// publishing anything: what `branch` compares against head to see a dirty
-/// tree, and what a command's snapshot is compared against once it is done
-/// (`snapshot::Snapshot::changed_on_disk`).
-///
-/// A file deleted between the walk and its read is one the disk no
-/// longer has ([`open_covered`]), as it would be a moment later.
-pub fn local_manifest(root: &Path) -> Result<Manifest> {
-    let mut manifest = Manifest::new();
-    for rel in covered_paths(root)? {
-        let Some(file) = open_covered(root, &rel)? else { continue };
-        let (hash, _) = weft_assets::hash_reader(file).with_context(|| format!("read {}", root.join(&rel).display()))?;
-        manifest.insert(rel, hash);
-    }
-    Ok(manifest)
-}
-
-/// Open the covered file `rel` under `root` for one read, `None` when it
-/// was deleted since the walk named it ([`covered_paths`]): another person
-/// or agent removing a file mid-walk is the disk changing, not an error.
-pub fn open_covered(root: &Path, rel: &str) -> Result<Option<std::fs::File>> {
-    let path = root.join(rel);
-    match std::fs::File::open(&path) {
-        Ok(file) => Ok(Some(file)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
-    }
-}
 
 // ----- the tree as the dispatcher answers it -----------------------------
 
@@ -344,14 +123,6 @@ pub fn read_spec(project: &Project, name: &str) -> Result<RunSpec> {
         .with_context(|| format!("no spec at {}", spec_file_path(project, name).display()))
 }
 
-/// [`read_spec`] with the file read by `read` (a command's snapshot, then
-/// the disk: the example a run uses is the one its version holds).
-pub fn read_spec_from(project: &Project, name: &str, read: &dyn Fn(&Path) -> std::io::Result<String>) -> Result<RunSpec> {
-    let path = spec_file_path(project, name);
-    read_spec_if_present_from(project, name, read)?
-        .with_context(|| format!("no spec at {}", path.display()))
-}
-
 /// The rows of a run's journal, as the replay endpoint answers them.
 ///
 /// One reader, because three commands hand-rolled the same four steps
@@ -406,19 +177,11 @@ fn spec_file_path(project: &Project, name: &str) -> PathBuf {
 /// A file an older weft wrote reads as today's spec, and the file is left
 /// as it is ([`RunSpec::parse_file`]): reading an example never changes
 /// the project. It takes today's shape when weft writes it ([`write_spec`]).
+///
+/// The spec is named after its file.
 pub fn read_spec_if_present(project: &Project, name: &str) -> Result<Option<RunSpec>> {
-    read_spec_if_present_from(project, name, &|path| std::fs::read_to_string(path))
-}
-
-/// [`read_spec_if_present`] with the file read by `read` ([`read_spec_from`]);
-/// its spec named after the file.
-pub fn read_spec_if_present_from(
-    project: &Project,
-    name: &str,
-    read: &dyn Fn(&Path) -> std::io::Result<String>,
-) -> Result<Option<RunSpec>> {
     let path = spec_file_path(project, name);
-    let text = match read(&path) {
+    let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
@@ -465,16 +228,14 @@ pub fn validate_example_name(name: &str) -> Result<()> {
     bail!("an example needs a name (a word, not a path or a directory): `weft freeze <name>`")
 }
 
-/// Write `spec` as `examples/<name>.json`, answering where and the text
-/// written (a command that wrote it keeps it in its snapshot,
-/// `snapshot::Snapshot::record`).
-pub fn write_spec(project: &Project, spec: &RunSpec) -> Result<(PathBuf, String)> {
+/// Write `spec` as `examples/<name>.json`, answering where.
+pub fn write_spec(project: &Project, spec: &RunSpec) -> Result<PathBuf> {
     validate_example_name(&spec.name)?;
     let path = spec_path(project, &spec.name);
     std::fs::create_dir_all(examples_dir(project))?;
     let text = spec.file_text().map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
     std::fs::write(&path, &text).with_context(|| format!("write {}", path.display()))?;
-    Ok((path, text))
+    Ok(path)
 }
 
 /// Every spec in `examples/`, by name, sorted, plus the files in there
@@ -515,140 +276,6 @@ pub fn list_specs(project: &Project) -> Result<(Vec<RunSpec>, Vec<String>)> {
     out.sort_by(|a, b| a.name.cmp(&b.name));
     unreadable.sort();
     Ok((out, unreadable))
-}
-
-/// The flags `weft run` turns into a spec.
-#[derive(Debug, Default, Clone, PartialEq)]
-pub struct RunFlags {
-    pub from: Vec<String>,
-    pub target: Vec<String>,
-    pub before: Vec<String>,
-    pub group: Option<String>,
-    pub feed: Vec<String>,
-    pub fire: Vec<String>,
-    pub emit: Vec<String>,
-    /// Which instance the run is in (`--instance`).
-    pub instance: Option<weft_core::instance::InstanceId>,
-    pub clear: Vec<String>,
-    /// Write what the run did down before each node starts (`--durable`).
-    pub durable: bool,
-    /// Never wait for the record except to pause (`--fast`), over a
-    /// durable trigger.
-    pub fast: bool,
-    /// How long the run is kept once it ends (`--keep-for`).
-    pub keep_for: Option<weft_core::run_settings::KeepFor>,
-    /// How long a wait holds while the run cannot pause (`--hold-secs`).
-    pub hold_secs: Option<u32>,
-}
-
-impl RunFlags {
-    pub fn is_empty(&self) -> bool {
-        self.from.is_empty()
-            && self.target.is_empty()
-            && self.before.is_empty()
-            && self.group.is_none()
-            && self.feed.is_empty()
-            && self.fire.is_empty()
-            && self.emit.is_empty()
-            && self.instance.is_none()
-            && self.clear.is_empty()
-            && !self.durable
-            && !self.fast
-            && self.keep_for.is_none()
-            && self.hold_secs.is_none()
-    }
-}
-
-/// Parse a node and JSON payload. Dots belong to the node id.
-fn parse_node_flag(flag: &str, verb: &str) -> Result<(String, Value)> {
-    let (node, json) = flag.split_once('=')
-        .ok_or_else(|| anyhow::anyhow!("{verb} wants node=<json>, got '{flag}'"))?;
-    if node.is_empty() { bail!("{verb} requires a node name"); }
-    let value = serde_json::from_str(json)
-        .with_context(|| format!("{verb} {node}: the value must be JSON"))?;
-    Ok((node.into(), value))
-}
-
-/// Repeated flags merge distinct ports; repeating a port is an error.
-fn parse_port_flags(flags: &[String], verb: &str, allow_bare: bool) -> Result<PortValues> {
-    let mut values: PortValues = BTreeMap::new();
-    for flag in flags {
-        let (node, json) = match flag.split_once('=') {
-            Some(parts) => parts,
-            None if allow_bare => (flag.as_str(), "{}"),
-            None => bail!("{verb} wants node=<json>, got '{flag}'"),
-        };
-        if node.is_empty() { bail!("{verb} requires a node name"); }
-        let ports = weft_core::run_spec::parse_port_object(json)
-            .with_context(|| format!("{verb} {node}: expected an object mapping ports to values; the value must be JSON"))?;
-        let target = values.entry(node.into()).or_default();
-        for (port, value) in ports {
-            if target.contains_key(&port) { bail!("{verb}: duplicate port '{node}.{port}'"); }
-            target.insert(port, value);
-        }
-    }
-    Ok(values)
-}
-
-/// The spec the flags describe, named `name`.
-pub fn spec_from_flags(name: &str, flags: &RunFlags) -> Result<RunSpec> {
-    apply_run_flags(&RunSpec::whole(name), flags)
-}
-
-/// Edit one loaded spec before graph validation. Clearing is explicit;
-/// supplying a new start replaces the saved start set and its payloads.
-pub fn apply_run_flags(base: &RunSpec, flags: &RunFlags) -> Result<RunSpec> {
-    if flags.fire.len() > 1 { bail!("a run can fire only one trigger"); }
-    let mut spec = base.clone();
-    for field in &flags.clear {
-        match field.as_str() {
-            "from" => spec.from.clear(),
-            "emit" => spec.emit.clear(),
-            "target" => spec.target.clear(),
-            "before" => spec.before.clear(),
-            "group" => spec.group = None,
-            "feed" => spec.feed.clear(),
-            "fire" => spec.fire = None,
-            "instance" => spec.instance = None,
-            "keeping" => spec.settings.keeping = None,
-            "keep_for" => spec.settings.keep_for = None,
-            "hold_secs" => spec.settings.hold_secs = None,
-            _ => bail!("--clear: unknown setting '{field}'; use from, emit, target, before, group, feed, fire, instance, keeping, keep_for, or hold_secs"),
-        }
-    }
-    if !flags.from.is_empty() { spec.from = parse_port_flags(&flags.from, "--from", true)?; }
-    if !flags.target.is_empty() { spec.target = flags.target.clone(); }
-    if !flags.before.is_empty() { spec.before = flags.before.clone(); }
-    if !flags.feed.is_empty() { spec.feed = flags.feed.clone(); }
-    if let Some(group) = &flags.group {
-        spec.group = parse_port_flags(std::slice::from_ref(group), "group", true)?.into_iter().next();
-    }
-    if let Some(fire) = flags.fire.first() { spec.fire = Some(parse_node_flag(fire, "--fire")?); }
-    if let Some(instance) = &flags.instance {
-        spec.instance = Some(instance.clone());
-    }
-    // What the run asks for by hand goes over the trigger it fires.
-    if flags.durable && flags.fast {
-        bail!("--durable and --fast ask for opposite things; pass one");
-    }
-    use weft_core::run_settings::Keeping;
-    if flags.durable {
-        spec.settings.keeping = Some(Keeping::Durable);
-    }
-    if flags.fast {
-        spec.settings.keeping = Some(Keeping::Fast);
-    }
-    if flags.keep_for.is_some() {
-        spec.settings.keep_for = flags.keep_for;
-    }
-    if let Some(secs) = flags.hold_secs {
-        weft_core::run_settings::RunSettings::default().holding_for(secs).map_err(anyhow::Error::msg)?;
-        spec.settings.hold_secs = Some(secs);
-    }
-    for (node, ports) in parse_port_flags(&flags.emit, "--emit", false)? {
-        spec.emit.entry(node).or_default().extend(ports);
-    }
-    Ok(spec)
 }
 
 // ----- wires: what a run put on every output port ------------------------
@@ -879,7 +506,7 @@ async fn media_hash(client: &DispatcherClient, key: &str) -> Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use weft_core::versions::{Head, ManifestDiff};
+    use weft_core::versions::ManifestDiff;
     use weft_core::primitive::AwaitEnd;
 
     #[test]
@@ -929,10 +556,8 @@ mod tests {
         readonly.set_readonly(false);
         std::fs::set_permissions(&path, readonly).unwrap();
 
-        let (written_to, text) = write_spec(&project, &spec).unwrap();
-        assert_eq!(written_to, path);
+        assert_eq!(write_spec(&project, &spec).unwrap(), path);
         let written = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(written, text, "the one write is the text the command keeps in its snapshot");
         assert_eq!(written, spec.file_text().unwrap(), "the file now holds today's shape");
         assert!(!written.contains("frozen_from") && written.contains("\"specVersion\""), "{written}");
         assert_eq!(read_spec(&project, "old").unwrap(), spec);
@@ -953,7 +578,7 @@ mod tests {
 
     #[test]
     fn a_version_is_found_by_label_before_id_prefix() {
-        let tree = VersionTree { head: Head::default(), versions: vec![version("aaaa", Some("try-x")), version("bbbb", Some("dup")), version("cccc", Some("dup"))], runs: vec![] };
+        let tree = VersionTree { working_copies: vec![], activated_versions: vec![], versions: vec![version("aaaa", Some("try-x")), version("bbbb", Some("dup")), version("cccc", Some("dup"))], runs: vec![] };
         assert_eq!(resolve_version(&tree, "try-x").unwrap().id, "aaaa00000000");
         assert_eq!(resolve_version(&tree, "aaa").unwrap().id, "aaaa00000000");
         assert!(resolve_version(&tree, "dup").unwrap_err().to_string().contains("labels 2 versions"));
@@ -1005,262 +630,6 @@ mod tests {
                     .unwrap_or_else(|_| panic!("{bad} suggested `{quoted}`, which is refused too"));
             }
         }
-    }
-
-    #[test]
-    fn a_version_covers_program_files_and_not_layouts_or_the_seeded_catalog() {
-        for yes in [
-            "main.weft",
-            "triage.weft",
-            "weft.toml",
-            "nodes/mine/mod.rs",
-            "nodes/pkg/metadata.json",
-            "prompts/p.txt",
-            "scripts/s.py",
-            "sql/q.sql",
-            "assets/pic.png",
-            "examples/angry.json",
-            "sub/dir/inc.weft",
-            // `target` is an ordinary word: a node, a prompt folder or
-            // a script folder may be called it, and dropping those
-            // would lose source on a branch back. Cargo's own output
-            // is told apart by the `Cargo.toml` beside it, which the
-            // walk checks and this pure rule cannot.
-            "nodes/target/mod.rs",
-            "prompts/target/tone.txt",
-            // A node may live beside the code under `src/` (the
-            // compiler's second node root), with its Rust, metadata and
-            // deps: all source, and a build on the install from the version
-            // needs every one of them.
-            "src/greeter/mod.rs",
-            "src/greeter/metadata.json",
-            "src/greeter/deps.toml",
-            "src/notes.md",
-            // The standard library is a folder of the project's nodes
-            // like any other.
-            "nodes/base_catalog/x/mod.rs",
-            // A program a package ships and the prompt it reads, which
-            // a build on the install compiles from the version through
-            // `__catalog/`.
-            "nodes/base_catalog/computer/agent.weft",
-            "nodes/base_catalog/computer/agent_prompt.md",
-        ] {
-            assert!(covers(yes), "{yes} is part of a version");
-        }
-        for no in [
-            "layouts/main.json",
-            ".weft/target/x",
-            ".git/HEAD",
-            // Every hidden top-level folder, not just those two: a
-            // `.weft` file under `.github` is somebody's CI, and the walk
-            // pruned `.github` while this rule used to answer that the
-            // file belonged to the version.
-            ".github/workflows/ci.weft",
-            ".vscode/settings.json",
-            "target/debug/x",
-            "README.md",
-            "notes.txt",
-            // Build output inside a node is build output too.
-            "nodes/bridge/node_modules/left-pad/index.js",
-            "src/bridge/node_modules/left-pad/index.js",
-            // The frontend ships through the project's CI from the
-            // repository, never through a version.
-            "front/src/routes/+page.svelte",
-        ] {
-            assert!(!covers(no), "{no} is not part of a version");
-        }
-    }
-
-    /// The walk's one disk-aware call: a `target/` is cargo's exactly
-    /// when a `Cargo.toml` sits beside it. Told wrong in either
-    /// direction it costs real files: thousands of build artifacts
-    /// hashed and re-deleted on a branch back, or somebody's writing
-    /// dropped out of the version that was supposed to keep it.
-    #[test]
-    fn a_target_folder_is_build_output_only_next_to_a_cargo_toml() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        let write = |rel: &str| {
-            let path = root.join(rel);
-            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-            std::fs::write(&path, "x").expect("write");
-        };
-        write("weft.toml");
-        write("nodes/pkg/Cargo.toml");
-        write("nodes/pkg/target/debug/build.log");
-        write("nodes/pkg/node_modules/left-pad/index.js");
-        write("prompts/target/tone.txt");
-        write("nodes/pkg/__pycache__/helper.cpython-312.pyc");
-        write("scripts/tool.pyc");
-
-        let paths = covered_paths(root).expect("walk");
-        assert!(!paths.iter().any(|p| p.contains("pycache") || p.ends_with(".pyc")), "{paths:?}");
-        assert!(paths.contains(&"prompts/target/tone.txt".to_string()), "{paths:?}");
-        assert!(paths.contains(&"nodes/pkg/Cargo.toml".to_string()), "{paths:?}");
-        assert!(!paths.iter().any(|p| p.starts_with("nodes/pkg/target/")), "{paths:?}");
-        assert!(!paths.iter().any(|p| p.contains("node_modules")), "{paths:?}");
-    }
-
-    /// The walk prunes exactly what `covers` excludes. Two spellings of
-    /// one rule is how a folder ends up silently in or out of a version,
-    /// and only the walk's opinion reaches the disk.
-    #[test]
-    fn the_walk_prunes_what_the_rule_excludes_and_nothing_else() {
-        // Every hidden top-level folder is tooling, not a version's files.
-        for rel in [".weft", ".git", ".github", ".vscode", ".weft-notes", "layouts", "target", "nodes/a/node_modules", "nodes/a/__pycache__"] {
-            assert!(prunes_whole_tree(rel), "{rel} holds nothing a version covers");
-        }
-        for rel in ["nodes", "nodes/base_catalog", "prompts", "scripts", "sql", "assets", "examples"] {
-            assert!(!prunes_whole_tree(rel), "{rel} can hold covered files");
-        }
-    }
-
-    /// A symlink is refused by name rather than followed: one pointing at
-    /// a folder above it is an endless walk, and one pointing out of the
-    /// project pulls files in under a path inside it, which a branch back
-    /// would write through.
-    #[test]
-    fn a_symlink_in_the_tree_is_refused_by_name() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
-        std::fs::write(root.join("weft.toml"), "x").expect("write");
-        std::fs::create_dir_all(root.join("prompts")).expect("mkdir");
-        std::fs::write(root.join("prompts/real.txt"), "x").expect("write");
-        #[cfg(unix)]
-        {
-            // A link a version would never take is nobody's business here,
-            // and most links in a project are exactly that: refusing them
-            // would refuse an ordinary project.
-            std::fs::create_dir_all(root.join(".weft")).expect("mkdir");
-            std::os::unix::fs::symlink(root, root.join(".weft/loop")).expect("symlink");
-            std::os::unix::fs::symlink(root.join("weft.toml"), root.join("README.md")).expect("symlink");
-            std::fs::create_dir_all(root.join("layouts")).expect("mkdir");
-            std::os::unix::fs::symlink(root.join("weft.toml"), root.join("layouts/notes.txt"))
-                .expect("symlink");
-            covered_paths(root).expect("a link a version would not take is passed over");
-
-            std::os::unix::fs::symlink(root, root.join("prompts/loop")).expect("symlink");
-            let err = covered_paths(root).expect_err("a symlink is refused");
-            assert!(err.to_string().contains("prompts/loop"), "{err}");
-            assert!(err.to_string().contains("symlink"), "{err}");
-        }
-    }
-
-    #[test]
-    fn starting_values_and_fire_flags_parse_and_refuse_plainly() {
-        let p = parse_port_flags(&[r#"classify={"text":"hi"}"#.into(), r#"g.inner={"count":3}"#.into(), "bare".into()], "--from", true).unwrap();
-        assert_eq!(p["classify"]["text"], json!("hi"));
-        assert_eq!(p["g.inner"]["count"], json!(3));
-        assert!(p["bare"].is_empty());
-        assert!(parse_port_flags(&["classify=hi".into()], "--from", true).unwrap_err().to_string().contains("must be JSON"));
-        assert!(parse_port_flags(&["classify=1".into()], "--from", true).unwrap_err().to_string().contains("expected an object"));
-        assert!(parse_port_flags(&[r#"a={"x":1}"#.into(), r#"a={"x":2}"#.into()], "--from", true).unwrap_err().to_string().contains("duplicate port"));
-        assert!(parse_port_flags(&["bare".into()], "--emit", false).is_err());
-        let k = parse_node_flag(r#"inbound={"a":1}"#, "--fire").unwrap();
-        assert_eq!(k, ("inbound".into(), json!({"a": 1})));
-        assert!(parse_node_flag("inbound", "--fire").is_err());
-    }
-
-    #[test]
-    fn flags_become_a_spec_and_no_flags_become_a_whole_run() {
-        let flags = RunFlags { from: vec![r#"a={"in":1}"#.into()], ..RunFlags::default() };
-        let spec = spec_from_flags("one-off", &flags).unwrap();
-        assert_eq!(spec.from.keys().collect::<Vec<_>>(), vec!["a"]);
-        assert_eq!(spec.from["a"]["in"], json!(1));
-        let spec = spec_from_flags("plain", &RunFlags::default()).unwrap();
-        assert_eq!(spec, RunSpec::whole("plain"));
-        let group = spec_from_flags("batch", &RunFlags { group: Some(r#"batch={"items":[1,2]}"#.into()), ..Default::default() }).unwrap();
-        assert_eq!(group.group, Some(("batch".into(), [("items".into(), json!([1,2]))].into())));
-        let bare = spec_from_flags("batch", &RunFlags { group: Some("batch".into()), ..Default::default() }).unwrap();
-        assert_eq!(bare.group, Some(("batch".into(), BTreeMap::new())));
-    }
-
-    #[test]
-    fn loaded_start_replacement_preserves_other_bounds_and_does_not_move_old_values() {
-        let saved: RunSpec = serde_json::from_value(json!({
-            "name":"case", "from":{"old":{"text":"saved"}}, "target":["end"],
-            "before":["publish"], "caller":["history"]
-        })).unwrap();
-        let edited = apply_run_flags(&saved, &RunFlags { from:vec!["renamed".into()], ..Default::default() }).unwrap();
-        assert_eq!(edited.from, PortValues::from([("renamed".into(), BTreeMap::new())]));
-        assert_eq!(edited.target, saved.target);
-        assert_eq!(edited.before, saved.before);
-        assert_eq!(edited.caller, saved.caller);
-        assert_eq!(saved.from["old"]["text"], json!("saved"));
-    }
-
-    #[test]
-    fn explicit_clearing_happens_before_replacement_and_rejects_unknown_settings() {
-        let saved: RunSpec = serde_json::from_value(json!({
-            "name":"case", "from":{"old":{}}, "target":["deleted"], "group":["old_group",{}],
-            "emit":{"stub":{"out":1}}, "fire":["trigger",null]
-        })).unwrap();
-        let edited = apply_run_flags(&saved, &RunFlags {
-            clear: vec!["from", "target", "group", "emit", "fire"].into_iter().map(String::from).collect(),
-            from: vec![r#"new={"text":"now"}"#.into()], ..Default::default()
-        }).unwrap();
-        assert_eq!(edited.from["new"]["text"], json!("now"));
-        assert!(edited.target.is_empty() && edited.emit.is_empty());
-        assert!(edited.group.is_none() && edited.fire.is_none());
-        for field in ["input", "scope", "expected", "misspelled"] {
-            assert!(apply_run_flags(&saved, &RunFlags { clear:vec![field.into()], ..Default::default() }).is_err());
-        }
-    }
-
-    #[test]
-    fn feed_is_saved_with_the_spec_and_cleared_on_request() {
-        let spec = spec_from_flags("case", &RunFlags {
-            from: vec!["hear.note".into()], feed: vec!["hear.note".into()], ..Default::default()
-        }).unwrap();
-        assert_eq!(spec.feed, vec!["hear.note".to_string()]);
-        let saved: RunSpec = serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
-        assert_eq!(saved.feed, spec.feed, "a saved example keeps it");
-        let cleared = apply_run_flags(&saved, &RunFlags { clear: vec!["feed".into()], ..Default::default() }).unwrap();
-        assert!(cleared.feed.is_empty());
-    }
-
-    #[test]
-    fn durable_is_saved_with_the_spec_and_cleared_on_request() {
-        let spec = spec_from_flags("case", &RunFlags { durable: true, ..Default::default() }).unwrap();
-        assert_eq!(spec.settings.keeping, Some(weft_core::run_settings::Keeping::Durable));
-        let saved: RunSpec = serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
-        assert_eq!(saved.settings, spec.settings, "a saved example keeps it");
-        let cleared = apply_run_flags(&saved, &RunFlags { clear: vec!["keeping".into()], ..Default::default() }).unwrap();
-        assert!(cleared.settings.is_empty(), "cleared, the run follows its trigger again");
-        assert!(spec_from_flags("case", &RunFlags { durable: true, fast: true, ..Default::default() }).is_err());
-    }
-
-    #[test]
-    fn keep_for_is_saved_with_the_spec_and_cleared_on_request() {
-        let forever = Some(weft_core::run_settings::KeepFor::Forever);
-        let spec = spec_from_flags("case", &RunFlags { keep_for: forever, ..Default::default() }).unwrap();
-        assert_eq!(spec.settings.keep_for, forever);
-        let saved: RunSpec = serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
-        assert_eq!(saved.settings, spec.settings, "a saved example keeps it");
-        let cleared = apply_run_flags(&saved, &RunFlags { clear: vec!["keep_for".into()], ..Default::default() }).unwrap();
-        assert!(cleared.settings.is_empty(), "cleared, the run is kept as its trigger or project says");
-    }
-
-    #[test]
-    fn hold_secs_is_saved_with_the_spec_checked_and_cleared_on_request() {
-        let spec = spec_from_flags("case", &RunFlags { hold_secs: Some(0), ..Default::default() }).unwrap();
-        assert_eq!(spec.settings.hold_secs, Some(0));
-        let saved: RunSpec = serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
-        assert_eq!(saved.settings, spec.settings, "a saved example keeps it");
-        let cleared = apply_run_flags(&saved, &RunFlags { clear: vec!["hold_secs".into()], ..Default::default() }).unwrap();
-        assert!(cleared.settings.is_empty(), "cleared, the run holds as its trigger says");
-        let too_long = weft_core::run_settings::MAX_HOLD_SECS + 1;
-        assert!(spec_from_flags("case", &RunFlags { hold_secs: Some(too_long), ..Default::default() }).is_err());
-    }
-
-    #[test]
-    fn emitted_port_edits_merge_with_saved_values_but_duplicate_new_ports_are_errors() {
-        let saved: RunSpec = serde_json::from_value(json!({"name":"case","emit":{"a":{"x":1,"y":2},"b":{"z":3}}})).unwrap();
-        let edited = apply_run_flags(&saved, &RunFlags { emit:vec![r#"a={"x":9}"#.into()], ..Default::default() }).unwrap();
-        assert_eq!(serde_json::to_value(&edited.emit).unwrap(), json!({"a":{"x":9,"y":2},"b":{"z":3}}));
-        assert!(apply_run_flags(&saved, &RunFlags {
-            emit:vec![r#"a={"x":9}"#.into(), r#"a={"x":10}"#.into()], ..Default::default()
-        }).is_err());
     }
 
     #[test]

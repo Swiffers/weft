@@ -279,17 +279,60 @@ pub async fn read_file(state: &DispatcherState, key: &str) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
+/// One stored file streamed into a new file at `dest`, chunk by chunk, on
+/// a link the broker signed for this process: what a version build lays
+/// its files out with, so no file is ever whole in memory. A body longer
+/// or shorter than the store records fails.
+pub async fn download_file(state: &DispatcherState, key: &str, dest: &std::path::Path) -> Result<()> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    let link = download_link(state, key, None, LinkReader::Runtime).await?;
+    let resp = state.http.get(&link.url).send().await.with_context(|| format!("read stored file {key}"))?;
+    anyhow::ensure!(resp.status().is_success(), "the store answered {} reading stored file {key}", resp.status());
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .await
+        .with_context(|| format!("create {}", dest.display()))?;
+    let mut body = resp.bytes_stream();
+    let mut total = 0u64;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.with_context(|| format!("read stored file {key}"))?;
+        total += chunk.len() as u64;
+        anyhow::ensure!(
+            total <= link.size_bytes,
+            "stored file {key} came back longer than the {} bytes the store records",
+            link.size_bytes
+        );
+        file.write_all(&chunk).await.with_context(|| format!("write {}", dest.display()))?;
+    }
+    file.flush().await.with_context(|| format!("write {}", dest.display()))?;
+    anyhow::ensure!(
+        total == link.size_bytes,
+        "stored file {key} came back {total} bytes long, and the store records {}",
+        link.size_bytes
+    );
+    Ok(())
+}
+
 /// A version build's view of the storage plane (`crate::build::ProjectStorage`).
-pub struct BrokerStorage<'a>(pub &'a DispatcherState);
+/// It owns its handle on the state, so a build can share it with the
+/// blocking compile (`crate::build::source::VersionFiles`).
+pub struct BrokerStorage(pub DispatcherState);
 
 #[async_trait::async_trait]
-impl crate::build::ProjectStorage for BrokerStorage<'_> {
+impl crate::build::ProjectStorage for BrokerStorage {
     async fn read(&self, key: &str) -> Result<Vec<u8>> {
-        read_file(self.0, key).await
+        read_file(&self.0, key).await
+    }
+
+    async fn download(&self, key: &str, dest: &std::path::Path) -> Result<()> {
+        download_file(&self.0, key, dest).await
     }
 
     async fn meta(&self, key: &str) -> Result<StoredFileMeta> {
-        file_meta(self.0, key).await
+        file_meta(&self.0, key).await
     }
 }
 
@@ -430,6 +473,69 @@ pub async fn upload_abort(
         &Tenanted { tenant: tenant.to_string(), inner: req },
     )
     .await
+}
+
+/// One tenant's asset uploads as the install itself drives them, over
+/// the verbs above: what dispatcher code publishes files through
+/// ([`asset_store`]).
+pub struct InstallUploads<'a> {
+    state: &'a DispatcherState,
+    tenant: String,
+}
+
+/// The tenant's content-addressed assets for dispatcher code to publish
+/// into: `weft_assets::publish_hashed(&files, &source, &asset_store(..))`.
+pub fn asset_store<'a>(state: &'a DispatcherState, tenant: &str) -> weft_assets::upload::ContentStore<InstallUploads<'a>> {
+    weft_assets::upload::ContentStore::new(InstallUploads { state, tenant: tenant.to_string() })
+}
+
+#[async_trait::async_trait]
+impl weft_assets::upload::UploadPlane for InstallUploads<'_> {
+    async fn held(&self, hashes: &[String]) -> Result<AssetsHeldResponse> {
+        assets_held(self.state, &self.tenant, AssetsHeldRequest { hashes: hashes.to_vec() }).await
+    }
+
+    async fn begin(&self, request: AssetUploadBeginRequest) -> Result<UploadBeginResponse> {
+        upload_begin(self.state, &self.tenant, request).await
+    }
+
+    async fn resume(&self, key: &str) -> Result<UploadResumeResponse> {
+        upload_resume(self.state, &self.tenant, UploadResumeRequest { key: key.to_string(), sender: weft_core::storage::PartSender::Runtime }).await
+    }
+
+    async fn parts(&self, key: &str, parts: Vec<weft_core::storage::PartAsk>) -> Result<Vec<weft_core::storage::PresignedPart>> {
+        Ok(upload_parts(self.state, &self.tenant, UploadPartsRequest { key: key.to_string(), parts, sender: weft_core::storage::PartSender::Runtime })
+            .await?.parts)
+    }
+
+    async fn part_done(&self, request: PartDoneRequest) -> Result<()> {
+        upload_part_done(self.state, &self.tenant, request).await
+    }
+
+    async fn complete(&self, key: &str) -> Result<()> {
+        upload_complete(self.state, &self.tenant, UploadCompleteRequest { key: key.to_string() }).await?;
+        Ok(())
+    }
+
+    async fn abort(&self, key: &str) -> Result<()> {
+        upload_abort(self.state, &self.tenant, UploadAbortRequest { key: key.to_string() }).await
+    }
+
+    async fn meta_if_found(&self, key: &str) -> Result<Option<StoredFileMeta>> {
+        match file_meta(self.state, key).await {
+            Ok(meta) => Ok(Some(meta)),
+            Err(e) if e.downcast_ref::<StorageNotFound>().is_some() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn completing(&self, error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.downcast_ref::<BrokerRejected>().is_some_and(|rejected| rejected.completing))
+    }
+
+    fn interrupted(&self, error: &anyhow::Error) -> bool {
+        storage_unreachable(error)
+    }
 }
 
 // ---------- durable terminate-sweep queue ----------

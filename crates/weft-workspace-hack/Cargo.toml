@@ -142,6 +142,7 @@ zeroize = { version = "1", features = ["derive"] }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
+mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["fs", "termios"] }
 spin = { version = "0.10" }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
@@ -152,6 +153,7 @@ tower-http = { version = "0.6", features = ["cors", "follow-redirect", "trace"] 
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
+mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["fs", "termios"] }
 spin = { version = "0.10" }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
@@ -162,6 +164,7 @@ tower-http = { version = "0.6", features = ["cors", "follow-redirect", "trace"] 
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
+mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["fs", "termios"] }
 spin = { version = "0.10" }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
@@ -172,6 +175,7 @@ tower-http = { version = "0.6", features = ["cors", "follow-redirect", "trace"] 
 bitflags = { version = "2", default-features = false, features = ["std"] }
 getrandom = { version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12", "webpki-tokio"] }
+mio = { version = "1", features = ["net", "os-ext"] }
 rustix = { version = "1", features = ["fs", "termios"] }
 spin = { version = "0.10" }
 tokio-util = { version = "0.7", features = ["codec", "io"] }

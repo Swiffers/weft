@@ -76,6 +76,7 @@ fn version_asked(project: uuid::Uuid, binary: &str, images: &[PlannedImage], ask
         manifest: Default::default(),
         inputs: Some(weft_core::builds::BuildInputs { node_set: weft_core::builds::NodeSet::Full, assets: Default::default() }),
         program: BuiltProgram {
+            version: format!("version-{binary}"),
             definition: serde_json::from_value(serde_json::json!({ "id": project, "nodes": [], "edges": [] })).unwrap(),
             binary_hash: binary.into(),
             definition_hash: format!("def-{binary}"),

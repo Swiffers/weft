@@ -18,6 +18,7 @@ pub mod graph;
 pub mod scopes;
 pub mod places;
 pub mod cut;
+pub mod coverage;
 
 /// The steps a stored [`ProjectDefinition`] takes from the shape an older
 /// weft wrote; `crate::stored` says how they run. A stored program keeps

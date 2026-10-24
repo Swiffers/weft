@@ -35,7 +35,7 @@ async fn by_node_and_field(rig: FakeRig) -> WeftResult<()> {
         })
     );
     match &rig.program_calls()[0].0 {
-        ProgramCall::ValuesGet { instance } => assert_eq!(instance.as_str(), "ada"),
+        ProgramCall::Instances(weft::program::instances::InstanceCall::ValuesGet { instance }) => assert_eq!(instance.as_str(), "ada"),
         other => panic!("unexpected call {other:?}"),
     }
     Ok(())

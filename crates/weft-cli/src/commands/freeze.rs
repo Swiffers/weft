@@ -1,5 +1,5 @@
 //! `weft freeze <name> [<run_id>]`: write `examples/<name>.json` from a
-//! run (default: head's run): its spec (or the whole-graph spec it
+//! run (default: this folder's head's run): its spec (or the whole-graph spec it
 //! ran), its outside facts (the answers people gave, the caller
 //! messages), `frozen_from`, and `expected` from every wire. Replacing an
 //! example takes its parameters and accepted outputs from the named run.
@@ -17,14 +17,14 @@ pub async fn run(ctx: Ctx, name: String, run_id: Option<String>, expect: Vec<Str
     // `write_spec` enforces, said before any work is done.
     super::versions::validate_example_name(&name)?;
     let project = ctx.project()?;
-    let client = ctx.client()?;
-    let project_id = project.id().to_string();
-    let tree = fetch_tree(&client, &project_id).await?;
+    let here = super::copy::this_copy(&ctx, None).await?;
+    let (client, project_id) = (&here.client, here.project_id.as_str());
+    let tree = fetch_tree(client, project_id).await?;
     let run = match run_id {
         Some(c) => resolve_run(&tree, &c)?.clone(),
         None => {
-            let head = tree.head.head_run.ok_or_else(|| {
-                anyhow::anyhow!("head has no run to freeze; name a run (`{}` lists them) or run first", ctx.weft("tree"))
+            let head = here.copy.head.head_run.ok_or_else(|| {
+                anyhow::anyhow!("this folder's head has no run to freeze; name a run (`{}` lists them) or run first", ctx.weft("tree"))
             })?;
             resolve_run(&tree, &head.to_string())?.clone()
         }
@@ -38,11 +38,11 @@ pub async fn run(ctx: Ctx, name: String, run_id: Option<String>, expect: Vec<Str
             ctx.weft("stop")
         );
     }
-    let rows = super::versions::replay_rows(&client, &run.run_id.to_string()).await?;
+    let rows = super::versions::replay_rows(client, &run.run_id.to_string()).await?;
     // Each `--expect` is read against the program the run ran, which this
     // folder may have moved on from, and comes back in `focus` spelled the
     // way that program writes it.
-    let expected = super::versions::output_wires(&client, &run.run_id.to_string(), &expect).await?;
+    let expected = super::versions::output_wires(client, &run.run_id.to_string(), &expect).await?;
     let facts = outside_facts(&rows)?;
 
     // A file that exists but does not parse is an
@@ -64,7 +64,7 @@ pub async fn run(ctx: Ctx, name: String, run_id: Option<String>, expect: Vec<Str
         definition_hash: run.definition_hash.clone(),
     });
     spec.expected = Some(expected);
-    let (path, _) = write_spec(project, &spec)?;
+    let path = write_spec(project, &spec)?;
     // The run remembers what it was frozen as.
     client
         .put_with_body(

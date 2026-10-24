@@ -258,6 +258,11 @@ pub enum DispatcherEvent {
     TriggerUrlChanged { project_id: uuid::Uuid, node_id: String, url: String },
     ProjectRegistered { project_id: uuid::Uuid, name: String },
     ProjectActivated { project_id: uuid::Uuid },
+    /// A working copy of the project changed: its files (a save synced, a
+    /// program writing), or its head (a stamp, a run, a switch). The editor
+    /// reads the tree again on it.
+    // SYNC: WorkingCopyChanged <-> extension-vscode/src/runFollower.ts DispatcherEvent (working_copy_changed)
+    WorkingCopyChanged { project_id: uuid::Uuid, working_copy: uuid::Uuid },
     ProjectDeactivated { project_id: uuid::Uuid },
     /// A project lifecycle axis flipped: entering/leaving a
     /// transitional state (activating, deactivating, building,
@@ -437,6 +442,7 @@ impl DispatcherEvent {
             | Self::TriggerUrlChanged { project_id, .. }
             | Self::ProjectRegistered { project_id, .. }
             | Self::ProjectActivated { project_id }
+            | Self::WorkingCopyChanged { project_id, .. }
             | Self::ProjectDeactivated { project_id }
             | Self::ProjectTransitionChanged { project_id, .. }
             | Self::InfraStatusChanged { project_id, .. }
@@ -495,6 +501,7 @@ impl DispatcherEvent {
             | Self::TriggerUrlChanged { .. }
             | Self::ProjectRegistered { .. }
             | Self::ProjectActivated { .. }
+            | Self::WorkingCopyChanged { .. }
             | Self::ProjectDeactivated { .. }
             | Self::ProjectTransitionChanged { .. }
             | Self::InfraStatusChanged { .. }
@@ -560,6 +567,7 @@ impl DispatcherEvent {
             Self::TriggerUrlChanged { .. }
             | Self::ProjectRegistered { .. }
             | Self::ProjectActivated { .. }
+            | Self::WorkingCopyChanged { .. }
             | Self::ProjectDeactivated { .. }
             | Self::ProjectTransitionChanged { .. }
             | Self::InfraStatusChanged { .. }

@@ -215,19 +215,18 @@ async fn while_in_maintenance_activate_is_refused(pool: PgPool) {
 /// A project registered with none (a build an older weft registered) has
 /// nothing to build from, which the lift says.
 #[sqlx::test]
-async fn the_lift_rebuilds_from_the_request_the_running_build_came_from(pool: PgPool) {
+async fn the_lift_rebuilds_from_the_version_the_running_build_came_from(pool: PgPool) {
     use std::sync::Arc;
     use weft_compiler::build_plan::{ImageKind, PlannedImage};
-    use weft_core::builds::{BuildInputs, BuiltProgram, NodeSet, VersionBuildRequest};
+    use weft_core::builds::{BuildInputs, BuiltProgram, NodeSet, VersionSource};
     use weft_dispatcher::build::{follow, prune::ImageHold, waiting, Version, VersionBuild, VersionBuilder};
     use weft_platform_traits::{BuildStatus, FakeImageBuilder, Staging};
 
     let (_, id) = setup(&pool).await;
     let projects: weft_dispatcher::ProjectStore = Arc::new(weft_dispatcher::PostgresProjectStore::new(pool.clone()));
-    assert!(projects.running_build_request(id).await.unwrap().is_none(), "registered with no build: nothing to build again");
+    assert!(projects.running_build(id).await.unwrap().is_none(), "registered with no build: nothing to build again");
 
-    let request = VersionBuildRequest {
-        name: "shop".into(),
+    let request = VersionSource {
         manifest: [("main.weft".to_string(), "sha256:aa".to_string())].into(),
         inputs: BuildInputs { node_set: NodeSet::Referenced, assets: [("text:readme".to_string(), json!("hello"))].into() },
     };
@@ -242,10 +241,11 @@ async fn the_lift_rebuilds_from_the_request_the_running_build_came_from(pool: Pg
         result_file: None,
     }];
     let version = Version {
-        name: request.name.clone(),
+        name: "shop".into(),
         manifest: request.manifest.clone(),
         inputs: Some(request.inputs.clone()),
         program: BuiltProgram {
+            version: weft_core::project::hash::manifest_version_id(&request.manifest),
             definition: serde_json::from_value(json!({ "id": id, "nodes": [], "edges": [] })).unwrap(),
             binary_hash: "rebuilt".into(),
             definition_hash: "def-rebuilt".into(),
@@ -283,8 +283,8 @@ async fn the_lift_rebuilds_from_the_request_the_running_build_came_from(pool: Pg
     let advanced = waiting::advance(&pool, projects.as_ref()).await.unwrap();
     assert_eq!(advanced.registered.iter().map(|s| s.id).collect::<Vec<_>>(), [id], "{:?}", advanced.failed);
 
-    let stored = projects.running_build_request(id).await.unwrap().expect("the registered build keeps its request");
-    assert_eq!((stored.name, stored.manifest, stored.inputs), (request.name, request.manifest, request.inputs));
+    let stored = projects.running_build(id).await.unwrap().expect("the registered build keeps its version");
+    assert_eq!(stored, request);
 }
 
 /// A gate that lets every build through.

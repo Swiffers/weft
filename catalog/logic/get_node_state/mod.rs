@@ -30,7 +30,7 @@ impl Node for GetNodeStateNode {
             WeftError::Input(format!("runId takes a run id (the one GetRunId gives), so it cannot be '{given}'"))
         })?;
         let node: String = ctx.inputs.get("node")?;
-        let state = ctx.node_state(run, node).await?;
+        let state = ctx.run_by_id(run).node_state(node).await?;
         ctx.pulse_downstream(NodeOutput::new().set_serialized("state", &state)?).await
     }
 }

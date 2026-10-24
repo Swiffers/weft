@@ -36,8 +36,8 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // as build / run / resync hash it before registering: hashing the
     // unresolved source would differ from every running hash of a
     // project with an asset in it, and the drift banner would never
-    // clear. Asset resolution also publishes the current references,
-    // including an empty set when the last asset was removed.
+    // clear. Resolving writes nothing: a file not stored yet stands for
+    // the value its upload would give it.
     // Whether the program runs infra of its own, for the first deploy's
     // order (its infra first, then its triggers).
     let mut declares_infra = false;
@@ -45,13 +45,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         match weft_compiler::hash::load_program(project) {
             Ok((mut def, catalog)) => {
                 declares_infra = weft_core::project::has_infra(&def);
-                let resolved = crate::commands::assets::resolve_project_assets(
-                    &ctx.client()?,
-                    &project.root,
-                    &mut def,
-                    true,
-                )
-                .await;
+                let resolved = crate::commands::assets::resolve_project_assets(&ctx.client()?, &project.root, &mut def).await;
                 // Both node sets: a worker built with the full catalog is as
                 // current as one built from the referenced set, and the
                 // dispatcher accepts either as "not drifted".

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use weft_core::infra::Install;
 
 use crate::roles::{CoreRole, Placement, RoleAddresses, RolePlacement, Vantage, INTERNAL_DOOR};
-use crate::runner::{WorkerOverrides, WorkerSettings};
+use weft_core::workers::{WorkerOverrides, WorkerSettings};
 
 // SYNC: InstallConfig <-> deploy/terraform/gcp/serverless.tf (local.install_config)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

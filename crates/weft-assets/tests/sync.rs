@@ -34,9 +34,6 @@ impl AssetSource for ChangingSource {
     fn open(&self, path: &str) -> anyhow::Result<Box<dyn Read + Send>> {
         Ok(Box::new(self.next(path)?))
     }
-    fn snapshot(&self, path: &str) -> anyhow::Result<Box<dyn weft_assets::AssetReader>> {
-        Ok(Box::new(self.next(path)?))
-    }
 }
 
 impl FakeSource {
@@ -50,9 +47,6 @@ impl FakeSource {
 
 impl AssetSource for FakeSource {
     fn open(&self, path: &str) -> anyhow::Result<Box<dyn Read + Send>> {
-        Ok(Box::new(self.bytes(path)?))
-    }
-    fn snapshot(&self, path: &str) -> anyhow::Result<Box<dyn weft_assets::AssetReader>> {
         Ok(Box::new(self.bytes(path)?))
     }
 }
@@ -112,11 +106,11 @@ impl AssetStore for FakeStore {
         if self.fail_upload_of.as_deref() == Some(hash) {
             anyhow::bail!("store rejected upload of {hash}");
         }
-        // The fake verifies what the broker enforces: the streamed bytes
-        // really are `size_bytes` long. Hash verification belongs to the
-        // publisher and happens before this call.
-        let (_, streamed_size) = hash_reader(bytes)?;
+        // The fake holds the bytes to what the store promises: they are
+        // `size_bytes` long and hash to the content they are stored as.
+        let (streamed_hash, streamed_size) = hash_reader(bytes)?;
         assert_eq!(streamed_size, size_bytes, "uploaded bytes match the declared size");
+        anyhow::ensure!(streamed_hash == hash, "the bytes uploaded are {streamed_hash}, not {hash}");
         self.mimes.lock().unwrap().push((hash.to_string(), mime.to_string()));
         let key = key_for(hash);
         self.existing.lock().unwrap().insert(hash.to_string(), key.clone());
@@ -420,15 +414,19 @@ async fn one_path_under_two_types_is_checked_under_each() {
     assert!(map[&audio_key("clip.wav")].get("__weft_audio__").is_some());
 }
 
+/// The upload streams the file again rather than a copy taken when it was
+/// hashed, so bytes edited in between reach the store, which refuses them
+/// (`weft_assets::upload` tests what the real store does), and the error
+/// names the file.
 #[tokio::test]
-async fn a_file_edited_between_the_two_reads_is_refused_before_upload() {
+async fn a_file_edited_between_the_two_reads_is_refused_by_the_store() {
     let source = ChangingSource {
         path: "a.png".into(),
         versions: Mutex::new(vec![png(b"one"), png(b"two")]),
     };
     let store = FakeStore::default();
     let err = sync_assets(&[image_ref("a.png")], &source, &store).await.unwrap_err();
-    assert!(err.to_string().contains("a.png changed while it was being published"), "{err:#}");
+    assert!(format!("{err:#}").contains("upload a.png"), "{err:#}");
     assert!(store.uploads.lock().unwrap().is_empty(), "changed bytes never reach storage");
     assert!(store.existing.lock().unwrap().is_empty(), "nothing is left under the first hash");
 }
@@ -453,8 +451,8 @@ async fn the_stored_media_type_comes_from_the_bytes_before_the_filename() {
 }
 
 /// A concurrent build finished uploading this exact content between our
-/// list and our begin. The store reads nothing and answers its key;
-/// the already verified snapshot needs no transfer.
+/// list and our begin. The store reads nothing and answers its key, so
+/// nothing is transferred.
 #[tokio::test]
 async fn content_the_store_already_holds_is_kept_not_deleted() {
     let bytes = png(b"shared");
@@ -504,14 +502,14 @@ async fn publish_files_names_every_unreadable_file_in_one_error() {
 }
 
 #[tokio::test]
-async fn publish_files_refuses_changed_bytes_before_upload() {
+async fn publish_files_refuses_changed_bytes() {
     let source = ChangingSource {
         path: "main.weft".into(),
         versions: Mutex::new(vec![b"one".to_vec(), b"two".to_vec()]),
     };
     let store = FakeStore::default();
     let err = publish_files(&["main.weft".into()], &source, &store).await.unwrap_err();
-    assert!(err.to_string().contains("main.weft changed while it was being published"), "{err:#}");
+    assert!(format!("{err:#}").contains("upload main.weft"), "{err:#}");
     assert!(store.uploads.lock().unwrap().is_empty());
     assert!(store.existing.lock().unwrap().is_empty());
 }

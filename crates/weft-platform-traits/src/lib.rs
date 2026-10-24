@@ -60,7 +60,9 @@ pub use object_store::{
     S3ObjectStore, SharedObjectStore, Unfollowed,
 };
 pub use roles::{CoreRole, Placement, RoleAddresses, RolePlacement, Vantage};
-pub use runner::{worker_auth_key, worker_auth_value, Patience, PortTaken, Runner, WorkerCall, WorkerEndpoint, WorkerOverrides, WorkerSettings, WorkerStarting, WorkerTarget, WorkerWontStart, WorkersResponse, MAX_QUEUE_WAIT_ENV, MAX_RUNS_AT_ONCE_ENV, SHARED_IDLE_ENV, WORKER_ANSWER_HEADER, WORKER_AUTH_HEADER};
+pub use runner::{worker_auth_key, worker_auth_value, Patience, PortTaken, Runner, WorkerCall, WorkerEndpoint, WorkerStarting, WorkerTarget, WorkerWontStart, WORKER_ANSWER_HEADER, WORKER_AUTH_HEADER};
+// A worker target carries its levers, so they are this crate's words too.
+pub use weft_core::workers::{WorkerOverrides, WorkerSettings, WorkersResponse, MAX_QUEUE_WAIT_ENV, MAX_RUNS_AT_ONCE_ENV, SHARED_IDLE_ENV};
 
 /// The `tracing` target of the line weft logs, once, when its own work is
 /// stuck (`weft_task_store::unanswered`): the platform turns it into an

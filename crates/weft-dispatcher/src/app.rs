@@ -134,6 +134,7 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     crate::infra_event_bridge::INFRA_EVENT_CHANNEL,
     weft_task_store::runs::EVENTS_CHANNEL,
     weft_task_store::parked_fires::PARKED_FIRE_CHANNEL,
+    crate::working_copies::WORKING_COPY_CHANNEL,
     crate::reaper::STORAGE_SWEEP_CHANNEL,
     crate::display_feeds::LOOK_NOW_CHANNEL,
     crate::holders::HELD_SIGNALS_CHANNEL,
@@ -203,6 +204,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
     let activations: crate::activation_store::ActivationStore =
         Arc::new(crate::activation_store::PostgresActivationStore::new(pool.clone()));
     let versions: crate::versions::VersionStore = Arc::new(crate::versions::PostgresVersionStore::new(pool.clone()));
+    let working_copies: crate::working_copies::WorkingCopyStore = Arc::new(crate::working_copies::PostgresWorkingCopyStore::new(pool.clone()));
     let event_bus = crate::EventBus::with_notify(pool.clone(), &signals)?;
     let displays = crate::display_feeds::DisplayFeeds::with_look_now(&signals)?;
     let held = Arc::new(crate::held::Held::follow(&signals)?);
@@ -253,6 +255,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         projects,
         activations,
         versions,
+        working_copies,
         events: event_bus,
         listener: ListenerClient::new(RoleClient::new(CoreRole::Listener, addresses.listener.clone(), tokens.clone(), http.clone())),
         authenticator,

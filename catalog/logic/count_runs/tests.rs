@@ -31,7 +31,7 @@ async fn every_filter(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(outcome.outputs["count"], json!(4));
     let calls = rig.program_calls();
     assert_eq!(calls.len(), 1);
-    let (ProgramCall::RunsCount { filter }, StopSelf::Keep) = &calls[0] else {
+    let (ProgramCall::Runs(weft::program::runs::RunCall::Count { filter }), StopSelf::Keep) = &calls[0] else {
         panic!("unexpected call {:?}", calls[0]);
     };
     assert_eq!(filter.instance.as_ref().map(|i| i.as_str()), Some("ada"));
@@ -47,7 +47,7 @@ async fn empty_inputs(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig.run(&CountRunsNode, json!({ "instance": "", "tag": "  " })).await.ok()?;
     assert_eq!(outcome.outputs["count"], json!(0));
     match &rig.program_calls()[0].0 {
-        ProgramCall::RunsCount { filter } => assert_eq!(filter, &RunFilter::default()),
+        ProgramCall::Runs(weft::program::runs::RunCall::Count { filter }) => assert_eq!(filter, &RunFilter::default()),
         other => panic!("unexpected call {other:?}"),
     }
     Ok(())

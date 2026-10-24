@@ -21,6 +21,8 @@ use crate::pulse::Failure;
 use crate::weft_type::WeftType;
 use crate::RunId;
 
+pub mod judge;
+
 /// The chosen origin of each reused result, independent of which nodes
 /// execute in the child. Readers reconstruct each origin under its own
 /// birth context and import history without replaying its scheduling.

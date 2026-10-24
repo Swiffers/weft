@@ -307,12 +307,63 @@ Read a stream input like any other value: `ctx.inputs.get::<Generator<Row>>("row
 two runs racing to stop each other leave the later one alive. `StopSelf::Include`
 ends this run too.
 
-## Your project beyond this run
+## Your project, and the owner's other projects
 
-The runtime answers each of these calls on behalf of this run and writes the
-answer into the run's journal, so a replay reads the answer back instead of
-asking again. Most of them take an optional `.instance(id)`, which picks that
-instance's copy instead of the shared one; `values()`, `connections()` and
+A node can do from code what a person does with the CLI: build and run a
+project, write its files, turn its triggers on, start its infra, read its runs.
+The runtime carries each call out on behalf of this run, with the same
+parameters and the same refusals the CLI gets, and writes the answer into the
+run's journal, so a replay reads the answer back instead of asking again.
+
+The calls below act on this run's own project. If you want the same call on
+another project of the same owner, put `ctx.project(id)` in front of it, `id`
+being the project's id (the one in its `weft.toml`):
+`ctx.project(shop_id).infra("bridge").start().await`. A project of another
+owner is answered as if it did not exist. `ctx.projects().list()` lists the
+owner's projects. If you want a new, empty one, call
+`ctx.projects().declare("shop")` and take its id from the answer (weft makes
+the id inside the call, so a replay gets the same id back), then write its
+files: at least a `weft.toml` naming it and carrying that id, and
+`nodes/base_catalog/` too if it uses the standard library, since a build only
+sees the files the project holds. If you want to copy files the owner
+already holds, such as the standard library of this run's own project, read
+their hashes with `state()` and name each one with `edit().blob(path, hash)`:
+nothing is downloaded or stored again, so the copy is one read and one write
+however many files it holds.
+
+```rust
+let shop = ctx.projects().declare("shop").await?;
+let shop_id: uuid::Uuid = shop.id.parse().node_err("read the new project's id")?;
+let weft_toml = format!("[package]\nname = \"shop\"\nid = \"{shop_id}\"\n");
+let source = "# your program here\n";
+let own = ctx.code().state().await?;
+let mut edit = ctx.project(shop_id).code().edit()
+    .text("weft.toml", weft_toml)
+    .text("src/main.weft", source);
+for (path, hash) in own.working.iter().filter(|(path, _)| path.starts_with("nodes/base_catalog/")) {
+    edit = edit.blob(path.clone(), hash)?;
+}
+edit.apply().await?;
+```
+
+Three things a program cannot do to its own project, each refused with the
+reason:
+
+| Refused on its own project | Why |
+|---|---|
+| Starting a run (`ctx.code().run()...start()`) | Every run of it would start the next, with nothing to end the chain. It is refused before anything is recorded as a version or built. Start it from another project, or reach the part you want with a trigger |
+| `resync` | The resync waits for the runs on the old version to end, and this run is one of them, so it would wait on itself |
+| `remove` | The removal cancels every run of the project, this one among them, before it finishes |
+
+If you want to hand out a token, mint an instance token with
+`tokens().mint_for_instance`, which hands the value to the run alone. Only a
+person can mint a signal token or a frontend's new token, because its value
+would sit in the journal.
+
+### The project's infra, triggers, instances and settings
+
+Most of these take an optional `.instance(id)`, which picks that instance's
+copy instead of the shared one; `values()`, `connections()` and
 `tokens().instance(..)` always name an instance.
 
 | Call | What it does |
@@ -322,26 +373,105 @@ instance's copy instead of the shared one; `values()`, `connections()` and
 | `infra("bridge").stop(take_down, stop_self).await` | Stops the copy, keeping its disks (a unit whose `onStop` keeps it running stays up until terminate). It returns once the stop is under way, and `status()` reads `stopping` until the copy is down. Answers an `InfraDownAnswer`: `TakenDown`; `AlreadyDown` when the copy was already stopped or stopping; or `NoCopy` (a copy never started, a mistyped instance id, or a copy terminated earlier) |
 | `infra("bridge").terminate(take_down, stop_self).await` | Deletes the copy and its disks, except the ones the node lists in `keep_on_terminate`. Answers as `stop` does, except that `AlreadyDown` means it was already being terminated |
 | `infra("bridge").instance(id).wipe(take_down, stop_self).await` | Deletes the instance's copy and every one of its disks, the kept ones too, even if the copy was already terminated. Always answers `TakenDown` |
-| `infra("bridge").upgrade(take_down, stop_self).await` | Moves a running copy onto the last build weft made (a stop, then a start; nothing is built). A copy already on that build is left alone, and a copy that is not running is refused. It returns once the upgrade is under way, not once the copy runs again; if you need it running, follow with `start()`, which waits |
+| `infra("bridge").upgrade(take_down, stop_self).await` | Moves a running copy onto the last build weft made (a stop, then a start; nothing is built). A copy already on that build, stopped or missing is left as it is. It returns once the upgrade is under way; its `command_ids` hold one command per owner (none when nothing was upgraded), and `all_infra().follow_command(id)` waits for one to end |
 | `infra("bridge").status().await` | The copy's state, `None` when there is none. A start or stop on its way reads `provisioning` or `stopping` at once, the same answer `weft status` gives |
 | `infra("bridge").copies().await` | Every copy: the shared one and each instance's |
+| `infra("bridge").logs(tail)`, `.show()`, `.press(kind, payload)`, `.rebake()` | `weft infra logs`, `show`, `press` and `rebake` for that node |
+| `all_infra().cancel(instance)`, `.look()`, `.doors()`, `.logs(tail)`, `.command(id)` | What reaches every copy at once: `weft infra cancel`, `look`, `list-doors` and `logs`, and where an upgrade's command stands |
 | `trigger("receive").activate(held).await` | Turns one trigger on if it is off. While it was down it may have held work that arrived: `ReleaseHeld::Run` runs that work, at half the trigger's own limits so new arrivals still get through, and `ReleaseHeld::Drop` deletes it and cancels the runs paused on it |
 | `triggers().deactivate(take_down, stop_self).await` | Turns off every shared trigger of the program, or an instance's triggers with `.instance(id)` (chain it again for each further instance), or every instance's with `.all_instances()`, which you cannot combine with `.instance(..)`. If you want only some triggers, name them with `.only([..])`. It returns once they are down, without waiting for the runs they started, even with `Running::Wait` |
+| `triggers().bake()`, `.resync(take_down)`, `.cancel_activate()` | `weft bake`, `weft resync` and `weft cancel-activate`. A resync returns once it has ended, parking the run between looks |
+| `status()`, `cancel_build()`, `remove()` | `weft status`, `weft cancel-build` and `weft rm` |
 | `values().instance(id).get().await` | The instance's values for the program's `@instance_filled` fields, by node and field |
 | `values().instance(id).set(node, field, value).clear(node, field).apply().await` | Sets and clears values in one change, all or none, each checked against its field and its node's rules first. Any live trigger of the instance that reads one is set up again, and `apply` returns those triggers' names |
 | `values().instance(id).forget().await` | Forgets every value the instance was given |
 | `connections().instance(id).list() / forget()` | Lists an instance's connections, or forgets all of them (the values naming them go too) |
 | `instances().list().await` | Every instance weft holds anything for, one entry each: how many values, connections and live tokens, its infra copies, and its triggers, each with the events waiting on a field not yet filled and why |
 | `costs().instance(id).service(s).since(t).list().await` | The cost records, each saying whose credential paid, narrowed by instance, node, service, run, `paid_by` or `since` (unix seconds) |
-| `runs().instance(id).status(s).older_than(d).clean(running, stop_self).await` | Deletes runs; runs still going follow `running` |
+| `runs().instance(id).status(s)?.older_than(d).clean(running, stop_self).await` | Deletes the matching runs and answers how many it deleted, cancelled and left running. If a run is still going, `StillGoing::Leave` leaves it alone and `StillGoing::Cancel` cancels it (its rows go at the next clean). This run is never deleted. If you pass `StopSelf::Include` and this run matches the filters, it is stopped once the rest is cleaned, and the call does not return |
 | `runs()...list(limit).await` / `.count().await` | The newest `limit` matching runs (1 to 200) with how many match in all, or just the count; same filters as `clean` |
-| `node_state(run, node).await` | Where one node of a run stands: `pending`, `running`, `waiting` (with the last answer its wait got), `completed`, `failed` (with the error), `skipped` or `cancelled`. Name the node the way `weft run --from` takes it: `render`, `work.render` inside a group, `one.render` inside the file the site `one` includes. A node inside a loop is refused (name the loop). Pass `ctx.run_id` for this run's own nodes |
-| `tokens().mint_for_instance(id, expires_in).await` | An instance token, value shown once |
+| `tokens().mint_for_instance(id, expires_in).await` | An instance token, value shown once. A replay past this call mints it again under the same id, so the value handed out before the replay stops working |
 | `tokens().instance(id).revoke().await` | Revokes an instance's tokens |
+| `tokens().list()`, `.revoke(id)` | `weft token ls` and `weft token revoke` |
+| `frontends()`, `workers()`, `picks()` | `weft frontend`, `weft workers` and the picks `weft connect` makes |
 
 `take_down` is a `TakeDownChoice` and `stop_self` a `StopSelf`. For what each
 one can say, with an example, go and read [taking something down from a
 run](../running/instances.md#taking-something-down-from-a-run).
+
+If you want `status()`, `cancel_build()`, `get()`, `tree()`,
+`running_source()`, `prune()`, `working_copies()`, `forget_working_copy()` or `set_run_example()` on
+this run's own project, go through `ctx.own_project()` (for example
+`ctx.own_project().status()`), because `ctx` has no short form for them.
+
+### One run, by its id
+
+`ctx.run_by_id(run)` reaches any run of the owner's, this one included
+(`ctx.run_id`), and a run whose project was removed since.
+
+| Call | What it does |
+|---|---|
+| `stop()` | `weft stop`. Called on this run, it stops it: the call does not return |
+| `wake(node)` / `wake_in(node, &[3])` | `weft wake`: resolves a time wait now, and refuses one that expects a value |
+| `logs(lines)`, `events()...read()` | `weft logs` and `weft events` |
+| `outputs(&[..])`, `detail()` | Everything the run produced, as `weft freeze` reads it, and the run with the waits it is parked on |
+| `node_state(node)` | Where one node of the run stands: `pending`, `running`, `waiting` (with the last answer its wait got), `completed`, `failed` (with the error), `skipped` or `cancelled`. Name the node the way `weft run --from` takes it: `render`, `work.render` inside a group, `one.render` inside the file the site `one` includes. A node inside a loop is refused (name the loop) |
+| `delete()` | `weft clean <run>`. A run still going is refused, and so is this one |
+
+`ctx.resolve_run("3f2a")` finds the one run whose id starts that way, the way
+`weft logs 3f2a` does.
+
+### A project's code
+
+`ctx.project(id).code()` reads and writes a project's files and builds and runs
+them, the way you do from a folder. A program writes into a working copy (for
+what that is, go and read [your folder is a
+copy](../running/versions.md#your-folder-is-a-copy)). If you name none, it
+writes into the project's most recently changed folder: on an install on that
+person's machine the files land on their disk right away, and on a cloud
+install at their next command that syncs. When the project has no
+folder, it writes into the program copy. If you want a particular working
+copy, `ctx.project(id).working_copies()` lists them, each with its `id`, and
+`ctx.project(id).code().working_copy(copy)` acts on that one. If a prune is
+refused because of a copy's head, move it with
+`.code().working_copy(copy).switch_to(version)` to a version outside that
+history, or call `ctx.project(id).forget_working_copy(copy)`, which records
+the copy's files as a version (named in `saved`, `None` when it held no file)
+and removes the copy, as `weft forget-copy` does. A folder that still exists
+registers again at its next command that syncs it.
+
+```rust
+let shop = ctx.project(shop_id).code();
+shop.write_text("prompts/tone.txt", "Answer in two sentences.").await?;
+let started = shop.run().example("angry-customer").start().await?;
+ctx.log(LogLevel::Info, format!("run {} on version {}", started.run_id, started.version)).await?;
+```
+
+| Call | What it does |
+|---|---|
+| `state()` | The working copy, and every file it holds by path and hash |
+| `read_text(path)` / `file(path)` | One file's text, or the file as a stored file to read with `ctx.storage(..)`; `None` when there is none |
+| `write_text(path, text)` / `remove(path)` | Writes or removes one file. Text is capped at 4 MiB; a larger or binary file goes through `edit().stored(path, key)` |
+| `edit().text(..).stored(..).blob(..)?.remove(..).apply()` | Several files changed together, all or none. `.blob(path, hash)` puts a file the owner already holds (a hash from `state()` or a version's files) at `path` without downloading it; a hash that is no sha256 fails the `blob` call, and one the install does not hold refuses the write. `.expecting(Some(hash))` after a change (`None`: no file there) lands it only while the file still holds what you read, and answers `Applied::Stale` naming the paths otherwise, so two writers never overwrite each other unseen |
+| `checkpoint(Some(label))` | `weft checkpoint` |
+| `switch_to(version)` / `switch_to_run(run)` | `weft branch`, given a full version or run id. What the copy held is recorded as a version first, named in `saved` |
+| `build().start()` | `weft build`, returning once the build registered. Between looks at it the run parks on a timer |
+| `run()...start()` | `weft run`: `.example(name)` is the example `weft run <name>` takes, `.seed_run(run)` is `--seed=<run>`, and each other setter is the flag of the same name (`.from(..)`, `.target(..)`, `.seed()`, `.instance(..)?`, `.durable()`...). It builds the code, checking the run against the compiled program before any image is built, so a run that could not start is refused before you wait on images. It returns once the run has started |
+
+If you want a project's version tree, `ctx.project(id).tree()` answers what
+`weft tree --json` prints, without `workingCopy` (the CLI adds that to say
+which folder it ran in). If you want what the project
+runs, `.running_source()` answers the version of its build and that build's
+files by path and hash.
+
+`.prune(version, frozen, plan_only)` is `weft prune`. In `frozen`, pass the
+`frozenFrom.version` of every `examples/*.json` in the project (read each with
+`read_text`): the prune is refused if it would delete a version a frozen
+example came from, or an ancestor of one, and an origin you leave out has no
+such protection. Set `plan_only` to see what it would remove without removing
+anything. If you froze a run as an example yourself,
+`.set_run_example(run, Some(name))` records it the way `weft freeze` does, and
+`None` forgets it.
 
 ## What is not here
 

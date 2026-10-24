@@ -25,7 +25,9 @@ to the dispatcher at `http://127.0.0.1:14111` (setting `weft.dispatcherUrl`).
   - **Runs**: runs of the pinned project, newest first (paged, "Load
     more (N more)" at the bottom). Row = status icon, entry node, time;
     tooltip = the run id. Inline "View in Graph" and "Delete"; title-bar
-    "Refresh Runs" and "Clear All Runs".
+    "Refresh Runs" and "Clear All Runs". The title-bar "Flat list / by
+    version" shows the runs under the versions they ran on, and there "Load
+    this version", on a version or on a run, does what `weft branch` does.
 - **The graph panel**, titled "Weft Graph: <project folder name>".
 - **The Problems panel** carries the compiler's live diagnostics.
 

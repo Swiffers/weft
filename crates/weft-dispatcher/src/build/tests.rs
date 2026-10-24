@@ -2,21 +2,37 @@
 //! become, and where each infra image lands.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::*;
 use weft_core::project::hash::Manifest;
 
 /// A store answering from maps: the dumb fake the build reads through.
+/// Every key a read or a download asked for is in `fetched`.
 #[derive(Default)]
 pub(crate) struct MapStorage {
     pub files: BTreeMap<String, Vec<u8>>,
     pub metas: BTreeMap<String, weft_core::storage::StoredFileMeta>,
+    pub fetched: std::sync::Mutex<Vec<String>>,
+}
+
+impl MapStorage {
+    fn file(&self, key: &str) -> Result<Vec<u8>> {
+        self.fetched.lock().unwrap().push(key.to_string());
+        self.files.get(key).cloned().ok_or_else(|| anyhow!("no file {key}"))
+    }
 }
 
 #[async_trait::async_trait]
 impl ProjectStorage for MapStorage {
     async fn read(&self, key: &str) -> Result<Vec<u8>> {
-        self.files.get(key).cloned().ok_or_else(|| anyhow!("no file {key}"))
+        self.file(key)
+    }
+    async fn download(&self, key: &str, dest: &std::path::Path) -> Result<()> {
+        let bytes = self.file(key)?;
+        let mut out = std::fs::File::create_new(dest)?;
+        std::io::Write::write_all(&mut out, &bytes)?;
+        Ok(())
     }
     async fn meta(&self, key: &str) -> Result<weft_core::storage::StoredFileMeta> {
         self.metas.get(key).cloned().ok_or_else(|| anyhow!("no file {key}"))
@@ -68,11 +84,11 @@ async fn a_stored_file_resolution_is_rebuilt_from_the_store() {
     let key = "local/asset/p/aa";
     let mut storage = MapStorage::default();
     storage.metas.insert(key.into(), meta(key, "image/png"));
-    let mut def = definition_with(CAT);
+    let def = definition_with(CAT);
     // The client claims another size and name; the store's answer wins.
     let sent = BTreeMap::from([(key_of(CAT), claimed(key, "image/png", 1))]);
-    resolve_assets(&storage, "local", &mut def, &sent).await.unwrap();
-    let file = weft_core::storage::StoredFile::from_value(&def.nodes[0].config["picture"]).unwrap();
+    let map = kept_assets(&storage, "local", &def, &sent).await.unwrap();
+    let file = weft_core::storage::StoredFile::from_value(&map[&key_of(CAT)]).unwrap();
     assert_eq!(file.size_bytes, 42);
     assert_eq!(file.filename, "cat.png");
 }
@@ -81,21 +97,13 @@ async fn a_stored_file_resolution_is_rebuilt_from_the_store() {
 async fn a_resolution_to_another_tenant_or_kind_is_refused() {
     let mut storage = MapStorage::default();
     storage.metas.insert("local/asset/p/doc".into(), meta("local/asset/p/doc", "application/pdf"));
-    let mut def = definition_with(CAT);
+    let def = definition_with(CAT);
     let foreign = BTreeMap::from([(key_of(CAT), claimed("other/asset/p/aa", "image/png", 1))]);
-    let e = resolve_assets(&storage, "local", &mut def, &foreign).await.unwrap_err().to_string();
+    let e = kept_assets(&storage, "local", &def, &foreign).await.unwrap_err().to_string();
     assert!(e.contains("not this install's"), "{e}");
     let wrong_kind = BTreeMap::from([(key_of(CAT), claimed("local/asset/p/doc", "image/png", 1))]);
-    let e = resolve_assets(&storage, "local", &mut def, &wrong_kind).await.unwrap_err().to_string();
+    let e = kept_assets(&storage, "local", &def, &wrong_kind).await.unwrap_err().to_string();
     assert!(e.contains("not image") || e.contains("not Image"), "{e}");
-}
-
-#[tokio::test]
-async fn an_unresolved_asset_fails_by_name() {
-    let storage = MapStorage::default();
-    let mut def = definition_with(CAT);
-    let e = resolve_assets(&storage, "local", &mut def, &BTreeMap::new()).await.unwrap_err().to_string();
-    assert!(e.contains("assets/cat.png"), "{e}");
 }
 
 fn storage_with(tenant: &str, files: &[(&str, &[u8])]) -> (MapStorage, Manifest) {
@@ -124,6 +132,19 @@ fn base_catalog_basic(edit: impl Fn(&str, Vec<u8>) -> Vec<u8>) -> Vec<(String, V
     out
 }
 
+/// Compile the version laid out at `root` the way a build does: on a
+/// blocking thread, through [`source::VersionFiles`] over `storage`.
+async fn compile_version(
+    storage: Arc<MapStorage>,
+    tenant: &str,
+    manifest: &Manifest,
+    root: &std::path::Path,
+) -> Result<(weft_core::ProjectDefinition, weft_catalog::FsCatalog, weft_compiler::project::Project)> {
+    let files = Arc::new(source::VersionFiles::new(root.to_path_buf(), manifest.clone(), storage, tenant.to_string()));
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || source::compile(&root, files)).await.unwrap()
+}
+
 const PROGRAM: &[(&str, &[u8])] = &[
     ("weft.toml", b"[package]\nname = 'v'\nid = '00000000-0000-0000-0000-000000000009'\n"),
     ("src/main.weft", b"greeting = Text { value: \"hi\" }\n"),
@@ -144,11 +165,12 @@ async fn a_version_builds_from_its_own_edited_standard_library() {
     let mut files: Vec<(&str, &[u8])> = PROGRAM.to_vec();
     files.extend(catalog.iter().map(|(p, b)| (p.as_str(), b.as_slice())));
     let (storage, manifest) = storage_with("local", &files);
+    let storage = Arc::new(storage);
     let (_blobs, cache) = fresh_cache();
     let root = tempfile::tempdir().unwrap();
-    source::materialize(&storage, &cache, "local", &manifest, root.path()).await.unwrap();
+    source::materialize(storage.as_ref(), &cache, "local", &manifest, root.path()).await.unwrap();
     assert!(!root.path().join("nodes/base_catalog/logic").exists(), "nothing beyond the version is laid out");
-    let (_, catalog, _) = source::compile(root.path()).unwrap();
+    let (_, catalog, _) = compile_version(storage, "local", &manifest, root.path()).await.unwrap();
     let label = &catalog.entry("Text").expect("the version's own Text").metadata.label;
     assert!(label.starts_with("Edited "), "{label}");
 }
@@ -167,10 +189,11 @@ async fn a_version_builds_a_program_that_includes_a_file_from_nodes() {
     ];
     files.extend(catalog.iter().map(|(p, b)| (p.as_str(), b.as_slice())));
     let (storage, manifest) = storage_with("local", &files);
+    let storage = Arc::new(storage);
     let (_blobs, cache) = fresh_cache();
     let root = tempfile::tempdir().unwrap();
-    source::materialize(&storage, &cache, "local", &manifest, root.path()).await.unwrap();
-    let (definition, _, _) = source::compile(root.path()).unwrap();
+    source::materialize(storage.as_ref(), &cache, "local", &manifest, root.path()).await.unwrap();
+    let (definition, _, _) = compile_version(storage, "local", &manifest, root.path()).await.unwrap();
     let hello = definition
         .nodes
         .iter()
@@ -184,12 +207,13 @@ async fn a_version_builds_a_program_that_includes_a_file_from_nodes() {
 #[tokio::test]
 async fn a_version_without_a_standard_library_gets_none() {
     let (storage, manifest) = storage_with("local", PROGRAM);
+    let storage = Arc::new(storage);
     let (_blobs, cache) = fresh_cache();
     let root = tempfile::tempdir().unwrap();
-    source::materialize(&storage, &cache, "local", &manifest, root.path()).await.unwrap();
+    source::materialize(storage.as_ref(), &cache, "local", &manifest, root.path()).await.unwrap();
     assert_eq!(std::fs::read(root.path().join("src/main.weft")).unwrap(), PROGRAM[1].1);
     assert!(!root.path().join("nodes/base_catalog").exists());
-    let (definition, _, _) = source::compile(root.path()).unwrap();
+    let (definition, _, _) = compile_version(storage, "local", &manifest, root.path()).await.unwrap();
     assert!(definition.broken.iter().any(|part| part.why.contains("Text")), "{:?}", definition.broken);
 }
 
@@ -243,21 +267,71 @@ async fn an_old_weft_entry_is_refused_by_name() {
     assert!(err.contains("weft:0.5.0:abc"), "{err}");
 }
 
-/// Bytes that do not hash to what the manifest names are refused, and so
-/// is a path that would land outside the build's directory.
+/// Bytes that do not hash to what the manifest names are refused by the
+/// file's path, and leave nothing behind; so is a path that would land
+/// outside the build's directory.
 #[tokio::test]
 async fn a_tampered_blob_or_a_climbing_path_is_refused() {
-    let (mut storage, manifest) = storage_with("local", &[("weft.toml", b"[package]")]);
+    let (mut storage, manifest) = storage_with("local", &[("src/main.weft", b"greeting = 1")]);
     let key = storage.files.keys().next().unwrap().clone();
     storage.files.insert(key, b"other bytes".to_vec());
     let (_blobs, cache) = fresh_cache();
     let root = tempfile::tempdir().unwrap();
     let e = source::materialize(&storage, &cache, "local", &manifest, root.path()).await.unwrap_err().to_string();
-    assert!(e.contains("other bytes") || e.contains("came back as"), "{e}");
+    let named = &manifest["src/main.weft"];
+    let got = weft_core::project::hash::sha256_hex(b"other bytes");
+    assert!(e.contains("'src/main.weft'") && e.contains(named.as_str()) && e.contains(got.as_str()), "{e}");
+    assert!(!root.path().join("src/main.weft").exists(), "the refused file is removed");
 
     let (storage, manifest) = storage_with("local", &[("../escape", b"x")]);
     let e = source::materialize(&storage, &cache, "local", &manifest, root.path()).await.unwrap_err().to_string();
     assert!(e.contains("not a project-relative path"), "{e}");
+}
+
+/// The project's `assets/` stay in the store: the code is laid out and no
+/// asset is fetched or written.
+#[tokio::test]
+async fn materialize_lays_out_code_and_leaves_assets_in_the_store() {
+    let mut files: Vec<(&str, &[u8])> = PROGRAM.to_vec();
+    files.push(("assets/cat.png", b"not really a png"));
+    let (storage, manifest) = storage_with("local", &files);
+    let (_blobs, cache) = fresh_cache();
+    let root = tempfile::tempdir().unwrap();
+    source::materialize(&storage, &cache, "local", &manifest, root.path()).await.unwrap();
+    assert_eq!(std::fs::read(root.path().join("src/main.weft")).unwrap(), PROGRAM[1].1);
+    assert!(root.path().join("weft.toml").is_file());
+    assert!(!root.path().join("assets").exists());
+    let asset_key = format!("local/asset/{}", manifest["assets/cat.png"]);
+    assert!(!storage.fetched.lock().unwrap().contains(&asset_key));
+}
+
+/// A `@file` naming an `assets/` file reads it through the version's
+/// files, fetched from the store when the compile asks; an asset nothing
+/// names, however big, is never fetched.
+#[tokio::test]
+async fn version_files_fetch_an_asset_only_when_the_compile_reads_it() {
+    let catalog = base_catalog_basic(|_, bytes| bytes);
+    let clip = vec![7u8; 2 * 1024 * 1024];
+    let mut files: Vec<(&str, &[u8])> = vec![
+        PROGRAM[0],
+        ("src/main.weft", b"notes = Text { value: @file(\"assets/notes.txt\") }\n"),
+        ("assets/notes.txt", b"read me lazily"),
+        ("assets/clip.bin", &clip),
+    ];
+    files.extend(catalog.iter().map(|(p, b)| (p.as_str(), b.as_slice())));
+    let (storage, manifest) = storage_with("local", &files);
+    let storage = Arc::new(storage);
+    let (_blobs, cache) = fresh_cache();
+    let root = tempfile::tempdir().unwrap();
+    source::materialize(storage.as_ref(), &cache, "local", &manifest, root.path()).await.unwrap();
+    let (definition, _, _) = compile_version(storage.clone(), "local", &manifest, root.path()).await.unwrap();
+    let notes = definition.nodes.iter().find(|n| n.id == "notes").expect("the notes node");
+    assert_eq!(notes.written_value("value"), Some(&serde_json::json!("read me lazily")));
+    let fetched = storage.fetched.lock().unwrap();
+    let notes_key = format!("local/asset/{}", manifest["assets/notes.txt"]);
+    let clip_key = format!("local/asset/{}", manifest["assets/clip.bin"]);
+    assert_eq!(fetched.iter().filter(|k| **k == notes_key).count(), 1, "{fetched:?}");
+    assert!(!fetched.contains(&clip_key), "{fetched:?}");
 }
 
 #[test]

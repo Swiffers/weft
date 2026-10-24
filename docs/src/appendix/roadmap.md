@@ -63,6 +63,6 @@ weft codebase under one plan, the same shape weft gives a program.
 
 **Branch lanes in the version tree.** The **Runs** view can already list runs
 by version (**Flat list / by version** on its title bar): every version as a tree, its runs under
-it, the current version (head) marked, and **Branch here** on a row. The plan is to draw it the way a
+it, the head of each working copy marked, and **Load this version** on a version or a run. The plan is to draw it the way a
 git client does, with a lane per branch, and to pick a run's seed from the same
 view.

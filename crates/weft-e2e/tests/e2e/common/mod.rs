@@ -277,9 +277,37 @@ pub fn warnings_of(stdout: &str) -> Vec<String> {
     out
 }
 
-/// The version tree, as `weft tree --json` answers it.
+/// The version tree, as `weft tree --json` answers it: the install's
+/// tree plus `workingCopy`, the id of the folder's own working copy.
+/// Reading it syncs the folder first, as every command does.
 pub async fn tree_of(project: &weft_e2e::project::Project) -> anyhow::Result<Value> {
     Ok(serde_json::from_str(project.weft(&["tree", "--json"]).await?.trim())?)
+}
+
+/// The folder's own working copy in a [`tree_of`] answer: its
+/// `headVersion`, `headRun`, `workingVersion` and `revision`.
+pub fn my_copy(tree: &Value) -> anyhow::Result<&Value> {
+    let id = tree["workingCopy"].as_str().ok_or_else(|| anyhow::anyhow!("the tree names no working copy of this folder: {tree}"))?;
+    tree["workingCopies"]
+        .as_array()
+        .and_then(|copies| copies.iter().find(|copy| copy["id"] == json!(id)))
+        .ok_or_else(|| anyhow::anyhow!("the folder's working copy {id} is not in the tree: {tree}"))
+}
+
+/// The id of every version a [`tree_of`] answer holds.
+pub fn version_ids(tree: &Value) -> Vec<String> {
+    tree["versions"]
+        .as_array()
+        .map(|versions| versions.iter().filter_map(|v| v["id"].as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// The project's working copies as the install holds them right now,
+/// read over `GET /projects/{id}/working-copies`. Unlike [`tree_of`] this
+/// runs no command in the folder, so nothing syncs on the way: what it
+/// shows of a save is what the runtime's own sync already landed.
+pub async fn working_copies(disp: &Dispatcher, project: &Uuid) -> anyhow::Result<Vec<weft_core::working_copy::WorkingCopy>> {
+    disp.get_json(&format!("/projects/{project}/working-copies")).await
 }
 
 /// Whether a node's rows in a run came from the seed. The node is

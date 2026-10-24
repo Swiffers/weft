@@ -1296,15 +1296,31 @@ binary types are refused; it is the marker for `assets/prompts/` and
 `assets/scripts/`, and its type defaults to `String`. `@asset`
 always names its type, and a file type names one kind: `Image`, `Video`,
 `Audio`, or `Blob` (never `File` or `Media`; the compiler never guesses a
-kind from a name or bytes). A file-typed `@asset` resolves through the
-build's asset sync (hash-addressed storage; the source keeps one line, never
-a blob), and the sync checks the file's bytes against the declared kind (an
-`Image` over an mp3 fails the build; `Blob` checks nothing). A text-typed
-`@asset` is read once at build from wherever its path points, in the project
-or anywhere on the machine, and its text is inlined. A list of markers feeds
-multi-file ports. An `@asset` source can also be an outside path, an
-`http(s)` URL, or a stored file's key; a text-typed one from a URL or a key
-is fetched at build.
+kind from a name or bytes). When the install builds a version, it
+works out what each `@asset` stands for. A path the version holds is
+already stored with the version, so nothing is uploaded. A file-typed
+`@asset` is checked against its declared kind (an `Image` over an mp3 fails
+the build; `Blob` checks nothing), and a text-typed one has its text
+inlined. A source can also be a stored file's key, which the install looks
+up, or an `http(s)` URL: a text-typed one is fetched and inlined, and a
+file-typed one stays a file that lives at that URL, so nothing checks its
+kind.
+
+A path the version does not hold (an absolute one, `~/...`, or a project
+file outside the folders a version covers) is refused by a cloud install,
+whose error says to put the file under `assets/` and name it from there. A
+local install reads it off the machine: an absolute path where it is, a
+relative one from the folder of the working copy the build came from. A
+program can also write code into a working copy that has no folder on any
+machine, and a build from that one refuses a relative path as well. So
+keep every file a program names in a folder a version covers, usually
+`assets/`. An `@file` in the source is read from the version's files when
+the install compiles, so it has to name a file a version covers: the
+`.weft` files, `weft.toml`, and what is under `src/`, `nodes/`, `prompts/`,
+`scripts/`, `sql/`, `assets/`, `examples/` and `layouts/`.
+
+A port that takes a list of files takes a list of markers:
+`[@asset("a.png", Image), @asset("b.png", Image)]`.
 
 ## When a check runs
 

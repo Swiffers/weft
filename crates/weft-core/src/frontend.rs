@@ -88,7 +88,7 @@ pub struct Repository {
 }
 
 /// `POST /projects/{id}/frontends`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddFrontendRequest {
     pub name: String,
     pub host: FrontendHost,
@@ -101,7 +101,7 @@ pub struct AddFrontendRequest {
 
 /// `PUT /projects/{id}/frontends/{name}/visitor-address`: set where the
 /// frontend passes the install's doors on to its visitors, or clear it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VisitorAddressRequest {
     #[serde(default, rename = "visitorAddress")]
     pub visitor_address: Option<String>,

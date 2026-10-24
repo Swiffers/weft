@@ -7,13 +7,38 @@ import { specScopedTo, type RunSpec } from '../../../packages/weft-graph/src/run
 import type { RunSummary } from './runs';
 import { describeOutcome } from './outcome';
 
-// SYNC: TreeJson, VersionSummary, VersionRun <-> crates/weft-core/src/versions.rs VersionTree, Head, VersionSummary, VersionRun (the shape `weft tree --json` prints, with `diskVersion` added by crates/weft-cli/src/commands/tree.rs)
+// SYNC: TreeJson, VersionSummary, VersionRun <-> crates/weft-core/src/versions.rs VersionTree, VersionSummary, VersionRun (the shape `weft tree --json` prints, with `workingCopy` added by crates/weft-cli/src/commands/tree.rs)
 export interface TreeJson {
-  head: { headVersion: string | null; headRun: string | null; activatedVersions: string[] };
+  /** Every place the project is edited, each with its own head. */
+  workingCopies: WorkingCopy[];
+  /** Every version some activation's listeners run. */
+  activatedVersions: string[];
   versions: VersionSummary[];
   runs: VersionRun[];
-  /** The version the files on disk are, when it is one the tree holds. */
-  diskVersion?: string | null;
+  /** The id of the working copy that is the folder the CLI ran in. */
+  workingCopy: string;
+}
+
+/** One place the project is edited: a folder on some machine, or the
+ *  copy programs write into. */
+// SYNC: WorkingCopy <-> crates/weft-core/src/working_copy.rs WorkingCopy, Head, WorkingCopyKind
+export interface WorkingCopy {
+  id: string;
+  kind: 'folder' | 'program';
+  /** The machine a folder is on, and the folder. */
+  host?: string;
+  path?: string;
+  /** The version its next stamp parents on, and the run the next
+   *  `--seed` inherits from. */
+  headVersion: string | null;
+  headRun: string | null;
+  /** The id its files would have as a version: `headVersion` when
+   *  nothing changed since. */
+  workingVersion: string;
+  revision: number;
+  /** Conflict copies the last sync found in the folder, project-relative. */
+  conflicts?: string[];
+  updatedAt: number;
 }
 
 export interface VersionSummary {
@@ -45,17 +70,73 @@ export interface VersionRun {
   listing: RunSummary | null;
 }
 
+/** What `weft branch --json` answers: the version this folder's files
+ *  were kept as before it moved (null when it held no file, so there is
+ *  nothing to go back to), and its working copy where it is now. */
+// SYNC: Switched <-> crates/weft-core/src/working_copy.rs Switched
+export interface Switched {
+  saved: string | null;
+  copy: WorkingCopy;
+}
+
 /** One version in the drawn tree. */
 export interface VersionTreeNode {
   version: VersionSummary;
   runs: VersionRun[];
   children: VersionTreeNode[];
-  /** Head's version. */
+  /** This folder's head is this version. */
   isHead: boolean;
-  /** The version the files on disk are. */
+  /** This folder's head is this version and its files changed since. */
+  changedSinceHead: boolean;
+  /** This folder's files are this version, and it is not its head (the
+   *  files changed since, into a version the tree holds). */
   isDisk: boolean;
+  /** The other working copies whose head is this version, by name. */
+  otherHeads: string[];
   /** The version the triggers are activated on. */
   isActivated: boolean;
+}
+
+/** This folder's working copy. A tree that does not hold it is one this
+ *  editor cannot draw honestly, so it is refused rather than drawn
+ *  without a head. */
+export function thisCopy(tree: TreeJson): WorkingCopy {
+  const mine = tree.workingCopies.find((c) => c.id === tree.workingCopy);
+  if (!mine) throw new Error(`the version tree holds no working copy ${tree.workingCopy}, which the CLI named as this folder's`);
+  return mine;
+}
+
+/** Whether a working copy's files changed since its head. */
+export function isChanged(copy: WorkingCopy): boolean {
+  return copy.headVersion !== copy.workingVersion;
+}
+
+/** How a mark names a working copy other than this folder's: a folder
+ *  the way `weft tree` names it, and the copy programs write into as
+ *  `program`. */
+export function copyName(copy: WorkingCopy): string {
+  if (copy.kind === 'program') return 'program';
+  if (copy.path && copy.host) return `${copy.path} on ${copy.host}`;
+  if (copy.path) return copy.path;
+  return `folder ${shortId(copy.id)}`;
+}
+
+/** Where a working copy's head is, as a sentence ends with it. */
+export function headPlace(copy: WorkingCopy): string {
+  if (copy.headVersion && copy.headRun) return `run ${shortId(copy.headRun)} on version ${shortId(copy.headVersion)}`;
+  if (copy.headVersion) return `version ${shortId(copy.headVersion)}`;
+  return 'no version yet';
+}
+
+/** This folder's line: where its head is and whether it changed since. */
+export function folderDescription(copy: WorkingCopy): string {
+  return `at ${headPlace(copy)}${isChanged(copy) ? ', changed since' : ''}`;
+}
+
+/** The other working copies whose `at` (their head version or head run)
+ *  is `id`, by name. */
+function otherHeadsAt(tree: TreeJson, id: string, at: (c: WorkingCopy) => string | null): string[] {
+  return tree.workingCopies.filter((c) => c.id !== tree.workingCopy && at(c) === id).map(copyName);
 }
 
 /** Nest the flat list: roots first (a version whose parent the tree no
@@ -69,6 +150,17 @@ export function buildVersionTree(tree: TreeJson): VersionTreeNode[] {
     list.push(r);
     runsOf.set(r.versionId, list);
   }
+  const mine = thisCopy(tree);
+  const marked = (v: VersionSummary): VersionTreeNode => ({
+    version: v,
+    runs: runsOf.get(v.id) ?? [],
+    children: [],
+    isHead: mine.headVersion === v.id,
+    changedSinceHead: mine.headVersion === v.id && isChanged(mine),
+    isDisk: mine.workingVersion === v.id && mine.headVersion !== v.id,
+    otherHeads: otherHeadsAt(tree, v.id, (c) => c.headVersion),
+    isActivated: tree.activatedVersions.includes(v.id),
+  });
   // Children indexed once, in order, instead of scanning every version
   // per version: a project records a version per run, so the history is
   // long and mostly linear, and the scan-per-node was quadratic in it.
@@ -92,28 +184,14 @@ export function buildVersionTree(tree: TreeJson): VersionTreeNode[] {
   // did, just later.
   const node = (v: VersionSummary): VersionTreeNode => {
     seen.add(v.id);
-    const root: VersionTreeNode = {
-      version: v,
-      runs: runsOf.get(v.id) ?? [],
-      children: [],
-      isHead: tree.head.headVersion === v.id,
-      isDisk: tree.diskVersion === v.id,
-      isActivated: tree.head.activatedVersions.includes(v.id),
-    };
+    const root = marked(v);
     const pending: VersionTreeNode[] = [root];
     while (pending.length > 0) {
       const parent = pending.pop()!;
       for (const c of childrenOf.get(parent.version.id) ?? []) {
         if (seen.has(c.id)) continue;
         seen.add(c.id);
-        const child: VersionTreeNode = {
-          version: c,
-          runs: runsOf.get(c.id) ?? [],
-          children: [],
-          isHead: tree.head.headVersion === c.id,
-          isDisk: tree.diskVersion === c.id,
-          isActivated: tree.head.activatedVersions.includes(c.id),
-        };
+        const child = marked(c);
         parent.children.push(child);
         pending.push(child);
       }
@@ -175,22 +253,25 @@ export function versionLabel(node: VersionTreeNode): string {
 /** What is special about a version, for its description. */
 export function versionMarks(node: VersionTreeNode): string[] {
   const marks: string[] = [];
-  if (node.isHead) marks.push('HEAD');
+  if (node.isHead) marks.push(node.changedSinceHead ? 'HEAD, changed since' : 'HEAD');
   if (node.isDisk) marks.push('on disk');
+  for (const name of node.otherHeads) marks.push(`head of ${name}`);
   if (node.isActivated) marks.push('activated');
   const fired = node.version.triggerRuns ?? 0;
   if (fired > 0) marks.push(`${fired} trigger run${fired === 1 ? '' : 's'}`);
   return marks;
 }
 
-/** A run's description: status, seed, scope, example. */
-export function runDescription(run: VersionRun, headRun: string | null): string {
+/** A run's description: status, seed, scope, example, and which working
+ *  copies it is the head run of. */
+export function runDescription(run: VersionRun, tree: TreeJson): string {
   const listing = run.listing;
   const parts = [describeOutcome(listing?.status ?? 'unknown', listing?.cancelCause, listing?.skippedNodes)];
   if (run.seedRunId) parts.push(`seed ${shortId(run.seedRunId)} (${run.stale.length} stale)`);
   if (run.spec) parts.push(`spec ${run.spec.name}`);
   if (run.example) parts.push(`example ${run.example}`);
-  if (headRun === run.runId) parts.push('HEAD run');
+  if (thisCopy(tree).headRun === run.runId) parts.push('HEAD run');
+  for (const name of otherHeadsAt(tree, run.runId, (c) => c.headRun)) parts.push(`head run of ${name}`);
   return parts.join('  ·  ');
 }
 

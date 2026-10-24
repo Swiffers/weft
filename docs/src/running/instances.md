@@ -462,7 +462,7 @@ weft clean --project <id> --instance user-42 --yes
 
 ```rust
 let week = Duration::from_secs(7 * 86400);
-ctx.runs().instance("user-42").status("completed").older_than(week).clean(StillGoing::Leave, StopSelf::Keep).await?;
+ctx.runs().instance("user-42").status("completed")?.older_than(week).clean(StillGoing::Leave, StopSelf::Keep).await?;
 ```
 
 If a program wants to read its runs rather than delete them, the same filters
@@ -471,7 +471,7 @@ many match in all) or `.count()`. The `ListRuns` and `CountRuns` nodes do the
 same from the graph.
 
 ```rust
-let failed_today = ctx.runs().instance("user-42").status("failed").count().await?;
+let failed_today = ctx.runs().instance("user-42").status("failed")?.count().await?;
 ```
 
 `clean` never deletes a run that is still going. With

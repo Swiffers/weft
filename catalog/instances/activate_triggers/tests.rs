@@ -22,7 +22,7 @@ pub fn tests() -> Vec<NodeTest> {
 async fn every(rig: FakeRig) -> WeftResult<()> {
     rig.run(&ActivateTriggersNode, json!({ "instance": "ada" })).await.ok()?;
     match &rig.program_calls()[0].0 {
-        ProgramCall::TriggerActivate { scope, held } => {
+        ProgramCall::Triggers(weft::program::triggers::TriggerCall::Activate { request: weft::activation::ActivateRequest { scope, held, .. } }) => {
             assert!(scope.triggers.is_empty());
             assert_eq!(scope.instances, weft::instance::InstanceTarget::named(vec![weft::instance::InstanceId::new("ada").unwrap()]));
             assert_eq!(*held, ReleaseHeld::Run, "what they held runs by default");
@@ -35,7 +35,7 @@ async fn every(rig: FakeRig) -> WeftResult<()> {
 async fn only(rig: FakeRig) -> WeftResult<()> {
     rig.run(&ActivateTriggersNode, json!({ "instance": "ada", "only": ["receive"] })).await.ok()?;
     match &rig.program_calls()[0].0 {
-        ProgramCall::TriggerActivate { scope, .. } => assert_eq!(scope.triggers, vec!["receive".to_string()]),
+        ProgramCall::Triggers(weft::program::triggers::TriggerCall::Activate { request: weft::activation::ActivateRequest { scope, .. } }) => assert_eq!(scope.triggers, vec!["receive".to_string()]),
         other => panic!("unexpected call {other:?}"),
     }
     Ok(())
@@ -44,7 +44,7 @@ async fn only(rig: FakeRig) -> WeftResult<()> {
 async fn the_programs_own(rig: FakeRig) -> WeftResult<()> {
     rig.run(&ActivateTriggersNode, json!({ "only": ["inbox"] })).await.ok()?;
     match &rig.program_calls()[0].0 {
-        ProgramCall::TriggerActivate { scope, .. } => {
+        ProgramCall::Triggers(weft::program::triggers::TriggerCall::Activate { request: weft::activation::ActivateRequest { scope, .. } }) => {
             assert_eq!(scope.triggers, vec!["inbox".to_string()]);
             assert!(scope.instances.is_shared(), "the program's own triggers");
         }
@@ -56,7 +56,7 @@ async fn the_programs_own(rig: FakeRig) -> WeftResult<()> {
 async fn dropped(rig: FakeRig) -> WeftResult<()> {
     rig.run(&ActivateTriggersNode, json!({ "held": "drop" })).await.ok()?;
     match &rig.program_calls()[0].0 {
-        ProgramCall::TriggerActivate { held, .. } => assert_eq!(*held, ReleaseHeld::Drop),
+        ProgramCall::Triggers(weft::program::triggers::TriggerCall::Activate { request: weft::activation::ActivateRequest { held, .. } }) => assert_eq!(*held, ReleaseHeld::Drop),
         other => panic!("unexpected call {other:?}"),
     }
     Ok(())

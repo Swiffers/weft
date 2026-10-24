@@ -442,6 +442,7 @@ impl WorkerStorage {
                         part_number,
                         size_bytes: bytes.len() as u64,
                     }],
+                    sender: weft_core::storage::PartSender::Caller,
                 },
                 "reserve upload part",
             )
@@ -472,7 +473,10 @@ impl WorkerStorage {
                     .post_json(
                         "/v1/storage/upload/resume",
                         run_id,
-                        &weft_core::storage::UploadResumeRequest { key: key.to_string() },
+                        &weft_core::storage::UploadResumeRequest {
+                            key: key.to_string(),
+                            sender: weft_core::storage::PartSender::Caller,
+                        },
                         "resume upload",
                     )
                     .await?;

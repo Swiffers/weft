@@ -1042,6 +1042,8 @@ pub struct MintedToken {
     pub expires_in_secs: u64,
     /// The id the run chose for it.
     pub id: uuid::Uuid,
+    /// The project it was minted for: `None` for the run's own.
+    pub project: Option<uuid::Uuid>,
 }
 
 /// The fake-tier harness handle. A test declares canned responses and
@@ -2622,17 +2624,24 @@ impl ContextHandle for TestHandle {
         Ok(())
     }
 
-    async fn program_call(&self, call: crate::program::ProgramCall, stop_self: crate::tag::StopSelf, _call_index: u32) -> WeftResult<Value> {
+    async fn program_call(
+        &self,
+        call: crate::program::ProgramCall,
+        stop_self: crate::tag::StopSelf,
+        _call_index: u32,
+        _project: Option<uuid::Uuid>,
+    ) -> WeftResult<Value> {
+        use crate::program::{infra::InfraCall, instances::InstanceCall, triggers::TriggerCall, ProgramCall};
         let name = call.journal_name();
         // A call that only acts, left unanswered by the test, answers the
         // way the runtime answers one it carried out: a start is queued, a
         // copy taken down, a change of values set nothing up again.
         let unanswered = match call {
-            crate::program::ProgramCall::InfraStart { .. } => serde_json::to_value(crate::program::InfraStartAnswer::Started),
-            crate::program::ProgramCall::InfraStop { .. } | crate::program::ProgramCall::InfraTerminate { .. } => {
+            ProgramCall::Infra(InfraCall::Start { .. }) => serde_json::to_value(crate::program::InfraStartAnswer::Started),
+            ProgramCall::Infra(InfraCall::Stop { .. } | InfraCall::Terminate { .. }) => {
                 serde_json::to_value(crate::program::InfraDownAnswer::TakenDown)
             }
-            crate::program::ProgramCall::ValuesChange { .. } | crate::program::ProgramCall::ValuesForget { .. } => {
+            ProgramCall::Instances(InstanceCall::ValuesChange { .. } | InstanceCall::ValuesForget { .. }) => {
                 serde_json::to_value(crate::instance_door::ValuesChanged::default())
             }
             _ => Ok(serde_json::json!({})),
@@ -2640,13 +2649,9 @@ impl ContextHandle for TestHandle {
         .expect("a program call answer serializes");
         let acts_only = matches!(
             call,
-            crate::program::ProgramCall::InfraStart { .. }
-                | crate::program::ProgramCall::InfraStop { .. }
-                | crate::program::ProgramCall::InfraTerminate { .. }
-                | crate::program::ProgramCall::TriggerActivate { .. }
-                | crate::program::ProgramCall::TriggerDeactivate { .. }
-                | crate::program::ProgramCall::ValuesChange { .. }
-                | crate::program::ProgramCall::ValuesForget { .. }
+            ProgramCall::Infra(InfraCall::Start { .. } | InfraCall::Stop { .. } | InfraCall::Terminate { .. })
+                | ProgramCall::Triggers(TriggerCall::Activate { .. } | TriggerCall::Deactivate { .. })
+                | ProgramCall::Instances(InstanceCall::ValuesChange { .. } | InstanceCall::ValuesForget { .. })
         );
         self.state.program_calls.lock().unwrap().push((call, stop_self));
         if let Some(answer) = self.state.program_answers.lock().unwrap().get_mut(name).and_then(VecDeque::pop_front) {
@@ -2667,6 +2672,7 @@ impl ContextHandle for TestHandle {
         expires_in_secs: u64,
         _displays: bool,
         id: uuid::Uuid,
+        project: Option<uuid::Uuid>,
     ) -> WeftResult<crate::program::MintedInstanceToken> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2674,7 +2680,7 @@ impl ContextHandle for TestHandle {
             .as_secs();
         let expires_at_unix = crate::signal_token::expiry_at(now, expires_in_secs).map_err(WeftError::Config)?;
         let mut minted = self.state.minted_tokens.lock().unwrap();
-        minted.push(MintedToken { instance: instance.clone(), expires_in_secs, id });
+        minted.push(MintedToken { instance: instance.clone(), expires_in_secs, id, project });
         Ok(crate::program::MintedInstanceToken { id, token: format!("wft-test-token-{}", minted.len()), expires_at_unix })
     }
 
@@ -3589,8 +3595,14 @@ impl ContextHandle for CapturingHandle {
         self.inner.stop_tagged(tag, stop_self).await
     }
 
-    async fn program_call(&self, call: crate::program::ProgramCall, stop_self: crate::tag::StopSelf, call_index: u32) -> WeftResult<Value> {
-        self.inner.program_call(call, stop_self, call_index).await
+    async fn program_call(
+        &self,
+        call: crate::program::ProgramCall,
+        stop_self: crate::tag::StopSelf,
+        call_index: u32,
+        project: Option<uuid::Uuid>,
+    ) -> WeftResult<Value> {
+        self.inner.program_call(call, stop_self, call_index, project).await
     }
 
     async fn mint_instance_token(
@@ -3599,8 +3611,9 @@ impl ContextHandle for CapturingHandle {
         expires_in_secs: u64,
         displays: bool,
         id: uuid::Uuid,
+        project: Option<uuid::Uuid>,
     ) -> WeftResult<crate::program::MintedInstanceToken> {
-        self.inner.mint_instance_token(instance, expires_in_secs, displays, id).await
+        self.inner.mint_instance_token(instance, expires_in_secs, displays, id, project).await
     }
 
     fn cancellation(&self) -> Arc<CancellationFlag> {

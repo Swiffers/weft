@@ -3,9 +3,14 @@
 // with no project open there is nothing to list. By version: the
 // pinned project's version tree (`weft tree --json`), root versions,
 // child versions, each expanding to its runs with status, seed, scope
-// and example, head and the version on disk marked. The view-in-graph
-// and delete actions hang off the individual items; branch, checkpoint,
-// prune, diff and freeze hang off the version-mode items.
+// and example, under a row for this folder (where its head is, whether
+// its files changed since, and its conflict copies); this folder's head,
+// every other working copy's head and the version on disk are marked.
+// The view-in-graph and delete actions hang off the individual items;
+// load, checkpoint, prune, diff and freeze hang off the version-mode
+// items.
+
+import * as nodePath from 'path';
 
 import * as vscode from 'vscode';
 
@@ -14,13 +19,16 @@ import type { DispatcherClient } from '../dispatcher';
 import type { WeftProject } from './projects';
 import {
   buildVersionTree,
+  folderDescription,
   runDescription,
+  thisCopy,
   runScopedTo,
   versionLabel,
   versionMarks,
   type VersionRun,
   type TreeJson,
   type VersionTreeNode,
+  type WorkingCopy,
 } from './version-tree';
 import { describeOutcome, statusThemeIcon } from './outcome';
 import type { CancelCause, RunPhase } from '../../../packages/weft-graph/src/protocol';
@@ -102,7 +110,7 @@ export class RunsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   /// Which project `tree` belongs to. A tree is only ever reused for the
   /// project it was read in: reusing it across a pin change drew one
   /// project's version tree under another project's name, and handed that
-  /// project's version ids to branch, diff-with-head and the graph
+  /// project's version ids to load, diff-with-head and the graph
   /// banner.
   private treeProjectId: string | undefined;
   /// Which install `tree` was read on (an `installGeneration`).
@@ -171,7 +179,7 @@ export class RunsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   }
 
   /** The tree last fetched, for the commands that need head or a
-   *  run's version (branch, diff with head, the graph banner). */
+   *  run's version (load, diff with head, the graph banner). */
   currentTree(): TreeJson | undefined {
     return this.tree;
   }
@@ -322,6 +330,9 @@ export class RunsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
           this.scheduleRefresh(RunsProvider.TREE_MIN_INTERVAL_MS - age);
         } else {
           tree = await runWeftJson<TreeJson>([...this.installArgs(), 'tree', '--json'], this.pinnedProject.rootPath);
+          // Read here, so a tree that names no copy for this folder is
+          // the error row rather than a view drawn without a head.
+          thisCopy(tree);
           treeFetchedAt = Date.now();
         }
       }
@@ -391,7 +402,10 @@ export class RunsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
   private drawnState(): string {
     const runs = this.tree?.runs.map((r) => `${r.runId}:${r.listing?.status}:${r.example ?? ''}`).join(',') ?? '';
     const versions = this.tree?.versions.map((v) => `${v.id}:${v.parentId ?? ''}:${v.label ?? ''}`).join(',') ?? '';
-    const head = this.tree ? `${this.tree.head.headVersion ?? ''}/${this.tree.head.headRun ?? ''}` : '';
+    const copies =
+      this.tree?.workingCopies
+        .map((c) => `${c.id}:${c.headVersion ?? ''}:${c.headRun ?? ''}:${c.workingVersion}:${(c.conflicts ?? []).join(';')}`)
+        .join(',') ?? '';
     return [
       this.mode,
       this.pinnedProject?.id ?? '',
@@ -403,9 +417,9 @@ export class RunsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
       this.cache.map((e) => `${e.runId}:${e.status}`).join(','),
       versions,
       runs,
-      head,
-      this.tree?.diskVersion ?? '',
-      (this.tree?.head.activatedVersions ?? []).join(','),
+      this.tree?.workingCopy ?? '',
+      copies,
+      (this.tree?.activatedVersions ?? []).join(','),
     ].join('|');
   }
 
@@ -429,7 +443,7 @@ export class RunsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
 
   async getChildren(element?: vscode.TreeItem): Promise<vscode.TreeItem[]> {
     if (element instanceof VersionNode) {
-      const headRun = this.tree?.head.headRun ?? null;
+      const tree = this.tree;
       return [
         ...element.node.runs.map(
           (r) =>
@@ -437,12 +451,15 @@ export class RunsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
               r,
               element.node.version.id,
               this.pinnedProject?.id ?? '',
-              headRun,
+              tree ? runDescription(r, tree) : '',
               runScopedTo(r, this.focusedGroup),
             ),
         ),
         ...element.node.children.map((c) => new VersionNode(c)),
       ];
+    }
+    if (element instanceof FolderCopyNode) {
+      return (element.copy.conflicts ?? []).map((p) => new ConflictCopyNode(p, element.root));
     }
     if (element) return [];
     // Re-fetch on expand whenever the list is empty, error row
@@ -456,6 +473,7 @@ export class RunsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
         nodes.push(new HintNode('Pin a project to see its version tree'));
         return nodes;
       }
+      if (this.tree) nodes.push(new FolderCopyNode(thisCopy(this.tree), this.pinnedProject.rootPath));
       const roots = this.tree ? buildVersionTree(this.tree) : [];
       if (roots.length === 0) nodes.push(new HintNode('No versions yet: `weft run` or `weft checkpoint` records one'));
       for (const root of roots) nodes.push(new VersionNode(root));
@@ -511,6 +529,56 @@ class HintNode extends vscode.TreeItem {
   }
 }
 
+/** This folder's working copy: where its head is, whether its files
+ *  changed since, and the conflict copies a sync left in it (the
+ *  install's bytes of a file both sides changed, written beside the
+ *  folder's own). */
+export class FolderCopyNode extends vscode.TreeItem {
+  constructor(
+    public readonly copy: WorkingCopy,
+    /// The folder, which the conflict copies are relative to.
+    public readonly root: string,
+  ) {
+    const conflicts = copy.conflicts ?? [];
+    super(
+      'This folder',
+      conflicts.length > 0 ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None,
+    );
+    this.id = `copy:${copy.id}`;
+    this.description = `${folderDescription(copy)}${
+      conflicts.length > 0 ? `  ·  ${conflicts.length} conflict cop${conflicts.length === 1 ? 'y' : 'ies'}` : ''
+    }`;
+    this.iconPath = new vscode.ThemeIcon(
+      'folder',
+      conflicts.length > 0 ? new vscode.ThemeColor('list.warningForeground') : undefined,
+    );
+    this.tooltip = new vscode.MarkdownString(
+      [
+        `**this folder** ${root}`,
+        `**head** ${copy.headVersion ?? 'none'}${copy.headRun ? `, run ${copy.headRun}` : ''}`,
+        `**files** ${copy.workingVersion}${copy.headVersion === copy.workingVersion ? ' (the head)' : ' (changed since the head)'}`,
+        ...(conflicts.length > 0
+          ? ['A file changed here and in the install at once: yours is kept, and the install\'s is beside it as a conflict copy.']
+          : []),
+      ].join('\n\n'),
+    );
+    this.contextValue = 'weftFolderCopy';
+  }
+}
+
+/** One conflict copy in this folder; clicking opens it. */
+class ConflictCopyNode extends vscode.TreeItem {
+  constructor(relative: string, root: string) {
+    super(relative, vscode.TreeItemCollapsibleState.None);
+    const uri = vscode.Uri.file(nodePath.join(root, relative));
+    this.resourceUri = uri;
+    this.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('list.warningForeground'));
+    this.tooltip = `The install's copy of a file that also changed here: ${relative}`;
+    this.contextValue = 'weftConflictCopy';
+    this.command = { command: 'vscode.open', title: 'Open', arguments: [uri] };
+  }
+}
+
 /** One version of the pinned project, expanding to its runs and the
  *  versions edited from it. */
 export class VersionNode extends vscode.TreeItem {
@@ -548,13 +616,14 @@ export class VersionRunNode extends vscode.TreeItem {
     /// "view in graph" needs a project to switch to, and a run row on
     /// its own does not name one.
     projectId: string,
-    headRun: string | null,
+    /// Its line: status, seed, scope, example, whose head run it is.
+    description: string,
     scopedToFocus: boolean,
   ) {
     super(`${scopedToFocus ? '◉ ' : ''}${run.runId.slice(0, 8)}`, vscode.TreeItemCollapsibleState.None);
     this.id = `run:${run.runId}`;
     this.summary = { runId: run.runId, projectId: projectId };
-    this.description = runDescription(run, headRun);
+    this.description = description;
     this.tooltip = new vscode.MarkdownString(
       [
         `**run** ${run.runId}`,

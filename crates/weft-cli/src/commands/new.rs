@@ -667,9 +667,9 @@ const TEMPLATE_EXCLUDE: &[&str] = &[
 
 /// Whether an entry of a template stays behind when it is copied: one of
 /// [`TEMPLATE_EXCLUDE`], or what Python writes beside a hook the checkout
-/// ran (`weft_catalog::is_python_cache`).
+/// ran (`weft_core::project::coverage::is_python_cache`).
 fn left_out_of_template(name: &str) -> bool {
-    TEMPLATE_EXCLUDE.contains(&name) || weft_catalog::is_python_cache(name)
+    TEMPLATE_EXCLUDE.contains(&name) || weft_core::project::coverage::is_python_cache(name)
 }
 
 /// True when `root` already holds Tangle for `spec`.

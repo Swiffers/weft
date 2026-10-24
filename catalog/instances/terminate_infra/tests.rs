@@ -24,7 +24,7 @@ async fn terminates(rig: FakeRig) -> WeftResult<()> {
     .await
     .ok()?;
     match &rig.program_calls()[0] {
-        (ProgramCall::InfraTerminate { node, instance, take_down, disks }, StopSelf::Keep) => {
+        (ProgramCall::Infra(weft::program::infra::InfraCall::Terminate { node, instance, take_down, disks }), StopSelf::Keep) => {
             assert_eq!(node, "one.bridge");
             assert_eq!(*disks, weft::infra::TerminateDisks::KeepListed);
             assert_eq!(instance.as_ref().unwrap().as_str(), "ada");
@@ -38,7 +38,7 @@ async fn terminates(rig: FakeRig) -> WeftResult<()> {
 async fn the_programs_own(rig: FakeRig) -> WeftResult<()> {
     rig.run(&TerminateInfraNode, json!({ "node": "pg" })).await.ok()?;
     match &rig.program_calls()[0] {
-        (ProgramCall::InfraTerminate { node, instance, .. }, StopSelf::Keep) => {
+        (ProgramCall::Infra(weft::program::infra::InfraCall::Terminate { node, instance, .. }), StopSelf::Keep) => {
             assert_eq!(node, "pg");
             assert!(instance.is_none(), "the program's own copy");
         }

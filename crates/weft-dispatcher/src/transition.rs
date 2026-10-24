@@ -374,16 +374,24 @@ pub(crate) async fn build_version_gated(
     state: &DispatcherState,
     id: uuid::Uuid,
     tenant: &crate::tenant::TenantId,
-    request: &weft_core::builds::VersionBuildRequest,
+    source: &weft_core::builds::VersionSource,
+    prepare: &dyn crate::build::Prepare,
     ask: i64,
     hold: crate::build::prune::ImageHold,
 ) -> Result<crate::build::VersionBuild, BuildFailed> {
     let gate = std::sync::Arc::new(ProjectBuildGate::new(state.clone(), id));
-    let storage = crate::storage::BrokerStorage(state);
+    let storage: std::sync::Arc<dyn crate::build::ProjectStorage> = std::sync::Arc::new(crate::storage::BrokerStorage(state.clone()));
     // The gate is let go where it was entered, with the starts
     // (`crate::build::VersionBuilder::start_images`).
-    match state.builder.build(&storage, id, tenant.as_str(), request, ask, gate.clone(), hold).await {
+    match state.builder.build(storage, id, tenant.as_str(), source, prepare, ask, gate.clone(), hold).await {
         Ok(built) => Ok(built),
+        // The run the build was for could not start: answered as the run
+        // itself answers it, every line, before any image was built.
+        Err(e) if e.downcast_ref::<crate::build::RunRefused>().is_some() => {
+            let refused = e.downcast::<crate::build::RunRefused>().expect("checked just above");
+            let (status, message) = crate::api::project::refusal_error(&refused.0);
+            Err(BuildFailed::of(status, message))
+        }
         Err(e) if crate::build::cancelled(&e) => Err(BuildFailed::of(StatusCode::CONFLICT, format!("build cancelled by user: {e:#}"))),
         // A lost single-flight (gate.begin refused) is a state conflict,
         // not a server fault. Anything else prints the FULL chain (`{e:#}`)
@@ -405,7 +413,7 @@ pub(crate) async fn build_version_gated(
 /// [`weft_core::builds::BUILD_BUSY_HEADER`], so a caller resending its ask
 /// waits and sends it again).
 #[derive(Debug)]
-pub(crate) struct BuildFailed {
+pub struct BuildFailed {
     pub status: StatusCode,
     pub message: String,
     pub busy: bool,

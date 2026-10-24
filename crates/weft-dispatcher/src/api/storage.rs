@@ -45,6 +45,11 @@ impl ApiError {
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
+
+    /// The refusal an action answers with: the status and the words.
+    pub(crate) fn into_refused(self) -> (StatusCode, String) {
+        (self.status, self.message)
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -158,6 +163,20 @@ fn ensure_tenant_key(tenant: &TenantId, key: &str) -> Result<String, ApiError> {
     }
 }
 
+/// Refuse part links signed for weft's own process on a route a person's
+/// machine calls: they would point at an address only the install reaches.
+fn sent_by_the_caller(sender: weft_core::storage::PartSender) -> Result<(), ApiError> {
+    match sender {
+        weft_core::storage::PartSender::Caller => Ok(()),
+        weft_core::storage::PartSender::Runtime => Err(ApiError::from((
+            StatusCode::BAD_REQUEST,
+            "this upload asked for part links meant for the install's own process, which your machine cannot \
+             reach; send the request without `sender` to get links for your machine"
+                .into(),
+        ))),
+    }
+}
+
 // ---------- asset upload (the pre-build sync) ----------
 //
 // The CLI drives the broker's multipart upload contract through these
@@ -195,56 +214,6 @@ pub async fn assets_held(
     Ok(Json(held))
 }
 
-/// Publish the complete asset set of the successfully resolved source.
-/// The broker checks every key against the authenticated tenant and project.
-pub async fn asset_references(
-    State(state): State<DispatcherState>,
-    caller: CallerTenant,
-    Json(mut req): Json<weft_core::storage::AssetReferencesRequest>,
-) -> Result<Json<weft_core::storage::AssetsPublished>, ApiError> {
-    let project = req.project.parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "project is not a valid id".to_string()))?;
-    // The build's own assets, plus every blob a surviving version of the
-    // project names: a version's files are the tenant's assets too, and
-    // must outlive the builds that stopped referencing them. What no
-    // version and no build of ANY of the tenant's projects names expires,
-    // which is how a prune reclaims its blobs. A version's blob is KEPT, not
-    // required: one that expired or was removed is that version's loss
-    // (it cannot be branched back to), never a reason the next build
-    // cannot publish. Requiring it left a project unable to build at
-    // all, with the way out being the build itself.
-    // Read once and computed once: a prune between two reads would make
-    // the kept set and the warnings disagree about which versions exist.
-    let blob_err = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("version blobs: {e}"));
-    let versions = state.versions.versions(project).await.map_err(blob_err)?;
-    let source = state.versions.registered_source(project).await.map_err(blob_err)?;
-    // Which versions name each blob, so a missing one is reported as
-    // the version's loss, by the id `weft tree` shows.
-    let mut named_by: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
-    for version in &versions {
-        for key in crate::api::versions::blob_keys(std::iter::once((version.id.as_str(), &version.manifest))).map_err(blob_err)? {
-            named_by.entry(ensure_tenant_key(&caller.0, &key)?).or_default().push(version.id[..8].to_string());
-        }
-    }
-    req.kept.extend(named_by.keys().cloned());
-    if let Some(source) = &source {
-        req.kept.extend(crate::api::versions::blob_keys(std::iter::once(("registered sources", source))).map_err(blob_err)?);
-    }
-    for key in req.keys.iter_mut().chain(req.kept.iter_mut()) {
-        *key = ensure_tenant_key(&caller.0, key)?;
-    }
-    let outcome = crate::storage::set_asset_references(&state, caller.0.as_str(), req)
-        .await.map_err(storage_err)?;
-    let warnings: Vec<String> = outcome.missing.iter().map(|key| {
-        let versions = named_by.get(key).map(|v| v.join(", ")).unwrap_or_else(|| "the registered sources".into());
-        tracing::warn!(%project, key, %versions, "a version names a stored file that no longer exists");
-        let (noun, verb, that) = if versions.contains(", ") { ("versions", "name", "those versions") } else { ("version", "names", "that version") };
-        format!("{noun} {versions} {verb} a stored file that no longer exists in storage ({}); {that} cannot be branched back to, `weft prune` drops it",
-            key.rsplit('/').next().unwrap_or(key))
-    }).collect();
-    Ok(Json(weft_core::storage::AssetsPublished { warnings }))
-}
-
 /// POST /storage/upload/parts: reserve + presign the parts the caller
 /// names. Naming them is what makes a reservation idempotent; see
 /// `weft_core::storage::UploadPartsRequest`.
@@ -253,6 +222,7 @@ pub async fn upload_parts(
     caller: CallerTenant,
     Json(mut req): Json<weft_core::storage::UploadPartsRequest>,
 ) -> Result<Json<weft_core::storage::UploadPartsResponse>, ApiError> {
+    sent_by_the_caller(req.sender)?;
     let tenant = caller.0;
     req.key = ensure_tenant_key(&tenant, &req.key)?;
     let out = crate::storage::upload_parts(&state, tenant.as_str(), req).await.map_err(storage_err)?;
@@ -290,6 +260,7 @@ pub async fn upload_resume(
     caller: CallerTenant,
     Json(mut req): Json<weft_core::storage::UploadResumeRequest>,
 ) -> Result<Json<weft_core::storage::UploadResumeResponse>, ApiError> {
+    sent_by_the_caller(req.sender)?;
     let tenant = caller.0;
     req.key = ensure_tenant_key(&tenant, &req.key)?;
     let out = crate::storage::upload_resume(&state, tenant.as_str(), req).await.map_err(storage_err)?;
@@ -366,6 +337,14 @@ mod tests {
         assert_eq!(ensure_tenant_key(&t(), "alice/run/c1/f").unwrap(), "alice/run/c1/f");
         let sha = "a".repeat(64);
         assert_eq!(ensure_tenant_key(&t(), &format!("asset/{sha}")).unwrap(), format!("alice/asset/{sha}"));
+    }
+
+    #[test]
+    fn a_person_cannot_ask_for_part_links_meant_for_the_install() {
+        let err = sent_by_the_caller(weft_core::storage::PartSender::Runtime).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("without `sender`"), "{}", err.message);
+        assert!(sent_by_the_caller(weft_core::storage::PartSender::Caller).is_ok());
     }
 
     #[test]

@@ -17,9 +17,12 @@ pub use crate::primitive::Phase;
 mod program_calls;
 mod pure;
 pub use program_calls::{
-    ConnectionCalls, CostQuery, InfraCalls, InstanceConnections, InstanceTokens, InstanceValueCalls, RunQuery, TokenCalls,
+    AllInfraCalls, BuildCalls, CodeCalls, ConnectionCalls, CostQuery, FileEdit, InfraCalls, InstanceConnections, InstanceTokens, InstanceValueCalls, ProjectCalls, RunCalls, RunQuery, TokenCalls,
     TriggerCalls, ValueCalls,
 };
+pub use program_calls::{Activate, Declare, ProjectList, Remove, Resync};
+pub use program_calls::{RunByIdCalls, RunEventsQuery};
+pub use program_calls::{FrontendAdd, FrontendCalls, OneFrontend, PickCalls, PickChange, WorkerCalls};
 
 
 /// How long a node's provider work may take, unless it says otherwise
@@ -2619,18 +2622,20 @@ pub trait ContextHandle: Send + Sync {
     /// `ctx.run` step the answer is journaled under (`run_step`): the
     /// same call on a replayed run has the same index, so the runtime
     /// keys the call on it and a call carried twice is one call.
-    async fn program_call(&self, call: crate::program::ProgramCall, stop_self: StopSelf, call_index: u32) -> WeftResult<Value>;
+    async fn program_call(&self, call: crate::program::ProgramCall, stop_self: StopSelf, call_index: u32, project: Option<uuid::Uuid>) -> WeftResult<Value>;
     /// Backs `ctx.tokens().mint_for_instance`: an instance token for
-    /// `instance` of this run's project, working for `expires_in_secs`,
-    /// reading the instance's own infra's displays when `displays`. `id`
-    /// is the token's id, chosen by the run: minting under an id that
-    /// already names this instance's token replaces that token.
+    /// `instance` of `project` (one of the run's owner's; this run's own
+    /// when `None`), working for `expires_in_secs`, reading the instance's
+    /// own infra's displays when `displays`. `id` is the token's id,
+    /// chosen by the run: minting under an id that already names this
+    /// instance's token replaces that token.
     async fn mint_instance_token(
         &self,
         instance: &crate::instance::InstanceId,
         expires_in_secs: u64,
         displays: bool,
         id: uuid::Uuid,
+        project: Option<uuid::Uuid>,
     ) -> WeftResult<crate::program::MintedInstanceToken>;
     fn cancellation(&self) -> Arc<CancellationFlag>;
 
@@ -3141,8 +3146,8 @@ mod value_bag_tests {
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
         async fn tag_run(&self, _: Vec<String>) -> WeftResult<()> { unreachable!() }
         async fn stop_tagged(&self, _: String, _: StopSelf) -> WeftResult<()> { unreachable!() }
-        async fn program_call(&self, _: crate::program::ProgramCall, _: StopSelf, _: u32) -> WeftResult<Value> { unreachable!() }
-        async fn mint_instance_token(&self, _: &crate::instance::InstanceId, _: u64, _: bool, _: uuid::Uuid) -> WeftResult<crate::program::MintedInstanceToken> { unreachable!() }
+        async fn program_call(&self, _: crate::program::ProgramCall, _: StopSelf, _: u32, _: Option<uuid::Uuid>) -> WeftResult<Value> { unreachable!() }
+        async fn mint_instance_token(&self, _: &crate::instance::InstanceId, _: u64, _: bool, _: uuid::Uuid, _: Option<uuid::Uuid>) -> WeftResult<crate::program::MintedInstanceToken> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         fn declared_input_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
@@ -3224,8 +3229,8 @@ mod value_bag_tests {
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
         async fn tag_run(&self, _: Vec<String>) -> WeftResult<()> { unreachable!() }
         async fn stop_tagged(&self, _: String, _: StopSelf) -> WeftResult<()> { unreachable!() }
-        async fn program_call(&self, _: crate::program::ProgramCall, _: StopSelf, _: u32) -> WeftResult<Value> { unreachable!() }
-        async fn mint_instance_token(&self, _: &crate::instance::InstanceId, _: u64, _: bool, _: uuid::Uuid) -> WeftResult<crate::program::MintedInstanceToken> { unreachable!() }
+        async fn program_call(&self, _: crate::program::ProgramCall, _: StopSelf, _: u32, _: Option<uuid::Uuid>) -> WeftResult<Value> { unreachable!() }
+        async fn mint_instance_token(&self, _: &crate::instance::InstanceId, _: u64, _: bool, _: uuid::Uuid, _: Option<uuid::Uuid>) -> WeftResult<crate::program::MintedInstanceToken> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         fn declared_input_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }

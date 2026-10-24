@@ -2459,58 +2459,6 @@ pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration
     })
 }
 
-/// Revoke instance tokens of `instance` in `project_id`: the one `id`, or
-/// every one of them. What a program's `ctx.tokens().instance(..).revoke()`
-/// does; answers how many went.
-// SYNC: signal_token instance rows <-> crates/weft-broker/src/program_tokens.rs (the program's mint)
-pub async fn revoke_instance_tokens(
-    pool: &sqlx::PgPool,
-    tenant: &str,
-    project_id: uuid::Uuid,
-    instance: &weft_core::instance::InstanceId,
-    id: Option<uuid::Uuid>,
-) -> anyhow::Result<u64> {
-    Ok(sqlx::query(
-        "DELETE FROM signal_token \
-         WHERE tenant_id = $1 AND instance_id = $2 AND allowed_projects = ARRAY[$3]::uuid[] \
-           AND ($4::uuid IS NULL OR id = $4)",
-    )
-    .bind(tenant)
-    .bind(instance.as_str())
-    .bind(project_id)
-    .bind(id)
-    .execute(pool)
-    .await?
-    .rows_affected())
-}
-
-/// How many instance tokens of `project_id` still work (not expired at
-/// `now_unix`), per instance, one entry per instance with at least one.
-pub async fn instance_token_counts(
-    pool: &sqlx::PgPool,
-    tenant: &str,
-    project_id: uuid::Uuid,
-    now_unix: i64,
-) -> anyhow::Result<Vec<(weft_core::instance::InstanceId, u32)>> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT instance_id, count(*)::bigint FROM signal_token \
-         WHERE tenant_id = $1 AND instance_id IS NOT NULL AND allowed_projects = ARRAY[$2]::uuid[] \
-           AND expires_at > $3 \
-         GROUP BY instance_id ORDER BY instance_id",
-    )
-    .bind(tenant)
-    .bind(project_id)
-    .bind(now_unix)
-    .fetch_all(pool)
-    .await?;
-    rows.into_iter()
-        .map(|(instance, n)| {
-            let instance = weft_core::instance::InstanceId::new(instance).map_err(|e| anyhow::anyhow!("signal_token.instance_id: {e}"))?;
-            Ok((instance, u32::try_from(n)?))
-        })
-        .collect()
-}
-
 /// Revoke every instance token of `project_id`: an instance token acts in
 /// its one project, so it outlives a removed project as nothing anybody
 /// could use.

@@ -99,11 +99,11 @@ pub trait ProjectStoreOps: Send + Sync {
         infra_places: Option<&std::collections::BTreeMap<String, String>>,
     ) -> anyhow::Result<Option<StoredProjectSummary>>;
 
-    /// The request the project's running build came from (its name, its
-    /// files and what they were compiled with), for the install to build
-    /// the same version again. `None` when it runs no build, or one an
+    /// The version the project's running build came from (its files and
+    /// what they were compiled with), for the install to build the same
+    /// version again. `None` when it runs no build, or one an
     /// older weft registered, which kept no inputs.
-    async fn running_build_request(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::builds::VersionBuildRequest>>;
+    async fn running_build(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::builds::VersionSource>>;
 
     /// Sources registered with this exact running program. Refuse a concurrent build.
     async fn program_source(&self, id: uuid::Uuid, program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<weft_core::project::hash::Manifest>;
@@ -650,13 +650,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- Its drive (`ResyncPlan::driver`): what every write of the
                 -- plan names, and the key of the task driving it.
                 resync_driver UUID,
-                -- The version tree's HEAD (`crate::versions`): the version
-                -- the next checkpoint or run parents on, the run the next
-                -- `--seed` inherits from (NULL when head is a bare
-                -- version). Moved by checkpoint, run and branch; nothing
-                -- lives on disk.
-                head_version TEXT,
-                head_run UUID,
                 -- The project's own port on a local install
                 -- (`crate::project_ports`): given at its first activation,
                 -- or named with `weft activate --port`, and kept, moved to a free one when another program took
@@ -790,7 +783,25 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         )"#,
     ],
     seed: &[],
-    data_steps: &[],
+    data_steps: &[
+        // A project's head moved off its row onto its working copies
+        // (`crate::working_copies`): the head it had becomes its program
+        // copy's, with that version's files as the copy's working files,
+        // so the next run seeds and parents where the last one left off.
+        // The folder a person works in registers itself on its next
+        // command and carries on from there.
+        weft_task_store::DataStep {
+            table: "project",
+            column: "head_version",
+            until: weft_task_store::Until::Dropped,
+            sql: "INSERT INTO working_copy (id, project_id, kind, head_version, head_run, working_manifest, synced, conflicts, revision, created_at, updated_at) \
+                  SELECT gen_random_uuid(), p.id, 'program', p.head_version, p.head_run, \
+                         COALESCE((SELECT v.manifest FROM project_version v WHERE v.project_id = p.id AND v.id = p.head_version), '{}'::jsonb), \
+                         '{}'::jsonb, '{}', 0, EXTRACT(EPOCH FROM now())::bigint, EXTRACT(EPOCH FROM now())::bigint \
+                  FROM project p WHERE p.head_version IS NOT NULL OR p.head_run IS NOT NULL \
+                  ON CONFLICT DO NOTHING",
+        },
+    ],
 };
 
 /// THE running-hash pointer advance: ONE atomic UPDATE of the trio of hashes
@@ -1019,19 +1030,19 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(Some(StoredProjectSummary { id, name, description, removing: false }))
     }
 
-    async fn running_build_request(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::builds::VersionBuildRequest>> {
-        let row: Option<(String, Option<serde_json::Value>, Option<serde_json::Value>, weft_core::stored::Version)> = sqlx::query_as(
-            "SELECT name, running_source, running_build_inputs, running_build_inputs_version FROM project WHERE id = $1",
+    async fn running_build(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::builds::VersionSource>> {
+        let row: Option<(Option<serde_json::Value>, Option<serde_json::Value>, weft_core::stored::Version)> = sqlx::query_as(
+            "SELECT running_source, running_build_inputs, running_build_inputs_version FROM project WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((name, Some(manifest), Some(inputs), version)) = row else { return Ok(None) };
+        let Some((Some(manifest), Some(inputs), version)) = row else { return Ok(None) };
         let inputs = weft_core::builds::BuildInputs::STORED
             .decode(inputs, version)
             .map_err(|e| e.at(format_args!("project {id}'s running build")))?;
         let manifest = serde_json::from_value(manifest).map_err(|e| anyhow::anyhow!("project {id}'s running source does not read: {e}"))?;
-        Ok(Some(weft_core::builds::VersionBuildRequest { name, manifest, inputs }))
+        Ok(Some(weft_core::builds::VersionSource { manifest, inputs }))
     }
 
     async fn program_source(&self, id: uuid::Uuid, program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<weft_core::project::hash::Manifest> {
@@ -1167,6 +1178,8 @@ impl ProjectStoreOps for PostgresProjectStore {
         sqlx::query("DELETE FROM project_version WHERE project_id = $1")
             .bind(id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM version_runs WHERE project_id = $1")
+            .bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM working_copy WHERE project_id = $1")
             .bind(id).execute(&mut *tx).await?;
         // The infra rows go in the same transaction, AFTER the project
         // row: the broker's command and event inserts lock the project

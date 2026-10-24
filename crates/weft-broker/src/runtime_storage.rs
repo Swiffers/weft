@@ -59,7 +59,7 @@ use weft_core::storage::{
     DownloadUrlResponse, FileLink, LinkAnswer, LinkReach, LinkReader, LinkRequest, ListFilesResponse, PartDoneRequest,
     PresignResult, StorageScope, StoredFile, StoredFileMeta, SweepRunRequest, SweepRunResponse, Tenanted,
     TenantScopeRequest, TenantUsage, UploadAbortRequest, UploadBeginRequest, UploadBeginResponse,
-    UploadCompleteRequest, UploadPartsRequest, UploadPartsResponse, UploadResumeRequest,
+    PartSender, UploadCompleteRequest, UploadPartsRequest, UploadPartsResponse, UploadResumeRequest,
     UploadResumeResponse, WipePrefixRequest, WipePrefixResponse,
 };
 use weft_platform_traits::PresignAudience;
@@ -176,6 +176,9 @@ fn map_err(e: RuntimeStoreError) -> ApiError {
         RuntimeStoreError::QuotaExceeded(m) => (StatusCode::PAYLOAD_TOO_LARGE, m),
         RuntimeStoreError::Conflict(m) | RuntimeStoreError::Completing(m) => (StatusCode::CONFLICT, m),
         RuntimeStoreError::Lost(m) => (StatusCode::GONE, m),
+        // The request was understood and its bytes are wrong for it: the
+        // same request can never succeed, and the upload is already ended.
+        RuntimeStoreError::NotItsContent(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
         RuntimeStoreError::NoUpload(m) => (StatusCode::NOT_FOUND, m),
         // The bucket refused rows, named in the message and marked; waiting
         // does not clear it, so it is a plain conflict (a wipe left waiting on
@@ -363,6 +366,7 @@ async fn upload_parts(
     Json(req): Json<UploadPartsRequest>,
 ) -> Result<Json<UploadPartsResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
+    callers_own_parts(req.sender)?;
     let store = &state.runtime_store;
     let parts = store
         .reserve_parts(
@@ -375,6 +379,27 @@ async fn upload_parts(
         .await
         .map_err(map_err)?;
     Ok(Json(UploadPartsResponse { parts }))
+}
+
+/// Refuse part URLs for weft's own process on a route a worker or a page
+/// calls: only the control plane uploads as the runtime.
+fn callers_own_parts(sender: PartSender) -> Result<(), ApiError> {
+    match sender {
+        PartSender::Caller => Ok(()),
+        PartSender::Runtime => Err(ApiError::from((
+            StatusCode::FORBIDDEN,
+            "denied: only the control plane uploads parts as weft's own process".into(),
+        ))),
+    }
+}
+
+/// The audience the control plane's part URLs are presigned for: a
+/// person's machine it fronts, or weft's own process.
+fn admin_parts_audience(sender: PartSender) -> PresignAudience {
+    match sender {
+        PartSender::Caller => PresignAudience::External,
+        PartSender::Runtime => PresignAudience::Runtime,
+    }
 }
 
 /// `POST /v1/storage/upload/part-done`: record a landed part's etag (verbatim).
@@ -417,6 +442,7 @@ async fn upload_resume(
     Json(req): Json<UploadResumeRequest>,
 ) -> Result<Json<UploadResumeResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
+    callers_own_parts(req.sender)?;
     let store = &state.runtime_store;
     let (part_size, missing, reserved_bytes) = store
         .resume_upload(&caller, &req.key, state.entitlements.as_ref(), &PresignAudience::Internal)
@@ -895,6 +921,7 @@ async fn slot_parts(
     Json(Slotted { slot, inner: req }): Json<Slotted<UploadPartsRequest>>,
 ) -> Result<Json<UploadPartsResponse>, ApiError> {
     let (claims, caller) = slot_upload(&state, &headers, &slot, &req.key).await?;
+    callers_own_parts(req.sender)?;
     let audience = slot_parts_audience(&state, &claims.project).await?;
     let parts = state
         .runtime_store
@@ -942,6 +969,7 @@ async fn slot_resume(
     Json(Slotted { slot, inner: req }): Json<Slotted<UploadResumeRequest>>,
 ) -> Result<Json<UploadResumeResponse>, ApiError> {
     let (claims, caller) = slot_upload(&state, &headers, &slot, &req.key).await?;
+    callers_own_parts(req.sender)?;
     let audience = slot_parts_audience(&state, &claims.project).await?;
     let (part_size, missing, reserved_bytes) = state
         .runtime_store
@@ -976,7 +1004,9 @@ fn wall(caller: &CallerAuth, key: &str) -> Result<key::ParsedKey, ApiError> {
 // against that tenant on every key-addressed verb, so a dispatcher bug can
 // still never cross tenants. The store code is the exact worker path: the
 // admin surface only differs in WHO vouches for the caller and in the part
-// URLs' audience (External: the editor's browser PUTs to the bucket directly).
+// URLs' audience (External for the person's machine it fronts, whose browser
+// or CLI PUTs to the bucket directly; Runtime when weft's own process sends
+// the parts, `PartSender::Runtime`).
 
 /// Re-derive the acting caller for a key-addressed admin upload verb: the key
 /// must be ASSET-scoped (the one admin-uploadable plane) and belong to the
@@ -1081,7 +1111,7 @@ async fn admin_upload_parts(
             &req.inner.key,
             &req.inner.parts,
             state.entitlements.as_ref(),
-            &PresignAudience::External,
+            &admin_parts_audience(req.inner.sender),
         )
         .await
         .map_err(map_err)?;
@@ -1123,7 +1153,7 @@ async fn admin_upload_resume(
     let store = &state.runtime_store;
     let caller = tenant_caller_for_key(&req.tenant, &req.inner.key)?;
     let (part_size, missing, reserved_bytes) = store
-        .resume_upload(&caller, &req.inner.key, state.entitlements.as_ref(), &PresignAudience::External)
+        .resume_upload(&caller, &req.inner.key, state.entitlements.as_ref(), &admin_parts_audience(req.inner.sender))
         .await
         .map_err(map_err)?;
     Ok(Json(UploadResumeResponse { part_size, missing, reserved_bytes }))

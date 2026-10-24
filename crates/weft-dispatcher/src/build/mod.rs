@@ -1,27 +1,24 @@
 //! Building a project version inside the install: the one way a project's
 //! images come to exist, on a laptop and on a cloud alike.
 //!
-//! The CLI uploads the version's files (only the blobs the store lacks,
-//! straight to the bucket) and asks for a build of that version. Here the
-//! version's files are fetched back and checked against their hashes, the
-//! project is compiled with the catalog this install ships, every image it
-//! needs is planned with content-addressed refs in the platform's image
-//! store, and the stale ones are started on the platform's builder
-//! (`weft_platform_traits::ImageBuilder`). The request answers as soon as
-//! they run: a build takes minutes, and a request held open that long with
-//! nothing on the wire is one any network path between may drop. The
-//! version is written down as waiting on them (`waiting`), and the build
-//! loop (`follow`) sees each build through and registers the version once
-//! they all ended; the caller only follows it. Nothing the client computed
-//! is believed: not a hash, not an image, not a stored file's metadata.
-//!
-//! What the compile cannot do on its own is read an `@asset` that lives on
-//! the author's disk outside the project, or a URL the author fetched: the
-//! CLI resolves those (uploading any file the asset plane lacks) and sends
-//! the resolutions with the request. A stored-file resolution is re-read
-//! from the store here and rebuilt from what the store says; a text
-//! resolution is program data, the same as the source it came with.
+//! A build builds one version the install holds: a working copy's files
+//! stamped into a version (`crate::actions::versions::stamp`), or a version
+//! named as it is. Here the version's files are fetched back and checked
+//! against their hashes (all but `assets/`, which the compile reads only
+//! when a `@file` names one), the project is compiled with the catalog
+//! this install ships, its `@asset`s are resolved by the install itself
+//! (`assets`), every image it needs is planned with content-addressed refs
+//! in the platform's image store, and the stale ones are started on the
+//! platform's builder (`weft_platform_traits::ImageBuilder`). The request
+//! answers as soon as they run: a build takes minutes, and a request held
+//! open that long with nothing on the wire is one any network path between
+//! may drop. The version is written down as waiting on them (`waiting`),
+//! and the build loop (`follow`) sees each build through and registers the
+//! version once they all ended; the caller only follows it. Nothing a
+//! client computed is believed: not a hash, not an image, not a stored
+//! file's metadata.
 
+pub mod assets;
 pub mod blob_cache;
 pub mod follow;
 pub mod ledger;
@@ -129,7 +126,7 @@ pub enum VersionBuild {
 /// version waiting on its builds keeps until then.
 #[derive(Debug, Clone)]
 pub struct Version {
-    /// The project's name, as the request named it.
+    /// The project's name, as the version's `weft.toml` says.
     pub name: String,
     /// The version's files, registered as the program's source.
     pub manifest: weft_core::project::hash::Manifest,
@@ -151,6 +148,53 @@ pub struct Version {
     pub ask: i64,
 }
 
+/// What a build does between its compile and its plan, which differs by
+/// who asked: resolve the program's `@asset`s, and refuse a run the build
+/// is for that could not start. A build of a version asked for now
+/// resolves them from the version (`assets::Resolving`); the build of a
+/// registered version again on a newer weft takes the resolutions it was
+/// first built with ([`Kept`]).
+#[async_trait::async_trait]
+pub trait Prepare: Send + Sync {
+    /// What each of `definition`'s `@asset`s stands for, by resolution key.
+    async fn assets(&self, storage: &dyn ProjectStorage, tenant: &str, definition: &weft_core::ProjectDefinition) -> Result<BTreeMap<String, serde_json::Value>>;
+    /// Refuse (a [`RunRefused`]) the run this build is for, held to the
+    /// compiled program, when it could not start.
+    async fn check(&self, definition: &weft_core::ProjectDefinition) -> Result<()>;
+}
+
+/// Why a build refused the run it was for: the refusal the run itself
+/// would answer, so the caller reads it the same way (a 422 with every
+/// line).
+#[derive(Debug)]
+pub struct RunRefused(pub weft_core::run_spec::Refusal);
+
+impl std::fmt::Display for RunRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the run this build is for cannot start:\n{}", self.0)
+    }
+}
+
+impl std::error::Error for RunRefused {}
+
+/// The resolutions a registered version was first built with, taken as
+/// they were (`BuildInputs::assets`). A stored-file resolution is still
+/// rebuilt from what the store records for its key, which must be this
+/// tenant's and of the kind the ref declares; a text resolution is
+/// program data, taken as it is.
+pub struct Kept<'a>(pub &'a BTreeMap<String, serde_json::Value>);
+
+#[async_trait::async_trait]
+impl Prepare for Kept<'_> {
+    async fn assets(&self, storage: &dyn ProjectStorage, tenant: &str, definition: &weft_core::ProjectDefinition) -> Result<BTreeMap<String, serde_json::Value>> {
+        kept_assets(storage, tenant, definition, self.0).await
+    }
+
+    async fn check(&self, _definition: &weft_core::ProjectDefinition) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// The project's files and stored-file metadata, as the build reads them.
 /// The production answer is the broker's storage plane
 /// (`crate::storage::BrokerStorage`); a test hands a map.
@@ -158,6 +202,10 @@ pub struct Version {
 pub trait ProjectStorage: Send + Sync {
     /// The bytes of one stored file, by its tenant-anchored key.
     async fn read(&self, key: &str) -> Result<Vec<u8>>;
+    /// One stored file streamed into a new file at `dest`, chunk by chunk,
+    /// never whole in memory. What fails midway may leave part of it there;
+    /// the caller removes it.
+    async fn download(&self, key: &str, dest: &std::path::Path) -> Result<()>;
     /// What the store records about one stored file.
     async fn meta(&self, key: &str) -> Result<weft_core::storage::StoredFileMeta>;
 }
@@ -182,19 +230,21 @@ pub struct VersionBuilder {
 }
 
 impl VersionBuilder {
-    /// Build `request` for `project_id`: fetch and check its files, compile,
-    /// plan, and start a build of every stale image. `gate` is entered
-    /// before the first real build; a version whose images all exist never
-    /// touches it. `hold` claims every planned image against a prune until
-    /// the version registers. `ask` is the request's place in the
-    /// project's order of asks, taken as it arrived.
+    /// Build the version `source` for `project_id`: fetch and check its
+    /// files, compile, resolve its `@asset`s and check the run it is for
+    /// (`prepare`), plan, and start a build of every stale image. `gate` is
+    /// entered before the first real build; a version whose images all
+    /// exist never touches it. `hold` claims every planned image against a
+    /// prune until the version registers. `ask` is the request's place in
+    /// the project's order of asks, taken as it arrived.
     #[allow(clippy::too_many_arguments)]
     pub async fn build(
         &self,
-        storage: &dyn ProjectStorage,
+        storage: Arc<dyn ProjectStorage>,
         project_id: uuid::Uuid,
         tenant: &str,
-        request: &weft_core::builds::VersionBuildRequest,
+        source: &weft_core::builds::VersionSource,
+        prepare: &dyn Prepare,
         ask: i64,
         gate: Arc<dyn BuildGate>,
         hold: prune::ImageHold,
@@ -208,17 +258,21 @@ impl VersionBuilder {
         // one may read it after this request answered: every start keeps a
         // clone, and the directory goes with the last (`Staging`).
         let staging = Staging::new(workdir);
-        source::materialize(storage, &self.blobs, tenant, &request.manifest, &root).await?;
+        source::materialize(storage.as_ref(), &self.blobs, tenant, &source.manifest, &root).await?;
+        let files = Arc::new(source::VersionFiles::new(root.clone(), source.manifest.clone(), storage.clone(), tenant.to_string()));
 
-        let assets = request.inputs.assets.clone();
-        let node_set = request.inputs.node_set;
+        let node_set = source.inputs.node_set;
         let bases = self.bases.clone();
         let images = self.images.clone();
         // The compile and the staging are blocking filesystem work.
-        let (mut compiled, catalog, project) = tokio::task::spawn_blocking(move || source::compile(&root))
+        let (mut compiled, catalog, project) = tokio::task::spawn_blocking(move || source::compile(&root, files))
             .await
             .context("the compile task panicked")??;
-        resolve_assets(storage, tenant, &mut compiled, &assets).await?;
+        let assets = prepare.assets(storage.as_ref(), tenant, &compiled).await?;
+        weft_compiler::file_ref::apply_asset_resolutions(&mut compiled, &assets)
+            .map_err(|errs| anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))?;
+        prepare.check(&compiled).await?;
+        let name = project.manifest.package.name.clone();
         let (plan, definition) = tokio::task::spawn_blocking(move || {
             let plan = weft_compiler::build_plan::plan_build_from(
                 &project,
@@ -246,10 +300,11 @@ impl VersionBuilder {
             .map(|image| image.image_ref.clone())
             .context("the build plan has no worker image")?;
         let version = Version {
-            name: request.name.clone(),
-            manifest: request.manifest.clone(),
-            inputs: Some(request.inputs.clone()),
+            name,
+            manifest: source.manifest.clone(),
+            inputs: Some(weft_core::builds::BuildInputs { node_set, assets }),
             program: weft_core::builds::BuiltProgram {
+                version: weft_core::project::hash::manifest_version_id(&source.manifest),
                 definition,
                 binary_hash: plan.binary_hash,
                 definition_hash: plan.definition_hash,
@@ -397,7 +452,13 @@ impl VersionBuilder {
                 Err(e) => Err(e),
             };
             match written {
-                Ok(build) => return Ok(VersionBuild::Waiting(weft_core::builds::BuildsUnderway { build, images: underway })),
+                Ok(build) => {
+                    return Ok(VersionBuild::Waiting(weft_core::builds::BuildsUnderway {
+                        version: version.program.version.clone(),
+                        build,
+                        images: underway,
+                    }))
+                }
                 Err(e) => failures.push(e),
             }
         }
@@ -550,17 +611,13 @@ fn with_secondary(primary: anyhow::Error, recorded: Result<()>) -> anyhow::Error
     }
 }
 
-/// Apply the author's `@asset` resolutions to the definition the build
-/// compiled. A stored-file resolution names a key; its value is rebuilt
-/// from what the store records for that key (never the metadata the client
-/// sent), the key must be this tenant's, and the stored kind must be the
-/// kind the ref declared. A text resolution is taken as sent.
-async fn resolve_assets(
+/// [`Kept`]'s resolutions, each held to the store as it is now.
+async fn kept_assets(
     storage: &dyn ProjectStorage,
     tenant: &str,
-    definition: &mut weft_core::ProjectDefinition,
+    definition: &weft_core::ProjectDefinition,
     sent: &BTreeMap<String, serde_json::Value>,
-) -> Result<()> {
+) -> Result<BTreeMap<String, serde_json::Value>> {
     let mut map = BTreeMap::new();
     let mut refused = Vec::new();
     let file_refs = weft_compiler::file_ref::collect_asset_refs(definition)
@@ -605,8 +662,7 @@ async fn resolve_assets(
     if !refused.is_empty() {
         bail!("assets the build cannot use:\n  {}", refused.join("\n  "));
     }
-    weft_compiler::file_ref::apply_asset_resolutions(definition, &map)
-        .map_err(|errs| anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))
+    Ok(map)
 }
 
 /// Every infra place's image refs, from the plan: the images belong to

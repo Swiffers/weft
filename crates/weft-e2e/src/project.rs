@@ -427,8 +427,12 @@ impl Project {
         }
         let extras: Vec<PathBuf> = std::mem::take(&mut *self.extra_dirs.lock().expect("extra dirs"));
         for extra in extras {
-            std::fs::remove_dir_all(&extra)
-                .with_context(|| format!("teardown: remove temp dir {}", extra.display()))?;
+            // A test may delete a second checkout itself (a folder that is
+            // gone is what it tests); what is already gone needs no removing.
+            match std::fs::remove_dir_all(&extra) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                done => done.with_context(|| format!("teardown: remove temp dir {}", extra.display()))?,
+            }
         }
         std::fs::remove_dir_all(&self.dir)
             .with_context(|| format!("teardown: remove temp dir {}", self.dir.display()))?;

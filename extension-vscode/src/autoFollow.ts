@@ -192,7 +192,10 @@ export class AutoFollowController {
       // Build/verb lifecycle: the dispatcher announces transition flips
       // (building, activating, ...) so the bar shows "Building... (cancel)"
       // without waiting for the verb round-trip to finish.
-      ev.kind === 'project_transition_changed'
+      ev.kind === 'project_transition_changed' ||
+      // The folder's files or its head moved (a save synced, a load),
+      // which moves the drift the bar shows.
+      ev.kind === 'working_copy_changed'
     ) {
       this.onActionable(ev);
     }

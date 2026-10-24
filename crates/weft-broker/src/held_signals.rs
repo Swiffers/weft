@@ -286,7 +286,7 @@ fn activation_held(row: &str) -> String {
 /// holder claims it: a freed claim's last word is not the truth.
 fn held_select() -> String {
     format!(
-        "SELECT s.token, s.tenant_id, s.node_id, s.spec_json, s.is_resume, s.run_id, \
+        "SELECT s.token, s.tenant_id, s.node_id, s.spec_json, s.spec_json_version, s.is_resume, s.run_id, \
                 s.surface_kind, s.mount_path, s.mount_methods, s.auth_kind, s.auth_config, \
                 s.kind_state, s.kind_state_seq, s.project_id, s.instance_id, s.holds, \
                 s.generation, s.held_failed, \
@@ -307,12 +307,16 @@ fn decode(r: sqlx::postgres::PgRow) -> anyhow::Result<SignalRowWire> {
         .ok_or_else(|| anyhow::anyhow!("unknown auth_kind '{auth_str}'"))?;
     let for_instance = weft_core::instance::InstanceScope::from_columns(r.try_get("project_id")?, r.try_get("instance_id")?)
         .map_err(|e| anyhow::anyhow!("corrupt instance_id: {e}"))?;
+    let token: String = r.try_get("token")?;
     Ok(SignalRowWire {
-        token: r.try_get("token")?,
         tenant_id: r.try_get("tenant_id")?,
         for_instance,
         node_id: r.try_get("node_id")?,
-        spec_json: r.try_get("spec_json")?,
+        // Handed to the listener in today's shape.
+        spec_json: weft_core::primitive::SignalSpec::STORED
+            .in_todays_shape(r.try_get("spec_json")?, r.try_get("spec_json_version")?)
+            .map_err(|e| e.at(format_args!("signal {token}")))?,
+        token,
         is_resume: r.try_get("is_resume")?,
         run_id: r.try_get("run_id")?,
         surface_kind,

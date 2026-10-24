@@ -22,7 +22,7 @@ use sha2::Sha256;
 
 use crate::project::hash::sha256_hex;
 use super::hex_of;
-use super::spec::{AuthStep, SignKind, Template};
+use super::spec::{AnswerReader, AuthStep, RefusalPaths, SignKind, Template};
 
 /// The shared hygiene base for every connection HTTP client:
 /// connection establishment bounded, NO total timeout (streams run
@@ -88,21 +88,28 @@ pub enum RefusalKind {
 
 impl RefusalKind {
     /// The kind of refusal a provider's answer is, read off its status and
-    /// its `body` (`Null` when it had none, or none in JSON). The codes the
-    /// body names ([`error_codes`]) decide first, since a status alone can
-    /// mislead: Google answers its rate limits 403, naming
+    /// its `body` (`Null` when it had none, or none in JSON), the codes it
+    /// names read where `paths` says the error sits
+    /// ([`RefusalPaths::codes`]). The codes decide first, since a status
+    /// alone can mislead: Google answers its rate limits 403, naming
     /// `rateLimitExceeded`. A code saying the provider is busy wins, then
     /// one a new sign-in fixes, then one refusing the request; a body
     /// naming no code known here is read off its status (a success status
-    /// carrying a refusal, Slack's `ok: false`, is then
+    /// carrying a refusal, a false success flag, is then
     /// [`RefusalKind::Other`]). The one reading of every provider answer
     /// weft classifies.
-    pub fn of_answer(status: reqwest::StatusCode, body: &serde_json::Value) -> Self {
-        let named: Vec<RefusalKind> = error_codes(body).into_iter().filter_map(RefusalKind::of_code).collect();
+    pub fn of(status: reqwest::StatusCode, paths: RefusalPaths<'_>, body: &serde_json::Value) -> Self {
+        let named: Vec<RefusalKind> = paths.codes(body).into_iter().filter_map(RefusalKind::of_code).collect();
         [RefusalKind::Temporary, RefusalKind::Auth, RefusalKind::Other]
             .into_iter()
             .find(|kind| named.contains(kind))
             .unwrap_or_else(|| RefusalKind::of_status(status))
+    }
+
+    /// [`RefusalKind::of`] for an answer no recipe declares a reader for
+    /// (a holder's own call): its codes read at the conventional `error`.
+    pub fn of_answer(status: reqwest::StatusCode, body: &serde_json::Value) -> Self {
+        Self::of(status, RefusalPaths::default(), body)
     }
 
     fn of_status(status: reqwest::StatusCode) -> Self {
@@ -135,18 +142,6 @@ impl RefusalKind {
     }
 }
 
-/// The error codes an answer's body names: Slack's `{"ok": false,
-/// "error": code}` and an OAuth endpoint's `{"error": code}`, or
-/// Google's `{"error": {"status": code, "errors": [{"reason": code}]}}`.
-pub fn error_codes(body: &serde_json::Value) -> Vec<&str> {
-    let Some(error) = body.get("error") else { return Vec::new() };
-    if let Some(code) = error.as_str() {
-        return vec![code];
-    }
-    let reasons = error.get("errors").and_then(serde_json::Value::as_array).into_iter().flatten().filter_map(|e| e.get("reason"));
-    error.get("status").into_iter().chain(reasons).filter_map(serde_json::Value::as_str).collect()
-}
-
 /// How long one declared call ([`run_connect_call`]) may take, end to end.
 /// These are short control calls to a provider (mint a socket address,
 /// subscribe, unsubscribe), never a stream a person waits on, and some
@@ -161,12 +156,12 @@ pub const CONNECT_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// back the JSON body (Null when the provider answers empty, which
 /// several stop calls do). The one executor behind every recipe call
 /// (socket mints, subscribe/unsubscribe), wherever it runs.
-pub async fn run_connect_call(
-    call: &crate::access::spec::ConnectCall,
+pub async fn run_connect_call<A: AnswerReader>(
+    call: &crate::access::spec::ConnectCall<A>,
     values: &BTreeMap<String, String>,
 ) -> Result<serde_json::Value, ConnectCallError> {
     use crate::access::spec::TestMethod;
-    let url = call.url.resolve(values).map_err(ConnectCallError::Unbuildable)?;
+    let url = call.url.resolve_url(values).map_err(ConnectCallError::Unbuildable)?;
     // Errors name the call by its TEMPLATE, never the resolved URL: a
     // recipe may interpolate a secret into the query, and these strings
     // travel to logs and the user.
@@ -181,6 +176,15 @@ pub async fn run_connect_call(
     if let Some(body) = &call.body {
         req = req.json(&crate::access::spec::resolve_body(body, values).map_err(ConnectCallError::Unbuildable)?);
     }
+    if !call.form.is_empty() {
+        let form = call
+            .form
+            .iter()
+            .map(|(name, template)| Ok((name.as_str(), template.resolve(values)?)))
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(ConnectCallError::Unbuildable)?;
+        req = req.form(&form);
+    }
     let resp = req
         .send()
         .await
@@ -193,22 +197,17 @@ pub async fn run_connect_call(
         .await
         .map_err(|e| ConnectCallError::Unreached(format!("the answer from {shown} did not arrive: {}", e.without_url())))?;
     let body: serde_json::Value = serde_json::from_str(&body_text).unwrap_or(serde_json::Value::Null);
+    let paths = call.answer.refusal_paths();
     if !status.is_success() {
         return Err(ConnectCallError::Refused {
-            kind: RefusalKind::of_answer(status, &body),
-            why: format!(
-                "{shown} answered {status}: {}",
-                body.get("error")
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| body_text.chars().take(300).collect())
-            ),
+            kind: RefusalKind::of(status, paths, &body),
+            why: format!("{shown} answered {status}: {}", crate::truncate_user_string(&body_text, 300)),
         });
     }
-    // The Slack-style 200-with-ok:false refusal, same guard as every
-    // other declared call.
-    if body.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
-        let code = body.get("error").and_then(serde_json::Value::as_str).unwrap_or("unknown error");
-        return Err(ConnectCallError::Refused { kind: RefusalKind::of_answer(status, &body), why: format!("{shown} refused: {code}") });
+    // A refusal answered with a success status, where the call's reader
+    // says it sits: the one check of every declared call.
+    if let Some(why) = paths.refusal(&body) {
+        return Err(ConnectCallError::Refused { kind: RefusalKind::of(status, paths, &body), why: format!("{shown} refused: {why}") });
     }
     Ok(body)
 }
@@ -1180,11 +1179,35 @@ mod tests {
         ];
         for (status, body, expected) in cases {
             let (base, _) = serve(move |_| (status, body.to_string())).await;
-            let call: crate::access::spec::ConnectCall = serde_json::from_value(serde_json::json!({ "url": base })).unwrap();
+            // Slack's reader: a success flag at `ok`, its code at `error`.
+            let call: crate::access::spec::ConnectCall =
+                serde_json::from_value(serde_json::json!({ "url": base, "okPath": "ok", "errorPath": "error" })).unwrap();
             match run_connect_call(&call, &values(&[])).await {
                 Err(ConnectCallError::Refused { kind, .. }) => assert_eq!(kind, expected, "{status} {body}"),
                 other => panic!("{status} {body}: expected a refusal, got {other:?}"),
             }
+        }
+    }
+
+    /// A success answer refuses only where the call's reader says: an
+    /// undeclared `ok: false` or `error` is just data, and a refusal at a
+    /// declared error path is classified by the code found there.
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn a_declared_call_refuses_only_where_its_reader_says() {
+        let (base, _) = serve(|_| (200, r#"{"ok":false,"error":{"code":"ok"},"url":"wss://x"}"#.to_string())).await;
+        let plain: crate::access::spec::ConnectCall = serde_json::from_value(serde_json::json!({ "url": base })).unwrap();
+        assert!(run_connect_call(&plain, &values(&[])).await.is_ok(), "nothing declared, nothing refused");
+
+        let (base, _) = serve(|_| (200, r#"{"status":"failed","why":"ratelimited","error":"invalid_auth"}"#.to_string())).await;
+        let declared: crate::access::spec::ConnectCall =
+            serde_json::from_value(serde_json::json!({ "url": base, "errorPath": "why" })).unwrap();
+        match run_connect_call(&declared, &values(&[])).await {
+            Err(ConnectCallError::Refused { kind, why }) => {
+                assert_eq!(kind, RefusalKind::Temporary, "classified by the code at `why`, not at `error`");
+                assert!(why.ends_with("refused: ratelimited"), "{why}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 
@@ -1431,6 +1454,24 @@ mod tests {
             }
         });
         (base, seen)
+    }
+
+    /// A declared call's URL carries each interpolated value whole: a
+    /// secret holding `&` or `=` arrives as ONE query value, never as
+    /// extra parameters.
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn a_declared_call_encodes_the_values_in_its_url() {
+        let (base, seen) = serve(|_| (200, "{}".to_string())).await;
+        let call: crate::access::spec::ConnectCall = serde_json::from_value(serde_json::json!({
+            "url": format!("{base}/x/{{id}}?client_secret={{client_secret}}&grant_type=g"),
+        }))
+        .unwrap();
+        run_connect_call(&call, &values(&[("client_secret", "a&b=c"), ("id", "1/2")])).await.unwrap();
+        let target = seen.lock().unwrap()[0].clone();
+        assert!(target.starts_with("/x/1%2F2?"), "{target}");
+        assert_eq!(query_param(&target, "client_secret").as_deref(), Some("a&b=c"));
+        assert_eq!(query_param(&target, "grant_type").as_deref(), Some("g"));
     }
 
     /// A query parameter of a recorded request target.

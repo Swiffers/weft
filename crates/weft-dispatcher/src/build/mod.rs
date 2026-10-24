@@ -133,6 +133,11 @@ pub struct Version {
     pub name: String,
     /// The version's files, registered as the program's source.
     pub manifest: weft_core::project::hash::Manifest,
+    /// What its files were compiled with, registered with them so the
+    /// install can build the version again (`crate::maintenance`). `None`
+    /// only for a version an older weft asked for and wrote down waiting,
+    /// which kept none.
+    pub inputs: Option<weft_core::builds::BuildInputs>,
     /// The answer registration completes (its `replaced_infra_images`,
     /// from [`replaced_infra_images`]) and hands the client.
     pub program: weft_core::builds::BuiltProgram,
@@ -205,8 +210,8 @@ impl VersionBuilder {
         let staging = Staging::new(workdir);
         source::materialize(storage, &self.blobs, tenant, &request.manifest, &root).await?;
 
-        let assets = request.assets.clone();
-        let node_set = request.node_set;
+        let assets = request.inputs.assets.clone();
+        let node_set = request.inputs.node_set;
         let bases = self.bases.clone();
         let images = self.images.clone();
         // The compile and the staging are blocking filesystem work.
@@ -219,6 +224,8 @@ impl VersionBuilder {
                 &project,
                 &compiled,
                 &catalog,
+                // `source::compile` read the project from disk.
+                weft_compiler::CompileFs::disk(&project.root),
                 &bases,
                 &ImageTags(images.as_ref()),
                 node_set,
@@ -241,6 +248,7 @@ impl VersionBuilder {
         let version = Version {
             name: request.name.clone(),
             manifest: request.manifest.clone(),
+            inputs: Some(request.inputs.clone()),
             program: weft_core::builds::BuiltProgram {
                 definition,
                 binary_hash: plan.binary_hash,

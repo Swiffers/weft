@@ -30,6 +30,7 @@
     ],
     "test": {
       "url": "https://api.telegram.org/getMe",
+      "okPath": "ok",
       "captures": [
         {
           "name": "botUsername",

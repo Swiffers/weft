@@ -68,9 +68,11 @@ fn main() {
         for path in files {
             let id = path.file_stem().expect("a named file").to_string_lossy().to_string();
             let draft = id.starts_with("draft_");
+            // SYNC: ".contract" <-> weft_task_store::schema_guard::CONTRACT_SUFFIX
+            let part = if id.ends_with(".contract") { "Part::Contract" } else { "Part::Expand" };
             writeln!(
                 out,
-                "    Migration {{ group: {group:?}, id: {id:?}, draft: {draft}, \
+                "    Migration {{ group: {group:?}, id: {id:?}, part: {part}, draft: {draft}, \
                  sql: include_str!({:?}) }},",
                 path.display().to_string()
             )

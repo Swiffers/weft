@@ -278,10 +278,10 @@ fn stored_split(
 }
 
 /// Whether `field` at `at` is one the program fills per instance.
-fn fills(places: &[(String, &weft_core::project::NodeDefinition)], at: &str, field: &str) -> bool {
+fn fills(places: &[weft_core::project::FilledPlace<'_>], at: &str, field: &str) -> bool {
     places
         .iter()
-        .any(|(place, node)| place == at && weft_core::instance::instance_filled_fields(node).any(|(filled, _)| filled == field))
+        .any(|place| place.spelled == at && weft_core::instance::instance_filled_fields(place.node).any(|(filled, _)| filled == field))
 }
 
 /// A clear must name a field the program fills per instance, or the clear
@@ -305,22 +305,27 @@ pub(crate) fn triggers_reading<'a>(
     instance: Option<&InstanceId>,
     changes: &ValueChanges,
 ) -> Vec<&'a Activation> {
-    let touched = changes.places();
+    let g = weft_core::project::graph::ProjectGraph::new(project);
+    let place_of = |spelled: &str| {
+        let (id, path) = weft_core::project::resolve_address(project, spelled);
+        weft_core::frames::Located::new(id, path)
+    };
+    let touched: Vec<weft_core::frames::Located> = changes.places().into_iter().map(place_of).collect();
+    // Every instance's activation of one trigger shares its setup: walked
+    // once per trigger.
+    let mut reads: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
     activations
         .iter()
         .filter(|a| instance.is_none_or(|m| a.key.instance() == Some(m)))
         .filter(|a| {
-            let (id, path) = weft_core::project::resolve_address(project, &a.key.trigger);
-            weft_core::project::cut::walk_setup(&weft_core::project::graph::ProjectGraph::new(project), &[weft_core::frames::Located::new(id, path)])
-                .map(|setup| {
-                    setup.runs.iter().any(|place| {
-                        touched.contains(weft_core::project::address_of(project, &place.id, &place.path).as_str())
-                    })
-                })
-                // A trigger whose setup cannot be computed any more (the
-                // program changed under it) is re-armed with the rest, so
-                // its setup's own refusal names what is wrong.
-                .unwrap_or(true)
+            *reads.entry(a.key.trigger.as_str()).or_insert_with(|| {
+                weft_core::project::cut::walk_setup(&g, &[place_of(&a.key.trigger)])
+                    .map(|setup| touched.iter().any(|place| setup.runs.contains(place)))
+                    // A trigger whose setup cannot be computed any more (the
+                    // program changed under it) is re-armed with the rest, so
+                    // its setup's own refusal names what is wrong.
+                    .unwrap_or(true)
+            })
         })
         .collect()
 }

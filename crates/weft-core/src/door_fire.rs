@@ -153,7 +153,7 @@ impl WaitsOn {
 /// room and its trigger): only that changing, or the trigger activated
 /// again, hands it over. What `weft status` and the editor show per
 /// trigger.
-// SYNC: the kinds <-> weft_task_store::parked_fires::WaitsFor (parked_fire.waits_for), packages/weft-graph/src/protocol.ts (WaitingFires.on)
+// SYNC: the kinds <-> weft_task_store::parked_fires::WaitsFor (parked_fire.waits_for), packages/weft-graph/src/protocol.ts (WaitingFires.on), crates/weft-core/src/program.rs (WaitingFires.on)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnclockedWait {

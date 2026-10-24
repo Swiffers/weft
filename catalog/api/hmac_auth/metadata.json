@@ -1,7 +1,7 @@
 {
   "type": "HmacAuth",
   "label": "HMAC Auth",
-  "description": "Gate a Route with a shared secret the caller signs each request with, typical for webhooks. The caller sends `X-Timestamp: <unix seconds>` and `X-Signature: <hex HMAC-SHA256 of \"<timestamp>.<raw body>\" under the secret>`; a timestamp more than five minutes off is refused as a replay. `caller` is `{}`. Another signing scheme needs its own access node with its own `verify` block.",
+  "description": "Gate a Route with a shared secret the caller signs each request with, typical for webhooks. The caller sends `X-Timestamp: <unix seconds>` and `X-Signature: <hex HMAC-SHA256 of \"<timestamp>.<raw body>\" under the secret>`; a timestamp more than five minutes off is refused as a replay. `caller` is `{}`. Another signing scheme, or signed identity tokens (`oidc`), needs an access node of your own with its own `verify` block.",
   "tags": [
     "api",
     "auth",
@@ -28,8 +28,12 @@
     "identity": "Signing secret",
     "verify": {
       "kind": "hmac",
-      "signatureHeader": "X-Signature",
-      "timestampHeader": "X-Timestamp",
+      "signature": {
+        "in": "header:X-Signature"
+      },
+      "timestamp": {
+        "in": "header:X-Timestamp"
+      },
       "concat": "{timestamp}.{body}"
     }
   },

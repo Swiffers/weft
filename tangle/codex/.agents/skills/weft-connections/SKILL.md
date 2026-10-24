@@ -61,6 +61,10 @@ The flags you run:
   install; no secrets travel and no file changes. A live trigger that
   reads the node is set up again with it, and the answer names it.
   `--disconnect` forgets the pick.
+- Each listed [connection] shows its account and its name. When a service
+  has several, pick the one whose name matches this project; if none
+  clearly does, ask the user which one in one plain sentence that gives
+  the names.
 - `--forget <id>` deletes a stored [connection] and every pick of it
   goes with it (under `--json` it reports the current project's places
   that lose their pick: `{"forgot": ..., "cleared": [...]}`; declining reports
@@ -76,6 +80,11 @@ The flags the user runs, in the command you hand them:
   reads the value from an environment variable so a secret never rides
   the command line. An explicitly empty `--set` or `--set-env` value is an
   error, not a silent skip.
+- `--label <name>` names the new [connection]; without it, it is named
+  after the service (or the app it signs in through). Suggest a name with
+  the project in it (`acme-scraper`) for a key only this project should
+  use; a key meant for every project, like a model provider's, keeps the
+  service's name.
 - Any flag that shapes a new [connection] (`--set`, `--set-env`, `--paste`,
   `--mint`, `--label`, `--permissions`, `--shared-app`) skips the
   stored-connections menu and goes straight to connecting.
@@ -84,7 +93,7 @@ The flags the user runs, in the command you hand them:
 
 The user expands the [access node] in the graph and clicks its
 "Connect <Service>..." field. The widget lists existing connections first
-("identity / what it can do", with Change and Disconnect), then
+("account / name / what it can do", with Change and Disconnect), then
 "+ Add a connection" with up to two [door]s. A [door] the service does not offer is
 hidden, never greyed out.
 

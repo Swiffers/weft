@@ -312,11 +312,13 @@ mod tests {
             url: Template::new("https://slack.com/api/apps.connections.open"),
             method: crate::access::spec::TestMethod::Post,
             body: None,
+            form: Default::default(),
             auth: vec![crate::access::spec::AuthStep::Header {
                 name: "Authorization".into(),
                 value: Template::new("Bearer {appToken}"),
             }],
             captures: vec![Capture { name: "url".into(), path: "url".into(), optional: false }],
+            answer: Default::default(),
         }
     }
 

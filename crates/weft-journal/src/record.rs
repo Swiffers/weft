@@ -41,6 +41,16 @@ pub struct RunLogRow {
     pub seq: i32,
     #[serde(with = "base64_bytes")]
     pub events: Vec<u8>,
+    /// The version its events were written at (`run_log.events_version`,
+    /// `crate::stored::STORED_EVENTS`).
+    pub events_version: weft_core::stored::Version,
+}
+
+impl RunLogRow {
+    /// `events`, all of one run, as this weft writes them at `seq`.
+    pub fn of(seq: i32, events: &[RunEvent]) -> Self {
+        RunLogRow { seq, events: crate::stored::encode(events), events_version: crate::stored::STORED_EVENTS.version() }
+    }
 }
 
 /// A program a run runs, as the record keeps it (`project_definition`,
@@ -53,6 +63,9 @@ pub struct StoredProgram {
     pub project_id: uuid::Uuid,
     pub definition_hash: String,
     pub project_json: String,
+    /// The version its JSON was written at
+    /// (`ProjectDefinition::STORED`).
+    pub project_json_version: weft_core::stored::Version,
 }
 
 impl StoredProgram {
@@ -62,15 +75,25 @@ impl StoredProgram {
             project_id,
             definition_hash: weft_core::project::hash::compute_definition_hash(program)?,
             project_json: serde_json::to_string(program)?,
+            project_json_version: ProjectDefinition::STORED.version(),
         })
     }
 
-    /// Refuse a program that is not what it says: its JSON is no program
-    /// of its project, or does not hash to the hash it is kept under (a
-    /// run reading it back by that hash would run something else).
+    /// Refuse a program that is not what it says: written at another
+    /// version than today's (only a worker an older weft built sends one,
+    /// and it is never accommodated: `weft resync` rebuilds it), no
+    /// program of its project, or not hashing to the hash it is kept under
+    /// (a run reading it back by that hash would run something else).
     pub fn check(&self) -> anyhow::Result<()> {
+        let today = ProjectDefinition::STORED.version();
+        anyhow::ensure!(
+            self.project_json_version == today,
+            "program {} is written at version {}, and this weft reads version {today}: the worker that sent it was built by another weft; `weft resync` rebuilds it",
+            self.definition_hash,
+            self.project_json_version
+        );
         let program: ProjectDefinition = serde_json::from_str(&self.project_json)
-            .map_err(|e| anyhow::anyhow!("program {} does not read as a program: {e}", self.definition_hash))?;
+            .map_err(|e| anyhow::anyhow!("program {}: {e}", self.definition_hash))?;
         anyhow::ensure!(program.id == self.project_id, "program {} is of project {}, not {}", self.definition_hash, program.id, self.project_id);
         let hash = weft_core::project::hash::compute_definition_hash(&program)?;
         anyhow::ensure!(hash == self.definition_hash, "program {} hashes to {hash}", self.definition_hash);
@@ -145,7 +168,7 @@ impl RawRecord {
         let mut decoded = Vec::new();
         let mut bad = Vec::new();
         for row in &self.rows {
-            match crate::stored::decode(run_id, &row.events) {
+            match crate::stored::decode(run_id, &row.events, row.events_version) {
                 Ok(events) => decoded
                     .extend(events.into_iter().enumerate().map(|(index, event)| JournalRow { seq: row.seq, index: index as u32, event })),
                 Err(reason) => bad.push(reason),
@@ -286,6 +309,10 @@ pub struct Born {
     pub seed_of: Option<RunId>,
     pub started_at: i64,
     pub keep_for: Option<i64>,
+    /// The version a spec on this row is written at (`run.spec_version`,
+    /// `RunSpec::STORED`): a run born in a batch holds no spec, and the
+    /// column, NOT NULL with no default, is still bound by every writer.
+    pub spec_version: weft_core::stored::Version,
 }
 
 impl Born {
@@ -315,6 +342,7 @@ impl Born {
             seed_of: seed.as_ref().map(|seed| seed.parent),
             started_at: *at_unix as i64,
             keep_for: keep_for.seconds(),
+            spec_version: weft_core::run_spec::RunSpec::STORED.version(),
         })
     }
 }
@@ -429,7 +457,7 @@ pub async fn record_batch(
     let now = unix_now();
     let answered: Vec<RecordedRow> = sqlx::query_as(
         "SELECT o_run_id, o_fate, o_project_id, o_tell_end, o_keep_until, o_unwatched FROM weft_record_batch(\
-         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
     )
     .bind(writer)
     .bind(tenant)
@@ -452,6 +480,7 @@ pub async fn record_batch(
     .bind(&resolved_run)
     .bind(&resolved_token)
     .bind(sqlx::types::Json(&head.programs))
+    .bind(head.events_version)
     .fetch_all(&mut *conn)
     .await?;
     anyhow::ensure!(
@@ -483,7 +512,8 @@ pub struct Queued<'a> {
     pub watch_end: bool,
     /// What the version tree shows of a run started by hand.
     pub stale: &'a [String],
-    pub spec: Option<&'a serde_json::Value>,
+    /// What it was asked to run, written as `RunSpec::STORED` writes it.
+    pub spec: Option<&'a weft_core::run_spec::RunSpec>,
     pub example: Option<&'a str>,
     /// The program its birth was born naming (`crate::birth::Birth`): its
     /// cut is kept with the run, once. `None` for a birth built by hand
@@ -530,9 +560,9 @@ pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> a
     let inserted = sqlx::query(
         "INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, entry_node, instance_id, \
              fired_by, source_version, definition_hash, binary_hash, seed_of, stale, spec, example, state, \
-             epoch, last_seq, attempts, watch_end, started_at, skipped, cost_micro_usd, keep_for, cut_from) \
+             epoch, last_seq, attempts, watch_end, started_at, skipped, cost_micro_usd, keep_for, cut_from, spec_version) \
          SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'queued', \
-             0, 0, 0, $18, $19, $20, $21, $22, $23 \
+             0, 0, 0, $18, $19, $20, $21, $22, $23, $24 \
          WHERE EXISTS (SELECT 1 FROM project WHERE id = $2 AND NOT removing) \
          ON CONFLICT (run_id) DO NOTHING",
     )
@@ -551,7 +581,7 @@ pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> a
     .bind(&born.binary_hash)
     .bind(born.seed_of)
     .bind(queued.stale)
-    .bind(queued.spec)
+    .bind(queued.spec.map(serde_json::to_value).transpose()?)
     .bind(queued.example)
     .bind(queued.watch_end)
     .bind(born.started_at)
@@ -559,6 +589,7 @@ pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> a
     .bind(written.cost_micro_usd)
     .bind(born.keep_for)
     .bind(&born.cut_from)
+    .bind(weft_core::run_spec::RunSpec::STORED.version())
     .execute(&mut *conn)
     .await?;
     if inserted.rows_affected() == 0 {
@@ -577,9 +608,10 @@ pub async fn insert_queued_in(conn: &mut PgConnection, queued: &Queued<'_>) -> a
     if let Some(program) = queued.program {
         insert_cut_in(conn, program).await?;
     }
-    sqlx::query("INSERT INTO run_log (run_id, seq, events, writer, written_at) VALUES ($1, 0, $2, $3, $4)")
+    sqlx::query("INSERT INTO run_log (run_id, seq, events, events_version, writer, written_at) VALUES ($1, 0, $2, $3, $4, $5)")
         .bind(run_id)
         .bind(crate::stored::encode(queued.events))
+        .bind(crate::stored::STORED_EVENTS.version())
         .bind(DISPATCHER)
         .bind(unix_now())
         .execute(&mut *conn)
@@ -602,16 +634,19 @@ pub async fn notify_queued_in(conn: &mut PgConnection, project_id: uuid::Uuid) -
 /// Keep the cut `program` runs in the record, once, marked with the
 /// registered program it was cut from (`project_definition.cut_from`, so
 /// it never reads as a registered version). Nothing for a run of the
-/// registered program itself.
-async fn insert_cut_in(conn: &mut PgConnection, program: &RunsProgram) -> anyhow::Result<()> {
+/// registered program itself. In the caller's transaction: a run's start
+/// keeps it, and so does a move of paused runs onto a new build
+/// (`weft_dispatcher`'s `move_paused_runs`).
+pub async fn insert_cut_in(conn: &mut PgConnection, program: &RunsProgram) -> anyhow::Result<()> {
     let Some(cut) = program.kept() else { return Ok(()) };
     sqlx::query(
-        "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, cut_from) \
-         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (project_id, definition_hash) DO NOTHING",
+        "INSERT INTO project_definition (project_id, definition_hash, project_json, project_json_version, recorded_at_unix, cut_from) \
+         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (project_id, definition_hash) DO NOTHING",
     )
     .bind(cut.project_id)
     .bind(&cut.definition_hash)
     .bind(&cut.project_json)
+    .bind(cut.project_json_version)
     .bind(unix_now())
     .bind(program.cut_from())
     .execute(&mut *conn)
@@ -720,10 +755,11 @@ pub async fn append_locked_in(
     let seq = locked.last_seq + 1;
     let now = unix_now();
     if !events.is_empty() {
-        sqlx::query("INSERT INTO run_log (run_id, seq, events, writer, written_at) VALUES ($1, $2, $3, $4, $5)")
+        sqlx::query("INSERT INTO run_log (run_id, seq, events, events_version, writer, written_at) VALUES ($1, $2, $3, $4, $5, $6)")
             .bind(run_id)
             .bind(seq)
             .bind(crate::stored::encode(events))
+            .bind(crate::stored::STORED_EVENTS.version())
             .bind(writer)
             .bind(now)
             .execute(&mut *conn)
@@ -968,13 +1004,13 @@ pub async fn claim(conn: &mut PgConnection, run_id: RunId, project_id: uuid::Uui
 /// The record of `run_id`: its rows after `after` (every row when
 /// `None`).
 pub async fn read_record(conn: &mut PgConnection, run_id: RunId, after: Option<i32>) -> anyhow::Result<RawRecord> {
-    let rows: Vec<(i32, Vec<u8>)> =
-        sqlx::query_as("SELECT seq, events FROM run_log WHERE run_id = $1 AND seq > $2 ORDER BY seq")
+    let rows: Vec<(i32, Vec<u8>, weft_core::stored::Version)> =
+        sqlx::query_as("SELECT seq, events, events_version FROM run_log WHERE run_id = $1 AND seq > $2 ORDER BY seq")
             .bind(run_id)
             .bind(after.unwrap_or(-1))
             .fetch_all(&mut *conn)
             .await?;
-    Ok(RawRecord { rows: rows.into_iter().map(|(seq, events)| RunLogRow { seq, events }).collect() })
+    Ok(RawRecord { rows: rows.into_iter().map(|(seq, events, events_version)| RunLogRow { seq, events, events_version }).collect() })
 }
 
 fn unix_now() -> i64 {
@@ -1003,6 +1039,22 @@ mod tests {
         RunId::from_u128(3)
     }
 
+    /// A program a worker sends is kept only at today's version, of its
+    /// own project, under its own hash.
+    #[test]
+    fn a_program_is_kept_only_at_todays_version_under_its_own_hash() {
+        let project = uuid::Uuid::from_u128(9);
+        let empty = serde_json::json!({ "id": project, "nodes": [], "edges": [] }).to_string();
+        let fresh = StoredProgram::of(project, &serde_json::from_str(&empty).unwrap()).unwrap();
+        fresh.check().expect("today's program under its own hash");
+        let older = StoredProgram { project_json_version: ProjectDefinition::STORED.version() - 1, ..fresh.clone() };
+        assert!(older.check().unwrap_err().to_string().contains("weft resync"));
+        let mislabelled = StoredProgram { definition_hash: "the-hash-it-was-made-under".into(), ..fresh.clone() };
+        assert!(mislabelled.check().unwrap_err().to_string().contains("hashes to"));
+        let elsewhere = StoredProgram { project_id: uuid::Uuid::from_u128(10), ..fresh };
+        assert!(elsewhere.check().unwrap_err().to_string().contains("is of project"));
+    }
+
     /// An ending with no error and no cause carries neither key: the batch
     /// reads each key as the row's value, and a JSON `null` would land as
     /// a value no reader decodes.
@@ -1024,8 +1076,8 @@ mod tests {
         let completed = RunEvent::RunCompleted { run_id, at_unix: 2 };
         let record = RawRecord {
             rows: vec![
-                RunLogRow { seq: 1, events: b"not zstd".to_vec() },
-                RunLogRow { seq: 2, events: crate::stored::encode(std::slice::from_ref(&completed)) },
+                RunLogRow { seq: 1, events: b"not zstd".to_vec(), events_version: crate::stored::STORED_EVENTS.version() },
+                RunLogRow::of(2, std::slice::from_ref(&completed)),
             ],
         };
         assert!(record.decode(run_id).unwrap_err().contains(&run_id.to_string()));
@@ -1101,8 +1153,8 @@ mod tests {
         let done = RunEvent::RunCompleted { run_id, at_unix: 1 };
         let record = RawRecord {
             rows: vec![
-                RunLogRow { seq: 0, events: crate::stored::encode(std::slice::from_ref(&birth)) },
-                RunLogRow { seq: 1, events: crate::stored::encode(std::slice::from_ref(&done)) },
+                RunLogRow::of(0, std::slice::from_ref(&birth)),
+                RunLogRow::of(1, std::slice::from_ref(&done)),
             ],
         };
         let rows = record.decode(run_id).unwrap();

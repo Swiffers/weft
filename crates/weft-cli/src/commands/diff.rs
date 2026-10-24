@@ -26,7 +26,7 @@ pub async fn wires_of(ctx: &Ctx, client: &crate::client::DispatcherClient, refer
         let tree = fetch_tree(client, &project_id).await?;
         let run = resolve_run(&tree, reference)?;
         resolved_run_id = run.run_id.to_string();
-        super::versions::output_wires(client, &run.run_id.to_string()).await?
+        super::versions::output_wires(client, &run.run_id.to_string(), &[]).await?
     };
     // Label with the RESOLVED run, not the prefix the user typed, so
     // `weft diff 3f a1b2c3d4` does not print one side as `3f` and the

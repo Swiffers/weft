@@ -63,6 +63,9 @@ CODE_QUALITY_TRIAGE.md
 # Draft migrations: local to the machine that wrote them, collapsed into a
 # released migration by `./setup.sh --migration <name> --release`.
 crates/weft-task-store/migrations/*/drafts/
+# A release's files waiting beside their place until its commit lands; one
+# left behind is finished by renaming it into place (the boot says so).
+crates/weft-task-store/migrations/*/*.sql.releasing
 
 # mdbook build output (docs/book.toml build-dir).
 docs/book/
@@ -95,3 +98,4 @@ tangle/old
 .codex/agents/ruthless-reviewer.toml
 
 test/
+tmp/

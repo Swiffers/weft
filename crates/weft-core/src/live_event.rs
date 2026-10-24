@@ -2,13 +2,16 @@
 //! per thing, with its delivery identity ([`IdentifiedEvent`]). The live
 //! stream (`/events/project/{id}`) and a run's replay
 //! (`/runs/{id}/replay`) answer the same rows, and every Rust
-//! reader (the CLI's `weft events`, `weft logs`, `weft follow`) decodes
-//! them through these types.
+//! reader (the dispatcher's `/runs/{id}/events`, `weft follow`, `weft
+//! wait`) decodes them through these types; [`spelled`] reads them the
+//! way a person does.
 
 use serde::{Deserialize, Serialize};
 
 use crate::frames::LoopFrames;
 use crate::RunId;
+
+pub mod spelled;
 
 /// An event and its delivery identity. A run's recorded events take theirs
 /// from their place in its record (the row's `seq`, the event's index in
@@ -453,24 +456,35 @@ impl DispatcherEvent {
         }
     }
 
-    /// The loop and call frames of the one place this event is about: a
-    /// firing (a node's lifecycle, a cost or a file edit at that firing)
-    /// or a scope's copy being decided; `None` for an event about the
-    /// run, the project, a loop as a whole, or anything else that is not
-    /// one place.
-    pub fn place_frames(&self) -> Option<&LoopFrames> {
+    /// The one place this event is about, by id, and the loop and call
+    /// frames it sits at: a firing (a node's lifecycle, a cost or a file
+    /// edit at that firing) at its frames; a scope's copy being decided at
+    /// that copy's; a loop's lifecycle at the frames around the loop, and
+    /// an iteration's launch or gather inside that iteration (the frames
+    /// around the loop and its index), which is where the iteration's
+    /// rows run. `None` for an event about the run, the project, or
+    /// anything else that is not one place.
+    pub fn place(&self) -> Option<(&str, LoopFrames)> {
         match self {
-            Self::NodeStarted { frames, .. }
-            | Self::NodeSuspended { frames, .. }
-            | Self::NodeResumed { frames, .. }
-            | Self::WaitEnded { frames, .. }
-            | Self::NodeCancelled { frames, .. }
-            | Self::NodeCompleted { frames, .. }
-            | Self::NodeFailed { frames, .. }
-            | Self::NodeSkipped { frames, .. }
-            | Self::CostReported { frames, .. }
-            | Self::FileEdited { frames, .. }
-            | Self::ScopeDecided { frames, .. } => Some(frames),
+            Self::NodeStarted { node, frames, .. }
+            | Self::NodeSuspended { node, frames, .. }
+            | Self::NodeResumed { node, frames, .. }
+            | Self::WaitEnded { node, frames, .. }
+            | Self::NodeCancelled { node, frames, .. }
+            | Self::NodeCompleted { node, frames, .. }
+            | Self::NodeFailed { node, frames, .. }
+            | Self::NodeSkipped { node, frames, .. } => Some((node, frames.clone())),
+            Self::CostReported { node_id, frames, .. } | Self::FileEdited { node_id, frames, .. } => Some((node_id, frames.clone())),
+            Self::ScopeDecided { scope, frames, .. } => Some((scope, frames.clone())),
+            Self::LoopInstantiated { group_id, parent_frames, .. } | Self::LoopTerminated { group_id, parent_frames, .. } => {
+                Some((group_id, parent_frames.clone()))
+            }
+            Self::LoopIterationLaunched { group_id, parent_frames, index, .. }
+            | Self::LoopOutFired { group_id, parent_frames, index, .. } => {
+                let mut frames = parent_frames.clone();
+                frames.push(crate::frames::Frame::Loop { index: *index });
+                Some((group_id, frames))
+            }
             Self::RunStarted { .. }
             | Self::RunCompleted { .. }
             | Self::RunFailed { .. }
@@ -478,10 +492,6 @@ impl DispatcherEvent {
             | Self::RunTagged { .. }
             | Self::RunDeleted { .. }
             | Self::RunParked { .. }
-            | Self::LoopInstantiated { .. }
-            | Self::LoopIterationLaunched { .. }
-            | Self::LoopOutFired { .. }
-            | Self::LoopTerminated { .. }
             | Self::TriggerUrlChanged { .. }
             | Self::ProjectRegistered { .. }
             | Self::ProjectActivated { .. }

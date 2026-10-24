@@ -392,7 +392,7 @@ impl FireGateInfo {
 fn gate_select() -> String {
     format!(
         "SELECT s.token, s.project_id, s.tenant_id, s.surface_kind, s.auth_kind, \
-                s.is_resume, s.program_json->>'binary_hash' AS binary_hash, \
+                s.is_resume, s.binary_hash, \
                 COALESCE(a.status, 'active') AS status, \
                 COALESCE(a.accepting_fires, TRUE) AS accepting_fires, \
                 a.fires_deadline_unix \
@@ -608,8 +608,7 @@ pub async fn signal_file_for_token(
         .into_iter()
         .find(|s| s.token == signal_token && s.consumer_payload.is_some())
         .ok_or_else(not_found)?;
-    let spec: weft_core::primitive::SignalSpec = serde_json::from_str(&sig.spec_json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("corrupt signal spec: {e}")))?;
+    let spec = sig.spec().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("corrupt signal spec: {e:#}")))?;
     // A field that holds no file is a 404; a field whose file cannot be
     // read is the signal being broken, and says so.
     let file = weft_core::signal::stored_file(&spec, &field)
@@ -1182,7 +1181,9 @@ pub const API_PROJECT_HEADER: &str = "x-weft-api-project";
 /// project's routes (pattern + method) pick the program serving the route,
 /// and the call is passed on to that project's workers as the caller sent
 /// it (`live_relay`), whose door runs every check. A path no route serves
-/// is answered here, so a stray call wakes no worker.
+/// is answered here, so a stray call wakes no worker, and so is a route
+/// whose trigger's door refuses (`weft_core::arrival`), with the `503` the
+/// worker's door would give (`weft_core::arrival::not_now_answer`).
 pub async fn connect_live(
     State(state): State<DispatcherState>,
     address: crate::api::CallerAddress,
@@ -1206,7 +1207,14 @@ pub async fn connect_live(
             true
         }
     };
-    let binary_hash = relayed_route(&state, mount, request.method().as_str(), path).await?;
+    let binary_hash = match relayed_route(&state, mount, request.method().as_str(), path).await? {
+        Relayed::To(binary_hash) => binary_hash,
+        Relayed::NotNow => {
+            use axum::response::IntoResponse;
+            tracing::info!(target: "weft_dispatcher::signal", project = %mount.project, %path, "a live caller turned away: the route's trigger takes no calls now (`weft status` shows it; `weft activate` switches it back on)");
+            return Ok(weft_core::arrival::not_now_answer().into_response());
+        }
+    };
     // The path as the caller sent it, still percent-encoded: the decoded
     // capture would turn an escaped `?`, `/` or `#` into a real one on the
     // way to the worker. A project's API domain serves its routes at its
@@ -1223,45 +1231,71 @@ pub async fn connect_live(
 }
 
 /// One public entry of a tenant as held in memory (`crate::held`): where
-/// it is mounted, whose it is, and the program it is armed for.
+/// it is mounted, whose it is, the program it is armed for, and how the
+/// activation governing it stands (a change to that is announced on the
+/// routes' channel too, so the copy follows it).
+#[derive(Debug)]
 pub(crate) struct HeldRoute {
     project_id: uuid::Uuid,
     row: RouteRow,
     binary_hash: String,
+    standing: weft_core::arrival::Standing,
 }
 
-/// The program serving `method` on `path` among the live routes of the
-/// project `mount` names. Matched against the routes this dispatcher
-/// holds, and against the rows themselves before refusing: a route armed a
-/// moment ago may not have been heard yet.
+/// Where a live call goes.
+#[derive(Debug, PartialEq, Eq)]
+enum Relayed {
+    /// To the workers of this program, whose door decides.
+    To(String),
+    /// Nowhere: the route's trigger is not on, and nothing holds a caller
+    /// on the line (`weft_core::arrival`), so the relay answers it, and no
+    /// worker is woken to say so.
+    NotNow,
+}
+
+impl HeldRoute {
+    /// Where a live call reaching this route at `now_unix` goes.
+    fn relayed(&self, now_unix: i64) -> Relayed {
+        match self.standing.arrival(now_unix) {
+            weft_core::arrival::Arrival::Live => Relayed::To(self.binary_hash.clone()),
+            weft_core::arrival::Arrival::Wait | weft_core::arrival::Arrival::Refused => Relayed::NotNow,
+        }
+    }
+}
+
+/// Where the live call `method` on `path` goes among the live routes of
+/// the project `mount` names. Matched against the routes this dispatcher
+/// holds, and against the rows themselves before refusing or turning it
+/// away: a route armed or switched on a moment ago may not have been heard
+/// yet.
 async fn relayed_route(
     state: &DispatcherState,
     mount: weft_core::route::SharedMount<'_>,
     method: &str,
     path: &str,
-) -> Result<String, (StatusCode, String)> {
+) -> Result<Relayed, (StatusCode, String)> {
+    let now = crate::lease::now_unix();
     if let Some(held) = state.held.routes.held(&mount.tenant.to_string()) {
-        if let Ok(found) = match_relayed(&held, mount, method, path) {
-            return Ok(found);
+        if let Ok(Relayed::To(binary_hash)) = match_relayed(&held, mount, method, path).map(|route| route.relayed(now)) {
+            return Ok(Relayed::To(binary_hash));
         }
     }
-    match_relayed(&fresh_tenant_routes(state, mount.tenant).await?, mount, method, path)
+    Ok(match_relayed(&fresh_tenant_routes(state, mount.tenant).await?, mount, method, path)?.relayed(now))
 }
 
-fn match_relayed(
-    routes: &[HeldRoute],
+fn match_relayed<'r>(
+    routes: &'r [HeldRoute],
     mount: weft_core::route::SharedMount<'_>,
     method: &str,
     path: &str,
-) -> Result<String, (StatusCode, String)> {
+) -> Result<&'r HeldRoute, (StatusCode, String)> {
     let candidates: Vec<&HeldRoute> = routes.iter().filter(|route| route.project_id == mount.project).collect();
     let rows: Vec<RouteRow> = candidates.iter().map(|route| route.row.clone()).collect();
     let (matched, _) = resolve_route(&rows, mount, method, path)?;
-    let route = candidates
-        .iter()
+    Ok(candidates
+        .into_iter()
         .find(|route| route.row.token == matched.token)
-        .expect("the matched route is one of the rows it was matched among");
-    Ok(route.binary_hash.clone())
+        .expect("the matched route is one of the rows it was matched among"))
 }
 
 /// Every public entry of `tenant` as the rows say now, kept for the next
@@ -1272,25 +1306,33 @@ async fn fresh_tenant_routes(state: &DispatcherState, tenant: &str) -> Result<Ar
 
 async fn read_tenant_routes(pool: &sqlx::PgPool, tenant: &str) -> Result<Vec<HeldRoute>, (StatusCode, String)> {
     // token, mount path, methods, project, the program's binary (an entry
-    // is armed with its program as it is captured)
-    type MountRow = (String, String, Vec<String>, uuid::Uuid, String);
-    let rows: Vec<MountRow> = sqlx::query_as(
-        "SELECT s.token, s.mount_path, s.mount_methods, s.project_id, s.program_json->>'binary_hash' \
-         FROM signal s \
+    // is armed with its program as it is captured), and the governing
+    // activation's standing, read as the fire gate reads it
+    // (`gate_select`: no governing activation reads as live and accepting)
+    type MountRow = (String, String, Vec<String>, uuid::Uuid, String, String, bool, Option<i64>);
+    let rows: Vec<MountRow> = sqlx::query_as(&format!(
+        "SELECT s.token, s.mount_path, s.mount_methods, s.project_id, s.binary_hash, \
+                COALESCE(a.status, 'active'), COALESCE(a.accepting_fires, TRUE), a.fires_deadline_unix \
+         FROM signal s {} \
          WHERE s.tenant_id = $1 AND s.surface_kind = 'public_entry' AND s.mount_path IS NOT NULL",
-    )
+        weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+    ))
     .bind(tenant)
     .fetch_all(pool)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("route lookup: {e}")))?;
-    Ok(rows
-        .into_iter()
-        .map(|(token, mount_path, mount_methods, project_id, binary_hash)| HeldRoute {
-            project_id,
-            row: RouteRow { token, mount_path, mount_methods },
-            binary_hash,
+    rows.into_iter()
+        .map(|(token, mount_path, mount_methods, project_id, binary_hash, status, accepting_fires, fires_deadline_unix)| {
+            let status = crate::activation_store::ProjectStatus::parse(&status)
+                .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, format!("unknown activation status '{status}'")))?;
+            Ok(HeldRoute {
+                project_id,
+                row: RouteRow { token, mount_path, mount_methods },
+                binary_hash,
+                standing: weft_core::arrival::Standing { status, accepting_fires, fires_deadline_unix },
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Project-token proxy: what a trigger node is showing. `{node}` is
@@ -1412,6 +1454,35 @@ mod route_lookup_tests {
 
     const P: uuid::Uuid = uuid::Uuid::from_u128(7);
 
+    use crate::activation_store::ProjectStatus;
+
+    fn standing(status: ProjectStatus, accepting_fires: bool, fires_deadline_unix: Option<i64>) -> weft_core::arrival::Standing {
+        weft_core::arrival::Standing { status, accepting_fires, fires_deadline_unix }
+    }
+
+    /// A route whose trigger is not on (whatever its door: nothing holds a
+    /// caller on the line) is answered by the relay, so the call never
+    /// reaches `live_relay::to_project`, the one place a live call asks the
+    /// platform for a worker; one that is on goes to the workers.
+    #[test]
+    fn a_down_routes_live_call_is_answered_without_a_worker() {
+        let route = |standing| HeldRoute {
+            project_id: P,
+            row: row(&weft_core::route::SharedMount::new("alice", P).mount_path("chat"), &[], "tok"),
+            binary_hash: "bin".into(),
+            standing,
+        };
+        let now = 1_000;
+        assert_eq!(route(standing(ProjectStatus::Inactive, false, None)).relayed(now), Relayed::NotNow);
+        assert_eq!(route(standing(ProjectStatus::Inactive, true, Some(now - 1))).relayed(now), Relayed::NotNow, "its door's window ended");
+        assert_eq!(route(standing(ProjectStatus::Active, true, None)).relayed(now), Relayed::To("bin".into()));
+        assert_eq!(route(standing(ProjectStatus::Inactive, true, None)).relayed(now), Relayed::NotNow, "a door that holds holds no caller");
+        let (status, headers, body) = weft_core::arrival::not_now_answer();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(headers[0], (axum::http::header::RETRY_AFTER, weft_core::arrival::NOT_NOW_RETRY_SECS.to_string()));
+        assert_eq!(body, weft_core::arrival::NOT_NOW_FOR_CALLER);
+    }
+
     fn mount() -> weft_core::route::SharedMount<'static> {
         weft_core::route::SharedMount::new("alice", P)
     }
@@ -1462,11 +1533,12 @@ mod route_lookup_tests {
             project_id: project,
             row: row(&weft_core::route::SharedMount::new("alice", project).mount_path("chat"), &[], token),
             binary_hash: binary.into(),
+            standing: standing(ProjectStatus::Active, true, None),
         };
         let routes = vec![held(P, "mine", "bin-p"), held(other, "theirs", "bin-o")];
-        assert_eq!(match_relayed(&routes, mount(), "GET", "chat").unwrap(), "bin-p");
+        assert_eq!(match_relayed(&routes, mount(), "GET", "chat").unwrap().binary_hash, "bin-p");
         let theirs = weft_core::route::SharedMount::new("alice", other);
-        assert_eq!(match_relayed(&routes, theirs, "GET", "chat").unwrap(), "bin-o");
+        assert_eq!(match_relayed(&routes, theirs, "GET", "chat").unwrap().binary_hash, "bin-o");
         let nobody = weft_core::route::SharedMount::new("alice", uuid::Uuid::from_u128(9));
         assert_eq!(match_relayed(&routes, nobody, "GET", "chat").unwrap_err().0, StatusCode::NOT_FOUND);
     }

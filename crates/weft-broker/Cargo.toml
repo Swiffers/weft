@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-weft-core = { workspace = true }
+weft-core = { workspace = true, features = ["server"] }
 weft-journal = { workspace = true }
 weft-task-store = { workspace = true, features = ["serve"] }
 weft-access-store = { workspace = true }

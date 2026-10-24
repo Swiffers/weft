@@ -163,6 +163,40 @@ fn copy_key(project_id: uuid::Uuid, node_id: &str, instance: Option<&weft_core::
     (project_id, node_id.to_string(), instance.cloned())
 }
 
+/// One copy's `infra_node` row: what `infra_nodes` hands the supervisor,
+/// and the columns its writes change that it never reads back.
+struct CopyRow {
+    node: SupervisorInfraNode,
+    progress: CopyProgress,
+}
+
+impl CopyRow {
+    /// A row seeded, or written by an apply's stamp, with nothing in
+    /// progress (`provisioning_since_unix` is the apply's own to set).
+    fn at_rest(node: SupervisorInfraNode) -> Self {
+        Self { node, progress: CopyProgress::default() }
+    }
+}
+
+/// The columns of a copy's row the supervisor writes and never reads
+/// back, as the broker's writes leave them: a stamp's failure, what the
+/// change in progress waits on (`set_waiting`, cleared by a stamp that
+/// changes the status), and when an apply began provisioning (cleared
+/// once the copy leaves provisioning).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CopyProgress {
+    pub failure_stage: Option<weft_broker_client::protocol::FailureStage>,
+    pub failure_message: Option<String>,
+    pub waiting_on: Option<String>,
+    /// The fake has no wall clock: an apply's provisioning stamp writes
+    /// [`PROVISIONING_SINCE_UNIX`], and what a test checks is that it is
+    /// there or gone.
+    pub provisioning_since_unix: Option<i64>,
+}
+
+/// What `set_provisioning` stamps as `provisioning_since_unix`.
+pub const PROVISIONING_SINCE_UNIX: i64 = 1;
+
 #[derive(Default)]
 struct Inner {
     /// All projects under this tenant. Keyed by project_id.
@@ -172,7 +206,7 @@ struct Inner {
     tenant_id: String,
 
     /// Infra nodes keyed by (project_id, node_id, instance): one per copy.
-    infra_nodes: HashMap<CopyKey, SupervisorInfraNode>,
+    infra_nodes: HashMap<CopyKey, CopyRow>,
 
     /// Where each project's health rules stand, as `set_health_state`
     /// last wrote it.
@@ -323,6 +357,103 @@ impl Inner {
             !self.completed(c.id) && self.owners.get(&c.project_id) == Some(&Owner::Nobody)
         })
     }
+
+    /// The uncompleted commands of `project_id` that reach the copy of
+    /// `node_id` owned by `instance`: the issued ones not yet completed,
+    /// and the ones a test scripted in flight (`set_infra_commands_in_flight`),
+    /// both standing for the broker's uncompleted `infra_lifecycle_command`
+    /// rows. `Some(id)` keeps command `id` alone.
+    fn uncompleted_reaching(
+        &self,
+        project_id: uuid::Uuid,
+        node_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        id: Option<i64>,
+    ) -> bool {
+        let issued = self.commands.iter().any(|c| {
+            id.is_none_or(|id| c.id == id)
+                && c.project_id == project_id
+                && !self.completed(c.id)
+                && weft_broker_client::protocol::InFlightCommand { node_id: c.node_id.clone(), copies: c.copies.clone() }
+                    .reaches(node_id, instance)
+        });
+        let scripted = id.is_none()
+            && self
+                .infra_commands_in_flight
+                .get(&project_id)
+                .is_some_and(|commands| commands.iter().any(|c| c.reaches(node_id, instance)));
+        issued || scripted
+    }
+
+    /// Stamp `status` on a copy, per unit or node-wide, under the broker's
+    /// fence (`weft_broker::lifecycle_writes::set_status`, the one path
+    /// both `set_status` and `set_unit_health` take there): the project
+    /// still owned (else Displaced), the copy's row there, the unit in its
+    /// roster for a per-unit stamp, and either `command` still uncompleted
+    /// and reaching the copy or, with no command (the health reconcile),
+    /// no uncompleted command reaching it (else Gone). Per unit, the
+    /// unit's status and health windows are set and the node status rolls
+    /// up; node-wide, every unit and the node take the status directly (so
+    /// a unit-less roster still takes a Failed / Terminating stamp). The
+    /// row's other columns change as the broker's write changes them: the
+    /// failure becomes `failure` (none clears it), what it waits on goes
+    /// when the node status changes, and the provisioning start goes once
+    /// the node is not provisioning.
+    #[allow(clippy::too_many_arguments)]
+    fn stamp(
+        &mut self,
+        command: Option<i64>,
+        project_id: uuid::Uuid,
+        node_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        unit: Option<&str>,
+        status: weft_broker_client::protocol::InfraNodeStatus,
+        failure: (Option<weft_broker_client::protocol::FailureStage>, Option<&str>),
+        not_ready_since_unix: Option<i64>,
+        ready_since_unix: Option<i64>,
+    ) -> weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetStatusResponse> {
+        use weft_broker_client::WriteOutcome;
+        if !self.owns(project_id) {
+            return WriteOutcome::Displaced;
+        }
+        let commands_pass = match command {
+            Some(id) => self.uncompleted_reaching(project_id, node_id, instance, Some(id)),
+            None => !self.uncompleted_reaching(project_id, node_id, instance, None),
+        };
+        if !commands_pass {
+            return WriteOutcome::Gone;
+        }
+        let Some(CopyRow { node, progress }) = self.infra_nodes.get_mut(&copy_key(project_id, node_id, instance)) else {
+            return WriteOutcome::Gone;
+        };
+        let before = node.status;
+        match unit {
+            Some(u) => {
+                let Some(ur) = node.units.get_mut(u) else {
+                    return WriteOutcome::Gone;
+                };
+                ur.status = status;
+                ur.not_ready_since_unix = not_ready_since_unix;
+                ur.ready_since_unix = ready_since_unix;
+                node.status = weft_broker_client::protocol::InfraNodeStatus::rollup(node.units.values().map(|u| &u.status));
+            }
+            None => {
+                for ur in node.units.values_mut() {
+                    ur.status = status;
+                }
+                node.status = status;
+            }
+        }
+        progress.failure_stage = failure.0;
+        progress.failure_message = failure.1.map(str::to_string);
+        if node.status != before {
+            progress.waiting_on = None;
+        }
+        if node.status != weft_broker_client::protocol::InfraNodeStatus::Provisioning {
+            progress.provisioning_since_unix = None;
+        }
+        WriteOutcome::Applied(weft_broker_client::protocol::SupervisorSetStatusResponse {})
+    }
 }
 
 pub struct FakeBroker {
@@ -458,7 +589,7 @@ impl FakeBroker {
     ) {
         self.inner.lock().infra_nodes.insert(
             copy_key(project_id, node_id, None),
-            SupervisorInfraNode {
+            CopyRow::at_rest(SupervisorInfraNode {
                 node_id: node_id.to_string(),
                 copy_id: copy_id.to_string(),
                 status,
@@ -474,7 +605,7 @@ impl FakeBroker {
                 units,
                 instance: None,
                 health_rules: None,
-            },
+            }),
         );
     }
 
@@ -492,7 +623,7 @@ impl FakeBroker {
         units.insert(node_id.to_string(), unit_runtime(status));
         self.inner.lock().infra_nodes.insert(
             copy_key(project_id, node_id, Some(instance)),
-            SupervisorInfraNode {
+            CopyRow::at_rest(SupervisorInfraNode {
                 node_id: node_id.to_string(),
                 copy_id: copy_id.to_string(),
                 status,
@@ -503,7 +634,7 @@ impl FakeBroker {
                 units,
                 instance: Some(instance.clone()),
                 health_rules: None,
-            },
+            }),
         );
     }
 
@@ -528,7 +659,7 @@ impl FakeBroker {
             .infra_nodes
             .get_mut(&copy_key(project_id, node_id, instance))
             .expect("set_keep_disks on a seeded row");
-        node.keep_disks = keep_disks;
+        node.node.keep_disks = keep_disks;
     }
 
     /// The health rules a seeded copy's last apply stamped (what its node
@@ -545,7 +676,7 @@ impl FakeBroker {
             .infra_nodes
             .get_mut(&copy_key(project_id, node_id, instance))
             .expect("set_health_rules on a seeded row");
-        node.health_rules = rules;
+        node.node.health_rules = rules;
     }
 
     /// Issue a command: it waits until `command_complete` records it,
@@ -676,7 +807,18 @@ impl FakeBroker {
             .lock()
             .infra_nodes
             .get(&copy_key(project_id, node_id, instance))
-            .cloned()
+            .map(|row| row.node.clone())
+    }
+
+    /// What the broker's writes left in a copy's row beside what the
+    /// supervisor reads ([`CopyProgress`]).
+    pub fn copy_progress(
+        &self,
+        project_id: uuid::Uuid,
+        node_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+    ) -> Option<CopyProgress> {
+        self.inner.lock().infra_nodes.get(&copy_key(project_id, node_id, instance)).map(|row| row.progress.clone())
     }
 
     /// `command_complete` calls that recorded an error (cancelled
@@ -883,7 +1025,7 @@ impl BrokerSupervisorOps for FakeBroker {
         let gone = copies
             .iter()
             .filter(|c| {
-                !inner.infra_nodes.values().any(|n| n.copy_id == c.copy_id)
+                !inner.infra_nodes.values().any(|row| row.node.copy_id == c.copy_id)
                     && (inner.infraless.contains(&project) || inner.undeclared.contains(&(project, c.node.clone())))
             })
             .map(|c| c.copy_id.clone())
@@ -903,7 +1045,7 @@ impl BrokerSupervisorOps for FakeBroker {
             .infra_nodes
             .iter()
             .filter(|((p, _, _), _)| *p == project_id)
-            .map(|(_, n)| n.clone())
+            .map(|(_, row)| row.node.clone())
             .collect())
     }
 
@@ -1030,47 +1172,9 @@ impl BrokerSupervisorOps for FakeBroker {
             failure_stage,
             failure_message: failure_message.map(|s| s.to_string()),
         });
-        // Every write is ownership-gated, matching the broker. A
-        // lost-ownership project is Displaced.
-        if !inner.owns(project_id) {
-            return Ok(weft_broker_client::WriteOutcome::Displaced);
-        }
-        if let Some(node) = inner
-            .infra_nodes
-            .get_mut(&copy_key(project_id, node_id, instance))
-        {
-            // Mirror prod: per-unit sets that unit then rolls up the
-            // node status; node-wide sets every unit AND the node
-            // status to the value directly (so a unit-less roster still
-            // takes a Failed / Terminating stamp). A per-unit stamp for
-            // a unit NOT in the roster is Gone, exactly like prod's
-            // fence (`units_json ? $1` matches no row while the supervisor
-            // still owns the project): the old silent no-op here let a
-            // caller bug pass tests.
-            match unit {
-                Some(u) => {
-                    let Some(ur) = node.units.get_mut(u) else {
-                        return Ok(weft_broker_client::WriteOutcome::Gone);
-                    };
-                    ur.status = status;
-                    node.status = weft_broker_client::protocol::InfraNodeStatus::rollup(
-                        node.units.values().map(|u| &u.status),
-                    );
-                }
-                None => {
-                    for ur in node.units.values_mut() {
-                        ur.status = status;
-                    }
-                    node.status = status;
-                }
-            }
-            Ok(weft_broker_client::WriteOutcome::Applied(
-                weft_broker_client::protocol::SupervisorSetStatusResponse {},
-            ))
-        } else {
-            // No row to update while still owning the project: Gone.
-            Ok(weft_broker_client::WriteOutcome::Gone)
-        }
+        // `BrokerSupervisorClient`'s `set_status` always sends the
+        // health windows empty.
+        Ok(inner.stamp(Some(command_id), project_id, node_id, instance, unit, status, (failure_stage, failure_message), None, None))
     }
 
     async fn set_unit_health(
@@ -1094,21 +1198,9 @@ impl BrokerSupervisorOps for FakeBroker {
             not_ready_since_unix,
             ready_since_unix,
         });
-        if !inner.owns(project_id) {
-            return Ok(weft_broker_client::WriteOutcome::Displaced);
-        }
-        // The broker's per-unit fence: a unit not in the roster is Gone.
-        let Some(node) = inner.infra_nodes.get_mut(&copy_key(project_id, node_id, instance)) else {
-            return Ok(weft_broker_client::WriteOutcome::Gone);
-        };
-        let Some(ur) = node.units.get_mut(unit) else {
-            return Ok(weft_broker_client::WriteOutcome::Gone);
-        };
-        ur.status = status;
-        ur.not_ready_since_unix = not_ready_since_unix;
-        ur.ready_since_unix = ready_since_unix;
-        node.status = weft_broker_client::protocol::InfraNodeStatus::rollup(node.units.values().map(|u| &u.status));
-        Ok(weft_broker_client::WriteOutcome::Applied(weft_broker_client::protocol::SupervisorSetStatusResponse {}))
+        // The broker's `set_unit_health` stamps through the same write as
+        // `set_status`, with no failure.
+        Ok(inner.stamp(None, project_id, node_id, instance, Some(unit), status, (None, None), not_ready_since_unix, ready_since_unix))
     }
 
     async fn set_waiting(
@@ -1135,10 +1227,17 @@ impl BrokerSupervisorOps for FakeBroker {
             // Releasing the gate closes it: every acquire then returns.
             let _ = gate.acquire().await;
         }
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         if !inner.owns(project_id) {
             return Ok(weft_broker_client::WriteOutcome::Displaced);
         }
+        // As the broker's write: the copy's row, reached by the command
+        // still uncompleted, else nothing matches (Gone).
+        let reaching = inner.uncompleted_reaching(project_id, node_id, instance, Some(command_id));
+        let Some(row) = inner.infra_nodes.get_mut(&copy_key(project_id, node_id, instance)).filter(|_| reaching) else {
+            return Ok(weft_broker_client::WriteOutcome::Gone);
+        };
+        row.progress.waiting_on = Some(waiting.to_string());
         Ok(weft_broker_client::WriteOutcome::Applied(weft_broker_client::protocol::SupervisorSetWaitingResponse {}))
     }
 
@@ -1253,19 +1352,24 @@ impl BrokerSupervisorOps for FakeBroker {
         // Mirror prod's `write_apply_row`: the provisioning stamp writes
         // a flat Provisioning (the node IS mid-apply, whatever a frozen
         // or carried unit says); set_applied derives from the roster.
+        // A failure and what an earlier change waited on go; the
+        // provisioning start is stamped.
         inner.infra_nodes.insert(
             copy_key(project_id, node_id, instance),
-            SupervisorInfraNode {
-                node_id: node_id.to_string(),
-                copy_id: copy_id.to_string(),
-                status: weft_broker_client::protocol::InfraNodeStatus::Provisioning,
-                applied_spec_hash: None,
-                applied_at_unix: None,
-                addresses: Default::default(),
-                keep_disks,
-                units,
-                instance: instance.cloned(),
-                health_rules,
+            CopyRow {
+                node: SupervisorInfraNode {
+                    node_id: node_id.to_string(),
+                    copy_id: copy_id.to_string(),
+                    status: weft_broker_client::protocol::InfraNodeStatus::Provisioning,
+                    applied_spec_hash: None,
+                    applied_at_unix: None,
+                    addresses: Default::default(),
+                    keep_disks,
+                    units,
+                    instance: instance.cloned(),
+                    health_rules,
+                },
+                progress: CopyProgress { provisioning_since_unix: Some(PROVISIONING_SINCE_UNIX), ..CopyProgress::default() },
             },
         );
         Ok(weft_broker_client::WriteOutcome::Applied(
@@ -1311,9 +1415,11 @@ impl BrokerSupervisorOps for FakeBroker {
         let status = weft_broker_client::protocol::InfraNodeStatus::applied_rollup(
             units.values().map(|u| &u.status),
         );
+        // A failure, what the apply waited on and its provisioning start
+        // all go.
         inner.infra_nodes.insert(
             copy_key(project_id, node_id, instance),
-            SupervisorInfraNode {
+            CopyRow::at_rest(SupervisorInfraNode {
                 node_id: node_id.to_string(),
                 copy_id: copy_id.to_string(),
                 status,
@@ -1326,7 +1432,7 @@ impl BrokerSupervisorOps for FakeBroker {
                 units,
                 instance: instance.cloned(),
                 health_rules,
-            },
+            }),
         );
         Ok(weft_broker_client::WriteOutcome::Applied(
             weft_broker_client::protocol::SupervisorSetAppliedResponse {},
@@ -1426,6 +1532,21 @@ mod tests {
             "inst1",
             weft_broker_client::protocol::InfraNodeStatus::Provisioning,
         );
+        // A health window the unit was in: a per-unit stamp clears it,
+        // as the broker's does.
+        b.set_unit_health(
+            "sup-1",
+            P1,
+            "n1",
+            None,
+            "n1",
+            weft_broker_client::protocol::InfraNodeStatus::Provisioning,
+            Some(10),
+            Some(20),
+        )
+        .await
+        .unwrap();
+        b.enqueue_command(stop(1, P1));
         b.set_status(
             "sup-1",
             1,
@@ -1444,6 +1565,8 @@ mod tests {
             node.status,
             weft_broker_client::protocol::InfraNodeStatus::Running
         );
+        let unit = &node.units["n1"];
+        assert_eq!((unit.not_ready_since_unix, unit.ready_since_unix), (None, None));
     }
 
     #[tokio::test]
@@ -1491,6 +1614,68 @@ mod tests {
         assert!(matches!(claim(&b, &[1]).await, SupervisorClaim::Nothing), "a command already running here is not handed out again");
         b.command_complete("sup-1", 1, None, false).await.unwrap();
         assert!(matches!(claim(&b, &[]).await, SupervisorClaim::Nothing));
+    }
+
+    /// A stamp passes the broker's whole fence: a health write while a
+    /// command reaches the copy is Gone, and so is a command's stamp once
+    /// that command completed or when it was never issued; with the
+    /// command done, the health write goes through.
+    #[tokio::test]
+    async fn a_stamp_is_refused_while_the_fence_says_no() {
+        use weft_broker_client::protocol::InfraNodeStatus as Status;
+        use weft_broker_client::WriteOutcome;
+        let b = FakeBroker::new("alice");
+        b.add_infra_node(P1, "n1", "inst1", Status::Running);
+        let health = || b.set_unit_health("sup-1", P1, "n1", None, "n1", Status::Flaky, Some(10), None);
+        let stamp = |command| b.set_status("sup-1", command, P1, "n1", None, Some("n1"), Status::Stopping, None, None);
+        assert!(matches!(stamp(1).await.unwrap(), WriteOutcome::Gone), "a command never issued stamps nothing");
+        b.enqueue_command(stop(1, P1));
+        assert!(matches!(health().await.unwrap(), WriteOutcome::Gone), "no health write while a command is in flight");
+        assert_eq!(b.infra_node(P1, "n1").unwrap().status, Status::Running);
+        assert!(matches!(stamp(1).await.unwrap(), WriteOutcome::Applied(_)));
+        b.command_complete("sup-1", 1, None, false).await.unwrap();
+        assert!(matches!(stamp(1).await.unwrap(), WriteOutcome::Gone), "a completed command stamps nothing more");
+        assert!(matches!(health().await.unwrap(), WriteOutcome::Applied(_)));
+        assert_eq!(b.infra_node(P1, "n1").unwrap().status, Status::Flaky);
+    }
+
+    /// A stamp changes the rest of the copy's row as the broker's does:
+    /// the failure is the stamp's own (none clears it), what the change
+    /// waits on stays while the status does and goes once it moves, and
+    /// the provisioning start goes once the copy leaves provisioning.
+    #[tokio::test]
+    async fn a_stamp_writes_its_failure_and_clears_what_the_change_left() {
+        use weft_broker_client::protocol::{FailureStage, InfraNodeStatus as Status};
+        use weft_broker_client::WriteOutcome;
+        let b = FakeBroker::new("alice");
+        b.enqueue_command(SupervisorCommandRow { verb: weft_broker_client::protocol::InfraLifecycleVerb::Apply, ..stop(1, P1) });
+        let units = BTreeMap::from([("n1".to_string(), unit_runtime(Status::Provisioning))]);
+        let provisioned = b.set_provisioning("sup-1", 1, P1, "n1", None, "inst1", Vec::new(), None, units).await.unwrap();
+        assert!(matches!(provisioned, WriteOutcome::Applied(_)));
+        let progress = || b.copy_progress(P1, "n1", None).unwrap();
+        assert_eq!(progress(), CopyProgress { provisioning_since_unix: Some(PROVISIONING_SINCE_UNIX), ..CopyProgress::default() });
+        assert!(matches!(b.set_waiting("sup-1", 1, P1, "n1", None, "the image").await.unwrap(), WriteOutcome::Applied(_)));
+        let stamp = |status, failure: Option<(FailureStage, &'static str)>| {
+            b.set_status("sup-1", 1, P1, "n1", None, Some("n1"), status, failure.map(|f| f.0), failure.map(|f| f.1))
+        };
+
+        assert!(matches!(stamp(Status::Provisioning, None).await.unwrap(), WriteOutcome::Applied(_)));
+        assert_eq!(progress().waiting_on.as_deref(), Some("the image"), "the status did not move");
+        assert_eq!(progress().provisioning_since_unix, Some(PROVISIONING_SINCE_UNIX), "still provisioning");
+
+        assert!(matches!(stamp(Status::Failed, Some((FailureStage::Apply, "boom"))).await.unwrap(), WriteOutcome::Applied(_)));
+        assert_eq!(
+            progress(),
+            CopyProgress { failure_stage: Some(FailureStage::Apply), failure_message: Some("boom".into()), ..CopyProgress::default() },
+            "the failure is written, and what the apply waited on and when it began provisioning go"
+        );
+
+        assert!(matches!(stamp(Status::Running, None).await.unwrap(), WriteOutcome::Applied(_)));
+        assert_eq!(progress(), CopyProgress::default(), "a stamp with no failure clears it");
+
+        b.command_complete("sup-1", 1, None, false).await.unwrap();
+        assert!(matches!(b.set_waiting("sup-1", 1, P1, "n1", None, "late").await.unwrap(), WriteOutcome::Gone), "a completed command records nothing");
+        assert_eq!(progress().waiting_on, None);
     }
 
     /// A cancel flags the command it is handed out with, and answers the

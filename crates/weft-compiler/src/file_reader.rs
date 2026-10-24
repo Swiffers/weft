@@ -3,8 +3,9 @@
 //! `@include("path")` names external content relative to the referencing
 //! file's directory, `@file("path")` relative to the project root, and
 //! either one starting `__catalog/` relative to the project's `nodes/`.
-//! Resolving them is two steps: turn `(base, relative_path)` into a
-//! canonical identity (with a containment check), then read that
+//! Resolving them is two steps: place `(base, relative_path)`, which
+//! gives the file's canonical identity and its path from the root (with
+//! a containment check, [`FileReader::place`]), then read that
 //! identity's bytes. Today there are two backings for those bytes:
 //!
 //!   - disk (the CLI on a laptop; a project folder unpacked to a temp dir and
@@ -21,34 +22,53 @@
 
 use std::path::{Component, Path, PathBuf};
 
-/// A resolved external reference: its canonical identity plus its content.
+/// Where a file a marker names sits, worked out before anything reads it.
 ///
-/// `identity` is the backing-agnostic key for the resolved path. The compiler
+/// `identity` is the backing-agnostic key for the file. The compiler
 /// uses it for two things, so every backing must produce one that supports both:
 ///   - `@include` cycle detection (is this identity already on the resolve
 ///     stack?), which needs identities to compare equal iff they name the same
 ///     file,
-///   - deriving the base for content referenced INSIDE the resolved file
+///   - deriving the base for content referenced INSIDE the file
 ///     (`identity.parent()`), so a nested `@file`/`@include` resolves against the
 ///     included file's own directory, not the parent's.
+///
+/// `from_root` is the file's path from the project root
+/// (`src/setup.weft`), which is what names it in the program: a body
+/// id, a broken part's file. It is taken from the identity against the
+/// root as the backing itself resolved it, so it never depends on how
+/// the root happens to be spelled on this machine (a symlinked temp
+/// dir, a relative path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedFile {
+    pub identity: PathBuf,
+    pub from_root: PathBuf,
+}
+
+/// A file a marker names, placed ([`FileReader::place`]) and then read.
 #[derive(Debug)]
 pub struct ResolvedFile {
-    pub identity: PathBuf,
+    pub file: PlacedFile,
     pub content: String,
 }
 
-/// Where a marker's path lands, worked out from its spelling alone,
-/// before any backing is asked about the file.
-#[derive(Debug)]
-pub struct SpelledPath {
-    /// The path joined onto its anchor and normalized, inside `root`.
-    pub path: PathBuf,
-    /// The project root, which the file read may not leave either (the
-    /// disk backing follows symlinks). A `__catalog/` path is held to
-    /// `nodes/` on its spelling alone ([`catalog_path`]); the file it
-    /// lands on is held to the project, like `nodes/...` written out, so
-    /// the two spellings of one path read the same file in every marker.
-    pub root: PathBuf,
+/// A file's path from the project root, `None` when it is not inside
+/// the project. Both sides are identities ONE backing gave
+/// ([`FileReader::identity`] for the root, [`FileReader::locate`] for
+/// the file), so the cut never depends on how either was spelled: a
+/// symlinked root and its real folder give a file the same path. The
+/// one containment rule: a marker's spelling and the file it lands on
+/// ([`FileReader::place`]), a broken part's file, an unsaved buffer's
+/// id ([`DiskFileReader::from_root`]).
+pub fn path_from_root(root: &Path, identity: &Path) -> Option<PathBuf> {
+    identity.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+/// A path from the project root the way weft writes one to a person or
+/// into a program (`src/lib/clean.weft`), with `/` between folders on
+/// every platform.
+pub fn slashed(from_root: &Path) -> String {
+    from_root.to_string_lossy().replace('\\', "/")
 }
 
 /// The refusal for a path, as written, that leaves the project root.
@@ -56,7 +76,7 @@ pub fn escapes_root(relative: &Path) -> String {
     format!("path {relative:?} escapes the project root")
 }
 
-/// Resolve and read the content named by `relative` against `base`.
+/// Place and read the content named by `relative` against `base`.
 ///
 /// `base` is the directory the reference is relative to (the referencing file's
 /// own directory). The error is a human-facing string the caller wraps in a
@@ -64,10 +84,10 @@ pub fn escapes_root(relative: &Path) -> String {
 /// failure ("escapes the root", "not found", "is not valid UTF-8") is just a
 /// message pointed at a source line.
 pub trait FileReader {
-    /// Read the file `relative` names from `base`, refusing anything
-    /// outside `root` (the project). The two differ for an `@include`,
-    /// whose path is relative to the file that writes it: the program
-    /// lives in `src/`, so `@include("../lib/x.weft")` in
+    /// Where the file `relative` names from `base` sits, refusing
+    /// anything outside `root` (the project). The two differ for an
+    /// `@include`, whose path is relative to the file that writes it:
+    /// the program lives in `src/`, so `@include("../lib/x.weft")` in
     /// `src/billing/charge.weft` climbs one level and lands inside the
     /// project. A `@file` / `@asset` path is relative to the project root
     /// wherever it is written, so for those the two are the same. A path
@@ -75,13 +95,16 @@ pub trait FileReader {
     /// from the project's `nodes/`, and its spelling may not climb out of
     /// it ([`catalog_path`]).
     ///
-    /// Every backing resolves through this one method, so the rule is
-    /// checked on the spelling, before the file is touched: a `../` that
-    /// climbs out is refused as such whether or not something is there
-    /// (a typo'd path used to report "no such file" instead of the rule).
-    fn resolve_and_read(&self, root: &Path, base: &Path, relative: &Path) -> Result<ResolvedFile, String> {
+    /// The rule is checked twice, both times through [`path_from_root`]:
+    /// on the spelling, before the file is touched, so a `../` that
+    /// climbs out is refused as such whether or not something is there (a
+    /// typo'd path used to report "no such file" instead of the rule);
+    /// then on the file it lands on, since the disk backing follows
+    /// symlinks. Nothing is read: placing a file that is not there, or is
+    /// not text, succeeds, and only a read of it fails.
+    fn place(&self, root: &Path, base: &Path, relative: &Path) -> Result<PlacedFile, String> {
         let root = self.identity(root)?;
-        let path = match catalog_path(relative) {
+        let spelled = match catalog_path(relative) {
             Some(path) => root.join(path.map_err(|why| format!("path {relative:?} {why}"))?),
             None => {
                 let base = self.identity(base)?;
@@ -92,21 +115,40 @@ pub trait FileReader {
                 normalize_lexical(&base.join(relative)).ok_or_else(|| escapes_root(relative))?
             }
         };
-        if !path.starts_with(&root) {
-            return Err(escapes_root(relative));
-        }
-        let spelled = SpelledPath { path, root };
-        self.read_spelled(&spelled, relative)
+        path_from_root(&root, &spelled).ok_or_else(|| escapes_root(relative))?;
+        self.place_in(&root, &spelled)
+            .map_err(|why| format!("path {relative:?} {why}"))?
+            .ok_or_else(|| escapes_root(relative))
     }
 
-    /// Read the file at `spelled.path`, already checked to sit inside
-    /// `spelled.root` as spelled. `relative` is the path as written, for
-    /// the messages.
-    fn read_spelled(&self, spelled: &SpelledPath, relative: &Path) -> Result<ResolvedFile, String>;
+    /// The file at `path` placed in the project whose root's identity
+    /// is `root`, `None` when it sits outside it. The `Err` is the reason
+    /// alone (`cannot be read: ...`), for the caller to put after the
+    /// path the way its own messages name one.
+    fn place_in(&self, root: &Path, path: &Path) -> Result<Option<PlacedFile>, String> {
+        let identity = self.locate(path)?;
+        Ok(path_from_root(root, &identity).map(|from_root| PlacedFile { identity, from_root }))
+    }
 
-    /// The identity `resolve_and_read` would give `path` (the disk backing
-    /// canonicalizes, the map backing normalizes lexically), so a caller can
-    /// express one identity relative to another: an included file's
+    /// Place the file `relative` names ([`Self::place`]), then read it.
+    fn resolve_and_read(&self, root: &Path, base: &Path, relative: &Path) -> Result<ResolvedFile, String> {
+        let file = self.place(root, base, relative)?;
+        let content = self.read(&file.identity).map_err(|why| format!("path {relative:?} {why}"))?;
+        Ok(ResolvedFile { file, content })
+    }
+
+    /// The identity of the file at `path` (absolute, normalized), which
+    /// need not exist. The `Err` is the reason alone.
+    fn locate(&self, path: &Path) -> Result<PathBuf, String>;
+
+    /// The text of the file [`Self::locate`] named `identity`. The `Err`
+    /// is the reason alone (`not found`, `cannot be read: ...`).
+    fn read(&self, identity: &Path) -> Result<String, String>;
+
+    /// The identity of the folder at `path` (the project root, a base),
+    /// the one [`Self::locate`] gives the files in it (the disk backing
+    /// canonicalizes, the map backing normalizes lexically), so a caller
+    /// can express one identity relative to another: an included file's
     /// `@file("x")` becomes `components/x` under the project root.
     fn identity(&self, path: &Path) -> Result<PathBuf, String>;
 }
@@ -121,7 +163,7 @@ pub trait FileReader {
 /// path the way its own messages name one.
 ///
 /// THE prefix rule: every backing reaches it through
-/// [`FileReader::resolve_and_read`] (`@include`), and every `@file` /
+/// [`FileReader::place`] (`@include`), and every `@file` /
 /// `@asset` through `file_ref::spell_from_root`, which spells the
 /// marker from the root before any read.
 // SYNC: catalog_path <-> extension-vscode/src/includePath.ts includeRelativeToFile
@@ -142,37 +184,71 @@ pub fn catalog_path(written: &Path) -> Option<Result<PathBuf, &'static str>> {
 pub const CATALOG_ESCAPE: &str =
     "escapes the project's nodes/ folder: a `__catalog/` path is read from nodes/ and has to stay inside it";
 
-/// The on-disk backing. Canonicalizes the spelled path (resolving
-/// symlinks), rejects anything that lands outside the root, then reads
-/// the bytes.
+/// The on-disk backing. A file is placed where its canonical path says
+/// (symlinks followed) and read from there.
 ///
 /// The project tree is TRUSTED: this runs at build time on the user's own
 /// project, and referenced files are part of that project. The containment
 /// check guards against an accidental `../` typo pulling a file from outside
 /// the project into the build. It is robust for that: `canonicalize`
-/// resolves `..` and follows symlinks before the prefix check, so any
+/// resolves `..` and follows symlinks before the containment check, so any
 /// path that lands outside the root (including via a symlink) is rejected.
 /// (`@asset` is different: it may name a file anywhere on the machine
 /// by an absolute path, read from where it sits and uploaded at compile.)
 pub struct DiskFileReader;
 
 impl FileReader for DiskFileReader {
-    fn read_spelled(&self, spelled: &SpelledPath, relative: &Path) -> Result<ResolvedFile, String> {
-        let identity = spelled
-            .path
-            .canonicalize()
-            .map_err(|e| format!("path {relative:?} cannot be read: {e}"))?;
-        if !identity.starts_with(&spelled.root) {
-            return Err(escapes_root(relative));
-        }
-        let content = std::fs::read_to_string(&identity)
-            .map_err(|e| format!("path {relative:?} cannot be read: {e}"))?;
-        Ok(ResolvedFile { identity, content })
+    fn locate(&self, path: &Path) -> Result<PathBuf, String> {
+        deepest_identity(path, |at| at.canonicalize())
+    }
+
+    fn read(&self, identity: &Path) -> Result<String, String> {
+        std::fs::read_to_string(identity).map_err(|e| format!("cannot be read: {e}"))
     }
 
     fn identity(&self, path: &Path) -> Result<PathBuf, String> {
         path.canonicalize()
             .map_err(|e| format!("project root {path:?} is unreadable: {e}"))
+    }
+}
+
+impl DiskFileReader {
+    /// `file`'s path from the project at `root`, placed the way a read
+    /// of it is ([`FileReader::place_in`]), for a file the compiler has
+    /// not read: the buffer the editor has open, saved or not, in a
+    /// folder that may not exist yet either. `Ok(None)` for a file
+    /// outside the project; an `Err` when the root cannot be resolved,
+    /// or something on the way to the file refuses to be looked at.
+    pub fn from_root(root: &Path, file: &Path) -> Result<Option<PathBuf>, String> {
+        let root = DiskFileReader.identity(root)?;
+        Ok(DiskFileReader.place_in(&root, file).map_err(|why| format!("{file:?} {why}"))?.map(|placed| placed.from_root))
+    }
+}
+
+/// The identity of `path` when nothing has to be there: the deepest
+/// folder on the way to it that `canonicalize` finds, joined with the
+/// names after it (`src/new/draft.weft` in a project whose `src/new/`
+/// does not exist yet is `<src's identity>/new/draft.weft`). A file that
+/// exists is its own canonical path. So a file is placed the same way
+/// whether or not it has been written, through a symlinked root too; a
+/// read of a file that is not there is what fails, saying so.
+fn deepest_identity(path: &Path, canonicalize: impl Fn(&Path) -> std::io::Result<PathBuf>) -> Result<PathBuf, String> {
+    let mut names = Vec::new();
+    let mut at = path;
+    loop {
+        // A bare name (`x.weft`) sits in the current folder.
+        let here = if at.as_os_str().is_empty() { Path::new(".") } else { at };
+        match canonicalize(here) {
+            Ok(found) => return Ok(names.iter().rev().fold(found, |path, name| path.join(name))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let (Some(parent), Some(name)) = (at.parent(), at.file_name()) else {
+                    return Err(format!("cannot be read: {e}"));
+                };
+                names.push(name);
+                at = parent;
+            }
+            Err(e) => return Err(format!("cannot be read: {e}")),
+        }
     }
 }
 
@@ -198,14 +274,12 @@ impl MapFileReader {
 }
 
 impl FileReader for MapFileReader {
-    fn read_spelled(&self, spelled: &SpelledPath, relative: &Path) -> Result<ResolvedFile, String> {
-        match self.files.get(&spelled.path) {
-            Some(content) => Ok(ResolvedFile {
-                identity: spelled.path.clone(),
-                content: content.clone(),
-            }),
-            None => Err(format!("path {relative:?} not found")),
-        }
+    fn locate(&self, path: &Path) -> Result<PathBuf, String> {
+        Ok(path.to_path_buf())
+    }
+
+    fn read(&self, identity: &Path) -> Result<String, String> {
+        self.files.get(identity).cloned().ok_or_else(|| "not found".to_string())
     }
 
     fn identity(&self, path: &Path) -> Result<PathBuf, String> {
@@ -232,19 +306,12 @@ impl<'a> TreeFileReader<'a> {
 
 #[cfg(feature = "build")]
 impl FileReader for TreeFileReader<'_> {
-    fn read_spelled(&self, spelled: &SpelledPath, relative: &Path) -> Result<ResolvedFile, String> {
-        let identity = self
-            .tree
-            .canonicalize(&spelled.path)
-            .map_err(|e| format!("path {relative:?} cannot be read: {e}"))?;
-        if !identity.starts_with(&spelled.root) {
-            return Err(escapes_root(relative));
-        }
-        let content = self
-            .tree
-            .read_to_string(&identity)
-            .map_err(|e| format!("path {relative:?} cannot be read: {e}"))?;
-        Ok(ResolvedFile { identity, content })
+    fn locate(&self, path: &Path) -> Result<PathBuf, String> {
+        deepest_identity(path, |at| self.tree.canonicalize(at))
+    }
+
+    fn read(&self, identity: &Path) -> Result<String, String> {
+        self.tree.read_to_string(identity).map_err(|e| format!("cannot be read: {e}"))
     }
 
     fn identity(&self, path: &Path) -> Result<PathBuf, String> {
@@ -256,7 +323,7 @@ impl FileReader for TreeFileReader<'_> {
 /// preceding component, WITHOUT touching the filesystem. Returns `None` if a
 /// `..` would climb above the path's root (the lexical equivalent of escaping
 /// the containment root), so a virtual backing rejects the same escapes the disk
-/// backing's canonicalize-then-prefix-check rejects.
+/// backing's canonicalize-then-containment check rejects.
 pub(crate) fn normalize_lexical(path: &Path) -> Option<PathBuf> {
     let mut out: Vec<Component> = Vec::new();
     for comp in path.components() {

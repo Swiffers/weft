@@ -389,7 +389,13 @@ enum Cmd {
     /// refused, naming its kind.
     Wake {
         run_id: String,
+        /// The waiting node, named the way the program the run ran spells
+        /// it, which a move or a rename since does not change.
         node: String,
+        /// For a node inside a loop waiting in several iterations at once,
+        /// which one: counted from 0, outermost loop first (`3`, `3.0`).
+        #[arg(long, value_name = "n")]
+        iteration: Option<String>,
     },
     /// The project's own worker levers: copies kept warm, the most copies,
     /// runs per copy, CPU and memory. What the project leaves unset follows
@@ -407,6 +413,18 @@ enum Cmd {
     Domain {
         #[command(subcommand)]
         action: DomainAction,
+    },
+    /// Switch everything on the install off while weft itself is updated,
+    /// so an older and a newer weft never run side by side: `on` takes down
+    /// every trigger that is on and stops every infra copy that runs, and
+    /// nothing is turned on until `off` builds those projects again on the
+    /// new weft, starts those copies on that build and then brings those
+    /// triggers back. Running `on` again adds what is on now;
+    /// nothing is forgotten until `off`. Plain, it says where the install
+    /// stands and what `off` brings back.
+    Maintenance {
+        #[command(subcommand)]
+        action: Option<MaintenanceAction>,
     },
     /// The project's frontends: websites that call the install for their
     /// visitors, each with a token of its own. With `--repo`, the install
@@ -819,12 +837,14 @@ enum Cmd {
     /// time, kind, node, and a short summary of the value or error.
     /// Values are truncated so a long run stays readable; `--node`
     /// and `--kind` narrow it, `--full` opens the values, and `--json`
-    /// prints the replay rows the graph view reads.
+    /// prints the rows. Nodes are named the way the program the run ran
+    /// spells them, whatever this folder holds now.
     Events {
         run_id: String,
-        /// Only events of this node, spelled the way the source reads:
-        /// `auth.check` is the node `check` of the file the site `auth`
-        /// includes, and only that use of it.
+        /// Only events of this node (or group, or loop), spelled the way
+        /// the program the run ran reads: `auth.check` is the node `check`
+        /// of the file the site `auth` includes, and only that use of it.
+        /// A node renamed or moved since is named as it was in that run.
         #[arg(long)]
         node: Option<String>,
         /// Only events of this kind (`node_failed`, `node_completed`,
@@ -1528,6 +1548,53 @@ enum WorkersAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum MaintenanceAction {
+    /// Whether the install is in maintenance, since when, what `off`
+    /// brings back, and what is on right now.
+    Status,
+    /// Take down every trigger that is on and stop every infra copy that
+    /// runs (every unit of it; disks are kept), then wait until what is
+    /// still going down has, however long that takes. Nothing is turned on
+    /// until `off`.
+    On {
+        /// What happens to the runs going now: they finish, and this waits
+        /// for them (wait, the default), or they are cancelled (cancel).
+        #[arg(long, value_name = "wait|cancel")]
+        running: Option<weft_core::Running>,
+    },
+    /// Build every project `on` took something down in again on this
+    /// weft, start the infra copies `on` stopped on that build, wait until
+    /// they run, then bring back the triggers `on` took down on it. What
+    /// does not come back stays recorded, the install stays in maintenance,
+    /// and `off` again tries it again.
+    Off,
+    /// Fail while something is on (a trigger, an infra copy, a run going):
+    /// what `./setup.sh` and the cloud install run before they replace
+    /// anything. An install that is not set up or not running passes.
+    Check {
+        /// Read the operator key from stdin rather than from the keys
+        /// `weft login` stored, for a script that has it from elsewhere.
+        #[arg(long)]
+        key_stdin: bool,
+        /// How the person runs the update, named as its step in the
+        /// refusal (`./setup.sh`, `run this workflow again`).
+        #[arg(long, default_value = "update weft")]
+        update: String,
+    },
+}
+
+impl From<MaintenanceAction> for commands::maintenance::MaintenanceAction {
+    fn from(value: MaintenanceAction) -> Self {
+        match value {
+            MaintenanceAction::Status => Self::Status,
+            MaintenanceAction::On { running } => Self::On { running },
+            MaintenanceAction::Off => Self::Off,
+            MaintenanceAction::Check { key_stdin, update } => Self::Check { key_stdin, update },
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
 enum DomainAction {
     /// Answer at a domain (`app.example.com`) you own.
     Add {
@@ -1992,8 +2059,11 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
         Cmd::Freeze { name, run_id, expect } => commands::freeze::run(ctx, name, run_id, expect).await,
         Cmd::Examples => commands::examples::run(ctx).await,
         Cmd::Prune { version, yes } => commands::prune::run(ctx, version, yes).await,
-        Cmd::Wake { run_id, node } => commands::wake::run(ctx, run_id, node).await,
+        Cmd::Wake { run_id, node, iteration } => commands::wake::run(ctx, run_id, node, iteration).await,
         Cmd::Domain { action } => commands::domain::run(ctx, action.into()).await,
+        Cmd::Maintenance { action } => {
+            commands::maintenance::run(ctx, action.map(Into::into).unwrap_or(commands::maintenance::MaintenanceAction::Status)).await
+        }
         Cmd::Frontend { action } => commands::frontend::run(ctx, action.into()).await,
         Cmd::Workers { action } => commands::workers::run(ctx, action.map(Into::into).unwrap_or(commands::workers::WorkersAction::Show)).await,
         Cmd::Follow { project } => commands::follow::run(ctx, project).await,
@@ -2080,16 +2150,7 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
             .await
         }
         Cmd::Events { run_id, node, kind, iteration, full } => {
-            let iteration = match iteration {
-                Some(text) => commands::runs::parse_iteration(&text)?,
-                None => Vec::new(),
-            };
-            commands::runs::events(
-                ctx,
-                run_id,
-                commands::runs::EventsFilter { node, call_path: Vec::new(), kind, iteration, full },
-            )
-            .await
+            commands::runs::events(ctx, run_id, commands::runs::EventsQuery { node, kind, iteration }, full).await
         }
         Cmd::Files { action } => match action {
             FilesAction::Ls { prefix } => commands::files::ls(ctx, prefix).await,

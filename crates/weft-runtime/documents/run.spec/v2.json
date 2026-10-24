@@ -1,0 +1,61 @@
+[
+  {
+    "name": "approve",
+    "from": {
+      "hook": {
+        "body": {
+          "text": "hello"
+        }
+      }
+    },
+    "target": [
+      "answer"
+    ],
+    "answers": [
+      {
+        "node": "review",
+        "frames": [],
+        "payload": {
+          "approved": true
+        }
+      }
+    ],
+    "settings": {
+      "keeping": "durable",
+      "keepFor": "7d"
+    }
+  },
+  {
+    "name": "one-off",
+    "fire": [
+      "hook",
+      {
+        "body": {
+          "text": "hi"
+        }
+      }
+    ]
+  },
+  {
+    "name": "kept",
+    "answers": [
+      {
+        "node": "review",
+        "frames": [],
+        "gaveUp": "node 'review' gave up its wait: quiet"
+      }
+    ],
+    "settings": {
+      "keepFor": "1d",
+      "holdSecs": 30
+    }
+  },
+  {
+    "name": "frozen",
+    "frozenFrom": {
+      "version": "v3",
+      "runId": "00000000-0000-0000-0000-000000000007",
+      "definitionHash": "the-hash-it-ran"
+    }
+  }
+]

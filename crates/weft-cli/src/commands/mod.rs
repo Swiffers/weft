@@ -51,11 +51,14 @@ pub mod prune;
 pub mod wake;
 pub mod workers;
 pub mod domain;
+pub mod maintenance;
 pub mod frontend;
 pub mod target;
 pub mod ci;
 
 use std::sync::Arc;
+
+use anyhow::Context;
 
 use weft_compiler::project::Project;
 
@@ -252,6 +255,25 @@ impl Ctx {
         Ok((&install.url, install.operator_key.as_deref()))
     }
 
+    /// A client for the install this command acts on carrying, with
+    /// `key_stdin`, the operator key piped in on stdin rather than the one
+    /// `weft login` stored: for a script that has it from elsewhere (CI
+    /// reading it from a secret store).
+    pub fn client_keyed(&self, key_stdin: bool) -> anyhow::Result<crate::client::DispatcherClient> {
+        let (url, stored) = self.install_access()?;
+        let key = match key_stdin {
+            true => {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line).context("read the key from stdin")?;
+                let key = line.trim().to_string();
+                anyhow::ensure!(!key.is_empty(), "no key on stdin");
+                Some(key)
+            }
+            false => stored.map(str::to_string),
+        };
+        Ok(crate::client::DispatcherClient::new(url.to_string(), key).for_target(self.on()))
+    }
+
     /// The one cwd project walk (see [`DiscoveredProject`]).
     fn discover_here() -> DiscoveredProject {
         let cwd = std::env::current_dir()?;
@@ -278,8 +300,7 @@ impl Ctx {
     /// A client for the install this command acts on; the first call
     /// resolves it, so an install with no address yet errors here.
     pub fn client(&self) -> anyhow::Result<crate::client::DispatcherClient> {
-        let install = self.install()?;
-        Ok(crate::client::DispatcherClient::new(install.url.clone(), install.operator_key.clone()).for_target(self.on()))
+        self.client_keyed(false)
     }
 
     /// The cwd-discovered project, lazy-loaded and cached, keeping
@@ -371,134 +392,61 @@ pub async fn resolve_run_id(ctx: &Ctx, input: &str) -> anyhow::Result<String> {
     Ok(resolved.run_id.to_string())
 }
 
-/// One node of the program, from the way a person spells it:
-/// `store` for a node of the entry file, `setup.store` for the `store`
-/// inside the file the site `setup` includes, the whole path from the
-/// entry file down through every site (see [`resolve_spelling`], the
-/// one reading every command shares). Outside a project the spelling is
-/// taken as the node itself, at the top.
-///
-/// What comes back is the PLACE, spelled the one way the daemon keys a
-/// place by (`setup.store`, the person's own spelling written back
-/// canonical): a wait parked on a node inside an included file, and the
-/// infra of one, belong to one call of it, and the daemon
-/// holds both under that spelling.
-pub fn node_address_for(ctx: &Ctx, spelled: &str) -> anyhow::Result<String> {
-    // Outside a project there is no program to check against, and the
-    // daemon checks every node it is handed anyway (an unknown one is
-    // refused there, naming the run or the project). So the spelling
-    // goes as it is, and it is the top-level node it names.
-    let Some(project) = ctx.project_here()? else { return Ok(spelled.to_string()) };
-    let (definition, _) = weft_compiler::hash::load_program(project)?;
-    let (id, call_path) = resolve_node(project, &definition, spelled)?;
-    Ok(weft_core::project::address_of(&definition, &id, &call_path))
+/// A name as a person typed it, without the `<file>:` qualifier
+/// [`resolve_node`] accepts: the spelling to answer them by.
+pub fn unqualified(name: &str) -> &str {
+    name.split_once(':').map_or(name, |(_, spelled)| spelled)
 }
 
-/// What a spelling a person wrote names in the compiled definition:
-/// the thing's own id and the call path that use of it runs under
-/// (`auth.check` is the node `Auth.check` under `["auth"]`).
-#[derive(Debug)]
-pub enum Spelled {
-    Node { id: String, call_path: Vec<String> },
-    /// A group, a loop or an include site. The commands that take a
-    /// node refuse it; `weft events --node` takes it, because a
-    /// group has rows of its own: its `scope_decided` rows (and a
-    /// loop's, its boundaries' rows).
-    Group { id: String, call_path: Vec<String> },
-}
-
-/// [`resolve_spelling`] for a command that takes a node: a group or an
+/// One node of the folder's program, from the way a person spells it
+/// (`weft options`, `weft connect --node`, the infra verbs): what it names
+/// in the compiled definition, its id and the call path that use of it
+/// runs under (`auth.check` is the node `Auth.check` under `["auth"]`).
+/// The spelling is read the one way every surface reads one
+/// (`weft_core::project::places::named`), optionally qualified by the
+/// file it is written in, relative to the project's root
+/// (`src/auth.weft:auth.check`), which is then checked. A group or an
 /// include site is refused, naming how to reach one of its nodes.
+///
+/// A name that belongs to a past run is never read here: the folder holds
+/// the program as it is now, and the dispatcher reads such a name against
+/// the program that run ran.
 pub fn resolve_node(
     project: &weft_compiler::project::Project,
     definition: &weft_core::ProjectDefinition,
     name: &str,
 ) -> anyhow::Result<(String, Vec<String>)> {
-    match resolve_spelling(project, definition, name)? {
-        Spelled::Node { id, call_path } => Ok((id, call_path)),
-        Spelled::Group { .. } => {
-            let spelled = unqualified(name);
-            anyhow::bail!(
-                "'{spelled}' is a group or an include site, and this takes a node; name one of \
-                 its nodes, like `{spelled}.<node>`"
-            )
-        }
-    }
-}
-
-/// A name as a person typed it, without the `<file>:` qualifier
-/// [`resolve_spelling`] accepts: the spelling to answer them by.
-pub fn unqualified(name: &str) -> &str {
-    name.split_once(':').map_or(name, |(_, spelled)| spelled)
-}
-
-/// Read a name the way a person writes it into what it names: the ONE
-/// reading every command that takes a node shares (`weft options`,
-/// `weft connect --node`, `weft wake`, the infra verbs, `weft events
-/// --node`). The name is a place spelling (`auth.check` for the `check`
-/// of the file the site `auth` includes), optionally qualified by the
-/// file it is written in, relative to the project's root
-/// (`src/auth.weft:auth.check`), which is then checked.
-pub fn resolve_spelling(
-    project: &weft_compiler::project::Project,
-    definition: &weft_core::ProjectDefinition,
-    name: &str,
-) -> anyhow::Result<Spelled> {
-    let Some((file, spelled)) = name.split_once(':') else { return read_spelling(definition, name) };
-    let found = read_spelling(definition, spelled)?;
-    let (Spelled::Node { id, .. } | Spelled::Group { id, .. }) = &found;
-    let asked = project.root.join(file);
-    // A node of an included file is keyed by that file's body id (the
-    // part before the first dot); anything else is written in the entry
-    // file.
-    let written_there = match id.strip_prefix('@') {
-        Some(_) => id.split('.').next() == Some(weft_compiler::source_name::body_id(&project.root, &asked).as_str()),
-        None => asked == project.main_weft(),
-    };
-    anyhow::ensure!(
-        written_there,
-        "'{spelled}' is not written in {file}; name it as `{spelled}`, or qualify it with the file it is in"
-    );
-    Ok(found)
-}
-
-/// Read a place spelling (no file qualifier) into what it names,
-/// refusing every spelling that names nothing with the one that would.
-///
-/// The compiled id is not something a person can be asked to type: a
-/// node inside an included file is keyed by the file's path
-/// (`@src:sweep.key`), which the language calls unspellable on purpose
-/// and names through the call site everywhere a person can see. It
-/// resolves, because it IS the id, and taking it would teach a person a
-/// spelling no other command accepts; so it is refused with the one
-/// that works. A loop's boundary the compiler made (`doubler__in`) is
-/// named by its loop; any other name ending that way is read as written.
-fn read_spelling(definition: &weft_core::ProjectDefinition, spelled: &str) -> anyhow::Result<Spelled> {
-    if let Some(group) = weft_core::project::boundary_loop(spelled) {
-        let (id, _) = weft_core::project::resolve_address(definition, group);
-        if definition.groups.iter().any(|g| g.id == id && matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
-            anyhow::bail!("'{spelled}' is a loop's boundary the compiler made; name the loop, `{group}`, and its rows come with it");
-        }
-    }
-    let (id, call_path) = weft_core::project::resolve_address(definition, spelled);
-    let Some(node) = definition.nodes.iter().find(|n| n.id == id) else {
-        if definition.groups.iter().any(|g| g.id == id) {
-            return Ok(Spelled::Group { id, call_path });
-        }
-        anyhow::bail!(
-            "'{spelled}' names no node in this program (a node inside an included file is named \
-             through its site, like `site.{}`)",
-            spelled.rsplit('.').next().unwrap_or(spelled)
-        );
-    };
-    if call_path.is_empty() && weft_core::project::places::enclosing_body(definition, node).is_some() {
-        anyhow::bail!(
-            "'{spelled}' is inside an included file; name it through the site that \
-             includes the file, like `site.{}`",
-            weft_core::project::address_of(definition, &id, &["site".into()]).trim_start_matches("site.")
+    let spelled = unqualified(name);
+    let found = weft_core::project::places::named(definition, spelled).map_err(anyhow::Error::msg)?;
+    if let Some((file, _)) = name.split_once(':') {
+        // The file placed the way the build places it (normalized,
+        // symlinks followed, held inside the project), so any spelling of
+        // one file names it. Nothing reads it: only where it sits matters.
+        use weft_compiler::FileReader as _;
+        let from_root = weft_compiler::DiskFileReader
+            .place(&project.root, &project.root, std::path::Path::new(file))
+            .map_err(|e| anyhow::anyhow!("'{name}' is qualified with a file the program cannot have: {e}"))?
+            .from_root;
+        let id = &found.place().id;
+        // A node of an included file is keyed by that file's body id (the
+        // part before the first dot); anything else is written in the
+        // entry file.
+        let written_there = match id.strip_prefix('@') {
+            Some(_) => id.split('.').next() == Some(weft_compiler::source_name::body_id(&from_root).as_str()),
+            None => weft_compiler::source_name::is_entry(&from_root),
+        };
+        anyhow::ensure!(
+            written_there,
+            "'{spelled}' is not written in {file}; name it as `{spelled}`, or qualify it with the file it is in"
         );
     }
-    Ok(Spelled::Node { id, call_path })
+    match found {
+        weft_core::project::places::Named::Node(place) => Ok((place.id, place.path)),
+        weft_core::project::places::Named::Group(_) => anyhow::bail!(
+            "'{spelled}' is a group or an include site, and this takes a node; name one of \
+             its nodes, like `{spelled}.<node>`"
+        ),
+    }
 }
 
 pub fn resolve_project_id(ctx: &Ctx, explicit: Option<String>) -> anyhow::Result<String> {
@@ -637,6 +585,56 @@ mod tests {
         super::Ctx::new(Some(env), Some("prod".into()), false).expect("the env var yields to --on");
     }
 
+    /// A node qualified by its file is checked against the file the
+    /// build reads under that spelling: `./`, a `..` that comes back in
+    /// and a symlink all name the same file, and a path out of the
+    /// project is refused as such.
+    #[cfg(unix)]
+    #[test]
+    fn a_node_qualified_by_its_file_takes_any_spelling_of_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("weft.toml"), "[package]\nname = \"p\"\nid = \"00000000-0000-0000-0000-000000000000\"\n").unwrap();
+        let main = "top = Debug {}\ns = @include(\"setup.weft\")\n";
+        std::fs::write(root.join("src/main.weft"), main).unwrap();
+        std::fs::write(
+            root.join("src/setup.weft"),
+            "Group() -> (out: String) {\n  f = Format(t: String) { template: \"{{t}}\", t: \"y\" }\n  self.out = f.text\n}\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(root.join("src"), root.join("alias")).unwrap();
+        std::fs::write(dir.path().join("outside.weft"), "").unwrap();
+        let project = Project::load(&root).unwrap();
+        let catalog = weft_catalog::FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
+        let (definition, errors) = weft_compiler::flatten_lenient(
+            main,
+            project.id(),
+            weft_compiler::CompileFs::disk(&root).anchored_at(Some(&project.src_dir())),
+            &catalog,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        for file in ["src/setup.weft", "./src/setup.weft", "src/../src/setup.weft", "../proj/src/setup.weft", "alias/setup.weft"] {
+            super::resolve_node(&project, &definition, &format!("{file}:s.f")).unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert!(super::resolve_node(&project, &definition, &format!("{file}:top")).is_err(), "{file}");
+        }
+        for file in ["src/main.weft", "./src/main.weft", "alias/main.weft"] {
+            super::resolve_node(&project, &definition, &format!("{file}:top")).unwrap_or_else(|e| panic!("{file}: {e}"));
+            let error = super::resolve_node(&project, &definition, &format!("{file}:s.f")).unwrap_err().to_string();
+            assert!(error.contains("is not written in"), "{file}: {error}");
+        }
+        let error = super::resolve_node(&project, &definition, "../outside.weft:top").unwrap_err().to_string();
+        assert!(error.contains("escapes the project root"), "{error}");
+        // Placing the file reads nothing, so a file that is not text, or
+        // not there at all, is placed like any other, and the answer is
+        // about where the node is written.
+        std::fs::write(root.join("src/binary.weft"), [0xff, 0xfe, 0x00]).unwrap();
+        for file in ["src/binary.weft", "src/missing/x.weft"] {
+            let error = super::resolve_node(&project, &definition, &format!("{file}:top")).unwrap_err().to_string();
+            assert!(error.contains("'top' is not written in"), "{file}: {error}");
+        }
+    }
+
     #[test]
     fn on_and_a_raw_address_together_are_refused() {
         let error = resolve_dispatcher_url(Some("http://x".into()), Some("prod"), || {
@@ -649,30 +647,5 @@ mod tests {
         })
         .unwrap();
         assert_eq!(url, "http://x");
-    }
-
-    /// A name ending `__in` or `__out` is refused as a loop's boundary only
-    /// when what comes before it is a loop; any other such name is read as
-    /// written.
-    #[test]
-    fn only_a_loops_boundary_is_refused_as_one() {
-        let definition: weft_core::ProjectDefinition = serde_json::from_value(serde_json::json!({
-            "id": "00000000-0000-0000-0000-000000000000",
-            "nodes": [{
-                "id": "fan__out", "nodeType": "T", "config": {}, "position": { "x": 0.0, "y": 0.0 },
-                "inputs": [], "outputs": [],
-            }],
-            "edges": [],
-            "groups": [
-                { "id": "lp", "kind": "loop", "loopConfig": {}, "nodeIds": [] },
-                { "id": "g", "kind": "group", "nodeIds": [] },
-            ],
-        }))
-        .unwrap();
-        let refused = super::read_spelling(&definition, "lp__in").unwrap_err().to_string();
-        assert!(refused.contains("loop's boundary") && refused.contains("`lp`"), "{refused}");
-        assert!(matches!(super::read_spelling(&definition, "fan__out"), Ok(super::Spelled::Node { id, .. }) if id == "fan__out"));
-        let unknown = super::read_spelling(&definition, "g__in").unwrap_err().to_string();
-        assert!(unknown.contains("names no node") && !unknown.contains("boundary"), "{unknown}");
     }
 }

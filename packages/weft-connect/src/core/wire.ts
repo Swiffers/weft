@@ -248,6 +248,11 @@ export interface Lookup {
   /** Keep only the items holding each value at its dotted path (per
    *  item), compared as JSON; applied server-side. */
   where?: Record<string, unknown>;
+  /** Where a refusal answered with a success status sits; read server-side. */
+  errorPath?: string;
+  /** A success flag (Slack's `ok`): anything there but `true` or `null`
+   *  refuses, nothing there passes; read server-side. */
+  okPath?: string;
 }
 
 // SYNC: PageSpec <-> crates/weft-core/src/node.rs PageSpec

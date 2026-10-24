@@ -39,46 +39,41 @@ use weft_core::infra::wire::{
     CommandOutcome, CommandStatus, CopyRef, Door, DoorsResponse, InfraLogs, InfraStatus, InfraStatusEntry,
     LifecycleCommandIssued, LogBlock, LogCursor, LogsFrom, StopRequest, SyncRequest, UpgradeRequest,
 };
+use weft_core::frames::Located;
 use weft_core::instance::{Copies, InstanceTarget};
 use weft_core::take_down::{Held, Running, TakeDown};
 use crate::infra_node::{self, InfraNodeRow, InfraNodeStatus};
 use crate::state::DispatcherState;
 
-/// Whether the infra place `spelled` (`one.db`) is a node that exists
-/// once per instance.
-pub(crate) fn is_per_instance_place(project: &weft_core::ProjectDefinition, spelled: &str) -> bool {
-    let (id, _) = weft_core::project::resolve_address(project, spelled);
-    project.nodes.iter().any(|n| n.id == id && n.per_instance.is_some())
-}
-
 /// The infra places a verb aimed at `nodes` (every infra node when
 /// empty) for `instance` acts on: the nodes marked per instance for an
-/// instance, the shared ones otherwise. A mismatch is refused naming the
+/// instance, the shared ones otherwise, each by its spelling (the key its
+/// row is stored under) with its place. A mismatch is refused naming the
 /// fix, like the trigger verbs do.
 pub(crate) fn resolve_infra_nodes(
     project: &weft_core::ProjectDefinition,
     nodes: &[String],
     instance: Option<&weft_core::instance::InstanceId>,
-) -> Result<std::collections::BTreeSet<String>, (StatusCode, String)> {
-    let per_instance_of = |spelled: &str| is_per_instance_place(project, spelled);
+) -> Result<std::collections::BTreeMap<String, Located>, (StatusCode, String)> {
     let declared = weft_core::project::infra_place_spellings(project);
+    let per_instance_of = |place: &Located| weft_core::project::is_per_instance(project, &place.id);
     if nodes.is_empty() {
-        return Ok(declared.into_iter().filter(|n| per_instance_of(n) == instance.is_some()).collect());
+        return Ok(declared.into_iter().filter(|(_, place)| per_instance_of(place) == instance.is_some()).collect());
     }
-    let mut out = std::collections::BTreeSet::new();
+    let mut out = std::collections::BTreeMap::new();
     for node in nodes {
-        if !declared.contains(node) {
+        let Some(place) = declared.get(node) else {
             // A node inside a group or an included file written by its
             // short name: name the full spelling it most likely meant.
             let suffix = format!(".{node}");
-            let meant: Vec<String> = declared.iter().filter(|d| d.ends_with(&suffix)).map(|d| format!("'{d}'")).collect();
+            let meant: Vec<String> = declared.keys().filter(|d| d.ends_with(&suffix)).map(|d| format!("'{d}'")).collect();
             let hint = if meant.is_empty() { String::new() } else { format!(" (did you mean {}?)", meant.join(" or ")) };
             return Err((
                 StatusCode::NOT_FOUND,
                 format!("'{node}' is no infra node of this program{hint}; name it the way the program writes it (`work.{node}` inside a group, `one.{node}` inside an included file)"),
             ));
-        }
-        match (per_instance_of(node), instance) {
+        };
+        match (per_instance_of(place), instance) {
             (true, None) => {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -99,7 +94,7 @@ pub(crate) fn resolve_infra_nodes(
                 ));
             }
             _ => {
-                out.insert(node.clone());
+                out.insert(node.clone(), place.clone());
             }
         }
     }
@@ -121,10 +116,10 @@ pub(crate) fn owner_nodes(
     if !matches!(target, InstanceTarget::Everything) || nodes.is_empty() {
         return Some(nodes.to_vec());
     }
-    let declared = weft_core::project::infra_place_spellings(project);
+    let declared = weft_core::project::DeclaredInfra::of(project);
     let mine: Vec<String> = nodes
         .iter()
-        .filter(|node| !declared.contains(*node) || is_per_instance_place(project, node) == instance.is_some())
+        .filter(|node| declared.per_instance(node).is_none_or(|per_instance| per_instance == instance.is_some()))
         .cloned()
         .collect();
     (!mine.is_empty()).then_some(mine)
@@ -191,7 +186,7 @@ pub(super) async fn sync_inner(
     for instance in owners {
         let Some(nodes) = owner_nodes(&registered, &body.instances, &body.nodes, instance.as_ref()) else { continue };
         let started: Result<(), StatusError> = async {
-            if let Some(begun) = begin_sync(&state, id, &body.build, instance.as_ref(), &nodes, body.instances.is_shared()).await? {
+            if let Some(begun) = begin_sync(&state, id, &body.build, instance.as_ref(), &nodes, body.instances.is_shared(), SyncKind::Start).await? {
                 finish_sync(&state, begun).await?;
             }
             Ok(())
@@ -270,7 +265,7 @@ pub async fn upgrade(
     for instance in copy_owners(&state, id, &sync.instances, false).await? {
         let Some(nodes) = owner_nodes(&registered, &sync.instances, &sync.nodes, instance.as_ref()) else { continue };
         let targeted = resolve_infra_nodes(&registered, &nodes, instance.as_ref())?;
-        let running: std::collections::BTreeSet<String> = targeted.into_iter().filter(|place| upgrades(&observed, &desired, place, instance.as_ref())).collect();
+        let running: std::collections::BTreeSet<String> = targeted.into_keys().filter(|place| upgrades(&observed, &desired, place, instance.as_ref())).collect();
         if !running.is_empty() {
             behind_by_owner.push((instance, nodes, running));
         }
@@ -489,7 +484,7 @@ async fn upgrade_legs(
     // stopped before the upgrade stays stopped, and one the build newly
     // needs is `weft infra start`'s to make.
     let targeted = resolve_infra_nodes(&project, &work.nodes, instance)?;
-    let start: Vec<String> = targeted.into_iter().filter(|place| work.running.contains(place)).collect();
+    let start: Vec<String> = targeted.into_keys().filter(|place| work.running.contains(place)).collect();
     if start.is_empty() {
         return Ok(UpgradeEnd::Done);
     }
@@ -501,7 +496,7 @@ async fn upgrade_legs(
         infra_hash: work.infra_hash.clone(),
     };
     crate::api::project::require_registered_build(state, id, &build).await?;
-    if let Some(begun) = apply_sync(state, id, instance, &start).await? {
+    if let Some(begun) = apply_sync(state, id, instance, &start, SyncKind::Upgrade).await? {
         finish_sync(state, begun).await?;
     }
     Ok(UpgradeEnd::Done)
@@ -579,11 +574,15 @@ pub(crate) struct BegunSync {
     run: crate::api::project::InfraSetupRun,
 }
 
-/// Which face of sync a request is: a plain start, or an upgrade's.
+/// Which face of sync a request is: a plain start, an upgrade's, or the
+/// maintenance lift's start of the copies `weft maintenance on` stopped
+/// (`crate::maintenance`), the one start that goes through while the
+/// install is in maintenance.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SyncKind {
+pub(crate) enum SyncKind {
     Start,
     Upgrade,
+    Lift,
 }
 
 /// Everything of a plain sync of `instance`'s copies (`None`: the shared
@@ -599,19 +598,20 @@ pub(crate) async fn begin_sync(
     instance: Option<&weft_core::instance::InstanceId>,
     nodes: &[String],
     table: bool,
+    kind: SyncKind,
 ) -> Result<Option<BegunSync>, StatusError> {
-    let registered = gate_sync(state, id, build, instance, nodes, SyncKind::Start, table).await?;
+    let registered = gate_sync(state, id, build, instance, nodes, kind, table).await?;
     let observed = infra_node::observe(&state.pg_pool, id, &registered)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra copies: {e:#}")))?;
     let off: Vec<String> = resolve_infra_nodes(&registered, nodes, instance)?
-        .into_iter()
+        .into_keys()
         .filter(|place| !matches!(observed.status_of(place, instance), Some(InfraNodeStatus::Running | InfraNodeStatus::Provisioning)))
         .collect();
     if off.is_empty() {
         return Ok(None);
     }
-    Ok(apply_sync(state, id, instance, &off).await?)
+    Ok(apply_sync(state, id, instance, &off, kind).await?)
 }
 
 /// The checks a sync or an upgrade passes before anything changes;
@@ -635,6 +635,10 @@ async fn gate_sync(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
     resolve_infra_nodes(&registered, nodes, instance)?;
+    // Fast reject; re-checked under the lock in `apply_sync`.
+    if kind != SyncKind::Lift {
+        crate::maintenance::refuse_while_on(&state.pg_pool).await?;
+    }
     let transition = state
         .projects
         .transition(id)
@@ -670,7 +674,7 @@ async fn gate_sync(
     // program or `--instance`, and gated by their own checks above.
     if table && instance.is_none() {
         let action = match kind {
-            SyncKind::Start => "infra_start",
+            SyncKind::Start | SyncKind::Lift => "infra_start",
             SyncKind::Upgrade => "infra_upgrade",
         };
         crate::api::project::require_action(state, id, &[action]).await?;
@@ -687,6 +691,7 @@ async fn apply_sync(
     id: uuid::Uuid,
     instance: Option<&weft_core::instance::InstanceId>,
     places: &[String],
+    kind: SyncKind,
 ) -> Result<Option<BegunSync>, (StatusCode, String)> {
     // Orphan reap. An `infra_node` row whose `node_id` isn't in the
     // current project source (or no longer carries `requiresInfra`)
@@ -706,6 +711,12 @@ async fn apply_sync(
     // held across it.
     let started: Result<Option<crate::api::project::InfraSetupRun>, (StatusCode, String)> =
         crate::lease::with_project_transition_lock(&state.lock_pool, id, || async {
+            // Under the lock `weft maintenance on` takes after recording
+            // the maintenance, before it reads the copies: a start either
+            // sees the maintenance or is one `on` sees in flight.
+            if kind != SyncKind::Lift && crate::maintenance::is_on(&state.pg_pool).await? {
+                return Ok(Err((StatusCode::CONFLICT, weft_core::maintenance::IN_MAINTENANCE.to_string())));
+            }
             if crate::api::project::infra_setup_in_flight(state, id, Some(instance)).await? {
                 return Ok(Err((
                     StatusCode::CONFLICT,
@@ -741,7 +752,9 @@ pub(crate) async fn finish_sync(state: &DispatcherState, begun: BegunSync) -> Re
 /// refused because another claim held its trigger comes back once that
 /// claim ends. Then the queued events that waited on infra are handed over
 /// again, and a stopped resync waiting on either change is taken up again
-/// (`crate::task_kinds::resync::retry_stopped`).
+/// (`crate::task_kinds::resync::retry_stopped`). One project's failure
+/// holds back no other's: every project is looked at, and the pass fails
+/// (to be tried again) naming each failure once all of them were.
 pub(crate) async fn bring_back_triggers_whose_infra_returned(state: DispatcherState) -> anyhow::Result<weft_task_store::drain::DrainStep> {
     // SYNC: 'infra' <-> weft_broker_client::activation::DownWith::Infra
     let marked: Vec<uuid::Uuid> = sqlx::query_scalar(
@@ -749,13 +762,21 @@ pub(crate) async fn bring_back_triggers_whose_infra_returned(state: DispatcherSt
     )
     .fetch_all(&state.pg_pool)
     .await?;
+    let mut failed = Vec::new();
     for id in marked {
-        bring_back_what_went_down_with_infra(&state, id).await?;
+        if let Err(e) = bring_back_what_went_down_with_infra(&state, id).await {
+            failed.push(format!("bringing back project {id}'s triggers: {e:#}"));
+        }
     }
     // The events that waited on infra the run reads: each is held to the
     // copies as they are now, and waits again if one is still down.
-    crate::parked_drain::drain_waiting_on(&state, weft_core::door_fire::UnclockedWait::Infra, None).await?;
-    crate::task_kinds::resync::retry_stopped(&state).await?;
+    if let Err(e) = crate::parked_drain::drain_waiting_on(&state, weft_core::door_fire::UnclockedWait::Infra, None).await {
+        failed.push(format!("handing over the events that waited on infra: {e:#}"));
+    }
+    if let Err(e) = crate::task_kinds::resync::retry_stopped(&state).await {
+        failed.push(format!("{e:#}"));
+    }
+    anyhow::ensure!(failed.is_empty(), "{}", failed.join("; "));
     Ok(weft_task_store::drain::DrainStep::Done)
 }
 
@@ -824,6 +845,11 @@ async fn bring_back(state: &DispatcherState, id: uuid::Uuid, by_owner: std::coll
             // (`crate::task_kinds::resync`).
             Err(crate::api::project::ActivateError::Refused(crate::activation_store::ClaimRefused::Resyncing)) => {
                 tracing::info!(target: "weft_dispatcher::infra", project_id = %id, ?owner, ?triggers, "a resync holds the project; brought back once it ends");
+            }
+            // The install is in maintenance: they stay down, and the next
+            // change of a copy after its lift tries again.
+            Err(crate::api::project::ActivateError::Refused(crate::activation_store::ClaimRefused::Maintenance)) => {
+                tracing::info!(target: "weft_dispatcher::infra", project_id = %id, ?owner, ?triggers, "the install is in maintenance; they stay down until it is lifted");
             }
             // `weft rm` marked the project: its triggers go with it.
             Err(crate::api::project::ActivateError::Refused(crate::activation_store::ClaimRefused::Removing)) => {
@@ -1054,7 +1080,7 @@ async fn plan_copies_down(
         }
     }
     let places = match nodes.is_empty() {
-        true => resolve_infra_nodes(project, &[], instance)?,
+        true => resolve_infra_nodes(project, &[], instance)?.into_keys().collect(),
         false => declared.into_iter().collect(),
     };
     let reach = crate::infra_reach::InfraReach { places, copies };
@@ -1465,12 +1491,11 @@ pub(crate) async fn live_endpoint_url(
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
     // `node` is a place spelling; the node behind it says whether it
     // serves a display, and the row under that spelling says where.
-    let (node_id, _) = weft_core::project::resolve_address(&project, node);
-    let node_def = project
-        .nodes
-        .iter()
-        .find(|n| n.id == node_id)
-        .ok_or((StatusCode::NOT_FOUND, "no such node in project".into()))?;
+    let node_def = match weft_core::project::places::named(&project, node) {
+        Ok(weft_core::project::places::Named::Node(at)) => project.nodes.iter().find(|n| n.id == at.id),
+        _ => None,
+    }
+    .ok_or((StatusCode::NOT_FOUND, "no such node in project".into()))?;
     let live_endpoint = node_def.features.live_endpoint.as_deref().ok_or((
         StatusCode::NOT_FOUND,
         "node does not expose a /live endpoint".to_string(),

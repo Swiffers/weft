@@ -60,12 +60,14 @@ pub async fn follow_run_id(
     run_id: &str,
     definition: Option<&weft_core::ProjectDefinition>,
 ) -> anyhow::Result<Outcome> {
+    // Indexed once, so spelling each row is a lookup, not a scan.
+    let graph = definition.map(weft_core::project::graph::ProjectGraph::new);
     watch_run(client, on, run_id, |step| {
         let Step::Event(event) = step else { return Ok(ControlFlow::Continue(())) };
         let row = serde_json::to_value(event)?;
-        match definition {
-            Some(definition) => {
-                if let Some(row) = super::runs::spell_node(row, definition) {
+        match &graph {
+            Some(graph) => {
+                if let Some(row) = weft_core::live_event::spelled::spell_row(row, graph) {
                     print_event(&row);
                 }
             }
@@ -202,20 +204,27 @@ fn short(v: Option<&serde_json::Value>) -> String {
 const TASK_LOOK_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Follow task `task` of project `project_id` (a resync, a deactivate's
-/// wait for its runs) until it ends, and answer what it ended with: one
-/// short look after another (`GET /projects/{id}/follow/{task}`, each
-/// waiting at most half a minute on the install), so following never rests
-/// on one long request a gateway would cut, and never ends on its own. A
-/// look the install could not answer (unreachable, restarting, its
-/// gateway cutting it) is said and tried again; a refusal is the task's
-/// own ending, raised. Ctrl+C stops following, never the task.
+/// wait for its runs) until it ends, and answer what it ended with
+/// ([`follow_at`] on `GET /projects/{id}/follow/{task}`).
 pub async fn follow_task(
     client: &crate::client::DispatcherClient,
     progress: &crate::progress::Progress,
     project_id: &str,
     task: uuid::Uuid,
 ) -> anyhow::Result<Value> {
-    let path = format!("/projects/{project_id}/follow/{task}?wait_ms=25000");
+    follow_at(client, &format!("/projects/{project_id}/follow/{task}"), |message| progress.warn(message)).await
+}
+
+/// Follow the task `follow` looks at (a `.../follow/{task}` route) until it
+/// ends, and answer what it ended with: one short look after another, each
+/// waiting at most half a minute on the install, so following never rests
+/// on one long request a gateway would cut, and never ends on its own. A
+/// look the install could not answer (unreachable, restarting, its
+/// gateway cutting it) is said and tried again; a refusal is the task's
+/// own ending, raised; `warn` says a look that failed. Ctrl+C stops
+/// following, never the task.
+pub async fn follow_at(client: &crate::client::DispatcherClient, follow: &str, warn: impl Fn(&str)) -> anyhow::Result<Value> {
+    let path = format!("{follow}?wait_ms=25000");
     loop {
         match client.get_json(&path).await {
             Ok(answer) => match serde_json::from_value(answer).context("read the task's state")? {
@@ -224,7 +233,7 @@ pub async fn follow_task(
             },
             Err(e) => {
                 let why = super::ensure::look_again_after(e)?;
-                progress.warn(&format!("could not look at it just now ({why}); looking again"));
+                warn(&format!("could not look at it just now ({why}); looking again"));
                 tokio::time::sleep(TASK_LOOK_AGAIN_AFTER).await;
             }
         }

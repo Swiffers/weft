@@ -1,0 +1,13 @@
+[
+  {
+    "kind": "route",
+    "config": { "path": "hook", "method": "POST" },
+    "match": [{ "field": "text", "op": "contains", "value": "hello" }],
+    "keeping": "durable"
+  },
+  {
+    "kind": "provider_events",
+    "config": { "service": "slack", "topic": "messages" },
+    "access": { "id": "7e2b9a41-0c3d-4e5f-8a6b-1c2d3e4f5a6b", "service": "slack" }
+  }
+]

@@ -195,9 +195,9 @@ impl DispatcherState {
 
     /// The program `project` recorded under `hash`, parsed; `None` when
     /// no such version was ever recorded. THE way the dispatcher reads a
-    /// recorded program. A recorded program that no longer parses is an
-    /// [`UnreadableProgram`] error, which a caller that shows runs tells
-    /// apart from the store failing.
+    /// recorded program, kept once read. A recorded program that no longer
+    /// reads is a `weft_core::stored::DecodeError` naming it, which a
+    /// caller that shows runs tells apart from the store failing.
     pub async fn program(
         &self,
         project: uuid::Uuid,
@@ -206,9 +206,8 @@ impl DispatcherState {
         if let Some(program) = self.programs.get(&(project, hash.to_string())) {
             return Ok(Some(program));
         }
-        let Some(json) = self.projects.definition_for_hash(project, hash).await? else { return Ok(None) };
-        let program: Arc<weft_core::ProjectDefinition> =
-            Arc::new(serde_json::from_str(&json).map_err(|e| UnreadableProgram(e.to_string()))?);
+        let Some(program) = self.projects.program(project, hash).await? else { return Ok(None) };
+        let program = Arc::new(program);
         self.programs.put((project, hash.to_string()), program.clone());
         Ok(Some(program))
     }
@@ -256,15 +255,3 @@ impl DispatcherState {
             .ok_or_else(|| anyhow::anyhow!("run {run_id} ran on worker {binary_hash}, which its project no longer records"))
     }
 }
-
-/// A recorded program that no longer parses as a definition, and why.
-#[derive(Debug)]
-pub struct UnreadableProgram(pub String);
-
-impl std::fmt::Display for UnreadableProgram {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the recorded program no longer reads: {}", self.0)
-    }
-}
-
-impl std::error::Error for UnreadableProgram {}

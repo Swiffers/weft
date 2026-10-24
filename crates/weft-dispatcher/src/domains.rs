@@ -81,6 +81,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             EXECUTE FUNCTION install_domain_notify()"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 #[derive(sqlx::FromRow)]

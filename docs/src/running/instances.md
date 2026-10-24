@@ -157,11 +157,19 @@ and nothing changes it afterwards:
 
 A gated route is one whose `auth` input is wired from an auth node such as
 `ApiKeyAuth` (weft's messages call it a route gated by a connection), so the
-caller must present a key before a run starts. If your own backend calls your
+caller must present a key or a signature before a run starts. If your own backend calls your
 program for an instance, this is the route it uses. It is also the only place
 weft honours the `Weft-Instance` header: on an open route anybody could claim
 any instance, so weft refuses the header there and says why. A browser presents
 an instance token instead.
+
+If a provider signs the webhooks it sends to your route, `HmacAuth` checks a
+hex HMAC-SHA256 of `<timestamp>.<body>` sent in `X-Signature`, with the
+unix-seconds timestamp in `X-Timestamp`, refused when it is more than five
+minutes off. For any other scheme (Standard Webhooks, Stripe, signed identity
+tokens from your sign-in provider), you write a small access node of your own,
+and for how, go and read
+[checking a signed request](../connections/verifying-requests.md).
 
 If you call a route and want the run to be for an instance, call it at one of
 its route addresses: `/connect/local/<project id>/<path>` on the install, the project's own

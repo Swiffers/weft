@@ -26,6 +26,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
              ON infra_owner(supervisor_replica)"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 /// Release a project's exclusive supervisor lease (its `infra_owner`

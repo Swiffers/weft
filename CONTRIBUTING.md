@@ -375,6 +375,34 @@ one command, and it all lands in one transaction, so a refusal leaves your
 tree and your database as they were. Forget the step and the
 `schema_agreement` test fails.
 
+Each migration comes as two files, which the command splits for you.
+`<id>.sql` only adds: a table, a nullable column, an index, a function.
+`<id>.contract.sql` takes away and tightens: a dropped column or table, a NOT
+NULL, a CHECK or UNIQUE on a table that already has rows. A booting weft runs
+every pending `.sql` file, then carries the JSON documents forward (next
+section), then runs every pending `.contract.sql` file, all in one boot. If you
+add a NOT NULL column with no default to a table that has rows, the first file
+adds it nullable and the second makes it NOT NULL, so whatever fills it runs in
+between (a data step, below). If you change a function's arguments, the first
+file drops the old one and makes the new one in the same transaction, so a call
+with the old arguments fails loudly (no such function), and the arguments you
+added need no `DEFAULT`.
+
+If the rows already there need something done before the second file runs,
+give the group whose tables the data lands in a `DataStep`: the table and
+column it waits on, what the second file does to that column (`until`), and an
+SQL statement that does the work. If you drop a column whose content has to
+live on somewhere else, the step copies it there, `until: Until::Dropped`
+(`UNITS_MOVE` in `crates/weft-dispatcher/src/infra_node.rs` is one). If you add
+a NOT NULL column the rows already there have to be filled in from somewhere,
+the step fills it, `until: Until::NotNull` (`TENANT_OF_QUEUED` in
+`crates/weft-dispatcher/src/search_index.rs` takes each queued run's tenant
+from its run, and drops a row whose run is gone). The boot runs it just before
+the pending `.contract.sql` files, in the same transaction, with its table
+locked, and only while the column is still there or still nullable. Nothing
+records that it ran, so the statement has to give the same result run twice
+(`ON CONFLICT DO NOTHING`, a `SET` on the rows still `NULL`).
+
 If you renamed a column or a table, say so. The diff alone sees a column going
 and another arriving, and would drop the old one with its rows, so the command
 stops and lists every such pair until you name each rename, in the order they
@@ -388,6 +416,91 @@ If the pair it lists really is two unrelated columns, add `--unrelated` instead,
 and the old one's rows are thrown away.
 
 Never edit a released migration by hand: the boot checksums every applied one and refuses the change. Ask for a new migration instead.
+
+### Changing a type weft stores as JSON
+
+Some columns hold JSON that outlives an update: a connection's recipe, a run's
+record, a program. If you rename, move, add or remove a field of one of those
+Rust types, the rows an older weft wrote no longer read as today's type, so
+the change needs a step that rewrites those rows into the new shape. You can
+find every such column, with its steps, in the `DOCUMENTS` list in
+`crates/weft-runtime/src/schema.rs`.
+
+If you change one of those types:
+
+1. Add a step at the end of the type's list of steps, which sits next to the
+   type (`ACCESS_SPEC_UPGRADES` beside `AccessSpec`, for example). The list is
+   what the type's `STORED` passes to `Kind::new`; if that says `&[]`, the type
+   has no list yet: make one next to the type and pass it there. A step is a few
+   `weft_core::stored::Op`s on the old JSON: `RenameKey`, `AddKey`, `DropKey`
+   and `RenameTag`. Each takes `at`, a dotted path into the JSON where `*`
+   means every item of a list or map. If none of them can say the change,
+   `Op::Code` takes a function over the JSON.
+2. If your type is also stored inside another one, give the outer type a step
+   too: a `Within` at the path where yours sits, running your step's ops.
+   `PROJECT_DEFINITION_UPGRADES` does this for the `AccessSpec` a program's
+   nodes carry.
+3. Add `v<N+1>.json` beside `v<N>.json` in
+   `crates/weft-runtime/documents/<table>.<column>/`: the same documents, in
+   the new shape.
+
+To check it, run `cargo nextest run --workspace -E
+'test(every_document_sample_reads_as_todays_type)'`. Today's file has to read
+as today's type and write back unchanged, and every older file, carried
+through the steps, has to come out identical to today's file. If you change
+the type and forget the step, it fails naming the column, as long as the
+samples hold the field you changed. If they don't, first add a document that
+does to every version's file.
+
+Every row says which version its document was written at, in the column
+beside it, `<column>_version`. If you write one of these columns, write that
+column too, with the type's `STORED.version()` (`AccessSpec::STORED`, for
+example). If you read one, read both and hand them to `STORED.decode`, which
+parses a document at today's version and carries an older one through its
+steps first. A row a newer weft wrote is refused, naming both versions. The
+version column has no default, so a write that forgets it fails instead of
+being labelled version 1.
+
+Between the two parts of the migrations, the boot also rewrites the older rows
+in place, in batches of 500, so the readers almost never carry one. The version column is how far it got, so an
+interrupted boot carries on with exactly the rows still behind.
+`weft_document_version` records the version each column was carried to: a
+boot that finds them all current reads that and nothing else, and one that
+finds a version it does not know refuses to start. If another column holds a
+hash of the JSON (`access_grant.events_recipe_hash` holds one of each
+connection's events recipes), the hash changes when the JSON does, so the
+entry's `rederive` names a function that computes it again; the boot runs it
+in the transaction that records the column. A program is the one exception:
+its hash is its identity, and other rows name it by that hash
+(`run.definition_hash`, an example's `frozenFrom.definitionHash`), so it keeps
+the hash it was made under and its entry has no `rederive`.
+
+If your step moves a value out of the JSON into a column or a table of its
+own, the old rows still hold it only in the JSON, so the entry needs a `Fill`:
+an SQL statement that reads the rows still at the step's version and writes
+the value where it lives now. The boot runs it just before the step, and runs
+it again if it was interrupted, so it has to give the same result twice
+(`project_store::RESYNC_FILLS` is one). The column or table it writes to
+arrives in the migration's first file, so it is there.
+
+A fill is for a column that stays. If the whole column goes, take it out of
+the `CREATE TABLE` and its entry out of the list, and if what it held lives
+on elsewhere, copy it there with a `DataStep` (see
+[Working on the database](#working-on-the-database)).
+
+If you add a column whose rows outlive an update, give its type a `STORED`
+next to it (`Kind::new` with what a message calls one, and `&[]`), add
+`Document::of(&YourType::STORED, ...)` to the list with a `v1.json`, put
+`<column>_version INTEGER NOT NULL` beside it in the `CREATE TABLE`, and bind
+it in every `INSERT` into the table, even one that leaves the document empty.
+The migration adds the column holding 1 on the rows already there, then drops
+that default.
+
+A saved example (`examples/<name>.json`) is a `RunSpec`, and takes the same
+steps as the `run.spec` column (`RUN_SPEC_UPGRADES` in
+`crates/weft-core/src/run_spec.rs`). The file keeps its own version under
+`specVersion`, and the CLI writes an old file back in today's shape the first
+time it reads one.
 
 ### Running the SQL tests
 

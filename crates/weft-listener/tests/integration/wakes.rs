@@ -596,6 +596,7 @@ async fn a_tick_whose_worker_is_down_waits_in_its_triggers_queue() {
     assert_eq!(parked[0]["token"], "tok");
     assert!(parked[0]["fire"]["payload"]["scheduledTime"].is_string(), "parked processed by its kind");
     assert!(parked[0]["fire"]["fire_id"].as_str().unwrap().parse::<uuid::Uuid>().is_ok());
+    assert_eq!((&parked[0]["fire"]["failures"], &parked[0]["fire"]["waits_for"]), (&json!(1), &Value::Null), "a failure, tried again shortly");
     assert_eq!(rig.rows.lock().unwrap()["tok"]["kind_state_seq"], 2, "the moment is claimed: the tick is kept");
 }
 

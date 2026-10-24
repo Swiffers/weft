@@ -37,8 +37,8 @@
 //!   fails for now (5xx, an auth or routing 4xx such as 401, 403 or 404,
 //!   or no answer at all) gets the wake again later, for as long as its
 //!   queue's retry window allows ([`WakeQueue`]). Only an answer that says
-//!   the request body itself is wrong (400, 413, 415, 422: a body from an
-//!   older build the receiver no longer reads) means the same call can
+//!   the request body itself is wrong (400, 413, 415, 422, 426: a body from
+//!   an older build the receiver no longer reads) means the same call can
 //!   never succeed: an alarm that can tell drops it, loudly
 //!   ([`WakeRefusal::of_status`]).
 //! - **Each delivery says which try it is.** The alarm counts the
@@ -118,7 +118,8 @@ pub enum WakeRefusal {
 impl WakeRefusal {
     /// Read the status of an answer that was not a success. Only the
     /// statuses that judge the request body (400 bad request, 413 too
-    /// large, 415 unsupported type, 422 unprocessable) are permanent.
+    /// large, 415 unsupported type, 422 unprocessable, 426 the shape weft's
+    /// own parts answer a body they do not read with) are permanent.
     /// Everything else is temporary: a 5xx, a 408 or 429, and also a 401,
     /// 403 or 404, which say the caller's credentials or the receiver's
     /// routes are not right YET (a rotating key, a role mid-deploy), and
@@ -126,6 +127,7 @@ impl WakeRefusal {
     pub fn of_status(status: u16) -> Self {
         match status {
             400 | 413 | 415 | 422 => WakeRefusal::Permanent,
+            unreadable if unreadable == weft_core::wire_shape::UNREADABLE_SHAPE.as_u16() => WakeRefusal::Permanent,
             _ => WakeRefusal::Temporary,
         }
     }
@@ -451,7 +453,7 @@ mod refusal_tests {
 
     #[test]
     fn only_a_rejected_body_is_permanent() {
-        for status in [400, 413, 415, 422] {
+        for status in [400, 413, 415, 422, 426] {
             assert_eq!(WakeRefusal::of_status(status), WakeRefusal::Permanent, "{status}");
         }
     }

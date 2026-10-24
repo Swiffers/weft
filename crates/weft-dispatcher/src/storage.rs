@@ -467,6 +467,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             EXECUTE FUNCTION storage_sweep_notify()"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 /// Sweep-queue reaper: ask the broker to sweep each pending run's un-kept

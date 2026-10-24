@@ -312,7 +312,7 @@ impl BakeStore for FakeStore {
         Ok(self.inner.lock().unwrap().trigger_setups.contains_key(&run_id))
     }
 
-    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&super::TriggerBake>) -> anyhow::Result<()> {
+    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&super::TriggerBake>) -> anyhow::Result<Option<super::UnreadablePriorBake>> {
         let mut g = self.inner.lock().unwrap();
         let project = g.trigger_setups.get(&run_id).copied();
         if let Some(project) = project {
@@ -327,7 +327,8 @@ impl BakeStore for FakeStore {
             }
             g.trigger_setups.remove(&run_id);
         }
-        Ok(())
+        // The fake keeps bakes as values, which always read.
+        Ok(None)
     }
 
     async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Vec<super::TriggerBake>> {

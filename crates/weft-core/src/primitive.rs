@@ -94,6 +94,9 @@ pub enum RegisterSignalResult {
 }
 
 impl SignalSpec {
+    /// A registered signal's spec, as its row stores it (`signal.spec_json`).
+    pub const STORED: crate::stored::Kind<SignalSpec> = crate::stored::Kind::new("signal spec", &[]);
+
     /// A spec carrying only a kind tag and its config: no connection,
     /// no filter, no consumer label. The shape most callers building a
     /// wire spec by hand want, and the one place the "everything else

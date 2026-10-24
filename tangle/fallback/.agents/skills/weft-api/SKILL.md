@@ -589,10 +589,10 @@ same as under Streaming, for every message a `Reply` or a `Stream` sends;
 under `surface` the socket closes with `1011`, and a `Reply` whose message was
 skipped leaves its `done` absent.
 
-**One connection is one run, so a socket whose gate names the person is not finished until it carries a `TagRun` and a `StopTagged`, wired as under Streaming above.** What a socket can tag on is who the [gate] let in. A path capture like `{room}` names a room shared by everyone in it, not one person, so it is the wrong tag here. The `caller` port takes the type you declare: declare it on the arrow as an open record holding the claim that names the person, and wire that claim into both nodes.
+**One connection is one run, so a socket whose gate names the person is not finished until it carries a `TagRun` and a `StopTagged`, wired as under Streaming above.** What a socket can tag on is who the [gate] let in. A path capture like `{room}` names a room shared by everyone in it, not one person, so it is the wrong tag here. The `caller` port takes the type you declare: declare it on the arrow as an open record holding the claim that names the person, and wire that claim into both nodes. Here `UserTokens` is an access node of the project's own whose `verify` is `oidc` (weft ships no identity-token gate: its service declares the fields `issuer`, `jwksUrl` and `audience`, and `"verify": { "kind": "oidc", "issuers": ["{issuer}"], "jwksUrl": "{jwksUrl}" }`).
 
 ```weft
-gate = JwtAuth
+gate = UserTokens
 sock = Socket -> (inbound: Generator[Said], caller: { sub: String, .. }) {
   path: "chat/{room}"
   auth: gate.access

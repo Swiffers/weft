@@ -480,10 +480,12 @@
 					{/if}
 				{/each}
 				<!-- A name field is always first, whatever the service
-				     declares: it is the connection list's middle column. -->
+				     declares: it is the connection list's middle column. Left
+				     empty, the store names it after the service, which is
+				     what the placeholder shows. -->
 				<div class="wc-field">
 					<label class="wc-muted" for={`wc-${spec.service}-own-name`}>Name</label>
-					<input id={`wc-${spec.service}-own-name`} type="text" class="wc-input" placeholder={`My ${label} app`} bind:value={ownName} />
+					<input id={`wc-${spec.service}-own-name`} type="text" class="wc-input" placeholder={label} bind:value={ownName} />
 				</div>
 				{#if (spec.capabilities ?? []).length > 0}
 					<div class="wc-warn">Fill the fields of at least one of: {(spec.capabilities ?? []).map((c) => c.label).join(', ')}.</div>

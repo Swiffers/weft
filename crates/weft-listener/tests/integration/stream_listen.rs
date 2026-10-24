@@ -138,7 +138,7 @@ async fn spawn_broker() -> String {
     )
     .route(
         "/v1/infra/listener-address",
-        post(|axum::Json(req): axum::Json<Value>| async move { axum::Json(json!({ "authority": req["authority"] })) }),
+        post(|axum::Json(req): axum::Json<Value>| async move { axum::Json(json!({ "authority": req["authority"], "is_infra": false })) }),
     )
     // An entry's event goes straight to its project's worker
     // (`FakeDoors`).

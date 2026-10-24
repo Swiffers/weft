@@ -47,6 +47,17 @@ connect --node account` goes straight to one node. `--disconnect` clears a
 node's pick and leaves the stored account alone, and `--forget <id>` deletes
 the stored account for good.
 
+Every project on the install can pick any stored connection, so if you keep
+two keys for one service, their names are how you tell them apart: the list
+shows each one's account and its name. When you connect a new one your own
+way, with your own key or your own application, `weft connect` asks for a name
+(`--label <name>` answers without asking), and pressing Enter names it after
+the service. The editor's **Name** field does the same when you leave it empty.
+If you sign in through a shared application, or through the one your project
+declares, that application names the connection (a shared key is named after
+the service), so nothing is asked and `--label` is refused. A name with the project in it, like
+`acme-scraper`, suits a key only that project should use.
+
 ## Picked on each install
 
 Which connection a node uses is kept by the install you picked it on, never

@@ -8,13 +8,14 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode};
 
 use weft_broker_client::protocol::ProgramMintInstanceTokenRequest;
 use weft_core::program::MintedInstanceToken;
 
 use crate::auth::{AuthedCaller, Role};
 use crate::state::BrokerState;
+use weft_core::wire_shape::Json;
 
 pub async fn mint_instance_token(
     State(state): State<Arc<BrokerState>>,

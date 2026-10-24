@@ -13,6 +13,8 @@ use sqlx::postgres::PgPool;
 
 use weft_core::ProjectDefinition;
 
+use crate::task_kinds::resync::ResyncPlan;
+
 /// The complete per-node infra image-tag map: `node_id -> { image_name ->
 /// image_ref }`. Written atomically alongside the running hashes by the
 /// build that made the images (`ProjectStoreOps::register_with_hashes`);
@@ -92,10 +94,16 @@ pub trait ProjectStoreOps: Send + Sync {
         infra_hash: Option<&str>,
         infra_image_tags: Option<&InfraImageTags>,
         code: Option<&ProgramCode>,
-        source: Option<&weft_core::project::hash::Manifest>,
+        source: Option<&RunningSource<'_>>,
         settles: Option<&crate::build::waiting::Settles<'_>>,
         infra_places: Option<&std::collections::BTreeMap<String, String>>,
     ) -> anyhow::Result<Option<StoredProjectSummary>>;
+
+    /// The request the project's running build came from (its name, its
+    /// files and what they were compiled with), for the install to build
+    /// the same version again. `None` when it runs no build, or one an
+    /// older weft registered, which kept no inputs.
+    async fn running_build_request(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::builds::VersionBuildRequest>>;
 
     /// Sources registered with this exact running program. Refuse a concurrent build.
     async fn program_source(&self, id: uuid::Uuid, program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<weft_core::project::hash::Manifest>;
@@ -162,17 +170,14 @@ pub trait ProjectStoreOps: Send + Sync {
     /// `running_binary_hash`.
     async fn running_definition_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
 
-    /// Look up a definition by hash. Returns `Ok(None)` when no
-    /// version with that hash was recorded. Used by the broker's
-    /// `fetch_definition` handler: workers and listeners pass
-    /// `(project_id, expected_hash)` and get back the exact JSON
-    /// that was registered under that hash, regardless of what the
-    /// project row's current `running_definition_hash` says.
-    async fn definition_for_hash(
-        &self,
-        id: uuid::Uuid,
-        hash: &str,
-    ) -> anyhow::Result<Option<String>>;
+    /// The program project `id` recorded under `hash` (a registered
+    /// version or a run's cut), read at the version it was written at;
+    /// `Ok(None)` when no program with that hash was recorded. One that no
+    /// longer reads is a `weft_core::stored::DecodeError` naming it, which
+    /// a caller that shows runs tells apart from the store failing.
+    /// Readers go through `DispatcherState::program`, which keeps what it
+    /// read.
+    async fn program(&self, id: uuid::Uuid, hash: &str) -> anyhow::Result<Option<ProjectDefinition>>;
 
     /// Read the stored infra hash. Same Result contract as
     /// `running_binary_hash`.
@@ -264,8 +269,10 @@ pub trait ProjectStoreOps: Send + Sync {
     async fn resume_resync(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<Option<uuid::Uuid>>;
 
     /// The resyncs that stopped, with their plans: what
-    /// `crate::task_kinds::resync::retry_stopped` reads.
-    async fn stopped_resyncs(&self) -> anyhow::Result<Vec<(uuid::Uuid, crate::task_kinds::resync::ResyncPlan)>>;
+    /// `crate::task_kinds::resync::retry_stopped` reads. A held plan that
+    /// does not read comes as its `Err`, beside the others, so one
+    /// project's unreadable plan holds back no other's retry.
+    async fn stopped_resyncs(&self) -> anyhow::Result<Vec<(uuid::Uuid, anyhow::Result<crate::task_kinds::resync::ResyncPlan>)>>;
 
     /// End the project's resync, its task under `driver` having brought
     /// every trigger back: the transition lands at rest in the same
@@ -284,6 +291,16 @@ pub trait ProjectStoreOps: Send + Sync {
     /// begins. Answers the plan as given up; `None` when no resync is
     /// under way.
     async fn give_up_resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::ResyncPlan>>;
+
+    /// Give up the project's resync under way whose plan no longer reads,
+    /// in one transaction: read again under the row lock, a plan that does
+    /// not read is replaced by the record of its giving up, which keeps
+    /// the document and why it did not read
+    /// (`crate::task_kinds::resync::ResyncPlan::given_up_unreadable`), and
+    /// the transition lands at rest. `weft status` shows it as
+    /// [`Self::given_up_resync`] answers it. `false` when there was
+    /// nothing to give up: no resync under way, or one that reads.
+    async fn give_up_unreadable_resync(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
 
     /// What the project's last resync left down, when a person gave it up
     /// ([`Self::give_up_resync`]), less the triggers activated or taken
@@ -425,6 +442,15 @@ pub fn project_status_from_str(s: &str) -> anyhow::Result<ProjectStatus> {
         .ok_or_else(|| anyhow::anyhow!("unknown project.status column value '{s}'"))
 }
 
+/// The source a registration records with the project's running build:
+/// its files, and what they were compiled with (`None` for a version an
+/// older weft asked for, which kept none).
+#[derive(Debug, Clone, Copy)]
+pub struct RunningSource<'a> {
+    pub manifest: &'a weft_core::project::hash::Manifest,
+    pub inputs: Option<&'a weft_core::builds::BuildInputs>,
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredProjectSummary {
     pub id: uuid::Uuid,
@@ -480,6 +506,46 @@ impl PostgresProjectStore {
     }
 }
 
+/// The project's resync under way, its row locked for the rest of the
+/// caller's transaction; `None` when none is.
+async fn held_resync(conn: &mut sqlx::PgConnection, id: uuid::Uuid) -> anyhow::Result<Option<ResyncPlan>> {
+    let row: Option<(serde_json::Value, weft_core::stored::Version, Option<uuid::Uuid>)> = sqlx::query_as(
+        "SELECT resync, resync_version, resync_driver FROM project \
+         WHERE id = $1 AND transition = 'resyncing' AND resync IS NOT NULL FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    row.map(|(json, version, driver)| ResyncPlan::stored(id, json, version, driver)).transpose()
+}
+
+/// Project `id`'s registered program `hash`, read on `conn` (a caller's
+/// transaction, or a connection of its own): `None` when it never
+/// registered that program; a program that no longer reads is a
+/// [`weft_core::stored::DecodeError`] naming its row.
+pub(crate) async fn program_in(conn: &mut sqlx::PgConnection, id: uuid::Uuid, hash: &str) -> anyhow::Result<Option<ProjectDefinition>> {
+    let row: Option<(String, weft_core::stored::Version)> = sqlx::query_as(
+        "SELECT project_json, project_json_version FROM project_definition \
+         WHERE project_id = $1 AND definition_hash = $2",
+    )
+    .bind(id)
+    .bind(hash)
+    .fetch_optional(conn)
+    .await?;
+    let Some((json, version)) = row else { return Ok(None) };
+    Ok(Some(
+        ProjectDefinition::STORED.decode(json.as_str(), version).map_err(|e| e.at(format_args!("project {id}'s program {hash}")))?,
+    ))
+}
+
+/// What `project.resync`'s version 2 moved out of the JSON
+/// (`ResyncPlan::STORED`): its drive, into `resync_driver`.
+pub const RESYNC_FILLS: &[weft_task_store::documents::Fill] = &[weft_task_store::documents::Fill {
+    from: 1,
+    sql: "UPDATE project SET resync_driver = (resync->>'driver')::uuid \
+          WHERE resync_version = 1 AND resync ? 'driver'",
+}];
+
 /// The `project` + `project_definition` tables. The canonical CREATEs
 /// live here, edited in place; an existing database is carried to them
 /// by a migration written with `./setup.sh --migration <name>` (the
@@ -520,11 +586,24 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 description TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 project_json TEXT NOT NULL,
+                -- The version `project_json` was written at
+                -- (`ProjectDefinition::STORED`).
+                project_json_version INTEGER NOT NULL,
                 updated_at BIGINT NOT NULL,
                 running_binary_hash TEXT,
                 running_definition_hash TEXT,
                 running_infra_hash TEXT,
                 running_source JSONB,
+                -- What the running build's files were compiled with
+                -- (weft_core::builds::BuildInputs), written with
+                -- `running_source`: with the name and those files, the
+                -- request the build came from, which the maintenance lift
+                -- builds again on a newer weft (`crate::maintenance`). NULL
+                -- for a build an older weft registered, which kept none.
+                running_build_inputs JSONB,
+                -- The version `running_build_inputs` was written at
+                -- (`BuildInputs::STORED`).
+                running_build_inputs_version INTEGER NOT NULL,
                 tenant_id TEXT NOT NULL,
                 -- Whether this project DECLARES infrastructure (any node
                 -- with requires_infra). Derived from the definition and
@@ -563,8 +642,14 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- `transition` is 'resyncing'; once its task ended it, or a
                 -- person gave it up (`given_up`: when, and the triggers it
                 -- left down, which `weft status` shows), kept as that
-                -- drive's record until the next resync.
+                -- drive's record until the next resync. Its drive is never in
+                -- it (it lives in `resync_driver`).
                 resync JSONB,
+                -- The version `resync` was written at (`ResyncPlan::STORED`).
+                resync_version INTEGER NOT NULL,
+                -- Its drive (`ResyncPlan::driver`): what every write of the
+                -- plan names, and the key of the task driving it.
+                resync_driver UUID,
                 -- The version tree's HEAD (`crate::versions`): the version
                 -- the next checkpoint or run parents on, the run the next
                 -- `--seed` inherits from (NULL when head is a bare
@@ -683,6 +768,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             project_id UUID NOT NULL,
             definition_hash TEXT NOT NULL,
             project_json TEXT NOT NULL,
+            -- The version `project_json` was written at
+            -- (`ProjectDefinition::STORED`).
+            project_json_version INTEGER NOT NULL,
             recorded_at_unix BIGINT NOT NULL,
             -- For a cut a run runs (`weft_journal::record::RunsProgram`),
             -- the registered program it was cut from; NULL for a version
@@ -702,6 +790,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         )"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 /// THE running-hash pointer advance: ONE atomic UPDATE of the trio of hashes
@@ -743,6 +832,8 @@ async fn advance_running_hashes(
         "UPDATE project SET \
              running_source = CASE WHEN ($1 IS NOT NULL AND running_binary_hash IS DISTINCT FROM $1) \
                 OR ($2 IS NOT NULL AND running_definition_hash IS DISTINCT FROM $2) THEN NULL ELSE running_source END, \
+             running_build_inputs = CASE WHEN ($1 IS NOT NULL AND running_binary_hash IS DISTINCT FROM $1) \
+                OR ($2 IS NOT NULL AND running_definition_hash IS DISTINCT FROM $2) THEN NULL ELSE running_build_inputs END, \
              running_binary_hash     = COALESCE($1, running_binary_hash), \
              running_definition_hash = COALESCE($2, running_definition_hash), \
              running_infra_hash      = COALESCE($3, running_infra_hash), \
@@ -793,7 +884,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         infra_hash: Option<&str>,
         infra_image_tags: Option<&InfraImageTags>,
         code: Option<&ProgramCode>,
-        source: Option<&weft_core::project::hash::Manifest>,
+        source: Option<&RunningSource<'_>>,
         settles: Option<&crate::build::waiting::Settles<'_>>,
         infra_places: Option<&std::collections::BTreeMap<String, String>>,
     ) -> anyhow::Result<Option<StoredProjectSummary>> {
@@ -826,12 +917,13 @@ impl ProjectStoreOps for PostgresProjectStore {
         let registered: Option<(uuid::Uuid,)> = sqlx::query_as(
             "INSERT INTO project \
                 (id, name, description, status, project_json, updated_at, \
-                 tenant_id, has_infra) \
-             VALUES ($1, $2, $3, 'registered', $4, $5, $6, $7) \
+                 tenant_id, has_infra, project_json_version, resync_version, running_build_inputs_version) \
+             VALUES ($1, $2, $3, 'registered', $4, $5, $6, $7, $8, $9, $10) \
              ON CONFLICT (id) DO UPDATE SET \
                 name = EXCLUDED.name, \
                 description = EXCLUDED.description, \
                 project_json = EXCLUDED.project_json, \
+                project_json_version = EXCLUDED.project_json_version, \
                 updated_at = EXCLUDED.updated_at, \
                 has_infra = EXCLUDED.has_infra \
              WHERE project.tenant_id = EXCLUDED.tenant_id AND NOT project.removing \
@@ -844,6 +936,9 @@ impl ProjectStoreOps for PostgresProjectStore {
         .bind(now)
         .bind(tenant_id)
         .bind(has_infra)
+        .bind(ProjectDefinition::STORED.version())
+        .bind(ResyncPlan::STORED.version())
+        .bind(weft_core::builds::BuildInputs::STORED.version())
         .fetch_optional(&mut *tx)
         .await?;
         if registered.is_none() {
@@ -863,8 +958,8 @@ impl ProjectStoreOps for PostgresProjectStore {
             // hash is the same program, and is now a registered version
             // too.
             sqlx::query(
-                "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, infra_places) \
-                 VALUES ($1, $2, $3, $4, $5) \
+                "INSERT INTO project_definition (project_id, definition_hash, project_json, project_json_version, recorded_at_unix, infra_places) \
+                 VALUES ($1, $2, $3, $6, $4, $5) \
                  ON CONFLICT (project_id, definition_hash) DO UPDATE SET cut_from = NULL, \
                      infra_places = COALESCE(EXCLUDED.infra_places, project_definition.infra_places)",
             )
@@ -873,6 +968,7 @@ impl ProjectStoreOps for PostgresProjectStore {
             .bind(&project_json)
             .bind(now)
             .bind(infra_places.map(sqlx::types::Json))
+            .bind(ProjectDefinition::STORED.version())
             .execute(&mut *tx)
             .await?;
         }
@@ -904,9 +1000,15 @@ impl ProjectStoreOps for PostgresProjectStore {
         )
         .await?;
         if binary_hash.is_some() || definition_hash.is_some() {
-            sqlx::query("UPDATE project SET running_source = $2 WHERE id = $1")
-                .bind(id).bind(source.map(serde_json::to_value).transpose()?)
-                .execute(&mut *tx).await?;
+            sqlx::query(
+                "UPDATE project SET running_source = $2, running_build_inputs = $3, running_build_inputs_version = $4 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(source.map(|source| serde_json::to_value(source.manifest)).transpose()?)
+            .bind(source.and_then(|source| source.inputs).map(serde_json::to_value).transpose()?)
+            .bind(weft_core::builds::BuildInputs::STORED.version())
+            .execute(&mut *tx)
+            .await?;
         }
         if binary_hash.is_some() {
             // A new image of the project: its queued runs whose workers
@@ -915,6 +1017,21 @@ impl ProjectStoreOps for PostgresProjectStore {
         }
         tx.commit().await?;
         Ok(Some(StoredProjectSummary { id, name, description, removing: false }))
+    }
+
+    async fn running_build_request(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::builds::VersionBuildRequest>> {
+        let row: Option<(String, Option<serde_json::Value>, Option<serde_json::Value>, weft_core::stored::Version)> = sqlx::query_as(
+            "SELECT name, running_source, running_build_inputs, running_build_inputs_version FROM project WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((name, Some(manifest), Some(inputs), version)) = row else { return Ok(None) };
+        let inputs = weft_core::builds::BuildInputs::STORED
+            .decode(inputs, version)
+            .map_err(|e| e.at(format_args!("project {id}'s running build")))?;
+        let manifest = serde_json::from_value(manifest).map_err(|e| anyhow::anyhow!("project {id}'s running source does not read: {e}"))?;
+        Ok(Some(weft_core::builds::VersionBuildRequest { name, manifest, inputs }))
     }
 
     async fn program_source(&self, id: uuid::Uuid, program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<weft_core::project::hash::Manifest> {
@@ -1089,20 +1206,8 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(row.and_then(|(h,)| h))
     }
 
-    async fn definition_for_hash(
-        &self,
-        id: uuid::Uuid,
-        hash: &str,
-    ) -> anyhow::Result<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT project_json FROM project_definition \
-             WHERE project_id = $1 AND definition_hash = $2",
-        )
-        .bind(id)
-        .bind(hash)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(j,)| j))
+    async fn program(&self, id: uuid::Uuid, hash: &str) -> anyhow::Result<Option<ProjectDefinition>> {
+        program_in(&mut *self.pool.acquire().await?, id, hash).await
     }
 
     async fn infra_places(&self, id: uuid::Uuid, definition_hash: &str) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
@@ -1193,22 +1298,23 @@ impl ProjectStoreOps for PostgresProjectStore {
         // checks it, under the row lock every registration takes
         // (`crate::build::waiting::settle`), so no build lands between the
         // check and the resync holding the project.
-        let entered = sqlx::query(
-            "UPDATE project SET transition = 'resyncing', transition_heartbeat_unix = 0, resync = $2 \
+        let sql = format!(
+            "UPDATE project SET transition = 'resyncing', transition_heartbeat_unix = 0, {} \
              WHERE id = $1 AND transition = 'none' \
-               AND ($3::text IS NULL OR running_binary_hash = $3) \
-               AND ($4::text IS NULL OR running_definition_hash = $4) \
-               AND ($5::text IS NULL OR running_infra_hash = $5) \
+               AND ($5::text IS NULL OR running_binary_hash = $5) \
+               AND ($6::text IS NULL OR running_definition_hash = $6) \
+               AND ($7::text IS NULL OR running_infra_hash = $7) \
                AND NOT EXISTS (SELECT 1 FROM trigger_activation a \
                                WHERE a.project_id = $1 AND a.status IN ('activating', 'deactivating'))",
-        )
-        .bind(id)
-        .bind(sqlx::types::Json(plan))
-        .bind(&plan.build.binary_hash)
-        .bind(&plan.build.definition_hash)
-        .bind(&plan.build.infra_hash)
-        .execute(&mut *tx)
-        .await?;
+            ResyncPlan::ROW
+        );
+        let entered = plan
+            .row_write(id, &sql)
+            .bind(&plan.build.binary_hash)
+            .bind(&plan.build.definition_hash)
+            .bind(&plan.build.infra_hash)
+            .execute(&mut *tx)
+            .await?;
         if entered.rows_affected() == 0 {
             return Ok(None);
         }
@@ -1219,59 +1325,52 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::ResyncState>> {
-        let row: Option<(sqlx::types::Json<crate::task_kinds::resync::ResyncPlan>, bool)> = sqlx::query_as(
-            "SELECT p.resync, EXISTS (SELECT 1 FROM task t WHERE t.tenant_id = p.tenant_id AND t.kind = $2 \
-                                      AND t.dedup_key = p.resync->>'driver' AND t.status IN ('pending', 'claimed')) \
+        let row: Option<(serde_json::Value, weft_core::stored::Version, Option<uuid::Uuid>, bool)> = sqlx::query_as(
+            "SELECT p.resync, p.resync_version, p.resync_driver, \
+                    EXISTS (SELECT 1 FROM task t WHERE t.tenant_id = p.tenant_id AND t.kind = $2 \
+                            AND t.dedup_key = p.resync_driver::text AND t.status IN ('pending', 'claimed')) \
              FROM project p WHERE p.id = $1 AND p.transition = 'resyncing' AND p.resync IS NOT NULL",
         )
         .bind(id)
         .bind(weft_task_store::TaskKind::Resync.as_str())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(plan, driven)| crate::task_kinds::resync::ResyncState { plan: plan.0, driven }))
+        row.map(|(json, version, driver, driven)| {
+            Ok(crate::task_kinds::resync::ResyncState { plan: ResyncPlan::stored(id, json, version, driver)?, driven })
+        })
+        .transpose()
     }
 
     async fn drive(&self, id: uuid::Uuid, driver: uuid::Uuid) -> anyhow::Result<Option<(crate::task_kinds::resync::ResyncPlan, bool)>> {
-        let row: Option<(sqlx::types::Json<crate::task_kinds::resync::ResyncPlan>, bool)> = sqlx::query_as(
-            "SELECT resync, transition = 'resyncing' FROM project \
-             WHERE id = $1 AND resync->>'driver' = $2 AND NOT resync ? 'given_up'",
+        let row: Option<(serde_json::Value, weft_core::stored::Version, bool)> = sqlx::query_as(
+            "SELECT resync, resync_version, transition = 'resyncing' FROM project \
+             WHERE id = $1 AND resync_driver = $2 AND resync IS NOT NULL",
         )
         .bind(id)
-        .bind(driver.to_string())
+        .bind(driver)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(plan, under_way)| (plan.0, under_way)))
+        let Some((json, version, under_way)) = row else { return Ok(None) };
+        let plan = ResyncPlan::stored(id, json, version, Some(driver))?;
+        // A person gave it up: no drive of it goes on.
+        Ok(plan.given_up.is_none().then_some((plan, under_way)))
     }
 
     async fn write_resync(&self, id: uuid::Uuid, plan: &crate::task_kinds::resync::ResyncPlan) -> anyhow::Result<bool> {
-        let written = sqlx::query(
-            "UPDATE project SET resync = $2 WHERE id = $1 AND transition = 'resyncing' AND resync->>'driver' = $3",
-        )
-        .bind(id)
-        .bind(sqlx::types::Json(plan))
-        .bind(plan.driver.to_string())
-        .execute(&self.pool)
-        .await?;
+        // Only the drive the plan names writes it.
+        let sql =
+            format!("UPDATE project SET {} WHERE id = $1 AND transition = 'resyncing' AND resync_driver = $4", ResyncPlan::ROW);
+        let written = plan.row_write(id, &sql).execute(&self.pool).await?;
         Ok(written.rows_affected() > 0)
     }
 
     async fn resume_resync(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<Option<uuid::Uuid>> {
         let mut tx = self.pool.begin().await?;
-        let held: Option<sqlx::types::Json<crate::task_kinds::resync::ResyncPlan>> = sqlx::query_scalar(
-            "SELECT resync FROM project WHERE id = $1 AND transition = 'resyncing' AND resync IS NOT NULL FOR UPDATE",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(sqlx::types::Json(mut plan)) = held else { return Ok(None) };
+        let Some(mut plan) = held_resync(&mut tx, id).await? else { return Ok(None) };
         if plan.stopped.is_some() {
             plan.driver = uuid::Uuid::now_v7();
             plan.stopped = None;
-            sqlx::query("UPDATE project SET resync = $2 WHERE id = $1")
-                .bind(id)
-                .bind(sqlx::types::Json(&plan))
-                .execute(&mut *tx)
-                .await?;
+            plan.row_write(id, &format!("UPDATE project SET {} WHERE id = $1", ResyncPlan::ROW)).execute(&mut *tx).await?;
         }
         let task = crate::task_kinds::resync::task(tenant, id, plan.driver);
         let task = weft_task_store::tasks::enqueue_dedup_in(&mut tx, task).await?.id();
@@ -1280,21 +1379,26 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(Some(task))
     }
 
-    async fn stopped_resyncs(&self) -> anyhow::Result<Vec<(uuid::Uuid, crate::task_kinds::resync::ResyncPlan)>> {
-        let rows: Vec<(uuid::Uuid, sqlx::types::Json<crate::task_kinds::resync::ResyncPlan>)> =
-            sqlx::query_as("SELECT id, resync FROM project WHERE transition = 'resyncing' AND resync ? 'stopped'")
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows.into_iter().map(|(id, plan)| (id, plan.0)).collect())
+    async fn stopped_resyncs(&self) -> anyhow::Result<Vec<(uuid::Uuid, anyhow::Result<crate::task_kinds::resync::ResyncPlan>)>> {
+        let rows: Vec<(uuid::Uuid, serde_json::Value, weft_core::stored::Version, Option<uuid::Uuid>)> = sqlx::query_as(
+            "SELECT id, resync, resync_version, resync_driver FROM project WHERE transition = 'resyncing' AND resync IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, json, version, driver)| (id, ResyncPlan::stored(id, json, version, driver)))
+            .filter(|(_, plan)| plan.as_ref().map_or(true, |plan| plan.stopped.is_some()))
+            .collect())
     }
 
     async fn end_resync(&self, id: uuid::Uuid, driver: uuid::Uuid) -> anyhow::Result<bool> {
         let ended = sqlx::query(
             "UPDATE project SET transition = 'none', transition_heartbeat_unix = 0 \
-             WHERE id = $1 AND transition = 'resyncing' AND resync->>'driver' = $2",
+             WHERE id = $1 AND transition = 'resyncing' AND resync_driver = $2",
         )
         .bind(id)
-        .bind(driver.to_string())
+        .bind(driver)
         .execute(&self.pool)
         .await?;
         Ok(ended.rows_affected() > 0)
@@ -1306,23 +1410,15 @@ impl ProjectStoreOps for PostgresProjectStore {
         // so the rows read below hold every one it made. A trigger whose
         // activation it started is still landing counts as down: the
         // person's cancel ends that activation.
-        let held: Option<sqlx::types::Json<crate::task_kinds::resync::ResyncPlan>> = sqlx::query_scalar(
-            "SELECT resync FROM project WHERE id = $1 AND transition = 'resyncing' AND resync IS NOT NULL FOR UPDATE",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some(sqlx::types::Json(mut plan)) = held else { return Ok(None) };
+        let Some(mut plan) = held_resync(&mut tx, id).await? else { return Ok(None) };
         let rows = crate::activation_store::list_in(&mut tx, id).await?;
         plan.given_up = Some(crate::task_kinds::resync::GivenUp {
             at_unix: crate::lease::now_unix(),
             left_down: crate::task_kinds::resync::left_down(&plan, &rows),
+            unreadable: None,
         });
-        sqlx::query("UPDATE project SET transition = 'none', transition_heartbeat_unix = 0, resync = $2 WHERE id = $1")
-            .bind(id)
-            .bind(sqlx::types::Json(&plan))
-            .execute(&mut *tx)
-            .await?;
+        let sql = format!("UPDATE project SET transition = 'none', transition_heartbeat_unix = 0, {} WHERE id = $1", ResyncPlan::ROW);
+        plan.row_write(id, &sql).execute(&mut *tx).await?;
         // Told with the write: a drive waiting for the runs on the old
         // version, on whichever dispatcher, stops waiting
         // (`crate::task_kinds::resync::given_up`).
@@ -1335,13 +1431,44 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(Some(plan))
     }
 
+    async fn give_up_unreadable_resync(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(serde_json::Value, weft_core::stored::Version, Option<uuid::Uuid>)> = sqlx::query_as(
+            "SELECT resync, resync_version, resync_driver FROM project \
+             WHERE id = $1 AND transition = 'resyncing' AND resync IS NOT NULL FOR UPDATE",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((document, version, driver)) = row else { return Ok(false) };
+        let error = match ResyncPlan::stored(id, document.clone(), version, driver) {
+            Ok(_) => return Ok(false),
+            Err(e) => e,
+        };
+        let unreadable = crate::task_kinds::resync::UnreadablePlan { error: format!("{error:#}"), document, version };
+        let plan = ResyncPlan::given_up_unreadable(unreadable, crate::lease::now_unix());
+        let sql = format!("UPDATE project SET transition = 'none', transition_heartbeat_unix = 0, {} WHERE id = $1", ResyncPlan::ROW);
+        plan.row_write(id, &sql).execute(&mut *tx).await?;
+        // Told with the write, as a person's give-up is: a drive of the
+        // plan waiting for the runs on the old version stops waiting.
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(crate::task_kinds::resync::RESYNC_GIVEN_UP_CHANNEL)
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     async fn given_up_resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::GivenUp>> {
-        let given: Option<sqlx::types::Json<crate::task_kinds::resync::GivenUp>> =
-            sqlx::query_scalar("SELECT resync->'given_up' FROM project WHERE id = $1 AND resync ? 'given_up'")
+        let row: Option<(serde_json::Value, weft_core::stored::Version, Option<uuid::Uuid>)> =
+            sqlx::query_as("SELECT resync, resync_version, resync_driver FROM project WHERE id = $1 AND resync IS NOT NULL")
                 .bind(id)
                 .fetch_optional(&self.pool)
                 .await?;
-        Ok(given.map(|given| given.0))
+        row.map(|(json, version, driver)| Ok(ResyncPlan::stored(id, json, version, driver)?.given_up))
+            .transpose()
+            .map(Option::flatten)
     }
 
     async fn request_cancel_build(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
@@ -1398,20 +1525,17 @@ impl ProjectStoreOps for PostgresProjectStore {
     /// failure propagates: a corrupt `project_json` is schema drift,
     /// not "no project".
     async fn project(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectDefinition>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT project_json FROM project WHERE id = $1",
+        let row: Option<(String, weft_core::stored::Version)> = sqlx::query_as(
+            "SELECT project_json, project_json_version FROM project WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
-        match row {
-            None => Ok(None),
-            Some((json,)) => {
-                let def = serde_json::from_str(&json)
-                    .map_err(|e| anyhow::anyhow!("decode project_json for id={id}: {e}"))?;
-                Ok(Some(def))
-            }
-        }
+        Ok(row
+            .map(|(json, version)| {
+                ProjectDefinition::STORED.decode(json.as_str(), version).map_err(|e| e.at(format_args!("project {id}'s program")))
+            })
+            .transpose()?)
     }
 
     async fn project_has_infra(&self, id: uuid::Uuid) -> anyhow::Result<Option<bool>> {

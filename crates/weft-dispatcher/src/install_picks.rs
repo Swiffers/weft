@@ -49,25 +49,20 @@ pub async fn change(
     };
     let checked =
         weft_core::picks::check_picks(project.as_deref(), set).map_err(|refusal| crate::api::project::refusal_error(&refusal))?;
-    // A clear, like a pick, is held to the program where it has the place,
-    // and is spelled the way the program spells that place, which is how
-    // the pick was stored.
+    // A clear, like a pick, is held to the program where it has the place
+    // (a place it no longer has can still be cleared of what was stored
+    // for it). A place is named the way the program spells it, which is
+    // how the pick was stored, so the name is the key as given.
     let mut cleared: Vec<(String, String)> = Vec::new();
     for (place, field) in clear {
-        let place = match &project {
-            Some(project) => {
-                let (id, path) = weft_core::project::resolve_address(project, place);
-                match project.nodes.iter().find(|n| n.id == id) {
-                    Some(node) if !weft_core::picks::picked_fields(node).any(|f| f == field) => {
-                        return Err((StatusCode::BAD_REQUEST, format!("'{place}.{field}' is no connection picked on the install")));
-                    }
-                    Some(_) => weft_core::project::address_of(project, &id, &path),
-                    None => place.clone(),
-                }
-            }
-            None => place.clone(),
-        };
-        cleared.push((place, field.clone()));
+        let node = project.as_deref().and_then(|project| match weft_core::project::places::named(project, place) {
+            Ok(weft_core::project::places::Named::Node(at)) => project.nodes.iter().find(|n| n.id == at.id),
+            _ => None,
+        });
+        if node.is_some_and(|node| !weft_core::picks::picked_fields(node).any(|f| f == field)) {
+            return Err((StatusCode::BAD_REQUEST, format!("'{place}.{field}' is no connection picked on the install")));
+        }
+        cleared.push((place.clone(), field.clone()));
     }
     let writes: Vec<weft_access_store::PickWrite> = checked
         .iter()
@@ -301,7 +296,7 @@ async fn rearm(state: &DispatcherState, project_id: uuid::Uuid, live: &[Activati
                 Err(crate::api::project::ActivateError::Refused(ClaimRefused::NotExpected)) => break,
                 Err(error @ (crate::api::project::ActivateError::Failed(..)
                 | crate::api::project::ActivateError::Refused(
-                    ClaimRefused::Building | ClaimRefused::Resyncing | ClaimRefused::ResyncGone | ClaimRefused::Removing,
+                    ClaimRefused::Building | ClaimRefused::Resyncing | ClaimRefused::ResyncGone | ClaimRefused::Removing | ClaimRefused::Maintenance,
                 ))) => {
                     let (_, why) = <(StatusCode, String)>::from(error);
                     let whose = match owner.instance() {

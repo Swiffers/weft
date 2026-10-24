@@ -281,6 +281,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             EXECUTE FUNCTION infra_command_cancel_notify()"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 /// A take-down a supervisor runs: its verb with the answers only that

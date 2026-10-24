@@ -251,6 +251,12 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/install", get(project::install))
         .route("/install/domains", get(domains::list).post(domains::add))
         .route("/install/domains/{name}", axum::routing::delete(domains::remove))
+        // The install's maintenance (`weft maintenance`): where it stands
+        // and what is on, switching everything off, and the lift (a task
+        // the caller follows below).
+        .route("/install/maintenance", get(crate::maintenance::state).post(crate::maintenance::on))
+        .route("/install/maintenance/off", post(crate::maintenance::off))
+        .route("/install/maintenance/follow/{task}", get(crate::maintenance::follow))
         .route("/projects/{id}/frontends", get(crate::frontends::list_route).post(crate::frontends::add))
         .route("/projects/{id}/frontends/{name}", axum::routing::delete(crate::frontends::remove))
         .route("/projects/{id}/frontends/{name}/visitor-address", axum::routing::put(crate::frontends::set_visitor_address))
@@ -340,6 +346,9 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/runs/{run_id}/nodes/{node}/state", get(run::node_state))
         .route("/runs/{run_id}/logs", get(run::list_logs))
         .route("/runs/{run_id}/replay", get(run::replay))
+        // The replay as a person reads it (`weft events`): filtered and
+        // spelled against the program the run ran.
+        .route("/runs/{run_id}/events", get(run::events))
         .route("/runs/{run_id}/outputs", get(run::outputs))
         .route(
             "/runs/{run_id}",
@@ -540,11 +549,16 @@ fn outside_caller_routes(state: DispatcherState) -> Router<DispatcherState> {
         // looks up the signal row by `mount_path` (an open entry
         // only; a connection-gated one is a live route served at
         // `/connect/...`), then hands the event to `signal::take_event`.
-        // Public-entry signals fire via this route. Methods other than
-        // POST or unmatched paths fall to axum's default 404.
+        // Public-entry signals fire via this route. Any other method is
+        // answered 404, like a path nothing serves: this route matches
+        // every path, so a 405 would tell a caller asking for an endpoint
+        // the install does not have (a CLI asking an older weft) that it
+        // exists for POST.
         .route(
             "/{*mount_path}",
-            post(signal::fire_public_entry).layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT)),
+            post(signal::fire_public_entry)
+                .layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT))
+                .fallback(|| async { axum::http::StatusCode::NOT_FOUND }),
         )
         .layer(axum::middleware::from_fn_with_state(state, guard_token_doors))
         .layer(permissive_cors())

@@ -3682,7 +3682,7 @@ fn an_included_file_opened_alone_sees_the_types_of_its_site() {
     std::fs::write(root.join("src/main.weft"), "type Settings = { tone: String }\nb = @include(\"bot.weft\")\n").unwrap();
     std::fs::write(root.join("src/bot.weft"), SETTINGS_USER).unwrap();
     let file = root.join("src/bot.weft");
-    let id = weft_compiler::source_name::file_id(Some(&root), Some(&file)).expect("not the entry");
+    let id = weft_compiler::source_name::file_id(Some(&root), Some(&file)).unwrap().expect("not the entry");
     let src_dir = root.join("src");
     let fs = CompileFs::disk(&root).anchored_at(Some(&src_dir));
     let (_, errors) = compile_lenient(SETTINGS_USER, uuid::Uuid::new_v4(), fs, IncludeMode::Interface, Some(&id));

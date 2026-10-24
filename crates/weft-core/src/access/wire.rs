@@ -102,9 +102,9 @@ pub struct GrantSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<crate::instance::InstanceId>,
     pub identity: Option<String>,
-    /// The connection list's middle column: the app's label, or the
-    /// name the user typed for a pasted credential. `None` only for
-    /// rows with neither (a runtime-supplied credential).
+    /// The connection list's middle column: the name the user typed,
+    /// else the app's label, else the service's own. `None` only for a
+    /// connection a node published without one.
     pub label: Option<String>,
     /// The granted permission set (the "what it can do" column).
     pub scopes: Vec<String>,
@@ -172,8 +172,7 @@ pub struct ConnectDirect {
     #[serde(default)]
     pub values: BTreeMap<String, String>,
     /// The name the user gave this connection (the list's middle
-    /// column, standing in where no app label exists). `None` shows
-    /// the service's own label.
+    /// column). `None` names it after its app, else after the service.
     #[serde(default)]
     pub label: Option<String>,
     /// The permissions the user CLAIMS the pasted credential holds

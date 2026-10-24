@@ -181,27 +181,20 @@ pub async fn referenced_images_query(
             }
         }
     }
-    // The refs live units actually run, recorded per unit on the
-    // infra_node row at every apply (see `UnitRuntime::image_refs`).
+    // The refs live units actually run, recorded on each unit's
+    // `infra_unit` row at every apply (see `UnitRuntime::image_refs`).
     // Covers what the project-row map cannot: an UP unit frozen at an
     // older image across one or more syncs keeps running that ref until
     // it is force-stopped, so its old ref must stay referenced.
     // All rows, all units, regardless of status: over-keeping a ref is
     // bounded (rows die with the node on terminate) and the safe
     // direction for a set reclamation deletes against.
-    let unit_rows: Vec<(uuid::Uuid, String, serde_json::Value)> =
-        sqlx::query_as("SELECT project_id, node_id, units_json FROM infra_node")
-            .fetch_all(&mut *conn)
-            .await?;
-    for (project_id, node_id, units) in unit_rows {
-        let by_unit =
-            weft_broker_client::protocol::decode_units_json(units, project_id, &node_id)?;
-        for runtime in by_unit.into_values() {
-            for image_ref in runtime.image_refs {
-                if !image_ref.is_empty() && scope.covers_infra_ref(&image_ref) {
-                    infra_refs.insert(image_ref);
-                }
-            }
+    let unit_refs: Vec<String> = sqlx::query_scalar("SELECT DISTINCT unnest(image_refs) FROM infra_unit")
+        .fetch_all(&mut *conn)
+        .await?;
+    for image_ref in unit_refs {
+        if !image_ref.is_empty() && scope.covers_infra_ref(&image_ref) {
+            infra_refs.insert(image_ref);
         }
     }
     Ok(ReferencedImages {
@@ -326,56 +319,78 @@ pub async fn build(
     use axum::response::IntoResponse;
     declare_project(&state, id, &req.name, &caller.0).await.map_err(IntoResponse::into_response)?;
     crate::api::versions::validate_manifest(&req.manifest).map_err(IntoResponse::into_response)?;
+    match build_and_register(&state, id, &caller.0, &req).await.map_err(IntoResponse::into_response)? {
+        Built::Registered(built) => Ok(Json(*built).into_response()),
+        Built::Underway(underway) => Ok((StatusCode::ACCEPTED, Json(underway)).into_response()),
+    }
+}
+
+/// How a build of a version went, short of failing.
+pub(crate) enum Built {
+    /// Every image was there: the version is the project's running one.
+    Registered(Box<weft_core::builds::BuiltProgram>),
+    /// Images are building: the install registers the version once they
+    /// end (`crate::build::waiting`).
+    Underway(weft_core::builds::BuildsUnderway),
+}
+
+/// Build the version `req` names for project `id` of `tenant` and, when
+/// every image is there already, register it: what a build request does
+/// past its checks, and what the maintenance lift does to build a project
+/// again on a newer weft (`crate::maintenance`).
+pub(crate) async fn build_and_register(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    tenant: &crate::tenant::TenantId,
+    req: &weft_core::builds::VersionBuildRequest,
+) -> Result<Built, crate::transition::BuildFailed> {
+    use crate::transition::BuildFailed;
     // Taken as the ask arrives, before the minutes of compiling: a
     // version registers only over an older ask, whichever finishes first
     // (`crate::build::waiting`).
-    let ask = state
-        .projects
-        .next_build_ask(id)
-        .await
-        .map_err(|e| crate::api::unavailable_or_internal("take the build's place in the project's order", e).into_response())?;
+    let ask = state.projects.next_build_ask(id).await.map_err(|e| {
+        let (status, message) = crate::api::unavailable_or_internal("take the build's place in the project's order", e);
+        BuildFailed::of(status, message)
+    })?;
     // Claims every image the build plans from its first look at the
     // registry until the version registers, so no prune deletes an image
     // this build found or built before anything references it
     // (`crate::build::prune::ImageHold`).
     let hold = crate::build::prune::ImageHold::new(&state.pg_pool, id);
-    let (version, hold) = match crate::transition::build_version_gated(&state, id, &caller.0, &req, ask, hold).await? {
-        crate::build::VersionBuild::Waiting(underway) => {
-            return Ok((StatusCode::ACCEPTED, Json(underway)).into_response());
-        }
+    let (version, hold) = match crate::transition::build_version_gated(state, id, tenant, req, ask, hold).await? {
+        crate::build::VersionBuild::Waiting(underway) => return Ok(Built::Underway(underway)),
         crate::build::VersionBuild::Ready { version, hold } => (version, hold),
     };
     if let Err(e) = hold.confirm().await {
         let released = hold.release().await;
-        let settled = crate::transition::settle(&state, Some(id)).await;
+        let settled = crate::transition::settle(state, Some(id)).await;
         let also: Vec<String> = [released.err(), settled.err()].into_iter().flatten().map(|e| format!("{e:#}")).collect();
         let mut message = format!("{e:#}");
         if !also.is_empty() {
             message.push_str(&format!("\n(and letting go of the build failed too: {})", also.join("; ")));
         }
-        return Err((StatusCode::CONFLICT, message).into_response());
+        return Err(BuildFailed::of(StatusCode::CONFLICT, message));
     }
     let registrar = crate::build::waiting::Registrar::Request { hold };
-    match crate::build::waiting::register(&state, id, caller.0.as_str(), &version, registrar).await {
-        Ok(Some(built)) => Ok(Json(built).into_response()),
-        Ok(None) => Err((
+    match crate::build::waiting::register(state, id, tenant.as_str(), &version, registrar).await {
+        Ok(Some(built)) => Ok(Built::Registered(Box::new(built))),
+        Ok(None) => Err(BuildFailed::of(
             StatusCode::CONFLICT,
             "a newer build of this project registered while this one was compiling, so this one was not registered; \
              build again to run this version"
                 .to_string(),
-        )
-            .into_response()),
-        Err(e) if crate::build::waiting::ResyncHolds::is(&e) => Err((StatusCode::CONFLICT, format!("{e:#}")).into_response()),
+        )),
+        Err(e) if crate::build::waiting::ResyncHolds::is(&e) => Err(BuildFailed::of(StatusCode::CONFLICT, format!("{e:#}"))),
         Err(e) => {
             let (status, mut message) = if crate::project_store::ProjectRemoving::is(&e) {
                 crate::project_store::ProjectRemoving::refusal()
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("register the build: {e:#}"))
             };
-            if let Err(settled) = crate::transition::settle(&state, Some(id)).await {
+            if let Err(settled) = crate::transition::settle(state, Some(id)).await {
                 message.push_str(&format!("\n(and settling the project failed too: {settled:#})"));
             }
-            Err((status, message).into_response())
+            Err(BuildFailed::of(status, message))
         }
     }
 }
@@ -761,7 +776,7 @@ pub(crate) struct QueueAs<'a> {
     /// ran again rather than inherit, what it was asked to run, and the
     /// saved example it came from.
     pub stale: &'a [String],
-    pub spec: Option<&'a serde_json::Value>,
+    pub spec: Option<&'a weft_core::run_spec::RunSpec>,
     pub example: Option<&'a str>,
 }
 
@@ -1027,14 +1042,7 @@ pub async fn start_infra_setup(
     // journaled/enqueued hash must come from the SAME definition (see
     // `coherent_definition`).
     let (program, project) = coherent_definition(state, project_id).await?;
-    let targeted = crate::api::infra::resolve_infra_nodes(&project, nodes, instance)?;
-    let places: Vec<Located> = targeted
-        .iter()
-        .map(|spelled| {
-            let (id, path) = weft_core::project::resolve_address(&project, spelled);
-            Located::new(id, path)
-        })
-        .collect();
+    let places: Vec<Located> = crate::api::infra::resolve_infra_nodes(&project, nodes, instance)?.into_values().collect();
     let Some((cut, kicks)) = setup_cut(&project, &places).map_err(|error| (StatusCode::BAD_REQUEST, error))? else {
         return Ok(None);
     };
@@ -1273,16 +1281,9 @@ pub(crate) async fn unanswered_for(state: &DispatcherState, project_id: uuid::Uu
         let error = held.standing_still()?;
         let now = crate::lease::now_unix();
         let at = held.plan.stopped.as_ref().map_or(now, |stopped| stopped.at_unix);
-        let by_itself = match held.plan.stopped.as_ref().and_then(|stopped| stopped.waits_for) {
-            Some(crate::task_kinds::resync::ResyncWait::Infra) => "it goes on by itself once the infra those triggers read runs; ",
-            Some(crate::task_kinds::resync::ResyncWait::Activation) => "it goes on by itself once that activation has landed; ",
-            None => "",
-        };
         Some(weft_core::projects::Unanswered {
             what: "a resync of this project stopped with triggers it took down still down; builds wait for it".to_string(),
-            then: format!(
-                "{by_itself}`weft resync --resume` tries it again where it stopped; `weft cancel-activate` gives it up and leaves those triggers down"
-            ),
+            then: crate::task_kinds::resync::what_next(held.plan.stopped.as_ref()),
             error,
             since_unix: at,
             last_unix: at,
@@ -1317,6 +1318,16 @@ async fn given_up_resync_left_down(
     let Some(given_up) = state.projects.given_up_resync(project_id).await.map_err(|e| internal("the project's given-up resync", e))? else {
         return Ok(None);
     };
+    if let Some(unreadable) = given_up.unreadable {
+        return Ok(Some(weft_core::projects::Unanswered {
+            what: "weft gave up a resync of this project: what it wrote down on the project no longer reads, so which triggers it had taken down is not known".to_string(),
+            then: "the project's triggers, as `weft status` lists them, show which are off: `weft activate` turns on the ones that should be on, or `weft resync` starts the resync over; this clears when the next resync begins".to_string(),
+            error: unreadable.error,
+            since_unix: given_up.at_unix,
+            last_unix: given_up.at_unix,
+            as_of_unix: crate::lease::now_unix(),
+        }));
+    }
     if given_up.left_down.is_empty() {
         return Ok(None);
     }
@@ -1774,17 +1785,16 @@ fn trigger_entries(
         waiting: None,
         version: None,
     };
-    let mut places: Vec<String> = weft_core::project::trigger_places(project)
-        .iter()
-        .map(|place| weft_core::project::address_of(project, &place.id, &place.path))
+    // Each trigger place by the way its activation is keyed, kept with the
+    // place itself.
+    let places: std::collections::BTreeMap<String, Located> = weft_core::project::trigger_places(project)
+        .into_iter()
+        .map(|place| (weft_core::project::address_of(project, &place.id, &place.path), place))
         .collect();
-    places.sort();
-    places.dedup();
     let mut entries: Vec<TriggerEntry> = places
         .iter()
-        .map(|node| {
-            let (id, _) = weft_core::project::resolve_address(project, node);
-            let per_instance = weft_core::project::is_per_instance(project, &id);
+        .map(|(node, place)| {
+            let per_instance = weft_core::project::is_per_instance(project, &place.id);
             let rows: Vec<&crate::activation_store::Activation> = activations.iter().filter(|a| &a.key.trigger == node).collect();
             let shared = rows.iter().copied().find(|a| a.key.instance().is_none());
             TriggerEntry {
@@ -1801,7 +1811,7 @@ fn trigger_entries(
         })
         .collect();
     let mut gone: std::collections::BTreeMap<&str, Vec<&crate::activation_store::Activation>> = Default::default();
-    for activation in activations.iter().filter(|a| !places.contains(&a.key.trigger)) {
+    for activation in activations.iter().filter(|a| !places.contains_key(&a.key.trigger)) {
         gone.entry(activation.key.trigger.as_str()).or_default().push(activation);
     }
     entries.extend(gone.into_iter().map(|(node, rows)| {
@@ -1873,9 +1883,8 @@ fn infra_entries(
         .collect();
     instance_infra.sort_by(|a, b| (&a.node, &a.instance).cmp(&(&b.node, &b.instance)));
     let mut infra = Vec::new();
-    for spelled in weft_core::project::infra_place_spellings(project) {
-        let (node_id, _) = weft_core::project::resolve_address(project, &spelled);
-        let Some(node) = project.nodes.iter().find(|n| n.id == node_id && n.requires_infra) else {
+    for (spelled, place) in weft_core::project::infra_place_spellings(project) {
+        let Some(node) = project.nodes.iter().find(|n| n.id == place.id) else {
             continue;
         };
         let entry = |status: String| ProjectInfraEntry {
@@ -2023,7 +2032,7 @@ pub(crate) async fn gather_action_snapshot(
     // SYNC: shared roles <-> crates/weft-compiler/src/weft_compiler.rs collect_included_contents
     let declared = weft_core::project::DeclaredInfra::of(project);
     let source_infra: std::collections::BTreeSet<String> = weft_core::project::infra_place_spellings(project)
-        .into_iter()
+        .into_keys()
         .filter(|n| declared.declares(n, false))
         .collect();
     let has_infra = !source_infra.is_empty();
@@ -2443,32 +2452,71 @@ pub(crate) async fn known_instances(state: &DispatcherState, id: uuid::Uuid) -> 
     Ok(crate::task_kinds::program_call::instances(state, &tenant, id).await?.into_iter().map(|held| held.instance).collect())
 }
 
-/// Refuse to turn on a trigger whose fire could never run: its setup may
-/// need nothing broken (a route needs nothing to register), while every
-/// fire runs the trigger's cut (`run_spec::compute_trigger_fire`), and one
-/// that needs a part that does not compile is refused at each call. The
-/// person is told now, naming the part, rather than every caller later.
-/// Asked of the triggers an activate switches on, whoever asks, and of the
-/// ones a resync puts back (before it takes any down); never of a
-/// re-arm, whose triggers are on and whose change has nothing to do with
-/// it.
-async fn refuse_unfireable(
+/// Refuse to turn on triggers the build `project` cannot run
+/// ([`cannot_come_on`]), naming every part they need that does not
+/// compile, so the person is told now rather than by a setup that fails
+/// halfway or by every caller later. Asked of the triggers an activate
+/// switches on, whoever asks, and of the ones a resync puts back (before
+/// it takes any down, and again before it brings each owner back); never
+/// of a re-arm, whose triggers are on and whose change has nothing to do
+/// with it.
+async fn refuse_unrunnable(
     state: &DispatcherState,
     id: uuid::Uuid,
     project: &ProjectDefinition,
     keys: &[weft_core::activation::ActivationKey],
-) -> Result<(), (StatusCode, String)> {
+) -> Result<(), Unrunnable> {
     let mut refused = Vec::new();
-    for key in keys {
-        let saved = saved_for_run(state, id, project, key.instance()).await?;
-        if let Err(why) = weft_core::run_spec::compute_trigger_fire(project, &key.trigger, &serde_json::Value::Null, None, &saved) {
-            refused.push(why);
-        }
+    for (_, owned) in keys_by_owner(keys) {
+        let saved = saved_for_run(state, id, project, keys_instance(&owned)).await.map_err(Unrunnable::Unchecked)?;
+        refused.extend(cannot_come_on(project, &owned, &saved));
     }
     if refused.is_empty() {
         return Ok(());
     }
-    Err((StatusCode::UNPROCESSABLE_ENTITY, refused.join("\n")))
+    Err(Unrunnable::Cannot(refused.join("\n")))
+}
+
+/// Why [`refuse_unrunnable`] did not let triggers come on. The two are
+/// kept apart because they call for opposite things: a build that cannot
+/// run them fails the same way on every try and is fixed in the source,
+/// while a check that could not be made (a read of what the infra saved
+/// failed) says nothing about the build and goes through once the read
+/// does.
+#[derive(Debug)]
+pub(crate) enum Unrunnable {
+    /// The build cannot run them: every part they need that does not
+    /// compile, one per line.
+    Cannot(String),
+    /// The check could not be made: the failed read's status and message.
+    Unchecked((StatusCode, String)),
+}
+
+impl From<Unrunnable> for (StatusCode, String) {
+    fn from(unrunnable: Unrunnable) -> Self {
+        match unrunnable {
+            Unrunnable::Cannot(why) => (StatusCode::UNPROCESSABLE_ENTITY, why),
+            Unrunnable::Unchecked(failed) => failed,
+        }
+    }
+}
+
+/// Why the build `project` cannot turn on `keys`, one owner's triggers,
+/// `saved` being what that owner's infra has saved: their setup run
+/// (`setup_cut`, which reaches what only feeds a trigger, like an auth
+/// node a gated route reads at setup) or a fire of one
+/// (`run_spec::compute_trigger_fire`) needs a part that does not compile,
+/// a node whose metadata did not load among them. Empty when both run.
+fn cannot_come_on(
+    project: &ProjectDefinition,
+    keys: &[weft_core::activation::ActivationKey],
+    saved: &weft_core::infra::bake::Saved,
+) -> Vec<String> {
+    let setup = setup_cut(project, &key_places(project, keys)).err();
+    let fires = keys
+        .iter()
+        .filter_map(|key| weft_core::run_spec::compute_trigger_fire(project, &key.trigger, &serde_json::Value::Null, None, saved).err());
+    setup.into_iter().chain(fires).collect()
 }
 
 /// The activations `scope` names in `project`, refusing a mismatch (a
@@ -2680,7 +2728,8 @@ pub(crate) enum ActivateAsker<'a> {
     /// A person (`weft activate`, the editor) or a program
     /// (`ctx.triggers().activate(..)`): held to the verb table
     /// ([`require_action`]), so it is refused while a build, a resync or
-    /// an infra change is in flight.
+    /// an infra change is in flight, and by the claim while the install is
+    /// in maintenance (`crate::maintenance`).
     Outside,
     /// weft bringing back triggers that went down with their infra, now
     /// it runs (and is healthy) again: past the verb table, since an infra
@@ -2693,6 +2742,11 @@ pub(crate) enum ActivateAsker<'a> {
     Resync(uuid::Uuid),
     /// A change of an instance's values re-arming its live triggers.
     Rearm(&'a Rearm<'a>),
+    /// The maintenance lift bringing back the triggers `weft maintenance
+    /// on` took down (`crate::maintenance`): past the verb table like an
+    /// infra's return, and the one activation that goes through while the
+    /// install is in maintenance.
+    Lift,
 }
 
 /// Ready the registered build's workers for the triggers' setup, and
@@ -2864,7 +2918,7 @@ async fn activate_trigger_setup_window(
         // A trigger its setup skipped (behind a closed gate) arms nothing.
         let Some(capture) = bake.captured.get(&key.trigger) else { continue };
         let arming = crate::task_kinds::register_signal::RegisterSignalExecutor::arm(state,
-            crate::task_kinds::register_signal::RegisterSignalPayload {
+            weft_task_store::RegisterSignalPayload {
                 run_id: bake.run_id, node_id: key.trigger.clone(), frames: Vec::new(),
                 spec: capture.spec.clone(), is_resume: false, call_index: 0,
                 port_snapshot: Some(capture.ports.clone()),
@@ -3007,6 +3061,7 @@ impl From<ActivateError> for (StatusCode, String) {
                     ClaimRefused::Resyncing => crate::project_store::ProjectTransition::Resyncing.refusal().unwrap_or_default(),
                     ClaimRefused::ResyncGone => "the resync bringing these triggers back was given up, or taken up again, meanwhile",
                     ClaimRefused::Removing => weft_core::projects::PROJECT_BEING_REMOVED,
+                    ClaimRefused::Maintenance => weft_core::maintenance::IN_MAINTENANCE,
                 }
                 .into(),
             ),
@@ -3130,15 +3185,18 @@ pub(crate) async fn activate_with(
     if matches!(asker, ActivateAsker::Outside) && scope.instances.is_shared() {
         require_action(state, id, &["activate"]).await?;
     }
-    // Every trigger an activate switches on is checked for a fire that
-    // could never run, whoever asks (a person, a program's run, an infra
-    // or health check bringing it back); a re-arm's triggers are on
-    // already, and a resync checked its own before taking any down.
-    let checks_fires = !matches!(asker, ActivateAsker::Rearm(_) | ActivateAsker::Resync(_));
-    let (rearm, resync) = match asker {
-        ActivateAsker::Outside | ActivateAsker::InfraBack => (None, None),
-        ActivateAsker::Resync(driver) => (None, Some(driver)),
-        ActivateAsker::Rearm(rearm) => (Some(rearm), None),
+    // Every trigger an activate switches on is checked for a setup or a
+    // fire that could never run, whoever asks (a person, a program's run,
+    // an infra or health check bringing it back); a re-arm's triggers are
+    // on already, and a resync checks its own itself, before taking any
+    // down and before bringing each owner back.
+    let checks_runnable = !matches!(asker, ActivateAsker::Rearm(_) | ActivateAsker::Resync(_));
+    use crate::activation_store::Claimant;
+    let (rearm, claimant) = match asker {
+        ActivateAsker::Outside | ActivateAsker::InfraBack => (None, Claimant::Anyone),
+        ActivateAsker::Resync(driver) => (None, Claimant::Resync(driver)),
+        ActivateAsker::Rearm(rearm) => (Some(rearm), Claimant::Anyone),
+        ActivateAsker::Lift => (None, Claimant::Lift),
     };
     // What runs is what the last build registered (its program, hashes
     // and every place's images together, `POST /projects/{id}/builds`);
@@ -3204,8 +3262,8 @@ pub(crate) async fn activate_with(
     if !elsewhere.is_empty() {
         return Err(ActivateError::Failed(StatusCode::CONFLICT, on_another_binary_refusal(&elsewhere)));
     }
-    if checks_fires {
-        refuse_unfireable(state, id, &project, &keys).await?;
+    if checks_runnable {
+        refuse_unrunnable(state, id, &project, &keys).await.map_err(<(StatusCode, String)>::from)?;
     }
     // Every connection the program needs picked on this install, before
     // any trigger moves: a run born without one is refused at its first
@@ -3226,7 +3284,7 @@ pub(crate) async fn activate_with(
     let mut answer = ActivateResponse::default();
     let mut released = weft_core::projects::HeldWork::default();
     for (owner, keys) in keys_by_owner(&keys) {
-        let owned = activate_owner(state, id, &keys, held, &project, &program, rearm, resync).await.map_err(|error| match error {
+        let owned = activate_owner(state, id, &keys, held, &project, &program, rearm, claimant).await.map_err(|error| match error {
             // Owners turned on before this one stay on: name them, so the
             // failure is read as what it is.
             ActivateError::Failed(code, message) if !answer.turned_on.is_empty() => {
@@ -3308,7 +3366,7 @@ async fn activate_owner(
     project: &ProjectDefinition,
     program: &weft_core::project::hash::ProgramIdentity,
     rearm: Option<&Rearm<'_>>,
-    resync: Option<uuid::Uuid>,
+    claimant: crate::activation_store::Claimant,
 ) -> Result<OwnerActivated, ActivateError> {
     // Single-flight gate: atomically claim Activating for every named
     // activation. While a trigger is activating (registering its
@@ -3321,7 +3379,7 @@ async fn activate_owner(
     let activation = weft_core::new_run_id();
     let previous = state
         .activations
-        .try_begin_activating(id, keys, activation, rearm.is_some().then_some(crate::activation_store::ProjectStatus::Active), resync)
+        .try_begin_activating(id, keys, activation, rearm.is_some().then_some(crate::activation_store::ProjectStatus::Active), claimant)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("try_begin_activating: {e}")))?
         .map_err(ActivateError::Refused)?;
@@ -3749,6 +3807,8 @@ pub async fn resync(
 ) -> Result<Json<ResyncAnswer>, StatusError> {
     use crate::activation_store::ProjectStatus;
     authorize_project(&state, &caller.0, id).await?;
+    // Before anything comes down: its bring-back would be refused.
+    crate::maintenance::refuse_while_on(&state.pg_pool).await?;
     let body = body.map(|Json(b)| b).unwrap_or_default();
     let take_down = body
         .choice
@@ -3823,8 +3883,9 @@ pub async fn resync(
     //    them down over a condition it could have checked while they
     //    were still up: a build or an infra change in flight, triggers
     //    mid-flip, infra a trigger's setup reads not running, a
-    //    connection not picked, a fire that could never run (its cut
-    //    needs a part that does not compile, judged on the program as its
+    //    connection not picked, a setup or a fire that could never run
+    //    (its cut needs a part that does not compile, a node whose
+    //    metadata did not load among them, judged on the program as its
     //    worker runs it, what it left out included). Every owner is
     //    checked before the first comes down. Each activate below re-reads
     //    and re-checks; this is what keeps the project whole.
@@ -3832,7 +3893,10 @@ pub async fn resync(
     let (_, runnable) = coherent_definition(&state, id).await?;
     for owner in &owners {
         require_trigger_infra(&state, id, &registered, &owner.keys(&owner.on)).await?;
-        refuse_unfireable(&state, id, &runnable, &owner.keys(&owner.on)).await?;
+        refuse_unrunnable(&state, id, &runnable, &owner.keys(&owner.on)).await.map_err(|unrunnable| match unrunnable {
+            Unrunnable::Cannot(why) => (StatusCode::UNPROCESSABLE_ENTITY, format!("{why}\n{RESYNC_TOOK_NOTHING_DOWN}")),
+            Unrunnable::Unchecked(failed) => failed,
+        })?;
     }
     crate::install_picks::require_activation_picks(&state, id, &registered).await?;
 
@@ -3876,6 +3940,11 @@ pub async fn resync(
     Ok(Json(ResyncAnswer::UnderWay { task }))
 }
 
+/// What a resync refused for a build that cannot run its triggers adds,
+/// below the parts that do not compile.
+const RESYNC_TOOK_NOTHING_DOWN: &str =
+    "The resync took nothing down. Fix that in the source (the message above says how), then run `weft resync` again.";
+
 /// What a resync with nothing behind answers: nothing taken down, and the
 /// triggers of the build that are off.
 fn nothing_to_resync(take_down: weft_core::take_down::TakeDown, off: Vec<weft_core::activation::OwnerTriggers>) -> ResyncResponse {
@@ -3891,15 +3960,28 @@ fn nothing_to_resync(take_down: weft_core::take_down::TakeDown, off: Vec<weft_co
 /// `POST /projects/{id}/resync/resume`: take the project's resync up
 /// again, where it stopped, with the answers and the build it began with,
 /// and follow it as [`resync`] does. One still going is followed as it
-/// is. Refused when the project holds no resync: it never starts one.
+/// is. Refused when the project holds no resync (it never starts one), and
+/// when it stopped because its build cannot run its triggers
+/// (`crate::task_kinds::resync::Stopped::build_cannot_run`), naming what
+/// does bring them back.
 pub async fn resume_resync(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<ResyncAnswer>, StatusError> {
     authorize_project(&state, &caller.0, id).await?;
+    crate::maintenance::refuse_while_on(&state.pg_pool).await?;
     let internal = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("take the resync up again: {e:#}"));
     let tenant = state.projects.tenant_for(id).await.map_err(internal)?.ok_or((StatusCode::NOT_FOUND, "project not found".to_string()))?;
+    // One its build cannot run would fail the same way: a resume keeps
+    // that build.
+    let held = state.projects.resync(id).await.map_err(internal)?;
+    if let Some(stopped) = held.as_ref().and_then(|held| held.plan.stopped.as_ref()).filter(|stopped| stopped.build_cannot_run) {
+        return Err(StatusError::Other(
+            StatusCode::CONFLICT,
+            format!("this resync stopped because its build cannot run the triggers it brings back:\n{}\n{}", stopped.error, crate::task_kinds::resync::BUILD_CANNOT_RUN_NEXT),
+        ));
+    }
     let Some(task) = state.projects.resume_resync(id, &tenant).await.map_err(internal)? else {
         return Err(StatusError::Other(
             StatusCode::CONFLICT,
@@ -3961,21 +4043,14 @@ pub async fn follow(
 /// its task's error otherwise.
 fn resync_stopped(stopped: Option<crate::task_kinds::resync::Stopped>, error: String) -> (StatusCode, String) {
     match stopped {
-        Some(stopped) => {
-            let by_itself = match stopped.waits_for {
-                Some(crate::task_kinds::resync::ResyncWait::Infra) => " It goes on by itself once that infra runs;",
-                Some(crate::task_kinds::resync::ResyncWait::Activation) => " It goes on by itself once that activation has landed;",
-                None => "",
-            };
-            (
-                StatusCode::from_u16(stopped.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                format!(
-                    "{}. The resync stopped with these triggers down, and holds the project until it finishes.{by_itself} \
-                     `weft resync --resume` tries it again, `weft cancel-activate` leaves them down",
-                    stopped.error
-                ),
-            )
-        }
+        Some(stopped) => (
+            StatusCode::from_u16(stopped.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            format!(
+                "{}\nThe resync stopped with these triggers down, and holds the project until it finishes: {}",
+                stopped.error,
+                crate::task_kinds::resync::what_next(Some(&stopped))
+            ),
+        ),
         None => (StatusCode::CONFLICT, error),
     }
 }
@@ -4125,6 +4200,12 @@ pub(crate) async fn resync_bring_back_owner(
     // The infra their setup reads, checked apart so a stop over it waits
     // for that infra to run again ([`ResyncWait::Infra`]).
     require_trigger_infra(state, id, &registered, &down).await.map_err(|refused| Halt::waiting(ResyncWait::Infra, refused))?;
+    // A build that cannot run them fails the same way however often it is
+    // tried, and a resync taken up again keeps its build: stopped at once,
+    // saying what does bring them back. A check that could not be made
+    // fails as any step does, and is tried again ([`Halt`]'s `From<Unrunnable>`).
+    let (_, runnable) = coherent_definition(state, id).await.map_err(Halt::from)?;
+    refuse_unrunnable(state, id, &runnable, &down).await?;
     // Reactivate, through the same path as an activate (hash
     // persistence, cleanup on failure), past the activate handler's gates:
     // the resync checked them before its take-down, and its claim is the
@@ -4590,7 +4671,7 @@ async fn run_trigger_setup(
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| (StatusCode::CONFLICT, "trigger setup did not complete successfully".into()))?;
     bake.targets = keys.iter().map(|key| key.trigger.clone()).collect();
-    state.bakes.finish_trigger_setup(run_id, Some(&bake)).await
+    crate::run_ends::land_trigger_bake(state, run_id, project_id, Some(&bake)).await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("publish trigger bake: {error:#}")))?;
     Ok(bake)
 }
@@ -4725,6 +4806,34 @@ mod trigger_kick_tests {
             sorted(&program),
             vec!["b".to_string(), "out".to_string(), "trigger_x".to_string()],
             "A feeds only the trigger, so it is outside the fire's subgraph"
+        );
+    }
+
+    /// A node that only feeds a trigger (an auth node a gated route reads
+    /// at setup) runs in the trigger's setup and in none of its fires: when
+    /// it does not load, the fires alone would let the trigger come on, and
+    /// its setup would fail halfway. The trigger is refused up front,
+    /// naming the loader's message; with the node loading, it comes on.
+    #[test]
+    fn a_trigger_whose_setup_needs_a_node_that_did_not_load_cannot_come_on() {
+        let mut p = project(
+            &[("auth", false, &[]), ("hook", true, &[]), ("out", false, &[])],
+            &[("auth", "hook"), ("hook", "out")],
+        );
+        let keys = [weft_core::activation::ActivationKey::new("hook", weft_core::instance::Owner::Shared)];
+        assert!(cannot_come_on(&p, &keys, &Default::default()).is_empty(), "everything loads");
+        p.broken.push(weft_core::project::Broken {
+            parts: vec!["auth".into()],
+            why: "node 'HmacAuth' failed to load: service.verify sets signatureHeader; run `weft catalog update`".into(),
+            hides: true,
+        });
+        assert!(fire(&p, "hook", Value::Null).kicks.iter().all(|kick| kick.node == "hook"), "the fire does not run the auth node");
+        let refused = cannot_come_on(&p, &keys, &Default::default());
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].starts_with("setting up hook cannot run") && refused[0].contains("HmacAuth' failed to load") && refused[0].contains("weft catalog update"),
+            "{}",
+            refused[0]
         );
     }
 

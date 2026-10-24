@@ -57,6 +57,13 @@ pub struct TriggerBake {
     pub at_unix: u64,
 }
 
+/// An earlier bake a trigger setup replaced because it no longer read
+/// ([`BakeStore::finish_trigger_setup`]): why, its row named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadablePriorBake {
+    pub error: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TriggerCapture {
     pub spec: weft_core::primitive::SignalSpec,
@@ -64,6 +71,19 @@ pub struct TriggerCapture {
 }
 
 impl TriggerBake {
+    /// A trigger's bake as its row stores it (`trigger_bake.bake_json`).
+    pub const STORED: weft_core::stored::Kind<TriggerBake> = weft_core::stored::Kind::new("trigger bake", &[]);
+
+    /// Where a stored bake sits, for a message about it: the project, whose
+    /// triggers (an instance's, or the shared ones) and the program they
+    /// were baked on (`trigger_bake`'s key).
+    pub fn row(project_id: uuid::Uuid, instance: Option<&str>, program_hash: &str) -> String {
+        match instance {
+            Some(instance) => format!("the bake of instance {instance}'s triggers of project {project_id} on program {program_hash}"),
+            None => format!("the bake of the shared triggers of project {project_id} on program {program_hash}"),
+        }
+    }
+
     /// This bake with `newer`'s captures laid over it: a setup of some
     /// of the triggers refreshes those, and the others keep what an
     /// earlier setup of the same code captured. The rest of the bake
@@ -457,7 +477,11 @@ pub trait BakeStore: Send + Sync {
 
     /// Publish one complete setup and release its birth-time ownership atomically.
     /// A failed/cancelled setup releases ownership without replacing any bake.
-    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&TriggerBake>) -> anyhow::Result<()>;
+    /// An earlier bake of the same owner's triggers on the same program
+    /// that no longer reads is replaced by this one, which carries nothing
+    /// of it: answered, so the caller says which triggers lost their bake
+    /// (`crate::run_ends::land_trigger_bake`).
+    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&TriggerBake>) -> anyhow::Result<Option<UnreadablePriorBake>>;
 
     /// The bakes of one owner's triggers: the shared ones for `None`, an
     /// instance's for `Some`.
@@ -496,9 +520,11 @@ pub struct SignalRegistration {
     /// person or looks one up by the name a person gave.
     pub node_id: String,
     pub is_resume: bool,
-    /// JSON-serialized `SignalSpec`. Stored so a listener brings the
-    /// signal back up from its row after a restart without re-running
-    /// trigger-setup.
+    /// JSON-serialized `SignalSpec`, in today's shape: the store reads
+    /// the row's through `SignalSpec::STORED`, and writes it at today's
+    /// version. Stored so a listener brings the signal back up from its
+    /// row after a restart without re-running trigger-setup. Read it with
+    /// [`Self::spec`].
     pub spec_json: String,
     /// The connection this signal acts as (`spec.access.id`),
     /// denormalized so inbound provider pushes route account-to-
@@ -634,7 +660,7 @@ impl SignalRegistration {
                 // all along at the address they were not given. No url at
                 // least says "I cannot tell you", and the parse failure
                 // is a broken row, which is worth a line in the log.
-                let spec = serde_json::from_str::<weft_core::primitive::SignalSpec>(&self.spec_json);
+                let spec = self.spec();
                 let is_live = match &spec {
                     Ok(spec) => weft_core::signal::caller_protocol(&spec.kind).is_some(),
                     Err(error) => {

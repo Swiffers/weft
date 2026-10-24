@@ -210,9 +210,10 @@ async fn open_projection(
     Ok(RunProjector::new(run_id, program, project_id).with_inheritance(inheritance))
 }
 
-/// A run whose record cannot be read back: logged, and published as the
-/// same corruption event the replay publishes, so the screen shows the run
-/// as unreadable and names `weft clean`.
+/// Something of a run that cannot be read back (its record, its seed,
+/// the bake its trigger setup landed on): logged, and published as the
+/// same corruption event the replay publishes, so the screen shows it on
+/// the run. `reason` names what did not read and what to do about it.
 pub(crate) async fn publish_unreadable(
     state: &DispatcherState,
     run_id: RunId,
@@ -223,8 +224,7 @@ pub(crate) async fn publish_unreadable(
     tracing::error!(
         target: "weft_dispatcher::live_view",
         %run_id, %reason,
-        "this run's record cannot be read back; its live view paints only what needs no \
-         program. `weft clean` removes the run."
+        "something this run's view reads cannot be read back"
     );
     let corruption = crate::events::IdentifiedEvent::transient(crate::events::DispatcherEvent::JournalCorruption {
         run_id,

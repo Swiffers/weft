@@ -35,7 +35,7 @@ async fn wake_reaches_a_timer_inside_an_included_file_through_its_site() -> anyh
     // but a deliberate refusal keeps it out of a person's hands.
     let refused = project.weft_refused(&["wake", &held.to_string(), "@src:lib:gate.hold"]).await?;
     anyhow::ensure!(refused.contains("inside an included file"), "{refused}");
-    anyhow::ensure!(refused.contains("site.hold"), "it names the spelling that works: {refused}");
+    anyhow::ensure!(refused.contains("`gate.hold`"), "it names the spelling that works: {refused}");
 
     // The spelling the program uses.
     let woke: Value =

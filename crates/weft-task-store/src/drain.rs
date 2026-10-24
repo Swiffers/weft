@@ -271,6 +271,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             PRIMARY KEY (role, loop_name)
         )"#],
     seed: &[],
+    data_steps: &[],
 };
 
 /// The database's clock, in unix milliseconds. Every due time is read and

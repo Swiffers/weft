@@ -77,7 +77,7 @@ from memory.
 
 ## Wiring patterns that recur
 
-**An [access node]**: you declare it (`telegram = TelegramAccess`) and wire its `.access` output into each consumer's `account` input (`access` on a model node and `LlmModerate`, and `auth` on a `Route` or `Socket` for an auth node such as `JwtAuth`). Consumers check at run time that the connection is picked and has the required scopes or values.
+**An [access node]**: you declare it (`telegram = TelegramAccess`) and wire its `.access` output into each consumer's `account` input (`access` on a model node and `LlmModerate`, and `auth` on a `Route` or `Socket` for an auth node such as `ApiKeyAuth`). Consumers check at run time that the connection is picked and has the required scopes or values.
 
 **A provider node**: a model node fed by its service's [access node], `router = OpenRouterAccess` then `provider: OpenRouterModel { access: router.access, model: "z-ai/glm-5.3" }.provider` inline, or the model declared long and shared across several LLM nodes. One access node serves every model of that service, and the connection is picked on it, never on the model node.
 

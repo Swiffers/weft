@@ -16,7 +16,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::Router;
 use serde_json::Value;
 use sqlx::Row;
 
@@ -29,6 +29,7 @@ use weft_broker_client::protocol::{
 use crate::auth::{AuthedCaller, CallerIdentity, Role};
 use crate::handlers::unavailable_or_internal;
 use crate::state::BrokerState;
+use weft_core::wire_shape::Json;
 
 type Resp<T> = Result<Json<T>, (StatusCode, String)>;
 
@@ -59,9 +60,9 @@ pub(crate) fn worker(caller: &CallerIdentity) -> Result<(&str, uuid::Uuid, &str)
 /// and how its activation stands.
 fn trigger_select(filter: &str) -> String {
     format!(
-        "SELECT s.token, s.node_id, s.surface_kind, s.mount_path, s.mount_methods, s.spec_json, s.auth_kind, s.auth_config, \
-                s.port_snapshot, s.program_json->>'definition_hash' AS definition_hash, \
-                s.program_json->>'binary_hash' AS binary_hash, s.source_version, s.instance_id, s.held_by, \
+        "SELECT s.token, s.node_id, s.surface_kind, s.mount_path, s.mount_methods, s.spec_json, s.spec_json_version, \
+                s.auth_kind, s.auth_config, s.port_snapshot, s.definition_hash, s.binary_hash, s.source_version, \
+                s.instance_id, s.held_by, \
                 CASE WHEN p.id IS NULL THEN 'inactive' ELSE COALESCE(a.status, 'active') END AS status, \
                 CASE WHEN p.id IS NULL THEN FALSE ELSE COALESCE(a.accepting_fires, TRUE) END AS accepting_fires, \
                 a.fires_deadline_unix \
@@ -211,9 +212,9 @@ fn armed_entry(row: &sqlx::postgres::PgRow, node_id: &str, caller: bool) -> anyh
         ));
     };
     let spec_json: String = row.try_get("spec_json")?;
-    let spec: weft_core::primitive::SignalSpec = match serde_json::from_str(&spec_json) {
+    let spec = match weft_core::primitive::SignalSpec::STORED.decode(spec_json.as_str(), row.try_get("spec_json_version")?) {
         Ok(spec) => spec,
-        Err(e) => return Ok(unservable(StatusCode::INTERNAL_SERVER_ERROR, format!("trigger '{node_id}': spec parse: {e}"))),
+        Err(e) => return Ok(unservable(StatusCode::INTERNAL_SERVER_ERROR, e.at(format_args!("trigger '{node_id}'")).to_string())),
     };
     // A kind that serves no caller on the line is not a live route.
     if caller {

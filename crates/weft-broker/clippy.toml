@@ -1,0 +1,17 @@
+# Every call the broker reads goes through `weft_core::wire_shape::Json`
+# (or `Query`), which answers a call in a shape this weft does not read (a
+# worker an older weft built) the one way every worker's client
+# understands.
+#
+# A handler that takes the raw body (`axum::body::Bytes`) and parses it
+# with `serde_json::from_slice` itself slips past these two. That cannot be
+# refused here without refusing what is right: clippy can only forbid a
+# function or a type everywhere, and the broker parses stored rows and task
+# payloads with `serde_json::from_*` and moves file contents as `Bytes`.
+# So a handler takes `Bytes` only for a body that is not JSON (a journal
+# frame, a file's contents), and a JSON part inside it is answered through
+# `crate::wire::UnreadableShapes::refuse`, as `crate::records` does.
+disallowed-types = [
+    { path = "axum::Json", reason = "read and answer bodies with `weft_core::wire_shape::Json` (see `crate::wire`)" },
+    { path = "axum::extract::Query", reason = "read a query string with `weft_core::wire_shape::Query` (see `crate::wire`)" },
+]

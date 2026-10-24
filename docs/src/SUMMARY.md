@@ -54,6 +54,7 @@
 - [Using a connection in a node](connections/using-one-in-a-node.md)
 - [Declaring a service](connections/declaring-a-service.md)
 - [Events from a service](connections/events.md)
+- [Checking a signed request](connections/verifying-requests.md)
 - [Measuring what a call costs](connections/meters.md)
 
 # Running programs

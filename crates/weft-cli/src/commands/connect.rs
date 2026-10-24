@@ -321,7 +321,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
                     println!();
                 }
                 println!("{}:", describe_target(target));
-                print_grants(target, target.spec.display_label(), &grants);
+                print_grants(target, &target.picked, Place { on: ctx.on(), instance: None }, target.spec.display_label(), &grants);
             }
         }
         if json {
@@ -361,7 +361,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
         json,
         doorway: Doorway::Owner,
         install: install_named(&ctx, &client),
-        on: ctx.on().map(str::to_string),
+        place: Place { on: ctx.on(), instance: None },
     };
 
     if opts.disconnect {
@@ -394,7 +394,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
                 })
             );
         } else {
-            print_grants(&target, &label, &grants);
+            print_grants(&target, &target.picked, cx.place, &label, &grants);
         }
         return Ok(());
     }
@@ -415,50 +415,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
     }
 
     if let Some(id) = &opts.upgrade {
-        // Upgrading re-runs a browser sign-in on the existing grant;
-        // a pasted-credential service has no sign-in to re-run.
-        if !target.spec.needs_browser_consent() {
-            bail!(
-                "{label} connections are not browser sign-ins, so there is nothing to \
-                 upgrade. To change what a connection holds, connect a new one with \
-                 --door own and pick it."
-            );
-        }
-        // The store only rotates a grant in place on a one-grant-per-
-        // account service; anywhere else a wider connection is simply a
-        // new one. Refuse locally, before any prompting.
-        if target.spec.grants != GrantCoexistence::Exclusive {
-            bail!(
-                "{label} keeps one connection per consent, so there is nothing to \
-                 upgrade in place; connect a new account (--door own|shared) and pick it"
-            );
-        }
-        let g = grants
-            .iter()
-            .find(|g| g.id == *id)
-            .with_context(|| format!("no stored {label} connection with id {id} (see --list)"))?;
-        // A shared-door upgrade's permission set is the app's declared
-        // one (the server replaces whatever a client asks for), so
-        // nothing is asked and --permissions is refused.
-        let ticked = if g.door == Door::Shared {
-            if opts.permissions.is_some() {
-                bail!(
-                    "--permissions applies to the own door; a shared-door connection \
-                     carries the app's declared set"
-                );
-            }
-            Vec::new()
-        } else {
-            ticked_permissions(&target.spec, &opts, interactive)?
-        };
-        let shared_app = if g.door == Door::Shared {
-            g.label.clone()
-        } else {
-            None
-        };
-        let grant = cx
-            .consent_flow(g.door, ticked, shared_app, Some(*id), None)
-            .await?;
+        let grant = cx.upgrade(&grants, *id, &opts).await?;
         cx.pick_grant(&grant).await?;
         return Ok(());
     }
@@ -469,7 +426,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
     // included), else walk the interactive menu over the stored
     // connections.
     if opts.door.is_none() && !opts.shapes_a_new_connection() {
-        print_grants(&target, &label, &grants);
+        print_grants(&target, &target.picked, cx.place, &label, &grants);
         let hint = "--grant <id>, --door shared|own, --disconnect, or --forget <id>";
         let menu = if grants.is_empty() {
             "(c)onnect a new account, (d)isconnect the node, (q)uit: ".to_string()
@@ -493,9 +450,9 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
                 let g = grant_by_number(&grants, n)?;
                 if confirm(
                     &format!(
-                        "Forget \"{}\" for good? Every project pointing at it will need \
+                        "Forget {} for good? Every project pointing at it will need \
                          a reconnect. [yes/no] ",
-                        g.identity.clone().unwrap_or_else(|| g.id.to_string())
+                        grant_title(g, &label)
                     ),
                     "--forget <id> --yes",
                 )? {
@@ -541,40 +498,33 @@ async fn as_instance(
     target: &AccessTarget,
     label: &str,
 ) -> Result<()> {
-    let json = ctx.json();
     let project_id = ctx.project()?.id();
-    let install = install_named(ctx, client);
-    let on = ctx.on().map(str::to_string);
+    let (json, install) = (ctx.json(), install_named(ctx, client));
+    let place = Place { on: ctx.on(), instance: Some(instance) };
     super::instance_values::as_instance(ctx, client, instance, |door| async move {
-        instance_connect(&door, project_id, instance, opts, target, label, json, install, on).await
+        let cx = Connecting {
+            client: &door,
+            project_id,
+            target,
+            service_label: label,
+            interactive: is_interactive(),
+            json,
+            doorway: Doorway::Instance,
+            install,
+            place,
+        };
+        instance_connect(&cx, opts).await
     })
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn instance_connect(
-    door: &DispatcherClient,
-    project_id: Uuid,
-    instance: &weft_core::instance::InstanceId,
-    opts: &ConnectOpts,
-    target: &AccessTarget,
-    label: &str,
-    json: bool,
-    install: String,
-    on: Option<String>,
-) -> Result<()> {
+/// The instance's side of `weft connect` (list, pick, connect,
+/// disconnect), through the same [`Connecting`] steps at the instance
+/// door.
+async fn instance_connect(cx: &Connecting<'_>, opts: &ConnectOpts) -> Result<()> {
+    let (target, label, json) = (cx.target, cx.service_label, cx.json);
     let node = target.spelling();
-    let cx = Connecting {
-        client: door,
-        project_id,
-        target,
-        service_label: label,
-        interactive: is_interactive(),
-        json,
-        doorway: Doorway::Instance,
-        install,
-        on,
-    };
+    let instance = cx.place.instance.context("an instance's connect runs inside an instance")?;
     if !matches!(target.picked, Pick::InstanceFilled) {
         bail!(
             "'{node}' takes the author's connection, not each instance's; write `{}: @instance_filled` on it \
@@ -583,26 +533,18 @@ async fn instance_connect(
         );
     }
     if opts.disconnect {
-        let clear = weft_core::run_spec::InstanceFieldRef { node: node.clone(), field: target.input.clone() };
-        let body = weft_core::instance_door::ValuesRequest { set: Vec::new(), clear: vec![clear] };
-        door.put_json("/instance/values", &serde_json::to_value(body)?).await?;
+        cx.clear_pick().await?;
         if json {
             println!("{}", serde_json::json!({ "node": node, "instance": instance, "picked": Value::Null }));
-        } else {
-            println!("'{node}' now has no connection picked for instance '{instance}'.");
         }
         return Ok(());
     }
-    let grants = list_grants(door, Doorway::Instance, Some(&target.spec.service)).await?;
+    let grants = list_grants(cx.client, Doorway::Instance, Some(&target.spec.service)).await?;
     if opts.list {
         if json {
             println!("{}", serde_json::json!({ "node": node, "instance": instance, "connections": grants }));
-        } else if grants.is_empty() {
-            println!("instance '{instance}' has no {label} connection yet; connect one with --door own (or shared).");
         } else {
-            for g in &grants {
-                println!("  {}  {}", g.id, g.identity.clone().unwrap_or_default());
-            }
+            print_grants(target, &instance_pick(cx.client, target).await?, cx.place, label, &grants);
         }
         return Ok(());
     }
@@ -613,41 +555,24 @@ async fn instance_connect(
             .with_context(|| format!("instance '{instance}' has no {label} connection with id {id} (see --list)"))?,
         None => cx.connect_new(opts).await?,
     };
-    let changed = door
-        .put_json(
-            "/instance/values",
-            &serde_json::to_value(weft_core::instance_door::ValuesRequest {
-                set: vec![weft_core::run_spec::InstanceValueInput {
-                    node: node.clone(),
-                    field: target.input.clone(),
-                    value: serde_json::json!({ "id": grant.id }),
-                }],
-                clear: Vec::new(),
-            })?,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "the connection is stored as {}; pick it with `{}`",
-                grant.id,
-                cx.weft(&format!("connect --instance {instance} --node {node} --grant {}", grant.id))
-            )
-        })?;
-    let rearmed = serde_json::from_value::<weft_core::instance_door::ValuesChanged>(changed)
-        .context("read the dispatcher's answer to the change; upgrade the dispatcher or this CLI so the versions match")?
-        .rearmed;
+    let rearmed = cx.pick_grant(&grant).await?;
     if json {
         println!("{}", serde_json::json!({ "node": node, "instance": instance, "picked": grant.id, "rearmed": rearmed }));
-    } else {
-        println!(
-            "'{node}' now uses {} for instance '{instance}'.",
-            grant.identity.clone().unwrap_or_else(|| grant.id.to_string())
-        );
-        if !rearmed.is_empty() {
-            println!("Its trigger(s) reading it were set up again: {}.", rearmed.join(", "));
-        }
     }
     Ok(())
+}
+
+/// What the instance picked for `target`'s connection field, read off
+/// the instance door's own list of the fields it fills.
+async fn instance_pick(door: &DispatcherClient, target: &AccessTarget) -> Result<Pick> {
+    let fields: Vec<weft_core::instance_door::InstanceField> = serde_json::from_value(door.get_json("/instance/fields").await?)
+        .context("read the instance's fields; upgrade the dispatcher or this CLI so the versions match")?;
+    let node = target.spelling();
+    let value = fields.into_iter().find(|f| f.node == node && f.field == target.input).and_then(|f| f.value);
+    Ok(match value {
+        Some(handle) => Pick::Handle(picked_handle(&node, &target.input, &handle)?),
+        None => Pick::None,
+    })
 }
 
 /// The ambient state of one `weft connect` invocation, threaded once
@@ -668,8 +593,25 @@ struct Connecting<'a> {
     /// The install the pick is kept on, as a person reads it: its target
     /// and its address.
     install: String,
-    /// The target the command was run `--on`, which every hint carries.
-    on: Option<String>,
+    /// Where the command acts, which every hint carries.
+    place: Place<'a>,
+}
+
+/// Where one `weft connect` acts: the install target it was run `--on`
+/// and the instance it acts inside (`--instance`), if any. Every command
+/// a message hands back names both, so it runs where this one did.
+#[derive(Debug, Clone, Copy)]
+struct Place<'a> {
+    on: Option<&'a str>,
+    instance: Option<&'a weft_core::instance::InstanceId>,
+}
+
+impl Place<'_> {
+    /// `weft connect` for `target`, here, followed by `rest`.
+    fn connect(&self, target: &AccessTarget, rest: &str) -> String {
+        let instance = self.instance.map(|i| format!("--instance {i} ")).unwrap_or_default();
+        super::weft_on(self.on, &format!("connect {instance}--node {} {rest}", target.spelling()))
+    }
 }
 
 /// The install `client` speaks to, as a message names it: the target the
@@ -847,21 +789,14 @@ fn discover(
     others: &mut Vec<OtherNode>,
 ) -> Result<(Vec<AccessTarget>, weft_core::ProjectDefinition)> {
     let main = project.read_main_weft().map_err(|e| anyhow::anyhow!("read {}: {e}", project.main_weft().display()))?;
-    // ONE spelling of the root for both halves. The compiler keys an
-    // included file by its path under the root it is given, taken from
-    // the file's canonical path, and the file walk below keys the same
-    // file by its path under the root it was given: hand each a
-    // different spelling of one folder (a symlink in the way) and the
-    // two ids disagree, so every node of every included file would be
-    // "at no place".
-    let root = project
-        .root
-        .canonicalize()
-        .with_context(|| format!("resolve {}", project.root.display()))?;
+    // The compiler and the file walk below both key an included file by
+    // its path from the root as the reader resolves it (`from_root`), so
+    // the two agree however the root is spelled (a symlink in the way).
+    let root = &project.root;
     let (program, parse_errors) = weft_compiler::flatten_lenient(
         &main,
         project.id(),
-        weft_compiler::CompileFs::disk(&root).anchored_at(Some(&root.join(weft_compiler::project::SRC_DIR))),
+        weft_compiler::CompileFs::disk(root).anchored_at(Some(&project.src_dir())),
         catalog,
     );
     if let Some(first) = parse_errors.first() {
@@ -875,8 +810,8 @@ fn discover(
     }
     let mut out = Vec::new();
     let mut visited: std::collections::BTreeSet<std::path::PathBuf> = Default::default();
-    let entry = read_through_compiler(&root, &root.join(weft_compiler::project::SRC_DIR), weft_compiler::project::ENTRY_FILE, "the entry file")?;
-    collect_targets(entry, &root, &program, catalog, &mut out, others, &mut visited)?;
+    let entry = read_through_compiler(root, &project.src_dir(), weft_compiler::project::ENTRY_FILE, "the entry file")?;
+    collect_targets(entry, root, &program, catalog, &mut out, others, &mut visited)?;
     Ok((out, program))
 }
 
@@ -893,7 +828,7 @@ fn collect_targets(
     others: &mut Vec<OtherNode>,
     visited: &mut std::collections::BTreeSet<std::path::PathBuf>,
 ) -> Result<()> {
-    let weft_compiler::ResolvedFile { identity: canonical, content: source } = file;
+    let weft_compiler::ResolvedFile { file: weft_compiler::PlacedFile { identity: canonical, from_root }, content: source } = file;
     if !visited.insert(canonical.clone()) {
         return Ok(());
     }
@@ -904,8 +839,10 @@ fn collect_targets(
     // no source id), so the entry is parsed bare here too. A main.weft
     // wrapped in one top-level group would otherwise come out as
     // `@src:main.x` against the program's `Untitled.x`.
-    let is_entry = visited.len() == 1;
-    let source_id = (!is_entry).then(|| weft_compiler::source_name::body_id(root, &canonical));
+    let is_entry = weft_compiler::source_name::is_entry(&from_root);
+    let source_id = (!is_entry).then(|| weft_compiler::source_name::body_id(&from_root));
+    // What names the file to a person, in a message and in `--json`.
+    let rel_file = weft_compiler::file_reader::slashed(&from_root);
     let base = canonical
         .parent()
         .map(std::path::Path::to_path_buf)
@@ -929,15 +866,11 @@ fn collect_targets(
         bail!(
             "{} does not parse (line {}: {}); fix it before connecting, so the \
              nodes to connect can be read from it",
-            canonical.display(),
+            rel_file,
             first.line,
             first.message
         );
     }
-    let rel_file = canonical
-        .strip_prefix(root)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| canonical.to_string_lossy().into_owned());
     let mut includes: Vec<String> = Vec::new();
     for node in &definition.nodes {
         if let Some(path) = &node.include_path {
@@ -1215,12 +1148,7 @@ async fn print_all_grants(client: &DispatcherClient, json: bool) -> Result<()> {
     }
     println!("Stored connections (every service):");
     for (i, g) in grants.iter().enumerate() {
-        let who = g
-            .identity
-            .clone()
-            .or_else(|| g.label.clone())
-            .unwrap_or_else(|| g.id.to_string());
-        println!("  [{}] {} - {}  (id {}){}", i + 1, g.service, who, g.id, no_key_note(g));
+        println!("  [{}] {} - {}  (id {}){}", i + 1, g.service, grant_title(g, &g.service), g.id, no_key_note(g));
     }
     Ok(())
 }
@@ -1246,27 +1174,52 @@ fn grant_by_number<'a>(grants: &'a [GrantSummary], raw: &str) -> Result<&'a Gran
     Ok(&grants[idx - 1])
 }
 
-fn print_grants(target: &AccessTarget, label: &str, grants: &[GrantSummary]) {
-    match &target.picked {
-        Pick::Handle(p) => println!("'{}' is connected as {}.", target.spelling(), p.who()),
-        Pick::None => println!("'{}' has no connection picked.", target.spelling()),
-        Pick::InstanceFilled => println!(
-            "'{}' is connected separately in each instance of the program; see one with --instance <id>.",
-            target.spelling()
-        ),
-        Pick::WrittenInSource => println!("{}", written_in_source(target)),
+/// How a stored connection reads in a list: who the account is, then
+/// the name the person gave it, the two columns the editor shows, so
+/// two keys to one service can be told apart. A connection with no
+/// account to name shows its name alone; one stored without a name (a
+/// node published it) goes by `service_label`.
+fn grant_title(g: &GrantSummary, service_label: &str) -> String {
+    let name = g.label.as_deref().unwrap_or(service_label);
+    match &g.identity {
+        Some(who) => format!("{who} (named \"{name}\")"),
+        None => format!("\"{name}\""),
     }
+}
+
+/// Print [`grants_listing`].
+fn print_grants(target: &AccessTarget, picked: &Pick, place: Place<'_>, label: &str, grants: &[GrantSummary]) {
+    print!("{}", grants_listing(target, picked, place, label, grants));
+}
+
+/// The one listing of a node's stored connections, the author's or an
+/// instance's (`place`): what the node is connected as, then every
+/// connection with what it can do and its id.
+fn grants_listing(target: &AccessTarget, picked: &Pick, place: Place<'_>, label: &str, grants: &[GrantSummary]) -> String {
+    let node = target.spelling();
+    let for_instance = place.instance.map(|i| format!(" for instance '{i}'")).unwrap_or_default();
+    let mut out = match picked {
+        Pick::Handle(p) => {
+            let who = grants.iter().find(|g| g.id == p.id).map_or_else(|| p.who(), |g| grant_title(g, label));
+            format!("'{node}' is connected as {who}{for_instance}.\n")
+        }
+        Pick::None => format!("'{node}' has no connection picked{for_instance}.\n"),
+        Pick::InstanceFilled => {
+            format!("'{node}' is connected separately in each instance of the program; see one with --instance <id>.\n")
+        }
+        Pick::WrittenInSource => format!("{}\n", written_in_source(target)),
+    };
+    let whose = place.instance.map_or_else(|| "Stored".to_string(), |i| format!("Instance '{i}''s"));
     if grants.is_empty() {
-        println!("No stored {label} connections yet.");
-        return;
+        out.push_str(&format!(
+            "{whose} {label} connections: none yet; connect one with `{}`.\n",
+            place.connect(target, "--door own")
+        ));
+        return out;
     }
-    println!("Stored {label} connections:");
+    out.push_str(&format!("{whose} {label} connections:\n"));
     for (i, g) in grants.iter().enumerate() {
-        let who = g
-            .identity
-            .clone()
-            .or_else(|| g.label.clone())
-            .unwrap_or_else(|| g.id.to_string());
+        let who = grant_title(g, label);
         let can = if g.owner.is_platform() && !g.has_credential {
             "runs on the runtime's own key, which is NOT configured".to_string()
         } else if g.owner.is_platform() {
@@ -1281,52 +1234,40 @@ fn print_grants(target: &AccessTarget, label: &str, grants: &[GrantSummary]) {
                 format!("{joined} (claimed)")
             }
         };
-        let picked = if target.picked.handle().is_some_and(|p| p.id == g.id) {
-            "  <- picked"
-        } else {
-            ""
-        };
-        println!("  [{}] {who} - {can}  (id {}){picked}{}", i + 1, g.id, no_key_note(g));
+        let mark = if picked.handle().is_some_and(|p| p.id == g.id) { "  <- picked" } else { "" };
+        out.push_str(&format!("  [{}] {who} - {can}  (id {}){mark}{}\n", i + 1, g.id, no_key_note(g)));
     }
+    out
 }
 
 impl Connecting<'_> {
     /// A `weft` command for a hint, on the install this one runs on.
     fn weft(&self, verb: &str) -> String {
-        super::weft_on(self.on.as_deref(), verb)
+        super::weft_on(self.place.on, verb)
     }
 }
 
 impl Connecting<'_> {
     /// Point the node, at the place it is named by, at this stored
-    /// connection on this install, and say so. Answers the triggers the
+    /// connection: the install's pick for the author, the instance's
+    /// value for an instance; and say so. Answers the triggers the
     /// change set up again. When the write fails the connection still
     /// exists, so the error names the way to attach it without redoing
     /// the sign-in.
     async fn pick_grant(&self, g: &GrantSummary) -> Result<Vec<String>> {
-        let body = ChangePicks {
-            set: vec![PickInput {
-                node: self.target.spelling(),
-                field: self.target.input.clone(),
-                connection: g.id,
-                service: self.target.spec.service.clone(),
-            }],
-            clear: Vec::new(),
-        };
-        let rearmed = self.write_picks(&body).await.with_context(|| {
+        let rearmed = self.write_pick(Some(g.id)).await.with_context(|| {
             format!(
                 "the connection is stored as {}; attach it with `{}`",
                 g.id,
-                self.weft(&format!("connect --node {} --grant {}", self.target.spelling(), g.id))
+                self.place.connect(self.target, &format!("--grant {}", g.id))
             )
         })?;
         if !self.json {
-            println!(
-                "'{}' now uses {} on {}.",
-                self.target.spelling(),
-                g.identity.clone().unwrap_or_else(|| g.id.to_string()),
-                self.install
-            );
+            let on = match self.place.instance {
+                Some(i) => format!("for instance '{i}'"),
+                None => format!("on {}", self.install),
+            };
+            println!("'{}' now uses {} {on}.", self.target.spelling(), grant_title(g, self.service_label));
             if !rearmed.is_empty() {
                 println!("The trigger(s) reading it were set up again: {}.", rearmed.join(", "));
             }
@@ -1334,29 +1275,104 @@ impl Connecting<'_> {
         Ok(rearmed)
     }
 
-    /// Forget the node's pick on this install (the stored connection
-    /// stays) and say so.
+    /// Forget the node's pick (the stored connection stays) and say so.
     async fn clear_pick(&self) -> Result<()> {
-        let body = ChangePicks {
-            set: Vec::new(),
-            clear: vec![InstanceFieldRef { node: self.target.spelling(), field: self.target.input.clone() }],
-        };
-        self.write_picks(&body).await?;
+        self.write_pick(None).await?;
         if !self.json {
-            println!("'{}' now has no connection picked on this install.", self.target.spelling());
+            let on = match self.place.instance {
+                Some(i) => format!("for instance '{i}'"),
+                None => "on this install".to_string(),
+            };
+            println!("'{}' now has no connection picked {on}.", self.target.spelling());
         }
         Ok(())
     }
 
-    /// Change the install's picks for the project.
-    async fn write_picks(&self, body: &ChangePicks) -> Result<Vec<String>> {
-        let answer = self
-            .client
-            .put_json(&format!("/projects/{}/picks", self.project_id), &serde_json::to_value(body)?)
-            .await?;
+    /// Set (`Some`) or clear (`None`) the node's connection where this
+    /// command keeps it: the install's picks for the project, or the
+    /// instance's values at the instance door.
+    async fn write_pick(&self, connection: Option<Uuid>) -> Result<Vec<String>> {
+        let place = InstanceFieldRef { node: self.target.spelling(), field: self.target.input.clone() };
+        let (path, body) = match self.doorway {
+            Doorway::Owner => {
+                let body = match connection {
+                    Some(id) => ChangePicks {
+                        set: vec![PickInput {
+                            node: place.node,
+                            field: place.field,
+                            connection: id,
+                            service: self.target.spec.service.clone(),
+                        }],
+                        clear: Vec::new(),
+                    },
+                    None => ChangePicks { set: Vec::new(), clear: vec![place] },
+                };
+                (format!("/projects/{}/picks", self.project_id), serde_json::to_value(body)?)
+            }
+            Doorway::Instance => {
+                let body = match connection {
+                    Some(id) => weft_core::instance_door::ValuesRequest {
+                        set: vec![weft_core::run_spec::InstanceValueInput {
+                            node: place.node,
+                            field: place.field,
+                            value: serde_json::json!({ "id": id }),
+                        }],
+                        clear: Vec::new(),
+                    },
+                    None => weft_core::instance_door::ValuesRequest { set: Vec::new(), clear: vec![place] },
+                };
+                ("/instance/values".to_string(), serde_json::to_value(body)?)
+            }
+        };
+        let answer = self.client.put_json(&path, &body).await?;
         Ok(serde_json::from_value::<weft_core::instance_door::ValuesChanged>(answer)
             .context("read the install's answer to the change; upgrade the dispatcher or this CLI so the versions match")?
             .rearmed)
+    }
+
+    /// Re-run the browser sign-in on the stored connection `id`, in
+    /// place, to widen what it holds: only a service with one grant per
+    /// account rotates a grant in place.
+    async fn upgrade(&self, grants: &[GrantSummary], id: Uuid, opts: &ConnectOpts) -> Result<GrantSummary> {
+        let (label, spec) = (self.service_label, &self.target.spec);
+        // Upgrading re-runs a browser sign-in on the existing grant;
+        // a pasted-credential service has no sign-in to re-run.
+        if !spec.needs_browser_consent() {
+            bail!(
+                "{label} connections are not browser sign-ins, so there is nothing to \
+                 upgrade. To change what a connection holds, connect a new one with \
+                 --door own and pick it."
+            );
+        }
+        // The store only rotates a grant in place on a one-grant-per-
+        // account service; anywhere else a wider connection is simply a
+        // new one. Refuse locally, before any prompting.
+        if spec.grants != GrantCoexistence::Exclusive {
+            bail!(
+                "{label} keeps one connection per consent, so there is nothing to \
+                 upgrade in place; connect a new account (--door own|shared) and pick it"
+            );
+        }
+        let g = grants
+            .iter()
+            .find(|g| g.id == id)
+            .with_context(|| format!("no stored {label} connection with id {id} (see --list)"))?;
+        // A shared-door upgrade's permission set is the app's declared
+        // one (the server replaces whatever a client asks for), so
+        // nothing is asked and --permissions is refused.
+        let ticked = if g.door == Door::Shared {
+            if opts.permissions.is_some() {
+                bail!(
+                    "--permissions applies to the own door; a shared-door connection \
+                     carries the app's declared set"
+                );
+            }
+            Vec::new()
+        } else {
+            ticked_permissions(spec, opts, self.interactive)?
+        };
+        let shared_app = if g.door == Door::Shared { g.label.clone() } else { None };
+        self.consent_flow(g.door, ticked, shared_app, Some(id), None).await
     }
 }
 
@@ -1442,7 +1458,7 @@ impl Connecting<'_> {
                 bail!("--set/--set-env/--paste/--mint fill your own credential; they do nothing with --door shared");
             }
             if opts.label.is_some() {
-                bail!("--label names a connection you create yourself; the shared door names it after the app");
+                bail!("--label names a connection you create yourself; the shared door names it after its app, or after the service");
             }
             // The shared door's permission set is the chosen app's fixed
             // one (or the runtime credential's full reach); nothing a
@@ -1868,7 +1884,9 @@ impl Connecting<'_> {
 }
 
 /// The connection's list name: the --label flag, else an interactive
-/// prompt (Enter keeps the service's own label), else nothing.
+/// prompt, else nothing. Nothing is a name too: the store names an
+/// unnamed connection after its app, else its service, which is what
+/// the prompt's Enter promises.
 fn connection_name(
     opts: &ConnectOpts,
     service_label: &str,
@@ -2170,6 +2188,79 @@ mod tests {
             secret,
             placeholder: None,
         }
+    }
+
+    /// Two keys to one service read apart: who the account is, then
+    /// the name the person gave it; a row without either falls back to
+    /// its name, then the service's.
+    #[test]
+    fn a_stored_connection_shows_its_account_and_its_name() {
+        let row = |identity: Option<&str>, label: Option<&str>| GrantSummary {
+            id: Uuid::nil(),
+            service: "firecrawl".into(),
+            project_id: None,
+            instance: None,
+            identity: identity.map(str::to_string),
+            label: label.map(str::to_string),
+            scopes: vec![],
+            permissions_verified: false,
+            owner: weft_core::CredentialOwner::own(None),
+            door: Door::Own,
+            expires_at: None,
+            value_names: vec![],
+            has_credential: true,
+        };
+        assert_eq!(
+            grant_title(&row(Some("firecrawl"), Some("acme-scraper")), "Firecrawl"),
+            "firecrawl (named \"acme-scraper\")"
+        );
+        assert_eq!(grant_title(&row(None, Some("Firecrawl")), "Firecrawl"), "\"Firecrawl\"");
+        assert_eq!(grant_title(&row(None, None), "Firecrawl"), "\"Firecrawl\"");
+    }
+
+    /// The instance's listing is the author's listing, said for the
+    /// instance, its hint run inside the instance; each row shows the
+    /// account and the name.
+    #[test]
+    fn an_instance_lists_its_connections_like_the_author() {
+        let target = AccessTarget {
+            rel_file: "main.weft".into(),
+            node: "mail".into(),
+            node_type: "MailAccess".into(),
+            input: "access".into(),
+            spec: serde_json::from_value(serde_json::json!({
+                "service": "fakeoauth",
+                "acquisition": { "kind": "oauth2", "grant": { "kind": "client_credentials" }, "tokenUrl": "https://p/token" },
+                "auth": [{ "kind": "header", "name": "Authorization", "value": "Bearer {token}" }],
+            }))
+            .unwrap(),
+            project_app: None,
+            picked: Pick::None,
+            spellings: vec!["mail".into()],
+        };
+        let g = GrantSummary {
+            id: Uuid::from_u128(7),
+            service: "fakeoauth".into(),
+            project_id: None,
+            instance: None,
+            identity: Some("ada@example.com".into()),
+            label: Some("Fake".into()),
+            scopes: vec![],
+            permissions_verified: false,
+            value_names: vec![],
+            owner: weft_core::CredentialOwner::Author,
+            door: Door::Own,
+            expires_at: None,
+            has_credential: true,
+        };
+        let ada = weft_core::instance::InstanceId::new("ada").unwrap();
+        let place = Place { on: None, instance: Some(&ada) };
+        let listing = grants_listing(&target, &Pick::None, place, "Fake", &[g]);
+        assert!(listing.contains("'mail' has no connection picked for instance 'ada'."), "{listing}");
+        assert!(listing.contains("Instance 'ada''s Fake connections:"), "{listing}");
+        assert!(listing.contains("ada@example.com (named \"Fake\")"), "{listing}");
+        let empty = grants_listing(&target, &Pick::None, place, "Fake", &[]);
+        assert!(empty.contains("`weft connect --instance ada --node mail --door own`"), "{empty}");
     }
 
     #[test]

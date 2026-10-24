@@ -1,0 +1,16 @@
+[
+  [
+    {
+      "name": "down when flaky",
+      "when": { "kind": "all", "conditions": [{ "kind": "unit_flaky", "unit": "postgres" }, { "kind": "listening" }] },
+      "action": { "kind": "take_down_triggers" },
+      "timeoutSeconds": 600
+    },
+    {
+      "name": "back when healthy",
+      "when": { "kind": "not", "condition": { "kind": "unit_flaky" } },
+      "action": { "kind": "bring_back" },
+      "timeoutSeconds": 1800
+    }
+  ]
+]

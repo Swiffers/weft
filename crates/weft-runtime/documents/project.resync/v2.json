@@ -1,0 +1,140 @@
+[
+  {
+    "owners": [
+      {
+        "owner": {
+          "kind": "shared"
+        },
+        "on": [
+          "feed",
+          "door"
+        ],
+        "down": [
+          "feed",
+          "door"
+        ]
+      },
+      {
+        "owner": {
+          "kind": "instance",
+          "instance": "ada"
+        },
+        "on": [
+          "feed"
+        ]
+      }
+    ],
+    "take_down": {
+      "door": "take",
+      "held": "keep",
+      "running": "wait"
+    },
+    "build": {
+      "binaryHash": "bin-B"
+    },
+    "held": {
+      "arrivals": 0,
+      "paused": 0
+    },
+    "old_builds": [
+      "bin-A"
+    ],
+    "switching": false,
+    "runs": 0,
+    "moved_runs": 0,
+    "stopped": {
+      "status": 409,
+      "error": "the infra it reads is down",
+      "at_unix": 1760000000,
+      "waits_for": "infra"
+    }
+  },
+  {
+    "owners": [
+      {
+        "owner": {
+          "kind": "shared"
+        },
+        "on": [
+          "feed",
+          "door"
+        ],
+        "down": [
+          "feed",
+          "door"
+        ]
+      },
+      {
+        "owner": {
+          "kind": "instance",
+          "instance": "ada"
+        },
+        "on": [
+          "feed"
+        ]
+      }
+    ],
+    "take_down": {
+      "door": "take",
+      "held": "keep",
+      "running": "wait"
+    },
+    "build": {},
+    "held": {
+      "arrivals": 0,
+      "paused": 0
+    },
+    "switching": false,
+    "runs": 0,
+    "moved_runs": 0,
+    "given_up": {
+      "at_unix": 1760000500,
+      "left_down": [
+        {
+          "owner": {
+            "kind": "shared"
+          },
+          "triggers": [
+            "feed"
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "owners": [
+      {
+        "owner": {
+          "kind": "shared"
+        },
+        "on": [
+          "feed"
+        ],
+        "down": [
+          "feed"
+        ]
+      }
+    ],
+    "take_down": {
+      "door": "take",
+      "held": "keep",
+      "running": "wait"
+    },
+    "build": {
+      "binaryHash": "bin-B"
+    },
+    "held": {
+      "arrivals": 0,
+      "paused": 0
+    },
+    "switching": false,
+    "runs": 0,
+    "moved_runs": 0,
+    "stopped": {
+      "status": 422,
+      "error": "node `auth` did not compile",
+      "at_unix": 1760001000,
+      "build_cannot_run": true
+    }
+  }
+]

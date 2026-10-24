@@ -6,6 +6,7 @@
 //! dependency tree once instead of once per file.
 
 mod claims;
+mod documents;
 mod news_outbox;
 mod schema_guard;
 mod signals;

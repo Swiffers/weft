@@ -12,7 +12,7 @@
 //!
 //! The outbound calls run here (the store side) like every other
 //! declared call against a tenant-influenced URL (test calls, token
-//! exchanges): the broker's egress lock is the containment.
+//! exchanges).
 
 use std::collections::BTreeMap;
 
@@ -23,9 +23,9 @@ use weft_core::access::client::{run_connect_call as core_run_connect_call, Conne
 use weft_core::access::events::{
     SubscriptionCalls, EXPIRES_AT, MINTED_ID, MINTED_TOKEN, MINTED_VALUE_NAMES, RECEIVER_URL,
 };
-use weft_core::access::spec::ConnectCall;
+use weft_core::access::spec::{AnswerReader, ConnectCall};
 
-use crate::flows::apply_captures;
+use crate::flows::{apply_captures, AnswerOf};
 use crate::resolve::resolve_event_source;
 use crate::{values_of, AccessError};
 
@@ -160,7 +160,7 @@ where
         values.insert(RECEIVER_URL.to_string(), receiver_url);
 
         let resp = run_connect_call(&req.service, &calls.subscribe, &values).await?;
-        apply_captures(&calls.subscribe.captures, &resp, &mut values)?;
+        apply_captures(&calls.subscribe.captures, &resp, &mut values, AnswerOf::First)?;
         let expires_at = match calls.renew_margin_secs {
             None => None,
             Some(_) => Some(parse_expiry(values.get(EXPIRES_AT).map(String::as_str).ok_or_else(
@@ -454,9 +454,9 @@ pub fn needs_renewal(
 /// store's error class: a credential the provider refused needs a
 /// reconnect, a provider not reached or not answering now is one to try
 /// again, and any other refusal is the caller's to read.
-pub async fn run_connect_call(
+pub async fn run_connect_call<A: AnswerReader>(
     service: &str,
-    call: &ConnectCall,
+    call: &ConnectCall<A>,
     values: &BTreeMap<String, String>,
 ) -> anyhow::Result<Value> {
     core_run_connect_call(call, values).await.map_err(|e| {

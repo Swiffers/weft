@@ -73,7 +73,7 @@ async fn each_call_holds_its_own_wait_and_is_woken_on_its_own() -> anyhow::Resul
     // with the spelling that works.
     let refused = project.weft_refused(&["wake", &held.to_string(), "@src:lib:part.hold"]).await?;
     anyhow::ensure!(refused.contains("inside an included file"), "{refused}");
-    anyhow::ensure!(refused.contains("site.hold"), "it names the spelling that works: {refused}");
+    anyhow::ensure!(refused.contains("`one.hold`") || refused.contains("`two.hold`"), "it names a spelling that works: {refused}");
 
     // Waking `one.hold` wakes that call alone: `two.hold` stays parked.
     let woke: Value =

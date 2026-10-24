@@ -71,8 +71,21 @@ weft_core::wire_enum! {
         /// Producer = the dispatcher's own quiesce; no caller of the broker
         /// may enqueue it.
         RemovalWait = "removal_wait",
+        /// Lift the install's maintenance (`weft maintenance off`): start
+        /// the infra copies `weft maintenance on` stopped, then bring back
+        /// the triggers it took down, then end the maintenance once nothing
+        /// is left. Install-wide (no project) and with no payload (`{}`):
+        /// what it brings back is what the maintenance tables hold, so a
+        /// task run again carries on from what is left. Deduplicated on
+        /// [`MAINTENANCE_LIFT_KEY`]. Producer = the dispatcher's own
+        /// maintenance API; no caller of the broker may enqueue it.
+        MaintenanceLift = "maintenance_lift",
     }
 }
+
+/// The dedup key of the [`TaskKind::MaintenanceLift`]: one lift at a time,
+/// so a second `weft maintenance off` while one goes follows that one.
+pub const MAINTENANCE_LIFT_KEY: &str = "maintenance_lift";
 
 /// The dedup key of the [`TaskKind::CancelCall`] of the wait `token`: one
 /// per wait, so a cancel that runs twice queues its call once. The
@@ -107,6 +120,36 @@ pub struct FireSignalPayload {
 pub struct WithdrawSignalPayload {
     pub run_id: weft_core::RunId,
     pub token: String,
+}
+
+/// Payload for `TaskKind::RegisterSignal`: a node's signal to arm, from
+/// the worker running it (a suspension, or a trigger's setup) or from
+/// activation arming a captured trigger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterSignalPayload {
+    pub run_id: weft_core::RunId,
+    pub node_id: String,
+    pub frames: weft_core::frames::LoopFrames,
+    pub spec: weft_core::primitive::SignalSpec,
+    pub is_resume: bool,
+    /// 0-based ordinal of the `await_signal` call within this
+    /// (run, node_id, frames). Set by the worker, which stamps it on
+    /// the `SuspensionRegistered` it records, so replay can rebuild the
+    /// per-(node, frames) sequence in order. Must not vary across replays
+    /// of the same body, so the dedup key and the resume token include it.
+    /// Required: a missing field would silently default to 0 and collide
+    /// every await on the same frame stack.
+    pub call_index: u32,
+    /// The trigger's delivered port values at registration time (an
+    /// entry registration only; `None` on resumes). Stored on the
+    /// signal row and replayed onto the trigger's ports at every fire.
+    #[serde(default)]
+    pub port_snapshot: Option<serde_json::Value>,
+    /// When the registration was asked for (ms since the epoch): the
+    /// worker stamps the moment the node called in, activation stamps
+    /// its own start. Handed to the listener so a relative wait counts
+    /// from here, whatever the trip to the listener cost.
+    pub asked_at_unix_ms: i64,
 }
 
 /// Payload for `TaskKind::RunNodeTest`: which test of which node, run on

@@ -42,6 +42,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         r#"CREATE INDEX IF NOT EXISTS idx_alarm_due ON alarm(at_unix_ms)"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 /// One wake as stored.

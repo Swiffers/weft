@@ -6,7 +6,6 @@
 mod accesses;
 mod aimed_run;
 mod api_auth;
-mod api_jwt;
 mod api_reply;
 mod api_stream;
 mod api_ticket;
@@ -45,6 +44,7 @@ mod lifecycle_transitions;
 mod live_chat;
 mod llm_stream_tool;
 mod loops;
+mod maintenance;
 mod metering_edges;
 mod node_crash;
 mod openrouter;

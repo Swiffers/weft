@@ -85,9 +85,7 @@ pub async fn fields(State(state): State<DispatcherState>, headers: HeaderMap) ->
     let picks = crate::api::project::stored_picks(&state, caller.project).await?;
     let mut out = Vec::new();
     let rules = weft_core::rules::RuleContext::new(&project);
-    for (place, node) in weft_core::project::instance_filled_places(&project) {
-        let (id, path) = weft_core::project::resolve_address(&project, &place);
-        let at = weft_core::frames::Located::new(id, path);
+    for weft_core::project::FilledPlace { spelled: place, place: at, node } in weft_core::project::instance_filled_places(&project) {
         for input in &node.inputs {
             let Some(filled) = node.port_literals.get(&input.name).and_then(weft_core::instance::as_instance_filled) else {
                 continue;
@@ -377,9 +375,10 @@ async fn field_source(
     index: usize,
 ) -> Result<(weft_core::node::ResourceSource, Option<weft_core::instance::WiredConnection>), ApiError> {
     let project = caller_project(state, caller).await?;
-    let Some((_, node)) = weft_core::project::instance_filled_places(&project).into_iter().find(|(at, _)| at == place) else {
+    let Some(filled) = weft_core::project::instance_filled_places(&project).into_iter().find(|filled| filled.spelled == place) else {
         return Err((StatusCode::NOT_FOUND, format!("'{place}' is no node with a field you fill")));
     };
+    let node = filled.node;
     if !weft_core::instance::instance_filled_fields(node).any(|(filled, _)| filled == field) {
         return Err((StatusCode::NOT_FOUND, format!("'{place}.{field}' is no field you fill")));
     }
@@ -396,8 +395,7 @@ async fn field_source(
         .await
         .map_err(access_err)?;
     let picks = crate::api::project::stored_picks(state, caller.project).await?;
-    let (id, path) = weft_core::project::resolve_address(&project, place);
-    let connection = weft_core::instance::lookup_connection(&project, &weft_core::frames::Located::new(id, path), field, &values, &picks)
+    let connection = weft_core::instance::lookup_connection(&project, &filled.place, field, &values, &picks)
         .and_then(weft_core::instance::LookupConnection::signing)
         .map_err(|why| (StatusCode::CONFLICT, why))?;
     Ok((source, connection))

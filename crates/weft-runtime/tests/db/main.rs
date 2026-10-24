@@ -6,4 +6,6 @@
 //! dependency tree once instead of once per file.
 
 mod db_tick;
+mod infra_units_move;
 mod schema_agreement;
+mod stored_documents;

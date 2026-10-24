@@ -5,8 +5,7 @@
 //! Verbs that only touch the DB run here; verbs whose work makes an
 //! OUTBOUND call to a tenant-influenced URL (direct connect, OAuth
 //! completion, lookups) are forwarded to the broker's access admin,
-//! because the broker's network egress is locked to the public
-//! internet (a crafted internal URL dies at the network layer).
+//! which holds the apps file's secrets.
 //!
 //! Everything here is tenant-authenticated ([`CallerTenant`]) and
 //! answers SUMMARIES only: a stored value (token, secret, refresh
@@ -148,9 +147,8 @@ pub(crate) async fn doors_status(state: &DispatcherState, req: &DoorsRequest) ->
 }
 
 /// POST /access/mint-app: run the service's "Create it for me" recipe;
-/// forwarded to the broker (its egress is locked to the public
-/// internet). Answers the minted app's captured values, for the
-/// editor to prefill the "Your own" form.
+/// forwarded to the broker (see the module docs). Answers the minted
+/// app's captured values, for the editor to prefill the "Your own" form.
 pub async fn mint_app(
     State(state): State<DispatcherState>,
     _caller: CallerTenant,
@@ -237,8 +235,8 @@ pub async fn delete_grant(
 
 /// POST /access/connect/direct: a paste / mint / server-to-server
 /// connect that completes in one request. Forwarded to the broker,
-/// which makes the spec's test call / token exchange (its egress is
-/// locked to the public internet; see the broker's access admin).
+/// which makes the spec's test call / token exchange (see the module
+/// docs).
 pub async fn connect_direct(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -323,7 +321,7 @@ pub async fn oauth_callback(
         )),
         (Some(st), Some(code), None) => {
             // Forwarded to the broker, which makes the code-for-token
-            // exchange (its egress is locked to the public internet).
+            // exchange.
             let fwd: Result<CompletedConnect, ApiError> =
                 crate::broker_admin::forward_json(
                     &state,
@@ -369,8 +367,7 @@ fn html_escape(s: &str) -> String {
 
 /// POST /access/lookup: run a `remote_select` lookup through the
 /// stored access. Forwarded to the broker, which holds the token and
-/// makes the call (its egress is locked to the public internet); the
-/// editor sees label/id pairs only.
+/// makes the call; the editor sees label/id pairs only.
 pub async fn lookup(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -434,7 +431,7 @@ pub async fn picker_page(
         .await
         .map_err(access_err)?;
     // The connection's token, resolved on the broker (a refresh makes
-    // an outbound call, and the broker's egress is the locked one).
+    // an outbound call).
     #[derive(Serialize)]
     struct TokenQuery {
         access_id: uuid::Uuid,

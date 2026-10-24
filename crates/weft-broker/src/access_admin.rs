@@ -1,9 +1,7 @@
 //! Control-plane access admin: the connect/lookup verbs whose work
 //! includes an OUTBOUND HTTP call to a URL the tenant influences (a
 //! spec's test call, an OAuth token exchange, a `remote_select`
-//! lookup, an app mint). They run on the broker, whose network egress
-//! is locked to "public internet only", so a crafted URL pointing
-//! inside the install dies at the network layer. The dispatcher stays
+//! lookup, an app mint). They run on the broker. The dispatcher stays
 //! the editor's authenticated front door and forwards here with its SA
 //! token, exactly like the runtime-file admin verbs.
 //!
@@ -21,7 +19,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::Router;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use weft_core::access::spec::{lookup_path, Door};
@@ -37,6 +35,7 @@ use weft_core::AccessSpec;
 use crate::app_provider::resolve_shared_app;
 use crate::auth::control_plane;
 use crate::state::BrokerState;
+use weft_core::wire_shape::Json;
 
 type ApiError = (StatusCode, String);
 

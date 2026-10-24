@@ -12,7 +12,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::Router;
 
 use weft_broker_client::protocol::{
     RecordOfRequest, RecordOfResponse, RunAnswer, RunAnswerOf, RunAnswersRequest, RunAnswersResponse, RunCancel, RunClaimRequest,
@@ -26,6 +26,7 @@ use crate::auth::{AuthedCaller, CallerIdentity};
 use crate::door::worker;
 use crate::handlers::unavailable_or_internal;
 use crate::state::BrokerState;
+use weft_core::wire_shape::Json;
 
 type Resp<T> = Result<Json<T>, (StatusCode, String)>;
 
@@ -75,7 +76,15 @@ pub fn previous_release_answer(answer: BatchAnswer) -> BatchAnswer {
 /// commits, the dispatcher is told what changed ([`crate::notices`]).
 async fn write_batch(state: &BrokerState, caller: &CallerIdentity, body: &Bytes) -> Result<BatchAnswer, (StatusCode, String)> {
     let (tenant, project, replica) = worker(caller)?;
-    let batch = weft_journal::frame::decode(body).map_err(|e| (StatusCode::BAD_REQUEST, format!("a batch of records does not read: {e:#}")))?;
+    let batch = weft_journal::frame::decode(body).map_err(|e| {
+        // A head of another shape is the call's body of another shape
+        // (`crate::wire`); a frame that is cut short is not.
+        let shape = e.chain().filter_map(|cause| cause.downcast_ref::<serde_json::Error>()).find(|e| e.classify() == serde_json::error::Category::Data);
+        match shape {
+            Some(shape) => state.unreadable_shapes.refuse(crate::wire::Sender::of_caller(caller), JOURNAL_RECORD_PATH, shape),
+            None => (StatusCode::BAD_REQUEST, format!("a batch of records does not read: {e:#}")),
+        }
+    })?;
     if let Some(stray) = batch.head.runs.iter().filter_map(|run| run.born.as_ref()).find(|born| born.project_id != project) {
         tracing::warn!(target: "weft_broker::scope", caller_project = %project, born_in = %stray.project_id, "broker refused a birth in another project");
         return Err((StatusCode::FORBIDDEN, "a worker bears runs of its own project only".into()));

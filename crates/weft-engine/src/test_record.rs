@@ -19,7 +19,7 @@ pub(crate) fn decode_batch(body: &[u8]) -> (BatchHead, Vec<(RunHead, Vec<RunEven
         .iter()
         .zip(&batch.rows)
         .map(|(run, row)| {
-            let events = weft_journal::stored::decode(run.run_id, row).expect("a lane writes rows that read back");
+            let events = weft_journal::stored::decode(run.run_id, row, batch.head.events_version).expect("a lane writes rows that read back");
             (run.clone(), events)
         })
         .collect();
@@ -167,7 +167,7 @@ impl RecordClient for FakeRecord {
 
     async fn record_of(&self, run_id: RunId) -> anyhow::Result<RawRecord> {
         let events = self.events(run_id);
-        Ok(RawRecord { rows: vec![RunLogRow { seq: 0, events: weft_journal::stored::encode(&events) }] })
+        Ok(RawRecord { rows: vec![RunLogRow::of(0, &events)] })
     }
 
     async fn give_up(&self, run_id: RunId, why: String) -> Result<(), BatchError> {

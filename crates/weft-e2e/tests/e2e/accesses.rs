@@ -47,11 +47,7 @@ use weft_e2e::{project::Project, run};
 async fn a_forgotten_connection_leaves_its_node_unpicked() -> Result<()> {
     let Some(db_url) = env_or_skip("WEFT_E2E_DATABASE_URL") else { return Ok(()) };
     let disp = ensure::up().await?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&db_url)
-        .await
-        .context("connect WEFT_E2E_DATABASE_URL")?;
+    let pool = weft_e2e::platform::database(&db_url, 2).await.context("connect WEFT_E2E_DATABASE_URL")?;
     let project = Project::prepare("access_stale", disp).await?;
     project.set_node_config("send", "channel", "\"C000\"")?;
 
@@ -63,13 +59,14 @@ async fn a_forgotten_connection_leaves_its_node_unpicked() -> Result<()> {
     sqlx::query(
         "INSERT INTO access_grant
            (id, tenant_id, service, registration_sealed, project_id, spec_json, values_sealed,
-            granted_scopes, permissions_verified, identity, expires_at)
-         VALUES ($1, 'local', 'slack', NULL, NULL, $2, $3, $4, TRUE, 'stale-test', NULL)",
+            granted_scopes, permissions_verified, identity, expires_at, spec_json_version)
+         VALUES ($1, 'local', 'slack', NULL, NULL, $2, $3, $4, TRUE, 'stale-test', NULL, $5)",
     )
     .bind(grant_id)
     .bind(catalog_spec("slack", "access")?)
     .bind(weft_access_store::seal_json(&json!({ "token": "xoxb-never-used" }))?)
     .bind(json!(["chat:write"]))
+    .bind(weft_core::AccessSpec::STORED.version())
     .execute(&pool)
     .await?;
     let seeded = SeededGrant::new(pool.clone(), grant_id)?;
@@ -181,11 +178,7 @@ async fn slack_bot_token_posts_a_real_message() -> Result<()> {
 async fn scope_drift_is_refused_at_resolution() -> Result<()> {
     let Some(db_url) = env_or_skip("WEFT_E2E_DATABASE_URL") else { return Ok(()) };
     let disp = ensure::up().await?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&db_url)
-        .await
-        .context("connect WEFT_E2E_DATABASE_URL")?;
+    let pool = weft_e2e::platform::database(&db_url, 2).await.context("connect WEFT_E2E_DATABASE_URL")?;
 
     // Seed a slack connection VERIFIED to hold only channels:read; the
     // fixture's SlackSendMessage requires chat:write.
@@ -193,13 +186,14 @@ async fn scope_drift_is_refused_at_resolution() -> Result<()> {
     sqlx::query(
         "INSERT INTO access_grant
            (id, tenant_id, service, registration_sealed, project_id, spec_json, values_sealed,
-            granted_scopes, permissions_verified, identity, expires_at)
-         VALUES ($1, 'local', 'slack', NULL, NULL, $2, $3, $4, TRUE, 'drift-test', NULL)",
+            granted_scopes, permissions_verified, identity, expires_at, spec_json_version)
+         VALUES ($1, 'local', 'slack', NULL, NULL, $2, $3, $4, TRUE, 'drift-test', NULL, $5)",
     )
     .bind(grant_id)
     .bind(catalog_spec("slack", "access")?)
     .bind(weft_access_store::seal_json(&json!({ "token": "xoxb-never-used" }))?)
     .bind(json!(["channels:read"]))
+    .bind(weft_core::AccessSpec::STORED.version())
     .execute(&pool)
     .await?;
     let seeded = SeededGrant::new(pool.clone(), grant_id)?;
@@ -234,11 +228,7 @@ async fn google_drive_refreshes_lazily_and_lists_real_files() -> Result<()> {
     let [client_id, client_secret, refresh_token, db_url] =
         <[String; 4]>::try_from(env).expect("four vars requested");
     let disp = ensure::up().await?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&db_url)
-        .await
-        .context("connect WEFT_E2E_DATABASE_URL")?;
+    let pool = weft_e2e::platform::database(&db_url, 2).await.context("connect WEFT_E2E_DATABASE_URL")?;
 
     // The app the refresh authenticates with, snapshotted on the grant
     // exactly as a real connect would (label + client id + secret).
@@ -250,9 +240,9 @@ async fn google_drive_refreshes_lazily_and_lists_real_files() -> Result<()> {
     sqlx::query(
         "INSERT INTO access_grant
            (id, tenant_id, service, registration_sealed, client_id, project_id, spec_json,
-            values_sealed, granted_scopes, identity, expires_at)
+            values_sealed, granted_scopes, identity, expires_at, spec_json_version)
          VALUES ($1, 'local', 'google', $2, $3, NULL, $4, $5, $6, 'gdrive-e2e',
-                 now() - interval '1 hour')",
+                 now() - interval '1 hour', $7)",
     )
     .bind(grant_id)
     .bind(weft_access_store::seal_json(&registration)?)
@@ -262,6 +252,7 @@ async fn google_drive_refreshes_lazily_and_lists_real_files() -> Result<()> {
         &json!({ "token": "expired-token", "refresh_token": refresh_token }),
     )?)
     .bind(json!(["https://www.googleapis.com/auth/drive.file"]))
+    .bind(weft_core::AccessSpec::STORED.version())
     .execute(&pool)
     .await?;
     let seeded = SeededGrant::new(pool.clone(), grant_id)?;

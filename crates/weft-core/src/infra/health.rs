@@ -38,6 +38,10 @@ fn default_timeout() -> NonZeroU32 {
     DEFAULT_RULE_TIMEOUT_SECONDS
 }
 
+/// The health rules an infra node wrote, as its copy's row stores them
+/// (`infra_node.health_rules_json`).
+pub const STORED_RULES: crate::stored::Kind<Vec<HealthRule>> = crate::stored::Kind::new("infra node's health rules", &[]);
+
 /// One rule: when its condition holds for a copy, its action runs for
 /// that copy, once, until the condition stops holding for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

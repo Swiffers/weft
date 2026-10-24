@@ -4,8 +4,6 @@
 //! signing secret); the overlap refusal at activation rides along.
 #![cfg(feature = "e2e")]
 
-use std::collections::BTreeMap;
-
 use reqwest::Method;
 use serde_json::{json, Value};
 use weft_e2e::access::{catalog_spec, connect_direct, set_account};
@@ -69,20 +67,16 @@ async fn api_keys_and_a_signing_secret_gate_their_routes() -> anyhow::Result<()>
     let signed = format!("{base}/signed");
     let body_bytes = serde_json::to_vec(&json!({ "text": "signed hi" }))?;
     let now = chrono::Utc::now().timestamp();
+    // The shipped HmacAuth node's own scheme signs, so the test signs
+    // exactly what the gate checks.
+    let hmac_auth: weft_core::access::events::VerifyKind =
+        serde_json::from_value(catalog_spec("api", "hmac_auth")?["verify"].clone())?;
     let sign = |ts: i64, body: &[u8]| -> anyhow::Result<String> {
-        Ok(weft_core::access::verify::hmac_signature(
+        Ok(weft_core::access::verify::hmac_digest(
+            &hmac_auth,
             "s3cret-e2e",
-            &"{timestamp}.{body}".parse().map_err(anyhow::Error::msg)?,
-            "",
-            weft_core::access::events::HmacAlgorithm::Sha256,
-            weft_core::access::events::DigestEncoding::Hex,
-            ts,
-            &weft_core::access::verify::PushParts {
-                body,
-                headers: &BTreeMap::new(),
-                url: None,
-                method: "POST",
-            },
+            Some(&ts.to_string()),
+            &weft_core::access::verify::PushParts { body, headers: &[], url: None, method: "POST" },
         )?)
     };
     let signature = sign(now, &body_bytes)?;

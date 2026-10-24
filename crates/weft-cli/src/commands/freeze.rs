@@ -39,19 +39,10 @@ pub async fn run(ctx: Ctx, name: String, run_id: Option<String>, expect: Vec<Str
         );
     }
     let rows = super::versions::replay_rows(&client, &run.run_id.to_string()).await?;
-    let mut expected = super::versions::output_wires(&client, &run.run_id.to_string()).await?;
-    // `--expect` and the run's node list are both spelled from the top
-    // (`triage.last`, `one.strip` through its site).
-    // A name the run has is taken as it is, so only a name it lacks can
-    // be a loop's boundary the compiler made, and only when its loop is
-    // among the run's places (a loop is spelled there by its name).
-    if let Some(node) = expect.iter().find(|node| !expected.nodes.contains(*node)) {
-        if let Some(group) = weft_core::project::boundary_loop(node).filter(|group| expected.nodes.iter().any(|known| known == group)) {
-            bail!("cannot focus '{node}': it is a loop's boundary the compiler made; name the loop, `--expect {group}`");
-        }
-        bail!("cannot focus '{node}': this node did not exist in run {}", short(&run.run_id.to_string()));
-    }
-    expected.focus = expect.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    // Each `--expect` is read against the program the run ran, which this
+    // folder may have moved on from, and comes back in `focus` spelled the
+    // way that program writes it.
+    let expected = super::versions::output_wires(&client, &run.run_id.to_string(), &expect).await?;
     let facts = outside_facts(&rows)?;
 
     // A file that exists but does not parse is an

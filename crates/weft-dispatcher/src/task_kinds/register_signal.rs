@@ -14,44 +14,17 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use weft_core::frames::LoopFrames;
-use weft_core::primitive::SignalSpec;
 use weft_core::signal as core_signal;
 use weft_core::signal::listener_protocol::StartMode;
 use weft_task_store::executor::TaskExecutor;
 use weft_task_store::tasks::Task;
+use weft_task_store::RegisterSignalPayload;
 
 use crate::state::DispatcherState;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterSignalPayload {
-    pub run_id: weft_core::RunId,
-    pub node_id: String,
-    pub frames: LoopFrames,
-    pub spec: SignalSpec,
-    pub is_resume: bool,
-    /// 0-based ordinal of the `await_signal` call within this
-    /// (run, node_id, frames). Set by the worker, which stamps it on
-    /// the `SuspensionRegistered` it records, so replay can rebuild the
-    /// per-(node, frames) sequence in order. Must not vary across replays
-    /// of the same body, so the dedup key and the resume token include it. Required: a missing field would silently default
-    /// to 0 and collide every await on the same frame stack.
-    pub call_index: u32,
-    /// The trigger's delivered port values at registration time (an
-    /// entry registration only; `None` on resumes). Stored on the
-    /// signal row and replayed onto the trigger's ports at every fire.
-    #[serde(default)]
-    pub port_snapshot: Option<serde_json::Value>,
-    /// When the registration was asked for (ms since the epoch): the
-    /// worker stamps the moment the node called in, activation stamps
-    /// its own start. Handed to the listener so a relative wait counts
-    /// from here, whatever the trip to the listener cost.
-    pub asked_at_unix_ms: i64,
-}
 
 pub struct RegisterSignalExecutor;
 

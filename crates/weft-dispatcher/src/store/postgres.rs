@@ -247,7 +247,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             project_id UUID NOT NULL,
             instance_id TEXT,
             program_hash TEXT NOT NULL,
-            bake_json TEXT NOT NULL
+            bake_json TEXT NOT NULL,
+            -- The version `bake_json` was written at (`TriggerBake::STORED`).
+            bake_json_version INTEGER NOT NULL,
+            -- The source version it baked, which a version's removal
+            -- deletes its bakes by: Postgres copies it out of the bake, so
+            -- it can never disagree with it.
+            source_version TEXT GENERATED ALWAYS AS (bake_json::jsonb ->> 'sourceVersion') STORED
         )"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_trigger_bake_key
              ON trigger_bake(project_id, instance_id, program_hash) NULLS NOT DISTINCT"#,
@@ -292,6 +298,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             seed_of UUID,
             stale TEXT[] NOT NULL DEFAULT '{}',
             spec JSONB,
+            -- The version `spec` was written at (`RunSpec::STORED`).
+            spec_version INTEGER NOT NULL,
             example TEXT,
             -- running | parked | queued | ended
             state TEXT NOT NULL,
@@ -418,6 +426,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             run_id UUID NOT NULL,
             seq INTEGER NOT NULL,
             events BYTEA NOT NULL,
+            -- The version its events were written at
+            -- (`weft_journal::stored::STORED_EVENTS`).
+            events_version INTEGER NOT NULL,
             -- The replica that wrote it.
             writer TEXT NOT NULL,
             written_at BIGINT NOT NULL,
@@ -477,6 +488,14 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE TABLE IF NOT EXISTS signal (
             token TEXT PRIMARY KEY,
             program_json JSONB,
+            -- The version `program_json` was written at
+            -- (`ProgramIdentity::STORED`).
+            program_json_version INTEGER NOT NULL,
+            -- The program's two hashes, which the doors route by: Postgres
+            -- copies them out of `program_json`, which stays whole because
+            -- it is the identity the signal was registered under.
+            definition_hash TEXT GENERATED ALWAYS AS (program_json ->> 'definition_hash') STORED,
+            binary_hash TEXT GENERATED ALWAYS AS (program_json ->> 'binary_hash') STORED,
             setup_run_id UUID,
             source_version TEXT,
             tenant_id TEXT NOT NULL,
@@ -487,6 +506,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- never one without the other.
             is_resume BOOLEAN NOT NULL CHECK (is_resume = (run_id IS NOT NULL)),
             spec_json TEXT NOT NULL,
+            -- The version `spec_json` was written at (`SignalSpec::STORED`).
+            spec_json_version INTEGER NOT NULL,
             -- The connection this signal acts as (`spec.access.id`),
             -- denormalized at register time. NULL for kinds without
             -- one. Inbound provider pushes route account-to-signal
@@ -781,6 +802,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // once, marked with what they were cut from (`p_born`'s
         // `cut_from`), so no run is ever on record without its program and
         // no program is kept that no run on record runs.
+        // The batch's rows and programs carry the version the worker wrote
+        // them at (`p_events_version`, each program's
+        // `project_json_version`), both required: a broker of the release
+        // before versions is refused by the writer guard before it gets
+        // here, and a current broker fills what an older worker left out.
         // Per run (the `p_ids` arrays, aligned; `p_born` and `p_ended` are
         // JSON arrays aligned the same way, `null` where it does not apply):
         //   - a run that starts here (`first_seq = 0`) is inserted, already
@@ -813,7 +839,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 p_costs BIGINT[], p_skipped INTEGER[], p_wrote BOOLEAN[], p_born JSONB, p_ended JSONB,
                 p_row_run INTEGER[], p_row_seq INTEGER[], p_row_events BYTEA[],
                 p_resolved_run INTEGER[], p_resolved_token TEXT[],
-                p_programs JSONB
+                p_programs JSONB, p_events_version INTEGER
             ) RETURNS TABLE (o_run_id UUID, o_fate TEXT, o_project_id UUID, o_tell_end BOOLEAN, o_keep_until BIGINT,
                              o_unwatched BOOLEAN) AS $$
             DECLARE
@@ -839,7 +865,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                                      instance_id, fired_by, source_version, definition_hash, cut_from, binary_hash,
                                      seed_of, state, owner, epoch, last_seq, started_at, ended_at, outcome, error,
                                      cancel_cause, skipped, wrote_files, cost_micro_usd, keep_for, keep_until,
-                                     delivered_until)
+                                     delivered_until, spec_version)
                     SELECT v.id, (x.b->>'project_id')::uuid, p_tenant, x.b->>'phase', x.b->>'kind', x.b->>'keeping',
                            (x.b->>'recorded')::boolean, x.b->>'entry_node', x.b->>'instance_id', x.b->>'fired_by',
                            x.b->>'source_version', x.b->>'definition_hash', x.b->>'cut_from', x.b->>'binary_hash',
@@ -849,7 +875,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                            v.epoch, v.last_seq, (x.b->>'started_at')::bigint, (x.e->>'at')::bigint, x.e->>'outcome',
                            x.e->>'error', x.e->'cancel_cause', v.skipped, v.wrote, v.costs, (x.b->>'keep_for')::bigint,
                            (x.e->>'at')::bigint + (x.b->>'keep_for')::bigint,
-                           CASE WHEN x.e IS NULL THEN p_delivered_until END
+                           CASE WHEN x.e IS NULL THEN p_delivered_until END, (x.b->>'spec_version')::integer
                     FROM unnest(p_ids, p_epochs, p_last, p_costs, p_skipped, p_wrote, v_fates)
                             WITH ORDINALITY AS v(id, epoch, last_seq, costs, skipped, wrote, fate, n)
                         CROSS JOIN LATERAL (SELECT p_born->(v.n::integer - 1) AS b,
@@ -878,8 +904,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- marked with the registered program it was cut from: a
                 -- refused birth keeps nothing, and nothing but a cut a
                 -- birth names goes in.
-                INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, cut_from)
-                    SELECT r.project_id, r.definition_hash, c->>'project_json', p_now, r.cut_from
+                INSERT INTO project_definition (project_id, definition_hash, project_json, project_json_version,
+                                                recorded_at_unix, cut_from)
+                    SELECT r.project_id, r.definition_hash, c->>'project_json',
+                           (c->>'project_json_version')::integer, p_now, r.cut_from
                     FROM jsonb_array_elements(p_programs) AS c
                         JOIN unnest(p_ids, v_fates) AS v(id, fate) ON v.fate = 'insert'
                         JOIN run r ON r.run_id = v.id
@@ -903,8 +931,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                             WITH ORDINALITY AS v(id, last_seq, costs, skipped, wrote, fate, n)
                         CROSS JOIN LATERAL (SELECT NULLIF(p_ended->(v.n::integer - 1), 'null'::jsonb) AS e) x
                     WHERE v.fate = 'continue' AND r.run_id = v.id;
-                INSERT INTO run_log (run_id, seq, events, writer, written_at)
-                    SELECT p_ids[w.run], w.seq, w.events, p_writer, p_now
+                INSERT INTO run_log (run_id, seq, events, events_version, writer, written_at)
+                    SELECT p_ids[w.run], w.seq, w.events, p_events_version, p_writer, p_now
                     FROM unnest(p_row_run, p_row_seq, p_row_events) AS w(run, seq, events)
                     WHERE v_fates[w.run] IN ('insert', 'continue')
                     ORDER BY 1, 2
@@ -964,6 +992,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             $$ LANGUAGE plpgsql"#),
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 #[async_trait]
@@ -973,8 +1002,9 @@ impl BakeStore for PostgresStore {
             .bind(run_id).fetch_one(&self.pool).await?)
     }
 
-    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&super::TriggerBake>) -> anyhow::Result<()> {
+    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&super::TriggerBake>) -> anyhow::Result<Option<super::UnreadablePriorBake>> {
         let mut tx = self.pool.begin().await?;
+        let mut lost = None;
         let owner: Option<(uuid::Uuid,)> = sqlx::query_as(
             "DELETE FROM trigger_setup WHERE run_id = $1 RETURNING project_id",
         ).bind(run_id).fetch_optional(&mut *tx).await?;
@@ -983,30 +1013,48 @@ impl BakeStore for PostgresStore {
             let instance = bake.instance.as_ref().map(|m| m.as_str());
             let digest = bake.program.digest();
             // A setup of some triggers refreshes those and keeps what an
-            // earlier setup captured for the others, under the row lock.
-            let prior: Option<(String,)> = sqlx::query_as(
-                "SELECT bake_json FROM trigger_bake \
+            // earlier setup captured for the others, under the row lock. A
+            // prior bake that no longer reads is replaced by this one: it
+            // keeps nothing a refresh could carry, and refusing would leave
+            // the setup unable ever to land. What it held for the others is
+            // gone, which the answer says.
+            let prior: Option<(String, weft_core::stored::Version)> = sqlx::query_as(
+                "SELECT bake_json, bake_json_version FROM trigger_bake \
                  WHERE project_id = $1 AND instance_id IS NOT DISTINCT FROM $2 AND program_hash = $3 FOR UPDATE",
             ).bind(project_id).bind(instance).bind(&digest).fetch_optional(&mut *tx).await?;
             let merged = match prior {
-                Some((json,)) => serde_json::from_str::<super::TriggerBake>(&json)?.refreshed_by(bake),
+                Some((json, version)) => match super::TriggerBake::STORED.decode(json.as_str(), version) {
+                    Ok(prior) => prior.refreshed_by(bake),
+                    Err(e) => {
+                        let e = e.at(super::TriggerBake::row(project_id, instance, &digest));
+                        lost = Some(super::UnreadablePriorBake { error: e.to_string() });
+                        bake.clone()
+                    }
+                },
                 None => bake.clone(),
             };
-            sqlx::query("INSERT INTO trigger_bake (project_id, instance_id, program_hash, bake_json) VALUES ($1, $2, $3, $4) \
-                ON CONFLICT (project_id, instance_id, program_hash) DO UPDATE SET bake_json = EXCLUDED.bake_json")
+            sqlx::query("INSERT INTO trigger_bake (project_id, instance_id, program_hash, bake_json, bake_json_version) VALUES ($1, $2, $3, $4, $5) \
+                ON CONFLICT (project_id, instance_id, program_hash) DO UPDATE SET bake_json = EXCLUDED.bake_json, bake_json_version = EXCLUDED.bake_json_version")
                 .bind(project_id).bind(instance).bind(&digest)
-                .bind(serde_json::to_string(&merged)?).execute(&mut *tx).await?;
+                .bind(serde_json::to_string(&merged)?).bind(super::TriggerBake::STORED.version()).execute(&mut *tx).await?;
         }
         tx.commit().await?;
-        Ok(())
+        Ok(lost)
     }
 
     async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Vec<super::TriggerBake>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT bake_json FROM trigger_bake WHERE project_id = $1 AND instance_id IS NOT DISTINCT FROM $2",
+        let instance = instance.map(|m| m.as_str());
+        let rows: Vec<(String, weft_core::stored::Version, String)> = sqlx::query_as(
+            "SELECT bake_json, bake_json_version, program_hash FROM trigger_bake WHERE project_id = $1 AND instance_id IS NOT DISTINCT FROM $2",
         )
-            .bind(project_id).bind(instance.map(|m| m.as_str())).fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(value,)| serde_json::from_str(&value).map_err(Into::into)).collect()
+            .bind(project_id).bind(instance).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|(value, version, program)| {
+                Ok(super::TriggerBake::STORED
+                    .decode(value.as_str(), version)
+                    .map_err(|e| e.at(super::TriggerBake::row(project_id, instance, &program)))?)
+            })
+            .collect()
     }
 }
 
@@ -1226,7 +1274,7 @@ impl RunStore for PostgresStore {
             .await?;
         let mut entries: Vec<LogEntry> = Vec::new();
         for row in &record.rows {
-            match weft_journal::stored::decode(run_id, &row.events) {
+            match weft_journal::stored::decode(run_id, &row.events, row.events_version) {
                 Ok(events) => entries.extend(events.iter().flat_map(LogEntry::from_event)),
                 Err(e) => {
                     let at = written_at.iter().find(|(seq, _)| *seq == row.seq).map_or(0, |(_, at)| *at);
@@ -1816,7 +1864,10 @@ async fn erase_run_ids(
         .context("erase runs: read a resume signal row")?;
     let removed = rows.into_iter().map(row_to_signal).collect::<anyhow::Result<Vec<_>>>()?;
     sqlx::query("DELETE FROM parked_fire WHERE run_id = ANY($1)").bind(run_ids).execute(&mut *tx).await?;
-    for table in ["run_search", "run_search_queue", "run_log", "run"] {
+    // The queue before the entries: a search building a run's entry holds
+    // its queue row, so the erase waits for it there and then removes the
+    // entry it wrote.
+    for table in ["run_search_queue", "run_search", "run_log", "run"] {
         sqlx::query(&format!("DELETE FROM {table} WHERE run_id = ANY($1)")).bind(run_ids).execute(&mut *tx).await?;
     }
     // A queued run its workers had failed (busy, refused, not reached)
@@ -1985,19 +2036,6 @@ pub async fn move_paused_runs(
     source_version: &str,
 ) -> anyhow::Result<u64> {
     let mut tx = pool.begin().await?;
-    if let Some(cut) = program.kept() {
-        sqlx::query(
-            "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, cut_from) \
-             VALUES ($1, $2, $3, EXTRACT(EPOCH FROM NOW())::BIGINT, $4) ON CONFLICT (project_id, definition_hash) DO NOTHING",
-        )
-        .bind(cut.project_id)
-        .bind(&cut.definition_hash)
-        .bind(&cut.project_json)
-        .bind(program.cut_from())
-        .execute(&mut *tx)
-        .await
-        .context("keep the cut the moved runs run")?;
-    }
     let moved = sqlx::query(
         "UPDATE run SET binary_hash = $2, definition_hash = $3, cut_from = $4, source_version = $5 \
          WHERE run_id = ANY($1) AND state = 'parked' \
@@ -2012,6 +2050,11 @@ pub async fn move_paused_runs(
     .await
     .context("move the paused runs onto the new build")?
     .rows_affected();
+    // The cut is kept only once a run names it, so a move that moved
+    // nothing keeps no program nobody runs.
+    if moved > 0 {
+        weft_journal::record::insert_cut_in(&mut tx, program).await.context("keep the cut the moved runs run")?;
+    }
     tx.commit().await?;
     Ok(moved)
 }
@@ -2078,7 +2121,8 @@ macro_rules! signal_columns {
             $p, "consumer_kind, ", $p, "tags, ", $p, "port_snapshot, ",
             $p, "consumer_payload, ", $p, "surface_kind, ", $p, "mount_path, ",
             $p, "auth_kind, ", $p, "auth_config, ", $p, "kind_state, ",
-            $p, "kind_state_seq, ", $p, "program_json, ", $p, "setup_run_id, ", $p, "source_version, ",
+            $p, "kind_state_seq, ", $p, "program_json, ", $p, "program_json_version, ", $p, "spec_json_version, ",
+            $p, "setup_run_id, ", $p, "source_version, ",
             $p, "mount_methods, ", $p, "instance_id, ", $p, "activation_trigger, ", $p, "holds, ",
             $p, "generation"
         )
@@ -2115,9 +2159,11 @@ const SIGNAL_SELECT_ENTRY_AT_PLACE: &str = concat!(
 /// parked fires are never among them.
 // SYNC: SIGNAL_REFRESHED_COLUMNS <-> bind_signal_refreshed (same order)
 //       <-> store/fake.rs `copy_refreshed`
-const SIGNAL_REFRESHED_COLUMNS: [&str; 16] = [
+const SIGNAL_REFRESHED_COLUMNS: [&str; 18] = [
     "spec_json",
+    "spec_json_version",
     "program_json",
+    "program_json_version",
     "setup_run_id",
     "source_version",
     "access_id",
@@ -2141,7 +2187,9 @@ fn bind_signal_refreshed<'q>(
 ) -> anyhow::Result<sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>> {
     Ok(query
         .bind(&sig.spec_json)
+        .bind(weft_core::primitive::SignalSpec::STORED.version())
         .bind(sig.program.as_ref().map(serde_json::to_value).transpose()?)
+        .bind(weft_core::project::hash::ProgramIdentity::STORED.version())
         .bind(sig.setup_run_id)
         .bind(&sig.source_version)
         .bind(sig.access_id.as_deref())
@@ -2315,6 +2363,7 @@ pub(crate) struct SignalRow {
     pub(crate) setup_run_id: Option<uuid::Uuid>,
     pub(crate) source_version: Option<String>,
     pub(crate) program_json: Option<serde_json::Value>,
+    pub(crate) program_json_version: weft_core::stored::Version,
     pub(crate) token: String,
     pub(crate) tenant_id: String,
     pub(crate) project_id: uuid::Uuid,
@@ -2322,6 +2371,7 @@ pub(crate) struct SignalRow {
     pub(crate) node_id: String,
     pub(crate) is_resume: bool,
     pub(crate) spec_json: String,
+    pub(crate) spec_json_version: weft_core::stored::Version,
     pub(crate) access_id: Option<String>,
     pub(crate) consumer_kind: Option<String>,
     pub(crate) tags: Vec<String>,
@@ -2367,6 +2417,14 @@ pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration
             }
         },
     };
+    let program = row
+        .program_json
+        .map(|json| weft_core::project::hash::ProgramIdentity::STORED.decode(json, row.program_json_version))
+        .transpose()
+        .map_err(|e| e.at(format_args!("signal {}'s program", row.token)))?;
+    let spec_json = weft_core::primitive::SignalSpec::STORED
+        .in_todays_shape(row.spec_json, row.spec_json_version)
+        .map_err(|e| e.at(format_args!("signal {}", row.token)))?;
     Ok(SignalRegistration {
         setup_run_id: row.setup_run_id,
         instance: row
@@ -2376,14 +2434,14 @@ pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration
             .map_err(|e| anyhow::anyhow!("corrupt signal.instance_id for token {}: {e}", row.token))?,
         activation_trigger: row.activation_trigger,
         source_version: row.source_version,
-        program: row.program_json.map(serde_json::from_value).transpose()?,
+        program,
         token: row.token,
         tenant_id: row.tenant_id,
         project_id: row.project_id,
         run_id,
         node_id: row.node_id,
         is_resume: row.is_resume,
-        spec_json: row.spec_json,
+        spec_json,
         access_id: row.access_id,
         consumer_kind: row.consumer_kind,
         tags: row.tags,

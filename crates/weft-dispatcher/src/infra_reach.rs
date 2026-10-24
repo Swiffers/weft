@@ -49,7 +49,7 @@ impl InfraReach {
             None => {
                 let declared = weft_core::project::DeclaredInfra::of(project);
                 weft_core::project::infra_place_spellings(project)
-                    .into_iter()
+                    .into_keys()
                     .filter(|place| match &copies {
                         Copies::Shared => declared.declares(place, false),
                         Copies::Instance(_) => declared.declares(place, true),
@@ -109,14 +109,11 @@ struct Programs<'a> {
 impl Programs<'_> {
     async fn infra_of(&mut self, definition_hash: &str) -> anyhow::Result<&BTreeSet<String>> {
         if !self.read.contains_key(definition_hash) {
-            let json = self
+            let program = self
                 .state
-                .projects
-                .definition_for_hash(self.project_id, definition_hash)
+                .program(self.project_id, definition_hash)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("no program {definition_hash} of project {} is on record", self.project_id))?;
-            let program: ProjectDefinition =
-                serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("program {definition_hash} does not read as a program: {e}"))?;
             self.read.insert(definition_hash.to_string(), weft_core::project::infra_reached(&program));
         }
         Ok(&self.read[definition_hash])

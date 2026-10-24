@@ -255,6 +255,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             EXECUTE FUNCTION task_ready_notify()"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 /// Insert a new task. Returns the minted id, time-ordered (a node test's

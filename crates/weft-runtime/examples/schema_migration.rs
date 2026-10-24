@@ -9,5 +9,6 @@
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    weft_task_store::schema_guard::write_migration(&weft_runtime::schema::groups()).await
+    weft_task_store::schema_guard::write_migration(&weft_runtime::schema::groups(), &weft_runtime::schema::documents())
+        .await
 }

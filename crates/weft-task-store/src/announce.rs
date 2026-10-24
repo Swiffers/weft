@@ -195,6 +195,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             $$ LANGUAGE plpgsql"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 /// Tell this process's flusher for `pool`'s database that a write which

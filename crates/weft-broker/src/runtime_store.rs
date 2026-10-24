@@ -706,6 +706,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         "#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 /// A clock seam so the expiry math is testable without wall-clock. The broker

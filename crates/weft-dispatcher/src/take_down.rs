@@ -3,7 +3,8 @@
 //! `weft deactivate` (the triggers `--trigger` / `--instance` /
 //! `--all-instances` name), `weft resync`'s first half, the infra verbs
 //! that take down the triggers whose cut contains their copies, the health
-//! loop taking down what reaches a broken copy, project removal, and a
+//! loop taking down what reaches a broken copy, `weft maintenance on`
+//! (`crate::maintenance`), project removal, and a
 //! program's own `ctx.trigger(..).deactivate(..)` calls all send the same
 //! request: a TARGET, a [`TakeDown`] (the door, what is held, what is
 //! running: `weft_core::take_down`), and the run that asked, if one did.
@@ -233,7 +234,7 @@ pub async fn take_down(
     };
     if keys.is_empty() && matches!(target, TakeDownTarget::Activations(_)) {
         let commands = match cause {
-            DownCause::Person | DownCause::Health(_) => Vec::new(),
+            DownCause::Person | DownCause::Health(_) | DownCause::Maintenance => Vec::new(),
             DownCause::Infra(commands) => match commands.issue(&state.pg_pool, project_id).await.map_err(|e| internal("issue the infra commands", e))? {
                 Some(crate::infra_lifecycle_command::Issued::Commands(ids)) => ids,
                 Some(crate::infra_lifecycle_command::Issued::UpgradeInFlight(command)) => {
@@ -317,8 +318,9 @@ pub async fn take_down(
 }
 
 /// Why the runs a take-down cancels were cancelled, as their record says
-/// it: the health check names the copies it found broken, a program's run
-/// names itself, and anything else was a person's command.
+/// it: the health check names the copies it found broken, the maintenance
+/// says so, a program's run names itself, and anything else was a
+/// person's command.
 fn cancel_cause(cause: &DownCause<'_>, asker: TakeDownAsker) -> weft_core::run::CancelCause {
     use weft_core::run::CancelCause;
     match (cause, asker.run()) {
@@ -337,8 +339,17 @@ fn cancel_cause(cause: &DownCause<'_>, asker: TakeDownAsker) -> weft_core::run::
                 ),
             }
         }
+        (DownCause::Maintenance, _) => maintenance_cancel(),
         (_, Some(by)) => CancelCause::Run { by, tag: None },
         (_, None) => CancelCause::User,
+    }
+}
+
+/// Why a run `weft maintenance on --running cancel` cancelled was
+/// cancelled, as its record says it.
+pub(crate) fn maintenance_cancel() -> weft_core::run::CancelCause {
+    weft_core::run::CancelCause::Runtime {
+        detail: "the install went into maintenance (`weft maintenance on --running cancel`), which cancelled the runs going".into(),
     }
 }
 
@@ -462,5 +473,9 @@ mod tests {
         assert_eq!(cancel_cause(&DownCause::Person, TakeDownAsker::Run(by)), CancelCause::Run { by, tag: None });
         assert_eq!(cancel_cause(&DownCause::Person, TakeDownAsker::Outside), CancelCause::User);
         assert_eq!(cancel_cause(&DownCause::Person, TakeDownAsker::Resync(uuid::Uuid::nil())), CancelCause::User);
+        let CancelCause::Runtime { detail } = cancel_cause(&DownCause::Maintenance, TakeDownAsker::Outside) else {
+            panic!("the maintenance is no person");
+        };
+        assert!(detail.contains("maintenance"), "{detail}");
     }
 }

@@ -50,6 +50,17 @@ pub struct Platform {
     install: weft_core::infra::Install,
 }
 
+/// A pool of at most `max_connections` on the install database at `url`:
+/// what a test that seeds rows directly (a connection, a recipe) writes
+/// through.
+pub async fn database(url: &str, max_connections: u32) -> Result<PgPool> {
+    PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(url)
+        .await
+        .context("connect to the install's Postgres")
+}
 
 impl Platform {
     /// Connect to `disp`'s install's Postgres, at the address its runtime
@@ -57,12 +68,7 @@ impl Platform {
     pub async fn connect(disp: &Dispatcher) -> Result<Self> {
         let install = disp.install().clone();
         let url = install.secret("WEFT_DATABASE_URL").map_err(anyhow::Error::msg)?;
-        let pool = PgPoolOptions::new()
-            .max_connections(4)
-            .acquire_timeout(Duration::from_secs(10))
-            .connect(&url)
-            .await
-            .context("connect to the install's Postgres")?;
+        let pool = database(&url, 4).await?;
         Ok(Self { pool, install })
     }
 

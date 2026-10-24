@@ -17,11 +17,12 @@ const TENANT: &str = "t1";
 async fn schema(pool: &PgPool) {
     weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
     sqlx::query(
-        "INSERT INTO project (id, name, tenant_id, status, project_json, updated_at) \
-         VALUES ($1, 'p', $2, 'registered', '{}', 0)",
+        "INSERT INTO project (id, name, tenant_id, status, project_json, updated_at, project_json_version, resync_version, running_build_inputs_version) \
+         VALUES ($1, 'p', $2, 'registered', '{}', 0, $3, 1, 1)",
     )
     .bind(PROJECT)
     .bind(TENANT)
+    .bind(weft_core::ProjectDefinition::STORED.version())
     .execute(pool)
     .await
     .expect("project row");

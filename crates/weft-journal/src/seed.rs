@@ -120,9 +120,11 @@ where
             _ => bail!("seed run {run_id} has no initial program identity"),
         };
         anyhow::ensure!(rows.iter().all(|row| row.run_id() == run_id), "seed run {run_id} contains another run's rows");
+        // Read BY its hash, which is the check: a stored program keeps the
+        // hash it was made under through every upgrade of its JSON, so
+        // hashing it again here could refuse an upgraded one
+        // (`weft_core::project::hash::compute_definition_hash`).
         let project = fetch_definition(project_id, hash.clone()).await.with_context(|| format!("read original program of seed {run_id}"))?;
-        anyhow::ensure!(weft_core::project::hash::compute_definition_hash(&project)? == hash,
-            "original program of seed {run_id} does not match its recorded definition hash");
         next = seed_of(&rows).map(|seed| seed.parent);
         nearest_first.push(Ancestor { run_id, project, rows });
     }

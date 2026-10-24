@@ -430,8 +430,8 @@ fn types_where_included(fs: &CompileFs, id: &str) -> Option<std::sync::Arc<weft_
     let src = root.join(crate::project::SRC_DIR);
     let entry = fs.reader.resolve_and_read(root, &src, std::path::Path::new(crate::project::ENTRY_FILE)).ok()?;
     let state = parse_weft(entry.content.as_str(), None);
-    let mut seen = vec![entry.identity.clone()];
-    let entry_fs = fs.anchored_at(entry.identity.parent());
+    let mut seen = vec![entry.file.identity.clone()];
+    let entry_fs = fs.anchored_at(entry.file.identity.parent());
     find_site_types(&state.includes, &state.groups, &entry_fs, root, id, &mut seen)
 }
 
@@ -446,16 +446,16 @@ fn find_site_types(
     let base = fs.base?;
     for inc in includes {
         let Ok(resolved) = fs.reader.resolve_and_read(root, base, std::path::Path::new(&inc.path)) else { continue };
-        let body_id = crate::source_name::body_id(root, &resolved.identity);
+        let body_id = crate::source_name::body_id(&resolved.file.from_root);
         if body_id == id {
             return Some(inc.types.clone());
         }
-        if seen.contains(&resolved.identity) {
+        if seen.contains(&resolved.file.identity) {
             continue;
         }
-        seen.push(resolved.identity.clone());
+        seen.push(resolved.file.identity.clone());
         let sub = inc.types.clone().scoped(|| parse_weft(resolved.content.as_str(), Some(&body_id)));
-        let sub_fs = fs.anchored_at(resolved.identity.parent());
+        let sub_fs = fs.anchored_at(resolved.file.identity.parent());
         if let Some(found) = find_site_types(&sub.includes, &sub.groups, &sub_fs, root, id, seen) {
             return Some(found);
         }
@@ -802,7 +802,8 @@ fn resolve_one_include(
         .reader
         .resolve_and_read(root, base, std::path::Path::new(&inc.path))
         .map_err(|e| at_include(format!("@include {e}")))?;
-    let canonical = resolved.identity;
+    let canonical = resolved.file.identity;
+    let from_root = resolved.file.from_root;
     if in_progress.contains(&canonical) {
         return Err(at_include(format!("@include cycle: {:?} includes itself", inc.path)));
     }
@@ -819,7 +820,7 @@ fn resolve_one_include(
     // lowers to it and its internals to `@lib:auth.*` with no rescope
     // pass, whichever site (and however many) calls it. Nobody reads the
     // id: a person names the file's nodes through a site (`auth.check`).
-    let body_id = crate::source_name::body_id(root, &canonical);
+    let body_id = crate::source_name::body_id(&from_root);
     if let Some(other) = bodies.paths.get(&body_id).filter(|p| **p != canonical) {
         return Err(at_include(format!(
             "@include(\"{}\"): the file takes the id `{body_id}` from its path, and {} already took it; \
@@ -881,10 +882,10 @@ fn resolve_one_include(
                 include_path: Some(inc.path.clone()),
                 include_contents: Some(include_node_types_and_files(
                     &group,
-                    root,
                     &included_fs,
                     in_progress,
                     &canonical,
+                    &from_root,
                 )),
                 source_file: None,
             };
@@ -980,26 +981,19 @@ fn resolve_one_include(
 /// file named.
 fn include_node_types_and_files(
     group: &ParsedGroup,
-    root: &std::path::Path,
     fs: &CompileFs,
     in_progress: &[std::path::PathBuf],
     canonical: &std::path::Path,
+    from_root: &std::path::Path,
 ) -> weft_core::project::IncludedContents {
-    // Canonicalized ONCE here and used for the whole walk, because the
-    // backing hands back canonicalized paths while `CompileFs` carries the
-    // root as it was spelled: a project reached through a symlink makes the
-    // two differ, and then neither the path-from-root nor the file's body
-    // id comes out right.
-    let canonical_root = root.canonicalize();
-    let root = canonical_root.as_deref().unwrap_or(root);
     let mut contents = weft_core::project::IncludedContents::default();
-    push_root_relative(&mut contents.files, root, canonical);
+    contents.files.push(crate::file_reader::slashed(from_root));
     // The cycle stack for this walk starts with the file we are already
     // inside, so a file that includes itself (directly or through a chain)
     // is visited once.
     let mut seen: Vec<std::path::PathBuf> = in_progress.to_vec();
     seen.push(canonical.to_path_buf());
-    collect_included_contents(group, root, fs, &mut seen, &mut contents);
+    collect_included_contents(group, fs, &mut seen, &mut contents);
     contents.node_types.sort();
     contents.node_types.dedup();
     contents.files.sort();
@@ -1007,25 +1001,11 @@ fn include_node_types_and_files(
     contents
 }
 
-/// Record a file under `contents.files` as its path from the project root,
-/// the one spelling every reader of the field can resolve. `root` must be
-/// the canonical root (the caller canonicalizes once for the whole walk),
-/// because the paths coming in are canonicalized by the backing.
-///
-/// A file that does not sit under the root cannot have come from an
-/// `@include`, which refuses anything outside it, so it is dropped rather
-/// than written down under a spelling nobody can resolve.
-fn push_root_relative(files: &mut Vec<String>, root: &std::path::Path, path: &std::path::Path) {
-    if let Ok(rel) = path.strip_prefix(root) {
-        files.push(rel.to_string_lossy().replace('\\', "/"));
-    }
-}
 
 /// Walk one parsed group: its own nodes' types, then down its child groups,
-/// then into each file it includes. `root` is the canonical project root.
+/// then into each file it includes.
 fn collect_included_contents(
     group: &ParsedGroup,
-    root: &std::path::Path,
     fs: &CompileFs,
     seen: &mut Vec<std::path::PathBuf>,
     contents: &mut weft_core::project::IncludedContents,
@@ -1037,7 +1017,7 @@ fn collect_included_contents(
         contents.node_types.push(node.node_type.clone());
     }
     for child in &group.child_groups {
-        collect_included_contents(child, root, fs, seen, contents);
+        collect_included_contents(child, fs, seen, contents);
     }
     let (Some(base), Some(fs_root)) = (fs.base, fs.root) else {
         return;
@@ -1046,7 +1026,7 @@ fn collect_included_contents(
         let Ok(resolved) = fs.reader.resolve_and_read(fs_root, base, std::path::Path::new(&inc.path)) else {
             continue;
         };
-        if seen.contains(&resolved.identity) {
+        if seen.contains(&resolved.file.identity) {
             continue;
         }
         // The real resolution also refuses two paths whose body ids
@@ -1059,7 +1039,7 @@ fn collect_included_contents(
         // the real resolution gives it, so the ids here are the ids the
         // build will use. Passing the call-site alias instead would be a
         // second spelling of the file's identity.
-        let body_id = crate::source_name::body_id(root, &resolved.identity);
+        let body_id = crate::source_name::body_id(&resolved.file.from_root);
         // Under the types visible at the include, as the build parses it.
         let Ok(mut sub) = inc.types.clone().scoped(|| parse_checked(resolved.content.as_str(), &body_id)) else {
             continue;
@@ -1072,12 +1052,12 @@ fn collect_included_contents(
             continue;
         }
         let nested = sub.groups.pop().expect("length checked");
-        push_root_relative(&mut contents.files, root, &resolved.identity);
-        seen.push(resolved.identity.clone());
+        contents.files.push(crate::file_reader::slashed(&resolved.file.from_root));
+        seen.push(resolved.file.identity.clone());
         // Anchored at the nested file's OWN directory: an `@include` path is
         // relative to the file that writes it.
-        let nested_fs = fs.anchored_at(resolved.identity.parent());
-        collect_included_contents(&nested, root, &nested_fs, seen, contents);
+        let nested_fs = fs.anchored_at(resolved.file.identity.parent());
+        collect_included_contents(&nested, &nested_fs, seen, contents);
     }
 }
 

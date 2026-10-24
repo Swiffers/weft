@@ -18,7 +18,7 @@ use super::{loop_in_id, loop_out_id, Edge, GroupDefinition, GroupKind, NodeDefin
 pub struct ProjectGraph<'a> {
     project: &'a ProjectDefinition,
     nodes: HashMap<&'a str, &'a NodeDefinition>,
-    groups: HashMap<&'a str, &'a GroupDefinition>,
+    groups: HashMap<&'a str, (usize, &'a GroupDefinition)>,
     into: HashMap<&'a str, Vec<&'a Edge>>,
     out_of: HashMap<&'a str, Vec<&'a Edge>>,
     /// Per group: every node inside it however deep (a loop's own
@@ -37,8 +37,8 @@ impl<'a> ProjectGraph<'a> {
             nodes.entry(node.id.as_str()).or_insert(node);
         }
         let mut groups = HashMap::with_capacity(project.groups.len());
-        for group in &project.groups {
-            groups.entry(group.id.as_str()).or_insert(group);
+        for (index, group) in project.groups.iter().enumerate() {
+            groups.entry(group.id.as_str()).or_insert((index, group));
         }
         let mut into: HashMap<&str, Vec<&Edge>> = HashMap::new();
         let mut out_of: HashMap<&str, Vec<&Edge>> = HashMap::new();
@@ -74,7 +74,7 @@ impl<'a> ProjectGraph<'a> {
             .collect();
         let mut site_indices: HashMap<&str, Vec<usize>> = HashMap::new();
         for (index, site) in project.groups.iter().enumerate().filter(|(_, g)| matches!(g.kind, GroupKind::Call { .. })) {
-            for around in groups_around(&groups, site) {
+            for around in groups_around(|id| groups.get(id).map(|(_, g)| *g), site) {
                 site_indices.entry(around).or_default().push(index);
             }
         }
@@ -101,6 +101,9 @@ pub trait GraphView {
     fn node(&self, id: &str) -> Option<&NodeDefinition>;
     /// The group with this id (the first, as a scan would find).
     fn group(&self, id: &str) -> Option<&GroupDefinition>;
+    /// Where the group with this id (the first) sits in the program's
+    /// group order.
+    fn group_position(&self, id: &str) -> Option<usize>;
     /// The wires into the node `id`, in the program's order.
     fn edges_into(&self, id: &str) -> impl Iterator<Item = &Edge>;
     /// The wires out of the node `id`, in the program's order.
@@ -141,7 +144,10 @@ impl GraphView for ProjectGraph<'_> {
         self.nodes.get(id).copied()
     }
     fn group(&self, id: &str) -> Option<&GroupDefinition> {
-        self.groups.get(id).copied()
+        self.groups.get(id).map(|(_, group)| *group)
+    }
+    fn group_position(&self, id: &str) -> Option<usize> {
+        self.groups.get(id).map(|(index, _)| *index)
     }
     fn edges_into(&self, id: &str) -> impl Iterator<Item = &Edge> {
         self.into.get(id).into_iter().flatten().copied()
@@ -167,6 +173,9 @@ impl GraphView for ProjectDefinition {
     fn group(&self, id: &str) -> Option<&GroupDefinition> {
         self.groups.iter().find(|g| g.id == id)
     }
+    fn group_position(&self, id: &str) -> Option<usize> {
+        self.groups.iter().position(|g| g.id == id)
+    }
     fn edges_into(&self, id: &str) -> impl Iterator<Item = &Edge> {
         self.edges.iter().filter(move |e| e.target == id)
     }
@@ -181,16 +190,16 @@ impl GraphView for ProjectDefinition {
     fn sites(&self, group: &str) -> impl Iterator<Item = &GroupDefinition> {
         let groups: HashMap<&str, &GroupDefinition> = self.groups.iter().map(|g| (g.id.as_str(), g)).collect();
         self.groups.iter().filter(|site| matches!(site.kind, GroupKind::Call { .. }))
-            .filter(move |site| groups_around(&groups, site).contains(&group))
+            .filter(move |site| groups_around(|id| groups.get(id).copied(), site).contains(&group))
             .collect::<Vec<_>>().into_iter()
     }
 }
 
 /// `group` and every group around it in its file, innermost first.
-fn groups_around<'a>(groups: &HashMap<&'a str, &'a GroupDefinition>, group: &'a GroupDefinition) -> Vec<&'a str> {
+fn groups_around<'a>(group_of: impl Fn(&str) -> Option<&'a GroupDefinition>, group: &'a GroupDefinition) -> Vec<&'a str> {
     let mut out = vec![group.id.as_str()];
     let mut at = group;
-    while let Some(parent) = at.parent_group_id.as_deref().and_then(|p| groups.get(p)) {
+    while let Some(parent) = at.parent_group_id.as_deref().and_then(&group_of) {
         out.push(parent.id.as_str());
         at = parent;
     }

@@ -31,6 +31,7 @@ pub mod news;
 pub mod notices;
 pub mod records;
 pub mod state;
+pub mod wire;
 
 use std::sync::Arc;
 
@@ -235,8 +236,8 @@ fn api(state: Arc<BrokerState>) -> Router {
         .merge(runtime_storage::router())
         // Access admin: the connect/lookup verbs whose work makes an
         // outbound call to a tenant-influenced URL; they run here
-        // because the broker's egress is locked to the public internet
-        // (the dispatcher forwards them, like the file admin verbs).
+        // because the broker holds the apps file's secrets. The
+        // dispatcher forwards them, like the file admin verbs.
         .merge(access_admin::routes())
         // Provider events: the listener's serving surface and the
         // receive-side verification the dispatcher forwards to.

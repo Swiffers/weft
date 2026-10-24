@@ -62,6 +62,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_project_frontend_visitor_address
             ON project_frontend(project_id) WHERE visitor_address IS NOT NULL"#],
     seed: &[],
+    data_steps: &[],
 };
 
 #[derive(sqlx::FromRow)]

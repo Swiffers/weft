@@ -125,11 +125,16 @@ Then [build your first program](first-program.md).
 **To change your keys**, edit `~/weft/access-apps.json`; the change takes effect at once
 ([the apps file](../connections/the-apps-file.md)).
 
-**To update**, run the install line again. It updates `~/weft` and runs the
-installer, the same as `git pull` and `./setup.sh` in that folder. Your projects and their history
-stay where they are. Before you do, check the
+**To update**, run `weft maintenance on` first, which takes down every
+trigger that is on and stops your programs' infrastructure, then run the
+install line again, then `weft maintenance off`, which builds those projects again on the new
+weft and brings back exactly what `on` took down. The install line updates `~/weft` and runs the
+installer, the same as `git pull` and `./setup.sh` in that folder, and the
+installer refuses to replace the running weft while something is on. Your
+projects and their history stay where they are. Before you do, check the
 [changelog](https://github.com/WeaveMindAI/weft/blob/main/CHANGELOG.md) for
-anything that needs you.
+anything that needs you. For what each step does, go and read
+[updating weft](../running/cli.md#updating-weft).
 
 If you installed weft before it stopped running on Kubernetes, that update is
 the exception: its database cannot come along. `./setup.sh` finds the old

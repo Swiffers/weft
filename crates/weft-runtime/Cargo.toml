@@ -20,6 +20,10 @@ weft-core = { workspace = true }
 weft-dispatcher = { path = "../weft-dispatcher" }
 weft-broker = { path = "../weft-broker" }
 weft-broker-client = { path = "../weft-broker-client" }
+# The documents its tables keep (`schema::documents`): their types and
+# what re-derives from them.
+weft-access-store = { workspace = true }
+weft-journal = { workspace = true }
 weft-listener = { path = "../weft-listener" }
 weft-infra-supervisor = { path = "../weft-infra-supervisor" }
 weft-task-store = { workspace = true, features = ["serve"] }

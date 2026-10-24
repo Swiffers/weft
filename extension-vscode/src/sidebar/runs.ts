@@ -584,7 +584,7 @@ export class LoadMoreNode extends vscode.TreeItem {
 }
 
 /** The `/runs` response: a page plus the total matching count. */
-// SYNC: RunPage <-> crates/weft-core/src/program.rs (RunPage), weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage)
+// SYNC: RunPage <-> crates/weft-core/src/program.rs (RunPage), weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage, in the weavemind repo)
 interface RunPage {
   runs: RunSummary[];
   total: number;

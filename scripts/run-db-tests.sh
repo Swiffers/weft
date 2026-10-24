@@ -99,7 +99,13 @@ selection="($selection)"
 # A filter is a plain substring of test names (`~`, nextest's contains
 # matcher), not a regex; a name is `<file>::<test>`. nextest refuses a run in
 # which no test matched, so a filter that selects nothing fails loudly
-# instead of reporting green on a suite where nothing executed.
+# instead of reporting green on a suite where nothing executed. It is spliced
+# into the filter expression, so anything but a test name's own characters
+# (`a|b` would select other crates' tests) is refused rather than run.
+if [ -n "$filter" ] && [[ ! "$filter" =~ ^[A-Za-z0-9_:]+$ ]]; then
+  echo "scripts/run-db-tests.sh: the test-name filter '$filter' holds characters a test name cannot; pass one plain name or name part, and run the script once per name" >&2
+  exit 1
+fi
 [ -n "$filter" ] && selection="$selection & test(~$filter)"
 nextest_args+=(-E "$selection")
 with_build_slot cargo nextest run --no-fail-fast "${nextest_args[@]}"

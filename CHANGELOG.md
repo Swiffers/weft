@@ -1,7 +1,111 @@
 # Changelog
 
 What changed between versions of weft that you need to know about when you
-update. To update, pull and run `./setup.sh` again.
+update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
+then run `weft maintenance off`.
+
+## 2026-10-24 (0.2.273)
+
+**Updating weft now happens in maintenance.** Run `weft maintenance on`, which
+takes down every trigger that is on and stops your infra, then update
+(`./setup.sh`, or the cloud's install workflow), then `weft maintenance off`,
+which builds those projects again on the new weft, starts that infra again on
+the new build and then brings back exactly those triggers. While the install
+is in maintenance, what arrives for the triggers it took down is refused (an
+event is dropped, a live call is answered `503`), and what they held before
+is kept and runs after `weft maintenance off`. Add
+`--on <target>` for a cloud install. `./setup.sh` and the workflow now refuse
+to replace a weft that has something on, naming these three steps.
+
+**This one update is different**, because the weft you update from has no
+`weft maintenance` yet. Just update (`./setup.sh`, or the workflow), then in
+each project that is switched on, run, adding `--on <target>` for a cloud
+install:
+
+1. `weft catalog update`, if the project keeps its own copy of the catalog
+   (`nodes/base_catalog`);
+2. `weft infra upgrade --all`, if it has infra;
+3. `weft resync --all`.
+
+From the next update on, `weft maintenance off` rebuilds the projects and
+brings back their infra and triggers by itself.
+
+The catalog copy needs updating because the nodes that check signatures changed
+shape, so the old copy of them no longer loads, and `weft validate` tells you
+when the copy is stale. Until you resync, the worker the previous weft built
+keeps running, and this weft no longer reads some of what it sends. That
+worker answers its callers with its own error, `503 the caller could not be
+checked; try again in a moment`; the install's log names the project and says
+to run `weft resync`, and so does the worker's log. `weft status` shows which
+projects are behind.
+
+`weft resync` now checks, before it takes any trigger down, that the new build
+can set up and fire every trigger it brings back. If one needs a node that
+does not load (an old catalog copy, say), it takes nothing down and prints the
+loader's message, which says what to run. If a resync ever stops because its
+build cannot run its triggers, it stops at once rather than trying again, and
+tells you what works: `weft resync --resume` would reuse the same build, so
+fix the source, then run `weft cancel-activate` and `weft activate`.
+
+**`weft status` shows your running infra as `behind the source` after this
+update.** weft's own engine runs each infra node's setup, so a new weft can
+change what that setup writes, and a copy set up by the previous one is behind
+until it is set up again. `weft infra upgrade` does that, taking down the
+triggers that depend on the copy while it restarts. Until you run it, the copy
+keeps running as it was.
+
+**If a route of yours is gated by `JwtAuth`:** that node is gone. Gate the
+route with an access node of your own whose `verify` block is `oidc`;
+[Verifying requests](docs/src/connections/verifying-requests.md) shows one. Its
+recipe declares a required `audience` field, and its `jwksUrl` must be
+`https`.
+
+**If a node of your own checks webhook signatures:** the `verify` block has a
+new shape (`signature`, `timestamp`, `secret`), and the old keys
+(`signatureHeader`, `timestampHeader`, `prefix`, `packed`) are refused with the
+block printed back in the new shape. Connections you already have are carried
+over on their own. The new shape can sign any header or body field, decode a
+`whsec_` secret, read several signatures, and check SHA-512, so schemes like
+Whop's, Svix's and Resend's can be expressed. The full reference is
+[Verifying requests](docs/src/connections/verifying-requests.md).
+
+**If you write an access node with OAuth:** a recipe can now rename the app's
+id and secret on the wire (`clientParams`), send `extraParams` on every token
+call, read its token, expiry, scopes and refusal from wherever the provider
+puts them, and run one more call right after the code exchange
+(`afterExchange`). A recipe whose token can be renewed but whose answer says
+nothing about when it expires is refused at connect, instead of dying silently
+an hour later.
+
+**The first start after this update takes a little longer.** weft now keeps a
+version on every JSON document it stores, and this start carries every older
+row to today's shape, printing its progress. Nothing to do on your side. A
+weft older than this one refuses to start on a database this one has
+upgraded, and says so.
+
+`weft events --node`, `weft logs`, `weft wake` and `weft freeze --expect` now
+read a node's name in the program the run actually ran, so a node you have
+moved since is still found by its old name on an old run. `weft events
+--iteration` now needs `--node`, and `weft wake --iteration` picks one
+iteration when several wait at the same node. `weft runs --through` finds
+nodes inside an included file by the name you write (`one.strip`).
+
+A project opened through a symlinked folder (on macOS, anything under
+`/var`) gave the nodes of an included file a different name than the build
+did, so `weft events --node` found nothing for them. That is fixed.
+
+A connection you do not name is named after its app, or its service, and
+`weft connect --list` shows both the account and the name.
+
+Saved examples (`examples/*.json`) now carry a `specVersion`. An older file
+still reads as it is, and takes today's shape the next time weft writes it
+(`weft run --save`, `weft freeze`).
+
+Tangle now shapes a program you will keep growing (more channels, sources or
+customers) around one general shape that each case plugs into, rather than a
+copy per case, and tells you where the next case will go. It also knows the
+sign-in keys a service you connect through your own node can declare. Run
+`weft tangle update` in each project to get it.
 
 ## 2026-10-22 (0.2.272)
 

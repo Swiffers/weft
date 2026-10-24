@@ -231,6 +231,7 @@ concat!(        r#"CREATE OR REPLACE FUNCTION weft_door_tick(
             $$ LANGUAGE sql"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 #[cfg(test)]

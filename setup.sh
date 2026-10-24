@@ -1916,6 +1916,34 @@ if [[ $build_cli -eq 1 || $refresh_daemon -eq 1 ]] && command -v docker >/dev/nu
   fi
 fi
 
+# ---- nothing on while weft is replaced ---------------------------------
+#
+# An update replaces the running weft, and an older and a newer weft never
+# run side by side: the install has nothing on (a trigger, an infra copy, a
+# run going), which `weft maintenance on` gets it to, and `weft maintenance
+# off` brings back after. Asked of the running install, before anything is
+# replaced, by the CLI this run installs (`weft maintenance check`, which
+# lets through an install that is not set up, not running, or whose weft
+# predates the maintenance). Only when this run replaces the runtime: one
+# whose runtime binary is already the installed one restarts nothing.
+if [[ $refresh_daemon -eq 1 ]]; then
+  checker="${new_cli:-${installed_bin}}"
+  replaces_runtime=1
+  if [[ -n "${new_runtime:-}" && -x "${installed_runtime}" ]] && cmp -s "${new_runtime}" "${installed_runtime}"; then
+    replaces_runtime=0
+  fi
+  if [[ $replaces_runtime -eq 1 && -x "${checker}" ]]; then
+    if ! "${checker}" help maintenance >/dev/null 2>&1; then
+      hint "${checker} has no ${C_BOLD}weft maintenance${C_RESET}, so whether something is on cannot be checked; going ahead"
+    elif ! maintenance_check="$(env WEFT_REPO_ROOT="${here}" WEFT_INSTALL="${install_env}" "${checker}" maintenance check --update ./setup.sh 2>&1)"; then
+      fail "${maintenance_check#error: }"
+      exit 1
+    else
+      hint "${maintenance_check}"
+    fi
+  fi
+fi
+
 # Every check that can refuse this run without touching the install is
 # above; from here on it changes the install.
 install_touched=1

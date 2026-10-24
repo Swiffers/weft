@@ -67,6 +67,9 @@ pub static DISPATCHER_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     &crate::frontends::GROUP,
     // Hangs off `project` (its rows cascade with the project).
     &crate::activation_store::GROUP,
+    // Whether the install is in maintenance, and the infra copies it
+    // stopped (they cascade with their project).
+    &crate::maintenance::GROUP,
     // The version tree hangs off `project` (its foreign keys and the head
     // columns), so it comes after.
     &crate::versions::GROUP,
@@ -141,6 +144,7 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     crate::held::INFRA_STATUS_CHANNEL,
     crate::held::ACCESS_CHANNEL,
     crate::build::follow::BUILD_CLAIMED_CHANNEL,
+    crate::build::waiting::VERSION_BUILD_ENDED_CHANNEL,
     crate::task_kinds::resync::RESYNC_GIVEN_UP_CHANNEL,
 ];
 
@@ -324,6 +328,7 @@ pub fn task_registry() -> crate::task_executor::TaskRegistry {
         TaskKind::Resync => Arc::new(crate::task_kinds::ResyncExecutor),
         TaskKind::TakeDownWait => Arc::new(crate::task_kinds::TakeDownWaitExecutor),
         TaskKind::RemovalWait => Arc::new(crate::task_kinds::RemovalWaitExecutor),
+        TaskKind::MaintenanceLift => Arc::new(crate::task_kinds::MaintenanceLiftExecutor),
     })
 }
 

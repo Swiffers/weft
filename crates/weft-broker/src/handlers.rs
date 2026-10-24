@@ -14,7 +14,6 @@ use std::time::Duration;
 use axum::{
     extract::State,
     http::StatusCode,
-    Json,
 };
 use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL, ISSUED_WAKE};
 use weft_broker_client::protocol::*;
@@ -24,6 +23,7 @@ use weft_task_store::TaskKind;
 use crate::auth::{AuthedCaller, CallerIdentity, Role};
 use crate::scope;
 use crate::state::BrokerState;
+use weft_core::wire_shape::Json;
 
 type Resp<T> = Result<Json<T>, (StatusCode, String)>;
 
@@ -209,6 +209,13 @@ fn merge_anchor_tenant(
     }
 }
 
+/// The answer to a task whose payload does not read as its kind's: the
+/// payload is part of the call's body, so it is refused as a body of
+/// another shape is (`crate::wire`).
+fn unreadable_payload(state: &BrokerState, caller: &CallerIdentity, e: &serde_json::Error) -> (StatusCode, String) {
+    state.unreadable_shapes.refuse(crate::wire::Sender::of_caller(caller), "/v1/task/enqueue_dedup", e)
+}
+
 pub async fn task_enqueue_dedup(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
@@ -281,7 +288,7 @@ pub async fn task_enqueue_dedup(
         // tenant anchor, and the signal must be the wait of the run the
         // answer names.
         let fire: weft_task_store::kinds::FireSignalPayload = serde_json::from_value(req.spec.payload.clone())
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("malformed fire_signal payload: {e}")))?;
+            .map_err(|e| unreadable_payload(&state, &caller, &e))?;
         let t = scope::require_signal_owned_by(&state.scope_cache, &state.pool, &caller, &fire.token).await?;
         merge_anchor_tenant(&mut anchor_tenant, t)?;
         let wait: Option<(bool, Option<weft_core::RunId>)> = sqlx::query_as("SELECT is_resume, run_id FROM signal WHERE token = $1")
@@ -328,7 +335,9 @@ pub async fn task_enqueue_dedup(
             StatusCode::BAD_REQUEST,
             format!("a {kind} task names the run it is for (run_id)"),
         ))?;
-        if req.spec.payload.get("run_id").and_then(|v| v.as_str()) != Some(named.to_string().as_str()) {
+        let register: weft_task_store::RegisterSignalPayload = serde_json::from_value(req.spec.payload.clone())
+            .map_err(|e| unreadable_payload(&state, &caller, &e))?;
+        if register.run_id != named {
             return Err((
                 StatusCode::FORBIDDEN,
                 format!("a {kind} task's payload names the same run as the task"),
@@ -344,7 +353,7 @@ pub async fn task_enqueue_dedup(
             format!("a {kind} task names the run it is for (run_id)"),
         ))?;
         let withdraw: weft_task_store::WithdrawSignalPayload = serde_json::from_value(req.spec.payload.clone())
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("malformed {kind} payload: {e}")))?;
+            .map_err(|e| unreadable_payload(&state, &caller, &e))?;
         let signal: Option<(bool, Option<weft_core::RunId>)> =
             sqlx::query_as("SELECT is_resume, run_id FROM signal WHERE token = $1")
                 .bind(&withdraw.token)
@@ -380,7 +389,7 @@ pub async fn task_enqueue_dedup(
             ));
         }
         let payload: weft_core::program::ProgramCallPayload = serde_json::from_value(req.spec.payload.clone())
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("program_call payload: {e}")))?;
+            .map_err(|e| unreadable_payload(&state, &caller, &e))?;
         if payload.by != run_id {
             return Err((
                 StatusCode::FORBIDDEN,
@@ -487,15 +496,16 @@ async fn declared_infra_under(
     }
     // Read with its own digest, so what is kept is filed under the
     // definition actually parsed, even if it changed since `digest`.
-    let row: Option<(String, String)> =
-        sqlx::query_as("SELECT project_json, md5(project_json) FROM project WHERE id = $1")
+    let row: Option<(String, weft_core::stored::Version, String)> =
+        sqlx::query_as("SELECT project_json, project_json_version, md5(project_json) FROM project WHERE id = $1")
             .bind(project)
             .fetch_optional(&state.pool)
             .await
             .map_err(definition_unavailable)?;
-    let Some((project_json, digest)) = row else { return Ok(None) };
-    let definition: weft_core::project::ProjectDefinition = serde_json::from_str(&project_json)
-        .map_err(|e| internal(anyhow::anyhow!("project {project}: definition: {e}")))?;
+    let Some((project_json, version, digest)) = row else { return Ok(None) };
+    let definition = weft_core::project::ProjectDefinition::STORED
+        .decode(project_json.as_str(), version)
+        .map_err(|e| internal(e.at(format_args!("project {project}'s program"))))?;
     let declared = Arc::new(weft_core::project::DeclaredInfra::of(&definition));
     state.declared_infra.put((project, digest), declared.clone());
     Ok(Some(declared))
@@ -690,8 +700,8 @@ pub async fn project_fetch_definition(
     }
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT project_json FROM project_definition \
+    let row: Option<(String, weft_core::stored::Version)> = sqlx::query_as(
+        "SELECT project_json, project_json_version FROM project_definition \
          WHERE project_id = $1 AND definition_hash = $2",
     )
     .bind(req.project_id)
@@ -699,7 +709,7 @@ pub async fn project_fetch_definition(
     .fetch_optional(&state.pool)
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    let Some((project_json,)) = row else {
+    let Some((project_json, project_json_version)) = row else {
         return Err((
             StatusCode::NOT_FOUND,
             format!(
@@ -710,6 +720,7 @@ pub async fn project_fetch_definition(
     };
     Ok(Json(ProjectFetchDefinitionResponse {
         project_json,
+        project_json_version,
         definition_hash: req.expected_hash,
     }))
 }
@@ -1061,12 +1072,13 @@ pub async fn supervisor_infra_nodes(
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
     use sqlx::Row;
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         "SELECT node_id, instance_id, copy_id, status, applied_spec_hash, applied_at_unix, \
-                endpoints_json, install_endpoints_json, public_paths_json, doors_json, keep_disks_json, units_json, \
-                health_rules_json \
-         FROM infra_node WHERE project_id = $1 ORDER BY node_id, instance_id NULLS FIRST",
-    )
+                endpoints_json, install_endpoints_json, public_paths_json, doors_json, keep_disks_json, {} AS units, \
+                health_rules_json, health_rules_json_version \
+         FROM infra_node n WHERE project_id = $1 ORDER BY node_id, instance_id NULLS FIRST",
+        weft_broker_client::protocol::units_of_copy_sql("n"),
+    ))
     .bind(req.project_id)
     .fetch_all(&state.pool)
     .await
@@ -1126,19 +1138,15 @@ pub async fn supervisor_infra_nodes(
         let health_rules: Option<serde_json::Value> = r
             .try_get("health_rules_json")
             .map_err(|e| internal(anyhow::anyhow!("decode health_rules_json: {e}")))?;
+        let health_rules_version: weft_core::stored::Version = r
+            .try_get("health_rules_json_version")
+            .map_err(|e| internal(anyhow::anyhow!("decode health_rules_json_version: {e}")))?;
         let health_rules = health_rules
-            .map(serde_json::from_value)
+            .map(|rules| weft_core::infra::health::STORED_RULES.decode(rules, health_rules_version))
             .transpose()
-            .map_err(|e| internal(anyhow::anyhow!("infra_node.health_rules_json for node='{node_id}' does not decode: {e}")))?;
-        let units_json: serde_json::Value = r
-            .try_get("units_json")
-            .map_err(|e| internal(anyhow::anyhow!("decode units_json: {e}")))?;
-        let units = weft_broker_client::protocol::decode_units_json(
-            units_json,
-            req.project_id,
-            &node_id,
-        )
-        .map_err(internal)?;
+            .map_err(|e| internal(e.at(format_args!("infra node '{node_id}'"))))?;
+        let units = r.try_get("units").map_err(|e| internal(anyhow::anyhow!("decode units: {e}")))?;
+        let units = weft_broker_client::protocol::decode_units(units, req.project_id, &node_id).map_err(internal)?;
         nodes.push(SupervisorInfraNode {
             node_id,
             instance,
@@ -1370,7 +1378,7 @@ async fn write_apply_row(
     copy_id: &str,
     keep_disks: &[String],
     health_rules: Option<&[weft_core::infra::health::HealthRule]>,
-    units_json: serde_json::Value,
+    units: &std::collections::BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     command_id: i64,
     owner: &str,
     row: ApplyRowState,
@@ -1394,12 +1402,14 @@ async fn write_apply_row(
     // terminate never finished, which this apply finished and replaces:
     // what it saved for its baked outputs is the dead copy's, so it goes
     // (a bake only writes the outputs its setup sent on, over what is
-    // there).
+    // there). The copy's units are written in the same transaction, once
+    // the row is ([`crate::lifecycle_writes::write_units`]).
+    let mut tx = state.pool.begin().await.map_err(|e| internal(anyhow::anyhow!("{e}")))?;
     let res = sqlx::query(
         &format!("INSERT INTO infra_node \
          (project_id, node_id, instance_id, copy_id, status, \
           failure_stage, failure_message, applied_spec_hash, \
-          applied_at_unix, endpoints_json, public_paths_json, doors_json, keep_disks_json, units_json, \
+          applied_at_unix, endpoints_json, public_paths_json, doors_json, keep_disks_json, health_rules_json_version, \
           install_endpoints_json, notes_json, waiting_on, provisioning_since_unix, health_rules_json) \
          SELECT $1, $2, $13, $3, $4, NULL, NULL, $5, \
                 CASE WHEN $6 THEN EXTRACT(EPOCH FROM NOW())::BIGINT ELSE NULL END, \
@@ -1428,8 +1438,8 @@ async fn write_apply_row(
             install_endpoints_json = EXCLUDED.install_endpoints_json, \
             notes_json         = EXCLUDED.notes_json, \
             keep_disks_json = EXCLUDED.keep_disks_json, \
-            units_json         = EXCLUDED.units_json, \
             health_rules_json  = EXCLUDED.health_rules_json, \
+            health_rules_json_version = EXCLUDED.health_rules_json_version, \
             waiting_on         = NULL, \
             provisioning_since_unix = EXCLUDED.provisioning_since_unix",
         owns = weft_broker_client::lifecycle_command::owns_project_predicate("$11", "$1"),
@@ -1443,7 +1453,7 @@ async fn write_apply_row(
     .bind(row.stamp_applied_at)
     .bind(endpoints_json)
     .bind(keep_disks_json)
-    .bind(units_json)
+    .bind(weft_core::infra::health::STORED_RULES.version())
     .bind(command_id)
     .bind(owner)
     .bind(public_paths_json)
@@ -1452,15 +1462,19 @@ async fn write_apply_row(
     .bind(install_endpoints_json)
     .bind(notes_json)
     .bind(health_rules_json)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
     if res.rows_affected() == 0 {
+        drop(tx);
         let outcome = crate::lifecycle_writes::stale_answer(&state.pool, owner, project_id)
             .await
             .map_err(internal)?;
         fenced_to_http(outcome, || format!("{op}(command id={command_id})"))?;
+        return Ok(());
     }
+    crate::lifecycle_writes::write_units(&mut tx, project_id, node_id, instance, units).await.map_err(internal)?;
+    tx.commit().await.map_err(|e| internal(anyhow::anyhow!("{e}")))?;
     Ok(())
 }
 
@@ -1473,8 +1487,6 @@ pub async fn supervisor_set_applied(
     require_node_id(&mut req.node_id)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let units_json = serde_json::to_value(&req.units)
-        .map_err(|e| internal(anyhow::anyhow!("units serialize: {e}")))?;
     write_apply_row(
         &state,
         "set_applied",
@@ -1484,7 +1496,7 @@ pub async fn supervisor_set_applied(
         &req.copy_id,
         &req.keep_disks,
         req.health_rules.as_deref(),
-        units_json,
+        &req.units,
         req.command_id,
         &req.replica,
         ApplyRowState {
@@ -1522,8 +1534,6 @@ pub async fn supervisor_set_provisioning(
     require_node_id(&mut req.node_id)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let units_json = serde_json::to_value(&req.units)
-        .map_err(|e| internal(anyhow::anyhow!("units serialize: {e}")))?;
     write_apply_row(
         &state,
         "set_provisioning",
@@ -1533,7 +1543,7 @@ pub async fn supervisor_set_provisioning(
         &req.copy_id,
         &req.keep_disks,
         req.health_rules.as_deref(),
-        units_json,
+        &req.units,
         req.command_id,
         &req.replica,
         ApplyRowState {
@@ -2190,16 +2200,15 @@ pub async fn signal_set_holds(
 /// every claim it holds is freed for the others. Mounted behind the guard
 /// that lets only weft itself in (the alarm calls with the core account).
 /// Answered 200 once handled, whatever was freed, so the alarm does not
-/// call again; a body that never reads is dropped the same way. A
-/// database that fails answers 500, and the alarm tries again.
-pub async fn held_check(State(state): State<Arc<BrokerState>>, body: axum::body::Bytes) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let call: weft_platform_traits::WakeCall<weft_platform_traits::HeldCheck> = match serde_json::from_slice(&body) {
-        Ok(call) => call,
-        Err(e) => {
-            tracing::error!(target: "weft_broker::held", error = %e, "a holder's check does not read; dropped");
-            return Ok(Json(serde_json::json!({ "dropped": true })));
-        }
-    };
+/// call again. A check in a shape this broker does not read (queued by
+/// the weft before an update) is answered as every call of another shape is,
+/// which the alarm takes as a call that can never be taken
+/// (`weft_platform_traits::alarm::WakeRefusal::of_status`). A database
+/// that fails answers 500, and the alarm tries again.
+pub async fn held_check(
+    State(state): State<Arc<BrokerState>>,
+    Json(call): Json<weft_platform_traits::WakeCall<weft_platform_traits::HeldCheck>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let check = call.body;
     let freed = crate::held_signals::release(&state.pool, &check.replica).await.map_err(unavailable_or_internal)?;
     if freed > 0 {

@@ -9,6 +9,7 @@ mod caller_auth;
 mod door_let_go;
 mod held_signals;
 mod lifecycle_writes;
+mod old_shapes;
 mod program_tokens;
 mod record_batch;
 mod runtime_store;

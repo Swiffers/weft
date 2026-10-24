@@ -43,12 +43,12 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::{Json, Router};
-use serde::Deserialize;
+use axum::Router;
+use serde::{Deserialize, Deserializer};
 
 use weft_core::storage::key::{self, CallerAuth};
 use weft_core::storage::slot::{
@@ -67,6 +67,7 @@ use weft_platform_traits::PresignAudience;
 use crate::auth::control_plane;
 use crate::runtime_store::RuntimeStoreError;
 use crate::state::BrokerState;
+use weft_core::wire_shape::{Json, Query};
 
 /// The run claim a worker stamps on every storage call, so the broker scopes
 /// the op to that run. (The file's scope / mime / filename / keep travel
@@ -501,8 +502,15 @@ async fn delete_file(
 
 #[derive(Deserialize)]
 struct ScopeQuery {
-    /// JSON-encoded `StorageScope`.
-    scope: String,
+    /// Sent JSON-encoded (`weft_engine::storage`'s list), read as part of
+    /// the query: a scope of another shape is a query of another shape.
+    #[serde(deserialize_with = "json_encoded")]
+    scope: StorageScope,
+}
+
+/// A query value that carries JSON, read as the `T` it encodes.
+fn json_encoded<'de, D: Deserializer<'de>, T: serde::de::DeserializeOwned>(d: D) -> Result<T, D::Error> {
+    serde_json::from_str(&String::deserialize(d)?).map_err(serde::de::Error::custom)
 }
 
 
@@ -513,9 +521,7 @@ async fn list_files(
 ) -> Result<Json<ListFilesResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
     let store = &state.runtime_store;
-    let scope: StorageScope = serde_json::from_str(&q.scope)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad scope: {e}")))?;
-    let prefix = key::prefix_for_list(&caller, &scope).map_err(|e| (StatusCode::FORBIDDEN, e))?;
+    let prefix = key::prefix_for_list(&caller, &q.scope).map_err(|e| (StatusCode::FORBIDDEN, e))?;
     let files = store.list(&prefix).await.map_err(map_anyhow)?;
     Ok(Json(ListFilesResponse { files }))
 }
@@ -1403,5 +1409,45 @@ mod link_route_tests {
     fn a_slot_with_no_upload_says_so() {
         let super::ApiError { status, message, .. } = map_err(RuntimeStoreError::NoUpload("nothing was uploaded".into()));
         assert_eq!((status, message.as_str()), (StatusCode::NOT_FOUND, "nothing was uploaded"));
+    }
+}
+
+#[cfg(test)]
+mod scope_query_tests {
+    use axum::extract::FromRequestParts;
+    use weft_core::wire_shape::AnswersUnreadable;
+
+    use super::{HeaderMap, IntoResponse, Query, Response, ScopeQuery, StatusCode, StorageScope};
+
+    /// Answers what does not read the way the broker does, without the
+    /// identity check.
+    struct Refuses;
+
+    impl AnswersUnreadable for Refuses {
+        type Caller = ();
+
+        async fn caller(&self, _: &HeaderMap) -> Result<(), Response> {
+            Ok(())
+        }
+
+        fn other_shape(&self, (): (), path: &str, why: &str) -> Response {
+            (weft_core::wire_shape::UNREADABLE_SHAPE, weft_core::wire_shape::unreadable_shape(&format!("{path}: {why}"))).into_response()
+        }
+    }
+
+    async fn scope(query: &str) -> Result<StorageScope, StatusCode> {
+        let (mut parts, ()) = axum::http::Request::get(format!("/v1/storage/list?{query}")).body(()).unwrap().into_parts();
+        Query::<ScopeQuery>::from_request_parts(&mut parts, &Refuses).await.map(|Query(q)| q.scope).map_err(|answer| answer.status())
+    }
+
+    /// The scope travels JSON-encoded in the query; one of another shape
+    /// (or none) is a query of another shape, answered as every call the
+    /// broker cannot read is.
+    #[tokio::test]
+    async fn a_scope_of_another_shape_is_answered_as_a_call_the_broker_cannot_read() {
+        assert_eq!(scope("scope=%7B%22kind%22%3A%22project%22%7D").await, Ok(StorageScope::Project));
+        assert_eq!(scope("scope=%22project%22").await, Err(StatusCode::UPGRADE_REQUIRED));
+        assert_eq!(scope("scope=%7B").await, Err(StatusCode::UPGRADE_REQUIRED));
+        assert_eq!(scope("other=1").await, Err(StatusCode::UPGRADE_REQUIRED));
     }
 }

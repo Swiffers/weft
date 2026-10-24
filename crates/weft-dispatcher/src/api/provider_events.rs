@@ -58,15 +58,11 @@ pub async fn receive_event(
         return (StatusCode::NOT_FOUND, "unknown event source").into_response();
     }
 
-    let header_map: BTreeMap<String, String> = headers
-        .iter()
-        .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
-        .collect();
     let verify = EventVerifyRequest {
         service: service.clone(),
         topic: topic.clone(),
         body_b64: base64::engine::general_purpose::STANDARD.encode(&body),
-        headers: header_map,
+        headers: weft_core::net::request_headers(&headers),
         query,
         // The route is POST-mounted (address-proving handshakes POST
         // too); schemes that sign the method cover this literal.

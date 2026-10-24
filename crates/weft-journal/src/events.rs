@@ -1224,7 +1224,7 @@ mod wire_tests {
         let old_scope = json!({ "kind": "scope_launched", "run_id": run_id(), "group_id": "g", "frames": [], "roots": [], "at_unix": 1 });
         assert!(serde_json::from_value::<RunEvent>(old_scope).is_err(), "boundaries are never journaled");
         let row = zstd::bulk::compress(format!("[{}]", old_started_text()).as_bytes(), 1).unwrap();
-        let err = crate::stored::decode(run_id(), &row).unwrap_err();
+        let err = crate::stored::decode(run_id(), &row, crate::stored::STORED_EVENTS.version()).unwrap_err();
         assert!(err.contains("weft clean"), "{err}");
     }
 
@@ -1499,8 +1499,9 @@ mod wire_tests {
 
     /// The fields that are legitimately `None` are still always
     /// written: a cancel's structured cause and a log line's clock and
-    /// sequence. A row lacking one is a truncated row, and a row
-    /// written before the field existed is an old row; neither decodes.
+    /// sequence. A row lacking one is a truncated row, and does not
+    /// decode. (A row an older weft wrote is carried to today's shape at
+    /// boot, `weft_runtime::schema::documents`, before anything reads it.)
     #[test]
     fn present_optional_fields_are_required_on_the_row() {
         let cancelled = round_trip(RunEvent::RunCancelled { run_id: run_id(), reason: "r".into(), cause: None, at_unix: 1 });

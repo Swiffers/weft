@@ -4890,6 +4890,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "base64",
  "bytes",
  "chrono",
@@ -5246,11 +5247,13 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "weft-access-store",
  "weft-broker",
  "weft-broker-client",
  "weft-core",
  "weft-dispatcher",
  "weft-infra-supervisor",
+ "weft-journal",
  "weft-listener",
  "weft-platform-gcp",
  "weft-platform-local",
@@ -5283,6 +5286,7 @@ dependencies = [
  "weft-platform-traits",
  "weft-task-store",
  "weft-workspace-hack",
+ "zstd",
 ]
 
 [[package]]

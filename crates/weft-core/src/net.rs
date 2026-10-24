@@ -242,6 +242,17 @@ pub fn caller_address(forwarded_for: Option<&str>, peer: std::net::IpAddr, trust
     chain[index]
 }
 
+/// Every text header a request carries, a repeated one once per value in
+/// the order sent: what a verify scheme checks (it reads every copy of a
+/// signature header) and what a run reads as the request it was opened
+/// by.
+pub fn request_headers(headers: &http::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| Some((name.as_str().to_string(), value.to_str().ok()?.to_string())))
+        .collect()
+}
+
 /// A call that sends no body, saying so with `Content-Length: 0`.
 ///
 /// Sent with no body at all, a POST goes out over HTTP/1.1 with no length,

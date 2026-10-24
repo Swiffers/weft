@@ -12,8 +12,9 @@
 
 use std::path::Path;
 
-/// The id of an included file's body: its path from the project root,
-/// extension dropped, folders joined with `:`, behind a leading `@`
+/// The id of an included file's body: its path from the project root
+/// (`from_root`, as [`crate::PlacedFile`] carries it), extension
+/// dropped, folders joined with `:`, behind a leading `@`
 /// (`lib/clean.weft` is `@lib:clean`). No program can spell `@` or `:`
 /// in a name, so the id clashes with nothing a person writes, and two
 /// files with one name in two folders are two bodies. The id holds no
@@ -22,11 +23,12 @@ use std::path::Path;
 /// path becomes `_`; two paths that land on one id are refused by the
 /// compiler. It is internal: every surface that talks to a person names
 /// the file's nodes through the site that calls them (`one.strip`),
-/// never through this. A file outside the root keeps its name alone
-/// (`@clean`).
-pub fn body_id(root: &Path, file: &Path) -> String {
-    let relative = file.strip_prefix(root).unwrap_or_else(|_| Path::new(file.file_name().unwrap_or_default()));
-    let mut parts: Vec<String> = relative.components()
+/// never through this. It is built from the path from the root alone,
+/// never by cutting an absolute path against a root, so two compiles
+/// that spell the root differently (a symlinked temp dir) give a file
+/// the same id.
+pub fn body_id(from_root: &Path) -> String {
+    let mut parts: Vec<String> = from_root.components()
         .filter_map(|c| match c { std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()), _ => None })
         .collect();
     if let Some(last) = parts.last_mut() {
@@ -66,22 +68,32 @@ pub fn display_name(group_id: &str) -> String {
 /// file sits in a project (the compiler gives an `@include` of it the
 /// same id, so the editor's standalone view of the file and the journal
 /// rows agree), else the filename-derived id. `None` for the project's
-/// ENTRY file, which has no anonymous root: an anonymous group is a
-/// file other files include, and the build compiles the entry with no
-/// source name for the same reason, so the editor's parse of it and
-/// the build refuse the same source.
-pub fn file_id(root: Option<&Path>, file: Option<&Path>) -> Option<String> {
-    match (root, file) {
-        (Some(root), Some(file)) => {
-            let entry = root.join(crate::project::SRC_DIR).join(crate::project::ENTRY_FILE);
-            let is_entry = match (file.canonicalize(), entry.canonicalize()) {
-                (Ok(a), Ok(b)) => a == b,
-                _ => file == entry,
-            };
-            (!is_entry).then(|| body_id(root, file))
-        }
-        _ => Some(derive_id(file)),
-    }
+/// ENTRY file ([`is_entry`]), which has no anonymous root: an anonymous
+/// group is a file other files include, and the build compiles the
+/// entry with no source name for the same reason, so the editor's parse
+/// of it and the build refuse the same source.
+///
+/// The file is placed in the project the way a read of it is
+/// ([`crate::DiskFileReader::from_root`]), so a root reached through a
+/// symlink names its files, saved or not, in a folder that exists or
+/// not, as the real folder does. A file outside the project is no body:
+/// it is named after itself, the way a file with no project is. An
+/// `Err` when the root cannot be resolved, or something on the way to
+/// the file refuses to be looked at.
+pub fn file_id(root: Option<&Path>, file: Option<&Path>) -> Result<Option<String>, String> {
+    let (Some(root), Some(file)) = (root, file) else { return Ok(Some(derive_id(file))) };
+    Ok(match crate::DiskFileReader::from_root(root, file)? {
+        Some(from_root) if is_entry(&from_root) => None,
+        Some(from_root) => Some(body_id(&from_root)),
+        None => Some(derive_id(Some(file))),
+    })
+}
+
+/// Whether the file at `from_root` (its path from the project root) is
+/// the project's entry file, `src/main.weft`: the one file the build
+/// compiles with no source name, whose nodes are keyed bare.
+pub fn is_entry(from_root: &Path) -> bool {
+    from_root == Path::new(crate::project::SRC_DIR).join(crate::project::ENTRY_FILE)
 }
 
 /// A file's anonymous-root group id, derived from the filename's stem in
@@ -144,23 +156,59 @@ mod tests {
 
     #[test]
     fn a_body_id_is_the_path_from_the_root_and_unspellable() {
-        let root = PathBuf::from("/p");
-        assert_eq!(body_id(&root, &root.join("src/lib/clean.weft")), "@src:lib:clean");
-        assert_eq!(body_id(&root, &root.join("clean.weft")), "@clean");
+        assert_eq!(body_id(Path::new("src/lib/clean.weft")), "@src:lib:clean");
+        assert_eq!(body_id(Path::new("clean.weft")), "@clean");
         // A file a program reaches through `__catalog/` sits under `nodes/`.
-        assert_eq!(body_id(&root, &root.join("nodes/base_catalog/computer/agent.weft")), "@nodes:base_catalog:computer:agent");
-        assert_eq!(body_id(&root, &PathBuf::from("/elsewhere/clean.weft")), "@clean");
+        assert_eq!(body_id(Path::new("nodes/base_catalog/computer/agent.weft")), "@nodes:base_catalog:computer:agent");
         // Neither a dot nor a boundary marker survives into the id.
-        assert_eq!(body_id(&root, &root.join("src/v1.2/clean.gen.weft")), "@src:v1_2:clean_gen");
-        assert_eq!(body_id(&root, &root.join("a__in.weft")), "@a_in");
-        assert_eq!(body_id(&root, &root.join("a---in.weft")), "@a_in");
+        assert_eq!(body_id(Path::new("src/v1.2/clean.gen.weft")), "@src:v1_2:clean_gen");
+        assert_eq!(body_id(Path::new("a__in.weft")), "@a_in");
+        assert_eq!(body_id(Path::new("a---in.weft")), "@a_in");
         assert!(!weft_core::is_rust_identifier("@src:lib:clean"));
-        assert_eq!(file_id(None, Some(&PathBuf::from("my-cleaner.weft"))).as_deref(), Some("MyCleaner"));
-        // Inside a project, an included file is parsed under its body
-        // id; the entry file under none, because it has no anonymous
-        // root to name (the compiler refuses one there).
-        assert_eq!(file_id(Some(&root), Some(&root.join("src/lib/clean.weft"))).as_deref(), Some("@src:lib:clean"));
-        assert_eq!(file_id(Some(&root), Some(&root.join("src/main.weft"))), None);
+    }
+
+    /// Inside a project, an included file is parsed under its body id;
+    /// the entry file under none, because it has no anonymous root to
+    /// name (the compiler refuses one there); a file outside the project
+    /// is named after itself.
+    #[test]
+    fn a_file_is_parsed_under_its_body_id_inside_a_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join("src/lib")).unwrap();
+        std::fs::write(root.join("src/lib/clean.weft"), "Group() {}").unwrap();
+        std::fs::write(root.join("src/main.weft"), "").unwrap();
+        assert_eq!(file_id(None, Some(&PathBuf::from("my-cleaner.weft"))).unwrap().as_deref(), Some("MyCleaner"));
+        assert_eq!(file_id(Some(&root), Some(&root.join("src/lib/clean.weft"))).unwrap().as_deref(), Some("@src:lib:clean"));
+        assert_eq!(file_id(Some(&root), Some(&root.join("src/main.weft"))).unwrap(), None);
+        assert_eq!(file_id(Some(&root), Some(&dir.path().join("my-cleaner.weft"))).unwrap().as_deref(), Some("MyCleaner"));
+    }
+
+    /// A buffer never saved, in a project opened through a symlink
+    /// (macOS's `/var`), takes the id a saved one there would: its folder
+    /// is resolved the way the root is, whichever spelling each side has.
+    #[cfg(unix)]
+    #[test]
+    fn an_unsaved_buffer_in_a_symlinked_root_is_named_from_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("src/lib")).unwrap();
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        for (root, folder) in [(&real, &linked), (&linked, &real), (&linked, &linked)] {
+            let unsaved = folder.join("src/lib/draft.weft");
+            assert_eq!(file_id(Some(root), Some(&unsaved)).unwrap().as_deref(), Some("@src:lib:draft"), "{root:?} {unsaved:?}");
+            assert_eq!(file_id(Some(root), Some(&folder.join("src/main.weft"))).unwrap(), None, "an unsaved entry file is the entry");
+        }
+        // A folder that does not exist yet is placed under the deepest one
+        // that does, through either spelling of the root.
+        for (root, folder) in [(&real, &linked), (&linked, &real), (&linked, &linked)] {
+            let unsaved = folder.join("src/new/deeper/draft.weft");
+            assert_eq!(file_id(Some(root), Some(&unsaved)).unwrap().as_deref(), Some("@src:new:deeper:draft"), "{root:?} {unsaved:?}");
+        }
+        // One outside the project is named after itself.
+        let outside = dir.path().join("elsewhere/new/my-draft.weft");
+        assert_eq!(file_id(Some(&linked), Some(&outside)).unwrap().as_deref(), Some("MyDraft"));
     }
     /// A body id is a path, so it reads as the file; a nested group
     /// reads as its own segment; a plain name is already one.

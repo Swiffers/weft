@@ -107,6 +107,10 @@ async fn events_are_addressed_through_the_site() -> anyhow::Result<()> {
     anyhow::ensure!(strips == ["one.strip", "outer.call.strip", "two.strip"].into_iter().collect(), "{strips:?}");
     let refused = project.weft_refused(&["events", &run_id.to_string(), "--node", "@src:lib:clean.strip"]).await?;
     anyhow::ensure!(refused.contains("inside an included file"), "{refused}");
+    // The runs listing finds the run by the same name, through the site.
+    let through: Value = serde_json::from_str(project.weft(&["runs", "--through", "two.strip", "--json"]).await?.trim())?;
+    let found = through["runs"].as_array().is_some_and(|runs| runs.iter().any(|r| r["runId"] == json!(run_id.to_string())));
+    anyhow::ensure!(found, "{through}");
     project.finish().await
 }
 

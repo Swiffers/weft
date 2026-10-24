@@ -39,7 +39,7 @@
       "accepts": [
         "wire"
       ],
-      "description": "Auth access node (ApiKeyAuth, JwtAuth, HmacAuth), checked on the opening request. Unwired, anyone with the URL may connect. The identity comes out on `caller`."
+      "description": "Auth access node (ApiKeyAuth, HmacAuth, or one of your own), checked on the opening request. Unwired, anyone with the URL may connect. The identity comes out on `caller`."
     },
     {
       "name": "maxSessionSecs",

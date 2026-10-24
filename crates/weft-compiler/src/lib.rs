@@ -91,7 +91,7 @@ pub mod error;
 use uuid::Uuid;
 use weft_core::{MetadataCatalog, ProjectDefinition};
 
-pub use file_reader::{CompileFs, DiskFileReader, FileReader, MapFileReader, ResolvedFile, SpelledPath};
+pub use file_reader::{CompileFs, DiskFileReader, FileReader, MapFileReader, PlacedFile, ResolvedFile};
 
 // Re-export weft_core's Diagnostic/Severity so downstream callers
 // keep using weft_compiler::Diagnostic without touching node impls.
@@ -278,7 +278,7 @@ pub fn compile_program(
     // A broken part names its file from the project root: the install
     // compiles in a directory of its own, whose path means nothing to
     // whoever reads the refusal.
-    let root = fs.root.and_then(|root| fs.reader.identity(root).ok());
+    let root = root_identity(&fs)?;
     catalog.type_registry().scoped(|| {
         let (mut project, parse_errors) =
             weft_compiler::compile_lenient(source, project_id, fs, weft_compiler::IncludeMode::Full, None);
@@ -297,18 +297,42 @@ pub fn compile_program(
     })
 }
 
+/// The project root as `fs`'s reader names it, the identity every file
+/// a compile through `fs` reads is held to ([`file_reader::path_from_root`]).
+/// `None` when compiling outside any project; a root the reader cannot
+/// resolve is a whole-program error.
+fn root_identity(fs: &CompileFs) -> Result<Option<std::path::PathBuf>, Vec<Diagnostic>> {
+    fs.root
+        .map(|root| fs.reader.identity(root))
+        .transpose()
+        .map_err(|why| vec![Diagnostic::at(Default::default(), Severity::Error, "project-root", why)])
+}
+
 /// The errors `project` has that it does not already carry as broken
 /// parts: none for a program [`compile_program`] settled, as long as
 /// nothing changed it in a way that breaks something new. The build's own
 /// gate, so a definition changed after its check can never build with an
-/// error nobody recorded. `root` is the project's, which
-/// [`compile_program`] spelled the files of broken parts from.
-pub fn unsettled(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, root: Option<&std::path::Path>) -> Vec<Diagnostic> {
+/// error nobody recorded. `fs` is the view of the project it was compiled
+/// through ([`compile_program`]'s), whose root the files of broken parts
+/// are spelled from, however this caller spells that root.
+pub fn unsettled(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, fs: CompileFs) -> Vec<Diagnostic> {
+    let root = match root_identity(&fs) {
+        Ok(root) => root,
+        Err(diagnostics) => return diagnostics,
+    };
     let hiding = hiding_nodes(project, catalog);
     validate::validate_with_mode(project, catalog, validate::ValidationMode::Structural)
         .into_iter()
         .filter(|d| matches!(d.severity, Severity::Error))
-        .filter(|d| d.subjects.is_empty() || !project.broken.contains(&broken_part(d, root, &hiding)))
+        .filter_map(|d| {
+            if d.subjects.is_empty() {
+                return Some(d);
+            }
+            match broken_part(&d, root.as_deref(), &hiding) {
+                Ok(part) => (!project.broken.contains(&part)).then_some(d),
+                Err(unplaced) => Some(unplaced),
+            }
+        })
         .collect()
 }
 
@@ -318,15 +342,26 @@ pub fn unsettled(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, roo
 fn settle(
     project: &mut ProjectDefinition,
     catalog: &dyn MetadataCatalog,
-    diagnostics: Vec<Diagnostic>,
+    mut diagnostics: Vec<Diagnostic>,
     root: Option<&std::path::Path>,
 ) -> Result<(), Vec<Diagnostic>> {
     if diagnostics.iter().any(is_whole_program_error) {
         return Err(diagnostics);
     }
     let hiding = hiding_nodes(project, catalog);
+    let mut parts = Vec::new();
+    let mut unplaced = Vec::new();
     for d in diagnostics.iter().filter(|d| matches!(d.severity, Severity::Error)) {
-        let part = broken_part(d, root, &hiding);
+        match broken_part(d, root, &hiding) {
+            Ok(part) => parts.push(part),
+            Err(why) => unplaced.push(why),
+        }
+    }
+    if !unplaced.is_empty() {
+        diagnostics.extend(unplaced);
+        return Err(diagnostics);
+    }
+    for part in parts {
         if !project.broken.contains(&part) {
             project.broken.push(part);
         }
@@ -356,26 +391,44 @@ fn hiding_nodes(project: &ProjectDefinition, catalog: &dyn MetadataCatalog) -> s
 }
 
 /// The broken part an error with subjects is: its parts, the error as one
-/// rendered line, its file spelled from `root` (a finding in the entry
-/// file names none, and reads as `src/main.weft`'s), and whether one of
-/// its parts is among the `hiding` nodes ([`hiding_nodes`]).
+/// rendered line, its file's path from the project root (a finding in the
+/// entry file names none, and reads as `src/main.weft`'s), and whether one
+/// of its parts is among the `hiding` nodes ([`hiding_nodes`]).
+///
+/// `root` is the root's identity, the one the reader held every file it
+/// read to, so a finding's file (the identity its read gave) is always
+/// inside it. One that is not was stamped by something other than a
+/// read, and is refused as the compiler bug it is (the `Err`, a
+/// whole-program error), never named by its absolute path: that would
+/// differ between two compiles of one program and read as a new error.
 fn broken_part(
     d: &Diagnostic,
     root: Option<&std::path::Path>,
     hiding: &std::collections::BTreeSet<String>,
-) -> weft_core::project::Broken {
+) -> Result<weft_core::project::Broken, Diagnostic> {
     let file = match d.file.as_deref() {
         Some(file) => root
-            .and_then(|root| std::path::Path::new(file).strip_prefix(root).ok())
-            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|| file.to_string()),
+            .and_then(|root| file_reader::path_from_root(root, std::path::Path::new(file)))
+            .map(|rel| file_reader::slashed(&rel))
+            .ok_or_else(|| {
+                Diagnostic::at(
+                    Default::default(),
+                    Severity::Error,
+                    "unplaced-finding",
+                    format!(
+                        "a finding names {file}, which is not a file of the project at {}; this is a bug in weft ({})",
+                        root.map_or("<no project>".to_string(), |root| root.display().to_string()),
+                        render_diagnostic(d)
+                    ),
+                )
+            })?,
         None => format!("{}/{}", project::SRC_DIR, project::ENTRY_FILE),
     };
-    weft_core::project::Broken {
+    Ok(weft_core::project::Broken {
         parts: d.subjects.clone(),
         why: format!("{file}:{}:{} {}", d.line, d.column, d.message),
         hides: d.subjects.iter().any(|part| hiding.contains(part)),
-    }
+    })
 }
 
 /// Render a diagnostic list as one `line:column message` per line.

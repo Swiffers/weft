@@ -519,13 +519,13 @@ with numbers measured then.
 **Problem.** Node bodies are compiled Rust, but the wiring between them
 is interpreted at run time, the way Python is. The program is a data
 structure (`ProjectDefinition`), and the execution loop
-(`crates/weft-engine/src/execution_driver.rs`) walks it:
+(`crates/weft-engine/src/run_driver.rs`) walks it:
 
 ```
 TODAY: node bodies are compiled Rust, the wiring is interpreted
 ───────────────────────────────────────────────────────────────────────
 loop:  scan every node of the program ─► "who has all its inputs?"
-       (weft_core::exec::ready::find_ready_nodes)
+       (weft_core::run::ready::find_ready_nodes)
        └► for each ready node: build a context, start a task for it,
           wait for its message back, file its outputs in a table keyed
           by node and port NAMES (text), write its records ─► scan again
@@ -588,8 +588,8 @@ measure again (`bench/README.md` has the worker-side profile).
 levels with numbers measured then, and before choosing the second, list
 what it needs feature by feature.
 
-[Update Notice Warning] If we touch `crates/weft-engine/src/execution_driver.rs`'s
-dispatch loop or `weft_core::exec::ready`, revisit this entry.
+[Update Notice Warning] If we touch `crates/weft-engine/src/run_driver.rs`'s
+dispatch loop or `weft_core::run::ready`, revisit this entry.
 
 ## "At once" is a share per copy, never the project's true count
 

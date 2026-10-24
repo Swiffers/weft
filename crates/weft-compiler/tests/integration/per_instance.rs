@@ -155,7 +155,7 @@ d.data = slack.access
     for id in ["shared", "d"] {
         assert!(node(id).instance_service.is_none() && node(id).instance_rules.is_none(), "{id}");
     }
-    let places: Vec<String> = weft_core::project::instance_filled_places(&project).into_iter().map(|(place, _)| place).collect();
+    let places: Vec<String> = weft_core::project::instance_filled_places(&project).into_iter().map(|filled| filled.spelled).collect();
     assert_eq!(places, vec!["slack".to_string()]);
 }
 

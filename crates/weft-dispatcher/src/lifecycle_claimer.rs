@@ -584,9 +584,10 @@ async fn run_reactivate(
         .filter(|row| matches!(row.status, crate::infra_node::InfraNodeStatus::Running | crate::infra_node::InfraNodeStatus::Flaky))
         .map(|row| weft_broker_client::protocol::InfraCopy { node_id: row.node_id.clone(), instance: row.instance.clone() })
         .collect();
+    let declared = weft_core::project::DeclaredInfra::of(&project);
     let targets = health_restore_targets(
         &project,
-        |place| crate::api::infra::is_per_instance_place(&project, place),
+        |place| declared.per_instance(place) == Some(true),
         &state.activations.list(project_id).await?,
         &restore.still_broken,
         |copy| up.contains(copy),
@@ -602,9 +603,15 @@ async fn run_reactivate(
             scope: weft_core::activation::ActivationScope::of_owner(triggers, &owner),
             ..Default::default()
         };
-        let activated = crate::api::project::activate_with(state, project_id, request, crate::api::project::ActivateAsker::InfraBack)
-            .await
-            .map_err(<(axum::http::StatusCode, String)>::from);
+        let activated = match crate::api::project::activate_with(state, project_id, request, crate::api::project::ActivateAsker::InfraBack).await {
+            // The install is in maintenance: nothing comes back until it is
+            // lifted, and what the health check took down is not the lift's
+            // to bring back.
+            Err(crate::api::project::ActivateError::Refused(crate::activation_store::ClaimRefused::Maintenance)) => {
+                return Ok(RunOutcome::Cancelled(weft_core::maintenance::IN_MAINTENANCE.to_string()));
+            }
+            activated => activated.map_err(<(axum::http::StatusCode, String)>::from),
+        };
         match activated {
             Ok(_) => {}
             Err((axum::http::StatusCode::NOT_FOUND, _)) => {

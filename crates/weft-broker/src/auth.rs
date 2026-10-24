@@ -155,7 +155,7 @@ impl IdentityCache {
 ///   - missing / empty bearer  -> 401
 ///   - refused by the platform -> 401 (the reason is logged, not sent)
 ///   - the check could not run -> 503
-pub async fn verified_principal(state: &Arc<BrokerState>, headers: &HeaderMap) -> Result<Principal, (StatusCode, String)> {
+pub async fn verified_principal(state: &BrokerState, headers: &HeaderMap) -> Result<Principal, (StatusCode, String)> {
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())

@@ -1,6 +1,6 @@
 //! Postgres-backed task queue shared by the dispatcher, the broker and the
 //! engine. Both sides go through the same SQL
-//! helpers; the boot applies the schema via `schema_guard::apply_groups`
+//! helpers; the boot applies the schema via `schema_guard::apply_schema`
 //! over each module's `GROUP`.
 //!
 //! Modules:
@@ -28,10 +28,13 @@
 //!     `SchemaGroup`s through. It builds a new database from the canonical
 //!     `CREATE TABLE` text and carries an existing one forward with the
 //!     group's migration files.
+//!   - `documents`: the same for the JSON a column holds: the rows an
+//!     older weft wrote, carried to the shape the code reads today.
 
 pub mod alarm;
 pub mod announce;
 pub mod db;
+pub mod documents;
 pub mod drain;
 pub mod executor;
 pub mod held_copy;
@@ -49,10 +52,11 @@ pub mod traits;
 pub mod unanswered;
 pub mod worker_door;
 
-pub use schema_guard::{apply_groups, Migration, SchemaGroup};
+pub use documents::{apply_documents, Document};
+pub use schema_guard::{apply_groups, apply_schema, DataStep, Migration, Part, SchemaGroup, Until};
 
 pub use executor::{dispatcher_picker_loop, TaskExecutor, TaskRegistry};
-pub use kinds::{FireSignalPayload, RemovalWaitPayload, ResyncPayload, RunNodeTestPayload, StopTaggedPayload, TakeDownWaitPayload, TaskKind, WithdrawSignalPayload};
+pub use kinds::{FireSignalPayload, RegisterSignalPayload, RemovalWaitPayload, ResyncPayload, RunNodeTestPayload, StopTaggedPayload, TakeDownWaitPayload, TaskKind, WithdrawSignalPayload};
 pub use tasks::{
     claim_duration_secs, claim_heartbeat_interval, claim_next, complete, enqueue, enqueue_dedup, fail, heartbeat, Claim,
     DedupOutcome, NewTask, Task, TaskOutcome, TaskStatus, TERMINAL_RETENTION_SECS,

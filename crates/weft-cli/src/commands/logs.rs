@@ -16,45 +16,36 @@ use super::{utc_time, resolve_project_id, Ctx};
 
 /// What a run skipped, with why: each node, and each scope (a group or
 /// an include's call site) that did not run, spelled the way the program
-/// reads them (`keep.db` for the db of an included file) when the cwd is
-/// the project. What `weft logs` prints for a run that wrote nothing, so
-/// the reader learns why nothing happened without a second command.
+/// the run ran reads them (`keep.db` for the db of an included file), the
+/// rows `weft events` prints. What `weft logs` prints for a run that wrote
+/// nothing, so the reader learns why nothing happened without a second
+/// command.
 async fn skipped_places(ctx: &Ctx, run_id: &str) -> anyhow::Result<Vec<Skipped>> {
-    use weft_core::live_event::DispatcherEvent;
-    use weft_core::run::scope::ScopeState;
     use weft_core::run::skip::SkipReason;
-    let definition = ctx.project().ok()
-        .and_then(|project| weft_compiler::hash::load_program(project).ok())
-        .map(|(definition, _)| definition);
-    let rows = super::versions::replay_rows(&ctx.client()?, run_id).await?;
+    let answer: weft_core::program::RunEvents =
+        serde_json::from_value(ctx.client()?.get_json(&format!("/runs/{run_id}/events")).await?)
+            .context("read the run's events")?;
     let mut skipped = Vec::new();
-    for row in &rows {
-        // The kind is also the field the row names it by.
-        let (kind, frames) = match &row.event {
-            DispatcherEvent::NodeSkipped { frames, .. } => ("node", frames),
-            DispatcherEvent::ScopeDecided { frames, state: ScopeState::Skipped { .. }, .. } => ("scope", frames),
+    for row in &answer.events {
+        // The kind is also the field the row names it by. An included
+        // body's decision has no row there: its site's row is the call's.
+        let kind = match (row.get("kind").and_then(|k| k.as_str()), row.get("state").and_then(|s| s.as_str())) {
+            (Some("node_skipped"), _) => "node",
+            (Some("scope_decided"), Some("skipped")) => "scope",
             _ => continue,
         };
-        // Spelled exactly as `weft events` spells it; an included body's
-        // decision has no row there, its site's row is the call's.
-        let wire = serde_json::to_value(row)?;
-        let spelled = match &definition {
-            Some(definition) => match super::runs::spell_node(wire, definition) {
-                Some(spelled) => spelled,
-                None => continue,
-            },
-            None => wire,
-        };
-        let name = spelled.get(kind).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let name = row.get(kind).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let frames: weft_core::LoopFrames = row.get("frames").map(|f| serde_json::from_value(f.clone()))
+            .transpose().context("read a skip's frames")?.unwrap_or_default();
         // The reason is the engine's own, rendered by its own words from
         // the spelled row (so a scope it names reads as written); a row
         // written without one says so.
-        let reason = spelled.get("reason").filter(|r| !r.is_null())
+        let reason = row.get("reason").filter(|r| !r.is_null())
             .map(|r| serde_json::from_value::<SkipReason>(r.clone()).context("read a skip's reason"))
             .transpose()?
             .map(|r| r.to_string())
             .unwrap_or_else(|| "(no reason recorded)".to_string());
-        skipped.push(Skipped { kind, name: format!("{name}{}", frames_suffix(frames)), reason });
+        skipped.push(Skipped { kind, name: format!("{name}{}", frames_suffix(&frames)), reason });
     }
     Ok(skipped)
 }
@@ -100,6 +91,9 @@ pub async fn run(ctx: Ctx, target: Option<String>, limit: Option<u32>) -> anyhow
     // default applied.
     let logs: RunLogs = serde_json::from_value(answer.clone()).context("read the run's log")?;
     let (arr, limit) = (&logs.lines, logs.limit as u64);
+    if let Some(why) = &logs.unspelled {
+        eprintln!("warning: nodes show as ids, because {why}");
+    }
     // A run that wrote nothing usually did nothing, and the reason is
     // a skip: a required input closed, a gate said no. The skip is a
     // lifecycle event, not a log line, so it is fetched here rather

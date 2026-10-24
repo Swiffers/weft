@@ -182,7 +182,7 @@ fn the_plan_names_the_record_only_when_the_dockerfile_writes_one() {
         runtime: weft_compiler::worker_image::DEFAULT_BASE_IMAGE.into(),
     };
     let worker = |project: &weft_compiler::project::Project| {
-        let plan = plan_build_from(project, &stock.definition, &stock.catalog, &bases, &BareTags, weft_core::builds::NodeSet::Referenced)
+        let plan = plan_build_from(project, &stock.definition, &stock.catalog, weft_compiler::CompileFs::disk(&stock.project.root), &bases, &BareTags, weft_core::builds::NodeSet::Referenced)
             .expect("plan");
         assert!(plan.images.iter().filter(|i| i.kind == ImageKind::Infra).all(|i| i.result_file.is_none()));
         plan.images.into_iter().find(|i| i.kind == ImageKind::Worker).expect("a worker image")

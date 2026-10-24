@@ -1518,10 +1518,11 @@ export interface WaitingFires {
 export type TriggerState = 'off' | 'turning_on' | 'on' | 'behind';
 
 /// What took a trigger down when it was not a person: the health check
-/// (its infra's health rules bring it back once that infra is healthy), or
-/// an infra verb (it comes back once its infra runs again).
+/// (its infra's health rules bring it back once that infra is healthy), an
+/// infra verb (it comes back once its infra runs again), or the install
+/// going into maintenance (`weft maintenance off` brings it back).
 // SYNC: DownWith <-> crates/weft-core/src/projects.rs DownWith
-export type DownWith = 'health' | 'infra';
+export type DownWith = 'health' | 'infra' | 'maintenance';
 
 /// One owner's activation of a trigger.
 // SYNC: TriggerCopy <-> crates/weft-core/src/projects.rs TriggerCopy

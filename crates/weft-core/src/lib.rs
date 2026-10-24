@@ -50,6 +50,7 @@ pub mod instance_door;
 pub mod live;
 #[cfg(feature = "runtime")]
 pub mod live_event;
+pub mod maintenance;
 pub mod picks;
 pub mod ports;
 #[cfg(feature = "runtime")]
@@ -91,12 +92,17 @@ pub mod storage;
 // to. The policy is pure (the language gives nodes its settings); what
 // records a payload is runtime-gated inside the module.
 pub mod stream_journal;
+// The steps that carry a stored JSON document from an older weft's shape
+// to today's.
+pub mod stored;
 pub mod tag;
 pub mod take_down;
 pub mod task;
 pub mod time_scale;
 pub mod versions;
 pub mod weft_type;
+#[cfg(feature = "runtime")]
+pub mod wire_shape;
 
 // Hosts the `stress_test!` macro (`#[macro_export]`). The macro is
 // available to every workspace crate's tests; its expansion uses

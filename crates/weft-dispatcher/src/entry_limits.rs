@@ -47,6 +47,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             $$ LANGUAGE sql"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 /// What the whole install allows at its public edge: the install config's.

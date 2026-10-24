@@ -168,3 +168,71 @@ scope.values = [1]
         assert!(!refused.contains("select the whole loop"), "{refused}");
     }
 }
+
+/// A project compiled through a symlinked folder (macOS's `/var` is one)
+/// names a broken part's file exactly as one compiled from the real
+/// folder: the path from the root, never an absolute path that differs
+/// between the two. The build's own gate, handed either spelling, finds
+/// the part already recorded.
+#[cfg(unix)]
+#[test]
+fn a_broken_part_is_named_the_same_through_a_symlinked_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(real.join("lib")).unwrap();
+    std::fs::write(real.join("lib/draft.weft"), DRAFT).unwrap();
+    let linked = dir.path().join("linked");
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    let main = MAIN.replace("@include(\"draft.weft\")", "@include(\"lib/draft.weft\")");
+    let catalog = catalog();
+    let compiled: Vec<_> = [&real, &linked]
+        .into_iter()
+        .map(|root| weft_compiler::compile_program(&main, uuid::Uuid::nil(), CompileFs::disk(root), &catalog).expect("compiles"))
+        .collect();
+    let own = compiled[0].broken.iter().find(|part| part.parts == ["draft"]).expect("the file's errors, pinned to its site");
+    assert!(own.why.starts_with("lib/draft.weft:"), "{}", own.why);
+    let place = dir.path().to_string_lossy().into_owned();
+    assert!(compiled.iter().flat_map(|p| &p.broken).all(|part| !part.why.contains(&place)), "{:?}", compiled[0].broken);
+    assert_eq!(compiled[0].broken, compiled[1].broken);
+    for program in &compiled {
+        for root in [&real, &linked] {
+            let left = weft_compiler::unsettled(program, &catalog, CompileFs::disk(root));
+            assert!(left.is_empty(), "{root:?}: {left:?}");
+        }
+    }
+}
+
+/// A program compiled through a reader that is not the disk (the
+/// browser's in-memory map) has its findings placed by that same reader
+/// at the build's gate: the trigger inside a loop in an included file is
+/// recorded as the included file's broken part, and the gate, handed the
+/// view the program was compiled through, finds nothing left. The same
+/// gate through the disk, where this project does not exist, cannot
+/// place it.
+#[test]
+fn the_gate_places_findings_through_the_reader_that_compiled() {
+    const LOOPED: &str = "Group() -> (out: List[String | Null]) {
+  scope = Loop(values: List[Number]) -> (out: List[String | Null]) {
+    over: [\"values\"]
+    tick = Cron { cron: \"0 0 * * * *\" }
+    self.out = tick.scheduledTime
+  }
+  scope.values = [1]
+  self.out = scope.out
+}
+";
+    let main = "wrap = @include(\"lib/looped.weft\")\nd = Debug { data: wrap.out }\n";
+    let root = std::path::Path::new("/weft-virtual/proj");
+    let reader = weft_compiler::MapFileReader::new([(root.join("lib/looped.weft"), LOOPED.to_string())].into());
+    let fs = CompileFs::with_reader(&reader, Some(root));
+    let catalog = catalog();
+    let program = weft_compiler::compile_program(main, uuid::Uuid::nil(), fs, &catalog).expect("compiles");
+    assert!(
+        program.broken.iter().any(|part| part.why.starts_with("lib/looped.weft:") && part.why.contains("inside a Loop")),
+        "{:?}",
+        program.broken
+    );
+    let left = weft_compiler::unsettled(&program, &catalog, fs);
+    assert!(left.is_empty(), "{left:?}");
+    assert!(!weft_compiler::unsettled(&program, &catalog, CompileFs::disk(root)).is_empty());
+}

@@ -9,6 +9,7 @@ mod db_build;
 mod db_entry_limits;
 mod db_install_state;
 mod db_lifecycle;
+mod db_maintenance;
 mod db_project_ports;
 mod db_proxy;
 mod db_tags;

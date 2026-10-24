@@ -448,6 +448,7 @@ pub async fn run(
     Json(body): Json<VersionRunRequest>,
 ) -> Result<Json<RunStarted>, ApiError> {
     authorize_project(&state, &caller.0, id).await?;
+    crate::maintenance::refuse_while_on(&state.pg_pool).await?;
     require_action(&state, id, &["run"]).await?;
     if (!body.seed_until.is_empty() || !body.seed_before.is_empty()) && !body.seed && body.seed_run.is_none() {
         return Err((StatusCode::BAD_REQUEST, "`--seed-until` and `--seed-before` need `--seed`".into()));
@@ -661,7 +662,7 @@ pub async fn run(
     // it says so.
     // Named the way the program reads them (`one.strip` for a node of
     // an included file under the site `one`).
-    let spell = |place: &Located| weft_core::project::address_of(&project, &place.id, &place.path);
+    let spell = |place: &Located| weft_core::project::address_of(&*project, &place.id, &place.path);
     // Among the kicks, the first ordinary root in the program's own
     // order (a trigger that does not fire is kicked too, and it is a
     // poor name for a run started by hand).
@@ -702,7 +703,6 @@ pub async fn run(
         // lineage.
         let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
         let version = commit_version(&state, id, &body.manifest, None, body.root, &head).await?;
-        let spec_json = serde_json::to_value(&starting_parameters).map_err(|e| internal("the run's spec", e))?;
         crate::api::project::start_queued_run_with(
             &state,
             &project.defaults,
@@ -727,7 +727,7 @@ pub async fn run(
             &birth_rows,
             crate::api::project::QueueAs {
                 stale: &stale_vec,
-                spec: Some(&spec_json),
+                spec: Some(&starting_parameters),
                 example: body.example.as_deref(),
                 ..Default::default()
             },

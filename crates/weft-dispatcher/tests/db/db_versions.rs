@@ -16,7 +16,7 @@ use weft_core::activation::ActivationKey;
 use weft_core::instance::Owner;
 use weft_core::run_spec::RunSpec;
 use weft_core::ProjectDefinition;
-use weft_dispatcher::activation_store::{ActivationLifecycle, ActivationStoreOps, PostgresActivationStore, SignalsGoing};
+use weft_dispatcher::activation_store::{ActivationLifecycle, ActivationStoreOps, Claimant, PostgresActivationStore, SignalsGoing};
 use weft_dispatcher::store::postgres::PostgresStore;
 use weft_dispatcher::store::RunStore;
 use weft_core::versions::Head;
@@ -80,11 +80,10 @@ async fn start_run(
         instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: at,
         settings: Default::default(),
     };
-    let spec = spec.map(|spec| serde_json::to_value(spec).unwrap());
     let stale = ["b".to_string(), "c".to_string()];
     let queued = Queued {
         events: std::slice::from_ref(&birth), tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
-        watch_end: false, stale: &stale, spec: spec.as_ref(), example: None, program: None,
+        watch_end: false, stale: &stale, spec, example: None, program: None,
     };
     assert!(store.queue_run(queued, false).await.unwrap());
     run_id
@@ -161,7 +160,7 @@ async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool:
     let activations = PostgresActivationStore::new(pool.clone());
     let keys = [ActivationKey::new("door", Owner::Shared)];
     let setup_run_id = Uuid::new_v4();
-    assert!(activations.try_begin_activating(project, &keys, setup_run_id, None, None).await.unwrap().is_ok());
+    assert!(activations.try_begin_activating(project, &keys, setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
     assert!(activations.record_activation_source(project, setup_run_id, &activated, "v1", &Default::default()).await.unwrap());
     activations.end_activating(project, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
     projects.register_with_hashes(rig_project(project), "db-rig", "", TENANT, Some("bin-B"), Some("def-2"), None, None, None, None, None, None).await.unwrap();

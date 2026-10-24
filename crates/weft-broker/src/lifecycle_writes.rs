@@ -518,13 +518,13 @@ fn supervisor_due(replica_param: &str, held_param: &str, listed_param: &str) -> 
                                  WHERE {pending_o} AND o.project_id = c.project_id \
                                    AND o.id < c.id AND {overlap}) \
            UNION ALL \
-             SELECT n.project_id, \
-                    CASE u.value->>'status' \
-                      WHEN 'running' THEN (u.value->>'not_ready_since_unix')::BIGINT + (u.value->>'flaky_after_seconds')::BIGINT \
-                      WHEN 'flaky' THEN (u.value->>'ready_since_unix')::BIGINT + (u.value->>'recovery_after_seconds')::BIGINT \
+             SELECT u.project_id, \
+                    CASE u.status \
+                      WHEN 'running' THEN u.not_ready_since_unix + u.flaky_after_seconds \
+                      WHEN 'flaky' THEN u.ready_since_unix + u.recovery_after_seconds \
                     END \
-               FROM infra_node n CROSS JOIN LATERAL jsonb_each(n.units_json) AS u \
-              WHERE u.value->>'status' IN ('running', 'flaky') \
+               FROM infra_unit u \
+              WHERE u.status IN ('running', 'flaky') \
            UNION ALL \
              SELECT h.project_id, h.next_retry_at_unix FROM infra_health_rule h \
               WHERE h.gave_up_at_unix IS NULL AND h.next_retry_at_unix IS NOT NULL \
@@ -1108,20 +1108,15 @@ pub async fn stale_answer(pool: &PgPool, replica: &str, project_id: uuid::Uuid) 
     Ok(if owns { FencedWrite::Gone } else { FencedWrite::Displaced })
 }
 
-/// Roll a units jsonb expression up to one node status (worst-of-units
-/// by `InfraNodeStatus::rollup_rank`). Must match
-/// `InfraNodeStatus::rollup_rank` in the protocol crate. Empty map ->
-/// 'stopped' (the rank-0 default). `units_expr` is the SQL expression
-/// holding the units map: this is parameterized (not hardcoded to the
-/// `units_json` column) because in a single UPDATE every SET RHS is
-/// evaluated against the OLD row, so rolling up the bare column would
-/// use the PRE-update unit statuses. We must roll up the SAME new-units
-/// expression we're writing.
-fn rollup_sql(units_expr: &str) -> String {
+/// Roll the unit statuses `statuses` (a query of one column) up to one
+/// node status (worst-of-units by `InfraNodeStatus::rollup_rank`). Must
+/// match `InfraNodeStatus::rollup_rank` in the protocol crate. No units ->
+/// 'stopped' (the rank-0 default).
+fn rollup_sql(statuses: &str) -> String {
     format!(
         "(SELECT COALESCE( \
-            (SELECT v->>'status' FROM jsonb_each({units_expr}) AS e(k, v) \
-             ORDER BY CASE v->>'status' \
+            (SELECT s.status FROM ({statuses}) AS s(status) \
+             ORDER BY CASE s.status \
                WHEN 'terminating' THEN 7 WHEN 'stopping' THEN 6 \
                WHEN 'provisioning' THEN 5 WHEN 'failed' THEN 4 \
                WHEN 'flaky' THEN 3 WHEN 'running' THEN 2 \
@@ -1134,39 +1129,44 @@ fn rollup_sql(units_expr: &str) -> String {
 /// Stamp a status on an `infra_node` row, per unit or node-wide, under
 /// the write's fence.
 ///
-/// Per-unit (`unit = Some`): set that unit's status inside `units_json`,
-/// then recompute the node-level `status` as the rollup over the
-/// UPDATED units. Node-wide (`unit = None`): set every unit's status
-/// AND the node status to the same value (a lifecycle-driven uniform
-/// transition like Stopping/Terminating). Both run in ONE UPDATE so the
-/// per-unit write and the rollup are atomic, and so the fence WHERE
-/// clause guards them together. CRITICAL: the rollup must read the NEW
-/// units expression, not the `units_json` column. In one UPDATE,
-/// Postgres evaluates every SET RHS against the pre-update row, so
-/// `status = rollup_sql("units_json")` would roll up the OLD statuses
-/// (leaving e.g. `stopping` after the unit already went `stopped`).
+/// Per-unit (`unit = Some`): set that unit's status on its `infra_unit`
+/// row, then recompute the node-level `status` as the rollup over the
+/// units as they now stand. Node-wide (`unit = None`): set every unit's
+/// status AND the node status to the same value (a lifecycle-driven
+/// uniform transition like Stopping/Terminating).
 ///
-/// Per-unit, the unit's presence in the roster is part of the fence
-/// (`units_json ? $1`), so a stamp for a unit the row does not carry
-/// matches no row and answers Gone. That is a real race for the health
-/// engine (its roster was read at the top of the tick) and never a
-/// write: the earlier COALESCE-seeded shape turned it into a
-/// `{"status": ...}` stub entry that fails every UnitRuntime decode of
-/// the row (a permanent brick; see `decode_units_json` for the
-/// repair), and a plain `(units_json->$1) || ...` would NULL the column
-/// and fail the UPDATE as an error instead of a stale answer.
+/// Both run as one transaction of two statements. The first reads the
+/// copy's `infra_node` row under the fence, locks it (`FOR UPDATE`), and
+/// writes the units, acting only on the row it found. The second writes
+/// the node status. They are two statements because of the rollup: under
+/// READ COMMITTED a statement reads the table as it stood when the
+/// statement began, so a rollup in the first statement could miss another
+/// unit's stamp that committed while this one waited on the row lock, and
+/// two units of one copy stamped at once could each leave the node rolled
+/// up from a roster without the other's new status. Every stamp of a copy
+/// takes that row lock before it writes a unit (and the apply's roster
+/// write, [`write_units`], runs in the transaction that upserted the row),
+/// so writes to one copy's units run one after another, and the second
+/// statement, which begins once the lock is held, rolls up every unit as
+/// committed plus this stamp's own.
+///
+/// Per-unit, the unit's presence in the roster is part of the fence, so
+/// a stamp for a unit the row does not carry matches no row and answers
+/// Gone. That is a real race for the health engine (its roster was read
+/// at the top of the tick) and never a write.
 ///
 /// The fence itself: `replica` must still hold the project's
-/// `infra_owner` lease, on both branches, evaluated inside the UPDATE's
-/// WHERE so check and write share one row snapshot (no TOCTOU window);
-/// the instant ownership moves, the write is rejected (Displaced). With
-/// a `command_id`, the row must also still be targeted by that
-/// uncompleted command, so the command flows to the new owner. Without
-/// one (the autonomous health reconcile), the write is also fenced
-/// against ANY uncompleted command for this project/node: the lifecycle
-/// handler owns the status while a user action is in flight, and the
-/// EXISTS is evaluated atomically with the write so a command that
-/// appeared after the supervisor's tick-level gate still blocks here.
+/// `infra_owner` lease, on both branches, evaluated in the first
+/// statement together with the lock and the unit writes, so nothing is
+/// written unless the fence passed on the row the lock holds; the
+/// instant ownership moves, the write is rejected (Displaced). With a
+/// `command_id`, the row must also still be targeted by that uncompleted
+/// command, so the command flows to the new owner. Without one (the
+/// autonomous health reconcile), the write is also fenced against ANY
+/// uncompleted command for this project/node: the lifecycle handler owns
+/// the status while a user action is in flight, and the EXISTS is
+/// evaluated atomically with the write so a command that appeared after
+/// the supervisor's tick-level gate still blocks here.
 pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyhow::Result<FencedWrite> {
     // What a change waits on belongs to the change the row's status is
     // in (an apply while it provisions, a stop while it stops, a
@@ -1181,80 +1181,137 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
              provisioning_since_unix = CASE WHEN {new_status} = 'provisioning' THEN provisioning_since_unix END"
         )
     };
-    // Binds: `$1` the unit (unused when unit=None), `$2` to `$8` the
-    // status, its failure, the copy and the fence's replica, `$9` the
-    // command, and `$10`, `$11` the stamps a unit's health windows run from
-    // (`UnitRuntime::not_ready_since_unix`, `ready_since_unix`).
-    let (set_clause, unit_fence) = if req.unit.is_some() {
-        let new_units = "jsonb_set(units_json, ARRAY[$1], \
-             (units_json->$1) || jsonb_build_object('status', $2::text, \
-                 'not_ready_since_unix', $10::bigint, 'ready_since_unix', $11::bigint))";
-        let rollup = rollup_sql(new_units);
+    // The first statement's binds: `$1` the unit (unused when unit=None),
+    // `$2` the status, `$3` to `$6` the project, the node, the fence's
+    // replica and the instance, `$7` the command, and `$8`, `$9` the
+    // stamps a unit's health windows run from
+    // (`UnitRuntime::not_ready_since_unix`, `ready_since_unix`). The
+    // second statement's: `$1` to `$3` the copy, `$4` the status (unused
+    // per unit, where the rollup decides), `$5`, `$6` its failure.
+    const SAME_COPY: &str = "u.project_id = f.project_id AND u.node_id = f.node_id AND u.instance_id IS NOT DISTINCT FROM f.instance_id";
+    let (unit_fence, units, node_status) = if req.unit.is_some() {
         (
+            " AND EXISTS (SELECT 1 FROM infra_unit u WHERE u.project_id = n.project_id AND u.node_id = n.node_id \
+              AND u.instance_id IS NOT DISTINCT FROM n.instance_id AND u.unit = $1)",
             format!(
-                "units_json = {new_units}, status = {rollup}, failure_stage = $3, failure_message = $4{}",
-                progress(&rollup),
+                "UPDATE infra_unit u SET status = $2::text, not_ready_since_unix = $8::bigint, \
+                 ready_since_unix = $9::bigint FROM fenced f WHERE {SAME_COPY} AND u.unit = $1"
             ),
-            " AND units_json ? $1",
+            rollup_sql(
+                "SELECT u.status FROM infra_unit u WHERE u.project_id = n.project_id AND u.node_id = n.node_id \
+                 AND u.instance_id IS NOT DISTINCT FROM n.instance_id",
+            ),
         )
     } else {
         // Node-wide: every unit's status and the node status become
-        // $2 directly. The rollup over all-equal units would be $2 too,
-        // except for a unit-less roster (a spec with only shared
-        // resources), where the rollup's empty-map default is 'stopped'
-        // and would turn a Failed / Terminating stamp into a cleanly
-        // stopped node.
-        let new_units = "(SELECT COALESCE(jsonb_object_agg(k, v || jsonb_build_object('status', $2::text)), '{}'::jsonb) \
-            FROM jsonb_each(units_json) AS e(k, v))";
-        (
-            format!(
-                "units_json = {new_units}, status = $2::text, failure_stage = $3, failure_message = $4{}",
-                progress("$2::text"),
-            ),
-            "",
-        )
+        // the stamp directly. The rollup over all-equal units would be
+        // the stamp too, except for a unit-less roster (a spec with only
+        // shared resources), where the rollup's empty default is
+        // 'stopped' and would turn a Failed / Terminating stamp into a
+        // cleanly stopped node.
+        ("", format!("UPDATE infra_unit u SET status = $2::text FROM fenced f WHERE {SAME_COPY}"), "$4::text".to_string())
     };
     let commands = match req.command_id {
         Some(_) => "EXISTS ( \
                SELECT 1 FROM infra_lifecycle_command c \
-               WHERE c.id = $9 \
-                 AND c.project_id = $5 \
+               WHERE c.id = $7 \
+                 AND c.project_id = $3 \
                  AND {reaches} \
                  AND c.completed_at_unix IS NULL \
              )",
         None => "NOT EXISTS ( \
                SELECT 1 FROM infra_lifecycle_command c \
-               WHERE c.project_id = $5 \
+               WHERE c.project_id = $3 \
                  AND {reaches} \
                  AND c.completed_at_unix IS NULL \
              )",
     }
-    .replace("{reaches}", &command_reaches_copy("c", "$6", "$8"));
+    .replace("{reaches}", &command_reaches_copy("c", "$4", "$6"));
     let unit_key = req.unit.clone().unwrap_or_default();
-    let sql = format!(
-        "UPDATE infra_node SET {set_clause} \
-         WHERE project_id = $5 AND node_id = $6 \
-           AND instance_id IS NOT DISTINCT FROM $8{unit_fence} AND {commands} AND {owns}",
-        owns = owns_project_predicate("$7", "$5"),
-    );
-    let res = sqlx::query(&sql)
-        .bind(&unit_key)
-        .bind(req.status.as_str())
-        .bind(req.failure_stage.map(|s| s.as_str()))
-        .bind(req.failure_message.as_deref())
-        .bind(req.project_id)
-        .bind(&req.node_id)
-        .bind(&req.replica)
-        .bind(req.instance.as_ref().map(|m| m.as_str()))
-        .bind(req.command_id)
-        .bind(req.not_ready_since_unix)
-        .bind(req.ready_since_unix)
-        .execute(pool)
-        .await?;
-    if res.rows_affected() > 0 {
-        return Ok(FencedWrite::Applied);
+    let instance = req.instance.as_ref().map(|m| m.as_str());
+    let mut tx = pool.begin().await?;
+    let fenced: i64 = sqlx::query_scalar(&format!(
+        "WITH fenced AS ( \
+             SELECT n.project_id, n.node_id, n.instance_id FROM infra_node n \
+              WHERE n.project_id = $3 AND n.node_id = $4 \
+                AND n.instance_id IS NOT DISTINCT FROM $6{unit_fence} AND {commands} AND {owns} \
+              FOR UPDATE), \
+              units AS ({units}) \
+         SELECT COUNT(*) FROM fenced",
+        owns = owns_project_predicate("$5", "$3"),
+    ))
+    .bind(&unit_key)
+    .bind(req.status.as_str())
+    .bind(req.project_id)
+    .bind(&req.node_id)
+    .bind(&req.replica)
+    .bind(instance)
+    .bind(req.command_id)
+    .bind(req.not_ready_since_unix)
+    .bind(req.ready_since_unix)
+    .fetch_one(&mut *tx)
+    .await?;
+    if fenced == 0 {
+        drop(tx);
+        return stale_answer(pool, &req.replica, req.project_id).await;
     }
-    stale_answer(pool, &req.replica, req.project_id).await
+    // The node row is ours until commit, so this write reaches it.
+    sqlx::query(&format!(
+        "UPDATE infra_node n SET status = {node_status}, failure_stage = $5, failure_message = $6{progress} \
+          WHERE n.project_id = $1 AND n.node_id = $2 AND n.instance_id IS NOT DISTINCT FROM $3",
+        progress = progress(&node_status),
+    ))
+    .bind(req.project_id)
+    .bind(&req.node_id)
+    .bind(instance)
+    .bind(req.status.as_str())
+    .bind(req.failure_stage.map(|s| s.as_str()))
+    .bind(req.failure_message.as_deref())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await.context("commit set_status tx")?;
+    Ok(FencedWrite::Applied)
+}
+
+/// Stamp a copy's roster whole, in the transaction that wrote its row:
+/// its `infra_unit` rows become exactly `units`.
+// SYNC: write_units <-> weft_broker_client::protocol::UnitRuntime, weft_broker_client::protocol::units_of_copy_sql, crates/weft-dispatcher/src/infra_node.rs (infra_unit, UNITS_MOVE)
+pub async fn write_units(
+    tx: &mut sqlx::PgConnection,
+    project_id: uuid::Uuid,
+    node_id: &str,
+    instance: Option<&weft_core::instance::InstanceId>,
+    units: &std::collections::BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
+) -> anyhow::Result<()> {
+    let instance = instance.map(|m| m.as_str());
+    sqlx::query("DELETE FROM infra_unit WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3")
+        .bind(project_id)
+        .bind(node_id)
+        .bind(instance)
+        .execute(&mut *tx)
+        .await?;
+    if units.is_empty() {
+        return Ok(());
+    }
+    let mut insert = sqlx::QueryBuilder::new(
+        "INSERT INTO infra_unit (project_id, node_id, instance_id, unit, status, stop_behavior, \
+         flaky_after_seconds, recovery_after_seconds, not_ready_since_unix, ready_since_unix, image_refs) ",
+    );
+    insert.push_values(units, |mut row, (unit, runtime)| {
+        row.push_bind(project_id)
+            .push_bind(node_id)
+            .push_bind(instance)
+            .push_bind(unit)
+            .push_bind(runtime.status.as_str())
+            .push_bind(runtime.stop_behavior.kind())
+            .push_bind(i64::from(runtime.flaky_after_seconds))
+            .push_bind(i64::from(runtime.recovery_after_seconds))
+            .push_bind(runtime.not_ready_since_unix)
+            .push_bind(runtime.ready_since_unix)
+            .push_bind(runtime.image_refs.iter().cloned().collect::<Vec<String>>());
+    });
+    insert.build().execute(&mut *tx).await?;
+    Ok(())
 }
 
 /// Record what the supervisor's command `req.command_id` (an apply, a

@@ -526,6 +526,8 @@ async fn ensure_standard_worker(image: &str, base: &str, rebuild: bool, suffix: 
             &stock.project,
             &stock.definition,
             &stock.catalog,
+            // `StockProject::materialize` compiled it from disk.
+            weft_compiler::CompileFs::disk(&stock.project.root),
             &bases,
             weft_core::builds::NodeSet::Full,
         )?;

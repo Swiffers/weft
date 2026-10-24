@@ -383,16 +383,16 @@ fn misnamed(value: Option<&Value>, project: &ProjectDefinition, named: Named) ->
         Some(Value::Object(map)) => map.keys().map(String::as_str).collect(),
         _ => Vec::new(),
     };
-    let node_at = |spelled: &str| {
-        let (id, _) = crate::project::resolve_address(project, spelled);
-        project.nodes.iter().find(|n| n.id == id)
+    let node_at = |spelled: &str| match crate::project::places::named(project, spelled) {
+        Ok(crate::project::places::Named::Node(place)) => project.nodes.iter().find(|n| n.id == place.id),
+        _ => None,
     };
     let fits = |spelled: &str| match named {
         Named::Node { role, per_instance } => {
             let Some(found) = node_at(spelled) else { return false };
             let role_fits = match role {
                 None => true,
-                Some(NodeRole::Infra) => crate::project::infra_place_spellings(project).contains(spelled),
+                Some(NodeRole::Infra) => crate::project::infra_place_spellings(project).contains_key(spelled),
                 Some(NodeRole::Trigger) => found.features.is_trigger,
             };
             role_fits && per_instance.is_none_or(|wanted| found.per_instance.is_some() == wanted)

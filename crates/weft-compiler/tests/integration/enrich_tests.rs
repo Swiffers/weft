@@ -1003,7 +1003,8 @@ fn a_navigated_into_include_parses_under_the_ids_the_build_uses() {
     let source_id = weft_compiler::source_name::file_id(
         Some(dir.path()),
         Some(&dir.path().join("lib/front.weft")),
-    );
+    )
+    .unwrap();
     let (parsed, _diags) = weft_compiler::parse_only(
         front,
         uuid::Uuid::new_v4(),

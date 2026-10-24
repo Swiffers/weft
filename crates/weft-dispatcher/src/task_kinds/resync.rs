@@ -43,7 +43,10 @@
 //!
 //! A step that fails is tried again a couple of times, a little later each
 //! time; then the resync stops, with why written into its plan for `weft
-//! status`, and the plan keeps holding the transition. A stop that waits
+//! status`, and the plan keeps holding the transition. A step refused
+//! because the build cannot run the triggers it brings back (a part they
+//! need does not compile) stops it at once: every try, and every resume,
+//! runs that same build ([`Stopped::build_cannot_run`]). A stop that waits
 //! on something that comes back by itself (the infra its triggers read, an
 //! activation still landing) is taken up again when it does
 //! ([`retry_stopped`]); any stop is taken up again by `weft resync
@@ -61,18 +64,66 @@ use weft_core::instance::Owner;
 use weft_task_store::executor::TaskExecutor;
 use weft_task_store::tasks::Task;
 
+use crate::api::project::Unrunnable;
 use crate::state::DispatcherState;
 
 /// How long a resync waits before it tries a step that failed again, after
 /// each failure but the last, which stops it.
 const RETRY_WAITS: [u64; 2] = [5, 20];
 
+/// The steps a stored [`ResyncPlan`] takes from the shape an older weft
+/// wrote; `weft_core::stored` says how they run.
+pub const RESYNC_UPGRADES: &[&[weft_core::stored::Op]] = &[
+    // Version 2: the drive moved to its own column (`project.resync_driver`,
+    // filled by `crate::project_store::RESYNC_FILLS`).
+    &[weft_core::stored::Op::DropKey { at: "", key: "driver" }],
+];
+
+impl ResyncPlan {
+    /// A resync as the project row keeps it (`project.resync`).
+    pub const STORED: weft_core::stored::Kind<ResyncPlan> = weft_core::stored::Kind::new("resync plan", RESYNC_UPGRADES);
+
+    /// The plan project `project's row holds: `resync`, written at
+    /// `version`, and its drive from `resync_driver`.
+    pub fn stored(
+        project: uuid::Uuid,
+        json: serde_json::Value,
+        version: weft_core::stored::Version,
+        driver: Option<uuid::Uuid>,
+    ) -> anyhow::Result<ResyncPlan> {
+        let mut plan = Self::STORED.decode(json, version).map_err(|e| e.at(format_args!("project {project}'s resync")))?;
+        plan.driver = driver
+            .ok_or_else(|| anyhow::anyhow!("project {project} holds a resync with no drive (project.resync_driver is NULL)"))?;
+        Ok(plan)
+    }
+
+    /// The columns of a project row that hold a plan, as a write sets
+    /// them: `$2` its JSON, `$3` the version it is written at, `$4` its
+    /// drive. Every write of a plan sets the three together, through
+    /// [`Self::row_write`].
+    pub const ROW: &'static str = "resync = $2, resync_version = $3, resync_driver = $4";
+
+    /// The write of this plan to project `project`'s row: `sql`, which
+    /// sets [`Self::ROW`] and names the project as `$1` (binds of its own
+    /// follow, from `$5`), with the plan's JSON, its version and its
+    /// drive bound.
+    pub fn row_write<'q>(
+        &'q self,
+        project: uuid::Uuid,
+        sql: &'q str,
+    ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+        sqlx::query(sql).bind(project).bind(sqlx::types::Json(self)).bind(Self::STORED.version()).bind(self.driver)
+    }
+}
+
 /// A resync under way, as the project row keeps it (`project.resync`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResyncPlan {
     /// The drive under way: minted when the resync begins and each time a
     /// stopped one is taken up again, carried by the task driving it, and
-    /// every write of the plan names it.
+    /// every write of the plan names it. The row keeps it in a column of
+    /// its own (`project.resync_driver`), which the store reads it from.
+    #[serde(skip)]
     pub driver: uuid::Uuid,
     /// Whose triggers, one owner each, in the order they are resynced.
     pub owners: Vec<ResyncOwner>,
@@ -119,7 +170,9 @@ pub struct ResyncPlan {
     /// Why it stopped, once its tries ran out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped: Option<Stopped>,
-    /// A person gave it up (`crate::project_store::ProjectStoreOps::give_up_resync`):
+    /// A person gave it up (`crate::project_store::ProjectStoreOps::give_up_resync`),
+    /// or weft did, its plan no longer reading
+    /// (`crate::project_store::ProjectStoreOps::give_up_unreadable_resync`):
     /// no drive of it goes on, and this says when and what it left down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub given_up: Option<GivenUp>,
@@ -135,6 +188,46 @@ pub struct ResyncPlan {
 pub struct GivenUp {
     pub at_unix: i64,
     pub left_down: Vec<OwnerTriggers>,
+    /// Set when weft gave it up because its plan no longer read: what
+    /// it left down is then not known, and `left_down` is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<UnreadablePlan>,
+}
+
+/// A resync's plan as the project row held it when it no longer read,
+/// kept on the record that gave it up: why it did not read, and the
+/// document itself, which is the only account left of the triggers it
+/// had taken down.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnreadablePlan {
+    pub error: String,
+    pub document: Value,
+    pub version: weft_core::stored::Version,
+}
+
+impl ResyncPlan {
+    /// The record that takes the place of a plan that no longer reads
+    /// (`unreadable`): given up at `at_unix`, under a drive of its own,
+    /// with nothing of the plan's (none of it read).
+    pub fn given_up_unreadable(unreadable: UnreadablePlan, at_unix: i64) -> Self {
+        ResyncPlan {
+            driver: uuid::Uuid::now_v7(),
+            owners: Vec::new(),
+            take_down: weft_core::take_down::TakeDown::DEFAULT,
+            build: Default::default(),
+            resynced: Vec::new(),
+            urls: Vec::new(),
+            held: Default::default(),
+            old_builds: Vec::new(),
+            old_tokens: Vec::new(),
+            switching: false,
+            runs: 0,
+            moved_runs: 0,
+            off: Vec::new(),
+            stopped: None,
+            given_up: Some(GivenUp { at_unix, left_down: Vec::new(), unreadable: Some(unreadable) }),
+        }
+    }
 }
 
 impl GivenUp {
@@ -219,7 +312,41 @@ pub struct Stopped {
     /// person takes it up again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waits_for: Option<ResyncWait>,
+    /// It stopped because its build cannot run the triggers it brings
+    /// back (a part they need does not compile). Taking it up again keeps
+    /// that build, so `weft resync --resume` is refused, and the person is
+    /// told what does bring them back ([`what_next`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub build_cannot_run: bool,
 }
+
+/// What a person is told comes next for a resync that stopped (`stopped`,
+/// or none recorded: its task ended without writing why): what takes it
+/// up again by itself, and what they can do. One sentence, lower case,
+/// for `weft status` and for the refusal the person following it reads.
+pub fn what_next(stopped: Option<&Stopped>) -> String {
+    let Some(stopped) = stopped else { return TAKE_UP_OR_GIVE_UP.to_string() };
+    if stopped.build_cannot_run {
+        return BUILD_CANNOT_RUN_NEXT.to_string();
+    }
+    let by_itself = match stopped.waits_for {
+        Some(ResyncWait::Infra) => "it goes on by itself once the infra those triggers read runs; ",
+        Some(ResyncWait::Activation) => "it goes on by itself once that activation has landed; ",
+        None => "",
+    };
+    format!("{by_itself}{TAKE_UP_OR_GIVE_UP}")
+}
+
+const TAKE_UP_OR_GIVE_UP: &str =
+    "`weft resync --resume` tries it again where it stopped; `weft cancel-activate` gives it up and leaves those triggers down";
+
+/// What comes next for a resync whose build cannot run its triggers: a
+/// resume keeps that build, and no build registers while the resync holds
+/// the project, so it is given up and the fixed source turned on.
+pub const BUILD_CANNOT_RUN_NEXT: &str =
+    "`weft resync --resume` would take it up again on the same build and fail the same way. Fix the source as the error says, \
+     then run `weft cancel-activate`, which gives the resync up and names the triggers it leaves down, and `weft activate`, \
+     which builds the fixed source and turns them back on";
 
 /// What a stopped resync waits on that comes back by itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,9 +413,9 @@ impl TaskExecutor<DispatcherState> for ResyncExecutor {
                     anyhow::bail!("the resync stood down: {}", weft_core::projects::PROJECT_BEING_REMOVED)
                 }
                 Err(Halt::Failed(failure)) => {
-                    if let Some(wait) = tries.next() {
+                    if let Some(wait) = wait_before_trying_again(&mut tries, &failure) {
                         tracing::warn!(target: "weft_dispatcher::resync", project_id = %id, error = %failure.error, "a resync step failed; trying it again");
-                        tokio::time::sleep(weft_core::time_scale::scaled(std::time::Duration::from_secs(*wait))).await;
+                        tokio::time::sleep(weft_core::time_scale::scaled(std::time::Duration::from_secs(wait))).await;
                         continue;
                     }
                     stop(state, id, driver, &failure).await?;
@@ -297,6 +424,17 @@ impl TaskExecutor<DispatcherState> for ResyncExecutor {
             }
         }
     }
+}
+
+/// How many seconds to wait before trying `failure`'s step again, `tries`
+/// holding the waits left; `None` when it is not tried again: its tries ran
+/// out, or its build cannot run the triggers, which fails the same way on
+/// every try.
+fn wait_before_trying_again<'a>(tries: &mut impl Iterator<Item = &'a u64>, failure: &Failure) -> Option<u64> {
+    if failure.build_cannot_run {
+        return None;
+    }
+    tries.next().copied()
 }
 
 /// Why a resync did not finish ([`advance`], one owner's
@@ -318,18 +456,32 @@ pub(crate) struct Failure {
     pub status: StatusCode,
     pub error: String,
     pub waits_for: Option<ResyncWait>,
+    /// See [`Stopped::build_cannot_run`]: never tried again.
+    pub build_cannot_run: bool,
 }
 
 impl Halt {
     /// A step that failed waiting on `wait`.
     pub(crate) fn waiting(wait: ResyncWait, (status, error): (StatusCode, String)) -> Self {
-        Halt::Failed(Failure { status, error, waits_for: Some(wait) })
+        Halt::Failed(Failure { status, error, waits_for: Some(wait), build_cannot_run: false })
+    }
+}
+
+/// A step refused because the resync's build cannot run the triggers it
+/// brings back stops it for good: no try of the same build goes through.
+/// A check that could not be made (a failed read) fails as any step does,
+/// and is tried again.
+impl From<Unrunnable> for Halt {
+    fn from(unrunnable: Unrunnable) -> Self {
+        let build_cannot_run = matches!(unrunnable, Unrunnable::Cannot(_));
+        let (status, error) = unrunnable.into();
+        Halt::Failed(Failure { status, error, waits_for: None, build_cannot_run })
     }
 }
 
 impl From<(StatusCode, String)> for Halt {
     fn from((status, error): (StatusCode, String)) -> Self {
-        Halt::Failed(Failure { status, error, waits_for: None })
+        Halt::Failed(Failure { status, error, waits_for: None, build_cannot_run: false })
     }
 }
 
@@ -510,6 +662,7 @@ async fn stop(state: &DispatcherState, id: uuid::Uuid, driver: uuid::Uuid, failu
         error: failure.error.clone(),
         at_unix: crate::lease::now_unix(),
         waits_for: failure.waits_for,
+        build_cannot_run: failure.build_cannot_run,
     };
     state.projects.write_resync(id, &ResyncPlan { stopped: Some(stopped), ..plan }).await?;
     crate::transition::publish_transition_changed(state, id).await;
@@ -523,14 +676,44 @@ async fn stop(state: &DispatcherState, id: uuid::Uuid, driver: uuid::Uuid, failu
 /// `crate::api::infra::bring_back_triggers_whose_infra_returned`), so a
 /// resync waiting on them goes on without a person. A stop that waits on
 /// nothing that comes back by itself is left for `weft resync --resume`.
+///
+/// A resync whose plan no longer reads can never be driven, resumed or
+/// given up by a person (each of those reads it), so it is given up here,
+/// for that project alone, and `weft status` says so
+/// (`crate::project_store::ProjectStoreOps::give_up_unreadable_resync`).
+/// A project whose retry fails (the store, on the way) is named in the
+/// error once every other project was looked at.
 pub(crate) async fn retry_stopped(state: &DispatcherState) -> Result<()> {
     let mut failed = Vec::new();
     for (id, plan) in state.projects.stopped_resyncs().await? {
-        if let Err(e) = retry_if_back(state, id, &plan).await {
+        let retried = match plan {
+            Ok(plan) => retry_if_back(state, id, &plan).await,
+            Err(unreadable) => give_up_unreadable(state, id, &unreadable).await,
+        };
+        if let Err(e) = retried {
             failed.push(format!("project {id}: {e:#}"));
         }
     }
     anyhow::ensure!(failed.is_empty(), "taking stopped resyncs up again failed: {}", failed.join("; "));
+    Ok(())
+}
+
+/// Give up project `id`'s resync, whose plan did not read (`unreadable`).
+async fn give_up_unreadable(state: &DispatcherState, id: uuid::Uuid, unreadable: &anyhow::Error) -> Result<()> {
+    if state.projects.give_up_unreadable_resync(id).await? {
+        tracing::error!(
+            target: "weft_dispatcher::resync",
+            project_id = %id, error = %format!("{unreadable:#}"),
+            "a resync's plan no longer reads, so it was given up; the triggers it had taken down may still be down"
+        );
+        crate::transition::publish_transition_changed(state, id).await;
+    } else {
+        tracing::warn!(
+            target: "weft_dispatcher::resync",
+            project_id = %id, error = %format!("{unreadable:#}"),
+            "a resync's plan did not read, and read again under its row's lock there was nothing to give up: it ended, or it reads now"
+        );
+    }
     Ok(())
 }
 
@@ -633,7 +816,7 @@ mod tests {
     /// infra says so on the wire.
     #[test]
     fn a_stop_says_what_it_waits_on() {
-        let stopped = Stopped { status: 428, error: "infra down".into(), at_unix: 1, waits_for: Some(ResyncWait::Infra) };
+        let stopped = Stopped { status: 428, error: "infra down".into(), at_unix: 1, waits_for: Some(ResyncWait::Infra), build_cannot_run: false };
         let wire = serde_json::to_value(&stopped).unwrap();
         assert_eq!(wire["waits_for"], "infra");
         let none = serde_json::json!({ "status": 409, "error": "no", "at_unix": 1 });
@@ -667,6 +850,7 @@ mod tests {
     fn a_given_up_resync_shows_only_what_is_still_left_down() {
         let ada = Owner::Instance(weft_core::instance::InstanceId::new("ada").unwrap());
         let mut given_up = GivenUp {
+            unreadable: None,
             at_unix: 1,
             left_down: vec![
                 OwnerTriggers { owner: Owner::Shared, triggers: vec!["feed".into(), "door".into(), "gone".into()] },
@@ -690,6 +874,54 @@ mod tests {
         assert!(given_up.forget(&[ActivationKey::new("feed", Owner::Shared), ActivationKey::new("feed", ada)]));
         assert_eq!(given_up.left_down, [shared(&["gone"])], "an owner with nothing left down goes");
         assert!(given_up.still_down(&project).is_empty());
+    }
+
+    /// A step that failed is tried again until its waits run out; one its
+    /// build cannot run is never tried again, and what the person is told
+    /// next offers no `--resume` (which keeps that build) but the commands
+    /// that do bring the triggers back. A stored stop of an older weft,
+    /// which says nothing about it, reads as one a resume may retry.
+    #[test]
+    fn a_build_that_cannot_run_is_not_tried_again_and_offers_what_works() {
+        let failure = |build_cannot_run| Failure { status: StatusCode::UNPROCESSABLE_ENTITY, error: "no".into(), waits_for: None, build_cannot_run };
+        let mut tries = RETRY_WAITS.iter();
+        assert_eq!(wait_before_trying_again(&mut tries, &failure(false)), Some(RETRY_WAITS[0]));
+        assert_eq!(wait_before_trying_again(&mut tries, &failure(true)), None, "never tried again");
+        assert_eq!(wait_before_trying_again(&mut tries, &failure(false)), Some(RETRY_WAITS[1]), "it spent no try");
+        assert_eq!(wait_before_trying_again(&mut tries, &failure(false)), None, "the tries ran out");
+
+        let stopped = |build_cannot_run, waits_for| Stopped { status: 422, error: "no".into(), at_unix: 1, waits_for, build_cannot_run };
+        let next = what_next(Some(&stopped(true, None)));
+        assert!(!next.contains("tries it again") && next.contains("weft cancel-activate") && next.contains("weft activate"), "{next}");
+        let next = what_next(Some(&stopped(false, Some(ResyncWait::Infra))));
+        assert!(next.starts_with("it goes on by itself") && next.contains("`weft resync --resume` tries it again"), "{next}");
+        assert!(what_next(None).contains("`weft resync --resume` tries it again"));
+
+        let older = serde_json::json!({ "status": 422, "error": "no", "at_unix": 1 });
+        assert!(!serde_json::from_value::<Stopped>(older).unwrap().build_cannot_run);
+        assert!(serde_json::to_value(stopped(false, None)).unwrap().get("build_cannot_run").is_none(), "written only when set");
+    }
+
+    /// A store failure while checking that the build can run the triggers
+    /// (a read of what the infra saved, answered 500) says nothing about
+    /// the build: the step is tried again like any failed one, and the
+    /// stop it may end in offers `--resume`. Only a build that cannot run
+    /// them stops the resync for good.
+    #[test]
+    fn a_check_that_could_not_be_made_is_tried_again() {
+        let failed = |halt: Halt| match halt {
+            Halt::Failed(failure) => failure,
+            _ => panic!("a check that refused is a failed step"),
+        };
+        let unchecked = failed(Unrunnable::Unchecked((StatusCode::INTERNAL_SERVER_ERROR, "infra_node: connection reset".into())).into());
+        assert!(!unchecked.build_cannot_run, "a store failure is not the build's");
+        assert_eq!((unchecked.status, unchecked.error.as_str()), (StatusCode::INTERNAL_SERVER_ERROR, "infra_node: connection reset"));
+        assert_eq!(wait_before_trying_again(&mut RETRY_WAITS.iter(), &unchecked), Some(RETRY_WAITS[0]), "tried again");
+
+        let cannot = failed(Unrunnable::Cannot("node `auth` did not compile".into()).into());
+        assert!(cannot.build_cannot_run);
+        assert_eq!(cannot.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(wait_before_trying_again(&mut RETRY_WAITS.iter(), &cannot), None, "never tried again");
     }
 
     /// The task names the drive it carries, and two drives are two tasks.

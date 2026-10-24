@@ -3,14 +3,17 @@
 One directory per schema group, holding that group's history.
 
 `origin.sql` is the group's `CREATE TABLE` frozen on the day it shipped. Every
-other file is one change since, named so the files sort in the order they were
-written.
+other file is one part of a change since, named so the files sort in the order
+they were written: `<id>.sql` holds what the change adds, and
+`<id>.contract.sql` what it drops and tightens. A booting weft runs every
+pending `.sql` file, then carries the JSON documents forward, then runs every
+pending `.contract.sql` file.
 
 Nothing in here is ever edited after it has run. If a file is wrong, write
 another one.
 
 A database that already exists runs the files it has not run before, oldest
-first. A database being created for the first time skips them all and is built
+first within each part. A database being created for the first time skips them all and is built
 from the canonical `CREATE TABLE` in the Rust source, which is where you edit
 the schema.
 

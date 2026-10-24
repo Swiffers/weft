@@ -105,7 +105,8 @@ pub trait TagPolicy {
 /// `@asset` marker would reach the build instead of the stored file it
 /// stands for. The project MUST already contain its own nodes (the seeded
 /// `nodes/base_catalog/` included); nothing is injected from outside the
-/// folder.
+/// folder. `fs` is the view the definition was compiled through
+/// (`build::build_project` places its findings with it).
 ///
 /// Pure + blocking (filesystem); run it on a blocking thread from async
 /// callers. The returned worker `context_dir` lives under a temp dir the caller
@@ -114,6 +115,7 @@ pub fn plan_build_from(
     project: &Project,
     definition: &weft_core::project::ProjectDefinition,
     catalog: &weft_catalog::FsCatalog,
+    fs: crate::CompileFs,
     bases: &crate::worker_image::BaseImages,
     tags: &dyn TagPolicy,
     node_set: weft_core::builds::NodeSet,
@@ -136,7 +138,7 @@ pub fn plan_build_from(
     // from source: it validates + codegens this definition, whose `@asset`
     // refs the caller already resolved into concrete file values.
     let staged =
-        crate::build::build_project(project, definition, catalog, bases, node_set)?;
+        crate::build::build_project(project, definition, catalog, fs, bases, node_set)?;
     let binary_hash = staged.content_hash.clone();
 
     let mut images = vec![PlannedImage {

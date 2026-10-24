@@ -1,0 +1,16 @@
+[
+  {
+    "nodeSet": "full",
+    "assets": {}
+  },
+  {
+    "nodeSet": "referenced",
+    "assets": {
+      "file:logo.png": {
+        "key": "tenant/assets/logo.png",
+        "hash": "sha256:00"
+      },
+      "text:readme": "hello"
+    }
+  }
+]

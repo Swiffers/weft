@@ -87,6 +87,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         )"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 /// What weft could not reach, or could not carry on.

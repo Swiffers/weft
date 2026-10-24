@@ -703,7 +703,13 @@ fn take_batch(lane: &Lane, budget: &Budget) -> Vec<Taken> {
 /// runs it holds, and each birth on a cut not yet on record with the
 /// cut's hash (the program is on record once one of them went in).
 fn frame(lane: &Lane, taken: &[Taken]) -> (Vec<u8>, usize, Vec<(usize, String)>) {
-    let mut head = BatchHead { durable: false, lane: lane.index, runs: Vec::with_capacity(taken.len()), programs: Vec::new() };
+    let mut head = BatchHead {
+        durable: false,
+        lane: lane.index,
+        runs: Vec::with_capacity(taken.len()),
+        programs: Vec::new(),
+        events_version: weft_journal::stored::STORED_EVENTS.version(),
+    };
     let mut rows = Vec::with_capacity(taken.len());
     let mut births = Vec::new();
     let on_record = lane.programs_on_record.lock().expect("record writer");

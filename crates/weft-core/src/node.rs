@@ -788,6 +788,7 @@ pub fn refuse_removed_metadata_keys(value: &serde_json::Value) -> Result<(), Str
                 .into(),
         );
     }
+    refuse_removed_verify_keys(obj)?;
     if obj.get("features").and_then(|f| f.get("isOutputDefault")).is_some() {
         return Err(
             "`features.isOutputDefault` no longer exists: every node runs when it is reached, \
@@ -808,6 +809,47 @@ pub fn refuse_removed_metadata_keys(value: &serde_json::Value) -> Result<(), Str
         }
     }
     refuse_renamed_metadata_keys(value)
+}
+
+/// The keys a signing `verify` block (`hmac`, `signature`) had before a
+/// signature and a timestamp were each a place in the request; what each
+/// became is [`crate::access::events::verify_to_v2`]'s.
+const REMOVED_VERIFY_KEYS: [&str; 4] = ["signatureHeader", "timestampHeader", "prefix", "packed"];
+
+/// Refuse a `verify` block of the service's (its caller gate, or a topic's
+/// push recipe) that still carries a [`REMOVED_VERIFY_KEYS`] key, showing
+/// the block written the new way. A recorded recipe is upgraded on read
+/// (`EVENTS_V2`); a node's own metadata is source its author edits, so it
+/// is pointed at the new shape instead of meeting serde's bare "unknown
+/// field".
+fn refuse_removed_verify_keys(node: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let Some(service) = node.get("service") else { return Ok(()) };
+    let gate = service.get("verify").map(|verify| ("service.verify".to_string(), verify));
+    let pushes = service.get("events").and_then(|e| e.as_object()).into_iter().flat_map(|topics| {
+        topics.iter().filter_map(|(topic, spec)| {
+            spec.get("webhook")?.get("verify").map(|verify| (format!("service.events.{topic}.webhook.verify"), verify))
+        })
+    });
+    for (at, verify) in gate.into_iter().chain(pushes) {
+        let old: Vec<String> =
+            REMOVED_VERIFY_KEYS.iter().filter(|key| verify.get(**key).is_some()).map(|key| format!("`{key}`")).collect();
+        if old.is_empty() {
+            continue;
+        }
+        let mut upgraded = verify.clone();
+        let rewrite = match crate::access::events::verify_to_v2(&mut upgraded) {
+            Ok(()) => format!("written the new way it reads {upgraded}"),
+            Err(why) => format!("it cannot be rewritten as it stands ({why})"),
+        };
+        return Err(format!(
+            "`{at}` sets {}, which no longer exist: the signature and the timestamp are each a place in \
+             the request now (`\"signature\": {{\"in\": \"header:<Name>\", \"pair\": \"=\", \"key\": \"v0\"}}`, \
+             `\"timestamp\": {{\"in\": \"header:<Name>\"}}`); {rewrite}. \
+             docs/src/connections/verifying-requests.md has every key",
+            old.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// The `metadata.json` keys that were snake_case and are camelCase now
@@ -849,8 +891,6 @@ pub const RENAMED_METADATA_KEYS: &[(&str, &str)] = &[
     ("multi_account", "multiAccount"),
     ("id_path", "idPath"),
     ("route_by", "routeBy"),
-    ("signature_header", "signatureHeader"),
-    ("timestamp_header", "timestampHeader"),
     ("jwks_url", "jwksUrl"),
     ("renew_margin_secs", "renewMarginSecs"),
 ];
@@ -943,6 +983,7 @@ pub const METADATA_PLACES: &[(&[&str], MetadataPlace, &str)] = {
             "dotted paths into the PROVIDER's list items (`can_do_text_to_speech`): the provider's names",
         ),
         (&["service", "**", "body"], Data, "the request body sent to the provider as written: the provider's names"),
+        (&["service", "**", "form"], Data, "a form body sent to the provider as written: the provider's parameter names"),
         (&["service", "ownPage", "mint", "payload"], Data, "the app-creation payload sent to the provider as written"),
         (
             &["service", "acquisition", "authParams"],
@@ -1383,51 +1424,7 @@ impl NodeMetadata {
                             input.name
                         ));
                     }
-                    for source in sources {
-                        match source {
-                            ResourceSource::FromUrl { pattern } => {
-                                if let Err(e) = regex::Regex::new(pattern.as_str()) {
-                                    return Err(format!(
-                                        "input '{}': from_url pattern does not parse: {e}",
-                                        input.name
-                                    ));
-                                }
-                            }
-                            ResourceSource::Picker { script, code, .. } => {
-                                if !script.starts_with("https://") {
-                                    return Err(format!(
-                                        "input '{}': a picker's script must be an https:// \
-                                         address, got '{script}'",
-                                        input.name
-                                    ));
-                                }
-                                if code.trim().is_empty() {
-                                    return Err(format!(
-                                        "input '{}': a picker needs its glue `code` (the \
-                                         statements that open the chooser and call \
-                                         weft.done)",
-                                        input.name
-                                    ));
-                                }
-                            }
-                            ResourceSource::List { requires, lookup } => {
-                                // "public" says the call carries no credential
-                                // at all; "requires" says it needs these
-                                // permissions on the connection. Declaring
-                                // both is self-contradictory and would leave
-                                // the editor's source-selection ambiguous.
-                                if lookup.public && !requires.is_empty() {
-                                    return Err(format!(
-                                        "input '{}': a `public` list source cannot also \
-                                         declare `requires` (a credential-free call has \
-                                         no permissions to hold)",
-                                        input.name
-                                    ));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+                    validate_resource_sources(&format!("input '{}'", input.name), &sources)?;
                     for parent in depends_on {
                         if !self.inputs.iter().any(|i| i.name == *parent) {
                             return Err(format!(
@@ -1614,6 +1611,12 @@ impl NodeMetadata {
                 for field in &spec.fields {
                     if let Some(problem) = field.declaration_problem() {
                         return Err(format!("portsFromConfig: spec '{}' {problem}", spec.kind));
+                    }
+                    if let Some(Widget::RemoteSelect { sources, .. }) = &field.widget {
+                        validate_resource_sources(
+                            &format!("portsFromConfig: spec '{}' field '{}'", spec.kind, field.key),
+                            sources,
+                        )?;
                     }
                     // `kind` and the key field are written into every
                     // entry FIRST; a spec field reusing either name
@@ -2332,7 +2335,7 @@ pub enum Named {
     },
     /// A place whose state a run can tell (`GetNodeState`): a node
     /// outside every loop, or a loop
-    /// (`crate::project::selection::state_place`).
+    /// (`crate::project::places::state_place`).
     State {},
 }
 
@@ -3832,6 +3835,54 @@ pub enum ResourceSource {
     FromUrl { pattern: String },
 }
 
+/// Refuse a `remote_select` source that cannot work, naming `owner` (the
+/// input or entry field it sits on): a `from_url` pattern that does not
+/// parse, a picker with no https script or no glue code, a list source
+/// both `public` and `requires`, or one whose `get` or refusal paths do
+/// not read. At load, never on the first dropdown click.
+fn validate_resource_sources(owner: &str, sources: &[ResourceSource]) -> Result<(), String> {
+    for source in sources {
+        match source {
+            ResourceSource::FromUrl { pattern } => {
+                if let Err(e) = regex::Regex::new(pattern.as_str()) {
+                    return Err(format!("{owner}: from_url pattern does not parse: {e}"));
+                }
+            }
+            ResourceSource::Picker { script, code, .. } => {
+                if !script.starts_with("https://") {
+                    return Err(format!(
+                        "{owner}: a picker's script must be an https:// address, got '{script}'"
+                    ));
+                }
+                if code.trim().is_empty() {
+                    return Err(format!(
+                        "{owner}: a picker needs its glue `code` (the statements that open \
+                         the chooser and call weft.done)"
+                    ));
+                }
+            }
+            ResourceSource::List { requires, lookup } => {
+                // "public" says the call carries no credential at all;
+                // "requires" says it needs these permissions on the
+                // connection. Declaring both is self-contradictory and
+                // would leave the editor's source-selection ambiguous.
+                if lookup.public && !requires.is_empty() {
+                    return Err(format!(
+                        "{owner}: a `public` list source cannot also declare `requires` (a \
+                         credential-free call has no permissions to hold)"
+                    ));
+                }
+                crate::access::spec::Template::new(lookup.get.clone())
+                    .placeholders()
+                    .map_err(|e| format!("{owner}: list source get: {e}"))?;
+                crate::access::spec::AnswerReader::validate(lookup, &format!("{owner}: list source"))?;
+            }
+            ResourceSource::Granted { .. } => {}
+        }
+    }
+    Ok(())
+}
+
 fn granted_default_label() -> String {
     "label".into()
 }
@@ -3875,6 +3926,30 @@ pub struct Lookup {
     /// Empty keeps every item.
     #[serde(default, rename = "where", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub where_equals: std::collections::BTreeMap<String, Value>,
+    /// Where a refusal answered with a success status sits, read as a
+    /// [`RefusalReader`](crate::access::spec::RefusalReader)'s `errorPath`
+    /// is. Nothing is read unless declared. Its own field rather than a
+    /// flattened reader: `ResourceSource::List` already flattens the
+    /// lookup, and serde cannot refuse unknown keys through two flattens.
+    #[serde(default, rename = "errorPath", skip_serializing_if = "Option::is_none")]
+    pub error_path: Option<String>,
+    /// A success flag, read as a reader's `okPath` is: anything there but
+    /// `true` or `null` refuses the lookup (Slack's `ok`), and nothing
+    /// there passes.
+    #[serde(default, rename = "okPath", skip_serializing_if = "Option::is_none")]
+    pub ok_path: Option<String>,
+}
+
+/// A lookup reads its answer's refusal exactly as every declared call
+/// does: the one check and the one validator.
+impl crate::access::spec::AnswerReader for Lookup {
+    fn refusal_paths(&self) -> crate::access::spec::RefusalPaths<'_> {
+        crate::access::spec::RefusalPaths { error: self.error_path.as_deref(), ok: self.ok_path.as_deref() }
+    }
+
+    fn validate(&self, what: &str) -> Result<(), String> {
+        crate::access::spec::validate_refusal_paths(what, &self.error_path, &self.ok_path)
+    }
 }
 
 /// Cursor pagination on a [`Lookup`]: the request param the cursor is
@@ -5207,6 +5282,29 @@ mod input_semantics_tests {
         }
     }
 
+    /// A node's own verify block still written the old way is refused
+    /// naming the keys, where they sit, and the block written the new way.
+    #[test]
+    fn an_old_verify_block_is_refused_with_its_new_shape() {
+        let old = json!({ "kind": "hmac", "signatureHeader": "X-Slack-Signature", "timestampHeader": "X-Slack-Request-Timestamp",
+                          "prefix": "v0=", "concat": "v0:{timestamp}:{body}" });
+        let gate = json!({ "type": "T", "label": "T", "description": "", "service": { "verify": old } });
+        let e = refuse_removed_metadata_keys(&gate).unwrap_err();
+        assert!(e.starts_with("`service.verify` sets `signatureHeader`, `timestampHeader`, `prefix`"), "{e}");
+        assert!(e.contains(r#""in":"header:X-Slack-Signature""#), "{e}");
+
+        let push = json!({ "type": "T", "label": "T", "description": "",
+            "service": { "events": { "messages": { "webhook": { "verify": { "kind": "hmac", "signatureHeader": "S",
+                "packed": { "timestamp": "t", "signature": "v1" }, "concat": "{timestamp}.{body}" } } } } } });
+        let e = refuse_removed_metadata_keys(&push).unwrap_err();
+        assert!(e.starts_with("`service.events.messages.webhook.verify` sets `signatureHeader`, `packed`"), "{e}");
+        assert!(e.contains(r#""in":"signature:t""#), "{e}");
+
+        let new = json!({ "type": "T", "label": "T", "description": "",
+            "service": { "verify": { "kind": "hmac", "signature": { "in": "header:S" }, "concat": "{body}" } } });
+        assert!(refuse_removed_metadata_keys(&new).is_ok());
+    }
+
     /// The type-derived widget: file-valued types get the drop control,
     /// Boolean a checkbox, Number a number box, everything else a
     /// textarea (JSON typed as in source). Containers of files are NOT
@@ -5458,6 +5556,58 @@ mod input_semantics_tests {
             free_text: false,
         });
         assert!(metadata_with(vec![account, field]).validate_semantics().is_ok());
+    }
+
+    /// A list source's refusal paths are checked at load like every
+    /// declared call's: an empty `errorPath` would refuse every answer
+    /// whole, so it is refused, on an input and on an entry kind's field
+    /// alike. A `get` that does not read is refused too.
+    #[test]
+    fn validate_semantics_refuses_a_list_source_that_cannot_read_its_answer() {
+        let list = |extra: Value| -> ResourceSource {
+            let mut raw = json!({ "kind": "list", "get": "https://x.example/items", "items": "i",
+                                  "label": "name", "value": "id" });
+            raw.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(raw).unwrap()
+        };
+        let account = input("account", WeftType::Access);
+        let with = |source: ResourceSource| {
+            let mut field = input("channel", WeftType::primitive(WeftPrimitive::String));
+            field.widget = Some(Widget::RemoteSelect {
+                access: "account".into(),
+                sources: vec![source],
+                depends_on: vec![],
+                free_text: false,
+            });
+            metadata_with(vec![account.clone(), field]).validate_semantics()
+        };
+        let e = with(list(json!({ "errorPath": "" }))).unwrap_err();
+        assert!(e.contains("input 'channel': list source.errorPath is empty"), "{e}");
+        let e = with(list(json!({ "okPath": " " }))).unwrap_err();
+        assert!(e.contains("okPath is empty"), "{e}");
+        let e = with(list(json!({ "get": "https://x.example/{team" }))).unwrap_err();
+        assert!(e.contains("unclosed"), "{e}");
+        with(list(json!({ "okPath": "ok", "errorPath": "error" }))).expect("declared paths load");
+
+        let mut m = metadata_with(vec![input("rules", WeftType::primitive(WeftPrimitive::String)), account.clone()]);
+        m.ports_from_config = Some(
+            serde_json::from_value(json!({
+                "field": "rules",
+                "specs": [{
+                    "kind": "pick", "keyField": "key",
+                    "fields": [
+                        { "key": "target", "required": true, "shape": "typed", "valueType": "String",
+                          "widget": { "kind": "remote_select", "access": "account",
+                                      "sources": [ { "kind": "list", "get": "u", "items": "i", "label": "name",
+                                                     "value": "id", "errorPath": "" } ] } }
+                    ],
+                    "addsOutputs": [ { "nameTemplate": "{key}", "portType": "String" } ]
+                }]
+            }))
+            .unwrap(),
+        );
+        let e = m.validate_semantics().unwrap_err();
+        assert!(e.contains("spec 'pick' field 'target': list source.errorPath is empty"), "{e}");
     }
 
     /// One name = one input; a duplicate is a metadata error.

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::Router;
 use base64::Engine as _;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -31,6 +31,7 @@ use weft_core::access::verify::{
 use weft_broker_client::protocol::{CallerVerified, CallerVerifyRequest};
 
 use crate::state::BrokerState;
+use weft_core::wire_shape::Json;
 
 type ApiError = (StatusCode, String);
 
@@ -178,7 +179,7 @@ pub async fn verify_caller(
     let body = base64::engine::general_purpose::STANDARD
         .decode(&req.body_b64)
         .map_err(|e| CallerRefusal::Malformed(format!("body_b64: {e}")))?;
-    let push = PushParts { body: &body, headers: &req.headers, url: None, method: &req.method };
+    let push = PushParts { body: &body, headers: &req.headers, url: req.url.as_deref(), method: &req.method };
 
     if !needs_issuer_keys(&kind) {
         return Ok(verified(verify_push(&kind, &push, &secrets, now_unix)?));
@@ -186,18 +187,17 @@ pub async fn verify_caller(
     let VerifyKind::Oidc { issuers, jwks_url } = &kind else {
         unreachable!("needs_issuer_keys is true for the oidc scheme only");
     };
-    let token = bearer_token(&req.headers)
-        .ok_or_else(|| VerifyError::MissingHeader("Authorization".into()))?;
-    // Signature, issuer and expiry always; the audience only when the
-    // connection names one (a token minted for a specific app). The
-    // claims ARE the identity: the program reads `sub`, `email`, roles,
-    // whatever the issuer put there, off the request's `caller`.
+    // The audience is what tells this gate's tokens apart from the ones
+    // the same issuer mints for every other app it serves (one Auth0
+    // tenant, one Firebase project); the recipe declares it required.
+    let audience = secrets.audience.as_deref().ok_or(VerifyError::NotConfigured("audience"))?;
+    let token = bearer_token(&req.headers).ok_or_else(|| VerifyError::Missing("Authorization header".into()))?;
+    // Signature, issuer, audience and expiry. The claims ARE the
+    // identity: the program reads `sub`, `email`, roles, whatever the
+    // issuer put there, off the request's `caller`.
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
     validation.set_issuer(&issuers.iter().map(|t| t.0.as_str()).collect::<Vec<_>>());
-    match &secrets.audience {
-        Some(aud) => validation.set_audience(&[aud.as_str()]),
-        None => validation.validate_aud = false,
-    }
+    validation.set_audience(&[audience]);
     let claims: Value = crate::events::decode_jwt(token, &validation, &jwks_url.0).await?;
     Ok(verified(claims))
 }

@@ -9,6 +9,7 @@
 
 pub mod cancel_call;
 pub mod fire_signal;
+pub mod maintenance_lift;
 pub mod program_call;
 pub mod register_signal;
 pub mod removal_wait;
@@ -22,6 +23,7 @@ pub mod withdraw_signal;
 // `crate::app::task_registry` to wire into the registry.
 pub use cancel_call::CancelCallExecutor;
 pub use fire_signal::FireSignalExecutor;
+pub use maintenance_lift::MaintenanceLiftExecutor;
 pub use program_call::ProgramCallExecutor;
 pub use register_signal::RegisterSignalExecutor;
 pub use removal_wait::RemovalWaitExecutor;

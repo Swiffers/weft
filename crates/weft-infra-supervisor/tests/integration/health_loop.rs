@@ -53,6 +53,26 @@ fn whole_project_command() -> weft_broker_client::protocol::InFlightCommand {
     weft_broker_client::protocol::InFlightCommand { node_id: None, copies: weft_core::instance::Copies::Shared }
 }
 
+/// Stamp `status` on this file's node as lifecycle command `id` (a `verb`
+/// of every node's shared copies: a stop, or an apply, which is what a
+/// start is) does: issued, stamping under its fence, then completed, so
+/// the health loop is not stood down after it.
+async fn stamp_as_command(rig: &SupervisorTestRig, id: i64, verb: weft_broker_client::protocol::InfraLifecycleVerb, status: Status) {
+    rig.broker.enqueue_command(weft_broker_client::protocol::SupervisorCommandRow {
+        id,
+        project_id: PROJECT,
+        node_id: None,
+        verb,
+        spec_json: None,
+        force: false,
+        copies: weft_core::instance::Copies::Shared,
+        cancel_requested: false,
+    });
+    let stamped = rig.broker.set_status("test-replica", id, PROJECT, NODE, None, Some(NODE), status, None, None).await.unwrap();
+    assert!(matches!(stamped, weft_broker_client::WriteOutcome::Applied(_)), "{stamped:?}");
+    rig.broker.command_complete("test-replica", id, None, false).await.unwrap();
+}
+
 fn rig() -> SupervisorTestRig {
     let rig = SupervisorTestRig::with_tenant(TENANT);
     rig.broker.add_project(PROJECT);
@@ -376,10 +396,7 @@ async fn stop_clears_health_state_then_start_does_not_flake() {
 
     // Stop: status flips to stopped. (Simulating what lifecycle's
     // stop verb would do; we just write directly here.)
-    rig.broker
-        .set_status("test-replica", 1, PROJECT, NODE, None, Some(NODE), Status::Stopped, None, None)
-        .await
-        .unwrap();
+    stamp_as_command(&rig, 1, weft_broker_client::protocol::InfraLifecycleVerb::Stop, Status::Stopped).await;
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", false)]);
 
     // Tick: should NOT evaluate health (status is stopped).
@@ -387,10 +404,7 @@ async fn stop_clears_health_state_then_start_does_not_flake() {
     rig.tick_health().await.unwrap();
 
     // Start: status flips back to running, replicas come back.
-    rig.broker
-        .set_status("test-replica", 1, PROJECT, NODE, None, Some(NODE), Status::Running, None, None)
-        .await
-        .unwrap();
+    stamp_as_command(&rig, 2, weft_broker_client::protocol::InfraLifecycleVerb::Apply, Status::Running).await;
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", true)]);
 
     // Several ticks while ready. Should not emit flaky.

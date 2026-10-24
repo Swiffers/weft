@@ -117,6 +117,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             EXECUTE FUNCTION parked_fire_drop_with_signal()"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 pub use weft_core::door_fire::{UnclockedWait, WaitsOn};

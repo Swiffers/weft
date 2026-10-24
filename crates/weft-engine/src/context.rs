@@ -424,8 +424,9 @@ impl ProjectClient for weft_broker_client::BrokerProjectClient {
         )
         .await?;
         let Some(r) = resp else { return Ok(None); };
-        let def: weft_core::ProjectDefinition = serde_json::from_str(&r.project_json)
-            .map_err(|e| anyhow::anyhow!("parse project_json: {e}"))?;
+        let def = weft_core::ProjectDefinition::STORED
+            .decode(r.project_json.as_str(), r.project_json_version)
+            .map_err(|e| e.at(format_args!("program {expected_hash}")))?;
         Ok(Some(def))
     }
 }
@@ -3537,18 +3538,18 @@ async fn enqueue_register_signal_task(
         "{}/{}/{}/{}/{}",
         run_id, node_id, frames_key, is_resume, call_index,
     );
-    let payload = serde_json::json!({
-        "run_id": run_id.to_string(),
-        "node_id": node_id,
-        "frames": frames,
-        "spec": spec,
-        "is_resume": is_resume,
-        "call_index": call_index,
-        "port_snapshot": port_snapshot,
+    let payload = serde_json::to_value(weft_task_store::RegisterSignalPayload {
+        run_id,
+        node_id: node_id.to_string(),
+        frames: frames.clone(),
+        spec: spec.clone(),
+        is_resume,
+        call_index,
+        port_snapshot,
         // Stamped here, where the node asked: a relative wait counts
         // from this moment, not from whenever the listener hears of it.
-        "asked_at_unix_ms": crate::now_unix_ms(),
-    });
+        asked_at_unix_ms: crate::now_unix_ms() as i64,
+    })?;
     let id = tasks
         .enqueue_dedup(task_store::NewTask {
             kind: TaskKind::RegisterSignal,

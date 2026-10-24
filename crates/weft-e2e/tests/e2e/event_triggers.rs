@@ -33,26 +33,23 @@ use weft_e2e::platform::Platform;
 use weft_e2e::{project::Project, run, SettledRun};
 
 /// Sign a synthetic Slack push exactly as Slack signs (the v0 scheme
-/// over `v0:{timestamp}:{body}`).
+/// over `v0:{timestamp}:{body}`), with the shipped recipe's own scheme.
 fn slack_signature(signing_secret: &str, timestamp: i64, body: &str) -> String {
-    let headers = std::collections::BTreeMap::new();
-    let concat: weft_core::access::events::SignedConcat =
-        "v0:{timestamp}:{body}".parse().expect("a well-formed slack concat");
-    weft_core::access::verify::hmac_signature(
+    let kind: weft_core::access::events::VerifyKind = serde_json::from_value(json!({
+        "kind": "hmac",
+        "signature": { "in": "header:X-Slack-Signature", "pair": "=", "key": "v0" },
+        "timestamp": { "in": "header:X-Slack-Request-Timestamp" },
+        "concat": "v0:{timestamp}:{body}"
+    }))
+    .expect("the slack scheme parses");
+    let digest = weft_core::access::verify::hmac_digest(
+        &kind,
         signing_secret,
-        &concat,
-        "v0=",
-        weft_core::access::events::HmacAlgorithm::Sha256,
-        weft_core::access::events::DigestEncoding::Hex,
-        timestamp,
-        &weft_core::access::verify::PushParts {
-            body: body.as_bytes(),
-            headers: &headers,
-            url: None,
-            method: "POST",
-        },
+        Some(&timestamp.to_string()),
+        &weft_core::access::verify::PushParts { body: body.as_bytes(), headers: &[], url: None, method: "POST" },
     )
-    .expect("no unresolvable part in the slack concat")
+    .expect("no unresolvable part in the slack concat");
+    format!("v0={digest}")
 }
 
 /// Seed the connection an inbound event routes to: workspace T0E2E,
@@ -77,9 +74,9 @@ async fn seed_slack_grant(
         "INSERT INTO access_grant
            (id, tenant_id, service, registration_sealed, client_id, project_id, spec_json,
             events_recipe_hash, values_sealed, granted_scopes, permissions_verified,
-            identity, provider_account)
+            identity, provider_account, spec_json_version)
          VALUES ($1, 'local', 'slack', $2, $3, NULL, $4, $5, $6, '[]', FALSE, 'events-e2e',
-                 'T0E2E')",
+                 'T0E2E', $7)",
     )
     .bind(grant_id)
     .bind(weft_access_store::seal_json(&json!({ "label": "E2E app", "client_id": client_id }))?)
@@ -89,16 +86,18 @@ async fn seed_slack_grant(
     .bind(weft_access_store::seal_json(
         &json!({ "token": "xoxb-never-used", "teamId": "T0E2E" }),
     )?)
+    .bind(weft_core::AccessSpec::STORED.version())
     .execute(pool)
     .await?;
     let seeded = SeededGrant::new(pool.clone(), grant_id)?;
     sqlx::query(
-        "INSERT INTO service_events_recipe (service, recipe_hash, events_json)
-         VALUES ('slack', $1, $2)
+        "INSERT INTO service_events_recipe (service, recipe_hash, events_json, events_json_version)
+         VALUES ('slack', $1, $2, $3)
          ON CONFLICT (service, recipe_hash) DO UPDATE SET updated_at = now()",
     )
     .bind(&recipe_hash)
     .bind(serde_json::to_value(&events)?)
+    .bind(weft_core::access::events::STORED_EVENTS.version())
     .execute(pool)
     .await?;
     Ok((grant_id, seeded))
@@ -147,11 +146,7 @@ async fn a_signed_synthetic_slack_event_fires_the_trigger() -> Result<()> {
     let [signing_secret, client_id, db_url] =
         <[String; 3]>::try_from(env).expect("three vars requested");
     let disp = ensure::up().await?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&db_url)
-        .await
-        .context("connect WEFT_E2E_DATABASE_URL")?;
+    let pool = weft_e2e::platform::database(&db_url, 2).await.context("connect WEFT_E2E_DATABASE_URL")?;
 
     let (grant_id, seeded) = seed_slack_grant(&pool, &client_id).await?;
 
@@ -264,11 +259,7 @@ async fn a_signed_interactivity_push_resumes_the_parked_run() -> Result<()> {
     let [signing_secret, client_id, db_url] =
         <[String; 3]>::try_from(env).expect("three vars requested");
     let disp = ensure::up().await?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&db_url)
-        .await
-        .context("connect WEFT_E2E_DATABASE_URL")?;
+    let pool = weft_e2e::platform::database(&db_url, 2).await.context("connect WEFT_E2E_DATABASE_URL")?;
     let (grant_id, seeded) = seed_slack_grant(&pool, &client_id).await?;
 
     let mut project = Project::prepare("slack_await", disp.clone()).await?;

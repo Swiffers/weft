@@ -311,14 +311,14 @@ fn token_reaches_display(
 /// Lifted out of the request so it can be tested. `resolve` around it
 /// is the token, the tenant and the fetches; this is the rule. `None`
 /// is every miss, which the door answers with its one 404.
-fn display_for_token(
+fn display_for_token<'a>(
     token: &crate::store::SignalToken,
     project_id: &uuid::Uuid,
-    project: &weft_core::project::ProjectDefinition,
+    project: &'a weft_core::project::ProjectDefinition,
     address: &str,
-) -> Option<DisplayKind> {
-    let (_, kind) = display_at(&displays_of(project), address)?;
-    token_reaches_display(token, project_id, address).then_some(kind)
+) -> Option<(&'a weft_core::project::NodeDefinition, DisplayKind)> {
+    let found = display_at(&displays_of(project), address)?;
+    token_reaches_display(token, project_id, address).then_some(found)
 }
 
 /// Every display of `project`: the node, what serves its panel, and
@@ -549,12 +549,11 @@ async fn resolve(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or_else(not_found)?;
-    let kind = display_for_token(&token, &id, &project, address).ok_or_else(not_found)?;
+    let (node, kind) = display_for_token(&token, &id, &project, address).ok_or_else(not_found)?;
     // Whose copy the token reads: an instance token reads its instance's copy
     // of a node that exists once per instance, and the shared one of any
     // other node; any other token reads the shared copies.
-    let (node_id, _) = weft_core::project::resolve_address(&project, address);
-    let per_instance = project.nodes.iter().find(|n| n.id == node_id).and_then(|n| n.per_instance);
+    let per_instance = node.per_instance;
     // An instance token reaches its instance's own copies alone: a shared
     // node's display (the shared bridge's pairing code) is the author's.
     if token.instance.is_some() && per_instance.is_none() {

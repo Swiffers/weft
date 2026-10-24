@@ -11,7 +11,7 @@ use super::{utc_time, Ctx};
 /// spelling, so it can hold anything they typed; only the handful of
 /// characters that would end the value or start another parameter have
 /// to move, and everything else stays readable in a log line.
-fn query_escaped(value: &str) -> String {
+pub(crate) fn query_escaped(value: &str) -> String {
     value
         .chars()
         .map(|c| match c {
@@ -134,96 +134,17 @@ pub async fn list(ctx: Ctx, filter: ListFilter) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What `weft events` keeps and how much of each row it shows. The
-/// default is the compact read a person or an agent can hold for a
-/// long run: every row, values cut short. The filters narrow to one
-/// node or one kind of event, and `full` opens the values.
+/// What `weft events` asks the dispatcher to keep, as typed: the
+/// dispatcher reads each against the program the run ran
+/// (`weft_core::live_event::spelled::EventsFilter`).
 #[derive(Debug, Default, Clone)]
-pub struct EventsFilter {
+pub struct EventsQuery {
+    /// A node, group or loop, spelled the way that program reads.
     pub node: Option<String>,
-    /// The call sites the named node's rows must run under, outermost
-    /// first: what `--node auth.check` resolves to beside the node's
-    /// id (`Auth.check` under `["auth"]`). Empty = any, or none.
-    pub call_path: Vec<String>,
+    /// A kind, matched exactly or as a substring.
     pub kind: Option<String>,
-    /// Loop iterations, outermost first (`--iteration 3` or `3.0` for the
-    /// first inner iteration inside the fourth outer one): only the rows
-    /// fired inside them pass. Empty = any.
-    pub iteration: Vec<u32>,
-    pub full: bool,
-}
-
-/// Read `--iteration`: iteration numbers from 0, outermost loop first,
-/// joined by `.` (`3`, `3.0`).
-pub fn parse_iteration(text: &str) -> anyhow::Result<Vec<u32>> {
-    text.split('.')
-        .map(|part| {
-            part.trim().parse::<u32>().map_err(|_| {
-                anyhow::anyhow!(
-                    "--iteration takes loop iteration numbers from 0, outermost loop first, joined by '.' \
-                     (`3`, or `3.0` for an inner loop's first iteration); got '{text}'"
-                )
-            })
-        })
-        .collect()
-}
-
-impl EventsFilter {
-    /// Read `--node` the way the program is written: through the call
-    /// sites (`auth.check`), which the compiled definition turns into
-    /// the node's own id and the call path its rows carry. Without a
-    /// definition the spelling is taken as the id itself. A node of an
-    /// included file has no spelling of its own: it is always named
-    /// through a site.
-    pub fn resolve_node(
-        &mut self,
-        project: &weft_compiler::project::Project,
-        definition: &weft_core::ProjectDefinition,
-    ) -> anyhow::Result<()> {
-        if let Some(spelled) = &self.node {
-            // A node or a group: `--node gate` names a group, whose
-            // decisions (its `scope_decided` rows) are its rows (see
-            // `keeps`), so a group is taken here where the daemon-facing
-            // commands refuse it.
-            let (id, call_path) = match super::resolve_spelling(project, definition, spelled)? {
-                super::Spelled::Node { id, call_path } | super::Spelled::Group { id, call_path } => (id, call_path),
-            };
-            self.node = Some(id);
-            self.call_path = call_path;
-        }
-        Ok(())
-    }
-
-    /// Whether one replay row survives the filters. A node filter is
-    /// exact (a node's id), so a run-level row (a start, a completion,
-    /// the run failing) never passes one: it names no node; and when
-    /// the node was named through call sites, only the rows under
-    /// that call path pass. A kind filter matches the kind exactly or
-    /// as a substring, so `failed` finds both `node_failed` and
-    /// `run_failed`, and `loop` finds the loop lifecycle.
-    /// `row` is `event` as it reads on the wire: the kind and node filters
-    /// read the wire spelling, the frame filters the typed place (a
-    /// firing, or a scope's copy being decided).
-    pub fn keeps(&self, event: &weft_core::live_event::DispatcherEvent, row: &serde_json::Value) -> bool {
-        let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-        let kind_ok = self.kind.as_deref().is_none_or(|k| kind == k || kind.contains(k));
-        // `--node doubler` names the loop: its own two boundaries are its
-        // rows too, and a group's decisions are its rows.
-        let node_ok = self.node.as_deref().is_none_or(|n| row_node(row).is_some_and(|id|
-            id == n || id == weft_core::project::loop_in_id(n) || id == weft_core::project::loop_out_id(n))
-            || row.get("scope").and_then(|s| s.as_str()) == Some(n));
-        let frames = event.place_frames();
-        let call_ok = self.call_path.is_empty()
-            || frames.is_some_and(|frames| {
-                weft_core::frames::call_path(frames) == self.call_path.iter().map(String::as_str).collect::<Vec<_>>()
-            });
-        // A row inside the named iterations: its own iterations, outermost
-        // first, start with them (an inner loop's rows belong to the outer
-        // iteration they ran in). A run-level row is inside none.
-        let iteration_ok = self.iteration.is_empty()
-            || frames.is_some_and(|frames| weft_core::frames::loop_indices(frames).starts_with(&self.iteration));
-        kind_ok && node_ok && call_ok && iteration_ok
-    }
+    /// Loop iterations, outermost first, joined by `.` (`3.0`).
+    pub iteration: Option<String>,
 }
 
 /// How much of a value the compact line shows before `...`. Long
@@ -235,16 +156,6 @@ const SUMMARY_CHARS: usize = 120;
 /// row of one run repeats (they name the run, which you already have:
 /// you asked for it by run). Nothing here reaches the generic tail.
 const COLUMNS: &[&str] = &["kind", "node", "nodeId", "atUnix", "runId", "projectId"];
-
-/// The node a replay row is about. Most rows name it `node`; the two
-/// that come off a pulse rather than a journal row (`cost_reported`,
-/// `bus_participant`) name it `nodeId`. One reader, so the filter and
-/// the printed column can never disagree about which rows have a node.
-fn row_node(row: &serde_json::Value) -> Option<&str> {
-    row.get("node")
-        .or_else(|| row.get("nodeId"))
-        .and_then(|v| v.as_str())
-}
 
 /// One replay row as the line `weft events` prints: local time, the
 /// kind, the node, then everything else the row carries, `key=value`,
@@ -264,7 +175,7 @@ pub fn event_line(row: &serde_json::Value, full: bool) -> String {
         Some(at) => format!("[{:<23}]", utc_time(at)),
         None => " ".repeat(25),
     };
-    let node = row_node(row).unwrap_or("");
+    let node = weft_core::live_event::spelled::row_node(row).unwrap_or("");
     let mut line = format!("{at} {kind:<23} {node}");
     if silent_completion(row) {
         // An empty output is dropped by the tail below, exactly like
@@ -382,179 +293,43 @@ fn field_text(value: &serde_json::Value, full: bool) -> String {
     format!("{cut}...")
 }
 
-pub async fn events(ctx: Ctx, run_id: String, mut filter: EventsFilter) -> anyhow::Result<()> {
+pub async fn events(ctx: Ctx, run_id: String, query: EventsQuery, full: bool) -> anyhow::Result<()> {
     let run_id = super::resolve_run_id(&ctx, &run_id).await?;
-    let client = ctx.client()?;
-    // `--node` is spelled through the call sites, the way the program
-    // reads; the project's compiled definition says which id and which
-    // call path that is, and the rows print their node the same way.
-    // That definition is this folder's project, so it only reads a run
-    // of that same project: another project's run shows ids, and a
-    // `--node` for it is refused, since this folder's spellings name
-    // other nodes. Outside a project the spelling is the id and the
-    // rows show ids. A project here that does not load (a compile
-    // error, a bad `weft.toml`) only stops a `--node` filter, which
-    // cannot be read without it; the journal itself still prints, by
-    // id, saying why.
-    let loaded = ctx.project_here().and_then(|here| match here {
-        Some(project) => {
-            let (definition, _) = weft_compiler::hash::load_program(project)?;
-            Ok(Some((project, definition)))
-        }
-        None => Ok(None),
-    });
-    let definition = match loaded {
-        Ok(Some((project, definition))) => {
-            let detail: weft_core::program::RunDetail =
-                serde_json::from_value(client.get_json(&format!("/runs/{run_id}")).await?)
-                    .context("read the run")?;
-            let run_project = detail.summary.project_id;
-            if run_project == definition.id {
-                filter.resolve_node(project, &definition)?;
-                Some(definition)
-            } else if filter.node.is_some() {
-                anyhow::bail!(
-                    "run {run_id} belongs to project {run_project}, not to this folder's project {}; `--node` is read \
-                     through this folder's program, so run `weft events` from that project's folder",
-                    definition.id
-                );
-            } else {
-                eprintln!(
-                    "warning: nodes show as ids, because run {run_id} belongs to project {run_project}, not to this folder's project {}",
-                    definition.id
-                );
-                None
-            }
-        }
-        Ok(None) => None,
-        Err(e) if filter.node.is_some() => {
-            return Err(e.context("`--node` is read the way the program is written, so this folder's project must load"));
-        }
-        Err(e) => {
-            eprintln!("warning: nodes show as ids, because this folder's project did not load: {e:#}");
-            None
-        }
-    };
-    // Typed first, so a row the dispatcher and this CLI disagree on
-    // fails here by name; the printing below then reads each row as the
-    // JSON object it is on the wire, since its generic tail prints
-    // whatever fields a kind carries.
-    let typed = super::versions::replay_rows(&client, &run_id).await?;
-    let arr = typed.iter().map(serde_json::to_value).collect::<Result<Vec<_>, _>>()?;
-    let kept: Vec<serde_json::Value> = typed.iter().zip(&arr).filter(|(event, row)| filter.keeps(&event.event, row))
-        .map(|(_, row)| row)
-        .filter_map(|row| match &definition { Some(definition) => spell_node(row.clone(), definition), None => Some(row.clone()) })
+    // The dispatcher keeps and spells the rows against the program the run
+    // ran: this folder may hold another version of it by now, or another
+    // project, so nothing here is read through the folder's program, and
+    // a name it does not take is refused there, with the name it would.
+    let filters: Vec<String> = [("node", &query.node), ("kind", &query.kind), ("iteration", &query.iteration)]
+        .into_iter()
+        .filter_map(|(key, value)| value.as_deref().map(|value| format!("{key}={}", query_escaped(value))))
         .collect();
-    if ctx.json_out(&kept)? {
+    let path = match filters.as_slice() {
+        [] => format!("/runs/{run_id}/events"),
+        _ => format!("/runs/{run_id}/events?{}", filters.join("&")),
+    };
+    let answer: weft_core::program::RunEvents =
+        serde_json::from_value(ctx.client()?.get_json(&path).await?).context("read the run's events")?;
+    if let Some(why) = &answer.unspelled {
+        eprintln!("warning: nodes show as ids, because {why}");
+    }
+    let kept = &answer.events;
+    if ctx.json_out(kept)? {
         return Ok(());
     }
     if kept.is_empty() {
         println!(
             "(no events{})",
-            if arr.is_empty() { String::new() } else { format!(" match; the run has {}", arr.len()) }
+            if answer.total == 0 { String::new() } else { format!(" match; the run has {}", answer.total) }
         );
         return Ok(());
     }
-    for row in &kept {
-        println!("{}", event_line(row, filter.full));
+    for row in kept {
+        println!("{}", event_line(row, full));
     }
-    if !filter.full && kept.iter().any(any_value_cut) {
+    if !full && kept.iter().any(any_value_cut) {
         println!("(some values were cut to fit; `--full` prints them whole, `--json` for a tool)");
     }
     Ok(())
-}
-
-/// The row with everything it names spelled the way the program
-/// reads: a node of an included file through the site its call frames
-/// say (`one.strip`), so two calls of one file read apart; a loop's
-/// boundary as the loop (`doubler`), with `boundary=in|out` saying which
-/// end; the call frames, a loop's id, a decided scope, a skip's scope,
-/// the run's subgraph, the seed's origins and the completion's outputs
-/// the same way. The loop frames stay, for the iteration.
-///
-/// `None` for a row that has no line of its own: an included body's
-/// copy being decided. Each call of an included file decides two
-/// copies, the site's and the body's, and both spell as the site; the
-/// site's decision is the call's, so only its row is shown.
-pub fn spell_node(mut row: serde_json::Value, project: &weft_core::ProjectDefinition) -> Option<serde_json::Value> {
-    use serde_json::Value;
-    use weft_core::frames::{call_path, Frame, Located, LoopFrames};
-    use weft_core::project::{address_of, group_address};
-    let boundary_of = |id: &str| project.nodes.iter().find(|n| n.id == id).and_then(|n| n.group_boundary.as_ref())
-        .map(|b| match b.role { weft_core::project::GroupBoundaryRole::In => "in", weft_core::project::GroupBoundaryRole::Out => "out" });
-    let spell_place = |place: &Located| address_of(project, &place.id, &place.path);
-    let spell_frames = |frames: &LoopFrames| -> Vec<Value> {
-        let mut above: Vec<String> = Vec::new();
-        frames.iter().map(|frame| match frame {
-            Frame::Loop { index } => serde_json::json!({ "index": index }),
-            Frame::Call { site } => {
-                let spelled = address_of(project, site, &above);
-                above.push(site.clone());
-                serde_json::json!({ "site": spelled })
-            }
-        }).collect()
-    };
-    let frames: LoopFrames = row.get("frames").and_then(|f| serde_json::from_value(f.clone()).ok()).unwrap_or_default();
-    let path: Vec<String> = call_path(&frames).into_iter().map(str::to_string).collect();
-    let key = ["node", "nodeId"].into_iter().find(|key| row.get(key).and_then(|v| v.as_str()).is_some());
-    if let Some(key) = key {
-        let id = row[key].as_str().unwrap_or_default().to_string();
-        row[key] = Value::String(address_of(project, &id, &path));
-        if let Some(role) = boundary_of(&id) { row["boundary"] = Value::String(role.into()); }
-    }
-    // A decided scope names the group or the site at its frames.
-    if row.get("kind").and_then(|k| k.as_str()) == Some("scope_decided") {
-        if let Some(scope) = row.get("scope").and_then(|s| s.as_str()).map(str::to_string) {
-            if weft_core::project::places::is_body(project, &scope) {
-                return None;
-            }
-            row["scope"] = Value::String(group_address(project, &scope, &path));
-        }
-    }
-    if !frames.is_empty() {
-        row["frames"] = Value::Array(spell_frames(&frames));
-    }
-    // A loop's lifecycle rows name the loop and the frames around it.
-    let parent_frames: LoopFrames = row.get("parentFrames").and_then(|f| serde_json::from_value(f.clone()).ok()).unwrap_or_default();
-    if let Some(group) = row.get("groupId").and_then(|g| g.as_str()).map(str::to_string) {
-        let parent_path: Vec<String> = call_path(&parent_frames).into_iter().map(str::to_string).collect();
-        row["groupId"] = Value::String(group_address(project, &group, &parent_path));
-    }
-    if !parent_frames.is_empty() {
-        row["parentFrames"] = Value::Array(spell_frames(&parent_frames));
-    }
-    if let Some(scope) = row.get("reason").and_then(|r| r.get("scope")).and_then(|s| s.as_str()).map(str::to_string) {
-        // A site is refused in its caller's frames, one above the
-        // call frame its body's rows carry.
-        let scope_path = if path.last() == Some(&scope) { &path[..path.len() - 1] } else { &path[..] };
-        row["reason"]["scope"] = Value::String(group_address(project, &scope, scope_path));
-    }
-    // A place list or map (`subgraph`, `seed.origins`, `outputs`): each
-    // key spelled, boundaries folded into their group.
-    let places = |value: &Value| -> Vec<(Located, Value)> {
-        match value {
-            Value::Array(items) => items.iter().filter_map(|i| serde_json::from_value::<Located>(i.clone()).ok().map(|p| (p, Value::Null))).collect(),
-            Value::Object(map) => map.iter().filter_map(|(k, v)| serde_json::from_str::<Located>(&format!("\"{k}\"")).ok().map(|p| (p, v.clone()))).collect(),
-            _ => Vec::new(),
-        }
-    };
-    if let Some(subgraph) = row.get("subgraph").cloned() {
-        let mut seen = std::collections::BTreeSet::new();
-        row["subgraph"] = Value::Array(places(&subgraph).into_iter()
-            .filter(|(place, _)| boundary_of(&place.id).is_none())
-            .map(|(place, _)| spell_place(&place)).filter(|s| seen.insert(s.clone())).map(Value::String).collect());
-    }
-    for key in ["outputs", "origins"] {
-        let holder = if key == "origins" { row.get_mut("seed") } else { Some(&mut row) };
-        let Some(holder) = holder else { continue };
-        if let Some(map) = holder.get(key).cloned().filter(|v| v.is_object()) {
-            let spelled: serde_json::Map<String, Value> = places(&map).into_iter()
-                .filter(|(place, _)| boundary_of(&place.id).is_none())
-                .map(|(place, v)| (spell_place(&place), v)).collect();
-            holder[key] = Value::Object(spelled);
-        }
-    }
-    Some(row)
 }
 
 /// What narrows a bulk clean beyond project and age: the same filters a
@@ -1112,127 +887,8 @@ async fn clean_build_cache() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{event_line, EventsFilter};
+    use super::event_line;
     use serde_json::json;
-
-    /// One replay row, typed and as it reads on the wire, from the fields
-    /// that matter to a filter (the rest filled with throwaway values).
-    fn replay_row(mut fields: serde_json::Value) -> (weft_core::live_event::DispatcherEvent, serde_json::Value) {
-        let row = fields.as_object_mut().unwrap();
-        let filler = json!({
-            "runId": "00000000-0000-0000-0000-000000000001",
-            "projectId": "00000000-0000-0000-0000-000000000002",
-            "atUnix": 1u64, "frames": [], "error": "e", "output": null, "outputs": null,
-        });
-        let kind = row["kind"].as_str().unwrap().to_string();
-        for (key, value) in filler.as_object().unwrap() {
-            let wanted = match key.as_str() {
-                "frames" | "output" => kind.starts_with("node_") && (key != "output" || kind == "node_completed"),
-                "error" => kind.ends_with("_failed"),
-                "outputs" => kind == "run_completed",
-                _ => true,
-            };
-            if wanted {
-                row.entry(key.clone()).or_insert(value.clone());
-            }
-        }
-        let event: weft_core::live_event::DispatcherEvent = serde_json::from_value(fields.clone()).unwrap();
-        let wire = serde_json::to_value(&event).unwrap();
-        (event, wire)
-    }
-
-    fn keeps(filter: &EventsFilter, (event, row): &(weft_core::live_event::DispatcherEvent, serde_json::Value)) -> bool {
-        filter.keeps(event, row)
-    }
-
-    /// The kind filter matches exactly or by substring, the node filter
-    /// exactly, and a run-level row (no node) never passes a node filter.
-    #[test]
-    fn events_filter_narrows_by_node_and_kind() {
-        let failed = replay_row(json!({"kind": "node_failed", "node": "llm"}));
-        let done = replay_row(json!({"kind": "node_completed", "node": "reply"}));
-        let run_failed = replay_row(json!({"kind": "run_failed"}));
-        let all = EventsFilter::default();
-        assert!(keeps(&all, &failed) && keeps(&all, &done) && keeps(&all, &run_failed));
-        let by_kind = EventsFilter { kind: Some("failed".into()), ..Default::default() };
-        assert!(keeps(&by_kind, &failed) && keeps(&by_kind, &run_failed) && !keeps(&by_kind, &done));
-        let exact = EventsFilter { kind: Some("node_completed".into()), ..Default::default() };
-        assert!(keeps(&exact, &done) && !keeps(&exact, &failed));
-        let by_node = EventsFilter { node: Some("llm".into()), ..Default::default() };
-        assert!(keeps(&by_node, &failed) && !keeps(&by_node, &done) && !keeps(&by_node, &run_failed));
-        // Named through a call site, only the rows under that call pass.
-        let in_call = replay_row(json!({"kind": "node_completed", "node": "Auth.check", "frames": [{"site": "auth"}]}));
-        let other_call = replay_row(json!({"kind": "node_completed", "node": "Auth.check", "frames": [{"index": 1}, {"site": "again"}]}));
-        let by_call = EventsFilter { node: Some("Auth.check".into()), call_path: vec!["auth".into()], ..Default::default() };
-        assert!(keeps(&by_call, &in_call) && !keeps(&by_call, &other_call));
-        let any_call = EventsFilter { node: Some("Auth.check".into()), ..Default::default() };
-        assert!(keeps(&any_call, &in_call) && keeps(&any_call, &other_call));
-    }
-
-    /// `--iteration` keeps the rows fired inside those loop iterations,
-    /// an inner loop's rows under the outer iteration they ran in.
-    #[test]
-    fn events_filter_narrows_by_loop_iteration() {
-        let outer_three = replay_row(json!({"kind": "node_completed", "node": "double", "frames": [{"index": 3}]}));
-        let inner = replay_row(json!({"kind": "node_completed", "node": "double", "frames": [{"index": 3}, {"site": "auth"}, {"index": 0}]}));
-        let outer_one = replay_row(json!({"kind": "node_completed", "node": "double", "frames": [{"index": 1}]}));
-        let run_level = replay_row(json!({"kind": "run_completed"}));
-        let third = EventsFilter { iteration: super::parse_iteration("3").unwrap(), ..Default::default() };
-        assert!(keeps(&third, &outer_three) && keeps(&third, &inner) && !keeps(&third, &outer_one) && !keeps(&third, &run_level));
-        let nested = EventsFilter { iteration: super::parse_iteration("3.0").unwrap(), ..Default::default() };
-        assert!(keeps(&nested, &inner) && !keeps(&nested, &outer_three));
-        assert!(super::parse_iteration("x").is_err() && super::parse_iteration("3.").is_err());
-    }
-
-    /// A scope's decision is a row of the group it decides, so the frame
-    /// filters read its frames as they read a firing's: a group named
-    /// through a call site (`one.g`) keeps the decisions under that call,
-    /// and `--iteration` keeps the decisions inside that iteration.
-    #[test]
-    fn events_filter_reads_a_scope_decisions_frames() {
-        let decided = |scope: &str, frames: serde_json::Value| {
-            replay_row(json!({"kind": "scope_decided", "scope": scope, "frames": frames, "state": "open"}))
-        };
-        let in_one = decided("@src:lib.g", json!([{"site": "one"}]));
-        let in_two = decided("@src:lib.g", json!([{"site": "two"}]));
-        let by_call = EventsFilter { node: Some("@src:lib.g".into()), call_path: vec!["one".into()], ..Default::default() };
-        assert!(keeps(&by_call, &in_one) && !keeps(&by_call, &in_two));
-        let third = decided("lp.inner", json!([{"index": 3}]));
-        let first = decided("lp.inner", json!([{"index": 1}]));
-        let by_iteration = EventsFilter { iteration: super::parse_iteration("3").unwrap(), ..Default::default() };
-        assert!(keeps(&by_iteration, &third) && !keeps(&by_iteration, &first));
-    }
-
-    /// The file `lib` included at two sites, with a group inside it.
-    fn program_including_lib() -> weft_core::ProjectDefinition {
-        serde_json::from_value(json!({
-            "id": "00000000-0000-0000-0000-000000000000",
-            "nodes": [], "edges": [],
-            "groups": [
-                { "id": "@src:lib", "kind": "body", "nodeIds": [], "childGroupIds": ["@src:lib.g"] },
-                { "id": "@src:lib.g", "kind": "group", "nodeIds": [], "parentGroupId": "@src:lib" },
-                { "id": "one", "kind": "call", "body": "@src:lib", "nodeIds": [] },
-                { "id": "two", "kind": "call", "body": "@src:lib", "nodeIds": [] },
-            ],
-        }))
-        .expect("the fixture deserializes")
-    }
-
-    /// A decision reads as the group or site it decides, through its call
-    /// site; an included body's own decision has no row, since its site's
-    /// row is the call's and both would read the same.
-    #[test]
-    fn a_scope_decision_is_spelled_and_a_bodys_copy_dropped() {
-        let p = program_including_lib();
-        let decided = |scope: &str, frames: serde_json::Value| {
-            replay_row(json!({"kind": "scope_decided", "scope": scope, "frames": frames, "state": "open"})).1
-        };
-        let site = super::spell_node(decided("one", json!([])), &p).expect("a site's decision is shown");
-        assert_eq!(site["scope"], "one");
-        assert!(super::spell_node(decided("@src:lib", json!([{"site": "one"}])), &p).is_none());
-        let nested = super::spell_node(decided("@src:lib.g", json!([{"site": "two"}])), &p).expect("a group's decision is shown");
-        assert_eq!(nested["scope"], "two.g");
-    }
 
     /// The compact line cuts a long value at the summary width on a
     /// character boundary; `full` prints it whole; and everything the

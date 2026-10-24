@@ -81,8 +81,48 @@ pub struct RegisteredApp {
     /// server-to-server (client-credentials) apps.
     #[serde(default)]
     pub auth_url: Option<String>,
+    /// Other addresses this app's credentials may travel to, each a
+    /// bare origin (`https://graph.instagram.com`): where a recipe's
+    /// own calls after the exchange or at renewal go when the provider
+    /// runs them on another host than its token endpoint. The token
+    /// endpoint's own origin is always allowed.
+    #[serde(default)]
+    pub origins: Vec<String>,
     #[serde(flatten)]
     pub app: AppRegistration,
+}
+
+impl RegisteredApp {
+    /// Every origin this app's credentials may reach, each ending in
+    /// `/` so a prefix test cannot pass `https://a.example.evil`: the
+    /// token endpoint's, then the declared `origins`.
+    fn allowed_origins(&self) -> Vec<String> {
+        std::iter::once(self.token_url.as_str())
+            .chain(self.origins.iter().map(String::as_str))
+            .filter_map(|u| url::Url::parse(u).ok())
+            .map(|u| format!("{}/", u.origin().ascii_serialization()))
+            .collect()
+    }
+}
+
+/// Refuse an `origins` entry that is not a bare origin (a scheme and a
+/// host, maybe a port, nothing after): a path there would read as a pin
+/// it is not, since a call is held to the origin only.
+fn check_origin(entry: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(entry).map_err(|e| format!("'{entry}' is not a URL ({e})"))?;
+    let bare = parsed.origin().is_tuple()
+        && matches!(parsed.path(), "" | "/")
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && parsed.username().is_empty();
+    if bare {
+        Ok(())
+    } else {
+        Err(format!(
+            "'{entry}' is not a bare origin; write the scheme and host only, like \
+             `https://graph.instagram.com`"
+        ))
+    }
 }
 
 /// The receive-side material of one registered app; see
@@ -309,6 +349,17 @@ impl FileAppProvider {
                         )
                     })?;
                 cred.trim_label();
+                if let SharedCredential::OauthApp(app) = &cred {
+                    for origin in &app.origins {
+                        check_origin(origin).map_err(|why| {
+                            anyhow::anyhow!(
+                                "the '{}' app under '{service}' in {} lists an origin {why}",
+                                app.app.label.trim(),
+                                path.display()
+                            )
+                        })?;
+                    }
+                }
                 if cred.label().is_empty() {
                     anyhow::bail!(
                         "an entry under '{service}' in {} has an empty label; every \
@@ -498,7 +549,7 @@ pub fn app_by_label<'a>(apps: &'a [RegisteredApp], label: &str) -> Option<&'a Re
 /// credentials are only ever sent where the operator wrote, full stop.
 /// (A user's own app has no pin; its addresses are theirs to point.)
 pub fn check_endpoints(spec: &AccessSpec, app: &RegisteredApp) -> anyhow::Result<()> {
-    let weft_core::access::spec::Acquisition::OAuth2 { grant, token_url, refresh, .. } =
+    let weft_core::access::spec::Acquisition::OAuth2 { grant, token_url, after_exchange, refresh, .. } =
         &spec.acquisition
     else {
         anyhow::bail!("a registered app only serves an oauth2 service");
@@ -512,27 +563,24 @@ pub fn check_endpoints(spec: &AccessSpec, app: &RegisteredApp) -> anyhow::Result
             app.token_url
         );
     }
-    // A declared renewal call runs with the app's credentials in
-    // scope, so on a registered app it may only address the same
-    // origin as the pinned token endpoint: the operator pinned where
-    // this app's secrets travel, and the renewal is no exception.
-    if let Some(call) = refresh {
-        // The full origin (scheme + host + any explicit port), so a
-        // pinned endpoint on a non-default port pins that port too.
-        let pinned = url::Url::parse(&app.token_url)
-            .ok()
-            .map(|u| format!("{}/", u.origin().ascii_serialization()));
-        let allowed = pinned
-            .as_deref()
-            .is_some_and(|origin| call.url.0.starts_with(origin));
-        if !allowed {
+    // A declared call (the swap after the exchange, a renewal) runs with
+    // the app's credentials in scope, so on a registered app it may only
+    // address an origin the operator pinned: the token endpoint's, or
+    // one the app lists under `origins`. The full origin (scheme + host
+    // + any explicit port), so a non-default port is pinned too.
+    let allowed = app.allowed_origins();
+    for (what, call) in [("afterExchange", after_exchange), ("refresh", refresh)] {
+        let Some(call) = call else { continue };
+        let url = &call.url.0;
+        if !allowed.iter().any(|origin| url.starts_with(origin.as_str())) {
             anyhow::bail!(
-                "the '{}' service's renewal call addresses {}, but the registered '{}' \
-                 app's credentials only travel to its pinned sign-in origin; the one-click \
-                 door only talks to its pinned addresses",
+                "the '{}' service's `{what}` call addresses {url}, but the registered '{}' \
+                 app's credentials only travel to the origins pinned in the apps file ({}); \
+                 if the provider really runs that call there, add its origin to the app's \
+                 `origins`",
                 spec.service,
-                call.url.0,
                 app.app.label,
+                allowed.iter().map(|o| o.trim_end_matches('/')).collect::<Vec<_>>().join(", "),
             );
         }
     }
@@ -600,6 +648,7 @@ mod tests {
             events: None,
             token_url: "https://a/t".into(),
             auth_url: Some("https://a/x".into()),
+            origins: Vec::new(),
             app: AppRegistration {
                 label: label.into(),
                 client_id: format!("cid-{label}"),
@@ -670,34 +719,53 @@ mod tests {
         assert!(err.contains("`authUrl`"), "{err}");
     }
 
-    /// A declared renewal call runs with the app's credentials in
-    /// scope, so on a registered app it may only address the pinned
-    /// sign-in origin: same origin passes, anywhere else is refused.
+    /// A declared call (the swap after the exchange, a renewal) runs with
+    /// the app's credentials in scope, so on a registered app it may only
+    /// address an origin the file pins: the token endpoint's, or one the
+    /// app lists under `origins`. Anywhere else is refused, naming the
+    /// call and the key that would allow it.
     #[test]
-    fn a_renewal_call_is_held_to_the_pinned_origin() {
-        let renewal_spec = |url: &str| -> AccessSpec {
+    fn a_declared_call_is_held_to_the_pinned_origins() {
+        let call_spec = |key: &str, url: &str| -> AccessSpec {
             let mut spec = spec_with_permissions(&["a"]);
-            if let weft_core::access::spec::Acquisition::OAuth2 { refresh, .. } =
+            let call = Some(serde_json::from_value(serde_json::json!({ "url": url })).unwrap());
+            if let weft_core::access::spec::Acquisition::OAuth2 { refresh, after_exchange, .. } =
                 &mut spec.acquisition
             {
-                *refresh = Some(
-                    serde_json::from_value(serde_json::json!({
-                        "url": url,
-                        "captures": [{ "name": "token", "path": "access_token" }]
-                    }))
-                    .unwrap(),
-                );
+                match key {
+                    "refresh" => *refresh = call,
+                    _ => *after_exchange = call,
+                }
             }
             spec
         };
-        let app = app("Pinned", &["a"]);
-        // The app pins https://a/t; a renewal on the same origin passes.
-        check_endpoints(&renewal_spec("https://a/exchange?token={token}"), &app)
-            .expect("same-origin renewal passes");
-        let err = check_endpoints(&renewal_spec("https://evil.example/x?t={token}"), &app)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("renewal") && err.contains("pinned"), "{err}");
+        let mut app = app("Pinned", &["a"]);
+        for key in ["refresh", "afterExchange"] {
+            // The app pins https://a/t; a call on the same origin passes.
+            check_endpoints(&call_spec(key, "https://a/exchange?token={token}"), &app)
+                .expect("a call on the token endpoint's origin passes");
+            let err = check_endpoints(&call_spec(key, "https://graph.example/x?t={token}"), &app)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("`{key}`")) && err.contains("`origins`"), "{err}");
+            // A host that merely starts like a pinned one is still elsewhere.
+            assert!(check_endpoints(&call_spec(key, "https://a.evil/x"), &app).is_err());
+        }
+        app.origins = vec!["https://graph.example".into()];
+        for key in ["refresh", "afterExchange"] {
+            check_endpoints(&call_spec(key, "https://graph.example/x?t={token}"), &app)
+                .expect("a listed origin passes");
+        }
+    }
+
+    #[test]
+    fn an_origin_entry_must_be_bare() {
+        assert!(check_origin("https://graph.instagram.com").is_ok());
+        assert!(check_origin("https://graph.instagram.com/").is_ok());
+        assert!(check_origin("http://127.0.0.1:8080").is_ok());
+        for bad in ["https://graph.instagram.com/v26.0", "https://a/?x=1", "graph.instagram.com", "https://u@a"] {
+            assert!(check_origin(bad).is_err(), "{bad}");
+        }
     }
 
     #[tokio::test]

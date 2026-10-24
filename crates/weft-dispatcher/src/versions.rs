@@ -92,6 +92,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         )"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 /// `path -> sha256` of every file a version covers.
@@ -242,7 +243,7 @@ async fn source_versions_in_use(
          UNION SELECT r.source_version FROM run r \
          WHERE r.project_id = $1 \
            AND (r.state <> 'ended' OR EXISTS (SELECT 1 FROM trigger_setup s WHERE s.run_id = r.run_id)) \
-         UNION SELECT bake_json::jsonb ->> 'sourceVersion' FROM trigger_bake WHERE project_id = $1 AND $2",
+         UNION SELECT source_version FROM trigger_bake WHERE project_id = $1 AND $2",
     )
     .bind(project)
     .bind(include_bakes)
@@ -260,7 +261,18 @@ pub(crate) async fn retain_source_version(conn: &mut sqlx::PgConnection, project
 }
 
 type VersionTuple = (String, uuid::Uuid, Option<String>, serde_json::Value, Option<String>, i64);
-type RunTuple = (uuid::Uuid, uuid::Uuid, String, Option<uuid::Uuid>, Vec<String>, Option<serde_json::Value>, String, Option<String>, i64);
+type RunTuple = (
+    uuid::Uuid,
+    uuid::Uuid,
+    String,
+    Option<uuid::Uuid>,
+    Vec<String>,
+    Option<serde_json::Value>,
+    weft_core::stored::Version,
+    String,
+    Option<String>,
+    i64,
+);
 
 fn version_from(row: VersionTuple) -> anyhow::Result<VersionRow> {
     let (id, project_id, parent_id, manifest, label, created_at) = row;
@@ -275,14 +287,17 @@ fn version_from(row: VersionTuple) -> anyhow::Result<VersionRow> {
 }
 
 fn run_from(row: RunTuple) -> anyhow::Result<RunRow> {
-    let (run_id, project_id, version_id, seed_run_id, stale, spec, definition_hash, example, created_at) = row;
+    let (run_id, project_id, version_id, seed_run_id, stale, spec, spec_version, definition_hash, example, created_at) = row;
     Ok(RunRow {
         run_id,
         project_id,
         version_id,
         seed_run_id,
         stale,
-        spec: spec.map(serde_json::from_value).transpose()?,
+        spec: spec
+            .map(|spec| RunSpec::STORED.decode(spec, spec_version))
+            .transpose()
+            .map_err(|e| e.at(format_args!("run {run_id}'s spec")))?,
         definition_hash,
         example,
         created_at: created_at as u64,
@@ -292,7 +307,7 @@ fn run_from(row: RunTuple) -> anyhow::Result<RunRow> {
 const VERSION_COLUMNS: &str = "id, project_id, parent_id, manifest, label, created_at";
 /// A run's tree columns, off its `run` row, in [`RunTuple`] order.
 const RUN_COLUMNS: &str =
-    "run_id, project_id, source_version, seed_of, stale, spec, definition_hash, example, started_at";
+    "run_id, project_id, source_version, seed_of, stale, spec, spec_version, definition_hash, example, started_at";
 /// A run the tree shows: a run of a program whose version is still in the
 /// tree (a run outlives a version pruned under it, until retention).
 const IN_TREE: &str = "source_version IS NOT NULL AND definition_hash IS NOT NULL \
@@ -354,7 +369,7 @@ impl VersionStoreOps for PostgresVersionStore {
             .bind(project).bind(ids).execute(&mut *tx).await?;
         let protected = source_versions_in_use(&mut tx, project, false).await?;
         anyhow::ensure!(!ids.iter().any(|id| protected.contains(id)), VERSIONS_IN_USE_REFUSAL);
-        sqlx::query("DELETE FROM trigger_bake WHERE project_id = $1 AND bake_json::jsonb ->> 'sourceVersion' = ANY($2)")
+        sqlx::query("DELETE FROM trigger_bake WHERE project_id = $1 AND source_version = ANY($2)")
             .bind(project).bind(ids).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM version_runs WHERE project_id = $1 AND source_version = ANY($2)")
             .bind(project).bind(ids).execute(&mut *tx).await?;

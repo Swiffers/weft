@@ -172,13 +172,14 @@ imagebot (a1b2…): took down 'feed', 'door': the door holds what arrives; 3 arr
 `upgrade` take these flags with these defaults, and the editor's buttons and
 a program's own calls answer the same questions (for the calls, go and read
 [taking something down from a
-run](instances.md#taking-something-down-from-a-run)). Two take triggers down
-with answers you do not pick:
+run](instances.md#taking-something-down-from-a-run)). Three take triggers down
+with answers you do not pick, or only some of them:
 
 | What takes them down | Door | Held | Running |
 |---|---|---|---|
 | `weft rm` | `refuse` | `drop` | `cancel` |
 | The health check, when infra a trigger reads breaks | `take` | `keep` | `cancel`, since those runs cannot go on without the infra |
+| `weft maintenance on`, before an update ([updating weft](cli.md#updating-weft)) | `take` | `keep` | `wait`, or `cancel` with `--running cancel` |
 
 ### Bringing them back
 

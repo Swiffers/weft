@@ -201,7 +201,8 @@ pub fn seed_plan(
     }
     // A fire and an emit are fresh events: what they reach runs again.
     let fresh: Vec<Located> = spec.emit.keys().chain(spec.fire.iter().map(|(node, _)| node))
-        .map(|spelled| { let (id, path) = crate::project::resolve_address(project, spelled); Located::new(id, path) }).collect();
+        .map(|spelled| crate::project::places::named(&g, spelled).map(crate::project::places::Named::into_place))
+        .collect::<Result<_, String>>().map_err(anyhow::Error::msg)?;
     invalid.extend(cut::downstream(&g, &fresh));
     // What a place depends on: one walk per place; the fixpoint below only
     // re-reads them.
@@ -232,7 +233,7 @@ pub fn seed_plan(
         .collect();
     // A start the seed reuses whole is said so: a node start, or a group
     // start whose every member this run would run is reused.
-    for place in spec.handed(project).keys() {
+    for place in spec.handed(project).map_err(anyhow::Error::msg)?.keys() {
         let reused: BTreeSet<RunId> = if g.group(&place.id).is_some() {
             let Some(members) = reused_group_start(&g, place, &authored.runs, &origins) else { continue };
             members.iter().map(|member| origins[member]).collect()
@@ -336,8 +337,8 @@ pub fn starting_parameters(
         }
     }
     let handed_by_place: Vec<(String, Located)> = saved.from.keys().chain(saved.group.iter().map(|(id, _)| id))
-        .map(|spelled| { let (id, path) = crate::project::resolve_address(project, spelled); (spelled.clone(), Located::new(id, path)) })
-        .collect();
+        .map(|spelled| Ok((spelled.clone(), crate::project::places::named(&g, spelled)?.into_place())))
+        .collect::<Result<_, String>>().map_err(anyhow::Error::msg)?;
     // What the old run handed a place: kept for one that runs again, or
     // as it was for one this run reuses.
     let handed_to = |place: &Located| -> Option<&BTreeMap<String, Value>> {

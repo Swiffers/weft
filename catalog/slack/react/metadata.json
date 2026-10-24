@@ -34,6 +34,8 @@
               "channels:read"
             ],
             "get": "https://slack.com/api/conversations.list?limit=200&exclude_archived=true",
+            "okPath": "ok",
+            "errorPath": "error",
             "items": "channels",
             "label": "name",
             "value": "id",

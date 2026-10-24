@@ -199,7 +199,8 @@ gets `text_list`, `String` gets `text`, and everything else gets `textarea`.
 | `from_url` | `pattern` | The person pastes a link and the first capture group is the id |
 
 A `Lookup` takes `get`, `items`, `label` and `value`, and optionally `page` (an
-object holding `cursorParam` and `cursorPath`), `public` and `where`. `get` is the URL to
+object holding `cursorParam` and `cursorPath`), `public`, `where`, `errorPath`
+and `okPath`. `get` is the URL to
 call. `items` is the dotted path to the array in the answer (`data.channels` for
 `{"data": {"channels": [...]}}`), or `""` when the answer is the array itself.
 `label` and `value` are dotted paths inside one item: the text the person sees
@@ -211,7 +212,9 @@ service never sees the search text, and the list only shows the items whose
 label or id contains it, ignoring case. If you want another input's value
 in the URL, list that input in the widget's `dependsOn` and write its name in
 braces: `{team}` becomes whatever is set on `team`. Weft percent-encodes every
-value it puts into the URL.
+value it puts into the path or the query. A value before the path, like a
+`{base}` holding `https://...`, goes in as it is. If a brace in `get` is never
+closed, the node fails to load and says so.
 
 If the endpoint is https and needs no credential, add `"public": true`. The list
 then works before anyone picks a connection, and the call never carries the
@@ -235,6 +238,11 @@ carrying flags like `can_do_text_to_speech`, so a text-to-speech node sets
 If the lookup also has a `page`, `where` filters each page as it arrives: a page where
 nothing matches adds nothing to the list, and the editor still shows "More..."
 for the next one.
+
+If the service answers a failed lookup with a 200 and says so in the body, like
+Slack's `{"ok": false, "error": "missing_scope"}`, add `errorPath` and `okPath`
+so the lookup fails with the service's own words. For what they read, go and
+read [refusals answered with a 200](../connections/declaring-a-service.md#refusals-answered-with-a-200).
 
 ## validate
 

@@ -25,6 +25,7 @@
       },
       "tokenUrl": "https://api.notion.com/v1/oauth/token",
       "tokenAuth": "basic",
+      "neverExpires": true,
       "authParams": {
         "owner": "user"
       },

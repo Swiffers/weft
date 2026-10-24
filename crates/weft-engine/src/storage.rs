@@ -117,6 +117,9 @@ async fn status_err(context: &str, resp: reqwest::Response) -> WeftError {
         Ok(body) => body,
         Err(e) => return e,
     };
+    if status == weft_broker_client::protocol::UNREADABLE_SHAPE {
+        return WeftError::NodeFailed(weft_broker_client::WorkerOutdated { path: context.to_string(), said: body }.to_string());
+    }
     match status.as_u16() {
         404 => WeftError::NodeFailed(format!("storage file not found: {body}")),
         401 | 403 => WeftError::NodeFailed(format!("storage denied: {body}")),

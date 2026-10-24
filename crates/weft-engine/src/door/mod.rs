@@ -176,6 +176,25 @@ impl Call<'_> {
         }
         weft_core::net::caller_address(forwarded_for(self.headers), self.peer, hops)
     }
+
+    /// Where the project's routes sit at the address the caller used:
+    /// the address their request names ([`weft_core::net::request_base_url`])
+    /// plus the path the relay said the routes sit under. `None` when the
+    /// request names no usable host.
+    fn routes_base(&self) -> Option<String> {
+        Some(format!("{}{}", weft_core::net::request_base_url(self.headers)?, self.route_prefix))
+    }
+
+    /// The full address the caller sent this request to, path and query
+    /// exactly as sent: what a scheme signing the URL covers (Twilio's
+    /// signs the address it was told to call, query included).
+    fn reached_url(&self) -> Option<String> {
+        let base = self.routes_base()?;
+        Some(match self.raw_query {
+            "" => format!("{base}{}", self.raw_path),
+            query => format!("{base}{}?{query}", self.raw_path),
+        })
+    }
 }
 
 fn answer(status: StatusCode, message: impl Into<String>) -> Arrived {
@@ -260,8 +279,7 @@ impl Door {
             Some(Err(e)) => return answer(StatusCode::INTERNAL_SERVER_ERROR, format!("the route's settings: {e}")),
             None => return answer(StatusCode::INTERNAL_SERVER_ERROR, "the route is not armed".to_string()),
         };
-        let headers_sent = headers_sent(call.headers);
-        let header_map: BTreeMap<String, String> = headers_sent.iter().cloned().collect();
+        let headers_sent = weft_core::net::request_headers(call.headers);
         let query = weft_core::route::parse_query(callers_query);
         let address = call.address(self.edge.trusted_hops);
 
@@ -285,12 +303,12 @@ impl Door {
                 } else {
                     (axum::body::Bytes::new(), body)
                 };
-                let (caller, credential_headers) = match self.gate(&entry, call.method, path, &header_map, &query, &bytes).await {
+                let (caller, credential_headers) = match self.gate(&entry, call.method, path, call.reached_url(), &headers_sent, &bytes).await {
                     Ok(Some(verified)) => (Some(verified.identity), verified.credential_headers),
                     Ok(None) => (None, Vec::new()),
                     Err(arrived) => return arrived,
                 };
-                let named = match self.instance(&header_map, entry.auth_kind != "none", &address.to_string(), now).await {
+                let named = match self.instance(&headers_sent, entry.auth_kind != "none", &address.to_string(), now).await {
                     Ok(named) => named,
                     Err(arrived) => return arrived,
                 };
@@ -366,10 +384,11 @@ impl Door {
     /// the routes this worker holds: the most specific pattern wins. One
     /// armed for another program is another worker's to serve.
     async fn live_route(&self, method: &str, path: &str) -> Result<RouteMatch, Arrived> {
-        let triggers = self.broker.triggers().await.map_err(|e| {
-            tracing::error!(target: "weft_engine::door", error = %format!("{e:#}"), "the project's triggers could not be read");
-            answer(StatusCode::SERVICE_UNAVAILABLE, "this worker could not read its routes; try again in a moment")
-        })?;
+        let triggers = self
+            .broker
+            .triggers()
+            .await
+            .map_err(|e| self.broker_failed(&e, "the project's triggers could not be read", "this worker could not read its routes; try again in a moment"))?;
         let (trigger, params) = match triggers.route(method, path) {
             weft_core::route::RouteMatch::Found { route, params } => (route.clone(), params),
             weft_core::route::RouteMatch::WrongMethod { allowed } => {
@@ -401,8 +420,8 @@ impl Door {
         entry: &ArmedEntry,
         method: &str,
         path: &str,
-        headers: &BTreeMap<String, String>,
-        query: &BTreeMap<String, String>,
+        url: Option<String>,
+        headers: &[(String, String)],
         body: &[u8],
     ) -> Result<Option<weft_broker_client::protocol::CallerVerified>, Arrived> {
         match entry.auth_kind.as_str() {
@@ -427,8 +446,8 @@ impl Door {
                     service: field("service")?,
                     method: method.to_string(),
                     path: path.to_string(),
-                    headers: headers.clone(),
-                    query: query.clone(),
+                    url,
+                    headers: headers.to_vec(),
                     body_b64: {
                         use base64::Engine as _;
                         base64::engine::general_purpose::STANDARD.encode(body)
@@ -439,10 +458,7 @@ impl Door {
                     // The broker's no IS the answer (flat, the reason in
                     // its log).
                     Ok(None) => Err(answer(StatusCode::UNAUTHORIZED, "refused")),
-                    Err(e) => {
-                        tracing::error!(target: "weft_engine::door", error = %format!("{e:#}"), "the caller's check could not be made");
-                        Err(answer(StatusCode::SERVICE_UNAVAILABLE, "the caller could not be checked; try again in a moment"))
-                    }
+                    Err(e) => Err(self.broker_failed(&e, "the caller's check could not be made", "the caller could not be checked; try again in a moment")),
                 }
             }
             other => Err(answer(StatusCode::INTERNAL_SERVER_ERROR, format!("unknown auth_kind: {other}"))),
@@ -457,7 +473,7 @@ impl Door {
     /// presenting refused tokens is bounded ([`Edge`]).
     async fn instance(
         &self,
-        headers: &BTreeMap<String, String>,
+        headers: &[(String, String)],
         gated: bool,
         address: &str,
         now: i64,
@@ -466,20 +482,19 @@ impl Door {
         let presented = headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(weft_core::instance::INSTANCE_TOKEN_HEADER))
-            .map(|(_, value)| value.trim().to_string());
+            .map(|(_, value)| value.trim());
         let Some(presented) = presented else { return named };
         if let Err(refused) = self.limits.address_allowed(address, self.edge.invalid_tokens_per_minute, now) {
             return Err(Arrived::Answer(too_many(refused)));
         }
-        let instance = match self.broker.instance_token(&presented).await {
+        let instance = match self.broker.instance_token(presented).await {
             Ok(Some(instance)) => instance,
             Ok(None) => {
                 self.limits.token_refused(address, now);
                 return Err(answer(StatusCode::UNAUTHORIZED, "this is not an instance token of this project"));
             }
             Err(e) => {
-                tracing::error!(target: "weft_engine::door", error = %format!("{e:#}"), "an instance token could not be checked");
-                return Err(answer(StatusCode::SERVICE_UNAVAILABLE, "the instance token could not be checked; try again in a moment"));
+                return Err(self.broker_failed(&e, "an instance token could not be checked", "the instance token could not be checked; try again in a moment"));
             }
         };
         // The header is checked only against the token here: a token is
@@ -511,7 +526,7 @@ impl Door {
         instance: Option<InstanceId>,
         now: i64,
     ) -> Arrived {
-        let Some(base) = weft_core::net::request_base_url(call.headers) else {
+        let Some(base) = call.routes_base() else {
             return answer(StatusCode::BAD_REQUEST, "the request names no host to open the socket at");
         };
         let claims = CallerTokenClaims {
@@ -524,7 +539,7 @@ impl Door {
             exp: now + weft_core::time_scale::scaled_secs(TICKET_LIFE_SECS),
         };
         let ticket = self.secret.mint_ticket(&claims);
-        let url = weft_core::caller_token::socket_url(&format!("{base}{}", call.route_prefix), call.raw_path, call.raw_query, &ticket);
+        let url = weft_core::caller_token::socket_url(&base, call.raw_path, call.raw_query, &ticket);
         // SYNC: the ticket answer's shape <-> crates/weft-e2e/src/live.rs (ticket), packages/weft-connect/src/core/socket.ts (socketAddress)
         let body = serde_json::json!({ "url": url, "protocol": "websocket" });
         Arrived::Answer(
@@ -664,6 +679,14 @@ impl Door {
         Ok(quiet)
     }
 
+    /// The `503` a call gets when the broker did not answer what the door
+    /// asked it for the call (`e`), logged as `failed` says; the caller
+    /// hears `for_caller`.
+    fn broker_failed(&self, e: &anyhow::Error, failed: &str, for_caller: &str) -> Arrived {
+        tracing::error!(target: "weft_engine::door", error = %format!("{e:#}"), "{failed}");
+        answer(StatusCode::SERVICE_UNAVAILABLE, for_caller)
+    }
+
     /// Something the tick looks at changed (a run came onto this worker, or
     /// one of its runs went quiet or moved again), once it is counted where
     /// the tick looks: the tick goes out now and renews the lease behind
@@ -678,10 +701,9 @@ impl Door {
 const TICKET_LIFE_SECS: i64 = 120;
 
 /// The `503` a call gets while what it called cannot take it
-/// (`weft_core::arrival::NOT_NOW_FOR_CALLER`).
+/// (`weft_core::arrival::not_now_answer`).
 pub(crate) fn not_now() -> Response {
-    use weft_core::arrival::{NOT_NOW_FOR_CALLER, NOT_NOW_RETRY_SECS};
-    (StatusCode::SERVICE_UNAVAILABLE, [(axum::http::header::RETRY_AFTER, NOT_NOW_RETRY_SECS.to_string())], NOT_NOW_FOR_CALLER).into_response()
+    weft_core::arrival::not_now_answer().into_response()
 }
 
 /// The `429` a refused call gets: which limit, and when to come back.
@@ -692,15 +714,6 @@ fn too_many(refused: limits::Refused) -> Response {
         refused.answer(),
     )
         .into_response()
-}
-
-/// Every header the caller sent, repeats included: what the gate checks,
-/// and what the run's trigger reads as the caller's opening request.
-fn headers_sent(headers: &HeaderMap) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| Some((name.as_str().to_string(), value.to_str().ok()?.to_string())))
-        .collect()
 }
 
 fn forwarded_for(headers: &HeaderMap) -> Option<&str> {
@@ -976,6 +989,36 @@ mod tests {
         let Arrived::Run(admitted, _) = arrive(&door, "POST", "/x", "", &headers(&[])).await else { panic!("admitted") };
         assert_eq!(admitted.opening.caller, Some(serde_json::json!({ "sub": "alice" })));
         assert_eq!(broker.verified.lock().unwrap().len(), 2);
+    }
+
+    /// The broker is asked with the full address the caller used (host,
+    /// the relay's route prefix, path and query as sent: what a scheme
+    /// signing `{url}` covers) and every value of a repeated header.
+    #[tokio::test]
+    async fn a_gated_route_hands_the_broker_the_url_and_every_header_value() {
+        let mut gated = route("t1", "route", "sms");
+        armed(&mut gated).auth_kind = "connection".into();
+        armed(&mut gated).auth_config = Some(serde_json::json!({ "access_id": "a", "service": "s" }));
+        let broker = FakeDoorBroker::new(vec![gated]);
+        let door = door(broker.clone());
+        let mut sent = headers(&[("x-forwarded-proto", "https")]);
+        sent.insert("host", "acme.example".parse().unwrap());
+        sent.append("x-sig", "one".parse().unwrap());
+        sent.append("x-sig", "two".parse().unwrap());
+        let call = Call {
+            method: "POST",
+            raw_path: "/sms",
+            raw_query: "foo=1&bar=%2B2",
+            headers: &sent,
+            peer: "10.0.0.1".parse().unwrap(),
+            relayed: false,
+            route_prefix: "/connect/acme",
+        };
+        door.arrive(call, axum::body::Body::empty()).await;
+        let asked = broker.verified.lock().unwrap();
+        assert_eq!(asked[0].url.as_deref(), Some("https://acme.example/connect/acme/sms?foo=1&bar=%2B2"));
+        let sigs: Vec<&str> = asked[0].headers.iter().filter(|(k, _)| k == "x-sig").map(|(_, v)| v.as_str()).collect();
+        assert_eq!(sigs, ["one", "two"]);
     }
 
     #[tokio::test]

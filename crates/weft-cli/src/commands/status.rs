@@ -129,6 +129,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     }
 
     println!("project: {} ({project_id})", data.name);
+    if let Some(line) = maintenance_line(&ctx).await {
+        println!("  {line}");
+    }
     // Half taken down: what follows is what is left.
     if data.removing {
         println!("  WARNING: {}", weft_core::projects::PROJECT_BEING_REMOVED);
@@ -279,6 +282,23 @@ pub async fn run(ctx: Ctx) -> Result<()> {
 
 /// Say on stderr (stdout may be the one JSON line the editor reads) that
 /// drift cannot be looked for, and why.
+/// The line `weft status` adds while the install is in maintenance, read
+/// off `GET /install/maintenance`; `None` when it is not. One that could
+/// not be read is said on stderr, the rest of the status still printed.
+async fn maintenance_line(ctx: &Ctx) -> Option<String> {
+    let read = async { serde_json::from_value::<weft_core::maintenance::MaintenanceState>(ctx.client()?.get_json("/install/maintenance").await?).map_err(anyhow::Error::from) };
+    match read.await {
+        Ok(state) => state.since_unix.map(|since| {
+            let since = chrono::DateTime::from_timestamp(since, 0).map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(|| since.to_string());
+            format!("maintenance: the install is in maintenance since {since}; nothing is turned on until `{}`", ctx.weft("maintenance off"))
+        }),
+        Err(e) => {
+            eprintln!("warning: could not read whether the install is in maintenance ({e:#})");
+            None
+        }
+    }
+}
+
 fn warn_no_drift(why: &str, e: &anyhow::Error) {
     eprintln!("warning: {why}, so whether the running program is behind the source is not checked ({e:#})");
 }
@@ -315,6 +335,9 @@ fn trigger_lines(entry: &weft_core::projects::TriggerEntry) -> Vec<String> {
                     ),
                     Some(weft_core::projects::DownWith::Infra) => {
                         format!("{door}, taken down with its infra (it comes back once that infra runs again)")
+                    }
+                    Some(weft_core::projects::DownWith::Maintenance) => {
+                        format!("{door}, taken down by the install's maintenance (`weft maintenance off` brings it back)")
                     }
                 }
             }
@@ -431,6 +454,8 @@ mod tests {
         assert!(health[0].contains("taken down by the health check") && health[0].contains("`weft activate`"), "{health:?}");
         let infra = super::trigger_lines(&entry(Some(weft_core::projects::DownWith::Infra)));
         assert!(infra[0].contains("taken down with its infra"), "{infra:?}");
+        let maintenance = super::trigger_lines(&entry(Some(weft_core::projects::DownWith::Maintenance)));
+        assert!(maintenance[0].contains("`weft maintenance off` brings it back"), "{maintenance:?}");
         assert!(!super::trigger_lines(&entry(None))[0].contains("taken down"));
         let mut held_back = entry(Some(weft_core::projects::DownWith::Health));
         held_back.shared.as_mut().unwrap().held_back = Some("triggers on another build. `weft resync --all` moves them".into());

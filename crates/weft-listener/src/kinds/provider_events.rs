@@ -656,7 +656,7 @@ fn spawn_shared_engine(
             // funnel), read through the topic's account concept.
             let frame_account =
                 if multi_account { topic.socket_frame_account(&frame) } else { None };
-            let named = topic.named_event(&event, &BTreeMap::new());
+            let named = topic.named_event(&event, &[]).expect("a socket frame has no headers, so no field is read twice");
             for entry in subscribers.iter() {
                 let sub = entry.value();
                 if multi_account && sub.scope == EventScope::Account {
@@ -918,10 +918,9 @@ mod tests {
                 }
             },
             "webhook": { "verify": { "kind": "hmac",
-                                     "signatureHeader": "X-Slack-Signature",
-                                     "timestampHeader": "X-Slack-Request-Timestamp",
-                                     "concat": "v0:{timestamp}:{body}",
-                                     "prefix": "v0=" } }
+                                     "signature": { "in": "header:X-Slack-Signature", "pair": "=", "key": "v0" },
+                                     "timestamp": { "in": "header:X-Slack-Request-Timestamp" },
+                                     "concat": "v0:{timestamp}:{body}" } }
         }))
     }
 

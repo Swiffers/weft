@@ -14,7 +14,7 @@ use weft_core::RunId;
 use crate::events::RunEvent;
 
 /// zstd's fastest level: a row is written on every run and read rarely.
-const LEVEL: i32 = 1;
+pub const LEVEL: i32 = 1;
 
 /// `events`, all of one run, as the row a write of them is stored as.
 pub fn encode(events: &[RunEvent]) -> Vec<u8> {
@@ -22,13 +22,17 @@ pub fn encode(events: &[RunEvent]) -> Vec<u8> {
     zstd::bulk::compress(&json, LEVEL).expect("zstd compresses a buffer it holds")
 }
 
-/// The events of one stored row of `run_id`, in order, its id set
-/// back on each. A row that does not
-/// decode fails with the one wording every reader shares, which names the
-/// run and how to remove it.
-pub fn decode(run_id: RunId, row: &[u8]) -> Result<Vec<RunEvent>, String> {
+/// A row of a run's record as `run_log.events` holds it, once
+/// decompressed: its events, in order, each without its run.
+pub const STORED_EVENTS: weft_core::stored::Kind<Vec<RunEvent>> = weft_core::stored::Kind::new("run record row", &[]);
+
+/// The events of one stored row of `run_id`, written at `version`
+/// (`run_log.events_version`), in order, its id set back on each. A row
+/// that does not decode fails with the one wording every reader shares,
+/// which names the run and how to remove it.
+pub fn decode(run_id: RunId, row: &[u8], version: weft_core::stored::Version) -> Result<Vec<RunEvent>, String> {
     let json = zstd::stream::decode_all(row).map_err(|e| undecodable(run_id, &e))?;
-    let mut events: Vec<RunEvent> = serde_json::from_slice(&json).map_err(|e| undecodable(run_id, &e))?;
+    let mut events = STORED_EVENTS.decode(&json[..], version).map_err(|e| undecodable(run_id, &e))?;
     for event in &mut events {
         *event.run_id_mut() = run_id;
     }
@@ -40,8 +44,8 @@ pub fn decode(run_id: RunId, row: &[u8]) -> Result<Vec<RunEvent>, String> {
 /// run, the reason, and the recovery.
 pub fn undecodable(run_id: RunId, why: &dyn std::fmt::Display) -> String {
     format!(
-        "a record row of run {run_id} does not decode ({why}): it was written by an earlier weft or \
-         is damaged, and the run cannot be read. `weft clean {run_id}` removes it."
+        "a record row of run {run_id} does not decode ({why}): it is damaged, and the run cannot be \
+         read. `weft clean {run_id}` removes it."
     )
 }
 
@@ -78,7 +82,7 @@ mod tests {
         let row = encode(&written);
         let json = String::from_utf8(zstd::stream::decode_all(&row[..]).unwrap()).unwrap();
         assert!(!json.contains("run_id"), "{json}");
-        let read = decode(run(), &row).unwrap();
+        let read = decode(run(), &row, STORED_EVENTS.version()).unwrap();
         assert_eq!(serde_json::to_value(&read).unwrap(), serde_json::to_value(&written).unwrap());
         assert!(read.iter().all(|event| event.run_id() == run()));
     }
@@ -86,7 +90,7 @@ mod tests {
     /// A row that does not decode names its run and the way out.
     #[test]
     fn a_damaged_row_names_its_run_and_the_way_out() {
-        let why = decode(run(), b"not zstd").unwrap_err();
+        let why = decode(run(), b"not zstd", STORED_EVENTS.version()).unwrap_err();
         assert!(why.contains(&run().to_string()) && why.contains("weft clean"), "{why}");
     }
 }

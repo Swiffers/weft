@@ -108,6 +108,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         super::waiting::ONE_WAITING_PER_PROJECT,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 /// What a dispatcher does about one image.

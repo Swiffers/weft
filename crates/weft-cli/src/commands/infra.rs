@@ -195,15 +195,21 @@ async fn infra_look(ctx: &Ctx) -> Result<()> {
 }
 
 /// The infra node a person named, as the daemon keys it: the place
-/// spelling (`one.db`), checked against the program and written
-/// canonical, the way `weft wake` does. A node the program no
-/// longer declares (its node deleted, or the include that reached it)
-/// is still live until it is stopped or terminated by hand, which is
-/// what these verbs are for; so a spelling the program does not know is
-/// taken as typed when the daemon lists a node under it, and
-/// refused with the program's answer otherwise.
+/// spelling (`one.db`), checked against the folder's program and written
+/// canonical. Outside a project there is no program to check against,
+/// and the daemon checks every node it is handed anyway, so the spelling
+/// goes as it is. A node the program no longer declares (its node
+/// deleted, or the include that reached it) is still live until it is
+/// stopped or terminated by hand, which is what these verbs are for; so a
+/// spelling the program does not know is taken as typed when the daemon
+/// lists a node under it, and refused with the program's answer otherwise.
 pub(crate) async fn place_named(ctx: &Ctx, spelled: &str) -> Result<String> {
-    let refusal = match super::node_address_for(ctx, spelled) {
+    let Some(project) = ctx.project_here()? else { return Ok(spelled.to_string()) };
+    let checked = weft_compiler::hash::load_program(project).and_then(|(definition, _)| {
+        let (id, call_path) = super::resolve_node(project, &definition, spelled)?;
+        Ok(weft_core::project::address_of(&definition, &id, &call_path))
+    });
+    let refusal = match checked {
         Ok(place) => return Ok(place),
         Err(refusal) => refusal,
     };

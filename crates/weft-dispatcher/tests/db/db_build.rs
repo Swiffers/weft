@@ -74,6 +74,7 @@ fn version_asked(project: uuid::Uuid, binary: &str, images: &[PlannedImage], ask
     Version {
         name: "p".into(),
         manifest: Default::default(),
+        inputs: Some(weft_core::builds::BuildInputs { node_set: weft_core::builds::NodeSet::Full, assets: Default::default() }),
         program: BuiltProgram {
             definition: serde_json::from_value(serde_json::json!({ "id": project, "nodes": [], "edges": [] })).unwrap(),
             binary_hash: binary.into(),
@@ -1032,10 +1033,12 @@ async fn a_prune_spares_an_image_registered_after_its_keep_set(pool: PgPool) {
     let hold = ImageHold::new(&pool, uuid::Uuid::new_v4());
     hold.claim(std::slice::from_ref(&image_ref)).await.unwrap();
     sqlx::query(
-        "INSERT INTO project (id, name, status, project_json, updated_at, tenant_id, running_binary_hash) \
-         VALUES ($1, 'p', 'inactive', '{}', 0, 't', 'registered')",
+        "INSERT INTO project (id, name, status, project_json, updated_at, tenant_id, running_binary_hash, \
+         project_json_version, resync_version, running_build_inputs_version) \
+         VALUES ($1, 'p', 'inactive', '{}', 0, 't', 'registered', $2, 1, 1)",
     )
     .bind(uuid::Uuid::new_v4())
+    .bind(weft_core::ProjectDefinition::STORED.version())
     .execute(&pool)
     .await
     .unwrap();

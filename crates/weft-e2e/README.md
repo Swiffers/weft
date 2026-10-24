@@ -98,7 +98,6 @@ They are named `WEFT_E2E_<SERVICE>_<FIELD>`:
 | Email | `WEFT_E2E_EMAIL_USER`, `_PASSWORD`, `_IMAP_HOST`, `_IMAP_PORT`, `_SMTP_HOST`, `_SMTP_PORT` |
 | ElevenLabs | `WEFT_E2E_ELEVENLABS_API_KEY` |
 | OpenRouter, your own key (`openrouter`'s own-key test, `openrouter_custom`, `llm_stream_tool`; spends money) | `OPENROUTER_API_KEY` |
-| JWT issuer (Auth0 or any OAuth issuer with a client-credentials grant) | `WEFT_E2E_JWT_ISSUER` (with its trailing slash, as the `iss` claim spells it), `_AUDIENCE`, `_CLIENT_ID`, `_CLIENT_SECRET`; the test mints its own token on every run, so nothing expires |
 | A GCP install (`gcp_install`, spends money on your cloud) | `WEFT_E2E_GCP_URL`, `_OPERATOR_KEY`, `_PROJECT`, `_REGION`; and, on this machine, a project whose `weft.toml` has a target at that address, with `weft login <that target>` done, because the CLI the test drives finds its key there |
 
 A test whose variables are absent **skips** rather than fails, through

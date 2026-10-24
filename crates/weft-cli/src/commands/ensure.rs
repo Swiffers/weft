@@ -517,8 +517,7 @@ pub async fn build_compiled(
     let body = weft_core::builds::VersionBuildRequest {
         name: project.manifest.package.name.clone(),
         manifest: manifest.clone(),
-        node_set,
-        assets: resolutions.map.clone(),
+        inputs: weft_core::builds::BuildInputs { node_set, assets: resolutions.map.clone() },
     };
     progress.build_start(&project.manifest.package.name);
     progress.dispatcher_call_start(&path);

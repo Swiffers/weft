@@ -380,15 +380,18 @@ impl SnapshotFirst<'_> {
 }
 
 impl weft_compiler::FileReader for SnapshotFirst<'_> {
-    fn read_spelled(&self, spelled: &weft_compiler::SpelledPath, relative: &Path) -> Result<weft_compiler::ResolvedFile, String> {
-        match self.covered(&spelled.path) {
-            Some(_) => {
-                let content =
-                    self.read_to_string(&spelled.path).map_err(|e| format!("path {relative:?} cannot be read: {e}"))?;
-                Ok(weft_compiler::ResolvedFile { identity: spelled.path.clone(), content })
-            }
-            None => weft_compiler::FileReader::read_spelled(&weft_compiler::DiskFileReader, spelled, relative),
+    /// A covered file is its own identity (the snapshot's root is the
+    /// disk's canonical one, `Project::find` canonicalized it); any other
+    /// is placed on the disk.
+    fn locate(&self, path: &Path) -> Result<PathBuf, String> {
+        match self.covered(path) {
+            Some(_) => Ok(path.to_path_buf()),
+            None => weft_compiler::FileReader::locate(&weft_compiler::DiskFileReader, path),
         }
+    }
+
+    fn read(&self, identity: &Path) -> Result<String, String> {
+        self.read_to_string(identity).map_err(|e| format!("cannot be read: {e}"))
     }
 
     /// The root is the one identity asked for, and the snapshot's is the

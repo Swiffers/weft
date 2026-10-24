@@ -68,6 +68,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             EXECUTE FUNCTION infra_event_notify()"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
 pub async fn insert(

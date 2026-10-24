@@ -98,11 +98,29 @@ the next minute. There is no background keep-alive.
 Two things opening the same connection at once queue behind each other, so it
 refreshes once and both get the fresh values.
 
+How it refreshes depends on the recipe. A sign-in sends its refresh token to
+the token endpoint, a `client_credentials` app asks for a new token, and a
+recipe that declares its own `refresh` call runs that instead. Whichever it
+is, the answer is read the way the recipe says, the new token and expiry are
+stored, a new refresh token replaces the old one when the provider rotates
+them, and the recipe's captures update what they find. For those keys, go and
+read [declaring a service](declaring-a-service.md#reading-the-token-answer).
+
+Only a token with a known expiry is ever refreshed, which is why a connect is
+refused when the provider's answer names none and the connection could be
+renewed. A recipe whose provider says its tokens never expire declares
+`neverExpires`.
+
+If a refresh answer names no expiry, or one weft cannot read (a lifetime of
+`0` included), the new token is given the lifetime the provider stated for
+the one before it, so the connection is not refreshed again every time a node
+opens it.
+
 When a refresh cannot happen, it fails loudly rather than retrying into
 nothing:
 
 ```text
-the 'slack' access needs reconnecting: the provider issued no refresh token,
+the 'google' access needs reconnecting: the provider issued no refresh token,
 so the expired sign-in cannot be renewed
 ```
 

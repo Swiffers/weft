@@ -81,7 +81,7 @@ pub async fn parse(file: Option<std::path::PathBuf>) -> Result<()> {
         None => (uuid::Uuid::nil(), FsCatalog::empty()),
     };
     let anchor = anchor_for(file.as_deref(), project.as_ref().map(|p| p.root.as_path()));
-    let resp = do_parse(&source, id, &anchor, &catalog, file.as_deref());
+    let resp = do_parse(&source, id, &anchor, &catalog, file.as_deref()).map_err(anyhow::Error::msg)?;
     println!("{}", serde_json::to_string(&resp).context("serialize parse response")?);
     Ok(())
 }
@@ -97,15 +97,15 @@ fn do_parse(
     anchor: &Anchor,
     catalog: &FsCatalog,
     file: Option<&std::path::Path>,
-) -> ParseResponse {
+) -> std::result::Result<ParseResponse, String> {
     // An anonymous top-level group takes the file's body id (its path from
     // the project root), so the file's root carries the same id at parse,
     // edit, render and in the journal. The entry file gets none: it may
     // not hold an anonymous group, and the parse says so.
-    let source_id = weft_compiler::source_name::file_id(anchor.root.as_deref(), file);
+    let source_id = weft_compiler::source_name::file_id(anchor.root.as_deref(), file)?;
     let (project, diagnostics) = weft_compiler::parse_only(source, id, anchor.fs(), catalog, source_id.as_deref());
     let catalog_map = collect_catalog(&project, catalog);
-    ParseResponse { project, catalog: catalog_map, diagnostics }
+    Ok(ParseResponse { project, catalog: catalog_map, diagnostics })
 }
 
 // ── Parse server ────────────────────────────────────────────────────────────
@@ -272,10 +272,10 @@ fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>
                 None => return ServerResponse { id, payload: None, error: Some("validate requires a project (no weft.toml found from the file's directory)".into()) },
             };
             match warm_catalog(catalogs, &project.root, req.reload_catalog) {
-                Ok(cat) => {
-                    let v = do_validate(&req.source, project.id(), &anchor, cat, req.file.as_deref(), mode);
-                    envelope(id, &v)
-                }
+                Ok(cat) => match do_validate(&req.source, project.id(), &anchor, cat, req.file.as_deref(), mode) {
+                    Ok(v) => envelope(id, &v),
+                    Err(e) => ServerResponse { id, payload: None, error: Some(e) },
+                },
                 Err(e) => ServerResponse { id, payload: None, error: Some(e) },
             }
         }
@@ -283,7 +283,10 @@ fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>
             // Apply the edit batch -> new source + the inverse text edit (undo).
             // Parse the result so the UI re-renders in one round-trip. Edit
             // failure is loud (the frontend keeps the pre-edit source).
-            let source_id = weft_compiler::source_name::file_id(anchor.root.as_deref(), req.file.as_deref());
+            let source_id = match weft_compiler::source_name::file_id(anchor.root.as_deref(), req.file.as_deref()) {
+                Ok(source_id) => source_id,
+                Err(e) => return ServerResponse { id, payload: None, error: Some(e) },
+            };
             // Edit ops validate written TYPE strings, so the project's
             // registry must be active (a declared name in a port
             // override is valid exactly when the catalog knows it).
@@ -356,9 +359,9 @@ fn parse_source(
     match project {
         Some(p) => {
             let cat = warm_catalog(catalogs, &p.root, reload_catalog)?;
-            Ok(do_parse(source, p.id(), anchor, cat, file))
+            do_parse(source, p.id(), anchor, cat, file)
         }
-        None => Ok(do_parse(source, uuid::Uuid::nil(), anchor, &FsCatalog::empty(), file)),
+        None => do_parse(source, uuid::Uuid::nil(), anchor, &FsCatalog::empty(), file),
     }
 }
 
@@ -461,7 +464,8 @@ pub async fn validate(ctx: Ctx, file: Option<std::path::PathBuf>) -> Result<()> 
     // Runtime: the terminal command is the complete pre-flight check (graph
     // shape plus runtime rules like a provider with no model named); callers that want
     // the structural tier go through the parse-server's mode field.
-    let resp = do_validate(&source, project.id(), &anchor, &catalog, file.as_deref(), ValidationMode::Runtime);
+    let resp = do_validate(&source, project.id(), &anchor, &catalog, file.as_deref(), ValidationMode::Runtime)
+        .map_err(anyhow::Error::msg)?;
     // The catalog's warnings (left-out folders, misspelled names) go
     // to stderr either way, as `weft describe-nodes` does; the JSON on
     // stdout carries them too.
@@ -484,10 +488,10 @@ fn do_validate(
     catalog: &FsCatalog,
     file: Option<&std::path::Path>,
     mode: ValidationMode,
-) -> ValidateResponse {
+) -> std::result::Result<ValidateResponse, String> {
     // Same anonymous-group id derivation as parse, so a standalone file's
     // diagnostics reference the same id the editor renders.
-    let source_id = weft_compiler::source_name::file_id(anchor.root.as_deref(), file);
+    let source_id = weft_compiler::source_name::file_id(anchor.root.as_deref(), file)?;
     let (_, diagnostics) = weft_compiler::compile_strict(
         source,
         id,
@@ -496,7 +500,7 @@ fn do_validate(
         mode,
         source_id.as_deref(),
     );
-    ValidateResponse { diagnostics, warnings: catalog.warnings().to_vec() }
+    Ok(ValidateResponse { diagnostics, warnings: catalog.warnings().to_vec() })
 }
 
 /// For each node type in the project, pull its catalog entry. Hidden
@@ -545,7 +549,8 @@ mod tests {
             &catalog,
             None,
             weft_compiler::validate::ValidationMode::Runtime,
-        );
+        )
+        .unwrap();
         assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
         assert!(resp.warnings.iter().any(|w| w.message.contains("broken")), "{:?}", resp.warnings);
         let json = serde_json::to_value(&resp).unwrap();

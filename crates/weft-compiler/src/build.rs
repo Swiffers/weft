@@ -138,6 +138,8 @@ pub fn standard_worker_hash() -> BuildResult<String> {
 ///
 /// 1. Check the (resolved) definition was settled after its last change
 ///    (`crate::unsettled`): every error in it is one of its broken parts.
+///    `fs` is the view the definition was compiled through, whose reader
+///    places each finding's file the way the compile placed it.
 /// 2. Codegen the cargo crate at `.weft/target/build/`.
 /// 3. Emit the multi-stage Dockerfile at
 ///    `.weft/target/Dockerfile.worker`.
@@ -162,6 +164,7 @@ pub fn build_project(
     project: &Project,
     definition: &weft_core::project::ProjectDefinition,
     catalog: &FsCatalog,
+    fs: crate::CompileFs,
     bases: &worker_image::BaseImages,
     node_set: weft_core::builds::NodeSet,
 ) -> BuildResult<StagedImageBuild> {
@@ -170,8 +173,7 @@ pub fn build_project(
     // (`crate::compile_program`), and the build goes on around them: a
     // part a run needs is refused when the run is cut. Anything else is a
     // definition changed since its check.
-    let root = project_root.canonicalize().map_err(BuildError::Io)?;
-    crate::bail_on_errors(crate::unsettled(definition, catalog, Some(&root)))?;
+    crate::bail_on_errors(crate::unsettled(definition, catalog, fs))?;
     // Project identity arrives with each run, never in the worker image.
     let crate_name = WORKER_CRATE_NAME;
 

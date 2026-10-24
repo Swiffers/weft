@@ -48,13 +48,15 @@ wire_enum! {
 /// the `weft_broker_client::protocol::*` paths keep working.
 pub use weft_core::infra::InfraNodeStatus;
 
-/// Per-unit runtime state carried in `infra_node.units_json`. The map
-/// key is the unit name. This is the per-unit truth: the node-level
-/// `infra_node.status` is a `InfraNodeStatus::rollup` over these. Also
+/// Per-unit runtime state, one `infra_unit` row each (read as a map of
+/// unit name to this, [`units_of_copy_sql`]). This is the per-unit truth:
+/// the node-level `infra_node.status` is a `InfraNodeStatus::rollup`
+/// over these. Also
 /// the authoritative roster of a node's EXPECTED units (a unit at 0
 /// replicas or a Service-only unit shows no workload, so the supervisor
 /// can't learn the roster from observed labels alone). Stamped at apply
 /// from the spec's units.
+// SYNC: UnitRuntime <-> crates/weft-dispatcher/src/infra_node.rs (infra_unit, UNITS_MOVE), units_of_copy_sql, crates/weft-broker/src/lifecycle_writes.rs (write_units)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitRuntime {
     pub status: InfraNodeStatus,
@@ -84,7 +86,7 @@ pub struct UnitRuntime {
     /// (the dispatcher's keep-set, `build::prune::keep_set`) unions these so an up unit's old
     /// image is never reclaimed out from under it. Empty for entries
     /// stamped before the field existed. The broker's per-unit status
-    /// patches (`jsonb_set ... 'status'`) leave this untouched.
+    /// writes leave this untouched.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub image_refs: std::collections::BTreeSet<String>,
 }
@@ -112,6 +114,11 @@ wire_enum! {
 /// half happened; a write is sent again only on this one.
 // SYNC: NOT_DONE <-> crates/weft-broker/src/handlers.rs (unavailable_or_internal), crates/weft-broker-client/src/client.rs (did_nothing)
 pub const NOT_DONE: &str = "the broker could not get a connection to its database, so nothing was done; send it again";
+
+/// The answer to a call in a shape the broker does not read, and its body
+/// (`weft_core::wire_shape`), re-exported here beside the broker's other
+/// answers.
+pub use weft_core::wire_shape::{unreadable_shape, UNREADABLE_SHAPE};
 
 // ---------- Records ----------
 
@@ -603,9 +610,12 @@ pub struct ProjectFetchDefinitionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectFetchDefinitionResponse {
-    /// Serialized `weft_core::ProjectDefinition`. The client
-    /// `serde_json::from_str` it into the typed value once.
+    /// Serialized `weft_core::ProjectDefinition`, as the row keeps it:
+    /// the client reads it once, through `ProjectDefinition::STORED`,
+    /// at `project_json_version`.
     pub project_json: String,
+    /// The version `project_json` was written at.
+    pub project_json_version: weft_core::stored::Version,
     /// Echoes the `running_definition_hash` the server matched
     /// against. Same as `expected_hash` on success; included so
     /// clients can stamp their cache by the verified value.
@@ -1207,7 +1217,7 @@ pub struct SupervisorSetStatusRequest {
     /// Whose copy: `None` for the shared one.
     pub instance: Option<weft_core::instance::InstanceId>,
     /// The unit whose status this write sets. `Some(unit)` updates that
-    /// unit's entry in `units_json` and recomputes the node-level
+    /// unit's `infra_unit` row and recomputes the node-level
     /// rollup; the autonomous health loop always targets a unit.
     /// `None` writes the node-level status directly AND every unit (a
     /// lifecycle-driven node-wide transition: Stopping/Terminating/
@@ -1617,52 +1627,37 @@ pub fn decode_infra_image_tags(
     })
 }
 
-/// Decode one `infra_node.units_json` value (`{unit: UnitRuntime}`, the
-/// roster the supervisor's apply stamps) into the typed map. THE
-/// canonical decode for the column: the broker (the supervisor's
-/// reads), the dispatcher's row reader and the referenced-images
-/// keep-set all route through it, so no reader hand-rolls the shape.
-/// Loud on a bad row, never coerced to empty (an empty roster would
-/// read as "nothing runs here" to the stop loop and shrink the keep-set
-/// below what still runs). `whose` names the row.
-///
-/// The one corruption this column has historically carried is a
-/// `{"status": ...}` stub: a per-unit status stamp that landed on a
-/// unit missing from the roster, back when the broker's SQL seeded the
-/// member with COALESCE (it now fences on membership and refuses).
-/// Such a stub lacks every other field, so it fails this decode; the
-/// error carries the exact repair statement (drop every entry with no
-/// `stop_behavior`), because a stub is undeletable through any weft
-/// surface and would otherwise brick this row's reads for good.
-// SYNC: the column's writers <-> crates/weft-broker/src/handlers.rs
-//       (write_apply_row, the full-map stamp; supervisor_set_status,
-//       the per-unit status patch)
-pub fn decode_units_json(
+/// The units of the `infra_node` row aliased `n`, as SQL: one JSON
+/// object of unit name to [`UnitRuntime`] built from its `infra_unit`
+/// rows (`{}` for a copy with none), which [`decode_units`] reads. THE
+/// read of a copy's roster: the broker (the supervisor's reads), the
+/// dispatcher's row reader and the referenced-images keep-set all select
+/// it.
+// SYNC: units_of_copy_sql <-> UnitRuntime (its fields), crates/weft-dispatcher/src/infra_node.rs (infra_unit, UNITS_MOVE), crates/weft-broker/src/lifecycle_writes.rs (write_units)
+pub fn units_of_copy_sql(n: &str) -> String {
+    format!(
+        "(SELECT COALESCE(jsonb_object_agg(u.unit, jsonb_build_object( \
+             'status', u.status, 'stop_behavior', jsonb_build_object('kind', u.stop_behavior), \
+             'flaky_after_seconds', u.flaky_after_seconds, 'recovery_after_seconds', u.recovery_after_seconds, \
+             'not_ready_since_unix', u.not_ready_since_unix, 'ready_since_unix', u.ready_since_unix, \
+             'image_refs', to_jsonb(u.image_refs))), '{{}}'::jsonb) \
+          FROM infra_unit u WHERE u.project_id = {n}.project_id AND u.node_id = {n}.node_id \
+            AND u.instance_id IS NOT DISTINCT FROM {n}.instance_id)"
+    )
+}
+
+/// One copy's units as [`units_of_copy_sql`] selects them, typed. Loud on
+/// a bad value, never coerced to empty (an empty roster would read as
+/// "nothing runs here" to the stop loop and shrink the keep-set below
+/// what still runs). `project_id` and `node_id` name the copy.
+pub fn decode_units(
     value: serde_json::Value,
     project_id: uuid::Uuid,
     node_id: &str,
 ) -> anyhow::Result<std::collections::BTreeMap<String, UnitRuntime>> {
     serde_json::from_value(value).map_err(|e| {
-        anyhow::anyhow!(
-            "infra_node.units_json for project={project_id} node={node_id} has wrong \
-             shape (expected {{unit: UnitRuntime}}): {e}. If the row holds a \
-             status-only stub entry, repair it with: {}",
-            units_json_repair_sql(project_id, node_id)
-        )
+        anyhow::anyhow!("the units of project={project_id} node={node_id} do not read as units: {e}")
     })
-}
-
-/// The statement that drops every status-only stub entry from one
-/// row's `units_json` (see `decode_units_json`): keeps exactly the
-/// entries carrying `stop_behavior`, which every real `UnitRuntime`
-/// has. Printed in the decode error for the operator to run by hand,
-/// and executed by the broker's db suite to prove it heals a row.
-pub fn units_json_repair_sql(project_id: uuid::Uuid, node_id: &str) -> String {
-    format!(
-        "UPDATE infra_node SET units_json = (SELECT COALESCE(jsonb_object_agg(k, v), \
-         '{{}}'::jsonb) FROM jsonb_each(units_json) AS e(k, v) WHERE v ? 'stop_behavior') \
-         WHERE project_id = '{project_id}' AND node_id = '{node_id}';"
-    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1919,6 +1914,8 @@ pub struct SignalRowWire {
     /// that instance's connections alone, as it did when first registered.
     pub for_instance: Option<weft_core::instance::InstanceScope>,
     pub node_id: String,
+    /// The signal's `SignalSpec`, in the broker's shape of today: it
+    /// reads the row's through `SignalSpec::STORED`.
     pub spec_json: String,
     pub is_resume: bool,
     pub run_id: Option<RunId>,
@@ -2093,14 +2090,8 @@ pub struct ListenerInfraAddress {
     /// (translated for weft's roles). An infra endpoint's address can
     /// move (a local unit made again on another port), so the listener
     /// asks again after a connect to it fails; any other address is
-    /// the one given, for good. An older broker that does not say is
-    /// read as an infra endpoint, which is always correct, only slower.
-    #[serde(default = "is_infra_unsaid")]
+    /// the one given, for good.
     pub is_infra: bool,
-}
-
-fn is_infra_unsaid() -> bool {
-    true
 }
 
 /// Give up on a signal for good (`signal/give_up`): it could not come up
@@ -2159,12 +2150,12 @@ pub struct SubscriptionDropRequest {
     pub signal_token: String,
 }
 
-/// One caller of a live route, as the dispatcher forwards it to the
+/// One caller of a live route, as the worker's door forwards it to the
 /// broker to check against the connection the route is gated by. The
 /// broker holds the connection (its `verify` recipe and its stored
-/// material); the dispatcher never sees a secret. The body is base64
-/// (an HMAC scheme signs the exact bytes); a scheme that does not read
-/// it is handed an empty one.
+/// material); the door never sees a secret. The body is base64 (an
+/// HMAC scheme signs the exact bytes); a scheme that does not read it
+/// is handed an empty one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallerVerifyRequest {
     pub tenant: String,
@@ -2176,12 +2167,20 @@ pub struct CallerVerifyRequest {
     pub service: String,
     pub method: String,
     /// The path as called under the project (no tenant, no leading
-    /// slash).
+    /// slash), for the broker's log.
     pub path: String,
+    /// The full address the caller sent the request to, as its own
+    /// `Host` / `X-Forwarded-*` name it, with the path and query exactly
+    /// as sent (still percent-encoded): what a scheme signing `{url}`
+    /// (Twilio's) covers. `None` when the request names no usable host;
+    /// such a scheme then refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Every header as sent, a repeated one once per value, so a scheme
+    /// sees all of them (a signature header sent twice, a header the
+    /// signature covers that must not be ambiguous).
     #[serde(default)]
-    pub headers: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
-    pub query: std::collections::BTreeMap<String, String>,
+    pub headers: Vec<(String, String)>,
     #[serde(default)]
     pub body_b64: String,
 }
@@ -2437,8 +2436,10 @@ pub struct EventVerifyRequest {
     pub service: String,
     pub topic: String,
     pub body_b64: String,
+    /// Every header as sent, a repeated one once per value (a signature
+    /// header sent twice keeps both).
     #[serde(default)]
-    pub headers: std::collections::BTreeMap<String, String>,
+    pub headers: Vec<(String, String)>,
     #[serde(default)]
     pub query: std::collections::BTreeMap<String, String>,
     /// The HTTP method the provider called with; some signing schemes
@@ -2570,10 +2571,12 @@ mod supervisor_protocol_tests {
         assert_eq!(v["expected_hash"], "abc123");
         let resp: ProjectFetchDefinitionResponse = serde_json::from_value(json!({
             "project_json": "{\"nodes\":[]}",
+            "project_json_version": 2,
             "definition_hash": "abc123",
         }))
         .unwrap();
         assert_eq!(resp.project_json, "{\"nodes\":[]}");
+        assert_eq!(resp.project_json_version, 2);
         assert_eq!(resp.definition_hash, "abc123");
     }
 
@@ -3470,9 +3473,7 @@ mod supervisor_protocol_tests {
             service: "slack".into(),
             topic: "messages".into(),
             body_b64: "eyJ4IjoxfQ==".into(),
-            headers: [("x-slack-signature".to_string(), "v0=abc".to_string())]
-                .into_iter()
-                .collect(),
+            headers: vec![("x-slack-signature".to_string(), "v0=abc".to_string())],
             query: [("challenge".to_string(), "tok".to_string())].into_iter().collect(),
             method: "POST".into(),
         };
@@ -3481,7 +3482,7 @@ mod supervisor_protocol_tests {
             v,
             json!({
                 "service": "slack", "topic": "messages", "body_b64": "eyJ4IjoxfQ==",
-                "headers": { "x-slack-signature": "v0=abc" },
+                "headers": [["x-slack-signature", "v0=abc"]],
                 "query": { "challenge": "tok" },
                 "method": "POST"
             })
@@ -3580,8 +3581,8 @@ mod supervisor_protocol_tests {
             service: "hmac_auth".into(),
             method: "POST".into(),
             path: "chat/room7".into(),
-            headers: [("x-signature".to_string(), "abc".to_string())].into_iter().collect(),
-            query: [("v".to_string(), "1".to_string())].into_iter().collect(),
+            url: Some("https://acme.example/p/chat/room7?v=1".into()),
+            headers: vec![("x-signature".into(), "abc".into()), ("X-Signature".into(), "def".into())],
             body_b64: "e30=".into(),
         };
         let v = serde_json::to_value(&req).unwrap();
@@ -3590,17 +3591,19 @@ mod supervisor_protocol_tests {
             json!({
                 "tenant": "alice", "access_id": "acc-1", "service": "hmac_auth",
                 "method": "POST", "path": "chat/room7",
-                "headers": { "x-signature": "abc" }, "query": { "v": "1" },
+                "url": "https://acme.example/p/chat/room7?v=1",
+                "headers": [["x-signature", "abc"], ["X-Signature", "def"]],
                 "body_b64": "e30="
             })
         );
         let back: CallerVerifyRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back.path, "chat/room7");
+        assert_eq!(back.headers.len(), 2, "a repeated header keeps every value");
         let bare: CallerVerifyRequest = serde_json::from_value(json!({
             "tenant": "t", "access_id": "a", "service": "s", "method": "GET", "path": ""
         }))
         .unwrap();
-        assert!(bare.headers.is_empty() && bare.query.is_empty() && bare.body_b64.is_empty());
+        assert!(bare.headers.is_empty() && bare.url.is_none() && bare.body_b64.is_empty());
 
         let ok = CallerVerified { identity: json!({ "key": 2 }), credential_headers: vec!["x-api-key".into()] };
         let v = serde_json::to_value(&ok).unwrap();

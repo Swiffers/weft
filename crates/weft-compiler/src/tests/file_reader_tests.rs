@@ -21,7 +21,7 @@ fn map_reads_content_and_identity() {
     assert_eq!(resolved.content, "be helpful");
     // Identity is the normalized join, the key downstream uses for cycle
     // detection and for deriving the included file's directory.
-    assert_eq!(resolved.identity, PathBuf::from("proj/prompts/system.txt"));
+    assert_eq!(resolved.file.identity, PathBuf::from("proj/prompts/system.txt"));
 }
 
 #[test]
@@ -32,7 +32,7 @@ fn map_resolves_dot_and_parent_within_root() {
     let resolved = reader
         .resolve_and_read(Path::new("proj"), Path::new("proj"), Path::new("sub/../a.txt"))
         .unwrap();
-    assert_eq!(resolved.identity, PathBuf::from("proj/a.txt"));
+    assert_eq!(resolved.file.identity, PathBuf::from("proj/a.txt"));
     assert_eq!(resolved.content, "A");
 }
 
@@ -114,7 +114,7 @@ fn a_climb_that_stays_inside_the_root_is_allowed_on_both_backings() {
         .resolve_and_read(Path::new("project"), Path::new("project/src"), Path::new("../assets/x.txt"))
         .unwrap();
     assert_eq!(map.content, "inside");
-    assert_eq!(map.identity, PathBuf::from("project/assets/x.txt"));
+    assert_eq!(map.file.identity, PathBuf::from("project/assets/x.txt"));
 }
 
 // ── The `__catalog/` prefix (Layer 1 on the map, Layer 3 on disk) ──────────
@@ -131,7 +131,7 @@ fn a_catalog_path_is_read_from_nodes_wherever_it_is_written() {
         let stdlib = reader
             .resolve_and_read(Path::new("proj"), Path::new(base), Path::new("__catalog/base_catalog/computer/agent.weft"))
             .unwrap();
-        assert_eq!(stdlib.identity, PathBuf::from("proj/nodes/base_catalog/computer/agent.weft"));
+        assert_eq!(stdlib.file.identity, PathBuf::from("proj/nodes/base_catalog/computer/agent.weft"));
         assert_eq!(stdlib.content, "stdlib");
         let own = reader
             .resolve_and_read(Path::new("proj"), Path::new(base), Path::new("__catalog/my_pkg/x.weft"))
@@ -190,4 +190,26 @@ fn a_catalog_path_reads_what_its_nodes_spelling_reads() {
         .resolve_and_read(&root, &root.join("src"), Path::new("__catalog/away/outside.weft"))
         .unwrap_err();
     assert!(err.contains("escapes the project root"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_root_spelled_through_a_symlink_gives_the_same_path_from_the_root() {
+    // A project compiled from a symlinked folder (macOS's `/var` is one)
+    // names its files exactly as one compiled from the real folder: the
+    // path from the root is what a body id is built from, so the two
+    // compiles give an included file's nodes the same ids.
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(real.join("src")).unwrap();
+    std::fs::write(real.join("src/setup.weft"), "Group() {}").unwrap();
+    let linked = dir.path().join("linked");
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    for root in [&real, &linked] {
+        let resolved = DiskFileReader
+            .resolve_and_read(root, &root.join("src"), Path::new("setup.weft"))
+            .unwrap();
+        assert_eq!(resolved.file.from_root, PathBuf::from("src/setup.weft"));
+        assert_eq!(crate::source_name::body_id(&resolved.file.from_root), "@src:setup");
+    }
 }

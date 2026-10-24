@@ -18,7 +18,7 @@ pub mod token;
 pub use client::{
     BrokerAccessClient, BrokerDoorClient, BrokerEventsClient, BrokerSteeringClient, BrokerInfraClient,
     BrokerInfraStateClient, BrokerProjectClient, BrokerRecordClient, BrokerRefused, BrokerRunClient, BrokerSignalClient,
-    BrokerSupervisorClient, BrokerTaskStoreClient, WriteOutcome,
+    BrokerSupervisorClient, BrokerTaskStoreClient, WorkerOutdated, WriteOutcome,
 };
 pub use line::BrokerLink;
 pub use token::TokenSource;

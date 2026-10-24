@@ -487,6 +487,24 @@ access shape the macro cannot serve (`access_node!` on a
 body and reads the pick with `ctx.inputs.access("<picker input>")?`, which
 returns `None` when nothing is picked.
 
+The sign-in is declared, never coded: when a service signs in differently
+from the standard OAuth flow, there is a key for it in the `service` block.
+`clientParams` renames what the token calls send (a `client_key` instead of
+`client_id`), `extraParams` adds fields to every token call, `afterExchange`
+swaps the first token for a longer-lived one, `refresh` replaces the standard
+renewal with a call you write out, and the answer reader says where
+each value sits in the token answer (`tokenPath`, `refreshTokenPath`,
+`expiresInPath` or `expiresPath`, `scopePath`), where an error answered with a
+`200` shows (`errorPath`, `okPath`), and `{{`/`}}` writes a literal brace in a
+template. A token that renews must say where its expiry is, or declare
+`neverExpires`; connecting refuses it otherwise. A gate that checks callers (a
+webhook signature, a bearer from an identity provider) is a `verify` block.
+For every key and its rules, go and read
+https://weavemindai.github.io/weft/connections/declaring-a-service.html and
+https://weavemindai.github.io/weft/connections/verifying-requests.html, and
+start from the catalog access node closest to the service (Slack's declares
+`okPath`, `HmacAuth` a `verify` block).
+
 **Infra node**: `"requiresInfra": true`, plus `images` (dirs with a
 Dockerfile the CLI builds) and `publishes` (the service name it hands out).
 Implement `async fn provision_infra(&self, ctx, input) -> WeftResult<InfraSpec>`

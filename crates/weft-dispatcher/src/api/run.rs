@@ -4,6 +4,7 @@
 //! and VS Code extension hit over HTTP: logs, replay,
 //! list_runs, get.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use weft_core::ProjectDefinition;
@@ -397,7 +398,7 @@ pub async fn list_logs(
     let run_id: RunId = run_id_str
         .parse()
         .map_err(|_| (StatusCode::BAD_REQUEST, format!("'{run_id_str}' is not a run id (a uuid)")))?;
-    authorize_run(&*state.runs, &caller.0, run_id).await?;
+    let owner = authorize_run(&*state.runs, &caller.0, run_id).await?;
     let limit = params.limit.unwrap_or(DEFAULT_LOG_LINES);
     if !(1..=MAX_LOG_LINES).contains(&limit) {
         return Err((
@@ -410,18 +411,43 @@ pub async fn list_logs(
     let entries = crate::projection::run_logs(&state, run_id, limit)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Each line's node is spelled the way the program the run was started
+    // on is written, whatever its project holds now.
+    let lookup = crate::projection::registered_program(&state, run_id, &owner).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read the run's program: {e:#}")))?;
+    let program = lookup.program();
+    // Indexed once: every line is spelled through it.
+    let graph = program.as_deref().map(weft_core::project::graph::ProjectGraph::new);
+    let spell = |node: String, frames: &weft_core::LoopFrames| {
+        let Some(program) = &graph else { return node };
+        let path: Vec<String> = weft_core::frames::call_path(frames).into_iter().map(str::to_string).collect();
+        weft_core::project::placed_address(program, &node, &path).unwrap_or_else(|| {
+            tracing::error!(target: "weft_dispatcher::api", %run_id, %node, "a log line names a node the run's program does not have; it is shown by its id");
+            node
+        })
+    };
     let lines = entries
         .into_iter()
         .map(|e| weft_core::program::RunLogLine {
             inherited_from: e.inherited_from,
             at_unix: e.at_unix,
             level: e.level,
-            node: e.node,
+            node: e.node.map(|node| spell(node, &e.frames)),
             frames: e.frames,
             message: e.message,
         })
         .collect();
-    Ok(Json(weft_core::program::RunLogs { limit, lines }))
+    let unspelled = lookup.unpaintable().map(|(_, why)| why.to_string());
+    Ok(Json(weft_core::program::RunLogs { limit, lines, unspelled }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OutputsParams {
+    /// The places whose outputs a later diff puts first (`weft freeze
+    /// --expect`), comma-separated, each a node or a loop spelled the way
+    /// the program the run ran is written; the answer's `focus` holds
+    /// them read against it.
+    pub expect: Option<String>,
 }
 
 /// Complete ordered output evidence, including streams and inherited results.
@@ -429,6 +455,7 @@ pub async fn outputs(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(run_id_str): Path<String>,
+    Query(params): Query<OutputsParams>,
 ) -> Result<Json<weft_core::run_spec::Expected>, (StatusCode, String)> {
     let run_id: RunId = run_id_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad run".into()))?;
     let owner = authorize_run(&*state.runs, &caller.0, run_id).await?;
@@ -441,21 +468,20 @@ pub async fn outputs(
     // place is spelled through the registered program the cut was taken
     // from: ids are that program's own, and only it still has the loop a
     // reused `LoopIn` or `LoopOut` belongs to.
-    let registered = match owner.registered_hash() {
-        Some(hash) => state.program(owner.project_id, hash).await
-            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read the run's program: {error:#}")))?
-            .ok_or_else(|| (StatusCode::CONFLICT, format!("the program run {run_id} was cut from ({hash}) is no longer recorded")))?,
-        None => fold.project().clone(),
-    };
-    let project = &*registered;
+    let program = crate::projection::registered_program(&state, run_id, &owner).await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read the run's program: {error:#}")))?
+        .or_why(run_id)
+        .map_err(|why| (StatusCode::CONFLICT, why))?;
+    // Indexed once: every wire and place below is spelled through it.
+    let project = &weft_core::project::graph::ProjectGraph::new(&program);
     // A loop's `LoopIn` is the compiler's: what it hands the body is the
     // wire of the node that fed the loop, so its wire says nothing a
     // person's wire does not, and its name (the loop's) would collide
     // with theirs. Its `LoopOut` is different: the list it gathers over
     // the iterations exists nowhere else, so it stays, as the loop's own
     // output (`doubler.results`).
-    let boundary = |id: &str| project.nodes.iter().any(|n| n.id == id && n.group_boundary.is_some()
-        && n.node_type != weft_core::project::boundary_types::LOOP_OUT);
+    let boundary = |id: &str| weft_core::project::graph::GraphView::node(project, id)
+        .is_some_and(|n| n.group_boundary.is_some() && n.node_type != weft_core::project::boundary_types::LOOP_OUT);
     let wires = fold.output_wires()
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .iter().filter(|wire| !boundary(&wire.node))
@@ -466,8 +492,24 @@ pub async fn outputs(
     let nodes = weft_core::project::places::every_place(fold.project()).into_iter()
         .chain(fold.snapshot().inherited_origins.keys().cloned())
         .map(|place| weft_core::project::address_of(project, &place.id, &place.path))
-        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-    Ok(Json(weft_core::run_spec::Expected { wires, nodes, focus: Vec::new() }))
+        .collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<String>>();
+    let mut focus = std::collections::BTreeSet::new();
+    for spelled in weft_core::comma_list::comma_list(params.expect.iter()) {
+        let spelling = match named_in_run(Ok::<_, &String>(project), run_id, &spelled)?.1 {
+            weft_core::project::places::Named::Node(place) => weft_core::project::address_of(project, &place.id, &place.path),
+            weft_core::project::places::Named::Group(place) if weft_core::project::graph::GraphView::is_loop(project, &place.id) => {
+                weft_core::project::group_address(project, &place.id, &place.path)
+            }
+            weft_core::project::places::Named::Group(_) => {
+                return Err((StatusCode::BAD_REQUEST, format!("'{spelled}' is a group, which has no outputs of its own; name a node, or a loop")));
+            }
+        };
+        if !nodes.contains(&spelling) {
+            return Err((StatusCode::BAD_REQUEST, format!("'{spelled}' did not run in run {run_id}, so it has no outputs there")));
+        }
+        focus.insert(spelling);
+    }
+    Ok(Json(weft_core::run_spec::Expected { wires, nodes, focus: focus.into_iter().collect() }))
 }
 
 /// Where one node of a run stands (`weft_core::program::NodeState`), the
@@ -499,6 +541,15 @@ pub async fn replay(
     // replay's event attribution.
     let project_id =
         authorize_run(&*state.runs, &caller.0, run_id).await.map_err(|(s, _)| s)?.project_id;
+    replay_events(&state, run_id, project_id).await.map(Json)
+}
+
+/// The rows [`replay`] answers, for a run the caller was authorized for.
+async fn replay_events(
+    state: &DispatcherState,
+    run_id: RunId,
+    project_id: uuid::Uuid,
+) -> Result<Vec<crate::events::LiveEvent>, StatusCode> {
     // The full record, folded over the run's program through the SAME
     // projection the live view runs (`crate::live_view`), so replay and
     // live cannot drift; bus and caller events ride along.
@@ -523,7 +574,7 @@ pub async fn replay(
         .into_iter()
         .map(|reason| (weft_core::primitive::CorruptionSite::UndecodableRow, reason))
         .collect();
-    let found = crate::projection::run_program(&state, run_id).await.map_err(|e| {
+    let found = crate::projection::run_program(state, run_id).await.map_err(|e| {
         tracing::error!(
             target: "weft_dispatcher::api",
             %run_id, error = %e,
@@ -545,7 +596,7 @@ pub async fn replay(
         }
     };
     let rows: Vec<weft_journal::RunEvent> = raw_events.iter().map(|r| r.event.clone()).collect();
-    let inheritance = match crate::projection::run_inheritance(&state, &rows, &program).await {
+    let inheritance = match crate::projection::run_inheritance(state, &rows, &program).await {
         Ok(chain) => chain,
         Err(reason) => {
             corruptions.push((weft_core::primitive::CorruptionSite::UndecodableRow, reason));
@@ -582,7 +633,94 @@ pub async fn replay(
             reason,
         }));
     }
-    Ok(Json(out))
+    Ok(out)
+}
+
+/// What `GET /runs/{id}/events` keeps: the rows about one node or group
+/// (`node`, spelled the way the program the run ran is written), of one
+/// kind, inside some loop iterations (`iteration`, `3` or `3.0`). All
+/// optional.
+#[derive(Debug, Deserialize)]
+pub struct EventsParams {
+    pub node: Option<String>,
+    pub kind: Option<String>,
+    pub iteration: Option<String>,
+}
+
+/// A run's events the way a person reads them (`weft events`): the
+/// replay's rows, kept by `params` and spelled, both against the program
+/// the run was started on, never whatever program its project holds now.
+/// So a node renamed or moved since is found by the name it had in that
+/// run, and its rows print under that name. A name that program does not
+/// have is refused naming the run. When the program cannot be read, the
+/// rows name their nodes by id and say why, and only a node filter, which
+/// cannot be read without it, is refused.
+pub async fn events(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(run_id_str): Path<String>,
+    Query(params): Query<EventsParams>,
+) -> Result<Json<weft_core::program::RunEvents>, (StatusCode, String)> {
+    let run_id: RunId = run_id_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, format!("'{run_id_str}' is not a run id")))?;
+    let owner = authorize_run(&*state.runs, &caller.0, run_id).await?;
+    let lookup = crate::projection::registered_program(&state, run_id, &owner).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read the run's program: {e:#}")))?;
+    let rows = replay_events(&state, run_id, owner.project_id).await.map_err(|status| (status, "read the run's events".to_string()))?;
+    events_answer(run_id, &lookup, &rows, params).map(Json)
+}
+
+/// [`events`] once the run's program and rows are read: pure, so how a
+/// name is read against the run's own program is pinned without a
+/// database.
+fn events_answer(
+    run_id: RunId,
+    lookup: &crate::projection::ProgramLookup,
+    rows: &[crate::events::LiveEvent],
+    params: EventsParams,
+) -> Result<weft_core::program::RunEvents, (StatusCode, String)> {
+    use weft_core::live_event::spelled::{parse_iteration, spell_row, EventsFilter};
+    let program = lookup.or_why(run_id);
+    // Indexed once for the request: every row is spelled through it, so a
+    // lookup per row is constant time, not a scan of the program.
+    let graph = program.as_deref().map(weft_core::project::graph::ProjectGraph::new);
+    let iteration = params.iteration.as_deref().map(parse_iteration).transpose()
+        .map_err(|why| (StatusCode::BAD_REQUEST, why))?.unwrap_or_default();
+    let filter = match &params.node {
+        Some(spelled) => {
+            let (graph, named) = named_in_run(graph.as_ref().map_err(|why| *why), run_id, spelled)?;
+            EventsFilter::at(graph, named, params.kind, iteration)
+        }
+        None => EventsFilter::anywhere(params.kind, iteration),
+    }
+    .map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+    let mut events = Vec::new();
+    for row in rows {
+        let wire = serde_json::to_value(row).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("an event: {e}")))?;
+        if !filter.keeps(&row.event, &wire) { continue; }
+        match &graph {
+            Ok(graph) => events.extend(spell_row(wire, graph)),
+            Err(_) => events.push(wire),
+        }
+    }
+    let unspelled = lookup.unpaintable().map(|(_, why)| why.to_string());
+    Ok(weft_core::program::RunEvents { total: rows.len(), events, unspelled })
+}
+
+/// What `spelled` names in the program `run_id` was started on
+/// (`weft_core::project::places::named`): a 400 naming the run for a name
+/// that program does not have (the name a person has now may not be the
+/// one it had then), a 409 when the program cannot be read. Answers with
+/// the program it was read in.
+fn named_in_run<'g, G: weft_core::project::graph::GraphView>(
+    program: Result<&'g G, &String>,
+    run_id: RunId,
+    spelled: &str,
+) -> Result<(&'g G, weft_core::project::places::Named), (StatusCode, String)> {
+    let program = program.map_err(|why| {
+        (StatusCode::CONFLICT, format!("'{spelled}' cannot be read: names are read against the program run {run_id} ran, and {why}"))
+    })?;
+    weft_core::project::places::named(program, spelled).map(|named| (program, named))
+        .map_err(|why| (StatusCode::BAD_REQUEST, format!("in the program run {run_id} ran: {why}")))
 }
 
 /// Query params for the runs list: page size + offset, and optional
@@ -694,16 +832,91 @@ pub async fn latest_for_project(
     page.runs.into_iter().next().map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WakeParams {
+    /// Which loop iteration's wait (`3`, or `3.0` inside an inner loop),
+    /// for a node waiting in several.
+    pub iteration: Option<String>,
+}
+
+/// The one of `waits` (the waits of `run_id` at the place `spelled`, a
+/// place inside `loops` loops) a wake means: the only one, or the only one
+/// in the loop iterations `wanted`, read off `iterations` (each wait's
+/// iterations by token, from the run's record,
+/// [`crate::node_state::wait_iterations`]; `None` when the record was not
+/// read, because nothing asked which). Anything but exactly one is
+/// refused: none names what there is, several list each by its
+/// iteration, so the next wake can name one.
+fn pick_wait(
+    waits: &[ParkedWait],
+    iterations: Option<&HashMap<String, Vec<u32>>>,
+    wanted: Option<&[u32]>,
+    loops: usize,
+    spelled: &str,
+    run_id: RunId,
+) -> Result<ParkedWait, (StatusCode, String)> {
+    if waits.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("'{spelled}' is not waiting on anything in {run_id}; `weft events {run_id} --node {spelled}` shows what it did"),
+        ));
+    }
+    let of = |w: &ParkedWait| iterations.and_then(|iterations| iterations.get(&w.token));
+    let chosen: Vec<&ParkedWait> = waits
+        .iter()
+        .filter(|w| wanted.is_none_or(|wanted| of(w).is_some_and(|at| at.starts_with(wanted))))
+        .collect();
+    let listed = |waits: &[&ParkedWait]| {
+        waits
+            .iter()
+            .map(|w| of(w).map_or_else(|| format!("wait {} (not on the run's record yet)", w.token), |at| iteration_text(at)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match chosen.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "'{spelled}' is not waiting in iteration {} in {run_id}; it waits in {}",
+                iteration_text(wanted.unwrap_or_default()),
+                listed(&waits.iter().collect::<Vec<_>>())
+            ),
+        )),
+        several if loops == 0 => Err((
+            StatusCode::CONFLICT,
+            format!("'{spelled}' holds {} waits in {run_id}, outside every loop, and nothing tells them apart", several.len()),
+        )),
+        several => Err((
+            StatusCode::CONFLICT,
+            format!(
+                "'{spelled}' waits {} times in {run_id}, in iterations {}; say which with `--iteration`",
+                several.len(),
+                listed(several)
+            ),
+        )),
+    }
+}
+
+/// Loop iterations as `--iteration` takes them (`3.0`).
+fn iteration_text(iteration: &[u32]) -> String {
+    iteration.iter().map(u32::to_string).collect::<Vec<_>>().join(".")
+}
+
 /// `POST /runs/{run_id}/wake/{node}`: resolve a wait now, instead
 /// of waiting for whatever it waits for.
 ///
 /// This side decides whether the wake may happen: the caller's tenancy,
-/// and that the node really has a wait parked on this run. What the
-/// wait then wakes WITH is the signal kind's own shape, so the listener
-/// holding it is asked, and it answers with nothing for every kind that
-/// has no truthful stand-in (a form is waiting for an answer; there is
-/// no inventing one). Those are refused naming the kind, and the fire
-/// goes through the same lifecycle gate every other fire passes.
+/// and that the node really has a wait parked on this run. The node is
+/// read against the program the run was started on, so a node moved since
+/// is named the way it was in that run. A node inside a loop can wait in
+/// several iterations at once, and then `iteration` (`3`, or `3.0` inside
+/// an inner loop) says which; without it the wake is refused, listing
+/// them. What the wait then wakes WITH is the signal kind's own shape, so
+/// the listener holding it is asked, and it answers with nothing for every
+/// kind that has no truthful stand-in (a form is waiting for an answer;
+/// there is no inventing one). Those are refused naming the kind, and the
+/// fire goes through the same lifecycle gate every other fire passes.
 ///
 /// Nothing here knows which kinds can be woken. That is why: a tier
 /// that minted one kind's payload would have to be edited for the next.
@@ -711,27 +924,45 @@ pub async fn wake(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path((run_id_str, node)): Path<(String, String)>,
+    Query(params): Query<WakeParams>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let run_id: RunId = run_id_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad run".to_string()))?;
-    // Authorization only: the run's own waits are read below, and the
-    // wall this crosses is the caller's tenancy, not the project id.
-    authorize_run(&*state.runs, &caller.0, run_id).await?;
-    let waits = parked_waits(&state, run_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signals: {e}")))?;
-    // The node is named the way a person writes it (`one.review`), which
-    // is the key its wait is registered under: one spelling, on the wire
-    // and in the row, so nothing here translates.
-    let Some(wait) = waits.into_iter().find(|w| w.node == node) else {
-        // Bounded, like every other caller string this surface echoes: the
-        // node name is a raw path segment, so an enormous one would come
-        // straight back in the body.
-        let node = weft_core::truncate_user_string(&node, 256);
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("'{node}' is not waiting on anything in {run_id}; `weft events {run_id} --node {node}` shows what it did"),
-        ));
+    let owner = authorize_run(&*state.runs, &caller.0, run_id).await?;
+    let internal = |what: &'static str| move |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
+    let program = crate::projection::registered_program(&state, run_id, &owner).await.map_err(internal("read the run's program"))?
+        .or_why(run_id);
+    // Bounded, like every other caller string this surface echoes: the
+    // node name is a raw path segment, so an enormous one would come
+    // straight back in the body.
+    let node = weft_core::truncate_user_string(&node, 256);
+    let (_, weft_core::project::places::Named::Node(place)) = named_in_run(program.as_deref(), run_id, &node)? else {
+        return Err((StatusCode::BAD_REQUEST, format!("'{node}' is a group, and only a node waits; name the node inside it that waits")));
     };
+    let program = program.map_err(|why| (StatusCode::CONFLICT, why))?;
+    // A wait is registered under the place spelled the way the program
+    // writes it, which is what the name was just read into.
+    let spelled = weft_core::project::address_of(&*program, &place.id, &place.path);
+    let iteration = params.iteration.as_deref().map(weft_core::live_event::spelled::parse_iteration).transpose()
+        .map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+    let loops = weft_core::live_event::spelled::check_iteration(
+        &*program,
+        &weft_core::project::places::Named::Node(place.clone()),
+        iteration.as_deref().unwrap_or_default(),
+    )
+    .map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+    let waits: Vec<ParkedWait> = parked_waits(&state, run_id).await.map_err(internal("signals"))?
+        .into_iter().filter(|w| w.node == spelled).collect();
+    // Which iteration each wait sits in is read off the run's record, and
+    // only when something asks which: one wait, with no iteration named,
+    // is the one.
+    let iterations = if waits.len() > 1 || iteration.is_some() {
+        let mut folds = crate::projection::reconstruct_run(&state, run_id).await.map_err(internal("the run's record"))?;
+        let fold = folds.remove(&run_id).ok_or_else(|| internal("the run's record")(anyhow::anyhow!("its own fold is missing")))?;
+        Some(crate::node_state::wait_iterations(&fold.current_snapshot(), &place))
+    } else {
+        None
+    };
+    let wait = pick_wait(&waits, iterations.as_ref(), iteration.as_deref(), loops, &spelled, run_id)?;
     // WHETHER a wake may happen is this side's question, and it has been
     // answered above: the project is live, the node really is waiting,
     // the caller may touch it. WHAT it wakes with is the signal kind's,
@@ -1077,6 +1308,58 @@ mod waits_tests {
         let wire = serde_json::to_value(&waits[0]).unwrap();
         assert_eq!(wire["node"], "sweep.key");
     }
+
+    /// A wake picks one of several waits at one node by the iteration the
+    /// run's record holds each in: the only one without asking, the one
+    /// named (or the only one inside the outer iteration named), and
+    /// several unnamed refused listing their iterations.
+    #[test]
+    fn a_wake_picks_its_wait_by_the_iteration_on_the_record() {
+        let mine = RunId::new_v4();
+        let waits = waits_of(&[signal("t0", Some(mine), "lp.ask", true, "timer"), signal("t1", Some(mine), "lp.ask", true, "timer")], mine).unwrap();
+        let iterations: HashMap<String, Vec<u32>> = [("t0".to_string(), vec![0, 0]), ("t1".to_string(), vec![1, 2])].into();
+        let pick = |waits: &[ParkedWait], wanted: Option<&[u32]>| pick_wait(waits, Some(&iterations), wanted, 2, "lp.ask", mine);
+        assert_eq!(pick(&waits, Some(&[1, 2])).unwrap().token, "t1");
+        assert_eq!(pick(&waits, Some(&[1])).unwrap().token, "t1");
+        let (status, why) = pick(&waits, Some(&[3])).unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(why.contains("it waits in 0.0, 1.2"), "{why}");
+        let (status, why) = pick(&waits, None).unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(why.contains("in iterations 0.0, 1.2; say which with `--iteration`"), "{why}");
+        assert_eq!(pick_wait(&waits[..1], None, None, 2, "lp.ask", mine).unwrap().token, "t0", "one wait needs no record");
+        assert_eq!(pick(&[], None).unwrap_err().0, StatusCode::NOT_FOUND);
+        // A wait the record does not hold yet is listed by its token, and
+        // no iteration picks it.
+        let (_, why) = pick_wait(&waits, Some(&HashMap::new()), None, 2, "lp.ask", mine).unwrap_err();
+        assert!(why.contains("wait t0 (not on the run's record yet)"), "{why}");
+    }
+
+    /// `--iteration` is checked against the place before any wait is
+    /// read, by the same check `weft events --iteration` passes: refused
+    /// at a node in no loop, and with more numbers than loops around it.
+    #[test]
+    fn a_wake_refuses_an_iteration_the_place_cannot_have() {
+        use weft_core::live_event::spelled::check_iteration;
+        use weft_core::project::places::named;
+        let node = |id: &str, scope: &[&str]| serde_json::json!({
+            "id": id, "nodeType": "T", "label": null, "config": {},
+            "position": {"x": 0, "y": 0}, "inputs": [], "outputs": [],
+            "features": {}, "scope": scope, "groupBoundary": null, "requiresInfra": false
+        });
+        let p: ProjectDefinition = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [node("plain", &[]), node("lp.ask", &["lp"])],
+            "edges": [],
+            "groups": [{"id": "lp", "kind": "loop", "loopConfig": {}, "nodeIds": ["lp.ask"]}]
+        }))
+        .unwrap();
+        let check = |spelled: &str, iteration: &[u32]| check_iteration(&p, &named(&p, spelled).unwrap(), iteration);
+        assert!(check("plain", &[0]).unwrap_err().contains("is in no loop"));
+        assert!(check("lp.ask", &[1, 0]).unwrap_err().contains("at most 1 number,"));
+        assert_eq!(check("lp.ask", &[1]), Ok(1));
+        assert_eq!(check("plain", &[]), Ok(0));
+    }
 }
 
 #[cfg(test)]
@@ -1176,5 +1459,110 @@ mod wake_tier_boundary {
                  quietly unwakeable."
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod events_tests {
+    use super::*;
+    use crate::projection::ProgramLookup;
+
+    const RUN: RunId = RunId::from_u128(9);
+
+    /// The file `setup` included at the site `setup`, its node `insights`
+    /// inside the group `stages`, or (`moved`) one group deeper, inside
+    /// `stages.brains`: the same program before and after a person moved
+    /// the node.
+    fn program(moved: bool) -> Arc<ProjectDefinition> {
+        let (insights, groups) = if moved {
+            ("@src:setup.stages.brains.insights", serde_json::json!([
+                {"id": "@src:setup", "kind": "body", "nodeIds": []},
+                {"id": "@src:setup.stages", "kind": "group", "nodeIds": [], "parentGroupId": "@src:setup"},
+                {"id": "@src:setup.stages.brains", "kind": "group", "nodeIds": ["@src:setup.stages.brains.insights"], "parentGroupId": "@src:setup.stages"},
+                {"id": "setup", "kind": "call", "body": "@src:setup", "nodeIds": []}
+            ]))
+        } else {
+            ("@src:setup.stages.insights", serde_json::json!([
+                {"id": "@src:setup", "kind": "body", "nodeIds": []},
+                {"id": "@src:setup.stages", "kind": "group", "nodeIds": ["@src:setup.stages.insights"], "parentGroupId": "@src:setup"},
+                {"id": "setup", "kind": "call", "body": "@src:setup", "nodeIds": []}
+            ]))
+        };
+        let scope: Vec<&str> = if moved { vec!["@src:setup", "@src:setup.stages", "@src:setup.stages.brains"] } else { vec!["@src:setup", "@src:setup.stages"] };
+        Arc::new(serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [{
+                "id": insights, "nodeType": "T", "label": null, "config": null,
+                "position": { "x": 0.0, "y": 0.0 }, "inputs": [], "outputs": [],
+                "features": {}, "scope": scope, "groupBoundary": null, "requiresInfra": false, "images": []
+            }],
+            "edges": [],
+            "groups": groups,
+        })).unwrap())
+    }
+
+    /// What the run recorded, under the program it ran (`moved` false): its
+    /// start, and `insights` completing under the site `setup`.
+    fn rows() -> Vec<crate::events::LiveEvent> {
+        let project_id = uuid::Uuid::nil();
+        [
+            DispatcherEvent::RunCompleted { run_id: RUN, project_id, outputs: serde_json::Value::Null, at_unix: 1 },
+            serde_json::from_value(serde_json::json!({
+                "kind": "node_completed", "runId": RUN, "projectId": project_id, "node": "@src:setup.stages.insights",
+                "frames": [{"site": "setup"}], "output": {"text": "hi"}, "atUnix": 1
+            })).unwrap(),
+        ].into_iter().map(crate::events::IdentifiedEvent::transient).collect()
+    }
+
+    fn by_node(node: &str) -> EventsParams {
+        EventsParams { node: Some(node.into()), kind: None, iteration: None }
+    }
+
+    /// A node moved since a run is found on that run by the name it had
+    /// there, and its rows read under that name: the name is read against
+    /// the program the run ran, never the one the project holds now.
+    #[test]
+    fn a_node_moved_since_is_found_by_its_old_name_on_the_old_run() {
+        let ran = ProgramLookup::Found(program(false));
+        let answer = events_answer(RUN, &ran, &rows(), by_node("setup.stages.insights")).unwrap();
+        assert_eq!(answer.total, 2);
+        assert_eq!(answer.events.len(), 1, "{:?}", answer.events);
+        assert_eq!(answer.events[0]["node"], "setup.stages.insights");
+        // The name it has now is no name of that run's program, and the
+        // refusal says whose program it was read against.
+        let (status, why) = events_answer(RUN, &ran, &rows(), by_node("setup.stages.brains.insights")).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(why.contains(&format!("the program run {RUN} ran")) && why.contains("unknown node"), "{why}");
+        // Read against the program as it is now, the old name is what
+        // misses: the reading this route never does.
+        let now = ProgramLookup::Found(program(true));
+        assert!(events_answer(RUN, &now, &rows(), by_node("setup.stages.insights")).is_err());
+    }
+
+    /// A program that cannot be read leaves the rows by id, saying why, and
+    /// refuses only a node filter, which cannot be read without it.
+    #[test]
+    fn an_unreadable_program_shows_ids_and_refuses_a_node_filter() {
+        let gone = ProgramLookup::ProgramGone("the code this run ran is no longer recorded".into());
+        let all = events_answer(RUN, &gone, &rows(), EventsParams { node: None, kind: None, iteration: None }).unwrap();
+        assert_eq!(all.events.len(), 2);
+        assert_eq!(all.events[1]["node"], "@src:setup.stages.insights");
+        assert!(all.unspelled.as_deref().is_some_and(|why| why.contains("no longer recorded")));
+        let (status, _) = events_answer(RUN, &gone, &rows(), by_node("setup.stages.insights")).unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// An iteration counts from the loops around the node named, so one
+    /// asked for with no node, or at a node in no loop, is refused rather
+    /// than matching every loop at once.
+    #[test]
+    fn an_iteration_needs_a_node_in_a_loop() {
+        let ran = ProgramLookup::Found(program(false));
+        let anywhere = EventsParams { node: None, kind: None, iteration: Some("3".into()) };
+        let (status, why) = events_answer(RUN, &ran, &rows(), anywhere).unwrap_err();
+        assert!(status == StatusCode::BAD_REQUEST && why.contains("needs --node"), "{why}");
+        let outside = EventsParams { iteration: Some("3".into()), ..by_node("setup.stages.insights") };
+        let (status, why) = events_answer(RUN, &ran, &rows(), outside).unwrap_err();
+        assert!(status == StatusCode::BAD_REQUEST && why.contains("is in no loop"), "{why}");
     }
 }

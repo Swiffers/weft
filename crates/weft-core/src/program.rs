@@ -192,7 +192,7 @@ impl InfraCopy {
 /// install has not picked, or a hand-over that kept failing, which holds
 /// the trigger's queue. What they wait on hands them over again, and so
 /// does activating the trigger.
-// SYNC: WaitingFires <-> packages/weft-graph/src/protocol.ts WaitingFires
+// SYNC: WaitingFires <-> packages/weft-graph/src/protocol.ts WaitingFires, crates/weft-core/src/door_fire.rs UnclockedWait (on)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitingFires {
     pub fires: u32,
@@ -560,9 +560,10 @@ pub struct RunSummary {
 /// One page of runs plus the total number matching the same filters
 /// (ignoring limit/offset), so a consumer can render page controls without a
 /// second count round-trip.
-// SYNC: RunPage <-> weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage),
-//       extension-vscode/src/sidebar/runs.ts (RunPage)
+// SYNC: RunPage <-> extension-vscode/src/sidebar/runs.ts (RunPage),
+//       weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage, in the weavemind repo)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunPage {
     pub runs: Vec<RunSummary>,
     pub total: u64,
@@ -617,6 +618,26 @@ pub struct DeletedRun {
 pub struct RunLogs {
     pub limit: u32,
     pub lines: Vec<RunLogLine>,
+    /// Why the lines name their node by id rather than the way the program
+    /// is written: the program the run ran cannot be read. Absent when
+    /// they are spelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unspelled: Option<String>,
+}
+
+/// `GET /runs/{id}/events`: a run's events, kept by the query's filters
+/// and spelled the way the program the run ran is written
+/// (`crate::live_event::spelled`), each as it reads on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunEvents {
+    /// How many events the run has, before the filters.
+    pub total: usize,
+    pub events: Vec<serde_json::Value>,
+    /// Why the events name nodes by id: the program the run ran cannot be
+    /// read. Absent when they are spelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unspelled: Option<String>,
 }
 
 /// One line of a run's log.
@@ -628,9 +649,11 @@ pub struct RunLogLine {
     pub inherited_from: Option<crate::RunId>,
     pub at_unix: u64,
     pub level: String,
-    /// The firing this line is about: the node, and the loop
-    /// iteration it was in. Absent on the wire for a run-level line
-    /// (the run itself failing or being cancelled).
+    /// The firing this line is about: the node, spelled the way the
+    /// program the run ran is written (`one.strip` for the `strip` of the
+    /// file the site `one` includes), and the loop iteration it was in.
+    /// Absent on the wire for a run-level line (the run itself failing or
+    /// being cancelled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

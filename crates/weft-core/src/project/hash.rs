@@ -45,6 +45,10 @@ pub struct ProgramIdentity {
 }
 
 impl ProgramIdentity {
+    /// The program a signal was registered by (`signal.program_json`) or a
+    /// trigger activated on (`trigger_activation.activation_program`).
+    pub const STORED: crate::stored::Kind<ProgramIdentity> = crate::stored::Kind::new("program identity", &[]);
+
     /// One fixed-size name for this identity, for anything that keys on
     /// it (a table's primary key, a map). The identity itself carries one
     /// hash per compiled node type, so a full-catalog worker makes it
@@ -170,6 +174,21 @@ impl ProgramIdentity {
 /// from the definition, and no other hash covers a node the project's
 /// graph does not reference. The cost is that editing that recipe, even
 /// cosmetically, flips this hash for every project that publishes it.
+///
+/// The hash is a program's identity, computed ONCE, when the program is
+/// made, and never again for a program already stored. When an upgrade
+/// respells a stored program's JSON (`crate::project::PROJECT_DEFINITION_UPGRADES`),
+/// the program keeps the hash it was written under, and so does every
+/// row naming it (`run.definition_hash`, `project.running_definition_hash`,
+/// an example's `frozenFrom.definitionHash`): it is still the same
+/// program. Hashing the upgraded JSON again can give another hash, so
+/// nothing that reads a stored program back checks it against this
+/// function: a program is read BY its hash, which is the check.
+/// `weft_journal::record::StoredProgram::check` runs only on a program a
+/// worker has just made and sends to be kept, and re-hashes it only when
+/// it is written at today's version: one made by a worker an older weft
+/// built is kept under the hash it claims, at its own version, by the
+/// same rule.
 pub fn compute_definition_hash(project: &ProjectDefinition) -> anyhow::Result<SourceHash> {
     let mut hasher = Sha256::new();
     hasher.update(b"weft-definition-v1\n");

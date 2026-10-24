@@ -79,6 +79,7 @@ function copyDetail(copy: TriggerCopy): string {
 		lines.push("Taken down by the health check: its infra's health rules bring it back once that infra is healthy; with rules that do not, Turn on does.");
 	}
 	if (copy.downWith === 'infra') lines.push('Taken down with its infra: it comes back once that infra runs again.');
+	if (copy.downWith === 'maintenance') lines.push('Taken down while the install is in maintenance: `weft maintenance off` brings it back.');
 	if (copy.heldBack) lines.push(`Held back: ${copy.heldBack}`);
 	if (copy.held && heldCount(copy) > 0) lines.push(`Holding ${describeHeld(copy.held)} for when it is back.`);
 	if (copy.waiting) lines.push(`${copy.waiting.fires} fire(s) waiting: ${copy.waiting.reason}`);

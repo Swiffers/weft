@@ -501,3 +501,191 @@ async fn runs_are_found_by_a_node_they_ran_and_by_what_went_through_them(pool: P
     assert_eq!(listed(None, Some("email")).await, Vec::<weft_core::RunId>::new(), "a field's name is not one of its values");
     assert_eq!(listed(Some("wait"), Some("bob@example.com")).await, vec![bob]);
 }
+
+/// A run found by a node it ran inside an included file, by the name a
+/// person gives it: through the site that called it, so the file's two
+/// calls are told apart, and never by its compiled id.
+#[sqlx::test]
+async fn a_run_is_found_through_the_site_of_the_included_node_it_ran(pool: PgPool) {
+    let (store, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    let program: ProjectDefinition = serde_json::from_value(json!({
+        "id": project,
+        "nodes": [{
+            "id": "@src:lib.strip", "nodeType": "T", "label": null, "config": null,
+            "position": { "x": 0.0, "y": 0.0 }, "inputs": [], "outputs": [],
+            "features": {}, "scope": ["@src:lib"], "groupBoundary": null, "requiresInfra": false, "images": []
+        }],
+        "edges": [],
+        "groups": [
+            { "id": "@src:lib", "kind": "body", "nodeIds": ["@src:lib.strip"] },
+            { "id": "one", "kind": "call", "body": "@src:lib", "nodeIds": [] },
+            { "id": "two", "kind": "call", "body": "@src:lib", "nodeIds": [] }
+        ]
+    }))
+    .expect("the program including lib");
+    projects
+        .register_with_hashes(program, "db-rig", "", TENANT, Some("bin-A"), Some("def-1"), None, None, None, None, None, None)
+        .await
+        .expect("register project");
+    let run = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let in_two = vec![weft_core::frames::Frame::Call { site: "two".into() }];
+    write(&store, run, &[
+        RunEvent::NodeStarted { run_id: run, node_id: "@src:lib.strip".into(), frames: in_two, at_unix: 2 },
+        RunEvent::RunCompleted { run_id: run, at_unix: 3 },
+    ]).await;
+    let through = |node: &'static str| {
+        let store = &store;
+        async move {
+            let query = weft_dispatcher::store::RunListQuery { limit: 10, node: Some(node.into()), ..Default::default() };
+            store.list_runs(TENANT, &query).await.unwrap().runs.into_iter().map(|s| s.run_id).collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(through("two.strip").await, vec![run]);
+    assert!(through("one.strip").await.is_empty(), "the other call of the file did not run");
+    assert!(through("@src:lib.strip").await.is_empty(), "a compiled id is no name a person asks with");
+
+    // An entry an older weft built (format 1, the compiled ids) is built
+    // again by the next search, so a run indexed before is found too.
+    sqlx::query("UPDATE run_search SET nodes = ARRAY['@src:lib.strip'], format = 1 WHERE run_id = $1")
+        .bind(run)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(through("two.strip").await, vec![run]);
+}
+
+
+/// A run whose program no longer reads never fails the search: it is
+/// indexed by its words, without its nodes (there is no program to spell
+/// them by), and the healthy run beside it is found as ever.
+#[sqlx::test]
+async fn a_run_whose_program_does_not_read_is_indexed_by_its_words(pool: PgPool) {
+    let (store, projects) = setup(&pool).await;
+    let (project, unread_project) = (Uuid::new_v4(), Uuid::new_v4());
+    seed_project(&projects, project).await;
+    seed_project(&projects, unread_project).await;
+    let healthy = ended_run_carrying(&store, project, "ada@example.com").await;
+    let unread_program = ended_run_carrying(&store, unread_project, "dave@example.com").await;
+    sqlx::query("UPDATE project_definition SET project_json = '{\"damaged\": true}' WHERE project_id = $1")
+        .bind(unread_project)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(found_carrying(&store, "dave@example.com").await, vec![unread_program], "its words without its program");
+    let by_node = weft_dispatcher::store::RunListQuery { limit: 10, node: Some("wait".into()), ..Default::default() };
+    let page = store.list_runs(TENANT, &by_node).await.expect("a search by node");
+    assert_eq!(page.runs.iter().map(|s| s.run_id).collect::<Vec<_>>(), vec![healthy], "only the healthy run's nodes are spelled");
+    assert_eq!(found_carrying(&store, "ada@example.com").await, vec![healthy]);
+}
+
+/// One ended run of `project`, whose record carries `word`.
+async fn ended_run_carrying(store: &PostgresStore, project: Uuid, word: &str) -> weft_core::RunId {
+    let run_id = start_run(store, project, weft_core::run::RunKind::Project).await;
+    write(store, run_id, &[
+        RunEvent::NodeStarted { run_id, node_id: "wait".into(), frames: vec![], at_unix: 1 },
+        RunEvent::PortEmitted {
+            run_id,
+            emission_id: Uuid::new_v4(),
+            node_id: "wait".into(),
+            frames: vec![],
+            port: "out".into(),
+            value: std::sync::Arc::new(json!({ "word": word })),
+            at_unix: 2,
+        },
+        RunEvent::RunCompleted { run_id, at_unix: 3 },
+    ])
+    .await;
+    run_id
+}
+
+/// The runs the listing finds carrying `word`.
+async fn found_carrying(store: &PostgresStore, word: &str) -> Vec<weft_core::RunId> {
+    let query = weft_dispatcher::store::RunListQuery { limit: 10, search: Some(word.into()), ..Default::default() };
+    let mut ids: Vec<_> = store.list_runs(TENANT, &query).await.expect("the search").runs.into_iter().map(|s| s.run_id).collect();
+    ids.sort();
+    ids
+}
+
+/// A search reads every run's program on its round's own connection, so
+/// it needs one connection however many programs it reads: on a pool of
+/// one, it finds the runs. A program read the store fails fails the
+/// search and leaves its runs queued; the next search, the store well
+/// again, builds them.
+#[sqlx::test]
+async fn a_search_reads_programs_on_its_own_connection(pool: PgPool) {
+    let (_, projects) = setup(&pool).await;
+    let one = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("a pool of one connection");
+    let store = PostgresStore::from_pool(one.clone());
+    let project = Uuid::new_v4();
+    seed_project(&projects, project).await;
+    let ada = ended_run_carrying(&store, project, "ada@example.com").await;
+    assert_eq!(found_carrying(&store, "ada@example.com").await, vec![ada], "one connection is enough");
+
+    let first = ended_run_carrying(&store, project, "bob@example.com").await;
+    let second = ended_run_carrying(&store, project, "bob@example.com").await;
+    sqlx::query("ALTER TABLE project_definition RENAME COLUMN project_json TO project_json_away").execute(&pool).await.unwrap();
+    let query = weft_dispatcher::store::RunListQuery { limit: 10, search: Some("bob@example.com".into()), ..Default::default() };
+    store.list_runs(TENANT, &query).await.expect_err("the program read failed");
+    let mut queued: Vec<weft_core::RunId> =
+        sqlx::query_scalar("SELECT run_id FROM run_search_queue").fetch_all(&pool).await.unwrap();
+    queued.sort();
+    let mut both = vec![first, second];
+    both.sort();
+    assert_eq!(queued, both, "both stay queued");
+
+    sqlx::query("ALTER TABLE project_definition RENAME COLUMN project_json_away TO project_json").execute(&pool).await.unwrap();
+    assert_eq!(found_carrying(&store, "bob@example.com").await, both, "the next search builds them");
+    // Closed here: the announcement flusher keeps a pool it was poked
+    // with, and an open connection holds up the test database's drop.
+    one.close().await;
+}
+
+/// A flagged ending is read off its run's row with the instance it ran
+/// inside, even when the row holds an outcome this weft does not know,
+/// so a trigger setup whose record does not read still
+/// names its own `weft bake`. Clearing one job's flag leaves the other's,
+/// and the run's keep time is answered only once no flag is left.
+#[sqlx::test]
+async fn a_flagged_ending_reads_its_instance_and_keeps_each_jobs_flag(pool: PgPool) {
+    use weft_dispatcher::run_ends::{clear_flags, take_flagged, Jobs};
+    let (store, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project).await;
+    let run_id = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    sqlx::query(
+        "UPDATE run SET state = 'ended', outcome = 'vanished', instance_id = 'ada', watch_end = TRUE, \
+         holds_signals = TRUE, keep_until = 42 WHERE run_id = $1",
+    )
+    .bind(run_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(store.run_summary(run_id).await.is_err(), "the whole summary refuses the outcome");
+
+    let mut tx = pool.begin().await.unwrap();
+    let ending = take_flagged(&mut tx, run_id).await.unwrap().expect("the run is flagged");
+    assert_eq!(ending.instance_id.as_deref(), Some("ada"));
+    assert!(ending.watch_end && ending.holds_signals);
+    let kept = clear_flags(&mut tx, run_id, Jobs { watch_end: false, holds_signals: true }).await.unwrap();
+    assert_eq!(kept, None, "a flag is left, so retention does not count the run yet");
+    tx.commit().await.unwrap();
+    let flags: (bool, bool) =
+        sqlx::query_as("SELECT watch_end, holds_signals FROM run WHERE run_id = $1").bind(run_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(flags, (true, false), "only the done job's flag went");
+
+    let mut tx = pool.begin().await.unwrap();
+    let ending = take_flagged(&mut tx, run_id).await.unwrap().expect("still flagged for its setup");
+    assert!(ending.watch_end && !ending.holds_signals);
+    let kept = clear_flags(&mut tx, run_id, Jobs { watch_end: true, holds_signals: false }).await.unwrap();
+    assert_eq!(kept, Some(42));
+    tx.commit().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    assert!(take_flagged(&mut tx, run_id).await.unwrap().is_none(), "nothing is left to do");
+}

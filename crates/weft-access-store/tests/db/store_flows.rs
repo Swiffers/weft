@@ -54,6 +54,9 @@ struct FakeProvider {
     pub token_refusal: Mutex<Option<u16>>,
     /// The status the exchange-style renewal is refused with, if any.
     pub exchange_refusal: Mutex<Option<u16>>,
+    /// A whole token answer to send instead of the flat one built from
+    /// the fields above (a nested answer, an error object on a 200).
+    pub token_answer: Mutex<Option<serde_json::Value>>,
 }
 
 impl FakeProvider {
@@ -67,6 +70,7 @@ impl FakeProvider {
             expires_in: Mutex::new(None),
             token_refusal: Mutex::new(None),
             exchange_refusal: Mutex::new(None),
+            token_answer: Mutex::new(None),
         })
     }
 
@@ -83,6 +87,9 @@ impl FakeProvider {
                     if let Some(status) = *s.token_refusal.lock().unwrap() {
                         let status = axum::http::StatusCode::from_u16(status).unwrap();
                         return (status, axum::Json(json!({ "error": "refused" })));
+                    }
+                    if let Some(answer) = s.token_answer.lock().unwrap().clone() {
+                        return (axum::http::StatusCode::OK, axum::Json(answer));
                     }
                     let mut resp = json!({ "access_token": *s.next_token.lock().unwrap() });
                     if let Some(rt) = s.next_refresh.lock().unwrap().clone() {
@@ -142,6 +149,15 @@ impl FakeProvider {
                         "expiration": "4102444800000",
                         "resourceId": format!("res-{target}")
                     }))
+                }),
+            )
+            // A Slack-class API: every answer is a 200, and a refusal
+            // says so inside the body.
+            .route(
+                "/refusing",
+                get(|State(s): State<Arc<FakeProvider>>| async move {
+                    s.calls.lock().unwrap().push("/refusing".into());
+                    axum::Json(json!({ "ok": false, "error": "invalid_auth" }))
                 }),
             )
             .route(
@@ -640,11 +656,12 @@ async fn refresh_is_lazy_single_flight_and_writes_back_rotated_tokens(pool: PgPo
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let spec = oauth_spec(&base, "coexisting");
-    // The consent's token EXPIRES IMMEDIATELY and carries a refresh
-    // token, so the very next resolution must refresh.
+    // The consent's token carries a refresh token and is made due at
+    // once, so the very next resolution must refresh.
     *fake.next_refresh.lock().unwrap() = Some("refresh-1".into());
     *fake.expires_in.lock().unwrap() = Some(1);
     let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    expire_now(&pool, grant.id).await;
     let consent_tokens = fake.token_requests.load(Ordering::SeqCst);
 
     // The refresh rotates both tokens (Xero-class single-use refresh).
@@ -710,6 +727,7 @@ async fn a_declared_renewal_call_replaces_the_standard_refresh(pool: PgPool) {
     *fake.next_refresh.lock().unwrap() = None;
     *fake.expires_in.lock().unwrap() = Some(1);
     let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    expire_now(&pool, grant.id).await;
     let consent_tokens = fake.token_requests.load(Ordering::SeqCst);
 
     *fake.next_token.lock().unwrap() = "tok-long-lived".into();
@@ -759,6 +777,7 @@ async fn a_declared_renewal_the_provider_could_not_answer_is_tried_again_not_a_r
     }
     *fake.expires_in.lock().unwrap() = Some(1);
     let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    expire_now(&pool, grant.id).await;
     let resolve = || resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]);
 
     for status in [429, 503] {
@@ -789,6 +808,7 @@ async fn a_revoked_refresh_fails_loud_with_the_reconnect_affordance(pool: PgPool
     *fake.next_refresh.lock().unwrap() = None;
     *fake.expires_in.lock().unwrap() = Some(1);
     let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    expire_now(&pool, grant.id).await;
     let err =
         resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap_err();
     match err.downcast_ref::<AccessError>() {
@@ -811,6 +831,7 @@ async fn a_refresh_the_provider_could_not_answer_is_tried_again_not_a_reconnect(
     *fake.next_refresh.lock().unwrap() = Some("refresh-1".into());
     *fake.expires_in.lock().unwrap() = Some(1);
     let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    expire_now(&pool, grant.id).await;
     let resolve = || resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]);
 
     for status in [429, 503] {
@@ -1456,8 +1477,8 @@ async fn a_shared_door_grant_never_serves_events_with_the_operators_app_values(p
         sqlx::query(
             "INSERT INTO access_grant
                (id, tenant_id, service, registration_sealed, spec_json, values_sealed,
-                granted_scopes, door, identity)
-             VALUES ($1, $2, 'fakeoauth', $3, $4, $5, '[]', $6, 'x')",
+                granted_scopes, door, identity, spec_json_version)
+             VALUES ($1, $2, 'fakeoauth', $3, $4, $5, '[]', $6, 'x', $7)",
         )
         .bind(id)
         .bind(TENANT_A)
@@ -1465,6 +1486,7 @@ async fn a_shared_door_grant_never_serves_events_with_the_operators_app_values(p
         .bind(serde_json::to_value(&spec).unwrap())
         .bind(weft_access_store::seal_json(&json!({ "token": "tok-1" })).unwrap())
         .bind(door)
+        .bind(weft_core::AccessSpec::STORED.version())
         .execute(&pool)
         .await
         .unwrap();
@@ -1503,6 +1525,7 @@ async fn a_shared_app_connection_never_carries_the_operators_app_secret(pool: Pg
     let base = fake.serve().await;
     let spec = oauth_spec(&base, "coexisting");
     *fake.next_refresh.lock().unwrap() = Some("rt-the-users".into());
+    *fake.expires_in.lock().unwrap() = Some(3600);
 
     // A shared-door consent through the operator's app.
     let started = begin_oauth(
@@ -1924,7 +1947,7 @@ async fn a_published_recipe_describes_something_the_project_runs(pool: PgPool) {
                 "account": { "value": "host", "path": "body.host" },
                 "webhook": {
                     "verify": { "kind": "hmac",
-                                "signatureHeader": "X-Sig",
+                                "signature": { "in": "header:X-Sig" },
                                 "concat": "{body}" }
                 }
             }},
@@ -2162,11 +2185,12 @@ async fn a_instances_connection_and_values_stay_theirs(pool: PgPool) {
     assert!(list_grants(&pool, TENANT_A, None, as_bob).await.unwrap().is_empty(), "bob's connection is gone");
 
     let orphan = sqlx::query(
-        "INSERT INTO access_grant (id, tenant_id, service, spec_json, values_sealed, instance_id) \
-         VALUES ($1, $2, 'fakestatic', '{}', '', 'ada')",
+        "INSERT INTO access_grant (id, tenant_id, service, spec_json, values_sealed, instance_id, spec_json_version) \
+         VALUES ($1, $2, 'fakestatic', '{}', '', 'ada', $3)",
     )
     .bind(uuid::Uuid::new_v4())
     .bind(TENANT_A)
+    .bind(weft_core::AccessSpec::STORED.version())
     .execute(&pool)
     .await
     .unwrap_err();
@@ -2452,4 +2476,387 @@ async fn an_abandoned_connect_goes_when_the_next_is_made_or_a_poll_finds_it_gone
     let err = take_connect_result(&pool, TENANT_A, &new).await.unwrap_err();
     assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Gone(_))), "{err}");
     assert!(rows().await.is_empty(), "the poll that found it gone deleted it");
+}
+
+/// The fixture OAuth service with `patch`'s keys set on its acquisition.
+fn oauth_spec_with(base: &str, patch: serde_json::Value) -> AccessSpec {
+    let mut spec = serde_json::to_value(oauth_spec(base, "coexisting")).unwrap();
+    for (k, v) in patch.as_object().unwrap() {
+        spec["acquisition"][k] = v.clone();
+    }
+    serde_json::from_value(spec).unwrap()
+}
+
+/// The last call the fake recorded that starts with `prefix`.
+fn last_call(fake: &FakeProvider, prefix: &str) -> String {
+    fake.calls.lock().unwrap().iter().rfind(|c| c.starts_with(prefix)).cloned().unwrap_or_default()
+}
+
+/// A provider that names the app's id differently (TikTok's
+/// `client_key`) gets it under that name on the consent URL, the
+/// exchange and the refresh, never as `client_id`; the declared extra
+/// params ride every token call, and the consent's own params read the
+/// app's values.
+#[sqlx::test]
+async fn a_provider_naming_the_client_differently_gets_that_name_everywhere(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = oauth_spec_with(&base, json!({
+        "clientParams": { "id": "client_key" },
+        "authParams": { "app": "{client_id}" },
+        "extraParams": { "audience": "{client_id}-api" }
+    }));
+    *fake.next_refresh.lock().unwrap() = Some("refresh-1".into());
+    *fake.expires_in.lock().unwrap() = Some(1);
+    let started = begin_oauth(
+        &pool,
+        TENANT_A,
+        BeginOAuth {
+            spec: spec.clone(),
+            door: Door::Own,
+            registration: Some(oauth_app()),
+            permissions: vec!["read".into()],
+            project_id: Some(PROJECT_1),
+            instance: None,
+            upgrade_grant_id: None,
+            redirect_uri: "http://disp.example/access/oauth/callback".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let consent = url::Url::parse(&started.consent_url).unwrap();
+    let query: BTreeMap<String, String> = consent.query_pairs().into_owned().collect();
+    assert_eq!(query.get("client_key").map(String::as_str), Some("cid"), "{consent}");
+    assert!(!query.contains_key("client_id"), "{consent}");
+    assert_eq!(query.get("app").map(String::as_str), Some("cid"), "{consent}");
+    let grant = complete_oauth(&pool, &started.state, "the-code").await.unwrap().grant;
+    expire_now(&pool, grant.id).await;
+
+    let exchange = last_call(&fake, "/token");
+    assert!(exchange.contains("client_key=cid") && exchange.contains("client_secret=sec"), "{exchange}");
+    assert!(!exchange.contains("client_id="), "{exchange}");
+    assert!(exchange.contains("audience=cid-api"), "{exchange}");
+
+    *fake.next_token.lock().unwrap() = "tok-fresh".into();
+    *fake.expires_in.lock().unwrap() = Some(3600);
+    let resolved = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[])
+        .await
+        .expect("the refresh succeeds");
+    assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-fresh"));
+    let refresh = last_call(&fake, "/token");
+    assert!(refresh.contains("grant_type=refresh_token"), "{refresh}");
+    assert!(refresh.contains("client_key=cid") && !refresh.contains("client_id="), "{refresh}");
+    assert!(refresh.contains("audience=cid-api"), "{refresh}");
+}
+
+/// The Instagram shape: the exchange answers a short-lived token nested
+/// under `data[0]` with no expiry, a declared GET swaps it at once for
+/// the token to keep (its answer sets the expiry), and a declared GET
+/// renews that one later. The standard token endpoint only ever sees
+/// the exchange.
+#[sqlx::test]
+async fn a_short_lived_token_is_swapped_after_the_exchange_and_renewed_by_a_get(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = oauth_spec_with(&base, json!({
+        "tokenPath": "data.0.access_token",
+        "scopePath": "data.0.permissions",
+        "captures": [{ "name": "userId", "path": "data.0.user_id" }],
+        "afterExchange": {
+            "url": format!("{base}/exchange?grant_type=swap&client_secret={{client_secret}}&access_token={{token}}")
+        },
+        "refresh": {
+            "url": format!("{base}/exchange?grant_type=renew&access_token={{token}}")
+        }
+    }));
+    *fake.token_answer.lock().unwrap() = Some(json!({
+        "data": [{ "access_token": "tok-short", "user_id": "1020", "permissions": "read" }]
+    }));
+    *fake.next_token.lock().unwrap() = "tok-long-1".into();
+    *fake.expires_in.lock().unwrap() = Some(1);
+    let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    expire_now(&pool, grant.id).await;
+    assert!(grant.expires_at.is_some(), "the swap's answer set the expiry");
+    assert_eq!(grant.scopes, vec!["read".to_string()], "the nested scope echo was read");
+    let swap = last_call(&fake, "/exchange");
+    assert!(swap.contains("\"swap\"") && swap.contains("\"tok-short\"") && swap.contains("\"sec\""), "{swap}");
+
+    *fake.next_token.lock().unwrap() = "tok-long-2".into();
+    *fake.expires_in.lock().unwrap() = Some(3600);
+    let resolved = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[])
+        .await
+        .expect("the declared renewal succeeds");
+    assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-long-2"));
+    assert_eq!(resolved.values.get("userId").map(String::as_str), Some("1020"), "the exchange's capture stays");
+    let renew = last_call(&fake, "/exchange");
+    assert!(renew.contains("\"renew\"") && renew.contains("\"tok-long-1\""), "{renew}");
+    assert_eq!(fake.token_requests.load(Ordering::SeqCst), 1, "only the exchange used the token endpoint");
+}
+
+/// A provider answering under its own names: the token, refresh token
+/// and absolute expiry are read through the declared paths, on the
+/// exchange AND on the standard refresh, whose captures run too and
+/// keep what a slimmer refresh answer leaves out.
+#[sqlx::test]
+async fn a_nested_answer_is_read_through_its_paths_on_the_exchange_and_the_refresh(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = oauth_spec_with(&base, json!({
+        "tokenPath": "result.token",
+        "refreshTokenPath": "result.renew",
+        "expiresPath": "result.until",
+        "captures": [
+            { "name": "account", "path": "result.account" },
+            { "name": "region", "path": "result.region", "optional": true }
+        ]
+    }));
+    let soon = chrono::Utc::now().timestamp() + 5;
+    *fake.token_answer.lock().unwrap() = Some(json!({
+        "result": { "token": "tok-n1", "renew": "rt-n1", "until": soon, "account": "acme", "region": "eu" }
+    }));
+    let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    assert_eq!(grant.expires_at.map(|at| at.timestamp()), Some(soon));
+    expire_now(&pool, grant.id).await;
+
+    let far = chrono::Utc::now() + chrono::Duration::hours(1);
+    *fake.token_answer.lock().unwrap() = Some(json!({
+        "result": { "token": "tok-n2", "until": far.to_rfc3339(), "region": "us" }
+    }));
+    let resolved = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[])
+        .await
+        .expect("the refresh reads the same paths");
+    assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-n2"));
+    assert_eq!(resolved.values.get("region").map(String::as_str), Some("us"), "the refresh's captures ran");
+    assert_eq!(resolved.values.get("account").map(String::as_str), Some("acme"), "a capture the refresh lacks is kept");
+    let refresh = last_call(&fake, "/token");
+    assert!(refresh.contains("refresh_token=rt-n1"), "the nested refresh token was stored: {refresh}");
+}
+
+/// A refusal answered with a success status and an error OBJECT (not
+/// an OAuth code string) fails the connect with the provider's words.
+#[sqlx::test]
+async fn a_refusal_answered_200_with_an_error_object_fails_the_connect(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = oauth_spec(&base, "coexisting");
+    *fake.token_answer.lock().unwrap() = Some(json!({
+        "error": { "message": "This authorization code has been used", "type": "OAuthException", "code": 100 }
+    }));
+    let err = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap_err();
+    assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Invalid(_))), "{err:#}");
+    assert!(err.to_string().contains("This authorization code has been used"), "{err:#}");
+}
+
+/// A connection weft could renew (a refresh token came back) whose
+/// answer names no expiry would never be renewed, so the connect is
+/// refused naming the keys that fix the recipe. Declaring the token
+/// never expires connects it with no expiry; a token weft could not
+/// renew anyway connects as it always did.
+#[sqlx::test]
+async fn a_renewable_token_with_no_expiry_is_refused_at_connect(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    *fake.next_refresh.lock().unwrap() = Some("refresh-1".into());
+    *fake.expires_in.lock().unwrap() = None;
+    let err = full_consent(&pool, TENANT_A, &oauth_spec(&base, "coexisting"), &["read"], None).await.unwrap_err();
+    let message = err.to_string();
+    assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Invalid(_))), "{err:#}");
+    assert!(message.contains("'expires_in'") && message.contains("expiresInPath"), "{message}");
+    assert!(message.contains("neverExpires"), "{message}");
+
+    let never = oauth_spec_with(&base, json!({ "neverExpires": true }));
+    let grant = full_consent(&pool, TENANT_A, &never, &["read"], None).await.expect("a declared never-expiring token connects");
+    assert_eq!(grant.expires_at, None);
+
+    *fake.next_refresh.lock().unwrap() = None;
+    let grant = full_consent(&pool, TENANT_A, &oauth_spec(&base, "coexisting"), &["read"], None)
+        .await
+        .expect("a token with nothing to renew it connects as before");
+    assert_eq!(grant.expires_at, None);
+}
+
+/// A Slack-class provider answers a refusal with a 200 and `ok: false`.
+/// It is seen exactly where the recipe declares its success flag: the
+/// token answer's `okPath` refuses the connect in the provider's words,
+/// and a lookup's `okPath` refuses the lookup, classified by its code
+/// (`invalid_auth` on a person's own connection asks for a reconnect).
+/// Without the flag declared, `ok` is just data.
+#[sqlx::test]
+async fn a_success_flag_refuses_only_where_the_recipe_declares_it(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    *fake.token_answer.lock().unwrap() = Some(json!({ "ok": false, "error": "invalid_code" }));
+    let flagged = oauth_spec_with(&base, json!({ "okPath": "ok" }));
+    let err = full_consent(&pool, TENANT_A, &flagged, &["read"], None).await.unwrap_err();
+    assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Invalid(_))), "{err:#}");
+    assert!(err.to_string().contains("invalid_code"), "{err:#}");
+
+    *fake.token_answer.lock().unwrap() = Some(json!({ "ok": false, "access_token": "tok-1" }));
+    full_consent(&pool, TENANT_A, &oauth_spec(&base, "coexisting"), &["read"], None)
+        .await
+        .expect("no flag declared, so `ok` is just data");
+
+    let done = connect_direct(
+        &pool,
+        TENANT_A,
+        ConnectDirect {
+            paste: false,
+            spec: static_spec(&base),
+            door: Door::Own,
+            registration: None,
+            values: [("token".to_string(), "tok-abc".to_string())].into_iter().collect(),
+            label: None,
+            permissions: Vec::new(),
+            project_id: None,
+            instance: None,
+        },
+    )
+    .await
+    .unwrap();
+    let resolved =
+        resolve_for_worker(&pool, TENANT_A, GrantUser::Author, done.grant.id, "fakestatic", &[], &[]).await.unwrap();
+    let lookup_spec: weft_core::node::Lookup = serde_json::from_value(json!({
+        "get": format!("{base}/refusing"), "items": "channels", "label": "name", "value": "id",
+        "okPath": "ok", "errorPath": "error"
+    }))
+    .unwrap();
+    let url = weft_access_store::lookup_url(&lookup_spec, "", &BTreeMap::new()).unwrap();
+    let err = lookup(Some(&resolved), &lookup_spec, None, &url).await.unwrap_err();
+    assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NeedsReconnect { .. })), "{err:#}");
+    assert!(err.to_string().contains("invalid_auth"), "{err:#}");
+}
+
+/// A refusal at a declared `errorPath` is classified by the code found
+/// THERE: on a refresh, a busy provider is tried again and keeps the
+/// connection, a refused grant asks for a reconnect, whatever the
+/// conventional `error` field says.
+#[sqlx::test]
+async fn a_refusal_at_a_declared_error_path_is_classified_by_its_code(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = oauth_spec_with(&base, json!({ "errorPath": "error_type" }));
+    *fake.next_refresh.lock().unwrap() = Some("refresh-1".into());
+    *fake.expires_in.lock().unwrap() = Some(1);
+    let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    expire_now(&pool, grant.id).await;
+
+    *fake.token_answer.lock().unwrap() =
+        Some(json!({ "error_type": "temporarily_unavailable", "error": "invalid_grant" }));
+    let err = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap_err();
+    assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Unreached(_))), "{err:#}");
+
+    *fake.token_answer.lock().unwrap() = Some(json!({ "error_type": "invalid_grant", "error": "ratelimited" }));
+    let err = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap_err();
+    assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NeedsReconnect { .. })), "{err:#}");
+    assert!(err.to_string().contains("invalid_grant"), "{err:#}");
+}
+
+/// Make a connection's token due for renewal now, as if its lifetime ran out.
+async fn expire_now(pool: &PgPool, id: uuid::Uuid) {
+    sqlx::query("UPDATE access_grant SET expires_at = now() - interval '1 minute' WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// A renewal answer naming no expiry lasts as long as the connection's
+/// token did (RFC 6749 lets a provider leave a documented lifetime out),
+/// so the connection is not renewed again on the next open. What a
+/// rotating provider issued is kept: the next renewal sends the NEW
+/// refresh token.
+#[sqlx::test]
+async fn a_renewal_naming_no_expiry_lasts_the_connections_lifetime(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = oauth_spec(&base, "coexisting");
+    *fake.next_refresh.lock().unwrap() = Some("refresh-1".into());
+    *fake.expires_in.lock().unwrap() = Some(3600);
+    let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    expire_now(&pool, grant.id).await;
+    let resolve = || resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]);
+
+    *fake.next_token.lock().unwrap() = "tok-2".into();
+    *fake.next_refresh.lock().unwrap() = Some("refresh-2".into());
+    *fake.expires_in.lock().unwrap() = None;
+    let before = fake.token_requests.load(Ordering::SeqCst);
+    let resolved = resolve().await.expect("the renewal lasts the known lifetime");
+    assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-2"));
+    assert!(last_call(&fake, "/token").contains("refresh_token=refresh-1"));
+    let fresh_for = resolved.fresh_until.expect("an expiry") - chrono::Utc::now();
+    assert!((3500..=3600).contains(&fresh_for.num_seconds()), "{fresh_for}");
+    assert_eq!(fake.token_requests.load(Ordering::SeqCst), before + 1);
+
+    resolve().await.expect("still fresh");
+    assert_eq!(fake.token_requests.load(Ordering::SeqCst), before + 1, "no renewal before that lifetime");
+
+    expire_now(&pool, grant.id).await;
+    *fake.next_refresh.lock().unwrap() = Some("refresh-3".into());
+    resolve().await.expect("renews again");
+    assert!(last_call(&fake, "/token").contains("refresh_token=refresh-2"), "the rotated token was persisted");
+}
+
+/// A renewal answer whose expiry does not read, or leaves the token no
+/// time to live, keeps what the provider issued and lasts the
+/// connection's known lifetime, so it is never renewed again on every
+/// open.
+#[sqlx::test]
+async fn an_unusable_renewal_expiry_lasts_the_connections_lifetime(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = oauth_spec(&base, "coexisting");
+    *fake.next_refresh.lock().unwrap() = Some("refresh-1".into());
+    *fake.expires_in.lock().unwrap() = Some(3600);
+    let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    let resolve = || resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]);
+
+    for (n, expires_in) in [json!("soon"), json!(0)].into_iter().enumerate() {
+        expire_now(&pool, grant.id).await;
+        let token = format!("tok-{}", n + 2);
+        *fake.token_answer.lock().unwrap() =
+            Some(json!({ "access_token": token, "refresh_token": format!("refresh-{}", n + 2), "expires_in": expires_in }));
+        let before = fake.token_requests.load(Ordering::SeqCst);
+        let resolved = resolve().await.expect("the renewal is kept");
+        assert_eq!(resolved.values.get("token"), Some(&token), "{expires_in}");
+        let fresh_for = resolved.fresh_until.expect("an expiry") - chrono::Utc::now();
+        assert!((3500..=3600).contains(&fresh_for.num_seconds()), "{expires_in}: {fresh_for}");
+        resolve().await.expect("still fresh");
+        assert_eq!(fake.token_requests.load(Ordering::SeqCst), before + 1, "{expires_in}: one renewal, not one per open");
+    }
+}
+
+/// `afterExchange` replaces the whole token set: a refresh token from
+/// the exchange belongs to the short-lived token it discarded, so when
+/// the swap's answer carries none the connection has none, and with no
+/// renewal declared and no expiry it connects as a token nothing renews
+/// (it is not judged renewable off the stale refresh token).
+#[sqlx::test]
+async fn after_exchange_drops_the_exchanges_refresh_token(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = oauth_spec_with(&base, json!({
+        "afterExchange": {
+            "url": format!("{base}/exchange?grant_type=swap&access_token={{token}}")
+        }
+    }));
+    *fake.token_answer.lock().unwrap() =
+        Some(json!({ "access_token": "tok-short", "refresh_token": "rt-stale", "expires_in": 3600 }));
+    *fake.next_token.lock().unwrap() = "tok-long".into();
+    *fake.expires_in.lock().unwrap() = None;
+    let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None)
+        .await
+        .expect("no refresh token survives the swap, so nothing is renewable and no expiry is needed");
+    assert_eq!(grant.expires_at, None);
+    let resolved = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap();
+    assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-long"));
 }

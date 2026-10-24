@@ -36,8 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::frames::Located;
 use super::graph::{GraphView, ProjectGraph};
 use super::places::{
-    enclosing_loops, every_place_in, incoming, locate, members_in, outgoing, scopes_around, validate_group_place,
-    validate_place,
+    enclosing_loops, every_place_in, incoming, loop_around, members_in, named, outgoing, scopes_around, Named,
 };
 use super::{CrossingSide, Edge, Given, GroupDefinition, GroupKind, ProjectDefinition};
 
@@ -128,20 +127,20 @@ impl Bounds {
     }
 }
 
-/// A node named as an end of a cut: one that does not compile is refused
-/// with the compiler's own reason, before any rule about where an end may
-/// sit (an infra node inside a loop is refused for being there, never
-/// told to select the loop), then [`validate_place`].
-fn node_endpoint(g: &ProjectGraph, place: &Located, spelled: &str) -> Result<(), String> {
-    refuse_broken(&g.project().broken, &BTreeSet::from([place.id.as_str()]))?;
-    validate_place(g, place, spelled)
-}
-
-/// [`node_endpoint`] for a group: its own compile errors, then
-/// [`validate_group_place`].
-fn group_endpoint(g: &ProjectGraph, place: &Located, spelled: &str) -> Result<(), String> {
-    refuse_broken(&g.project().broken, &BTreeSet::from([place.id.as_str()]))?;
-    validate_group_place(g, place, spelled)
+/// A node or a group named as an end of a cut: one that does not compile
+/// is refused with the compiler's own reason, before any rule about where
+/// an end may sit (an infra node inside a loop is refused for being there,
+/// never told to select the loop); then one inside a loop, which runs
+/// whole, is refused naming the loop.
+fn endpoint(g: &ProjectGraph, found: &Named, spelled: &str) -> Result<(), String> {
+    refuse_broken(&g.project().broken, &BTreeSet::from([found.place().id.as_str()]))?;
+    match loop_around(g, found) {
+        Some(around) => Err(format!(
+            "cannot cut at '{spelled}' inside loop '{}'; select the whole loop",
+            super::group_address(g.project(), &around.id, &around.path)
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Resolve `bounds` against the program. Refuses bounds that name
@@ -150,13 +149,11 @@ pub fn resolve(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Bounds, Str
     let project = g.project();
     let mut resolved = Bounds { given: bounds.baked.clone(), ..Bounds::default() };
     for spelled in &bounds.from {
-        let place = locate(g, spelled)?;
-        let fresh = if g.group(&place.id).is_some() {
-            group_endpoint(g, &place, spelled)?;
-            resolved.group_starts.insert(place)
-        } else {
-            node_endpoint(g, &place, spelled)?;
-            resolved.node_starts.insert(place)
+        let found = named(g, spelled)?;
+        endpoint(g, &found, spelled)?;
+        let fresh = match found {
+            Named::Group(place) => resolved.group_starts.insert(place),
+            Named::Node(place) => resolved.node_starts.insert(place),
         };
         if !fresh {
             return Err(format!("starting entry '{spelled}' is supplied more than once"));
@@ -166,42 +163,41 @@ pub fn resolve(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Bounds, Str
         if !bounds.from.is_empty() || !bounds.emit.is_empty() || !bounds.target.is_empty() || !bounds.before.is_empty() {
             return Err("group cannot be combined with from, emit, target, or before".into());
         }
-        let place = locate(g, group)?;
-        if g.group(&place.id).is_none() {
-            return Err(format!("unknown group '{group}'"));
-        }
-        group_endpoint(g, &place, group)?;
+        let found = named(g, group)?;
+        let Named::Group(place) = &found else {
+            return Err(format!("'{group}' is a node, and --group takes a group"));
+        };
+        endpoint(g, &found, group)?;
+        let place = place.clone();
         resolved.targets.extend(members_in(g, &place.id, &place.path));
         resolved.group_starts.insert(place);
     }
     for spelled in &bounds.emit {
-        let place = locate(g, spelled)?;
-        if g.group(&place.id).is_some() {
+        let found = named(g, spelled)?;
+        if let Named::Group(_) = found {
             return Err(format!("cannot supply outputs of group '{spelled}'; use --from {spelled} with its input payload"));
         }
-        node_endpoint(g, &place, spelled)?;
-        resolved.emits.insert(place);
+        endpoint(g, &found, spelled)?;
+        resolved.emits.insert(found.into_place());
     }
     if let Some(spelled) = &bounds.fire {
-        let place = locate(g, spelled)?;
-        node_endpoint(g, &place, spelled)?;
-        if !g.is_trigger(&place.id) {
+        let found = named(g, spelled)?;
+        endpoint(g, &found, spelled)?;
+        if !g.is_trigger(&found.place().id) {
             return Err(format!("'{spelled}' is not a trigger"));
         }
-        resolved.fired = Some(place);
+        resolved.fired = Some(found.into_place());
     }
     if let Some(place) = resolved.emits.iter().find(|place| resolved.node_starts.contains(*place) || resolved.fired.as_ref() == Some(*place)) {
         return Err(format!("'{}' cannot both run and have its outputs supplied", super::address_of(project, &place.id, &place.path)));
     }
     for (inclusive, ends) in [(true, &bounds.target), (false, &bounds.before)] {
         for spelled in ends {
-            let place = locate(g, spelled)?;
-            let endpoints: Vec<Located> = if g.group(&place.id).is_some() {
-                group_endpoint(g, &place, spelled)?;
-                members_in(g, &place.id, &place.path)
-            } else {
-                node_endpoint(g, &place, spelled)?;
-                vec![place]
+            let found = named(g, spelled)?;
+            endpoint(g, &found, spelled)?;
+            let endpoints: Vec<Located> = match found {
+                Named::Group(place) => members_in(g, &place.id, &place.path),
+                Named::Node(place) => vec![place],
             };
             if inclusive { resolved.targets.extend(endpoints) } else { resolved.befores.extend(endpoints) }
         }
@@ -209,8 +205,7 @@ pub fn resolve(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Bounds, Str
     resolved.feeders = feeders_of(g, &bounds.feed, &bounds.handed, &resolved.node_starts, &resolved.group_starts)?;
     for (spelled, ports) in &bounds.handed {
         if !ports.iter().any(|port| crate::run::skip::is_gate_port(port)) { continue; }
-        let place = locate(g, spelled)?;
-        if g.group(&place.id).is_some() {
+        if let Named::Group(place) = named(g, spelled)? {
             resolved.handed_gates.insert(place);
         }
     }
@@ -229,7 +224,7 @@ pub fn walk(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Walk, String> 
 /// a target inside a loop and a walk that would hold part of one.
 pub fn walk_setup(g: &ProjectGraph, targets: &[Located]) -> Result<Walk, String> {
     for target in targets {
-        node_endpoint(g, target, &super::address_of(g.project(), &target.id, &target.path))?;
+        endpoint(g, &Named::Node(target.clone()), &super::address_of(g.project(), &target.id, &target.path))?;
     }
     let walked = walk_bounds(g, &Bounds::setup(targets));
     validate_loops(g, &walked)?;
@@ -469,7 +464,7 @@ fn feeders_of(
     let nothing = BTreeSet::new();
     for spelled in feed {
         let handed = handed.get(spelled).unwrap_or(&nothing);
-        let start = locate(g, spelled)?;
+        let start = named(g, spelled)?.into_place();
         let mut sources = Vec::new();
         if group_starts.contains(&start) {
             let this_start = BTreeSet::from([start.clone()]);

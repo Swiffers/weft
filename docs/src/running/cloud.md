@@ -164,10 +164,17 @@ The address works at once, over HTTPS, with no extra charge. If you want a
 name of your own instead, see [your own domain](#your-own-domain), which
 costs money.
 
-If you want to upgrade weft, merge upstream into your fork and run the
-workflow again; Terraform changes only what is different from last time.
-Then rebuild your CLI from that commit, or `activate` refuses to deploy
-([when something goes wrong](#when-something-goes-wrong)).
+If you want to upgrade weft, run `weft maintenance on --on prod` from a
+project, merge upstream into your fork, run the workflow again, then run
+`weft maintenance off --on prod`. The first takes down every trigger that is
+on and stops the infra that runs, so the old weft and the new one never run
+side by side, and the workflow refuses to replace anything while something
+is on. Terraform changes only what is different from last time. The last
+builds those projects again on the new weft and brings back exactly what the
+first took down. Then rebuild your CLI from that
+commit, or `activate` refuses to deploy
+([when something goes wrong](#when-something-goes-wrong)). For what each step
+does, go and read [updating weft](cli.md#updating-weft).
 
 If you want weft gone, delete the GCP project you made for it: weft and
 everything it ever started live in that project and nowhere else, so that is

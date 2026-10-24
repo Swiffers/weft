@@ -1,19 +1,18 @@
 //! Layer-3 contract tests for the broker's fenced lifecycle writes
 //! (`lifecycle_writes`) against a REAL Postgres. The fence, the roster
 //! membership check, the rollup and the Displaced-versus-Gone answer
-//! all live IN SQL (one UPDATE evaluated on one row snapshot), so the
+//! all live IN SQL (the fence evaluated with the write that relies on it), so the
 //! supervisor's in-memory fake cannot prove them; these tests drive the
-//! exact statements the handlers serve. Also proves the repair statement
-//! `decode_units_json` prints actually heals a bricked row.
+//! exact statements the handlers serve.
 
 use sqlx::PgPool;
 
 use weft_broker::lifecycle_writes::{
     cancels_for, claim_next, complete_command, health_state, issue_command, record_event, set_health_state, set_status,
-    set_waiting, sync_ownership, unowned_work_waiting, FencedWrite, IssuedCommand,
+    set_waiting, sync_ownership, unowned_work_waiting, write_units, FencedWrite, IssuedCommand,
 };
 use weft_broker_client::protocol::{
-    decode_units_json, InfraLifecycleVerb, units_json_repair_sql, FailureStage, HealthCommandEnding, HealthRuleState, QueuedHealthCommand, InfraNodeStatus as Status,
+    InfraLifecycleVerb, FailureStage, HealthCommandEnding, HealthRuleState, QueuedHealthCommand, InfraNodeStatus as Status,
     SupervisorCommandCompleteRequest, SupervisorSetHealthStateRequest, SupervisorSetStatusRequest, SupervisorSetWaitingRequest,
     SupervisorSyncOwnershipRequest,
 };
@@ -82,11 +81,12 @@ async fn command_on(pool: &PgPool, project: uuid::Uuid, instance: Option<&str>) 
 /// declares no infra and runs none).
 async fn project_row(pool: &PgPool, id: uuid::Uuid, has_infra: bool) {
     sqlx::query(
-        "INSERT INTO project (id, name, tenant_id, status, project_json, updated_at, has_infra) \
-         VALUES ($1, 'p', 'tenant', 'inactive', '{}', 0, $2)",
+        "INSERT INTO project (id, name, tenant_id, status, project_json, updated_at, has_infra, project_json_version, resync_version, running_build_inputs_version) \
+         VALUES ($1, 'p', 'tenant', 'inactive', '{}', 0, $2, $3, 1, 1)",
     )
     .bind(id)
     .bind(has_infra)
+    .bind(weft_core::ProjectDefinition::STORED.version())
     .execute(pool)
     .await
     .expect("project row");
@@ -103,25 +103,41 @@ fn unit(status: &str) -> serde_json::Value {
 
 async fn node_row(pool: &PgPool, status: &str, units: serde_json::Value) {
     sqlx::query(
-        "INSERT INTO infra_node (project_id, node_id, copy_id, status, units_json) \
-         VALUES ($1, $2, 'inst1', $3, $4)",
+        "INSERT INTO infra_node (project_id, node_id, copy_id, status, health_rules_json_version) \
+         VALUES ($1, $2, 'inst1', $3, 1)",
     )
     .bind(PROJECT)
     .bind(NODE)
     .bind(status)
-    .bind(units)
     .execute(pool)
     .await
     .expect("node row");
+    put_units(pool, None, units).await;
 }
 
+/// The units of the copy of `instance` become `units` (unit name to
+/// `UnitRuntime`, as JSON), through the broker's own roster write, as an
+/// apply stamps them.
+async fn put_units(pool: &PgPool, instance: Option<&str>, units: serde_json::Value) {
+    let units: std::collections::BTreeMap<String, weft_broker_client::protocol::UnitRuntime> =
+        serde_json::from_value(units).expect("units as UnitRuntime");
+    let instance = instance.map(|m| weft_core::instance::InstanceId::new(m).expect("instance id"));
+    let mut tx = pool.begin().await.expect("begin");
+    write_units(&mut tx, PROJECT, NODE, instance.as_ref(), &units).await.expect("units");
+    tx.commit().await.expect("commit units");
+}
+
+/// The shared copy's status and its units, as the readers see them.
 async fn row(pool: &PgPool) -> (String, serde_json::Value) {
-    sqlx::query_as("SELECT status, units_json FROM infra_node WHERE project_id = $1 AND node_id = $2")
-        .bind(PROJECT)
-        .bind(NODE)
-        .fetch_one(pool)
-        .await
-        .expect("row")
+    sqlx::query_as(&format!(
+        "SELECT n.status, {} FROM infra_node n WHERE n.project_id = $1 AND n.node_id = $2 AND n.instance_id IS NULL",
+        weft_broker_client::protocol::units_of_copy_sql("n")
+    ))
+    .bind(PROJECT)
+    .bind(NODE)
+    .fetch_one(pool)
+    .await
+    .expect("row")
 }
 
 fn stamp(replica: &str, command_id: Option<i64>, unit: Option<&str>, status: Status) -> SupervisorSetStatusRequest {
@@ -175,9 +191,79 @@ async fn per_unit_stamp_patches_the_unit_and_rolls_up_the_new_roster(pool: PgPoo
     assert_eq!(units["a"]["stop_behavior"]["kind"], "stop");
 }
 
+/// Two per-unit stamps of one copy in turn: the second rolls up over the
+/// first's unit, not over the roster as it was before either.
+#[sqlx::test]
+async fn sequential_per_unit_stamps_roll_up_every_unit(pool: PgPool) {
+    schema(&pool).await;
+    lease(&pool, OWNER).await;
+    node_row(&pool, "running", serde_json::json!({ "a": unit("running"), "b": unit("running") })).await;
+
+    let out = set_status(&pool, &stamp(OWNER, None, Some("a"), Status::Failed)).await.unwrap();
+    assert_eq!(out, FencedWrite::Applied);
+    let out = set_status(&pool, &stamp(OWNER, None, Some("b"), Status::Flaky)).await.unwrap();
+    assert_eq!(out, FencedWrite::Applied);
+    let (status, units) = row(&pool).await;
+    assert_eq!((units["a"]["status"].as_str(), units["b"]["status"].as_str()), (Some("failed"), Some("flaky")));
+    assert_eq!(status, "failed", "the rollup is over both stamps: failed outranks flaky");
+}
+
+/// A stamp that waits for the copy's row behind another writer rolls up
+/// over what that writer committed. Here the other writer is a
+/// transaction holding the row (as a stamp of another unit does) that
+/// fails unit `b` and commits only once the stamp of `a` is blocked
+/// behind it: a rollup read from before the wait would see `b` running
+/// and leave the copy `flaky`.
+#[sqlx::test]
+async fn a_stamp_that_waited_on_the_copy_rolls_up_what_committed_meanwhile(pool: PgPool) {
+    schema(&pool).await;
+    lease(&pool, OWNER).await;
+    node_row(&pool, "running", serde_json::json!({ "a": unit("running"), "b": unit("running") })).await;
+
+    let mut other = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM infra_node WHERE project_id = $1 AND node_id = $2 AND instance_id IS NULL FOR UPDATE")
+        .bind(PROJECT)
+        .bind(NODE)
+        .execute(&mut *other)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE infra_unit SET status = 'failed' WHERE project_id = $1 AND node_id = $2 AND unit = 'b'")
+        .bind(PROJECT)
+        .bind(NODE)
+        .execute(&mut *other)
+        .await
+        .unwrap();
+
+    let stamping = tokio::spawn({
+        let pool = pool.clone();
+        async move { set_status(&pool, &stamp(OWNER, None, Some("a"), Status::Flaky)).await.unwrap() }
+    });
+    // Wait for the stamp to be blocked on the row lock, a condition the
+    // server reports, so the commit below lands while it waits.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the stamp never blocked on the copy's row");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    other.commit().await.unwrap();
+
+    assert_eq!(stamping.await.unwrap(), FencedWrite::Applied);
+    let (status, units) = row(&pool).await;
+    assert_eq!((units["a"]["status"].as_str(), units["b"]["status"].as_str()), (Some("flaky"), Some("failed")));
+    assert_eq!(status, "failed", "the rollup saw b's committed failure");
+}
+
 /// A per-unit stamp for a unit the roster does not carry is Gone and
-/// writes NOTHING: no status-only stub entry (the corruption that
-/// bricked every decode of the row), no status change.
+/// writes NOTHING: no unit, no status change.
 #[sqlx::test]
 async fn per_unit_stamp_on_a_missing_unit_is_gone_and_writes_nothing(pool: PgPool) {
     schema(&pool).await;
@@ -189,7 +275,8 @@ async fn per_unit_stamp_on_a_missing_unit_is_gone_and_writes_nothing(pool: PgPoo
     assert_eq!(out, FencedWrite::Gone);
     let (status, units) = row(&pool).await;
     assert_eq!(status, "running");
-    assert_eq!(units, serde_json::json!({ "a": unit("running") }));
+    let decode = |units| weft_broker_client::protocol::decode_units(units, PROJECT, NODE).unwrap();
+    assert_eq!(decode(units), decode(serde_json::json!({ "a": unit("running") })));
     // The autonomous (no command) branch answers the same.
     let out = set_status(&pool, &stamp(OWNER, None, Some("ghost"), Status::Running)).await.unwrap();
     assert_eq!(out, FencedWrite::Gone);
@@ -353,7 +440,7 @@ async fn node_wide_stamp_sets_every_unit_and_the_node_even_with_no_units(pool: P
     assert_eq!(units["b"]["status"], "failed");
 
     // Unit-less roster.
-    sqlx::query("UPDATE infra_node SET units_json = '{}'::jsonb").execute(&pool).await.unwrap();
+    put_units(&pool, None, serde_json::json!({})).await;
     assert_eq!(
         set_status(&pool, &stamp(OWNER, Some(cmd), None, Status::Terminating)).await.unwrap(),
         FencedWrite::Applied
@@ -441,21 +528,22 @@ async fn an_apply_that_succeeds_stamps_its_copy_with_its_build(pool: PgPool) {
     node_row(&pool, "running", serde_json::json!({})).await;
     for (hash, places, cut_from) in [("program", Some(serde_json::json!({ NODE: "h-2" })), None), ("cut", None, Some("program"))] {
         sqlx::query(
-            "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, cut_from, infra_places) \
-             VALUES ($1, $2, '{}', 0, $3, $4)",
+            "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, cut_from, infra_places, project_json_version) \
+             VALUES ($1, $2, '{}', 0, $3, $4, $5)",
         )
         .bind(PROJECT)
         .bind(hash)
         .bind(cut_from)
         .bind(places)
+        .bind(weft_core::ProjectDefinition::STORED.version())
         .execute(&pool)
         .await
         .unwrap();
     }
     let run_id = uuid::Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, definition_hash, cut_from, state, last_seq, started_at) \
-         VALUES ($1, $2, $3, 'infra_setup', 'project', 'durable', TRUE, 'cut', 'program', 'running', 0, 0)",
+        "INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, definition_hash, cut_from, state, last_seq, started_at, spec_version) \
+         VALUES ($1, $2, $3, 'infra_setup', 'project', 'durable', TRUE, 'cut', 'program', 'running', 0, 0, 1)",
     )
     .bind(run_id)
     .bind(PROJECT)
@@ -686,7 +774,7 @@ async fn sync_ownership_books_the_supervisors_pass_at_next_due_and_clears_it_whe
     assert_eq!(booked_pass(&pool).await, Some((now + 20) * 1000));
     assert_eq!(alarm.wakes().len(), 1, "one wake for the booking");
 
-    sqlx::query("UPDATE infra_node SET units_json = $1").bind(serde_json::json!({ "web": unit("running") })).execute(&pool).await.unwrap();
+    put_units(&pool, None, serde_json::json!({ "web": unit("running") })).await;
     assert_eq!(sync(OWNER).await.next_due_unix, None, "a unit that is ready again leaves nothing to look at");
     assert_eq!(booked_pass(&pool).await, None, "the booking is cleared");
     assert_eq!(alarm.cancelled().len(), 1, "and its wake cancelled");
@@ -1383,29 +1471,6 @@ async fn nothing_is_issued_or_recorded_for_a_deleted_project(pool: PgPool) {
     assert!(event.unwrap().is_some());
 }
 
-/// The repair statement the decode error prints heals a row carrying a
-/// status-only stub: before it the canonical decode fails, after it
-/// the stub is gone and the real entries are intact.
-#[sqlx::test]
-async fn repair_sql_drops_status_only_stubs(pool: PgPool) {
-    schema(&pool).await;
-    node_row(
-        &pool,
-        "running",
-        serde_json::json!({ "a": unit("running"), "stub": { "status": "stopped" } }),
-    )
-    .await;
-    let (_, units) = row(&pool).await;
-    let err = decode_units_json(units, PROJECT, NODE).unwrap_err().to_string();
-    assert!(err.contains(&units_json_repair_sql(PROJECT, NODE)), "{err}");
-
-    sqlx::query(&units_json_repair_sql(PROJECT, NODE)).execute(&pool).await.expect("repair");
-    let (_, units) = row(&pool).await;
-    let decoded = decode_units_json(units, PROJECT, NODE).expect("healed row decodes");
-    assert_eq!(decoded.len(), 1);
-    assert_eq!(decoded["a"].status, Status::Running);
-}
-
 /// An instance's copy is its own row: a stamp naming the instance moves
 /// only that copy, and a command naming copies hands the same copies
 /// back to the supervisor that claims it.
@@ -1418,17 +1483,17 @@ async fn an_instances_copy_is_stamped_and_commanded_on_its_own(pool: PgPool) {
     let ada = InstanceId::new("ada").unwrap();
     node_row(&pool, "running", serde_json::json!({ "a": unit("running") })).await;
     sqlx::query(
-        "INSERT INTO infra_node (project_id, node_id, copy_id, status, units_json, instance_id) \
-         VALUES ($1, $2, 'inst-ada', 'running', $3, 'ada')",
+        "INSERT INTO infra_node (project_id, node_id, copy_id, status, instance_id, health_rules_json_version) \
+         VALUES ($1, $2, 'inst-ada', 'running', 'ada', 1)",
     )
     .bind(PROJECT)
     .bind(NODE)
-    .bind(serde_json::json!({ "a": unit("running") }))
     .execute(&pool)
     .await
     .expect("ada's copy");
+    put_units(&pool, Some("ada"), serde_json::json!({ "a": unit("running") })).await;
     let duplicate = sqlx::query(
-        "INSERT INTO infra_node (project_id, node_id, status, instance_id) VALUES ($1, $2, 'running', 'ada')",
+        "INSERT INTO infra_node (project_id, node_id, status, instance_id, health_rules_json_version) VALUES ($1, $2, 'running', 'ada', 1)",
     )
     .bind(PROJECT)
     .bind(NODE)

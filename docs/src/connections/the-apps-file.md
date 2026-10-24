@@ -36,7 +36,7 @@ Every key weft defines is camelCase (`tokenUrl`, `signingSecret`), while
 | Key | What it is |
 |---|---|
 | `kind` | `"api_key"` |
-| `label` | The name the connection list shows |
+| `label` | A name for this entry, unique within the service. A connection made with it is named after the service |
 | `key` | The credential. At most one `api_key` per service |
 
 This is what "use ours" hands out. Calls on it spend money on that account, so
@@ -64,6 +64,7 @@ keep the file private.
 | `label` | Unique within the service |
 | `covers` | Exactly the permissions this app asks for, by their ids from the service's catalogue |
 | `authUrl`, `tokenUrl` | The provider addresses this app signs in against, copied from the recipe |
+| `origins` | Only if the recipe's own token calls run on another host than `tokenUrl`. Each entry is a bare origin, a scheme and a host with nothing after them, like `https://graph.instagram.com` |
 | `client_id`, `client_secret` | From the provider. `client_secret` is absent for a public PKCE app |
 | `events` | Only if this app receives pushes. Whatever the recipe verifies them with: `signingSecret` (Slack), `publicKey` (Discord, SendGrid), or for a signed identity token, `audience` and `pushEmail` |
 
@@ -75,6 +76,29 @@ up as its own labelled choice with its permissions listed.
 The addresses are pinned here, and a recipe that tries to substitute a
 different sign-in address is refused. A connection through a registered app
 only ever talks to the addresses you wrote.
+
+That holds for a recipe's own token calls too, its `afterExchange` and its
+`refresh`, because they run with the app's secret at hand. Each one has to go
+to the origin of `tokenUrl` or to one listed in `origins`. Instagram swaps and
+renews its tokens on `graph.instagram.com` while its `tokenUrl` is on
+`api.instagram.com`, so its app lists that origin:
+
+```json
+{
+  "instagram": [{
+    "kind": "oauth_app",
+    "label": "Instagram",
+    "covers": ["instagram_business_basic", "instagram_business_content_publish"],
+    "authUrl": "https://www.instagram.com/oauth/authorize",
+    "tokenUrl": "https://api.instagram.com/oauth/access_token",
+    "origins": ["https://graph.instagram.com"],
+    "client_id": "...",
+    "client_secret": "..."
+  }]
+}
+```
+
+Without it, the connect is refused naming the call, the address and `origins`.
 
 You also have to register the callback URL the connect panel shows you as the
 app's redirect URL, and re-register it whenever your public address changes.
@@ -102,6 +126,8 @@ node the operator thought was configured.
 - More than one `api_key` for a service
 - An OAuth app with no `covers`
 - A permission in `covers` that the service's catalogue does not have
+- An `origins` entry that is not a bare origin (a path after the host, a
+  query, a user name)
 - An `events` block on a service with no webhook transport, or a key in it
   weft does not know
 - A key an older weft spelled snake_case (`auth_url`, `token_url`,

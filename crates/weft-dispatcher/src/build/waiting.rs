@@ -42,6 +42,11 @@ pub(crate) const WAITING: &str = "waiting";
 /// removed ([`forget_project`]).
 pub const ENDED_KEPT_SECS: i64 = 3600;
 
+/// The channel a version build announces its end on (registered, failed,
+/// cancelled or superseded), the payload its id: what a wait for it inside
+/// the install hears ([`wait_ended`]).
+pub const VERSION_BUILD_ENDED_CHANNEL: &str = "weft_version_build_ended";
+
 /// Why a version superseded by a newer registration never registers.
 const NEWER_REGISTERED: &str = "a newer build of this project registered first";
 
@@ -59,6 +64,11 @@ pub const VERSION_BUILD_TABLE: &str = r#"CREATE TABLE IF NOT EXISTS version_buil
             project_name TEXT NOT NULL,
             -- The version's files, registered as the program's source.
             manifest JSONB NOT NULL,
+            -- What they were compiled with (weft_core::builds::BuildInputs),
+            -- registered with them. NULL for a version an older weft
+            -- wrote down, which kept none; a row lives only while its
+            -- images build, so no document version goes with it.
+            inputs JSONB,
             -- The BuiltProgram the request compiled (replacedInfraImages
             -- empty: the registration fills it).
             program JSONB NOT NULL,
@@ -139,13 +149,14 @@ async fn end(
         "WITH ended AS (UPDATE version_build SET state = $2, reason = $3, registered = $4, ended_at = $5 \
                         WHERE id = $1 AND state = 'waiting' RETURNING id), \
               dropped AS (DELETE FROM image_claim WHERE claim_id IN (SELECT id FROM ended)) \
-         SELECT count(*) FROM ended",
+         SELECT count(*) FROM (SELECT pg_notify($6, id::TEXT) FROM ended) told",
     )
     .bind(id)
     .bind(status_name(status))
     .bind(reason)
     .bind(registered.map(serde_json::to_value).transpose()?)
     .bind(now)
+    .bind(VERSION_BUILD_ENDED_CHANNEL)
     .fetch_one(conn)
     .await
     .context("end the version build")?;
@@ -225,8 +236,8 @@ pub async fn ask(
     };
     sqlx::query(
         "INSERT INTO version_build (id, ask, project_id, tenant_id, project_name, manifest, program, images, waits_on, \
-                                    state, reason, registered, asked_at, ended_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, $12, $13) \
+                                    state, reason, registered, asked_at, ended_at, inputs) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, $12, $13, $15) \
          RETURNING pg_notify($14, id::TEXT)",
     )
     .bind(id)
@@ -243,6 +254,7 @@ pub async fn ask(
     .bind(now)
     .bind(ended_at)
     .bind(super::follow::BUILD_CLAIMED_CHANNEL)
+    .bind(version.inputs.as_ref().map(serde_json::to_value).transpose()?)
     .execute(&mut *tx)
     .await
     .context("write the waiting version")?;
@@ -491,7 +503,7 @@ async fn registered_in_store(
             Some(&answer.infra_hash),
             Some(&infra_images),
             Some(&code),
-            Some(&version.manifest),
+            Some(&crate::project_store::RunningSource { manifest: &version.manifest, inputs: version.inputs.as_ref() }),
             Some(&settles),
             Some(&answer.infra_places),
         )
@@ -620,7 +632,7 @@ pub async fn advance(pool: &PgPool, projects: &dyn ProjectStoreOps) -> Result<Ad
         .await
         .context("forget the long-ended version builds")?;
     let rows: Vec<WaitingRow> = sqlx::query_as(
-        "SELECT id, ask, project_id, tenant_id, project_name, manifest, program, images, waits_on FROM version_build \
+        "SELECT id, ask, project_id, tenant_id, project_name, manifest, inputs, program, images, waits_on FROM version_build \
          WHERE state = 'waiting' ORDER BY asked_at",
     )
     .fetch_all(pool)
@@ -662,6 +674,7 @@ struct WaitingRow {
     tenant_id: String,
     project_name: String,
     manifest: serde_json::Value,
+    inputs: Option<serde_json::Value>,
     program: serde_json::Value,
     images: Vec<String>,
     waits_on: serde_json::Value,
@@ -696,6 +709,7 @@ async fn advance_one(pool: &PgPool, projects: &dyn ProjectStoreOps, row: Waiting
             let version = super::Version {
                 name: row.project_name,
                 manifest: serde_json::from_value(row.manifest).context("its files do not read")?,
+                inputs: row.inputs.map(serde_json::from_value).transpose().context("what its files were compiled with does not read")?,
                 program: serde_json::from_value(row.program).context("its program does not read")?,
                 images: row.images,
                 ask: row.ask,
@@ -708,6 +722,32 @@ async fn advance_one(pool: &PgPool, projects: &dyn ProjectStoreOps, row: Waiting
                 Some((summary, _)) => Moved::Registered(summary),
                 None => Moved::Ended,
             })
+        }
+    }
+}
+
+/// Wait until version build `id` of `project` ends, and answer how it
+/// stands then. Heard as it ends ([`VERSION_BUILD_ENDED_CHANNEL`]), and
+/// read again whenever the watch may have missed something; never on a
+/// clock. No deadline: its images build for as long as they take, and
+/// `weft cancel-build` ends it.
+pub async fn wait_ended(state: &DispatcherState, project: uuid::Uuid, id: uuid::Uuid) -> Result<VersionBuildState> {
+    // Subscribed before the first read, so an end between the two is heard.
+    let mut heard = state.signals.subscribe();
+    let payload = id.to_string();
+    loop {
+        let now = self::state(&state.pg_pool, project, id)
+            .await?
+            .ok_or_else(|| anyhow!("version build {id} of project {project} is gone"))?;
+        if now.state != VersionBuildStatus::Waiting {
+            return Ok(now);
+        }
+        loop {
+            match heard.next().await? {
+                weft_task_store::pg_signal::Heard::Signal { channel, payload: p } if channel == VERSION_BUILD_ENDED_CHANNEL && *p == *payload => break,
+                weft_task_store::pg_signal::Heard::Recheck | weft_task_store::pg_signal::Heard::Resumed => break,
+                _ => {}
+            }
         }
     }
 }

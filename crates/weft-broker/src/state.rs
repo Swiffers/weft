@@ -111,6 +111,9 @@ pub struct BrokerState {
     pub http: reqwest::Client,
     /// See [`BrokerSettings::supervisor_booking`].
     pub supervisor_booking: Option<weft_task_store::drain::Booking>,
+    /// When the log last said a sender's calls do not read
+    /// (`crate::wire`).
+    pub unreadable_shapes: crate::wire::UnreadableShapes,
 }
 
 /// What the broker is built from, besides the pool and the signal watch
@@ -212,6 +215,7 @@ impl BrokerState {
             slot_key: settings.slot_key,
             http: reqwest::Client::new(),
             supervisor_booking: settings.supervisor_booking,
+            unreadable_shapes: crate::wire::UnreadableShapes::default(),
         }))
     }
 }

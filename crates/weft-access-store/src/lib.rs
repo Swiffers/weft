@@ -100,12 +100,12 @@ pub(crate) async fn read_answer(resp: reqwest::Response, shown: &str) -> anyhow:
 }
 
 /// The store's error for a provider's refusal of `kind` (read off its
-/// answer with [`RefusalKind::of_answer`]): one saying it could not answer
+/// answer with [`RefusalKind::of`]): one saying it could not answer
 /// now (busy, slow or down) is [`AccessError::Unreached`], tried again,
 /// never a reconnect; any other is what `refused` makes of it, since only
 /// the caller knows whether the credential or the request was refused.
 ///
-/// [`RefusalKind::of_answer`]: weft_core::access::client::RefusalKind::of_answer
+/// [`RefusalKind::of`]: weft_core::access::client::RefusalKind::of
 pub(crate) fn refusal(
     kind: weft_core::access::client::RefusalKind,
     why: String,
@@ -173,6 +173,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             project_id UUID,
             -- The AccessSpec snapshot: refresh/auth need no catalog.
             spec_json JSONB NOT NULL,
+            -- The version `spec_json` was written at (`AccessSpec::STORED`).
+            spec_json_version INTEGER NOT NULL,
             -- The stored values (token, refresh_token, captures, pasted
             -- fields), SEALED (crypt.rs). What a resolution hands over
             -- is everything here EXCEPT the store's own keep-alive
@@ -230,6 +232,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- project's, so an instance's connection always names one.
             instance_id TEXT,
             expires_at TIMESTAMPTZ,
+            -- How many seconds the connection's token lasts, as the
+            -- provider last stated it (its expires_in, or an absolute
+            -- expiry less the moment the answer arrived), never
+            -- re-measured at the write. A renewal answer naming no
+            -- usable expiry gets this lifetime again. NULL while the
+            -- token has no expiry.
+            token_lifetime_secs BIGINT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             -- How many times the connection was made again over this row
@@ -411,6 +420,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- sha256 hex of the recipe's canonical JSON.
             recipe_hash TEXT NOT NULL,
             events_json JSONB NOT NULL,
+            -- The version `events_json` was written at
+            -- (`weft_core::access::events::STORED_EVENTS`).
+            events_json_version INTEGER NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (service, recipe_hash)
         );
@@ -474,14 +486,88 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             FOR EACH ROW EXECUTE FUNCTION access_notify()"#,
     ],
     seed: &[],
+    data_steps: &[],
 };
 
-/// Parse a grant row's spec snapshot back into the typed recipe. A
-/// snapshot that no longer parses is a real bug (the spec vocabulary
-/// only grows), surfaced loudly.
-pub(crate) fn spec_of(spec_json: &serde_json::Value) -> anyhow::Result<weft_core::AccessSpec> {
-    serde_json::from_value(spec_json.clone())
-        .map_err(|e| anyhow::anyhow!("stored access spec no longer parses: {e}"))
+/// A connection's `events_recipe_hash` is the hash of the recipe in its
+/// own snapshot, which is what routes a push to it: hashed again from
+/// each snapshot once the snapshots are in today's shape, so a connection
+/// keeps matching the recipe [`rekey_events_recipes`] keeps it under.
+/// What `access_grant.spec_json` re-derives once its documents are carried
+/// to today's shape (`weft_runtime::schema::documents`).
+pub fn rehash_grant_recipes(conn: &mut sqlx::PgConnection) -> weft_task_store::documents::Rederived<'_> {
+    Box::pin(async move {
+        let rows: Vec<(uuid::Uuid, serde_json::Value, weft_core::stored::Version, Option<String>)> =
+            sqlx::query_as("SELECT id, spec_json, spec_json_version, events_recipe_hash FROM access_grant")
+                .fetch_all(&mut *conn)
+                .await?;
+        for (id, spec, version, stored) in rows {
+            let hash = resolve::events_recipe_hash(&spec_of(format_args!("connection {id}"), spec, version)?.events);
+            if hash != stored {
+                sqlx::query("UPDATE access_grant SET events_recipe_hash = $2 WHERE id = $1")
+                    .bind(id)
+                    .bind(hash)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// A recorded recipe is kept under the hash of its JSON: keyed again
+/// once its JSON is in today's shape. Two recipes landing on one hash are
+/// one recipe, kept once. What `service_events_recipe.events_json`
+/// re-derives once its documents are carried to today's shape.
+pub fn rekey_events_recipes(conn: &mut sqlx::PgConnection) -> weft_task_store::documents::Rederived<'_> {
+    Box::pin(async move {
+        let rows: Vec<(String, String, serde_json::Value, weft_core::stored::Version)> =
+            sqlx::query_as("SELECT service, recipe_hash, events_json, events_json_version FROM service_events_recipe")
+                .fetch_all(&mut *conn)
+                .await?;
+        for (service, stored, events, version) in rows {
+            let events = weft_core::access::events::STORED_EVENTS
+                .decode(events, version)
+                .map_err(|e| e.at(format_args!("a recorded events recipe of '{service}' ({stored})")))?;
+            let hash = resolve::events_recipe_hash(&events)
+                .ok_or_else(|| anyhow::anyhow!("a recorded events recipe of '{service}' declares no topic"))?;
+            if hash == stored {
+                continue;
+            }
+            let taken: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM service_events_recipe WHERE service = $1 AND recipe_hash = $2)",
+            )
+            .bind(&service)
+            .bind(&hash)
+            .fetch_one(&mut *conn)
+            .await?;
+            if taken {
+                sqlx::query("DELETE FROM service_events_recipe WHERE service = $1 AND recipe_hash = $2")
+                    .bind(&service)
+                    .bind(&stored)
+                    .execute(&mut *conn)
+                    .await?;
+            } else {
+                sqlx::query("UPDATE service_events_recipe SET recipe_hash = $3 WHERE service = $1 AND recipe_hash = $2")
+                    .bind(&service)
+                    .bind(&stored)
+                    .bind(&hash)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// A grant row's spec snapshot (`access_grant.spec_json`), written at
+/// `version`, as the typed recipe; `at` names the connection for a message.
+pub(crate) fn spec_of(
+    at: impl std::fmt::Display,
+    spec_json: serde_json::Value,
+    version: weft_core::stored::Version,
+) -> anyhow::Result<weft_core::AccessSpec> {
+    Ok(weft_core::AccessSpec::STORED.decode(spec_json, version).map_err(|e| e.at(at))?)
 }
 
 pub(crate) fn values_of(

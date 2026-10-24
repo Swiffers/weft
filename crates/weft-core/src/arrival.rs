@@ -89,6 +89,15 @@ pub const NOT_NOW_FOR_CALLER: &str = "This service is unavailable right now; try
 /// How long a caller turned away with [`NOT_NOW_FOR_CALLER`] is told to wait.
 pub const NOT_NOW_RETRY_SECS: u64 = 5;
 
+/// The whole answer a caller turned away gets ([`NOT_NOW_FOR_CALLER`]), as
+/// a response's status, headers and body: the one every door that turns a
+/// caller away sends (a worker's, the install's relay), so they never
+/// drift apart.
+#[cfg(feature = "runtime")]
+pub fn not_now_answer() -> (http::StatusCode, [(http::header::HeaderName, String); 1], &'static str) {
+    (http::StatusCode::SERVICE_UNAVAILABLE, [(http::header::RETRY_AFTER, NOT_NOW_RETRY_SECS.to_string())], NOT_NOW_FOR_CALLER)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -73,15 +73,18 @@ pub fn saved_for_run(
 /// saved outputs of: at least one output read, every one read baked and
 /// saved. Reads are the wires into a node of `runs`; a place named in
 /// `named` (what the run was asked to start at, stop at or run) always
-/// runs.
-pub fn covered(project: &ProjectDefinition, saved: &Saved, runs: &BTreeSet<Located>, named: &BTreeSet<String>) -> Saved {
+/// runs, and only that place: a file included twice is two places, and
+/// naming one of them leaves the other reading its bake. Takes the
+/// program's index the caller's walk already holds, so the reads of every
+/// saved place go through one index.
+pub fn covered(g: &impl crate::project::graph::GraphView, saved: &Saved, runs: &BTreeSet<Located>, named: &BTreeSet<Located>) -> Saved {
     saved
         .iter()
         .filter(|(place, values)| {
-            if named.contains(&place.id) || !runs.contains(*place) {
+            if named.contains(*place) || !runs.contains(*place) {
                 return false;
             }
-            let read = crate::project::places::ports_read_by(project, place, runs);
+            let read = crate::project::places::ports_read_by(g, place, runs);
             !read.is_empty() && read.iter().all(|port| values.contains_key(port))
         })
         .map(|(place, values)| (place.clone(), values.clone()))
@@ -208,9 +211,98 @@ mod covered_tests {
         // A run that also runs watch reads db.status, which is not baked.
         assert!(covered(&project, &saved, &places(&["trig", "query", "db", "cfg", "watch"]), &none).is_empty());
         // A place the run was asked to run runs.
-        let named = BTreeSet::from(["db".to_string()]);
+        let named = BTreeSet::from([Located::top("db")]);
         assert!(covered(&project, &saved, &places(&["trig", "query", "db", "cfg"]), &named).is_empty());
         // Nothing in the run reads it: it runs as asked.
         assert!(covered(&project, &saved, &places(&["db", "cfg"]), &none).is_empty());
+    }
+
+    /// The view a walk hands over, recording every wire lookup it answers.
+    struct Counting<'a> {
+        inner: crate::project::graph::ProjectGraph<'a>,
+        wire_lookups: std::cell::Cell<usize>,
+    }
+
+    impl crate::project::graph::GraphView for Counting<'_> {
+        fn project(&self) -> &ProjectDefinition {
+            self.inner.project()
+        }
+        fn node(&self, id: &str) -> Option<&crate::project::NodeDefinition> {
+            self.inner.node(id)
+        }
+        fn group(&self, id: &str) -> Option<&crate::project::GroupDefinition> {
+            self.inner.group(id)
+        }
+        fn group_position(&self, id: &str) -> Option<usize> {
+            self.inner.group_position(id)
+        }
+        fn edges_into(&self, id: &str) -> impl Iterator<Item = &crate::project::Edge> {
+            self.wire_lookups.set(self.wire_lookups.get() + 1);
+            self.inner.edges_into(id)
+        }
+        fn edges_out_of(&self, id: &str) -> impl Iterator<Item = &crate::project::Edge> {
+            self.wire_lookups.set(self.wire_lookups.get() + 1);
+            self.inner.edges_out_of(id)
+        }
+        fn members(&self, group: &str) -> impl Iterator<Item = &crate::project::NodeDefinition> {
+            self.inner.members(group)
+        }
+        fn sites(&self, group: &str) -> impl Iterator<Item = &crate::project::GroupDefinition> {
+            self.inner.sites(group)
+        }
+    }
+
+    /// What a run reads of a saved place is looked up through the index
+    /// the caller holds, never a fresh one per place.
+    #[test]
+    fn the_reads_go_through_the_view_the_caller_holds() {
+        let project = program();
+        let saved = saved_for_run(&project, &[copy(true, &[("access", json!("a1"))])], None);
+        let view = Counting { inner: crate::project::graph::ProjectGraph::new(&project), wire_lookups: Default::default() };
+        let kept = covered(&view, &saved, &places(&["trig", "query", "db", "cfg"]), &BTreeSet::new());
+        assert!(kept.contains_key(&Located::top("db")));
+        assert_eq!(view.wire_lookups.get(), 1, "one saved place, one lookup of its wires out, through the view");
+    }
+
+    /// A file holding `db` (its `access` baked) and the `query` reading
+    /// it, included at the sites `one` and `two`: two places of `db`, and
+    /// naming one of them runs that one alone, the other still reading its
+    /// bake.
+    #[test]
+    fn naming_one_call_of_an_included_file_leaves_the_other_reading_its_bake() {
+        let node = |id: &str, inputs: &[&str], outputs: &[&str], extra: serde_json::Value| {
+            let mut n = json!({
+                "id": id, "nodeType": "T", "label": null, "config": {},
+                "position": {"x": 0, "y": 0},
+                "inputs": inputs.iter().map(|p| json!({"name": p, "portType": "String", "required": true})).collect::<Vec<_>>(),
+                "outputs": outputs.iter().map(|p| json!({"name": p, "portType": "String", "required": true})).collect::<Vec<_>>(),
+                "features": {}, "requiresInfra": false, "scope": ["L"],
+            });
+            n.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            n
+        };
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [
+                node("L.db", &[], &["access"], json!({"requiresInfra": true, "bakedOutputs": ["access"]})),
+                node("L.query", &["access"], &[], json!({})),
+            ],
+            "edges": [{"id": "e", "source": "L.db", "target": "L.query", "sourceHandle": "access", "targetHandle": "access"}],
+            "groups": [
+                {"id": "L", "kind": "body", "nodeIds": ["L.db", "L.query"]},
+                {"id": "one", "kind": "call", "body": "L", "nodeIds": []},
+                {"id": "two", "kind": "call", "body": "L", "nodeIds": []}
+            ]
+        }))
+        .unwrap();
+        let at = |id: &str, site: &str| Located::new(id, vec![site.to_string()]);
+        let saved: Saved = [at("L.db", "one"), at("L.db", "two")].into_iter()
+            .map(|place| (place, BTreeMap::from([("access".to_string(), json!("a1"))])))
+            .collect();
+        let runs: BTreeSet<Located> = ["one", "two"].into_iter().flat_map(|site| [at("L.db", site), at("L.query", site)]).collect();
+        let both = covered(&project, &saved, &runs, &BTreeSet::new());
+        assert_eq!(both.keys().cloned().collect::<Vec<_>>(), vec![at("L.db", "one"), at("L.db", "two")]);
+        let named = covered(&project, &saved, &runs, &BTreeSet::from([at("L.db", "one")]));
+        assert_eq!(named.keys().cloned().collect::<Vec<_>>(), vec![at("L.db", "two")]);
     }
 }

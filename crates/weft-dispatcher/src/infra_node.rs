@@ -98,9 +98,30 @@ pub struct InfraNodeRow {
     pub source_hash: Option<String>,
 }
 
+/// Each unit an older weft kept inside its copy's row, in
+/// `infra_node.units_json`, copied into a row of `infra_unit`. An entry
+/// with no `stop_behavior` is a status-only stub an older broker could
+/// leave, never a real unit, and is left out.
+// SYNC: the unit's columns <-> weft_broker_client::protocol::UnitRuntime, units_of_copy_sql, infra_unit (the table below), crates/weft-broker/src/lifecycle_writes.rs (write_units)
+const UNITS_MOVE: weft_task_store::DataStep = weft_task_store::DataStep {
+    table: "infra_node",
+    column: "units_json",
+    until: weft_task_store::Until::Dropped,
+    sql: "INSERT INTO infra_unit (project_id, node_id, instance_id, unit, status, stop_behavior, \
+              flaky_after_seconds, recovery_after_seconds, not_ready_since_unix, ready_since_unix, image_refs) \
+          SELECT n.project_id, n.node_id, n.instance_id, u.key, u.value->>'status', \
+              u.value->'stop_behavior'->>'kind', (u.value->>'flaky_after_seconds')::bigint, \
+              (u.value->>'recovery_after_seconds')::bigint, (u.value->>'not_ready_since_unix')::bigint, \
+              (u.value->>'ready_since_unix')::bigint, \
+              ARRAY(SELECT jsonb_array_elements_text(COALESCE(u.value->'image_refs', '[]'::jsonb))) \
+          FROM infra_node n CROSS JOIN LATERAL jsonb_each(n.units_json) AS u \
+          WHERE u.value ? 'stop_behavior' \
+          ON CONFLICT DO NOTHING",
+};
+
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "infra_node",
-    tables: &["infra_node"],
+    tables: &["infra_node", "infra_unit"],
     ddl: &[
         r#"CREATE TABLE IF NOT EXISTS infra_node (
             project_id          UUID NOT NULL,
@@ -118,10 +139,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- Disk names to keep on terminate. JSON array; empty means
             -- "delete every disk the copy owns".
             keep_disks_json  JSONB NOT NULL DEFAULT '[]'::jsonb,
-            -- Per-unit runtime (status + resolved health windows +
-            -- stop_behavior) keyed by unit name. The `status` column
-            -- is a rollup over these. Stamped at apply.
-            units_json          JSONB NOT NULL DEFAULT '{}'::jsonb,
             -- Whose copy: NULL for the program's shared one, else the
             -- instance whose copy of a `@per_instance` node this is.
             instance_id         TEXT,
@@ -154,11 +171,61 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- a JSON array), which the supervisor's health loop runs on
             -- the copy. NULL: the node wrote none, so it runs the
             -- built-in ones. Stamped at apply.
-            health_rules_json   JSONB
+            health_rules_json   JSONB,
+            -- The version `health_rules_json` was written at
+            -- (`weft_core::infra::health::STORED_RULES`).
+            health_rules_json_version INTEGER NOT NULL
         )"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_infra_node_copy
              ON infra_node(project_id, node_id, instance_id) NULLS NOT DISTINCT"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_node_project   ON infra_node(project_id)"#,
+        // One row per unit of a copy, as it runs: the copy's roster, which
+        // its apply stamps whole (a unit at 0 replicas or a Service-only
+        // unit shows no workload, so the supervisor cannot learn the roster
+        // from what it observes), and each unit's status, which the
+        // copy's `status` is the rollup of. The units of a copy go with it
+        // (`infra_node_units_on_delete`).
+        // SYNC: infra_unit's columns <-> weft_broker_client::protocol::UnitRuntime, units_of_copy_sql, UNITS_MOVE, crates/weft-broker/src/lifecycle_writes.rs (write_units)
+        r#"CREATE TABLE IF NOT EXISTS infra_unit (
+            project_id UUID NOT NULL,
+            node_id TEXT NOT NULL,
+            -- Whose copy: NULL for the shared one (`infra_node.instance_id`).
+            instance_id TEXT,
+            unit TEXT NOT NULL,
+            -- `InfraNodeStatus::as_str`.
+            status TEXT NOT NULL,
+            -- `StopBehavior`'s kind, resolved at apply from `Unit.on_stop`.
+            stop_behavior TEXT NOT NULL,
+            -- The health windows, resolved at apply: the unit's own or the
+            -- supervisor's default.
+            flaky_after_seconds BIGINT NOT NULL,
+            recovery_after_seconds BIGINT NOT NULL,
+            -- Since when (unix seconds) a running unit has been seen not
+            -- ready, and a flaky one ready again.
+            not_ready_since_unix BIGINT,
+            ready_since_unix BIGINT,
+            -- The image refs its containers run after the apply that
+            -- stamped it, which image reclamation keeps.
+            image_refs TEXT[] NOT NULL DEFAULT '{}'
+        )"#,
+        r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_infra_unit_key
+             ON infra_unit(project_id, node_id, instance_id, unit) NULLS NOT DISTINCT"#,
+        // A copy's units go with it, whichever statement removes it: a
+        // foreign key cannot say this, since the shared copy's
+        // `instance_id` is NULL.
+        r#"CREATE OR REPLACE FUNCTION infra_node_units_delete() RETURNS trigger AS $$
+            BEGIN
+                DELETE FROM infra_unit u
+                 WHERE u.project_id = OLD.project_id AND u.node_id = OLD.node_id
+                   AND u.instance_id IS NOT DISTINCT FROM OLD.instance_id;
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS infra_node_units_on_delete ON infra_node"#,
+        r#"CREATE TRIGGER infra_node_units_on_delete
+            AFTER DELETE ON infra_node
+            FOR EACH ROW
+            EXECUTE FUNCTION infra_node_units_delete()"#,
         // Tell every dispatcher a project's copies came, went, changed
         // status or now answer at another address, so its copy of which
         // are up (`crate::held::Held`) is read again; the broker passes it
@@ -190,13 +257,19 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             EXECUTE FUNCTION infra_node_status_notify()"#,
     ],
     seed: &[],
+    data_steps: &[UNITS_MOVE],
 };
 
-/// The columns every read decodes (`parse_row`).
-const ROW_COLUMNS: &str = "project_id, node_id, instance_id, copy_id, status, \
-     failure_stage, failure_message, applied_spec_hash, \
-     applied_at_unix, endpoints_json, install_endpoints_json, public_paths_json, doors_json, keep_disks_json, units_json, notes_json, \
-     waiting_on, provisioning_since_unix, source_hash";
+/// The columns every read decodes (`parse_row`), its units among them.
+static ROW_COLUMNS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "project_id, node_id, instance_id, copy_id, status, \
+         failure_stage, failure_message, applied_spec_hash, \
+         applied_at_unix, endpoints_json, install_endpoints_json, public_paths_json, doors_json, keep_disks_json, \
+         {} AS units, notes_json, waiting_on, provisioning_since_unix, source_hash",
+        weft_broker_client::protocol::units_of_copy_sql("infra_node")
+    )
+});
 
 /// Read one copy's row. Returns None when the row doesn't exist (no
 /// infra was ever applied for this copy).
@@ -207,8 +280,9 @@ pub async fn get(
     instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<Option<InfraNodeRow>> {
     let row = sqlx::query(&format!(
-        "SELECT {ROW_COLUMNS} FROM infra_node \
-         WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3"
+        "SELECT {} FROM infra_node \
+         WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
+        *ROW_COLUMNS
     ))
     .bind(project_id)
     .bind(node_id)
@@ -229,7 +303,8 @@ pub async fn list_for_project(
     project_id: uuid::Uuid,
 ) -> Result<Vec<InfraNodeRow>> {
     let rows = sqlx::query(&format!(
-        "SELECT {ROW_COLUMNS} FROM infra_node WHERE project_id = $1 ORDER BY node_id, instance_id NULLS FIRST"
+        "SELECT {} FROM infra_node WHERE project_id = $1 ORDER BY node_id, instance_id NULLS FIRST",
+        *ROW_COLUMNS
     ))
     .bind(project_id)
     .fetch_all(pool)
@@ -546,30 +621,31 @@ pub async fn pending_ops(
     }
     // A setup run that has not ended brings up the infra places its
     // program (its cut of the project) runs, for its instance.
-    let infra: std::collections::BTreeSet<String> = weft_core::project::infra_place_spellings(project);
+    let infra = weft_core::project::infra_place_spellings(project);
     /// run_id, instance_id, started_at, the program it runs.
-    type SetupRow = (weft_core::RunId, Option<String>, i64, Option<String>);
+    type SetupRow = (weft_core::RunId, Option<String>, i64, Option<String>, Option<weft_core::stored::Version>);
     let setups: Vec<SetupRow> = sqlx::query_as(
-        "SELECT r.run_id, r.instance_id, r.started_at, d.project_json FROM run r \
+        "SELECT r.run_id, r.instance_id, r.started_at, d.project_json, d.project_json_version FROM run r \
          LEFT JOIN project_definition d ON d.project_id = r.project_id AND d.definition_hash = r.definition_hash \
          WHERE r.project_id = $1 AND r.phase = 'infra_setup' AND r.state <> 'ended'",
     )
     .bind(project_id)
     .fetch_all(pool)
     .await?;
-    for (run_id, instance, started_at, program) in setups {
+    for (run_id, instance, started_at, program, version) in setups {
         let instance = instance
             .map(weft_core::instance::InstanceId::new)
             .transpose()
             .map_err(|e| anyhow::anyhow!("infra setup {run_id} instance: {e}"))?;
-        let Some(program) = program else {
+        let (Some(program), Some(version)) = (program, version) else {
             anyhow::bail!("infra setup {run_id} names a program its project does not keep; it cannot say what it brings up");
         };
-        let program: weft_core::ProjectDefinition = serde_json::from_str(&program)
-            .map_err(|e| anyhow::anyhow!("infra setup {run_id}'s program does not read: {e}"))?;
+        let program = weft_core::ProjectDefinition::STORED
+            .decode(program.as_str(), version)
+            .map_err(|e| e.at(format_args!("infra setup {run_id}'s program")))?;
         for place in weft_core::project::places::running_places(&program) {
             let spelled = weft_core::project::address_of(project, &place.id, &place.path);
-            if infra.contains(&spelled) {
+            if infra.contains_key(&spelled) {
                 ops.push(PendingOp {
                     kind: PendingKind::Start,
                     node: Some(spelled),
@@ -657,8 +733,7 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
                  is not a Vec<String>: {e}"
             )
         })?;
-    let units_json: Value = row.try_get("units_json")?;
-    let units = weft_broker_client::protocol::decode_units_json(units_json, project_id, &node_id)?;
+    let units = weft_broker_client::protocol::decode_units(row.try_get("units")?, project_id, &node_id)?;
     let notes_json: Value = row.try_get("notes_json")?;
     let notes: Vec<String> = serde_json::from_value(notes_json).map_err(|e| {
         anyhow::anyhow!("infra_node.notes_json for project={project_id} node={node_id} is not a Vec<String>: {e}")

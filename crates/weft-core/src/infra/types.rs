@@ -183,6 +183,17 @@ pub enum StopBehavior {
     KeepRunning,
 }
 
+impl StopBehavior {
+    /// Its `kind`, as serde writes it and the unit's row stores it
+    /// (`infra_unit.stop_behavior`).
+    pub const fn kind(self) -> &'static str {
+        match self {
+            StopBehavior::Stop => "stop",
+            StopBehavior::KeepRunning => "keep_running",
+        }
+    }
+}
+
 // =============================================================
 // Containers
 // =============================================================
@@ -585,6 +596,14 @@ pub fn env_map(env: &[EnvEntry]) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kind a unit's row stores is the one serde writes.
+    #[test]
+    fn a_stop_behaviors_kind_is_its_serde_tag() {
+        for behavior in [StopBehavior::Stop, StopBehavior::KeepRunning] {
+            assert_eq!(serde_json::to_value(behavior).unwrap()["kind"], behavior.kind());
+        }
+    }
 
     fn spec() -> InfraSpec {
         InfraSpec {

@@ -141,9 +141,8 @@ pub fn required_consumer(
 /// site's node, never the other site's). A wire into a trigger is not a
 /// read: a run never delivers it (a trigger read its inputs when it was
 /// set up).
-pub fn ports_read_by(project: &ProjectDefinition, place: &Located, runs: &BTreeSet<Located>) -> BTreeSet<String> {
-    let g = ProjectGraph::new(project);
-    outgoing(&g, place)
+pub fn ports_read_by(g: &impl GraphView, place: &Located, runs: &BTreeSet<Located>) -> BTreeSet<String> {
+    outgoing(g, place)
         .filter(|(_, target)| runs.contains(target) && !g.is_trigger(&target.id))
         .map(|(edge, _)| edge.source_port().to_string())
         .collect()
@@ -240,38 +239,30 @@ pub enum StatePlace {
     Loop(Located),
 }
 
-/// The place `spelled` names (written the way `--from` takes it) whose
-/// state a run can tell, or why it has none. A node inside a loop fires
-/// once per iteration, so it is refused like a cut inside a loop, and the
-/// loop around it is named instead; a plain group or an include's site
-/// has no state of its own (it is a scope: whether it ran is the state
-/// of the nodes inside it).
+/// The place `spelled` names (written the way `--from` takes it, read by
+/// [`named`]) whose state a run can tell, or why it has none. A node
+/// inside a loop fires once per iteration, so it is refused like a cut
+/// inside a loop, and the outermost loop around it is named instead; a
+/// plain group or an include's site has no state of its own (it is a
+/// scope: whether it ran is the state of the nodes inside it).
 pub fn state_place(project: &ProjectDefinition, spelled: &str) -> Result<StatePlace, String> {
     let g = ProjectGraph::new(project);
-    let (id, path) = super::resolve_address(project, spelled);
-    let place = Located::new(id.clone(), path);
-    let (subject, around) = if g.node(&id).is_some() {
-        ("node", enclosing_loops(&g, &place))
-    } else if g.is_loop(&id) {
-        ("loop", scopes_around_group(&g, &place).into_iter().filter(|scope| g.is_loop(&scope.id)).collect())
-    } else if g.group(&id).is_some() {
-        return Err(format!("'{spelled}' is a group, and a group has no state of its own; name a node inside it, or a loop"));
-    } else {
-        return Err(format!("'{spelled}' is no node or loop of this program"));
+    let found = named(&g, spelled)?;
+    let subject = match &found {
+        Named::Node(_) => "node",
+        Named::Group(place) if g.is_loop(&place.id) => "loop",
+        Named::Group(_) => {
+            return Err(format!("'{spelled}' is a group, and a group has no state of its own; name a node inside it, or a loop"));
+        }
     };
-    if let Some(outer) = around.last() {
-        let outer = super::group_address(project, &outer.id, &outer.path);
-        return Err(format!("the {subject} '{spelled}' is inside loop '{outer}': it runs once per iteration, so it has no one state; read the loop '{outer}' instead"));
+    if let Some(around) = loop_around(&g, &found) {
+        let around = super::group_address(project, &around.id, &around.path);
+        return Err(format!("the {subject} '{spelled}' is inside loop '{around}': it runs once per iteration, so it has no one state; read the loop '{around}' instead"));
     }
-    // Outside every loop, what is left to refuse is a file's node or group
-    // named without the site that calls it.
-    if subject == "node" {
-        validate_place(&g, &place, spelled)?;
-        Ok(StatePlace::Node(place))
-    } else {
-        validate_group_place(&g, &place, spelled)?;
-        Ok(StatePlace::Loop(place))
-    }
+    Ok(match found {
+        Named::Node(place) => StatePlace::Node(place),
+        Named::Group(place) => StatePlace::Loop(place),
+    })
 }
 
 /// Every place in the program: the top-level nodes, and each included
@@ -379,45 +370,91 @@ pub fn members_in(g: &impl GraphView, group: &str, path: &[String]) -> Vec<Locat
     out
 }
 
-/// A bound as a person wrote it, resolved: the node or group id and the
-/// call path it names. An unknown spelling is reported as written.
-pub fn locate(g: &impl GraphView, spelled: &str) -> Result<Located, String> {
-    let (id, path) = super::resolve_address(g.project(), spelled);
-    if g.node(&id).is_some() || g.group(&id).is_some() {
-        Ok(Located::new(id, path))
-    } else {
-        Err(format!("unknown node '{spelled}'"))
+/// What a name a person wrote names in a program: a node, or a group (a
+/// plain group, a loop, or an include's site), each at the place it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Named {
+    Node(Located),
+    Group(Located),
+}
+
+impl Named {
+    pub fn place(&self) -> &Located {
+        match self {
+            Self::Node(place) | Self::Group(place) => place,
+        }
+    }
+
+    pub fn into_place(self) -> Located {
+        match self {
+            Self::Node(place) | Self::Group(place) => place,
+        }
     }
 }
 
-/// A group may be an endpoint (cut at, started, or run as `--group`)
-/// under the same rule as a node (`validate_place`): nothing between
-/// the top of the program and it runs whole, so no loop around it and
-/// none around a site on its path; and a group inside an included file
-/// is named through a site, never through the file's own id. A body is
-/// never an endpoint: it runs through the site that calls it. A loop is
-/// cut whole, so a loop itself is an endpoint like any group.
-pub fn validate_group_place(g: &impl GraphView, place: &Located, spelled: &str) -> Result<(), String> {
-    let group = g.group(&place.id).ok_or_else(|| format!("unknown group '{spelled}'"))?;
-    if matches!(group.kind, GroupKind::Body) {
-        return Err(format!("cannot cut at '{spelled}': it is an included file, which runs through the site that includes it; name the site"));
-    }
-    if let Some(container) = groups_around(g, &group.id).into_iter().find(|id| g.is_loop(id)) {
-        let container = super::plain_id(&container);
-        return Err(format!("cannot cut at '{spelled}' inside loop '{container}'; select the whole loop"));
-    }
-    if place.path.is_empty() {
-        if let Some(body) = body_of_group(g, &group.id) {
-            return Err(inside_a_file(g.project(), spelled, &group.id, &body));
+/// THE reading of a name a person writes for a place of a program
+/// (`check`, `auth.check` through the site `auth`, `each` for a loop),
+/// shared by everything that takes one: a run's bounds, a node state read,
+/// the CLI's node arguments, and every read of a past run, which reads the
+/// name against the program that run ran. [`super::resolve_address`] walks
+/// the call sites; this is that walk, refusing every name that does not
+/// name one place, each time with the spelling that would:
+///
+/// - a name nothing in the program answers to;
+/// - a loop's boundary the compiler made (`each__in`), which nobody wrote:
+///   its loop is named (a node a person named that way reads as written);
+/// - something inside an included file named by its compiled id
+///   (`@src:lib.check`), which says nothing about which call of the file:
+///   it is named through a site;
+/// - an included file's body itself, which runs through its site.
+pub fn named(g: &impl GraphView, spelled: &str) -> Result<Named, String> {
+    let project = g.project();
+    if let Some(group) = super::boundary_loop(spelled) {
+        if g.is_loop(&super::resolve_address(project, group).0) {
+            return Err(format!("'{spelled}' is a loop's boundary the compiler made; name the loop, `{group}`"));
         }
     }
-    for site in &place.path {
-        if let Some(container) = groups_around(g, site).into_iter().find(|id| g.is_loop(id)) {
-            let (site, container) = (super::plain_id(site), super::plain_id(&container));
-            return Err(format!("cannot cut at '{spelled}': the site '{site}' sits inside loop '{container}'; select the whole loop"));
+    let (id, path) = super::resolve_address(project, spelled);
+    let inside_body = match (g.node(&id), g.group(&id)) {
+        (Some(node), _) => body_around(g, node),
+        (None, Some(_)) => body_of_group(g, &id),
+        (None, None) => {
+            return Err(format!(
+                "unknown node '{spelled}': nothing in the program is named that (a node inside an included file is \
+                 named through its site, like `site.{}`)",
+                spelled.rsplit('.').next().unwrap_or(spelled)
+            ));
         }
+    };
+    // Through a site, the walk has already left the file's compiled ids
+    // behind; only a name with no site on its path can be one.
+    if let Some(body) = inside_body.filter(|_| path.is_empty()) {
+        if body == id {
+            return Err(format!("'{spelled}' is an included file, which runs through the site that includes it; name the site"));
+        }
+        let example = project.groups.iter()
+            .find(|g| matches!(&g.kind, GroupKind::Call { body: called, .. } if *called == body))
+            .map(|g| super::address_of(project, &id, std::slice::from_ref(&g.id)))
+            .unwrap_or_else(|| format!("<site>.{}", id.rsplit('.').next().unwrap_or(&id)));
+        return Err(format!(
+            "'{spelled}' is inside an included file, which is reached through a site; name it through the site, like `{example}`"
+        ));
     }
-    Ok(())
+    let place = Located::new(id, path);
+    Ok(if g.node(&place.id).is_some() { Named::Node(place) } else { Named::Group(place) })
+}
+
+/// The outermost loop `named` runs inside, at the place the loop runs, if
+/// any: a loop around the node or group itself, or around any site on its
+/// call path (a call inside a loop runs whole with the loop). A loop's own
+/// boundaries are inside it; a loop is not inside itself. A loop runs once
+/// per iteration as a whole, so a place inside one is no end of a run and
+/// has no one state: the loop is what is named instead.
+pub fn loop_around(g: &impl GraphView, named: &Named) -> Option<Located> {
+    match named {
+        Named::Node(place) => enclosing_loops(g, place).into_iter().next(),
+        Named::Group(place) => scopes_around_group(g, place).into_iter().find(|scope| g.is_loop(&scope.id)),
+    }
 }
 
 /// The included file's body `group` sits in (itself, when it is one).
@@ -430,75 +467,110 @@ pub fn body_of_group(g: &impl GraphView, group: &str) -> Option<String> {
     None
 }
 
-/// The refusal for a body's node or group named without a site: the
-/// spelling that names one call of it.
-fn inside_a_file(project: &ProjectDefinition, spelled: &str, id: &str, body: &str) -> String {
-    let example = project.groups.iter()
-        .find(|g| matches!(&g.kind, GroupKind::Call { body: called, .. } if called == body))
-        .map(|g| super::address_of(project, id, std::slice::from_ref(&g.id)))
-        .unwrap_or_else(|| format!("<site>.{}", id.rsplit('.').next().unwrap_or(id)));
-    format!("cannot cut at '{spelled}': it is inside an included file, which is reached through a site; name it through the site, like `{example}`")
-}
-
-/// A node may be an endpoint when nothing between the top of the program
-/// and it runs whole: not the node's own loops, and not a loop around any
-/// site on its call path (a site inside a loop is cut with the loop). A
-/// node inside an included file is reached through its site, spelled
-/// `site.node`; naming the body's own id (`Triage.up`) says nothing about
-/// which call, so it is refused with the spelling that does.
-pub fn validate_place(g: &impl GraphView, place: &Located, spelled: &str) -> Result<(), String> {
-    let node = g.node(&place.id).ok_or_else(|| format!("unknown node '{spelled}'"))?;
-    if let Some(container) = enclosing_loop(g, node) {
-        let container = super::plain_id(&container);
-        return Err(format!("cannot cut at '{spelled}' inside loop '{container}'; select the whole loop"));
-    }
-    if place.path.is_empty() {
-        if let Some(body) = body_around(g, node) {
-            return Err(inside_a_file(g.project(), spelled, &place.id, &body));
-        }
-    }
-    for site in &place.path {
-        if g.group(site).is_none() {
-            return Err(format!("call site '{}' is not in the program", super::plain_id(site)));
-        }
-        if let Some(container) = groups_around(g, site).into_iter().find(|id| g.is_loop(id)) {
-            let (site, container) = (super::plain_id(site), super::plain_id(&container));
-            return Err(format!("cannot cut at '{spelled}': the site '{site}' sits inside loop '{container}'; select the whole loop"));
-        }
-    }
-    Ok(())
-}
-
 /// Whether `group` is an included file's body.
-pub fn is_body(project: &ProjectDefinition, group: &str) -> bool {
-    project.group(group).is_some_and(|g| matches!(g.kind, GroupKind::Body))
+pub fn is_body(g: &impl GraphView, group: &str) -> bool {
+    g.group(group).is_some_and(|group| matches!(group.kind, GroupKind::Body))
 }
 
-/// The included file's body `node` sits in, if any.
-pub fn enclosing_body(project: &ProjectDefinition, node: &NodeDefinition) -> Option<String> {
-    body_around(project, node)
-}
-
+/// The included file's body `node` sits in, if any: the first, in the
+/// program's group order, of the groups it is a member or a boundary of.
 fn body_around(g: &impl GraphView, node: &NodeDefinition) -> Option<String> {
-    first_group_around(g, node, |kind| matches!(kind, GroupKind::Body))
-}
-
-/// The loop around `node`, if any: a loop's body runs whole, once per
-/// iteration, so a run is never cut inside one. The first in the
-/// program's group order, when the node is in several. A loop's own
-/// boundaries count as inside it.
-fn enclosing_loop(g: &impl GraphView, node: &NodeDefinition) -> Option<String> {
-    first_group_around(g, node, |kind| matches!(kind, GroupKind::Loop { .. }))
-}
-
-/// The first group, in the program's group order, of a kind `wanted`
-/// takes, that `node` is a member or a loop boundary of.
-fn first_group_around(g: &impl GraphView, node: &NodeDefinition, wanted: impl Fn(&GroupKind) -> bool) -> Option<String> {
-    let project = g.project();
-    let order = |id: &str| project.groups.iter().position(|group| group.id == id);
     node.scope.iter().chain(node.group_boundary.iter().map(|b| &b.group_id))
-        .filter(|id| g.group(id).is_some_and(|group| wanted(&group.kind)))
-        .filter_map(|id| order(id).map(|at| (at, id)))
+        .filter(|id| g.group(id).is_some_and(|group| matches!(group.kind, GroupKind::Body)))
+        .filter_map(|id| g.group_position(id).map(|at| (at, id)))
         .min()
         .map(|(_, id)| id.clone())
+}
+
+#[cfg(test)]
+mod named_tests {
+    use super::{loop_around, named, state_place, Named};
+    use crate::frames::Located;
+    use crate::project::ProjectDefinition;
+
+    /// `plain` and `fan__out` at the top; the file `Auth` (with `check`)
+    /// included at `auth`; the loop `lp` holding `inner`, the loop `deep`
+    /// with `x`, and a second include of `Auth` at the site `site`.
+    fn program() -> ProjectDefinition {
+        let node = |id: &str, scope: &[&str]| serde_json::json!({
+            "id": id, "nodeType": "T", "label": null, "config": {},
+            "position": {"x": 0, "y": 0}, "inputs": [], "outputs": [],
+            "features": {}, "scope": scope, "groupBoundary": null, "requiresInfra": false
+        });
+        serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [
+                node("plain", &[]), node("fan__out", &[]), node("Auth.check", &["Auth"]),
+                node("lp.inner", &["lp"]), node("lp.deep.x", &["lp", "lp.deep"]),
+            ],
+            "edges": [],
+            "groups": [
+                {"id": "Auth", "kind": "body", "nodeIds": ["Auth.check"]},
+                {"id": "auth", "kind": "call", "body": "Auth", "nodeIds": []},
+                {"id": "lp", "kind": "loop", "loopConfig": {}, "nodeIds": ["lp.inner"]},
+                {"id": "lp.deep", "kind": "loop", "loopConfig": {}, "nodeIds": ["lp.deep.x"], "parentGroupId": "lp"},
+                {"id": "lp.site", "kind": "call", "body": "Auth", "nodeIds": [], "parentGroupId": "lp"}
+            ]
+        })).unwrap()
+    }
+
+    fn at(id: &str, path: &[&str]) -> Located {
+        Located::new(id.to_string(), path.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// A name reads through the call sites to the one place it names: a
+    /// node, a group, a site, and a node a person called `__out`.
+    #[test]
+    fn a_name_reads_to_its_place() {
+        let p = program();
+        assert_eq!(named(&p, "plain"), Ok(Named::Node(at("plain", &[]))));
+        assert_eq!(named(&p, "auth.check"), Ok(Named::Node(at("Auth.check", &["auth"]))));
+        assert_eq!(named(&p, "lp.site.check"), Ok(Named::Node(at("Auth.check", &["lp.site"]))));
+        assert_eq!(named(&p, "auth"), Ok(Named::Group(at("auth", &[]))));
+        assert_eq!(named(&p, "lp.deep"), Ok(Named::Group(at("lp.deep", &[]))));
+        assert_eq!(named(&p, "fan__out"), Ok(Named::Node(at("fan__out", &[]))));
+    }
+
+    /// Every name that does not name one place is refused with the name
+    /// that would: nothing by that name, a loop's boundary, a file's node
+    /// by its compiled id, and the file itself.
+    #[test]
+    fn a_name_that_names_no_one_place_is_refused_with_the_one_that_would() {
+        let p = program();
+        let unknown = named(&p, "nope").unwrap_err();
+        assert!(unknown.contains("unknown node 'nope'"), "{unknown}");
+        let boundary = named(&p, "lp__in").unwrap_err();
+        assert!(boundary.contains("loop's boundary") && boundary.contains("`lp`"), "{boundary}");
+        let compiled = named(&p, "Auth.check").unwrap_err();
+        assert!(compiled.contains("included file") && compiled.contains("`auth.check`"), "{compiled}");
+        let body = named(&p, "Auth").unwrap_err();
+        assert!(body.contains("name the site"), "{body}");
+        for malformed in ["auth.", ".check", ""] {
+            assert!(named(&p, malformed).is_err(), "{malformed}");
+        }
+    }
+
+    /// The loop around a place is the outermost one: around the node
+    /// itself, or around a site on its call path. A loop is not inside
+    /// itself.
+    #[test]
+    fn the_loop_around_a_place_is_the_outermost() {
+        let p = program();
+        let around = |spelled: &str| loop_around(&p, &named(&p, spelled).unwrap());
+        assert_eq!(around("lp.deep.x"), Some(at("lp", &[])));
+        assert_eq!(around("lp.site.check"), Some(at("lp", &[])));
+        assert_eq!(around("lp.deep"), Some(at("lp", &[])));
+        assert_eq!(around("lp"), None);
+        assert_eq!(around("auth.check"), None);
+    }
+
+    /// A node inside nested loops has no one state, and the loop to read
+    /// instead is the outermost, the one whose state is one thing.
+    #[test]
+    fn a_state_inside_nested_loops_names_the_outermost() {
+        let p = program();
+        let refused = state_place(&p, "lp.deep.x").unwrap_err();
+        assert!(refused.contains("read the loop 'lp' instead"), "{refused}");
+        assert!(state_place(&p, "auth").unwrap_err().contains("is a group"));
+    }
 }

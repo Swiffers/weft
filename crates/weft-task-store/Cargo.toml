@@ -27,6 +27,8 @@ tokio = { workspace = true }
 tokio-util = { version = "0.7" }
 tracing = { workspace = true }
 uuid = { workspace = true }
+# A column of documents stored compressed (`documents::Encoding::Zstd`).
+zstd = { workspace = true }
 weft-core = { workspace = true }
 # What the outbox tells news through (`announce::tell_news_through`).
 weft-platform-traits = { workspace = true }

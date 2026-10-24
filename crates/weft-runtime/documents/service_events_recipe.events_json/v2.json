@@ -1,0 +1,351 @@
+[
+  {
+    "files": {
+      "fields": {
+        "channel": "channel_id",
+        "fileId": "file_id",
+        "type": "type",
+        "user": "user_id"
+      },
+      "account": {
+        "value": "teamId",
+        "path": "team_id"
+      },
+      "socket": {
+        "connect": {
+          "url": "https://slack.com/api/apps.connections.open",
+          "method": "POST",
+          "auth": [
+            {
+              "kind": "header",
+              "name": "Authorization",
+              "value": "Bearer {appToken}"
+            }
+          ],
+          "captures": [
+            {
+              "name": "url",
+              "path": "url",
+              "optional": false
+            }
+          ]
+        },
+        "replies": [
+          {
+            "whenField": "envelope_id",
+            "frame": "{\"envelope_id\":\"{value}\"}"
+          }
+        ],
+        "eventPath": "payload.event",
+        "multiAccount": true
+      },
+      "webhook": {
+        "handshake": {
+          "kind": "echo_body_field",
+          "path": "challenge"
+        },
+        "eventPath": "event",
+        "verify": {
+          "kind": "hmac",
+          "signature": {
+            "in": "header:X-Slack-Signature",
+            "pair": "=",
+            "key": "v0"
+          },
+          "timestamp": {
+            "in": "header:X-Slack-Request-Timestamp"
+          },
+          "concat": "v0:{timestamp}:{body}"
+        },
+        "routeBy": "account"
+      }
+    },
+    "interactions": {
+      "fields": {
+        "action": "actions.0.action_id",
+        "callbackId": "message.metadata.event_payload.callback",
+        "channel": "channel.id",
+        "responseUrl": "response_url",
+        "ts": "message.ts",
+        "type": "type",
+        "user": "user.id",
+        "userName": "user.username",
+        "value": "actions.0.value"
+      },
+      "account": {
+        "value": "teamId",
+        "path": "team.id"
+      },
+      "socket": {
+        "connect": {
+          "url": "https://slack.com/api/apps.connections.open",
+          "method": "POST",
+          "auth": [
+            {
+              "kind": "header",
+              "name": "Authorization",
+              "value": "Bearer {appToken}"
+            }
+          ],
+          "captures": [
+            {
+              "name": "url",
+              "path": "url",
+              "optional": false
+            }
+          ]
+        },
+        "replies": [
+          {
+            "whenField": "envelope_id",
+            "frame": "{\"envelope_id\":\"{value}\"}"
+          }
+        ],
+        "eventPath": "payload"
+      },
+      "webhook": {
+        "verify": {
+          "kind": "hmac",
+          "signature": {
+            "in": "header:X-Slack-Signature",
+            "pair": "=",
+            "key": "v0"
+          },
+          "timestamp": {
+            "in": "header:X-Slack-Request-Timestamp"
+          },
+          "concat": "v0:{timestamp}:{body}"
+        },
+        "routeBy": "account",
+        "decode": {
+          "path": "payload",
+          "encoding": "form_json"
+        }
+      }
+    },
+    "messages": {
+      "fields": {
+        "bot": "bot_id",
+        "channel": "channel",
+        "text": "text",
+        "thread": "thread_ts",
+        "ts": "ts",
+        "type": "type",
+        "user": "user",
+        "workspace": "team"
+      },
+      "account": {
+        "value": "teamId",
+        "path": "team_id"
+      },
+      "socket": {
+        "connect": {
+          "url": "https://slack.com/api/apps.connections.open",
+          "method": "POST",
+          "auth": [
+            {
+              "kind": "header",
+              "name": "Authorization",
+              "value": "Bearer {appToken}"
+            }
+          ],
+          "captures": [
+            {
+              "name": "url",
+              "path": "url",
+              "optional": false
+            }
+          ]
+        },
+        "replies": [
+          {
+            "whenField": "envelope_id",
+            "frame": "{\"envelope_id\":\"{value}\"}"
+          }
+        ],
+        "eventPath": "payload.event",
+        "multiAccount": true
+      },
+      "webhook": {
+        "handshake": {
+          "kind": "echo_body_field",
+          "path": "challenge"
+        },
+        "eventPath": "event",
+        "verify": {
+          "kind": "hmac",
+          "signature": {
+            "in": "header:X-Slack-Signature",
+            "pair": "=",
+            "key": "v0"
+          },
+          "timestamp": {
+            "in": "header:X-Slack-Request-Timestamp"
+          },
+          "concat": "v0:{timestamp}:{body}"
+        },
+        "routeBy": "account"
+      }
+    },
+    "reactions": {
+      "fields": {
+        "channel": "item.channel",
+        "emoji": "reaction",
+        "messageUser": "item_user",
+        "ts": "item.ts",
+        "type": "type",
+        "user": "user"
+      },
+      "account": {
+        "value": "teamId",
+        "path": "team_id"
+      },
+      "socket": {
+        "connect": {
+          "url": "https://slack.com/api/apps.connections.open",
+          "method": "POST",
+          "auth": [
+            {
+              "kind": "header",
+              "name": "Authorization",
+              "value": "Bearer {appToken}"
+            }
+          ],
+          "captures": [
+            {
+              "name": "url",
+              "path": "url",
+              "optional": false
+            }
+          ]
+        },
+        "replies": [
+          {
+            "whenField": "envelope_id",
+            "frame": "{\"envelope_id\":\"{value}\"}"
+          }
+        ],
+        "eventPath": "payload.event",
+        "multiAccount": true
+      },
+      "webhook": {
+        "handshake": {
+          "kind": "echo_body_field",
+          "path": "challenge"
+        },
+        "eventPath": "event",
+        "verify": {
+          "kind": "hmac",
+          "signature": {
+            "in": "header:X-Slack-Signature",
+            "pair": "=",
+            "key": "v0"
+          },
+          "timestamp": {
+            "in": "header:X-Slack-Request-Timestamp"
+          },
+          "concat": "v0:{timestamp}:{body}"
+        },
+        "routeBy": "account"
+      }
+    }
+  },
+  {
+    "drive_changes": {
+      "fields": {
+        "changed": "header:X-Goog-Changed",
+        "messageNumber": "header:X-Goog-Message-Number",
+        "resource": "header:X-Goog-Resource-Id",
+        "resourceUri": "header:X-Goog-Resource-URI",
+        "state": "header:X-Goog-Resource-State"
+      },
+      "account": {
+        "value": "userEmail",
+        "path": "header:X-Goog-Channel-Token"
+      },
+      "webhook": {
+        "idPath": "header:X-Goog-Channel-ID",
+        "tokenPath": "header:X-Goog-Channel-Token",
+        "verify": {
+          "kind": "token_echo"
+        },
+        "routeBy": "subscription",
+        "subscribe": {
+          "subscribe": {
+            "url": "https://www.googleapis.com/drive/v3/files/{target}/watch?supportsAllDrives=true",
+            "method": "POST",
+            "body": {
+              "id": "{subscriptionId}",
+              "type": "web_hook",
+              "address": "{receiverUrl}",
+              "token": "{subscriptionToken}"
+            },
+            "auth": [
+              {
+                "kind": "header",
+                "name": "Authorization",
+                "value": "Bearer {token}"
+              }
+            ],
+            "captures": [
+              {
+                "name": "expiresAt",
+                "path": "expiration",
+                "optional": false
+              },
+              {
+                "name": "resourceId",
+                "path": "resourceId",
+                "optional": false
+              }
+            ]
+          },
+          "unsubscribe": {
+            "url": "https://www.googleapis.com/drive/v3/channels/stop",
+            "method": "POST",
+            "body": {
+              "id": "{subscriptionId}",
+              "resourceId": "{resourceId}"
+            },
+            "auth": [
+              {
+                "kind": "header",
+                "name": "Authorization",
+                "value": "Bearer {token}"
+              }
+            ]
+          },
+          "renewMarginSecs": 600
+        }
+      }
+    }
+  },
+  {
+    "payments": {
+      "fields": {
+        "type": "type"
+      },
+      "account": {
+        "value": "accountId",
+        "path": "account"
+      },
+      "webhook": {
+        "eventPath": "data.object",
+        "verify": {
+          "kind": "hmac",
+          "signature": {
+            "in": "header:Stripe-Signature",
+            "list": ",",
+            "pair": "=",
+            "key": "v1"
+          },
+          "timestamp": {
+            "in": "signature:t"
+          },
+          "concat": "{timestamp}.{body}"
+        },
+        "routeBy": "account"
+      }
+    }
+  }
+]

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::frames::{Located, LoopFrames};
+use crate::stored::Op;
 use crate::primitive::AwaitEnd;
 use crate::project::cut::{self, SelectionBounds};
 use crate::project::graph::{GraphView, ProjectGraph};
@@ -112,73 +113,63 @@ pub struct RunSpec {
     pub settings: crate::run_settings::SettingsChoice,
 }
 
-/// The keys a saved spec file once spelled snake_case, and their spelling
-/// now: `(where, old, new)`, `where` the path of the object holding the
-/// key (`[]` for any list item). The old spelling is refused, never read
-/// as an alias; this only lets the refusal name the new one.
-const RENAMED_SPEC_KEYS: &[(&[&str], &str, &str)] = &[
-    (&[], "frozen_from", "frozenFrom"),
-    (&["frozenFrom"], "execution_id", "runId"),
-    (&["frozen_from"], "execution_id", "runId"),
-    (&["frozenFrom"], "definition_hash", "definitionHash"),
-    (&["frozen_from"], "definition_hash", "definitionHash"),
-    (&["answers", "[]"], "gave_up", "gaveUp"),
-    (&["settings"], "keep_for", "keepFor"),
-    (&["settings"], "hold_secs", "holdSecs"),
-];
+/// The steps a stored [`RunSpec`] takes from the shape an older weft
+/// wrote, wherever it is kept: a saved spec file (`examples/<name>.json`)
+/// and a run's row (`run.spec`); `crate::stored` says how they run. A file
+/// says its version under [`SPEC_FILE_VERSION_KEY`], and one without it is
+/// version 1: every file written before files carried a version, in either
+/// spelling.
+pub const RUN_SPEC_UPGRADES: &[&[Op]] = &[&[
+    // Version 2: the keys a spec once spelled snake_case.
+    Op::RenameKey { at: "", from: "frozen_from", to: "frozenFrom" },
+    Op::RenameKey { at: "frozenFrom", from: "execution_id", to: "runId" },
+    Op::RenameKey { at: "frozenFrom", from: "definition_hash", to: "definitionHash" },
+    Op::RenameKey { at: "answers.*", from: "gave_up", to: "gaveUp" },
+    Op::RenameKey { at: "settings", from: "keep_for", to: "keepFor" },
+    Op::RenameKey { at: "settings", from: "hold_secs", to: "holdSecs" },
+]];
+
+/// The key a saved spec file holds its version under ([`RUN_SPEC_UPGRADES`]).
+pub const SPEC_FILE_VERSION_KEY: &str = "specVersion";
 
 impl RunSpec {
-    /// A saved spec file's text as a spec (the `name` is the caller's to
-    /// set from the file name). When it does not fit and the reason is a
-    /// key an older weft spelled differently, the refusal names every
-    /// such key and its spelling now instead of serde's bare "unknown
-    /// field".
-    pub fn parse_file(text: &str) -> Result<Self, String> {
-        serde_json::from_str(text).map_err(|error| {
-            let renamed = serde_json::from_str::<Value>(text).map(|value| renamed_spec_keys(&value)).unwrap_or_default();
-            if renamed.is_empty() {
-                error.to_string()
-            } else {
-                format!(
-                    "this spec was saved by an older weft, and these keys are spelled differently now: {}. \
-                     The old spelling is no longer read; rename them",
-                    renamed.join(", ")
-                )
-            }
-        })
-    }
-}
+    /// A run spec as weft stores it: a saved spec file and a run's row.
+    pub const STORED: crate::stored::Kind<RunSpec> = crate::stored::Kind::new("run spec", RUN_SPEC_UPGRADES);
 
-/// Every [`RENAMED_SPEC_KEYS`] key `value` still holds, as "`at.old` is
-/// `new`".
-fn renamed_spec_keys(value: &Value) -> Vec<String> {
-    fn at<'a>(value: &'a Value, path: &[&str]) -> Vec<(String, &'a serde_json::Map<String, Value>)> {
-        match path.split_first() {
-            None => value.as_object().map(|o| vec![(String::new(), o)]).unwrap_or_default(),
-            Some((&"[]", rest)) => value
-                .as_array()
-                .into_iter()
-                .flatten()
-                .enumerate()
-                .flat_map(|(i, item)| at(item, rest).into_iter().map(move |(p, o)| (format!("[{i}]{p}"), o)))
-                .collect(),
-            Some((key, rest)) => value
-                .get(*key)
-                .map(|child| at(child, rest).into_iter().map(|(p, o)| (format!(".{key}{p}"), o)).collect())
-                .unwrap_or_default(),
-        }
+    /// A saved spec file's text as a spec (the `name` is the caller's to
+    /// set from the file name), carried to today's shape in memory when an
+    /// older weft wrote it. Reading never rewrites the file: it takes
+    /// today's shape the next time weft writes it anyway ([`Self::file_text`]).
+    /// A file written by a newer weft is refused, naming both versions.
+    pub fn parse_file(text: &str) -> Result<RunSpec, String> {
+        // Through `UniqueValue`, so a key written twice is still refused.
+        let UniqueValue(mut value) = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        let version = match value.as_object_mut().and_then(|file| file.remove(SPEC_FILE_VERSION_KEY)) {
+            None => crate::stored::unversioned(),
+            Some(v) => v
+                .as_i64()
+                .and_then(|n| crate::stored::Version::try_from(n).ok())
+                .filter(|n| *n >= 1)
+                .ok_or_else(|| format!("`{SPEC_FILE_VERSION_KEY}` is a whole number from 1 up, not {v}"))?,
+        };
+        Self::STORED.decode(value, version).map_err(|e| e.to_string())
     }
-    let mut out = Vec::new();
-    for (path, old, new) in RENAMED_SPEC_KEYS {
-        for (place, object) in at(value, path) {
-            if object.contains_key(*old) {
-                let place = place.trim_start_matches('.');
-                let old = if place.is_empty() { (*old).to_string() } else { format!("{place}.{old}") };
-                out.push(format!("`{old}` is `{new}`"));
-            }
+
+    /// The text a saved spec file holds for this spec: the spec, with the
+    /// version its shape is at, then a newline.
+    pub fn file_text(&self) -> Result<String, String> {
+        #[derive(Serialize)]
+        struct File<'a> {
+            #[serde(rename = "specVersion")]
+            version: crate::stored::Version,
+            #[serde(flatten)]
+            spec: &'a RunSpec,
         }
+        let mut text = serde_json::to_string_pretty(&File { version: Self::STORED.version(), spec: self })
+            .map_err(|e| e.to_string())?;
+        text.push('\n');
+        Ok(text)
     }
-    out
 }
 
 fn deserialize_unique<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(deserializer: D) -> Result<T, D::Error> {
@@ -425,7 +416,7 @@ impl ExpectedWire {
     /// The wire as an example file spells it: the node's address
     /// through its sites, the loop positions kept, the call frames
     /// folded into the address.
-    pub fn spell(project: &ProjectDefinition, wire: &OutputWire) -> Self {
+    pub fn spell(project: &impl crate::project::graph::GraphView, wire: &OutputWire) -> Self {
         let place = wire.place();
         Self {
             node: crate::project::address_of(project, &place.id, &place.path),
@@ -481,13 +472,11 @@ impl RunSpec {
 
     /// The values the spec hands its starts, by the start's place (a node,
     /// or a group whose inputs and gate they are): `from` and `group`
-    /// together.
-    pub fn handed(&self, project: &ProjectDefinition) -> BTreeMap<Located, BTreeMap<String, Value>> {
+    /// together. A start that names nothing is refused
+    /// (`crate::project::places::named`).
+    pub fn handed(&self, project: &ProjectDefinition) -> Result<BTreeMap<Located, BTreeMap<String, Value>>, String> {
         self.from.iter().chain(self.group.iter().map(|(id, ports)| (id, ports)))
-            .map(|(spelled, ports)| {
-                let (id, path) = crate::project::resolve_address(project, spelled);
-                (Located::new(id, path), ports.clone())
-            })
+            .map(|(spelled, ports)| Ok((crate::project::places::named(project, spelled)?.into_place(), ports.clone())))
             .collect()
     }
 }
@@ -603,16 +592,13 @@ struct FireCut {
 }
 
 fn fire_cut(project: &ProjectDefinition, trigger: &str, saved: &crate::infra::bake::Saved) -> Result<FireCut, String> {
-    let (fired, path) = crate::project::resolve_address(project, trigger);
-    if !project.nodes.iter().any(|node| node.id == fired && node.features.is_trigger) {
-        return Err(format!("'{trigger}' is not a trigger"));
-    }
     let g = ProjectGraph::new(project);
     let bounds = cut::resolve(&g, &SelectionBounds { fire: Some(trigger.into()), ..Default::default() })?;
+    let fired = bounds.fired.clone().ok_or_else(|| format!("'{trigger}' is not a trigger"))?;
     let (walked, baked) = walk_reading_baked(&g, bounds, saved, &BTreeSet::from([fired.clone()]));
     let mut given = Given { inputs: BTreeMap::new(), outputs: baked_stand_ins(&baked) };
     let program = cut::cut(project, &walked, &mut given).map_err(|why| format!("a fire of '{trigger}' cannot run: {why}"))?;
-    Ok(FireCut { fired: Located::new(fired, path), program, given, baked })
+    Ok(FireCut { fired, program, given, baked })
 }
 
 /// A trigger's cut as its registration records it: what tells whether it
@@ -729,10 +715,10 @@ fn walk_reading_baked(
     g: &ProjectGraph,
     mut bounds: cut::Bounds,
     saved: &crate::infra::bake::Saved,
-    named: &BTreeSet<String>,
+    named: &BTreeSet<Located>,
 ) -> (cut::Walk, crate::infra::bake::Saved) {
     let first = cut::walk_bounds(g, &bounds);
-    let covered = crate::infra::bake::covered(g.project(), saved, &first.kept(), named);
+    let covered = crate::infra::bake::covered(g, saved, &first.kept(), named);
     if covered.is_empty() {
         return (first, covered);
     }
@@ -888,11 +874,12 @@ pub fn resolve_spec(spec: &RunSpec, project: &ProjectDefinition, saved: &crate::
 /// run handed them.
 pub fn resolve_seeded(spec: &RunSpec, project: &ProjectDefinition, saved: &crate::infra::bake::Saved, seed: Option<&SeedPlan>) -> Result<Resolved, Refusal> {
     let g = ProjectGraph::new(project);
-    let named: BTreeSet<String> = spec.from.keys().chain(spec.emit.keys()).chain(&spec.target).chain(&spec.before)
-        .chain(spec.feed.iter()).chain(spec.group.iter().map(|(group, _)| group)).chain(spec.fire.iter().map(|(node, _)| node))
-        .map(|spelled| crate::project::resolve_address(project, spelled).0)
-        .collect();
     let bounds = cut::resolve(&g, &spec.bounds()).map_err(Refusal::error)?;
+    let named: BTreeSet<Located> = spec.from.keys().chain(spec.emit.keys()).chain(&spec.target).chain(&spec.before)
+        .chain(spec.feed.iter()).chain(spec.group.iter().map(|(group, _)| group)).chain(spec.fire.iter().map(|(node, _)| node))
+        .map(|spelled| crate::project::places::named(&g, spelled).map(crate::project::places::Named::into_place))
+        .collect::<Result<_, String>>().map_err(Refusal::error)?;
+    let fired = bounds.fired.clone();
     let (mut walked, baked) = walk_reading_baked(&g, bounds, saved, &named);
     // The bounds name nothing to run. A seed reusing all of what they name
     // leaves nothing to run either, which is a run that reuses everything.
@@ -909,7 +896,7 @@ pub fn resolve_seeded(spec: &RunSpec, project: &ProjectDefinition, saved: &crate
 
     let mut refusal = Refusal::default();
     let mut warnings = Vec::new();
-    let handed = spec.handed(project);
+    let handed = spec.handed(project).map_err(Refusal::error)?;
     // What the seed carries over for a start that runs again was handed
     // to that start's code as it was then, so it is held to the program as
     // it is now, like a value handed today: a port gone is said, a value
@@ -1033,8 +1020,17 @@ pub fn resolve_seeded(spec: &RunSpec, project: &ProjectDefinition, saved: &crate
     let mut outputs = baked_stand_ins(&baked);
     outputs.extend(seed.into_iter().flat_map(|seed| seed.stand_ins.clone()));
     for (spelled, ports) in &spec.emit {
-        let (id, path) = crate::project::resolve_address(project, spelled);
-        let place = Located::new(id, path);
+        let place = match crate::project::places::named(&g, spelled) {
+            Ok(crate::project::places::Named::Node(place)) => place,
+            Ok(crate::project::places::Named::Group(_)) => {
+                refusal.errors.push(format!("cannot supply outputs of group '{spelled}'; use --from {spelled} with its input payload"));
+                continue;
+            }
+            Err(why) => {
+                refusal.errors.push(why);
+                continue;
+            }
+        };
         let Some(node) = g.node(&place.id) else { continue };
         let mut given = BTreeMap::new();
         let types = node.types_at(&place.path);
@@ -1049,10 +1045,7 @@ pub fn resolve_seeded(spec: &RunSpec, project: &ProjectDefinition, saved: &crate
         }
         outputs.insert(place, StandIn { ports: given, origin: GivenOrigin::Emitted });
     }
-    let fire = spec.fire.as_ref().map(|(spelled, value)| {
-        let (id, path) = crate::project::resolve_address(project, spelled);
-        (Located::new(id, path), value)
-    });
+    let fire = fired.zip(spec.fire.as_ref().map(|(_, value)| value));
     if let Some((fire, payload)) = &fire {
         if !walked.runs.contains(fire) {
             refusal.errors.push(format!("fired trigger '{}' is outside the selected run", crate::project::address_of(project, &fire.id, &fire.path)));
@@ -1453,7 +1446,7 @@ pub fn check_instance_values(
     inputs: &[InstanceValueInput],
 ) -> Result<Vec<CheckedInstanceValue>, Refusal> {
     let places: BTreeMap<String, &crate::project::NodeDefinition> =
-        crate::project::instance_filled_places(project).into_iter().collect();
+        crate::project::instance_filled_places(project).into_iter().map(|filled| (filled.spelled, filled.node)).collect();
     let mut refusal = Refusal { errors: Vec::new() };
     let mut checked = Vec::new();
     let mut after = stored.clone();
@@ -1507,10 +1500,10 @@ pub fn check_instance_values(
 /// The flag a value for the start spelled `node` is handed with: the
 /// `--group` start's own, else `--from`.
 fn start_flag(project: &ProjectDefinition, spec: &RunSpec) -> impl Fn(&str) -> &'static str {
-    let group = spec.group.as_ref().map(|(spelled, _)| {
-        let (id, path) = crate::project::resolve_address(project, spelled);
-        crate::project::group_address(project, &id, &path)
-    });
+    // Read the one way every name is read, and spelled back the way a
+    // start is named (a site's body as the site).
+    let group = spec.group.as_ref().and_then(|(spelled, _)| crate::project::places::named(project, spelled).ok())
+        .map(|named| crate::project::group_address(project, &named.place().id, &named.place().path));
     move |node| if group.as_deref() == Some(node) { "--group" } else { "--from" }
 }
 
@@ -1550,24 +1543,29 @@ mod tests {
         }
     }
 
-    /// A saved spec with a key an older weft spelled snake_case is refused
-    /// naming each one and its spelling now; any other refusal is serde's,
-    /// and a current file parses.
+    /// A saved spec with keys an older weft spelled snake_case reads as
+    /// today's spec, which writes in today's shape and reads back as
+    /// itself; anything else wrong is still refused.
     #[test]
-    fn a_spec_file_with_an_old_spelling_names_the_new_one() {
-        let old = r#"{"name":"x","answers":[{"node":"review","gave_up":"quiet"}],"settings":{"hold_secs":5}}"#;
-        assert_eq!(
-            RunSpec::parse_file(old).unwrap_err(),
-            "this spec was saved by an older weft, and these keys are spelled differently now: \
-             `answers[0].gave_up` is `gaveUp`, `settings.hold_secs` is `holdSecs`. The old spelling is \
-             no longer read; rename them"
-        );
+    fn a_spec_file_an_older_weft_wrote_is_carried_to_todays_shape() {
+        let old = r#"{"name":"x","answers":[{"node":"review","gave_up":"quiet"}],"settings":{"hold_secs":5},
+                      "frozen_from":{"version":"v","execution_id":"00000000-0000-0000-0000-000000000007","definition_hash":"h"}}"#;
+        let read = RunSpec::parse_file(old).unwrap();
+        let today = r#"{"name":"x","answers":[{"node":"review","gaveUp":"quiet"}],"settings":{"holdSecs":5},
+                        "frozenFrom":{"version":"v","runId":"00000000-0000-0000-0000-000000000007","definitionHash":"h"}}"#;
+        assert_eq!(read, RunSpec::parse_file(today).unwrap());
+        let written = read.file_text().unwrap();
+        assert!(written.starts_with("{\n  \"specVersion\": 2,"), "{written}");
+        assert_eq!(RunSpec::parse_file(&written).unwrap(), read, "a current file is read as it is");
+
+        let newer = RunSpec::parse_file(r#"{"specVersion":99,"name":"x"}"#).unwrap_err();
+        assert!(newer.contains("run spec was written by a newer weft: it is at version 99"), "{newer}");
         let other = RunSpec::parse_file(r#"{"name":"x","bogus":1}"#).unwrap_err();
         assert!(other.contains("unknown field `bogus`"), "{other}");
-        let current = RunSpec::parse_file(r#"{"name":"x","answers":[{"node":"review","gaveUp":"quiet"}],"settings":{"holdSecs":5}}"#);
-        assert!(current.is_ok(), "{current:?}");
         let dup = RunSpec::parse_file(r#"{"name":"x","from":{"a":{"v":1,"v":2}}}"#).unwrap_err();
         assert!(dup.contains("duplicate key 'v'"), "duplicate keys are still caught: {dup}");
+        let top_dup = RunSpec::parse_file(r#"{"name":"x","name":"y"}"#).unwrap_err();
+        assert!(top_dup.contains("duplicate key 'name'"), "{top_dup}");
     }
 
     /// A file saying two endings at once, or none, is refused by name;

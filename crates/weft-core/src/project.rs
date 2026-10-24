@@ -19,6 +19,17 @@ pub mod scopes;
 pub mod places;
 pub mod cut;
 
+/// The steps a stored [`ProjectDefinition`] takes from the shape an older
+/// weft wrote; `crate::stored` says how they run. A stored program keeps
+/// the hash it was written under through every step
+/// ([`hash::compute_definition_hash`] says why).
+pub const PROJECT_DEFINITION_UPGRADES: &[&[crate::stored::Op]] = &[&[
+    // Version 2: the service recipes a node carries moved with
+    // `AccessSpec`'s own version 2.
+    crate::stored::Op::Within { at: "nodes.*.publishedService", ops: crate::access::spec::ACCESS_SPEC_V2 },
+    crate::stored::Op::Within { at: "nodes.*.instanceService", ops: crate::access::spec::ACCESS_SPEC_V2 },
+]];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDefinition {
     pub id: Uuid,
@@ -63,6 +74,10 @@ pub struct ProjectDefinition {
 }
 
 impl ProjectDefinition {
+    /// A program as weft keeps it (`project_definition.project_json`, a
+    /// project's current one in `project.project_json`).
+    pub const STORED: crate::stored::Kind<ProjectDefinition> = crate::stored::Kind::new("program", PROJECT_DEFINITION_UPGRADES);
+
     /// Whether a broken part may hide nodes ([`Broken::hides`]), so a
     /// trigger or an infra copy this program does not declare is not
     /// proven gone: every decision that takes something down for being
@@ -1606,10 +1621,13 @@ mod address_tests {
 /// The way a person writes the group `group_id` running under
 /// `call_path`: a body is the site that calls it (`one` for the file
 /// `one` includes), any other group its own address.
-pub fn group_address(project: &ProjectDefinition, group_id: &str, call_path: &[String]) -> String {
+///
+/// Takes the program indexed ([`graph::ProjectGraph`]) or bare, like
+/// [`address_of`].
+pub fn group_address(g: &impl graph::GraphView, group_id: &str, call_path: &[String]) -> String {
     match call_path.split_last() {
-        Some((site, above)) if places::is_body(project, group_id) => address_of(project, site, above),
-        _ => address_of(project, group_id, call_path),
+        Some((site, above)) if places::is_body(g, group_id) => address_of(g, site, above),
+        _ => address_of(g, group_id, call_path),
     }
 }
 
@@ -1649,12 +1667,16 @@ pub fn plain_id(id: &str) -> String {
 /// (a trigger's display poll is keyed by this spelling), so the two
 /// are kept the same function; the loop arm exists only here, because
 /// the editor never addresses a loop's boundary.
+///
+/// Takes the program bare for one spelling, or indexed
+/// ([`graph::ProjectGraph`]) by a caller spelling many (every row of a
+/// run's record), so each lookup is constant time.
 // SYNC: address_of <-> packages/weft-graph/src/run-spec.ts addressOf
-pub fn address_of(project: &ProjectDefinition, id: &str, call_path: &[String]) -> String {
+pub fn address_of(g: &impl graph::GraphView, id: &str, call_path: &[String]) -> String {
     // A loop's boundary, read off its id rather than spelled for every
     // loop: every firing asks this.
-    if let Some(group) = boundary_loop(id).and_then(|group| project.groups.iter().find(|g| g.id == group)) {
-        return group_address(project, &group.id, call_path);
+    if let Some(group) = boundary_loop(id).and_then(|group| g.group(group)) {
+        return group_address(g, &group.id, call_path);
     }
     let Some((first, rest)) = call_path.split_first() else { return id.to_string() };
     // The body a site or node sits in is the prefix its scope chain
@@ -1671,6 +1693,18 @@ pub fn address_of(project: &ProjectDefinition, id: &str, call_path: &[String]) -
     parts.extend(rest.iter().map(|s| local(s)));
     parts.push(local(id));
     parts.join(".")
+}
+
+/// [`address_of`] for an id that came from outside the program (a row of
+/// a run's record): `None` when the program has no node or group of that
+/// id, or a site on `call_path` is not one of its call sites.
+/// [`address_of`] trusts its id, since every other caller took it from the
+/// program itself, and spells an unknown one as plausible text; a record
+/// read against a program it does not belong to must not read that way.
+pub fn placed_address(g: &impl graph::GraphView, id: &str, call_path: &[String]) -> Option<String> {
+    let known = g.node(id).is_some() || g.group(id).is_some();
+    let sites = call_path.iter().all(|site| g.is_site(site));
+    (known && sites).then(|| address_of(g, id, call_path))
 }
 
 /// A node named the way a person reads the program, through the call
@@ -1782,17 +1816,29 @@ pub struct InstanceRules {
     pub custom_outputs: Vec<String>,
 }
 
-/// Every place of a node with a `@instance_filled` field, spelled, with the
-/// node: what the instance door lists, and what an instance's values are
-/// keyed by. A node inside a file included twice is at two places, and an
-/// instance fills each on its own.
-pub fn instance_filled_places(project: &ProjectDefinition) -> Vec<(String, &NodeDefinition)> {
-    places::every_place(project)
+/// One place of a node with a `@instance_filled` field
+/// ([`instance_filled_places`]).
+#[derive(Debug, Clone)]
+pub struct FilledPlace<'a> {
+    /// The place spelled (`one.form`): what an instance's values are
+    /// keyed by, and what a person names it by.
+    pub spelled: String,
+    pub place: Located,
+    pub node: &'a NodeDefinition,
+}
+
+/// Every place of a node with a `@instance_filled` field: what the
+/// instance door lists, and what an instance's values are keyed by. A node
+/// inside a file included twice is at two places, and an instance fills
+/// each on its own.
+pub fn instance_filled_places(project: &ProjectDefinition) -> Vec<FilledPlace<'_>> {
+    let g = graph::ProjectGraph::new(project);
+    places::every_place_in(&g)
         .into_iter()
         .filter_map(|place| {
             let node = project.nodes.iter().find(|n| n.id == place.id)?;
             crate::instance::instance_filled_fields(node).next()?;
-            Some((address_of(project, &place.id, &place.path), node))
+            Some(FilledPlace { spelled: address_of(&g, &place.id, &place.path), place, node })
         })
         .collect()
 }
@@ -1802,11 +1848,13 @@ pub fn instance_filled_places(project: &ProjectDefinition) -> Vec<(String, &Node
 /// `one` includes): the key its `infra_node` row is stored under. THE
 /// set every reader of those rows checks the rows against (what is
 /// missing, what is an orphan, what counts in the rollup), so they
-/// cannot disagree on what the program declares.
-pub fn infra_place_spellings(project: &ProjectDefinition) -> std::collections::BTreeSet<String> {
+/// cannot disagree on what the program declares. Each spelling is kept
+/// with its place, so a reader that goes on to the node behind it has it
+/// at hand rather than reading the spelling back.
+pub fn infra_place_spellings(project: &ProjectDefinition) -> std::collections::BTreeMap<String, Located> {
     infra_places(project)
-        .iter()
-        .map(|place| address_of(project, &place.id, &place.path))
+        .into_iter()
+        .map(|place| (address_of(project, &place.id, &place.path), place))
         .collect()
 }
 
@@ -1830,19 +1878,22 @@ impl DeclaredInfra {
     pub fn of(project: &ProjectDefinition) -> Self {
         let places = infra_place_spellings(project)
             .into_iter()
-            .map(|spelled| {
-                let (id, _) = resolve_address(project, &spelled);
-                let per_instance = is_per_instance(project, &id);
-                (spelled, per_instance)
-            })
+            .map(|(spelled, place)| (spelled, is_per_instance(project, &place.id)))
             .collect();
         Self { places, hides: project.hides_nodes() }
+    }
+
+    /// Whether the infra place `spelled` has one copy per instance
+    /// (`Some(true)`) or one shared copy (`Some(false)`); `None` when the
+    /// program declares no infra place by that name.
+    pub fn per_instance(&self, spelled: &str) -> Option<bool> {
+        self.places.get(spelled).copied()
     }
 
     /// Whether the program has a copy of `spelled` of this kind: an
     /// instance's (`instance_copy`) or the shared one.
     pub fn declares(&self, spelled: &str, instance_copy: bool) -> bool {
-        self.places.get(spelled) == Some(&instance_copy)
+        self.per_instance(spelled) == Some(instance_copy)
     }
 
     /// Whether the copy `spelled` of this kind is gone from the program

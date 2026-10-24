@@ -340,7 +340,8 @@ pub fn spec_path(project: &Project, name: &str) -> PathBuf {
 /// file itself for anything ending in `.json` (a path, relative to the
 /// project root or absolute).
 pub fn read_spec(project: &Project, name: &str) -> Result<RunSpec> {
-    read_spec_from(project, name, &|path| std::fs::read_to_string(path))
+    read_spec_if_present(project, name)?
+        .with_context(|| format!("no spec at {}", spec_file_path(project, name).display()))
 }
 
 /// [`read_spec`] with the file read by `read` (a command's snapshot, then
@@ -370,12 +371,19 @@ pub async fn replay_rows(
 }
 
 /// What every wire of a run carried, with stored media resolved to its
-/// bytes so two runs' values compare as values.
+/// bytes so two runs' values compare as values. `expect` names the places
+/// whose outputs a diff puts first, each read against the program the run
+/// ran and answered in `focus` (`weft freeze --expect`).
 pub async fn output_wires(
     client: &crate::client::DispatcherClient,
     run_id: &str,
+    expect: &[String],
 ) -> Result<Expected> {
-    let mut expected: Expected = serde_json::from_value(client.get_json(&format!("/runs/{run_id}/outputs")).await?)
+    let query = match expect {
+        [] => String::new(),
+        names => format!("?expect={}", super::runs::query_escaped(&names.join(","))),
+    };
+    let mut expected: Expected = serde_json::from_value(client.get_json(&format!("/runs/{run_id}/outputs{query}")).await?)
         .context("decode complete output history")?;
     normalize_media(client, &mut expected.wires).await?;
     Ok(expected)
@@ -394,11 +402,16 @@ fn spec_file_path(project: &Project, name: &str) -> PathBuf {
 /// Only a missing file is an absence. A file that exists and does not
 /// read or parse is an error: treating it as "nothing here" lets the
 /// caller write over a spec whose only problem was a typo in it.
+///
+/// A file an older weft wrote reads as today's spec, and the file is left
+/// as it is ([`RunSpec::parse_file`]): reading an example never changes
+/// the project. It takes today's shape when weft writes it ([`write_spec`]).
 pub fn read_spec_if_present(project: &Project, name: &str) -> Result<Option<RunSpec>> {
     read_spec_if_present_from(project, name, &|path| std::fs::read_to_string(path))
 }
 
-/// [`read_spec_if_present`] with the file read by `read` ([`read_spec_from`]).
+/// [`read_spec_if_present`] with the file read by `read` ([`read_spec_from`]);
+/// its spec named after the file.
 pub fn read_spec_if_present_from(
     project: &Project,
     name: &str,
@@ -459,8 +472,7 @@ pub fn write_spec(project: &Project, spec: &RunSpec) -> Result<(PathBuf, String)
     validate_example_name(&spec.name)?;
     let path = spec_path(project, &spec.name);
     std::fs::create_dir_all(examples_dir(project))?;
-    let mut text = serde_json::to_string_pretty(spec)?;
-    text.push('\n');
+    let text = spec.file_text().map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
     std::fs::write(&path, &text).with_context(|| format!("write {}", path.display()))?;
     Ok((path, text))
 }
@@ -487,9 +499,10 @@ pub fn list_specs(project: &Project) -> Result<(Vec<RunSpec>, Vec<String>)> {
         // error out instead meant a directory called `examples/notes.json`,
         // or one file with the wrong permissions, stopped `weft prune`
         // dead with a bare "Is a directory (os error 21)" and no path.
-        match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|text| {
-            RunSpec::parse_file(&text).map_err(|e| format!("is not a spec ({e})"))
-        }) {
+        match std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| RunSpec::parse_file(&text).map_err(|e| format!("is not a spec ({e})")))
+        {
             Ok(mut spec) => {
                 // The filename is the runnable name; an edited display name
                 // inside the JSON must not point the listing at another file.
@@ -884,31 +897,45 @@ mod tests {
         assert_eq!(listed, vec![spec]);
     }
 
-    /// A spec an older weft saved, with keys spelled the old way, is
-    /// refused naming the file, each old key and its spelling now.
+    /// A spec an older weft saved, with keys spelled the old way, reads
+    /// as today's everywhere it is read (a run, `weft examples`, `weft
+    /// prune`, `weft diff`), and reading leaves the file as it is: the
+    /// project's files, and so its version, do not change. The file takes
+    /// today's shape when weft writes it (`weft run --save`, `weft freeze`).
     #[test]
-    fn a_spec_with_an_old_spelling_is_refused_naming_the_file_and_the_new_key() {
+    fn a_spec_an_older_weft_saved_reads_as_todays_and_is_left_as_it_is() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("weft.toml"), "[package]\nname = 'test'\nid = '00000000-0000-0000-0000-000000000001'\n").unwrap();
         let project = Project::load(dir.path()).unwrap();
         std::fs::create_dir_all(examples_dir(&project)).unwrap();
         let path = spec_path(&project, "old");
-        std::fs::write(
-            &path,
-            r#"{"name":"old","frozen_from":{"version":"v","execution_id":"00000000-0000-0000-0000-000000000002","definition_hash":"h"},"settings":{"keep_for":"1d"}}"#,
-        )
-        .unwrap();
-        let error = read_spec(&project, "old").unwrap_err().to_string();
-        assert_eq!(
-            error,
-            format!(
-                "parse {}: this spec was saved by an older weft, and these keys are spelled differently now: \
-                 `frozen_from` is `frozenFrom`, `frozen_from.execution_id` is `runId`, \
-                 `frozen_from.definition_hash` is `definitionHash`, `settings.keep_for` is `keepFor`. \
-                 The old spelling is no longer read; rename them",
-                path.display()
-            )
-        );
+        let old = r#"{"name":"old","frozen_from":{"version":"v","execution_id":"00000000-0000-0000-0000-000000000002","definition_hash":"h"},"settings":{"keep_for":"1d"}}"#;
+        std::fs::write(&path, old).unwrap();
+        let spec = read_spec(&project, "old").unwrap();
+        let frozen = spec.frozen_from.as_ref().expect("the frozen run carried over");
+        assert_eq!(frozen.definition_hash, "h");
+        let (listed, unreadable) = list_specs(&project).unwrap();
+        assert!(unreadable.is_empty(), "{unreadable:?}");
+        assert_eq!(listed, vec![spec.clone()]);
+        assert_eq!(read_spec_if_present(&project, "old").unwrap().as_ref(), Some(&spec));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old, "reading never rewrites the file");
+
+        // Read-only, the file still reads: a read needs no write access.
+        let mut readonly = std::fs::metadata(&path).unwrap().permissions();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&path, readonly.clone()).unwrap();
+        assert_eq!(list_specs(&project).unwrap().0, vec![spec.clone()]);
+        #[allow(clippy::permissions_set_readonly_false)]
+        readonly.set_readonly(false);
+        std::fs::set_permissions(&path, readonly).unwrap();
+
+        let (written_to, text) = write_spec(&project, &spec).unwrap();
+        assert_eq!(written_to, path);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, text, "the one write is the text the command keeps in its snapshot");
+        assert_eq!(written, spec.file_text().unwrap(), "the file now holds today's shape");
+        assert!(!written.contains("frozen_from") && written.contains("\"specVersion\""), "{written}");
+        assert_eq!(read_spec(&project, "old").unwrap(), spec);
     }
 
     fn version(id: &str, label: Option<&str>) -> VersionSummary {

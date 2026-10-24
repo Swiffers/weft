@@ -19,11 +19,12 @@ async fn schema(pool: &PgPool) {
 
 async fn project(pool: &PgPool, id: uuid::Uuid) {
     sqlx::query(
-        "INSERT INTO project (id, name, tenant_id, status, project_json, updated_at) \
-         VALUES ($1, $2, 'local', 'registered', '{}', 0)",
+        "INSERT INTO project (id, name, tenant_id, status, project_json, updated_at, project_json_version, resync_version, running_build_inputs_version) \
+         VALUES ($1, $2, 'local', 'registered', '{}', 0, $3, 1, 1)",
     )
     .bind(id)
     .bind(id.to_string())
+    .bind(weft_core::ProjectDefinition::STORED.version())
     .execute(pool)
     .await
     .expect("project row");
@@ -35,8 +36,8 @@ async fn project(pool: &PgPool, id: uuid::Uuid) {
 async fn signal(pool: &PgPool, token: &str, project_id: uuid::Uuid, status: ProjectStatus) {
     sqlx::query(
         "INSERT INTO trigger_activation \
-           (project_id, trigger, status, accepting_fires, fires_visible_to_consumers, updated_at) \
-         VALUES ($1, $2, $3, TRUE, TRUE, 0)",
+           (project_id, trigger, status, accepting_fires, fires_visible_to_consumers, updated_at, activation_program_version) \
+         VALUES ($1, $2, $3, TRUE, TRUE, 0, 1)",
     )
     .bind(project_id)
     .bind(token)
@@ -45,11 +46,13 @@ async fn signal(pool: &PgPool, token: &str, project_id: uuid::Uuid, status: Proj
     .await
     .expect("activation row");
     sqlx::query(
-        "INSERT INTO signal (token, tenant_id, project_id, node_id, is_resume, spec_json, created_at, activation_trigger) \
-         VALUES ($1, 'local', $2, $1, FALSE, '{}', 0, $1)",
+        "INSERT INTO signal (token, tenant_id, project_id, node_id, is_resume, spec_json, created_at, activation_trigger, \
+         spec_json_version, program_json_version) \
+         VALUES ($1, 'local', $2, $1, FALSE, '{}', 0, $1, $3, 1)",
     )
     .bind(token)
     .bind(project_id)
+    .bind(weft_core::primitive::SignalSpec::STORED.version())
     .execute(pool)
     .await
     .expect("signal row");
@@ -146,11 +149,13 @@ async fn a_held_wait_names_its_run(pool: PgPool) {
     project(&pool, ACTIVE).await;
     let run = uuid::Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO signal (token, tenant_id, project_id, run_id, node_id, is_resume, spec_json, created_at) \
-         VALUES ('wait', 'local', $1, $2, 'hold', TRUE, '{}', 0)",
+        "INSERT INTO signal (token, tenant_id, project_id, run_id, node_id, is_resume, spec_json, created_at, \
+         spec_json_version, program_json_version) \
+         VALUES ('wait', 'local', $1, $2, 'hold', TRUE, '{}', 0, $3, 1)",
     )
     .bind(ACTIVE)
     .bind(run)
+    .bind(weft_core::primitive::SignalSpec::STORED.version())
     .execute(&pool)
     .await
     .expect("wait row");

@@ -116,7 +116,24 @@ machine_lock_take "$weft_e2e_run_lock" "the e2e run lock (one e2e run at a time 
 # and removing what was kept only needs the install as it is (the clean
 # fails loudly if no runtime answers). Its log goes beside this install's
 # other e2e files once the install is known; until then, in a temp file.
+# setup.sh refuses to replace a runtime that has something on (`weft
+# maintenance check`), and what failed runs kept (their projects, triggers
+# on, infra up) is exactly that. None of it is worth waiting for or bringing
+# back, since the sweep below removes it: so an install with something on
+# goes into maintenance first, its runs cancelled, through the weft it runs
+# now, and the maintenance is lifted once the sweep is done (below), with
+# whatever is left of it coming back.
 if [ "$CLEAN" -eq 0 ]; then
+  MAINTENANCE_LOG="$(mktemp -t weft-e2e-maintenance.XXXXXX)"
+  if weft_checkout_install "$REPO_ROOT" 2>/dev/null && "$WHICH_BIN/weft" help maintenance >/dev/null 2>&1 \
+    && ! WEFT_INSTALL="$WHICH_ENV" "$WHICH_BIN/weft" maintenance check >"$MAINTENANCE_LOG" 2>&1; then
+    echo "the install has something on (what failed runs kept); putting it in maintenance, its runs cancelled, for the update"
+    if ! WEFT_INSTALL="$WHICH_ENV" "$WHICH_BIN/weft" maintenance on --running cancel >>"$MAINTENANCE_LOG" 2>&1; then
+      echo "\`weft maintenance on --running cancel\` failed, so setup.sh would refuse the update; its output is in $MAINTENANCE_LOG" >&2
+      echo "scripts/run-e2e.sh --clean removes what failed runs kept" >&2
+      exit 1
+    fi
+  fi
   echo "bringing this checkout's install to current code (setup.sh --cli --daemon)"
   SETUP_LOG="$(mktemp -t weft-e2e-setup.XXXXXX)"
   if ! without_machine_locks ./setup.sh --cli --daemon >"$SETUP_LOG" 2>&1; then
@@ -149,7 +166,7 @@ FAILED_LIST="$E2E_DIR/failed"
 # removes.
 export WEFT_E2E_KEPT_DIR="$E2E_DIR/kept"
 mkdir -p "$E2E_DIR"
-[ "$CLEAN" -eq 0 ] && mv -f "$SETUP_LOG" "$E2E_DIR/setup.log"
+[ "$CLEAN" -eq 0 ] && mv -f "$SETUP_LOG" "$E2E_DIR/setup.log" && mv -f "$MAINTENANCE_LOG" "$E2E_DIR/maintenance.log"
 
 # Run one command with its output in a log, for a step whose waiting
 # line (the build slot's) must still reach the terminal.
@@ -167,6 +184,13 @@ echo "removing what earlier failed runs kept"
 if ! with_build_slot logged "$E2E_DIR/clean.log" cargo build -q --workspace --features weft-e2e/e2e --bin weft-e2e-clean \
   || ! without_machine_locks "$REPO_ROOT/target/debug/weft-e2e-clean" >>"$E2E_DIR/clean.log" 2>&1; then
   echo "removing what earlier runs kept failed; its output is in $E2E_DIR/clean.log" >&2
+  exit 1
+fi
+# The maintenance the update ran in, lifted now that what failed runs
+# kept is gone: the tests switch things on. An install that is not in
+# maintenance answers that there is nothing to lift.
+if [ "$CLEAN" -eq 0 ] && ! "$INSTALL_WEFT" maintenance off >>"$E2E_DIR/maintenance.log" 2>&1; then
+  echo "\`weft maintenance off\` failed, and the tests cannot switch anything on in maintenance; its output is in $E2E_DIR/maintenance.log" >&2
   exit 1
 fi
 rm -rf "$RUN_DIR"

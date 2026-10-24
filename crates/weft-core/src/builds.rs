@@ -280,6 +280,18 @@ pub struct VersionBuildRequest {
     /// The version: every covered file's hash. Every blob is already in
     /// the tenant's assets (the CLI's snapshot put them there).
     pub manifest: crate::project::hash::Manifest,
+    /// What the files are compiled with.
+    #[serde(flatten)]
+    pub inputs: BuildInputs,
+}
+
+/// What a build compiles a version's files with, beside the files
+/// themselves: kept with the build a project registers
+/// (`project.running_build_inputs`), so the install can build the same
+/// version again on a newer weft (the maintenance lift,
+/// `crate::maintenance`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BuildInputs {
     /// Compile every catalog node into the worker (`full`) or only the
     /// ones the program references (`referenced`).
     #[serde(rename = "nodeSet")]
@@ -290,9 +302,30 @@ pub struct VersionBuildRequest {
     pub assets: BTreeMap<String, serde_json::Value>,
 }
 
+impl BuildInputs {
+    /// What a registered build keeps of its inputs (`project.running_build_inputs`).
+    pub const STORED: crate::stored::Kind<BuildInputs> = crate::stored::Kind::new("build's inputs", &[]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a build compiles its files with sits beside them on the wire,
+    /// as it always did, and reads back as the request.
+    #[test]
+    fn a_build_request_keeps_its_inputs_beside_its_files() {
+        let request = VersionBuildRequest {
+            name: "shop".into(),
+            manifest: [("main.weft".to_string(), "sha256:aa".to_string())].into(),
+            inputs: BuildInputs { node_set: NodeSet::Referenced, assets: [("text:a".to_string(), serde_json::json!("x"))].into() },
+        };
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["nodeSet"], "referenced");
+        assert_eq!(wire["assets"]["text:a"], "x");
+        let back: VersionBuildRequest = serde_json::from_value(wire).unwrap();
+        assert_eq!((back.name, back.manifest, back.inputs), (request.name, request.manifest, request.inputs));
+    }
 
     #[test]
     fn a_built_program_round_trips_under_its_wire_names() {

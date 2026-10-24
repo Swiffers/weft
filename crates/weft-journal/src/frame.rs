@@ -15,7 +15,7 @@ use crate::record::{Born, Fate, StoredProgram, Written};
 
 /// What a batch says besides its rows.
 // SYNC: BatchHead <-> crate::record::record_batch (what it binds)
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BatchHead {
     /// Somebody waits on this batch being on disk (a durable run at a
     /// commit point): it commits synced. A batch of fast runs does not
@@ -28,6 +28,9 @@ pub struct BatchHead {
     /// The cut programs the batch's births run that the lane has not sent
     /// before (`crate::record::StoredProgram`); the record keeps each once.
     pub programs: Vec<StoredProgram>,
+    /// The version its rows' events are written at
+    /// (`crate::stored::STORED_EVENTS`): the worker's, which wrote them.
+    pub events_version: weft_core::stored::Version,
 }
 
 /// One run's share of a batch.
@@ -120,6 +123,7 @@ mod tests {
                 })
                 .collect(),
             programs: Vec::new(),
+            events_version: crate::stored::STORED_EVENTS.version(),
         }
     }
 

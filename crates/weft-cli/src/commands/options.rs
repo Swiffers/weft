@@ -357,6 +357,8 @@ mod tests {
             page: None,
             public: false,
             where_equals: BTreeMap::new(),
+            error_path: None,
+            ok_path: None,
         }
     }
 

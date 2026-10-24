@@ -377,27 +377,51 @@ pub(crate) async fn build_version_gated(
     request: &weft_core::builds::VersionBuildRequest,
     ask: i64,
     hold: crate::build::prune::ImageHold,
-) -> Result<crate::build::VersionBuild, axum::response::Response> {
-    use axum::response::IntoResponse;
+) -> Result<crate::build::VersionBuild, BuildFailed> {
     let gate = std::sync::Arc::new(ProjectBuildGate::new(state.clone(), id));
     let storage = crate::storage::BrokerStorage(state);
     // The gate is let go where it was entered, with the starts
     // (`crate::build::VersionBuilder::start_images`).
     match state.builder.build(&storage, id, tenant.as_str(), request, ask, gate.clone(), hold).await {
         Ok(built) => Ok(built),
-        Err(e) if crate::build::cancelled(&e) => {
-            Err((StatusCode::CONFLICT, format!("build cancelled by user: {e:#}")).into_response())
-        }
+        Err(e) if crate::build::cancelled(&e) => Err(BuildFailed::of(StatusCode::CONFLICT, format!("build cancelled by user: {e:#}"))),
         // A lost single-flight (gate.begin refused) is a state conflict,
         // not a server fault. Anything else prints the FULL chain (`{e:#}`)
         // so the compile diagnostics (`line:col message`) reach the
         // client, not just the outermost context.
         Err(e) => match e.chain().find_map(|cause| cause.downcast_ref::<BuildRefused>()) {
-            Some(BuildRefused { resyncing: true, message }) => Err((StatusCode::CONFLICT, message.clone()).into_response()),
+            Some(BuildRefused { resyncing: true, message }) => Err(BuildFailed::of(StatusCode::CONFLICT, message.clone())),
             Some(BuildRefused { resyncing: false, message }) => {
-                Err((StatusCode::CONFLICT, [(weft_core::builds::BUILD_BUSY_HEADER, "1")], message.clone()).into_response())
+                Err(BuildFailed { status: StatusCode::CONFLICT, message: message.clone(), busy: true })
             }
-            None => Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")).into_response()),
+            None => Err(BuildFailed::of(StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}"))),
         },
+    }
+}
+
+/// Why a build of a version did not register: the status and message its
+/// request answers, and whether another ask of the project was starting
+/// its image builds right now (`busy`: the answer carries
+/// [`weft_core::builds::BUILD_BUSY_HEADER`], so a caller resending its ask
+/// waits and sends it again).
+#[derive(Debug)]
+pub(crate) struct BuildFailed {
+    pub status: StatusCode,
+    pub message: String,
+    pub busy: bool,
+}
+
+impl BuildFailed {
+    pub fn of(status: StatusCode, message: String) -> Self {
+        Self { status, message, busy: false }
+    }
+}
+
+impl axum::response::IntoResponse for BuildFailed {
+    fn into_response(self) -> axum::response::Response {
+        match self.busy {
+            true => (self.status, [(weft_core::builds::BUILD_BUSY_HEADER, "1")], self.message).into_response(),
+            false => (self.status, self.message).into_response(),
+        }
     }
 }

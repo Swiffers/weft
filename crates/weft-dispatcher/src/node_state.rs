@@ -8,9 +8,11 @@
 //! which only the listener can read off the wait (the answer is the kind's
 //! own state), so that one part is asked of it.
 
+use std::collections::HashMap;
+
 use axum::http::StatusCode;
 
-use weft_core::frames::{FiringLocation, Located, LoopFrames};
+use weft_core::frames::{loop_indices, FiringLocation, Located, LoopFrames};
 use weft_core::primitive::{AwaitedEntryKind, LoopInstanceKey, LoopTerminationReason, RunSnapshot};
 use weft_core::program::{NodeState, NodeStatus};
 use weft_core::project::places::{members_in, scopes_around, state_place, StatePlace};
@@ -29,37 +31,57 @@ type ReadError = (StatusCode, String);
 /// run `run_id` of `project_id`. A run of another project is no run here.
 pub async fn read(state: &DispatcherState, project_id: uuid::Uuid, run_id: RunId, spelled: &str) -> Result<NodeState, ReadError> {
     let internal = |what: &'static str| move |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
-    let owner = state.runs.run_owner(run_id).await.map_err(internal("the run's row"))?;
-    if owner.as_ref().is_none_or(|owner| owner.project_id != project_id) {
-        return Err((StatusCode::NOT_FOUND, format!("there is no run {run_id} in this project")));
-    }
-    let lookup = crate::projection::run_program(state, run_id).await.map_err(internal("the run's program"))?;
-    let program = lookup.program().ok_or_else(|| {
-        let why = lookup.unpaintable().map(|(_, reason)| reason.to_string()).unwrap_or_else(|| format!("run {run_id} ran no program"));
-        (StatusCode::CONFLICT, why)
-    })?;
-    let place = state_place(&program, spelled).map_err(|why| {
-        // A run started on part of its program runs a cut of it: a node
-        // the cut left out is no node of what this run runs.
-        let (id, _) = weft_core::project::resolve_address(&program, spelled);
-        let left_out = program.nodes.iter().all(|n| n.id != id) && program.groups.iter().all(|g| g.id != id);
-        match &owner {
-            Some(owner) if owner.cut_from.is_some() && left_out => (
-                StatusCode::BAD_REQUEST,
-                format!("run {run_id} runs only part of its program, and '{spelled}' is not in that part"),
-            ),
-            _ => (StatusCode::BAD_REQUEST, why),
-        }
-    })?;
+    let owner = state.runs.run_owner(run_id).await.map_err(internal("the run's row"))?
+        .filter(|owner| owner.project_id == project_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("there is no run {run_id} in this project")))?;
+    // The name is read against the whole program the run was started on
+    // (a run of part of it runs a cut, which leaves out what it reuses),
+    // so it is found by the name it had in that run.
+    let program = crate::projection::registered_program(state, run_id, &owner).await.map_err(internal("the run's program"))?
+        .or_why(run_id)
+        .map_err(|why| (StatusCode::CONFLICT, why))?;
+    let place = state_place(&program, spelled).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
     let mut folds = crate::projection::reconstruct_run(state, run_id).await.map_err(internal("the run's record"))?;
     let fold = folds.remove(&run_id).ok_or_else(|| internal("the run's record")(anyhow::anyhow!("its own fold is missing")))?;
     let snapshot = fold.current_snapshot();
+    if !in_run(fold.project(), &snapshot, &place) {
+        return Err((StatusCode::BAD_REQUEST, format!("run {run_id} runs only part of its program, and '{spelled}' is not in that part")));
+    }
     let seen = seen_at(&program, &snapshot, &place);
     let live = match &seen.waiting_on {
         Some(token) => wait_answer(state, token).await?,
         None => None,
     };
     Ok(NodeState { status: seen.status, live, error: seen.error })
+}
+
+/// Whether `place` is part of the run whose program is `cut` (the part of
+/// its registered program it runs) and whose record is `snapshot`: a place
+/// its cut holds, or one its seed handed it. A loop is part of it when its
+/// `LoopIn` is: a cut takes a loop whole.
+pub(crate) fn in_run(cut: &ProjectDefinition, snapshot: &RunSnapshot, place: &StatePlace) -> bool {
+    let at = match place {
+        StatePlace::Node(place) => place.clone(),
+        StatePlace::Loop(place) => Located::new(loop_in_id(&place.id), place.path.clone()),
+    };
+    snapshot.inherited_origins.contains_key(&at) || weft_core::project::places::every_place(cut).contains(&at)
+}
+
+/// The loop iterations each wait the node at `place` registered sits in,
+/// by the wait's token, outermost first, read off the run's record
+/// (`snapshot`): what tells two iterations waiting at one node apart.
+pub(crate) fn wait_iterations(snapshot: &RunSnapshot, place: &Located) -> HashMap<String, Vec<u32>> {
+    snapshot
+        .awaited_sequences
+        .iter()
+        .filter(|(at, _)| Located::at(at.node_id.clone(), &at.frames) == *place)
+        .flat_map(|(at, entries)| {
+            entries.iter().filter_map(move |entry| match &entry.kind {
+                AwaitedEntryKind::Await { token, .. } => Some((token.clone(), loop_indices(&at.frames))),
+                _ => None,
+            })
+        })
+        .collect()
 }
 
 /// What a run's record says of one place: its status, the wait it is on
@@ -256,6 +278,46 @@ mod tests {
         let suspended = RunEvent::NodeSuspended { run_id: RUN, node_id: "a".into(), frames: vec![], token: "t1".into(), at_unix: 3 };
         let paused = seen(&[started("a"), registered("a", "t1"), suspended], "a");
         assert_eq!((paused.status, paused.waiting_on.as_deref()), (NodeStatus::Waiting, Some("t1")));
+    }
+
+    /// Each wait a node registered is read off the record with the loop
+    /// iterations it sits in; another node's waits are not its own.
+    #[test]
+    fn a_nodes_waits_are_read_with_their_iterations() {
+        let in_iteration = |node: &str, index: u32, token: &str| RunEvent::SuspensionRegistered {
+            run_id: RUN,
+            node_id: node.into(),
+            frames: vec![weft_core::frames::Frame::Loop { index }],
+            token: token.into(),
+            spec: SignalSpec::of_kind("poll_endpoint", json!({ "url": "https://x/status" })),
+            call_index: 0,
+            at_unix: 2,
+        };
+        let project = program();
+        let snapshot = weft_journal::fold_to_snapshot(
+            RUN,
+            Arc::new(project.clone()),
+            &[in_iteration("c", 0, "t0"), in_iteration("c", 1, "t1"), registered("a", "ta")],
+        );
+        let iterations = wait_iterations(&snapshot, &Located::top("c"));
+        assert_eq!(iterations, HashMap::from([("t0".to_string(), vec![0]), ("t1".to_string(), vec![1])]));
+    }
+
+    /// A name is read against the whole registered program, and a place
+    /// is part of a run of a cut of it when the cut holds it (a loop by its
+    /// `LoopIn`, the cut takes it whole) or its seed handed it over.
+    #[test]
+    fn a_place_is_in_a_run_when_its_cut_holds_it_or_its_seed_handed_it() {
+        let registered = program();
+        let mut cut = program();
+        cut.nodes.retain(|node| node.id != "b");
+        let mut snapshot = weft_journal::fold_to_snapshot(RUN, Arc::new(cut.clone()), &[]);
+        let place = |spelled: &str| state_place(&registered, spelled).unwrap();
+        assert!(in_run(&cut, &snapshot, &place("a")));
+        assert!(in_run(&cut, &snapshot, &place("g")), "a loop, by its LoopIn");
+        assert!(!in_run(&cut, &snapshot, &place("b")), "the cut left it out");
+        snapshot.inherited_origins.insert(Located::top("b"), RunId::from_u128(9));
+        assert!(in_run(&cut, &snapshot, &place("b")), "the seed handed it over");
     }
 
     /// A node inside a group that did not run reads skipped from the

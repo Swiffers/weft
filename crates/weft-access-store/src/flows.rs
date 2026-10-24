@@ -13,8 +13,8 @@ use sqlx::PgPool;
 
 use weft_core::access::client::{authed_client, base_client, resolve_steps, RefusalKind};
 use weft_core::access::spec::{
-    lookup_path, Acquisition, CredentialField, Door, GrantCoexistence, OAuthGrant, TestCall,
-    VerificationRung,
+    lookup_path, Acquisition, AnswerReader, CredentialField, Door, GrantCoexistence, OAuthGrant, TestCall,
+    TokenAnswer, TokenCall, TokenExpiry, TokenLife, TokenRead, VerificationRung,
 };
 // The connect wire shapes live in the core (weft-core `access::wire`),
 // one definition for every client; this crate only executes them.
@@ -67,6 +67,23 @@ fn same_owner_sql(m: &str, p: &str) -> String {
     format!("instance_id IS NOT DISTINCT FROM {m} AND ({m}::text IS NULL OR project_id = {p})")
 }
 
+/// The `access_grant` columns a listing reads.
+#[derive(sqlx::FromRow)]
+struct ListedRow {
+    id: uuid::Uuid,
+    service: String,
+    project_id: Option<uuid::Uuid>,
+    identity: Option<String>,
+    label: Option<String>,
+    granted_scopes: Value,
+    permissions_verified: bool,
+    owner: String,
+    door: String,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    value_names: Vec<String>,
+    instance_id: Option<String>,
+}
+
 /// One owner's connections, optionally narrowed to one service.
 /// Summaries only; stored values never leave the store side.
 pub async fn list_grants(
@@ -76,21 +93,7 @@ pub async fn list_grants(
     owner: GrantOwnerScope<'_>,
 ) -> anyhow::Result<Vec<GrantSummary>> {
     let (scope_project, scope_instance) = owner.columns();
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(
-        uuid::Uuid,
-        String,
-        Option<uuid::Uuid>,
-        Option<String>,
-        Option<String>,
-        Value,
-        bool,
-        String,
-        String,
-        Option<chrono::DateTime<chrono::Utc>>,
-        Vec<String>,
-        Option<String>,
-    )> = sqlx::query_as(&format!(
+    let rows: Vec<ListedRow> = sqlx::query_as(&format!(
         // Only the value NAMES: the values themselves never leave the
         // store side, and the editor's check needs nothing more.
         "SELECT id, service, project_id, identity, label, granted_scopes,
@@ -109,42 +112,31 @@ pub async fn list_grants(
     .fetch_all(pool)
     .await?;
     rows.into_iter()
-        .map(
-            |(
-                id,
-                service,
-                project_id,
-                identity,
-                label,
-                scopes,
-                verified,
+        .map(|row| {
+            let owner = owner_of(&row.owner, row.instance_id.as_deref())?;
+            Ok(GrantSummary {
+                id: row.id,
+                service: row.service,
+                project_id: row.project_id,
+                instance: row
+                    .instance_id
+                    .map(weft_core::instance::InstanceId::new)
+                    .transpose()
+                    .map_err(anyhow::Error::msg)?,
+                identity: row.identity,
+                label: row.label,
+                scopes: scopes_of(&row.granted_scopes),
+                permissions_verified: row.permissions_verified,
+                // A stored credential is one; a runtime-owned row's
+                // is the broker's to confirm (the dispatcher's
+                // listing asks it and overwrites this).
+                has_credential: !owner.is_platform(),
                 owner,
-                door,
-                expires_at,
-                value_names,
-                instance,
-            )| {
-                let owner = owner_of(&owner, instance.as_deref())?;
-                Ok(GrantSummary {
-                    id,
-                    service,
-                    project_id,
-                    instance: instance.map(weft_core::instance::InstanceId::new).transpose().map_err(anyhow::Error::msg)?,
-                    identity,
-                    label,
-                    scopes: scopes_of(&scopes),
-                    permissions_verified: verified,
-                    // A stored credential is one; a runtime-owned row's
-                    // is the broker's to confirm (the dispatcher's
-                    // listing asks it and overwrites this).
-                    has_credential: !owner.is_platform(),
-                    owner,
-                    door: door_of(&door)?,
-                    expires_at,
-                    value_names,
-                })
-            },
-        )
+                door: door_of(&row.door)?,
+                expires_at: row.expires_at,
+                value_names: row.value_names,
+            })
+        })
         .collect()
 }
 
@@ -321,15 +313,15 @@ pub async fn connect_direct(
             verified: false,
             platform: true,
             door: Door::Shared,
-            label: None,
+            label: Some(connection_name(req.label, &None, spec)),
             identity: None,
-            expires_at: None,
+            life: None,
         })
         .await;
     }
 
     let mut values = req.values;
-    let mut expires_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut life: Option<TokenLife> = None;
     match &spec.acquisition {
         Acquisition::Static { fields } => {
             values = storable_values(spec, fields, values)?;
@@ -344,13 +336,14 @@ pub async fn connect_direct(
             // connect instead of at first run. The minted token is
             // stored like any other value and re-minted lazily on
             // expiry at resolution time.
-            expires_at = crate::resolve::mint_and_exchange(spec, &mut values).await?;
+            life = crate::resolve::mint_and_exchange(spec, &mut values).await?;
         }
         Acquisition::OAuth2 { grant: OAuthGrant::ClientCredentials, .. } => {
             let reg = require_registration(&req.registration, spec)?;
-            expires_at =
-                crate::resolve::client_credentials_token(spec, &reg.to_values(), &mut values)
+            let expiry =
+                crate::resolve::client_credentials_token(spec, &reg.to_values(), &mut values, AnswerOf::First)
                     .await?;
+            life = connect_expiry(spec, expiry, &values)?;
         }
         Acquisition::OAuth2 { grant: OAuthGrant::AuthorizationCode { .. }, .. } => {
             return Err(AccessError::Invalid(
@@ -382,10 +375,7 @@ pub async fn connect_direct(
     // A pasted secret is not display text: whichever set is recorded,
     // the reserved capture never stays in the stored values.
     values.remove(GRANTED_PERMISSIONS_CAPTURE);
-    let label = match req.label {
-        Some(l) if !l.trim().is_empty() => Some(l.trim().to_string()),
-        _ => req.registration.as_ref().map(|r| r.label.clone()),
-    };
+    let label = Some(connection_name(req.label, &req.registration, spec));
     insert_grant(pool, tenant, NewGrant {
         spec,
         registration: &req.registration,
@@ -399,7 +389,7 @@ pub async fn connect_direct(
         door: req.door,
         label,
         identity,
-        expires_at,
+        life,
     })
     .await
 }
@@ -492,7 +482,19 @@ struct NewGrant<'a> {
     door: Door,
     label: Option<String>,
     identity: Option<String>,
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When its token dies and the lifetime it was issued with; `None`
+    /// for a credential that does not expire.
+    life: Option<TokenLife>,
+}
+
+/// The name a person's connection is listed under: the one they typed,
+/// else its app's, else the service's own ("Firecrawl"), so every
+/// connection a person makes has a name each list can show.
+fn connection_name(typed: Option<String>, registration: &Option<AppRegistration>, spec: &AccessSpec) -> String {
+    match typed {
+        Some(l) if !l.trim().is_empty() => l.trim().to_string(),
+        _ => registration.as_ref().map_or_else(|| spec.display_label().to_string(), |r| r.label.clone()),
+    }
 }
 
 /// `values` reduced to what may actually be STORED for `spec`, or the
@@ -539,6 +541,7 @@ async fn insert_grant(
     grant: NewGrant<'_>,
 ) -> anyhow::Result<CompletedConnect> {
     let owner = if grant.platform { CredentialOwner::Platform } else { CredentialOwner::own(grant.instance.clone()) };
+    let (expires_at, lifetime_secs) = life_columns(grant.life);
     // A node's published connection REPLACES the one it published
     // before (its key is the node, not the moment), so the same write
     // serves a first publish and a re-publish. A person's connect has
@@ -557,6 +560,7 @@ async fn insert_grant(
              registration_sealed = EXCLUDED.registration_sealed,
              client_id = EXCLUDED.client_id,
              spec_json = EXCLUDED.spec_json,
+             spec_json_version = EXCLUDED.spec_json_version,
              events_recipe_hash = EXCLUDED.events_recipe_hash,
              values_sealed = EXCLUDED.values_sealed,
              value_names = EXCLUDED.value_names,
@@ -568,6 +572,7 @@ async fn insert_grant(
              identity = EXCLUDED.identity,
              provider_account = EXCLUDED.provider_account,
              expires_at = EXCLUDED.expires_at,
+             token_lifetime_secs = EXCLUDED.token_lifetime_secs,
              updated_at = now()"
     } else {
         ""
@@ -577,9 +582,9 @@ async fn insert_grant(
            (id, tenant_id, service, registration_sealed, client_id, project_id, spec_json,
             events_recipe_hash, values_sealed, value_names, granted_scopes,
             permissions_verified, owner, door, label, identity, provider_account, expires_at,
-            published_by_node, instance_id)
+            published_by_node, instance_id, spec_json_version, token_lifetime_secs)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                 $18, $19, $20){upsert}
+                 $18, $19, $20, $21, $22){upsert}
          RETURNING id"
     ))
     .bind(uuid::Uuid::new_v4())
@@ -599,30 +604,135 @@ async fn insert_grant(
     .bind(&grant.label)
     .bind(&grant.identity)
     .bind(provider_account_of(grant.spec, &grant.values))
-    .bind(grant.expires_at)
+    .bind(expires_at)
     .bind(&grant.published_by_node)
     .bind(grant.instance.as_ref().map(|m| m.as_str()))
+    .bind(weft_core::AccessSpec::STORED.version())
+    .bind(lifetime_secs)
     .fetch_one(db)
     .await?;
-    Ok(CompletedConnect {
+    let label = grant.label.clone();
+    Ok(completed(id, grant, label))
+}
+
+/// Write `grant` over the existing row `id` in place: an exclusive-class
+/// grant upgraded or signed in again, so every project following it
+/// keeps it. Every column [`insert_grant`] writes is written here too
+/// (the row becomes exactly what was just built), and the reconnect is
+/// counted. Guarded by owner like every write: an instance rotates only
+/// its own row in its project.
+async fn rotate_grant(
+    db: impl sqlx::PgExecutor<'_>,
+    tenant: &str,
+    id: uuid::Uuid,
+    grant: NewGrant<'_>,
+) -> anyhow::Result<CompletedConnect> {
+    let owner = if grant.platform { CredentialOwner::Platform } else { CredentialOwner::own(grant.instance.clone()) };
+    let (expires_at, lifetime_secs) = life_columns(grant.life);
+    let rotated = sqlx::query(&format!(
+        "UPDATE access_grant
+         SET values_sealed = $3, value_names = $4, granted_scopes = $5,
+             permissions_verified = $6, identity = $7, label = $8, door = $9,
+             expires_at = $10, spec_json = $11, registration_sealed = $12,
+             client_id = $13, provider_account = $14, events_recipe_hash = $15,
+             project_id = $16, spec_json_version = $17, token_lifetime_secs = $18, owner = $19,
+             reconnects = reconnects + 1, updated_at = now()
+         WHERE id = $1 AND tenant_id = $2 AND {}",
+        same_owner_sql("$20", "$16")
+    ))
+    .bind(id)
+    .bind(tenant)
+    .bind(crate::seal_json(&serde_json::to_value(&grant.values)?)?)
+    .bind(value_names_of(&grant.values))
+    .bind(serde_json::to_value(&grant.granted)?)
+    .bind(grant.verified)
+    .bind(&grant.identity)
+    .bind(&grant.label)
+    .bind(door_str(grant.door))
+    .bind(expires_at)
+    // The recipe as this weft writes it, whatever shape the row kept it in.
+    .bind(serde_json::to_value(grant.spec)?)
+    // Re-consent carries the current app; write it through so a later
+    // refresh uses the app this consent actually used, not the one the
+    // row was first created with.
+    .bind(registration_snapshot(grant.registration)?)
+    .bind(grant.registration.as_ref().map(|r| r.client_id.clone()))
+    .bind(provider_account_of(grant.spec, &grant.values))
+    .bind(crate::resolve::events_recipe_hash(&grant.spec.events))
+    .bind(grant.project_id)
+    .bind(weft_core::AccessSpec::STORED.version())
+    .bind(lifetime_secs)
+    .bind(owner_str(&owner))
+    .bind(grant.instance.as_ref().map(|m| m.as_str()))
+    .execute(db)
+    .await?;
+    if rotated.rows_affected() != 1 {
+        return Err(AccessError::NotFound.into());
+    }
+    let label = grant.label.clone();
+    Ok(completed(id, grant, label))
+}
+
+/// What a connect that just wrote `grant` as row `id`, named `label`,
+/// answers. It was gated on its credential existing (the broker refuses
+/// a shared-key connect without one).
+fn completed(id: uuid::Uuid, grant: NewGrant<'_>, label: Option<String>) -> CompletedConnect {
+    let owner = if grant.platform { CredentialOwner::Platform } else { CredentialOwner::own(grant.instance.clone()) };
+    let (expires_at, _) = life_columns(grant.life);
+    CompletedConnect {
         grant: GrantSummary {
             id,
             service: grant.spec.service.clone(),
             project_id: grant.project_id,
             instance: grant.instance,
             identity: grant.identity,
-            label: grant.label,
+            label,
             scopes: grant.granted,
             permissions_verified: grant.verified,
             owner,
             door: grant.door,
-            expires_at: grant.expires_at,
+            expires_at,
             value_names: grant.values.keys().cloned().collect(),
-            // A connect that just completed was gated on its credential
-            // existing (the broker refuses a shared-key connect without one).
             has_credential: true,
         },
-    })
+    }
+}
+
+/// What an in-place upgrade reads of the row it is about to overwrite.
+#[derive(sqlx::FromRow)]
+struct RowBefore {
+    granted_scopes: Value,
+    /// The app the row was signed in through, sealed; `None` for one
+    /// made by pasting a credential.
+    registration_sealed: Option<String>,
+}
+
+/// The row `id` an in-place upgrade is about to overwrite: the same
+/// tenant, the same service (an id naming another provider's row must
+/// never take this provider's tokens) and the same owner (an instance's
+/// own row in its project, the author's own). Anything else is a clean
+/// miss.
+async fn row_before(
+    db: impl sqlx::PgExecutor<'_>,
+    tenant: &str,
+    service: &str,
+    id: uuid::Uuid,
+    instance: Option<&weft_core::instance::InstanceId>,
+    project_id: Option<uuid::Uuid>,
+) -> anyhow::Result<RowBefore> {
+    let row: Option<RowBefore> = sqlx::query_as(&format!(
+        "SELECT granted_scopes, registration_sealed FROM access_grant \
+         WHERE id = $1 AND tenant_id = $2 AND service = $3 AND {}",
+        same_owner_sql("$4", "$5")
+    ))
+    .bind(id)
+    .bind(tenant)
+    .bind(service)
+    .bind(instance.map(|m| m.as_str()))
+    .bind(project_id)
+    .fetch_optional(db)
+    .await?;
+    Ok(row.ok_or(AccessError::NotFound)?)
 }
 
 // ---------- Resource picker sessions ----------
@@ -896,6 +1006,7 @@ pub async fn begin_oauth(
         grant: OAuthGrant::AuthorizationCode { auth_url, pkce },
         scope_delimiter,
         auth_params,
+        client_params,
         ..
     } = &spec.acquisition
     else {
@@ -938,22 +1049,8 @@ pub async fn begin_oauth(
         Some(id) => {
             // Upgrading is the owner's: an instance upgrades its own row,
             // the author theirs.
-            let row: Option<(Option<String>,)> = sqlx::query_as(&format!(
-                "SELECT registration_sealed FROM access_grant \
-                 WHERE id = $1 AND tenant_id = $2 AND service = $3 AND {}",
-                same_owner_sql("$4", "$5")
-            ))
-            .bind(id)
-            .bind(tenant)
-            .bind(&spec.service)
-            .bind(req.instance.as_ref().map(|m| m.as_str()))
-            .bind(req.project_id)
-            .fetch_optional(pool)
-            .await?;
-            let Some((sealed,)) = row else {
-                return Err(AccessError::NotFound.into());
-            };
-            let Some(sealed) = sealed else {
+            let before = row_before(pool, tenant, &spec.service, id, req.instance.as_ref(), req.project_id).await?;
+            let Some(sealed) = before.registration_sealed else {
                 return Err(AccessError::Invalid(
                     "this connection was made without an app; it cannot be upgraded \
                      through a browser consent"
@@ -989,6 +1086,13 @@ pub async fn begin_oauth(
         None => require_registration(&req.registration, spec)?,
     };
     let client_id = registration.client_id.clone();
+    // The consent URL's extra params read the app's values (validation
+    // held them to its non-secret ones).
+    let app_values = registration.to_values();
+    let extra: Vec<(&String, String)> = auth_params
+        .iter()
+        .map(|(name, template)| Ok((name, template.resolve(&app_values).map_err(AccessError::Invalid)?)))
+        .collect::<Result<_, AccessError>>()?;
 
     // The ticked permissions, with what the service asks for always (what
     // its test call reads the account by): a grant is checked against
@@ -1005,14 +1109,14 @@ pub async fn begin_oauth(
     {
         let mut q = url.query_pairs_mut();
         q.append_pair("response_type", "code");
-        q.append_pair("client_id", &client_id);
+        q.append_pair(&client_params.id, &client_id);
         q.append_pair("redirect_uri", redirect_uri);
         q.append_pair("state", &state);
         if !requested.is_empty() {
             let delim = scope_delimiter.as_deref().unwrap_or(" ");
             q.append_pair("scope", &requested.join(delim));
         }
-        for (k, v) in auth_params {
+        for (k, v) in &extra {
             q.append_pair(k, v);
         }
         if let Some(verifier) = &verifier {
@@ -1267,9 +1371,12 @@ async fn finish_connect(
         )
         .into());
     }
-    let spec = crate::spec_of(&spec_json)?;
+    // A connect in flight lives minutes and is no stored document: its
+    // recipe is the one this weft's begin wrote.
+    let spec: weft_core::AccessSpec = serde_json::from_value(spec_json)
+        .map_err(|e| anyhow::anyhow!("a connect in flight holds a recipe that does not read: {e}"))?;
     let ticked = scopes_of(&ticked_json);
-    let Acquisition::OAuth2 { token_url, captures, token_auth, .. } = &spec.acquisition else {
+    let Acquisition::OAuth2 { token_url, captures, answer, after_exchange, .. } = &spec.acquisition else {
         return Err(anyhow::anyhow!("pending connect row is not an oauth2 spec"));
     };
 
@@ -1279,35 +1386,26 @@ async fn finish_connect(
         ("code".into(), code.to_string()),
         ("redirect_uri".into(), redirect_uri),
     ];
-    let basic = place_client_auth(*token_auth, &reg, &mut params);
     if let Some(verifier) = verifier {
         params.push(("code_verifier".into(), verifier));
     }
-    let resp = token_request(token_url, &params, basic).await.map_err(sign_in_spent)?;
+    let basic = token_params(&spec, &reg, &mut params)?;
+    let resp = token_request(token_url, &params, basic, answer).await.map_err(sign_in_spent)?;
 
     let mut values: BTreeMap<String, String> = BTreeMap::new();
-    let token = resp
-        .get("access_token")
-        .and_then(Value::as_str)
-        .ok_or_else(|| AccessError::Invalid("token response carries no access_token".into()))?;
-    values.insert("token".into(), token.to_string());
-    if let Some(rt) = resp.get("refresh_token").and_then(Value::as_str) {
-        values.insert("refresh_token".into(), rt.to_string());
+    let read = read_token(answer, &resp, "the token endpoint")?;
+    // The provider's granted-scope echo, when it answers with one: the
+    // exchange's, the one answer that is about what was consented to.
+    let echo = read.scope.clone();
+    let mut expiry = store_token(read, &mut values, AnswerOf::First);
+    apply_captures(captures, &resp, &mut values, AnswerOf::First)?;
+    // A short-lived token swapped at once for the one to keep.
+    if let Some(call) = after_exchange {
+        expiry = run_token_call(&spec.service, call, &reg, &mut values, AnswerOf::First)
+            .await
+            .map_err(sign_in_spent)?;
     }
-    let expires_at = expires_at_of(&resp);
-    apply_captures(captures, &resp, &mut values)?;
-
-    // The provider's granted-scope echo, when it answers with one.
-    let echo: Option<Vec<String>> = resp
-        .get("scope")
-        .and_then(Value::as_str)
-        .map(|s| {
-            s.split([' ', ','])
-                .filter(|p| !p.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .filter(|v: &Vec<String>| !v.is_empty());
+    let life = connect_expiry(&spec, expiry, &values)?;
     if let Some(echoed) = &echo {
         if let Some(missing) = ticked.iter().find(|t| !echoed.contains(t)) {
             return Err(AccessError::Invalid(format!(
@@ -1368,150 +1466,213 @@ async fn finish_connect(
         (None, GrantCoexistence::Exclusive) => None,
         (None, GrantCoexistence::Coexisting) => project_id,
     };
-    let (grant_id, project_id, recorded_scopes) = match rotate_id {
+    let registration = Some(registration);
+    let grant = |granted: Vec<String>, project_id: Option<uuid::Uuid>| NewGrant {
+        spec: &spec,
+        registration: &registration,
+        project_id,
+        instance: instance.clone(),
+        published_by_node: None,
+        values: values.clone(),
+        granted,
+        verified,
+        platform: false,
+        door,
+        label: label.clone(),
+        identity: identity.clone(),
+        life,
+    };
+    match rotate_id {
         Some(id) => {
             // Union of scopes: an exclusive grant only ever grows, and
             // every referencing project follows the row.
-            // Guarded by service like the begin-side lookup: the rotate
-            // must never land on a row of a different provider, nor on
-            // another owner's row.
-            let prior: Option<(Value,)> = sqlx::query_as(&format!(
-                "SELECT granted_scopes FROM access_grant \
-                 WHERE id = $1 AND tenant_id = $2 AND service = $3 AND {}",
-                same_owner_sql("$4", "$5")
-            ))
-            .bind(id)
-            .bind(&tenant)
-            .bind(&service)
-            .bind(instance.as_ref().map(|m| m.as_str()))
-            .bind(project_id)
-            .fetch_optional(pool)
-            .await?;
-            let Some((prior_scopes,)) = prior else {
-                return Err(AccessError::NotFound.into());
-            };
-            let mut union = scopes_of(&prior_scopes);
+            let before = row_before(pool, &tenant, &service, id, instance.as_ref(), project_id).await?;
+            let mut union = scopes_of(&before.granted_scopes);
             for s in &granted {
                 if !union.contains(s) {
                     union.push(s.clone());
                 }
             }
-            let rotated = sqlx::query(&format!(
-                "UPDATE access_grant
-                 SET values_sealed = $3, value_names = $4, granted_scopes = $5,
-                     permissions_verified = $6, identity = $7, label = $8, door = $9,
-                     expires_at = $10, spec_json = $11, registration_sealed = $12,
-                     client_id = $13, provider_account = $14, events_recipe_hash = $15,
-                     project_id = $16, reconnects = reconnects + 1, updated_at = now()
-                 WHERE id = $1 AND tenant_id = $2 AND {}",
-                same_owner_sql("$17", "$18")
-            ))
-            .bind(id)
-            .bind(&tenant)
-            .bind(crate::seal_json(&serde_json::to_value(&values)?)?)
-            .bind(value_names_of(&values))
-            .bind(serde_json::to_value(&union)?)
-            .bind(verified)
-            .bind(&identity)
-            .bind(&label)
-            .bind(door_str(door))
-            .bind(expires_at)
-            .bind(&spec_json)
-            // Re-consent carries the current app; write it through so a
-            // later refresh uses the app this consent actually used, not
-            // the one the row was first created with.
-            .bind(crate::seal_json(&serde_json::to_value(&registration)?)?)
-            .bind(&registration.client_id)
-            .bind(provider_account_of(&spec, &values))
-            .bind(crate::resolve::events_recipe_hash(&spec.events))
-            .bind(owner_project)
-            .bind(instance.as_ref().map(|m| m.as_str()))
-            .bind(project_id)
-            .execute(pool)
-            .await?;
-            if rotated.rows_affected() != 1 {
-                return Err(AccessError::NotFound.into());
-            }
-            (id, owner_project, union)
+            rotate_grant(pool, &tenant, id, grant(union, owner_project)).await
         }
-        None => {
-            let project = owner_project;
-            // The same write path a pasted connection and a published
-            // one take. A consent is a third way a connection comes
-            // into being, and it earns nothing by spelling the column
-            // list out a third time.
-            let done = insert_grant(
-                pool,
-                &tenant,
-                NewGrant {
-                    spec: &spec,
-                    registration: &Some(registration.clone()),
-                    project_id: project,
-                    instance: instance.clone(),
-                    published_by_node: None,
-                    values: values.clone(),
-                    granted: granted.clone(),
-                    verified,
-                    platform: false,
-                    door,
-                    label: label.clone(),
-                    identity: identity.clone(),
-                    expires_at,
-                },
-            )
-            .await?;
-            (done.grant.id, project, granted)
-        }
-    };
-
-    Ok(CompletedConnect {
-        grant: GrantSummary {
-            id: grant_id,
-            service,
-            project_id,
-            owner: CredentialOwner::own(instance.clone()),
-            instance,
-            identity,
-            label,
-            scopes: recorded_scopes,
-            permissions_verified: verified,
-            door,
-            expires_at,
-            value_names: values.keys().cloned().collect(),
-            has_credential: true,
-        },
-    })
+        // The same write path a pasted connection and a published one
+        // take: a consent is a third way a connection comes into being.
+        None => insert_grant(pool, &tenant, grant(granted, owner_project)).await,
+    }
 }
 
 // ---------- Shared helpers (also used by resolve) ----------
 
-/// POST a token-endpoint form and parse the JSON answer. Loud on a
-/// non-success status AND on the Slack-style `{"ok": false}` body
-/// (Slack answers 200 for errors).
-/// Place the app's client_id + client_secret where the spec's
-/// `tokenAuth` says the token endpoint reads them: `Body` pushes them
-/// into the form params (the return is `None`), `Basic` hands them
-/// back for the request's HTTP Basic header. One helper so exchange,
-/// refresh, and client-credentials can never disagree.
-pub(crate) fn place_client_auth(
-    token_auth: weft_core::access::spec::TokenAuth,
+/// Finish a token call's form for an OAuth2 `spec`: the app's client
+/// id and secret where its `tokenAuth` says the endpoint reads them,
+/// and its `extraParams`. `Body` pushes the two into the form under
+/// the `clientParams` names (the return is `None`); `Basic` hands them
+/// back for the request's HTTP Basic header. One helper so the
+/// exchange, the refresh and client credentials can never disagree.
+pub(crate) fn token_params(
+    spec: &AccessSpec,
     reg: &BTreeMap<String, String>,
     params: &mut Vec<(String, String)>,
-) -> Option<(String, String)> {
-    match token_auth {
-        weft_core::access::spec::TokenAuth::Body => {
-            for name in ["client_id", "client_secret"] {
-                if let Some(v) = reg.get(name) {
-                    params.push((name.into(), v.clone()));
+) -> anyhow::Result<Option<(String, String)>> {
+    use weft_core::access::spec::TokenAuth;
+    let Acquisition::OAuth2 { token_auth, client_params, extra_params, .. } = &spec.acquisition else {
+        return Err(anyhow::anyhow!("token_params on a non-oauth2 spec"));
+    };
+    let basic = match token_auth {
+        TokenAuth::Body => {
+            for (stored, wire) in [("client_id", &client_params.id), ("client_secret", &client_params.secret)] {
+                if let Some(v) = reg.get(stored) {
+                    params.push((wire.clone(), v.clone()));
                 }
             }
             None
         }
-        weft_core::access::spec::TokenAuth::Basic => Some((
+        TokenAuth::Basic => Some((
             reg.get("client_id").cloned().unwrap_or_default(),
             reg.get("client_secret").cloned().unwrap_or_default(),
         )),
+    };
+    // Extra params interpolate registration values (Zoom's account_id
+    // is pasted at registration time).
+    for (name, template) in extra_params {
+        params.push((name.clone(), template.resolve(reg).map_err(AccessError::Invalid)?));
     }
+    Ok(basic)
+}
+
+/// Read a token answer with `answer`, once whoever received it has
+/// refused a refusal in it ([`token_request`], or the declared call's
+/// own check): the token, refresh token, expiry and scope echo. `from`
+/// names the endpoint in errors.
+pub(crate) fn read_token(answer: &TokenAnswer, body: &Value, from: &str) -> anyhow::Result<TokenRead> {
+    answer
+        .read(body, chrono::Utc::now())
+        .map_err(|e| AccessError::Invalid(format!("{from}: {e}")).into())
+}
+
+/// Store what a token answer gave and hand back the token's expiry:
+/// the token, and the refresh token as `of` says. The FIRST answer of a
+/// connection is its whole token set, so one carrying no refresh token
+/// leaves none (an `afterExchange` answer drops the exchange's, which
+/// belongs to the token it discarded). A RENEWAL carrying none keeps the
+/// stored one, which a provider that does not rotate leaves valid; one
+/// carrying one replaces it.
+pub(crate) fn store_token(read: TokenRead, values: &mut BTreeMap<String, String>, of: AnswerOf) -> TokenExpiry {
+    values.insert("token".into(), read.token);
+    match (read.refresh_token, of) {
+        (Some(refresh_token), _) => {
+            values.insert("refresh_token".into(), refresh_token);
+        }
+        (None, AnswerOf::First) => {
+            values.remove("refresh_token");
+        }
+        (None, AnswerOf::Renewal) => {}
+    }
+    read.expiry
+}
+
+/// Run a declared token call (`afterExchange`, a declared `refresh`)
+/// over the stored values plus the app's, store what its answer gives
+/// (as `of` says), and write its captures back. Hands back the token's
+/// expiry. The call's own reader refuses a refusal in its answer.
+pub(crate) async fn run_token_call(
+    service: &str,
+    call: &TokenCall,
+    reg: &BTreeMap<String, String>,
+    values: &mut BTreeMap<String, String>,
+    of: AnswerOf,
+) -> anyhow::Result<TokenExpiry> {
+    let mut inputs = values.clone();
+    for (k, v) in reg {
+        inputs.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    let resp = crate::run_connect_call(service, call, &inputs).await?;
+    let read = read_token(&call.answer, &resp, &call.url.0)?;
+    let expiry = store_token(read, values, of);
+    apply_captures(&call.captures, &resp, values, of)?;
+    Ok(expiry)
+}
+
+/// The two `access_grant` columns a token's life is stored in:
+/// `expires_at`, and `token_lifetime_secs`, the lifetime the provider
+/// stated, which a later renewal answer naming no usable expiry is given
+/// again ([`renewed_life`]). Both `None` for a token with no expiry.
+pub(crate) fn life_columns(life: Option<TokenLife>) -> (Option<chrono::DateTime<chrono::Utc>>, Option<i64>) {
+    (life.map(|l| l.at), life.map(|l| l.lifetime.num_seconds()))
+}
+
+/// The expiry a fresh CONNECT stores, read off the last answer (the
+/// `afterExchange` call's when there is one). A connection is renewable
+/// when it stored a refresh token, declares a renewal call, or is
+/// re-requested from client credentials, and a renewable token whose
+/// answer names no expiry would never be renewed, so the connect is
+/// refused, naming where the recipe should say the expiry is. An expiry
+/// the reader declares but the answer lacks or garbles is refused too.
+fn connect_expiry(
+    spec: &AccessSpec,
+    expiry: TokenExpiry,
+    values: &BTreeMap<String, String>,
+) -> anyhow::Result<Option<TokenLife>> {
+    let Acquisition::OAuth2 { grant, answer, after_exchange, refresh, .. } = &spec.acquisition else {
+        return Err(anyhow::anyhow!("connect_expiry on a non-oauth2 spec"));
+    };
+    let renewable = values.contains_key("refresh_token")
+        || refresh.is_some()
+        || matches!(grant, OAuthGrant::ClientCredentials);
+    let (reader, site) = match after_exchange {
+        Some(call) => (&call.answer, "acquisition.afterExchange"),
+        None => (answer, "the acquisition"),
+    };
+    match expiry {
+        TokenExpiry::At(life) => Ok(Some(life)),
+        TokenExpiry::Never => Ok(None),
+        TokenExpiry::Unknown if !renewable => Ok(None),
+        TokenExpiry::Unknown => Err(AccessError::Invalid(format!(
+            "the provider's answer names no expiry at {}, so weft would never know when to \
+             renew this connection and it would stop working without a word. If the provider \
+             sends the lifetime under another name, declare it on {site} (`expiresInPath` for \
+             seconds, `expiresPath` for a time); if the token never expires, declare \
+             `neverExpires: true` there",
+            reader.expiry_source()
+        ))
+        .into()),
+        TokenExpiry::Unreadable(why) => Err(AccessError::Invalid(format!(
+            "{why} (declared on {site}), so weft cannot know when to renew this connection"
+        ))
+        .into()),
+    }
+}
+
+/// The life a RENEWED token is stored with. An answer naming no expiry,
+/// or one that does not read (a lifetime of zero or a time already past
+/// included), lasts `lifetime` again, the one the provider stated for
+/// the connection's token before: RFC 6749 (5.1) lets a token answer
+/// leave `expires_in` out when the lifetime is documented elsewhere, and
+/// a token stored as already dead would be renewed on every use. A
+/// connection that never stored a lifetime keeps no expiry.
+pub(crate) fn renewed_life(expiry: TokenExpiry, lifetime: Option<chrono::Duration>) -> Option<TokenLife> {
+    match expiry {
+        TokenExpiry::At(life) => Some(life),
+        TokenExpiry::Never => None,
+        TokenExpiry::Unknown | TokenExpiry::Unreadable(_) => {
+            lifetime.map(|lifetime| TokenLife::lasting(chrono::Utc::now(), lifetime))
+        }
+    }
+}
+
+/// Which answer a connection's values are read from, which decides what
+/// a value the answer lacks does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnswerOf {
+    /// The first answer a connection (or a subscription) is made from:
+    /// a capture it lacks fails loudly unless `optional`, since it must
+    /// carry what the recipe promised, and a refresh token it lacks is
+    /// none ([`store_token`]).
+    First,
+    /// A renewal's answer, often slimmer than the connect's (no team,
+    /// no account): a capture or refresh token it lacks keeps the value
+    /// already stored, which stays true.
+    Renewal,
 }
 
 /// A provider not reached while finishing a sign-in, which was claimed
@@ -1526,14 +1687,16 @@ fn sign_in_spent(e: anyhow::Error) -> anyhow::Error {
 
 /// One request to a provider's token endpoint, answered as JSON. Not
 /// reached, cut off, or answered busy or down (408, 429, 5xx, or an
-/// error code saying so whatever the status, like Slack's `ratelimited`:
-/// [`RefusalKind::of_answer`]) is
-/// [`AccessError::Unreached`]; any other refusal is
-/// [`AccessError::Invalid`], which the caller names for what it is.
+/// error code saying so whatever the status: [`RefusalKind::of`])
+/// is [`AccessError::Unreached`]; any other refusal, a success-status
+/// answer refusing where `answer` says (its `errorPath` and `okPath`)
+/// included, is [`AccessError::Invalid`], which the caller names for
+/// what it is.
 pub(crate) async fn token_request(
     token_url: &str,
     params: &[(String, String)],
     basic: Option<(String, String)>,
+    answer: &TokenAnswer,
 ) -> anyhow::Result<Value> {
     let mut req = base_client()
         .post(token_url)
@@ -1549,42 +1712,35 @@ pub(crate) async fn token_request(
     let status = resp.status();
     let body = crate::read_answer(resp, "the token endpoint").await?;
     let parsed: Option<Value> = serde_json::from_str(&body).ok();
+    let paths = answer.refusal_paths();
     if !status.is_success() {
         let answered = format!("token endpoint answered {status}: {}", head_of(&body));
-        let kind = RefusalKind::of_answer(status, parsed.as_ref().unwrap_or(&Value::Null));
+        let kind = RefusalKind::of(status, paths, parsed.as_ref().unwrap_or(&Value::Null));
         return Err(crate::refusal(kind, answered, AccessError::Invalid).into());
     }
-    let json = parsed.ok_or_else(|| AccessError::Invalid(format!(
+    let parsed = parsed.ok_or_else(|| AccessError::Invalid(format!(
         "token endpoint answered non-JSON: {}",
         head_of(&body)
     )))?;
-    // A refusal answered 200: Slack's `ok: false`, or an OAuth `error`.
-    // Its code says whether the provider was only busy (Slack's
-    // `ratelimited`), which is tried again like a 429.
-    let refused = json.get("ok").and_then(Value::as_bool) == Some(false);
-    if let Some(code) = json.get("error").and_then(Value::as_str).or(refused.then_some("unknown error")) {
+    // A refusal answered with a success status, where the recipe's
+    // reader says it sits, classified by its code like any other answer
+    // (so a busy provider is tried again).
+    if let Some(why) = paths.refusal(&parsed) {
         return Err(crate::refusal(
-            RefusalKind::of_answer(status, &json),
-            format!("token endpoint refused: {code}"),
+            RefusalKind::of(status, paths, &parsed),
+            format!("the token endpoint refused: {why}"),
             AccessError::Invalid,
         )
         .into());
     }
-    Ok(json)
-}
-
-/// `expires_in` seconds -> an absolute expiry (with a safety margin
-/// applied at REFRESH time, not here).
-pub(crate) fn expires_at_of(resp: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
-    resp.get("expires_in")
-        .and_then(Value::as_i64)
-        .map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs))
+    Ok(parsed)
 }
 
 pub(crate) fn apply_captures(
     captures: &[weft_core::access::spec::Capture],
     resp: &Value,
     values: &mut BTreeMap<String, String>,
+    of: AnswerOf,
 ) -> anyhow::Result<()> {
     for c in captures {
         match lookup_path(resp, &c.path) {
@@ -1595,7 +1751,7 @@ pub(crate) fn apply_captures(
                 };
                 values.insert(c.name.clone(), s);
             }
-            None if c.optional => {}
+            None if c.optional || of == AnswerOf::Renewal => {}
             None => {
                 return Err(AccessError::Invalid(format!(
                     "the response carries nothing at '{}' (capture '{}')",
@@ -1617,7 +1773,7 @@ pub(crate) async fn run_test_call(
     values: &mut BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     let Some(test) = test else { return Ok(()) };
-    let url = test.url.resolve(values).map_err(AccessError::Invalid)?;
+    let url = test.url.resolve_url(values).map_err(AccessError::Invalid)?;
     let steps = resolve_steps(auth, values).map_err(AccessError::Invalid)?;
     let client = authed_client(steps);
     let req = match test.method {
@@ -1633,27 +1789,27 @@ pub(crate) async fn run_test_call(
             // auth (a query token, a path-prefix token).
             AccessError::Unreached(format!("test call to {} failed: {}", test.url.0, weft_core::access::client::send_error(e)))
         })?;
-    let status = resp.status().as_u16();
+    let status = resp.status();
     let body: Value = crate::read_json_answer(resp, &test.url.0).await?;
-    if status != test.expect_status {
-        return Err(AccessError::Invalid(format!(
+    let paths = test.answer.refusal_paths();
+    let refused = if status.as_u16() != test.expect_status {
+        Some(format!(
             "the credential did not pass the service's test call ({} answered {status}, \
              expected {})",
-            test.url.0,
-            test.expect_status
+            test.url.0, test.expect_status
         ))
-        .into());
+    } else {
+        // A refusal answered with the expected status, where the test
+        // call's reader says it sits.
+        paths.refusal(&body).map(|why| format!("the credential did not pass the service's test call: {why}"))
+    };
+    if let Some(why) = refused {
+        // A provider busy or down (429, 5xx, Slack's `ratelimited`)
+        // said nothing about the credential: the connect can be tried
+        // again. Any other refusal is of the credential.
+        return Err(crate::refusal(RefusalKind::of(status, paths, &body), why, AccessError::Invalid).into());
     }
-    // Slack answers 200 with ok:false for a dead token; same guard as
-    // the token endpoint.
-    if body.get("ok").and_then(Value::as_bool) == Some(false) {
-        return Err(AccessError::Invalid(format!(
-            "the credential did not pass the service's test call: {}",
-            body.get("error").and_then(Value::as_str).unwrap_or("unknown error")
-        ))
-        .into());
-    }
-    apply_captures(&test.captures, &body, values)
+    apply_captures(&test.captures, &body, values, AnswerOf::First)
 }
 
 pub(crate) fn resolve_identity(
@@ -1693,30 +1849,147 @@ mod tests {
     /// tried again; any other refusal is of the request.
     #[tokio::test]
     async fn a_token_endpoint_busy_or_down_is_not_reached_and_a_refusal_is_invalid() {
+        let oauth = TokenAnswer::default();
         for status in [408, 429, 500, 502, 503] {
-            let err = token_request(&token_endpoint(status, "busy").await, &[], None).await.unwrap_err();
+            let err = token_request(&token_endpoint(status, "busy").await, &[], None, &oauth).await.unwrap_err();
             assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Unreached(_))), "{status}: {err:#}");
         }
         for status in [400, 401, 403, 404] {
-            let err = token_request(&token_endpoint(status, r#"{"error":"invalid_grant"}"#).await, &[], None).await.unwrap_err();
+            let err = token_request(&token_endpoint(status, r#"{"error":"invalid_grant"}"#).await, &[], None, &oauth).await.unwrap_err();
             assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Invalid(_))), "{status}: {err:#}");
         }
-        // A refusal answered 200 is read by its code: busy is tried again,
-        // anything else is of the request.
-        for body in [r#"{"ok":false,"error":"ratelimited"}"#, r#"{"error":"temporarily_unavailable"}"#] {
-            let err = token_request(&token_endpoint(200, body).await, &[], None).await.unwrap_err();
+        // A refusal answered 200 is seen where the reader says, and read
+        // by its code: busy is tried again, anything else is of the
+        // request. Slack's reader declares its success flag.
+        let slack: TokenAnswer = serde_json::from_value(serde_json::json!({ "okPath": "ok" })).unwrap();
+        let instagram: TokenAnswer = serde_json::from_value(serde_json::json!({ "errorPath": "error_type" })).unwrap();
+        let refused_200 = |reader: TokenAnswer, body: &'static str| async move {
+            token_request(&token_endpoint(200, body).await, &[], None, &reader).await.unwrap_err()
+        };
+        for (reader, body) in [
+            (slack.clone(), r#"{"ok":false,"error":"ratelimited"}"#),
+            (oauth.clone(), r#"{"error":"temporarily_unavailable"}"#),
+            (instagram.clone(), r#"{"error_type":"temporarily_unavailable"}"#),
+        ] {
+            let err = refused_200(reader, body).await;
             assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Unreached(_))), "{body}: {err:#}");
         }
-        for body in [r#"{"ok":false,"error":"invalid_auth"}"#, r#"{"ok":false}"#, r#"{"error":"invalid_grant"}"#] {
-            let err = token_request(&token_endpoint(200, body).await, &[], None).await.unwrap_err();
+        for (reader, body) in [
+            (slack.clone(), r#"{"ok":false,"error":"invalid_auth"}"#),
+            (slack.clone(), r#"{"ok":false}"#),
+            (oauth.clone(), r#"{"error":"invalid_grant"}"#),
+            (oauth.clone(), r#"{"error":{"message":"bad code","type":"OAuthException"}}"#),
+            (instagram.clone(), r#"{"error_type":"OAuthException","error":"ratelimited"}"#),
+        ] {
+            let err = refused_200(reader, body).await;
             assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Invalid(_))), "{body}: {err:#}");
         }
+        assert!(refused_200(oauth.clone(), r#"{"error":{"message":"bad code"}}"#).await.to_string().contains("bad code"));
+        // A success flag nobody declared is just data.
+        let ok = token_request(&token_endpoint(200, r#"{"ok":false,"access_token":"t"}"#).await, &[], None, &oauth).await.unwrap();
+        assert_eq!(ok["access_token"], "t");
         // Nothing listens on the port once its listener is dropped.
         let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
-        let err = token_request(&format!("http://{closed}/token"), &[], None).await.unwrap_err();
+        let err = token_request(&format!("http://{closed}/token"), &[], None, &oauth).await.unwrap_err();
         assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Unreached(_))), "{err:#}");
-        let ok = token_request(&token_endpoint(200, r#"{"access_token":"t"}"#).await, &[], None).await.unwrap();
+        let ok = token_request(&token_endpoint(200, r#"{"access_token":"t"}"#).await, &[], None, &oauth).await.unwrap();
         assert_eq!(ok["access_token"], "t");
+    }
+
+    /// A test call the provider answers busy or down (429, 5xx, or a 200
+    /// whose code says so, Slack's `ratelimited`) refused nothing about
+    /// the credential, so it is answered as not reached; a refusal of
+    /// the credential stays invalid.
+    #[tokio::test]
+    async fn a_test_call_busy_or_down_is_not_reached_and_a_refusal_is_invalid() {
+        let test = |url: String, reader: serde_json::Value| -> TestCall {
+            let mut raw = serde_json::json!({ "url": url, "method": "POST" });
+            raw.as_object_mut().unwrap().extend(reader.as_object().unwrap().clone());
+            serde_json::from_value(raw).unwrap()
+        };
+        let slack = serde_json::json!({ "okPath": "ok", "errorPath": "error" });
+        let run = |call: TestCall| async move { run_test_call(Some(&call), &[], &mut BTreeMap::new()).await };
+        for status in [429, 500, 503] {
+            let err = run(test(token_endpoint(status, "busy").await, serde_json::json!({}))).await.unwrap_err();
+            assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Unreached(_))), "{status}: {err:#}");
+        }
+        let err = run(test(token_endpoint(200, r#"{"ok":false,"error":"ratelimited"}"#).await, slack.clone()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Unreached(_))), "{err:#}");
+        for (status, body) in [(401, "{}"), (200, r#"{"ok":false,"error":"invalid_auth"}"#)] {
+            let err = run(test(token_endpoint(status, body).await, slack.clone())).await.unwrap_err();
+            assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Invalid(_))), "{status} {body}: {err:#}");
+        }
+        run(test(token_endpoint(200, r#"{"ok":true}"#).await, slack)).await.expect("a passing test call");
+    }
+
+    /// A renewal answer naming no expiry, or one that does not read,
+    /// lasts the lifetime the connection last had, so it is never stored
+    /// as already dead; a connection that never stored one keeps none.
+    #[test]
+    fn a_renewal_naming_no_usable_expiry_reuses_the_known_lifetime() {
+        let hour = chrono::Duration::hours(1);
+        for expiry in [TokenExpiry::Unknown, TokenExpiry::Unreadable("garbled".into())] {
+            let life = renewed_life(expiry, Some(hour)).expect("an expiry");
+            assert_eq!(life.lifetime, hour, "the stated lifetime is kept whole, never re-measured");
+            let off = (life.at - (chrono::Utc::now() + hour)).num_seconds().abs();
+            assert!(off <= 2, "{}", life.at);
+        }
+        assert_eq!(renewed_life(TokenExpiry::Unknown, None), None);
+        assert_eq!(renewed_life(TokenExpiry::Never, Some(hour)), None);
+        let stated = TokenLife::lasting(chrono::Utc::now(), chrono::Duration::seconds(60));
+        assert_eq!(renewed_life(TokenExpiry::At(stated), Some(hour)), Some(stated));
+        assert_eq!(life_columns(Some(stated)), (Some(stated.at), Some(60)), "the stored lifetime is the stated one");
+        assert_eq!(life_columns(None), (None, None));
+    }
+
+    /// A connect refuses a renewable token whose answer names no expiry
+    /// (nothing would ever renew it), naming where to declare one, and an
+    /// expiry that does not read; a token nothing renews lasts.
+    #[test]
+    fn a_connect_refuses_a_renewable_token_with_no_known_expiry() {
+        let spec: AccessSpec = serde_json::from_value(serde_json::json!({
+            "service": "fakeoauth",
+            "acquisition": {
+                "kind": "oauth2",
+                "grant": { "kind": "authorization_code", "authUrl": "https://p/auth" },
+                "tokenUrl": "https://p/token"
+            },
+            "auth": [{ "kind": "header", "name": "Authorization", "value": "Bearer {token}" }],
+        }))
+        .expect("spec parses");
+        let renewable = BTreeMap::from([("refresh_token".to_string(), "r".to_string())]);
+        let err = connect_expiry(&spec, TokenExpiry::Unknown, &renewable).unwrap_err().to_string();
+        assert!(err.contains("expiresInPath") && err.contains("neverExpires"), "{err}");
+        let err = connect_expiry(&spec, TokenExpiry::Unreadable("garbled".into()), &renewable).unwrap_err().to_string();
+        assert!(err.contains("garbled"), "{err}");
+        assert_eq!(connect_expiry(&spec, TokenExpiry::Unknown, &BTreeMap::new()).unwrap(), None);
+        assert_eq!(connect_expiry(&spec, TokenExpiry::Never, &renewable).unwrap(), None);
+    }
+
+    /// The first answer is the connection's whole token set: no refresh
+    /// token in it leaves none (an `afterExchange` answer drops the
+    /// exchange's); a renewal without one keeps the stored one.
+    #[test]
+    fn a_first_answer_replaces_the_refresh_token_and_a_renewal_keeps_it() {
+        let read = |refresh: Option<&str>| TokenRead {
+            token: "t2".into(),
+            refresh_token: refresh.map(str::to_string),
+            expiry: TokenExpiry::Unknown,
+            scope: None,
+        };
+        let stored = || BTreeMap::from([("token".to_string(), "t1".to_string()), ("refresh_token".to_string(), "r1".to_string())]);
+        let mut values = stored();
+        store_token(read(None), &mut values, AnswerOf::First);
+        assert_eq!(values.get("refresh_token"), None, "the exchange's refresh token belonged to the discarded token");
+        assert_eq!(values["token"], "t2");
+        let mut values = stored();
+        store_token(read(None), &mut values, AnswerOf::Renewal);
+        assert_eq!(values["refresh_token"], "r1");
+        let mut values = stored();
+        store_token(read(Some("r2")), &mut values, AnswerOf::Renewal);
+        assert_eq!(values["refresh_token"], "r2");
     }
 
     /// A chooser gets the raw token, so only the caller's own
@@ -1753,6 +2026,27 @@ mod tests {
 
     fn values(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// A connection left unnamed is named after its app, else its
+    /// service, so no list ever shows a nameless row a person made.
+    #[test]
+    fn an_unnamed_connection_is_named_after_its_app_else_its_service() {
+        let spec: AccessSpec = serde_json::from_value(serde_json::json!({
+            "service": "firecrawl",
+            "label": "Firecrawl",
+            "acquisition": { "kind": "static", "fields": [{ "name": "api_key" }] },
+        }))
+        .expect("a static spec");
+        let app = Some(AppRegistration {
+            label: "Acme app".into(),
+            client_id: "id".into(),
+            client_secret: None,
+            extra: BTreeMap::new(),
+        });
+        assert_eq!(connection_name(Some(" acme-scraper ".into()), &app, &spec), "acme-scraper");
+        assert_eq!(connection_name(Some("  ".into()), &app, &spec), "Acme app");
+        assert_eq!(connection_name(None, &None, &spec), "Firecrawl");
     }
 
     /// The gate every set of values a person or a node supplied
@@ -1917,7 +2211,7 @@ async fn publish_grant_in(
     let values = storable_values(&spec, fields, values)?;
     let identity = resolve_identity(&spec, &values)?;
     let current: Option<Published> = sqlx::query_as(
-        "SELECT id, spec_json, values_sealed, label, identity FROM access_grant
+        "SELECT id, spec_json, spec_json_version, values_sealed, label, identity FROM access_grant
          WHERE tenant_id = $1 AND project_id = $2 AND published_by_node = $3
            AND service = $4 AND instance_id IS NOT DISTINCT FROM $5",
     )
@@ -1933,7 +2227,8 @@ async fn publish_grant_in(
         // stores no app, no scopes and no expiry), so equal ones mean an
         // equal row. Stored values that no longer open are not equal to
         // anything: the publish writes the row over them.
-        let unchanged = current.spec_json == serde_json::to_value(&spec)?
+        let unchanged = current.spec_json_version == weft_core::AccessSpec::STORED.version()
+            && current.spec_json == serde_json::to_value(&spec)?
             && crate::open_json(&current.values_sealed).is_ok_and(|stored| crate::values_of(&stored) == values)
             && current.label == label
             && current.identity == identity;
@@ -1957,7 +2252,7 @@ async fn publish_grant_in(
             door: Door::Own,
             label,
             identity,
-            expires_at: None,
+            life: None,
         },
     )
     .await?;
@@ -1996,8 +2291,8 @@ pub async fn write_pushed_values(
         return Err(AccessError::Invalid(format!("{node_id} has no baked output '{stray}', so the value its infrastructure sent for it has nowhere to go")).into());
     }
     if !values.connection.is_empty() {
-        let published: Vec<(Value, String, Option<String>, String)> = sqlx::query_as(
-            "SELECT g.spec_json, g.values_sealed, g.label, g.tenant_id FROM access_grant g JOIN project p ON p.tenant_id = g.tenant_id \
+        let published: Vec<(Value, weft_core::stored::Version, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT g.spec_json, g.spec_json_version, g.values_sealed, g.label, g.tenant_id FROM access_grant g JOIN project p ON p.tenant_id = g.tenant_id \
              WHERE p.id = $1 AND g.project_id = $1 AND g.published_by_node = $2 AND g.instance_id IS NOT DISTINCT FROM $3",
         )
         .bind(project_id)
@@ -2005,7 +2300,7 @@ pub async fn write_pushed_values(
         .bind(&instance_id)
         .fetch_all(&mut *tx)
         .await?;
-        let (spec, sealed, label, tenant) = match published.as_slice() {
+        let (spec, version, sealed, label, tenant) = match published.as_slice() {
             [one] => one,
             [] => return Err(AccessError::Invalid(format!("{node_id} has published no connection, so the connection values its infrastructure sent have nowhere to go")).into()),
             _ => return Err(AccessError::Invalid(format!("{node_id} published several connections, so the connection values its infrastructure sent name none of them")).into()),
@@ -2019,11 +2314,12 @@ pub async fn write_pushed_values(
             .into());
         }
         stored.extend(values.connection.clone());
+        let spec = crate::spec_of(format_args!("the connection {node_id} published"), spec.clone(), *version)?;
         publish_grant_in(
             &mut tx,
             tenant,
             PublishAccess {
-                spec: crate::spec_of(spec)?,
+                spec,
                 project_id,
                 node_id: node_id.clone(),
                 instance: instance_id.map(weft_core::instance::InstanceId::new).transpose().map_err(anyhow::Error::msg)?,
@@ -2050,6 +2346,7 @@ pub async fn write_pushed_values(
 struct Published {
     id: uuid::Uuid,
     spec_json: Value,
+    spec_json_version: weft_core::stored::Version,
     values_sealed: String,
     label: Option<String>,
     identity: Option<String>,

@@ -26,12 +26,13 @@ pub struct ActivationLifecycle {
     pub accepting_fires: bool,
     pub fires_visible_to_consumers: bool,
     pub fires_deadline_unix: Option<i64>,
-    /// Why the CURRENT take-down happened, when it was the infra in the
-    /// trigger's cut going down rather than a person: the health loop
-    /// taking it down because a copy broke, or an infra verb (stop,
-    /// terminate, upgrade) taking it down with its copies. The copy coming
-    /// back brings it back (the health loop's auto-recover, an infra
-    /// start); one a person took down stays down until they switch it on.
+    /// Why the CURRENT take-down happened, when it was not a person: the
+    /// health loop taking it down because a copy broke, an infra verb
+    /// (stop, terminate, upgrade) taking it down with its copies, or the
+    /// install going into maintenance. What took it down coming back
+    /// brings it back (the health loop's auto-recover, an infra start, the
+    /// maintenance lift); one a person took down stays down until they
+    /// switch it on.
     pub went_down: Option<WentDown>,
     /// The trigger-setup run of the activation in flight, reserved before
     /// setup is queued; every write the activation makes is guarded by it.
@@ -177,6 +178,7 @@ fn same_cause(lifecycles: &[&ActivationLifecycle]) -> Option<WentDown> {
         went = match (went, lifecycle.went_down?) {
             (WentDown::Health, WentDown::Health) => WentDown::Health,
             (WentDown::Infra { first_command: a }, WentDown::Infra { first_command: b }) => WentDown::Infra { first_command: a.min(b) },
+            (WentDown::Maintenance, WentDown::Maintenance) => WentDown::Maintenance,
             _ => return None,
         };
     }
@@ -194,6 +196,9 @@ pub enum WentDown {
     /// `first_command`: what ended or came back after that command is
     /// what brings it back, so nothing older can.
     Infra { first_command: i64 },
+    /// `weft maintenance on` took it down with everything else on the
+    /// install: the maintenance lift brings it back.
+    Maintenance,
 }
 
 impl WentDown {
@@ -201,13 +206,14 @@ impl WentDown {
         match self {
             WentDown::Health => DownWith::Health,
             WentDown::Infra { .. } => DownWith::Infra,
+            WentDown::Maintenance => DownWith::Maintenance,
         }
     }
 
     /// The command its mark names, for an infra take-down.
     pub fn first_command(self) -> Option<i64> {
         match self {
-            WentDown::Health => None,
+            WentDown::Health | WentDown::Maintenance => None,
             WentDown::Infra { first_command } => Some(first_command),
         }
     }
@@ -218,6 +224,7 @@ impl WentDown {
             (None, None) => Ok(None),
             (Some((_, Some(DownWith::Health))), None) => Ok(Some(WentDown::Health)),
             (Some((_, Some(DownWith::Infra))), Some(first_command)) => Ok(Some(WentDown::Infra { first_command })),
+            (Some((_, Some(DownWith::Maintenance))), None) => Ok(Some(WentDown::Maintenance)),
             (Some((spelling, None)), _) => Err(format!("unknown trigger_activation.went_down_with '{spelling}'")),
             (with, command) => Err(format!(
                 "trigger_activation.went_down_with={:?} and went_down_by_command={command:?} disagree: an infra take-down names its command, nothing else does",
@@ -292,10 +299,11 @@ mod tests {
         assert_eq!(WentDown::of_columns(None, None), Ok(None));
         assert_eq!(WentDown::of_columns(Some("health"), None), Ok(Some(WentDown::Health)));
         assert_eq!(WentDown::of_columns(Some("infra"), Some(7)), Ok(Some(WentDown::Infra { first_command: 7 })));
-        for (with, command) in [(Some("infra"), None), (Some("health"), Some(7)), (None, Some(7)), (Some("flood"), None)] {
+        assert_eq!(WentDown::of_columns(Some("maintenance"), None), Ok(Some(WentDown::Maintenance)));
+        for (with, command) in [(Some("infra"), None), (Some("health"), Some(7)), (Some("maintenance"), Some(7)), (None, Some(7)), (Some("flood"), None)] {
             assert!(WentDown::of_columns(with, command).is_err(), "{with:?} {command:?}");
         }
-        for went in [WentDown::Health, WentDown::Infra { first_command: 3 }] {
+        for went in [WentDown::Health, WentDown::Infra { first_command: 3 }, WentDown::Maintenance] {
             assert_eq!(DownWith::parse(went.with().as_str()), Some(went.with()));
         }
     }
@@ -311,5 +319,8 @@ mod tests {
         assert_eq!(aggregate(&[marked(Some(WentDown::Health)), marked(Some(WentDown::Health))]).went_down, Some(WentDown::Health));
         assert_eq!(aggregate(&[infra(4), marked(Some(WentDown::Health))]).went_down, None);
         assert_eq!(aggregate(&[infra(4), marked(None)]).went_down, None);
+        let maintenance = || marked(Some(WentDown::Maintenance));
+        assert_eq!(aggregate(&[maintenance(), maintenance()]).went_down, Some(WentDown::Maintenance));
+        assert_eq!(aggregate(&[maintenance(), infra(4)]).went_down, None);
     }
 }

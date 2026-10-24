@@ -76,8 +76,7 @@ impl HttpCore {
     /// wrappers.
     fn parse_success<Res: for<'de> serde::Deserialize<'de>>(answer: Answer, path: &str) -> Result<Res> {
         if !answer.status.is_success() {
-            let body = String::from_utf8_lossy(&answer.body).into_owned();
-            return Err(BrokerRefused { path: path.to_string(), status: answer.status, body }.into());
+            return Err(refusal(path, &answer));
         }
         serde_json::from_slice(&answer.body).with_context(|| format!("parse {path}"))
     }
@@ -130,6 +129,31 @@ pub struct BrokerRefused {
     pub path: String,
     pub status: reqwest::StatusCode,
     pub body: String,
+}
+
+/// A non-2xx answer to `path`, typed: [`WorkerOutdated`] when the broker
+/// could not read the call's shape, [`BrokerRefused`] for every other
+/// status. Every client below builds its refusals here.
+pub fn refusal(path: &str, answer: &Answer) -> anyhow::Error {
+    let body = String::from_utf8_lossy(&answer.body).into_owned();
+    match answer.status {
+        UNREADABLE_SHAPE => WorkerOutdated { path: path.to_string(), said: body }.into(),
+        status => BrokerRefused { path: path.to_string(), status, body }.into(),
+    }
+}
+
+/// The broker could not read a call this worker sent ([`UNREADABLE_SHAPE`]):
+/// the broker runs a newer weft than the one that built this worker's
+/// program, and the project has to be resynced before the call can work.
+/// Asking again repeats the same answer.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "this worker was built by an older weft than the one running now, and the broker cannot read its call to {path}: \
+     run `weft resync` on this project to rebuild it (the broker said: {said})"
+)]
+pub struct WorkerOutdated {
+    pub path: String,
+    pub said: String,
 }
 
 impl BrokerRefused {
@@ -300,14 +324,7 @@ impl RecordClient for BrokerRecordClient {
             return serde_json::from_slice(&answer.body)
                 .map_err(|e| BatchError::Refused(format!("the broker's answer to a batch does not read: {e}")));
         }
-        let refused = BrokerRefused {
-            path: JOURNAL_RECORD_PATH.to_string(),
-            status: answer.status,
-            body: String::from_utf8_lossy(&answer.body).into_owned(),
-        };
-        // An outage answered nothing about the batch; any other status is
-        // the broker's answer to it, which sending it again repeats.
-        Err(if refused.is_outage() { BatchError::Unanswered(refused.into()) } else { BatchError::Refused(refused.to_string()) })
+        Err(batch_refusal(JOURNAL_RECORD_PATH, &answer))
     }
 
     async fn record_of(&self, run_id: RunId) -> Result<weft_journal::record::RawRecord> {
@@ -327,8 +344,18 @@ impl RecordClient for BrokerRecordClient {
         if answer.status.is_success() {
             return Ok(());
         }
-        let refused = BrokerRefused { path: path.to_string(), status: answer.status, body: String::from_utf8_lossy(&answer.body).into_owned() };
-        Err(if refused.is_outage() { BatchError::Unanswered(refused.into()) } else { BatchError::Refused(refused.to_string()) })
+        Err(batch_refusal(path, &answer))
+    }
+}
+
+/// A non-2xx answer to a call about a run's record, as the writer lanes
+/// read it: an outage answered nothing about it; any other status is the
+/// broker's answer to it, which sending it again repeats.
+fn batch_refusal(path: &str, answer: &Answer) -> BatchError {
+    let refused = refusal(path, answer);
+    match refused.downcast_ref::<BrokerRefused>().is_some_and(BrokerRefused::is_outage) {
+        true => BatchError::Unanswered(refused),
+        false => BatchError::Refused(refused.to_string()),
     }
 }
 
@@ -1211,5 +1238,38 @@ mod read_retry_tests {
         .await;
         assert!(answer.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    fn answer(status: reqwest::StatusCode, body: &str) -> Answer {
+        Answer { status, body: body.as_bytes().to_vec() }
+    }
+
+    /// The broker's answer to a call it cannot read is one error, saying
+    /// the project needs a resync, on every client and at any depth of
+    /// context; it is not an outage, so nothing waits it out.
+    #[test]
+    fn a_call_the_broker_cannot_read_says_the_project_needs_a_resync() {
+        let said = unreadable_shape("/v1/caller/verify: invalid type: map, expected a sequence");
+        let e = refusal("/v1/caller/verify", &answer(UNREADABLE_SHAPE, &said)).context("verify a caller");
+        let typed = e.chain().find_map(|cause| cause.downcast_ref::<WorkerOutdated>()).expect("the typed error");
+        assert_eq!(typed.path, "/v1/caller/verify");
+        assert!(format!("{e:#}").contains("run `weft resync` on this project"), "{e:#}");
+        assert!(!broker_unavailable(&e));
+        assert!(refusal("/v1/caller/verify", &answer(reqwest::StatusCode::BAD_REQUEST, "no")).downcast_ref::<WorkerOutdated>().is_none());
+    }
+
+    /// A writer lane's batch the broker cannot read fails its runs with
+    /// the same words, never as an outage to send again.
+    #[test]
+    fn a_batch_the_broker_cannot_read_is_refused_with_the_resync() {
+        match batch_refusal(JOURNAL_RECORD_PATH, &answer(UNREADABLE_SHAPE, &unreadable_shape("x"))) {
+            BatchError::Refused(why) => assert!(why.contains("`weft resync`"), "{why}"),
+            other => panic!("refused, got {other:?}"),
+        }
     }
 }

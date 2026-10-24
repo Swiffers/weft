@@ -206,7 +206,7 @@ async fn infra_start(
     }
     // Up to the setup run being journaled, here; the rest of the sync runs
     // on after the answer. A start never takes a run down.
-    let begun = match crate::api::infra::begin_sync(state, project_id, &Default::default(), instance, &[node.to_string()], instance.is_none())
+    let begun = match crate::api::infra::begin_sync(state, project_id, &Default::default(), instance, &[node.to_string()], instance.is_none(), crate::api::infra::SyncKind::Start)
         .await
         .map_err(|refused| refused.into_parts())
     {

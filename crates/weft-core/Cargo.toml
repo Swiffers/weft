@@ -25,6 +25,11 @@ sha2 = { workspace = true }
 # a typo'd extractor fails the node's metadata parse, not a later paste.
 regex = { workspace = true }
 fancy-regex = { workspace = true }
+# URL parsing, in the pure layer too: a push recipe's jwksUrl is checked
+# (`access::events::check_jwks_url`) wherever recipes load, the compiler
+# included; at run time, the URL surgery of the personal-access auth
+# pipeline (`access::client`).
+url = { workspace = true }
 # Runtime-only deps, gated behind the `runtime` feature (default on). The
 # language TYPE layer (project/node/weft_type/...) that the compiler's
 # parse+validate path needs does NOT use any of these, so a parse-only consumer
@@ -61,9 +66,6 @@ reqwest-middleware = { workspace = true, optional = true }
 # The plain outbound HTTP capability (`ctx.http()`): the one shared, pooled
 # client for unpaid calls, so nodes never construct their own.
 reqwest = { workspace = true, optional = true }
-# The personal-access auth pipeline (`access::client`): URL surgery for
-# query/path transforms, and the middleware's Extensions type.
-url = { workspace = true, optional = true }
 # Byte-exact percent decoding for the node-test rig's canonical query
 # keys (the URL stack's pair parser decodes lossily to UTF-8, which
 # would merge distinct binary tokens), and for the RFC 5987 filename a
@@ -75,6 +77,9 @@ http = { version = "1", optional = true }
 # engine, node code handing a connected stream to a protocol library).
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
+# The broker's one reader of the JSON its callers send, as an axum
+# extractor (`wire_shape::Json`): under `server` only.
+axum = { workspace = true, optional = true }
 # The workspace-wide feature union (`.config/hakari.toml`), under `runtime`
 # so the parse-only shape stays free of tokio and the rest.
 weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack", optional = true }
@@ -99,13 +104,14 @@ runtime = [
     "dep:p256",
     "dep:reqwest-middleware",
     "dep:reqwest",
-    "dep:url",
     "dep:http",
     "dep:tokio-rustls",
     "dep:rustls-native-certs",
     "dep:lru",
     "dep:weft-workspace-hack",
 ]
+# The broker: the JSON and query extractors of `wire_shape`.
+server = ["runtime", "dep:axum"]
 # Ships the hand-rolled fakes colocated with their traits (currently
 # `caller::FakeCallerConnection`) so downstream crates can wire them into
 # layer-3 tests. Off by default; consumers enable it in `[dev-dependencies]`.

@@ -46,6 +46,19 @@ impl CallbackAddress {
     }
 }
 
+/// The steps a stored [`AccessSpec`] (a connection's snapshot of its
+/// recipe, a program's published or instance service) takes from the
+/// shape an older weft wrote; `crate::stored` says how they run.
+pub const ACCESS_SPEC_UPGRADES: &[&[crate::stored::Op]] = &[ACCESS_SPEC_V2];
+
+/// Version 2: a route gate's scheme and every push recipe's scheme moved
+/// to the shape where the signature and the timestamp are each a place in
+/// the request (`crate::access::events::verify_to_v2`).
+pub const ACCESS_SPEC_V2: &[crate::stored::Op] = &[
+    crate::stored::Op::Code { at: "verify", run: crate::access::events::verify_to_v2 },
+    crate::stored::Op::Within { at: "events", ops: crate::access::events::EVENTS_V2 },
+];
+
 /// The recipe for one service's personal accesses: how a grant is
 /// acquired, how a request through it is authenticated, and how grants
 /// coexist across projects.
@@ -597,13 +610,22 @@ pub enum Acquisition {
         /// default is a space; Slack-class providers use a comma.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope_delimiter: Option<String>,
+        /// The parameter names the app's client id and secret travel
+        /// under, on the consent URL and on every token call that
+        /// carries them in its form. OAuth's `client_id` and
+        /// `client_secret` by default; TikTok's `client_key`. Only the
+        /// WIRE name changes: the stored values keep their names.
+        #[serde(default, skip_serializing_if = "ClientParams::is_default")]
+        client_params: ClientParams,
         /// Extra CONSENT-URL params (Google's `access_type=offline` +
-        /// `prompt=consent` for a refresh token). Plain strings; the
-        /// consent URL has no stored values to interpolate.
+        /// `prompt=consent` for a refresh token). Templates over the
+        /// app's non-secret registration values (the consent URL is
+        /// shown in the browser, so a secret never rides it).
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        auth_params: BTreeMap<String, String>,
-        /// Extra token-request params some providers demand (Zoom S2S
-        /// `account_id`, audience params). Values are templates over
+        auth_params: BTreeMap<String, Template>,
+        /// Extra params some providers demand on EVERY token call
+        /// (exchange, refresh, client credentials): Zoom S2S
+        /// `account_id`, audience params. Values are templates over
         /// registration values.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extra_params: BTreeMap<String, Template>,
@@ -617,23 +639,38 @@ pub enum Acquisition {
         /// How the token endpoint authenticates the CLIENT, on every
         /// token call (exchange, refresh, client credentials). `Body`
         /// (the RFC's form-field option, the wider-supported default)
-        /// sends client_id + client_secret as form fields; `Basic`
+        /// sends the id and secret as form fields (named by
+        /// `clientParams`); `Basic`
         /// sends them as HTTP Basic, for providers that ignore body
         /// credentials (Notion, Airtable).
         #[serde(default)]
         token_auth: TokenAuth,
+        /// Where the token endpoint's answer keeps what weft stores
+        /// (the token, the refresh token, the expiry, the granted
+        /// scopes, a refusal), for the exchange, the standard refresh
+        /// and client credentials. Flat on the acquisition.
+        #[serde(flatten)]
+        answer: TokenAnswer,
+        /// One call run right after the code exchange, for providers
+        /// whose exchange hands out a short-lived token that must be
+        /// swapped at once (Instagram's long-lived token). Templated
+        /// over the values the exchange just stored plus the app's
+        /// registration values; its answer, read with its own reader,
+        /// replaces the whole token set: the token, its expiry, and
+        /// the refresh token (the one it carries, or none: a refresh
+        /// token from the exchange belongs to the discarded token).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_exchange: Option<Box<TokenCall>>,
         /// How a stale grant is RENEWED, for providers whose renewal
         /// is not the standard refresh-token POST (Meta's long-lived
-        /// token exchange: a GET interpolating the current token).
-        /// A declared authenticated call, run at refresh time over
-        /// the stored values plus the app's registration values; its
-        /// captures write back like any acquisition's (capture the
-        /// fresh credential under the name the auth steps
-        /// interpolate), and a top-level `expires_in` in the answer
-        /// sets the next expiry. Absent = the standard renewal for
-        /// the grant kind (refresh_token / re-request).
+        /// token GET interpolating the current token). Run at refresh
+        /// time over the stored values plus the app's registration
+        /// values; its answer, read with its own reader, replaces the
+        /// token and sets the next expiry, and its captures write
+        /// back. Absent = the standard renewal for the grant kind
+        /// (refresh_token / re-request).
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        refresh: Option<ConnectCall>,
+        refresh: Option<Box<TokenCall>>,
     },
     /// The runtime supplies the credential at call time: nothing is
     /// stored on the connection, nothing is validated at connect, and
@@ -680,6 +717,464 @@ pub enum TokenAuth {
     Basic,
 }
 
+/// The parameter names an app's client id and secret are sent under;
+/// see the `clientParams` field on [`Acquisition::OAuth2`]. The keys
+/// are weft's, the values the provider's spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientParams {
+    #[serde(default = "default_client_id_param")]
+    pub id: String,
+    #[serde(default = "default_client_secret_param")]
+    pub secret: String,
+}
+
+fn default_client_id_param() -> String {
+    "client_id".into()
+}
+
+fn default_client_secret_param() -> String {
+    "client_secret".into()
+}
+
+impl Default for ClientParams {
+    fn default() -> Self {
+        Self { id: default_client_id_param(), secret: default_client_secret_param() }
+    }
+}
+
+impl ClientParams {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for (key, name) in [("id", &self.id), ("secret", &self.secret)] {
+            if !is_param_name(name) {
+                return Err(format!(
+                    "clientParams.{key} '{name}' is not a usable parameter name"
+                ));
+            }
+        }
+        if self.id == self.secret {
+            return Err(format!(
+                "clientParams sends the client id and the secret under the same name '{}'",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A name usable as a query or form parameter: printable, and none of
+/// the characters that would split it (`&`, `=`, `#`).
+fn is_param_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| b.is_ascii_graphic() && !matches!(b, b'&' | b'=' | b'#'))
+}
+
+/// Where a token answer keeps what weft stores from it. Every token
+/// call reads its answer through one of these: the OAuth2 exchange,
+/// refresh and client credentials (the acquisition's own), a declared
+/// [`TokenCall`] (its own), and a minted JWT's exchange. Every field
+/// is a dotted path ([`lookup_path`]); unset takes the OAuth answer's
+/// standard name, so a provider that answers the RFC way declares
+/// nothing. (The editor's acquisition wire passes unknown keys
+/// through, so this, [`ClientParams`] and [`TokenCall`] need no
+/// frontend mirror.)
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TokenAnswer {
+    /// The token, stored as `token`. Default `access_token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_path: Option<String>,
+    /// The refresh token, stored as `refresh_token` when present.
+    /// Default `refresh_token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token_path: Option<String>,
+    /// The token's lifetime in seconds from now, a number or a string
+    /// of digits. Default `expires_in`, unless `expiresPath` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_path: Option<String>,
+    /// The token's absolute expiry instead: an RFC 3339 time or epoch
+    /// seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_path: Option<String>,
+    /// The token does not expire: no expiry is read, and nothing ever
+    /// refreshes it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub never_expires: bool,
+    /// The granted-scope echo: a string split on spaces and commas, or
+    /// a list of strings. Default `scope`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_path: Option<String>,
+    /// A refusal answered with a success status: anything there but
+    /// `null`, `false` or an empty string refuses the answer (an
+    /// OAuth `error` code, or an error object). Default `error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_path: Option<String>,
+    /// A success flag: anything there but `true` or `null` refuses the
+    /// answer (Slack's `ok`). Nothing there, or no path declared, passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok_path: Option<String>,
+}
+
+/// When a token read off an answer stops working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenExpiry {
+    At(TokenLife),
+    /// The reader declares `neverExpires`.
+    Never,
+    /// The answer carries nothing where the reader looks.
+    Unknown,
+    /// The answer carries no expiry where the reader declares one, or
+    /// one that is not a time; the reason names the path. The token and
+    /// the refresh token are read all the same: the provider issued
+    /// them, and a rotating provider has already spent the old ones.
+    Unreadable(String),
+}
+
+/// A token's end and the lifetime it was issued with, both as the
+/// provider stated them. The lifetime is the answer's `expires_in` when
+/// it gave one; for an absolute expiry it is that time less the moment
+/// the answer arrived, measured once there. Never re-measured later: a
+/// lifetime measured at a write would shrink by every network call made
+/// in between, and a renewal answer naming no usable expiry is given it
+/// again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenLife {
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub lifetime: chrono::Duration,
+}
+
+impl TokenLife {
+    /// A token issued at `now` that lasts `lifetime`.
+    pub fn lasting(now: chrono::DateTime<chrono::Utc>, lifetime: chrono::Duration) -> Self {
+        TokenLife { at: now + lifetime, lifetime }
+    }
+}
+
+/// What a [`TokenAnswer`] read off one answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenRead {
+    pub token: String,
+    pub refresh_token: Option<String>,
+    pub expiry: TokenExpiry,
+    pub scope: Option<Vec<String>>,
+}
+
+impl TokenAnswer {
+    pub fn token_path(&self) -> &str {
+        self.token_path.as_deref().unwrap_or("access_token")
+    }
+
+    pub fn refresh_token_path(&self) -> &str {
+        self.refresh_token_path.as_deref().unwrap_or("refresh_token")
+    }
+
+    pub fn scope_path(&self) -> &str {
+        self.scope_path.as_deref().unwrap_or("scope")
+    }
+
+    pub fn error_path(&self) -> &str {
+        self.error_path.as_deref().unwrap_or(CONVENTIONAL_ERROR_PATH)
+    }
+
+    /// The relative-lifetime path in effect: the declared one, else
+    /// `expires_in` unless the reader reads an absolute expiry or none.
+    fn expires_in_path(&self) -> Option<&str> {
+        match (&self.expires_in_path, &self.expires_path) {
+            (Some(path), _) => Some(path),
+            (None, None) if !self.never_expires => Some("expires_in"),
+            _ => None,
+        }
+    }
+
+    /// Where this reader looks for the expiry, in the words an error
+    /// names it by.
+    pub fn expiry_source(&self) -> String {
+        match (&self.expires_path, self.expires_in_path()) {
+            (Some(at), _) => format!("'{at}' (expiresPath)"),
+            (None, Some(path)) => format!("'{path}' (expiresInPath)"),
+            (None, None) => "nowhere (neverExpires)".into(),
+        }
+    }
+
+    /// Refuse a contradictory reader, naming the site (`what`).
+    pub fn validate(&self, what: &str) -> Result<(), String> {
+        for (key, path) in [
+            ("tokenPath", &self.token_path),
+            ("refreshTokenPath", &self.refresh_token_path),
+            ("expiresInPath", &self.expires_in_path),
+            ("expiresPath", &self.expires_path),
+            ("scopePath", &self.scope_path),
+            ("errorPath", &self.error_path),
+            ("okPath", &self.ok_path),
+        ] {
+            if path.as_deref().is_some_and(|p| p.trim().is_empty()) {
+                return Err(format!("{what}.{key} is empty; name a path, or leave the key out"));
+            }
+        }
+        if self.expires_in_path.is_some() && self.expires_path.is_some() {
+            return Err(format!(
+                "{what} declares both expiresInPath and expiresPath; a token has one expiry, \
+                 keep the one the provider answers"
+            ));
+        }
+        if self.never_expires && (self.expires_in_path.is_some() || self.expires_path.is_some()) {
+            return Err(format!(
+                "{what} declares neverExpires and also where the expiry is; keep one"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read one answer. The token must be there; everything else is
+    /// read when present, and a value present but unreadable is an
+    /// error naming its path, except the expiry, whose trouble is
+    /// [`TokenExpiry::Unreadable`] so the tokens are never dropped.
+    /// `now` anchors a relative lifetime.
+    pub fn read(&self, body: &Value, now: chrono::DateTime<chrono::Utc>) -> Result<TokenRead, String> {
+        let token = match lookup_path(body, self.token_path()) {
+            Some(Value::String(t)) if !t.is_empty() => t.clone(),
+            _ => {
+                return Err(format!(
+                    "the answer carries no token at '{}' (declare `tokenPath` if the provider \
+                     puts it elsewhere)",
+                    self.token_path()
+                ))
+            }
+        };
+        let refresh_token = match lookup_path(body, self.refresh_token_path()) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(t)) if t.is_empty() => None,
+            Some(Value::String(t)) => Some(t.clone()),
+            Some(other) => {
+                return Err(format!(
+                    "the refresh token at '{}' is not a string: {other}",
+                    self.refresh_token_path()
+                ))
+            }
+        };
+        // A path the recipe declares is a promise, so its absence is
+        // an error; the default `expires_in` may simply not be there.
+        let declared_but_missing =
+            |path: &str| format!("the answer carries no expiry at '{path}', which the recipe declares");
+        // A token already dead when it arrives would be renewed on
+        // every use, so a lifetime of nothing is unreadable, not a time.
+        let lived = |path: &str, v: &Value, lifetime: chrono::Duration| {
+            if lifetime > chrono::Duration::zero() {
+                TokenExpiry::At(TokenLife::lasting(now, lifetime))
+            } else {
+                TokenExpiry::Unreadable(format!(
+                    "the expiry at '{path}' ({v}) leaves the token no time to live from the moment \
+                     the answer arrived"
+                ))
+            }
+        };
+        let expiry = if self.never_expires {
+            TokenExpiry::Never
+        } else if let Some(path) = &self.expires_path {
+            match lookup_path(body, path) {
+                None | Some(Value::Null) => TokenExpiry::Unreadable(declared_but_missing(path)),
+                Some(v) => match absolute_time(v) {
+                    Some(at) => lived(path, v, at - now),
+                    None => TokenExpiry::Unreadable(format!(
+                        "the expiry at '{path}' is neither an RFC 3339 time nor epoch seconds: {v}"
+                    )),
+                },
+            }
+        } else {
+            let path = self.expires_in_path().unwrap_or("expires_in");
+            match lookup_path(body, path) {
+                None | Some(Value::Null) if self.expires_in_path.is_some() => {
+                    TokenExpiry::Unreadable(declared_but_missing(path))
+                }
+                None | Some(Value::Null) => TokenExpiry::Unknown,
+                Some(v) => match seconds_of(v) {
+                    Some(secs) => lived(path, v, chrono::Duration::seconds(secs)),
+                    None => TokenExpiry::Unreadable(format!(
+                        "the lifetime at '{path}' is not a number of seconds: {v}"
+                    )),
+                },
+            }
+        };
+        let scope = match lookup_path(body, self.scope_path()) {
+            Some(Value::String(s)) => Some(
+                s.split([' ', ','])
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            ),
+            Some(Value::Array(items)) => {
+                Some(items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            }
+            _ => None,
+        }
+        .filter(|v| !v.is_empty());
+        Ok(TokenRead { token, refresh_token, expiry, scope })
+    }
+}
+
+impl AnswerReader for TokenAnswer {
+    fn refusal_paths(&self) -> RefusalPaths<'_> {
+        RefusalPaths { error: Some(self.error_path()), ok: self.ok_path.as_deref() }
+    }
+
+    fn validate(&self, what: &str) -> Result<(), String> {
+        TokenAnswer::validate(self, what)
+    }
+}
+
+/// Where an answer says it was refused although its status said
+/// success: the one refusal check every declared call, token call and
+/// lookup goes through ([`RefusalPaths::refusal`]). A reader declares
+/// the paths; this is what they are read with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefusalPaths<'a> {
+    /// A refusal's code or message: anything there but `null`, `false`
+    /// or an empty string refuses.
+    pub error: Option<&'a str>,
+    /// A success flag: anything there but `true` (or `null`) refuses.
+    pub ok: Option<&'a str>,
+}
+
+/// OAuth's `error`, where most JSON APIs put a refusal's code: the
+/// error path a [`TokenAnswer`] reads by default, and where a refused
+/// answer's code is read to classify it when its reader declares no
+/// error path (never, there, to decide that it refused).
+pub const CONVENTIONAL_ERROR_PATH: &str = "error";
+
+impl<'a> RefusalPaths<'a> {
+    /// The refusal `body` carries, in the provider's words: the code at
+    /// the error path (an error object's `message`, or the object
+    /// itself), else, when only the success flag refused, the answer
+    /// itself. `None` = not refused.
+    pub fn refusal(&self, body: &Value) -> Option<String> {
+        let said = self.error.and_then(|path| lookup_path(body, path)).filter(|v| {
+            !matches!(v, Value::Null | Value::Bool(false)) && v.as_str() != Some("")
+        });
+        let flagged = self
+            .ok
+            .and_then(|path| lookup_path(body, path))
+            .is_some_and(|v| !matches!(v, Value::Null | Value::Bool(true)));
+        match said {
+            Some(Value::String(code)) => Some(code.clone()),
+            Some(other) => {
+                let message = other.get("message").and_then(Value::as_str);
+                Some(message.map(str::to_string).unwrap_or_else(|| {
+                    crate::truncate_user_string(&other.to_string(), 300)
+                }))
+            }
+            None => flagged.then(|| crate::truncate_user_string(&body.to_string(), 300)),
+        }
+    }
+
+    /// The error codes a refused answer names, read at the declared
+    /// error path ([`CONVENTIONAL_ERROR_PATH`] when none is): a code
+    /// there, or an error object's `status` and the `reason` of each
+    /// of its `errors` (Google's `{"error": {"status": code, "errors":
+    /// [{"reason": code}]}}`). What classifies a refusal.
+    pub fn codes<'b>(&self, body: &'b Value) -> Vec<&'b str> {
+        let Some(error) = lookup_path(body, self.error.unwrap_or(CONVENTIONAL_ERROR_PATH)) else {
+            return Vec::new();
+        };
+        if let Some(code) = error.as_str() {
+            return vec![code];
+        }
+        let reasons = error.get("errors").and_then(Value::as_array).into_iter().flatten().filter_map(|e| e.get("reason"));
+        error.get("status").into_iter().chain(reasons).filter_map(Value::as_str).collect()
+    }
+}
+
+/// What a declared call's answer is read with: at least where it says
+/// it refused. A plain call ([`RefusalReader`]) reads nothing more; a
+/// token call ([`TokenAnswer`]) reads its token too.
+pub trait AnswerReader {
+    fn refusal_paths(&self) -> RefusalPaths<'_>;
+    /// Refuse a contradictory reader, naming the site (`what`).
+    fn validate(&self, what: &str) -> Result<(), String>;
+}
+
+/// The reader of a call that answers no token (a test call, a socket
+/// mint, a subscribe): where its answer says it refused despite a
+/// success status. Nothing is read by default, because a success
+/// answer may legitimately carry an `error` field (TikTok's carries
+/// `{"error": {"code": "ok"}}`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RefusalReader {
+    /// A refusal's code or message: anything there but `null`, `false`
+    /// or an empty string refuses the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_path: Option<String>,
+    /// A success flag: anything there but `true` or `null` refuses the
+    /// answer (Slack's `ok`). Nothing there passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok_path: Option<String>,
+}
+
+impl AnswerReader for RefusalReader {
+    fn refusal_paths(&self) -> RefusalPaths<'_> {
+        RefusalPaths { error: self.error_path.as_deref(), ok: self.ok_path.as_deref() }
+    }
+
+    fn validate(&self, what: &str) -> Result<(), String> {
+        validate_refusal_paths(what, &self.error_path, &self.ok_path)
+    }
+}
+
+/// Refuse an empty refusal path, naming the site (`what`).
+pub fn validate_refusal_paths(what: &str, error_path: &Option<String>, ok_path: &Option<String>) -> Result<(), String> {
+    for (key, path) in [("errorPath", error_path), ("okPath", ok_path)] {
+        if path.as_deref().is_some_and(|p| p.trim().is_empty()) {
+            return Err(format!("{what}.{key} is empty; name a path, or leave the key out"));
+        }
+    }
+    Ok(())
+}
+
+/// A whole number of seconds, from a JSON number or a string of digits.
+fn seconds_of(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// An absolute time, from an RFC 3339 string or epoch seconds (a
+/// number, or a string of digits).
+fn absolute_time(v: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Some(Ok(at)) = v.as_str().map(chrono::DateTime::parse_from_rfc3339) {
+        return Some(at.with_timezone(&chrono::Utc));
+    }
+    seconds_of(v).and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+}
+
+/// A declared call that answers a token: a [`ConnectCall`] whose
+/// answer is read with a [`TokenAnswer`], flat in one object. What
+/// `afterExchange` and a declared `refresh` are.
+pub type TokenCall = ConnectCall<TokenAnswer>;
+
+impl TokenCall {
+    /// Refuse a malformed call, or one interpolating a value nothing
+    /// provides: every placeholder must be in `known`.
+    fn validate_over(&self, what: &str, known: &[String]) -> Result<(), String> {
+        self.validate(what)?;
+        for name in self.value_names()? {
+            if !known.contains(&name) {
+                return Err(format!(
+                    "{what} interpolates '{{{name}}}', which nothing stores at that point \
+                     (known: {})",
+                    known.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The OAuth2 grant flow.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase", deny_unknown_fields)]
@@ -720,12 +1215,13 @@ pub struct TokenExchange {
     /// POST target; a template over the pasted fields
     /// (`https://api.github.com/app/installations/{installation_id}/access_tokens`).
     pub url: Template,
-    /// Path to the token in the response; stored as `token`.
-    pub token_path: String,
-    /// Path to the token's expiry (RFC3339 string or epoch seconds);
-    /// absent = re-mint on every resolution past the JWT's own ttl.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_path: Option<String>,
+    /// Where the answer keeps the token and its expiry, flat on the
+    /// exchange (`tokenPath`, `expiresPath`, ...). An answer naming
+    /// no expiry is re-minted once the JWT's own lifetime runs out. A
+    /// minted token is re-minted, never refreshed, so a refresh token
+    /// or a scope echo means nothing here.
+    #[serde(flatten)]
+    pub answer: TokenAnswer,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captures: Vec<Capture>,
 }
@@ -749,6 +1245,10 @@ pub struct TestCall {
     /// Identity/context values captured off the test response.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captures: Vec<Capture>,
+    /// Where the answer says the credential was refused despite the
+    /// expected status (`errorPath`, `okPath`), flat on the call.
+    #[serde(flatten)]
+    pub answer: RefusalReader,
 }
 
 fn default_expect_status() -> u16 {
@@ -834,10 +1334,12 @@ pub enum SignKind {
 /// AppSync, Dialpad), and equally the "tell the API where to send
 /// events" pattern (Google's `files.watch`, Telegram's `setWebhook`).
 /// One shape for both, because both are "POST this body with these
-/// credentials and read these values out of the answer".
+/// credentials and read these values out of the answer". `A` is what
+/// the answer is read with: a [`RefusalReader`] for a plain call, a
+/// [`TokenAnswer`] for a [`TokenCall`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ConnectCall {
+pub struct ConnectCall<A = RefusalReader> {
     /// The address, as a template over the caller's values (a watch
     /// call addresses `.../files/{target}/watch`).
     pub url: Template,
@@ -847,6 +1349,12 @@ pub struct ConnectCall {
     /// caller's values; absent = no body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<Value>,
+    /// A form body (`application/x-www-form-urlencoded`) instead, the
+    /// way a token endpoint takes its parameters: the provider's
+    /// parameter names, each value a template over the caller's
+    /// values. Never beside `body`, never on a GET.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub form: BTreeMap<String, Template>,
     /// How this call authenticates, in the same vocabulary as a
     /// service's own `auth`: templates over the values the caller
     /// resolved (a socket mint uses `Bearer {appToken}`, which is a
@@ -857,9 +1365,13 @@ pub struct ConnectCall {
     /// follow (the socket URL, the subscription's expiry).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captures: Vec<Capture>,
+    /// What the answer is read with, flat on the call (`errorPath`,
+    /// `okPath`, and a token call's `tokenPath` and the rest).
+    #[serde(flatten)]
+    pub answer: A,
 }
 
-impl ConnectCall {
+impl<A: AnswerReader> ConnectCall<A> {
     /// Every value name this call interpolates (url + body + auth),
     /// which is exactly the handoff set it needs resolved. Also the
     /// validator: a malformed template is an `Err`.
@@ -877,6 +1389,13 @@ impl ConnectCall {
                 }
             }
         }
+        for template in self.form.values() {
+            for name in template.placeholders()? {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
         Ok(names)
     }
 
@@ -885,6 +1404,18 @@ impl ConnectCall {
     pub fn validate(&self, what: &str) -> Result<(), String> {
         self.value_names().map_err(|e| format!("{what}: {e}"))?;
         validate_captures(&self.captures).map_err(|e| format!("{what}: {e}"))?;
+        self.answer.validate(what)?;
+        if !self.form.is_empty() {
+            if self.body.is_some() {
+                return Err(format!("{what} declares both a JSON `body` and a `form`; send one"));
+            }
+            if self.method == TestMethod::Get {
+                return Err(format!("{what} sends a `form` on a GET, which carries no body; use POST"));
+            }
+            if let Some(name) = self.form.keys().find(|k| !is_param_name(k)) {
+                return Err(format!("{what}.form has '{name}', which is not a usable parameter name"));
+            }
+        }
         Ok(())
     }
 }
@@ -1033,16 +1564,44 @@ impl MintedSocket {
 /// A string interpolating STORED VALUES by name: `"Bearer {token}"`,
 /// `"/bot{token}/"`. The only way a spec references a value; names
 /// resolve against the grant's stored values at apply time, and an
-/// unknown name is a loud error. `{` and `}` have no escape: a template
-/// is an interpolation string, not general text.
+/// unknown name is a loud error. A literal brace is doubled: `{{` and
+/// `}}` (a GraphQL query in a JSON body).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Template(pub String);
 
 
 /// The values a consent stores that are secrets by nature, whatever the
-/// recipe declares: the tokens and the app's own secret.
-const SECRET_TOKEN_NAMES: &[&str] = &["access_token", "refresh_token", "client_secret"];
+/// recipe declares: the tokens (stored as `token` and `refresh_token`)
+/// and the app's own secret.
+const SECRET_TOKEN_NAMES: &[&str] = &["token", "refresh_token", "client_secret"];
+
+/// Why a [`Template`] could not be filled in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplateError {
+    /// The template itself does not read: a `{` never closed, a `}`
+    /// never opened, or a placeholder name outside [A-Za-z0-9_].
+    Malformed(String),
+    /// It names a value the caller did not give: the name.
+    Missing(String),
+}
+
+impl std::fmt::Display for TemplateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TemplateError::Malformed(why) => f.write_str(why),
+            TemplateError::Missing(name) => {
+                write!(f, "template references '{{{name}}}' but the access stores no value named '{name}'")
+            }
+        }
+    }
+}
+
+impl From<TemplateError> for String {
+    fn from(e: TemplateError) -> Self {
+        e.to_string()
+    }
+}
 
 impl From<&str> for Template {
     fn from(s: &str) -> Self {
@@ -1055,35 +1614,70 @@ impl Template {
         Self(s.into())
     }
 
-    /// The value names this template interpolates, in order of first
-    /// appearance. Also the validator: a malformed placeholder is an
-    /// `Err`. This is what decides which stored values a worker may
-    /// receive: exactly the names the declared steps interpolate,
-    /// nothing more.
-    pub fn placeholders(&self) -> Result<Vec<String>, String> {
-        let mut names = Vec::new();
-        let mut rest = self.0.as_str();
-        while let Some(start) = rest.find('{') {
-            let after = &rest[start + 1..];
-            let Some(end) = after.find('}') else {
-                return Err(format!("unclosed '{{' in template {:?}", self.0));
-            };
-            let name = &after[..end];
-            if name.is_empty()
-                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                return Err(format!(
-                    "bad placeholder '{{{name}}}' in template {:?}: names are [A-Za-z0-9_]+",
-                    self.0
-                ));
+    /// The template read into its pieces, in order: the one parser of
+    /// the template grammar, behind both [`Template::placeholders`] and
+    /// every interpolation, so what validates at load is exactly what
+    /// fills in at use. A placeholder is `{name}`, the name made of
+    /// [A-Za-z0-9_]; `{{` and `}}` are a literal `{` and `}` (a JSON
+    /// body's GraphQL query, `{{ viewer {{ login }} }}`); a `{` never
+    /// closed, a lone `}`, and an empty or badly spelled name are each
+    /// [`TemplateError::Malformed`].
+    fn pieces(&self) -> Result<Vec<TemplatePiece<'_>>, TemplateError> {
+        let malformed = |why: String| TemplateError::Malformed(format!("{why} in template {:?}", self.0));
+        let text = self.0.as_str();
+        let bytes = text.as_bytes();
+        let mut pieces = Vec::new();
+        // Every brace is ASCII, so each index below is a char boundary.
+        let mut literal_from = 0;
+        let mut at = 0;
+        fn literal<'a>(pieces: &mut Vec<TemplatePiece<'a>>, text: &'a str, from: usize, to: usize) {
+            if to > from {
+                pieces.push(TemplatePiece::Literal(&text[from..to]));
             }
-            if !names.iter().any(|n| n == name) {
-                names.push(name.to_string());
-            }
-            rest = &after[end + 1..];
         }
-        if rest.contains('}') {
-            return Err(format!("stray '}}' in template {:?}", self.0));
+        while at < bytes.len() {
+            match (bytes[at], bytes.get(at + 1)) {
+                // A doubled brace is one literal brace: the text up to
+                // and including the first, then on past the second.
+                (b'{', Some(b'{')) | (b'}', Some(b'}')) => {
+                    literal(&mut pieces, text, literal_from, at + 1);
+                    at += 2;
+                    literal_from = at;
+                }
+                (b'{', _) => {
+                    literal(&mut pieces, text, literal_from, at);
+                    let Some(len) = text[at + 1..].find('}') else {
+                        return Err(malformed("unclosed '{'".into()));
+                    };
+                    let name = &text[at + 1..at + 1 + len];
+                    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        return Err(malformed(format!("bad placeholder '{{{name}}}' (names are [A-Za-z0-9_]+)")));
+                    }
+                    pieces.push(TemplatePiece::Value(name));
+                    at += len + 2;
+                    literal_from = at;
+                }
+                (b'}', _) => return Err(malformed("stray '}' (a literal one is written '}}')".into())),
+                _ => at += 1,
+            }
+        }
+        literal(&mut pieces, text, literal_from, bytes.len());
+        Ok(pieces)
+    }
+
+    /// The value names this template interpolates, in order of first
+    /// appearance. Also the validator: a malformed template is an `Err`
+    /// ([`Template::pieces`]). This is what decides which stored values
+    /// a worker may receive: exactly the names the declared steps
+    /// interpolate, nothing more.
+    pub fn placeholders(&self) -> Result<Vec<String>, String> {
+        let mut names: Vec<String> = Vec::new();
+        for piece in self.pieces()? {
+            if let TemplatePiece::Value(name) = piece {
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.to_string());
+                }
+            }
         }
         Ok(names)
     }
@@ -1092,29 +1686,63 @@ impl Template {
     /// (never an empty substitution: a blank secret spliced into an
     /// auth header is a silent authentication failure).
     pub fn resolve(&self, values: &BTreeMap<String, String>) -> Result<String, String> {
+        Ok(self.interpolate(values, |_, value| value.to_string())?)
+    }
+
+    /// Interpolate a template that IS a URL. A value landing in the
+    /// path or the query is percent-encoded (everything but RFC 3986's
+    /// unreserved characters), so a secret holding `&` or `/` stays
+    /// one value. A value landing before the path (the scheme, host
+    /// and port: a captured API base like `{instance_url}/...`) is
+    /// URL structure, and goes in as it is.
+    pub fn resolve_url(&self, values: &BTreeMap<String, String>) -> Result<String, String> {
+        Ok(self.resolve_url_typed(values)?)
+    }
+
+    /// [`Template::resolve_url`] with the reason typed, for a caller
+    /// that names a missing value in its own words (a lookup's missing
+    /// parent is one the person has to pick first).
+    pub fn resolve_url_typed(&self, values: &BTreeMap<String, String>) -> Result<String, TemplateError> {
+        self.interpolate(values, |before, value| {
+            let path_started = before.contains('?')
+                || before.split_once("://").is_some_and(|(_, rest)| rest.contains('/'));
+            if path_started {
+                percent_encode(value)
+            } else {
+                value.to_string()
+            }
+        })
+    }
+
+    /// The one interpolation loop: `place` turns a value into what is
+    /// spliced in, given everything written before it.
+    fn interpolate(
+        &self,
+        values: &BTreeMap<String, String>,
+        place: impl Fn(&str, &str) -> String,
+    ) -> Result<String, TemplateError> {
         let mut out = String::with_capacity(self.0.len());
-        let mut rest = self.0.as_str();
-        while let Some(start) = rest.find('{') {
-            out.push_str(&rest[..start]);
-            let after = &rest[start + 1..];
-            let Some(end) = after.find('}') else {
-                return Err(format!("unclosed '{{' in template {:?}", self.0));
-            };
-            let name = &after[..end];
-            match values.get(name) {
-                Some(v) => out.push_str(v),
-                None => {
-                    return Err(format!(
-                        "template references '{{{name}}}' but the access stores no value \
-                         named '{name}'"
-                    ))
+        for piece in self.pieces()? {
+            match piece {
+                TemplatePiece::Literal(text) => out.push_str(text),
+                TemplatePiece::Value(name) => {
+                    let value = values.get(name).ok_or_else(|| TemplateError::Missing(name.to_string()))?;
+                    let placed = place(&out, value);
+                    out.push_str(&placed);
                 }
             }
-            rest = &after[end + 1..];
         }
-        out.push_str(rest);
         Ok(out)
     }
+}
+
+/// One piece of a parsed [`Template`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemplatePiece<'t> {
+    /// Text written as it is.
+    Literal(&'t str),
+    /// A `{name}` placeholder: the name.
+    Value(&'t str),
 }
 
 /// Look a dotted [`Capture::path`] up in a JSON value. Numeric
@@ -1387,6 +2015,10 @@ pub fn spec_for_service<'a>(
 }
 
 impl AccessSpec {
+    /// A connection's snapshot of its recipe, as its row stores it
+    /// (`access_grant.spec_json`).
+    pub const STORED: crate::stored::Kind<AccessSpec> = crate::stored::Kind::new("connection's recipe", ACCESS_SPEC_UPGRADES);
+
     /// Stamp this recipe's identity onto an access widget: the service
     /// name, and whether the owning node runs without a connection
     /// picked. THE one definition of the stamp, shared by the
@@ -1482,13 +2114,54 @@ impl AccessSpec {
                 }
                 vec![fields]
             }
-            Acquisition::OAuth2 { extra_params, registration_fields, captures, refresh, .. } => {
-                for t in extra_params.values() {
-                    t.placeholders()?;
-                }
+            Acquisition::OAuth2 {
+                extra_params,
+                auth_params,
+                client_params,
+                registration_fields,
+                captures,
+                answer,
+                after_exchange,
+                refresh,
+                ..
+            } => {
+                client_params.validate()?;
+                answer.validate("acquisition")?;
+                // What each call can interpolate: the app's values
+                // everywhere; the consent URL only the ones that are
+                // not secret (it is shown in the browser); the calls
+                // after the exchange also what it stored.
+                let public: Vec<String> = std::iter::once("client_id".to_string())
+                    .chain(registration_fields.iter().filter(|f| !f.secret).map(|f| f.name.clone()))
+                    .collect();
+                check_params("acquisition.authParams", auth_params, &public)?;
+                check_params("acquisition.extraParams", extra_params, &oauth_registration(registration_fields))?;
                 validate_captures(captures)?;
+                if let Some(call) = after_exchange {
+                    if !self.needs_browser_consent() {
+                        return Err(
+                            "acquisition.afterExchange runs after a code exchange, and a \
+                             client_credentials grant has none; fold it into the token request"
+                                .into(),
+                        );
+                    }
+                    call.validate_over(
+                        "acquisition.afterExchange",
+                        &oauth_exchanged(registration_fields, captures),
+                    )?;
+                }
                 if let Some(call) = refresh {
-                    call.validate("acquisition.refresh")?;
+                    // The renewal runs over everything the connection
+                    // stores: the exchange's, the call after it, and the
+                    // connect-time check's captures.
+                    let mut stored = oauth_exchanged(registration_fields, captures);
+                    if let Some(after) = after_exchange {
+                        stored.extend(after.captures.iter().map(|c| c.name.clone()));
+                    }
+                    if let Some(test) = &self.test {
+                        stored.extend(test.captures.iter().map(|c| c.name.clone()));
+                    }
+                    call.validate_over("acquisition.refresh", &stored)?;
                 }
                 vec![registration_fields]
             }
@@ -1502,8 +2175,14 @@ impl AccessSpec {
                 }
                 if let Some(ex) = exchange {
                     ex.url.placeholders()?;
-                    if ex.token_path.is_empty() {
-                        return Err("token exchange needs a tokenPath".into());
+                    ex.answer.validate("acquisition.exchange")?;
+                    if ex.answer.refresh_token_path.is_some() || ex.answer.scope_path.is_some() {
+                        return Err(
+                            "acquisition.exchange declares refreshTokenPath or scopePath, but a \
+                             minted token is minted again when it runs out, never refreshed, \
+                             and asks for no scopes; remove them"
+                                .into(),
+                        );
                     }
                     validate_captures(&ex.captures)?;
                 }
@@ -1594,13 +2273,15 @@ impl AccessSpec {
         if let Some(test) = &self.test {
             test.url.placeholders()?;
             validate_captures(&test.captures)?;
+            test.answer.validate("test")?;
         }
         if let Some(identity) = &self.identity {
             // The identity is shown wherever a connection is listed (the
             // editor, `weft connect --list`, an instance's settings page), so
             // it may never be assembled from a secret.
-            for name in identity.placeholders()? {
-                if SECRET_TOKEN_NAMES.contains(&name.as_str()) || secret_fields.contains(&name) {
+            let names = identity.placeholders()?;
+            for name in &names {
+                if SECRET_TOKEN_NAMES.contains(&name.as_str()) || secret_fields.contains(name) {
                     return Err(format!(
                         "identity names '{name}', a secret: it is shown wherever the connection \
                          is listed, so build it from a non-secret value (an account name, a host)"
@@ -1678,26 +2359,31 @@ impl AccessSpec {
             // The scheme reads the connection: every value it needs must
             // be a field the paste page declares, or no connection of
             // this service could ever verify anyone.
-            let declared: Vec<String> = self.own_fields().into_iter().map(|f| f.name).collect();
+            let declared = self.own_fields();
             for name in verify.required_value_names()? {
-                if !declared.contains(&name) {
-                    return Err(format!(
-                        "service '{}' declares a `{}` verify that reads the stored value \
-                         '{name}', but no credential field of that name is declared; add it \
-                         to the acquisition fields",
-                        self.service,
-                        verify.tag()
-                    ));
+                match declared.iter().find(|f| f.name == name) {
+                    None => {
+                        return Err(format!(
+                            "service '{}' declares a `{}` verify that reads the stored value \
+                             '{name}', but no credential field of that name is declared; add it \
+                             to the acquisition fields",
+                            self.service,
+                            verify.tag()
+                        ))
+                    }
+                    Some(field) if field.optional => {
+                        return Err(format!(
+                            "service '{}' declares a `{}` verify that reads the stored value \
+                             '{name}' on every check, but its field is `optional`, so a connection \
+                             left without it could verify nobody; drop `optional` from the field",
+                            self.service,
+                            verify.tag()
+                        ))
+                    }
+                    Some(_) => {}
                 }
             }
-            if matches!(verify, crate::access::events::VerifyKind::TokenEcho) {
-                return Err(format!(
-                    "service '{}' declares a token_echo verify for callers, but that scheme \
-                     compares a token weft minted when subscribing, which a caller of a \
-                     route never has; use api_keys, hmac, signature or oidc",
-                    self.service
-                ));
-            }
+            verify.validate(&self.service, crate::access::events::VerifySide::Caller)?;
         }
         if let Some(page) = &self.own_page {
             if let Some(mint) = &page.mint {
@@ -1917,6 +2603,50 @@ pub fn percent_encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// What an OAuth2 acquisition's calls can interpolate from its app:
+/// `client_id`, `client_secret`, and the app's own fields.
+fn oauth_registration(registration_fields: &[CredentialField]) -> Vec<String> {
+    ["client_id", "client_secret"]
+        .into_iter()
+        .map(String::from)
+        .chain(registration_fields.iter().map(|f| f.name.clone()))
+        .collect()
+}
+
+/// What an OAuth2 connection stores once its code exchange answered:
+/// its app's values ([`oauth_registration`]), the token and refresh
+/// token, and the exchange's `captures`.
+fn oauth_exchanged(registration_fields: &[CredentialField], captures: &[Capture]) -> Vec<String> {
+    let mut names = oauth_registration(registration_fields);
+    names.extend(["token".to_string(), "refresh_token".to_string()]);
+    names.extend(captures.iter().map(|c| c.name.clone()));
+    names
+}
+
+/// Refuse a parameter map (`authParams`, `extraParams`) whose name is
+/// unusable or whose value interpolates a name outside `known`.
+fn check_params(
+    what: &str,
+    params: &BTreeMap<String, Template>,
+    known: &[String],
+) -> Result<(), String> {
+    for (name, template) in params {
+        if !is_param_name(name) {
+            return Err(format!("{what} has '{name}', which is not a usable parameter name"));
+        }
+        for placeholder in template.placeholders()? {
+            if !known.contains(&placeholder) {
+                return Err(format!(
+                    "{what}.{name} interpolates '{{{placeholder}}}', which it cannot use here \
+                     (it can use: {})",
+                    known.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_captures(captures: &[Capture]) -> Result<(), String> {
@@ -2281,7 +3011,9 @@ mod tests {
         assert!(spec("{user}").validate().is_ok());
         let err = spec("{api_key}").validate().unwrap_err();
         assert!(err.contains("'api_key', a secret"), "{err}");
-        assert!(spec("{access_token}").validate().is_err());
+        // The names a consent stores its tokens under.
+        assert!(spec("{token}").validate().is_err());
+        assert!(spec("{refresh_token}").validate().is_err());
     }
 
     /// Guide steps are generated from the ticked permissions, never a
@@ -2623,6 +3355,44 @@ mod tests {
         );
     }
 
+    /// One grammar for validation and interpolation: everything
+    /// `placeholders` refuses, filling the template in refuses too, as
+    /// `Malformed` (a stray `}` before a placeholder included, which
+    /// neither caught before).
+    #[test]
+    fn interpolation_refuses_what_validation_refuses() {
+        let values = BTreeMap::from([("token".to_string(), "t".to_string()), ("a".to_string(), "x".to_string())]);
+        for bad in ["Bearer }", "a}b{token}", "Bearer {", "{bad-name}", "{}", "{a{token}"] {
+            let template = Template::new(bad);
+            assert!(template.placeholders().is_err(), "{bad} validates");
+            for filled in [template.resolve_url_typed(&values), template.interpolate(&values, |_, v| v.to_string())] {
+                assert!(matches!(filled, Err(TemplateError::Malformed(_))), "{bad} fills in: {filled:?}");
+            }
+        }
+        assert!(Template::new("a}b{token}").placeholders().unwrap_err().contains("stray '}'"));
+    }
+
+    /// A doubled brace is a literal one, so a JSON body can carry a
+    /// GraphQL query beside a placeholder; a single one stays a
+    /// placeholder, and `{{name}}` is the literal text `{name}`.
+    #[test]
+    fn doubled_braces_are_literal_braces() {
+        let values = BTreeMap::from([("login".to_string(), "ada".to_string())]);
+        let query = Template::new("query {{ viewer {{ login }} }}");
+        assert_eq!(query.placeholders().unwrap(), Vec::<String>::new());
+        assert_eq!(query.resolve(&values).unwrap(), "query { viewer { login } }");
+        assert_eq!(Template::new("{{ viewer }}").resolve(&values).unwrap(), "{ viewer }");
+        let mixed = Template::new("{{\"user\": \"{login}\"}}");
+        assert_eq!(mixed.placeholders().unwrap(), vec!["login"]);
+        assert_eq!(mixed.resolve(&values).unwrap(), "{\"user\": \"ada\"}");
+        assert_eq!(Template::new("{{login}}").resolve(&values).unwrap(), "{login}");
+        let body = serde_json::json!({ "query": "{{ viewer {{ login }} }}", "as": "{login}" });
+        assert_eq!(
+            resolve_body(&body, &values).unwrap(),
+            serde_json::json!({ "query": "{ viewer { login } }", "as": "ada" })
+        );
+    }
+
     #[test]
     fn worker_value_names_are_exactly_what_auth_interpolates() {
         let spec = slack_spec();
@@ -2749,6 +3519,17 @@ mod tests {
         let echo = verifier_spec(&["token"], json!({ "kind": "token_echo" })).unwrap();
         let err = echo.validate().expect_err("token echo cannot gate callers");
         assert!(err.contains("token_echo"), "{err}");
+
+        // A gate's signing scheme meets the same rules a push recipe
+        // does: one signing {timestamp} with nowhere to read it from is
+        // refused here, never verified at runtime with no replay check.
+        let unsourced = verifier_spec(
+            &["signingSecret"],
+            json!({ "kind": "hmac", "signature": { "in": "header:X-Signature" }, "concat": "{timestamp}.{body}" }),
+        )
+        .unwrap();
+        let err = unsourced.validate().expect_err("a signed timestamp needs a source");
+        assert!(err.contains("no timestamp source"), "{err}");
     }
 
     /// The oidc scheme resolves its templates against a connection's
@@ -2762,7 +3543,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             kind.required_value_names().unwrap(),
-            vec!["jwksUrl".to_string(), "issuer".to_string()]
+            vec!["jwksUrl".to_string(), "issuer".to_string(), "audience".to_string()]
         );
         let values = BTreeMap::from([
             ("issuer".to_string(), "https://auth.example".to_string()),
@@ -2801,5 +3582,300 @@ mod tests {
             .validate()
             .expect_err("a push is never keyed");
         assert!(err.contains("api_keys"), "{err}");
+    }
+
+    fn read_at(answer: &TokenAnswer, body: serde_json::Value) -> Result<TokenRead, String> {
+        let now = chrono::DateTime::from_timestamp(1_000_000, 0).unwrap();
+        answer.read(&body, now)
+    }
+
+    /// The expiry of a token read at `read_at`'s moment (1_000_000)
+    /// that dies at epoch `secs`.
+    fn at(secs: i64) -> TokenExpiry {
+        TokenExpiry::At(TokenLife {
+            at: chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+            lifetime: chrono::Duration::seconds(secs - 1_000_000),
+        })
+    }
+
+    /// The default reader is the RFC answer: `access_token`,
+    /// `refresh_token`, `expires_in` (a number or a string of digits)
+    /// and the `scope` echo split on spaces and commas.
+    #[test]
+    fn a_token_answer_reads_the_rfc_names_by_default() {
+        let answer = TokenAnswer::default();
+        let read = read_at(
+            &answer,
+            json!({ "access_token": "t", "refresh_token": "r", "expires_in": 3600, "scope": "a b,c" }),
+        )
+        .unwrap();
+        assert_eq!(read.token, "t");
+        assert_eq!(read.refresh_token.as_deref(), Some("r"));
+        assert_eq!(read.expiry, at(1_003_600));
+        assert_eq!(read.scope, Some(vec!["a".into(), "b".into(), "c".into()]));
+        let read = read_at(&answer, json!({ "access_token": "t", "expires_in": "60" })).unwrap();
+        assert_eq!(read.expiry, at(1_000_060), "a string of digits is seconds too");
+        assert_eq!(read.refresh_token, None);
+        let read = read_at(&answer, json!({ "access_token": "t" })).unwrap();
+        assert_eq!(read.expiry, TokenExpiry::Unknown, "no expires_in is an unknown expiry, never an error");
+        let err = read_at(&answer, json!({ "token": "t" })).unwrap_err();
+        assert!(err.contains("'access_token'") && err.contains("tokenPath"), "{err}");
+        let read = read_at(&answer, json!({ "access_token": "t", "refresh_token": "r2", "expires_in": "soon" })).unwrap();
+        assert!(matches!(&read.expiry, TokenExpiry::Unreadable(why) if why.contains("expires_in")), "{:?}", read.expiry);
+        assert_eq!(read.refresh_token.as_deref(), Some("r2"), "an unreadable expiry never drops the tokens");
+    }
+
+    fn unreadable(read: Result<TokenRead, String>) -> String {
+        match read.unwrap().expiry {
+            TokenExpiry::Unreadable(why) => why,
+            other => panic!("expected an unreadable expiry, got {other:?}"),
+        }
+    }
+
+    /// A nested answer (Instagram's `data[0]`) is read by declaring the
+    /// paths; an absolute expiry reads RFC 3339 or epoch seconds; a
+    /// declared expiry path that is missing is an unreadable expiry,
+    /// since the recipe promised it.
+    #[test]
+    fn a_token_answer_reads_declared_paths() {
+        let nested: TokenAnswer = serde_json::from_value(json!({
+            "tokenPath": "data.0.access_token",
+            "scopePath": "data.0.permissions",
+            "expiresInPath": "data.0.ttl"
+        }))
+        .unwrap();
+        let read = read_at(
+            &nested,
+            json!({ "data": [{ "access_token": "ig", "permissions": ["basic", "publish"], "ttl": 10 }] }),
+        )
+        .unwrap();
+        assert_eq!(read.token, "ig");
+        assert_eq!(read.scope, Some(vec!["basic".into(), "publish".into()]));
+        assert_eq!(read.expiry, at(1_000_010));
+        let err = unreadable(read_at(&nested, json!({ "data": [{ "access_token": "ig" }] })));
+        assert!(err.contains("data.0.ttl"), "{err}");
+
+        let absolute: TokenAnswer = serde_json::from_value(json!({ "expiresPath": "expires_at" })).unwrap();
+        let read = read_at(&absolute, json!({ "access_token": "t", "expires_at": "1970-01-12T13:47:40Z" })).unwrap();
+        assert_eq!(read.expiry, at(1_000_060), "the lifetime is measured from the moment the answer arrived");
+        // An expiry at or before that moment would renew on every use.
+        let err = unreadable(read_at(&absolute, json!({ "access_token": "t", "expires_at": "1970-01-12T13:46:40Z" })));
+        assert!(err.contains("no time to live"), "{err}");
+        let err = unreadable(read_at(&TokenAnswer::default(), json!({ "access_token": "t", "expires_in": 0 })));
+        assert!(err.contains("expires_in"), "{err}");
+        let read = read_at(&absolute, json!({ "access_token": "t", "expires_at": 2_000_000 })).unwrap();
+        assert_eq!(read.expiry, at(2_000_000));
+        // With an absolute path declared, `expires_in` is not read at all.
+        let err = unreadable(read_at(&absolute, json!({ "access_token": "t", "expires_in": 5 })));
+        assert!(err.contains("expires_at"), "{err}");
+
+        let never: TokenAnswer = serde_json::from_value(json!({ "neverExpires": true })).unwrap();
+        let read = read_at(&never, json!({ "access_token": "t", "expires_in": 5 })).unwrap();
+        assert_eq!(read.expiry, TokenExpiry::Never);
+    }
+
+    /// A refusal answered with a success status: Slack's `ok: false`, an
+    /// OAuth `error` code, or an error OBJECT (which used to pass), at the
+    /// default `error` or a declared path.
+    #[test]
+    fn a_token_answer_sees_a_refusal_answered_200() {
+        let answer = TokenAnswer::default();
+        let refusal = |reader: &TokenAnswer, body: Value| reader.refusal_paths().refusal(&body);
+        assert_eq!(refusal(&answer, json!({ "error": "invalid_grant" })).as_deref(), Some("invalid_grant"));
+        assert_eq!(
+            refusal(&answer, json!({ "error": { "message": "Invalid code", "code": 100 } })).as_deref(),
+            Some("Invalid code")
+        );
+        assert!(refusal(&answer, json!({ "error": { "code": 100 } })).unwrap().contains("100"));
+        for fine in [json!({ "access_token": "t" }), json!({ "error": null }), json!({ "error": "" }), json!({ "error": false })] {
+            assert_eq!(refusal(&answer, fine.clone()), None, "{fine}");
+        }
+        // No success flag unless the reader declares one: `ok` means
+        // nothing to a provider that never said it does.
+        assert_eq!(refusal(&answer, json!({ "ok": false, "access_token": "t" })), None);
+        let declared: TokenAnswer = serde_json::from_value(json!({ "errorPath": "error_type" })).unwrap();
+        assert_eq!(
+            refusal(&declared, json!({ "error_type": "OAuthException", "error_message": "used" })).as_deref(),
+            Some("OAuthException")
+        );
+    }
+
+    /// A declared success flag refuses anything there but `true`, in
+    /// the error path's words when it has some, else the answer's own;
+    /// nothing there passes.
+    #[test]
+    fn a_declared_success_flag_refuses_an_answer_that_is_not_ok() {
+        let slack: TokenAnswer = serde_json::from_value(json!({ "okPath": "ok" })).unwrap();
+        let refusal = |body: Value| slack.refusal_paths().refusal(&body);
+        assert_eq!(refusal(json!({ "ok": false, "error": "invalid_code" })).as_deref(), Some("invalid_code"));
+        assert!(refusal(json!({ "ok": false })).unwrap().contains("\"ok\":false"));
+        assert!(refusal(json!({ "ok": "no" })).is_some(), "anything but true refuses");
+        for fine in [json!({ "ok": true, "access_token": "t" }), json!({ "access_token": "t" }), json!({ "ok": null })] {
+            assert_eq!(refusal(fine.clone()), None, "{fine}");
+        }
+        // A plain call reads no error path unless it declares one: a
+        // success answer may carry an `error` object (TikTok's).
+        let plain = RefusalReader::default();
+        assert_eq!(plain.refusal_paths().refusal(&json!({ "error": { "code": "ok" } })), None);
+        let flagged: RefusalReader = serde_json::from_value(json!({ "okPath": "ok", "errorPath": "error" })).unwrap();
+        assert_eq!(flagged.refusal_paths().refusal(&json!({ "ok": false, "error": "invalid_auth" })).as_deref(), Some("invalid_auth"));
+        assert!(serde_json::from_value::<RefusalReader>(json!({ "okPath": " " })).unwrap().validate("test").unwrap_err().contains("test.okPath"));
+    }
+
+    /// A refused answer's codes are read where the reader says the
+    /// error sits, the conventional `error` when it says nothing.
+    #[test]
+    fn a_refusals_codes_are_read_at_the_declared_error_path() {
+        let declared: TokenAnswer = serde_json::from_value(json!({ "errorPath": "error_type" })).unwrap();
+        let body = json!({ "error_type": "temporarily_unavailable", "error": "ignored" });
+        assert_eq!(declared.refusal_paths().codes(&body), vec!["temporarily_unavailable"]);
+        let google = json!({ "error": { "status": "PERMISSION_DENIED", "errors": [{ "reason": "rateLimitExceeded" }] } });
+        assert_eq!(RefusalReader::default().refusal_paths().codes(&google), vec!["PERMISSION_DENIED", "rateLimitExceeded"]);
+    }
+
+    #[test]
+    fn a_contradictory_token_answer_is_refused() {
+        for (bad, says) in [
+            (json!({ "expiresInPath": "a", "expiresPath": "b" }), "both"),
+            (json!({ "neverExpires": true, "expiresInPath": "a" }), "neverExpires"),
+            (json!({ "tokenPath": " " }), "tokenPath"),
+        ] {
+            let answer: TokenAnswer = serde_json::from_value(bad.clone()).unwrap();
+            let err = answer.validate("acquisition").unwrap_err();
+            assert!(err.contains(says), "{bad}: {err}");
+        }
+        assert!(serde_json::from_value::<TokenAnswer>(json!({ "tokenpath": "x" })).is_err(), "a typo is refused");
+    }
+
+    /// A template that IS a URL encodes what lands in its path or query,
+    /// and leaves a value that is the URL's base (scheme, host) as it is.
+    #[test]
+    fn a_url_template_encodes_its_path_and_query_values() {
+        let values: BTreeMap<String, String> = [
+            ("secret", "a&b=c/d e"),
+            ("base", "https://eu.example.com"),
+            ("id", "x/y"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let url = Template::new("https://h.example/t?client_secret={secret}&k=1").resolve_url(&values).unwrap();
+        assert_eq!(url, "https://h.example/t?client_secret=a%26b%3Dc%2Fd%20e&k=1");
+        let url = Template::new("{base}/files/{id}/watch").resolve_url(&values).unwrap();
+        assert_eq!(url, "https://eu.example.com/files/x%2Fy/watch");
+        // Outside a URL the value goes in raw (a header, a body).
+        assert_eq!(Template::new("Bearer {secret}").resolve(&values).unwrap(), "Bearer a&b=c/d e");
+    }
+
+    /// The OAuth2 acquisition's new keys: they default (a stored
+    /// snapshot without them parses), round-trip, and validate.
+    #[test]
+    fn the_token_keys_default_round_trip_and_validate() {
+        let spec = slack_spec();
+        let Acquisition::OAuth2 { client_params, answer, after_exchange, .. } = &spec.acquisition else { unreachable!() };
+        assert_eq!(client_params.id, "client_id");
+        assert_eq!(client_params.secret, "client_secret");
+        assert_eq!(*answer, TokenAnswer::default());
+        assert!(after_exchange.is_none());
+        assert!(!serde_json::to_value(&spec).unwrap()["acquisition"].as_object().unwrap().contains_key("clientParams"));
+
+        let full: AccessSpec = serde_json::from_value(json!({
+            "service": "instagram",
+            "acquisition": {
+                "kind": "oauth2",
+                "grant": { "kind": "authorization_code", "authUrl": "https://www.instagram.com/oauth/authorize", "pkce": false },
+                "tokenUrl": "https://api.instagram.com/oauth/access_token",
+                "clientParams": { "id": "client_key" },
+                "tokenPath": "data.0.access_token",
+                "scopePath": "data.0.permissions",
+                "errorPath": "error_type",
+                "authParams": { "app": "{client_id}" },
+                "extraParams": { "aud": "{client_secret}" },
+                "afterExchange": {
+                    "url": "https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret={client_secret}&access_token={token}"
+                },
+                "refresh": {
+                    "url": "https://graph.instagram.com/refresh_access_token",
+                    "method": "POST",
+                    "form": { "grant_type": "ig_refresh_token", "access_token": "{token}" },
+                    "expiresInPath": "expires_in"
+                }
+            },
+            "auth": [{ "kind": "header", "name": "Authorization", "value": "Bearer {token}" }]
+        }))
+        .unwrap();
+        full.validate().expect("valid");
+        let back: AccessSpec = serde_json::from_value(serde_json::to_value(&full).unwrap()).unwrap();
+        assert_eq!(back, full);
+        let Acquisition::OAuth2 { client_params, refresh, .. } = &full.acquisition else { unreachable!() };
+        assert_eq!(client_params.id, "client_key");
+        assert_eq!(client_params.secret, "client_secret", "an unset half keeps OAuth's name");
+        let refresh = refresh.as_ref().unwrap();
+        assert_eq!(refresh.form.get("grant_type").map(|t| t.0.as_str()), Some("ig_refresh_token"));
+        assert_eq!(refresh.answer.expires_in_path.as_deref(), Some("expires_in"));
+
+        let refused = |acquisition: serde_json::Value| -> String {
+            let mut v = serde_json::to_value(&full).unwrap();
+            for (k, val) in acquisition.as_object().unwrap() {
+                v["acquisition"][k] = val.clone();
+            }
+            match serde_json::from_value::<AccessSpec>(v) {
+                Ok(spec) => spec.validate().unwrap_err(),
+                Err(e) => e.to_string(),
+            }
+        };
+        assert!(refused(json!({ "authParams": { "x": "{client_secret}" } })).contains("authParams.x"));
+        assert!(refused(json!({ "extraParams": { "x": "{nope}" } })).contains("extraParams.x"));
+        assert!(refused(json!({ "afterExchange": { "url": "https://graph.instagram.com/x?t={nope}" } })).contains("afterExchange"));
+        assert!(refused(json!({ "refresh": { "url": "https://g/x", "form": { "a": "b" } } })).contains("GET"));
+        assert!(refused(json!({ "refresh": { "url": "https://g/x", "method": "POST", "form": { "a": "b" }, "body": {} } })).contains("both"));
+        assert!(refused(json!({ "clientParams": { "id": "same", "secret": "same" } })).contains("same name"));
+        assert!(refused(json!({ "clientParams": { "id": "a=b" } })).contains("clientParams.id"));
+        assert!(refused(json!({ "refresh": { "url": "https://g/x", "tokenpath": "a" } })).contains("unknown field"));
+        // A refresh may read what the connect-time check captured.
+        let mut with_test = serde_json::to_value(&full).unwrap();
+        with_test["test"] = json!({ "url": "https://graph.instagram.com/me", "captures": [{ "name": "userId", "path": "id" }] });
+        with_test["acquisition"]["refresh"]["form"]["user"] = json!("{userId}");
+        serde_json::from_value::<AccessSpec>(with_test).unwrap().validate().expect("test captures are stored values");
+    }
+
+    /// The minted JWT's exchange reads with the same reader, and the
+    /// keys it always had (`tokenPath`, `expiresPath`) keep their
+    /// spelling, so a stored snapshot still parses.
+    #[test]
+    fn the_jwt_exchange_reads_with_the_shared_reader() {
+        let spec: AccessSpec = serde_json::from_value(json!({
+            "service": "github_app",
+            "acquisition": {
+                "kind": "mint_jwt",
+                "fields": [{ "name": "private_key" }, { "name": "installation_id", "secret": false }],
+                "claims": { "iss": "1" },
+                "exchange": {
+                    "url": "https://api.github.com/app/installations/{installation_id}/access_tokens",
+                    "tokenPath": "token",
+                    "expiresPath": "expires_at"
+                }
+            }
+        }))
+        .unwrap();
+        spec.validate().unwrap();
+        let Acquisition::MintJwt { exchange: Some(exchange), .. } = &spec.acquisition else { unreachable!() };
+        let read = read_at(&exchange.answer, json!({ "token": "ghs", "expires_at": "2030-01-01T00:00:00Z" })).unwrap();
+        assert_eq!(read.token, "ghs");
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["acquisition"]["exchange"]["tokenPath"], "token");
+        let mut refreshable = v.clone();
+        refreshable["acquisition"]["exchange"]["refreshTokenPath"] = json!("r");
+        let err = serde_json::from_value::<AccessSpec>(refreshable).unwrap().validate().unwrap_err();
+        assert!(err.contains("minted"), "{err}");
+    }
+
+    /// A stored value the consent writes is a secret whatever the recipe
+    /// says, so an identity built from the token is refused.
+    #[test]
+    fn an_identity_built_from_the_stored_token_is_refused() {
+        let mut spec = slack_spec();
+        spec.identity = Some(Template::new("{token}"));
+        assert!(spec.validate().unwrap_err().contains("'token'"));
     }
 }

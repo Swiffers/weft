@@ -479,6 +479,9 @@ crate::wire_enum! {
         /// An infra verb took it down with the copies in its cut; it comes
         /// back once they run again.
         Infra = "infra",
+        /// `weft maintenance on` took it down with everything else on the
+        /// install; `weft maintenance off` brings it back.
+        Maintenance = "maintenance",
     }
 }
 

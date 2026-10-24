@@ -78,6 +78,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             copies BIGINT NOT NULL
         )"#],
     seed: &[],
+    data_steps: &[],
 };
 
 /// The count to set the pool to, when `wanted` copies are needed and the

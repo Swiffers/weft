@@ -50,6 +50,15 @@ impl ProgramLookup {
         }
     }
 
+    /// The program, or why `run_id` has none, in words for a person.
+    pub fn or_why(&self, run_id: weft_core::RunId) -> Result<Arc<ProjectDefinition>, String> {
+        match self {
+            Self::Found(p) => Ok(p.clone()),
+            Self::NoProgram => Err(format!("run {run_id} ran no program")),
+            Self::Unreadable(reason) | Self::ProgramGone(reason) => Err(reason.clone()),
+        }
+    }
+
     /// The same state, with the reason emptied.
     ///
     /// For a reader that has already published the reason and must not
@@ -830,16 +839,40 @@ pub async fn program_of_owner(
     run_id: weft_core::RunId,
     owner: &crate::store::RunOwner,
 ) -> anyhow::Result<ProgramLookup> {
-    let Some(hash) = owner.definition_hash.clone() else {
+    program_at(state, run_id, owner, owner.definition_hash.as_ref()).await
+}
+
+/// The registered program a run's program is (the one it was cut from,
+/// or its own: `RunOwner::registered_hash`), for the readers that name
+/// its places the way a person does: every place the run ran is one of
+/// its places under the same id, and so is every place a cut left out,
+/// so a name is read against the whole program the run was started on,
+/// whatever its folder holds now. The permanent misses are
+/// [`ProgramLookup`] variants, as for [`run_program`].
+pub async fn registered_program(
+    state: &crate::state::DispatcherState,
+    run_id: weft_core::RunId,
+    owner: &crate::store::RunOwner,
+) -> anyhow::Result<ProgramLookup> {
+    program_at(state, run_id, owner, owner.registered_hash()).await
+}
+
+/// The program recorded under `hash` for the run `owner` describes.
+async fn program_at(
+    state: &crate::state::DispatcherState,
+    run_id: weft_core::RunId,
+    owner: &crate::store::RunOwner,
+    hash: Option<&String>,
+) -> anyhow::Result<ProgramLookup> {
+    let Some(hash) = hash.cloned() else {
         return Ok(ProgramLookup::NoProgram);
     };
     let read = match state.program(owner.project_id, &hash).await {
-        Err(e) => match e.downcast::<crate::state::UnreadableProgram>() {
+        Err(e) => match e.downcast::<weft_core::stored::DecodeError>() {
             Ok(why) => {
                 return Ok(ProgramLookup::Unreadable(format!(
-                    "the definition recorded for run {run_id} (project {}, hash {hash}) no longer reads: \
-                     {}. `weft clean {run_id}` removes the run.",
-                    owner.project_id, why.0
+                    "the definition recorded for run {run_id} no longer reads ({why}). `weft clean {run_id}` \
+                     removes the run."
                 )))
             }
             Err(store) => return Err(store),

@@ -23,6 +23,7 @@
       },
       "tokenUrl": "https://slack.com/api/oauth.v2.access",
       "scopeDelimiter": ",",
+      "okPath": "ok",
       "captures": [
         {
           "name": "team",
@@ -53,6 +54,8 @@
     "test": {
       "url": "https://slack.com/api/auth.test",
       "method": "POST",
+      "okPath": "ok",
+      "errorPath": "error",
       "captures": [
         {
           "name": "team",
@@ -186,6 +189,8 @@
           "connect": {
             "url": "https://slack.com/api/apps.connections.open",
             "method": "POST",
+            "okPath": "ok",
+            "errorPath": "error",
             "auth": [
               {
                 "kind": "header",
@@ -216,10 +221,15 @@
           },
           "verify": {
             "kind": "hmac",
-            "signatureHeader": "X-Slack-Signature",
-            "timestampHeader": "X-Slack-Request-Timestamp",
-            "concat": "v0:{timestamp}:{body}",
-            "prefix": "v0="
+            "signature": {
+              "in": "header:X-Slack-Signature",
+              "pair": "=",
+              "key": "v0"
+            },
+            "timestamp": {
+              "in": "header:X-Slack-Request-Timestamp"
+            },
+            "concat": "v0:{timestamp}:{body}"
           },
           "eventPath": "event"
         }
@@ -241,6 +251,8 @@
           "connect": {
             "url": "https://slack.com/api/apps.connections.open",
             "method": "POST",
+            "okPath": "ok",
+            "errorPath": "error",
             "auth": [
               {
                 "kind": "header",
@@ -271,10 +283,15 @@
           },
           "verify": {
             "kind": "hmac",
-            "signatureHeader": "X-Slack-Signature",
-            "timestampHeader": "X-Slack-Request-Timestamp",
-            "concat": "v0:{timestamp}:{body}",
-            "prefix": "v0="
+            "signature": {
+              "in": "header:X-Slack-Signature",
+              "pair": "=",
+              "key": "v0"
+            },
+            "timestamp": {
+              "in": "header:X-Slack-Request-Timestamp"
+            },
+            "concat": "v0:{timestamp}:{body}"
           },
           "eventPath": "event"
         }
@@ -299,6 +316,8 @@
           "connect": {
             "url": "https://slack.com/api/apps.connections.open",
             "method": "POST",
+            "okPath": "ok",
+            "errorPath": "error",
             "auth": [
               {
                 "kind": "header",
@@ -324,10 +343,15 @@
         "webhook": {
           "verify": {
             "kind": "hmac",
-            "signatureHeader": "X-Slack-Signature",
-            "timestampHeader": "X-Slack-Request-Timestamp",
-            "concat": "v0:{timestamp}:{body}",
-            "prefix": "v0="
+            "signature": {
+              "in": "header:X-Slack-Signature",
+              "pair": "=",
+              "key": "v0"
+            },
+            "timestamp": {
+              "in": "header:X-Slack-Request-Timestamp"
+            },
+            "concat": "v0:{timestamp}:{body}"
           },
           "decode": {
             "path": "payload",
@@ -351,6 +375,8 @@
           "connect": {
             "url": "https://slack.com/api/apps.connections.open",
             "method": "POST",
+            "okPath": "ok",
+            "errorPath": "error",
             "auth": [
               {
                 "kind": "header",
@@ -381,10 +407,15 @@
           },
           "verify": {
             "kind": "hmac",
-            "signatureHeader": "X-Slack-Signature",
-            "timestampHeader": "X-Slack-Request-Timestamp",
-            "concat": "v0:{timestamp}:{body}",
-            "prefix": "v0="
+            "signature": {
+              "in": "header:X-Slack-Signature",
+              "pair": "=",
+              "key": "v0"
+            },
+            "timestamp": {
+              "in": "header:X-Slack-Request-Timestamp"
+            },
+            "concat": "v0:{timestamp}:{body}"
           },
           "eventPath": "event"
         }

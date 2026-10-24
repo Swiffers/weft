@@ -27,7 +27,7 @@ along several independent channels at once.
 
 | Key | What it says |
 |---|---|
-| `fields` | The named facts of one event, and where each lives in the payload. A dotted path, or `header:X-Some-Header` |
+| `fields` | The named facts of one event, and where each lives in the payload. A dotted path, or `header:X-Some-Header` (a push that sends that header twice with two different values is refused) |
 | `account` | Which stored value names the account on a connection, and where the same id sits on an event. That pair is what routes a shared application's events to the right connection |
 | `socket` | Present when the service offers dial out |
 | `webhook` | Present when the service dials in |
@@ -42,11 +42,11 @@ A `webhook` topic declares how the provider's pushes are handled:
 
 | Key | What it is |
 |---|---|
-| `verify` | How a push is proved real: `hmac`, `signature` (Ed25519 or ECDSA), `oidc`, or `token_echo` (the push carries back a token weft minted) |
+| `verify` | How a push is checked: `hmac`, `signature` (Ed25519 or ECDSA), `oidc`, or `token_echo` (the push carries back a token weft minted). For every key, go and read [checking a signed request](verifying-requests.md) |
 | `handshake` | The one-off proof of ownership: echo a field from the body, echo a query parameter, or call a URL back |
 | `eventPath` | Where the event sits inside the envelope |
 | `routeBy` | `account` (the default: the event names the provider account) or `subscription` (it names an id weft minted when it subscribed) |
-| `idPath` | Where a push carries the subscription id weft minted. Needed with `routeBy: subscription` |
+| `idPath` | Where a push carries the subscription id weft minted. Needed with `routeBy: subscription`, and with `token_echo` |
 | `tokenPath` | Where a push carries the token weft minted. Needed with `token_echo` |
 | `decode` | For an event wrapped in base64 or a form encoding |
 | `subscribe` | The calls that create, renew and cancel the subscription |

@@ -106,7 +106,7 @@
         async fn record_of(&self, run_id: RunId) -> anyhow::Result<weft_journal::record::RawRecord> {
             let events = self.events_of(run_id);
             Ok(weft_journal::record::RawRecord {
-                rows: vec![weft_journal::record::RunLogRow { seq: 0, events: weft_journal::stored::encode(&events) }],
+                rows: vec![weft_journal::record::RunLogRow::of(0, &events)],
             })
         }
         /// The record writes the ending of a run its worker gave up on.

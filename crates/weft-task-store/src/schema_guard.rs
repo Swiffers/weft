@@ -34,21 +34,30 @@
 //! (a trigger is dropped and created again), so a boot that re-ran it
 //! stalled every write and, under enough of them, deadlocked with them.
 //!
-//! When there is work, it is applied in one transaction under an advisory
-//! lock, in the same order the agreement test replays: first the DDL of
-//! every group new to this database (its migrations are recorded as
-//! history it was born with), then every PENDING migration across every
-//! group in one global id order (ids are timestamps, so this is the order
-//! the changes were actually written, and what a migration referencing
-//! another group's table relies on), then every group's seeds. The
-//! transaction waits a short while for each table lock it needs, never
-//! behind the writes queued on it; one that cannot get its locks, or meets
-//! a write in a deadlock, is rolled back whole and tried again, since a
-//! release's work on a busy database is exactly that.
+//! Every migration comes in two parts ([`Part`]), which the generator
+//! splits and the boot runs apart, with the stored JSON documents carried
+//! between them (`crate::documents`): first the EXPAND work, in one
+//! transaction under an advisory lock (the DDL of every group new to this
+//! database, its migrations recorded as history it was born with, then
+//! every PENDING expand part across every group in one global id order:
+//! ids are timestamps, so this is the order the changes were actually
+//! written, and what a migration referencing another group's table relies
+//! on); then the documents; then the CONTRACT work, in a second such
+//! transaction (every group's [`DataStep`]s still with work on the rows
+//! already there, every pending contract part, in the same order, the shape
+//! check below, every group's seeds). The expand part only adds, so a
+//! value a document's step moves out of its JSON has somewhere to go; the
+//! contract part drops and tightens, so it runs once the documents are
+//! carried and nothing it takes away still holds a value. Each transaction waits a short while
+//! for each table lock it needs, never behind the writes queued on it;
+//! one that cannot get its locks, or meets a write in a deadlock, is
+//! rolled back whole and tried again, since a release's work on a busy
+//! database is exactly that.
 //!
-//! **A stamp that moved is refreshed on evidence, never on faith**: the
-//! canonical DDL is built into a scratch schema in the same transaction
-//! and compared, object by object, with what the live schema holds. A
+//! **A stamp that moved is refreshed on evidence, never on faith**: once
+//! the contract parts ran, the canonical DDL is built into a scratch
+//! schema in the contract transaction and compared, object by object,
+//! with what the live schema holds. A
 //! match restamps silently (the fingerprint moved with no shape change,
 //! or a migration provably landed the shape). A difference is the drift
 //! case: the boot fails naming the group and the exact objects that
@@ -57,19 +66,27 @@
 
 use std::collections::HashMap;
 
+use anyhow::Context as _;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
-/// One change to one group's tables: the file's SQL, the group it sits under,
-/// and the id it is filed by. Ids sort chronologically
-/// (`20260823T1412_add_owner`), which is the order they run in.
+use crate::documents::Document;
+
+/// One part of one change to one group's tables: the file's SQL, the group
+/// it sits under, the id it is filed by, and which [`Part`] of the change
+/// it is. Ids sort chronologically (`20260823T1412_add_owner`), which is
+/// the order they run in within their part.
 ///
 /// An id is recorded the moment its SQL runs, so it never runs twice, and its
 /// checksum is recorded with it, so editing a file that has already run
 /// somewhere fails loudly instead of leaving two databases silently apart.
 pub struct Migration {
     pub group: &'static str,
+    /// The file's name without `.sql`: the change's id for its expand
+    /// part, and the id followed by [`CONTRACT_SUFFIX`] for its contract
+    /// part, so the two are recorded apart.
     pub id: &'static str,
+    pub part: Part,
     /// A draft exists only on the machine that wrote it (its file is
     /// gitignored). It keeps that one database in step with a shape still
     /// being decided, and is collapsed into a released migration when the
@@ -78,6 +95,28 @@ pub struct Migration {
     pub draft: bool,
     pub sql: &'static str,
 }
+
+/// Which half of a change a migration file holds. The generator splits
+/// every change in two, and the boot runs every pending expand part, then
+/// carries the stored documents (`crate::documents`), then runs every
+/// pending contract part ([`apply_schema`]). The expand part only adds
+/// (a table, a nullable column, an index, a function, a trigger, an enum
+/// label, a rename): what a document's step moves values out to. The
+/// contract part takes away and tightens (a dropped table, column, index,
+/// constraint, trigger or function, a NOT NULL, a CHECK or UNIQUE on a
+/// table that already holds rows), once the documents are carried and the
+/// data steps moved what it takes away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    Expand,
+    Contract,
+}
+
+/// What ends a contract part's file name before `.sql`, after its
+/// change's id: `20261023T120000_project_resync_drive.contract.sql` beside
+/// the change's `20261023T120000_project_resync_drive.sql`.
+// SYNC: CONTRACT_SUFFIX <-> crates/weft-task-store/build.rs (the part of each file)
+pub const CONTRACT_SUFFIX: &str = ".contract";
 
 // Every file under `migrations/`, gathered at build time. Writing a migration
 // is dropping a file in there; nothing registers it.
@@ -104,22 +143,66 @@ pub struct SchemaGroup {
     /// seed row is invisible to the schema reader, so the shape check
     /// finds nothing to differ and restamps).
     pub seed: &'static [&'static str],
+    /// What the rows already there need done before a contract part
+    /// takes away or tightens a column, declared by the group whose
+    /// tables the data lands in: see [`DataStep`].
+    pub data_steps: &'static [DataStep],
 }
 
-/// Group and table names are interpolated into the mismatch error's
-/// paste-ready reset SQL, so they must be plain SQL identifiers; a stray
-/// quote would hand the operator broken SQL at the worst moment. Static
-/// declarations, so this fails the first boot of the build that
-/// introduced the bad name.
-fn validate_identifiers(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
+/// Work on the rows a database already holds that a contract part needs
+/// done before it runs: a column's content copied to where it lives now
+/// before the column is dropped, or a column the expand part added
+/// filled on the rows already there before it is made NOT NULL. It runs at
+/// the start of the contract transaction ([`apply_schema`]), after the
+/// expand parts made the place it writes to and the documents were
+/// carried, and only while `table.column` is still the way the contract
+/// part has not left it yet ([`Until`]): a fresh database, built from the
+/// DDL, never needs it, and neither does one the contract part ran on.
+/// `table` is locked first, so no write lands between the step and the
+/// contract part.
+///
+/// A [`crate::documents::Fill`] is the other way a value leaves where it
+/// was: it runs before a step of a JSON column that stays, on the rows
+/// still at the step's version. A data step has no version to key on.
+pub struct DataStep {
+    /// The table and the column the step waits on (and locks the table
+    /// of). The table is one of its group's `tables`, which the boot
+    /// checks.
+    pub table: &'static str,
+    pub column: &'static str,
+    /// What the contract part does to the column, which ends the step's work.
+    pub until: Until,
+    /// The statement that does the work. Nothing records that it ran: only
+    /// the column's state stops it, so every boot with schema work to do
+    /// runs it again until a contract part changes the column, and it must
+    /// give the same result run twice (`ON CONFLICT DO NOTHING`, a `SET`
+    /// on the rows still `NULL`).
+    pub sql: &'static str,
+}
+
+/// What a contract part does to a [`DataStep`]'s column, which leaves the
+/// step nothing to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Until {
+    /// It drops the column: the step copies what the column holds to
+    /// where it lives now, while the column is there.
+    Dropped,
+    /// It makes the column NOT NULL: the step fills the column on the rows
+    /// already there, while it may still hold `NULL`.
+    NotNull,
+}
+
+/// Refuse a group declaration the schema work could not run safely. Group
+/// and table names are interpolated into the mismatch error's paste-ready
+/// reset SQL, so they must be plain SQL identifiers; a stray quote would
+/// hand the operator broken SQL at the worst moment. Static declarations,
+/// so this fails the first boot (or release) of the build that introduced
+/// the bad one.
+fn validate_groups(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     for group in groups {
         for name in std::iter::once(group.name).chain(group.tables.iter().copied()) {
             anyhow::ensure!(
-                !name.is_empty()
-                    && name.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                is_identifier(name),
                 "schema group '{}' declares a non-identifier name '{name}'; group and \
                  table names must match [a-z_][a-z0-9_]*",
                 group.name
@@ -127,13 +210,37 @@ fn validate_identifiers(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
         }
         // The guard's own bookkeeping tables are excluded from every
         // shape reading (see THING_QUERIES), so a group table by
-        // either name would be invisible to the drift check.
+        // one of their names would be invisible to the drift check.
         for table in group.tables {
             anyhow::ensure!(
-                *table != "weft_schema_stamp" && *table != "weft_migration",
+                !BOOKKEEPING.contains(table),
                 "schema group '{}' declares '{table}', which is the schema guard's \
                  own bookkeeping table; pick another name",
                 group.name
+            );
+        }
+        // A data step's table is spliced into the lock it takes, and a
+        // step only ever finds work on a table of its own group: on any
+        // other (a typo, another group's table) it would find none on
+        // every boot, and the contract part would then drop what it
+        // was meant to carry.
+        for step in group.data_steps {
+            for name in [step.table, step.column] {
+                anyhow::ensure!(
+                    is_identifier(name),
+                    "schema group '{}' has a data step on '{name}', which is not a plain SQL identifier ([a-z_][a-z0-9_]*)",
+                    group.name
+                );
+            }
+            anyhow::ensure!(
+                group.tables.contains(&step.table),
+                "schema group '{}' has a data step on {}.{}, but '{}' is not one of its tables ({}); \
+                 declare the step on the group whose tables hold that column",
+                group.name,
+                step.table,
+                step.column,
+                step.table,
+                group.tables.join(", ")
             );
         }
     }
@@ -160,6 +267,34 @@ fn validate_identifiers(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// A plain SQL identifier (`[a-z_][a-z0-9_]*`): safe to splice into SQL
+/// and into the reset text an error prints.
+pub(crate) fn is_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The guard's own tables: the stamps and the migrations it recorded, and
+/// the version each column of documents is at (`crate::documents`). Left
+/// out of every shape reading.
+const BOOKKEEPING: &[&str] = &["weft_schema_stamp", "weft_migration", "weft_document_version"];
+
+/// What makes the guard's own tables ([`BOOKKEEPING`]).
+const BOOKKEEPING_DDL: &str = "CREATE TABLE IF NOT EXISTS weft_schema_stamp (\
+         group_name TEXT PRIMARY KEY, fingerprint TEXT NOT NULL);\
+     CREATE TABLE IF NOT EXISTS weft_migration (\
+         group_name TEXT NOT NULL, \
+         id TEXT NOT NULL, \
+         checksum TEXT NOT NULL, \
+         applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+         PRIMARY KEY (group_name, id));\
+     CREATE TABLE IF NOT EXISTS weft_document_version (\
+         table_name TEXT NOT NULL, \
+         column_name TEXT NOT NULL, \
+         version INTEGER NOT NULL, \
+         PRIMARY KEY (table_name, column_name))";
 
 /// The functions, enum types, and triggers a group's DDL declares, read
 /// from the CREATE statements themselves, so ownership never depends on
@@ -346,35 +481,75 @@ async fn refuse_a_database_from_before_the_history(tx: &mut sqlx::Transaction<'_
     Ok(())
 }
 
-/// Bring `pool`'s schema up to what `groups` describe.
+/// Bring `pool`'s schema up to what `groups` describe, and its stored
+/// documents to the shape this build reads: the boot.
 ///
-/// The whole run executes in one transaction under an advisory lock:
-/// `IF NOT EXISTS` is idempotent but not concurrency-safe in Postgres
-/// (two backends racing the same CREATE on a fresh database both pass the
-/// existence check, then one fails on a duplicate catalog key), so
-/// concurrent boots serialize and the losers see the tables present. The
-/// transaction also makes each stamp atomic with its DDL: a stamp is never
-/// written for DDL that did not run.
-pub async fn apply_groups(pool: &PgPool, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
-    apply_groups_with(pool, groups, MIGRATIONS).await
+/// Three steps, in this order (see [`Part`]): the expand work, in one
+/// transaction under the advisory lock (every group new to the database
+/// built from its canonical DDL, every pending expand part run); then
+/// every column of `documents` carried to today's shape
+/// (`crate::documents`); then the contract work, in one transaction under
+/// the lock (every [`DataStep`] that still has work run, every
+/// pending contract part run, every moved stamp proved
+/// against the shape the database now holds, every seed). One transaction
+/// each, because `IF NOT EXISTS` is idempotent but not concurrency-safe in
+/// Postgres (two backends racing the same CREATE on a fresh database both
+/// pass the existence check, then one fails on a duplicate catalog key),
+/// so concurrent boots serialize and the losers see the tables present,
+/// and because a stamp is then never written for DDL that did not run. A
+/// database that already holds everything takes no lock and runs nothing.
+pub async fn apply_schema(pool: &PgPool, groups: &[&SchemaGroup], documents: &[&Document]) -> anyhow::Result<()> {
+    apply_schema_with(pool, groups, documents, MIGRATIONS).await
 }
 
-/// [`apply_groups`], against a migration set the caller names. The boot always
-/// uses every migration there is; a test names its own.
+/// [`apply_schema`], against a migration set the caller names. The boot
+/// always uses every migration there is; a test names its own.
+pub async fn apply_schema_with(
+    pool: &PgPool,
+    groups: &[&SchemaGroup],
+    documents: &[&Document],
+    migrations: &[Migration],
+) -> anyhow::Result<()> {
+    validate_groups(groups)?;
+    let holds = holds_everything(pool, groups, migrations).await?;
+    if !holds {
+        while_contended(|| expand_under_lock(pool, groups, migrations)).await?;
+    }
+    crate::documents::apply_documents(pool, documents).await.context("carry the stored documents to today's shape")?;
+    if !holds {
+        while_contended(|| contract_under_lock(pool, groups, migrations)).await?;
+    }
+    Ok(())
+}
+
+/// [`apply_schema`] with no stored documents: a group's tables alone, as a
+/// test or a role that keeps no documents builds them.
+pub async fn apply_groups(pool: &PgPool, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
+    apply_schema_with(pool, groups, &[], MIGRATIONS).await
+}
+
+/// [`apply_groups`], against a migration set the caller names.
 pub async fn apply_groups_with(
     pool: &PgPool,
     groups: &[&SchemaGroup],
     migrations: &[Migration],
 ) -> anyhow::Result<()> {
-    validate_identifiers(groups)?;
-    if holds_everything(pool, groups, migrations).await? {
-        return Ok(());
-    }
+    apply_schema_with(pool, groups, &[], migrations).await
+}
+
+/// Run `work` (one transaction of schema work), and again, waiting longer
+/// each time, while it gives way to the writes holding its tables
+/// ([`contended`]), for at most [`CONTENDED_FOR`].
+pub(crate) async fn while_contended<T, F, Fut>(mut work: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
     let started = std::time::Instant::now();
     let mut wait = CONTENDED_FIRST;
     loop {
-        match apply_under_lock(pool, groups, migrations).await {
-            Ok(()) => return Ok(()),
+        match work().await {
+            Ok(done) => return Ok(done),
             Err(e) if contended(&e) && started.elapsed() < CONTENDED_FOR => {
                 tracing::warn!(
                     target: "weft_task_store::schema_guard",
@@ -393,7 +568,7 @@ pub async fn apply_groups_with(
 /// How long a release's schema work waits for one table lock before it
 /// gives way to the writes queued behind it, and how long, in all, it keeps
 /// trying again before the boot fails naming the contention.
-const LOCK_WAIT: &str = "5s";
+pub(crate) const LOCK_WAIT: &str = "5s";
 const CONTENDED_FIRST: std::time::Duration = std::time::Duration::from_millis(500);
 const CONTENDED_LONGEST: std::time::Duration = std::time::Duration::from_secs(10);
 const CONTENDED_FOR: std::time::Duration = std::time::Duration::from_secs(180);
@@ -420,7 +595,8 @@ fn contended(e: &anyhow::Error) -> bool {
 /// refuses, is the locked path's to do or to explain.
 async fn holds_everything(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[Migration]) -> anyhow::Result<bool> {
     let ledgers: (bool,) = sqlx::query_as(
-        "SELECT to_regclass('weft_schema_stamp') IS NOT NULL AND to_regclass('weft_migration') IS NOT NULL",
+        "SELECT to_regclass('weft_schema_stamp') IS NOT NULL AND to_regclass('weft_migration') IS NOT NULL \
+         AND to_regclass('weft_document_version') IS NOT NULL",
     )
     .fetch_one(pool)
     .await?;
@@ -487,52 +663,57 @@ async fn missing_tables<'e>(
         .await?)
 }
 
-/// The schema's work, in one transaction under the advisory lock (see the
-/// module doc).
-async fn apply_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[Migration]) -> anyhow::Result<()> {
+/// One group as a locked transaction finds it: its stamp, and the
+/// migrations the database records for it.
+struct GroupState<'a> {
+    group: &'a SchemaGroup,
+    fp: String,
+    stamped: Option<String>,
+    applied: HashMap<String, String>,
+}
+
+/// A transaction holding the schema's advisory lock, whose every table
+/// lock waits [`LOCK_WAIT`] at most, so the work never sits at the head of
+/// a table's queue holding back the writes behind it ([`while_contended`]
+/// tries again). The schema's work and the documents' carry
+/// (`crate::documents`) both run in one.
+///
+/// Taking the advisory lock itself waits as long as another schema pass
+/// (a replica booting beside this one, a release) holds it, on purpose:
+/// that wait holds no table lock, so no write of the install queues behind
+/// it, and the other pass ends on its own (a long carry of documents can
+/// take minutes, which [`CONTENDED_FOR`] would cut short into a failed
+/// boot). Only the table locks taken once it is held are bounded, which is
+/// why `lock_timeout` is set after it.
+pub(crate) async fn locked_tx(pool: &PgPool) -> anyhow::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('weft:schema-migrate', 0))")
         .execute(&mut *tx)
         .await?;
-    // Every table lock taken from here waits this long at most, so the
-    // work never sits at the head of a table's queue holding back the
-    // writes behind it (`apply_groups_with` tries again).
     sqlx::query(&format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'")).execute(&mut *tx).await?;
-    sqlx::raw_sql(
-        "CREATE TABLE IF NOT EXISTS weft_schema_stamp (\
-             group_name TEXT PRIMARY KEY, fingerprint TEXT NOT NULL);\
-         CREATE TABLE IF NOT EXISTS weft_migration (\
-             group_name TEXT NOT NULL, \
-             id TEXT NOT NULL, \
-             checksum TEXT NOT NULL, \
-             applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-             PRIMARY KEY (group_name, id))",
-    )
-    .execute(&mut *tx)
-    .await?;
-    refuse_a_database_from_before_the_history(&mut tx).await?;
+    Ok(tx)
+}
 
-    // Pass 1: read each group's state and refuse rewritten history, so
-    // nothing runs before every group has been checked.
-    struct GroupState<'a> {
-        group: &'a SchemaGroup,
-        fp: String,
-        stamped: Option<String>,
-        applied: HashMap<String, String>,
-    }
+/// Read each group's state and refuse rewritten history, so nothing runs
+/// before every group has been checked.
+async fn group_states<'a>(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    groups: &[&'a SchemaGroup],
+    migrations: &[Migration],
+) -> anyhow::Result<Vec<GroupState<'a>>> {
     let mut states: Vec<GroupState> = Vec::new();
     for group in groups {
         let stored: Option<(String,)> =
             sqlx::query_as("SELECT fingerprint FROM weft_schema_stamp WHERE group_name = $1")
                 .bind(group.name)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await?;
         let applied: HashMap<String, String> =
             sqlx::query_as::<_, (String, String)>(
                 "SELECT id, checksum FROM weft_migration WHERE group_name = $1",
             )
             .bind(group.name)
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut **tx)
             .await?
             .into_iter()
             .collect();
@@ -562,7 +743,9 @@ async fn apply_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[
              no file for. Either this build is older than the release (rebuild from the \
              tree that carries the file with ./setup.sh, or check out the branch that does), \
              or a release was interrupted before writing its file: `./setup.sh --migration \
-             <name> --release` tells the two apart and says what to do.",
+             <name> --release` tells the two apart and says what to do. A `<file>.sql.releasing` \
+             left beside where the file belongs is a release interrupted after its commit: \
+             rename it to `<file>.sql` to finish it.",
             group.name,
             stray.join(", ")
         );
@@ -582,7 +765,7 @@ async fn apply_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[
                     group.name
                 ),
                 None if stored.is_some() => {
-                    record_migration(&mut tx, group.name, ORIGIN_ID, embedded).await?;
+                    record_migration(tx, group.name, ORIGIN_ID, embedded).await?;
                 }
                 None => {}
             }
@@ -594,10 +777,99 @@ async fn apply_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[
             applied,
         });
     }
+    Ok(states)
+}
 
-    // Pass 2: build every group that is new to this database from its
-    // canonical DDL; its migrations (and origin) are history it was
-    // born with, recorded without running.
+/// Run, in id order across every group, the pending migrations of `part`
+/// of the groups `states` holds stamped, recording each. Ids are
+/// timestamps, so this is the order the changes were written, the same
+/// order the agreement test replays, and the order a migration touching
+/// another group's table relies on.
+async fn run_pending(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    states: &[GroupState<'_>],
+    migrations: &[Migration],
+    part: Part,
+) -> anyhow::Result<()> {
+    let mut todo: Vec<(&SchemaGroup, &Migration)> = Vec::new();
+    for st in states {
+        if st.stamped.is_none() {
+            continue;
+        }
+        for m in pending(&for_group(migrations, st.group.name), &st.applied) {
+            if m.part == part {
+                todo.push((st.group, m));
+            }
+        }
+    }
+    todo.sort_by_key(|(_, m)| m.id);
+    for (group, m) in todo {
+        sqlx::raw_sql(m.sql).execute(&mut **tx).await.map_err(|e| {
+            anyhow::Error::from(e).context(format!("schema group '{}': migration '{}' failed", group.name, m.id))
+        })?;
+        record_migration(tx, group.name, m.id, m.sql).await?;
+    }
+    Ok(())
+}
+
+/// Run every [`DataStep`] of `groups` that still has work, in the
+/// transaction the contract parts then run in: its table is locked first,
+/// as the contract part would lock it, so nothing written to the table
+/// after the step runs is left out of it.
+async fn run_data_steps(tx: &mut sqlx::PgConnection, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
+    for group in groups {
+        for step in group.data_steps {
+            // `None`: the column is gone; `Some(true)`: it is NOT NULL.
+            let not_null: Option<bool> = sqlx::query_scalar(
+                "SELECT attnotnull FROM pg_attribute \
+                 WHERE attrelid = to_regclass($1) AND attname = $2 AND attnum > 0 AND NOT attisdropped",
+            )
+            .bind(step.table)
+            .bind(step.column)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let has_work = match step.until {
+                Until::Dropped => not_null.is_some(),
+                Until::NotNull => not_null == Some(false),
+            };
+            if !has_work {
+                continue;
+            }
+            sqlx::raw_sql(&format!("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", step.table)).execute(&mut *tx).await?;
+            sqlx::raw_sql(step.sql).execute(&mut *tx).await.map_err(|e| {
+                anyhow::Error::from(e).context(format!(
+                    "schema group '{}': the data step on {}.{} failed",
+                    group.name, step.table, step.column
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `table` holds `column`.
+pub(crate) async fn column_present(conn: &mut sqlx::PgConnection, table: &str, column: &str) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_attribute \
+         WHERE attrelid = to_regclass($1) AND attname = $2 AND attnum > 0 AND NOT attisdropped)",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(conn)
+    .await?)
+}
+
+/// The expand work (see [`apply_schema`]), in one transaction under the
+/// advisory lock.
+async fn expand_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[Migration]) -> anyhow::Result<()> {
+    let mut tx = locked_tx(pool).await?;
+    sqlx::raw_sql(BOOKKEEPING_DDL).execute(&mut *tx).await?;
+    refuse_a_database_from_before_the_history(&mut tx).await?;
+    let states = group_states(&mut tx, groups, migrations).await?;
+
+    // Every group that is new to this database is built from its
+    // canonical DDL; its migrations (both parts) and origin are history it
+    // was born with, recorded without running.
     for st in &states {
         if st.stamped.is_some() {
             continue;
@@ -621,15 +893,15 @@ async fn apply_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[
         }
     }
 
-    // Pass 2b: a group this database holds at its current shape (stamp
-    // current, nothing pending) whose table is gone (dropped by hand) is
-    // built again from its canonical DDL, every statement of which is
-    // idempotent on what is still there (it runs on the group's other
-    // tables too, and on any table its triggers sit on). A group with a
-    // migration pending is not: a table its migration creates is missing
-    // until pass 3 runs it, and the canonical DDL is the shape after every
-    // migration, which a pending one would then run on. Its missing tables
-    // are pass 3's to make, or pass 4's to name.
+    // A group this database holds at its current shape (stamp current,
+    // nothing pending) whose table is gone (dropped by hand) is built
+    // again from its canonical DDL, every statement of which is idempotent
+    // on what is still there (it runs on the group's other tables too, and
+    // on any table its triggers sit on). A group with a migration pending
+    // is not: a table its migration creates is missing until it runs, and
+    // the canonical DDL is the shape after every migration, which a
+    // pending one would then run on. Its missing tables are the
+    // migrations' to make, or the contract work's shape check to name.
     for st in &states {
         if st.stamped.as_deref() != Some(st.fp.as_str())
             || !pending(&for_group(migrations, st.group.name), &st.applied).is_empty()
@@ -645,37 +917,33 @@ async fn apply_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[
         }
     }
 
-    // Pass 3: one global run of everything pending across every stamped
-    // group, sorted by id. Ids are timestamps, so this is the order the
-    // changes were written, the same order the agreement test replays,
-    // and the order a migration touching another group's table relies
-    // on.
-    let mut todo: Vec<(&SchemaGroup, &Migration)> = Vec::new();
-    for st in &states {
-        if st.stamped.is_none() {
-            continue;
-        }
-        for m in pending(&for_group(migrations, st.group.name), &st.applied) {
-            todo.push((st.group, m));
-        }
-    }
-    todo.sort_by_key(|(_, m)| m.id);
-    for (group, m) in todo {
-        sqlx::raw_sql(m.sql).execute(&mut *tx).await.map_err(|e| {
-            anyhow::Error::from(e).context(format!("schema group '{}': migration '{}' failed", group.name, m.id))
-        })?;
-        record_migration(&mut tx, group.name, m.id, m.sql).await?;
-    }
+    run_pending(&mut tx, &states, migrations, Part::Expand).await?;
+    tx.commit().await?;
+    Ok(())
+}
 
-    // Pass 4: verify every moved stamp against the database itself, as it
-    // stands after pass 3's migrations. The canonical DDL is built into a scratch
-    // schema inside this same transaction and compared, object by object,
-    // with what the live schema holds. A group whose live shape matches is
-    // restamped: a fingerprint that moved with no shape change (a comment,
-    // a seed moved out of the DDL) is a non-event, and a migration that
-    // landed the shape is proven rather than assumed. A group whose live
-    // shape differs is the drift case, whatever migrations ran: "something
-    // was pending" must never launder a DDL edit nothing carried across.
+/// The contract work (see [`apply_schema`]), in one transaction under the
+/// advisory lock, once the stored documents are carried.
+async fn contract_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[Migration]) -> anyhow::Result<()> {
+    let mut tx = locked_tx(pool).await?;
+    let states = group_states(&mut tx, groups, migrations).await?;
+    run_data_steps(&mut tx, groups).await?;
+    run_pending(&mut tx, &states, migrations, Part::Contract).await?;
+
+    // Every moved stamp is verified against the database itself, as it
+    // stands once both parts of every pending migration ran: the only
+    // point where the canonical DDL, which is the shape after every
+    // migration, is what the database must hold. The canonical DDL is
+    // built into a scratch schema inside this same transaction and
+    // compared, object by object, with what the live schema holds. A group
+    // whose live shape matches is restamped: a fingerprint that moved with
+    // no shape change (a comment, a seed moved out of the DDL) is a
+    // non-event, and a migration that landed the shape is proven rather
+    // than assumed. A group whose live shape differs is the drift case,
+    // whatever migrations ran: "something was pending" must never launder
+    // a DDL edit nothing carried across. The expand work stands either
+    // way (it only added, and is recorded); this transaction, and with it
+    // every contract part it ran, rolls back.
     let moved: Vec<&GroupState> =
         states.iter().filter(|st| st.stamped.as_ref().is_some_and(|stored_fp| *stored_fp != st.fp)).collect();
     let mut mismatched: Vec<(&SchemaGroup, String)> = Vec::new();
@@ -746,7 +1014,7 @@ async fn apply_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[
         );
     }
 
-    // Pass 5: seeds, idempotent DML, after every table exists.
+    // Seeds, idempotent DML, after every table exists.
     for group in groups {
         for stmt in group.seed {
             sqlx::raw_sql(stmt)
@@ -873,10 +1141,11 @@ pub async fn replay_origins(pool: &PgPool, groups: &[&SchemaGroup]) -> anyhow::R
     Ok(())
 }
 
-/// Run, in id order across every group, the migrations of `groups` that
-/// `keep` picks. A test that stops the history at one release (to write
-/// rows the way an older build wrote them) and then plays the rest picks
-/// the two halves by id.
+/// Run the migrations of `groups` that `keep` picks as one boot runs
+/// them: every expand part, then every contract part, each in id order
+/// across every group. A test that stops the history at one release (to
+/// write rows the way an older build wrote them) and then plays the rest
+/// picks the two halves by id.
 pub async fn replay_migrations(
     pool: &PgPool,
     groups: &[&SchemaGroup],
@@ -887,7 +1156,9 @@ pub async fn replay_migrations(
         .iter()
         .filter(|m| names.contains(m.group) && keep(m))
         .collect();
-    all.sort_by_key(|m| m.id);
+    // As one boot runs them: every expand part, then every contract part,
+    // each in id order.
+    all.sort_by_key(|m| (m.part == Part::Contract, m.id));
     for m in all {
         let group = m.group;
         sqlx::raw_sql(m.sql)
@@ -895,6 +1166,35 @@ pub async fn replay_migrations(
             .await
             .map_err(|e| anyhow::anyhow!("migration '{}' of '{group}' failed: {e}", m.id))?;
     }
+    Ok(())
+}
+
+/// Build the database an older weft left behind, one whose history held
+/// the migrations `keep` picks: every group's frozen origin, those
+/// migrations run as one boot runs them, and each recorded as that weft's
+/// boot recorded it, with stamps this build no longer matches (so the next
+/// boot runs what is pending, carries the documents, and proves the
+/// shape). What a test of an upgrade fills, the way that weft wrote its
+/// rows, before booting this one on it.
+pub async fn build_as_of(pool: &PgPool, groups: &[&SchemaGroup], keep: impl Fn(&Migration) -> bool) -> anyhow::Result<()> {
+    replay_origins(pool, groups).await?;
+    replay_migrations(pool, groups, |m| !m.draft && keep(m)).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::raw_sql(BOOKKEEPING_DDL).execute(&mut *tx).await?;
+    refuse_a_database_from_before_the_history(&mut tx).await?;
+    for group in groups {
+        sqlx::query("INSERT INTO weft_schema_stamp (group_name, fingerprint) VALUES ($1, 'an older weft')")
+            .bind(group.name)
+            .execute(&mut *tx)
+            .await?;
+        if let Some(origin) = embedded_origin(group.name) {
+            record_migration(&mut tx, group.name, ORIGIN_ID, origin).await?;
+        }
+        for m in MIGRATIONS.iter().filter(|m| m.group == group.name && !m.draft && keep(m)) {
+            record_migration(&mut tx, group.name, m.id, m.sql).await?;
+        }
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -971,16 +1271,16 @@ const THING_QUERIES: &[&str] = &[
      LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
      WHERE n.nspname = $1 AND rel.relkind = 'r' \
        AND a.attnum > 0 AND NOT a.attisdropped \
-       AND rel.relname NOT IN ('weft_schema_stamp', 'weft_migration')",
+       AND rel.relname NOT IN ('weft_schema_stamp', 'weft_migration', 'weft_document_version')",
     "SELECT 'index' AS kind, tablename AS \"table\", indexname AS name, indexdef AS body \
      FROM pg_indexes WHERE schemaname = $1 \
-       AND tablename NOT IN ('weft_schema_stamp', 'weft_migration')",
+       AND tablename NOT IN ('weft_schema_stamp', 'weft_migration', 'weft_document_version')",
     "SELECT 'constraint' AS kind, rel.relname AS \"table\", c.conname AS name, \
          pg_get_constraintdef(c.oid) AS body \
      FROM pg_constraint c JOIN pg_class rel ON rel.oid = c.conrelid \
      JOIN pg_namespace n ON n.oid = rel.relnamespace \
      WHERE n.nspname = $1 \
-       AND rel.relname NOT IN ('weft_schema_stamp', 'weft_migration')",
+       AND rel.relname NOT IN ('weft_schema_stamp', 'weft_migration', 'weft_document_version')",
     "SELECT 'trigger' AS kind, rel.relname AS \"table\", t.tgname AS name, \
          pg_get_triggerdef(t.oid) AS body \
      FROM pg_trigger t JOIN pg_class rel ON rel.oid = t.tgrelid \
@@ -1019,9 +1319,11 @@ pub enum Owner {
     Named(String),
 }
 
-/// One statement of a planned migration, with its owner.
+/// One statement of a planned migration, with its owner and the part of
+/// the migration it goes in.
 pub struct Planned {
     pub owner: Owner,
+    pub part: Part,
     pub stmt: String,
 }
 
@@ -1051,7 +1353,14 @@ fn owner_of(thing: &Thing) -> Owner {
 /// the order given, and the rest is diffed against the schema as it
 /// stands after them. A constraint or index whose definition then matches
 /// under another name is renamed rather than rebuilt.
-pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyhow::Result<Vec<Planned>> {
+///
+/// A function whose arguments changed, the one function of its name on each
+/// side, is the same function replaced, in the expand part
+/// ([`replaced_function`]), where an add beside the old one would make
+/// every call ambiguous until the contract part dropped the old. A NOT NULL column with no default in `backfills`
+/// is added holding the value given there on the rows already in its
+/// table, a default the contract part then drops.
+pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfills: &[Backfill]) -> anyhow::Result<Vec<Planned>> {
     let key = |t: &Thing| (t.kind.clone(), t.table.clone(), t.name.clone());
     let (old, mut plan) = apply_renames(old, renames)?;
     let paired = pair_renamed_objects(&old, new);
@@ -1075,9 +1384,22 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyho
     let new_by: HashMap<_, _> = new.iter().map(|t| (key(t), t.clone())).collect();
     let old_tables: std::collections::HashSet<&str> =
         old.iter().map(|t| t.table.as_str()).collect();
+    let replaced = replaced_functions(old, new);
+    // A column's NOT NULL constraint (Postgres names one per NOT NULL
+    // column) arrives with the statement that adds the column or makes it
+    // NOT NULL: one of its own would be a second, which fails, or a no-op
+    // when the names happen to match.
+    let implied_not_null = |thing: &Thing| {
+        thing.kind == "constraint"
+            && thing.body.strip_prefix("NOT NULL ").is_some_and(|column| {
+                let column = ("column".to_string(), thing.table.clone(), column.trim().to_string());
+                new_by.get(&column).is_some_and(|now| column_parts(&now.body).not_null)
+                    && old_by.get(&column).is_none_or(|was| !column_parts(&was.body).not_null)
+            })
+    };
     let mut created: std::collections::HashSet<&str> = Default::default();
     for thing in new {
-        if backs_constraint(thing) {
+        if backs_constraint(thing) || implied_not_null(thing) {
             continue;
         }
         // A table nobody had before: its columns arrive with the CREATE
@@ -1093,19 +1415,28 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyho
                     .collect();
                 plan.push(Planned {
                     owner: Owner::Table(thing.table.clone()),
+                    part: Part::Expand,
                     stmt: format!("CREATE TABLE {} (\n{}\n);", thing.table, cols.join(",\n")),
                 });
             }
             if thing.kind == "column" {
                 continue;
             }
-            plan.push(Planned { owner: owner_of(thing), stmt: added(thing) });
+            // A new table holds no row, so all of it arrives in the
+            // expand part.
+            plan.push(Planned { owner: owner_of(thing), part: Part::Expand, stmt: added_whole(thing) });
             continue;
         }
         match old_by.get(&key(thing)) {
-            None => plan.push(Planned { owner: owner_of(thing), stmt: added(thing) }),
+            None => match replaced.get(&key(thing)) {
+                Some(was) => plan.push(Planned { owner: owner_of(thing), part: Part::Expand, stmt: replaced_function(was, thing) }),
+                None => {
+                    let backfill = backfills.iter().find(|b| b.table == thing.table && b.column == thing.name);
+                    plan.extend(added(thing, backfill).into_iter().map(|(part, stmt)| Planned { owner: owner_of(thing), part, stmt }))
+                }
+            },
             Some(was) if was.body != thing.body => {
-                plan.push(Planned { owner: owner_of(thing), stmt: changed(was, thing) })
+                plan.extend(changed(was, thing).into_iter().map(|(part, stmt)| Planned { owner: owner_of(thing), part, stmt }))
             }
             Some(_) => {}
         }
@@ -1130,6 +1461,7 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyho
             if dropped.insert(thing.table.as_str()) {
                 plan.push(Planned {
                     owner: Owner::Table(thing.table.clone()),
+                    part: Part::Contract,
                     stmt: format!(
                         "-- Throws away every row in {}.\nDROP TABLE {};",
                         thing.table, thing.table
@@ -1138,7 +1470,7 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyho
             }
             continue;
         }
-        if new_by.contains_key(&key(thing)) {
+        if new_by.contains_key(&key(thing)) || replaced.values().any(|was| key(was) == key(thing)) {
             continue;
         }
         // A column's NOT NULL constraint (Postgres names one per NOT NULL
@@ -1152,7 +1484,8 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyho
                 }
             }
         }
-        let planned = Planned { owner: owner_of(thing), stmt: removed(thing) };
+        let (part, stmt) = removed(thing);
+        let planned = Planned { owner: owner_of(thing), part, stmt };
         match thing.kind.as_str() {
             "trigger" => dropped_triggers.push(planned),
             "function" => dropped_functions.push(planned),
@@ -1166,6 +1499,55 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyho
     // DROP would then fail on a trigger that is gone.
     plan.extend(dropped_functions);
     Ok(plan)
+}
+
+/// The functions `new` holds under arguments `old` does not, each the one
+/// function of its name on both sides, keyed by the new one, with the old
+/// one it replaces. Two functions of one name in the canonical DDL are
+/// overloads meant to stand side by side, and are planned one by one.
+fn replaced_functions(old: &[Thing], new: &[Thing]) -> HashMap<(String, String, String), Thing> {
+    let only = |things: &[Thing], name: &str| -> Option<Thing> {
+        let mut named = things.iter().filter(|t| t.kind == "function" && bare_name(&t.name) == name);
+        match (named.next(), named.next()) {
+            (Some(one), None) => Some(one.clone()),
+            _ => None,
+        }
+    };
+    new.iter()
+        .filter(|t| t.kind == "function")
+        .filter_map(|now| {
+            let was = only(old, bare_name(&now.name))?;
+            (was.name != now.name && only(new, bare_name(&now.name)).is_some())
+                .then(|| ((now.kind.clone(), now.table.clone(), now.name.clone()), was))
+        })
+        .collect()
+}
+
+/// The statements that replace `was` with `now`, a function of the same
+/// name whose arguments changed, in one go: the old one dropped (no
+/// CASCADE, so anything still on it fails the migration loudly) and the
+/// new one made.
+fn replaced_function(was: &Thing, now: &Thing) -> String {
+    format!(
+        "-- {} takes other arguments now: a call with the old ones fails loudly (no such function).\n\
+         DROP FUNCTION {};\n{};",
+        bare_name(&now.name),
+        was.name,
+        now.body
+    )
+}
+
+/// What a column added NOT NULL with no default holds on the rows already
+/// in its table, given by the one who knows (a document's version column:
+/// `crate::documents::Document::backfill`). The migration adds it with
+/// this as its default, so every row there takes it, and the contract
+/// part drops the default, so a write that leaves the column out fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backfill {
+    pub table: String,
+    pub column: String,
+    /// SQL for the value.
+    pub value: String,
 }
 
 /// One rename the person releasing a migration names, because no diff
@@ -1231,10 +1613,11 @@ fn apply_renames(old: &[Thing], renames: &[Rename]) -> anyhow::Result<(Vec<Thing
                 }
                 plan.push(Planned {
                     owner: Owner::Table(to.clone()),
+                    part: Part::Expand,
                     stmt: format!("ALTER TABLE {from} RENAME TO {to};"),
                 });
                 for (was, now) in sequences {
-                    plan.push(Planned { owner: Owner::Table(to.clone()), stmt: format!("ALTER SEQUENCE {was} RENAME TO {now};") });
+                    plan.push(Planned { owner: Owner::Table(to.clone()), part: Part::Expand, stmt: format!("ALTER SEQUENCE {was} RENAME TO {now};") });
                 }
             }
             Rename::Column { table, from, to } => {
@@ -1260,10 +1643,11 @@ fn apply_renames(old: &[Thing], renames: &[Rename]) -> anyhow::Result<(Vec<Thing
                 }
                 plan.push(Planned {
                     owner: Owner::Table(table.clone()),
+                    part: Part::Expand,
                     stmt: format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to};"),
                 });
                 if let Some((was, now)) = sequence {
-                    plan.push(Planned { owner: Owner::Table(table.clone()), stmt: format!("ALTER SEQUENCE {was} RENAME TO {now};") });
+                    plan.push(Planned { owner: Owner::Table(table.clone()), part: Part::Expand, stmt: format!("ALTER SEQUENCE {was} RENAME TO {now};") });
                 }
             }
         }
@@ -1387,7 +1771,7 @@ fn pair_renamed_objects(old: &[Thing], new: &[Thing]) -> Paired {
         } else {
             format!("ALTER TABLE {} RENAME CONSTRAINT {} TO {};", now.table, was.name, now.name)
         };
-        out.plan.push(Planned { owner: owner_of(now), stmt });
+        out.plan.push(Planned { owner: owner_of(now), part: Part::Expand, stmt });
         out.old.insert(key(was));
         out.new.insert(key(now));
     }
@@ -1430,14 +1814,18 @@ fn column_parts(body: &str) -> ColumnParts {
 /// reports. Rendering of [`column_parts`], so there is one parser of
 /// the body format.
 fn describe_column(body: &str) -> String {
-    let parts = column_parts(body);
+    render_column(&column_parts(body))
+}
+
+/// The column clause of a CREATE TABLE or an ADD COLUMN for `parts`.
+fn render_column(parts: &ColumnParts) -> String {
     let mut out;
     if let Some(expr) = &parts.generated {
         out = format!("{} GENERATED ALWAYS AS ({expr}) STORED", parts.ty);
     } else if let Some(kind) = &parts.identity {
         let when = if kind == "ALWAYS" { "ALWAYS" } else { "BY DEFAULT" };
         out = format!("{} GENERATED {when} AS IDENTITY", parts.ty);
-    } else if let Some(serial) = serial_form(&parts) {
+    } else if let Some(serial) = serial_form(parts) {
         // A default of nextval on the column's own sequence is how
         // Postgres reports a serial; rendering the default literally
         // would reference a sequence the CREATE never made.
@@ -1468,29 +1856,16 @@ fn serial_form(parts: &ColumnParts) -> Option<&'static str> {
     }
 }
 
-fn added(thing: &Thing) -> String {
+/// The statement that makes `thing` whole: as it arrives with a table
+/// nobody had before, which holds no row.
+fn added_whole(thing: &Thing) -> String {
     match thing.kind.as_str() {
         "type" => format!(
             "CREATE TYPE {} AS ENUM ({});",
             thing.name,
             thing.body.split(',').map(|l| format!("'{l}'")).collect::<Vec<_>>().join(", ")
         ),
-        "column" => {
-            let parts = column_parts(&thing.body);
-            let price = if parts.not_null && parts.default.is_none() && parts.identity.is_none()
-            {
-                "-- Fails if the table holds any row: add it nullable, backfill, \
-                 then SET NOT NULL.\n"
-            } else {
-                ""
-            };
-            format!(
-                "{price}ALTER TABLE {} ADD COLUMN {} {};",
-                thing.table,
-                thing.name,
-                describe_column(&thing.body)
-            )
-        }
+        "column" => format!("ALTER TABLE {} ADD COLUMN {} {};", thing.table, thing.name, describe_column(&thing.body)),
         "constraint" => {
             format!("ALTER TABLE {} ADD CONSTRAINT {} {};", thing.table, thing.name, thing.body)
         }
@@ -1499,16 +1874,88 @@ fn added(thing: &Thing) -> String {
     }
 }
 
-fn changed(was: &Thing, now: &Thing) -> String {
+/// The statements that add `thing` to a schema whose tables may already
+/// hold rows, each with the part it goes in ([`Part`]). A constraint, or
+/// a unique index, tightens what the rows may hold, so it waits for the
+/// contract part. A NOT NULL column with no default is added with
+/// `backfill`'s value as its default when there is one, which the
+/// contract part drops; with none, it is added nullable in the expand
+/// part, so whatever fills it (a document's fill, the code) runs before
+/// the contract part makes it NOT NULL.
+fn added(thing: &Thing, backfill: Option<&Backfill>) -> Vec<(Part, String)> {
+    match thing.kind.as_str() {
+        "column" => {
+            let parts = column_parts(&thing.body);
+            if parts.not_null && parts.default.is_none() && parts.identity.is_none() && parts.generated.is_none() {
+                if let Some(backfill) = backfill {
+                    let filled = ColumnParts { default: Some(backfill.value.clone()), ..parts };
+                    return vec![
+                        (
+                            Part::Expand,
+                            format!(
+                                "-- The rows already here hold {}; the contract part drops the default.\n\
+                                 ALTER TABLE {} ADD COLUMN {} {};",
+                                backfill.value,
+                                thing.table,
+                                thing.name,
+                                render_column(&filled)
+                            ),
+                        ),
+                        (Part::Contract, format!("ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;", thing.table, thing.name)),
+                    ];
+                }
+                let nullable = ColumnParts { not_null: false, ..parts };
+                vec![
+                    (
+                        Part::Expand,
+                        format!(
+                            "-- Added nullable: fill it before the contract part makes it NOT NULL.\n\
+                             ALTER TABLE {} ADD COLUMN {} {};",
+                            thing.table,
+                            thing.name,
+                            render_column(&nullable)
+                        ),
+                    ),
+                    (Part::Contract, set_not_null(&thing.table, &thing.name)),
+                ]
+            } else {
+                vec![(Part::Expand, added_whole(thing))]
+            }
+        }
+        "constraint" => vec![(Part::Contract, added_whole(thing))],
+        "index" if is_unique_index(thing) => vec![(Part::Contract, added_whole(thing))],
+        _ => vec![(Part::Expand, added_whole(thing))],
+    }
+}
+
+/// Whether `thing` is an index that refuses two rows holding the same key.
+fn is_unique_index(thing: &Thing) -> bool {
+    thing.kind == "index" && thing.body.starts_with("CREATE UNIQUE INDEX")
+}
+
+/// The statement that makes a column NOT NULL, with what it costs.
+fn set_not_null(table: &str, column: &str) -> String {
+    format!(
+        "-- Fails if any row still holds a null here.\n\
+         ALTER TABLE {table} ALTER COLUMN {column} SET NOT NULL;"
+    )
+}
+
+/// The statements that turn `was` into `now`, each with the part it goes
+/// in ([`Part`]): what only loosens or replaces in place (a function, an
+/// enum label, a trigger, a column's type or default, a dropped NOT NULL)
+/// in the expand part, what tightens (a constraint, a unique index, a new
+/// NOT NULL) in the contract part.
+fn changed(was: &Thing, now: &Thing) -> Vec<(Part, String)> {
     match now.kind.as_str() {
         // CREATE OR REPLACE cannot change what a function returns nor rename
         // its parameters: one whose signature changed is dropped first (no
         // CASCADE, so a trigger still on it fails the migration loudly
         // instead of going with it).
         "function" if function_signature(&was.body) != function_signature(&now.body) => {
-            format!("DROP FUNCTION {};\n{};", now.name, now.body)
+            vec![(Part::Expand, format!("DROP FUNCTION {};\n{};", now.name, now.body))]
         }
-        "function" => format!("{};", now.body),
+        "function" => vec![(Part::Expand, format!("{};", now.body))],
         "type" => {
             // Postgres only ever ADDS enum labels; a removed or
             // reordered one needs a rebuild, priced in the comment.
@@ -1533,19 +1980,22 @@ fn changed(was: &Thing, now: &Thing) -> String {
                     ),
                 );
             }
-            out.join("\n")
+            vec![(Part::Expand, out.join("\n"))]
         }
-        "trigger" => format!(
+        "trigger" => vec![(Part::Expand, format!(
             "DROP TRIGGER {} ON {};\n{};",
             now.name, now.table, now.body
-        ),
-        "index" => format!("DROP INDEX {};\n{};", now.name, now.body),
-        "constraint" => format!(
+        ))],
+        "index" => {
+            let part = if is_unique_index(now) { Part::Contract } else { Part::Expand };
+            vec![(part, format!("DROP INDEX {};\n{};", now.name, now.body))]
+        }
+        "constraint" => vec![(Part::Contract, format!(
             "ALTER TABLE {t} DROP CONSTRAINT {n};\nALTER TABLE {t} ADD CONSTRAINT {n} {b};",
             t = now.table,
             n = now.name,
             b = now.body
-        ),
+        ))],
         _ => {
             let was = column_parts(&was.body);
             let now_p = column_parts(&now.body);
@@ -1553,27 +2003,27 @@ fn changed(was: &Thing, now: &Thing) -> String {
             let (ty, not_null, default) = (now_p.ty, now_p.not_null, now_p.default);
             let mut out = Vec::new();
             if was.identity != now_p.identity || was.generated != now_p.generated {
-                out.push(format!(
+                out.push((Part::Expand, format!(
                     "-- {}.{} changed its identity/generated form; Postgres has no \
                      single ALTER for this.\n-- Write the ALTER TABLE ... ALTER COLUMN \
                      ... [ADD|DROP|SET] GENERATED steps by hand here.",
                     now.table, now.name
-                ));
+                )));
             }
             if old_ty != ty {
                 // The cast is the plain one. A column whose old values need
                 // real conversion (a date out of a string, a unit change)
                 // wants a different USING, which is why this one is spelled
                 // out rather than hidden.
-                out.push(format!(
+                out.push((Part::Expand, format!(
                     "-- {}.{} was {old_ty}. The cast below is a plain one; if the rows \
                      already there\n-- need converting differently, change the USING.\n\
                      ALTER TABLE {} ALTER COLUMN {} TYPE {ty} USING {}::{ty};",
                     now.table, now.name, now.table, now.name, now.name
-                ));
+                )));
             }
             if old_default != default {
-                out.push(match &default {
+                out.push((Part::Expand, match &default {
                     Some(d) => format!(
                         "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {d};",
                         now.table, now.name
@@ -1582,20 +2032,16 @@ fn changed(was: &Thing, now: &Thing) -> String {
                         "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
                         now.table, now.name
                     ),
-                });
+                }));
             }
             if old_not_null != not_null {
                 out.push(if not_null {
-                    format!(
-                        "-- Fails if any row still holds a null here.\n\
-                         ALTER TABLE {} ALTER COLUMN {} SET NOT NULL;",
-                        now.table, now.name
-                    )
+                    (Part::Contract, set_not_null(&now.table, &now.name))
                 } else {
-                    format!("ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;", now.table, now.name)
+                    (Part::Expand, format!("ALTER TABLE {} ALTER COLUMN {} DROP NOT NULL;", now.table, now.name))
                 });
             }
-            out.join("\n")
+            out
         }
     }
 }
@@ -1608,27 +2054,28 @@ fn function_signature(definition: &str) -> (Option<&str>, Option<&str>) {
     (head, lines.find(|line| line.starts_with("RETURNS ")))
 }
 
-fn removed(thing: &Thing) -> String {
+/// The statement that takes `thing` away, with the part it goes in: every
+/// drop waits for the contract part, so what the documents' steps and the
+/// data steps read is there until they ran.
+fn removed(thing: &Thing) -> (Part, String) {
     match thing.kind.as_str() {
         // IF EXISTS on an index or a constraint: one that names a column
         // this same plan drops leaves with that column, whichever
         // statement runs first.
-        "index" => format!("DROP INDEX IF EXISTS {};", thing.name),
-        "trigger" => format!("DROP TRIGGER {} ON {};", thing.name, thing.table),
+        "index" => (Part::Contract, format!("DROP INDEX IF EXISTS {};", thing.name)),
+        "trigger" => (Part::Contract, format!("DROP TRIGGER {} ON {};", thing.name, thing.table)),
         // CASCADE, for anything still hanging off it that the plan does
         // not drop by name; the plan drops functions last, after the
         // triggers it names.
-        "function" => format!("DROP FUNCTION {} CASCADE;", thing.name),
-        "type" => format!("DROP TYPE {};", thing.name),
+        "function" => (Part::Contract, format!("DROP FUNCTION {} CASCADE;", thing.name)),
+        "type" => (Part::Contract, format!("DROP TYPE {};", thing.name)),
         "constraint" => {
-            format!("ALTER TABLE {} DROP CONSTRAINT IF EXISTS {};", thing.table, thing.name)
+            (Part::Contract, format!("ALTER TABLE {} DROP CONSTRAINT IF EXISTS {};", thing.table, thing.name))
         }
-        "persistence" => format!("ALTER TABLE {} SET LOGGED;", thing.table),
-        _ => format!(
-            "-- Throws away what is in {}.{}. Ship this in a later release than the one \n\
-             -- that stopped reading the column, so replicas still on the old release do not fall over.\n\
-             ALTER TABLE {} DROP COLUMN {};",
-            thing.table, thing.name, thing.table, thing.name
+        "persistence" => (Part::Expand, format!("ALTER TABLE {} SET LOGGED;", thing.table)),
+        _ => (
+            Part::Contract,
+            format!("-- Throws away what is in {}.{}.\nALTER TABLE {} DROP COLUMN {};", thing.table, thing.name, thing.table, thing.name),
         ),
     }
 }
@@ -1678,7 +2125,10 @@ fn history_declared(group: &str, name: &str) -> bool {
     history_declared_names(group).iter().any(|n| n == name)
 }
 
-/// Split a plan into one file per group, and say where each file goes.
+/// Split a plan into one file per group and part, and say where each
+/// file goes: a group's expand statements in `<id>.sql`, its contract
+/// statements in `<id>.contract.sql` ([`CONTRACT_SUFFIX`]), each written
+/// only when it holds a statement.
 ///
 /// A statement is filed under the group that owns it: for a table, the
 /// group listing it in `tables`, or, for a table the canonical DDL no
@@ -1694,15 +2144,16 @@ fn history_declared(group: &str, name: &str) -> bool {
 /// silently replacing a file that may already have run somewhere would
 /// break its recorded checksum with the original content gone.
 ///
-/// Returns the group, the path to write, and the file's contents.
+/// Returns the group, the part, the path to write, and the file's
+/// contents.
 pub fn file_per_group(
     groups: &[&SchemaGroup],
     plan: &[Planned],
     name: &str,
     draft: bool,
-) -> anyhow::Result<Vec<(String, std::path::PathBuf, String)>> {
+) -> anyhow::Result<Vec<(String, Part, std::path::PathBuf, String)>> {
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S");
-    let mut by_group: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+    let mut by_group: std::collections::BTreeMap<(&str, bool), Vec<&str>> = Default::default();
     for planned in plan {
         let owner = groups
             .iter()
@@ -1725,11 +2176,11 @@ pub fn file_per_group(
                     planned.stmt
                 )
             })?;
-        by_group.entry(owner.name).or_default().push(planned.stmt.as_str());
+        by_group.entry((owner.name, planned.part == Part::Contract)).or_default().push(planned.stmt.as_str());
     }
     by_group
         .into_iter()
-        .map(|(group, stmts)| {
+        .map(|((group, contract), stmts)| {
             // The group is part of the id, so one release touching two
             // groups writes two DISTINCT ids: both run-orderings sort
             // by id with different tie-breaks, and identical ids would
@@ -1740,6 +2191,7 @@ pub fn file_per_group(
             } else {
                 format!("{stamp}_{group}_{name}")
             };
+            let id = if contract { format!("{id}{CONTRACT_SUFFIX}") } else { id };
             let dir = migrations_root().join(group);
             let path =
                 if draft { dir.join("drafts") } else { dir }.join(format!("{id}.sql"));
@@ -1749,7 +2201,8 @@ pub fn file_per_group(
                  run somewhere. Pick a different name.",
                 path.display()
             );
-            Ok((group.to_string(), path, format!("{}\n", stmts.join("\n\n"))))
+            let part = if contract { Part::Contract } else { Part::Expand };
+            Ok((group.to_string(), part, path, format!("{}\n", stmts.join("\n\n"))))
         })
         .collect()
 }
@@ -1803,47 +2256,87 @@ pub async fn unborn_groups(
     Ok(groups.iter().map(|g| g.name).filter(|name| !stamped.iter().any(|(s,)| s == name)).collect())
 }
 
-/// One released migration as it settles on the live database: its
-/// group, its id, its SQL, and whether the database still has to RUN
-/// it (it never saw the drafts) or only has it RECORDED (it ran them,
-/// so it already holds the result).
+/// One part of a released migration as it settles on the live database:
+/// its group, its id, which part it is, its SQL, and whether the database
+/// still has to RUN it (it never saw the drafts) or only has it RECORDED
+/// (it ran them, so it already holds the result).
 pub struct Settling {
     pub group: String,
     pub id: String,
+    pub part: Part,
     pub sql: String,
     pub run: bool,
 }
 
 /// Bring the live database to a release, in ONE transaction under the
-/// migration lock: run what it has to run, record every released
-/// migration, clear the draft rows of EVERY group (two drafts that
-/// cancel out produce no released file, and their rows would
-/// otherwise be junk nothing cleans), then verify it now holds exactly
-/// `expected` over what these groups own before committing. A failure
-/// anywhere rolls all of it back, so the database is never recorded as
-/// holding a migration it does not, and a recorded migration only
-/// ever means "this database holds its result".
+/// migration lock, in the order a boot runs it: clear the draft rows of
+/// EVERY group (two drafts that cancel out produce no released file, and
+/// their rows would otherwise be junk nothing cleans), run and record the
+/// expand parts, carry `documents` to today's shape, run the groups'
+/// data steps ([`DataStep`]), run and record the contract parts, then verify it
+/// now holds exactly `expected` over what these groups own before
+/// committing. A failure anywhere rolls all of it
+/// back, so the database is never recorded as holding a migration it does
+/// not, and a recorded migration only ever means "this database holds its
+/// result".
+///
+/// The live database is usually a running install, so the transaction is
+/// a [`locked_tx`]: a table lock it cannot get within [`LOCK_WAIT`] rolls
+/// it back whole instead of stalling the install's writes queued behind
+/// it, and [`while_contended`] runs it again from the start, as the boot
+/// does. A retry is the same transaction on the same database: nothing of
+/// the attempt that gave way was kept.
 pub async fn settle_release(
     pool: &PgPool,
     groups: &[&SchemaGroup],
+    documents: &[&Document],
     expected: &[Thing],
     released: &[Settling],
 ) -> anyhow::Result<()> {
-    use anyhow::Context;
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('weft:schema-migrate', 0))")
-        .execute(&mut *tx)
-        .await?;
+    validate_groups(groups)?;
+    while_contended(|| settle_release_once(pool, groups, documents, expected, released)).await
+}
+
+/// One attempt of [`settle_release`], in one transaction.
+async fn settle_release_once(
+    pool: &PgPool,
+    groups: &[&SchemaGroup],
+    documents: &[&Document],
+    expected: &[Thing],
+    released: &[Settling],
+) -> anyhow::Result<()> {
+    let mut tx = locked_tx(pool).await?;
     for group in groups {
         sqlx::query("DELETE FROM weft_migration WHERE group_name = $1 AND id LIKE 'draft\\_%'")
             .bind(group.name)
             .execute(&mut *tx)
             .await?;
     }
-    for m in released {
+    settle_part(&mut tx, released, Part::Expand).await?;
+    crate::documents::apply_documents_within(&mut tx, documents).await.context("carry the stored documents to today's shape")?;
+    run_data_steps(&mut tx, groups).await?;
+    settle_part(&mut tx, released, Part::Contract).await?;
+    for group in groups {
+        if let Some(diff) = shape_diff(&mut tx, &[group], expected).await? {
+            anyhow::bail!(
+                "after the release ran, group '{}' on the live database still does not hold \
+                 the shape the code declares, so nothing was recorded:\n{diff}",
+                group.name
+            );
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Run what `released` has to run of `part`, in id order, and record each.
+async fn settle_part(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, released: &[Settling], part: Part) -> anyhow::Result<()> {
+    let mut mine: Vec<&Settling> = released.iter().filter(|m| m.part == part).collect();
+    mine.sort_by(|a, b| a.id.cmp(&b.id));
+    for m in mine {
         if m.run {
             sqlx::raw_sql(&m.sql)
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await
                 .with_context(|| format!("running released migration '{}' of '{}'", m.id, m.group))?;
         }
@@ -1856,7 +2349,7 @@ pub async fn settle_release(
         )
         .bind(&m.group)
         .bind(&m.id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
         if let Some((stored,)) = existing {
             anyhow::ensure!(
@@ -1868,18 +2361,8 @@ pub async fn settle_release(
             );
             continue;
         }
-        record_migration(&mut tx, &m.group, &m.id, &m.sql).await?;
+        record_migration(tx, &m.group, &m.id, &m.sql).await?;
     }
-    for group in groups {
-        if let Some(diff) = shape_diff(&mut tx, &[group], expected).await? {
-            anyhow::bail!(
-                "after the release ran, group '{}' on the live database still does not hold \
-                 the shape the code declares, so nothing was recorded:\n{diff}",
-                group.name
-            );
-        }
-    }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -2037,9 +2520,11 @@ fn live_database_url() -> anyhow::Result<(String, String)> {
 /// holds): freeze missing origins, build the schema
 /// the databases out there hold (origins + released migrations + this
 /// machine's drafts), build the schema the code declares, diff them,
-/// file the difference, and on `--release` collapse the drafts and
-/// record the released file on the live database (after PROVING it
-/// holds the shape).
+/// file the difference (an expand file and a contract file per group,
+/// [`Part`]), and on `--release` collapse the drafts and settle the
+/// released files on the live database as a boot runs them, `documents`
+/// carried and the groups' data steps run between the two parts (after PROVING
+/// it holds the shape).
 ///
 /// Reads the same env contract `./setup.sh --migration` provides:
 /// `DATABASE_URL` (a throwaway Postgres to build schemas in), the
@@ -2047,8 +2532,12 @@ fn live_database_url() -> anyhow::Result<(String, String)> {
 /// `--unrelated`. A release finds the database you have been working
 /// against itself ([`live_database_url`]): the one of the install the
 /// command acts on from where it runs.
-pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
-    use anyhow::Context;
+pub async fn write_migration(groups: &[&SchemaGroup], documents: &[&Document]) -> anyhow::Result<()> {
+    // Every declared group, before anything is planned, built or written:
+    // a draft pass files what a bad declaration plans as surely as a
+    // release does, and a release settles only the groups the live
+    // database holds.
+    validate_groups(groups)?;
     let name = std::env::args().nth(1).context(
         "name the change, as it will be part of the file name: \
          ./setup.sh --migration add_owner",
@@ -2121,26 +2610,30 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
         unnamed.join("\n  "),
         if release { " --release" } else { "" }
     );
-    let plan = plan_migration(&before, &after, &renames)?;
+    let backfills: Vec<Backfill> = documents.iter().map(|d| d.backfill()).collect();
+    let plan = plan_migration(&before, &after, &renames, &backfills)?;
     if plan.is_empty() {
         println!("nothing changed: every group's migrations already reach its CREATE TABLE");
         return Ok(());
     }
 
     let written = file_per_group(groups, &plan, &name, !release)?;
-    let released: Vec<(String, String, String)> = written
+    let released: Vec<(String, String, Part, String)> = written
         .iter()
-        .map(|(group, path, body)| {
+        .map(|(group, part, path, body)| {
             let id = path.file_stem().expect("a named file").to_string_lossy().to_string();
-            (group.clone(), id, body.clone())
+            (group.clone(), id, *part, body.clone())
         })
         .collect();
 
     // On a release, the live database is settled BEFORE any file is
-    // written or draft deleted, so a refusal or a failed run leaves
+    // put in place or draft deleted, so a refusal or a failed run leaves
     // the tree as it was: a released file on disk with the database
     // never carried forward would make the re-run answer "nothing
     // changed" and leave the drafts to break every later draft pass.
+    // The files are written first, waiting beside their place
+    // ([`write_files`]), so a file that cannot be written fails the
+    // release before anything is recorded.
     // Each changed GROUP is decided on its own, since one can have run
     // its drafts while another never had any: a group that already
     // holds the new shape has the release RECORDED on it, one sitting
@@ -2153,6 +2646,7 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     // leaves a column the code no longer declares, and no file to
     // carry that database anywhere). The running and recording then
     // land in one transaction.
+    let mut settle: Option<(PgPool, Vec<&SchemaGroup>, Vec<Settling>)> = None;
     if release {
         let (install, live_url) = live_database_url()?;
         let live = PgPool::connect(&live_url).await.with_context(|| {
@@ -2162,13 +2656,15 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
             )
         })?;
         let mut conn = live.acquire().await?;
-        // A release records itself on the database and THEN writes
-        // its file; a release cut between the two (Ctrl-C) leaves a
-        // recorded id no tree carries, which the boot refuses and
+        // A release records itself on the database and THEN puts its
+        // files in place; a release cut between the two (Ctrl-C) leaves
+        // a recorded id no tree carries, which the boot refuses and
         // only this command can tell apart from a build that is
-        // merely older than its file. It is named here with the one
-        // remedy that fits: the row goes, and this release records
-        // its result under the new id.
+        // merely older than its file. Its file waits beside its place
+        // (written before the record), so the remedy is to put it
+        // there; one with no waiting file is named with the one remedy
+        // that fits: the row goes, and this release records its result
+        // under the new id.
         for group in groups {
             let applied: HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
                 "SELECT id, checksum FROM weft_migration WHERE group_name = $1",
@@ -2179,6 +2675,22 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
             .into_iter()
             .collect();
             let stray = recorded_without_file(&for_group(MIGRATIONS, group.name), &applied);
+            let waiting: Vec<String> = stray
+                .iter()
+                .map(|id| group_dir(group).join(format!("{id}.sql")))
+                .filter_map(|path| {
+                    let at = waiting_path(&path);
+                    at.exists().then(|| move_back(&at, &path))
+                })
+                .collect();
+            anyhow::ensure!(
+                waiting.is_empty(),
+                "group '{}': your database records migration(s) {} whose release was cut before \
+                 its file was put in place; the file waits beside it. Put it there and rebuild:\n  {}",
+                group.name,
+                stray.join(", "),
+                waiting.join("\n  ")
+            );
             anyhow::ensure!(
                 stray.is_empty(),
                 "group '{}': your database records migration(s) {} that no file carries. If \
@@ -2221,7 +2733,7 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
                 );
             }
         }
-        for (group_name, id, sql) in &released {
+        for (group_name, id, part, sql) in &released {
             if unborn.contains(&group_name.as_str()) {
                 continue;
             }
@@ -2246,11 +2758,17 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
                     group.name
                 );
             };
-            settling.push(Settling { group: group_name.clone(), id: id.clone(), sql: sql.clone(), run });
+            settling.push(Settling { group: group_name.clone(), id: id.clone(), part: *part, sql: sql.clone(), run });
         }
         drop(conn);
-        settle_release(&live, groups, &after, &settling).await?;
-        for m in &settling {
+        settle = Some((live, groups.to_vec(), settling));
+    }
+
+    let files: Vec<(&std::path::Path, &str)> = written.iter().map(|(_, _, path, body)| (path.as_path(), body.as_str())).collect();
+    let settled = async {
+        let Some((live, groups, settling)) = &settle else { return Ok(()) };
+        settle_release(live, groups, documents, &after, settling).await?;
+        for m in settling {
             println!(
                 "your database {} the released migration '{}' of '{}'",
                 if m.run { "ran and records" } else { "records, instead of the drafts," },
@@ -2258,13 +2776,10 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
                 m.group
             );
         }
-    }
-
-    for (_, path, body) in &written {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, body)?;
+        Ok(())
+    };
+    write_files(&files, release, settled).await?;
+    for (path, _) in &files {
         println!("wrote {}", path.display());
     }
     if release {
@@ -2277,6 +2792,89 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where a file of a migration waits beside its place, written but not
+/// yet put there ([`write_files`]). The build script embeds `.sql` files
+/// only, so a waiting one is never read as a migration.
+fn waiting_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut waiting = path.as_os_str().to_owned();
+    waiting.push(".releasing");
+    waiting.into()
+}
+
+/// The command that puts the waiting file `waiting` at `path`.
+fn move_back(waiting: &std::path::Path, path: &std::path::Path) -> String {
+    format!("mv '{}' '{}'", waiting.display(), path.display())
+}
+
+/// Write `files` (each path and its text), then await `settle` (a
+/// release's commit on the live database, `recorded` true; nothing for a
+/// draft), then put them in place. Each is first written waiting beside
+/// its place ([`waiting_path`]), so a file that cannot be written fails
+/// before `settle` records anything, and a `settle` that fails removes
+/// them all: the tree is left as it was. A file that cannot be put in
+/// place once `settle` recorded it fails naming the rename that finishes
+/// the release (the database records it, and boots refuse it until its
+/// file is there).
+async fn write_files(
+    files: &[(&std::path::Path, &str)],
+    recorded: bool,
+    settle: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    let mut waiting: Vec<std::path::PathBuf> = Vec::new();
+    if let Err(e) = write_waiting(files, &mut waiting) {
+        return Err(remove_waiting(&waiting, e));
+    }
+    if let Err(e) = settle.await {
+        return Err(remove_waiting(&waiting, e));
+    }
+    let stuck: Vec<String> = files
+        .iter()
+        .filter_map(|(path, _)| {
+            let at = waiting_path(path);
+            std::fs::rename(&at, path).err().map(|e| format!("{} ({e})", move_back(&at, path)))
+        })
+        .collect();
+    anyhow::ensure!(
+        stuck.is_empty(),
+        "{} could not be put in place{}; run:\n  {}",
+        if stuck.len() == 1 { "a migration file" } else { "migration files" },
+        if recorded {
+            ". Your database already records the release, and boots refuse it until its files are there"
+        } else {
+            ""
+        },
+        stuck.join("\n  ")
+    );
+    Ok(())
+}
+
+/// Write each of `files` waiting beside its place, each one written added
+/// to `waiting`.
+fn write_waiting(files: &[(&std::path::Path, &str)], waiting: &mut Vec<std::path::PathBuf>) -> anyhow::Result<()> {
+    for (path, body) in files {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+        let at = waiting_path(path);
+        std::fs::write(&at, body).with_context(|| format!("write {}", at.display()))?;
+        waiting.push(at);
+    }
+    Ok(())
+}
+
+/// `error`, once the files `waiting` are removed; one that could not be
+/// removed is named in it, to remove by hand.
+fn remove_waiting(waiting: &[std::path::PathBuf], error: anyhow::Error) -> anyhow::Error {
+    let left: Vec<String> = waiting
+        .iter()
+        .filter_map(|at| std::fs::remove_file(at).err().map(|e| format!("{} ({e})", at.display())))
+        .collect();
+    if left.is_empty() {
+        return error;
+    }
+    error.context(format!("nothing was recorded, and these files were left behind; remove them: {}", left.join(", ")))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2286,7 +2884,7 @@ mod tests {
         let thing = |kind: &str, table: &str, name: &str| Thing { kind: kind.into(), table: table.into(), name: name.into(), body: String::new() };
         let kept = thing("column", "run_event", "run_id");
         let old = vec![thing("function", "", "check"), kept.clone(), thing("trigger", "run_event", "check_on_insert")];
-        let plan: Vec<String> = plan_migration(&old, &[kept], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
+        let plan: Vec<String> = plan_migration(&old, &[kept], &[], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         assert_eq!(plan, ["DROP TRIGGER check_on_insert ON run_event;", "DROP FUNCTION check CASCADE;"]);
     }
     /// A function whose result changed is dropped before it is made again
@@ -2298,14 +2896,33 @@ mod tests {
         let func = |body: &str| Thing { kind: "function".into(), table: String::new(), name: "f(integer)".into(), body: body.into() };
         let was = func("CREATE OR REPLACE FUNCTION public.f(p integer)\n RETURNS integer\n LANGUAGE sql\nAS $$ SELECT 1 $$");
         let wider = func("CREATE OR REPLACE FUNCTION public.f(p integer)\n RETURNS TABLE(a integer, b boolean)\n LANGUAGE sql\nAS $$ SELECT 1, true $$");
-        let plan: Vec<String> = plan_migration(std::slice::from_ref(&was), std::slice::from_ref(&wider), &[]).unwrap().into_iter().map(|p| p.stmt).collect();
+        let plan: Vec<String> = plan_migration(std::slice::from_ref(&was), std::slice::from_ref(&wider), &[], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         assert_eq!(plan, [format!("DROP FUNCTION f(integer);\n{};", wider.body)]);
         let rewritten = func("CREATE OR REPLACE FUNCTION public.f(p integer)\n RETURNS integer\n LANGUAGE sql\nAS $$ SELECT 2 $$");
-        let plan: Vec<String> = plan_migration(std::slice::from_ref(&was), std::slice::from_ref(&rewritten), &[]).unwrap().into_iter().map(|p| p.stmt).collect();
+        let plan: Vec<String> = plan_migration(std::slice::from_ref(&was), std::slice::from_ref(&rewritten), &[], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         assert_eq!(plan, [format!("{};", rewritten.body)]);
         let renamed = func("CREATE OR REPLACE FUNCTION public.f(q integer)\n RETURNS integer\n LANGUAGE sql\nAS $$ SELECT 1 $$");
-        let plan: Vec<String> = plan_migration(&[was], std::slice::from_ref(&renamed), &[]).unwrap().into_iter().map(|p| p.stmt).collect();
+        let plan: Vec<String> = plan_migration(&[was], std::slice::from_ref(&renamed), &[], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         assert_eq!(plan, [format!("DROP FUNCTION f(integer);\n{};", renamed.body)]);
+    }
+    /// A function whose arguments changed, alone under its name on both
+    /// sides, is replaced in the expand part; an overload added beside one
+    /// the canonical DDL keeps is only added.
+    #[test]
+    fn a_function_whose_arguments_changed_is_replaced_and_an_added_overload_is_not() {
+        use super::{plan_migration, Part, Thing};
+        let func = |name: &str| Thing { kind: "function".into(), table: String::new(), name: name.into(), body: format!("CREATE OR REPLACE FUNCTION {name}") };
+        let (one, two) = (func("f(integer)"), func("f(integer, integer)"));
+        let plan = plan_migration(std::slice::from_ref(&one), std::slice::from_ref(&two), &[], &[]).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].part, Part::Expand);
+        assert!(plan[0].stmt.contains("DROP FUNCTION f(integer);\nCREATE OR REPLACE FUNCTION f(integer, integer);"), "{}", plan[0].stmt);
+        let plan: Vec<(Part, String)> = plan_migration(std::slice::from_ref(&one), &[one.clone(), two.clone()], &[], &[])
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.part, p.stmt))
+            .collect();
+        assert_eq!(plan, [(Part::Expand, format!("{};", two.body))]);
     }
     /// A trigger that fires on a column holds it: the trigger goes before the
     /// column, whatever order the old schema lists them in.
@@ -2315,7 +2932,7 @@ mod tests {
         let thing = |kind: &str, name: &str, body: &str| Thing { kind: kind.into(), table: "signal".into(), name: name.into(), body: body.into() };
         let kept = thing("column", "token", "text null=NO default=-");
         let old = vec![kept.clone(), thing("column", "parked_fires", "jsonb null=NO default=-"), thing("trigger", "notify_on_grow", "")];
-        let plan: Vec<String> = plan_migration(&old, &[kept], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
+        let plan: Vec<String> = plan_migration(&old, &[kept], &[], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         let trigger = plan.iter().position(|s| s.starts_with("DROP TRIGGER notify_on_grow")).expect("the trigger goes");
         let column = plan.iter().position(|s| s.contains("DROP COLUMN parked_fires")).expect("the column goes");
         assert!(trigger < column, "{plan:?}");
@@ -2340,7 +2957,7 @@ mod tests {
             t("index", "g_by_id", "CREATE INDEX g_by_id ON g USING btree (id, instance_id)"),
         ];
         let renames = ["g.member_id=instance_id".parse().unwrap()];
-        let plan: Vec<String> = plan_migration(&old, &new, &renames).unwrap().into_iter().map(|p| p.stmt).collect();
+        let plan: Vec<String> = plan_migration(&old, &new, &renames, &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         assert_eq!(plan, [
             "ALTER TABLE g RENAME COLUMN member_id TO instance_id;",
             "ALTER TABLE g RENAME CONSTRAINT g_member_has_id TO g_instance_has_id;",
@@ -2356,7 +2973,7 @@ mod tests {
         let new = [c("copy_id", "text null=NO default=''::text"), c("instance_id", "text null=YES default=-")];
         let renames = ["g.instance_id=copy_id".parse().unwrap(), "g.member_id=instance_id".parse().unwrap()];
         assert!(unnamed_renames(&old, &new, &renames).unwrap().is_empty());
-        let plan: Vec<String> = plan_migration(&old, &new, &renames).unwrap().into_iter().map(|p| p.stmt).collect();
+        let plan: Vec<String> = plan_migration(&old, &new, &renames, &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         assert_eq!(plan, [
             "ALTER TABLE g RENAME COLUMN instance_id TO copy_id;",
             "ALTER TABLE g RENAME COLUMN member_id TO instance_id;",
@@ -2393,7 +3010,7 @@ mod tests {
             t("instance_value", "index", "instance_value_pkey", "CREATE UNIQUE INDEX instance_value_pkey ON instance_value USING btree (grant_id)"),
         ];
         let renames = ["member_value=instance_value".parse().unwrap()];
-        let plan: Vec<String> = plan_migration(&old, &new, &renames).unwrap().into_iter().map(|p| p.stmt).collect();
+        let plan: Vec<String> = plan_migration(&old, &new, &renames, &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         // The primary key's index follows its constraint's RENAME; planning
         // it on its own would create a duplicate.
         assert_eq!(plan, [
@@ -2410,13 +3027,13 @@ mod tests {
         let old = [t("execution_tag", "column", "seq", "bigint null=NO default=nextval('execution_tag_seq_seq'::regclass)")];
         let new = [t("run_tag", "column", "seq", "bigint null=NO default=nextval('run_tag_seq_seq'::regclass)")];
         let plan: Vec<String> =
-            plan_migration(&old, &new, &["execution_tag=run_tag".parse().unwrap()]).unwrap().into_iter().map(|p| p.stmt).collect();
+            plan_migration(&old, &new, &["execution_tag=run_tag".parse().unwrap()], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         assert_eq!(plan, ["ALTER TABLE execution_tag RENAME TO run_tag;", "ALTER SEQUENCE execution_tag_seq_seq RENAME TO run_tag_seq_seq;"]);
 
         let old = [t("tag", "column", "n", "bigint null=NO default=nextval('tag_n_seq'::regclass)")];
         let new = [t("tag", "column", "seq", "bigint null=NO default=nextval('tag_seq_seq'::regclass)")];
         let plan: Vec<String> =
-            plan_migration(&old, &new, &["tag.n=seq".parse().unwrap()]).unwrap().into_iter().map(|p| p.stmt).collect();
+            plan_migration(&old, &new, &["tag.n=seq".parse().unwrap()], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         assert_eq!(plan, ["ALTER TABLE tag RENAME COLUMN n TO seq;", "ALTER SEQUENCE tag_n_seq RENAME TO tag_seq_seq;"]);
     }
 
@@ -2424,11 +3041,48 @@ mod tests {
     fn a_rename_of_something_that_is_not_there_is_refused() {
         use super::{plan_migration, Thing};
         let c = Thing { kind: "column".into(), table: "g".into(), name: "a".into(), body: "text null=YES default=-".into() };
-        let Err(err) = plan_migration(std::slice::from_ref(&c), std::slice::from_ref(&c), &["g.typo=b".parse().unwrap()]) else {
+        let Err(err) = plan_migration(std::slice::from_ref(&c), std::slice::from_ref(&c), &["g.typo=b".parse().unwrap()], &[]) else {
             panic!("a rename of a missing column must be refused");
         };
         let err = err.to_string();
         assert!(err.contains("has no column 'typo'"), "{err}");
+    }
+
+    /// What a plan adds goes in the expand part, what it drops or
+    /// tightens in the contract part: a NOT NULL column with no default is
+    /// added nullable first and made NOT NULL after, and a new table arrives
+    /// whole, its key with it.
+    #[test]
+    fn a_plan_splits_into_what_adds_and_what_drops_or_tightens() {
+        use super::{plan_migration, Part, Thing};
+        let t = |table: &str, kind: &str, name: &str, body: &str| Thing { kind: kind.into(), table: table.into(), name: name.into(), body: body.into() };
+        let id = t("p", "column", "id", "integer null=NO default=-");
+        let old = vec![id.clone(), t("p", "column", "doomed", "text null=YES default=-")];
+        let new = vec![
+            id,
+            t("p", "column", "owner", "text null=NO default=-"),
+            t("p", "constraint", "p_owner_short", "CHECK ((length(owner) < 10))"),
+            t("q", "column", "k", "integer null=NO default=-"),
+            t("q", "constraint", "q_pkey", "PRIMARY KEY (k)"),
+        ];
+        let plan: Vec<(Part, String)> = plan_migration(&old, &new, &[], &[]).unwrap().into_iter().map(|p| (p.part, p.stmt)).collect();
+        let of = |part: Part| plan.iter().filter(|(p, _)| *p == part).map(|(_, s)| s.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            of(Part::Expand),
+            [
+                "-- Added nullable: fill it before the contract part makes it NOT NULL.\nALTER TABLE p ADD COLUMN owner text;",
+                "CREATE TABLE q (\n    k integer NOT NULL\n);",
+                "ALTER TABLE q ADD CONSTRAINT q_pkey PRIMARY KEY (k);",
+            ]
+        );
+        assert_eq!(
+            of(Part::Contract),
+            [
+                "-- Fails if any row still holds a null here.\nALTER TABLE p ALTER COLUMN owner SET NOT NULL;",
+                "ALTER TABLE p ADD CONSTRAINT p_owner_short CHECK ((length(owner) < 10));",
+                "-- Throws away what is in p.doomed.\nALTER TABLE p DROP COLUMN doomed;",
+            ]
+        );
     }
 
     #[test]
@@ -2440,11 +3094,11 @@ mod tests {
     // a database still owes.
     use std::collections::HashMap;
 
-    use super::{checksum, edited_after_running, fingerprint_of, pending, recorded_without_file, Migration, ORIGIN_ID};
+    use super::{checksum, edited_after_running, fingerprint_of, pending, recorded_without_file, Migration, Part, ORIGIN_ID};
 
-    static A: Migration = Migration { group: "g", id: "20260101_a", draft: false, sql: "SELECT 1" };
-    static B: Migration = Migration { group: "g", id: "20260202_b", draft: false, sql: "SELECT 2" };
-    static C: Migration = Migration { group: "g", id: "20260303_c", draft: false, sql: "SELECT 3" };
+    static A: Migration = Migration { group: "g", id: "20260101_a", part: Part::Expand, draft: false, sql: "SELECT 1" };
+    static B: Migration = Migration { group: "g", id: "20260202_b", part: Part::Expand, draft: false, sql: "SELECT 2" };
+    static C: Migration = Migration { group: "g", id: "20260303_c", part: Part::Expand, draft: false, sql: "SELECT 3" };
 
     #[test]
     fn same_ddl_same_fingerprint() {
@@ -2470,16 +3124,124 @@ mod tests {
             tables: &["worker_replica"],
             ddl: &["CREATE TABLE IF NOT EXISTS worker_replica (id INT)"],
             seed: &[],
+            data_steps: &[],
         };
-        let err = super::validate_identifiers(&[&bad]).expect_err("a quoted name must refuse");
+        let err = super::validate_groups(&[&bad]).expect_err("a quoted name must refuse");
         assert!(err.to_string().contains("non-identifier"), "{err}");
         let good = super::SchemaGroup {
             name: "worker_replica",
             tables: &["worker_replica", "infra_owner2"],
             ddl: &[],
             seed: &[],
+            data_steps: &[],
         };
-        super::validate_identifiers(&[&good]).expect("plain identifiers pass");
+        super::validate_groups(&[&good]).expect("plain identifiers pass");
+    }
+
+    /// `write_migration` refuses a bad declaration before it plans,
+    /// builds or writes anything (here, before it even reads its
+    /// arguments or a database): a draft pass as surely as a release.
+    #[tokio::test]
+    async fn a_migration_refuses_a_bad_data_step_before_planning() {
+        static STEP: &[super::DataStep] =
+            &[super::DataStep { table: "elsewhere", column: "owner", until: super::Until::Dropped, sql: "SELECT 1" }];
+        static BAD: super::SchemaGroup =
+            super::SchemaGroup { name: "worker_replica", tables: &["worker_replica"], ddl: &[], seed: &[], data_steps: STEP };
+        let err = super::write_migration(&[&BAD], &[]).await.expect_err("refused");
+        assert!(err.to_string().contains("elsewhere.owner"), "{err}");
+    }
+
+    /// A scratch directory of its own for one test.
+    fn scratch() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("weft-write-files-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The files land once `settle` is done, and none waits behind.
+    #[tokio::test]
+    async fn written_files_land_after_the_release_is_recorded() {
+        let dir = scratch();
+        let path = dir.join("group").join("1_a.sql");
+        super::write_files(&[(&path, "SELECT 1;\n")], true, async {
+            assert!(!path.exists(), "nothing is in place before the release is recorded");
+            assert!(super::waiting_path(&path).exists(), "it is written, waiting");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "SELECT 1;\n");
+        assert!(!super::waiting_path(&path).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A file that cannot be written fails before anything is recorded,
+    /// and a release that fails to record removes what it wrote: the tree
+    /// is as it was either way.
+    #[tokio::test]
+    async fn a_file_not_written_or_a_release_not_recorded_leaves_nothing() {
+        let dir = scratch();
+        let fine = dir.join("1_a.sql");
+        // A file where the second one's directory would go.
+        std::fs::write(dir.join("blocked"), "").unwrap();
+        let blocked = dir.join("blocked").join("1_b.sql");
+        let recorded = std::cell::Cell::new(false);
+        let err = super::write_files(&[(&fine, "a"), (&blocked, "b")], true, async {
+            recorded.set(true);
+            Ok(())
+        })
+        .await
+        .expect_err("the second file cannot be written");
+        assert!(!recorded.get(), "the release was never recorded");
+        assert!(format!("{err:#}").contains("blocked"), "{err:#}");
+        assert!(!fine.exists() && !super::waiting_path(&fine).exists(), "what was written is gone");
+
+        let err = super::write_files(&[(&fine, "a")], true, async { Err(anyhow::anyhow!("the commit failed")) })
+            .await
+            .expect_err("the release failed");
+        assert_eq!(err.to_string(), "the commit failed");
+        assert!(!fine.exists() && !super::waiting_path(&fine).exists(), "what was written is gone");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A file that cannot be put in place once its release is recorded
+    /// names the rename that finishes the release, and stays waiting for it.
+    #[tokio::test]
+    async fn a_file_not_put_in_place_names_the_rename_that_finishes_it() {
+        let dir = scratch();
+        let path = dir.join("1_a.sql");
+        // A directory with something in it where the file goes.
+        std::fs::create_dir_all(path.join("in_the_way")).unwrap();
+        let err = super::write_files(&[(&path, "a")], true, async { Ok(()) }).await.expect_err("it cannot be put in place");
+        let waiting = super::waiting_path(&path);
+        let err = err.to_string();
+        assert!(err.contains(&super::move_back(&waiting, &path)) && err.contains("already records the release"), "{err}");
+        assert_eq!(std::fs::read_to_string(&waiting).unwrap(), "a", "the file waits for the rename");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_data_step_on_a_table_outside_its_group_is_refused() {
+        static STEP: &[super::DataStep] = &[super::DataStep {
+            table: "worker_replicas",
+            column: "owner",
+            until: super::Until::Dropped,
+            sql: "SELECT 1",
+        }];
+        let typo = super::SchemaGroup {
+            name: "worker_replica",
+            tables: &["worker_replica"],
+            ddl: &[],
+            seed: &[],
+            data_steps: STEP,
+        };
+        let err = super::validate_groups(&[&typo]).expect_err("a step's table must be one of its group's");
+        assert!(
+            err.to_string().contains("worker_replicas.owner") && err.to_string().contains("not one of its tables"),
+            "{err}"
+        );
+        let own = super::SchemaGroup { tables: &["worker_replica", "worker_replicas"], ..typo };
+        super::validate_groups(&[&own]).expect("a step on its own group's table passes");
     }
 
     #[test]
@@ -2511,7 +3273,7 @@ mod tests {
     #[test]
     fn an_edited_migration_is_caught_and_an_untouched_one_is_not() {
         static A_EDITED: Migration =
-            Migration { group: "g", id: "20260101_a", draft: false, sql: "SELECT 999" };
+            Migration { group: "g", id: "20260101_a", part: Part::Expand, draft: false, sql: "SELECT 999" };
         let applied = HashMap::from([
             (A.id.to_string(), checksum(A.sql)),
             (B.id.to_string(), checksum(B.sql)),
@@ -2522,7 +3284,7 @@ mod tests {
     #[test]
     fn a_migration_that_has_not_run_yet_can_still_be_edited() {
         static A_EDITED: Migration =
-            Migration { group: "g", id: "20260101_a", draft: false, sql: "SELECT 999" };
+            Migration { group: "g", id: "20260101_a", part: Part::Expand, draft: false, sql: "SELECT 999" };
         assert!(edited_after_running(&[&A_EDITED], &HashMap::new()).is_empty());
     }
 

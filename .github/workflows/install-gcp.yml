@@ -124,6 +124,26 @@ jobs:
         if: steps.release.outputs.found != 'yes'
         run: cargo build --release --locked -p weft-cli -p weft-runtime
 
+      # Before anything of the running install is replaced: an update never
+      # runs beside what the install has on. `weft maintenance on` switches
+      # it all off, and `weft maintenance off` brings it back once this has
+      # run. A first install has no address yet, and so nothing to check;
+      # one whose weft predates the maintenance cannot be asked, and goes
+      # ahead (`weft maintenance check` says so).
+      - name: nothing is on in the install
+        working-directory: deploy/terraform/gcp
+        run: |
+          if ! url=$(terraform output -raw url 2>/dev/null) || [ -z "$url" ]; then
+            echo "no install yet, so nothing to check"
+            exit 0
+          fi
+          key_secret=$(terraform output -raw bootstrap_operator_key_secret)
+          if ! gcloud secrets versions access latest --secret "$key_secret" --project "${{ vars.GCP_PROJECT_ID }}" \
+              | "$GITHUB_WORKSPACE/target/release/weft" maintenance check --dispatcher "$url" --key-stdin --update "run this workflow again"; then
+            echo "::error::the install has something on, so nothing was replaced; the steps to update are just above"
+            exit 1
+          fi
+
       # The runtime image and the worker builder base this checkout names,
       # pushed to the install's registry. Each is taken from the install's
       # registry if there, else copied from the release's (the same tag is

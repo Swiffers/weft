@@ -36,10 +36,7 @@ pub const INSTANCE_TOKEN_HEADER: &str = "Weft-Instance-Token";
 /// anybody could name any instance, so the header is refused there rather
 /// than ignored, and the caller hears why. `headers` as received (any
 /// case).
-pub fn instance_from_header(
-    headers: &std::collections::BTreeMap<String, String>,
-    gated: bool,
-) -> Result<Option<InstanceId>, String> {
+pub fn instance_from_header(headers: &[(String, String)], gated: bool) -> Result<Option<InstanceId>, String> {
     let Some((_, value)) = headers.iter().find(|(name, _)| name.eq_ignore_ascii_case(INSTANCE_HEADER)) else {
         return Ok(None);
     };
@@ -817,11 +814,11 @@ mod tests {
 
     #[test]
     fn the_instance_header_is_honoured_only_behind_a_gate() {
-        let with = |value: &str| std::collections::BTreeMap::from([("weft-instance".to_string(), value.to_string())]);
+        let with = |value: &str| vec![("weft-instance".to_string(), value.to_string())];
         assert_eq!(instance_from_header(&with("ada"), true).unwrap(), Some(InstanceId::new("ada").unwrap()));
         assert!(instance_from_header(&with("ada"), false).unwrap_err().contains("gated by a connection"));
         assert!(instance_from_header(&with("a/b"), true).is_err());
-        assert_eq!(instance_from_header(&Default::default(), false).unwrap(), None);
+        assert_eq!(instance_from_header(&[], false).unwrap(), None);
     }
 
     #[test]

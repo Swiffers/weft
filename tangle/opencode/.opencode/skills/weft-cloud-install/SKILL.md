@@ -165,9 +165,14 @@ The install needs no domain: its own address is HTTPS and free. A domain
 costs money, so it is never part of the install; read weft-deploying when
 the user asks for one.
 
-Upgrading weft on the cloud is merging upstream into the fork
-(`gh repo sync <fork>`) and running the workflow again, then rebuilding the
-user's CLI from that commit (`./setup.sh --cli`). Each program on it with
+Upgrading weft on the cloud is `weft maintenance on --on prod` (every
+trigger that is on taken down and the infra that runs stopped, so the old weft
+and the new one never run side by side; the workflow refuses to replace
+anything while something is on), merging upstream into the fork (`gh repo
+sync <fork>`), running the workflow again, then `weft maintenance off --on
+prod` (those projects built again on the new weft, that infra started on
+that build, then those triggers back), then rebuilding
+the user's CLI from that commit (`./setup.sh --cli`). Each program on it with
 infrastructure then needs `weft infra upgrade --on prod`, through the
 deployer: the new weft builds each piece's image anew, and `weft status --on
 prod` marks each infra node `behind the source` until it is done. A program's deploy

@@ -202,6 +202,17 @@ pub async fn upload_begin(
     Ok(Json(out))
 }
 
+/// POST /storage/import/begin: begin copying one file in from another
+/// install (`weft migrate files`), under the key it had there with the
+/// caller's tenant in it. The rest is the ordinary upload.
+pub async fn import_begin(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Json(req): Json<weft_core::storage::FileImportBeginRequest>,
+) -> Result<Json<weft_core::storage::UploadBeginResponse>, ApiError> {
+    Ok(Json(crate::storage::import_begin(&state, caller.0.as_str(), req).await.map_err(storage_err)?))
+}
+
 /// POST /storage/assets/held: which of the named contents the caller's
 /// tenant already stores (a publish's diff input). Tenant from auth, so the
 /// answer never reaches another tenant's files.

@@ -188,8 +188,10 @@ pub async fn referenced_images_query(
 pub async fn install(
     State(state): State<DispatcherState>,
     _caller: CallerTenant,
-) -> Json<weft_core::install::InstallInfo> {
-    Json(state.install_info.clone())
+) -> Result<Json<weft_core::install::InstallInfo>, (StatusCode, String)> {
+    let public_url = state.address.stable().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let service_url = state.address.service_url().to_string();
+    Ok(Json(weft_core::install::InstallInfo { public_url, service_url, ..state.install_info.clone() }))
 }
 
 /// `GET /projects` (`weft ps`).

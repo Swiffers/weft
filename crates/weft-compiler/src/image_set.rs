@@ -49,7 +49,7 @@ pub struct InfraImage {
 ///
 /// Order follows the definition's node order then each node's image order, so the
 /// list is deterministic across runs (callers that dedup by tag rely on this).
-pub fn infra_images(definition: &ProjectDefinition, catalog: &FsCatalog) -> Result<Vec<InfraImage>> {
+pub fn infra_images(definition: &ProjectDefinition, catalog: &FsCatalog, fingerprints: &crate::hash::Fingerprints) -> Result<Vec<InfraImage>> {
     let mut out = Vec::new();
     for node in definition.nodes.iter().filter(|n| n.requires_infra) {
         let entry = catalog.entry(&node.node_type).ok_or_else(|| {
@@ -96,7 +96,7 @@ pub fn infra_images(definition: &ProjectDefinition, catalog: &FsCatalog) -> Resu
                     dockerfile.display()
                 ));
             }
-            let content_hash = compute_image_hash(&node.node_type, &source_dir)?;
+            let content_hash = compute_image_hash(&node.node_type, &source_dir, fingerprints)?;
             out.push(InfraImage {
                 node_id: node.id.clone(),
                 image_name,

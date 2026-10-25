@@ -80,7 +80,13 @@ pub struct DeactivateResponse {
 #[serde(rename_all = "camelCase")]
 pub enum ResyncAnswer {
     Done(ResyncResponse),
-    UnderWay { task: uuid::Uuid },
+    UnderWay {
+        task: uuid::Uuid,
+        /// What the install's maintenance had left down in the project and
+        /// the resync brought back first ([`ResyncResponse::brought_back`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        brought_back: Option<crate::maintenance::ProjectLifted>,
+    },
 }
 
 /// What one look at a task a person follows answers
@@ -136,6 +142,11 @@ pub struct ResyncResponse {
     /// Triggers of the new build that are off, by owner.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub off: Vec<OwnerTriggers>,
+    /// What the install's maintenance took down in the project and could
+    /// not bring back then (its code did not build on the new weft), brought
+    /// back first on this build: what came back, and what still did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brought_back: Option<crate::maintenance::ProjectLifted>,
 }
 
 /// How a person reads one owner's triggers: "the program's triggers" or

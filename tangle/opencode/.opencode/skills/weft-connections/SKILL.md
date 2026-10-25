@@ -89,6 +89,21 @@ The flags the user runs, in the command you hand them:
   `--mint`, `--label`, `--permissions`, `--shared-app`) skips the
   stored-connections menu and goes straight to connecting.
 
+## On a cloud install
+
+A connection this machine already holds is copied to a cloud install with
+`weft migrate connections`, never made again (the weft-cloud-install skill,
+"Moving an app from this machine").
+
+Once a cloud install's own domain is live, its sign-in callback moves to
+`https://<domain>/access/oauth/callback`. Each provider app only sends people
+back to the addresses it lists, so for each service in `callbackServices`
+(from `weft domain list --json`, which the deployer reports) you give the
+user one line: "In your <service> app's dashboard, add
+`https://<domain>/access/oauth/callback` to the allowed redirect URLs." A
+connection already made keeps working, since a refresh needs no callback;
+only a new sign-in goes through the new one.
+
 ## The editor flow, door by door
 
 The user expands the [access node] in the graph and clicks its

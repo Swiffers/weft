@@ -99,3 +99,6 @@ tangle/old
 
 test/
 tmp/
+# Written by `mdbook-mermaid install` on every docs build (docs.yml does it too).
+docs/mermaid.min.js
+docs/mermaid-init.js

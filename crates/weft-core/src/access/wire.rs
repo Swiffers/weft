@@ -152,6 +152,15 @@ pub struct SharedCredentialsAnswer {
     pub available: Vec<String>,
 }
 
+/// The services the apps file holds a sign-in app for (one with a
+/// consent page): each such app lists the install's OAuth callback at its
+/// provider, so it must be told when that callback moves.
+// SYNC: SignInServices <-> crates/weft-broker/src/access_admin.rs sign_in_services
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SignInServices {
+    pub services: Vec<String>,
+}
+
 /// A ONE-REQUEST connect: the acquisitions needing no browser (`static`
 /// paste, `mint_jwt`, server-to-server `oauth2`/`client_credentials`,
 /// or the SHARED door of a key service). A browser-consent acquisition

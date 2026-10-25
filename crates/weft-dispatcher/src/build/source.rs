@@ -85,8 +85,11 @@ pub async fn materialize(
 }
 
 /// One file of [`materialize`], written at `dest`: copied from the cache,
-/// or streamed from the store, hashed from the disk once written, and
-/// kept. A file that fails on the way, its hash included, is removed.
+/// or streamed from the store, and either way hashed from the disk once
+/// written, so what the build reads (and names its images after) is the
+/// version's bytes. A cached copy that does not hash to its name is
+/// dropped from the cache and fetched again; it is kept only once it
+/// checks. A file that fails on the way, its hash included, is removed.
 async fn lay_out(
     storage: &dyn ProjectStorage,
     cache: &BlobCache,
@@ -100,7 +103,12 @@ async fn lay_out(
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     if cache.get_into(tenant, hash, &dest)? {
-        return Ok(());
+        if hash_of(&dest)? == hash {
+            return Ok(());
+        }
+        tracing::warn!(target: "weft_dispatcher::build", %path, %hash, "a cached copy of a version file did not hash to its name; fetching it from the store again");
+        std::fs::remove_file(&dest).with_context(|| format!("remove {}", dest.display()))?;
+        cache.forget(tenant, hash)?;
     }
     let fetched = fetch_checked(storage, tenant, scope, path, hash, &dest).await;
     if fetched.is_err() {
@@ -124,10 +132,14 @@ async fn fetch_checked(
         .download(&format!("{tenant}/{scope_key}"), dest)
         .await
         .with_context(|| format!("fetch '{path}' of the version"))?;
-    let file = std::fs::File::open(dest).with_context(|| format!("read {}", dest.display()))?;
-    let (got, _) = weft_assets::hash_reader(std::io::BufReader::new(file))
-        .with_context(|| format!("hash {}", dest.display()))?;
-    check_hash(path, hash, &got)
+    check_hash(path, hash, &hash_of(dest)?)
+}
+
+/// The sha256 of the file at `path`, read from the disk.
+fn hash_of(path: &Path) -> Result<String> {
+    let file = std::fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
+    let (got, _) = weft_assets::hash_reader(std::io::BufReader::new(file)).with_context(|| format!("hash {}", path.display()))?;
+    Ok(got)
 }
 
 /// Refuse bytes that hash to `got` when the version names `path` by `hash`.

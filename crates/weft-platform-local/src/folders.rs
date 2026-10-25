@@ -635,6 +635,20 @@ mod tests {
             assert!(self.until(|| self.passes() >= n).await, "waited for {n} passes, saw {}", self.passes());
         }
 
+        /// Wait until the pass that started has ended: its last step saves
+        /// the folder's hash cache, so the folder is not written to any more.
+        async fn first_pass_ended(&self) {
+            let saved = self.root().join(".weft").join("hash-cache.json");
+            let ended = tokio::time::timeout(PATIENCE, async {
+                while !saved.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_ok();
+            assert!(ended, "the first pass never saved the folder's hash cache");
+        }
+
         /// Wait until the working copy holds `path`.
         async fn working_holds(&self, path: &str) {
             let landed = self.until(|| self.install.working.lock().unwrap().get(&self.copy).is_some_and(|(w, _)| w.contains_key(path))).await;
@@ -705,6 +719,7 @@ mod tests {
         worker_threads: 4,
         async fn body() {
             let rig = Rig::start().await;
+            rig.first_pass_ended().await;
             std::fs::remove_dir_all(rig.root()).unwrap();
             rig.stays_at(1).await;
             // Not even a notice makes a pass over a folder that is not there.

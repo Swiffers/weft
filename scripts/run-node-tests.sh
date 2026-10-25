@@ -63,7 +63,21 @@ trap machine_lock_release_mine EXIT
 # This checkout's install, its own weft first on PATH and named for every
 # weft this script starts.
 # SYNC: WEFT_INSTALL <-> crates/weft-core/src/infra/install.rs (INSTALL_ENV)
-weft_checkout_install "$REPO_ROOT" || exit 1
+# WEFT_INSTALL=<name> (`default` is the main install) runs the tests with
+# that install's weft instead, from any checkout and with no setup.sh
+# here: the weft is only the tool, the nodes under test are this
+# checkout's (WEFT_REPO_ROOT below). Right for a branch that changes
+# catalog nodes; one that changes the compiler or the CLI should be
+# tested with its own install.
+if [ -n "${WEFT_INSTALL:-}" ]; then
+  weft_which "$REPO_ROOT" "$(command -v weft || echo weft)" "$WEFT_INSTALL" || exit 1
+  if [ "$WHICH_INSTALLED" != 1 ]; then
+    echo "WEFT_INSTALL=$WEFT_INSTALL names the install in $WHICH_DIR, which has no weft; run ./setup.sh in the checkout that owns it" >&2
+    exit 1
+  fi
+else
+  weft_checkout_install "$REPO_ROOT" || exit 1
+fi
 export WEFT_INSTALL="$WHICH_ENV"
 export PATH="$WHICH_BIN:$PATH"
 # A stale binary without the test-node verb would fail confusingly

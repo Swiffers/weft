@@ -425,7 +425,7 @@ fn package_crate_slot(
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"weft-package-crate-v1\n");
-    crate::hash::hash_package_root(&mut hasher, &pkg.module_ident, &pkg.package.root)
+    crate::hash::hash_package_root(&mut hasher, &pkg.module_ident, &pkg.package.root, &crate::hash::DISK)
         .map_err(|e| BuildError::Build(format!("hash package {}: {e}", pkg.package.name)))?;
     hasher.update(b"Cargo.toml:\n");
     hasher.update(cargo_toml.as_bytes());

@@ -119,16 +119,17 @@ pub fn plan_build_from(
     bases: &crate::worker_image::BaseImages,
     tags: &dyn TagPolicy,
     node_set: weft_core::builds::NodeSet,
+    fingerprints: &crate::hash::Fingerprints,
 ) -> BuildResult<BuildPlan> {
     let weft_root = crate::build::resolve_weft_root()?;
-    let implementations = crate::hash::implementation_hashes(definition, project, &weft_root, catalog, node_set)?;
+    let implementations = crate::hash::implementation_hashes(definition, project, &weft_root, catalog, node_set, fingerprints)?;
 
     let definition_hash = crate::hash::compute_definition_hash(definition)
         .map_err(|e| e.context("compute definition hash"))?;
     let infra_hash =
-        crate::hash::compute_infra_hash(definition, &project.root, &weft_root, catalog)
+        crate::hash::compute_infra_hash(definition, &project.root, &weft_root, catalog, fingerprints)
             .map_err(|e| e.context("compute infra hash"))?;
-    let infra_places = crate::hash::compute_infra_place_hashes(definition, &project.root, &weft_root, catalog)
+    let infra_places = crate::hash::compute_infra_place_hashes(definition, &project.root, &weft_root, catalog, fingerprints)
         .map_err(|e| e.context("compute the infra places' hashes"))?;
     let definition_json = serde_json::to_string(definition)
         .map_err(|e| anyhow::anyhow!("serialize compiled definition: {e}"))?;
@@ -138,7 +139,7 @@ pub fn plan_build_from(
     // from source: it validates + codegens this definition, whose `@asset`
     // refs the caller already resolved into concrete file values.
     let staged =
-        crate::build::build_project(project, definition, catalog, fs, bases, node_set)?;
+        crate::build::build_project(project, definition, catalog, fs, bases, node_set, fingerprints)?;
     let binary_hash = staged.content_hash.clone();
 
     let mut images = vec![PlannedImage {
@@ -153,7 +154,7 @@ pub fn plan_build_from(
 
     // Every infra image, via the shared enumerator (same set, same content hashes as
     // the CLI). Each infra image's context is its own source dir (holds a Dockerfile).
-    for img in image_set::infra_images(definition, catalog)
+    for img in image_set::infra_images(definition, catalog, fingerprints)
         .map_err(|e| e.context("enumerate infra images"))?
     {
         let InfraImage { node_id, image_name, source_dir, content_hash } = img;

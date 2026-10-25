@@ -886,6 +886,15 @@ enum Cmd {
         #[arg(long)]
         full: bool,
     },
+    /// Copy saved connections or stored files from the install this
+    /// command acts on to another (`--to <target>`), so moving an app to
+    /// another install never means making them again. Name what to copy:
+    /// `--all`, or `--id`, `--since`/`--until`, and `--service`/`--project`
+    /// (connections) or `--prefix` (files). `--dry-run` copies nothing.
+    Migrate {
+        #[command(subcommand)]
+        action: commands::migrate::MigrateAction,
+    },
     /// Browse + manage stored files (the tenant's runtime storage):
     /// run, project, instance, shared and asset spaces.
     Files {
@@ -2176,6 +2185,7 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
         Cmd::Events { run_id, node, kind, iteration, full } => {
             commands::runs::events(ctx, run_id, commands::runs::EventsQuery { node, kind, iteration }, full).await
         }
+        Cmd::Migrate { action } => commands::migrate::run(ctx, action).await,
         Cmd::Files { action } => match action {
             FilesAction::Ls { prefix } => commands::files::ls(ctx, prefix).await,
             FilesAction::Inspect { key } => commands::files::inspect(ctx, key).await,

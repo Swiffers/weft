@@ -136,6 +136,14 @@ projects and their history stay where they are. Before you do, check the
 anything that needs you. For what each step does, go and read
 [updating weft](../running/cli.md#updating-weft).
 
+If something in a project does not come back with `weft maintenance off`,
+everything else is back anyway, and `off` says what went wrong. If the
+message says the project's copy of the standard nodes is older than this
+weft, run `weft catalog update` in that folder (it replaces
+`nodes/base_catalog/`, so any edits you made in there are lost); otherwise
+fix what it says. Then run `weft resync` there, which builds the project and
+brings back what the update took down.
+
 If you installed weft before it stopped running on Kubernetes, that update is
 the exception: its database cannot come along. `./setup.sh` finds the old
 install and asks before wiping it. The wipe deletes the old cluster, your run

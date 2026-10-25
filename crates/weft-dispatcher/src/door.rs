@@ -110,7 +110,9 @@ impl Door {
             tracing::warn!(target: "weft_dispatcher::door", error = %format!("{e:#}"), "could not read the install's domains");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("the install could not read its domains to route this request ({e:#}); try again shortly"),
+                // No promise of a retry: when the database refuses for good
+                // (a plan's quota), its own words are the one thing to fix.
+                format!("the install could not read its domains to route this request: {e:#}"),
             )
                 .into_response()
         })

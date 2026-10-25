@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use sha2::Digest as _;
 use weft_platform_traits::config::GcpPlatform;
+use weft_core::install::Certificate;
 use weft_platform_traits::DomainHosting;
 
 use crate::api::{is_status, Google};
@@ -421,6 +422,67 @@ impl DomainHosting for LoadBalancerDomains {
     fn cost(&self) -> Option<&'static str> {
         Some("a Google Cloud load balancer, about $18 a month while any domain is stored, plus $0.008 per GB through it")
     }
+
+    async fn certified(&self, names: &[String]) -> anyhow::Result<std::collections::BTreeMap<String, Certificate>> {
+        let mut out = std::collections::BTreeMap::new();
+        for name in names {
+            let url = format!("{}/certificates/{}", self.certificates(), certificate_id(&self.door(), name));
+            let found = self.google.get_opt(&url).await.map_err(|e| e.context(format!("read {name}'s certificate")))?;
+            let state = match found {
+                Some(certificate) => cert_state(&certificate),
+                None => Certificate::Pending { why: Some("the door has not asked for its certificate yet".into()) },
+            };
+            out.insert(name.clone(), state);
+        }
+        Ok(out)
+    }
+}
+
+/// Where a Google-managed certificate stands, from Certificate Manager's
+/// answer: `managed.state` (`ACTIVE`, `PROVISIONING`, `FAILED`), with the
+/// reason from `managed.authorizationAttemptInfo[]` (per domain:
+/// `failureReason` `CONFIG`, `CAA` or `RATE_LIMITED`, and `details`) or
+/// `managed.provisioningIssue` (`reason`, `details`).
+fn cert_state(certificate: &Value) -> Certificate {
+    let managed = &certificate["managed"];
+    let why = cert_problem(managed);
+    match managed["state"].as_str() {
+        Some("ACTIVE") => Certificate::Issued,
+        Some("FAILED") => Certificate::Failed {
+            why: why.unwrap_or_else(|| "Google gave up issuing it after several tries".into()),
+        },
+        _ => Certificate::Pending { why },
+    }
+}
+
+/// What holds a certificate up, in plain words, with Google's own
+/// explanation after; `None` while nothing has gone wrong yet.
+fn cert_problem(managed: &Value) -> Option<String> {
+    let failed = managed["authorizationAttemptInfo"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|attempt| attempt["state"].as_str() == Some("FAILED") || attempt["failureReason"].as_str().is_some());
+    let (reason, details) = match failed {
+        Some(attempt) => (attempt["failureReason"].as_str(), attempt["details"].as_str()),
+        None => (managed["provisioningIssue"]["reason"].as_str(), managed["provisioningIssue"]["details"].as_str()),
+    };
+    let plain = match reason {
+        Some("CONFIG") => Some(
+            "Google cannot reach the door at this name yet: its DNS record must point straight at the door's address \
+             (an A record, not proxied: with Cloudflare, the grey cloud)",
+        ),
+        Some("CAA") => Some("a CAA record on the domain forbids Google's certificate authority; allow pki.goog in it"),
+        Some("RATE_LIMITED") => Some("the certificate authority is rate limiting this domain; Google tries again on its own"),
+        Some("AUTHORIZATION_ISSUE") => Some("Google could not confirm the name points at the door"),
+        _ => None,
+    };
+    match (plain, details.filter(|d| !d.trim().is_empty())) {
+        (Some(plain), Some(details)) => Some(format!("{plain} (Google says: {details})")),
+        (Some(plain), None) => Some(plain.to_string()),
+        (None, Some(details)) => Some(details.to_string()),
+        (None, None) => None,
+    }
 }
 
 #[cfg(test)]
@@ -434,6 +496,31 @@ mod tests {
         assert!(id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'));
         assert_eq!(id, certificate_id("weft-door", "api.shop.example.com"));
         assert_ne!(id, certificate_id("weft-door", "app.shop.example.com"));
+    }
+
+    #[test]
+    fn a_certificate_reads_as_issued_pending_or_failed() {
+        assert_eq!(cert_state(&json!({ "managed": { "state": "ACTIVE", "domains": ["w.example.com"] } })), Certificate::Issued);
+        assert_eq!(cert_state(&json!({ "managed": { "state": "PROVISIONING" } })), Certificate::Pending { why: None });
+        let authorizing = json!({ "managed": { "state": "PROVISIONING", "authorizationAttemptInfo": [
+            { "domain": "w.example.com", "state": "AUTHORIZING" }
+        ] } });
+        assert_eq!(cert_state(&authorizing), Certificate::Pending { why: None }, "still trying, nothing wrong yet");
+        let not_pointed = json!({ "managed": { "state": "PROVISIONING", "authorizationAttemptInfo": [
+            { "domain": "w.example.com", "state": "FAILED", "failureReason": "CONFIG", "details": "Domain not visible" }
+        ] } });
+        let Certificate::Pending { why: Some(why) } = cert_state(&not_pointed) else { panic!("pending with a reason") };
+        assert!(why.contains("grey cloud") && why.contains("Domain not visible"), "{why}");
+        let rate = json!({ "managed": { "state": "PROVISIONING", "provisioningIssue": { "reason": "RATE_LIMITED" } } });
+        let Certificate::Pending { why: Some(why) } = cert_state(&rate) else { panic!("pending with a reason") };
+        assert!(why.contains("rate limiting"), "{why}");
+        let caa = json!({ "managed": { "state": "FAILED", "authorizationAttemptInfo": [
+            { "domain": "w.example.com", "state": "FAILED", "failureReason": "CAA", "details": "" }
+        ] } });
+        let Certificate::Failed { why } = cert_state(&caa) else { panic!("failed") };
+        assert!(why.contains("pki.goog") && !why.contains("Google says"), "{why}");
+        let Certificate::Failed { why } = cert_state(&json!({ "managed": { "state": "FAILED" } })) else { panic!("failed") };
+        assert!(why.contains("gave up"), "{why}");
     }
 
     #[test]

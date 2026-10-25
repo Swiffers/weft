@@ -362,6 +362,21 @@ pub struct UploadSpec<'a> {
     /// ([`weft_core::storage::slot`]): the upload is the slot's one, and
     /// once it lands it waits ('uploaded') for the run that receives it.
     pub slot: Option<SlotUpload<'a>>,
+    /// A file copied from another install (`weft migrate files`), which
+    /// keeps the id, version and birth it had there: a stored-file value
+    /// names a file by key and version, so the values a person carries
+    /// over still name it. Never on the asset scope, whose id is its
+    /// content.
+    pub imported: Option<ImportedFile<'a>>,
+}
+
+/// What a file copied from another install keeps ([`UploadSpec::imported`]):
+/// its key there, with this install's tenant in it.
+#[derive(Debug, Clone, Copy)]
+pub struct ImportedFile<'a> {
+    pub key: &'a weft_core::storage::key::ParsedKey,
+    pub version: u64,
+    pub created_at_unix: i64,
 }
 
 /// The slot an upload goes through: its id, when it ends (an upload
@@ -1332,8 +1347,18 @@ impl RuntimeStore {
         spec: &UploadSpec<'_>,
         entitlements: &dyn EntitlementSource,
     ) -> StoreResult<BeginUpload> {
-        let UploadSpec { scope, mime, filename, keep, declared_size, content_hash, identity, slot } = *spec;
+        let UploadSpec { scope, mime, filename, keep, declared_size, content_hash, identity, slot, imported } = *spec;
         refuse_too_large(declared_size)?;
+        if let Some(imported) = imported {
+            let (Some(_), None, None, None, false) = (declared_size, content_hash, identity, slot, matches!(scope, StorageScope::Asset)) else {
+                return Err(RuntimeStoreError::Invalid(
+                    "a copied file names its size, and is no asset, slot upload or identified file".into(),
+                ));
+            };
+            if imported.version < weft_core::storage::FIRST_FILE_VERSION {
+                return Err(RuntimeStoreError::Invalid(format!("a file's version starts at {}", weft_core::storage::FIRST_FILE_VERSION)));
+            }
+        }
         if let Some(slot) = slot {
             let (Some(size), None, None, None) = (declared_size, identity, content_hash, keep) else {
                 return Err(RuntimeStoreError::Invalid(
@@ -1387,8 +1412,19 @@ impl RuntimeStore {
             }
             (_, None) => uuid::Uuid::new_v4().to_string(),
         };
-        let parsed = weft_core::storage::key::key_for_put(caller, scope, &id)
-            .map_err(RuntimeStoreError::Denied)?;
+        let parsed = match imported {
+            // A copied file's key is the one it had, under the tenant
+            // copying it, which only that tenant's admin caller names.
+            Some(imported) => match caller {
+                CallerAuth::Copying { tenant }
+                    if *tenant == imported.key.tenant && imported.key.scope.storage_scope().as_ref() == Ok(scope) =>
+                {
+                    imported.key.clone()
+                }
+                _ => return Err(RuntimeStoreError::Denied("a copied file is written by its tenant's copy, in its own scope".into())),
+            },
+            None => weft_core::storage::key::key_for_put(caller, scope, &id).map_err(RuntimeStoreError::Denied)?,
+        };
         let key = parsed.to_key();
         let tenant = parsed.tenant.clone();
         let part_size = part_size_for(declared_size);
@@ -1478,10 +1514,70 @@ impl RuntimeStore {
                             .map_err(RuntimeStoreError::Other)?;
                             return Ok(Reserved::Pending(key.clone(), part_size as u64));
                         }
+                        // Another publish of these same bytes has claimed the
+                        // completion: the asset lands in a moment, and the
+                        // caller waits for it (marked, so it knows to).
+                        Some("completing") => {
+                            return Err(RuntimeStoreError::Completing(format!(
+                                "asset '{key}' is being completed by another upload of the same content; it lands shortly"
+                            )));
+                        }
                         Some(status) => {
                             return Err(RuntimeStoreError::Conflict(format!(
                                 "asset '{key}' already exists ({status}); it is being cleared from \
                                  the store, so this content's key frees itself shortly"
+                            )));
+                        }
+                        None => {}
+                    }
+                }
+                // A copied file keeps its key, so the key may be here
+                // already: the same copy made before (the same version and
+                // size) is this begin's answer, one cut off part way up
+                // carries on, anything else under the key is refused.
+                if let Some(imported) = imported {
+                    let existing: Option<(String, i64, i64)> = sqlx::query_as(
+                        "SELECT status, version, CASE WHEN status = 'active' THEN size_bytes ELSE COALESCE(declared_size, -1) END \
+                         FROM runtime_file WHERE key = $1",
+                    )
+                    .bind(&key)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .context("runtime begin_upload: check the copied file's key")
+                    .map_err(RuntimeStoreError::Other)?;
+                    let same = |version: i64, size: i64| {
+                        u64::try_from(version).ok() == Some(imported.version) && u64::try_from(size).ok() == declared_size
+                    };
+                    match existing {
+                        Some((status, version, size)) if status == "active" && same(version, size) => {
+                            return Ok(Reserved::AlreadyActive(key.clone()));
+                        }
+                        Some((status, version, size)) if status == "pending" && same(version, size) => {
+                            let part_size: i64 = sqlx::query_scalar("SELECT part_size FROM runtime_file WHERE key = $1")
+                                .bind(&key)
+                                .fetch_one(&mut *tx)
+                                .await
+                                .context("runtime begin_upload: read the pending part size")
+                                .map_err(RuntimeStoreError::Other)?;
+                            return Ok(Reserved::Pending(key.clone(), part_size as u64));
+                        }
+                        // An earlier copy's completion claimed it: the file
+                        // lands in a moment, and the copy run again then
+                        // answers against what landed.
+                        Some((status, _, _)) if status == "completing" => {
+                            return Err(RuntimeStoreError::Completing(format!(
+                                "'{key}' is being completed by an earlier upload; run the copy again once it has landed"
+                            )));
+                        }
+                        Some((status, _, _)) if status == "reaping" => {
+                            return Err(RuntimeStoreError::Conflict(format!(
+                                "'{key}' is being cleared from the store; its key frees itself shortly, then run the copy again"
+                            )));
+                        }
+                        Some((status, _, _)) => {
+                            return Err(RuntimeStoreError::Conflict(format!(
+                                "'{key}' is already here ({status}) holding another version or size; remove it here \
+                                 (`weft files rm {key}`) to copy it again"
                             )));
                         }
                         None => {}
@@ -1534,8 +1630,8 @@ impl RuntimeStore {
                     "INSERT INTO runtime_file \
                      (key, tenant_id, mime_type, filename, size_bytes, status, keep, expires_at_unix, \
                       keep_ttl_secs, created_at_unix, upload_id, part_size, declared_size, \
-                      reserved_bytes, progressed_at_unix, identity, upload_slot, slot_accepts) \
-                     VALUES ($1, $2, $3, $4, 0, 'pending', $5, $13, $6, $7, $8, $9, $10, $11, $7, $12, $14, $15)",
+                      reserved_bytes, progressed_at_unix, identity, upload_slot, slot_accepts, version) \
+                     VALUES ($1, $2, $3, $4, 0, 'pending', $5, $13, $6, COALESCE($16, $7), $8, $9, $10, $11, $7, $12, $14, $15, $17)",
                 )
                 .bind(&key)
                 .bind(&tenant)
@@ -1554,6 +1650,8 @@ impl RuntimeStore {
                 .bind(slot.map(|s| s.ends_unix))
                 .bind(slot.map(|s| s.sid))
                 .bind(slot.map(|s| s.accepts))
+                .bind(imported.map(|i| i.created_at_unix))
+                .bind(imported.map_or(weft_core::storage::FIRST_FILE_VERSION, |i| i.version) as i64)
                 .execute(&mut *tx)
                 .await
                 .context("runtime begin_upload: reserve pending row")
@@ -3342,6 +3440,7 @@ impl RuntimeStore {
             content_hash: None,
             identity,
             slot: None,
+            imported: None,
         };
         match self.begin_upload(caller, &spec, entitlements).await? {
             BeginUpload::Ready { key, .. } => self.fill_by_copy(caller, &key, &from.to_key()).await,

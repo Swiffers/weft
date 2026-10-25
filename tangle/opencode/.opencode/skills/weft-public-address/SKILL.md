@@ -162,3 +162,11 @@ the pid from its project's `.hosting/site.pid` and `.hosting/tunnel.pid`, or
 the one the listing showed, never `pkill -f`, whose pattern matches your own
 shell too. Stopping a site that belongs to another project is the user's
 call: ask first, naming it.
+
+**Moving that name to a cloud install.** If the user wants the name this
+machine hosts at to become a cloud install's domain, the tunnel's record on
+it (a CNAME to `<tunnel id>.cfargotunnel.com`) has to go before the cloud's
+`A` record is made. You delete it through the Cloudflare API, the way the
+weft-deploying skill sets the record ("A name instead of the install's own
+address"), never with `cloudflared`. The tunnel itself can stay, or be
+pointed at another name with `cloudflared tunnel route dns`.

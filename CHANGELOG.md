@@ -4,6 +4,79 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-10-25 (c2d4bc11)
+
+**A domain you give a cloud install becomes its address.** Once Google has
+issued the domain's certificate, every link the install hands out uses the
+domain instead of the `run.app` address: sign-in callbacks, webhook
+addresses, file links, `weft target export`. The `run.app` address keeps
+answering, so nothing already handed out breaks. If you already have an
+install domain, run `weft domain list --on <target>` once after the update:
+it checks the certificate, and the domain becomes the address there and
+then. Then add `https://<your domain>/access/oauth/callback` to the allowed
+redirect URLs of each provider app you sign in through, and run `weft target
+export` again for any site that talks to the install. `weft domain list`
+shows where each certificate stands and prints those steps.
+
+**New: `weft migrate connections` and `weft migrate files`.** They copy saved
+connections and stored files from one install to another (`--to <target>`),
+so moving an app from your machine to the cloud no longer means making every
+connection again. Name what to copy with `--all`, `--id`, `--since`/`--until`,
+`--service`/`--project` or `--prefix`; `--dry-run` shows it first.
+
+**New: a cloud install can have a Postgres of its own on Cloud SQL.** Set
+the fork's repository variable `WEFT_DATABASE` to `cloud_sql` and the install
+workflow makes one in the install's region and network, for a busy program
+that would run past a hosted free plan. It bills every hour it runs. An
+install already on another Postgres moves to it with its data: run `weft
+maintenance on`, set the variable, run the workflow, then `weft maintenance
+off`. Without the variable, nothing changes.
+
+## 2026-10-25 (ccabce57)
+
+**On a cloud install, rebuild your CLI before `weft maintenance off`.** What
+`off` answers changed shape, and a CLI from before this release cannot read
+it: run `./setup.sh --cli` from the new commit first, then `weft maintenance
+off --on <target>`. The cloud upgrade steps now say so in that order. On your
+machine, `./setup.sh` already does this.
+
+**Something that cannot come back no longer keeps the install in
+maintenance.** `weft maintenance off` now ends the maintenance once it has
+tried every project, even when a project's build, infra or triggers fail, and
+it exits successfully. Everything else comes back, and `off` names what did
+not and why. If the message says the project's copy of the standard nodes is
+older than this weft, run `weft catalog update` in its folder (it replaces
+`nodes/base_catalog/`, so any edits you made in there are lost); otherwise
+fix what it says. Then `weft resync` there brings back what the update took
+down and says what it brought back. If you want some of those triggers left
+off, run `weft deactivate` on them before the resync. In `weft maintenance
+off --json`, the `lifted` field is gone, because a report now always means
+the maintenance is over; a project whose `failed` list is not empty still has
+down what the maintenance could not bring back in it (everything it took down
+there, when the entry is its build). `weft resync --json` says what it brought back in
+`broughtBack`.
+
+**Saving a file and running a command at once no longer fails with a 409.**
+On a local install the runtime uploads a saved file while the command you run
+next uploads the same bytes, and the second one could be refused with
+`already exists (completing)`. It now waits for the other upload to land and
+carries on. A folder deleted or moved just as a sync ends is also no longer
+made again as an empty one.
+
+**Running pytest in a node's folder no longer rebuilds its images.**
+`.pytest_cache/` is now left out of versions and of what decides whether an
+image builds again.
+
+**A build checks every file it takes from the install's cache.** A copy that
+does not match the version is fetched again. Before, a copy damaged on disk
+could give the same version a different image, and that build failed.
+
+**Images are named after the version's file fingerprints.** A build from a
+version names its worker and infra images from the fingerprints the version
+already stores, so one version always gives the same images. Because the
+names changed form, every image builds once more after this update, and a
+node package's recorded live test passes count as out of date once.
+
 ## 2026-10-24 (0.2.274)
 
 **Update the CLI and the install together.** The requests and answers between

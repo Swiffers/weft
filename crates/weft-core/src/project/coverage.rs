@@ -58,15 +58,16 @@ pub fn covers(rel: &str) -> bool {
     matches!(first, "src" | "nodes" | "prompts" | "scripts" | "sql" | "assets" | "examples" | "layouts")
 }
 
-// SYNC: is_python_cache <-> .dockerignore (the `__pycache__` / `*.pyc` lines)
+// SYNC: is_python_cache <-> .dockerignore (the `__pycache__` / `*.pyc` / `.pytest_cache` lines)
 /// True if an entry of this name is what Python writes beside a module
-/// the first time it imports it (`__pycache__/`, a `.pyc`). Never
-/// source, and leaving it in would make a machine that ran a node hash
-/// the same tree differently from one that did not, and build again for
-/// nothing. Asked at any depth, by every walk that decides what a
-/// project or a node is made of.
+/// the first time it imports it (`__pycache__/`, a `.pyc`), or what
+/// pytest keeps between its runs (`.pytest_cache/`, rewritten by every
+/// run). Never source, and leaving it in would make a machine that ran a
+/// node, or its tests, hash the same tree differently from one that did
+/// not, and build again for nothing. Asked at any depth, by every walk
+/// that decides what a project or a node is made of.
 pub fn is_python_cache(name: &str) -> bool {
-    name == "__pycache__" || name.ends_with(".pyc")
+    name == "__pycache__" || name == ".pytest_cache" || name.ends_with(".pyc")
 }
 
 /// What every conflict copy's file name carries ([`conflict_copy_name`]).
@@ -164,6 +165,7 @@ mod tests {
             "notes.txt",
             "nodes/bridge/node_modules/left-pad/index.js",
             "nodes/pkg/__pycache__/helper.cpython-312.pyc",
+            "nodes/pkg/images/app/.pytest_cache/v/cache/lastfailed",
             "scripts/tool.pyc",
             "front/src/routes/+page.svelte",
             "main.weft-conflict-1a2b3c4d.weft",

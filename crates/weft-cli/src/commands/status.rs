@@ -54,17 +54,17 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                     Ok(_) => (
                         or_warn(
                             "the worker code's hash",
-                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Referenced),
+                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Referenced, &weft_compiler::hash::DISK),
                         ),
                         or_warn(
                             "the worker code's hash with every node",
-                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full),
+                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full, &weft_compiler::hash::DISK),
                         ),
                         or_warn("the project definition's hash", weft_compiler::hash::compute_definition_hash(&def)),
                         Some(weft_core::projects::NamedHashes(weft_core::run_spec::trigger_fingerprints(&def)).encode()),
                         or_warn(
                             "each infra place's hash",
-                            weft_compiler::hash::compute_infra_place_hashes(&def, &project.root, &weft_root, &catalog)
+                            weft_compiler::hash::compute_infra_place_hashes(&def, &project.root, &weft_root, &catalog, &weft_compiler::hash::DISK)
                                 .map(|places| weft_core::projects::NamedHashes(places).encode()),
                         ),
                     ),
@@ -123,7 +123,8 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     }
 
     println!("project: {} ({project_id})", data.name);
-    if let Some(line) = maintenance_line(&ctx).await {
+    let (maintenance, address) = tokio::join!(maintenance_line(&ctx), address_line(&ctx));
+    for line in [maintenance, address].into_iter().flatten() {
         println!("  {line}");
     }
     // Half taken down: what follows is what is left.
@@ -293,6 +294,20 @@ async fn maintenance_line(ctx: &Ctx) -> Option<String> {
     }
 }
 
+/// The line naming the address the install hands out in its links, read
+/// off `GET /install`; one that could not be read is said on stderr.
+async fn address_line(ctx: &Ctx) -> Option<String> {
+    let read = async { serde_json::from_value::<weft_core::install::InstallInfo>(ctx.client()?.get_json("/install").await?).map_err(anyhow::Error::from) };
+    match read.await {
+        Ok(info) if info.public_url == info.service_url => Some(format!("install address: {}", info.public_url)),
+        Ok(info) => Some(format!("install address: {} (it still answers at {} too)", info.public_url, info.service_url)),
+        Err(e) => {
+            eprintln!("warning: could not read the install's address ({e:#})");
+            None
+        }
+    }
+}
+
 fn warn_no_drift(why: &str, e: &anyhow::Error) {
     eprintln!("warning: {why}, so whether the running program is behind the source is not checked ({e:#})");
 }
@@ -331,7 +346,10 @@ fn trigger_lines(entry: &weft_core::projects::TriggerEntry) -> Vec<String> {
                         format!("{door}, taken down with its infra (it comes back once that infra runs again)")
                     }
                     Some(weft_core::projects::DownWith::Maintenance) => {
-                        format!("{door}, taken down by the install's maintenance (`weft maintenance off` brings it back)")
+                        format!(
+                            "{door}, taken down by the install's maintenance (`weft maintenance off` brings it back; once \
+                             the maintenance is over, `weft resync` does too)"
+                        )
                     }
                 }
             }
@@ -449,7 +467,7 @@ mod tests {
         let infra = super::trigger_lines(&entry(Some(weft_core::projects::DownWith::Infra)));
         assert!(infra[0].contains("taken down with its infra"), "{infra:?}");
         let maintenance = super::trigger_lines(&entry(Some(weft_core::projects::DownWith::Maintenance)));
-        assert!(maintenance[0].contains("`weft maintenance off` brings it back"), "{maintenance:?}");
+        assert!(maintenance[0].contains("`weft maintenance off` brings it back") && maintenance[0].contains("`weft resync` does too"), "{maintenance:?}");
         assert!(!super::trigger_lines(&entry(None))[0].contains("taken down"));
         let mut held_back = entry(Some(weft_core::projects::DownWith::Health));
         held_back.shared.as_mut().unwrap().held_back = Some("triggers on another build. `weft resync --all` moves them".into());

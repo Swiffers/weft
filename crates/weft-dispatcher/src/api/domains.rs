@@ -57,14 +57,33 @@ async fn one_at_a_time<T>(
         .map_err(internal)?
 }
 
-pub async fn list(State(state): State<DispatcherState>, _caller: CallerTenant) -> Result<Json<DomainList>, ApiError> {
-    let domains = crate::domains::list(&state.pg_pool).await.map_err(internal)?;
+/// `GET /install/domains`. A person looking is a reason to ask after the
+/// certificates still pending, so the answer says where each stands now.
+pub async fn list(State(state): State<DispatcherState>, caller: CallerTenant) -> Result<Json<DomainList>, ApiError> {
+    let stored = crate::domains::list_stored(&state.pg_pool).await.map_err(internal)?;
+    // A certificate that cannot be read is said beside the rest: this is
+    // the answer that explains what is wrong, so it never goes missing.
+    let (stored, certificates_unread) = match crate::domains::check_certificates(&state.pg_pool, state.domains.as_ref(), stored.clone(), |_| true).await {
+        Ok(checked) => (checked, None),
+        Err(e) => (stored, Some(format!("{e:#}"))),
+    };
     let door_refused = crate::domains::door_state(&state.pg_pool).await.map_err(internal)?.refused;
-    if domains.is_empty() {
-        return Ok(Json(DomainList { domains: Vec::new(), door_refused }));
+    let live_address = state.address.stable_fresh().await.map_err(internal)?;
+    let callback_url = crate::api::access::callback_url(&live_address);
+    let callback_services = sign_in_services(&state, &caller.0 .0).await?;
+    let listed = |domains| DomainList {
+        domains,
+        door_refused: door_refused.clone(),
+        live_address: live_address.clone(),
+        callback_url: callback_url.clone(),
+        callback_services: callback_services.clone(),
+        certificates_unread: certificates_unread.clone(),
+    };
+    if stored.is_empty() {
+        return Ok(Json(listed(Vec::new())));
     }
     let Some(address) = state.domains.address().await.map_err(door_failed)? else {
-        let why = door_refused.unwrap_or_else(|| "it is being made".to_string());
+        let why = door_refused.clone().unwrap_or_else(|| "it is being made".to_string());
         return Err((
             StatusCode::CONFLICT,
             format!(
@@ -73,8 +92,24 @@ pub async fn list(State(state): State<DispatcherState>, _caller: CallerTenant) -
             ),
         ));
     };
-    let domains = domains.into_iter().map(|domain| DomainEntry { record: record_for(&domain.name, address), domain }).collect();
-    Ok(Json(DomainList { domains, door_refused }))
+    let domains = stored
+        .into_iter()
+        .map(|s| DomainEntry { record: record_for(&s.domain.name, address), domain: s.domain, certificate: s.certificate })
+        .collect();
+    Ok(Json(listed(domains)))
+}
+
+/// The services with a sign-in on this install, by name: the ones
+/// `tenant` connected through an app of its own, and the ones the apps
+/// file holds a sign-in app for.
+async fn sign_in_services(state: &DispatcherState, tenant: &str) -> Result<Vec<String>, ApiError> {
+    let mut services = weft_access_store::own_sign_in_services(&state.pg_pool, tenant).await.map_err(internal)?;
+    let shared: weft_core::access::wire::SignInServices =
+        crate::broker_admin::forward_json(state, "/v1/access/admin/sign-in-services", &serde_json::json!({})).await?;
+    services.extend(shared.services);
+    services.sort();
+    services.dedup();
+    Ok(services)
 }
 
 pub async fn add(
@@ -159,12 +194,27 @@ mod tests {
         let entry = DomainEntry {
             domain: Domain { name: "weft.example.com".into(), serves: DomainServes::Install },
             record: record_for("weft.example.com", "34.1.2.3".parse().unwrap()),
+            certificate: weft_core::install::Certificate::Pending { why: Some("the DNS record".into()) },
         };
         let v = serde_json::to_value(&entry).unwrap();
         assert_eq!(v["domain"]["name"], "weft.example.com");
         assert_eq!(v["domain"]["for"]["kind"], "install");
         assert_eq!(v["record"]["type"], "A");
+        assert_eq!(v["certificate"], serde_json::json!({ "state": "pending", "why": "the DNS record" }));
         let back: DomainEntry = serde_json::from_value(v).unwrap();
-        assert_eq!(back.domain, entry.domain);
+        assert_eq!(back, entry);
+        let list = DomainList {
+            domains: vec![entry],
+            door_refused: None,
+            live_address: "https://weft.example.com".into(),
+            callback_url: "https://weft.example.com/access/oauth/callback".into(),
+            callback_services: vec!["google".into()],
+            certificates_unread: None,
+        };
+        let v = serde_json::to_value(&list).unwrap();
+        assert_eq!(v["liveAddress"], "https://weft.example.com");
+        assert_eq!(v["callbackUrl"], "https://weft.example.com/access/oauth/callback");
+        assert_eq!(v["callbackServices"], serde_json::json!(["google"]));
+        assert_eq!(serde_json::from_value::<DomainList>(v).unwrap(), list);
     }
 }

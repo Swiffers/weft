@@ -255,6 +255,45 @@ async fn a_second_build_reads_kept_blobs_without_the_store() {
     assert_eq!(std::fs::read(second.path().join("src/main.weft")).unwrap(), PROGRAM[1].1);
 }
 
+/// A version build names its files by the version's fingerprints for real:
+/// the project the compile loads sits where the manifest's paths resolve
+/// (a different spelling of the root would quietly read the disk instead),
+/// so a file changed on the disk after it was checked still carries the
+/// version's fingerprint.
+#[tokio::test]
+async fn a_version_build_finds_its_files_in_the_version() {
+    let (storage, manifest) = storage_with("local", PROGRAM);
+    let storage = Arc::new(storage);
+    let (_blobs, cache) = fresh_cache();
+    let root = tempfile::tempdir().unwrap();
+    source::materialize(storage.as_ref(), &cache, "local", &manifest, root.path()).await.unwrap();
+    let (_, _, project) = compile_version(storage, "local", &manifest, root.path()).await.unwrap();
+    let fingerprints = weft_compiler::hash::Fingerprints::of_version(project.root.clone(), manifest.clone());
+    let main = project.root.join("src/main.weft");
+    std::fs::write(&main, b"changed after it was checked").unwrap();
+    assert_eq!(fingerprints.of(&main).unwrap(), manifest["src/main.weft"], "the version's fingerprint, not the disk's");
+    assert_ne!(weft_compiler::hash::DISK.of(&main).unwrap(), manifest["src/main.weft"]);
+}
+
+/// A kept blob whose bytes went bad on this replica's disk is never laid
+/// out: it fails its hash, goes from the cache, and the store's copy is
+/// fetched and kept in its place, so the build reads (and names its
+/// images after) the version's bytes.
+#[tokio::test]
+async fn a_kept_blob_gone_bad_is_fetched_again_and_replaced() {
+    let (storage, manifest) = storage_with("local", PROGRAM);
+    let (dir, cache) = fresh_cache();
+    let first = tempfile::tempdir().unwrap();
+    source::materialize(&storage, &cache, "local", &manifest, first.path()).await.unwrap();
+    let hash = &manifest["src/main.weft"];
+    let kept = dir.path().join("blobs").join("local").join(hash);
+    std::fs::write(&kept, b"greeting = Text { value: \"ho\" }\n").unwrap();
+    let second = tempfile::tempdir().unwrap();
+    source::materialize(&storage, &cache, "local", &manifest, second.path()).await.unwrap();
+    assert_eq!(std::fs::read(second.path().join("src/main.weft")).unwrap(), PROGRAM[1].1, "the store's bytes, not the cache's");
+    assert_eq!(std::fs::read(&kept).unwrap(), PROGRAM[1].1, "the cache holds the right bytes again");
+}
+
 /// A version stored while a manifest named the installed weft by a
 /// `weft:<version>:<catalog hash>` entry fails by that entry's name.
 #[tokio::test]

@@ -231,6 +231,12 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("a default reqwest client builds");
+    let address = Arc::new(weft_task_store::install_address::InstallAddress::follow(
+        pool.clone(),
+        &signals,
+        &config.public_url,
+        config.internet_address(),
+    )?);
     Ok(DispatcherState {
         replica: replica.clone(),
         runs: store.clone(),
@@ -252,6 +258,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         alert_after_secs: whole_secs_up(config.alert_delay()),
         builder,
         install_info: install_info(config),
+        address,
         projects,
         activations,
         versions,
@@ -261,8 +268,6 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         authenticator,
         tenant_router,
         project_reclaimer,
-        public_base_url: config.public_url.trim_end_matches('/').to_string(),
-        internet: config.internet_address(),
         files: match &config.object_store {
             weft_platform_traits::config::ObjectStoreSettings::S3(store) if !store.public_internet => {
                 Some(crate::files_door::FilesTarget { endpoint: store.endpoint.clone(), bucket: store.bucket.clone() })
@@ -295,11 +300,14 @@ fn whole_secs_up(delay: std::time::Duration) -> i64 {
     i64::try_from(delay.as_millis().div_ceil(1000)).unwrap_or(i64::MAX)
 }
 
-/// What the install tells about itself (`GET /install`), from its config.
+/// What the install tells about itself (`GET /install`), from its config:
+/// its address there is the platform's own, which `GET /install` answers
+/// with the install's domain once that domain is the address.
 pub fn install_info(config: &InstallConfig) -> weft_core::install::InstallInfo {
     use weft_platform_traits::config::PlatformConfig;
     weft_core::install::InstallInfo {
         public_url: config.public_url.clone(),
+        service_url: config.public_url.clone(),
         cloud: match &config.platform {
             PlatformConfig::Local(_) => None,
             PlatformConfig::Gcp(g) => Some(weft_core::install::CloudInstall::Gcp(weft_core::install::GcpInstall {
@@ -360,6 +368,7 @@ pub fn drain_loops(state: &DispatcherState, registry: crate::task_executor::Task
         crate::holders::drain_loop(state),
         crate::holders::access_loop(state),
         crate::domains::drain_loop(state),
+        crate::domains::certificates_loop(state),
     ];
     loops.extend(crate::reaper::drain_loops(state));
     // A dispatcher at zero is woken by name for what `loop_wakes` says,
@@ -400,6 +409,7 @@ pub fn loop_wakes() -> Vec<(&'static str, &'static [WakeOn])> {
         ("holders", crate::holders::ON_HELD_SIGNALS),
         (crate::holders::HOLDER_ACCESS, crate::holders::ON_ACCESS),
         ("domains_door", crate::domains::ON_DOMAINS),
+        ("domains_certificates", crate::domains::ON_DOMAINS),
         ("image_builds", crate::build::follow::WAKE_ON),
     ]
 }

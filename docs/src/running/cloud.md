@@ -134,6 +134,27 @@ transaction, also add a direct address of the same database as
 out a different connection for each transaction. If you leave it out and the
 address cannot listen, weft refuses to start and its log names this secret.
 
+If your program will be busy (schedules every few minutes, a connection held
+open all day, a site calling it constantly), its database rarely gets to
+sleep, and a hosted free plan runs out: Neon's caps the data sent out of the
+database at 5 GB a month, and every query weft makes crosses the internet to
+reach it. For that, the install can have a Postgres of its own instead, on
+Cloud SQL in its own region and network. Set the repository variable
+`WEFT_DATABASE` to `cloud_sql` and leave `WEFT_DATABASE_URL` out. It bills
+every hour it runs, even with nobody using the install, and Google's Cloud
+SQL pricing page has the price for your region. Its size is the repository
+variable `WEFT_CLOUD_SQL_TIER` (`db-g1-small`, a small shared machine, when
+unset).
+
+You can switch to it later. Run `weft maintenance on --on prod`, set
+`WEFT_DATABASE` to `cloud_sql`, and run the workflow again: it makes the
+install's own database, copies everything from the one it used, and only then
+points the install at it. Until the install uses the new database, every run
+of the workflow copies again from scratch, so if anything fails on the way,
+the install stays on the old database and running the workflow again starts
+over. Then `weft maintenance off --on prod`. Once you are happy with it, you
+can delete the `WEFT_DATABASE_URL` secret and the old database.
+
 ### OAuth apps of your own (optional)
 
 If your programs sign in to services through OAuth apps of your own
@@ -165,16 +186,26 @@ name of your own instead, see [your own domain](#your-own-domain), which
 costs money.
 
 If you want to upgrade weft, run `weft maintenance on --on prod` from a
-project, merge upstream into your fork, run the workflow again, then run
-`weft maintenance off --on prod`. The first takes down every trigger that is
-on and stops the infra that runs, so the old weft and the new one never run
-side by side, and the workflow refuses to replace anything while something
-is on. Terraform changes only what is different from last time. The last
-builds those projects again on the new weft and brings back exactly what the
-first took down. Then rebuild your CLI from that
-commit, or `activate` refuses to deploy
-([when something goes wrong](#when-something-goes-wrong)). For what each step
+project, merge upstream into your fork, run the workflow again, rebuild your
+CLI from that commit (`./setup.sh --cli`), then run `weft maintenance off
+--on prod`. The first takes down every trigger that is on and stops the
+infra that runs, so the old weft and the new one never run side by side, and
+the workflow refuses to replace anything while something is on. Terraform
+changes only what is different from last time. The CLI goes before `off`
+because an older CLI cannot read what `off` answers, and `activate` refuses
+to deploy from one ([when something goes wrong](#when-something-goes-wrong)).
+The last builds those projects again on the new weft and brings back exactly
+what the first took down. For what each step
 does, go and read [updating weft](cli.md#updating-weft).
+
+If something in a project does not come back with `weft maintenance off --on
+prod`, everything else is back anyway, and `off` says what went wrong. If the
+message says the project's copy of the standard nodes is older than this
+weft, run `weft catalog update` in that folder once your weft checkout and CLI
+are on the new commit, since it copies the standard nodes from the checkout
+on your machine (it replaces `nodes/base_catalog/`, so any edits you made in
+there are lost); otherwise fix what it says. Then run `weft resync --on prod`
+there, which builds the project and brings back what the upgrade took down.
 
 If you want weft gone, delete the GCP project you made for it: weft and
 everything it ever started live in that project and nowhere else, so that is
@@ -328,10 +359,28 @@ weft domain add weft.example.com --on prod --accept-cost
 ```
 
 It prints the DNS record to set at your registrar (type `A`, the name, and
-the load balancer's address) and waits until the name points there. Google
-then issues the domain's certificate once it sees the record, and
-`https://weft.example.com` works. `weft domain list --on prod` shows
-every domain with its record.
+the load balancer's address) and waits until the name points there, then
+until Google has issued the domain's certificate, which usually takes a few
+minutes once the record is seen. The record has to point straight at that
+address: on Cloudflare, set it to "DNS only" (the grey cloud), because a
+proxied record hides the load balancer and Google never issues the
+certificate. If the name already points somewhere else (a tunnel to your
+machine, say), remove that record first. `weft domain list --on prod` shows
+every domain with its record and where its certificate stands, and says why
+when it is stuck.
+
+Once the certificate is issued, the domain becomes the install's address.
+Every link it hands out from then on uses it: sign-in callbacks, webhook
+addresses, file links, `weft target export`. The `run.app` address keeps
+working, so nothing you already handed out breaks. Two things are yours to do
+then, and `weft domain add` (or `weft domain list`) prints both:
+
+- Each provider you sign in through (Google, Meta, TikTok...) only sends
+  people back to addresses its app lists. Add the new callback,
+  `https://weft.example.com/access/oauth/callback`, to each app's allowed
+  redirect URLs.
+- A site that talks to the install was given its address by `weft target
+  export`; run it again so the site uses the domain.
 
 A domain can also serve one project instead of the whole install:
 `--for api` answers that project's routes at the root of the domain
@@ -341,6 +390,42 @@ straight to the project's own Cloud Run service, and
 `--for frontend --to <address>` passes visitors on to the project's
 frontend on Cloud Run, at the address `weft frontend ls --on prod` shows for
 it.
+
+### Moving from your machine to the cloud
+
+If you built an app on your machine and now run it on a cloud install, you do
+not have to make every connection again or upload every file by hand. `weft
+migrate` copies them from the install a command acts on to the one `--to`
+names, and the install they come from keeps everything:
+
+```bash
+weft migrate connections --to prod --all
+weft migrate files --to prod --prefix project/<project id>/
+```
+
+You always say what to copy: `--all`, or any mix of `--id <id>` (repeat it
+for several), `--since`/`--until` (a date like `2026-10-01`, or a time), and
+`--service`/`--project` for connections or `--prefix` for files. Add
+`--dry-run` to see what would be copied first. Each line says what happened
+to one item: copied, already there, or skipped and why.
+
+A connection's secrets are never in the clear on the way: the cloud install
+makes a key pair, your machine seals the connections to it, and only the
+cloud install opens them. Each connection keeps its id, so a program that
+names one finds it. The connections your nodes use are picked per install,
+so the command ends by printing the `weft connect --grant` lines to pick them
+on the cloud too. A connection that spends one of the install's own keys
+copies only when the cloud install holds that key. A copied sign-in (Google,
+Slack and the like) renews itself with a refresh token that both installs
+now hold. Most providers accept that, but one that replaces its token on
+every renewal breaks whichever install renews second; the command names the
+sign-ins it copied, and if one stops working on the cloud, connect it again
+there with `weft connect`.
+
+A file keeps its key, its version and its lifetime, so a value that names it
+still finds it. A run's file stays behind with its run, unless you kept it.
+Run `weft migrate` from the project's folder, where `--to prod` means the
+target the project names.
 
 ## Deploy a project
 

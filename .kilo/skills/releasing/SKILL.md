@@ -61,11 +61,12 @@ only what publishes waits for the gate.
 
 ## Before every push to a PR, run what the PR runs
 
-Before you push a commit to a branch with a PR (the first push that
-opens it, and every fix pushed after), run locally everything the PR's
-checks run, not only the tests your change reaches. This is the one
-place the [test scope] does not apply: a red PR costs a full CI round
-trip, and twice a PR has gone red on a test in a crate the change only
+Before the first push that opens a PR, run locally everything the PR's
+checks run, once, not only the tests your change reaches. A fix pushed
+after that is back under the [test scope]: run what the fix can break
+and workspace clippy, never the full list again over code that already
+passed it. This is the one place the [test scope] does not apply: a
+red PR costs a full CI round trip, and twice a PR has gone red on a test in a crate the change only
 touched indirectly. Background the run, and fix everything before the
 push, not after. Locally the cargo commands go one after another (they
 share one build directory, which cargo locks, and overlapping cargo runs

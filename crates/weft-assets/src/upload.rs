@@ -1,4 +1,6 @@
-//! The one upload protocol into a tenant's assets, whoever drives it.
+//! The one upload protocol into a tenant's assets, whoever drives it, and
+//! the same protocol carrying a file copied in from another install
+//! (`weft migrate files`, [`ContentStore::copy`]).
 //!
 //! An asset is stored under its content hash through the store's multipart
 //! contract: begin (the store mints the key and says whether the content is
@@ -23,8 +25,8 @@ use std::io::Read;
 use anyhow::{bail, Context, Result};
 use sha2::Digest;
 use weft_core::storage::{
-    AssetUploadBeginRequest, AssetsHeldResponse, PartAsk, PartDoneRequest, PresignedPart, StoredFileMeta,
-    UploadBeginResponse, UploadResumeResponse,
+    AssetUploadBeginRequest, AssetsHeldResponse, FileImportBeginRequest, PartAsk, PartDoneRequest, PresignedPart,
+    StoredFileMeta, UploadBeginResponse, UploadResumeResponse,
 };
 
 use crate::AssetStore;
@@ -37,8 +39,8 @@ pub trait UploadPlane: Send + Sync {
     /// Which of `hashes` the tenant stores whole, and the key each other
     /// one would be stored under.
     async fn held(&self, hashes: &[String]) -> Result<AssetsHeldResponse>;
-    /// Begin the upload of one content.
-    async fn begin(&self, request: AssetUploadBeginRequest) -> Result<UploadBeginResponse>;
+    /// Begin the upload of one content, or of one copied file.
+    async fn begin(&self, request: Begin) -> Result<UploadBeginResponse>;
     /// Pick up the upload already part way up under `key`.
     async fn resume(&self, key: &str) -> Result<UploadResumeResponse>;
     /// Reserve and presign `parts` of the upload under `key`.
@@ -58,6 +60,30 @@ pub trait UploadPlane: Send + Sync {
     /// Whether `error` is a request cut off on the way (a dropped
     /// connection, a timeout) rather than an answer.
     fn interrupted(&self, error: &anyhow::Error) -> bool;
+}
+
+/// What an upload is begun as: an asset, found by its content, or a file
+/// copied from another install under the key it had there.
+#[derive(Debug, Clone)]
+pub enum Begin {
+    Asset(AssetUploadBeginRequest),
+    Copy(FileImportBeginRequest),
+}
+
+/// What one upload did.
+struct Sent {
+    key: String,
+    /// `false` when the store held the file already.
+    uploaded: bool,
+}
+
+/// What [`ContentStore::copy`] did with one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Copied {
+    /// Its key on this install.
+    pub key: String,
+    /// The install held this very copy already.
+    pub already_there: bool,
 }
 
 /// A tenant's content-addressed assets over an [`UploadPlane`].
@@ -149,33 +175,23 @@ impl<P: UploadPlane> ContentStore<P> {
             .context("report asset part")
     }
 
-    /// Upload `bytes` as the content `hash`, `size_bytes` long, and answer
-    /// its key: this call's upload, or another publisher's of the same
-    /// content that finished first.
-    async fn transfer(
-        &self,
-        hash: &str,
-        mime: &str,
-        filename: &str,
-        size_bytes: u64,
-        bytes: &mut (dyn Read + Send),
-    ) -> Result<String> {
+    /// Upload `bytes`, `size_bytes` long, as what `begin` says, and answer
+    /// its key. An asset's is this call's upload, or another publisher's of
+    /// the same content that finished first; a copied file's is the key it
+    /// keeps.
+    async fn transfer(&self, begin: Begin, size_bytes: u64, bytes: &mut (dyn Read + Send)) -> Result<Sent> {
+        let (hash, filename) = match &begin {
+            Begin::Asset(request) => (Some(request.content_hash.clone()), request.filename.clone()),
+            Begin::Copy(request) => (None, request.filename.clone()),
+        };
+        let filename = filename.as_str();
         let mut upload_key = None;
         // Set when the bytes read are not the content: that upload is ended
         // here, so no other publisher's finish can answer for it.
         let mut changed = false;
         let mut bytes = Hashing { inner: bytes, hasher: sha2::Sha256::new() };
-        let transferred: Result<String> = async {
-            let begin = self
-                .plane
-                .begin(AssetUploadBeginRequest {
-                    mime_type: mime.to_string(),
-                    filename: filename.to_string(),
-                    declared_size: Some(size_bytes),
-                    content_hash: hash.to_string(),
-                })
-                .await
-                .with_context(|| format!("begin the upload of {filename}"))?;
+        let transferred: Result<Sent> = async {
+            let begin = self.plane.begin(begin).await.with_context(|| format!("begin the upload of {filename}"))?;
             // Three answers, all from the begin itself, so this never has to
             // guess the key: the store mints it (it is tenant-anchored) and
             // says it in every one of them.
@@ -185,7 +201,7 @@ impl<P: UploadPlane> ContentStore<P> {
             // the same asset, and the begin answers the existing key with
             // nothing to transfer.
             if begin.already_stored {
-                return Ok(begin.key);
+                return Ok(Sent { key: begin.key, uploaded: false });
             }
             let key = begin.key;
             let (part_size, mut reserved, carved) = if begin.resume {
@@ -251,7 +267,7 @@ impl<P: UploadPlane> ContentStore<P> {
                     let want = (buf.len() as u64).min(to - *at) as usize;
                     if fill(bytes, &mut buf[..want]).context("skip already-uploaded bytes")? < want {
                         bail!(
-                            "asset {filename} is shorter than the {to} bytes already uploaded under its own \
+                            "{filename} is shorter than the {to} bytes already uploaded under its own \
                              content hash; cancel that upload and publish again"
                         );
                     }
@@ -262,10 +278,10 @@ impl<P: UploadPlane> ContentStore<P> {
             for part in reserved {
                 skip_to(&mut bytes, &mut buf, &mut at, part.offset_bytes)?;
                 let want = part.size_bytes as usize;
-                let filled = fill(&mut bytes, &mut buf[..want]).context("read asset chunk")?;
+                let filled = fill(&mut bytes, &mut buf[..want]).context("read a chunk")?;
                 if filled < want {
                     bail!(
-                        "asset {filename} shrank while uploading (read {at} + {filled} of {size_bytes} \
+                        "{filename} shrank while uploading (read {at} + {filled} of {size_bytes} \
                          bytes); run the command again"
                     );
                 }
@@ -278,10 +294,10 @@ impl<P: UploadPlane> ContentStore<P> {
             skip_to(&mut bytes, &mut buf, &mut at, carved)?;
             while at < size_bytes {
                 let want = part_size.min((size_bytes - at) as usize);
-                let filled = fill(&mut bytes, &mut buf[..want]).context("read asset chunk")?;
+                let filled = fill(&mut bytes, &mut buf[..want]).context("read a chunk")?;
                 if filled < want {
                     bail!(
-                        "asset {filename} shrank while uploading (read {at} + {filled} of {size_bytes} \
+                        "{filename} shrank while uploading (read {at} + {filled} of {size_bytes} \
                          bytes); run the command again"
                     );
                 }
@@ -307,7 +323,7 @@ impl<P: UploadPlane> ContentStore<P> {
             // content the upload was begun for would be refused by the
             // store's complete, so the upload is ended here instead.
             let sent = format!("{:x}", std::mem::take(&mut bytes.hasher).finalize());
-            if sent != hash {
+            if let Some(hash) = hash.as_deref().filter(|hash| sent != *hash) {
                 changed = true;
                 let said = format!(
                     "{filename} changed while it was being published (it hashed to {hash}, and the bytes \
@@ -318,19 +334,22 @@ impl<P: UploadPlane> ContentStore<P> {
                     Err(e) => e.context(format!("{said}. Ending its upload failed too")),
                 });
             }
-            self.plane.complete(&key).await.context("complete asset upload")?;
-            Ok(key)
+            self.plane.complete(&key).await.context("complete the upload")?;
+            Ok(Sent { key, uploaded: true })
         }
         .await;
         let error = match transferred {
-            Ok(uploaded) => return Ok(uploaded),
+            Ok(sent) => return Ok(sent),
             Err(error) => error,
         };
+        // Only an asset is found by its content: another publisher's
+        // upload of a copied file is no answer for this one.
+        let Some(hash) = hash else { return Err(error) };
         // The begin itself can find another publisher completing these same
         // bytes (a save the runtime syncs while a command publishes it):
         // there is no key yet, so the content is waited for by its hash.
         if upload_key.is_none() && !changed && self.plane.completing(&error) {
-            return self.wait_for_content(hash, error).await;
+            return Ok(Sent { key: self.wait_for_content(&hash, error).await?, uploaded: false });
         }
         // Any transfer step can lose to another publisher finishing these
         // same content-addressed bytes. When the store said so outright (a
@@ -357,7 +376,7 @@ impl<P: UploadPlane> ContentStore<P> {
                     meta.key,
                     meta.size_bytes
                 );
-                return Ok(key);
+                return Ok(Sent { key, uploaded: false });
             }
             if !completing {
                 return Err(error);
@@ -376,6 +395,16 @@ impl<P: UploadPlane> ContentStore<P> {
 }
 
 impl<P: UploadPlane> ContentStore<P> {
+    /// Copy one file in from another install, reading its bytes from
+    /// `bytes` (exactly `request.size_bytes` of them): under the key it had
+    /// there, keeping its version, birth and lifetime. The same copy made
+    /// before is already there; one cut off part way up carries on.
+    pub async fn copy(&self, request: FileImportBeginRequest, bytes: &mut (dyn Read + Send)) -> Result<Copied> {
+        let size_bytes = request.size_bytes;
+        let sent = self.transfer(Begin::Copy(request), size_bytes, bytes).await?;
+        Ok(Copied { key: sent.key, already_there: !sent.uploaded })
+    }
+
     /// The key of `hash`'s content once another publisher's completion of
     /// it lands, with the bounded backoff a completion has everywhere
     /// ([`completing_wait`]); `error` (the refused begin) says why it was
@@ -426,9 +455,15 @@ impl<P: UploadPlane> AssetStore for ContentStore<P> {
         // store keeps what arrived, and the next publish of the same
         // content resumes it through the upload protocol. Nothing is lost
         // and nothing is blocked, so there is no reason to own the signal.
-        let key = self.transfer(hash, mime, filename, size_bytes, bytes).await?;
+        let begin = Begin::Asset(AssetUploadBeginRequest {
+            mime_type: mime.to_string(),
+            filename: filename.to_string(),
+            declared_size: Some(size_bytes),
+            content_hash: hash.to_string(),
+        });
+        let sent = self.transfer(begin, size_bytes, bytes).await?;
         self.note_uploaded();
-        Ok(key)
+        Ok(sent.key)
     }
 
     fn interrupted(&self, error: &anyhow::Error) -> bool {
@@ -577,7 +612,7 @@ mod tests {
                 unheld: Default::default(),
             })
         }
-        async fn begin(&self, _request: AssetUploadBeginRequest) -> Result<UploadBeginResponse> {
+        async fn begin(&self, _request: Begin) -> Result<UploadBeginResponse> {
             self.step("begin")?;
             Ok(self.begin.clone())
         }
@@ -659,6 +694,40 @@ mod tests {
         assert_eq!(key.unwrap(), "t/asset/k");
         assert_eq!(*bucket.parts.lock().unwrap(), [(1, b"abcd".to_vec()), (2, b"efgh".to_vec()), (3, b"ij".to_vec())]);
         assert_eq!(store.plane.calls(), ["begin", "parts", "part-done", "parts", "part-done", "parts", "part-done", "complete"]);
+    }
+
+    /// A copied file goes up under the key it keeps, with no content hash
+    /// to hold it to; one the store holds already reads nothing; and a
+    /// refused step is that step's error, never a look for another
+    /// publisher's upload (a copy is found by its key, not its content).
+    #[tokio::test]
+    async fn a_copied_file_goes_up_under_its_own_key() {
+        let request = || FileImportBeginRequest {
+            key: "src/project/p/f".into(),
+            version: 3,
+            mime_type: "text/plain".into(),
+            filename: "notes.txt".into(),
+            size_bytes: 6,
+            created_at_unix: 1,
+            keep: None,
+        };
+        let copied_key = || UploadBeginResponse { key: "t/project/p/f".into(), part_size: 4, already_stored: false, resume: false };
+        let bucket = Arc::new(Bucket::default());
+        let (base, server) = serve(bucket.clone()).await;
+        let store = ContentStore::new(FakePlane::new(&base, copied_key()));
+        let copied = store.copy(request(), &mut &b"abcdef"[..]).await.unwrap();
+        assert_eq!(copied, Copied { key: "t/project/p/f".into(), already_there: false });
+        assert_eq!(*bucket.parts.lock().unwrap(), [(1, b"abcd".to_vec()), (2, b"ef".to_vec())]);
+        assert_eq!(store.plane.calls(), ["begin", "parts", "part-done", "parts", "part-done", "complete"]);
+
+        let store = ContentStore::new(FakePlane::new(&base, UploadBeginResponse { already_stored: true, ..copied_key() }));
+        let copied = store.copy(request(), &mut &b""[..]).await.unwrap();
+        assert!(copied.already_there);
+
+        let store = ContentStore::new(FakePlane { refuse: Some("complete"), stored_after: Some(0), ..FakePlane::new(&base, copied_key()) });
+        store.copy(request(), &mut &b"abcdef"[..]).await.unwrap_err();
+        server.abort();
+        assert!(!store.plane.calls().iter().any(|c| c == "held" || c == "meta"), "{:?}", store.plane.calls());
     }
 
     /// Content already stored is answered by the begin, and nothing is read.

@@ -6,13 +6,15 @@
 //! stands, so the first add needs `--accept-cost`) and the last one takes
 //! down. Adding one stores it and prints the DNS record to set at the
 //! registrar; the command then waits until the name points at the door,
-//! which then gets the name's certificate on its own.
+//! which then gets the name's certificate on its own, and until that
+//! certificate is issued. From then on an install domain is the address
+//! the install hands out in its links, its OAuth callback included.
 
 use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::Context;
-use weft_core::install::{AddDomain, Domain, DomainAdded, DomainList, DomainServes};
+use weft_core::install::{AddDomain, Certificate, Domain, DomainAdded, DomainList, DomainServes};
 
 use super::Ctx;
 
@@ -36,6 +38,10 @@ pub enum DomainAction {
 /// How often the DNS is looked at while waiting for the record.
 const DNS_LOOK_EVERY: Duration = Duration::from_secs(5);
 
+/// How often the install is asked after the certificate while waiting
+/// for it (each ask is a call to the platform).
+const CERTIFICATE_LOOK_EVERY: Duration = Duration::from_secs(20);
+
 pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
     let client = ctx.client()?;
     match action {
@@ -44,15 +50,18 @@ pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
             if ctx.json_out(&entries)? {
                 return Ok(());
             }
-            let DomainList { domains, door_refused } = serde_json::from_value(entries).context("read the install's domains")?;
-            if let Some(why) = door_refused {
+            let list: DomainList = serde_json::from_value(entries).context("read the install's domains")?;
+            if let Some(why) = &list.door_refused {
                 eprintln!("the door in front of the install's domains refuses to follow them, and the install keeps trying: {why}");
             }
-            if domains.is_empty() {
+            if let Some(why) = &list.certificates_unread {
+                eprintln!("the certificates could not be asked after just now, so each one below is as last recorded: {why}");
+            }
+            if list.domains.is_empty() {
                 println!("no domains; the install answers at its own address only (add one with `{}`)", ctx.weft("domain add <name>"));
                 return Ok(());
             }
-            for e in domains {
+            for e in &list.domains {
                 let what = match &e.domain.serves {
                     DomainServes::Frontend { project, upstream } => format!("frontend of {project} ({upstream})"),
                     DomainServes::Api { project } => format!("API of {project}"),
@@ -60,7 +69,9 @@ pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
                 };
                 println!("{:<32} {what}", e.domain.name);
                 println!("  DNS: {}", e.record);
+                println!("  certificate: {}", certificate_line(&e.certificate));
             }
+            print_address(&ctx, &list);
             Ok(())
         }
         DomainAction::Rm { name } => {
@@ -101,13 +112,78 @@ pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
                 .parse()
                 .map_err(|_| anyhow::anyhow!("the install answered '{}' as the record's address", entry.record.value))?;
             wait_for_dns(&name, address).await;
-            println!(
-                "{name} points at the install; https://{name} works once the door has its certificate, which is issued on its own once \
-                 the record is seen, and can take a while (`{}` shows the record again)",
-                ctx.weft("domain list")
-            );
+            println!("{name} points at the install; waiting for its certificate, which Google issues on its own (usually minutes; Ctrl+C stops waiting, the install keeps looking)");
+            let list = wait_for_certificate(&client, &name).await?;
+            match list.domains.iter().find(|e| e.domain.name == name).map(|e| &e.certificate) {
+                Some(Certificate::Failed { why }) => {
+                    anyhow::bail!(
+                        "{name}'s certificate could not be issued: {why}. Fix that, then `{}` and add it again",
+                        ctx.weft(&format!("domain rm {name}"))
+                    )
+                }
+                _ => println!("{name}'s certificate is issued: https://{name} works"),
+            }
+            print_address(&ctx, &list);
             Ok(())
         }
+    }
+}
+
+/// Who asks after a waiting certificate: the install, for a while, and
+/// every `weft domain list`.
+// SYNC: CHECKED_HOW <-> crates/weft-dispatcher/src/domains.rs CERTIFICATE_LOOKS_FOR
+const CHECKED_HOW: &str = " (the install asks Google on its own for 3 days after the domain is added, and `weft domain list` asks again)";
+
+/// How a certificate's state reads in `weft domain list`.
+fn certificate_line(certificate: &Certificate) -> String {
+    match certificate {
+        Certificate::Issued => "issued".to_string(),
+        Certificate::Pending { why: None } => format!("waiting (Google checks the DNS record, then issues it){CHECKED_HOW}"),
+        Certificate::Pending { why: Some(why) } => format!("waiting: {why}{CHECKED_HOW}"),
+        Certificate::Failed { why } => format!("failed: {why} (remove the domain and add it again to retry)"),
+    }
+}
+
+/// What the install's address is now and, once an install domain is it,
+/// what the person has to do about it: tell each sign-in provider the new
+/// callback, and hand their site the new address.
+fn print_address(ctx: &Ctx, list: &DomainList) {
+    println!("links the install hands out use {}", list.live_address);
+    let moved = list
+        .domains
+        .iter()
+        .any(|e| e.domain.serves == DomainServes::Install && e.certificate == Certificate::Issued && list.live_address == format!("https://{}", e.domain.name));
+    if !moved {
+        return;
+    }
+    if !list.callback_services.is_empty() {
+        println!(
+            "sign-ins now come back to {}: add it to the allowed redirect URLs of your app at {}",
+            list.callback_url,
+            list.callback_services.join(", ")
+        );
+    }
+    println!("if a site uses this install, export its settings again: `{}`", ctx.weft("target export <target>"));
+}
+
+/// Ask the install after `name`'s certificate until it is no longer
+/// pending, and answer the list that says so.
+async fn wait_for_certificate(client: &crate::client::DispatcherClient, name: &str) -> anyhow::Result<DomainList> {
+    let started = std::time::Instant::now();
+    let mut said = started;
+    loop {
+        let list: DomainList = serde_json::from_value(client.get_json("/install/domains").await?).context("read the install's domains")?;
+        let Some(entry) = list.domains.iter().find(|e| e.domain.name == name) else {
+            anyhow::bail!("'{name}' is no longer one of the install's domains");
+        };
+        if !matches!(entry.certificate, Certificate::Pending { .. }) {
+            return Ok(list);
+        }
+        if said.elapsed() >= Duration::from_secs(120) {
+            said = std::time::Instant::now();
+            println!("  still waiting after {} min; {}", started.elapsed().as_secs() / 60, certificate_line(&entry.certificate));
+        }
+        tokio::time::sleep(CERTIFICATE_LOOK_EVERY).await;
     }
 }
 

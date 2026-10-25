@@ -5,4 +5,5 @@
 //! Each module was once a test file of its own; one binary links the
 //! dependency tree once instead of once per file.
 
+mod migrate;
 mod store_flows;

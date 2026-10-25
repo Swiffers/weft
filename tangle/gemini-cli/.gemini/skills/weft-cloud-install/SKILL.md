@@ -130,7 +130,9 @@ to do before anything that creates or costs something:
    `TF_STATE_BUCKET`, `GCP_WORKLOAD_IDENTITY_PROVIDER` and
    `GCP_INSTALL_SERVICE_ACCOUNT`. A project's frontend is added later, from
    the project (read weft-deploying), never here.
-6. **The database.** If the user has no Postgres, read weft-database. If
+6. **The database.** If the user has no Postgres, read weft-database,
+   which also says when to offer the install a Postgres of its own on Cloud
+   SQL instead. If
    they already have a
    Postgres they want, put its address in the `WEFT_DATABASE_URL` secret
    with `gh secret set WEFT_DATABASE_URL --repo <fork>` (piping it in, never
@@ -201,6 +203,36 @@ unlink <id>`, then `gcloud projects delete <id>` (Google keeps it 30 days,
 `gcloud projects undelete <id>` brings it back). It deletes everything in
 it, so say so and wait for the user's yes. The database is theirs, at its
 own provider, and stays.
+
+## Moving an app from this machine
+
+When the user built an app here and now runs it on the cloud install, you
+never ask them to make its keys or sign-ins again, or to upload its files:
+you copy them. From the project's folder, once its target is added and
+logged in (read weft-deploying):
+
+```bash
+weft migrate connections --to prod --all --dry-run
+weft migrate connections --to prod --all
+weft migrate files --to prod --prefix project/<project id>/
+```
+
+`--to` names a target of the project; what is copied comes from the install
+the command acts on (this machine's, unless `--on <other>`). A selection is
+required: `--all`, or any mix of `--id <id>` (repeatable), `--since` and
+`--until` (a date like `2026-10-01`, or an RFC 3339 time), `--service <name>`
+or `--project <id>` for connections, and `--prefix <key prefix>` for files.
+`--dry-run` lists what would be copied, and `--json` gives the same as data.
+Each line says copied, already there, or skipped and why.
+
+Secrets travel sealed to the cloud install and keep their ids. Which
+connection each node uses is picked per install, so the command ends with
+`weft connect --node <node> --grant <id> --on prod` lines: hand those to the
+deployer to run, in the project folder. A connection that spends the
+install's own shared key copies only when the cloud install holds that key;
+for one that is skipped, the user connects it there themselves. A run's
+files stay behind unless they were kept. A file keeps its key, version and
+lifetime, so a value that names it still finds it on the cloud.
 
 For deploying projects to the install once the key is in `weft login`,
 read weft-deploying.

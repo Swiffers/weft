@@ -303,7 +303,9 @@ pub async fn resolve_storage_caller(
 pub(crate) async fn control_plane(state: &Arc<BrokerState>, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
     match resolve_storage_caller(state, headers, None).await? {
         weft_core::storage::key::CallerAuth::ControlPlane => Ok(()),
-        weft_core::storage::key::CallerAuth::Worker { .. } | weft_core::storage::key::CallerAuth::Tenant { .. } => {
+        weft_core::storage::key::CallerAuth::Worker { .. }
+        | weft_core::storage::key::CallerAuth::Tenant { .. }
+        | weft_core::storage::key::CallerAuth::Copying { .. } => {
             Err((StatusCode::FORBIDDEN, "the admin surface is dispatcher-only".into()))
         }
     }

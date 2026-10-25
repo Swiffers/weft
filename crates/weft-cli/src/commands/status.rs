@@ -123,7 +123,8 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     }
 
     println!("project: {} ({project_id})", data.name);
-    if let Some(line) = maintenance_line(&ctx).await {
+    let (maintenance, address) = tokio::join!(maintenance_line(&ctx), address_line(&ctx));
+    for line in [maintenance, address].into_iter().flatten() {
         println!("  {line}");
     }
     // Half taken down: what follows is what is left.
@@ -288,6 +289,20 @@ async fn maintenance_line(ctx: &Ctx) -> Option<String> {
         }),
         Err(e) => {
             eprintln!("warning: could not read whether the install is in maintenance ({e:#})");
+            None
+        }
+    }
+}
+
+/// The line naming the address the install hands out in its links, read
+/// off `GET /install`; one that could not be read is said on stderr.
+async fn address_line(ctx: &Ctx) -> Option<String> {
+    let read = async { serde_json::from_value::<weft_core::install::InstallInfo>(ctx.client()?.get_json("/install").await?).map_err(anyhow::Error::from) };
+    match read.await {
+        Ok(info) if info.public_url == info.service_url => Some(format!("install address: {}", info.public_url)),
+        Ok(info) => Some(format!("install address: {} (it still answers at {} too)", info.public_url, info.service_url)),
+        Err(e) => {
+            eprintln!("warning: could not read the install's address ({e:#})");
             None
         }
     }

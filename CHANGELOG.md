@@ -4,6 +4,34 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## Unreleased
+
+**A domain you give a cloud install becomes its address.** Once Google has
+issued the domain's certificate, every link the install hands out uses the
+domain instead of the `run.app` address: sign-in callbacks, webhook
+addresses, file links, `weft target export`. The `run.app` address keeps
+answering, so nothing already handed out breaks. If you already have an
+install domain, run `weft domain list --on <target>` once after the update:
+it checks the certificate, and the domain becomes the address there and
+then. Then add `https://<your domain>/access/oauth/callback` to the allowed
+redirect URLs of each provider app you sign in through, and run `weft target
+export` again for any site that talks to the install. `weft domain list`
+shows where each certificate stands and prints those steps.
+
+**New: `weft migrate connections` and `weft migrate files`.** They copy saved
+connections and stored files from one install to another (`--to <target>`),
+so moving an app from your machine to the cloud no longer means making every
+connection again. Name what to copy with `--all`, `--id`, `--since`/`--until`,
+`--service`/`--project` or `--prefix`; `--dry-run` shows it first.
+
+**New: a cloud install can have a Postgres of its own on Cloud SQL.** Set
+the fork's repository variable `WEFT_DATABASE` to `cloud_sql` and the install
+workflow makes one in the install's region and network, for a busy program
+that would run past a hosted free plan. It bills every hour it runs. An
+install already on another Postgres moves to it with its data: run `weft
+maintenance on`, set the variable, run the workflow, then `weft maintenance
+off`. Without the variable, nothing changes.
+
 ## 2026-10-25 (ccabce57)
 
 **On a cloud install, rebuild your CLI before `weft maintenance off`.** What

@@ -2,7 +2,7 @@
 # Google's serverless pieces (Cloud Run for weft's roles, the holders and
 # project workers, Cloud Build for builds, Cloud Tasks for wakes), infra
 # machines on Compute Engine as projects ask for them, and the database
-# wherever its URL points. Applied by .github/workflows/install-gcp.yml.
+# wherever its URL points, or on Cloud SQL (database.tf). Applied by .github/workflows/install-gcp.yml.
 terraform {
   required_version = ">= 1.6"
 
@@ -52,6 +52,9 @@ resource "google_project_service" "apis" {
     "pubsub.googleapis.com",
     "run.googleapis.com",
     "secretmanager.googleapis.com",
+    # the install's own Postgres, when it has one (database.tf)
+    "servicenetworking.googleapis.com",
+    "sqladmin.googleapis.com",
     "storage.googleapis.com",
     # making Cloud Logging's service agent up front (machines.tf)
     "workloadidentity.googleapis.com",

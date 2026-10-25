@@ -1,4 +1,4 @@
-# SYNC: the variables the install workflow sets (project_id, region, zone, database_url, database_listen_url, runtime_image, builder_base_image, weft_repository, weft_commit, access_apps_json, alert_email) <-> .github/workflows/install-gcp.yml (the TF_VAR_* names)
+# SYNC: the variables the install workflow sets (project_id, region, zone, database_url, database_listen_url, cloud_sql, cloud_sql_tier, runtime_image, builder_base_image, weft_repository, weft_commit, access_apps_json, alert_email) <-> .github/workflows/install-gcp.yml (the TF_VAR_* names)
 
 variable "project_id" {
   description = "The GCP project the install lives in."
@@ -24,9 +24,28 @@ variable "name" {
 }
 
 variable "database_url" {
-  description = "The Postgres the install keeps everything in, as a connection URL (postgres://user:password@host/db?sslmode=require). Any Postgres works; one that scales to zero costs nothing while the install is idle. A pooled address is fine."
+  description = "The Postgres the install keeps everything in, as a connection URL (postgres://user:password@host/db?sslmode=require). Any Postgres works; one that scales to zero costs nothing while the install is idle. A pooled address is fine. Not read when cloud_sql is on, which makes the install a Postgres of its own."
   type        = string
+  default     = ""
   sensitive   = true
+}
+
+variable "cloud_sql" {
+  description = "Give the install a Postgres of its own on Cloud SQL, in its region and network (database.tf), instead of database_url. It bills every hour it runs and never sleeps; it has no transfer quota and no trip across the internet, which suits a busy program."
+  type        = bool
+  default     = false
+}
+
+variable "cloud_sql_tier" {
+  description = "The Cloud SQL machine type of the install's own Postgres, when cloud_sql is on (the shared-core db-g1-small by default; a db-custom-<cpus>-<MiB> one for a busier program)."
+  type        = string
+  default     = "db-g1-small"
+}
+
+variable "cloud_sql_max_connections" {
+  description = "How many connections the install's own Postgres takes at once, when cloud_sql is on. Each role opens its pools straight on it, with no pooler between: one copy of every role holds up to about 110 (crates/weft-runtime/src/lib.rs, the pools), and a busy role runs more than one copy."
+  type        = number
+  default     = 250
 }
 
 variable "database_listen_url" {

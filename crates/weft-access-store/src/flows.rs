@@ -140,13 +140,28 @@ pub async fn list_grants(
         .collect()
 }
 
+/// The services `tenant` signed in to through an app of its own (the own
+/// door, a browser consent): each such app lists the install's OAuth
+/// callback at its provider, so it must be told when that callback moves.
+pub async fn own_sign_in_services(pool: &PgPool, tenant: &str) -> anyhow::Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT DISTINCT service FROM access_grant
+         WHERE tenant_id = $1 AND door = 'own' AND registration_sealed IS NOT NULL
+           AND spec_json -> 'acquisition' -> 'grant' ->> 'kind' = 'authorization_code'
+         ORDER BY service",
+    )
+    .bind(tenant)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// The `WITH` clause that deletes `table`'s rows past their life (made
 /// before the bind `cutoff_param`, [`CONNECT_TTL`] ago) in the statement
 /// that adds one to it: an abandoned consent, picker or unpolled result
 /// goes when the next one of its kind is made, with no timer looking for
 /// it, and a read that finds one past its life deletes it. Named
 /// `pruned`, for a statement that adds clauses of its own after it.
-fn pruning(table: &str, cutoff_param: &str) -> String {
+pub(crate) fn pruning(table: &str, cutoff_param: &str) -> String {
     format!("WITH pruned AS (DELETE FROM {table} WHERE created_at < {cutoff_param})")
 }
 
@@ -302,7 +317,7 @@ pub async fn connect_direct(
     if req.door == Door::Shared && !spec.is_oauth() {
         let mut stored = spec.clone();
         stored.acquisition = Acquisition::Runtime {};
-        return insert_grant(pool, tenant, NewGrant {
+        return insert_grant(pool, tenant, None, NewGrant {
             spec: &stored,
             registration: &None,
             project_id: req.project_id,
@@ -376,7 +391,7 @@ pub async fn connect_direct(
     // the reserved capture never stays in the stored values.
     values.remove(GRANTED_PERMISSIONS_CAPTURE);
     let label = Some(connection_name(req.label, &req.registration, spec));
-    insert_grant(pool, tenant, NewGrant {
+    insert_grant(pool, tenant, None, NewGrant {
         spec,
         registration: &req.registration,
         project_id: req.project_id,
@@ -457,34 +472,46 @@ pub(crate) fn value_names_of(values: &BTreeMap<String, String>) -> Value {
 
 /// Everything one grant INSERT needs. The single write path for every
 /// way a connection comes into being (a person pasting one, a browser
-/// consent finishing, and a node publishing one for something it
-/// runs), so the column list exists once and cannot drift between
-/// them. A re-consent that rotates an EXISTING row is the one write
+/// consent finishing, a node publishing one for something it runs, and
+/// one copied from another install), so the column list exists once and
+/// cannot drift between them. A re-consent that rotates an EXISTING row is the one write
 /// that is not an insert, and updates in place.
-struct NewGrant<'a> {
-    spec: &'a AccessSpec,
-    registration: &'a Option<AppRegistration>,
-    project_id: Option<uuid::Uuid>,
+pub(crate) struct NewGrant<'a> {
+    pub(crate) spec: &'a AccessSpec,
+    pub(crate) registration: &'a Option<AppRegistration>,
+    pub(crate) project_id: Option<uuid::Uuid>,
     /// Whose connection inside the project: an instance's (which connected
     /// it, or whose copy of a node published it), `None` for the
     /// author's.
-    instance: Option<weft_core::instance::InstanceId>,
+    pub(crate) instance: Option<weft_core::instance::InstanceId>,
     /// Set only by [`publish_grant`]; a person's connect leaves it None.
-    published_by_node: Option<String>,
-    values: BTreeMap<String, String>,
-    granted: Vec<String>,
-    verified: bool,
+    pub(crate) published_by_node: Option<String>,
+    pub(crate) values: BTreeMap<String, String>,
+    pub(crate) granted: Vec<String>,
+    pub(crate) verified: bool,
     /// Whether calls spend the runtime's own credential (a shared-door
     /// connection): its owner is then the platform, else whoever made
     /// it, the instance or the author. Never together with `instance`: an
     /// instance connects its own account.
-    platform: bool,
-    door: Door,
-    label: Option<String>,
-    identity: Option<String>,
+    pub(crate) platform: bool,
+    pub(crate) door: Door,
+    pub(crate) label: Option<String>,
+    pub(crate) identity: Option<String>,
     /// When its token dies and the lifetime it was issued with; `None`
     /// for a credential that does not expire.
-    life: Option<TokenLife>,
+    pub(crate) life: Option<TokenLife>,
+}
+
+/// The id, birth and token expiry of a connection copied from another
+/// install (`crate::migrate`): kept as they were there, where a new
+/// connection gets fresh ones. The expiry is kept column for column (a
+/// row from before lifetimes were recorded has an expiry and none), so
+/// the copy's [`NewGrant::life`] is `None`.
+pub(crate) struct Moved {
+    pub id: uuid::Uuid,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub token_lifetime_secs: Option<i64>,
 }
 
 /// The name a person's connection is listed under: the one they typed,
@@ -535,13 +562,17 @@ fn storable_values(
     Ok(values)
 }
 
-async fn insert_grant(
+pub(crate) async fn insert_grant(
     db: impl sqlx::PgExecutor<'_>,
     tenant: &str,
+    moved: Option<Moved>,
     grant: NewGrant<'_>,
 ) -> anyhow::Result<CompletedConnect> {
     let owner = if grant.platform { CredentialOwner::Platform } else { CredentialOwner::own(grant.instance.clone()) };
-    let (expires_at, lifetime_secs) = life_columns(grant.life);
+    let (expires_at, lifetime_secs) = match &moved {
+        Some(moved) => (moved.expires_at, moved.token_lifetime_secs),
+        None => life_columns(grant.life),
+    };
     // A node's published connection REPLACES the one it published
     // before (its key is the node, not the moment), so the same write
     // serves a first publish and a re-publish. A person's connect has
@@ -582,12 +613,12 @@ async fn insert_grant(
            (id, tenant_id, service, registration_sealed, client_id, project_id, spec_json,
             events_recipe_hash, values_sealed, value_names, granted_scopes,
             permissions_verified, owner, door, label, identity, provider_account, expires_at,
-            published_by_node, instance_id, spec_json_version, token_lifetime_secs)
+            published_by_node, instance_id, spec_json_version, token_lifetime_secs, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                 $18, $19, $20, $21, $22){upsert}
+                 $18, $19, $20, $21, $22, COALESCE($23, now())){upsert}
          RETURNING id"
     ))
-    .bind(uuid::Uuid::new_v4())
+    .bind(moved.as_ref().map_or_else(uuid::Uuid::new_v4, |m| m.id))
     .bind(tenant)
     .bind(&grant.spec.service)
     .bind(registration_snapshot(grant.registration)?)
@@ -609,6 +640,7 @@ async fn insert_grant(
     .bind(grant.instance.as_ref().map(|m| m.as_str()))
     .bind(weft_core::AccessSpec::STORED.version())
     .bind(lifetime_secs)
+    .bind(moved.map(|m| m.created_at))
     .fetch_one(db)
     .await?;
     let label = grant.label.clone();
@@ -671,6 +703,36 @@ async fn rotate_grant(
     }
     let label = grant.label.clone();
     Ok(completed(id, grant, label))
+}
+
+/// The row an exclusive-class service keeps for one account: `tenant`'s
+/// connection to `service` as `identity`, made through the app
+/// `client_id`, of the same owner (an instance's own row in its project,
+/// the author's own). Exclusivity is per app and account, so a row made
+/// through another app is never this one.
+pub(crate) async fn exclusive_row(
+    db: impl sqlx::PgExecutor<'_>,
+    tenant: &str,
+    service: &str,
+    identity: Option<&str>,
+    client_id: &str,
+    instance: Option<&weft_core::instance::InstanceId>,
+    project_id: Option<uuid::Uuid>,
+) -> anyhow::Result<Option<uuid::Uuid>> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT id FROM access_grant
+         WHERE tenant_id = $1 AND service = $2 AND identity IS NOT DISTINCT FROM $3
+           AND client_id = $4 AND {}",
+        same_owner_sql("$5", "$6")
+    ))
+    .bind(tenant)
+    .bind(service)
+    .bind(identity)
+    .bind(client_id)
+    .bind(instance.map(|m| m.as_str()))
+    .bind(project_id)
+    .fetch_optional(db)
+    .await?)
 }
 
 /// What a connect that just wrote `grant` as row `id`, named `label`,
@@ -1437,23 +1499,7 @@ async fn finish_connect(
     let rotate_id: Option<uuid::Uuid> = match upgrade_grant_id {
         Some(id) => Some(id),
         None if spec.grants == GrantCoexistence::Exclusive => {
-            // The same owner's row only: an instance's consent rotates that
-            // instance's own row in its project, never the author's.
-            let existing: Option<(uuid::Uuid,)> = sqlx::query_as(&format!(
-                "SELECT id FROM access_grant
-                 WHERE tenant_id = $1 AND service = $2 AND identity IS NOT DISTINCT FROM $3
-                   AND client_id = $4 AND {}",
-                same_owner_sql("$5", "$6")
-            ))
-            .bind(&tenant)
-            .bind(&service)
-            .bind(&identity)
-            .bind(&registration.client_id)
-            .bind(instance.as_ref().map(|m| m.as_str()))
-            .bind(project_id)
-            .fetch_optional(pool)
-            .await?;
-            existing.map(|(id,)| id)
+            exclusive_row(pool, &tenant, &service, identity.as_deref(), &registration.client_id, instance.as_ref(), project_id).await?
         }
         None => None,
     };
@@ -1497,7 +1543,7 @@ async fn finish_connect(
         }
         // The same write path a pasted connection and a published one
         // take: a consent is a third way a connection comes into being.
-        None => insert_grant(pool, &tenant, grant(granted, owner_project)).await,
+        None => insert_grant(pool, &tenant, None, grant(granted, owner_project)).await,
     }
 }
 
@@ -2239,6 +2285,7 @@ async fn publish_grant_in(
     let done = insert_grant(
         &mut *conn,
         tenant,
+        None,
         NewGrant {
             spec: &spec,
             registration: &None,

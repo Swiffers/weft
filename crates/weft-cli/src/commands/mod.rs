@@ -53,6 +53,7 @@ pub mod wake;
 pub mod workers;
 pub mod domain;
 pub mod maintenance;
+pub mod migrate;
 pub mod frontend;
 pub mod target;
 pub mod ci;
@@ -296,6 +297,15 @@ impl Ctx {
         }
         println!("{}", serde_json::to_string(value)?);
         Ok(true)
+    }
+
+    /// A client for the cwd project's target `name`, resolved the way
+    /// `--on <name>` would be: for a command that talks to a second
+    /// install beside the one it acts on (`weft migrate --to`).
+    pub fn client_for_target(&self, name: &str) -> anyhow::Result<crate::client::DispatcherClient> {
+        let url = resolve_dispatcher_url(None, Some(name), || Ok(self.project_here()?.cloned()))?;
+        let key = crate::credentials::operator_key_for(&url, Some(name))?;
+        Ok(crate::client::DispatcherClient::new(url, key).for_target(Some(name)))
     }
 
     /// A client for the install this command acts on; the first call

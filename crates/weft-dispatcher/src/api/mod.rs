@@ -385,6 +385,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         // the worker uses, proxied to the broker's admin upload surface; part
         // URLs are caller-facing so bytes go straight to the bucket.
         .route("/storage/upload/begin", post(storage::upload_begin))
+        .route("/storage/import/begin", post(storage::import_begin))
         // The pre-build asset sync's diff input: the project's published assets.
         .route("/storage/assets/held", post(storage::assets_held))
         .route("/storage/upload/parts", post(storage::upload_parts))
@@ -407,6 +408,9 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/access/lookup", post(access::lookup))
         .route("/access/granted", post(access::granted))
         .route("/access/picker/begin", post(access::picker_begin))
+        .route("/access/migrate/key", post(access::migrate_key))
+        .route("/access/migrate/export", post(access::migrate_export))
+        .route("/access/migrate/import", post(access::migrate_import))
         // Node self-test runs (a short-lived test process per run).
         .route("/projects/{id}/node-tests/run", post(node_tests::run))
         .route(

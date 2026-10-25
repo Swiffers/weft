@@ -154,6 +154,13 @@ resource "google_cloud_run_v2_service" "role" {
 
   template {
     service_account = google_service_account.core.email
+    # The roles read their database's address from a secret's latest
+    # version, which a new version does not restart them for: a database
+    # that moved (database.tf) makes a new revision through this, so no
+    # role keeps writing to the old one. A digest, never the address.
+    labels = {
+      database = substr(nonsensitive(sha256(local.database_url)), 0, 12)
+    }
     # A wake or an internal call may run as long as its work does. The
     # broker tells each line this limit, and a worker whose runs only wait
     # stops before it.

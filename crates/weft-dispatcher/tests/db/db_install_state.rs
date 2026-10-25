@@ -7,7 +7,7 @@
 
 use sqlx::PgPool;
 use uuid::Uuid;
-use weft_core::install::{Domain, DomainServes};
+use weft_core::install::{Certificate, Domain, DomainServes};
 use weft_dispatcher::ProjectStoreOps as _;
 
 async fn project(pool: &PgPool) -> Uuid {
@@ -101,15 +101,30 @@ async fn a_frontend_is_kept_once_and_its_repository_while_used(pool: PgPool) {
 }
 
 /// A platform door that answers each `serve` from a script (`true`
-/// refuses), and records the names it was asked to serve.
+/// refuses), and records the names it was asked to serve. Every
+/// certificate is issued unless one is set otherwise.
 struct ScriptedDoor {
     refuse: std::sync::Mutex<std::collections::VecDeque<bool>>,
     asked: std::sync::Mutex<Vec<Vec<String>>>,
+    certificates: std::sync::Mutex<std::collections::BTreeMap<String, Certificate>>,
+    /// Every set of names asked about, and whether asking fails.
+    certified: std::sync::Mutex<Vec<Vec<String>>>,
+    unreadable: std::sync::atomic::AtomicBool,
 }
 
 impl ScriptedDoor {
     fn new(refuse: &[bool]) -> Self {
-        Self { refuse: std::sync::Mutex::new(refuse.iter().copied().collect()), asked: std::sync::Mutex::new(Vec::new()) }
+        Self {
+            refuse: std::sync::Mutex::new(refuse.iter().copied().collect()),
+            asked: std::sync::Mutex::new(Vec::new()),
+            certificates: Default::default(),
+            certified: Default::default(),
+            unreadable: Default::default(),
+        }
+    }
+
+    fn certificate(&self, name: &str, certificate: Certificate) {
+        self.certificates.lock().unwrap().insert(name.into(), certificate);
     }
 
     fn asked(&self) -> Vec<Vec<String>> {
@@ -132,6 +147,13 @@ impl weft_platform_traits::DomainHosting for ScriptedDoor {
 
     fn cost(&self) -> Option<&'static str> {
         None
+    }
+
+    async fn certified(&self, names: &[String]) -> anyhow::Result<std::collections::BTreeMap<String, Certificate>> {
+        self.certified.lock().unwrap().push(names.to_vec());
+        anyhow::ensure!(!self.unreadable.load(std::sync::atomic::Ordering::SeqCst), "the platform did not answer");
+        let set = self.certificates.lock().unwrap();
+        Ok(names.iter().map(|n| (n.clone(), set.get(n).cloned().unwrap_or(Certificate::Issued))).collect())
     }
 }
 
@@ -229,4 +251,64 @@ async fn the_door_follows_the_stored_domains_and_backs_off_a_refusal(pool: PgPoo
     let accepted = door_state(&pool).await.unwrap();
     assert_eq!((accepted.refused, accepted.refusals), (None, 0));
     assert_eq!(accepted.served.map(|(names, _)| names), Some(vec!["a.example.com".to_string(), "b.example.com".to_string()]));
+}
+
+/// An install domain is the address the install hands out only once its
+/// certificate is recorded issued: the certificates' loop asks after a
+/// pending one soon (never through the door), says so to every copy of
+/// the address, and the platform's own address stays until then and after
+/// the domain goes. A push the platform's own address got is verified
+/// against that address.
+#[sqlx::test]
+async fn an_install_domain_becomes_the_address_once_its_certificate_is_issued(pool: PgPool) {
+    use weft_dispatcher::domains::{add, list_stored, look_after_certificates, remove, settle, DOMAINS_CHANNEL};
+    use weft_task_store::drain::DrainStep;
+    use weft_task_store::install_address::InstallAddress;
+    let project = project(&pool).await;
+    const SERVICE: &str = "https://weft-x.a.run.app";
+    let address = InstallAddress::unfollowed(pool.clone(), SERVICE, weft_platform_traits::config::InternetAddress::Fixed(SERVICE.into()));
+    assert_eq!(address.stable().await.unwrap(), SERVICE);
+
+    static CHANNELS: &[&str] = &[DOMAINS_CHANNEL];
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.unwrap();
+    let mut heard = watch.subscribe();
+    let now = weft_dispatcher::lease::now_unix();
+    add(&pool, &Domain { name: "w.example.com".into(), serves: DomainServes::Install }, now).await.unwrap();
+    add(&pool, &Domain { name: "api.example.com".into(), serves: DomainServes::Api { project } }, now).await.unwrap();
+    let door = ScriptedDoor::new(&[false]);
+    door.certificate("w.example.com", Certificate::Pending { why: Some("the DNS record".into()) });
+    assert_eq!(settle(&pool, &door).await.unwrap(), DrainStep::Done, "the door's pass asks after no certificate");
+    assert!(door.certified.lock().unwrap().is_empty());
+
+    let DrainStep::RetryIn(look) = look_after_certificates(&pool, &door, now).await.unwrap() else { panic!("a pending certificate is asked after again") };
+    assert!(look <= weft_core::time_scale::scaled(std::time::Duration::from_secs(60)), "soon after the domain was added: {look:?}");
+    let stored = list_stored(&pool).await.unwrap();
+    let certificate = |name: &str| stored.iter().find(|s| s.domain.name == name).unwrap().certificate.clone();
+    assert_eq!(certificate("w.example.com"), Certificate::Pending { why: Some("the DNS record".into()) });
+    assert_eq!(certificate("api.example.com"), Certificate::Issued, "a project's domain is recorded too");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    assert!(heard.woken_before(deadline, |c, p| c == DOMAINS_CHANNEL && p == "certificate").await.unwrap(), "a certificate recorded says so");
+    assert_eq!(address.stable().await.unwrap(), SERVICE, "not the address while its certificate is pending");
+    assert_eq!(address.internet().await.unwrap().as_deref(), Some(SERVICE));
+
+    // A platform that cannot be read still gets the same bounded look,
+    // and one past the time a certificate is looked after gets none.
+    door.unreadable.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(look_after_certificates(&pool, &door, now + 60).await.unwrap(), DrainStep::RetryIn(_)));
+    let asked = door.certified.lock().unwrap().len();
+    assert_eq!(look_after_certificates(&pool, &door, now + 4 * 24 * 3600).await.unwrap(), DrainStep::Done);
+    assert_eq!(door.certified.lock().unwrap().len(), asked, "nothing is asked once no certificate is looked after");
+    door.unreadable.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    door.certificate("w.example.com", Certificate::Issued);
+    assert_eq!(look_after_certificates(&pool, &door, now + 120).await.unwrap(), DrainStep::Done, "nothing pending: no look booked");
+    assert_eq!(door.asked().len(), 1, "the door was put on the domains once");
+    assert_eq!(address.stable().await.unwrap(), "https://w.example.com");
+    assert_eq!(address.internet().await.unwrap().as_deref(), Some("https://w.example.com"));
+    assert_eq!(address.arrived_at(Some("weft-x.a.run.app")).await.unwrap().as_deref(), Some(SERVICE), "a push sent to the platform's address");
+    assert_eq!(address.arrived_at(Some("w.example.com")).await.unwrap().as_deref(), Some("https://w.example.com"));
+    assert_eq!(address.service_url(), SERVICE);
+
+    assert!(remove(&pool, "w.example.com").await.unwrap());
+    assert_eq!(address.stable().await.unwrap(), SERVICE, "back once the domain goes");
 }

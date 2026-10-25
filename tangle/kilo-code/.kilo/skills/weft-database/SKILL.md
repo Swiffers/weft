@@ -10,8 +10,8 @@ from the fork's `WEFT_DATABASE_URL` secret. Any Postgres works; if its
 address goes through a pooler, the install also needs a direct address of the
 same database in `WEFT_DATABASE_LISTEN_URL`.
 When the user has none, offer Neon: a hosted Postgres that sleeps while
-nothing uses it, with a free plan. Before they sign up, tell them what the
-free plan's limits mean for weft (What it costs, below). If they would rather use one they already
+nothing uses it, with a free plan. Before they sign up, ask how busy the program will be
+and pick the plan with them (Which plan, below). If they would rather use one they already
 pay for, take its address instead and skip the rest of this.
 
 ## What the user does
@@ -110,3 +110,40 @@ command. So does anything holding a live stream open: `weft follow` while it
 runs, and a VS Code editor pointed at the install while the person uses it.
 The editor closes its live connection once the window has been out of focus
 or untouched for 5 minutes, and picks back up when they return.
+
+## Which plan
+
+Neon's free plan caps two things a month: 100 CU-hours awake, and 5 GB of
+data sent out of the database. weft reaches its database over the internet
+(the install runs on Google Cloud, Neon on AWS or Azure), so everything it
+reads counts against those 5 GB. When either one runs out, Neon suspends the
+database until the next month or an upgrade, and the install stops with it:
+every call answers 503 with Neon's own message saying the quota is exceeded.
+Nothing is deleted.
+
+So before they sign up, ask how busy the program will be. If it is mostly
+idle (triggers that fire a few times a day, nothing held open), Neon's free
+plan fits, and it stays the default. If it runs schedules every few minutes,
+keeps a connection open (a chat or messaging listener), or a site calls it
+all day, the database rarely sleeps and the transfer adds up: before the
+install is made, offer the install a Postgres of its own on Cloud SQL, in its
+own region and network, with no transfer quota and no trip across the
+internet. It bills every hour it runs, even while nobody uses the install
+(Google's Cloud SQL pricing page has the price for the region), so it is the
+user's yes. On a yes you make no Neon project: set the fork's repository
+variable `WEFT_DATABASE` to `cloud_sql` (`gh variable set WEFT_DATABASE --body
+cloud_sql --repo <fork>`), leave the `WEFT_DATABASE_URL` secret out, and the
+install workflow makes the database itself. Its size is the variable
+`WEFT_CLOUD_SQL_TIER`, `db-g1-small` (a small shared machine) when unset.
+
+An install already on Neon can move to its own Cloud SQL later, with its
+data: `weft maintenance on --on <target>`, the same `WEFT_DATABASE` variable,
+the install workflow run again (it makes the database, copies everything
+into it, and only then points the install at it; until the install uses
+it, every run copies again from scratch, so a failed one leaves the install
+where it was and running the workflow again starts over), then `weft
+maintenance off --on <target>`. Offer it when an install's program has grown
+busy. A Neon project suspended on a quota cannot be copied from until it
+answers again: upgrade it to Launch first (or wait for the month to turn),
+then move. Once the user
+is happy with it, the `WEFT_DATABASE_URL` secret and the Neon project can go.

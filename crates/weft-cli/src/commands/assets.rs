@@ -150,7 +150,7 @@ impl AssetSource for DiskSource {
 /// serves them: control calls go to its `/storage/*` routes, bytes go
 /// straight to the bucket on the presigned part URLs it returns (the same
 /// contract the editor's upload field drives).
-pub(crate) struct DispatcherPlane<'a>(&'a DispatcherClient);
+pub(crate) struct DispatcherPlane<'a>(pub(crate) &'a DispatcherClient);
 
 #[async_trait::async_trait]
 impl UploadPlane for DispatcherPlane<'_> {
@@ -160,9 +160,12 @@ impl UploadPlane for DispatcherPlane<'_> {
         serde_json::from_value(resp).context("parse the stored-contents answer")
     }
 
-    async fn begin(&self, request: weft_core::storage::AssetUploadBeginRequest) -> Result<weft_core::storage::UploadBeginResponse> {
-        let resp = self.0.post_json("/storage/upload/begin", &serde_json::to_value(request)?).await?;
-        serde_json::from_value(resp).context("parse upload/begin")
+    async fn begin(&self, request: weft_assets::upload::Begin) -> Result<weft_core::storage::UploadBeginResponse> {
+        let resp = match request {
+            weft_assets::upload::Begin::Asset(request) => self.0.post_json("/storage/upload/begin", &serde_json::to_value(request)?).await?,
+            weft_assets::upload::Begin::Copy(request) => self.0.post_json("/storage/import/begin", &serde_json::to_value(request)?).await?,
+        };
+        serde_json::from_value(resp).context("parse the upload's begin")
     }
 
     async fn resume(&self, key: &str) -> Result<weft_core::storage::UploadResumeResponse> {

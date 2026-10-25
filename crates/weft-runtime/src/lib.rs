@@ -237,7 +237,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 entitlements: Arc::new(weft_broker::entitlement::LocalEntitlementSource::from_env()),
                 credentials: Arc::new(weft_broker::credential::FileCredentialSource::from_env()),
                 app_provider: Arc::new(weft_broker::app_provider::FileAppProvider::from_env()),
-                public_base_url: config.public_url.clone(),
+                service_url: config.public_url.clone(),
                 internet: config.internet_address(),
                 own_base_url: config.own_base_url().to_string(),
                 object_store_public_internet: config.object_store.public_internet(),

@@ -14,25 +14,37 @@
 //! its domains) still ends with the door matching the rows, and nothing
 //! billed stands for a domain nobody keeps. `weft domain add` and `rm`
 //! also change the door themselves, to answer with the outcome.
+//!
+//! A loop of its own ([`certificates_loop`]) records whether the door
+//! holds each name's certificate yet, asking the platform only while a
+//! recent one is still pending. An
+//! install domain becomes the address the install hands out in its links
+//! the moment its certificate is recorded issued
+//! (`weft_task_store::install_address`).
 
 use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::Result;
 use sqlx::PgPool;
-use weft_core::install::{Domain, DomainServes};
+use weft_core::install::{Certificate, Domain, DomainServes};
 use weft_platform_traits::DomainHosting;
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn, DB_NOW_MS};
 
 use crate::state::DispatcherState;
 
-/// Announced when a domain row comes or goes (the table's triggers).
-// SYNC: DOMAINS_CHANNEL <-> GROUP's install_domain_notify (below)
-pub const DOMAINS_CHANNEL: &str = "weft_install_domains";
+/// Announced when a domain row comes or goes (payload empty), or its
+/// certificate changes (payload [`CERTIFICATE_CHANGED`]).
+pub use weft_task_store::install_address::DOMAINS_CHANNEL;
 
-pub(crate) static ON_DOMAINS: &[WakeOn] = &[WakeOn::any(DOMAINS_CHANNEL)];
+/// The payload of a notice that only a certificate changed: the door
+/// serves the same names, so its loop is not woken by it.
+// SYNC: CERTIFICATE_CHANGED <-> GROUP's install_domain_notify (below)
+const CERTIFICATE_CHANGED: &str = "certificate";
 
-// SYNC: install_domain <-> crates/weft-core/src/install.rs (Domain)
+pub(crate) static ON_DOMAINS: &[WakeOn] = &[WakeOn { channel: DOMAINS_CHANNEL, concerns: |payload| payload != CERTIFICATE_CHANGED }];
+
+// SYNC: install_domain <-> crates/weft-core/src/install.rs (Domain, Certificate), crates/weft-task-store/src/install_address.rs (live_install_domain)
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "install_domain",
     tables: &["install_domain", "install_domain_door"],
@@ -47,15 +59,23 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- Where a frontend runs (its service's https address).
             upstream TEXT,
             added_unix BIGINT NOT NULL,
+            -- Where the door's certificate for it stands: 'pending' until
+            -- it is issued, 'issued', or 'failed' once the authority gave
+            -- up (removing it and adding it again asks anew).
+            certificate TEXT NOT NULL DEFAULT 'pending' CHECK (certificate IN ('pending', 'issued', 'failed')),
+            -- Why it is not issued, as the platform says it.
+            certificate_why TEXT,
             CHECK ((serves = 'install') = (project_id IS NULL)),
             CHECK ((serves = 'frontend') = (upstream IS NOT NULL))
         )"#,
         // Every row that comes or goes, a project's removal included,
-        // wakes the loop that puts the platform's door on the rows.
-        // SYNC: 'weft_install_domains' <-> DOMAINS_CHANNEL (above)
+        // wakes the loop that puts the platform's door on the rows; a
+        // certificate that changes says so, so every copy of the install's
+        // address reads it again and the door's loop sleeps on.
+        // SYNC: 'weft_install_domains' <-> DOMAINS_CHANNEL (above), 'certificate' <-> CERTIFICATE_CHANGED (above)
         r#"CREATE OR REPLACE FUNCTION install_domain_notify() RETURNS trigger AS $$
             BEGIN
-                PERFORM pg_notify('weft_install_domains', '');
+                PERFORM pg_notify('weft_install_domains', CASE TG_OP WHEN 'UPDATE' THEN 'certificate' ELSE '' END);
                 RETURN NULL;
             END;
             $$ LANGUAGE plpgsql"#,
@@ -76,7 +96,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         )"#,
         r#"DROP TRIGGER IF EXISTS install_domain_changed ON install_domain"#,
         r#"CREATE TRIGGER install_domain_changed
-            AFTER INSERT OR DELETE ON install_domain
+            AFTER INSERT OR DELETE OR UPDATE OF certificate, certificate_why ON install_domain
             FOR EACH ROW
             EXECUTE FUNCTION install_domain_notify()"#,
     ],
@@ -84,23 +104,51 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     data_steps: &[],
 };
 
+/// A stored domain, with where the door's certificate for it stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    pub domain: Domain,
+    pub certificate: Certificate,
+    /// When it was stored (unix seconds).
+    pub added_unix: i64,
+}
+
 #[derive(sqlx::FromRow)]
 struct Row {
     name: String,
     serves: String,
     project_id: Option<uuid::Uuid>,
     upstream: Option<String>,
+    added_unix: i64,
+    certificate: String,
+    certificate_why: Option<String>,
 }
 
 impl Row {
-    fn into_domain(self) -> Result<Domain> {
+    fn into_stored(self) -> Result<Stored> {
         let serves = match (self.serves.as_str(), self.project_id, self.upstream) {
             ("install", None, None) => DomainServes::Install,
             ("frontend", Some(project), Some(upstream)) => DomainServes::Frontend { project, upstream },
             ("api", Some(project), None) => DomainServes::Api { project },
             (other, _, _) => anyhow::bail!("the stored domain '{}' has an unreadable shape ('{other}')", self.name),
         };
-        Ok(Domain { name: self.name, serves })
+        let certificate = match (self.certificate.as_str(), self.certificate_why) {
+            ("issued", _) => Certificate::Issued,
+            ("pending", why) => Certificate::Pending { why },
+            ("failed", Some(why)) => Certificate::Failed { why },
+            ("failed", None) => Certificate::Failed { why: "the platform gave no reason".into() },
+            (other, _) => anyhow::bail!("the stored domain '{}' has an unreadable certificate state ('{other}')", self.name),
+        };
+        Ok(Stored { domain: Domain { name: self.name, serves }, certificate, added_unix: self.added_unix })
+    }
+}
+
+/// How `certificate` is stored: its state and why.
+fn certificate_columns(certificate: &Certificate) -> (&'static str, Option<&str>) {
+    match certificate {
+        Certificate::Issued => ("issued", None),
+        Certificate::Pending { why } => ("pending", why.as_deref()),
+        Certificate::Failed { why } => ("failed", Some(why.as_str())),
     }
 }
 
@@ -147,12 +195,69 @@ pub async fn add(pool: &PgPool, domain: &Domain, now_unix: i64) -> Result<Added>
 
 /// Every stored domain, by name.
 pub async fn list(pool: &PgPool) -> Result<Vec<Domain>> {
-    sqlx::query_as::<_, Row>("SELECT name, serves, project_id, upstream FROM install_domain ORDER BY name")
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(Row::into_domain)
-        .collect()
+    Ok(list_stored(pool).await?.into_iter().map(|stored| stored.domain).collect())
+}
+
+/// Every stored domain with its certificate, by name.
+pub async fn list_stored(pool: &PgPool) -> Result<Vec<Stored>> {
+    sqlx::query_as::<_, Row>(
+        "SELECT name, serves, project_id, upstream, added_unix, certificate, certificate_why FROM install_domain ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(Row::into_stored)
+    .collect()
+}
+
+/// Record where each name's certificate stands. A row whose record says
+/// that already is left alone, so nothing is announced for it.
+async fn record_certificates(pool: &PgPool, certificates: &std::collections::BTreeMap<String, Certificate>) -> Result<()> {
+    let (mut names, mut states, mut whys) = (Vec::new(), Vec::new(), Vec::new());
+    for (name, certificate) in certificates {
+        let (state, why) = certificate_columns(certificate);
+        names.push(name.as_str());
+        states.push(state);
+        whys.push(why);
+    }
+    sqlx::query(
+        "UPDATE install_domain d SET certificate = c.state, certificate_why = c.why \
+         FROM UNNEST($1::text[], $2::text[], $3::text[]) AS c(name, state, why) \
+         WHERE d.name = c.name AND (d.certificate, d.certificate_why) IS DISTINCT FROM (c.state, c.why)",
+    )
+    .bind(&names)
+    .bind(&states)
+    .bind(&whys)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Ask the platform about every certificate in `stored` still pending
+/// that `ask` picks, record what it says, and answer `stored` as it
+/// stands now.
+pub async fn check_certificates(
+    pool: &PgPool,
+    hosting: &dyn DomainHosting,
+    mut stored: Vec<Stored>,
+    ask: impl Fn(&Stored) -> bool,
+) -> Result<Vec<Stored>> {
+    let pending: Vec<String> = stored
+        .iter()
+        .filter(|s| matches!(s.certificate, Certificate::Pending { .. }) && ask(s))
+        .map(|s| s.domain.name.clone())
+        .collect();
+    if pending.is_empty() {
+        return Ok(stored);
+    }
+    let certificates = hosting.certified(&pending).await?;
+    record_certificates(pool, &certificates).await?;
+    for s in &mut stored {
+        if let Some(certificate) = certificates.get(&s.domain.name) {
+            s.certificate = certificate.clone();
+        }
+    }
+    Ok(stored)
 }
 
 /// Remove `name`. `false` when it was not stored.
@@ -378,6 +483,137 @@ pub async fn settle(pool: &PgPool, hosting: &dyn DomainHosting) -> Result<DrainS
                 "the platform's door refused to follow the stored domains; `weft domain list` shows why, and it is tried again"
             );
             Ok(DrainStep::RetryIn(retry))
+        }
+    }
+}
+
+/// Look after the certificates the door is waiting on, apart from the
+/// door itself: asking whether a certificate is issued is a read, and
+/// putting the door on the domains again for it would be dozens of calls
+/// to the platform each time (and a refusal there would count against
+/// the door). Woken by a domain that comes or goes; between, it books
+/// its own looks while a recent certificate is pending
+/// ([`next_certificate_look`]).
+pub fn certificates_loop(state: &DispatcherState) -> DrainLoop {
+    let state = state.clone();
+    DrainLoop::new(
+        "domains_certificates",
+        "ask after the certificates of the install's domains",
+        ON_DOMAINS,
+        CERTIFICATE_LOOK_MOST,
+        move || {
+            let state = state.clone();
+            async move { look_after_certificates(&state.pg_pool, state.domains.as_ref(), crate::lease::now_unix()).await }
+        },
+    )
+}
+
+/// One pass of [`certificates_loop`] at `now_unix`: ask after each pending
+/// certificate still looked after, record what the platform says, and
+/// answer when to look again. Asks nothing once no certificate is looked
+/// after, so an idle install is never woken for one.
+pub async fn look_after_certificates(pool: &PgPool, hosting: &dyn DomainHosting, now_unix: i64) -> Result<DrainStep> {
+    let stored = list_stored(pool).await?;
+    // Past that time `weft domain list` is what asks, and its waiting line
+    // says so: nothing is logged here, since this pass runs again at every
+    // wake and would say it every time.
+    if next_certificate_look(&stored, now_unix).is_none() {
+        return Ok(DrainStep::Done);
+    }
+    let looked_after = |s: &Stored| certificate_look(pending_for(s, now_unix)).is_some();
+    let stored = match check_certificates(pool, hosting, stored.clone(), looked_after).await {
+        Ok(checked) => checked,
+        // The look is booked as if it had found nothing new: the cadence
+        // and its end hold even while the platform cannot be read.
+        Err(e) => {
+            tracing::warn!(target: "weft_dispatcher::domains", error = %format!("{e:#}"), "could not read the door's certificates; asking again later");
+            stored
+        }
+    };
+    Ok(next_certificate_look(&stored, now_unix).map_or(DrainStep::Done, DrainStep::RetryIn))
+}
+
+/// How long `stored`'s certificate has been pending at `now_unix`: since
+/// its domain was added.
+fn pending_for(stored: &Stored, now_unix: i64) -> Duration {
+    Duration::from_secs(u64::try_from(now_unix - stored.added_unix).unwrap_or(0))
+}
+
+/// How soon a certificate is asked after again, at first: Google issues
+/// one within minutes of the DNS record pointing at the door.
+const CERTIFICATE_LOOK_FIRST: Duration = Duration::from_secs(60);
+
+/// The longest wait between two looks at a pending certificate.
+const CERTIFICATE_LOOK_MOST: Duration = Duration::from_secs(30 * 60);
+
+// SYNC: CERTIFICATE_LOOKS_FOR <-> crates/weft-cli/src/commands/domain.rs CHECKED_HOW
+/// How long after its domain was added a pending certificate stops being
+/// asked after on its own. A record nobody sets keeps it pending, and an
+/// install that scales to zero must not be woken for it for good; `weft
+/// domain list` still asks.
+const CERTIFICATE_LOOKS_FOR: Duration = Duration::from_secs(3 * 24 * 3600);
+
+/// When to look at the pending certificates of `stored` again, at this
+/// install's pace: soon after a domain is added, less often the longer it
+/// has been pending, and not at all once none is pending, or each has
+/// been for longer than [`CERTIFICATE_LOOKS_FOR`].
+fn next_certificate_look(stored: &[Stored], now_unix: i64) -> Option<Duration> {
+    stored
+        .iter()
+        .filter(|s| matches!(s.certificate, Certificate::Pending { .. }))
+        .filter_map(|s| certificate_look(pending_for(s, now_unix)))
+        .min()
+        .map(weft_core::time_scale::scaled)
+}
+
+/// How soon to ask about a certificate pending for `pending_for`, in real
+/// time: a quarter of that, between [`CERTIFICATE_LOOK_FIRST`] and
+/// [`CERTIFICATE_LOOK_MOST`]; `None` past [`CERTIFICATE_LOOKS_FOR`].
+fn certificate_look(pending_for: Duration) -> Option<Duration> {
+    (pending_for <= CERTIFICATE_LOOKS_FOR).then(|| (pending_for / 4).clamp(CERTIFICATE_LOOK_FIRST, CERTIFICATE_LOOK_MOST))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored(name: &str, certificate: Certificate, added_unix: i64) -> Stored {
+        Stored { domain: Domain { name: name.into(), serves: DomainServes::Install }, certificate, added_unix }
+    }
+
+    #[test]
+    fn a_pending_certificate_is_asked_after_less_often_and_then_not_at_all() {
+        assert_eq!(certificate_look(Duration::ZERO), Some(CERTIFICATE_LOOK_FIRST));
+        assert_eq!(certificate_look(Duration::from_secs(3600)), Some(Duration::from_secs(900)));
+        assert_eq!(certificate_look(Duration::from_secs(24 * 3600)), Some(CERTIFICATE_LOOK_MOST));
+        assert_eq!(certificate_look(CERTIFICATE_LOOKS_FOR + Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn only_a_pending_certificate_books_a_look() {
+        let now = 1_000_000;
+        let pending = Certificate::Pending { why: None };
+        assert_eq!(next_certificate_look(&[], now), None);
+        assert_eq!(next_certificate_look(&[stored("a.example", Certificate::Issued, now)], now), None);
+        assert_eq!(next_certificate_look(&[stored("a.example", Certificate::Failed { why: "x".into() }, now)], now), None);
+        let soonest = next_certificate_look(&[stored("a.example", pending.clone(), now - 7200), stored("b.example", pending, now - 60)], now);
+        assert_eq!(soonest, Some(weft_core::time_scale::scaled(CERTIFICATE_LOOK_FIRST)), "the newest pending one decides");
+    }
+
+    #[test]
+    fn a_certificate_is_stored_and_read_back_the_same() {
+        for certificate in [Certificate::Issued, Certificate::Pending { why: None }, Certificate::Pending { why: Some("dns".into()) }, Certificate::Failed { why: "caa".into() }] {
+            let (state, why) = certificate_columns(&certificate);
+            let row = Row {
+                name: "a.example".into(),
+                serves: "install".into(),
+                project_id: None,
+                upstream: None,
+                added_unix: 1,
+                certificate: state.into(),
+                certificate_why: why.map(str::to_string),
+            };
+            assert_eq!(row.into_stored().unwrap().certificate, certificate);
         }
     }
 }

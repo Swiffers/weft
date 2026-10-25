@@ -53,7 +53,7 @@ async fn broker_state(pool: PgPool) -> Arc<weft_broker::BrokerState> {
             entitlements: Arc::new(weft_broker::entitlement::LocalEntitlementSource::from_env()),
             credentials: Arc::new(weft_broker::credential::FileCredentialSource::from_env()),
             app_provider: Arc::new(weft_broker::app_provider::FileAppProvider::from_env()),
-            public_base_url: "http://broker".into(),
+            service_url: "http://broker".into(),
             internet: weft_platform_traits::config::InternetAddress::None,
             own_base_url: "http://broker".into(),
             object_store_public_internet: false,

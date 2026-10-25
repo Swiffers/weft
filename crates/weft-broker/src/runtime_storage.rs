@@ -141,6 +141,7 @@ pub fn router() -> Router<Arc<BrokerState>> {
         // Project-scoped only; part URLs are presigned for the browser-facing
         // endpoint (the editor PUTs bytes to the bucket directly).
         .route("/v1/storage/admin/upload/begin", post(admin_upload_begin))
+        .route("/v1/storage/admin/import/begin", post(admin_import_begin))
         .route("/v1/storage/admin/upload/parts", post(admin_upload_parts))
         .route("/v1/storage/admin/upload/part-done", post(admin_upload_part_done))
         .route("/v1/storage/admin/upload/complete", post(admin_upload_complete))
@@ -238,7 +239,7 @@ async fn worker_caller(state: &Arc<BrokerState>, headers: &HeaderMap) -> Result<
     let caller = crate::auth::resolve_storage_caller(state, headers, run_id).await?;
     match &caller {
         CallerAuth::Worker { .. } => Ok(caller),
-        CallerAuth::ControlPlane | CallerAuth::Tenant { .. } => Err(ApiError::from((
+        CallerAuth::ControlPlane | CallerAuth::Tenant { .. } | CallerAuth::Copying { .. } => Err(ApiError::from((
             StatusCode::FORBIDDEN,
             "control-plane callers use the admin surface, not the data path".into(),
         ))),
@@ -301,6 +302,7 @@ async fn upload_begin(
                 content_hash: None,
                 identity: req.identity.as_deref(),
                 slot: None,
+                imported: None,
             },
             state.entitlements.as_ref(),
         )
@@ -876,6 +878,7 @@ impl SlotBegin {
                 accepts: &self.claims.accepts,
                 sha256: self.sha256.as_deref(),
             }),
+            imported: None,
         }
     }
 }
@@ -1009,9 +1012,12 @@ fn wall(caller: &CallerAuth, key: &str) -> Result<key::ParsedKey, ApiError> {
 // the parts, `PartSender::Runtime`).
 
 /// Re-derive the acting caller for a key-addressed admin upload verb: the key
-/// must be ASSET-scoped (the one admin-uploadable plane) and belong to the
-/// vouched tenant. Returns the caller whose walls (`check_key_access`) then
-/// hold for the store call.
+/// must belong to the vouched tenant. An asset key is the tenant's asset
+/// plane; any other key gets the copying caller, which the admin surface
+/// begins only for a file copied in from another install, and which
+/// reaches every key of the tenant: these routes act for the tenant's
+/// operator, who may already remove any of its files. Returns the caller
+/// whose walls (`check_key_access`) then hold for the store call.
 fn tenant_caller_for_key(tenant: &str, k: &str) -> Result<CallerAuth, ApiError> {
     let parsed = key::parse_key(k).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     if parsed.tenant != tenant {
@@ -1020,13 +1026,10 @@ fn tenant_caller_for_key(tenant: &str, k: &str) -> Result<CallerAuth, ApiError> 
             "denied: key does not belong to the acting tenant".into(),
         )));
     }
-    if parsed.scope != key::KeyScope::Asset {
-        return Err(ApiError::from((
-            StatusCode::FORBIDDEN,
-            "admin uploads are asset-scoped; the key names a different scope".into(),
-        )));
-    }
-    Ok(CallerAuth::Tenant { tenant: tenant.to_string() })
+    Ok(match parsed.scope {
+        key::KeyScope::Asset => CallerAuth::Tenant { tenant: tenant.to_string() },
+        _ => CallerAuth::Copying { tenant: tenant.to_string() },
+    })
 }
 
 async fn admin_upload_begin(
@@ -1050,22 +1053,65 @@ async fn admin_upload_begin(
                 content_hash: Some(&req.content_hash),
                 identity: None,
                 slot: None,
+                imported: None,
             },
             state.entitlements.as_ref(),
         )
         .await
         .map_err(map_err)?;
-    Ok(Json(match begun {
-        crate::runtime_store::BeginUpload::Ready { key, part_size } => {
-            UploadBeginResponse { key, part_size, already_stored: false, resume: false }
-        }
-        crate::runtime_store::BeginUpload::AlreadyStored { key } => {
-            UploadBeginResponse { key, part_size: 0, already_stored: true, resume: false }
-        }
-        crate::runtime_store::BeginUpload::Resume { key, part_size } => {
-            UploadBeginResponse { key, part_size, already_stored: false, resume: true }
-        }
-    }))
+    Ok(Json(begun_answer(begun)))
+}
+
+/// Begin copying one file in from another install, under the key it had
+/// there with the acting tenant in it (`weft migrate files`). The same
+/// copy begun again answers the file already here, or carries on with the
+/// upload part way up; anything else under the key is a conflict.
+// SYNC: admin_import_begin <-> crates/weft-core/src/storage/mod.rs FileImportBeginRequest
+async fn admin_import_begin(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(Tenanted { tenant, inner: req }): Json<Tenanted<weft_core::storage::FileImportBeginRequest>>,
+) -> Result<Json<UploadBeginResponse>, ApiError> {
+    control_plane(&state, &headers).await?;
+    validate_serveable(&req.mime_type, &req.filename)?;
+    let from = key::parse_key(&req.key).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let here = key::ParsedKey { tenant: tenant.clone(), ..from };
+    let scope = here.scope.storage_scope().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if scope == StorageScope::Asset {
+        return Err(ApiError::from((
+            StatusCode::BAD_REQUEST,
+            "an asset is copied through the asset upload, which finds it by its content".into(),
+        )));
+    }
+    let begun = state
+        .runtime_store
+        .begin_upload(
+            &CallerAuth::Copying { tenant },
+            &crate::runtime_store::UploadSpec {
+                scope: &scope,
+                mime: &req.mime_type,
+                filename: &req.filename,
+                keep: req.keep,
+                declared_size: Some(req.size_bytes),
+                content_hash: None,
+                identity: None,
+                slot: None,
+                imported: Some(crate::runtime_store::ImportedFile { key: &here, version: req.version, created_at_unix: req.created_at_unix }),
+            },
+            state.entitlements.as_ref(),
+        )
+        .await
+        .map_err(map_err)?;
+    Ok(Json(begun_answer(begun)))
+}
+
+/// A begin as the admin surface answers it.
+fn begun_answer(begun: crate::runtime_store::BeginUpload) -> UploadBeginResponse {
+    match begun {
+        crate::runtime_store::BeginUpload::Ready { key, part_size } => UploadBeginResponse { key, part_size, already_stored: false, resume: false },
+        crate::runtime_store::BeginUpload::AlreadyStored { key } => UploadBeginResponse { key, part_size: 0, already_stored: true, resume: false },
+        crate::runtime_store::BeginUpload::Resume { key, part_size } => UploadBeginResponse { key, part_size, already_stored: false, resume: true },
+    }
 }
 
 async fn admin_asset_references(

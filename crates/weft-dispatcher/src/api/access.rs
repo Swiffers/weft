@@ -28,6 +28,7 @@ use weft_core::access::wire::{
     GrantSummary, MintAppRequest, MintAppResponse, SharedCredentialsAnswer, SharedCredentialsQuery,
     SharedDoorPick, StartedOAuth,
 };
+use weft_core::migrate::{ExportConnections, ExportedConnections, ImportConnections, ImportedConnections, TransferKey};
 use weft_core::storage::Tenanted;
 
 use crate::authenticator::CallerTenant;
@@ -46,29 +47,21 @@ fn access_err(e: anyhow::Error) -> ApiError {
 /// The callback URL a tenant registers at the provider. Shown by the
 /// editor during app registration and used verbatim in the code
 /// exchange. The consent rides the operator's browser, so the STABLE
-/// base works and never rots; only a provider that restricts its
-/// callbacks (`callback` on the spec) moves it to an address that
-/// qualifies, loudly when this weft has none.
+/// address works and never rots (the install's domain once its
+/// certificate is issued, `weft_task_store::install_address`); only a
+/// provider that restricts its callbacks (`callback` on the spec) moves it
+/// to an address that qualifies, loudly when this weft has none.
 pub(crate) async fn redirect_uri(state: &DispatcherState, spec: &weft_core::AccessSpec) -> Result<String, ApiError> {
     use weft_core::access::spec::CallbackAddress;
-    let install_domain = match spec.callback {
-        CallbackAddress::Domain => crate::domains::list(&state.pg_pool)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read the install's domains: {e:#}")))?
-            .into_iter()
-            .find(|d| d.serves == weft_core::install::DomainServes::Install)
-            .map(|d| format!("https://{}", d.name)),
-        _ => None,
-    };
-    // The internet address is asked for only when nothing stable
-    // qualifies: a quick tunnel's is read live, and a provider the stable
-    // base suits never waits on it.
-    let stable = callback_base(&state.public_base_url, None, install_domain.as_deref(), spec.callback).map(str::to_string);
-    let base = match stable {
-        Some(base) => Some(base),
+    let stable = state.address.stable().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // The internet address is asked for only when the stable one does not
+    // qualify: a quick tunnel's is read live, and a provider the stable
+    // address suits never waits on it.
+    let base = match callback_base(&stable, None, spec.callback) {
+        Some(base) => Some(base.to_string()),
         None => {
             let internet = state.internet_url().await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
-            callback_base(&state.public_base_url, internet.as_deref(), install_domain.as_deref(), spec.callback).map(str::to_string)
+            callback_base(&stable, internet.as_deref(), spec.callback).map(str::to_string)
         }
     };
     let base = base
@@ -88,19 +81,19 @@ pub(crate) async fn redirect_uri(state: &DispatcherState, spec: &weft_core::Acce
             };
             (StatusCode::PRECONDITION_FAILED, why)
         })?;
-    Ok(format!("{}/access/oauth/callback", base.trim_end_matches('/')))
+    Ok(callback_url(&base))
+}
+
+/// The OAuth callback on `base`.
+pub(crate) fn callback_url(base: &str) -> String {
+    format!("{}/access/oauth/callback", base.trim_end_matches('/'))
 }
 
 /// Which base the OAuth callback rides, for a provider accepting
-/// `needs`: the STABLE base when it qualifies, else the install's
-/// domain, else the additional internet address. `None` = no address
-/// qualifies. Pure so the branching is unit-tested below.
-fn callback_base<'a>(
-    base: &'a str,
-    internet: Option<&'a str>,
-    install_domain: Option<&'a str>,
-    needs: weft_core::access::spec::CallbackAddress,
-) -> Option<&'a str> {
+/// `needs`: the STABLE address when it qualifies, else the additional
+/// internet address. `None` = no address qualifies. Pure so the branching
+/// is unit-tested below.
+fn callback_base<'a>(stable: &'a str, internet: Option<&'a str>, needs: weft_core::access::spec::CallbackAddress) -> Option<&'a str> {
     use weft_core::access::spec::CallbackAddress;
     let qualifies = |url: &str| match needs {
         CallbackAddress::Any => true,
@@ -112,7 +105,46 @@ fn callback_base<'a>(
                 })
         }
     };
-    [Some(base), install_domain, internet].into_iter().flatten().find(|url| qualifies(url))
+    [Some(stable), internet].into_iter().flatten().find(|url| qualifies(url))
+}
+
+// ---------- Moving connections between installs (`weft migrate connections`) ----------
+
+/// POST /access/migrate/key, on the install connections move TO: a key
+/// pair for one move, whose private half stays here.
+// SYNC: migrate_key <-> crates/weft-core/src/migrate.rs TransferKey, crates/weft-broker/src/access_admin.rs migrate_key, crates/weft-cli/src/commands/migrate.rs connections
+pub async fn migrate_key(State(state): State<DispatcherState>, caller: CallerTenant) -> Result<Json<TransferKey>, ApiError> {
+    crate::broker_admin::forward_json(&state, "/v1/access/admin/migrate/key", &Tenanted { tenant: caller.0 .0, inner: serde_json::Map::new() })
+        .await
+        .map(Json)
+}
+
+/// POST /access/migrate/export, on the install they move FROM: the
+/// caller's picked connections, sealed to the target's key (the broker
+/// opens and seals; this side never sees a secret).
+// SYNC: migrate_export <-> crates/weft-core/src/migrate.rs ExportConnections, crates/weft-broker/src/access_admin.rs migrate_export, crates/weft-cli/src/commands/migrate.rs connections
+pub async fn migrate_export(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Json(req): Json<ExportConnections>,
+) -> Result<Json<ExportedConnections>, ApiError> {
+    req.selection.validate().map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    crate::broker_admin::forward_json(&state, "/v1/access/admin/migrate/export", &Tenanted { tenant: caller.0 .0, inner: req })
+        .await
+        .map(Json)
+}
+
+/// POST /access/migrate/import, on the target: write the sealed batch as
+/// the caller's connections.
+// SYNC: migrate_import <-> crates/weft-core/src/migrate.rs ImportConnections, crates/weft-broker/src/access_admin.rs migrate_import, crates/weft-cli/src/commands/migrate.rs connections
+pub async fn migrate_import(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Json(req): Json<ImportConnections>,
+) -> Result<Json<ImportedConnections>, ApiError> {
+    crate::broker_admin::forward_json(&state, "/v1/access/admin/migrate/import", &Tenanted { tenant: caller.0 .0, inner: req })
+        .await
+        .map(Json)
 }
 
 // ---------- Doors (which connect doors are actually open) ----------
@@ -642,52 +674,38 @@ mod callback_base_tests {
     use super::callback_base;
     use weft_core::access::spec::CallbackAddress::{Any, Domain, Https};
 
-    /// The stable base serves every provider without a demand, tunnel
+    /// The stable address serves every provider without a demand, tunnel
     /// or not: a tunnel must never rotate the registered callback of a
     /// provider that accepts the stable address.
     #[test]
     fn stable_base_wins_without_a_demand() {
-        assert_eq!(callback_base("http://127.0.0.1:14112", None, None, Any), Some("http://127.0.0.1:14112"));
-        assert_eq!(
-            callback_base("http://127.0.0.1:14112", Some("https://x.trycloudflare.com"), None, Any),
-            Some("http://127.0.0.1:14112")
-        );
+        assert_eq!(callback_base("http://127.0.0.1:14112", None, Any), Some("http://127.0.0.1:14112"));
+        assert_eq!(callback_base("http://127.0.0.1:14112", Some("https://x.trycloudflare.com"), Any), Some("http://127.0.0.1:14112"));
     }
 
-    /// An https demand met by the stable base needs no second address.
+    /// An https demand met by the stable address needs no second one.
     #[test]
     fn https_stable_base_meets_the_demand_itself() {
-        assert_eq!(
-            callback_base("https://weft.example.com", Some("https://x.trycloudflare.com"), None, Https),
-            Some("https://weft.example.com")
-        );
-        assert_eq!(callback_base("https://34.1.2.3", None, None, Https), Some("https://34.1.2.3"));
+        assert_eq!(callback_base("https://weft.example.com", Some("https://x.trycloudflare.com"), Https), Some("https://weft.example.com"));
+        assert_eq!(callback_base("https://34.1.2.3", None, Https), Some("https://34.1.2.3"));
     }
 
     /// An https demand on an http base uses the internet address iff
     /// it is https; none = no callback, the caller teaches the fix.
     #[test]
     fn https_demand_on_http_base_needs_an_https_internet_address() {
-        assert_eq!(
-            callback_base("http://127.0.0.1:14112", Some("https://x.trycloudflare.com"), None, Https),
-            Some("https://x.trycloudflare.com")
-        );
-        assert_eq!(callback_base("http://127.0.0.1:14112", None, None, Https), None);
-        assert_eq!(callback_base("http://127.0.0.1:14112", Some("http://tunnel.local"), None, Https), None);
+        assert_eq!(callback_base("http://127.0.0.1:14112", Some("https://x.trycloudflare.com"), Https), Some("https://x.trycloudflare.com"));
+        assert_eq!(callback_base("http://127.0.0.1:14112", None, Https), None);
+        assert_eq!(callback_base("http://127.0.0.1:14112", Some("http://tunnel.local"), Https), None);
     }
 
-    /// A domain demand passes over an address that is an IP, and takes
-    /// the install's domain, or a tunnel's name, instead.
+    /// A domain demand passes over an address that is an IP, and takes a
+    /// tunnel's name instead. The install's domain, once issued, IS the
+    /// stable address, so it needs no slot of its own.
     #[test]
     fn a_domain_demand_never_takes_an_ip() {
-        assert_eq!(callback_base("https://34.1.2.3", None, None, Domain), None);
-        assert_eq!(
-            callback_base("https://34.1.2.3", None, Some("https://weft.example.com"), Domain),
-            Some("https://weft.example.com")
-        );
-        assert_eq!(
-            callback_base("http://127.0.0.1:14112", Some("https://x.trycloudflare.com"), None, Domain),
-            Some("https://x.trycloudflare.com")
-        );
+        assert_eq!(callback_base("https://34.1.2.3", None, Domain), None);
+        assert_eq!(callback_base("https://weft.example.com", None, Domain), Some("https://weft.example.com"));
+        assert_eq!(callback_base("http://127.0.0.1:14112", Some("https://x.trycloudflare.com"), Domain), Some("https://x.trycloudflare.com"));
     }
 }

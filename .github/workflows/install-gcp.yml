@@ -7,8 +7,14 @@
 #   repository variables  GCP_PROJECT_ID, GCP_REGION, GCP_ZONE,
 #                         TF_STATE_BUCKET, GCP_WORKLOAD_IDENTITY_PROVIDER,
 #                         GCP_INSTALL_SERVICE_ACCOUNT
+#                         (and optionally WEFT_DATABASE=cloud_sql and
+#                         WEFT_CLOUD_SQL_TIER, below)
 #   repository secrets    WEFT_DATABASE_URL (the Postgres the install keeps
-#                         everything in), WEFT_DATABASE_LISTEN_URL (only
+#                         everything in; not needed with the variable
+#                         WEFT_DATABASE set to cloud_sql, which gives the
+#                         install a Postgres of its own on Cloud SQL, and
+#                         copies the data of the one it used before into
+#                         it), WEFT_DATABASE_LISTEN_URL (only
 #                         when that address goes through a pooler: a
 #                         direct one to the same database), WEFT_ACCESS_APPS
 #                         (optional: the access-apps.json holding OAuth
@@ -46,15 +52,27 @@ jobs:
       TF_VAR_zone: ${{ vars.GCP_ZONE }}
       TF_VAR_weft_repository: ${{ github.repository }}
       TF_VAR_weft_commit: ${{ github.sha }}
+      # `cloud_sql` gives the install a Postgres of its own; unset, it
+      # uses the one WEFT_DATABASE_URL names.
+      TF_VAR_cloud_sql: ${{ vars.WEFT_DATABASE == 'cloud_sql' }}
+      TF_VAR_cloud_sql_tier: ${{ vars.WEFT_CLOUD_SQL_TIER || 'db-g1-small' }}
     steps:
       # Before anything is built: without a database there is nothing to
       # install.
       - name: the database
         env:
           WEFT_DATABASE_URL: ${{ secrets.WEFT_DATABASE_URL }}
+          WEFT_DATABASE: ${{ vars.WEFT_DATABASE }}
         run: |
+          case "$WEFT_DATABASE" in
+            cloud_sql) exit 0 ;;
+            "") ;;
+            *)
+              echo "::error::the repository variable WEFT_DATABASE is '$WEFT_DATABASE'; it is cloud_sql (a Postgres of the install's own) or unset (the one WEFT_DATABASE_URL names)"
+              exit 1 ;;
+          esac
           if [ -z "$WEFT_DATABASE_URL" ]; then
-            echo "::error::the repository secret WEFT_DATABASE_URL is not set: weft needs a Postgres to keep everything in (the cloud chapter of the docs walks through getting one)"
+            echo "::error::the repository secret WEFT_DATABASE_URL is not set: weft needs a Postgres to keep everything in (the cloud chapter of the docs walks through getting one), or set the repository variable WEFT_DATABASE to cloud_sql for one of the install's own"
             exit 1
           fi
 
@@ -193,6 +211,81 @@ jobs:
             echo "::add-mask::$email"
           fi
           echo "TF_VAR_alert_email=$email" >> "$GITHUB_ENV"
+
+      # An install moving to a Postgres of its own: the instance is made
+      # first, with the roles still on the database they use, then that
+      # database is copied into it (while the install is in maintenance,
+      # which the step above made sure of), and only then does the next
+      # step point the roles at it. Every run that finds the roles not yet
+      # on it copies again from scratch, so a failed copy, or a switch that
+      # never happened, is never taken as done; once the roles use it,
+      # every later run passes straight through.
+      - name: move the database into the install's own
+        if: vars.WEFT_DATABASE == 'cloud_sql'
+        working-directory: deploy/terraform/gcp
+        env:
+          TF_VAR_database_url: ${{ secrets.WEFT_DATABASE_URL }}
+          TF_VAR_database_listen_url: ${{ secrets.WEFT_DATABASE_LISTEN_URL }}
+        run: |
+          if ! url=$(terraform output -raw url 2>/dev/null) || [ -z "$url" ]; then
+            echo "a new install starts on its own Postgres; nothing to move"
+            exit 0
+          fi
+          terraform apply -input=false -auto-approve \
+            -target=google_secret_manager_secret_version.cloud_sql_url \
+            -target=google_secret_manager_secret_iam_member.core_reads_cloud_sql_url \
+            -target=google_compute_subnetwork.roles
+          move=$(terraform output -json database_move)
+          project="${{ vars.GCP_PROJECT_ID }}"
+          region="${{ vars.GCP_REGION }}"
+          from=""
+          for secret in $(echo "$move" | jq -r '.from_secrets[]'); do
+            if gcloud secrets describe "$secret" --project "$project" >/dev/null 2>&1; then
+              from="$secret"
+              break
+            fi
+          done
+          if [ -z "$from" ]; then
+            echo "::error::the install names no database to move from (none of $(echo "$move" | jq -r '.from_secrets | join(", ")') is in Secret Manager)"
+            exit 1
+          fi
+          to=$(echo "$move" | jq -r .to_secret)
+          # What the roles read decides it, never the source picked above (a
+          # direct address can outlive the switch when the apply that drops
+          # it failed). Read here only to compare, never printed.
+          roles=$(echo "$move" | jq -r .roles_secret)
+          if [ "$(gcloud secrets versions access latest --secret "$roles" --project "$project")" = \
+               "$(gcloud secrets versions access latest --secret "$to" --project "$project")" ]; then
+            echo "the install already uses its own Postgres; nothing to move"
+            exit 0
+          fi
+          job=$(echo "$move" | jq -r .job)
+          # The install's own database is used only once the roles are
+          # pointed at it, so until then whatever it holds (an earlier copy
+          # whose switch never happened) is stale: it is emptied and filled
+          # again in the one transaction that restores the dump, and the dump
+          # is taken whole, to a file, before any of it is restored.
+          script='set -euo pipefail
+          pg_dump --no-owner --no-privileges --file /tmp/dump.sql "$FROM"
+          tail -n 5 /tmp/dump.sql | grep -q "PostgreSQL database dump complete"
+          { echo "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"; cat /tmp/dump.sql; } \
+            | psql --single-transaction -v ON_ERROR_STOP=1 -q "$TO"
+          echo copied'
+          gcloud run jobs deploy "$job" --project "$project" --region "$region" --quiet \
+            --image docker.io/library/postgres:18 \
+            --service-account "$(echo "$move" | jq -r .service_account)" \
+            --network "$(echo "$move" | jq -r .network)" --subnet "$(echo "$move" | jq -r .subnet)" \
+            --vpc-egress private-ranges-only \
+            --set-secrets "FROM=$from:latest,TO=$to:latest" \
+            --command bash --args="^~^-c~$script" \
+            --memory 4Gi --max-retries 0 --task-timeout 21600s
+          moved=0
+          gcloud run jobs execute "$job" --project "$project" --region "$region" --wait || moved=$?
+          gcloud run jobs delete "$job" --project "$project" --region "$region" --quiet
+          if [ "$moved" -ne 0 ]; then
+            echo "::error::copying the database into the install's own failed, so the install still uses the one it had and the new one is empty; its log: gcloud logging read 'resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$job\"' --project $project --freshness 1h"
+            exit 1
+          fi
 
       - name: create the cloud
         working-directory: deploy/terraform/gcp

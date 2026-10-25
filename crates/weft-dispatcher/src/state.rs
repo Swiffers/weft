@@ -77,7 +77,9 @@ pub struct DispatcherState {
     /// Builds a project version inside the install (`crate::build`): the
     /// one way a project's program and images come to exist.
     pub builder: Arc<crate::build::VersionBuilder>,
-    /// What the install tells about itself (`GET /install`).
+    /// What the install tells about itself (`GET /install`), as its
+    /// config says it: its `public_url` is the platform's own address,
+    /// and `GET /install` puts [`Self::address`] there.
     pub install_info: weft_core::install::InstallInfo,
     pub projects: ProjectStore,
     /// Which triggers listen, per trigger per owner
@@ -102,18 +104,16 @@ pub struct DispatcherState {
     /// removed (before the project row is dropped). Canonical doc on the
     /// `ProjectReclaimer` trait in `reclaim.rs`.
     pub project_reclaimer: Arc<dyn crate::reclaim::ProjectReclaimer>,
-    /// The STABLE base URL people and editors reach this install at.
-    pub public_base_url: String,
-    /// Where the open internet reaches this install (a tunnel's address,
-    /// a fixed one), read each time it is used
-    /// ([`weft_platform_traits::config::InternetAddress::current`]): a quick
-    /// tunnel opened again comes back under a new name, and an address
-    /// read once at boot would point at the old one from then on. Never a
-    /// replacement for the base: local surfaces (the OAuth callback shown
-    /// to the operator) stay on the stable base, and only internet-facing
-    /// surfaces (activation URLs, event pushes) prefer this one via
+    /// The address the install hands out in its links
+    /// (`weft_task_store::install_address`): its domain once that
+    /// domain's certificate is issued, else the platform's own; and where
+    /// the open internet reaches it, read each time it is used (a quick
+    /// tunnel opened again comes back under a new name). Local surfaces
+    /// (the OAuth callback shown to the operator) stay on the stable
+    /// address, and only internet-facing ones (activation URLs, event
+    /// pushes) prefer the internet one via
     /// [`DispatcherState::external_base_url`].
-    pub internet: weft_platform_traits::config::InternetAddress,
+    pub address: Arc<weft_task_store::install_address::InstallAddress>,
     /// Where the files door passes requests on to (`crate::files_door`):
     /// `None` on a store the open internet reaches itself, whose links
     /// never go through the install.
@@ -176,14 +176,14 @@ impl DispatcherState {
     /// `None` when it reaches none. A quick tunnel that does not say its
     /// address is an error naming it.
     pub async fn internet_url(&self) -> anyhow::Result<Option<String>> {
-        self.internet.current(&self.http).await
+        self.address.internet().await
     }
 
     /// The base for URLs handed to OUTSIDE callers (webhook activation
     /// URLs, addresses a provider posts events to): the internet address
-    /// as it is now when there is one, the stable base otherwise.
+    /// as it is now when there is one, the stable address otherwise.
     pub async fn external_base_url(&self) -> anyhow::Result<String> {
-        Ok(self.internet_url().await?.unwrap_or_else(|| self.public_base_url.clone()))
+        self.address.outside().await
     }
 
     /// The base for outside URLs ([`DispatcherState::external_base_url`]),

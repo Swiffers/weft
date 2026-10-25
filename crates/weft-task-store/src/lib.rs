@@ -24,6 +24,8 @@
 //!     whoever waits on the work behind them to see why.
 //!   - `held_copy`: a process's copy of rows read on every request,
 //!     dropped the moment a notification says they changed.
+//!   - `install_address`: the address the install hands out in its
+//!     links, its domain once that domain's certificate is issued.
 //!   - `schema_guard`: the schema runner every boot routes its
 //!     `SchemaGroup`s through. It builds a new database from the canonical
 //!     `CREATE TABLE` text and carries an existing one forward with the
@@ -40,6 +42,7 @@ pub mod executor;
 pub mod held_copy;
 pub mod infra_command;
 pub mod infra_copies;
+pub mod install_address;
 pub mod kinds;
 pub mod locks;
 pub mod parked_fires;

@@ -27,9 +27,10 @@ use weft_access_store::GrantedQuery;
 use weft_core::access::wire::{
     BeginOAuth, CompletedConnect, ConnectDirect, DoorsAnswer, DoorsRequest, MintAppRequest,
     MintAppResponse, SharedAppChoice, SharedCredentialsAnswer, SharedCredentialsQuery,
-    SharedDoorPick, StartedOAuth,
+    SharedDoorPick, SignInServices, StartedOAuth,
 };
 use weft_core::storage::Tenanted;
+use weft_core::migrate::{ExportConnections, ExportedConnections, ImportConnections, ImportedConnections, TransferKey};
 use weft_core::AccessSpec;
 
 use crate::app_provider::resolve_shared_app;
@@ -50,6 +51,72 @@ pub fn routes() -> Router<Arc<BrokerState>> {
         .route("/v1/access/admin/granted", post(granted))
         .route("/v1/access/admin/picker-token", post(picker_token))
         .route("/v1/access/admin/shared-credentials", post(shared_credentials))
+        .route("/v1/access/admin/sign-in-services", post(sign_in_services))
+        .route("/v1/access/admin/migrate/key", post(migrate_key))
+        .route("/v1/access/admin/migrate/export", post(migrate_export))
+        .route("/v1/access/admin/migrate/import", post(migrate_import))
+}
+
+/// POST /v1/access/admin/migrate/key: a key pair for one move of the
+/// tenant's connections to this install (`weft_access_store::migrate`).
+// SYNC: migrate_key <-> crates/weft-core/src/migrate.rs TransferKey, crates/weft-dispatcher/src/api/access.rs migrate_key, crates/weft-cli/src/commands/migrate.rs connections
+async fn migrate_key(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<Tenanted<serde_json::Map<String, Value>>>,
+) -> Result<Json<TransferKey>, ApiError> {
+    control_plane(&state, &headers).await?;
+    weft_access_store::migrate::make_transfer_key(&state.pool, &req.tenant).await.map(Json).map_err(crate::handlers::store_err)
+}
+
+/// POST /v1/access/admin/migrate/export: the tenant's picked connections,
+/// sealed to the target install's key. The broker is where secrets are
+/// opened; nothing it answers carries one in the clear.
+// SYNC: migrate_export <-> crates/weft-core/src/migrate.rs ExportConnections, crates/weft-dispatcher/src/api/access.rs migrate_export, crates/weft-cli/src/commands/migrate.rs connections
+async fn migrate_export(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<Tenanted<ExportConnections>>,
+) -> Result<Json<ExportedConnections>, ApiError> {
+    control_plane(&state, &headers).await?;
+    weft_access_store::migrate::export(&state.pool, &req.tenant, &req.inner.selection, req.inner.public_key.as_deref())
+        .await
+        .map(Json)
+        .map_err(crate::handlers::store_err)
+}
+
+/// POST /v1/access/admin/migrate/import: open a batch sealed to this
+/// install's key and write each connection as the tenant's. One that
+/// spends the install's own key copies only when this install holds it.
+// SYNC: migrate_import <-> crates/weft-core/src/migrate.rs ImportConnections, crates/weft-dispatcher/src/api/access.rs migrate_import, crates/weft-cli/src/commands/migrate.rs connections
+async fn migrate_import(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<Tenanted<ImportConnections>>,
+) -> Result<Json<ImportedConnections>, ApiError> {
+    control_plane(&state, &headers).await?;
+    let import = weft_access_store::migrate::begin_import(&state.pool, &req.tenant, req.inner.key_id, &req.inner.sealed)
+        .await
+        .map_err(crate::handlers::store_err)?;
+    let mut shared_keys = std::collections::BTreeSet::new();
+    for grant in import.batch().iter().filter(|g| g.runs_on_shared_key()) {
+        if state.credentials.available(grant.service()).await.map_err(shared_app_err)? {
+            shared_keys.insert(grant.service().to_string());
+        }
+    }
+    weft_access_store::migrate::import(import, &req.tenant, &shared_keys)
+        .await
+        .map(Json)
+        .map_err(crate::handlers::store_err)
+}
+
+/// POST /v1/access/admin/sign-in-services: the services the apps file
+/// holds a sign-in app for, which `weft domain list` names as the
+/// providers to tell when the install's callback moves.
+// SYNC: sign_in_services <-> crates/weft-core/src/access/wire.rs SignInServices
+async fn sign_in_services(State(state): State<Arc<BrokerState>>, headers: HeaderMap) -> Result<Json<SignInServices>, ApiError> {
+    control_plane(&state, &headers).await?;
+    Ok(Json(SignInServices { services: state.app_provider.sign_in_services().await.map_err(shared_app_err)? }))
 }
 
 /// POST /v1/access/admin/shared-credentials: which of the asked

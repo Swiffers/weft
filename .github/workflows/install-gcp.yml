@@ -22,6 +22,11 @@ name: install on GCP
 
 on:
   workflow_dispatch:
+    inputs:
+      skip_running_check:
+        description: "Skip asking the running install what is on (only when it cannot answer, e.g. its database is gone)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -131,6 +136,7 @@ jobs:
       # one whose weft predates the maintenance cannot be asked, and goes
       # ahead (`weft maintenance check` says so).
       - name: nothing is on in the install
+        if: ${{ !inputs.skip_running_check }}
         working-directory: deploy/terraform/gcp
         run: |
           if ! url=$(terraform output -raw url 2>/dev/null) || [ -z "$url" ]; then

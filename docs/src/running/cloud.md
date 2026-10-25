@@ -165,16 +165,26 @@ name of your own instead, see [your own domain](#your-own-domain), which
 costs money.
 
 If you want to upgrade weft, run `weft maintenance on --on prod` from a
-project, merge upstream into your fork, run the workflow again, then run
-`weft maintenance off --on prod`. The first takes down every trigger that is
-on and stops the infra that runs, so the old weft and the new one never run
-side by side, and the workflow refuses to replace anything while something
-is on. Terraform changes only what is different from last time. The last
-builds those projects again on the new weft and brings back exactly what the
-first took down. Then rebuild your CLI from that
-commit, or `activate` refuses to deploy
-([when something goes wrong](#when-something-goes-wrong)). For what each step
+project, merge upstream into your fork, run the workflow again, rebuild your
+CLI from that commit (`./setup.sh --cli`), then run `weft maintenance off
+--on prod`. The first takes down every trigger that is on and stops the
+infra that runs, so the old weft and the new one never run side by side, and
+the workflow refuses to replace anything while something is on. Terraform
+changes only what is different from last time. The CLI goes before `off`
+because an older CLI cannot read what `off` answers, and `activate` refuses
+to deploy from one ([when something goes wrong](#when-something-goes-wrong)).
+The last builds those projects again on the new weft and brings back exactly
+what the first took down. For what each step
 does, go and read [updating weft](cli.md#updating-weft).
+
+If something in a project does not come back with `weft maintenance off --on
+prod`, everything else is back anyway, and `off` says what went wrong. If the
+message says the project's copy of the standard nodes is older than this
+weft, run `weft catalog update` in that folder once your weft checkout and CLI
+are on the new commit, since it copies the standard nodes from the checkout
+on your machine (it replaces `nodes/base_catalog/`, so any edits you made in
+there are lost); otherwise fix what it says. Then run `weft resync --on prod`
+there, which builds the project and brings back what the upgrade took down.
 
 If you want weft gone, delete the GCP project you made for it: weft and
 everything it ever started live in that project and nowhere else, so that is

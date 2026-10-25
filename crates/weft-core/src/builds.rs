@@ -144,13 +144,20 @@ impl LeftOut {
 }
 
 impl LeftOutPackage {
-    /// What a person is told about a run that reaches one of its nodes.
+    /// What a person is told about a run that reaches one of its nodes. A
+    /// package of the project's copy of the standard nodes that no longer
+    /// compiles is that copy being older than this weft, and the one
+    /// command that brings it up to date is named.
     pub fn reason(&self, log: Option<&str>) -> String {
         let log = match log {
             Some(url) => format!("its full errors are in the build log: {url}"),
             None => "its full errors are in the build log".to_string(),
         };
-        format!("package '{}' didn't compile: {}; {log}", self.package, self.error)
+        let stale = match self.error.contains("/base_catalog/") {
+            true => " (the project's copy of the standard nodes is older than this weft: `weft catalog update` in its folder brings it up to date)",
+            false => "",
+        };
+        format!("package '{}' didn't compile: {}; {log}{stale}", self.package, self.error)
     }
 }
 
@@ -458,5 +465,14 @@ mod tests {
             "shrink: package 'media' didn't compile: error[E0308]: mismatched types; its full errors are in the build log: https://log/1"
         );
         assert!(left_out.packages[0].reason(None).ends_with("its full errors are in the build log"));
+        // A package of the project's copy of the standard nodes names the
+        // command that brings the copy up to date.
+        let stale = LeftOutPackage {
+            package: "logic".into(),
+            node_types: vec!["GetNodeState".into()],
+            error: "error[E0599]: no method named `node_state` at /weft/project-nodes/nodes/base_catalog/logic/get_node_state/mod.rs:33".into(),
+        };
+        assert!(stale.reason(None).ends_with("`weft catalog update` in its folder brings it up to date)"), "{}", stale.reason(None));
+        assert!(!left_out.packages[0].reason(None).contains("catalog update"), "a project's own package is its own to fix");
     }
 }

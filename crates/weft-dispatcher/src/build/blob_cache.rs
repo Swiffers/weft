@@ -78,6 +78,16 @@ impl BlobCache {
         Ok(true)
     }
 
+    /// Drop the blob `tenant` stored under `hash`: one whose bytes did not
+    /// hash to its name when it was read. Nothing kept is no error.
+    pub fn forget(&self, tenant: &str, hash: &str) -> Result<()> {
+        let path = self.tenant_dir(tenant)?.join(hash);
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).with_context(|| format!("remove cached blob {}", path.display())),
+            _ => Ok(()),
+        }
+    }
+
     /// Keep a copy of the file at `src`, fetched from `tenant`'s assets and
     /// already verified to hash to `hash`, unless it is larger than
     /// [`Self::largest_kept`]. Written to a private file (a dot name, which

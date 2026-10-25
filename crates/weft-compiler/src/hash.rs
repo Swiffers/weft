@@ -80,6 +80,12 @@
 //!   binary and infra hashes, so an edit to the engine or the
 //!   toolchain moves all three together.
 //!
+//! A file enters every digest as its path and its fingerprint (the sha256
+//! of its bytes), never its bytes: a build from a stored version takes the
+//! fingerprints the version already names ([`Fingerprints::of_version`]),
+//! so its image names come from the version itself and the files are not
+//! read a second time; everything else reads them off the disk.
+//!
 //! Implementation note: SHA-256 hex-encoded. Hash inputs are ordered
 //! deterministically (sorted file walks, sorted node lists), so the
 //! same source produces the same digest regardless of OS file-listing
@@ -118,6 +124,39 @@ mod fs_hashes {
     use weft_core::project::hash::hash_definition_slice;
     use weft_core::project::{graph::ProjectGraph, infra_ids, upstream_closure};
     use crate::project::Project;
+
+    /// Where a file's fingerprint (the sha256 of its bytes) comes from: what
+    /// a stored version names for a file it holds under its root, else the
+    /// disk. The version's are checked already: every file a build lays out
+    /// is hashed against them (the dispatcher's `build::source`).
+    #[derive(Debug, Clone, Default)]
+    pub struct Fingerprints {
+        version: Option<(PathBuf, weft_core::project::hash::Manifest)>,
+    }
+
+    /// Every fingerprint read off the disk.
+    pub static DISK: Fingerprints = Fingerprints { version: None };
+
+    impl Fingerprints {
+        /// The fingerprints of the version laid out at `root`, by `manifest`.
+        pub fn of_version(root: PathBuf, manifest: weft_core::project::hash::Manifest) -> Self {
+            Self { version: Some((root, manifest)) }
+        }
+
+        /// The fingerprint of the file at `path`.
+        pub fn of(&self, path: &Path) -> Result<String> {
+            if let Some((root, manifest)) = &self.version {
+                let named = path.strip_prefix(root).ok().and_then(|rel| rel.to_str()).and_then(|rel| manifest.get(&rel.replace('\\', "/")));
+                if let Some(hash) = named {
+                    return Ok(hash.clone());
+                }
+            }
+            let file = std::fs::File::open(path).with_context(|| format!("read {} for hashing", path.display()))?;
+            let mut hasher = Sha256::new();
+            std::io::copy(&mut std::io::BufReader::new(file), &mut hasher).with_context(|| format!("read {} for hashing", path.display()))?;
+            Ok(hex(&hasher.finalize()))
+        }
+    }
 
     /// Dockerfile (relative to the weft root) that builds the shared
     /// worker builder-base image. Part of the worker build environment:
@@ -160,14 +199,14 @@ mod fs_hashes {
                 crate::build::worker_crate_entries(&weft_root.join("crates").join(name))
                     .map_err(|e| anyhow::anyhow!("enumerate crate {name}: {e}"))?;
             for (entry_name, entry_path) in entries {
-                hash_path(hasher, &format!("crates/{name}/{entry_name}"), &entry_path)?;
+                hash_path(hasher, &format!("crates/{name}/{entry_name}"), &entry_path, &DISK)?;
             }
         }
         for rel in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
-            hash_path(hasher, rel, &weft_root.join(rel))?;
+            hash_path(hasher, rel, &weft_root.join(rel), &DISK)?;
         }
         for rel in [BUILDER_BASE_DOCKERFILE, BUILDER_BASE_SPLIT_SCRIPT, CACHE_GC_SCRIPT_PATH] {
-            hash_path(hasher, rel, &weft_root.join(rel))?;
+            hash_path(hasher, rel, &weft_root.join(rel), &DISK)?;
         }
         Ok(())
     }
@@ -184,7 +223,7 @@ mod fs_hashes {
         let stdlib = weft_catalog::stdlib_root().map_err(|e| anyhow::anyhow!("{e}"))?;
         for path in walk_dir(&stdlib)?.into_iter().filter(|p| p.file_name().is_some_and(|n| n == "deps.toml")) {
             let rel = path.strip_prefix(&stdlib).map_err(|_| anyhow::anyhow!("{} is outside the stdlib", path.display()))?;
-            hash_path(hasher, &format!("catalog/{}", rel.display()), &path)?;
+            hash_path(hasher, &format!("catalog/{}", rel.display()), &path, &DISK)?;
         }
         Ok(())
     }
@@ -212,6 +251,7 @@ mod fs_hashes {
         weft_root: &Path,
         catalog: &FsCatalog,
         node_set: weft_core::builds::NodeSet,
+        fingerprints: &Fingerprints,
     ) -> Result<SourceHash> {
         let project_root = project.root.as_path();
         let mut hasher = Sha256::new();
@@ -219,7 +259,7 @@ mod fs_hashes {
         // left out (`weft_core::builds::LEFT_OUT_RECORD_PATH`); an image
         // from before has none to read.
         hasher.update(b"weft-binary-v3\n");
-        hash_image_recipe(&mut hasher, project)?;
+        hash_image_recipe(&mut hasher, project, fingerprints)?;
 
         // SET of referenced node TYPES: the dispatch table in registry.rs
         // is generated from this. The ORDER doesn't matter (we sort), and
@@ -246,6 +286,7 @@ mod fs_hashes {
             &mut hasher,
             &catalog.package_roots_for(&referenced),
             &[project_root, weft_root],
+            fingerprints,
         )?;
 
         // The baked type registry: `write_main_rs` bakes EVERY
@@ -271,11 +312,12 @@ mod fs_hashes {
         weft_root: &Path,
         catalog: &FsCatalog,
         node_set: weft_core::builds::NodeSet,
+        fingerprints: &Fingerprints,
     ) -> Result<std::collections::BTreeMap<String, SourceHash>> {
         let mut shared = Sha256::new();
         shared.update(b"weft-implementation-v1\n");
         hash_worker_build_env(&mut shared, weft_root)?;
-        hash_image_recipe(&mut shared, project)?;
+        hash_image_recipe(&mut shared, project, fingerprints)?;
         hash_type_registry(&mut shared, catalog);
         // Fingerprints describe the compiled worker, whose type set can be
         // wider than this graph. The types weft gives its own nodes (a
@@ -292,7 +334,7 @@ mod fs_hashes {
                 hash.clone()
             } else {
                 let mut hasher = shared.clone();
-                hash_package_roots(&mut hasher, &roots, &[&project.root, weft_root])?;
+                hash_package_roots(&mut hasher, &roots, &[&project.root, weft_root], fingerprints)?;
                 let hash = hex(&hasher.finalize());
                 packages.insert(roots, hash.clone());
                 hash
@@ -326,7 +368,7 @@ mod fs_hashes {
     /// hash and the node-test hash so every image-naming digest covers
     /// the same recipe inputs; a base-image or template edit flips
     /// both instead of silently serving a stale cached image.
-    fn hash_image_recipe(hasher: &mut Sha256, project: &Project) -> Result<()> {
+    fn hash_image_recipe(hasher: &mut Sha256, project: &Project, fingerprints: &Fingerprints) -> Result<()> {
         let project_root = project.root.as_path();
         // Names, IDs and dispatcher addresses do not change executable code.
         hasher.update(b"worker_build:\n");
@@ -349,7 +391,7 @@ mod fs_hashes {
                     template_path.display()
                 );
             }
-            hash_path(hasher, "dockerfile_template", &template_path)?;
+            hash_path(hasher, "dockerfile_template", &template_path, fingerprints)?;
         }
         Ok(())
     }
@@ -361,7 +403,7 @@ mod fs_hashes {
     /// by the source hash (referenced roots) and the infra hash (closure
     /// roots): both fold "the node trees that matter" into a digest the
     /// same way, over the same node-tree walk policy (`walk_dir`).
-    fn hash_package_roots(hasher: &mut Sha256, roots: &[PathBuf], bases: &[&Path]) -> Result<()> {
+    fn hash_package_roots(hasher: &mut Sha256, roots: &[PathBuf], bases: &[&Path], fingerprints: &Fingerprints) -> Result<()> {
         let mut labeled = std::collections::BTreeMap::new();
         for root in roots {
             let label = bases
@@ -383,7 +425,7 @@ mod fs_hashes {
             hasher.update(b"package:");
             hasher.update(label.as_bytes());
             hasher.update(b"\n");
-            hash_package_root(hasher, &label, root)?;
+            hash_package_root(hasher, &label, root, fingerprints)?;
         }
         Ok(())
     }
@@ -392,8 +434,8 @@ mod fs_hashes {
     /// (`build::stage_project_nodes`): every file but what
     /// `weft_catalog::is_left_out_of_package_build` names, so a `.weft`
     /// file a program includes from the package flips no package hash.
-    pub fn hash_package_root(hasher: &mut Sha256, label: &str, root: &Path) -> Result<()> {
-        hash_path_skipping(hasher, label, root, &|name, _| weft_catalog::is_left_out_of_package_build(name))
+    pub fn hash_package_root(hasher: &mut Sha256, label: &str, root: &Path, fingerprints: &Fingerprints) -> Result<()> {
+        hash_path_skipping(hasher, label, root, &|name, _| weft_catalog::is_left_out_of_package_build(name), fingerprints)
     }
 
     /// Content hash of everything that can change a package's node-test
@@ -411,7 +453,7 @@ mod fs_hashes {
     ) -> Result<SourceHash> {
         let mut hasher = Sha256::new();
         hasher.update(b"weft-node-test-outcome-v1\n");
-        hash_package_roots(&mut hasher, std::slice::from_ref(&package_root.to_path_buf()), bases)?;
+        hash_package_roots(&mut hasher, std::slice::from_ref(&package_root.to_path_buf()), bases, &DISK)?;
         hash_type_registry(&mut hasher, catalog);
         Ok(hex(&hasher.finalize()))
     }
@@ -435,11 +477,12 @@ mod fs_hashes {
         let mut hasher = Sha256::new();
         // v2: the image starts its test server itself (`CMD ["serve"]`).
         hasher.update(b"weft-node-test-v2\n");
-        hash_image_recipe(&mut hasher, project)?;
+        hash_image_recipe(&mut hasher, project, &DISK)?;
         hash_package_roots(
             &mut hasher,
             std::slice::from_ref(&package_root.to_path_buf()),
             &[project.root.as_path(), weft_root],
+            &DISK,
         )?;
         // The test crate's main.rs bakes the FULL catalog type
         // registry (see the binary hash's identical step): a type
@@ -459,6 +502,7 @@ mod fs_hashes {
         project_root: &Path,
         weft_root: &Path,
         catalog: &FsCatalog,
+        fingerprints: &Fingerprints,
     ) -> Result<SourceHash> {
         let mut hasher = Sha256::new();
         hasher.update(b"weft-infra-v2\n");
@@ -474,7 +518,7 @@ mod fs_hashes {
         // sorted, so a comment or a canvas drag cannot flip it either.
         let closure = upstream_closure(&ProjectGraph::new(project), &infra_ids(project));
         hash_definition_slice(&mut hasher, project, &closure)?;
-        hash_path(&mut hasher, "weft.toml", &project_root.join("weft.toml"))?;
+        hash_path(&mut hasher, "weft.toml", &project_root.join("weft.toml"), fingerprints)?;
 
         // Hash each package root that owns a closure node (mod.rs /
         // metadata.json / deps.toml of every node in the package, plus
@@ -487,7 +531,7 @@ mod fs_hashes {
             .filter_map(|n| catalog.package_of(&n.node_type))
             .map(|pkg| pkg.root.clone())
             .collect();
-        hash_package_roots(&mut hasher, &closure_roots, &[project_root, weft_root])?;
+        hash_package_roots(&mut hasher, &closure_roots, &[project_root, weft_root], fingerprints)?;
 
         // Worker build environment: engine + core compile into the
         // worker binary that runs InfraSetup, inside the builder base.
@@ -508,6 +552,7 @@ mod fs_hashes {
         project_root: &Path,
         weft_root: &Path,
         catalog: &FsCatalog,
+        fingerprints: &Fingerprints,
     ) -> Result<std::collections::BTreeMap<String, SourceHash>> {
         let graph = ProjectGraph::new(project);
         let mut out = std::collections::BTreeMap::new();
@@ -519,14 +564,14 @@ mod fs_hashes {
             hasher.update(b"\n");
             let closure = upstream_closure(&graph, std::slice::from_ref(&place.id));
             hash_definition_slice(&mut hasher, project, &closure)?;
-            hash_path(&mut hasher, "weft.toml", &project_root.join("weft.toml"))?;
+            hash_path(&mut hasher, "weft.toml", &project_root.join("weft.toml"), fingerprints)?;
             let roots: Vec<PathBuf> = closure
                 .iter()
                 .filter_map(|id| project.nodes.iter().find(|n| n.id == *id))
                 .filter_map(|n| catalog.package_of(&n.node_type))
                 .map(|pkg| pkg.root.clone())
                 .collect();
-            hash_package_roots(&mut hasher, &roots, &[project_root, weft_root])?;
+            hash_package_roots(&mut hasher, &roots, &[project_root, weft_root], fingerprints)?;
             hash_worker_build_env(&mut hasher, weft_root)?;
             out.insert(spelled, hex(&hasher.finalize()));
         }
@@ -536,12 +581,12 @@ mod fs_hashes {
     /// Hash a single image's source: Dockerfile + every file in the
     /// image source dir, scoped by node type. Used verbatim as the
     /// infra docker image tag suffix.
-    pub fn compute_image_hash(node_type: &str, image_source_dir: &Path) -> Result<SourceHash> {
+    pub fn compute_image_hash(node_type: &str, image_source_dir: &Path, fingerprints: &Fingerprints) -> Result<SourceHash> {
         let mut hasher = Sha256::new();
         hasher.update(b"weft-image-v1\n");
         hasher.update(node_type.as_bytes());
         hasher.update(b"\n");
-        hash_path(&mut hasher, "image-source", image_source_dir)?;
+        hash_path(&mut hasher, "image-source", image_source_dir, fingerprints)?;
         Ok(hex(&hasher.finalize()))
     }
 
@@ -669,6 +714,7 @@ mod fs_hashes {
         label: &str,
         path: &Path,
         left_out: LeftOut<'_>,
+        fingerprints: &Fingerprints,
     ) -> Result<()> {
         if !path.exists() {
             // Hash the absence so a future appearance invalidates.
@@ -678,9 +724,9 @@ mod fs_hashes {
             return Ok(());
         }
         if path.is_file() {
-            hash_file(hasher, label, path)
+            hash_file(hasher, label, path, fingerprints)
         } else if path.is_dir() {
-            hash_dir(hasher, label, path, left_out)
+            hash_dir(hasher, label, path, left_out, fingerprints)
         } else {
             Ok(())
         }
@@ -694,22 +740,20 @@ mod fs_hashes {
     /// Public so the image-stamp hasher in the CLI's `images.rs` can
     /// share the exact same framing rules (no
     /// two-different-hash-functions-for-the-same-job drift).
-    pub fn hash_path(hasher: &mut Sha256, label: &str, path: &Path) -> Result<()> {
-        hash_path_skipping(hasher, label, path, &|_, _| false)
+    pub fn hash_path(hasher: &mut Sha256, label: &str, path: &Path, fingerprints: &Fingerprints) -> Result<()> {
+        hash_path_skipping(hasher, label, path, &|_, _| false, fingerprints)
     }
 
-    fn hash_file(hasher: &mut Sha256, label: &str, path: &Path) -> Result<()> {
+    fn hash_file(hasher: &mut Sha256, label: &str, path: &Path, fingerprints: &Fingerprints) -> Result<()> {
         hasher.update(b"file:");
         hasher.update(label.as_bytes());
         hasher.update(b"\n");
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("read {} for hashing", path.display()))?;
-        hasher.update(&bytes);
+        hasher.update(fingerprints.of(path)?.as_bytes());
         hasher.update(b"\n");
         Ok(())
     }
 
-    fn hash_dir(hasher: &mut Sha256, label: &str, dir: &Path, left_out: LeftOut<'_>) -> Result<()> {
+    fn hash_dir(hasher: &mut Sha256, label: &str, dir: &Path, left_out: LeftOut<'_>, fingerprints: &Fingerprints) -> Result<()> {
         hasher.update(b"dir:");
         hasher.update(label.as_bytes());
         hasher.update(b"\n");
@@ -722,11 +766,8 @@ mod fs_hashes {
             hasher.update(b"path:");
             hasher.update(rel.as_bytes());
             hasher.update(b"\n");
-            // `walk_dir` yields files only (dirs recursed, symlinks resolved), so
-            // read unconditionally; a non-file here fails loud via `read`.
-            let bytes = std::fs::read(&entry)
-                .with_context(|| format!("read {} for hashing", entry.display()))?;
-            hasher.update(&bytes);
+            // `walk_dir` yields files only (dirs recursed, symlinks resolved).
+            hasher.update(fingerprints.of(&entry)?.as_bytes());
             hasher.update(b"\n");
         }
         Ok(())
@@ -808,6 +849,32 @@ mod fs_hashes {
     mod package_identity_tests {
         use super::*;
 
+        /// An image is named after its files' fingerprints: the same files
+        /// name it the same whether read off the disk or taken from the
+        /// version that holds them, and a version build keeps the
+        /// version's name whatever the disk holds.
+        #[test]
+        fn an_image_is_named_after_its_files_fingerprints() {
+            let dir = tempfile::tempdir().unwrap();
+            let image = dir.path().join("nodes/media/images/studio");
+            std::fs::create_dir_all(&image).unwrap();
+            std::fs::write(image.join("Dockerfile"), "FROM scratch\n").unwrap();
+            std::fs::write(image.join("font.ttf"), b"the version's bytes").unwrap();
+            let manifest: weft_core::project::hash::Manifest = [
+                ("nodes/media/images/studio/Dockerfile", DISK.of(&image.join("Dockerfile")).unwrap()),
+                ("nodes/media/images/studio/font.ttf", DISK.of(&image.join("font.ttf")).unwrap()),
+            ]
+            .into_iter()
+            .map(|(path, hash)| (path.to_string(), hash))
+            .collect();
+            let version = Fingerprints::of_version(dir.path().to_path_buf(), manifest);
+            let from_disk = compute_image_hash("Media", &image, &DISK).unwrap();
+            assert_eq!(compute_image_hash("Media", &image, &version).unwrap(), from_disk, "one name for the same files");
+            std::fs::write(image.join("font.ttf"), b"bytes gone bad").unwrap();
+            assert_eq!(compute_image_hash("Media", &image, &version).unwrap(), from_disk, "the version names its own image");
+            assert_ne!(compute_image_hash("Media", &image, &DISK).unwrap(), from_disk, "the disk is read when nothing names the file");
+        }
+
         #[test]
         fn implementation_identity_matches_the_compiled_type_set() {
             let dir = tempfile::tempdir().unwrap();
@@ -822,8 +889,8 @@ mod fs_hashes {
                 "groupBoundary":{"groupId":"l","role":"In"}
             })).unwrap());
             for set in [weft_core::builds::NodeSet::Full, weft_core::builds::NodeSet::Referenced] {
-                let before = implementation_hashes(&empty, &project, root, &catalog, set).unwrap();
-                let after = implementation_hashes(&looped, &project, root, &catalog, set).unwrap();
+                let before = implementation_hashes(&empty, &project, root, &catalog, set, &DISK).unwrap();
+                let after = implementation_hashes(&looped, &project, root, &catalog, set, &DISK).unwrap();
                 assert_eq!(before, after, "adding a built-in boundary does not change the worker's implementation map");
                 // Every type weft gives its own nodes, the placeholder a
                 // broken include leaves among them: a program holding one
@@ -859,7 +926,7 @@ mod fs_hashes {
             let mut graph: ProjectDefinition = serde_json::from_value(serde_json::json!({
                 "id":project.id(), "nodes":[{"id":"text", "nodeType":"Text", "config":{"value":"before"}, "position":{"x":0,"y":0}}], "edges":[]
             })).unwrap();
-            let hash = |graph: &ProjectDefinition| compute_binary_hash(graph, &project, root, &catalog, weft_core::builds::NodeSet::Full).unwrap();
+            let hash = |graph: &ProjectDefinition| compute_binary_hash(graph, &project, root, &catalog, weft_core::builds::NodeSet::Full, &DISK).unwrap();
             let initial = hash(&graph);
             assert_eq!(hash(&graph), initial);
             graph.nodes[0].config = serde_json::json!({"value":"after"});
@@ -883,7 +950,7 @@ mod fs_hashes {
             })).unwrap();
             let hash = || {
                 let catalog = crate::build::build_project_catalog(dir.path()).unwrap();
-                compute_binary_hash(&graph, &project, root, &catalog, weft_core::builds::NodeSet::Full).unwrap()
+                compute_binary_hash(&graph, &project, root, &catalog, weft_core::builds::NodeSet::Full, &DISK).unwrap()
             };
             let before = hash();
             let deps = dir.path().join("nodes/base_catalog/http/request/deps.toml");
@@ -895,7 +962,7 @@ mod fs_hashes {
 
         fn digest(roots: &[PathBuf], bases: &[&Path]) -> String {
             let mut hash = Sha256::new();
-            hash_package_roots(&mut hash, roots, bases).unwrap();
+            hash_package_roots(&mut hash, roots, bases, &DISK).unwrap();
             hex(&hash.finalize())
         }
 

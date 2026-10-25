@@ -55,6 +55,10 @@ const RECORD_LIMIT: usize = 4000;
 /// says too little to be worth a line, and the build fails instead.
 const SHORTEST_ERROR: usize = 80;
 
+/// The fewest characters of an error's headline [`shorten`] keeps beside
+/// where the error points.
+const SHORTEST_HEADLINE: usize = 20;
+
 /// What codegen writes to `isolate.json`: the package crates the build may
 /// leave out.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -526,13 +530,24 @@ fn fit_record(packages: &[LeftOutPackage], limit: usize) -> Result<String, Strin
     }
 }
 
-/// `text` cut to `cap` characters, the cut marked with "...".
+/// `text` cut to `cap` characters, the cut marked with "...". Where the
+/// error points (its last ` at <file>:<line>`, [`error_line`]) is kept
+/// whole while the headline still has room beside it: the file says which
+/// package failed, and a file in the project's copy of the standard nodes
+/// is what names the one command that fixes it
+/// (`weft_core::builds::LeftOutPackage::reason`).
 fn shorten(text: &str, cap: usize) -> String {
     if text.chars().count() <= cap {
         return text.to_string();
     }
-    let kept: String = text.chars().take(cap.saturating_sub(3)).collect();
-    format!("{kept}...")
+    let cut = |text: &str, cap: usize| -> String { text.chars().take(cap.saturating_sub(3)).collect::<String>() + "..." };
+    match text.rfind(" at ") {
+        Some(at) if text[at..].chars().count() + SHORTEST_HEADLINE <= cap => {
+            let (head, place) = text.split_at(at);
+            format!("{}{place}", cut(head, cap - place.chars().count()))
+        }
+        _ => cut(text, cap),
+    }
 }
 
 #[cfg(test)]
@@ -807,6 +822,13 @@ not a message
         let record: Record = serde_json::from_str(&json).unwrap();
         assert_eq!(record.packages.len(), 10);
         assert!(record.packages.iter().all(|p| p.error.ends_with("...") && p.error.chars().count() >= SHORTEST_ERROR && p.node_types.len() == 1));
+
+        // Where an error points survives the cut: the headline goes first.
+        let place = " at /weft/project-nodes/nodes/base_catalog/logic/get_node_state/mod.rs:33";
+        let pointed: Vec<LeftOutPackage> =
+            (0..10).map(|i| LeftOutPackage { error: format!("{}{place}", "e".repeat(2000)), ..left(&format!("p{i}"), 0) }).collect();
+        let record: Record = serde_json::from_str(&fit_record(&pointed, RECORD_LIMIT).unwrap()).unwrap();
+        assert!(record.packages.iter().all(|p| p.error.ends_with(place) && p.error.contains("...")), "{:?}", record.packages[0].error);
 
         let too_many: Vec<LeftOutPackage> = (0..60).map(|i| left(&format!("p{i}"), 2000)).collect();
         let err = fit_record(&too_many, RECORD_LIMIT).unwrap_err();

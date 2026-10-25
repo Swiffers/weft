@@ -338,14 +338,14 @@ pub fn runtime_image_ref() -> Result<String> {
     for (label, path) in &inputs {
         weft_compiler::hash::hash_path_skipping(&mut hasher, label, path, &|name, at_top| {
             at_top && NOT_IN_THE_BINARY.contains(&name)
-        })?;
+        }, &weft_compiler::hash::DISK)?;
     }
     // The weft source a version compiles against, every file of it (the
     // Dockerfile copies these whole), minus what `.dockerignore` keeps
     // out, which is the node-tree exclusion every hash walk already
     // applies (`weft_catalog::is_node_tree_excluded`).
     for rel in ["crates", "catalog", weft_compiler::hash::BUILDER_BASE_DOCKERFILE, weft_compiler::hash::BUILDER_BASE_SPLIT_SCRIPT] {
-        weft_compiler::hash::hash_path(&mut hasher, &format!("carried:{rel}"), &root.join(rel))?;
+        weft_compiler::hash::hash_path(&mut hasher, &format!("carried:{rel}"), &root.join(rel), &weft_compiler::hash::DISK)?;
     }
     Ok(qualified_ref(RUNTIME_REPO, &short_hex(&hasher.finalize())))
 }
@@ -530,6 +530,7 @@ async fn ensure_standard_worker(image: &str, base: &str, rebuild: bool, suffix: 
             weft_compiler::CompileFs::disk(&stock.project.root),
             &bases,
             weft_core::builds::NodeSet::Full,
+            &weft_compiler::hash::DISK,
         )?;
         record_build_uses(&build.uses).await?;
         docker_build_worker(&target, &build.build_context.join("Dockerfile"), &build.build_context, &[]).await?;

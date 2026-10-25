@@ -54,17 +54,17 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                     Ok(_) => (
                         or_warn(
                             "the worker code's hash",
-                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Referenced),
+                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Referenced, &weft_compiler::hash::DISK),
                         ),
                         or_warn(
                             "the worker code's hash with every node",
-                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full),
+                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full, &weft_compiler::hash::DISK),
                         ),
                         or_warn("the project definition's hash", weft_compiler::hash::compute_definition_hash(&def)),
                         Some(weft_core::projects::NamedHashes(weft_core::run_spec::trigger_fingerprints(&def)).encode()),
                         or_warn(
                             "each infra place's hash",
-                            weft_compiler::hash::compute_infra_place_hashes(&def, &project.root, &weft_root, &catalog)
+                            weft_compiler::hash::compute_infra_place_hashes(&def, &project.root, &weft_root, &catalog, &weft_compiler::hash::DISK)
                                 .map(|places| weft_core::projects::NamedHashes(places).encode()),
                         ),
                     ),
@@ -331,7 +331,10 @@ fn trigger_lines(entry: &weft_core::projects::TriggerEntry) -> Vec<String> {
                         format!("{door}, taken down with its infra (it comes back once that infra runs again)")
                     }
                     Some(weft_core::projects::DownWith::Maintenance) => {
-                        format!("{door}, taken down by the install's maintenance (`weft maintenance off` brings it back)")
+                        format!(
+                            "{door}, taken down by the install's maintenance (`weft maintenance off` brings it back; once \
+                             the maintenance is over, `weft resync` does too)"
+                        )
                     }
                 }
             }
@@ -449,7 +452,7 @@ mod tests {
         let infra = super::trigger_lines(&entry(Some(weft_core::projects::DownWith::Infra)));
         assert!(infra[0].contains("taken down with its infra"), "{infra:?}");
         let maintenance = super::trigger_lines(&entry(Some(weft_core::projects::DownWith::Maintenance)));
-        assert!(maintenance[0].contains("`weft maintenance off` brings it back"), "{maintenance:?}");
+        assert!(maintenance[0].contains("`weft maintenance off` brings it back") && maintenance[0].contains("`weft resync` does too"), "{maintenance:?}");
         assert!(!super::trigger_lines(&entry(None))[0].contains("taken down"));
         let mut held_back = entry(Some(weft_core::projects::DownWith::Health));
         held_back.shared.as_mut().unwrap().held_back = Some("triggers on another build. `weft resync --all` moves them".into());

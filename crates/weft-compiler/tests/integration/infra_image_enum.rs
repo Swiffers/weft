@@ -43,7 +43,7 @@ fn cloud_compile_enumerates_the_infra_nodes_image() {
         .expect("MiniService node present in the enriched definition");
     assert!(svc.requires_infra, "MiniService must be requires_infra");
 
-    let images = weft_compiler::image_set::infra_images(&definition, &catalog)
+    let images = weft_compiler::image_set::infra_images(&definition, &catalog, &weft_compiler::hash::DISK)
         .expect("enumerate infra images");
     assert_eq!(images.len(), 1, "expected exactly one infra image, got {images:?}");
     assert_eq!(images[0].image_name, "mini_service");

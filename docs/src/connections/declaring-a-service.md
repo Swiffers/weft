@@ -180,6 +180,13 @@ declares both keys on each of its calls, like its test call:
 }
 ```
 
+### A status other than 200
+
+The `test` call passes when it answers 200. If the provider checks the key
+before it reads the request, set `expectStatus` to the status you get once the
+key is accepted. `ExaAccess` sends a POST with no body and expects 400: a good
+key reaches the missing-body error, and a bad one is refused earlier with 401.
+
 ### Minting your own
 
 A `mint_jwt` acquisition signs a JWT from the pasted key with the `claims` you

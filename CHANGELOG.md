@@ -4,7 +4,7 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## Unreleased
+## 2026-10-25 (c2d4bc11)
 
 **A domain you give a cloud install becomes its address.** Once Google has
 issued the domain's certificate, every link the install hands out uses the

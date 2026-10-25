@@ -289,6 +289,12 @@ pub(crate) async fn bake(state: &DispatcherState, actor: &Actor, id: uuid::Uuid,
 /// project holding a resync already (under way, or stopped with triggers
 /// down) refuses this: [`resume_resync`] takes that one up again. A
 /// program's resync of its own project is refused ([`refuse_own_resync`]).
+///
+/// What the install's maintenance took down in the project and could not
+/// bring back then comes back too, on the registered build
+/// (`crate::maintenance::bring_back_project`), once every refusal above
+/// has passed: a project whose code did not build on the new weft is fixed
+/// in its folder, and this resync is what turns it back on.
 pub(crate) async fn resync(state: &DispatcherState, actor: &Actor, id: uuid::Uuid, request: &ResyncRequest) -> Result<ResyncAnswer, Refused> {
     use crate::activation_store::ProjectStatus;
     actor.may_act_on(state, id).await?;
@@ -306,6 +312,11 @@ pub(crate) async fn resync(state: &DispatcherState, actor: &Actor, id: uuid::Uui
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".to_string()))?;
     require_registered_build(state, id, &request.build).await?;
+    let bring_back = || async {
+        crate::maintenance::bring_back_project(state, id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("bring back what the maintenance left down: {e:#}")))
+    };
 
     // 1. Which triggers: the scope's, as the registered build has them, of
     //    which the ones on and behind it are refreshed and the ones off
@@ -343,7 +354,14 @@ pub(crate) async fn resync(state: &DispatcherState, actor: &Actor, id: uuid::Uui
     let behind: Vec<weft_core::activation::ActivationKey> =
         keys.iter().filter(|key| row(key).is_some_and(|a| desired.behind(a))).cloned().collect();
     if behind.is_empty() {
-        return Ok(ResyncAnswer::Done(nothing_to_resync(take_down, weft_core::activation::by_owner(&off))));
+        let brought_back = bring_back().await?;
+        // What came back is on now, so no longer among the triggers off.
+        let back: Vec<&weft_core::activation::OwnerTriggers> = brought_back.iter().flat_map(|b| &b.turned_on).collect();
+        let off: Vec<weft_core::activation::ActivationKey> = off
+            .into_iter()
+            .filter(|key| !back.iter().any(|on| on.owner == key.owner && on.triggers.contains(&key.trigger)))
+            .collect();
+        return Ok(ResyncAnswer::Done(ResyncResponse { brought_back, ..nothing_to_resync(take_down, weft_core::activation::by_owner(&off)) }));
     }
     // One binary answers the project's routes: a trigger left on outside
     // this resync, on another build, would split them. Refused before
@@ -384,6 +402,7 @@ pub(crate) async fn resync(state: &DispatcherState, actor: &Actor, id: uuid::Uui
         })?;
     }
     crate::install_picks::require_activation_picks(state, id, &registered).await?;
+    let brought_back = bring_back().await?;
 
     // 3. Write the resync down and enter the project's `resyncing`
     //    transition, which it holds until every owner's triggers are back:
@@ -411,18 +430,26 @@ pub(crate) async fn resync(state: &DispatcherState, actor: &Actor, id: uuid::Uui
     let task = crate::task_kinds::resync::task(&tenant, id, plan.driver);
     let internal = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("resync transition: {e:#}"));
     let Some(task) = state.projects.try_begin_resyncing(id, &plan, task).await.map_err(internal)? else {
+        // What the maintenance had left down came back already; the
+        // refusal says so, since nothing else would.
+        let back = match &brought_back {
+            Some(back) if !back.turned_on.is_empty() || !back.started.is_empty() => {
+                " (what the install's maintenance had left down came back on this build before the resync was refused)"
+            }
+            _ => "",
+        };
         let held = state.projects.transition(id).await.map_err(internal)?.unwrap_or(crate::project_store::ProjectTransition::None);
         if let Some(why) = held.refusal() {
-            return Err((StatusCode::CONFLICT, format!("cannot resync now: {why}")));
+            return Err((StatusCode::CONFLICT, format!("cannot resync now: {why}{back}")));
         }
-        require_registered_build(state, id, &request.build).await?;
+        require_registered_build(state, id, &request.build).await.map_err(|(status, why)| (status, format!("{why}{back}")))?;
         return Err((
             StatusCode::CONFLICT,
-            "cannot resync now: a trigger of the project is being switched on; try again once it has landed".into(),
+            format!("cannot resync now: a trigger of the project is being switched on; try again once it has landed{back}"),
         ));
     };
     crate::transition::publish_transition_changed(state, id).await;
-    Ok(ResyncAnswer::UnderWay { task })
+    Ok(ResyncAnswer::UnderWay { task, brought_back })
 }
 
 /// What a resync refused for a build that cannot run its triggers adds,
@@ -439,6 +466,7 @@ fn nothing_to_resync(take_down: weft_core::take_down::TakeDown, off: Vec<weft_co
         resynced: Vec::new(),
         moved_runs: 0,
         off,
+        brought_back: None,
     }
 }
 
@@ -473,7 +501,7 @@ pub(crate) async fn resume_resync(state: &DispatcherState, actor: &Actor, id: uu
         ));
     };
     crate::transition::publish_transition_changed(state, id).await;
-    Ok(ResyncAnswer::UnderWay { task })
+    Ok(ResyncAnswer::UnderWay { task, brought_back: None })
 }
 
 #[cfg(test)]

@@ -49,7 +49,10 @@ impl<'a> ProjectCalls<'a> {
     async fn resynced(self, answer: ResyncAnswer) -> WeftResult<ResyncResponse> {
         match answer {
             ResyncAnswer::Done(response) => Ok(response),
-            ResyncAnswer::UnderWay { task } => self.follow(task).await,
+            ResyncAnswer::UnderWay { task, brought_back } => {
+                let followed: ResyncResponse = self.follow(task).await?;
+                Ok(ResyncResponse { brought_back, ..followed })
+            }
         }
     }
 }

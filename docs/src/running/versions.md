@@ -114,7 +114,7 @@ they already are, so ten runs of unchanged code record one.
 | In it | Not in it |
 |---|---|
 | Every `.weft` file, at any depth | Anything hidden at the top: `.git`, `.env`, `.weft` |
-| `weft.toml` | `target/` at the root or beside a `Cargo.toml`, and `node_modules` and `__pycache__` anywhere |
+| `weft.toml` | `target/` at the root or beside a `Cargo.toml`, and `node_modules`, `__pycache__` and `.pytest_cache` anywhere |
 | `src/**` and `nodes/**`, including a node that sits beside your code and the standard library in `nodes/base_catalog/`, edits and all | Any other file or folder at the top, such as `README.md` or `docs/`, and `front/`, which ships through your project's CI |
 | `assets/**`, `prompts/**`, `scripts/**`, `sql/**` | Conflict copies |
 | `examples/**`, so going back restores the examples that existed then | |

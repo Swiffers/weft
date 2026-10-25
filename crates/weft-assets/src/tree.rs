@@ -238,11 +238,17 @@ impl HashCache {
     }
 
     /// Write the cache under `root`, whole or not at all: a reader never
-    /// sees half a file.
+    /// sees half a file. Only ever inside a folder that is there: one
+    /// deleted or moved away a moment ago is not made again, as an empty
+    /// folder the next sync would read as every file removed.
     pub fn save(&self, root: &Path) -> Result<()> {
         let path = cache_file(root);
         let dir = path.parent().expect("the cache file has a folder");
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        match std::fs::create_dir(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("create {}", dir.display())),
+        }
         let mut temp = tempfile::NamedTempFile::new_in(dir).with_context(|| format!("create a file in {}", dir.display()))?;
         serde_json::to_writer(&mut temp, self).context("write the hash cache")?;
         temp.persist(&path).with_context(|| format!("write {}", path.display()))?;
@@ -455,6 +461,21 @@ mod tests {
             assert!(err.to_string().contains("prompts/loop"), "{err}");
             assert!(err.to_string().contains("symlink"), "{err}");
         }
+    }
+
+    /// A folder that went while a pass ran is not made again by the pass's
+    /// last step: saving the cache into it fails, leaving nothing behind.
+    #[test]
+    fn saving_the_cache_never_makes_a_folder_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        std::fs::create_dir(&root).expect("mkdir");
+        let cache = HashCache::default();
+        cache.save(&root).expect("a folder that is there keeps its cache");
+        cache.save(&root).expect("and keeps it again");
+        std::fs::remove_dir_all(&root).expect("the folder goes");
+        cache.save(&root).expect_err("a folder that went is not made again");
+        assert!(!root.exists(), "nothing is left where the folder was");
     }
 
     #[test]

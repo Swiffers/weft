@@ -60,7 +60,21 @@ async fn status(ctx: &Ctx) -> anyhow::Result<()> {
                 println!("  {} ({}): brings back {}", project.name, project.id, left_words(&project.copies, &project.triggers));
             }
         }
-        None => println!("not in maintenance"),
+        None => {
+            println!("not in maintenance");
+            // What a project could not bring back when the last one was
+            // lifted stays down, and is that project's own to bring back.
+            for project in &state.left {
+                println!(
+                    "  {} ({}): still down since the last maintenance: {}; fix what kept it down, then `{}` in its folder \
+                     brings it back",
+                    project.name,
+                    project.id,
+                    left_words(&project.copies, &project.triggers),
+                    ctx.weft("resync")
+                );
+            }
+        }
     }
     let on = state.going.words();
     println!("on now: {}", if on.is_empty() { "nothing" } else { &on });
@@ -144,7 +158,7 @@ async fn off(ctx: &Ctx) -> anyhow::Result<()> {
         .context("read the lift's answer (the install and this CLI disagree on its shape; upgrade one of them)")?;
     let task = match answer {
         LiftAnswer::NotOn => {
-            if !ctx.json_out(&LiftReport { projects: Vec::new(), lifted: true })? {
+            if !ctx.json_out(&LiftReport { projects: Vec::new() })? {
                 println!("the install is not in maintenance; nothing to bring back");
             }
             return Ok(());
@@ -155,39 +169,50 @@ async fn off(ctx: &Ctx) -> anyhow::Result<()> {
     let follow = format!("/install/maintenance/follow/{task}");
     let report: LiftReport = serde_json::from_value(super::follow::follow_at(&client, &follow, |message| eprintln!("{message}")).await?)
         .context("read the lift's report (the install and this CLI disagree on its shape; upgrade one of them)")?;
-    if !ctx.json_out(&report)? {
-        for project in &report.projects {
-            let mut did = Vec::new();
-            if project.rebuilt {
-                did.push("built again on this weft".to_string());
-            }
-            if !project.started.is_empty() {
-                did.push(format!("started infra {}", copy_list(&project.started)));
-            }
-            if !project.turned_on.is_empty() {
-                did.push(format!("turned on {}", weft_core::activation::OwnerTriggers::list_words(&project.turned_on)));
-            }
-            if !did.is_empty() {
-                println!("  {} ({}): {}", project.name, project.id, did.join("; "));
-            }
-            for skipped in &project.skipped {
-                println!("  {} ({}): skipped {skipped}", project.name, project.id);
-            }
-            for failed in &project.failed {
-                eprintln!("  {} ({}): did not come back: {failed}", project.name, project.id);
-            }
+    if ctx.json_out(&report)? {
+        return Ok(());
+    }
+    let mut down = Vec::new();
+    for project in &report.projects {
+        let (did, failed) = lifted_lines(project);
+        if !did.is_empty() {
+            println!("  {} ({}): {}", project.name, project.id, did.join("; "));
+        }
+        for failed in &failed {
+            eprintln!("  {} ({}): did not come back: {failed}", project.name, project.id);
+        }
+        if !failed.is_empty() {
+            down.push(project.name.as_str());
         }
     }
-    if !report.lifted {
-        anyhow::bail!(
-            "the install is still in maintenance: what did not come back (said above) is still recorded; fix it, then run `{}` again",
-            ctx.weft("maintenance off")
+    println!("the maintenance is lifted");
+    if !down.is_empty() {
+        eprintln!(
+            "{} stayed down, without holding anything else: fix what is said above in its folder, then `{}` there brings \
+             back what the update took down (or `{}` what you want left off)",
+            down.join(", "),
+            ctx.weft("resync"),
+            ctx.weft("deactivate")
         );
     }
-    if !ctx.json() {
-        println!("the maintenance is lifted");
-    }
     Ok(())
+}
+
+/// What a lift did in one project, as lines: what came back (and what it
+/// had nothing to do for), then what did not, each with why.
+pub(crate) fn lifted_lines(project: &weft_core::maintenance::ProjectLifted) -> (Vec<String>, Vec<String>) {
+    let mut did = Vec::new();
+    if project.rebuilt {
+        did.push("built again on this weft".to_string());
+    }
+    if !project.started.is_empty() {
+        did.push(format!("started infra {}", copy_list(&project.started)));
+    }
+    if !project.turned_on.is_empty() {
+        did.push(format!("turned on {}", weft_core::activation::OwnerTriggers::list_words(&project.turned_on)));
+    }
+    did.extend(project.skipped.iter().map(|skipped| format!("skipped {skipped}")));
+    (did, project.failed.clone())
 }
 
 /// `weft maintenance check`: fail while something is on, so an update

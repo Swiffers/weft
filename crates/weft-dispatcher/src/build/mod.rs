@@ -273,6 +273,9 @@ impl VersionBuilder {
             .map_err(|errs| anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))?;
         prepare.check(&compiled).await?;
         let name = project.manifest.package.name.clone();
+        // Every file was checked against the version as it was laid out, so
+        // the images are named after the version's own fingerprints.
+        let fingerprints = weft_compiler::hash::Fingerprints::of_version(project.root.clone(), source.manifest.clone());
         let (plan, definition) = tokio::task::spawn_blocking(move || {
             let plan = weft_compiler::build_plan::plan_build_from(
                 &project,
@@ -283,6 +286,7 @@ impl VersionBuilder {
                 &bases,
                 &ImageTags(images.as_ref()),
                 node_set,
+                &fingerprints,
             )
             .map_err(|e| anyhow!("plan the build: {e}"))?;
             Ok::<_, anyhow::Error>((plan, compiled))

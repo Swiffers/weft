@@ -8,7 +8,10 @@
 //! narrows any of them. The resync runs apart from the request that asked
 //! for it, followed in short looks until it ends
 //! (`super::follow::follow_task`). A trigger that is off is never turned on: the answer names it
-//! with the `weft activate` that would.
+//! with the `weft activate` that would. The one exception is what the
+//! install's maintenance took down and could not bring back (the project
+//! did not build on the new weft): that comes back on this build, and the
+//! answer says what came back.
 //!
 //! `weft resync --resume` takes up again a resync that stopped with
 //! triggers down, where it stopped, with the answers and the build it
@@ -59,8 +62,10 @@ async fn answer_of(
     };
     match serde_json::from_value(answer).map_err(unreadable)? {
         ResyncAnswer::Done(done) => Ok(done),
-        ResyncAnswer::UnderWay { task } => {
-            serde_json::from_value(super::follow::follow_task(client, progress, project_id, task).await?).map_err(unreadable)
+        ResyncAnswer::UnderWay { task, brought_back } => {
+            let followed: ResyncResponse =
+                serde_json::from_value(super::follow::follow_task(client, progress, project_id, task).await?).map_err(unreadable)?;
+            Ok(ResyncResponse { brought_back, ..followed })
         }
     }
 }
@@ -92,6 +97,15 @@ async fn run_inner(
 /// brought back (`subject` names the project), the paused runs it moved,
 /// and the triggers it left off with the command that turns each on.
 fn report(ctx: &Ctx, progress: &crate::progress::Progress, answer: &ResyncResponse, subject: &str) {
+    if let Some(back) = &answer.brought_back {
+        let (did, failed) = super::maintenance::lifted_lines(back);
+        if !did.is_empty() {
+            progress.warn(&format!("brought back what the install's update took down: {}", did.join("; ")));
+        }
+        for why in &failed {
+            progress.warn(&format!("still down after the install's update: {why}"));
+        }
+    }
     for line in off_lines(&answer.off, ctx.on()) {
         progress.warn(&line);
     }

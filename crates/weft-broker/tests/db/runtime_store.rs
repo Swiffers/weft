@@ -911,6 +911,17 @@ async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: Pg
     assert_eq!(resume_key, key, "the store's own key, not one the caller guessed");
     assert_eq!(resume_part_size, part_size);
 
+    // Once another publish of the same bytes has claimed the completion, a
+    // begin is told so (the marked "ask again" refusal), not that the key
+    // is being cleared: the asset lands in a moment, and the caller waits
+    // for it by its hash.
+    sqlx::query("UPDATE runtime_file SET status = 'completing' WHERE key = $1").bind(&key).execute(&pool).await.unwrap();
+    assert!(
+        matches!(s.begin_upload(&w, &asset_spec(Some(sha_static)), &big()).await, Err(RuntimeStoreError::Completing(_))),
+        "a begin that meets a completing upload of the same content is told to wait"
+    );
+    sqlx::query("UPDATE runtime_file SET status = 'pending' WHERE key = $1").bind(&key).execute(&pool).await.unwrap();
+
     upload_parts(&s, &bucket, &w, &key, part_size, &bytes::Bytes::from_static(b"weft"), &big())
         .await
         .unwrap();

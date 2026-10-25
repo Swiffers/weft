@@ -1478,6 +1478,14 @@ impl RuntimeStore {
                             .map_err(RuntimeStoreError::Other)?;
                             return Ok(Reserved::Pending(key.clone(), part_size as u64));
                         }
+                        // Another publish of these same bytes has claimed the
+                        // completion: the asset lands in a moment, and the
+                        // caller waits for it (marked, so it knows to).
+                        Some("completing") => {
+                            return Err(RuntimeStoreError::Completing(format!(
+                                "asset '{key}' is being completed by another upload of the same content; it lands shortly"
+                            )));
+                        }
                         Some(status) => {
                             return Err(RuntimeStoreError::Conflict(format!(
                                 "asset '{key}' already exists ({status}); it is being cleared from \

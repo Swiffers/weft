@@ -326,6 +326,12 @@ impl<P: UploadPlane> ContentStore<P> {
             Ok(uploaded) => return Ok(uploaded),
             Err(error) => error,
         };
+        // The begin itself can find another publisher completing these same
+        // bytes (a save the runtime syncs while a command publishes it):
+        // there is no key yet, so the content is waited for by its hash.
+        if upload_key.is_none() && !changed && self.plane.completing(&error) {
+            return self.wait_for_content(hash, error).await;
+        }
         // Any transfer step can lose to another publisher finishing these
         // same content-addressed bytes. When the store said so outright (a
         // "completing" refusal), the file is about to land: wait for it with
@@ -361,6 +367,29 @@ impl<P: UploadPlane> ContentStore<P> {
                     "{error:#}; another publish of {filename} was completing it as {key}, and the file \
                      had not landed after waiting. The store finishes or ends that upload on its own; \
                      run the command again"
+                );
+            };
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+        }
+    }
+}
+
+impl<P: UploadPlane> ContentStore<P> {
+    /// The key of `hash`'s content once another publisher's completion of
+    /// it lands, with the bounded backoff a completion has everywhere
+    /// ([`completing_wait`]); `error` (the refused begin) says why it was
+    /// waited for if it never does.
+    async fn wait_for_content(&self, hash: &str, error: anyhow::Error) -> Result<String> {
+        let mut attempt = 0;
+        loop {
+            if let Some(key) = self.plane.held(&[hash.to_string()]).await.context("ask which contents are already stored")?.keys.remove(hash) {
+                return Ok(key);
+            }
+            let Some(delay) = completing_wait(attempt) else {
+                bail!(
+                    "{error:#}; another publish was completing this content, and it had not landed after waiting. \
+                     The store finishes or ends that upload on its own; run the command again"
                 );
             };
             tokio::time::sleep(delay).await;
@@ -537,8 +566,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl UploadPlane for FakePlane {
-        async fn held(&self, _hashes: &[String]) -> Result<AssetsHeldResponse> {
-            unreachable!("the transfer never asks")
+        async fn held(&self, hashes: &[String]) -> Result<AssetsHeldResponse> {
+            // Only a begin the other publish's completion refused asks.
+            self.calls.lock().unwrap().push("held".into());
+            let mut looks = self.looks.lock().unwrap();
+            *looks += 1;
+            let landed = self.stored_after.is_some_and(|after| *looks > after);
+            Ok(AssetsHeldResponse {
+                keys: hashes.iter().filter(|_| landed).map(|hash| (hash.clone(), "t/asset/k".to_string())).collect(),
+                unheld: Default::default(),
+            })
         }
         async fn begin(&self, _request: AssetUploadBeginRequest) -> Result<UploadBeginResponse> {
             self.step("begin")?;
@@ -705,6 +742,25 @@ mod tests {
                 assert_eq!(store.plane.calls().iter().filter(|c| *c == "meta").count(), 1, "refused at {refused}");
             }
         }
+    }
+
+    /// A save the runtime syncs and a command that publishes it can begin
+    /// the same new content together: the begin that comes second is
+    /// refused as "completing", has no key yet, and waits for the content
+    /// by its hash instead of failing.
+    #[tokio::test]
+    async fn a_begin_refused_as_completing_waits_for_the_content_to_land() {
+        let plane = FakePlane {
+            refuse: Some("begin"),
+            completing: true,
+            stored_after: Some(1),
+            ..FakePlane::new("http://unused", fresh(4))
+        };
+        let store = ContentStore::new(plane);
+        let key = upload(&store, &sha(b"data"), b"data").await;
+        assert_eq!(key.unwrap(), "t/asset/k");
+        assert_eq!(store.plane.calls().iter().filter(|c| *c == "held").count(), 2, "it looked again after waiting");
+        assert!(!store.plane.calls().contains(&"parts".to_string()), "nothing was uploaded: the other publish's copy landed");
     }
 
     /// Two publishes of the same new content: the other one claimed the

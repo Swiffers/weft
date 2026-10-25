@@ -129,7 +129,7 @@ pub fn standard_worker_hash() -> BuildResult<String> {
     }
     let stock = StockProject::materialize()?;
     let root = resolve_weft_root()?;
-    let hash = crate::hash::compute_binary_hash(&stock.definition, &stock.project, &root, &stock.catalog, weft_core::builds::NodeSet::Full)
+    let hash = crate::hash::compute_binary_hash(&stock.definition, &stock.project, &root, &stock.catalog, weft_core::builds::NodeSet::Full, &crate::hash::DISK)
         .map_err(|e| BuildError::Build(format!("compute the standard worker's hash: {e}")))?;
     Ok(HASH.get_or_init(|| hash).clone())
 }
@@ -167,6 +167,7 @@ pub fn build_project(
     fs: crate::CompileFs,
     bases: &worker_image::BaseImages,
     node_set: weft_core::builds::NodeSet,
+    fingerprints: &crate::hash::Fingerprints,
 ) -> BuildResult<StagedImageBuild> {
     let project_root = project.root.as_path();
     // What does not compile is already in the definition as broken parts
@@ -216,7 +217,7 @@ pub fn build_project(
     )?;
 
     let content_hash =
-        crate::hash::compute_binary_hash(definition, project, &weft_root, catalog, node_set)
+        crate::hash::compute_binary_hash(definition, project, &weft_root, catalog, node_set, fingerprints)
             .map_err(|e| BuildError::Build(format!("compute binary hash: {e}")))?;
 
     Ok(StagedImageBuild::new(build_context, content_hash, &dockerfile_summary))

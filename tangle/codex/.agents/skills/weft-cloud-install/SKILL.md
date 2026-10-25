@@ -169,10 +169,19 @@ Upgrading weft on the cloud is `weft maintenance on --on prod` (every
 trigger that is on taken down and the infra that runs stopped, so the old weft
 and the new one never run side by side; the workflow refuses to replace
 anything while something is on), merging upstream into the fork (`gh repo
-sync <fork>`), running the workflow again, then `weft maintenance off --on
-prod` (those projects built again on the new weft, that infra started on
-that build, then those triggers back), then rebuilding
-the user's CLI from that commit (`./setup.sh --cli`). Each program on it with
+sync <fork>`), running the workflow again, rebuilding the user's CLI from
+that commit (`./setup.sh --cli`; an older CLI cannot read what `off`
+answers), then `weft maintenance off --on prod` (those projects built again
+on the new weft, that infra started on that build, then those triggers
+back). If something in a project does
+not come back, `off` says what and why, brings everything
+else back, and still ends the maintenance. If the message says the project's copy of the
+standard nodes is older than this weft, run `weft catalog update` in its
+folder once the user's checkout and CLI are on the new commit, since it copies
+from that checkout (it deletes any edits the user made under
+`nodes/base_catalog/`, so check with them first); otherwise fix what the error
+says. Then `weft resync --on prod` in that folder brings back what the upgrade
+took down. Each program on it with
 infrastructure then needs `weft infra upgrade --on prod`, through the
 deployer: the new weft builds each piece's image anew, and `weft status --on
 prod` marks each infra node `behind the source` until it is done. A program's deploy

@@ -295,7 +295,14 @@ impl ResyncPlan {
     fn answer(self) -> weft_core::deactivation::ResyncResponse {
         let keys: Vec<ActivationKey> = self.owners.iter().flat_map(|owner| owner.keys(&owner.down)).collect();
         let report = crate::take_down::Taken { keys, held: self.held, runs: self.runs, commands: Vec::new(), tokens: Vec::new() }.report(self.take_down);
-        weft_core::deactivation::ResyncResponse { report, urls: self.urls, resynced: self.resynced, moved_runs: self.moved_runs, off: self.off }
+        weft_core::deactivation::ResyncResponse {
+            report,
+            urls: self.urls,
+            resynced: self.resynced,
+            moved_runs: self.moved_runs,
+            off: self.off,
+            brought_back: None,
+        }
     }
 }
 

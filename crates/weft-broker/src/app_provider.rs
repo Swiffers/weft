@@ -200,6 +200,10 @@ impl SharedCredential {
 pub trait AppProvider: Send + Sync {
     /// Every registered OAuth app for `service`, in file order.
     async fn apps(&self, service: &str) -> anyhow::Result<Vec<RegisteredApp>>;
+
+    /// Every service with a registered app that signs a person in (one
+    /// with a consent page, `auth_url`), by name.
+    async fn sign_in_services(&self) -> anyhow::Result<Vec<String>>;
 }
 
 /// The default: apps read from a json file. A missing file means no apps
@@ -472,6 +476,18 @@ impl AppProvider for FileAppProvider {
                 SharedCredential::OauthApp(app) => Some(*app),
                 SharedCredential::ApiKey(_) => None,
             })
+            .collect())
+    }
+
+    async fn sign_in_services(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .snapshot()
+            .await?
+            .into_iter()
+            .filter(|(_, credentials)| {
+                credentials.iter().any(|c| matches!(c, SharedCredential::OauthApp(app) if app.auth_url.is_some()))
+            })
+            .map(|(service, _)| service)
             .collect())
     }
 }

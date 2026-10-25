@@ -194,6 +194,11 @@ impl DispatcherClient {
         Self { base: base.into(), target: None, bearer: operator_key.map(|key| Arc::new(RwLock::new(key))), http }
     }
 
+    /// The install's address, as requests are sent to it.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
     /// The same client, naming the install by `target` when it does not
     /// answer.
     pub fn for_target(mut self, target: Option<&str>) -> Self {

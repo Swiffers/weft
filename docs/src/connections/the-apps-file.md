@@ -102,7 +102,9 @@ Without it, the connect is refused naming the call, the address and `origins`.
 
 You also have to register the callback URL the connect panel shows you as the
 app's redirect URL, and re-register it whenever your public address changes.
-Some providers, Slack among them, only accept https callbacks.
+On a cloud install that happens once, when a domain you add becomes its
+address: `weft domain list` then prints the new callback and the providers to
+give it to. Some providers, Slack among them, only accept https callbacks.
 
 ## Making it take effect
 

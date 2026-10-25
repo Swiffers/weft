@@ -35,6 +35,9 @@ pub const BROKER_CHANNELS: &[&str] = &[
     // A stored file's expiry set sooner than the expiry loop's next look
     // (`crate::runtime_store`).
     crate::runtime_store::FILE_EXPIRY_CHANNEL,
+    // The install's domains, whose certificate decides the address its
+    // links are built on (`weft_task_store::install_address`).
+    weft_task_store::install_address::DOMAINS_CHANNEL,
 ];
 
 pub struct BrokerState {
@@ -84,17 +87,17 @@ pub struct BrokerState {
     /// ever resolves its app here; project metadata never supplies
     /// one (the own door carries the user's own app instead).
     pub app_provider: Arc<dyn crate::app_provider::AppProvider>,
-    /// The address the open internet reaches this weft at, as it is now
-    /// (a quick tunnel's is asked each time). Event subscribe calls tell
-    /// the provider to post to `<it>/events/<service>/<topic>`, and a link
-    /// to a stored file goes through it when its project declares no
+    /// The address the install hands out in its links, and where the open
+    /// internet reaches it as it is now (a quick tunnel's is asked each
+    /// time; the install's domain once its certificate is issued,
+    /// `weft_task_store::install_address`). Event subscribe calls tell the
+    /// provider to post to `<internet>/events/<service>/<topic>`, and a
+    /// link to a stored file goes through it when its project declares no
     /// visitor address; a weft with none refuses those subscriptions
-    /// loudly, naming the fix.
-    pub internet: weft_platform_traits::config::InternetAddress,
-    /// The stable base URL users hit for this weft: a public infra
-    /// endpoint's address hangs off it when the open internet does not
-    /// reach the install ([`Self::front_door`]).
-    pub public_base_url: String,
+    /// loudly, naming the fix. A public infra endpoint's address hangs off
+    /// the stable address when the open internet does not reach the
+    /// install ([`Self::front_door`]).
+    pub address: weft_task_store::install_address::InstallAddress,
     /// The install's own address for a link outside callers open when
     /// neither a site nor the internet carries it (the network address
     /// when one is set): such a link says `public: false`.
@@ -107,8 +110,6 @@ pub struct BrokerState {
     /// What signs and reads the upload slots pages send files through
     /// (`weft_core::storage::slot`).
     pub slot_key: weft_core::storage::slot::SlotKey,
-    /// The process's client for asking a quick tunnel its address.
-    pub http: reqwest::Client,
     /// See [`BrokerSettings::supervisor_booking`].
     pub supervisor_booking: Option<weft_task_store::drain::Booking>,
     /// When the log last said a sender's calls do not read
@@ -125,9 +126,11 @@ pub struct BrokerSettings {
     pub entitlements: Arc<dyn EntitlementSource>,
     pub credentials: Arc<dyn CredentialSource>,
     pub app_provider: Arc<dyn crate::app_provider::AppProvider>,
-    /// The stable base URL users hit for this weft.
-    pub public_base_url: String,
-    /// The address the open internet reaches this weft at, read live.
+    /// The platform's own address for this weft, from the config
+    /// (`InstallConfig::public_url`).
+    pub service_url: String,
+    /// The address the open internet reaches this weft at when no domain
+    /// is the address, read live.
     pub internet: weft_platform_traits::config::InternetAddress,
     pub own_base_url: String,
     pub object_store_public_internet: bool,
@@ -149,14 +152,14 @@ impl BrokerState {
     /// The base URL the OPEN INTERNET reaches this weft at, now, or
     /// `None` when there is none.
     pub async fn internet_base(&self) -> anyhow::Result<Option<String>> {
-        self.internet.current(&self.http).await
+        self.address.internet().await
     }
 
     /// The base a public infra endpoint's address handed to a caller (a
     /// provider's webhook target) is built on: the address the open
-    /// internet reaches this weft at now, else its stable base URL.
+    /// internet reaches this weft at now, else its stable address.
     pub async fn front_door(&self) -> anyhow::Result<String> {
-        Ok(self.internet_base().await?.unwrap_or_else(|| self.public_base_url.clone()))
+        self.address.outside().await
     }
 
     /// Build the broker state over the process's pool and signal watch.
@@ -188,6 +191,7 @@ impl BrokerState {
             settings.object_store.clone(),
             Arc::new(weft_platform_traits::clock::SystemClock),
         ));
+        let address = weft_task_store::install_address::InstallAddress::follow(pool.clone(), &signals, &settings.service_url, settings.internet)?;
         Ok(Arc::new(Self {
             pool,
             lock_pool,
@@ -208,12 +212,10 @@ impl BrokerState {
             entitlements: settings.entitlements,
             credentials: settings.credentials,
             app_provider: settings.app_provider,
-            internet: settings.internet,
-            public_base_url: settings.public_base_url,
+            address,
             own_base_url: settings.own_base_url.trim_end_matches('/').to_string(),
             object_store_public_internet: settings.object_store_public_internet,
             slot_key: settings.slot_key,
-            http: reqwest::Client::new(),
             supervisor_booking: settings.supervisor_booking,
             unreadable_shapes: crate::wire::UnreadableShapes::default(),
         }))

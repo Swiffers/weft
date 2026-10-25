@@ -814,6 +814,7 @@ mod tests {
         };
         let mut info = InstallInfo {
             public_url: "https://w.example.com".into(),
+            service_url: "https://weft-x.a.run.app".into(),
             cloud: Some(CloudInstall::Gcp(GcpInstall {
                 project: "p".into(),
                 region: "us-central1".into(),
@@ -876,6 +877,7 @@ mod tests {
         read.sort();
         let info = weft_core::install::InstallInfo {
             public_url: "https://w".into(),
+            service_url: "https://w".into(),
             cloud: Some(weft_core::install::CloudInstall::Gcp(weft_core::install::GcpInstall {
                 project: String::new(),
                 region: String::new(),

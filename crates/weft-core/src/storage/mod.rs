@@ -1271,6 +1271,47 @@ pub struct AssetUploadBeginRequest {
     pub content_hash: String,
 }
 
+/// `POST /storage/import/begin`: one file copied in from another install
+/// (`weft migrate files`), into the caller's tenant. It keeps the key it
+/// had there, its tenant segment replaced by the caller's, and its
+/// version, birth and lifetime, so a stored-file value naming it still
+/// does. The rest of the upload is the ordinary multipart one.
+// SYNC: FileImportBeginRequest <-> crates/weft-broker/src/runtime_storage.rs admin_import_begin
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileImportBeginRequest {
+    /// The key it had on the install it comes from.
+    pub key: String,
+    pub version: u64,
+    pub mime_type: String,
+    pub filename: String,
+    pub size_bytes: u64,
+    pub created_at_unix: i64,
+    /// Its lifetime there; `None` for a file that does not expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<KeepTtl>,
+}
+
+impl FileImportBeginRequest {
+    /// The begin that copies the file `meta` describes.
+    pub fn of(meta: &StoredFileMeta) -> Self {
+        let keep = match (meta.keep_ttl_secs, meta.keep) {
+            (Some(secs), _) => Some(KeepTtl::Secs { secs }),
+            (None, true) => Some(KeepTtl::Never),
+            (None, false) => None,
+        };
+        Self {
+            key: meta.key.clone(),
+            version: meta.version,
+            mime_type: meta.mime_type.clone(),
+            filename: meta.filename.clone(),
+            size_bytes: meta.size_bytes,
+            created_at_unix: meta.created_at_unix,
+            keep,
+        }
+    }
+}
+
 /// `POST /storage/assets/held`: which of these contents the caller's tenant
 /// already stores, so a publish uploads only the rest. Asked by hash rather
 /// than by listing, so the answer costs what the publish names, never what

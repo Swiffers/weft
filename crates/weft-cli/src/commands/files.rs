@@ -14,7 +14,7 @@ use super::Ctx;
 
 /// Every file in the caller's tenant (the dispatcher takes the tenant
 /// from the credential, so this works outside a project folder too).
-async fn list_files(client: &crate::client::DispatcherClient) -> anyhow::Result<Vec<weft_core::storage::StoredFileMeta>> {
+pub(crate) async fn list_files(client: &crate::client::DispatcherClient) -> anyhow::Result<Vec<weft_core::storage::StoredFileMeta>> {
     let listing: weft_core::storage::ListFilesResponse =
         serde_json::from_value(client.get_json("/storage/files").await?).context("parse files listing")?;
     Ok(listing.files)
@@ -26,11 +26,11 @@ async fn list_files(client: &crate::client::DispatcherClient) -> anyhow::Result<
 /// the leading tenant segment for display, matching, and prefix filters.
 /// The dispatcher re-adds the caller's tenant on the way back in, so the
 /// user never sees or types it.
-fn scope_key(wire_key: &str) -> &str {
+pub(crate) fn scope_key(wire_key: &str) -> &str {
     wire_key.split_once('/').map(|(_tenant, rest)| rest).unwrap_or(wire_key)
 }
 
-fn fmt_size(bytes: u64) -> String {
+pub(crate) fn fmt_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = bytes as f64;
     let mut unit = 0;

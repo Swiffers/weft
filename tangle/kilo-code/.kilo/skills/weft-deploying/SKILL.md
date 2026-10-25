@@ -39,12 +39,63 @@ install, about $18 a month plus $0.008 per GB through it, for as long as the
 install has any domain. weft makes it with the first domain and takes it
 down with the last. So before the first domain, tell the user that price
 and go on only once they agree. With their yes, the deployer runs `weft domain add <name> --on prod
---accept-cost` (without `--accept-cost` the first domain is refused, naming
-the price). It prints the DNS record to set (type `A`, the name, the load
-balancer's address), which the deployer hands back for the user to set at
-their registrar; Google then issues the certificate on its own once it sees
-the record. `weft domain list --on prod`
-shows every domain and its record.
+--accept-cost --no-wait` (without `--accept-cost` the first domain is refused, naming
+the price) and hands back the DNS record it prints: type `A` (or `AAAA`),
+the name, and the load balancer's IP.
+
+You set that record yourself whenever a CLI or an API can.
+`dig NS <zone> +short` says who serves the zone:
+
+- **Cloudflare** (the servers end in `ns.cloudflare.com`): the Cloudflare
+  API, with `curl` and a token that can edit DNS on that zone.
+  `cloudflared` only makes tunnel CNAMEs, never an `A` record, so it is not
+  the tool here. Use `$CLOUDFLARE_API_TOKEN` when it is set. Otherwise ask
+  the user once: "In the Cloudflare dashboard, open My Profile, then API
+  Tokens, create one from the "Edit zone DNS" template for `<zone>`, and add
+  `CLOUDFLARE_API_TOKEN=<the token>` to this project's `.env`." Then load
+  it without printing it (`set -a; . ./.env; set +a;` in front of each
+  call). Every call carries `-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"`:
+  1. the zone's id: `GET https://api.cloudflare.com/client/v4/zones?name=<zone>`;
+  2. what is already on the name: `GET .../zones/<zone id>/dns_records?name=<fqdn>`,
+     and `DELETE .../zones/<zone id>/dns_records/<record id>` for each one that
+     is not the wanted `A` record (a name that pointed at the user's machine
+     through a tunnel has a CNAME to `<tunnel id>.cfargotunnel.com` there);
+  3. the record: `POST .../zones/<zone id>/dns_records` with
+     `{"type":"A","name":"<fqdn>","content":"<ip>","proxied":false,"ttl":1}`
+     (`"AAAA"` when that is the type it printed).
+
+  `"proxied": false` (DNS only, the grey cloud) is required: Google issues
+  the certificate only when the record points straight at the load
+  balancer's IP, with no proxy or CDN in between.
+- **Google Cloud DNS** (servers like `ns-cloud-*.googledomains.com`):
+  `gcloud dns managed-zones list --project <project>` names the zone, then
+  `gcloud dns record-sets create <fqdn>. --zone=<zone> --type=A --ttl=300
+  --rrdatas=<ip> --project <project>`.
+- **Anyone else**: one line to the user, "At <registrar>, add an A record:
+  name `<sub>`, value `<ip>`, and remove any other record on that name."
+
+Once the record is set, dispatch the deployer to watch the certificate.
+`weft domain list --on prod` shows each domain's `certificate: issued`,
+`waiting: <why>`, or `failed: <why> (remove the domain and add it again to
+retry)`, and `--json` gives the same as `domains[].certificate.state`
+(`issued`, `pending` or `failed`, with `why`). It usually takes a few minutes
+once Google sees the record. When it is issued, check it yourself with
+`curl -sI https://<name>/`.
+
+From then on the domain is the install's address: every link weft hands
+out uses it (sign-in callbacks, webhook addresses, file links, `weft
+target export`), and the `run.app` address keeps answering. `weft status
+--on prod` says so: `install address: <url> (it still answers at <run.app
+address> too)`. Two things follow, both from what the deployer reports out
+of `weft domain list --on prod --json` (`liveAddress`, `callbackUrl`,
+`callbackServices`):
+
+- For each service in `callbackServices`, one line to the user: "In your
+  <service> app's dashboard, add `<callbackUrl>` to the allowed redirect
+  URLs." No CLI does this for Google, Meta, TikTok, Whop and the like, so it
+  is always the user's.
+- Run `weft target export prod ...` again, the way it was run before, for
+  any site that talks to the install: `WEFT_PUBLIC_URL` changed.
 
 A domain can serve one project instead of the whole install: `--for api`
 serves that project's routes at the root of the domain
@@ -123,6 +174,9 @@ folder:
 5. Pick the program's connections on prod, every access node
    ([Connections](#connections) below says how), the program's own keys
    included. A node connected on this machine has nothing picked on prod.
+   When this machine already holds them, you copy them across first with
+   `weft migrate connections` (the weft-cloud-install skill, "Moving an app
+   from this machine"): the user never makes them again.
 6. If the program has infrastructure (a database, a bridge), `weft infra
    start --on prod`. It builds the program for prod first, on the
    install's builder (the worker and every piece's image, about 2 minutes
@@ -285,8 +339,12 @@ is made there: `weft connect --on prod --node <node> --list` shows prod's
 stored connections, `--grant <id>` picks one (a live trigger reading it is
 set up again).
 
-A connection prod does not hold yet is added one of two ways:
+A connection prod does not hold yet is added one of three ways:
 
+- **One this machine already holds**: you copy it with `weft migrate
+  connections --to prod --all` (or a narrower pick) from the project folder (the weft-cloud-install
+  skill, "Moving an app from this machine"), never by asking the user for
+  it again. Check this first, with `--dry-run`.
 - **A key the project issued itself**, kept in the project's own `.env`
   (the key that guards its own API, a webhook signing secret): the
   deployer stores it without ever reading it, by naming the variable:

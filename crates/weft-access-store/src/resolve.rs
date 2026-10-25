@@ -562,7 +562,7 @@ pub fn events_recipe_hash(events: &BTreeMap<String, EventsSpec>) -> Option<Strin
 /// hash, so a push is answered by the recipe the connection itself
 /// declared and recipes recorded by different specs stand side by
 /// side. A spec with no topics records nothing.
-pub async fn record_events_recipes(pool: &PgPool, spec: &AccessSpec) -> anyhow::Result<()> {
+pub async fn record_events_recipes(db: impl sqlx::PgExecutor<'_>, spec: &AccessSpec) -> anyhow::Result<()> {
     let Some(hash) = events_recipe_hash(&spec.events) else {
         return Ok(());
     };
@@ -575,7 +575,7 @@ pub async fn record_events_recipes(pool: &PgPool, spec: &AccessSpec) -> anyhow::
     .bind(&hash)
     .bind(serde_json::to_value(&spec.events)?)
     .bind(weft_core::access::events::STORED_EVENTS.version())
-    .execute(pool)
+    .execute(db)
     .await?;
     Ok(())
 }

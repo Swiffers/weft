@@ -68,8 +68,12 @@ fn listener_only(caller: &crate::auth::CallerIdentity) -> Result<(), ApiError> {
 /// teaching error instead of a subscribe that can never deliver. A quick
 /// tunnel that cannot say its address is an error.
 pub async fn receiver_url(state: &BrokerState, service: &str, topic: &str) -> anyhow::Result<Option<String>> {
-    let Some(base) = state.internet_base().await? else { return Ok(None) };
-    Ok(Some(format!("{}/events/{service}/{topic}", base.trim_end_matches('/'))))
+    Ok(state.internet_base().await?.map(|base| receiver_on(&base, service, topic)))
+}
+
+/// The receiver address on `base`.
+fn receiver_on(base: &str, service: &str, topic: &str) -> String {
+    format!("{}/events/{service}/{topic}", base.trim_end_matches('/'))
 }
 
 /// Whether verifying a push under `verify` reads the address the
@@ -337,14 +341,18 @@ async fn verify_and_route(
     };
 
     // The push as the schemes see it. The url is where the provider
-    // was TOLD to post, and that is the receiver's address as it is now:
-    // a push only arrives at the address the provider sends to, and once
-    // the address changes (a quick tunnel's new hostname) the old one is
-    // dead, so a push that arrived was sent to the current one. It is
-    // read only for a scheme that uses it, so no other push pays for
-    // asking a quick tunnel its address.
+    // was TOLD to post, which is the address the push came in at: a
+    // quick tunnel's old hostname is dead once it changes, so a push that
+    // arrived there was sent to the current one, while the platform's own
+    // address keeps answering after the install's domain became the
+    // address, and a provider told it earlier posts there until its
+    // subscription is renewed. It is read only for a scheme that uses it,
+    // so no other push pays for asking a quick tunnel its address.
     let receiver = match uses_receiver_url(&webhook.verify, &receiving_apps) {
-        true => receiver_url(state, &req.service, &req.topic).await.map_err(internal)?,
+        true => {
+            let host = req.headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("host")).map(|(_, host)| host.as_str());
+            state.address.arrived_at(host).await.map_err(internal)?.map(|base| receiver_on(&base, &req.service, &req.topic))
+        }
         false => None,
     };
     let push = weft_core::access::verify::PushParts {

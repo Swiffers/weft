@@ -179,6 +179,7 @@ async fn put_via(
                 content_hash: None,
                 identity: None,
                 slot: None,
+                imported: None,
             },
             budget,
         )
@@ -207,7 +208,7 @@ async fn begin_via(
     match s
         .begin_upload(
             caller,
-            &UploadSpec { scope, mime, filename, keep, declared_size, content_hash: None, identity: None, slot: None },
+            &UploadSpec { scope, mime, filename, keep, declared_size, content_hash: None, identity: None, slot: None, imported: None },
             budget,
         )
         .await?
@@ -291,6 +292,7 @@ async fn an_identified_put_stores_one_file_per_scope(pool: PgPool) {
         content_hash: None,
         identity,
         slot: None,
+        imported: None,
     };
     let BeginUpload::Ready { key, part_size } =
         s.begin_upload(&w, &spec(Some("whatsapp:m1")), &big()).await.expect("first begin")
@@ -821,6 +823,7 @@ async fn assemble_concatenates_existing_objects_into_an_asset(pool: PgPool) {
         content_hash: Some(sha_static),
         identity: None,
         slot: None,
+        imported: None,
     };
     let sources = vec![("chunks/c1".to_string(), 6u64), ("chunks/c2".to_string(), 5u64)];
     let meta = s.assemble(&w, &spec, &sources, &big()).await.unwrap();
@@ -873,6 +876,7 @@ async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: Pg
         content_hash: hash,
         identity: None,
         slot: None,
+        imported: None,
     };
 
     // A missing or malformed hash is refused loud (assets ARE their hash).
@@ -961,6 +965,7 @@ async fn an_asset_whose_bytes_are_not_its_hash_is_refused_and_leaves_nothing(poo
         content_hash: Some(&sha),
         identity: None,
         slot: None,
+        imported: None,
     };
     let BeginUpload::Ready { key, part_size } = s.begin_upload(&w, &spec, &big()).await.unwrap() else {
         panic!("fresh asset content must reserve a real upload");
@@ -1038,6 +1043,7 @@ async fn asset_via(s: &RuntimeStore, bucket: &FakeObjectStore, tenant: &str, id:
         content_hash: Some(&hash),
         identity: None,
         slot: None,
+        imported: None,
     };
     let BeginUpload::Ready { key, part_size } = s.begin_upload(&caller, &spec, &big()).await.unwrap() else {
         panic!("test asset must be new");
@@ -1129,6 +1135,7 @@ async fn an_asset_is_stored_and_charged_once_per_tenant(pool: PgPool) {
         content_hash: Some(&hash),
         identity: None,
         slot: None,
+        imported: None,
     };
     assert_eq!(
         s.begin_upload(&acting("t1"), &spec, &big()).await.unwrap(),
@@ -2188,6 +2195,7 @@ async fn an_expired_file_is_gone_before_the_loop_removes_it(pool: PgPool) {
         content_hash: None,
         identity: Some("source:1"),
         slot: None,
+        imported: None,
     };
     let BeginUpload::Ready { key, part_size } = s.begin_upload(&w, &spec, &big()).await.unwrap() else { panic!("fresh") };
     upload_parts(&s, &bucket, &w, &key, part_size, &body(b"abc"), &big()).await.unwrap();
@@ -2322,6 +2330,7 @@ async fn slot_upload_via(
         content_hash: None,
         identity: None,
         slot: Some(weft_broker::runtime_store::SlotUpload { sid, ends_unix: ends, max_bytes: 1 << 20, accepts: "Video", sha256 }),
+        imported: None,
     };
     match s.begin_slot_upload(&page, &spec, &big()).await.unwrap() {
         BeginUpload::Ready { key, part_size } => {
@@ -2440,6 +2449,7 @@ async fn a_slot_upload_landed_by_a_drive_is_held_to_its_type(pool: PgPool) {
         content_hash: None,
         identity: None,
         slot: Some(weft_broker::runtime_store::SlotUpload { sid: "s1", ends_unix: ends, max_bytes: 1 << 20, accepts: "Video", sha256: None }),
+        imported: None,
     };
     let BeginUpload::Ready { key, part_size } = s.begin_slot_upload(&page, &spec, &big()).await.unwrap() else {
         panic!("a fresh slot begins a fresh upload");
@@ -2527,6 +2537,7 @@ async fn typed_slot_upload(
         content_hash: None,
         identity: None,
         slot: Some(weft_broker::runtime_store::SlotUpload { sid, ends_unix: ends, max_bytes: claims.max_bytes, accepts, sha256: None }),
+        imported: None,
     };
     let BeginUpload::Ready { key, part_size } = s.begin_slot_upload(&page, &spec, &big()).await? else {
         panic!("a fresh slot begins a fresh upload");
@@ -2612,6 +2623,7 @@ async fn a_slot_refuses_a_file_heavier_than_it_takes(pool: PgPool) {
         content_hash: None,
         identity: None,
         slot: Some(slot),
+        imported: None,
     };
     for size in [11, weft_broker::runtime_store::LARGEST_FILE_BYTES + 1] {
         assert!(s.begin_slot_upload(&page, &spec(size), &big()).await.is_err(), "{size}");
@@ -2752,6 +2764,7 @@ async fn a_check_on_a_slot_that_holds_an_upload_is_accepted(pool: PgPool) {
         content_hash: None,
         identity: None,
         slot: Some(weft_broker::runtime_store::SlotUpload { sid, ends_unix: ends, max_bytes: 1 << 20, accepts: "Video", sha256: None }),
+        imported: None,
     };
     let full = budget(Entitlement::from_disk_bytes(MP4.len() as u64));
     s.check_slot_upload(&page, &spec("s1"), &full).await.unwrap();
@@ -2904,6 +2917,7 @@ async fn a_slot_begun_again_while_its_copy_runs_is_told_it_is_completing(pool: P
         content_hash: None,
         identity: None,
         slot: Some(weft_broker::runtime_store::SlotUpload { sid: "s2", ends_unix: ends, max_bytes: 1 << 20, accepts: "Video", sha256: Some(&hash) }),
+        imported: None,
     };
     let (entered, release) = held.hold_next_copy(CopyHold::Before);
     let meanwhile = async {
@@ -3022,6 +3036,7 @@ fn slot_spec<'a>(filename: &'a str, size: u64, sha256: Option<&'a str>, ends: i6
         content_hash: None,
         identity: None,
         slot: Some(weft_broker::runtime_store::SlotUpload { sid: "s1", ends_unix: ends, max_bytes: 1 << 20, accepts: "Video", sha256 }),
+        imported: None,
     }
 }
 
@@ -3173,6 +3188,7 @@ async fn a_run_claim_receives_an_upload_that_landed_while_it_copied(pool: PgPool
         content_hash: None,
         identity: None,
         slot: Some(weft_broker::runtime_store::SlotUpload { sid: "s2", ends_unix: ends, max_bytes: 1 << 20, accepts: "Video", sha256: None }),
+        imported: None,
     };
     let BeginUpload::Ready { key: second, part_size } = s.begin_slot_upload(&page, &spec, &big()).await.unwrap() else {
         panic!("a fresh slot begins");
@@ -3467,4 +3483,45 @@ async fn a_pass_that_marks_then_fails_still_records_the_mark(pool: PgPool) {
     let shown: Option<String> =
         sqlx::query_scalar("SELECT error FROM unanswered_call WHERE callee = 'reaps:'").fetch_optional(&pool).await.unwrap();
     assert!(shown.is_some_and(|e| e.contains(&first.key)), "the mark is written down");
+}
+
+/// A file copied in from another install keeps its key (under this
+/// tenant), its version and its birth; the same copy begun again is
+/// already there; anything else under the key is refused. Only the
+/// tenant's copying caller may name a key like that.
+#[sqlx::test]
+async fn a_copied_file_keeps_its_key_version_and_birth(pool: PgPool) {
+    use weft_broker::runtime_store::ImportedFile;
+    let (s, bucket, _clock) = store(&pool).await;
+    let copying = CallerAuth::Copying { tenant: "t2".into() };
+    let key = weft_core::storage::key::parse_key("t1/project/p1/0b1c").unwrap();
+    let here = weft_core::storage::key::ParsedKey { tenant: "t2".into(), ..key };
+    let bytes = body(b"the notes");
+    let spec = |version, size| UploadSpec {
+        scope: &StorageScope::Project,
+        mime: "text/plain",
+        filename: "notes.txt",
+        keep: None,
+        declared_size: Some(size),
+        content_hash: None,
+        identity: None,
+        slot: None,
+        imported: Some(ImportedFile { key: &here, version, created_at_unix: 1_700_000_000 }),
+    };
+
+    let refused = s.begin_upload(&worker("t2", "p1", None), &spec(3, bytes.len() as u64), &big()).await.unwrap_err();
+    assert!(matches!(refused, RuntimeStoreError::Denied(_)), "{refused:?}");
+    let BeginUpload::Ready { key, part_size } = s.begin_upload(&copying, &spec(3, bytes.len() as u64), &big()).await.unwrap() else {
+        panic!("a new copy is uploaded");
+    };
+    assert_eq!(key, "t2/project/p1/0b1c");
+    upload_parts(&s, &bucket, &copying, &key, part_size, &bytes, &big()).await.unwrap();
+    let meta = s.complete_upload(&copying, &key).await.unwrap();
+    assert_eq!((meta.version, meta.created_at_unix, meta.size_bytes), (3, 1_700_000_000, bytes.len() as u64));
+
+    let again = s.begin_upload(&copying, &spec(3, bytes.len() as u64), &big()).await.unwrap();
+    assert!(matches!(again, BeginUpload::AlreadyStored { key: k } if k == key), "the same copy is already there");
+    let other = s.begin_upload(&copying, &spec(4, bytes.len() as u64), &big()).await.unwrap_err();
+    assert!(matches!(&other, RuntimeStoreError::Conflict(why) if why.contains("weft files rm")), "{other:?}");
+    assert!(bucket.in_progress_uploads().is_empty(), "a refused begin leaves no upload open");
 }

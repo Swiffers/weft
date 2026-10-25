@@ -48,6 +48,13 @@ pub enum CallerAuth {
     /// content-addressed assets and nothing else, so no project, run
     /// or shared file is reachable through it.
     Tenant { tenant: String },
+    /// The dispatcher acting for `tenant` as it copies the tenant's files
+    /// in from another install (`weft migrate files`), on the admin upload
+    /// surface. Each file keeps the key it had there (under this tenant),
+    /// so the caller names every key itself: the wall admits any of the
+    /// tenant's keys and nothing of another tenant's, and no key is ever
+    /// minted for it.
+    Copying { tenant: String },
     /// The dispatcher (install control plane). Used only by the
     /// admin surface (presign, sweep, usage, wipe); the worker file
     /// verbs reject it so the data path stays worker-only.
@@ -147,6 +154,18 @@ pub fn scope_key(scope: &KeyScope, id: &str) -> Result<String, String> {
 }
 
 impl KeyScope {
+    /// The scope a writer names to store a file under this one; an
+    /// instance segment that is no instance id is refused, naming it.
+    pub fn storage_scope(&self) -> Result<StorageScope, String> {
+        Ok(match self {
+            KeyScope::Run { .. } => StorageScope::Run,
+            KeyScope::Project { .. } => StorageScope::Project,
+            KeyScope::Shared { name } => StorageScope::Shared { name: name.clone() },
+            KeyScope::Asset => StorageScope::Asset,
+            KeyScope::Instance { instance, .. } => StorageScope::Instance { of: Some(crate::instance::InstanceId::new(instance)?) },
+        })
+    }
+
     /// Build the scope for a `(tag, owner)` pair, or None if `tag` is not
     /// a known scope tag. The canonical tag -> variant mapping; `parse_key`
     /// routes through here so the grammar and `SCOPE_TAGS` cannot drift.
@@ -416,6 +435,9 @@ fn owned_scope(caller: &CallerAuth, scope: &StorageScope) -> Result<(String, Key
         CallerAuth::ControlPlane => {
             return Err("only workers address scoped files; the control plane uses the admin surface".into());
         }
+        CallerAuth::Copying { .. } => {
+            return Err("a copied file names its own key; none is minted for it".into());
+        }
     };
     let owned = |label: &str, seg: &str| -> Result<String, String> {
         if valid_segment(seg) {
@@ -520,6 +542,12 @@ pub fn check_key_access(caller: &CallerAuth, parsed: &ParsedKey) -> Result<(), S
             return match parsed.scope {
                 KeyScope::Asset => Ok(()),
                 _ => Err("denied: a caller acting for the tenant reaches only the tenant's assets".into()),
+            };
+        }
+        CallerAuth::Copying { tenant } => {
+            return match &parsed.tenant == tenant {
+                true => Ok(()),
+                false => Err(format!("denied: file belongs to tenant '{}', not the copying tenant '{tenant}'", parsed.tenant)),
             };
         }
         // Admin verbs run on dedicated routes; a control-plane call
@@ -688,6 +716,10 @@ mod tests {
         };
         assert!(check_key_access(&other_project, &asset).is_ok());
         assert!(check_key_access(&CallerAuth::ControlPlane, &asset).is_err());
+        let copying = CallerAuth::Copying { tenant: "t1".into() };
+        assert!(check_key_access(&copying, &pk("t1", KeyScope::Project { project_id: "p".into() })).is_ok(), "a copy reaches every key of its tenant");
+        assert!(check_key_access(&copying, &pk("t2", KeyScope::Project { project_id: "p".into() })).is_err(), "and none of another's");
+        assert!(key_for_put(&copying, &StorageScope::Project, "id").is_err(), "and is minted no key");
         // The tenant wall holds: another tenant's worker, or a caller acting
         // for another tenant, is denied the same content.
         let foreign = pk("t2", KeyScope::Asset);

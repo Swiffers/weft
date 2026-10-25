@@ -26,18 +26,20 @@ resource "random_password" "bootstrap_operator_key" {
 locals {
   secrets = merge(
     {
-      WEFT_DATABASE_URL           = var.database_url
+      WEFT_DATABASE_URL           = local.database_url
       CREDENTIAL_ENCRYPTION_KEY   = random_bytes.sealing_key.base64
       WEFT_CALLER_TOKEN_SECRET    = random_id.caller_token_secret.hex
       WEFT_BOOTSTRAP_OPERATOR_KEY = random_password.bootstrap_operator_key.result
     },
-    # Only when the database's address goes through a pooler.
-    { for k, v in { WEFT_DATABASE_LISTEN_URL = var.database_listen_url } : k => v if nonsensitive(v != "") },
+    # Only when the database's address goes through a pooler (never the
+    # install's own Cloud SQL, reached directly).
+    { for k, v in { WEFT_DATABASE_LISTEN_URL = var.database_listen_url } : k => v if !var.cloud_sql && nonsensitive(v != "") },
   )
 }
 
 # Named after the install and the variable without its own `WEFT_`
 # (`weft-caller-token-secret`, not `weft-weft-caller-token-secret`).
+# SYNC: secret_id <-> outputs.tf (database_move's from_secrets)
 # Renaming replaces a secret, which keeps its value (every value comes from
 # this state), and the new one is made before the old one goes, so the
 # roles never point at a secret that is not there.
@@ -57,6 +59,12 @@ resource "google_secret_manager_secret_version" "install" {
   for_each    = nonsensitive(toset(keys(local.secrets)))
   secret      = google_secret_manager_secret.install[each.value].id
   secret_data = local.secrets[each.value]
+  lifecycle {
+    precondition {
+      condition     = nonsensitive(local.database_url != "")
+      error_message = "the install has no database: set the repository secret WEFT_DATABASE_URL to a Postgres, or the repository variable WEFT_DATABASE to cloud_sql for one of its own"
+    }
+  }
 }
 
 # The roles read every secret.

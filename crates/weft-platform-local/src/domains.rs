@@ -24,4 +24,12 @@ impl DomainHosting for NoDomains {
     fn cost(&self) -> Option<&'static str> {
         None
     }
+
+    /// It serves no name, so it holds no certificate.
+    async fn certified(&self, names: &[String]) -> anyhow::Result<std::collections::BTreeMap<String, weft_core::install::Certificate>> {
+        Ok(names
+            .iter()
+            .map(|n| (n.clone(), weft_core::install::Certificate::Failed { why: "a local install has no door to hold a certificate".into() }))
+            .collect())
+    }
 }

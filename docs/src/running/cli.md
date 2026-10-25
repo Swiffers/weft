@@ -318,7 +318,7 @@ naming those flags.
 | `weft frontend rm <name> [--force]` | Removes one: its tokens stop working, and a service the install made for it is deleted. `--force` forgets it even when the service cannot be removed, naming what stays |
 | `weft frontend token <name> [--done <id>]` | A new token, beside the one it has, with its id; `--done <id>` once that token is in place retires every other token of the frontend |
 | `weft domain add <name>` | Makes a cloud install answer at a domain you own: prints the DNS record to set and waits until it points there. `--for api` serves the project's routes there instead, `--for frontend --to <address>` its frontend. `--no-wait` returns after printing the record. The first domain makes a load balancer that is billed while any domain exists, so it needs `--accept-cost` ([your own domain](cloud.md#your-own-domain)) |
-| `weft domain list` | Every domain, with its DNS record |
+| `weft domain list` | Every domain, with its DNS record and where its certificate stands, the address the install's links use, and the sign-in callback to give your providers once a domain is that address |
 | `weft domain rm <name>` | Stops answering at it; the last one takes the load balancer down |
 | `weft workers` | The project's worker settings: copies kept warm, the most copies, how many calls Cloud Run sends one copy at once (`concurrency`), CPU, memory, how long a copy holds on to things its runs share, such as a database pool, after nothing uses them (`shared_idle_seconds`), how many calls and events one copy takes at once (`max_runs_at_once`) and how long a call waits when it is full (`max_queue_wait_seconds`; for both, go and read [when a worker is full](architecture.md#when-a-worker-is-full)). It shows which the project sets and which come from the install. CPU and memory only apply on a cloud install, where an unset CPU means one CPU; on your machine no worker is capped |
 | `weft workers set --min-instances 1 ...` | Changes settings for this project. On a cloud install, calls after the change go to workers that have them, and a worker started before finishes what it runs and then stops. On your machine, the worker at the project's own address keeps its port, and keeps answering there, until it has nothing left running; then it is stopped and a worker with the new settings takes the port |
@@ -328,6 +328,8 @@ naming those flags.
 
 | Command | What it does |
 |---|---|
+| `weft migrate connections --to <target>` | Copies saved connections to another install, their secrets sealed to it. Name what: `--all`, `--id`, `--since`/`--until`, `--service`, `--project`; `--dry-run` copies nothing ([moving to the cloud](cloud.md#moving-from-your-machine-to-the-cloud)) |
+| `weft migrate files --to <target>` | Copies stored files to another install, keeping each one's key, version and lifetime. Name what: `--all`, `--id`, `--since`/`--until`, `--prefix`; `--dry-run` copies nothing |
 | `weft files ls [<prefix>]` | Everything stored, grouped by space |
 | `weft files inspect <key>` | One file's full metadata |
 | `weft files download <key> [-o <path>]` | Streams it out. A failed download never leaves a half file behind |

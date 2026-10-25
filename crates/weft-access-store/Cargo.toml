@@ -34,6 +34,9 @@ jsonwebtoken = { workspace = true }
 rand = "0.8"
 # At-rest sealing of stored credential material (crypt.rs).
 aes-gcm = { workspace = true }
+# Sealing connections to another install (transfer.rs): ECDH on P-256,
+# its secret drawn into an AES key with HKDF-SHA256.
+p256 = { workspace = true, features = ["ecdh"] }
 weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [dev-dependencies]

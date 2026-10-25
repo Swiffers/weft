@@ -9,7 +9,10 @@
 //! project's frontend). That something can cost money while it stands, so
 //! it stands only while the install has a domain.
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
+use weft_core::install::Certificate;
 
 #[async_trait]
 pub trait DomainHosting: Send + Sync {
@@ -26,6 +29,12 @@ pub trait DomainHosting: Send + Sync {
     /// What the door costs while it stands, in words a person can weigh
     /// before adding the first domain; `None` when it costs nothing.
     fn cost(&self) -> Option<&'static str>;
+
+    /// Whether the door holds an issued certificate for each of `names`
+    /// (names it serves, lower case), by name. A link on a name is handed
+    /// out only once its certificate is issued: before that, whoever opens
+    /// it meets a TLS error.
+    async fn certified(&self, names: &[String]) -> anyhow::Result<BTreeMap<String, Certificate>>;
 }
 
 /// Records every call and puts every door at one made-up address.
@@ -36,6 +45,11 @@ pub mod fake {
     #[derive(Default)]
     pub struct FakeDomainHosting {
         pub served: parking_lot::Mutex<Vec<Vec<String>>>,
+        /// What [`DomainHosting::certified`] answers per name; a name not
+        /// set is pending.
+        pub certificates: parking_lot::Mutex<BTreeMap<String, Certificate>>,
+        /// Every set of names asked about.
+        pub asked: parking_lot::Mutex<Vec<Vec<String>>>,
     }
 
     pub const FAKE_DOOR: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(34, 1, 2, 3));
@@ -53,6 +67,12 @@ pub mod fake {
 
         fn cost(&self) -> Option<&'static str> {
             Some("a made-up price")
+        }
+
+        async fn certified(&self, names: &[String]) -> anyhow::Result<BTreeMap<String, Certificate>> {
+            self.asked.lock().push(names.to_vec());
+            let set = self.certificates.lock();
+            Ok(names.iter().map(|n| (n.clone(), set.get(n).cloned().unwrap_or(Certificate::Pending { why: None }))).collect())
         }
     }
 }

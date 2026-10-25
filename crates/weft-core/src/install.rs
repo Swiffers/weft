@@ -21,9 +21,14 @@ pub const VERSION_NOTE_HEADER: &str = "x-weft-version-note";
 #[serde(deny_unknown_fields)]
 pub struct InstallInfo {
     /// Where people and providers reach the install
-    /// (`https://weft.example.com`).
+    /// (`https://weft.example.com`): its domain once that domain's
+    /// certificate is issued, else the platform's own address.
     #[serde(rename = "publicUrl")]
     pub public_url: String,
+    /// The platform's own address (a Cloud Run service's `run.app` name),
+    /// which keeps answering whatever domain the install has.
+    #[serde(rename = "serviceUrl")]
+    pub service_url: String,
     /// The cloud the install runs on, `None` on a local one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud: Option<CloudInstall>,
@@ -115,18 +120,56 @@ impl DomainServes {
     }
 }
 
+/// Where the certificate the install's door holds for a domain stands.
+/// A link on a domain is handed out only once its certificate is issued:
+/// before that, whoever opens it meets a TLS error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Certificate {
+    /// Issued: the domain answers over https.
+    Issued,
+    /// Not issued yet, and the authority is still trying; `why` says what
+    /// it waits on when it says (usually the DNS record).
+    Pending {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        why: Option<String>,
+    },
+    /// The authority gave up. Removing the domain and adding it again
+    /// asks anew.
+    Failed { why: String },
+}
+
 /// A stored domain and the DNS record that points it at the install:
-/// what `GET /install/domains` lists and `POST /install/domains` answers.
+/// what `GET /install/domains` lists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainEntry {
     pub domain: Domain,
     pub record: DnsRecord,
+    pub certificate: Certificate,
 }
 
 /// What `GET /install/domains` answers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainList {
     pub domains: Vec<DomainEntry>,
+    /// The address the install hands out in its links now: its domain
+    /// once that domain's certificate is issued, else the platform's own.
+    #[serde(rename = "liveAddress")]
+    pub live_address: String,
+    /// Where a provider sends a person back after they sign in
+    /// (`<liveAddress>/access/oauth/callback`): what each provider's app
+    /// must list once the address moves to a domain.
+    #[serde(rename = "callbackUrl")]
+    pub callback_url: String,
+    /// The services with a sign-in on this install (an app of their own
+    /// on a connection, or a shared app in the apps file): the providers
+    /// whose app must list [`Self::callback_url`].
+    #[serde(rename = "callbackServices")]
+    pub callback_services: Vec<String>,
+    /// Why the certificates could not be asked after just now, when they
+    /// could not: each domain's then says what was last recorded.
+    #[serde(default, rename = "certificatesUnread", skip_serializing_if = "Option::is_none")]
+    pub certificates_unread: Option<String>,
     /// Why the platform's door refused to follow the stored domains, while
     /// it keeps refusing. The install tries again on its own, less often
     /// each time; what it says is usually something a person has to fix.
@@ -254,6 +297,7 @@ mod tests {
     fn a_cloud_install_round_trips_and_a_local_one_is_small() {
         let gcp = InstallInfo {
             public_url: "https://weft.example.com".into(),
+            service_url: "https://weft-x.a.run.app".into(),
             cloud: Some(CloudInstall::Gcp(GcpInstall {
                 project: "p".into(),
                 region: "us-central1".into(),
@@ -270,9 +314,13 @@ mod tests {
         assert_eq!(v["cloud"]["provider"], "gcp");
         assert_eq!(v["cloud"]["subnet"], "weft");
         assert_eq!(v["source"]["repository"], "me/weft");
+        assert_eq!(v["serviceUrl"], "https://weft-x.a.run.app");
         assert_eq!(serde_json::from_value::<InstallInfo>(v).unwrap(), gcp);
-        let local = InstallInfo { public_url: "http://127.0.0.1:14112".into(), cloud: None, source: None };
-        assert_eq!(serde_json::to_value(&local).unwrap(), serde_json::json!({ "publicUrl": "http://127.0.0.1:14112" }));
-        assert!(serde_json::from_value::<InstallInfo>(serde_json::json!({ "publicUrl": "x", "typo": 1 })).is_err());
+        let local = InstallInfo { public_url: "http://127.0.0.1:14112".into(), service_url: "http://127.0.0.1:14112".into(), cloud: None, source: None };
+        assert_eq!(
+            serde_json::to_value(&local).unwrap(),
+            serde_json::json!({ "publicUrl": "http://127.0.0.1:14112", "serviceUrl": "http://127.0.0.1:14112" })
+        );
+        assert!(serde_json::from_value::<InstallInfo>(serde_json::json!({ "publicUrl": "x", "serviceUrl": "x", "typo": 1 })).is_err());
     }
 }

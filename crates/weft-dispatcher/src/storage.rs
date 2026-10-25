@@ -385,6 +385,15 @@ pub async fn upload_begin(
     .await
 }
 
+/// Begin copying one file into `tenant` from another install.
+pub async fn import_begin(
+    state: &DispatcherState,
+    tenant: &str,
+    req: weft_core::storage::FileImportBeginRequest,
+) -> Result<UploadBeginResponse> {
+    post_admin(state, "/v1/storage/admin/import/begin", "import-begin", &Tenanted { tenant: tenant.to_string(), inner: req }).await
+}
+
 /// Which of the named contents `tenant` already stores: a publish's diff.
 pub async fn assets_held(
     state: &DispatcherState,
@@ -495,8 +504,11 @@ impl weft_assets::upload::UploadPlane for InstallUploads<'_> {
         assets_held(self.state, &self.tenant, AssetsHeldRequest { hashes: hashes.to_vec() }).await
     }
 
-    async fn begin(&self, request: AssetUploadBeginRequest) -> Result<UploadBeginResponse> {
-        upload_begin(self.state, &self.tenant, request).await
+    async fn begin(&self, request: weft_assets::upload::Begin) -> Result<UploadBeginResponse> {
+        match request {
+            weft_assets::upload::Begin::Asset(request) => upload_begin(self.state, &self.tenant, request).await,
+            weft_assets::upload::Begin::Copy(request) => import_begin(self.state, &self.tenant, request).await,
+        }
     }
 
     async fn resume(&self, key: &str) -> Result<UploadResumeResponse> {

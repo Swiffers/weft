@@ -51,6 +51,7 @@ pub mod live;
 #[cfg(feature = "runtime")]
 pub mod live_event;
 pub mod maintenance;
+pub mod migrate;
 pub mod picks;
 pub mod ports;
 #[cfg(feature = "runtime")]

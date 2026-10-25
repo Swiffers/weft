@@ -18,16 +18,18 @@
 mod crypt;
 mod flows;
 pub mod instance_tokens;
+pub mod migrate;
 mod picks;
 mod resolve;
 mod subscriptions;
+mod transfer;
 
 pub use crypt::{open_json, open_str, seal_json, seal_str};
 
 pub use flows::{
     begin_oauth, begin_picker, own_connection_gate, change_instance_values, complete_oauth, connection_handle, connect_direct, delete_grant,
     delete_published_grants, finish_picker, forget_instance_grants, forget_project_access, list_grants, load_picker,
-    instance_connection_counts, instance_value_counts, instance_values, publish_grant, published_connection,
+    instance_connection_counts, instance_value_counts, instance_values, own_sign_in_services, publish_grant, published_connection,
     ConnectionValue, InstanceValueWrite,
     take_connect_result, BeginPicker, GrantOwnerScope, OAuthComplete, PickerSession,
     PublishAccess, write_pushed_values,
@@ -153,6 +155,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         "access_connect",
         "access_picker",
         "access_connect_result",
+        "access_transfer_key",
         "signal_subscription",
         "service_events_recipe",
     ],
@@ -373,6 +376,18 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         );
         CREATE INDEX IF NOT EXISTS access_connect_result_created
             ON access_connect_result (created_at);
+        -- A key pair `weft migrate connections` made on this install, the
+        -- one connections move TO: the source seals them to its public
+        -- half, and only this install opens them, with the private half
+        -- kept here (any dispatcher or broker copy may take the batch).
+        -- Used once, gone after its time (`migrate.rs`).
+        CREATE TABLE IF NOT EXISTS access_transfer_key (
+            id UUID PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            -- SEALED (crypt.rs).
+            secret_sealed TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
         -- One provider-side event subscription serving one registered
         -- signal: the id + token weft minted, what the provider
         -- answered (its resource id, the expiry), and which signal it

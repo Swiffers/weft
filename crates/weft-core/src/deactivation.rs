@@ -80,7 +80,13 @@ pub struct DeactivateResponse {
 #[serde(rename_all = "camelCase")]
 pub enum ResyncAnswer {
     Done(ResyncResponse),
-    UnderWay { task: uuid::Uuid },
+    UnderWay {
+        task: uuid::Uuid,
+        /// What the install's maintenance had left down in the project and
+        /// the resync brought back first ([`ResyncResponse::brought_back`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        brought_back: Option<crate::maintenance::ProjectLifted>,
+    },
 }
 
 /// What one look at a task a person follows answers
@@ -97,7 +103,7 @@ pub enum Following {
 /// `POST /projects/{id}/deactivate`: the take-down's answers and which
 /// activations: the named triggers (every one when none is) of the
 /// owners named (the shared ones when none is).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct DeactivateRequest {
     #[serde(flatten)]
     pub choice: TakeDownChoice,
@@ -110,7 +116,7 @@ pub struct DeactivateRequest {
 /// which: the named triggers (every one when none is) of the owners named
 /// (the shared ones when none is), of which only those on and behind the
 /// build are refreshed. They come back at once on the new build.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ResyncRequest {
     #[serde(flatten)]
     pub build: BuildHashes,
@@ -136,6 +142,11 @@ pub struct ResyncResponse {
     /// Triggers of the new build that are off, by owner.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub off: Vec<OwnerTriggers>,
+    /// What the install's maintenance took down in the project and could
+    /// not bring back then (its code did not build on the new weft), brought
+    /// back first on this build: what came back, and what still did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brought_back: Option<crate::maintenance::ProjectLifted>,
 }
 
 /// How a person reads one owner's triggers: "the program's triggers" or

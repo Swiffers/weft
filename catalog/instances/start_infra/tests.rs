@@ -37,7 +37,7 @@ async fn starts_the_instances_copy(rig: FakeRig) -> WeftResult<()> {
     let calls = rig.program_calls();
     assert_eq!(calls.len(), 2, "the start, then one look that found it running");
     match &calls[0] {
-        (ProgramCall::InfraStart { node, instance }, StopSelf::Keep) => {
+        (ProgramCall::Infra(weft::program::infra::InfraCall::Start { node, instance }), StopSelf::Keep) => {
             assert_eq!(node, "bridge");
             assert_eq!(instance.as_ref().map(|i| i.as_str()), Some("user-42"));
         }
@@ -54,7 +54,7 @@ async fn starts_the_programs_own_copy(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(calls.len(), 2, "the start, then one look that found it running: {calls:?}");
     for (call, _) in &calls {
         match call {
-            ProgramCall::InfraStart { node, instance } | ProgramCall::InfraStatus { node, instance } => {
+            ProgramCall::Infra(weft::program::infra::InfraCall::Start { node, instance } | weft::program::infra::InfraCall::Status { node, instance }) => {
                 assert_eq!(node, "bridge");
                 assert!(instance.is_none(), "the program's own copy: {call:?}");
             }
@@ -109,7 +109,7 @@ async fn stopped_while_waiting(rig: FakeRig) -> WeftResult<()> {
     rig.signal(json!({}));
     let err = rig.run(&StartInfraNode, json!({ "node": "bridge", "instance": "user-42" })).await.failure()?;
     assert!(err.contains("took it down"), "{err}");
-    let starts = rig.program_calls().iter().filter(|(call, _)| matches!(call, ProgramCall::InfraStart { .. })).count();
+    let starts = rig.program_calls().iter().filter(|(call, _)| matches!(call, ProgramCall::Infra(weft::program::infra::InfraCall::Start { .. }))).count();
     assert_eq!(starts, 1, "a stop while waiting is never undone by a second start");
     Ok(())
 }
@@ -127,7 +127,7 @@ async fn refused_for_now(rig: FakeRig) -> WeftResult<()> {
     rig.answer_program_call("weft.infra.status", running());
     rig.signal(json!({}));
     let outcome = rig.run(&StartInfraNode, json!({ "node": "bridge", "instance": "user-42" })).await.ok()?;
-    let starts = rig.program_calls().iter().filter(|(call, _)| matches!(call, ProgramCall::InfraStart { .. })).count();
+    let starts = rig.program_calls().iter().filter(|(call, _)| matches!(call, ProgramCall::Infra(weft::program::infra::InfraCall::Start { .. }))).count();
     assert_eq!(starts, 2, "asked again after the wait");
     assert_eq!(rig.awaited_signals().len(), 1);
     assert_eq!(outcome.outputs["done"], json!(true));
@@ -141,7 +141,7 @@ async fn without_waiting(rig: FakeRig) -> WeftResult<()> {
         .ok()?;
     let calls = rig.program_calls();
     assert_eq!(calls.len(), 1, "the start only, no look at the copy: {calls:?}");
-    assert!(matches!(&calls[0], (ProgramCall::InfraStart { .. }, StopSelf::Keep)), "{calls:?}");
+    assert!(matches!(&calls[0], (ProgramCall::Infra(weft::program::infra::InfraCall::Start { .. }), StopSelf::Keep)), "{calls:?}");
     assert!(rig.awaited_signals().is_empty());
     assert_eq!(outcome.outputs["done"], json!(true));
     Ok(())
@@ -157,7 +157,7 @@ async fn without_waiting_refused_for_now(rig: FakeRig) -> WeftResult<()> {
         .ok()?;
     let calls = rig.program_calls();
     assert_eq!(calls.len(), 2, "asked again after the wait, then done without a look: {calls:?}");
-    assert!(calls.iter().all(|(call, _)| matches!(call, ProgramCall::InfraStart { .. })), "{calls:?}");
+    assert!(calls.iter().all(|(call, _)| matches!(call, ProgramCall::Infra(weft::program::infra::InfraCall::Start { .. }))), "{calls:?}");
     assert_eq!(rig.awaited_signals().len(), 1);
     assert_eq!(outcome.outputs["done"], json!(true));
     Ok(())

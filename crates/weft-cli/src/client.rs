@@ -352,10 +352,14 @@ impl DispatcherClient {
     /// the route) still fails loudly through `check`, so a missing
     /// route can never read as "not registered yet".
     pub async fn get_json_if_found(&self, path: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        self.get_json_unless_marked(path, "x-weft-not-found").await
+    }
+
+    /// [`Self::get_json_if_found`] for a route whose 404 carries its own
+    /// marker header (`marker`), saying which absence it is.
+    pub async fn get_json_unless_marked(&self, path: &str, marker: &str) -> anyhow::Result<Option<serde_json::Value>> {
         let resp = self.send(reqwest::Method::GET, path, None).await?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND
-            && resp.headers().contains_key("x-weft-not-found")
-        {
+        if resp.status() == reqwest::StatusCode::NOT_FOUND && resp.headers().contains_key(marker) {
             return Ok(None);
         }
         Ok(Some(self.answer(resp).await?))

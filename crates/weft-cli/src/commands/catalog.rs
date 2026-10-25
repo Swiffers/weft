@@ -28,7 +28,7 @@ pub async fn preload(ctx: Ctx, key_stdin: bool) -> Result<()> {
 /// Store the installed standard library in the tenant's assets, so the
 /// first version of the first project finds every `nodes/base_catalog/`
 /// file already stored and uploads none of it. The files are exactly the
-/// ones `weft new` seeds, published the way a version snapshot publishes
+/// ones `weft new` seeds, published the way a folder's files are
 /// (hashed, verified, and only what the tenant lacks is sent), so a re-run
 /// stores nothing new. Until a project references them they sit on the
 /// store's ordinary countdown, like any upload nothing references yet.
@@ -36,7 +36,7 @@ pub async fn preload_standard_library(client: &crate::client::DispatcherClient) 
     let seeded = tempfile::tempdir().context("make a folder to lay the standard library out in")?;
     weft_compiler::project::seed_base_catalog(seeded.path())
         .map_err(|e| anyhow::anyhow!("lay out the installed standard library: {e}"))?;
-    let paths = super::versions::covered_paths(seeded.path())?;
+    let paths = weft_assets::tree::covered_paths(seeded.path())?;
     let source = super::assets::DiskSource::new(seeded.path().to_path_buf());
     let store = super::assets::DispatcherStore::new(client);
     weft_assets::publish_files(&paths, &source, &store).await?;

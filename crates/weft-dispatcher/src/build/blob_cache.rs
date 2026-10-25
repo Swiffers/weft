@@ -9,7 +9,8 @@
 //! One tenant naming a hash another tenant stored never gets those bytes.
 //!
 //! Bounded: after each fill the least recently used blobs (by mtime, which
-//! a hit refreshes) go until the cache fits under its cap.
+//! a hit refreshes) go until the cache fits under its cap, and a blob over
+//! a tenth of the cap is never kept ([`BlobCache::largest_kept`]).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -43,31 +44,68 @@ impl BlobCache {
         Ok(self.dir.join(tenant))
     }
 
-    /// The bytes `tenant` stored under `hash`, or `None` when this replica
-    /// has not kept them for that tenant (never fetched, or evicted). A hit
-    /// counts as a use. `hash` must already be checked as a content hash.
-    pub fn get(&self, tenant: &str, hash: &str) -> Result<Option<Vec<u8>>> {
+    /// The largest blob this cache keeps: a tenth of its cap. Keeping one
+    /// near the cap would evict most of what is kept for a single file, so
+    /// a big one is fetched from the store each time it is needed instead.
+    pub fn largest_kept(&self) -> u64 {
+        self.cap_bytes / 10
+    }
+
+    /// Copy the blob `tenant` stored under `hash` to a new file at `dest`:
+    /// true on a hit (which counts as a use), false when this replica has
+    /// not kept it for that tenant (never fetched, too big to keep, or
+    /// evicted). `hash` must already be checked as a content hash. A copy
+    /// that fails midway removes what it wrote.
+    pub fn get_into(&self, tenant: &str, hash: &str, dest: &Path) -> Result<bool> {
         let path = self.tenant_dir(tenant)?.join(hash);
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                touch(&path);
-                Ok(Some(bytes))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("read cached blob {}", path.display())),
+        // Open before copying: once open, an eviction meanwhile cannot
+        // take the bytes from under the copy.
+        let mut blob = match std::fs::File::open(&path) {
+            Ok(blob) => blob,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e).with_context(|| format!("read cached blob {}", path.display())),
+        };
+        let copied = std::fs::File::create_new(dest)
+            .with_context(|| format!("create {}", dest.display()))
+            .and_then(|mut out| {
+                std::io::copy(&mut blob, &mut out).with_context(|| format!("copy cached blob {} to {}", path.display(), dest.display()))
+            });
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(dest);
+            return Err(e);
+        }
+        touch(&path);
+        Ok(true)
+    }
+
+    /// Drop the blob `tenant` stored under `hash`: one whose bytes did not
+    /// hash to its name when it was read. Nothing kept is no error.
+    pub fn forget(&self, tenant: &str, hash: &str) -> Result<()> {
+        let path = self.tenant_dir(tenant)?.join(hash);
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).with_context(|| format!("remove cached blob {}", path.display())),
+            _ => Ok(()),
         }
     }
 
-    /// Keep `bytes`, fetched from `tenant`'s assets and already verified to
-    /// hash to `hash`. Written to a private file (a dot name, which eviction
-    /// leaves alone while it is fresh) and renamed into place, so a reader
-    /// never sees half a blob.
-    pub fn put(&self, tenant: &str, hash: &str, bytes: &[u8]) -> Result<()> {
+    /// Keep a copy of the file at `src`, fetched from `tenant`'s assets and
+    /// already verified to hash to `hash`, unless it is larger than
+    /// [`Self::largest_kept`]. Written to a private file (a dot name, which
+    /// eviction leaves alone while it is fresh) and renamed into place, so
+    /// a reader never sees half a blob.
+    pub fn put_from(&self, tenant: &str, hash: &str, src: &Path) -> Result<()> {
         let dir = self.tenant_dir(tenant)?;
+        let len = std::fs::metadata(src).with_context(|| format!("stat {}", src.display()))?.len();
+        if len > self.largest_kept() {
+            return Ok(());
+        }
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         let tmp = dir.join(format!("{TEMP_PREFIX}{hash}.{}", uuid::Uuid::new_v4().simple()));
         let blob = dir.join(hash);
-        std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
+        if let Err(e) = std::fs::copy(src, &tmp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("copy {} to {}", src.display(), tmp.display()));
+        }
         match std::fs::rename(&tmp, &blob) {
             Ok(()) => Ok(()),
             // Our private file is gone (only a stale-temp sweep removes
@@ -182,23 +220,53 @@ fn touch(path: &Path) {
 mod tests {
     use super::*;
 
+    /// A file holding `bytes` under `dir`, to keep from.
+    fn file(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(format!("src.{name}"));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// What the cache hands back for `hash`, read from the copy it made.
+    fn got(cache: &BlobCache, tenant: &str, hash: &str) -> Option<Vec<u8>> {
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("out");
+        cache.get_into(tenant, hash, &dest).unwrap().then(|| std::fs::read(&dest).unwrap())
+    }
+
+    /// Kept through a cache whose cap keeps everything, evicted through a
+    /// view of the same directory capped at 10 bytes.
     #[test]
     fn a_kept_blob_comes_back_and_the_cap_evicts_the_oldest() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = BlobCache::new(dir.path().join("c"), 10);
-        assert_eq!(cache.get("t", "a").unwrap(), None);
-        cache.put("t", "a", b"123456").unwrap();
+        let keep = BlobCache::new(dir.path().join("c"), u64::MAX);
+        let tight = BlobCache::new(dir.path().join("c"), 10);
+        assert_eq!(got(&keep, "t", "a"), None);
+        keep.put_from("t", "a", &file(dir.path(), "a", b"123456")).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        cache.put("t", "b", b"7890").unwrap();
-        cache.evict().unwrap();
-        assert_eq!(cache.get("t", "a").unwrap().as_deref(), Some(&b"123456"[..]));
+        keep.put_from("t", "b", &file(dir.path(), "b", b"7890")).unwrap();
+        tight.evict().unwrap();
+        assert_eq!(got(&keep, "t", "a").as_deref(), Some(&b"123456"[..]));
         // "a" was just used, so "b" is the oldest once "c" overflows.
         std::thread::sleep(std::time::Duration::from_millis(20));
-        cache.put("t", "c", b"xy").unwrap();
+        keep.put_from("t", "c", &file(dir.path(), "c", b"xy")).unwrap();
+        tight.evict().unwrap();
+        assert_eq!(got(&keep, "t", "b"), None);
+        assert!(got(&keep, "t", "a").is_some());
+        assert!(got(&keep, "t", "c").is_some());
+    }
+
+    /// A blob over a tenth of the cap is never kept, so one big file
+    /// cannot flush everything else the cache holds.
+    #[test]
+    fn a_blob_over_a_tenth_of_the_cap_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = BlobCache::new(dir.path().join("c"), 100);
+        cache.put_from("t", "small", &file(dir.path(), "small", &[1; 10])).unwrap();
+        cache.put_from("t", "big", &file(dir.path(), "big", &[2; 11])).unwrap();
         cache.evict().unwrap();
-        assert_eq!(cache.get("t", "b").unwrap(), None);
-        assert!(cache.get("t", "a").unwrap().is_some());
-        assert!(cache.get("t", "c").unwrap().is_some());
+        assert_eq!(got(&cache, "t", "big"), None);
+        assert_eq!(got(&cache, "t", "small"), Some(vec![1; 10]));
     }
 
     /// A blob one tenant's build fetched is never another tenant's hit, even
@@ -207,10 +275,10 @@ mod tests {
     fn a_kept_blob_is_its_tenants_only() {
         let dir = tempfile::tempdir().unwrap();
         let cache = BlobCache::new(dir.path().join("c"), u64::MAX);
-        cache.put("alice", "h", b"bytes").unwrap();
-        assert_eq!(cache.get("alice", "h").unwrap().as_deref(), Some(&b"bytes"[..]));
-        assert_eq!(cache.get("bob", "h").unwrap(), None);
-        assert!(cache.get("../alice", "h").is_err());
+        cache.put_from("alice", "h", &file(dir.path(), "h", b"bytes")).unwrap();
+        assert_eq!(got(&cache, "alice", "h").as_deref(), Some(&b"bytes"[..]));
+        assert_eq!(got(&cache, "bob", "h"), None);
+        assert!(cache.get_into("../alice", "h", &dir.path().join("x")).is_err());
     }
 
     /// A put's in-progress file is neither counted nor removed while fresh,
@@ -220,8 +288,8 @@ mod tests {
     fn eviction_spares_fresh_in_progress_files_and_sweeps_leftovers() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("c");
+        BlobCache::new(root.clone(), u64::MAX).put_from("t", "a", &file(dir.path(), "a", b"123")).unwrap();
         let cache = BlobCache::new(root.clone(), 0);
-        cache.put("t", "a", b"123").unwrap();
         let fresh = root.join("t").join(".b.1");
         std::fs::write(&fresh, b"half").unwrap();
         let stale = root.join("t").join(".b.2");
@@ -234,7 +302,7 @@ mod tests {
         assert!(fresh.exists());
         assert!(!stale.exists());
         assert!(!legacy.exists());
-        assert_eq!(cache.get("t", "a").unwrap(), None);
+        assert_eq!(got(&cache, "t", "a"), None);
     }
 
     /// A second put of the same bytes after the first landed still succeeds.
@@ -242,8 +310,9 @@ mod tests {
     fn a_repeated_put_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let cache = BlobCache::new(dir.path().join("c"), u64::MAX);
-        cache.put("t", "h", b"x").unwrap();
-        cache.put("t", "h", b"x").unwrap();
-        assert_eq!(cache.get("t", "h").unwrap().as_deref(), Some(&b"x"[..]));
+        let src = file(dir.path(), "h", b"x");
+        cache.put_from("t", "h", &src).unwrap();
+        cache.put_from("t", "h", &src).unwrap();
+        assert_eq!(got(&cache, "t", "h").as_deref(), Some(&b"x"[..]));
     }
 }

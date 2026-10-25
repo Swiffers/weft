@@ -686,7 +686,10 @@ pub fn apply_asset_resolutions(
             return;
         }
         if is_url_ref(&file_ref) && file_ref.ty.references_file() {
-            *value = weft_core::storage::url_file_value(&file_ref.path, &file_ref.ty);
+            match file_ref.ty.concrete_file_kind() {
+                Some(kind) => *value = weft_core::storage::url_file_value(&file_ref.path, kind),
+                None => missing.push(format!("@asset({:?}, {}) must name one kind of file: Image, Video, Audio, or Blob", file_ref.path, file_ref.ty)),
+            }
             return;
         }
         match map.get(&file_ref.resolution_key()) {

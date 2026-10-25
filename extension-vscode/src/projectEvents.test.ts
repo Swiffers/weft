@@ -1,15 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { DispatcherClient } from './dispatcher';
-import { ReconnectingStream } from './projectEvents';
+import { ProjectEventStream, ReconnectingStream } from './projectEvents';
+import type { DispatcherEvent } from './runFollower';
 import type { LivePause } from './presence';
 
 type Handlers = NonNullable<Parameters<DispatcherClient['subscribe']>[2]>;
 
 class FakeDispatcher extends DispatcherClient {
-  subscriptions: Array<{ path: string; handlers: Handlers; closed: boolean }> = [];
+  subscriptions: Array<{ path: string; onEvent: (ev: { data: string }) => void; handlers: Handlers; closed: boolean }> = [];
   constructor() { super(); }
-  override subscribe(path: string, _onEvent: (ev: { data: string }) => void, handlers: Handlers = {}) {
-    const entry = { path, handlers, closed: false };
+  override subscribe(path: string, onEvent: (ev: { data: string }) => void, handlers: Handlers = {}) {
+    const entry = { path, onEvent, handlers, closed: false };
     this.subscriptions.push(entry);
     return { close: () => { entry.closed = true; } };
   }
@@ -71,5 +72,23 @@ describe('a reconnecting stream while the person is away', () => {
     pause.set(true);
     pause.set(false);
     expect(client.subscriptions).toHaveLength(0);
+  });
+});
+
+describe('the project stream', () => {
+  it('hands on a working copy moving as the dispatcher spells it', () => {
+    const client = new FakeDispatcher();
+    const stream = new ProjectEventStream(client, new ManualPause());
+    const seen: DispatcherEvent[] = [];
+    stream.onEvent((ev) => seen.push(ev));
+    stream.setProject('p1');
+    expect(client.subscriptions.map((s) => s.path)).toEqual(['/events/project/p1']);
+    // `DispatcherEvent::WorkingCopyChanged` on the wire: the kind in
+    // snake_case, its fields in camelCase.
+    client.subscriptions[0].onEvent({ data: JSON.stringify({ eventId: 'e1', kind: 'working_copy_changed', projectId: 'p1', workingCopy: 'wc1' }) });
+    expect(seen).toEqual([{ eventId: 'e1', kind: 'working_copy_changed', projectId: 'p1', workingCopy: 'wc1' }]);
+    const ev = seen[0];
+    expect(ev.kind === 'working_copy_changed' && ev.workingCopy).toBe('wc1');
+    stream.dispose();
   });
 });

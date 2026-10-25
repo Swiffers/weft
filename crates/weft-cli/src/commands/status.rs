@@ -36,8 +36,8 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // as build / run / resync hash it before registering: hashing the
     // unresolved source would differ from every running hash of a
     // project with an asset in it, and the drift banner would never
-    // clear. Asset resolution also publishes the current references,
-    // including an empty set when the last asset was removed.
+    // clear. Resolving writes nothing: a file not stored yet stands for
+    // the value its upload would give it.
     // Whether the program runs infra of its own, for the first deploy's
     // order (its infra first, then its triggers).
     let mut declares_infra = false;
@@ -45,13 +45,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         match weft_compiler::hash::load_program(project) {
             Ok((mut def, catalog)) => {
                 declares_infra = weft_core::project::has_infra(&def);
-                let resolved = crate::commands::assets::resolve_project_assets(
-                    &ctx.client()?,
-                    &project.root,
-                    &mut def,
-                    true,
-                )
-                .await;
+                let resolved = crate::commands::assets::resolve_project_assets(&ctx.client()?, &project.root, &mut def).await;
                 // Both node sets: a worker built with the full catalog is as
                 // current as one built from the referenced set, and the
                 // dispatcher accepts either as "not drifted".
@@ -60,17 +54,17 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                     Ok(_) => (
                         or_warn(
                             "the worker code's hash",
-                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Referenced),
+                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Referenced, &weft_compiler::hash::DISK),
                         ),
                         or_warn(
                             "the worker code's hash with every node",
-                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full),
+                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full, &weft_compiler::hash::DISK),
                         ),
                         or_warn("the project definition's hash", weft_compiler::hash::compute_definition_hash(&def)),
                         Some(weft_core::projects::NamedHashes(weft_core::run_spec::trigger_fingerprints(&def)).encode()),
                         or_warn(
                             "each infra place's hash",
-                            weft_compiler::hash::compute_infra_place_hashes(&def, &project.root, &weft_root, &catalog)
+                            weft_compiler::hash::compute_infra_place_hashes(&def, &project.root, &weft_root, &catalog, &weft_compiler::hash::DISK)
                                 .map(|places| weft_core::projects::NamedHashes(places).encode()),
                         ),
                     ),
@@ -337,7 +331,10 @@ fn trigger_lines(entry: &weft_core::projects::TriggerEntry) -> Vec<String> {
                         format!("{door}, taken down with its infra (it comes back once that infra runs again)")
                     }
                     Some(weft_core::projects::DownWith::Maintenance) => {
-                        format!("{door}, taken down by the install's maintenance (`weft maintenance off` brings it back)")
+                        format!(
+                            "{door}, taken down by the install's maintenance (`weft maintenance off` brings it back; once \
+                             the maintenance is over, `weft resync` does too)"
+                        )
                     }
                 }
             }
@@ -455,7 +452,7 @@ mod tests {
         let infra = super::trigger_lines(&entry(Some(weft_core::projects::DownWith::Infra)));
         assert!(infra[0].contains("taken down with its infra"), "{infra:?}");
         let maintenance = super::trigger_lines(&entry(Some(weft_core::projects::DownWith::Maintenance)));
-        assert!(maintenance[0].contains("`weft maintenance off` brings it back"), "{maintenance:?}");
+        assert!(maintenance[0].contains("`weft maintenance off` brings it back") && maintenance[0].contains("`weft resync` does too"), "{maintenance:?}");
         assert!(!super::trigger_lines(&entry(None))[0].contains("taken down"));
         let mut held_back = entry(Some(weft_core::projects::DownWith::Health));
         held_back.shared.as_mut().unwrap().held_back = Some("triggers on another build. `weft resync --all` moves them".into());

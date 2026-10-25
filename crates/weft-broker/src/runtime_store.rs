@@ -245,7 +245,7 @@ fn unexpired(now_param: &str) -> String {
 
 /// A key's upload row in any status, as [`PendingUpload`] reads it; callers
 /// add the status they accept.
-const PENDING_ROW_SELECT_ANY: &str = "SELECT status, tenant_id, mime_type, keep_ttl_secs, upload_id, part_size, declared_size, replaces, \
+const PENDING_ROW_SELECT_ANY: &str = "SELECT status, tenant_id, mime_type, filename, keep_ttl_secs, upload_id, part_size, declared_size, replaces, \
      slot_accepts, receives FROM runtime_file WHERE key = $1";
 
 /// How long a claim on a row ('completing' or 'reaping', stamped in
@@ -318,6 +318,12 @@ pub enum RuntimeStoreError {
     /// the upload was ended and its reservation freed. Final; re-upload.
     #[error("lost: {0}")]
     Lost(String),
+    /// An upload into a content-addressed key (an asset, whose id is the
+    /// sha256 of its bytes) assembled bytes that hash to something else:
+    /// the upload was ended and its key freed. Final; upload the right
+    /// bytes.
+    #[error("not its content: {0}")]
+    NotItsContent(String),
     /// A slot has no upload to receive: nothing came through it, or its
     /// upload ended with it. Said in those words, never as a missing
     /// file key.
@@ -742,6 +748,7 @@ fn of_slot(slot: &str, e: RuntimeStoreError) -> RuntimeStoreError {
         RuntimeStoreError::Stale(m) => RuntimeStoreError::Stale(say(m)),
         RuntimeStoreError::Completing(m) => RuntimeStoreError::Completing(say(m)),
         RuntimeStoreError::Lost(m) => RuntimeStoreError::Lost(say(m)),
+        RuntimeStoreError::NotItsContent(m) => RuntimeStoreError::NotItsContent(say(m)),
         RuntimeStoreError::NoUpload(m) => RuntimeStoreError::NoUpload(say(m)),
         RuntimeStoreError::RemovalIncomplete(m) => RuntimeStoreError::RemovalIncomplete(say(m)),
         e @ (RuntimeStoreError::NotFound(_) | RuntimeStoreError::Other(_)) => e,
@@ -909,6 +916,8 @@ struct PendingUpload {
     replaces: Option<String>,
     /// The type the upload was begun as.
     mime_type: String,
+    /// The name the upload was begun with.
+    filename: String,
     /// For a page's upload through a slot, the type its slot accepts
     /// ([`RuntimeStore::landed_mime`]).
     slot_accepts: Option<String>,
@@ -1468,6 +1477,14 @@ impl RuntimeStore {
                             .context("runtime begin_upload: read the pending part size")
                             .map_err(RuntimeStoreError::Other)?;
                             return Ok(Reserved::Pending(key.clone(), part_size as u64));
+                        }
+                        // Another publish of these same bytes has claimed the
+                        // completion: the asset lands in a moment, and the
+                        // caller waits for it (marked, so it knows to).
+                        Some("completing") => {
+                            return Err(RuntimeStoreError::Completing(format!(
+                                "asset '{key}' is being completed by another upload of the same content; it lands shortly"
+                            )));
                         }
                         Some(status) => {
                             return Err(RuntimeStoreError::Conflict(format!(
@@ -2504,16 +2521,49 @@ impl RuntimeStore {
             false => parts.iter().map(|(_, _, s)| *s as u64).sum(),
         };
         match self.bucket_completion(key, &pending, &parts, total, recovering).await? {
-            Bucket::Assembled(actual) => match self.landed_mime(key, &pending, actual).await {
-                Ok(mime) => self.finish_completion(key, &pending, total, actual, &mime).await,
-                Err(refused @ RuntimeStoreError::Invalid(_)) => {
-                    self.end_completion(key, &pending, false).await?;
-                    Err(refused)
+            Bucket::Assembled(actual) => {
+                let landed = match self.held_to_its_address(key, &pending, actual).await {
+                    Ok(()) => self.landed_mime(key, &pending, actual).await,
+                    Err(e) => Err(e),
+                };
+                match landed {
+                    Ok(mime) => self.finish_completion(key, &pending, total, actual, &mime).await,
+                    Err(refused @ (RuntimeStoreError::Invalid(_) | RuntimeStoreError::NotItsContent(_))) => {
+                        self.end_completion(key, &pending, false).await?;
+                        Err(refused)
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            },
+            }
             Bucket::Lost { why, overwritten } => self.lose_completion(key, &pending, &why, overwritten).await,
         }
+    }
+
+    /// Hold an assembled ASSET upload to its key: an asset's id is the
+    /// sha256 of its bytes, which every reader and every later publish of
+    /// the same content trusts without looking, so bytes that hash to
+    /// anything else are refused ([`RuntimeStoreError::NotItsContent`]) and
+    /// the caller ends the upload, freeing the key for a correct one.
+    /// Uploads into any other scope have no content address to hold.
+    async fn held_to_its_address(&self, key: &str, pending: &PendingUpload, size: u64) -> StoreResult<()> {
+        let parsed = weft_core::storage::key::parse_key(key)
+            .map_err(|e| RuntimeStoreError::Other(anyhow::anyhow!("a completing upload's key '{key}': {e}")))?;
+        if parsed.scope != weft_core::storage::key::KeyScope::Asset {
+            return Ok(());
+        }
+        let actual = self
+            .object_sha256(key, &pending.object_key(key), size)
+            .await
+            .context("runtime complete_upload: hash an assembled asset")
+            .map_err(RuntimeStoreError::Other)?;
+        if actual != parsed.id {
+            return Err(RuntimeStoreError::NotItsContent(format!(
+                "the bytes uploaded as '{}' (asset '{key}') hash to {actual}, not to {}, the content \
+                 its key names; the upload was ended, so upload the file again",
+                pending.filename, parsed.id
+            )));
+        }
+        Ok(())
     }
 
     /// The type a landed upload is stored as: the one it was begun as, or
@@ -3375,11 +3425,9 @@ impl RuntimeStore {
     }
 
     /// Read a landed slot upload back from the bucket and record its
-    /// sha256: what a later page sending the same content is matched
-    /// against ([`Self::begin_slot_upload`]). Read in pieces, so a file of
-    /// any size costs a piece of memory.
+    /// sha256 ([`Self::object_sha256`]): what a later page sending the
+    /// same content is matched against ([`Self::begin_slot_upload`]).
     pub async fn hash_upload(&self, key: &str) -> Result<()> {
-        use sha2::Digest;
         let size: Option<i64> = sqlx::query_scalar("SELECT size_bytes FROM runtime_file WHERE key = $1 AND status = 'uploaded'")
             .bind(key)
             .fetch_optional(&self.pool)
@@ -3387,20 +3435,7 @@ impl RuntimeStore {
             .context("hash_upload: read the upload")?;
         let Some(size) = size else { return Ok(()) };
         let size = size as u64;
-        let mut hasher = sha2::Sha256::new();
-        let mut at = 0;
-        while at < size {
-            let end = (at + HASH_PIECE_BYTES).min(size);
-            let piece = self
-                .bucket
-                .get_range(&object_key(key), at, end)
-                .await
-                .with_context(|| format!("hash_upload: read bytes {at}..{end} of '{key}'"))?
-                .ok_or_else(|| anyhow::anyhow!("hash_upload: '{key}' is gone from the bucket"))?;
-            hasher.update(&piece);
-            at = end;
-        }
-        let hash = weft_core::access::hex_of(&hasher.finalize());
+        let hash = self.object_sha256(key, &object_key(key), size).await.context("hash_upload")?;
         sqlx::query("UPDATE runtime_file SET content_sha256 = $2 WHERE key = $1 AND size_bytes = $3")
             .bind(key)
             .bind(hash)
@@ -3409,6 +3444,27 @@ impl RuntimeStore {
             .await
             .context("hash_upload: record the hash")?;
         Ok(())
+    }
+
+    /// The sha256 (hex) of the `size` bytes of `object`, the bucket object
+    /// of the file `key`. Read in pieces, so a file of any size costs a
+    /// piece of memory.
+    async fn object_sha256(&self, key: &str, object: &str, size: u64) -> Result<String> {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        let mut at = 0;
+        while at < size {
+            let end = (at + HASH_PIECE_BYTES).min(size);
+            let piece = self
+                .bucket
+                .get_range(object, at, end)
+                .await
+                .with_context(|| format!("read bytes {at}..{end} of '{key}'"))?
+                .ok_or_else(|| anyhow::anyhow!("'{key}' is gone from the bucket"))?;
+            hasher.update(&piece);
+            at = end;
+        }
+        Ok(weft_core::access::hex_of(&hasher.finalize()))
     }
 
     /// Receive the uploads of `slots`, pages' uploads, into the run

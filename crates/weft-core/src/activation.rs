@@ -215,7 +215,7 @@ pub fn by_owner(keys: &[ActivationKey]) -> Vec<OwnerTriggers> {
 /// `POST /projects/{id}/activate`: turn on every trigger the scope names
 /// that is off, and leave the ones on as they are. It never touches the
 /// runs going, and never starts infra.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ActivateRequest {
     /// The build the caller just made: refused when another registered
     /// since. Absent (activating by id, a program's own call), the
@@ -240,7 +240,7 @@ pub struct ActivateRequest {
 }
 
 /// `POST /projects/{id}/bake`: which triggers to prepare.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct BakeRequest {
     #[serde(default)]
     pub scope: ActivationScope,
@@ -259,6 +259,7 @@ pub struct ActivateResponse {
     /// released (paced) or dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held: Option<HeldReleased>,
+    #[serde(default)]
     pub urls: Vec<ActivationUrl>,
     /// The program's shared infra that is not running, and how to start
     /// it. Activating starts only what a trigger reads (and refuses when

@@ -26,7 +26,12 @@ The terms below:
   `examples/name.json`, whose field names are camelCase (`keepFor`,
   `holdSecs`), like every JSON file weft writes. A [frozen example] is an [example] that `freeze`
   has given accepted output evidence, stored as `expected`.
-- [head] is the version the project is on; `weft branch` moves it.
+- [head] is the version this folder is on, with the run it came from when
+  there is one. Each working copy has its own: this folder, another folder
+  of the same project, the copy programs write into. A folder's first
+  command starts it at the head of the project's most recently changed
+  working copy. `weft branch` moves it, and so does every command that
+  records a version.
 
 ## Carve the work you want to exercise
 
@@ -176,8 +181,9 @@ of the project instead, one a trigger started or one that failed included,
 which is how a run that failed or broke off is picked up again after a fix
 (the `=` is required, since a bare word after `--seed` is an example name).
 `--root` starts a new tree with nothing to reuse, so it is refused beside a
-seed. If you also want that run's code back, `weft branch <run-id>` first;
-that restores the files, so you checkpoint edits you want to keep.
+seed. If you also want that run's code back, `weft branch <run-id>` first:
+it writes that run's files into the folder, after recording the files you
+had as a version, and prints the `weft branch <id>` that comes back to them.
 
 - `--seed --seed-before classify` reuses earlier compatible work and runs
   `classify` and what follows.
@@ -303,17 +309,29 @@ charges.
 
 ## Keep a reviewable trail
 
-`weft checkpoint [label]` saves a source version without running anything.
-`weft tree` shows versions and runs; `weft branch <version|label|run-id>`
-restores a point in that tree. [head] is shared per project. A dirty
-branch refusal names the files: you checkpoint them before switching.
-Discarding edits and pruning history require the user's authority.
+`weft checkpoint [label]` records a version without running anything, and
+the label is a name `weft branch` and `weft prune` accept in place of its id. `weft tree` shows every working copy with
+its head, then the versions and their runs; `weft branch <version|label|run-id>`
+puts this folder on a point in that tree. A switch loses nothing: the files
+the folder held become a version first, and the command prints the `weft
+branch <id>` that comes back to them. Another folder of the project has its
+own [head], but a program writing code with `ctx.code()` writes into the
+project's most recently changed folder unless it names a working copy, so
+its files can land in yours.
 
-`weft prune <version>` removes its subtree and runs. It refuses when
-[head], a frozen origin, running work, or preserved trigger settings still
-need that history: you move the relevant reference or preserve the
-history, never bypass the refusal. Unused bakes belonging to explicitly
-pruned versions go too.
+`weft prune <version>` deletes history: the version, everything under it,
+and their runs, so you ask the user before you run it. It refuses when any
+working copy's [head], an activated version, the version the project's
+build runs, a frozen example's origin, a version that still supplies
+trigger settings, or a run that has not ended (a paused one counts) is
+inside that history. The first refusal names each thing in the way and what
+to do (`weft branch <version> --copy <copy>` or `weft forget-copy <copy>` for a working copy, `weft deactivate`, build another
+version, `weft freeze` from another run, `weft stop` the run). Once those
+are clear, a second one can still come: `these versions still supply
+trigger settings or running runs; stop the runs and replace or wipe those
+trigger settings before pruning`, which names no version. No flag skips
+either (`--yes` only skips the question). The trigger bakes made from the
+pruned versions are deleted with them.
 
 After an edit, you run the relevant saved use cases, inspect their diffs,
 and report what actually ran, what changed, why a result is acceptable or

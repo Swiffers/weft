@@ -1,341 +1,197 @@
-//! `weft branch <version|run_id>`: restore that version's files (a run
-//! means its version) and move head. A run sets head's run, so the
-//! next `--seed` inherits from it; a version clears it. Refuses on a
-//! dirty tree naming the files; `--discard` overrides.
+//! `weft branch <version|run_id>`: move this folder to that version (a run
+//! means its version) and write its files here. A run becomes the head's
+//! run, so the next `--seed` inherits from it; a version clears it. With
+//! `--copy`, another working copy moves instead (the program copy, or a
+//! folder elsewhere), and nothing is written here.
+//!
+//! `weft forget-copy <copy>`: keep a working copy's files as a version and
+//! remove the copy, for a folder that is gone or the program copy, whose
+//! head would otherwise keep its versions from every prune.
+//!
+//! Nothing is lost on the way: the folder is synced first, and the install
+//! stamps where its working copy was as a version before it moves
+//! (`POST /projects/{id}/versions/switch`), so `weft branch <that version>`
+//! comes back. The folder is synced again after, which writes the
+//! version's files to disk; a file edited here meanwhile is kept, with the
+//! version's written beside it as a conflict copy.
 
 use anyhow::{bail, Context};
-use weft_core::versions::{HeadRequest, HeadResponse};
+use weft_core::versions::VersionTree;
+use weft_core::working_copy::{Forgotten, SwitchRequest, SwitchTo, Switched, WorkingCopy, WorkingCopyKind, WorkingCopyRef};
 
-use super::versions::{fetch_tree, local_manifest, resolve_run, resolve_version, short, Manifest};
+use super::versions::{fetch_tree, resolve_run, resolve_version, short};
 use super::Ctx;
 
-pub async fn run(ctx: Ctx, reference: String, discard: bool) -> anyhow::Result<()> {
-    let project = ctx.project()?;
-    let client = ctx.client()?;
-    let id = project.id().to_string();
-    let tree = fetch_tree(&client, &id).await?;
-
-    // Dirty: the files differ from head's version. Nothing to compare
-    // against before the first checkpoint or run.
-    if !discard {
-        if let Some(head) = tree.head.head_version.as_deref().and_then(|h| tree.versions.iter().find(|v| v.id == h)) {
-            let local = local_manifest(&project.root)?;
-            let dirty = dirty_files(&head.manifest, &local);
-            if !dirty.is_empty() {
-                bail!(
-                    "the tree has changes since head {}:\n  {}\n`{}` keeps them as a version, or `--discard` throws them away",
-                    short(&head.id),
-                    dirty.join("\n  "),
-                    ctx.weft("checkpoint")
-                );
-            }
-        }
-    }
-
-    // A run means its version and becomes head's run.
-    let (body, version_id) = match resolve_run(&tree, &reference) {
-        Ok(run) => (HeadRequest { run: Some(run.run_id), version: None }, run.version_id.clone()),
-        Err(_) => {
-            let version = resolve_version(&tree, &reference)?;
-            (HeadRequest { version: Some(version.id.clone()), run: None }, version.id.clone())
-        }
+pub async fn run(ctx: Ctx, reference: String, copy: Option<String>) -> anyhow::Result<()> {
+    let here = super::copy::this_copy(&ctx, None).await?;
+    let tree = fetch_tree(&here.client, &here.project_id).await?;
+    // A run means its version and becomes the head's run.
+    let to = match resolve_run(&tree, &reference) {
+        Ok(run) => SwitchTo { run: Some(run.run_id), version: None },
+        Err(_) => SwitchTo { version: Some(resolve_version(&tree, &reference)?.id.clone()), run: None },
     };
-    let manifest: Manifest = tree
-        .versions
-        .iter()
-        .find(|v| v.id == version_id)
-        .map(|v| v.manifest.clone())
-        .with_context(|| format!("version {} is not in this project's tree", short(&version_id)))?;
-
-    // FILES FIRST, head after.
-    //
-    // Neither order is atomic: `restore` writes one file at a time, so a
-    // download that fails or a full disk leaves the tree part way either
-    // way. What the order decides is what the person is told and what
-    // they can do about it. Head moved first meant the dirty check (which
-    // measures against head) was already satisfied by the half-restored
-    // tree, so the next `weft branch` refused and listed half the tree as
-    // changed, with `--discard` the only way out. Head moved last leaves
-    // it where it was, and both failures below name the command that
-    // finishes the job.
-    restore(&client, project, &manifest).await.with_context(|| {
-        format!(
-            "the tree is part way to version {}; `{}` finishes restoring it",
-            short(&version_id),
-            ctx.weft(&format!("branch {} --discard", short(&version_id)))
-        )
-    })?;
-    let resp = client
-        .put_json(&format!("/projects/{id}/versions/head"), &serde_json::to_value(&body)?)
-        .await
-        .with_context(|| {
-            format!(
-                "the files on disk ARE version {} now, but head could not be moved there. \
-                 `{}` finishes the job, and it names {reference} \
-                 again rather than the version, because that is what you asked for and a run \
-                 also sets head's run. Plain `{}` will refuse, because head \
-                 is still the old version and reads the restored files as your own uncommitted \
-                 changes; `--discard` overwrites the files with this version, which is what they \
-                 already are unless you have edited them since",
-                short(&version_id),
-                ctx.weft(&format!("branch {reference} --discard")),
-                ctx.weft(&format!("branch {reference}"))
-            )
-        })?;
-    // The answer's version is what is printed, never the one we ASKED
-    // for: an answer that does not read means the shape drifted.
-    let moved: HeadResponse = serde_json::from_value(resp.clone()).context("read the head answer")?;
-
-    if ctx.json_out(&resp)? {
+    let other = match &copy {
+        Some(named) => Some(resolve_copy(&tree, named)?).filter(|c| c.id != here.copy.id),
+        None => None,
+    };
+    if let Some(other) = other {
+        let body = SwitchRequest { working_copy: WorkingCopyRef { working_copy: Some(other.id) }, to };
+        let answer = here
+            .client
+            .post_json(&format!("/projects/{}/versions/switch", here.project_id), &serde_json::to_value(&body)?)
+            .await
+            .with_context(|| format!("switch {}", copy_name(other)))?;
+        let switched: Switched = serde_json::from_value(answer).context("read the switch answer")?;
+        if ctx.json_out(&switched)? {
+            return Ok(());
+        }
+        let at = switched.copy.head.head_version.as_deref().map(short).unwrap_or("no version");
+        println!("{} is now at version {at}", copy_name(other));
+        if let Some(saved) = &switched.saved {
+            println!("its files as they were are version {}", short(saved));
+        }
         return Ok(());
     }
-    match moved.run {
-        Some(run) => println!("head is now run {} on version {}", short(&run.to_string()), short(&moved.version)),
-        None => println!("head is now version {}", short(&moved.version)),
+    let body = SwitchRequest { working_copy: here.named(), to };
+    let answer = here
+        .client
+        .post_json(&format!("/projects/{}/versions/switch", here.project_id), &serde_json::to_value(&body)?)
+        .await
+        .context("switch this folder's working copy")?;
+    let switched: Switched = serde_json::from_value(answer).context("read the switch answer")?;
+    // The working copy moved; this writes its files here.
+    let landed = super::copy::this_copy(&ctx, None).await.with_context(|| {
+        let back = match &switched.saved {
+            Some(saved) => format!(", and `{}` goes back to where you were", ctx.weft(&format!("branch {}", short(saved)))),
+            None => String::new(),
+        };
+        format!(
+            "this folder's working copy moved, but its files could not all be written here; `{}` finishes writing them{back}",
+            ctx.weft("tree")
+        )
+    })?;
+    let done = Switched { saved: switched.saved, copy: landed.copy };
+    if ctx.json_out(&done)? {
+        return Ok(());
+    }
+    for line in moved_lines(&done, &|verb| ctx.weft(verb)) {
+        println!("{line}");
     }
     Ok(())
 }
 
-/// The covered paths whose bytes differ between head's manifest and
-/// the disk (added, removed, or changed), sorted.
-pub fn dirty_files(head: &Manifest, local: &Manifest) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for (path, hash) in local.iter() {
-        if head.get(path) != Some(hash) {
-            out.push(path.clone());
-        }
+pub async fn forget(ctx: Ctx, named: String) -> anyhow::Result<()> {
+    let here = super::copy::this_copy(&ctx, None).await?;
+    let tree = fetch_tree(&here.client, &here.project_id).await?;
+    let copy = resolve_copy(&tree, &named)?;
+    if copy.id == here.copy.id {
+        bail!("{named} is this folder's working copy, which every command run here registers again at once; run this from another folder");
     }
-    for (path, _) in head.iter() {
-        if !local.contains_key(path) {
-            out.push(path.clone());
-        }
+    let answer = here
+        .client
+        .delete_json(&format!("/projects/{}/working-copies/{}", here.project_id, copy.id))
+        .await
+        .with_context(|| format!("forget {}", copy_name(copy)))?;
+    let forgotten: Forgotten = serde_json::from_value(answer).context("read the answer")?;
+    if ctx.json_out(&forgotten)? {
+        return Ok(());
     }
-    out.sort();
-    out.dedup();
-    out
-}
-
-/// Make the disk match `manifest`: download every blob whose bytes
-/// differ, remove every covered file the manifest does not name.
-async fn restore(client: &crate::client::DispatcherClient, project: &weft_compiler::project::Project, manifest: &Manifest) -> anyhow::Result<()> {
-    let local = local_manifest(&project.root)?;
-    // Every path is checked BEFORE anything is written, so a bad entry
-    // halfway down the manifest cannot leave the tree half restored.
-    //
-    // The path is as untrusted as the hash beside it, and for the same
-    // reason: both came off the wire. `Path::join` with an absolute path
-    // THROWS THE ROOT AWAY, and a `..` segment walks out of it, so an
-    // entry naming one would be written outside the project, where the
-    // removal loop below (which only knows the paths it read from disk)
-    // could never undo it. The dispatcher refuses such an entry when a
-    // version is recorded; this is the other end of the same rule,
-    // because where a client writes is not a server's word to take.
-    // EXACTLY the rule the dispatcher applies when a version is recorded
-    // (`api/versions.rs` `validate_manifest`), and no more. Asking
-    // `covers()` as well was stricter than the recording rule, so an
-    // entry weft had legitimately stored but that today's coverage rule
-    // would not record turned a branch into a total refusal whose message
-    // claimed weft would never have recorded it.
-    let bad = unrecordable_paths(manifest);
-    if !bad.is_empty() {
-        bail!(
-            "this version lists {}, which weft would never record as a project file; nothing was \
-             restored",
-            bad.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", ")
-        );
-    }
-    validate_destinations(&project.root, manifest)?;
-    // Download before changing the working tree. Deleting obsolete files first
-    // then permits a path to change between a file and a directory.
-    let staged = tempfile::tempdir()?;
-    download_into(client, manifest, &local, staged.path()).await?;
-    // From here the working tree changes. Nothing above touched it, so a
-    // failure above leaves the person exactly where they were; a failure
-    // below may leave a mixture of two versions, and says which.
-    let mut touched = false;
-    apply_restore(&project.root, &local, manifest, staged.path(), &mut touched).with_context(|| {
-        if touched {
-            "the working tree is now partly restored (some files are from the version you asked for, \
-             the rest from where you were); fix the cause and run the same weft branch again to finish"
-        } else {
-            "nothing was restored; the working tree is as it was"
-        }
-    })
-}
-
-/// Download every file of `manifest` that `have` does not already hold
-/// byte for byte into `dest`, at its path. The paths were checked by the
-/// caller; the hashes are checked here, through the key grammar.
-pub(crate) async fn download_into(
-    client: &crate::client::DispatcherClient,
-    manifest: &Manifest,
-    have: &Manifest,
-    dest: &std::path::Path,
-) -> anyhow::Result<()> {
-    for (path, hash) in manifest.iter() {
-        if have.get(path) == Some(hash) {
-            continue;
-        }
-        // Through the key grammar's own constructor: the hash comes
-        // off a manifest the dispatcher sent, so it is not this side's
-        // to trust. Named by PATH, which is the file the person can
-        // actually look at.
-        let scope = weft_core::storage::key::KeyScope::Asset;
-        let key = weft_core::storage::key::scope_key(&scope, hash).map_err(|e| {
-            anyhow::anyhow!("this version lists '{path}' as '{hash}', which is not a storable address ({e})")
-        })?;
-        let bytes = super::files::download_bytes(client, &key)
-            .await
-            .with_context(|| format!("download {path} ({hash})"))?;
-        let full = dest.join(path);
-        if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        }
-        std::fs::write(&full, bytes).with_context(|| format!("write {}", full.display()))?;
+    match &forgotten.saved {
+        Some(saved) => println!(
+            "forgot {}; its files are version {}, and `{}` brings them to this folder",
+            copy_name(copy),
+            short(saved),
+            ctx.weft(&format!("branch {}", short(saved)))
+        ),
+        None => println!("forgot {}, which held no files", copy_name(copy)),
     }
     Ok(())
 }
 
-/// The manifest paths weft would never record as a project file (empty,
-/// absolute, a backslash, or a `.`/`..`/empty segment): a path off the
-/// wire that would write outside the folder it is restored into.
-pub(crate) fn unrecordable_paths(manifest: &Manifest) -> Vec<&String> {
-    manifest.iter()
-        .filter(|(path, _)| {
-            path.is_empty()
-                || path.starts_with('/')
-                || path.contains('\\')
-                || path.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..")
-        })
-        .map(|(path, _)| path)
-        .collect()
+/// The working copy `named` names: `program` (the program copy), a
+/// folder's path, or a working copy's id or the start of one.
+fn resolve_copy<'a>(tree: &'a VersionTree, named: &str) -> anyhow::Result<&'a WorkingCopy> {
+    let matches: Vec<&WorkingCopy> = if named == "program" {
+        tree.working_copies.iter().filter(|c| c.kind == WorkingCopyKind::Program).collect()
+    } else if named.starts_with('/') {
+        let path = named.trim_end_matches('/');
+        tree.working_copies.iter().filter(|c| c.path.as_deref() == Some(path)).collect()
+    } else {
+        tree.working_copies.iter().filter(|c| c.id.to_string().starts_with(named)).collect()
+    };
+    match matches.as_slice() {
+        [one] => Ok(one),
+        [] if named == "program" => bail!("this project has no program copy"),
+        [] => bail!("no working copy of this project is {named}; `weft tree` lists them"),
+        many => bail!(
+            "{named} names {} working copies (on different machines); name one by its id: {}",
+            many.len(),
+            many.iter().map(|c| c.id.to_string()).collect::<Vec<_>>().join(", ")
+        ),
+    }
 }
 
-fn validate_destinations(root: &std::path::Path, manifest: &Manifest) -> anyhow::Result<()> {
-    for (path, _) in manifest.iter() {
-        let mut full = root.to_path_buf();
-        for part in std::path::Path::new(path).components() {
-            full.push(part);
-            match std::fs::symlink_metadata(&full) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    bail!("cannot restore '{path}': {} is a symbolic link", full.display());
-                }
-                Ok(_) => {}
-                Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => break,
-                Err(error) => return Err(error).with_context(|| format!("inspect {}", full.display())),
-            }
-        }
+/// How a line names a working copy that is not this folder's.
+fn copy_name(copy: &WorkingCopy) -> String {
+    match (&copy.path, &copy.host) {
+        (Some(path), Some(host)) => format!("the working copy at {path} on {host}"),
+        (Some(path), None) => format!("the working copy at {path}"),
+        (None, _) => "the program copy".to_string(),
     }
-    Ok(())
 }
 
-/// Make `root` hold `manifest`, given it holds `local` now and every file
-/// that has to change is downloaded under `staged`. Obsolete files go
-/// first, so a path can change between a file and a directory. Not
-/// atomic: `touched` turns true at the first change to the tree, so the
-/// caller can say whether a failure left a mixture.
-fn apply_restore(root: &std::path::Path, local: &Manifest, manifest: &Manifest, staged: &std::path::Path, touched: &mut bool) -> anyhow::Result<()> {
-    // Checked again right before the first write: the downloads above
-    // took time, and a symlink planted meanwhile would be written through.
-    validate_destinations(root, manifest)?;
-    for (path, _) in local.iter() {
-        if !manifest.contains_key(path) {
-            let full = root.join(path);
-            std::fs::remove_file(&full).with_context(|| format!("remove {}", full.display()))?;
-            *touched = true;
-            // And the directories it emptied, up to the project root: a
-            // branch back past the creation of `nodes/my-pkg/` otherwise
-            // left the folder sitting there, so the tree on disk did not
-            // look like the version the person just asked for.
-            let mut parent = full.parent().map(std::path::Path::to_path_buf);
-            while let Some(dir) = parent {
-                if dir == root || !dir.starts_with(root) {
-                    break;
-                }
-                if std::fs::remove_dir(&dir).is_err() {
-                    break; // not empty, which is the ordinary case
-                }
-                parent = dir.parent().map(std::path::Path::to_path_buf);
-            }
-        }
+/// What a switch says: where the folder is now, and the line that comes
+/// back to where it was (none when it held no file, so nothing was kept).
+fn moved_lines(done: &Switched, weft: &dyn Fn(&str) -> String) -> Vec<String> {
+    let at = done.copy.head.head_version.as_deref().map(short).unwrap_or("no version");
+    let here = match done.copy.head.head_run {
+        Some(run) => format!("this folder is now at run {} on version {at}", short(&run.to_string())),
+        None => format!("this folder is now at version {at}"),
+    };
+    let mut lines = vec![here];
+    if !done.copy.conflicts.is_empty() {
+        lines.push(format!("conflict copies to look at: {}", done.copy.conflicts.join(", ")));
     }
-    for (path, hash) in manifest.iter() {
-        if local.get(path) == Some(hash) { continue; }
-        let full = root.join(path);
-        if full.is_dir() {
-            // Never erase untracked contents to make room for a file.
-            std::fs::remove_dir(&full).with_context(|| format!("replace directory {} with a file", full.display()))?;
-            *touched = true;
-        }
-        if let Some(parent) = full.parent().filter(|parent| !parent.is_dir()) {
-            std::fs::create_dir_all(parent).with_context(|| format!("create {} for {path}", parent.display()))?;
-            *touched = true;
-        }
-        std::fs::copy(staged.join(path), &full).with_context(|| format!("restore {}", full.display()))?;
-        *touched = true;
+    if let Some(saved) = &done.saved {
+        lines.push(format!("your files as they were are version {}; `{}` comes back to them", short(saved), weft(&format!("branch {}", short(saved)))));
     }
-    Ok(())
+    lines
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weft_core::working_copy::{Head, WorkingCopy, WorkingCopyKind};
 
-    fn m(entries: &[(&str, &str)]) -> Manifest {
-        entries.iter().map(|(p, h)| (p.to_string(), h.to_string())).collect()
+    fn switched(run: Option<uuid::Uuid>, conflicts: &[&str]) -> Switched {
+        Switched {
+            saved: Some("aaaabbbbcccc".into()),
+            copy: WorkingCopy {
+                id: uuid::Uuid::nil(),
+                kind: WorkingCopyKind::Folder,
+                host: None,
+                path: None,
+                head: Head { head_version: Some("11112222ffff".into()), head_run: run },
+                working_version: "11112222ffff".into(),
+                revision: 1,
+                conflicts: conflicts.iter().map(|c| c.to_string()).collect(),
+                updated_at: 0,
+            },
+        }
     }
 
     #[test]
-    fn dirty_files_names_added_removed_and_changed() {
-        let head = m(&[("main.weft", "1"), ("gone.weft", "2")]);
-        let local = m(&[("main.weft", "X"), ("new.weft", "3")]);
-        assert_eq!(dirty_files(&head, &local), vec!["gone.weft", "main.weft", "new.weft"]);
-        assert!(dirty_files(&head, &head).is_empty());
-    }
-
-    #[test]
-    fn restore_changes_files_to_directories_and_back() {
-        let root = tempfile::tempdir().unwrap();
-        let staged = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("node"), "old").unwrap();
-        std::fs::create_dir(staged.path().join("node")).unwrap();
-        std::fs::write(staged.path().join("node/main.rs"), "new").unwrap();
-        let file = m(&[("node", "old")]);
-        let directory = m(&[("node/main.rs", "new")]);
-        let mut touched = false;
-        apply_restore(root.path(), &file, &directory, staged.path(), &mut touched).unwrap();
-        assert!(touched);
-        assert_eq!(std::fs::read_to_string(root.path().join("node/main.rs")).unwrap(), "new");
-        let staged_file = tempfile::tempdir().unwrap();
-        std::fs::write(staged_file.path().join("node"), "restored").unwrap();
-        let mut touched = false;
-        apply_restore(root.path(), &directory, &file, staged_file.path(), &mut touched).unwrap();
-        assert!(touched);
-        assert_eq!(std::fs::read_to_string(root.path().join("node")).unwrap(), "restored");
-    }
-
-    /// A restore that fails before its first write says so truthfully:
-    /// nothing is marked touched, and nothing on disk changed.
-    #[test]
-    fn a_restore_that_fails_at_once_reports_an_untouched_tree() {
-        let root = tempfile::tempdir().unwrap();
-        let staged = tempfile::tempdir().unwrap(); // holds no file for `main.weft`
-        std::fs::write(root.path().join("main.weft"), "old").unwrap();
-        let mut touched = false;
-        let error = apply_restore(root.path(), &m(&[("main.weft", "old")]), &m(&[("main.weft", "new")]), staged.path(), &mut touched)
-            .unwrap_err();
-        assert!(error.to_string().contains("restore"), "{error:#}");
-        assert!(!touched);
-        assert_eq!(std::fs::read_to_string(root.path().join("main.weft")).unwrap(), "old");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn restore_refuses_hidden_symlink_ancestors() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join(".cache")).unwrap();
-        assert!(validate_destinations(root.path(), &m(&[(".cache/payload", "hash")])).is_err());
-        assert!(!outside.path().join("payload").exists());
+    fn a_switch_says_where_the_folder_is_and_how_to_come_back() {
+        let weft = |verb: &str| format!("weft {verb}");
+        assert_eq!(
+            moved_lines(&switched(None, &[]), &weft),
+            vec!["this folder is now at version 11112222", "your files as they were are version aaaabbbb; `weft branch aaaabbbb` comes back to them"]
+        );
+        let run: uuid::Uuid = "c2000000-0000-0000-0000-000000000000".parse().unwrap();
+        let lines = moved_lines(&switched(Some(run), &["main.weft-conflict-1"]), &weft);
+        assert_eq!(lines[0], "this folder is now at run c2000000 on version 11112222");
+        assert_eq!(lines[1], "conflict copies to look at: main.weft-conflict-1");
+        let empty = Switched { saved: None, ..switched(None, &[]) };
+        assert_eq!(moved_lines(&empty, &weft), vec!["this folder is now at version 11112222"], "nothing was kept, so there is nothing to come back to");
     }
 }

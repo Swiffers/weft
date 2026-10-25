@@ -39,9 +39,10 @@ pub mod options;
 pub mod files;
 // The version tree and its verbs.
 pub mod versions;
-pub mod snapshot;
+pub mod copy;
 pub mod checkpoint;
 pub mod branch;
+pub mod resolve;
 pub mod running_source;
 pub mod tree;
 pub mod diff;

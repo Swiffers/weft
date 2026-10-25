@@ -76,3 +76,4 @@ mod version_tree_grow;
 mod wait_format;
 mod wait_outcomes;
 mod web_trigger;
+mod working_copies;

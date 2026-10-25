@@ -1,0 +1,45 @@
+{
+  "type": "WriteCodeAndRun",
+  "label": "Write code and run",
+  "description": "Write a text file into another project's code (keeping the file it replaces at another path), then start a run of that project's `out` on it. A project-local node the e2e rig uses to prove a program can edit, build and run another project of its owner.",
+  "tags": [
+    "custom",
+    "e2e"
+  ],
+  "icon": "FilePenLine",
+  "color": "#8b5cf6",
+  "inputs": [
+    {
+      "name": "project",
+      "type": "String",
+      "required": true,
+      "description": "The id of the project whose code is written and run."
+    },
+    {
+      "name": "path",
+      "type": "String",
+      "required": true,
+      "description": "The project-relative path of the file to write."
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "required": true,
+      "description": "What the file holds afterwards."
+    },
+    {
+      "name": "keptAs",
+      "type": "String",
+      "required": true,
+      "description": "Where the file it replaces is kept, copied by its hash."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "runId",
+      "type": "String",
+      "description": "The id of the run started on the written code."
+    }
+  ],
+  "requiresInfra": false
+}

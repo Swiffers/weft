@@ -137,7 +137,7 @@ impl ContextHandle for PureHandle {
         self.refused("stop tagged runs")
     }
 
-    async fn program_call(&self, _call: crate::program::ProgramCall, _stop_self: StopSelf, _call_index: u32) -> WeftResult<Value> {
+    async fn program_call(&self, _call: crate::program::ProgramCall, _stop_self: StopSelf, _call_index: u32, _project: Option<uuid::Uuid>) -> WeftResult<Value> {
         self.refused("call on its program")
     }
 
@@ -147,6 +147,7 @@ impl ContextHandle for PureHandle {
         _expires_in_secs: u64,
         _displays: bool,
         _id: uuid::Uuid,
+        _project: Option<uuid::Uuid>,
     ) -> WeftResult<crate::program::MintedInstanceToken> {
         self.refused("mint an instance token")
     }

@@ -138,7 +138,7 @@ the provider sent it. A failed check does not replace it, and an answer over
   `render: waiting` and then `last answer: {"status":"IN_QUEUE"}`;
 - in a program, with the `GetNodeState` node, which takes a run's id (a run
   gets its own id from the `GetRunId` node);
-- in your own node's code, with `ctx.node_state(run, node)`.
+- in your own node's code, with `ctx.run_by_id(run).node_state(node)`.
 
 ## When the run cannot pause
 

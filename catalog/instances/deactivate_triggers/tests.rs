@@ -27,7 +27,7 @@ async fn down(rig: FakeRig) -> WeftResult<()> {
     .await
     .ok()?;
     match &rig.program_calls()[0] {
-        (ProgramCall::TriggerDeactivate { scope, take_down }, StopSelf::Include) => {
+        (ProgramCall::Triggers(weft::program::triggers::TriggerCall::Deactivate { request: weft::deactivation::DeactivateRequest { scope, choice: take_down } }), StopSelf::Include) => {
             assert_eq!(scope.instances, weft::instance::InstanceTarget::named(vec![weft::instance::InstanceId::new("ada").unwrap()]));
             assert_eq!((take_down.door, take_down.held, take_down.running), (Some(Door::Refuse), Some(Held::Drop), Some(Running::Cancel)));
         }
@@ -39,7 +39,7 @@ async fn down(rig: FakeRig) -> WeftResult<()> {
 async fn the_programs_own(rig: FakeRig) -> WeftResult<()> {
     rig.run(&DeactivateTriggersNode, json!({ "doorForMinutes": 30 })).await.ok()?;
     match &rig.program_calls()[0] {
-        (ProgramCall::TriggerDeactivate { scope, take_down }, StopSelf::Keep) => {
+        (ProgramCall::Triggers(weft::program::triggers::TriggerCall::Deactivate { request: weft::deactivation::DeactivateRequest { scope, choice: take_down } }), StopSelf::Keep) => {
             assert!(scope.triggers.is_empty(), "every shared trigger");
             assert!(scope.instances.is_shared(), "the program's own triggers");
             assert_eq!((take_down.door, take_down.door_for_minutes), (Some(Door::Take), Some(30)));

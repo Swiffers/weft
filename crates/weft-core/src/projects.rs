@@ -17,7 +17,7 @@ pub struct ProjectSummary {
 
 /// `POST /projects`: the project exists on this install, under the
 /// caller's tenant, with nothing built yet.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeclareRequest {
     pub id: uuid::Uuid,
     pub name: String,
@@ -86,7 +86,7 @@ impl ProjectTransition {
 /// `GET /projects/{id}/status`'s query: the hashes the client computed
 /// for its current source, each compared with what the project runs. A
 /// hash left out is compared with the registered build's instead.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct StatusQuery {
     /// Compared against the running binary hash: "the worker image
     /// needs rebuilding", and, for a trigger that is on, whether its fires
@@ -306,7 +306,7 @@ impl Unanswered {
 }
 
 /// What `POST /projects/{id}/quiesce` asks: `weft rm`'s first step.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuiesceRequest {
     /// Wait for every run of the project to end, not only for the last

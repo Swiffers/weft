@@ -1,32 +1,25 @@
-//! Shared helper: discover the cwd project, compile it, and have the
+//! Shared helper: sync this folder with its working copy and have the
 //! install build it. Every mutating project-scoped command (`run`,
 //! `activate`, `bake`, `resync`, the infra verbs, `build`) calls this first
 //! so users don't have to remember `weft build` as a prerequisite.
 //!
 //! Semantics:
-//!   - Snapshot first (`snapshot::Snapshot`): every covered file is read
-//!     once, and everything after compiles, publishes and builds those
-//!     bytes, so files other people or agents edit meanwhile never reach
-//!     this command. It ends naming the files that moved on disk after the
-//!     snapshot, as a warning: the build is the snapshot.
-//!   - Compile here first, from the snapshot: a mistake in the program as
-//!     a whole is reported at once, with every diagnostic, before anything
-//!     is uploaded. A mistake in some part of it (an included file that
-//!     does not parse, a node that did not load) only breaks that part
-//!     (`weft_compiler::compile_program`): the command goes on, a run that
-//!     needs the part is refused when it is cut, and once the command did
-//!     what it came for, every broken part is printed as a warning
-//!     ([`ProjectHandle::warn_broken`]).
-//!   - Publish: every file of the snapshot the tenant's assets lack is
-//!     uploaded straight to the bucket; the manifest names the version.
-//!   - Resolve the `@asset` refs only this machine can read (a file outside
-//!     the project, a URL) and send them with the version.
-//!   - `POST /projects/{id}/builds`: the install fetches the version back,
-//!     compiles it, and starts a build of every stale image with its own
-//!     builder, answering at once with those builds. The install registers
-//!     the version itself once they are built; this command follows it
-//!     until it is registered or failed. Nothing is built or loaded on this
-//!     machine, and nothing this machine computed is believed.
+//!   - Sync first (`super::copy::this_copy`): the folder's edits go up to
+//!     its working copy, so the build is of what the folder holds.
+//!   - `POST /projects/{id}/builds` naming that working copy: the install
+//!     stamps it into a version, compiles it, resolves its `@asset`s, holds
+//!     the run the build is for (when there is one) to the program, and
+//!     starts a build of every stale image with its own builder, answering
+//!     at once with those builds. A program that does not compile, or a run
+//!     that could not start, is refused there, before any image is built.
+//!     The install registers the version itself once its images are built;
+//!     this command follows it until it is registered or failed. Nothing is
+//!     compiled, built or loaded on this machine.
+//!   - A part of the program that does not compile (an included file that
+//!     does not parse, a node that did not load) only breaks that part: the
+//!     command goes on, a run that needs the part is refused when it is
+//!     cut, and once the command did what it came for, every broken part is
+//!     printed as a warning ([`ProjectHandle::warn_broken`]).
 //!   - Registering a build is UNCONDITIONAL even while runs run on
 //!     the previous image: every worker task is stamped with the image it
 //!     was enqueued for and only claimable by a process baked from it, so
@@ -35,7 +28,7 @@
 
 use anyhow::{Context, Result};
 
-use weft_core::builds::{BuildsUnderway, BuiltProgram, ImageBuild, VersionBuildState, VersionBuildStatus};
+use weft_core::builds::{BuildRequest, BuildsUnderway, BuiltProgram, ImageBuild, VersionBuildState, VersionBuildStatus};
 use weft_core::projects::{BuildState, BuildStateResponse};
 
 use super::Ctx;
@@ -46,8 +39,10 @@ pub struct ProjectHandle {
     pub id: String,
     pub name: String,
     pub client: DispatcherClient,
-    /// The version's files: the snapshot this command compiled and built.
-    pub manifest: super::versions::Manifest,
+    /// This folder's working copy, as the sync before the build left it.
+    pub copy: weft_core::working_copy::WorkingCopy,
+    /// The version the install stamped the working copy as and built.
+    pub version: String,
     /// What the install built and registered: the compiled program and its
     /// three authoritative hashes (binary = worker image identity,
     /// definition = runtime shape / resync drift, infra = infra closure /
@@ -381,150 +376,35 @@ pub async fn ensure_project_known(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// Discover + compile the cwd project and have the install build and
-/// register it (see the module doc). Nothing here parks, drains, or
-/// prompts.
+/// Sync the cwd project's folder and have the install build it with
+/// `node_set` and register it (see the module doc). Nothing here parks,
+/// drains, or prompts.
 pub async fn ensure_registered(
     ctx: &Ctx,
     progress: &Progress,
     node_set: weft_core::builds::NodeSet,
 ) -> Result<ProjectHandle> {
-    let compiled = compile_project(ctx, progress)?;
-    build_compiled(ctx, progress, node_set, compiled).await
+    ensure_built(ctx, progress, BuildRequest { node_set, ..Default::default() }).await
 }
 
-pub struct CompiledProject {
-    pub definition: weft_core::ProjectDefinition,
-    /// The project as the snapshot reads it (its `weft.toml`): the build
-    /// is asked for under its name and id, never the disk's.
-    project: weft_compiler::project::Project,
-    /// The files it was compiled from, which the build publishes.
-    snapshot: std::sync::Arc<super::snapshot::Snapshot>,
-}
-
-impl CompiledProject {
-    /// Where a command resolves the markers in what it sends beside the
-    /// program (a run's handed values): this compile's snapshot, then the
-    /// disk.
-    pub fn files(&self) -> super::snapshot::SnapshotFirst<'_> {
-        self.snapshot.then_disk()
-    }
-}
-
-/// Snapshot the project and compile it, without publishing files or
-/// building an image. Commands check their requested operation against this
-/// same definition before registration. Fails only on a mistake in the
-/// program as a whole; a part that does not compile is in
-/// `definition.broken`.
-pub fn compile_project(ctx: &Ctx, progress: &Progress) -> Result<CompiledProject> {
-    compile_snapshot(progress, super::snapshot::Snapshot::take(&ctx.project()?.root)?)
-}
-
-/// [`compile_project`] from a snapshot the command already took (`weft run`
-/// reads its example from it first).
-pub fn compile_snapshot(progress: &Progress, snapshot: super::snapshot::Snapshot) -> Result<CompiledProject> {
-    let snapshot = std::sync::Arc::new(snapshot);
-    let project = snapshot.project()?;
-    // Use the diagnostic-bearing loader so a compile failure can fire a
-    // structured progress error (the editor's action-bar modal renders
-    // per-diagnostic info) instead of a single flattened string.
-    let definition = match weft_compiler::hash::load_program_in(&project, snapshot.clone()) {
-        Ok((definition, _)) => definition,
-        Err(weft_compiler::hash::CompileLoadError::Read(msg)) => anyhow::bail!("{msg}"),
-        Err(weft_compiler::hash::CompileLoadError::Diagnostics(diags)) => {
-            return Err(compile_failure(&project, progress, &diags));
-        }
-    };
-    Ok(CompiledProject { definition, project, snapshot })
-}
-
-/// Report compile diagnostics both ways at once and hand back the error
-/// to return: a structured progress event for the editor, and the same
-/// per-line rendering in the error text for a terminal.
-fn compile_failure(
-    project: &weft_compiler::project::Project,
-    progress: &Progress,
-    diags: &[weft_compiler::Diagnostic],
-) -> anyhow::Error {
-    let summary = diags
-        .iter()
-        .find(|d| matches!(d.severity, weft_compiler::Severity::Error))
-        .map(|d| d.message.clone())
-        .unwrap_or_else(|| "compile failed".to_string());
-    // The editor's action-bar modal renders one entry per
-    // diagnostic from this structured event; the location's
-    // `file` is the diagnostic's own source file (an @include's
-    // nodes keep their file's coordinates), falling back to
-    // main.weft, so a click jumps to the right buffer.
-    // SYNC: diagnostic -> ActionErrorDiagnostic mapping <->
-    //       extension-vscode/src/preflight.ts preflightBlock
-    let main_weft = project.main_weft();
-    let json_diags: Vec<serde_json::Value> = diags
-        .iter()
-        .map(|d| {
-            let severity = match d.severity {
-                weft_compiler::Severity::Error => "error",
-                weft_compiler::Severity::Warning => "warning",
-                weft_compiler::Severity::Info => "info",
-                weft_compiler::Severity::Hint => "info",
-            };
-            serde_json::json!({
-                "severity": severity,
-                "code": d.code,
-                "message": d.message,
-                "location": {
-                    "file": d.file.clone().unwrap_or_else(|| main_weft.to_string_lossy().into_owned()),
-                    "line": d.line,
-                    "column": d.column,
-                },
-            })
-        })
-        .collect();
-    progress.structured_error(serde_json::json!({
-        "message": summary,
-        "what": "Compiling project",
-        "stage": "compile",
-        "diagnostics": json_diags,
-    }));
-    // In TTY mode there's no action-bar to read the structured
-    // event, so the error itself must carry the per-line
-    // locations: one `line:column message` per error, the same
-    // rendering the catalog/parse path produces. A bare
-    // "compile failed with N diagnostic(s)" would force the
-    // user back to the editor to find WHERE.
-    anyhow::anyhow!("compile failed:\n{}", weft_compiler::render_diagnostics(diags))
-}
-
-/// Upload the version the compile read, and have the install build it.
-pub async fn build_compiled(
-    ctx: &Ctx,
-    progress: &Progress,
-    node_set: weft_core::builds::NodeSet,
-    compiled: CompiledProject,
-) -> Result<ProjectHandle> {
-    let CompiledProject { definition, project, snapshot } = compiled;
-    let client = ctx.client()?;
-    let manifest = snapshot.publish(&client, !progress.json).await?;
-
-    // The `@asset` refs only this machine can read, resolved here and sent
-    // with the version (a referenced file the tenant's assets lack is
-    // uploaded on the way).
-    let resolutions =
-        crate::commands::assets::asset_resolutions(&client, &snapshot.then_disk(), &definition, true).await?;
-
-    let id = project.id().to_string();
+/// [`ensure_registered`] for the build `request` asks (a new root, the
+/// run it is for); the working copy it builds is this folder's.
+pub async fn ensure_built(ctx: &Ctx, progress: &Progress, mut request: BuildRequest) -> Result<ProjectHandle> {
+    let super::copy::FolderCopy { project_id: id, client, copy } = super::copy::this_copy(ctx, Some(progress)).await?;
+    request.working_copy = weft_core::working_copy::WorkingCopyRef { working_copy: Some(copy.id) };
+    let name = ctx.project()?.manifest.package.name.clone();
     let path = format!("/projects/{id}/builds");
-    let body = weft_core::builds::VersionBuildRequest {
-        name: project.manifest.package.name.clone(),
-        manifest: manifest.clone(),
-        inputs: weft_core::builds::BuildInputs { node_set, assets: resolutions.map.clone() },
-    };
-    progress.build_start(&project.manifest.package.name);
+    progress.build_start(&name);
     progress.dispatcher_call_start(&path);
     let started = std::time::Instant::now();
     // The ask answers at once: the version registered (200), or the image
     // builds it waits on (202), which the install registers it after.
-    let (built, following) = match ask_to_build(&client, &path, &serde_json::to_value(&body)?, progress, started).await? {
+    let asked = ask_to_build(&client, &path, &serde_json::to_value(&request)?, progress, started).await.inspect_err(|e| {
+        if let Some(text) = compile_failure(e) {
+            progress.structured_error(serde_json::json!({ "message": text, "what": "Compiling project", "stage": "compile" }));
+        }
+    })?;
+    let (built, following) = match asked {
         Asked::Registered(built) => (*built, Following::default()),
         Asked::Underway(underway) => {
             let mut following = Following::new(underway.images, started.elapsed());
@@ -533,51 +413,23 @@ pub async fn build_compiled(
         }
     };
     progress.dispatcher_call_done(serde_json::json!({ "projectId": id }));
-    progress.build_done(&project.manifest.package.name, &following.built);
+    progress.build_done(&name, &following.built);
     if let Some(note) = replaced_infra_images_note(&built.replaced_infra_images, ctx.on()) {
         progress.warn(&note);
     }
-
-    // The version's blobs and the assets the built program uses are the
-    // project's current references; everything else starts expiring.
-    for warning in crate::commands::assets::publish_references(&client, &built.definition, &resolutions, Some(&manifest)).await? {
-        progress.warn(&warning);
-    }
-    // The install built the files as the snapshot read them; whatever moved
-    // on disk since is not in this build, and the next edit would look
-    // live already if nobody said so.
-    // The build already registered, so a look at the disk that fails is
-    // said rather than failing the command after its work.
-    match snapshot.changed_on_disk() {
-        Ok(moved) => {
-            if let Some(note) = moved_since_note(&snapshot.taken_at(), &moved) {
-                progress.warn(&note);
-            }
-        }
-        Err(e) => progress.warn(&format!("could not check which of your files changed during this command: {e:#}")),
-    }
-
-    Ok(ProjectHandle {
-        id,
-        name: project.manifest.package.name.clone(),
-        client,
-        manifest,
-        built,
-    })
+    let version = built.version.clone();
+    Ok(ProjectHandle { id, name, client, copy, version, built })
 }
 
-/// What a person is told when files moved on disk after the command's
-/// snapshot (`taken`): the build is the snapshot, and these are not in it.
-fn moved_since_note(taken: &chrono::DateTime<chrono::Local>, moved: &[String]) -> Option<String> {
-    if moved.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "built from your files as they were at {}; these changed after that and are not in this build \
-         (run the command again to take them): {}",
-        taken.format("%H:%M:%S"),
-        moved.join(", ")
-    ))
+/// The install's words when the build was refused because the program as
+/// a whole does not compile: what its 422 says from `compile failed:` on,
+/// one `line:column message` per diagnostic.
+// SYNC: "compile failed:" <-> crates/weft-dispatcher/src/build/source.rs compile
+fn compile_failure(e: &anyhow::Error) -> Option<String> {
+    let refused = crate::client::refusal(e).filter(|refused| refused.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY)?;
+    let text = refused.to_string();
+    let at = text.find("compile failed:")?;
+    Some(text[at..].to_string())
 }
 
 #[cfg(test)]
@@ -638,6 +490,27 @@ mod tests {
         assert_eq!(following.failures[0], "the build of worker failed:\ncargo: error[E0425]\nits log: https://log/1");
         assert_eq!(following.failures[1], "the build of db was cancelled");
         assert_eq!(following.failures[2], "the build of cache is no longer on record");
+    }
+
+    /// The install's refusal of a program that does not compile is told
+    /// apart from every other failed build, so the editor shows it as a
+    /// compile failure.
+    #[tokio::test]
+    async fn a_compile_failure_is_read_off_the_install_refusal() {
+        use crate::client::fake::{install, Then};
+        let ask = |answer: &'static str| async move {
+            DispatcherClient::new(install(Then::Answer(answer)).await, None)
+                .post_json_success("/projects/p/builds", &serde_json::json!({}))
+                .await
+                .unwrap_err()
+                .context("the build failed")
+        };
+        let failed = ask("HTTP/1.1 422 Unprocessable Entity\r\ncontent-length: 39\r\n\r\nbuild: compile failed:\n3:1 unknown node").await;
+        assert_eq!(compile_failure(&failed).as_deref(), Some("compile failed:\n3:1 unknown node"));
+        let other = ask("HTTP/1.1 422 Unprocessable Entity\r\ncontent-length: 14\r\n\r\nunknown assets").await;
+        assert_eq!(compile_failure(&other), None);
+        let busy = ask("HTTP/1.1 409 Conflict\r\ncontent-length: 15\r\n\r\ncompile failed:").await;
+        assert_eq!(compile_failure(&busy), None, "only the install's 422 is a compile failure");
     }
 
     /// A look the install refused, or answered with something unreadable,

@@ -68,6 +68,7 @@ pub mod pulse;
 pub mod route;
 pub mod rules;
 pub mod run;
+pub mod run_flags;
 pub mod run_settings;
 pub mod run_spec;
 #[cfg(feature = "runtime")]
@@ -100,6 +101,8 @@ pub mod take_down;
 pub mod task;
 pub mod time_scale;
 pub mod versions;
+pub mod working_copy;
+pub mod workers;
 pub mod weft_type;
 #[cfg(feature = "runtime")]
 pub mod wire_shape;

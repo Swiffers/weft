@@ -19,11 +19,12 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use sqlx::PgPool;
-use weft_core::frontend::{AddFrontendRequest, AddedFrontend, Frontend, FrontendHost, FrontendWithToken, Repository};
+use weft_core::frontend::{AddFrontendRequest, AddedFrontend, Frontend, FrontendHost, FrontendWithToken, Repository, VisitorAddressRequest};
 use weft_core::signal_token::MintTokenRequest;
 use weft_platform_traits::FrontendSite;
 
-use crate::authenticator::{authorize_project, CallerTenant};
+use crate::actions::{settings, Actor, Refused};
+use crate::authenticator::CallerTenant;
 use crate::state::DispatcherState;
 use crate::tenant::TenantId;
 
@@ -209,8 +210,8 @@ fn site(frontend: &Frontend) -> Option<FrontendSite> {
 }
 
 /// A caller token for `name` of `project`, scoped to that project, minted
-/// under `owner`: the tenant that owns the project, which every route here
-/// has already checked is the caller's (`authorize_project`).
+/// under `owner`: the tenant that owns the project, which every action on a
+/// frontend has already held its actor to (`crate::actions::settings`).
 async fn mint_token(
     state: &DispatcherState,
     owner: &TenantId,
@@ -218,7 +219,7 @@ async fn mint_token(
     name: &str,
 ) -> Result<weft_core::signal_token::MintedToken, (StatusCode, String)> {
     let body = MintTokenRequest { allowed_projects: vec![project], ..MintTokenRequest::caller(format!("frontend {name}")) };
-    crate::api::signal_token::mint(state, &CallerTenant(owner.clone()), body).await
+    settings::mint(state, owner, body).await
 }
 
 /// Revoke `id`. One already gone is fine: a retry finds it so.
@@ -227,21 +228,29 @@ async fn revoke_token(state: &DispatcherState, owner: &TenantId, id: uuid::Uuid)
     Ok(())
 }
 
-/// `POST /projects/{id}/frontends`: the frontend and, for one the install
-/// hosts, its service; for one running elsewhere, its token (shown this
-/// once). A hosted one gets no token here: its deploy workflow puts its
-/// first in place (`weft target export` makes it), and one made now would
-/// be a working credential nobody holds. A step that fails takes back what
-/// the steps before it made: the service and the repository's access
-/// (unless another frontend uses it), then the token.
+/// `POST /projects/{id}/frontends`.
 pub async fn add(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(project): Path<uuid::Uuid>,
     Json(req): Json<AddFrontendRequest>,
-) -> Result<Json<AddedFrontend>, (StatusCode, String)> {
-    authorize_project(&state, &caller.0, project).await?;
-    req.validate().map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+) -> Result<Json<AddedFrontend>, Refused> {
+    Ok(Json(settings::frontend_add(&state, &Actor::operator(caller.0), project, req).await?))
+}
+
+/// Make the frontend `req` of `project`, owned by `owner`, and, for one the
+/// install hosts, its service; for one running elsewhere, its token (shown
+/// this once). A hosted one gets no token here: its deploy workflow puts
+/// its first in place (`weft target export` makes it), and one made now
+/// would be a working credential nobody holds. A step that fails takes
+/// back what the steps before it made: the service and the repository's
+/// access (unless another frontend uses it), then the token.
+pub(crate) async fn make(
+    state: &DispatcherState,
+    owner: &TenantId,
+    project: uuid::Uuid,
+    req: AddFrontendRequest,
+) -> Result<AddedFrontend, Refused> {
     let taken = || {
         (
             StatusCode::CONFLICT,
@@ -251,10 +260,9 @@ pub async fn add(
     if get(&state.pg_pool, project, &req.name).await.map_err(internal)?.is_some() {
         return Err(taken());
     }
-    let owner = &caller.0;
     let minted = match req.host {
         FrontendHost::CloudRun => None,
-        FrontendHost::External => Some(mint_token(&state, owner, project, &req.name).await?),
+        FrontendHost::External => Some(mint_token(state, owner, project, &req.name).await?),
     };
     let mut frontend = Frontend {
         name: req.name.clone(),
@@ -291,14 +299,14 @@ pub async fn add(
     }
     .await;
     let failure = match made {
-        Ok(true) => return Ok(Json(AddedFrontend { frontend, token: minted.map(|minted| minted.token) })),
+        Ok(true) => return Ok(AddedFrontend { frontend, token: minted.map(|minted| minted.token) }),
         Ok(false) => taken(),
-        Err(e) if visitor_address_taken(&e) => another_visitor_address(&state, project).await,
+        Err(e) if visitor_address_taken(&e) => another_visitor_address(state, project).await,
         Err(e) => (StatusCode::BAD_GATEWAY, format!("add frontend '{}': {e:#}", req.name)),
     };
     let (status, mut msg) = failure;
     if let (true, Some(site)) = (opened, &site) {
-        if let Err(undo) = take_back_site(&state, site).await {
+        if let Err(undo) = take_back_site(state, site).await {
             msg.push_str(&format!(
                 "\n(and taking back its service and {}'s access failed: {undo:#}; `weft frontend add {}` again, then \
                  `weft frontend rm {}`, finishes it)",
@@ -307,7 +315,7 @@ pub async fn add(
         }
     }
     if let Some(minted) = &minted {
-        if let Err(undo) = revoke_token(&state, owner, minted.id).await {
+        if let Err(undo) = revoke_token(state, owner, minted.id).await {
             msg.push_str(&format!("\n(and its token {} could not be revoked: {undo:#}; `weft token revoke {}` does it)", minted.id, minted.id));
         }
     }
@@ -340,38 +348,43 @@ async fn another_visitor_address(state: &DispatcherState, project: uuid::Uuid) -
     )
 }
 
-/// `PUT /projects/{id}/frontends/{name}/visitor-address`: set where the
-/// frontend's server passes the install's doors on to its visitors, or
-/// clear it.
+/// `PUT /projects/{id}/frontends/{name}/visitor-address`.
 pub async fn set_visitor_address(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path((project, name)): Path<(uuid::Uuid, String)>,
-    Json(req): Json<weft_core::frontend::VisitorAddressRequest>,
-) -> Result<Json<Frontend>, (StatusCode, String)> {
-    authorize_project(&state, &caller.0, project).await?;
-    if let Some(address) = &req.visitor_address {
-        weft_core::frontend::check_visitor_address(address).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
-    }
+    Json(req): Json<VisitorAddressRequest>,
+) -> Result<Json<Frontend>, Refused> {
+    Ok(Json(settings::frontend_visitor_address(&state, &Actor::operator(caller.0), project, &name, &req).await?))
+}
+
+/// Set where the frontend `name` of `project` passes the install's doors
+/// on to its visitors, or clear it.
+pub(crate) async fn set_visitor(
+    state: &DispatcherState,
+    project: uuid::Uuid,
+    name: &str,
+    req: &VisitorAddressRequest,
+) -> Result<Frontend, Refused> {
     let address = req.visitor_address.as_deref().map(|a| a.trim_end_matches('/'));
     let set = sqlx::query("UPDATE project_frontend SET visitor_address = $3 WHERE project_id = $1 AND name = $2")
         .bind(project)
-        .bind(&name)
+        .bind(name)
         .bind(address)
         .execute(&state.pg_pool)
         .await;
     match set {
-        Ok(done) if done.rows_affected() == 0 => return Err(not_found(&name)),
+        Ok(done) if done.rows_affected() == 0 => return Err(not_found(name)),
         Ok(_) => {}
         Err(e) => {
             let e = anyhow::Error::from(e);
             if visitor_address_taken(&e) {
-                return Err(another_visitor_address(&state, project).await);
+                return Err(another_visitor_address(state, project).await);
             }
             return Err(internal(format!("{e:#}")));
         }
     }
-    get(&state.pg_pool, project, &name).await.map_err(internal)?.map(Json).ok_or_else(|| not_found(&name))
+    get(&state.pg_pool, project, name).await.map_err(internal)?.ok_or_else(|| not_found(name))
 }
 
 /// Undo a failed `open` of `site`: the service, and the repository's access
@@ -409,13 +422,21 @@ pub async fn list_route(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(project): Path<uuid::Uuid>,
-) -> Result<Json<Vec<Frontend>>, (StatusCode, String)> {
-    authorize_project(&state, &caller.0, project).await?;
-    Ok(Json(list(&state.pg_pool, project).await.map_err(internal)?))
+) -> Result<Json<Vec<Frontend>>, Refused> {
+    Ok(Json(settings::frontends_list(&state, &Actor::operator(caller.0), project).await?))
 }
 
-/// `POST /projects/{id}/frontends/{name}/token`: a new token for the
-/// frontend, shown this once, waiting beside the one it has: that one
+/// `POST /projects/{id}/frontends/{name}/token`.
+pub async fn new_token(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path((project, name)): Path<(uuid::Uuid, String)>,
+) -> Result<Json<FrontendWithToken>, Refused> {
+    Ok(Json(settings::frontend_token_new(&state, &Actor::operator(caller.0), project, &name).await?))
+}
+
+/// A new token for the frontend `name` of `project`, owned by `owner`,
+/// shown this once, waiting beside the one it has: that one
 /// keeps working until a new one is put in place (`token/{id}/done`), so
 /// the site never goes without. Every new token made and not yet in place
 /// keeps working too: one may already sit in a repository, waiting for its
@@ -424,26 +445,25 @@ pub async fn list_route(
 /// Made under the frontend's lock: a removal either comes first, and this
 /// answers that there is no such frontend, or comes after and revokes
 /// this token with the rest.
-pub async fn new_token(
-    State(state): State<DispatcherState>,
-    caller: CallerTenant,
-    Path((project, name)): Path<(uuid::Uuid, String)>,
-) -> Result<Json<FrontendWithToken>, (StatusCode, String)> {
-    authorize_project(&state, &caller.0, project).await?;
-    let owner = &caller.0;
+pub(crate) async fn renew_token(
+    state: &DispatcherState,
+    owner: &TenantId,
+    project: uuid::Uuid,
+    name: &str,
+) -> Result<FrontendWithToken, Refused> {
     let mut tx = state.pg_pool.begin().await.map_err(internal)?;
-    lock_frontend(&mut tx, project, &name).await.map_err(internal)?;
-    if get(&mut *tx, project, &name).await.map_err(internal)?.is_none() {
-        return Err(not_found(&name));
+    lock_frontend(&mut tx, project, name).await.map_err(internal)?;
+    if get(&mut *tx, project, name).await.map_err(internal)?.is_none() {
+        return Err(not_found(name));
     }
-    let minted = mint_token(&state, owner, project, &name).await?;
+    let minted = mint_token(state, owner, project, name).await?;
     let recorded: anyhow::Result<Row> = async {
         let row = sqlx::query_as::<_, Row>(&format!(
             "UPDATE project_frontend SET pending_token_ids = array_append(pending_token_ids, $3) \
              WHERE project_id = $1 AND name = $2 RETURNING {COLUMNS}"
         ))
         .bind(project)
-        .bind(&name)
+        .bind(name)
         .bind(minted.id)
         .fetch_one(&mut *tx)
         .await?;
@@ -452,15 +472,15 @@ pub async fn new_token(
     }
     .await;
     match recorded {
-        Ok(row) => Ok(Json(FrontendWithToken {
+        Ok(row) => Ok(FrontendWithToken {
             frontend: row.into_frontend().map_err(internal)?,
             token: minted.token,
             token_id: minted.id,
-        })),
+        }),
         // The write failed: nothing holds the token.
         Err(e) => {
             let mut msg = format!("record the new token of frontend '{name}': {e:#}");
-            if let Err(undo) = revoke_token(&state, owner, minted.id).await {
+            if let Err(undo) = revoke_token(state, owner, minted.id).await {
                 msg.push_str(&format!("\n(and it could not be revoked: {undo:#}; `weft token revoke {}` does it)", minted.id));
             }
             Err((StatusCode::INTERNAL_SERVER_ERROR, msg))
@@ -468,68 +488,90 @@ pub async fn new_token(
     }
 }
 
-/// `POST /projects/{id}/frontends/{name}/token/{token}/done`: the new
-/// token `token` is in place. It becomes the frontend's token, and every
+/// `POST /projects/{id}/frontends/{name}/token/{token}/done`.
+pub async fn token_done(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path((project, name, token)): Path<(uuid::Uuid, String, uuid::Uuid)>,
+) -> Result<StatusCode, Refused> {
+    settings::frontend_token_done(&state, &Actor::operator(caller.0), project, &name, token).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The new token `token` of the frontend `name` of `project`, owned by
+/// `owner`, is in place. It becomes the frontend's token, and every
 /// other one (the one it replaces, and new ones never put in place) stops
 /// working. Saying it again of the token already in place does nothing, so
 /// a deploy says it every time.
 ///
 /// The retired tokens are revoked before the change commits: a revoke
 /// that fails leaves the record as it was, so saying it again retries.
-pub async fn token_done(
-    State(state): State<DispatcherState>,
-    caller: CallerTenant,
-    Path((project, name, token)): Path<(uuid::Uuid, String, uuid::Uuid)>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    authorize_project(&state, &caller.0, project).await?;
+pub(crate) async fn put_token_in_place(
+    state: &DispatcherState,
+    owner: &TenantId,
+    project: uuid::Uuid,
+    name: &str,
+    token: uuid::Uuid,
+) -> Result<(), Refused> {
     let mut tx = state.pg_pool.begin().await.map_err(internal)?;
-    lock_frontend(&mut tx, project, &name).await.map_err(internal)?;
+    lock_frontend(&mut tx, project, name).await.map_err(internal)?;
     let row: Option<(Option<uuid::Uuid>, Vec<uuid::Uuid>)> = sqlx::query_as(
         "SELECT token_id, pending_token_ids FROM project_frontend WHERE project_id = $1 AND name = $2",
     )
     .bind(project)
-    .bind(&name)
+    .bind(name)
     .fetch_optional(&mut *tx)
     .await
     .map_err(internal)?;
-    let Some((current, pending)) = row else { return Err(not_found(&name)) };
+    let Some((current, pending)) = row else { return Err(not_found(name)) };
     if current == Some(token) {
-        return Ok(StatusCode::NO_CONTENT);
+        return Ok(());
     }
     if !pending.contains(&token) {
         return Err((StatusCode::CONFLICT, format!("{token} is not a new token of frontend '{name}'")));
     }
     sqlx::query("UPDATE project_frontend SET token_id = $3, pending_token_ids = '{}' WHERE project_id = $1 AND name = $2")
         .bind(project)
-        .bind(&name)
+        .bind(name)
         .bind(token)
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
     let retired: Vec<uuid::Uuid> = current.into_iter().chain(pending).filter(|t| *t != token).collect();
-    revoke_all(&state, &caller.0, &retired).await.map_err(internal)?;
+    revoke_all(state, owner, &retired).await.map_err(internal)?;
     tx.commit().await.map_err(internal)?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
-/// `DELETE /projects/{id}/frontends/{name}/token/{token}`: the new token
-/// `token` will never be put in place (an export that failed); it stops
-/// working, and the others stay. Revoked before the change commits, like
-/// `token_done`'s, so a revoke that fails can be retried.
+/// `DELETE /projects/{id}/frontends/{name}/token/{token}`.
 pub async fn drop_token(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path((project, name, token)): Path<(uuid::Uuid, String, uuid::Uuid)>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    authorize_project(&state, &caller.0, project).await?;
+) -> Result<StatusCode, Refused> {
+    settings::frontend_token_drop(&state, &Actor::operator(caller.0), project, &name, token).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The new token `token` of the frontend `name` of `project`, owned by
+/// `owner`, will never be put in place (an export that failed); it stops
+/// working, and the others stay. Revoked before the change commits, like
+/// [`put_token_in_place`]'s, so a revoke that fails can be retried.
+pub(crate) async fn drop_new_token(
+    state: &DispatcherState,
+    owner: &TenantId,
+    project: uuid::Uuid,
+    name: &str,
+    token: uuid::Uuid,
+) -> Result<(), Refused> {
     let mut tx = state.pg_pool.begin().await.map_err(internal)?;
-    lock_frontend(&mut tx, project, &name).await.map_err(internal)?;
+    lock_frontend(&mut tx, project, name).await.map_err(internal)?;
     let dropped = sqlx::query(
         "UPDATE project_frontend SET pending_token_ids = array_remove(pending_token_ids, $3) \
          WHERE project_id = $1 AND name = $2 AND $3 = ANY(pending_token_ids)",
     )
     .bind(project)
-    .bind(&name)
+    .bind(name)
     .bind(token)
     .execute(&mut *tx)
     .await
@@ -538,9 +580,9 @@ pub async fn drop_token(
     if dropped == 0 {
         return Err((StatusCode::NOT_FOUND, format!("{token} is not a new token of frontend '{name}'")));
     }
-    revoke_token(&state, &caller.0, token).await.map_err(internal)?;
+    revoke_token(state, owner, token).await.map_err(internal)?;
     tx.commit().await.map_err(internal)?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 /// Revoke every one of `ids`, trying all of them; the error names each one
@@ -564,21 +606,32 @@ pub struct RemoveQuery {
     pub force: bool,
 }
 
-/// `DELETE /projects/{id}/frontends/{name}`: its service (and its
-/// repository's right to deploy, when no other frontend deploys from it),
-/// its tokens, then the record. Answers what `force` left on the cloud.
+/// `DELETE /projects/{id}/frontends/{name}`.
 pub async fn remove(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path((project, name)): Path<(uuid::Uuid, String)>,
     Query(query): Query<RemoveQuery>,
-) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    authorize_project(&state, &caller.0, project).await?;
-    let left = take_down(&state, &caller.0, project, &name, query.force)
+) -> Result<Json<Vec<String>>, Refused> {
+    Ok(Json(settings::frontend_remove(&state, &Actor::operator(caller.0), project, &name, query.force).await?))
+}
+
+/// Remove the frontend `name` of `project`, owned by `owner`: its service
+/// (and its repository's right to deploy, when no other frontend deploys
+/// from it), its tokens, then the record. Answers what `force` left on the
+/// cloud.
+pub(crate) async fn remove_one(
+    state: &DispatcherState,
+    owner: &TenantId,
+    project: uuid::Uuid,
+    name: &str,
+    force: bool,
+) -> Result<Vec<String>, Refused> {
+    let left = take_down(state, owner, project, name, force)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("remove frontend '{name}': {e:#}")))?
-        .ok_or_else(|| not_found(&name))?;
-    Ok(Json(left.into_iter().collect()))
+        .ok_or_else(|| not_found(name))?;
+    Ok(left.into_iter().collect())
 }
 
 /// Remove the frontend `name` of `project`: what the cloud holds, its

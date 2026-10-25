@@ -810,7 +810,7 @@ async fn assemble_concatenates_existing_objects_into_an_asset(pool: PgPool) {
     // any caller moving bytes.
     bucket.put("chunks/c1", body(b"HELLO ")).await.unwrap();
     bucket.put("chunks/c2", body(b"WORLD")).await.unwrap();
-    let sha = "cd".repeat(32);
+    let sha = sha256_hex(b"HELLO WORLD");
     let sha_static: &'static str = Box::leak(sha.clone().into_boxed_str());
     let spec = UploadSpec {
         scope: &StorageScope::Asset,
@@ -863,7 +863,7 @@ async fn assemble_concatenates_existing_objects_into_an_asset(pool: PgPool) {
 async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: PgPool) {
     let (s, bucket, _c) = store(&pool).await;
     let w = acting("t1");
-    let sha = "ab".repeat(32);
+    let sha = sha256_hex(b"weft");
     let asset_spec = |hash: Option<&'static str>| UploadSpec {
         scope: &StorageScope::Asset,
         mime: "image/png",
@@ -911,6 +911,17 @@ async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: Pg
     assert_eq!(resume_key, key, "the store's own key, not one the caller guessed");
     assert_eq!(resume_part_size, part_size);
 
+    // Once another publish of the same bytes has claimed the completion, a
+    // begin is told so (the marked "ask again" refusal), not that the key
+    // is being cleared: the asset lands in a moment, and the caller waits
+    // for it by its hash.
+    sqlx::query("UPDATE runtime_file SET status = 'completing' WHERE key = $1").bind(&key).execute(&pool).await.unwrap();
+    assert!(
+        matches!(s.begin_upload(&w, &asset_spec(Some(sha_static)), &big()).await, Err(RuntimeStoreError::Completing(_))),
+        "a begin that meets a completing upload of the same content is told to wait"
+    );
+    sqlx::query("UPDATE runtime_file SET status = 'pending' WHERE key = $1").bind(&key).execute(&pool).await.unwrap();
+
     upload_parts(&s, &bucket, &w, &key, part_size, &bytes::Bytes::from_static(b"weft"), &big())
         .await
         .unwrap();
@@ -932,6 +943,49 @@ async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: Pg
     assert_eq!(s.list("t1/asset/").await.unwrap().len(), 0);
 }
 
+/// An asset's key is the sha256 of its bytes, and the store holds every
+/// upload to it: bytes that hash to anything else are refused at complete,
+/// naming the file and both hashes, and leave neither a row nor an object,
+/// so the key is free for the right bytes, which then complete.
+#[sqlx::test]
+async fn an_asset_whose_bytes_are_not_its_hash_is_refused_and_leaves_nothing(pool: PgPool) {
+    let (s, bucket, _c) = store(&pool).await;
+    let w = acting("t1");
+    let sha = sha256_hex(b"weft");
+    let spec = UploadSpec {
+        scope: &StorageScope::Asset,
+        mime: "text/plain",
+        filename: "assets/word.txt",
+        keep: None,
+        declared_size: Some(4),
+        content_hash: Some(&sha),
+        identity: None,
+        slot: None,
+    };
+    let BeginUpload::Ready { key, part_size } = s.begin_upload(&w, &spec, &big()).await.unwrap() else {
+        panic!("fresh asset content must reserve a real upload");
+    };
+    upload_parts(&s, &bucket, &w, &key, part_size, &body(b"waft"), &big()).await.unwrap();
+    let refused = s.complete_upload(&w, &key).await;
+    let Err(RuntimeStoreError::NotItsContent(why)) = refused else { panic!("{refused:?}") };
+    for named in ["assets/word.txt", sha.as_str(), sha256_hex(b"waft").as_str()] {
+        assert!(why.contains(named), "the refusal names {named}: {why}");
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_file").fetch_one(&pool).await.unwrap();
+    assert_eq!(rows, 0, "the refused upload left no row");
+    assert!(bucket.keys().is_empty(), "the refused upload left no object: {:?}", bucket.keys());
+    assert_eq!(s.tenant_usage("t1").await.unwrap(), (0, 0), "nothing is charged");
+
+    let BeginUpload::Ready { key: again, part_size } = s.begin_upload(&w, &spec, &big()).await.unwrap() else {
+        panic!("the key is free again, so the right bytes start a fresh upload");
+    };
+    assert_eq!(again, key);
+    upload_parts(&s, &bucket, &w, &key, part_size, &body(b"weft"), &big()).await.unwrap();
+    let meta = s.complete_upload(&w, &key).await.unwrap();
+    assert_eq!((meta.key.as_str(), meta.size_bytes), (key.as_str(), 4));
+    assert_eq!(bucket.get(&object_key(&key)).await.unwrap().as_deref(), Some(&b"weft"[..]));
+}
+
 #[sqlx::test]
 async fn delete_removes_and_a_link_requires_the_file(pool: PgPool) {
     let (s, bucket, _c) = store(&pool).await;
@@ -951,14 +1005,30 @@ fn acting(tenant: &str) -> CallerAuth {
     CallerAuth::Tenant { tenant: tenant.into() }
 }
 
-/// The asset named `id` (its hash is `id` spelled as 64 hex digits).
+/// The sha256 of `bytes`, in hex: an asset's id.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    weft_core::access::hex_of(&sha2::Sha256::digest(bytes))
+}
+
+/// The three bytes of the test asset `id` (a single digit).
+fn asset_bytes(id: u64) -> Vec<u8> {
+    format!("ca{id}").into_bytes()
+}
+
+/// The content hash of the test asset `id`.
+fn asset_hash(id: u64) -> String {
+    sha256_hex(&asset_bytes(id))
+}
+
+/// The key of the test asset `id`.
 fn asset_key(tenant: &str, id: u64) -> String {
-    format!("{tenant}/asset/{id:064x}")
+    format!("{tenant}/asset/{}", asset_hash(id))
 }
 
 async fn asset_via(s: &RuntimeStore, bucket: &FakeObjectStore, tenant: &str, id: u64) -> StoredFileMeta {
     let caller = acting(tenant);
-    let hash = format!("{id:064x}");
+    let hash = asset_hash(id);
     let spec = UploadSpec {
         scope: &StorageScope::Asset,
         mime: "image/png",
@@ -972,7 +1042,7 @@ async fn asset_via(s: &RuntimeStore, bucket: &FakeObjectStore, tenant: &str, id:
     let BeginUpload::Ready { key, part_size } = s.begin_upload(&caller, &spec, &big()).await.unwrap() else {
         panic!("test asset must be new");
     };
-    upload_parts(s, bucket, &caller, &key, part_size, &body(b"cat"), &big()).await.unwrap();
+    upload_parts(s, bucket, &caller, &key, part_size, &body(&asset_bytes(id)), &big()).await.unwrap();
     s.complete_upload(&caller, &key).await.unwrap()
 }
 
@@ -1049,7 +1119,7 @@ async fn an_asset_is_stored_and_charged_once_per_tenant(pool: PgPool) {
     let (s, bucket, _) = store(&pool).await;
     let first = asset_via(&s, &bucket, "t1", 1).await;
     assert_eq!(first.key, asset_key("t1", 1));
-    let hash = format!("{:064x}", 1);
+    let hash = asset_hash(1);
     let spec = UploadSpec {
         scope: &StorageScope::Asset,
         mime: "image/png",
@@ -1077,7 +1147,7 @@ async fn an_asset_is_stored_and_charged_once_per_tenant(pool: PgPool) {
     assert_eq!(s.tenant_usage("t2").await.unwrap(), (1, 3));
     assert_eq!(s.tenant_usage("t1").await.unwrap(), (1, 3));
     assert_eq!(
-        s.held_assets("t1", &[hash.clone(), format!("{:064x}", 2)]).await.unwrap(),
+        s.held_assets("t1", &[hash.clone(), asset_hash(2)]).await.unwrap(),
         [(hash.clone(), first.key.clone())].into_iter().collect(),
         "only what the tenant stores whole, under its own key"
     );

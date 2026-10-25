@@ -173,18 +173,20 @@ and the graph print back.
 
 | Command | What it does |
 |---|---|
-| `weft build` | compile, resolve assets, build the worker image (content-addressed) and register the project with [the daemon]. Starts nothing. You never need it while building a program: `weft run`, `weft activate` and `weft resync` build on their own, so running `weft build` before them only builds twice. Its one use is the final deployment, `weft build --referenced`, which ships only the node types the program uses. Also the repair when [the daemon] no longer holds the code a past run ran: registering records the compiled program under its own hash, the one the run names, so unchanged files make the run readable again. Adds nothing to the version tree; `weft checkpoint` does that |
+| `weft build` | record this folder's files as a version, then have the install compile that version, resolve its assets, build the worker image (content-addressed) and register it with [the daemon]; the CLI compiles nothing itself. Starts nothing. You never need it while building a program: `weft run`, `weft activate` and `weft resync` build on their own, so running `weft build` before them only builds twice. Its one use is the final deployment, `weft build --referenced`, which ships only the node types the program uses. Also the repair when [the daemon] no longer holds the code a past run ran: registering records the compiled program under its own hash, the one the run names, so unchanged files make the run readable again. Like every command that builds, it records a version, and unchanged files record nothing new |
 | `weft validate --file src/main.weft < src/main.weft` | strict compile + validate, diagnostics as JSON, nothing runs |
 | `weft run [<example>] [--referenced] [--seed[=<run-id>]] [--root] [--from <node>=<ports-json>]... [--emit <node>=<ports-json>]... [--target <id>]... [--before <id>]... [--group <id>=<ports-json>] [--feed <start>]... [--fire <trigger>=<wake-json>] [--instance <id>] [--check] [--save <name>] [--durable\|--fast] [--keep-for <duration>] [--hold-secs <seconds>]` | build and start one run; `--detach` returns its run id, and without it the command follows the run and exits `0` when it completed, `10` when it failed or was cancelled (`weft wait` has the codes). On a cloud install one stretch of a run lasts an hour at most; a run that pauses whole starts a fresh hour, so split longer work with a pause. `--durable` writes down what the run did before each node that is not `pure` starts, so if its worker dies another one carries the run on, with the node that was running failed, unless it is pure, had sent nothing on and was not reading a stream; `--fast` turns a trigger's `durable` back off. A run started by hand is always recorded, even when its trigger has `recorded` off. `--keep-for` (`30m`, `12h`, `7d`, `forever`) is how long the run is kept once it ends, over the trigger's `keepRunsFor` and the project's `[runs] keep_for`. A run that fires a trigger (`--fire`) is durable or fast the way the trigger's `durable` says and kept as long as its `keepRunsFor` says, and a run that fires nothing is fast; `--durable`, `--fast` and `--keep-for` override either, and `--hold-secs` how long a wait holds while the run cannot pause (a bus between its nodes open) over the trigger's `holdSecs`. `--seed[=<run-id>]` reuses finished work and `--check` only tests whether the run could start; both, with the starts, ends, stand-ins and the refusals they draw, are in the `weft-sdp` skill |
-| `weft checkpoint [<label>]` | record the files as a version under head, no run, no build; `already at <id>` when identical |
-| `weft branch <version\|label\|run-id>` | restore that version's files and move head (a checkpoint label names its version; a run id makes that run the next seed). Refuses on a dirty tree naming the files; `--discard` overrides |
-| `weft tree` | the version tree: versions with what changed, their runs beneath, head marked (`--json` adds `diskVersion`) |
+| `weft checkpoint [<label>]` | record this folder's files as a version under its head and move the head there, no run, no build; `already at <id>` when identical |
+| `weft branch <version\|label\|run-id>` | put this folder on that version: its head moves there and the version's files are written into the folder (a checkpoint label names its version; a run id means its version, and makes that run the one the next `--seed` reuses from). It no longer refuses a folder with changes: it first records the folder's files as a version, then prints `this folder is now at version <id>` (`at run <run> on version <id>` for a run), any `conflict copies to look at: ...`, and `your files as they were are version <id>` with the `weft branch <id>` that comes back to them. `--copy <copy>` moves another working copy instead and leaves this folder where it is: `program` for the program copy, a folder's absolute path, or the start of a working copy's id |
+| `weft resolve [<file>...] --keep folder\|incoming` | settle the conflict copies in this folder once the user has picked a side: `--keep folder` deletes them and keeps the folder's files, `--keep incoming` moves each one over its file; then it syncs, so the working copy gets the result. Name a file to settle its copies, a conflict copy to settle only that one, or nothing to settle every one in the folder. `--keep` has no default; `--keep incoming` refuses a file with several conflict copies until one is named. `--json` answers `{keep, resolved, copy}` |
+| `weft forget-copy <copy>` | record another working copy's files as a version and remove the copy (named as for `--copy`), and print that version; for a folder that is gone, or the program copy (with a folder present, programs that name no working copy write into the folder). The version it records sits under the copy's old head, so the prune it clears the way for deletes it too (unless those exact files were already a version elsewhere). Refuses this folder's own copy, and a folder that still exists registers again at its next command that syncs it (a build, `weft tree`, `checkpoint`, `branch`, `freeze`) |
+| `weft tree` | every working copy of the project (this folder, the project's other folders, the copy programs write into) with its head, whether its files changed since and its conflict copies; then the version tree: versions with what changed, their runs beneath, each head marked (`--json` adds `workingCopy`, this folder's working copy id) |
 | `weft diff <ref> <ref> [--full]` | compare observed outputs for human or AI review, including frozen focus nodes. A ref is a run id, its unambiguous prefix or `example:<name>`. Differences are evidence and do not fail the command |
 | `weft freeze <name> [<run>] [--expect <node>]...` | save that run's starting parameters and observed outputs in `examples/<name>.json`; default is head's run. `--expect` marks nodes to focus on during review. Run and diff leave the accepted file intact; freeze again after accepting its replacement |
 | `weft examples` | list saved parameters and frozen examples; inspect them, rerun one with `weft run <name>`, then compare with `weft diff` |
 | `weft bake [--referenced] [--trigger <node>]...` | prepare trigger inputs without arming listeners. A manual `--fire` requires a matching bake; use `--referenced` here when the run uses `--referenced`. Activation also prepares and records a bake before arming |
 | `weft wake <run-id> <node>` | resolve a pure time wait now; refused for a wait expecting a value, naming its kind |
-| `weft prune <version>` | delete a version, everything under it, and their runs; asks first, `--yes` for scripts. Refuses on head's version, under a frozen example's origin, and while a run in the subtree is running |
+| `weft prune <version>` | delete a version, everything under it, and their runs; asks first, `--yes` for scripts. Refuses while a working copy's head is inside it (the refusal names the copy, a folder's path or `program`, and both ways out: `weft branch <version> --copy <copy>` to a version outside it, or `weft forget-copy <copy>`; after the update that brought working copies, each project's old head is a program copy, so a prune of the history holding it names `program`), while an activated version, the version the project's build runs or a frozen example's origin is inside it, while a version in it still supplies an armed trigger's settings, and while a run in the subtree is running or paused |
 | `weft stop <run-id>` | cancel a run |
 | `weft wait <run-id> [--timeout <duration>] [--waiting-for-input]` | wait for a run to end and say how, in a line and in the exit code (How you run a command, above) |
 | `weft node-state <run-id> <node>` | where one node of a run stands: `pending`, `running`, `waiting` (with the last answer its wait read, such as an outside job's status), `completed`, `failed` (with its error), `skipped` or `cancelled`. A node inside a loop is refused: name the loop. `GetNodeState` asks the same from a program |
@@ -264,14 +266,46 @@ as friction.
 
 ### When files change, or part of the program does not compile
 
-Every command reads the project's files once, when it starts (the `.weft`
-files, the nodes under `nodes/` and `src/`, every `@file` and `@asset`), and
-builds from that copy, so a file you or a specialist save meanwhile changes
-nothing in it. The command ends by naming what changed after it read them:
-`built from your files as they were at 14:02:11; these changed after that and
-are not in this build (run the command again to take them):
-src/triage.weft`. Until a command takes them, the program that answers is
-the one before them.
+The project folder is a working copy: the install holds its own copy of
+the project's files, and the two are kept the same both ways. On a local
+install the runtime does this as you go: a save reaches the install about a
+second after the folder goes quiet, and a file a program writes into the
+project's code appears on disk. On a cloud install nothing watches the
+folder. Either way, every command that builds, and `weft tree`, `weft
+checkpoint`, `weft branch` and `weft freeze`, first syncs the folder and says
+what moved (`sent your changes to the install: src/triage.weft`, `brought the install's
+changes into this folder: ...`).
+
+A save never records a version. A version is recorded when something is
+done with the code: `weft run`, `weft build`, `weft activate`, `weft bake`,
+`weft resync`, `weft infra start` and `weft infra upgrade` record the folder's files as a version and
+build that, and so do `weft checkpoint` and `weft branch` (without the
+build). Files that did not change are the version they already were, so
+nothing new is recorded. A file you or a specialist save while a command
+builds is not in that build; the next command takes it.
+
+If a file changed both in the folder and in the install, the folder's file
+stays and the install's is written beside it as
+`<stem>.weft-conflict-<8 hex>.<ext>` (`prompts/tone.weft-conflict-1a2b3c4d.txt`),
+with the warning `<path> changed both here and in the install: your file is
+kept, and the install's is written beside it as <copy>`, followed by the two
+`weft resolve` commands that settle it. A conflict copy is never compiled and
+never part of a version, and nothing waits on it: builds and runs go on with
+the folder's file. Which side stays is the user's call, so tell them the
+conflict copy is there and what differs, and ask. Once they pick, run `weft
+resolve <path> --keep incoming` to put the install's in place or `weft
+resolve <path> --keep folder` to keep the user's file and delete the copy. If the user had deleted the
+file, `--keep incoming` brings it back and `--keep folder` keeps it deleted.
+
+If the install removed a file the folder changed, the warning is `<path>
+changed here and was removed in the install: your file is kept; delete it if
+you want the removal`. No conflict copy is written, so `resolve` has nothing
+to settle; if the user wants the removal, delete the file.
+
+On a local install, a project folder on a Windows drive under WSL
+(`/mnt/c/...`) is refused, because WSL tells Linux nothing of the changes
+made there, so weft cannot keep it in sync. The fix is to move the project
+into the Linux filesystem (under `~/`) and run the command again from there.
 
 A part of the program that does not compile stops only what needs it. A
 part is an included file that does not parse or whose path leads nowhere, a

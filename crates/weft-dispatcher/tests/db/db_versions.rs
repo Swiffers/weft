@@ -19,8 +19,9 @@ use weft_core::ProjectDefinition;
 use weft_dispatcher::activation_store::{ActivationLifecycle, ActivationStoreOps, Claimant, PostgresActivationStore, SignalsGoing};
 use weft_dispatcher::store::postgres::PostgresStore;
 use weft_dispatcher::store::RunStore;
-use weft_core::versions::Head;
+use weft_core::working_copy::{Expect, Head, WorkingChange};
 use weft_dispatcher::versions::{version_id, PostgresVersionStore, VersionRow, VersionStoreOps};
+use weft_dispatcher::working_copies::{PostgresWorkingCopyStore, WorkingCopyStoreOps, Write, Written};
 use weft_journal::record::{Queued, Then};
 use weft_journal::RunEvent;
 
@@ -143,17 +144,20 @@ async fn runs_round_trip_and_list_in_recording_order(pool: PgPool) {
     );
 }
 
-/// Head lives on the project row, moved by checkpoint, run and branch.
-/// The activated versions are read off the trigger activations: a build
-/// leaves them alone, and a deactivation clears them.
+/// A head lives on a working copy, moved by a stamp, a run and a switch,
+/// compare-and-set. The activated versions are read off the trigger
+/// activations: a build leaves them alone, and a deactivation clears them.
 #[sqlx::test]
-async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool: PgPool) {
+async fn heads_live_on_working_copies_and_activations_name_their_versions(pool: PgPool) {
     let (_, projects, versions) = setup(&pool).await;
+    let copies = PostgresWorkingCopyStore::new(pool.clone());
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
-    assert_eq!(versions.head(project).await.unwrap(), Default::default());
+    let copy = copies.program_copy(project, &manifest(&[]), &Head::default(), 1).await.unwrap();
+    assert_eq!(copy.head, Head::default());
     let run_id = Uuid::new_v4();
-    versions.move_head(project, &Head::default(), Some("v1"), Some(run_id)).await.unwrap();
+    let v1 = Head { head_version: Some("v1".into()), head_run: Some(run_id) };
+    assert!(copies.move_head(copy.id, &Head::default(), &v1, 2).await.unwrap());
     let activated = weft_core::project::hash::ProgramIdentity {
         binary_hash: "bin-A".into(), definition_hash: "def-1".into(), implementations: Default::default(),
     };
@@ -166,54 +170,91 @@ async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool:
     projects.register_with_hashes(rig_project(project), "db-rig", "", TENANT, Some("bin-B"), Some("def-2"), None, None, None, None, None, None).await.unwrap();
     let listed = activations.list(project).await.unwrap();
     assert_eq!(listed[0].program, Some(activated), "a build preserves the code activation used");
-    let head = versions.head(project).await.unwrap();
-    assert_eq!(head.head_version.as_deref(), Some("v1"));
-    assert_eq!(head.head_run, Some(run_id));
-    assert_eq!(head.activated_versions, vec!["v1".to_string()]);
-    versions
-        .move_head(project, &Head { head_version: Some("v1".into()), head_run: Some(run_id), activated_versions: vec![] }, Some("v2"), None)
-        .await
-        .unwrap();
+    assert_eq!(copies.get(copy.id).await.unwrap().unwrap().head, v1);
+    assert_eq!(versions.activated_versions(project).await.unwrap(), vec!["v1".to_string()]);
+    let v2 = Head { head_version: Some("v2".into()), head_run: None };
+    assert!(copies.move_head(copy.id, &v1, &v2, 3).await.unwrap());
     activations.set_lifecycle_guarded(project, &keys, &ActivationLifecycle::refused(), SignalsGoing::Kept, weft_dispatcher::activation_store::Forget::Nothing, weft_dispatcher::activation_store::DownCause::Person, None).await.unwrap();
     assert_eq!(activations.list(project).await.unwrap()[0].program, None);
-    let head = versions.head(project).await.unwrap();
-    assert_eq!((head.head_version.as_deref(), head.head_run, head.activated_versions), (Some("v2"), None, vec![]));
-    assert!(
-        versions.move_head(Uuid::new_v4(), &Head::default(), Some("v"), None).await.is_err(),
-        "no such project"
-    );
-    // A lost race is Ok(false), never an error: the handler turns it
-    // into a 409, and a decode failure here used to make it a 500.
-    let stale = Head { head_version: Some("nowhere".into()), head_run: None, activated_versions: vec![] };
-    assert!(
-        !versions.move_head(project, &stale, Some("v2"), None).await.unwrap(),
-        "head is not where the caller thought, so nothing moves"
-    );
+    assert!(versions.activated_versions(project).await.unwrap().is_empty());
+    assert!(copies.move_head(Uuid::new_v4(), &Head::default(), &v2, 4).await.is_err(), "no such working copy");
+    // A lost race is Ok(false), never an error: the action turns it into
+    // a 409.
+    let stale = Head { head_version: Some("nowhere".into()), head_run: None };
+    assert!(!copies.move_head(copy.id, &stale, &v1, 5).await.unwrap(), "head is not where the caller thought, so nothing moves");
+    assert_eq!(copies.get(copy.id).await.unwrap().unwrap().head, v2);
 }
 
-/// `weft clean <run_id>` erases the run, and a head that pointed at
+/// `weft clean <run_id>` erases the run, and every head that pointed at
 /// it keeps its version and loses the run pointer.
 #[sqlx::test]
 async fn cleaning_a_run_erases_it_and_clears_head_run(pool: PgPool) {
     let (store, projects, versions) = setup(&pool).await;
+    let copies = PostgresWorkingCopyStore::new(pool.clone());
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
     let m = manifest(&[("main.weft", "aaa")]);
     let v = version(project, &m, None, None, 1);
     versions.upsert_version(&v).await.unwrap();
     let run_id = start_run(&store, project, &v.id, None, Some(&RunSpec::default()), 5).await;
-    versions.move_head(project, &Head::default(), Some(&v.id), Some(run_id)).await.unwrap();
+    let copy = copies.program_copy(project, &m, &Head::default(), 1).await.unwrap();
+    let on_run = Head { head_version: Some(v.id.clone()), head_run: Some(run_id) };
+    assert!(copies.move_head(copy.id, &Head::default(), &on_run, 2).await.unwrap());
     // The order `clean_run` uses.
-    versions.forget_head_run(run_id).await.unwrap();
+    copies.forget_head_run(run_id).await.unwrap();
     store.delete_run(run_id).await.unwrap();
     assert!(versions.run(run_id).await.unwrap().is_none(), "the run is gone");
     // Idempotent, which is what makes the retry safe.
-    versions.forget_head_run(run_id).await.unwrap();
+    copies.forget_head_run(run_id).await.unwrap();
     store.delete_run(run_id).await.unwrap();
-    let head = versions.head(project).await.unwrap();
+    let head = copies.get(copy.id).await.unwrap().unwrap().head;
     assert_eq!(head.head_version.as_deref(), Some(v.id.as_str()));
     assert_eq!(head.head_run, None);
     assert_eq!(versions.versions(project).await.unwrap().len(), 1, "the version stays");
+}
+
+/// Two writers of one file of a working copy: the one that read the file
+/// before the other wrote is refused whole, nothing of it lands, and the
+/// revision moves only with a change of the files.
+#[sqlx::test]
+async fn a_stale_writer_of_a_working_copy_is_refused(pool: PgPool) {
+    let (_, projects, _) = setup(&pool).await;
+    let copies = PostgresWorkingCopyStore::new(pool.clone());
+    let project = Uuid::new_v4();
+    seed_project(&projects, project).await;
+    let (one, two, three) = ("1".repeat(64), "2".repeat(64), "3".repeat(64));
+    let folder = copies
+        .register_folder(project, "box", "/home/me/shop", &manifest(&[("main.weft", &one)]), &Head::default(), 1)
+        .await
+        .unwrap();
+    assert_eq!(folder.synced, folder.working, "a folder starts as what it holds");
+    let again = copies.register_folder(project, "box", "/home/me/shop", &manifest(&[]), &Head::default(), 2).await.unwrap();
+    assert_eq!((again.id, again.working.len()), (folder.id, 1), "registering again changes nothing");
+    let change = |hash: &str, read: &str| WorkingChange { path: "main.weft".into(), hash: Some(hash.into()), expected: Expect::Hash { hash: read.into() } };
+    let first = copies.write(folder.id, Write { changes: &[change(&two, &one)], ..Default::default() }, 3).await.unwrap();
+    let Written::Landed(row) = first else { panic!("the first writer lands: {first:?}") };
+    assert_eq!((row.revision, row.working["main.weft"].as_str()), (1, two.as_str()));
+    let second = copies.write(folder.id, Write { changes: &[change(&three, &one)], ..Default::default() }, 4).await.unwrap();
+    assert_eq!(second, Written::Stale(vec!["main.weft".into()]));
+    let now = copies.get(folder.id).await.unwrap().unwrap();
+    assert_eq!((now.revision, now.working["main.weft"].as_str()), (1, two.as_str()));
+    // What the folder holds moves alone, without a revision.
+    let synced = BTreeMap::from([("main.weft".to_string(), Some(two.clone()))]);
+    let Written::Landed(row) = copies.write(folder.id, Write { changes: &[], synced: Some(&synced), conflicts: Some(&[]) }, 5).await.unwrap() else {
+        panic!("a report of what the folder holds lands")
+    };
+    assert_eq!((row.revision, row.synced["main.weft"].as_str()), (1, two.as_str()));
+    // A switch replaces the files only from the revision it read.
+    let to = Head { head_version: Some("v9".into()), head_run: None };
+    assert!(copies.replace(folder.id, 0, &manifest(&[]), &to, 6).await.unwrap().is_none(), "a stale revision moves nothing");
+    let switched = copies.replace(folder.id, 1, &manifest(&[("main.weft", &three)]), &to, 7).await.unwrap().expect("its revision");
+    assert_eq!((switched.revision, switched.head), (2, to));
+    // Forgetting it, too, goes only from the revision it read: a write
+    // that landed after is never lost with the copy.
+    assert!(!copies.remove(folder.id, 1).await.unwrap(), "a stale revision removes nothing");
+    assert!(copies.get(folder.id).await.unwrap().is_some());
+    assert!(copies.remove(folder.id, 2).await.unwrap());
+    assert!(copies.list(project).await.unwrap().is_empty(), "the copy is gone");
 }
 
 /// A pruned version takes its runs out of the tree (they stay on record

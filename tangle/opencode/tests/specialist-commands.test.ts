@@ -82,7 +82,7 @@ const reference: Case[] = [
   ["deployer", "weft target export prod --github", "deny"],
   ["deployer", "weft login prod", "deny"],
   ["deployer", "weft daemon restart", "deny"],
-  ["deployer", "weft branch abc --on prod --discard", "deny"],
+  ["deployer", "weft branch abc --on prod", "allow"],
   ["deployer", "weft workers set --min-instances 1 --on prod", "deny"],
   ["deployer", "weft workers --on prod", "allow"],
   ["deployer", "curl https://x", "deny"],

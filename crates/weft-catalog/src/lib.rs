@@ -85,19 +85,9 @@ pub const NODE_TREE_EXCLUDE_SUFFIXES: &[&str] = &[".db", ".db-journal", ".db-shm
 pub fn is_node_tree_excluded(name: &str) -> bool {
     NODE_TREE_EXCLUDE.contains(&name)
         || NODE_TREE_EXCLUDE_SUFFIXES.iter().any(|s| name.ends_with(s))
-        || is_python_cache(name)
+        || weft_core::project::coverage::is_python_cache(name)
 }
 
-// SYNC: is_python_cache <-> .dockerignore (the `__pycache__` / `*.pyc` lines)
-/// True if an entry of this name is what Python writes beside a module
-/// the first time it imports it (`__pycache__/`, a `.pyc`). Never
-/// source, and leaving it in would make a machine that ran a node hash
-/// the same tree differently from one that did not, and build again for
-/// nothing. Asked at any depth, by every walk that decides what a
-/// project or a node is made of.
-pub fn is_python_cache(name: &str) -> bool {
-    name == "__pycache__" || name.ends_with(".pyc")
-}
 
 /// True if an entry of this name is left out of what a node PACKAGE is
 /// built from: everything [`is_node_tree_excluded`] leaves out, plus a

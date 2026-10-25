@@ -33,7 +33,7 @@ async fn one_change(rig: FakeRig) -> WeftResult<()> {
     let calls = rig.program_calls();
     assert_eq!(calls.len(), 1);
     match &calls[0].0 {
-        ProgramCall::ValuesChange { instance, set, clear } => {
+        ProgramCall::Instances(weft::program::instances::InstanceCall::ValuesChange { instance, set, clear }) => {
             assert_eq!(instance.as_str(), "ada");
             let mut nodes: Vec<(&str, &str)> = set.iter().map(|v| (v.node.as_str(), v.field.as_str())).collect();
             nodes.sort();

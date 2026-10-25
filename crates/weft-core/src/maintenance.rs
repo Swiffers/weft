@@ -9,7 +9,8 @@
 //! clears nothing. `weft maintenance off` builds each project it took
 //! something down in again on this weft, starts the copies it stopped on
 //! that build, then brings back the triggers it took down, and ends the
-//! maintenance once nothing is left. The update itself (`./setup.sh`, the GCP install
+//! maintenance. A project that cannot come back stays down without holding
+//! the others, and its next `weft resync` brings it back. The update itself (`./setup.sh`, the GCP install
 //! workflow) refuses to replace an install that has something on
 //! ([`update_refusal`]).
 //!
@@ -200,15 +201,14 @@ pub enum LiftAnswer {
     UnderWay { task: uuid::Uuid },
 }
 
-/// What a lift did: its task's result.
+/// What a lift did: its task's result. The maintenance is over once it
+/// has one; a project with something [`ProjectLifted::failed`] stays down
+/// until its next `weft resync`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiftReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projects: Vec<ProjectLifted>,
-    /// Nothing was left, and the maintenance is over. When `false`, what
-    /// failed is still recorded and `weft maintenance off` tries it again.
-    pub lifted: bool,
 }
 
 /// What a lift did in one project.
@@ -231,7 +231,8 @@ pub struct ProjectLifted {
     /// the maintenance, one the program no longer has).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<String>,
-    /// What did not come back, and why: still recorded for the next lift.
+    /// What did not come back, and why: still recorded, and brought back by
+    /// the project's next `weft resync` (or `weft maintenance off`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed: Vec<String>,
 }

@@ -26,13 +26,13 @@ up as soon as you update it.
 ## When your files change, or part of them is broken
 
 Every command that builds (`run`, `build`, `bake`, `activate`, `resync`,
-`infra start` and `infra upgrade`) reads your project's files once, when it starts, and
-builds from that copy. So you can keep editing while it runs. If a file
-changed after the read, the command names it once its build is done:
-
-```text
-warning: built from your files as they were at 14:02:31; these changed after that and are not in this build (run the command again to take them): src/main.weft
-```
+`infra start` and `infra upgrade`) first syncs this folder with the install's
+copy of it, then has the install record those files as a version and build
+that version. The command compiles nothing itself: the install compiles the
+version, so a compile error it prints is about the files in that version. A
+file you change after that goes into the next command. For how your folder
+and the install stay in step, go and read [your folder is a
+copy](versions.md#your-folder-is-a-copy).
 
 A part of the program that does not compile (a `.weft` file that does not
 parse, an include that does not resolve, a node type weft cannot find, a wire
@@ -79,9 +79,9 @@ The package is built again once its files change, so fix it and run the command 
 
 | Command | What it does |
 |---|---|
-| `weft run` | Compiles, registers, records a version, starts a run, and follows it |
+| `weft run` | Has the install record your files as a version and build it, then starts a run and follows it |
 | `weft run <example>` | The same, with a saved example's starting values |
-| `weft build` | Compiles and registers, starting nothing. Also how you put back code the dispatcher no longer holds |
+| `weft build` | Has the install record your files as a version, build it and register it, starting nothing. Also how you put back code the dispatcher no longer holds |
 | `weft bake` | Prepares every trigger's settings and starts no listeners |
 | `weft stop <run-id>` | Cancels a run |
 | `weft wait <run-id>` | Waits until a run ends, then says how in one line and in its exit code (below) |
@@ -194,9 +194,11 @@ answers "has my trigger fired since I changed it".
 
 | Command | What it does |
 |---|---|
-| `weft tree` | The version tree, with runs beneath each version and head marked |
-| `weft checkpoint [<label>]` | Records the files as a version. No run, no build |
-| `weft branch <ref> [--discard]` | Restores a version's files and moves head. Refuses if you have uncommitted changes, unless `--discard` |
+| `weft tree` | Every working copy of the project and where its head is, then the version tree with the runs started by hand beneath each version. `--json` adds `workingCopy`, the id of this folder's working copy |
+| `weft checkpoint [<label>]` | Records this folder's files as a version and moves its head there. No run, no build |
+| `weft branch <ref>` | Records this folder's files as a version, moves the folder to the version (or run) you name and writes its files here, then prints the `weft branch` that comes back. `--copy <copy>` moves another working copy instead (`program`, a folder's absolute path, or the start of a working copy's id) and leaves this folder where it is |
+| `weft forget-copy <copy>` | Records another working copy's files as a version and removes the copy, for a folder that is gone or the program copy, when its head keeps `weft prune` from deleting a version. `<copy>` is named as for `--copy`. A folder that still exists registers again at its next command that syncs it, which is why this folder's own copy is refused |
+| `weft resolve [<file>...] --keep folder\|incoming` | Settles the conflict copies a sync wrote beside files that changed both here and in the install. `--keep folder` keeps this folder's files and deletes the copies; `--keep incoming` moves each one over its file. Then it syncs, so the working copy gets the result. Name a file to settle its copies, a conflict copy to settle that one, or nothing to settle every one in the folder. `--keep` has no default, and `--keep incoming` refuses a file with several conflict copies until you name one. `--json` answers `keep`, `resolved` (the files settled) and `copy` (the working copy after the sync) |
 | `weft diff <left> <right>` | Compares what two runs put on their wires. A ref is a run id or `example:<name>`. `--full` for every wire |
 | `weft freeze <name> [<run-id>]` | Writes `examples/<name>.json` from a run: its parameters, the answers people gave, and the outputs you accept. `--expect <node>` emphasises a node in later diffs |
 | `weft examples` | Saved examples, whether each is frozen, and its latest run |
@@ -209,7 +211,7 @@ answers "has my trigger fired since I changed it".
 | `weft activate` | Turns on every one of the program's own triggers that is off, and leaves the ones that are on alone; with nothing off it says so and succeeds. Builds and registers first if it has to, and prints the project's own address, where its routes answer at the root (on your machine a local port, on a cloud install its Cloud Run address). It never starts infra and never touches a run going now: it refuses a trigger whose setup reads infra that is not running (a trigger whose runs alone use it is turned on with a note naming it), and refuses while a connection the program needs is not picked on this install, naming each node. A trigger that runs once per instance is left off and named in a warning, with the way to switch it on. `--held run\|drop` decides what happens to the work the triggers held while they were down: run it (the default, at half each trigger's limits) or drop it |
 | `weft activate --port <n>` | On your machine, opens the project's own address on that port, and the project keeps it for later activates. If another program or another of your projects holds it, nothing is activated. Without it, the project keeps the port it has, or takes a free one |
 | `weft deactivate` | Takes the program's own triggers down, and tells you how many instances still have theirs on |
-| `weft resync` | Builds, then brings every trigger that is on and behind the build onto it, and leaves every other trigger alone. With nothing behind, it says `no trigger that is on is behind this build; nothing to resync`. It turns nothing on: a trigger of the new build that is off is named with the `weft activate` that would. Before it takes anything down, it checks everything that could refuse it, so a refusal leaves your triggers as they were. `weft resync --resume` takes up again a resync that stopped with triggers down, and takes no other flag. While a resync runs, or stands stopped, a build you start is refused with `cannot build now` |
+| `weft resync` | Builds, then brings every trigger that is on and behind the build onto it, and leaves every other trigger alone. With nothing behind, it says `no trigger that is on is behind this build; nothing to resync`. It turns on nothing you switched off. It does first bring back, on the build it just made, what an update's `weft maintenance off` could not bring back in this project, and says what came back and what is still down. Any other trigger of the new build that is off is named with the `weft activate` that would. Before it takes anything down, it checks everything that could refuse it, so a refusal leaves your triggers as they were. `weft resync --resume` takes up again a resync that stopped with triggers down, and takes no other flag. While a resync runs, or stands stopped, a build you start is refused with `cannot build now` |
 | `weft cancel-activate` | Cancels an activate in flight. With no `--trigger` or `--instance`, it also gives up a resync, running or stopped, and names the triggers it leaves down |
 | `weft cancel-build` | Cancels a build in flight. The install stops the build, and the command that was building fails saying it was cancelled |
 
@@ -360,7 +362,7 @@ check first, and refuse to replace anything while something is on.
 | Command | What it does |
 |---|---|
 | `weft maintenance on` | Takes down every trigger that is on, in every project, with its door refusing what arrives meanwhile (what it held already is kept), and stops every infra copy that runs. Every unit of a copy comes down, even one its node keeps up on a plain stop; disks are kept. Then it waits for the runs going to finish and the copies to stop, however long that takes. `--running cancel` cancels the runs instead. Until `off`, nothing can be turned on: an activate, an infra start, a resync or a `weft run` is refused, naming `off`, and nothing weft brings back on its own comes back. A trigger it took down takes no work, as with any door that refuses: an event for it is dropped, and a live call is answered `503` with a `Retry-After`. You can run it again: it takes down whatever is on by then and forgets nothing it took down before |
-| `weft maintenance off` | Builds every project `on` took something down in again on the new weft, from the same files and settings its last build used, then starts the infra copies `on` stopped on that build, waits until they run, and brings back the triggers `on` took down on it, with what they held before `on`. A project last built by a weft older than this command has nothing stored to build again from: it comes back on the build it has, and `off` says to run `weft resync` in its folder. Only those: a trigger you took down yourself during the maintenance stays off, and a copy you terminated is skipped. If something does not come back, it says why, the install stays in maintenance, and running `off` again tries what is left. It runs on the install, so closing the terminal does not stop it |
+| `weft maintenance off` | Builds every project `on` took something down in again on the new weft, from the same files and settings its last build used, then starts the infra copies `on` stopped on that build, waits until they run, and brings back the triggers `on` took down on it, with what they held before `on`. A project last built by a weft older than this command has nothing stored to build again from: it comes back on the build it has, and `off` says to run `weft resync` in its folder. Only those: a trigger you took down yourself during the maintenance stays off, and a copy you terminated is skipped. If something in a project does not come back, `off` says what and why, and ends the maintenance anyway: everything else comes back, and what did not stays down until that project's next `weft resync`. If the message says the project's copy of the standard nodes is older than this weft, run `weft catalog update` in its folder; otherwise fix what it says (usually something in the project's folder). Then `weft resync` there builds it, first brings back what `on` took down in it and `off` could not bring back, and says what came back. If you want some of those triggers left off, `weft deactivate` them before the resync. Running `off` again also tries what is left and says again what does not come back, but it builds from the same files as before, so it does not pick up a change you made in the folder. It runs on the install, so closing the terminal does not stop it |
 | `weft maintenance` | Whether the install is in maintenance and since when, what `off` brings back, and what is on right now. `status` is the same |
 | `weft maintenance check` | Fails while something is on (a trigger, an infra copy, a run going). It is what the installer and the workflow run before they replace anything. An install that is not set up or not running passes, and so does one whose weft is older than this command, saying it cannot tell |
 
@@ -454,7 +456,6 @@ default.
 | `weft deactivate --running cancel` (or `resync`, or an infra verb) | The runs going now, cancelled |
 | `weft maintenance on --running cancel` | Every run going now on the install, cancelled |
 | `weft activate --held drop` | Everything the triggers held while they were down, answers people sent to waiting runs included, and the runs paused on them are cancelled |
-| `weft branch --discard` | Your uncommitted changes |
 | `weft catalog update` | Anything you edited under `nodes/base_catalog/` |
 | `weft tangle update` | Your edits to the Tangle files the template owns |
 | `weft freeze <name>` | The previous `examples/<name>.json`, replaced whole |

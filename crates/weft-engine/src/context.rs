@@ -3251,11 +3251,12 @@ impl ContextHandle for RunnerHandle {
         call: weft_core::program::ProgramCall,
         stop_self: weft_core::StopSelf,
         call_index: u32,
+        project: Option<uuid::Uuid>,
     ) -> WeftResult<Value> {
         let name = call.journal_name();
         let frames = frames_dedup_key(&self.node_frames)
             .map_err(|e| WeftError::NodeFailed(format!("{name}: frames: {e}")))?;
-        let payload = weft_core::program::ProgramCallPayload { by: self.run_id, stop_self, call };
+        let payload = weft_core::program::ProgramCallPayload { by: self.run_id, stop_self, project, call };
         let id = self
             .clients
             .tasks
@@ -3313,12 +3314,14 @@ impl ContextHandle for RunnerHandle {
         expires_in_secs: u64,
         displays: bool,
         id: uuid::Uuid,
+        project: Option<uuid::Uuid>,
     ) -> WeftResult<weft_core::program::MintedInstanceToken> {
         self.clients
             .access_broker
             .mint_instance_token(&weft_broker_client::protocol::ProgramMintInstanceTokenRequest {
                 id,
                 run_id: self.run_id,
+                project,
                 instance: instance.clone(),
                 expires_in_secs,
                 displays,
@@ -4287,8 +4290,7 @@ mod replay_tests {
     async fn url_backed_values_route_by_handle_in_storage_verbs() {
         use weft_core::storage::{KeepTtl, StorageScope};
         let ctx = ctx_over(handle_with_sequence(vec![]));
-        let ty = weft_core::WeftType::parse("Image").unwrap();
-        let url_value = weft_core::storage::url_file_value("https://x/pic.png", &ty);
+        let url_value = weft_core::storage::url_file_value("https://x/pic.png", weft_core::weft_type::FileKind::Image);
         let url_file = weft_core::storage::FileHandle::from_value(&url_value).unwrap();
         let storage = ctx.storage(StorageScope::Run);
 

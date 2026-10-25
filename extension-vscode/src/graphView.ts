@@ -146,9 +146,7 @@ export class GraphViewController {
   private remoteInstall: RemoteInstall | undefined;
   private switchInstallHandler: ((name: string) => void) | undefined;
   private installLeftHandler: (() => void) | undefined;
-  private treeVerbHandler:
-    | ((args: string[]) => Promise<unknown>)
-    | undefined;
+  private loadVersionHandler: ((reference: string) => Promise<void>) | undefined;
   /// Called whenever the webview signals `ready` (initial mount,
   /// or iframe rebuild after a column move). Lets extension.ts
   /// re-push state that's owned outside graphView (action bar
@@ -387,8 +385,8 @@ export class GraphViewController {
     return true;
   }
 
-  setTreeVerbHandler(fn: (args: string[]) => Promise<unknown>): void {
-    this.treeVerbHandler = fn;
+  setLoadVersionHandler(fn: (reference: string) => Promise<void>): void {
+    this.loadVersionHandler = fn;
   }
 
   /** Public so runFollower can push events into the panel. */
@@ -1229,18 +1227,13 @@ export class GraphViewController {
     void this.refreshActionAvailability();
   }
 
-  /// Put the files on disk onto another version. A tree verb, not an
-  /// action-bar verb: it runs outside the bar's pump and reports its own
-  /// failure, the same way the sidebar's "branch here" does.
+  /// Put this folder onto another version: the host's "Load this
+  /// version", the same one the Runs view's items run. A tree verb, not
+  /// an action-bar verb: it runs outside the bar's pump and reports its
+  /// own failure.
   private async branchTo(reference: string): Promise<void> {
-    if (!this.treeVerbHandler || this.refusedOnInstall('Branching the files on disk')) return;
-    const out = await this.treeVerbHandler(['branch', reference]);
-    if (out) {
-      void vscode.window.showInformationMessage(
-        `Weft: branched to ${reference.slice(0, 8)}; the files on disk are that version now.`,
-      );
-    }
-    void this.refreshActionAvailability();
+    if (!this.loadVersionHandler || this.refusedOnInstall('Loading a version into the folder')) return;
+    await this.loadVersionHandler(reference);
   }
 
   /// Run `weft status --json` via the host. Pulls the latest drift

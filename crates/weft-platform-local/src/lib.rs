@@ -10,10 +10,12 @@
 //! - `alarm`: wakes kept in Postgres, delivered by the runtime.
 //! - `identity`: identities the install signs with its own key.
 //! - `news`: nothing to carry, the database being listened to for good.
+//! - `folders`: every folder working copy kept in sync with its folder.
 
 pub mod alarm;
 pub mod docker;
 pub mod domains;
+pub mod folders;
 pub mod frontends;
 pub mod holders;
 pub mod identity;

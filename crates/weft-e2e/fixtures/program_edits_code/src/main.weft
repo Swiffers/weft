@@ -1,0 +1,18 @@
+# A program that edits ANOTHER project's code and runs it. `write` puts
+# `text` at `path` in the target project's working copy, keeping what was
+# there at `keptAs`, then starts a
+# run of the target's `out` on that code and hands its run id on.
+#
+# The target is the `version_tree` fixture, whose `out` shows the text
+# of prompts/greeting.txt, so its run shows what this program wrote.
+# The test swaps the target project's id in for the placeholder.
+
+write = WriteCodeAndRun {
+  project: "__E2E_TOKEN__"
+  path: "prompts/greeting.txt"
+  text: "written by another project's program"
+  keptAs: "prompts/before.txt"
+}
+
+out = Debug
+out.data = write.runId

@@ -324,7 +324,7 @@ impl FileReader for TreeFileReader<'_> {
 /// `..` would climb above the path's root (the lexical equivalent of escaping
 /// the containment root), so a virtual backing rejects the same escapes the disk
 /// backing's canonicalize-then-containment check rejects.
-pub(crate) fn normalize_lexical(path: &Path) -> Option<PathBuf> {
+pub fn normalize_lexical(path: &Path) -> Option<PathBuf> {
     let mut out: Vec<Component> = Vec::new();
     for comp in path.components() {
         match comp {

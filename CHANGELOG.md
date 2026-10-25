@@ -4,6 +4,139 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-10-25 (ccabce57)
+
+**On a cloud install, rebuild your CLI before `weft maintenance off`.** What
+`off` answers changed shape, and a CLI from before this release cannot read
+it: run `./setup.sh --cli` from the new commit first, then `weft maintenance
+off --on <target>`. The cloud upgrade steps now say so in that order. On your
+machine, `./setup.sh` already does this.
+
+**Something that cannot come back no longer keeps the install in
+maintenance.** `weft maintenance off` now ends the maintenance once it has
+tried every project, even when a project's build, infra or triggers fail, and
+it exits successfully. Everything else comes back, and `off` names what did
+not and why. If the message says the project's copy of the standard nodes is
+older than this weft, run `weft catalog update` in its folder (it replaces
+`nodes/base_catalog/`, so any edits you made in there are lost); otherwise
+fix what it says. Then `weft resync` there brings back what the update took
+down and says what it brought back. If you want some of those triggers left
+off, run `weft deactivate` on them before the resync. In `weft maintenance
+off --json`, the `lifted` field is gone, because a report now always means
+the maintenance is over; a project whose `failed` list is not empty still has
+down what the maintenance could not bring back in it (everything it took down
+there, when the entry is its build). `weft resync --json` says what it brought back in
+`broughtBack`.
+
+**Saving a file and running a command at once no longer fails with a 409.**
+On a local install the runtime uploads a saved file while the command you run
+next uploads the same bytes, and the second one could be refused with
+`already exists (completing)`. It now waits for the other upload to land and
+carries on. A folder deleted or moved just as a sync ends is also no longer
+made again as an empty one.
+
+**Running pytest in a node's folder no longer rebuilds its images.**
+`.pytest_cache/` is now left out of versions and of what decides whether an
+image builds again.
+
+**A build checks every file it takes from the install's cache.** A copy that
+does not match the version is fetched again. Before, a copy damaged on disk
+could give the same version a different image, and that build failed.
+
+**Images are named after the version's file fingerprints.** A build from a
+version names its worker and infra images from the fingerprints the version
+already stores, so one version always gives the same images. Because the
+names changed form, every image builds once more after this update, and a
+node package's recorded live test passes count as out of date once.
+
+## 2026-10-24 (0.2.274)
+
+**Update the CLI and the install together.** The requests and answers between
+them changed shape, so a CLI and an install from either side of this update do
+not understand each other. `./setup.sh` updates both on your machine; for a
+cloud install, run its install workflow as well. `./setup.sh` migrates the
+database: each project's head moves to the copy that programs write into, and
+the first command you run in your folder starts it from that head.
+
+**Your folder is now a copy the install keeps in step with its own.** Every
+command that builds, and `weft tree`, `checkpoint`, `branch` and `freeze`,
+syncs the folder first and says what it moved. On your machine, the runtime
+also watches every folder you have run one of those in: a save reaches the
+install about a second later, and when a program writes into your project,
+the files land in your folder. On a cloud install the sync before a command
+is the only one. If a file changed both in your folder and in the install,
+your file is kept and the install's is written beside it as
+`<stem>.weft-conflict-<8 characters>.<ext>`, which is never compiled and never
+in a version. Builds and runs go on with your file. If you want the install's
+version, run `weft resolve <file> --keep incoming`; if you want yours, `weft
+resolve <file> --keep folder` deletes the conflict copy. On your machine, a
+project on a Windows drive under WSL (`/mnt/c/...`) is refused, since WSL tells Linux
+nothing about changes there; move it under `~/`. For the whole story, go and
+read [your folder is a copy](docs/src/running/versions.md#your-folder-is-a-copy).
+
+**A version is recorded when you do something with the code** (a run, a
+build, an activate, a bake, a resync, an infra start or upgrade, a
+checkpoint), never on a save, and recording the same files again gives the
+version they already are. `weft build` now adds to the version tree too.
+`layouts/` is now part of every version, so going back to one puts the
+graph's boxes where they were.
+
+**`weft branch` no longer refuses when your folder holds changes no version
+records, and `--discard` is gone.** It records what your folder holds as a
+version first, moves the folder, writes the files, and prints the
+`weft branch <id>` that comes back. In the editor's **Runs** view (by
+version), **Load this version** on a version or a run does the same. Each
+folder now has its own head, and `weft tree` lists every working copy with
+where its head is and the conflict copies it holds. `weft tree --json` no longer
+has `head` or `diskVersion`: `activatedVersions` is now at the top level,
+`workingCopies` lists every working copy (each with `headVersion`, `headRun`
+and `workingVersion`), and `workingCopy` is the id of this folder's. That
+copy's `workingVersion` is always set: it equals `headVersion` when nothing
+changed since, and otherwise is the id the files would have as a version,
+which may not be recorded yet (in that case `diskVersion` used to be `null`).
+
+**A command that builds no longer compiles anything itself.** The install
+compiles the version it recorded, so a compile error a build prints comes
+from it. `weft run --check` still compiles on your machine. `@asset` is
+resolved by the install too: a file the version holds is used as it is, and a
+file outside it (an absolute path, `~/...`) is read off your machine by a
+local install and refused by a cloud one, which tells you to move it under
+`assets/`.
+
+**A program can now do to any project of its owner what you do with the
+CLI**: write its files (`ctx.project(id).code()`), checkpoint, switch, build
+and run it, turn its triggers on, bake, resync, start, stop and upgrade its
+infra, read and stop its runs, and change its instances, tokens, frontends
+and workers, with the same refusals the CLI gets. It cannot start a run of its own project, resync
+it or remove it, and each refusal says why (a run's refusal comes before anything is
+recorded as a version or built). If it copies
+files the owner already holds, such as another project's standard library,
+`edit().blob(path, hash)` names each by the hash `state()` gave, so the copy
+is one write with nothing downloaded. For every call, go and read [the
+ctx](docs/src/nodes/ctx.md#your-project-and-the-owners-other-projects).
+
+**If `weft prune` refuses because of a working copy's head**, the refusal now
+names both ways out. `weft branch <version> --copy <copy>` moves another
+working copy to a version outside that history, and `weft forget-copy <copy>`
+records its files as a version and removes it, where `<copy>` is a folder's
+absolute path or `program`. This update turns each project's head into a
+program copy, so a prune of the history holding that head names `program`,
+and your folder too once you have run a command in it, since a folder starts
+on the head of the copy that changed last. Running `weft branch <version>` in the folder and `weft
+forget-copy program` clears both. A program can do the same with
+`ctx.project(project).forget_working_copy(copy)`, `copy` being a working
+copy's id. A frozen example's refusal now names `frozenFrom`, the key as the
+example file spells it. For the details,
+go and read [cleaning up](docs/src/running/versions.md#cleaning-up).
+
+**If a node of yours calls `ctx.node_state(run, node)`**, it is now
+`ctx.run_by_id(run).node_state(node)`. The standard library's
+`GetNodeState` changed the same way, so if your project keeps its own copy of
+the catalog (`nodes/base_catalog`), run `weft catalog update`.
+
+**Run `weft tangle update` in each project**, so Tangle knows how `weft
+branch` works now and what a node can do to other projects.
+
 ## 2026-10-24 (0.2.273)
 
 **Updating weft now happens in maintenance.** Run `weft maintenance on`, which

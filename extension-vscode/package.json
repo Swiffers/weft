@@ -2,7 +2,7 @@
   "name": "weft-vscode",
   "displayName": "Weft",
   "description": "Write Weft programs and watch them run: a live, editable graph of every .weft file, with diagnostics and runs in the editor.",
-  "version": "0.2.273",
+  "version": "0.2.274",
   "publisher": "weavemind",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -199,10 +199,10 @@
         "icon": "$(cloud)"
       },
       {
-        "command": "weft.branchHere",
-        "title": "Branch here",
+        "command": "weft.loadVersion",
+        "title": "Load this version",
         "category": "Weft",
-        "icon": "$(git-branch)"
+        "icon": "$(history)"
       },
       {
         "command": "weft.checkpointLabel",
@@ -338,9 +338,14 @@
           "group": "inline@2"
         },
         {
-          "command": "weft.branchHere",
+          "command": "weft.loadVersion",
           "when": "view == weft.runs && viewItem == weftVersion",
           "group": "inline@1"
+        },
+        {
+          "command": "weft.loadVersion",
+          "when": "view == weft.runs && viewItem == weftVersion",
+          "group": "1_version@1"
         },
         {
           "command": "weft.pruneVersion",
@@ -363,14 +368,19 @@
           "group": "1_run@2"
         },
         {
-          "command": "weft.branchHere",
+          "command": "weft.loadVersion",
           "when": "view == weft.runs && viewItem =~ /^weftVersionRun-/",
           "group": "1_run@3"
         },
         {
-          "command": "weft.deleteRun",
+          "command": "weft.loadVersion",
           "when": "view == weft.runs && viewItem =~ /^weftVersionRun-/",
           "group": "inline@2"
+        },
+        {
+          "command": "weft.deleteRun",
+          "when": "view == weft.runs && viewItem =~ /^weftVersionRun-/",
+          "group": "inline@3"
         },
         {
           "command": "weft.clearRunSearch",

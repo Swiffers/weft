@@ -216,7 +216,7 @@ mod events;
 mod provider_events;
 pub(crate) mod signal_token;
 pub(crate) mod infra;
-mod display;
+pub(crate) mod display;
 // `pub` (not `pub(crate)`) like `project` above: the parked-fire queue
 // helpers (`append_parked_fire` and siblings) are the dispatcher's
 // correctness-critical SQL that the db-test rig in `tests/db/db_lifecycle.rs`
@@ -280,7 +280,13 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/projects/{id}/versions/tree", get(versions::tree))
         .route("/projects/{id}/versions/running", get(versions::running))
         .route("/projects/{id}/versions/sweep", post(versions::sweep))
-        .route("/projects/{id}/versions/head", axum::routing::put(versions::set_head))
+        .route("/projects/{id}/versions/switch", post(versions::switch))
+        .route("/projects/{id}/working-copies", get(versions::working_copies))
+        .route("/projects/{id}/working-copies/state", get(versions::working_state))
+        .route("/projects/{id}/working-copies/folder", get(versions::find_folder).post(versions::register_folder))
+        .route("/projects/{id}/working-copies/changes", post(versions::change_files))
+        .route("/projects/{id}/working-copies/{wc}", axum::routing::delete(versions::forget))
+        .route("/projects/{id}/working-copies/{wc}/sync", post(versions::sync))
         .route("/projects/{id}/trigger-bakes", get(versions::trigger_bakes))
         .route("/projects/{id}/versions/{version}", axum::routing::delete(versions::prune))
         .route("/projects/{id}/status", get(project::status))
@@ -381,7 +387,6 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/storage/upload/begin", post(storage::upload_begin))
         // The pre-build asset sync's diff input: the project's published assets.
         .route("/storage/assets/held", post(storage::assets_held))
-        .route("/storage/assets/references", post(storage::asset_references))
         .route("/storage/upload/parts", post(storage::upload_parts))
         .route("/storage/upload/part-done", post(storage::upload_part_done))
         .route("/storage/upload/complete", post(storage::upload_complete))

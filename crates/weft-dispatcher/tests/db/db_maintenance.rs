@@ -93,7 +93,7 @@ async fn maintenance_on_marks_records_and_accumulates(pool: PgPool) {
         assert_eq!(activation.lifecycle.went_down, Some(weft_broker_client::activation::WentDown::Maintenance), "{}", activation.key);
     }
     assert_eq!(going(&pool).await.triggers_on, 0);
-    assert!(!maintenance::end_if_nothing_left(&pool).await.unwrap(), "something is left to bring back");
+    assert!(!maintenance::left(&pool).await.unwrap().is_empty(), "something is left to bring back");
 }
 
 /// A copy whose stop is asked for and not yet carried out reads as being
@@ -139,9 +139,7 @@ async fn a_persons_deactivate_clears_the_maintenance_mark(pool: PgPool) {
     let feed = activations.list(id).await.unwrap().remove(0);
     assert_eq!((feed.lifecycle.status, feed.lifecycle.went_down), (ProjectStatus::Inactive, None));
     assert!(maintenance::marked_triggers(&pool).await.unwrap().is_empty());
-    assert!(maintenance::left(&pool).await.unwrap().is_empty());
-    assert!(maintenance::end_if_nothing_left(&pool).await.unwrap(), "nothing left: the maintenance ends");
-    assert!(!maintenance::is_on(&pool).await.unwrap());
+    assert!(maintenance::left(&pool).await.unwrap().is_empty(), "nothing left for the lift to bring back");
 }
 
 /// The lift reads back only what the maintenance took down (never a
@@ -175,9 +173,9 @@ async fn the_lift_brings_back_only_what_was_marked_infra_first(pool: PgPool) {
     // and the lift's claim clears the trigger's mark.
     maintenance::forget_copies(&pool, id, None, &["db".into()]).await.unwrap();
     maintenance::forget_copies(&pool, id, ada.instance(), &["cache".into()]).await.unwrap();
-    assert!(!maintenance::end_if_nothing_left(&pool).await.unwrap(), "the trigger is still to come back");
+    assert!(!maintenance::left(&pool).await.unwrap().is_empty(), "the trigger is still to come back");
     turn_on(&activations, id, &[key("feed")], Claimant::Lift).await;
-    assert!(maintenance::end_if_nothing_left(&pool).await.unwrap());
+    assert!(maintenance::left(&pool).await.unwrap().is_empty());
     let still_down: Vec<(ActivationKey, Option<weft_broker_client::activation::WentDown>)> = activations
         .list(id)
         .await
@@ -204,8 +202,41 @@ async fn while_in_maintenance_activate_is_refused(pool: PgPool) {
     assert!(activations.list(id).await.unwrap().is_empty(), "a refused claim writes nothing");
     turn_on(&activations, id, &[key("feed")], Claimant::Lift).await;
 
-    assert!(maintenance::end_if_nothing_left(&pool).await.unwrap());
+    maintenance::end(&pool).await.unwrap();
     turn_on(&activations, id, &[key("door")], Claimant::Anyone).await;
+}
+
+/// A project the lift could not bring back (its code did not build on the
+/// new weft) does not hold the install: the maintenance ends, nothing is
+/// refused any more, and what it had taken down stays recorded as that
+/// project's, for its next resync to bring back, which clears the mark.
+#[sqlx::test]
+async fn what_a_project_could_not_bring_back_outlives_the_maintenance(pool: PgPool) {
+    let (activations, id) = setup(&pool).await;
+    turn_on(&activations, id, &[key("feed")], Claimant::Anyone).await;
+    maintenance::begin(&pool, 100).await.unwrap();
+    take_down(&activations, id, &[key("feed")], DownCause::Maintenance).await;
+    maintenance::record_copies(&pool, id, None, &["db".into()], 100).await.unwrap();
+
+    maintenance::end(&pool).await.unwrap();
+    assert!(!maintenance::is_on(&pool).await.unwrap(), "one project left down never keeps the install in maintenance");
+    let left = maintenance::left(&pool).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(
+        left[0].steps(),
+        vec![
+            LiftStep::Start { owner: Owner::Shared, nodes: vec!["db".into()] },
+            LiftStep::BringBack { owner: Owner::Shared, triggers: vec!["feed".into()] },
+        ],
+        "still the project's own, to bring back"
+    );
+    // What the resync's bring-back does: the copy started and forgotten,
+    // the trigger claimed and landed on, which clears its mark.
+    maintenance::forget_copies(&pool, id, None, &["db".into()]).await.unwrap();
+    turn_on(&activations, id, &[key("feed")], Claimant::Lift).await;
+    assert!(maintenance::left(&pool).await.unwrap().is_empty());
+    let feed = activations.list(id).await.unwrap().remove(0);
+    assert_eq!((feed.lifecycle.status, feed.lifecycle.went_down), (ProjectStatus::Active, None));
 }
 
 /// The lift builds a project again from the request its running build came
@@ -215,19 +246,18 @@ async fn while_in_maintenance_activate_is_refused(pool: PgPool) {
 /// A project registered with none (a build an older weft registered) has
 /// nothing to build from, which the lift says.
 #[sqlx::test]
-async fn the_lift_rebuilds_from_the_request_the_running_build_came_from(pool: PgPool) {
+async fn the_lift_rebuilds_from_the_version_the_running_build_came_from(pool: PgPool) {
     use std::sync::Arc;
     use weft_compiler::build_plan::{ImageKind, PlannedImage};
-    use weft_core::builds::{BuildInputs, BuiltProgram, NodeSet, VersionBuildRequest};
+    use weft_core::builds::{BuildInputs, BuiltProgram, NodeSet, VersionSource};
     use weft_dispatcher::build::{follow, prune::ImageHold, waiting, Version, VersionBuild, VersionBuilder};
     use weft_platform_traits::{BuildStatus, FakeImageBuilder, Staging};
 
     let (_, id) = setup(&pool).await;
     let projects: weft_dispatcher::ProjectStore = Arc::new(weft_dispatcher::PostgresProjectStore::new(pool.clone()));
-    assert!(projects.running_build_request(id).await.unwrap().is_none(), "registered with no build: nothing to build again");
+    assert!(projects.running_build(id).await.unwrap().is_none(), "registered with no build: nothing to build again");
 
-    let request = VersionBuildRequest {
-        name: "shop".into(),
+    let request = VersionSource {
         manifest: [("main.weft".to_string(), "sha256:aa".to_string())].into(),
         inputs: BuildInputs { node_set: NodeSet::Referenced, assets: [("text:readme".to_string(), json!("hello"))].into() },
     };
@@ -242,10 +272,11 @@ async fn the_lift_rebuilds_from_the_request_the_running_build_came_from(pool: Pg
         result_file: None,
     }];
     let version = Version {
-        name: request.name.clone(),
+        name: "shop".into(),
         manifest: request.manifest.clone(),
         inputs: Some(request.inputs.clone()),
         program: BuiltProgram {
+            version: weft_core::project::hash::manifest_version_id(&request.manifest),
             definition: serde_json::from_value(json!({ "id": id, "nodes": [], "edges": [] })).unwrap(),
             binary_hash: "rebuilt".into(),
             definition_hash: "def-rebuilt".into(),
@@ -283,8 +314,8 @@ async fn the_lift_rebuilds_from_the_request_the_running_build_came_from(pool: Pg
     let advanced = waiting::advance(&pool, projects.as_ref()).await.unwrap();
     assert_eq!(advanced.registered.iter().map(|s| s.id).collect::<Vec<_>>(), [id], "{:?}", advanced.failed);
 
-    let stored = projects.running_build_request(id).await.unwrap().expect("the registered build keeps its request");
-    assert_eq!((stored.name, stored.manifest, stored.inputs), (request.name, request.manifest, request.inputs));
+    let stored = projects.running_build(id).await.unwrap().expect("the registered build keeps its version");
+    assert_eq!(stored, request);
 }
 
 /// A gate that lets every build through.
@@ -326,5 +357,5 @@ async fn a_failed_lift_activation_keeps_the_mark(pool: PgPool) {
     // Landed on: the mark goes, and nothing is left.
     turn_on(&activations, id, &[key("feed")], Claimant::Lift).await;
     assert!(maintenance::marked_triggers(&pool).await.unwrap().is_empty());
-    assert!(maintenance::end_if_nothing_left(&pool).await.unwrap());
+    assert!(maintenance::left(&pool).await.unwrap().is_empty());
 }

@@ -27,16 +27,20 @@
 //! `weft maintenance off` ([`off`]) runs the lift as a task of its own
 //! (`crate::task_kinds::maintenance_lift`): project by project, the
 //! project is built again on this weft from the request its running build
-//! came from (`ProjectStoreOps::running_build_request`) and registered,
+//! came from (`ProjectStoreOps::running_build`) and registered,
 //! the recorded copies are started on that build and waited for, then the
 //! marked triggers are brought back on it ([`ProjectLift::steps`]), each
 //! record and mark going as what it names comes back. A project whose
 //! running build an older weft registered kept no request: it comes back
 //! on that build, and the report names the `weft resync` that builds it
-//! again. One whose build fails keeps everything it had recorded. The row goes
-//! once nothing is left ([`end_if_nothing_left`]); a failure leaves what
-//! is left recorded and the maintenance on, and the next `off` tries it
 //! again.
+//!
+//! One project that cannot come back (its code does not build on this
+//! weft, a trigger's setup fails) never holds the others: the lift tries
+//! every project, then ends the maintenance ([`end`]). What that project
+//! had taken down stays recorded, and is its own: once its code is fixed,
+//! its next `weft resync` brings it back ([`bring_back_project`]), and so
+//! does another `weft maintenance off`.
 //!
 //! Nothing here keeps anything up: `on` is one request, and the lift is
 //! one task that ends.
@@ -209,17 +213,12 @@ pub async fn marked_triggers(pool: &PgPool) -> anyhow::Result<Vec<(uuid::Uuid, A
         .collect()
 }
 
-/// End the maintenance when nothing is left for a lift to bring back:
-/// no copy recorded, no trigger marked. Answers whether it ended (or was
-/// not on).
-pub async fn end_if_nothing_left(pool: &PgPool) -> anyhow::Result<bool> {
-    sqlx::query(
-        "DELETE FROM maintenance WHERE NOT EXISTS (SELECT 1 FROM maintenance_copy) \
-           AND NOT EXISTS (SELECT 1 FROM trigger_activation WHERE went_down_with = 'maintenance' AND status = 'inactive')",
-    )
-    .execute(pool)
-    .await?;
-    Ok(!is_on(pool).await?)
+/// End the maintenance: every verb that turns something on goes through
+/// again. What a project could not bring back stays recorded beside it,
+/// for its own next lift.
+pub async fn end(pool: &PgPool) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM maintenance").execute(pool).await?;
+    Ok(())
 }
 
 /// What is on across `tenant`'s projects right now. The infra copies are
@@ -389,10 +388,13 @@ pub async fn on(
 }
 
 /// `POST /install/maintenance/off` (`weft maintenance off`): start the
-/// lift as a task of its own, or follow the one under way.
+/// lift as a task of its own, or follow the one under way. Once the
+/// maintenance is over, a project that could not come back still has its
+/// records, and this lifts those again.
 pub async fn off(State(state): State<DispatcherState>, caller: CallerTenant) -> Result<Json<LiftAnswer>, ApiError> {
     let internal = |what: &str, e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
-    if !is_on(&state.pg_pool).await.map_err(|e| internal("read whether the install is in maintenance", e))? {
+    let on = is_on(&state.pg_pool).await.map_err(|e| internal("read whether the install is in maintenance", e))?;
+    if !on && left(&state.pg_pool).await.map_err(|e| internal("read what the maintenance left", e))?.is_empty() {
         return Ok(Json(LiftAnswer::NotOn));
     }
     let task = weft_task_store::tasks::enqueue_dedup(&state.pg_pool, crate::task_kinds::maintenance_lift::task(caller.0.as_str()))
@@ -555,8 +557,9 @@ async fn cancel_going(state: &DispatcherState, id: uuid::Uuid) -> anyhow::Result
 /// Lift the maintenance of `tenant`'s install, project by project: the
 /// project built again on this weft ([`rebuild`]), then every recorded copy
 /// started and every marked trigger brought back on that build
-/// ([`ProjectLift::steps`]), then the maintenance ended if nothing is left.
-/// What could not come back stays recorded and is in the report.
+/// ([`ProjectLift::steps`]). Then the maintenance ends, whatever a project
+/// could not bring back: that stays recorded, is in the report, and comes
+/// back with the project's next `weft resync` ([`bring_back_project`]).
 pub(crate) async fn lift(state: &DispatcherState, tenant: &str) -> anyhow::Result<LiftReport> {
     let names = project_names(state, tenant).await.map_err(|(_, why)| anyhow::anyhow!(why))?;
     let mut report = LiftReport::default();
@@ -564,41 +567,62 @@ pub(crate) async fn lift(state: &DispatcherState, tenant: &str) -> anyhow::Resul
         let id = lift.project_id;
         let mut lifted = ProjectLifted { id, name: names.get(&id).cloned().unwrap_or_default(), ..Default::default() };
         // A build that failed brings nothing back: what is recorded waits
-        // for the next lift, on a build that runs on this weft.
-        if !rebuild(state, tenant, id, &mut lifted).await? {
-            report.projects.push(lifted);
-            continue;
-        }
-        for step in lift.steps() {
-            match step {
-                LiftStep::Start { owner, nodes } => start_copies(state, id, owner.instance(), &nodes, &mut lifted).await?,
-                LiftStep::BringBack { owner, triggers } => bring_back(state, id, &owner, triggers, &mut lifted).await,
-            }
+        // for a build that runs on this weft.
+        if rebuild(state, tenant, id, &mut lifted).await? {
+            run_steps(state, &lift, &mut lifted).await?;
         }
         report.projects.push(lifted);
     }
-    report.lifted = end_if_nothing_left(&state.pg_pool).await?;
+    end(&state.pg_pool).await?;
     // What weft brings back on its own was refused while the maintenance
     // lasted, and the copies' changes that would wake it again came while
     // it still did: what went down with its infra, the events that waited
     // on infra and a resync stopped on either get their look now.
-    if report.lifted {
-        if let Err(e) = crate::api::infra::bring_back_triggers_whose_infra_returned(state.clone()).await {
-            tracing::error!(target: "weft_dispatcher::maintenance", "the maintenance is lifted, but bringing back what went down with its infra failed; the next change of a copy tries again: {e:#}");
-        }
+    if let Err(e) = crate::api::infra::bring_back_triggers_whose_infra_returned(state.clone()).await {
+        tracing::error!(target: "weft_dispatcher::maintenance", "the maintenance is lifted, but bringing back what went down with its infra failed; the next change of a copy tries again: {e:#}");
     }
     Ok(report)
 }
 
-/// Build project `id` of `tenant` again on this weft, from the request its
-/// running build came from, and register it, through the same path a build
-/// request takes (`crate::api::project::build_and_register`), waiting for
-/// its images when they build. `false` when it failed, said in `lifted`.
+/// Bring back what the maintenance took down in project `id` and could
+/// not bring back then, on the build it has registered now: what a
+/// `weft resync` does first, once the project's code builds on this weft
+/// again. `None` when nothing of it is left, or while the install is still
+/// in maintenance (the lift is what brings things back then).
+pub(crate) async fn bring_back_project(state: &DispatcherState, id: uuid::Uuid) -> anyhow::Result<Option<ProjectLifted>> {
+    if is_on(&state.pg_pool).await? {
+        return Ok(None);
+    }
+    let Some(lift) = left(&state.pg_pool).await?.into_iter().find(|lift| lift.project_id == id) else { return Ok(None) };
+    let name = state.projects.get(id).await?.map(|project| project.name).unwrap_or_default();
+    let mut lifted = ProjectLifted { id, name, ..Default::default() };
+    run_steps(state, &lift, &mut lifted).await?;
+    Ok(Some(lifted))
+}
+
+/// Run `lift`'s steps on the build its project has registered, saying in
+/// `lifted` what came back and what did not.
+async fn run_steps(state: &DispatcherState, lift: &ProjectLift, lifted: &mut ProjectLifted) -> anyhow::Result<()> {
+    let id = lift.project_id;
+    for step in lift.steps() {
+        match step {
+            LiftStep::Start { owner, nodes } => start_copies(state, id, owner.instance(), &nodes, lifted).await?,
+            LiftStep::BringBack { owner, triggers } => bring_back(state, id, &owner, triggers, lifted).await,
+        }
+    }
+    Ok(())
+}
+
+/// Build project `id` of `tenant` again on this weft, from the version its
+/// running build came from and the resolutions it was built with, and
+/// register it, through the same path a build takes
+/// (`crate::actions::build::build_and_register`), waiting for its images
+/// when they build. `false` when it failed, said in `lifted`.
 /// A project with no stored request (its build an older weft registered)
 /// is not built, said in `lifted`, and comes back on the build it has.
 async fn rebuild(state: &DispatcherState, tenant: &str, id: uuid::Uuid, lifted: &mut ProjectLifted) -> anyhow::Result<bool> {
-    use crate::api::project::Built;
-    let Some(request) = state.projects.running_build_request(id).await? else {
+    use crate::actions::build::Built;
+    let Some(source) = state.projects.running_build(id).await? else {
         lifted.skipped.push(
             "building it again on this weft: its running build is one an older weft registered, which kept nothing to build \
              it again from, so it comes back on that build; run `weft resync` in its folder to build it on this weft"
@@ -607,7 +631,8 @@ async fn rebuild(state: &DispatcherState, tenant: &str, id: uuid::Uuid, lifted: 
         return Ok(true);
     };
     let tenant = crate::tenant::TenantId(tenant.to_string());
-    let ended = match crate::api::project::build_and_register(state, id, &tenant, &request).await {
+    let kept = crate::build::Kept(&source.inputs.assets);
+    let ended = match crate::actions::build::build_and_register(state, id, &tenant, &source, &kept).await {
         Ok(Built::Registered(_)) => None,
         Ok(Built::Underway(underway)) => {
             let ended = crate::build::waiting::wait_ended(state, id, underway.build).await?;
@@ -624,7 +649,7 @@ async fn rebuild(state: &DispatcherState, tenant: &str, id: uuid::Uuid, lifted: 
             Ok(true)
         }
         Some(why) => {
-            lifted.failed.push(format!("building it again on this weft: {why}; what it had taken down stays recorded"));
+            lifted.failed.push(format!("building it again on this weft: {why}"));
             Ok(false)
         }
     }
@@ -711,7 +736,7 @@ async fn bring_back(state: &DispatcherState, id: uuid::Uuid, owner: &Owner, trig
         Ok(Json(answer)) => lifted.turned_on.extend(answer.turned_on),
         Err(error) => {
             let (_, why) = <(StatusCode, String)>::from(error);
-            lifted.failed.push(format!("triggers {words}: {why} (to leave them off instead, `weft deactivate` them)"));
+            lifted.failed.push(format!("triggers {words}: {why}"));
         }
     }
 }

@@ -37,7 +37,7 @@ async fn lists_every_instance(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(outcome.outputs["instances"], instances);
     assert_eq!(outcome.outputs["ids"], json!(["ada", "bob"]));
     assert_eq!(outcome.outputs["waiting"], json!(["bob"]));
-    assert!(matches!(rig.program_calls()[0].0, ProgramCall::InstancesList));
+    assert!(matches!(rig.program_calls()[0].0, ProgramCall::Instances(weft::program::instances::InstanceCall::List)));
     Ok(())
 }
 

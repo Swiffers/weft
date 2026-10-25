@@ -156,14 +156,7 @@
       "weft infra logs",
       "weft infra list-doors",
       "weft tree",
-      {
-        "prefix": "weft branch",
-        "refuse": [
-          [
-            "--discard"
-          ]
-        ]
-      },
+      "weft branch",
       "weft connect",
       "weft domain add",
       "weft domain list",

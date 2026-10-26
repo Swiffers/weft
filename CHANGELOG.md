@@ -4,7 +4,7 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## Unreleased
+## 2026-10-26 (caf76429)
 
 **`weft maintenance off` is faster and shows what it is doing.** It used to
 bring projects back one after another, printing one line and then nothing

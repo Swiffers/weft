@@ -296,7 +296,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         // install, never written in the source.
         .route("/projects/{id}/picks", get(picks::list).put(picks::change))
         .route("/projects/{id}/picks/move", post(picks::move_picks))
-        .route("/projects/{id}/picks/check", post(picks::check))
+        .route("/projects/{id}/picks/kept", get(picks::kept))
         // The project's own worker levers.
         .route("/projects/{id}/workers", get(workers::get).put(workers::put))
         .route("/projects/{id}/runs/latest", get(run::latest_for_project))

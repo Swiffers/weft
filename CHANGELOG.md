@@ -4,6 +4,15 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-10-26 (a8eef1b0)
+
+**`weft target export` checks a large program's connections again.** On a
+program with many included files, the check that every connection is picked
+on the target failed with `length limit exceeded`, printed as if there were
+connections to fix. The check now runs on your machine against what the
+install keeps, so no size of program stops it, and a check that cannot run
+says so plainly instead of listing gaps.
+
 ## 2026-10-25 (c2d4bc11)
 
 **A domain you give a cloud install becomes its address.** Once Google has

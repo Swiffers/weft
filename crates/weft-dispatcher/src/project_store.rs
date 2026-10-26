@@ -406,6 +406,20 @@ pub(crate) fn transition_held(p: &str, stale_before: &str) -> String {
     )
 }
 
+/// Land at rest every project in a transition nothing holds any more
+/// ([`transition_held`]): `$1` the oldest heartbeat still alive, `$2` one
+/// project, or NULL for every one. Answers the ids it landed.
+pub(crate) fn settle_transition_sql() -> String {
+    format!(
+        "UPDATE project p SET transition = 'none' \
+         WHERE p.transition <> 'none' \
+           AND NOT {} \
+           AND ($2::UUID IS NULL OR p.id = $2) \
+         RETURNING p.id",
+        transition_held("p", "$1")
+    )
+}
+
 /// The SQL condition "the project row `p` is in a transition only the
 /// request driving it holds": a build no version of which waits. Once
 /// that request's heartbeat is stale nothing holds it
@@ -1504,18 +1518,7 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn settle_transition(&self, project: Option<uuid::Uuid>, stale_before: i64) -> anyhow::Result<Vec<uuid::Uuid>> {
-        Ok(sqlx::query_scalar(&format!(
-            "UPDATE project p SET transition = 'none' \
-             WHERE p.transition <> 'none' \
-               AND NOT {} \
-               AND ($2::UUID IS NULL OR p.id = $2) \
-             RETURNING p.id",
-            transition_held("p", "$1")
-        ))
-        .bind(stale_before)
-        .bind(project)
-        .fetch_all(&self.pool)
-        .await?)
+        Ok(sqlx::query_scalar(&settle_transition_sql()).bind(stale_before).bind(project).fetch_all(&self.pool).await?)
     }
 
     async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()> {

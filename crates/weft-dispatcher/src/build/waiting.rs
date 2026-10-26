@@ -384,6 +384,16 @@ pub(crate) async fn settle(conn: &mut sqlx::PgConnection, project: uuid::Uuid, s
         .execute(&mut *conn)
         .await
         .context("record the ask the project runs")?;
+    // A registered version is runnable at once: the project lands at rest
+    // in this same transaction when nothing else holds its build, so
+    // whoever hears the version registered (its waiter, woken as this
+    // commits) never finds the project still building.
+    sqlx::query_scalar::<_, uuid::Uuid>(&crate::project_store::settle_transition_sql())
+        .bind(now - crate::transition::heartbeat_stale_secs())
+        .bind(Some(project))
+        .fetch_all(&mut *conn)
+        .await
+        .context("land the project at rest")?;
     Ok(true)
 }
 
@@ -512,10 +522,10 @@ async fn registered_in_store(
     Ok(summary.map(|summary| (summary, answer)))
 }
 
-/// Register `version` ([`register_version`]), then say so: the project
-/// lands at rest unless something else still holds its build transition
-/// (a registered version must be runnable at once, not after the build
-/// loop's next look), the images its earlier builds left are reclaimed
+/// Register `version` ([`register_version`], which lands the project at
+/// rest in the same transaction unless something else still holds its
+/// build transition: a registered version must be runnable at once), then
+/// say so: the images its earlier builds left are reclaimed
 /// (`super::prune::AfterBuildPrunes`), and every editor hears of it. THE
 /// way a version becomes its project's running one.
 pub async fn register(
@@ -538,15 +548,9 @@ pub async fn register(
 /// the others did, and a failure is logged with what it leaves, never
 /// answered: the version IS the project's running one.
 pub async fn announce(state: &DispatcherState, summary: &StoredProjectSummary) {
-    if let Err(e) = crate::transition::settle(state, Some(summary.id)).await {
-        tracing::error!(
-            target: "weft_dispatcher::build",
-            project_id = %summary.id,
-            error = %format!("{e:#}"),
-            "landing the project at rest failed after the version registered; the build loop or the stuck-transition \
-             reaper settles it"
-        );
-    }
+    // The registration landed the project at rest when nothing else held
+    // it ([`settle`]); editors hear of that here.
+    crate::transition::publish_transition_changed(state, summary.id).await;
     state.builder.prunes.request(state, Some(summary.id));
     // The files the build reads are the project's references now, beside
     // every version's and working copy's.

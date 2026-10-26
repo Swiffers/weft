@@ -110,7 +110,7 @@ impl<'a> ProjectCalls<'a> {
     pub(super) async fn follow<T: DeserializeOwned>(self, task: uuid::Uuid) -> WeftResult<T> {
         loop {
             match self.call::<Following>(ProgramCall::Project(ProjectCall::Follow { task }), StopSelf::Keep).await? {
-                Following::Going => {}
+                Following::Going(_) => {}
                 Following::Done(value) => {
                     return serde_json::from_value(value)
                         .map_err(|e| WeftError::NodeFailed(format!("task {task} ended with an answer this node cannot read: {e}")))

@@ -56,7 +56,7 @@ use weft_core::activation::ActivationKey;
 use weft_core::infra::wire::CopyRef;
 use weft_core::instance::{InstanceId, Owner};
 use weft_core::maintenance::{
-    Going, LiftAnswer, LiftReport, MaintenanceOn, MaintenanceOnRequest, MaintenanceState, ProjectLeft, ProjectLifted, ProjectWentDown,
+    Going, LiftAnswer, LiftAt, LiftDoing, LiftProgress, LiftReport, MaintenanceOn, MaintenanceOnRequest, MaintenanceState, ProjectLeft, ProjectLifted, ProjectWentDown,
 };
 use weft_core::take_down::{Running, TakeDown};
 
@@ -287,25 +287,6 @@ pub struct ProjectLift {
     pub triggers: BTreeMap<Owner, Vec<String>>,
 }
 
-/// One step of a lift.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LiftStep {
-    /// Start these copies of one owner, and wait until they land.
-    Start { owner: Owner, nodes: Vec<String> },
-    /// Bring back these triggers of one owner.
-    BringBack { owner: Owner, triggers: Vec<String> },
-}
-
-impl ProjectLift {
-    /// The steps, in the order they run: every copy first, since a
-    /// trigger's setup reads the infra in its cut, then every trigger.
-    pub fn steps(&self) -> Vec<LiftStep> {
-        let starts = self.copies.iter().map(|(owner, nodes)| LiftStep::Start { owner: owner.clone(), nodes: nodes.clone() });
-        let bring_backs = self.triggers.iter().map(|(owner, triggers)| LiftStep::BringBack { owner: owner.clone(), triggers: triggers.clone() });
-        starts.chain(bring_backs).collect()
-    }
-}
-
 /// What a lift of `copies` and `triggers` does, project by project.
 pub fn plan(copies: Vec<RecordedCopy>, triggers: Vec<(uuid::Uuid, ActivationKey)>) -> Vec<ProjectLift> {
     let mut by_project: BTreeMap<uuid::Uuid, ProjectLift> = BTreeMap::new();
@@ -424,7 +405,11 @@ pub async fn follow(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("follow the lift: {e:#}")))?;
     match outcome.status {
-        weft_core::task::TaskStatus::Pending | weft_core::task::TaskStatus::Claimed => Ok(Json(weft_core::deactivation::Following::Going)),
+        weft_core::task::TaskStatus::Pending | weft_core::task::TaskStatus::Claimed => Ok(Json(weft_core::deactivation::Following::Going(
+            weft_task_store::tasks::progress(&state.pg_pool, task)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read where the lift is: {e:#}")))?,
+        ))),
         weft_core::task::TaskStatus::Complete => {
             Ok(Json(weft_core::deactivation::Following::Done(outcome.result.unwrap_or(serde_json::Value::Null))))
         }
@@ -554,25 +539,29 @@ async fn cancel_going(state: &DispatcherState, id: uuid::Uuid) -> anyhow::Result
 // The lift
 // =================================================================
 
-/// Lift the maintenance of `tenant`'s install, project by project: the
-/// project built again on this weft ([`rebuild`]), then every recorded copy
-/// started and every marked trigger brought back on that build
-/// ([`ProjectLift::steps`]). Then the maintenance ends, whatever a project
-/// could not bring back: that stays recorded, is in the report, and comes
-/// back with the project's next `weft resync` ([`bring_back_project`]).
-pub(crate) async fn lift(state: &DispatcherState, tenant: &str) -> anyhow::Result<LiftReport> {
+/// Lift the maintenance of `tenant`'s install, every project side by side
+/// (nothing of one waits on another): the project built again on this
+/// weft ([`rebuild`]), then its recorded copies started and its marked
+/// triggers brought back on that build ([`run_steps`]). Then the
+/// maintenance ends, whatever a project could not bring back: that stays
+/// recorded, is in the report, and comes back with the project's next
+/// `weft resync` ([`bring_back_project`]).
+pub(crate) async fn lift(state: &DispatcherState, tenant: &str, task: uuid::Uuid) -> anyhow::Result<LiftReport> {
     let names = project_names(state, tenant).await.map_err(|(_, why)| anyhow::anyhow!(why))?;
-    let mut report = LiftReport::default();
-    for lift in left(&state.pg_pool).await? {
+    let tell = Telling::on(Some(task));
+    let lifts = left(&state.pg_pool).await?;
+    futures::future::try_join_all(lifts.iter().map(|lift| async {
         let id = lift.project_id;
         let mut lifted = ProjectLifted { id, name: names.get(&id).cloned().unwrap_or_default(), ..Default::default() };
         // A build that failed brings nothing back: what is recorded waits
         // for a build that runs on this weft.
-        if rebuild(state, tenant, id, &mut lifted).await? {
-            run_steps(state, &lift, &mut lifted).await?;
+        if rebuild(state, tenant, id, &mut lifted, &tell).await? {
+            run_steps(state, lift, &mut lifted, &tell).await?;
         }
-        report.projects.push(lifted);
-    }
+        tell.done(&state.pg_pool, lifted).await
+    }))
+    .await?;
+    let report = LiftReport { projects: tell.into_done() };
     end(&state.pg_pool).await?;
     // What weft brings back on its own was refused while the maintenance
     // lasted, and the copies' changes that would wake it again came while
@@ -596,21 +585,99 @@ pub(crate) async fn bring_back_project(state: &DispatcherState, id: uuid::Uuid) 
     let Some(lift) = left(&state.pg_pool).await?.into_iter().find(|lift| lift.project_id == id) else { return Ok(None) };
     let name = state.projects.get(id).await?.map(|project| project.name).unwrap_or_default();
     let mut lifted = ProjectLifted { id, name, ..Default::default() };
-    run_steps(state, &lift, &mut lifted).await?;
+    run_steps(state, &lift, &mut lifted, &Telling::on(None)).await?;
     Ok(Some(lifted))
 }
 
-/// Run `lift`'s steps on the build its project has registered, saying in
-/// `lifted` what came back and what did not.
-async fn run_steps(state: &DispatcherState, lift: &ProjectLift, lifted: &mut ProjectLifted) -> anyhow::Result<()> {
+/// Bring back `lift` on the build its project has registered, saying in
+/// `lifted` what came back and what did not: every recorded copy first,
+/// every owner's at once, since a trigger's setup reads the infra in its
+/// cut; then every marked trigger, every owner's at once.
+async fn run_steps(state: &DispatcherState, lift: &ProjectLift, lifted: &mut ProjectLifted, tell: &Telling) -> anyhow::Result<()> {
     let id = lift.project_id;
-    for step in lift.steps() {
-        match step {
-            LiftStep::Start { owner, nodes } => start_copies(state, id, owner.instance(), &nodes, lifted).await?,
-            LiftStep::BringBack { owner, triggers } => bring_back(state, id, &owner, triggers, lifted).await,
-        }
+    if !lift.copies.is_empty() {
+        let copies = lift
+            .copies
+            .iter()
+            .flat_map(|(owner, nodes)| nodes.iter().map(|node| CopyRef { node: node.clone(), instance: owner.instance().cloned() }))
+            .collect();
+        tell.at(&state.pg_pool, lifted, LiftDoing::StartingInfra { copies }).await?;
+        let parts = futures::future::try_join_all(lift.copies.iter().map(|(owner, nodes)| async {
+            let mut part = ProjectLifted::default();
+            start_copies(state, id, owner.instance(), nodes, &mut part).await?;
+            anyhow::Ok(part)
+        }))
+        .await?;
+        parts.into_iter().for_each(|part| lifted.absorb(part));
+    }
+    if !lift.triggers.is_empty() {
+        let triggers = lift
+            .triggers
+            .iter()
+            .map(|(owner, triggers)| weft_core::activation::OwnerTriggers { owner: owner.clone(), triggers: triggers.clone() })
+            .collect();
+        tell.at(&state.pg_pool, lifted, LiftDoing::TurningOn { triggers }).await?;
+        let parts = futures::future::join_all(lift.triggers.iter().map(|(owner, triggers)| async {
+            let mut part = ProjectLifted::default();
+            bring_back(state, id, owner, triggers.clone(), &mut part).await;
+            part
+        }))
+        .await;
+        parts.into_iter().for_each(|part| lifted.absorb(part));
     }
     Ok(())
+}
+
+/// Where a lift is, said on its task as it goes ([`LiftProgress`]), which
+/// `weft maintenance off` shows while it follows. Says nothing for a
+/// project's resync bringing back what a lift left (`task` is `None`).
+/// The projects the lift goes through side by side share it: each write
+/// says all of them, one write at a time.
+struct Telling {
+    task: Option<uuid::Uuid>,
+    progress: tokio::sync::Mutex<LiftProgress>,
+}
+
+impl Telling {
+    fn on(task: Option<uuid::Uuid>) -> Self {
+        Self { task, progress: tokio::sync::Mutex::new(LiftProgress::default()) }
+    }
+
+    /// `lifted`'s project is on step `doing` from now.
+    async fn at(&self, pool: &PgPool, lifted: &ProjectLifted, doing: LiftDoing) -> anyhow::Result<()> {
+        let at = LiftAt { id: lifted.id, name: lifted.name.clone(), since_unix: crate::lease::now_unix(), doing };
+        let mut progress = self.progress.lock().await;
+        progress.going.retain(|going| going.id != lifted.id);
+        progress.going.push(at);
+        self.say(pool, &progress).await
+    }
+
+    /// `lifted`'s project goes on with its step, as `doing` now (a build
+    /// whose images started).
+    async fn still(&self, pool: &PgPool, lifted: &ProjectLifted, doing: LiftDoing) -> anyhow::Result<()> {
+        let mut progress = self.progress.lock().await;
+        if let Some(at) = progress.going.iter_mut().find(|going| going.id == lifted.id) {
+            at.doing = doing;
+        }
+        self.say(pool, &progress).await
+    }
+
+    /// The lift is done with `lifted`'s project.
+    async fn done(&self, pool: &PgPool, lifted: ProjectLifted) -> anyhow::Result<()> {
+        let mut progress = self.progress.lock().await;
+        progress.going.retain(|going| going.id != lifted.id);
+        progress.done.push(lifted);
+        self.say(pool, &progress).await
+    }
+
+    fn into_done(self) -> Vec<ProjectLifted> {
+        self.progress.into_inner().done
+    }
+
+    async fn say(&self, pool: &PgPool, progress: &LiftProgress) -> anyhow::Result<()> {
+        let Some(task) = self.task else { return Ok(()) };
+        weft_task_store::tasks::set_progress(pool, task, &serde_json::to_value(progress)?).await
+    }
 }
 
 /// Build project `id` of `tenant` again on this weft, from the version its
@@ -620,7 +687,7 @@ async fn run_steps(state: &DispatcherState, lift: &ProjectLift, lifted: &mut Pro
 /// when they build. `false` when it failed, said in `lifted`.
 /// A project with no stored request (its build an older weft registered)
 /// is not built, said in `lifted`, and comes back on the build it has.
-async fn rebuild(state: &DispatcherState, tenant: &str, id: uuid::Uuid, lifted: &mut ProjectLifted) -> anyhow::Result<bool> {
+async fn rebuild(state: &DispatcherState, tenant: &str, id: uuid::Uuid, lifted: &mut ProjectLifted, tell: &Telling) -> anyhow::Result<bool> {
     use crate::actions::build::Built;
     let Some(source) = state.projects.running_build(id).await? else {
         lifted.skipped.push(
@@ -632,9 +699,11 @@ async fn rebuild(state: &DispatcherState, tenant: &str, id: uuid::Uuid, lifted: 
     };
     let tenant = crate::tenant::TenantId(tenant.to_string());
     let kept = crate::build::Kept(&source.inputs.assets);
+    tell.at(&state.pg_pool, lifted, LiftDoing::Building { build: None }).await?;
     let ended = match crate::actions::build::build_and_register(state, id, &tenant, &source, &kept).await {
         Ok(Built::Registered(_)) => None,
         Ok(Built::Underway(underway)) => {
+            tell.still(&state.pg_pool, lifted, LiftDoing::Building { build: Some(underway.build) }).await?;
             let ended = crate::build::waiting::wait_ended(state, id, underway.build).await?;
             match ended.state {
                 weft_core::builds::VersionBuildStatus::Registered => None,
@@ -791,7 +860,7 @@ mod tests {
     /// A lift goes project by project, each one's copies grouped by owner
     /// before its triggers, grouped the same way.
     #[test]
-    fn a_lift_starts_each_projects_copies_before_its_triggers() {
+    fn a_lift_groups_each_projects_copies_and_triggers_by_owner() {
         let (a, b) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
         let copies = vec![
             RecordedCopy { project_id: a, node: "db".into(), instance: None },
@@ -806,15 +875,12 @@ mod tests {
         let lifts = plan(copies, triggers);
         assert_eq!(lifts.iter().map(|l| l.project_id).collect::<Vec<_>>(), vec![a, b]);
         assert_eq!(
-            lifts[0].steps(),
-            vec![
-                LiftStep::Start { owner: Owner::Shared, nodes: vec!["db".into(), "queue".into()] },
-                LiftStep::Start { owner: ada(), nodes: vec!["cache".into()] },
-                LiftStep::BringBack { owner: Owner::Shared, triggers: vec!["door".into()] },
-                LiftStep::BringBack { owner: ada(), triggers: vec!["inbox".into()] },
-            ]
+            lifts[0].copies,
+            BTreeMap::from([(Owner::Shared, vec!["db".into(), "queue".into()]), (ada(), vec!["cache".into()])])
         );
-        assert_eq!(lifts[1].steps(), vec![LiftStep::BringBack { owner: Owner::Shared, triggers: vec!["cron".into()] }]);
+        assert_eq!(lifts[0].triggers, BTreeMap::from([(Owner::Shared, vec!["door".into()]), (ada(), vec!["inbox".into()])]));
+        assert!(lifts[1].copies.is_empty());
+        assert_eq!(lifts[1].triggers, BTreeMap::from([(Owner::Shared, vec!["cron".into()])]));
     }
 
     #[test]

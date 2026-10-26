@@ -15,7 +15,7 @@ use weft_dispatcher::activation_store::{
     ActivationLifecycle, ActivationStoreOps, Claimant, ClaimRefused, DownCause, Forget, LifecycleWrite, PostgresActivationStore, ProjectStatus,
     SignalsGoing,
 };
-use weft_dispatcher::maintenance::{self, LiftStep};
+use weft_dispatcher::maintenance;
 
 const TENANT: &str = "tenant-1";
 
@@ -143,10 +143,10 @@ async fn a_persons_deactivate_clears_the_maintenance_mark(pool: PgPool) {
 }
 
 /// The lift reads back only what the maintenance took down (never a
-/// trigger a person or the health check took down), infra first, and the
-/// maintenance ends once each record and mark is gone.
+/// trigger a person or the health check took down), each owner's apart,
+/// and the maintenance ends once each record and mark is gone.
 #[sqlx::test]
-async fn the_lift_brings_back_only_what_was_marked_infra_first(pool: PgPool) {
+async fn the_lift_brings_back_only_what_was_marked(pool: PgPool) {
     let (activations, id) = setup(&pool).await;
     turn_on(&activations, id, &[key("feed"), key("door"), key("cron")], Claimant::Anyone).await;
     take_down(&activations, id, &[key("door")], DownCause::Person).await;
@@ -160,14 +160,8 @@ async fn the_lift_brings_back_only_what_was_marked_infra_first(pool: PgPool) {
     let left = maintenance::left(&pool).await.unwrap();
     assert_eq!(left.len(), 1);
     let ada = Owner::from_instance(ada());
-    assert_eq!(
-        left[0].steps(),
-        vec![
-            LiftStep::Start { owner: Owner::Shared, nodes: vec!["db".into()] },
-            LiftStep::Start { owner: ada.clone(), nodes: vec!["cache".into()] },
-            LiftStep::BringBack { owner: Owner::Shared, triggers: vec!["feed".into()] },
-        ]
-    );
+    assert_eq!(left[0].copies, std::collections::BTreeMap::from([(Owner::Shared, vec!["db".into()]), (ada.clone(), vec!["cache".into()])]));
+    assert_eq!(left[0].triggers, std::collections::BTreeMap::from([(Owner::Shared, vec!["feed".into()])]));
 
     // What the lift does as each comes back: a started copy is forgotten,
     // and the lift's claim clears the trigger's mark.
@@ -222,14 +216,8 @@ async fn what_a_project_could_not_bring_back_outlives_the_maintenance(pool: PgPo
     assert!(!maintenance::is_on(&pool).await.unwrap(), "one project left down never keeps the install in maintenance");
     let left = maintenance::left(&pool).await.unwrap();
     assert_eq!(left.len(), 1);
-    assert_eq!(
-        left[0].steps(),
-        vec![
-            LiftStep::Start { owner: Owner::Shared, nodes: vec!["db".into()] },
-            LiftStep::BringBack { owner: Owner::Shared, triggers: vec!["feed".into()] },
-        ],
-        "still the project's own, to bring back"
-    );
+    assert_eq!(left[0].copies, std::collections::BTreeMap::from([(Owner::Shared, vec!["db".into()])]), "still the project's own, to bring back");
+    assert_eq!(left[0].triggers, std::collections::BTreeMap::from([(Owner::Shared, vec!["feed".into()])]));
     // What the resync's bring-back does: the copy started and forgotten,
     // the trigger claimed and landed on, which clears its mark.
     maintenance::forget_copies(&pool, id, None, &["db".into()]).await.unwrap();

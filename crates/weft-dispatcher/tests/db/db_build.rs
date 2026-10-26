@@ -1095,7 +1095,8 @@ async fn a_prune_takes_what_failed_and_cancelled_builds_left(pool: PgPool) {
 /// The build transition outlives the request that entered it: once the
 /// request let go, the version waiting on its builds holds it, a settle
 /// leaves it while that version waits (a build ending is not enough), and
-/// the first settle after the version registered lands it at rest. A
+/// the registration lands it at rest itself, in its own transaction, so
+/// whoever hears the version registered finds the project runnable. A
 /// project waiting on a build another project started is held the same
 /// way.
 #[sqlx::test]
@@ -1122,12 +1123,8 @@ async fn a_waiting_version_holds_the_transition_until_it_registers(pool: PgPool)
     assert_eq!(transition_of(&projects, own).await, "building");
 
     waiting::advance(&pool, projects.as_ref()).await.unwrap();
-    let mut settled = projects.settle_transition(None, stale_before()).await.unwrap();
-    settled.sort();
-    let mut both = vec![own, joiner];
-    both.sort();
-    assert_eq!(settled, both, "both registered: both at rest");
-    assert_eq!(transition_of(&projects, own).await, "none");
+    assert_eq!(transition_of(&projects, own).await, "none", "registered: at rest with no settle after");
+    assert_eq!(transition_of(&projects, joiner).await, "none");
 }
 
 /// A request asking again while its version waits enters the transition

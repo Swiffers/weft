@@ -230,7 +230,8 @@ pub fn check_picks(project: Option<&ProjectDefinition>, inputs: &[PickInput]) ->
 /// the program: a pick (`instance: None`) or one instance's value for a
 /// field written `@instance_filled`. `service` is the connection's
 /// service when the value is a connection, else `None`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoredField {
     pub node: String,
     pub field: String,
@@ -324,6 +325,19 @@ pub fn stranded(project: &ProjectDefinition, stored: &[StoredField]) -> Vec<Stra
             Some(Stranded { node: at.to_string(), candidates: candidates.into_iter().cloned().collect() })
         })
         .collect()
+}
+
+/// What an install keeps for a project's connections, which an activation
+/// checks the program against (`activation_picks`): `GET
+/// /projects/{id}/picks/kept`, read by `weft target export` to run the
+/// same check on the program it is about to deploy, wherever that program
+/// is (it never travels: a large one would not fit in a request).
+// SYNC: Kept <-> crates/weft-dispatcher/src/api/picks.rs kept, crates/weft-cli/src/commands/target.rs unpicked_connections
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Kept {
+    pub picks: Picks,
+    pub stored: Vec<StoredField>,
 }
 
 /// What an activation checks of the install's picks before any trigger
@@ -439,6 +453,24 @@ mod tests {
         let refused = run_picks(&p, &Picks::new()).unwrap_err();
         assert_eq!(refused.errors.len(), 1, "the optional one is not required: {refused:?}");
         assert!(refused.errors[0].contains("weft connect --node slack"), "{refused:?}");
+    }
+
+    #[test]
+    fn what_an_install_keeps_reads_back_and_checks_like_activation() {
+        let handle = json!({ "id": uuid::Uuid::nil(), "identity": "me" });
+        let kept = Kept {
+            picks: BTreeMap::from([("slack".into(), BTreeMap::from([("access".into(), handle)]))]),
+            stored: vec![StoredField { node: "slack".into(), field: "access".into(), service: Some("slack".into()), instance: None }],
+        };
+        let v = serde_json::to_value(&kept).unwrap();
+        assert_eq!(v["stored"][0], json!({ "node": "slack", "field": "access", "service": "slack", "instance": null }));
+        let back: Kept = serde_json::from_value(v).unwrap();
+        assert_eq!(back, kept);
+        let p = project(vec![access_node("slack", false)]);
+        assert_eq!(activation_picks(&p, &back.picks, &back.stored), Ok(()));
+        let moved = project(vec![access_node("chat", false)]);
+        let refused = activation_picks(&moved, &back.picks, &back.stored).unwrap_err();
+        assert!(!refused.errors.is_empty(), "a pick left at a place the program no longer has is named");
     }
 
     #[test]

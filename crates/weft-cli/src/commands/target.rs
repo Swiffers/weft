@@ -330,7 +330,7 @@ async fn export(
             .context("read the project's frontends")?;
     let frontend = hosted_frontend(&frontends, frontend, repo.as_ref())?;
 
-    let unpicked = unpicked_connections(&client, project).await;
+    let picks = check_picks(&client, project).await;
     let labels = ExportLabels::of(project);
     let (keys, minted) = mint_ci_keys(&client, name, project, &labels, front_env, frontend).await?;
     let prepared = async {
@@ -366,7 +366,7 @@ async fn export(
                 "frontend '{frontend}' keeps its old token working until the deploy workflow puts the new one in place and retires it"
             );
         }
-        print_unpicked(&unpicked, name);
+        picks.print(name);
         return Ok(());
     }
     if let Err(e) = set_repository_values(&project.root, &settings) {
@@ -393,46 +393,68 @@ async fn export(
     for id in &stale {
         println!("revoked an earlier export's key {id}");
     }
-    print_unpicked(&unpicked, name);
+    picks.print(name);
     Ok(())
 }
 
+/// Whether activating this program on the target would refuse any of its
+/// connection picks there ([`check_picks`]).
+enum PicksCheck {
+    /// Every connection the program reads is picked.
+    Clear,
+    /// Each gap, as the line that says how to fix it.
+    Gaps(Vec<String>),
+    /// The check could not run, and why.
+    Unchecked(String),
+}
+
 /// What activating this program on `client`'s install would refuse of its
-/// connection picks, each gap as the line that says how to fix it: the
-/// deploy workflow's `weft resync` refuses to move the triggers that are
-/// on onto the new version until they are fixed, and so does `weft
-/// activate` turning them on, and both are late places to find out. The install answers with
-/// activation's own check, run on this machine's compile of the program
-/// (the install may not have built it yet). A program that does not
-/// compile, or an install that cannot answer, come back as one line saying
-/// so.
-async fn unpicked_connections(client: &crate::client::DispatcherClient, project: &weft_compiler::project::Project) -> Vec<String> {
+/// connection picks: the deploy workflow's `weft resync` refuses to move
+/// the triggers that are on onto the new version until they are fixed, and
+/// so does `weft activate` turning them on, and both are late places to
+/// find out. It is activation's own check (`weft_core::picks::activation_picks`),
+/// run here on this machine's compile of the program (the install may not
+/// have built it yet) against what the install keeps for the project's
+/// connections: the program never travels, so no size of program can
+/// stop the check.
+// SYNC: check_picks <-> crates/weft-core/src/picks.rs Kept, crates/weft-dispatcher/src/api/picks.rs kept
+async fn check_picks(client: &crate::client::DispatcherClient, project: &weft_compiler::project::Project) -> PicksCheck {
     let definition = match weft_compiler::hash::load_program_with_diagnostics(project) {
         Ok((definition, _)) => definition,
-        Err(_) => return vec!["the program does not compile here, so its connections were not checked".into()],
+        Err(_) => return PicksCheck::Unchecked("the program does not compile here".into()),
     };
-    let asked = async {
-        let body = serde_json::to_value(&definition)?;
-        let answer = client.post_json(&format!("/projects/{}/picks/check", project.id()), &body).await?;
-        anyhow::Ok(serde_json::from_value::<weft_core::run_spec::Refusal>(answer)?)
+    let kept = async {
+        let answer = client.get_json(&format!("/projects/{}/picks/kept", project.id())).await?;
+        anyhow::Ok(serde_json::from_value::<weft_core::picks::Kept>(answer)?)
     };
-    match asked.await {
-        Ok(refusal) => refusal.errors,
-        Err(e) => vec![format!("could not check the install's connection picks ({e:#})")],
+    match kept.await {
+        Ok(kept) => match weft_core::picks::activation_picks(&definition, &kept.picks, &kept.stored) {
+            Ok(()) => PicksCheck::Clear,
+            Err(refusal) => PicksCheck::Gaps(refusal.errors),
+        },
+        Err(e) => PicksCheck::Unchecked(format!("the install did not say what it keeps ({e:#})")),
     }
 }
 
-fn print_unpicked(unpicked: &[String], target: &str) {
-    if unpicked.is_empty() {
-        println!("connections: every connection the program reads is picked on {target}");
-        return;
-    }
-    println!(
-        "until these are fixed on {target}, the deploy workflow's resync refuses to move the triggers that are on \
-         onto the new version, and `weft activate --on {target}` refuses to turn them on (add `--on {target}` to each fix below):"
-    );
-    for line in unpicked {
-        println!("  {line}");
+impl PicksCheck {
+    fn print(&self, target: &str) {
+        match self {
+            PicksCheck::Clear => println!("connections: every connection the program reads is picked on {target}"),
+            PicksCheck::Gaps(gaps) => {
+                println!(
+                    "until these are fixed on {target}, the deploy workflow's resync refuses to move the triggers that are on \
+                     onto the new version, and `weft activate --on {target}` refuses to turn them on (add `--on {target}` to each fix below):"
+                );
+                for line in gaps {
+                    println!("  {line}");
+                }
+            }
+            // Nothing is known to be wrong: said as a check that did not
+            // run, never as gaps to fix.
+            PicksCheck::Unchecked(why) => println!(
+                "connections: not checked ({why}); `weft activate --on {target}` checks them itself and names any that are not picked"
+            ),
+        }
     }
 }
 

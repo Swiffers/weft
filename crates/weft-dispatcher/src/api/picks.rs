@@ -35,15 +35,15 @@ pub async fn change(
     Ok(Json(settings::picks_change(&state, &Actor::operator(caller.0), id, &body).await?))
 }
 
-/// `POST /projects/{id}/picks/check`: what activating the program in the
-/// body would refuse of this install's picks.
-pub async fn check(
+/// `GET /projects/{id}/picks/kept`: what this install keeps for the
+/// project's connections, which an activation checks the program against.
+// SYNC: kept <-> crates/weft-core/src/picks.rs Kept, crates/weft-cli/src/commands/target.rs unpicked_connections
+pub async fn kept(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
-    Json(program): Json<weft_core::ProjectDefinition>,
-) -> Result<Json<weft_core::run_spec::Refusal>, Refused> {
-    Ok(Json(settings::picks_check(&state, &Actor::operator(caller.0), id, &program).await?))
+) -> Result<Json<weft_core::picks::Kept>, Refused> {
+    Ok(Json(settings::picks_kept(&state, &Actor::operator(caller.0), id).await?))
 }
 
 /// `POST /projects/{id}/picks/move`: carry a place's picks and every

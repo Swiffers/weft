@@ -38,6 +38,15 @@ impl DockerOutput {
 pub trait Docker: Send + Sync {
     /// Run `docker <args>` to completion.
     async fn exec(&self, args: &[String]) -> anyhow::Result<DockerOutput>;
+
+    /// [`Self::exec`] with everything the call prints written to `log` as
+    /// it prints it, stdout and stderr together, so the file can be
+    /// followed while the call runs. Answers how it exited.
+    async fn exec_logged(&self, args: &[String], log: &std::path::Path) -> anyhow::Result<i32> {
+        let out = self.exec(args).await?;
+        tokio::fs::write(log, format!("{}{}", out.stdout, out.stderr)).await.map_err(|e| anyhow::anyhow!("write {}: {e}", log.display()))?;
+        Ok(out.code)
+    }
 }
 
 /// The real daemon, through the `docker` command on the PATH.
@@ -61,6 +70,22 @@ impl Docker for DockerCli {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
+    }
+
+    async fn exec_logged(&self, args: &[String], log: &std::path::Path) -> anyhow::Result<i32> {
+        let file = std::fs::File::create(log).map_err(|e| anyhow::anyhow!("create {}: {e}", log.display()))?;
+        let both = file.try_clone().map_err(|e| anyhow::anyhow!("open {} twice: {e}", log.display()))?;
+        let status = tokio::process::Command::new("docker")
+            .args(args)
+            .env("DOCKER_BUILDKIT", "1")
+            .stdin(Stdio::null())
+            .stdout(file)
+            .stderr(both)
+            .kill_on_drop(true)
+            .status()
+            .await
+            .map_err(|e| anyhow::anyhow!("run `docker`: {e} (is Docker installed and on the PATH?)"))?;
+        Ok(status.code().unwrap_or(-1))
     }
 }
 

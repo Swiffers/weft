@@ -610,7 +610,9 @@ pub(crate) async fn follow(
         .map_err(|e| internal("follow the task", format!("{e:#}")))?
         .ok_or((StatusCode::NOT_FOUND, format!("project {id} has no task {task} to follow")))?;
     match outcome.status {
-        weft_core::task::TaskStatus::Pending | weft_core::task::TaskStatus::Claimed => Ok(Following::Going),
+        weft_core::task::TaskStatus::Pending | weft_core::task::TaskStatus::Claimed => Ok(Following::Going(
+            weft_task_store::tasks::progress(&state.pg_pool, task).await.map_err(|e| internal("read where the task is", format!("{e:#}")))?,
+        )),
         weft_core::task::TaskStatus::Complete => Ok(Following::Done(outcome.result.unwrap_or(serde_json::Value::Null))),
         weft_core::task::TaskStatus::Failed => {
             let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM task WHERE id = $1 AND project_id = $2")

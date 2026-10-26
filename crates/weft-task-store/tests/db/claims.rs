@@ -46,6 +46,20 @@ async fn partial_result_round_trips_on_the_task_row(pool: PgPool) {
     assert_eq!(tasks::stored_result(&pool, Uuid::new_v4()).await.expect("read"), None);
 }
 
+/// What a running task says about where it is replaces what it said
+/// before, and is read back by whoever follows it; a task that never said
+/// anything, or no task at all, reads as nothing.
+#[sqlx::test]
+async fn a_task_says_where_it_is(pool: PgPool) {
+    setup(&pool).await;
+    let task_id = tasks::enqueue(&pool, dispatcher_task("t1")).await.expect("enqueue");
+    assert_eq!(tasks::progress(&pool, task_id).await.expect("read"), None);
+    tasks::set_progress(&pool, task_id, &json!({ "at": "building" })).await.expect("say");
+    tasks::set_progress(&pool, task_id, &json!({ "at": "starting" })).await.expect("say again");
+    assert_eq!(tasks::progress(&pool, task_id).await.expect("read"), Some(json!({ "at": "starting" })));
+    assert_eq!(tasks::progress(&pool, Uuid::new_v4()).await.expect("read"), None);
+}
+
 /// Surrender-requeue: the claimer that can no longer renew its lease puts
 /// the row back to `pending`, and a requeue from a claimant that lost the
 /// row is a no-op that never clobbers the new claim.

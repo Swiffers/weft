@@ -471,7 +471,7 @@ fn build_wait_line(elapsed: u64, building: &[&str], built: &[&str]) -> String {
 }
 
 /// `seconds` as a person reads a wait: `45s`, `1m51s`.
-fn elapsed_text(seconds: u64) -> String {
+pub(crate) fn elapsed_text(seconds: u64) -> String {
     if seconds >= 60 {
         format!("{}m{:02}s", seconds / 60, seconds % 60)
     } else {

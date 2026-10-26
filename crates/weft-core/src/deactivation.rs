@@ -91,12 +91,13 @@ pub enum ResyncAnswer {
 
 /// What one look at a task a person follows answers
 /// (`GET /projects/{id}/follow/{task}?wait_ms=<n>`): still going after
-/// waiting at most that long, or what it ended with. One that failed is
+/// waiting at most that long, with where it last said it is when it says
+/// (in its kind's own shape), or what it ended with. One that failed is
 /// answered as the refusal it ended with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Following {
-    Going,
+    Going(Option<serde_json::Value>),
     Done(serde_json::Value),
 }
 

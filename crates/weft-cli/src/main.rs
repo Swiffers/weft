@@ -12,6 +12,7 @@ mod startup;
 pub mod images;
 pub mod progress;
 pub mod prompt;
+mod spinner;
 pub mod user_config;
 
 #[derive(Debug, Parser)]

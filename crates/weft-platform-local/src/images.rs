@@ -193,11 +193,6 @@ impl ImageBuilder for DockerImageBuilder {
             return Ok(BuildHandle::named(name));
         }
         let log = build_log(&self.install_dir, &image_ref).await?;
-        // Said at once, since the address is handed out now: the whole
-        // output replaces it when the build ends.
-        tokio::fs::write(&log, "the build is running; its output lands here when it ends\n")
-            .await
-            .map_err(|e| anyhow::anyhow!("write {}: {e}", log.display()))?;
         let args = build_args(&req);
         // `docker build` reads the context while it runs, after the
         // request that staged it answered: the build task keeps the
@@ -210,21 +205,20 @@ impl ImageBuilder for DockerImageBuilder {
         let mut table = self.builds.lock();
         let task_log = log.clone();
         let task = tokio::spawn(async move {
-            let out = docker.exec(&args).await;
+            // The whole output is the build's log (`BuildHandle::log_url`),
+            // written as docker prints it, so it can be followed while the
+            // build runs: where a person reads every error of a package
+            // the worker left out, whose record keeps only the first line.
+            let code = docker.exec_logged(&args, &task_log).await;
             drop(staging);
-            // The whole output is the build's log (`BuildHandle::log_url`):
-            // where a person reads every error of a package the worker
-            // left out, whose record keeps only the first line.
-            let text = match &out {
-                Ok(out) => format!("{}\n{}", out.stdout, out.stderr),
-                Err(e) => format!("docker build could not run: {e:#}\n"),
-            };
-            if let Err(e) = tokio::fs::write(&task_log, text).await {
-                tracing::warn!(target: "weft_platform_local::images", log = %task_log.display(), error = %e, "could not keep a build's log");
-            }
-            let status = match out {
-                Ok(out) if out.success() => built(docker.as_ref(), &install, &image_ref, result_file.as_deref()).await,
-                Ok(out) => BuildStatus::Failed { reason: tail(&format!("{}\n{}", out.stdout, out.stderr), FAILURE_LOG_LINES) },
+            let status = match code {
+                Ok(0) => built(docker.as_ref(), &install, &image_ref, result_file.as_deref()).await,
+                Ok(_) => BuildStatus::Failed {
+                    reason: match tokio::fs::read_to_string(&task_log).await {
+                        Ok(text) => tail(&text, FAILURE_LOG_LINES),
+                        Err(e) => format!("docker build failed, and its log {} could not be read: {e}", task_log.display()),
+                    },
+                },
                 Err(e) => BuildStatus::Failed { reason: format!("{e:#}") },
             };
             if let Some(entry) = builds.lock().get_mut(&task_name) {

@@ -153,6 +153,9 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             claim_rests_on UUID,
             attempts INTEGER NOT NULL DEFAULT 0,
             result JSONB,
+            -- Where a running task says it is, for whoever follows it
+            -- (`set_progress`); its kind's own shape.
+            progress JSONB,
             error TEXT,
             created_at_unix BIGINT NOT NULL,
             completed_at_unix BIGINT
@@ -576,6 +579,18 @@ pub async fn fail(
         anyhow::bail!("fail: task {task_id} no longer claimed by {replica}");
     }
     Ok(())
+}
+
+/// Say where task `task_id` is now, for whoever follows it ([`progress`]):
+/// its kind's own shape, replacing what it said before.
+pub async fn set_progress(pool: &PgPool, task_id: Uuid, progress: &Value) -> Result<()> {
+    sqlx::query("UPDATE task SET progress = $1 WHERE id = $2").bind(progress).bind(task_id).execute(pool).await?;
+    Ok(())
+}
+
+/// Where task `task_id` last said it is ([`set_progress`]), when it said.
+pub async fn progress(pool: &PgPool, task_id: Uuid) -> Result<Option<Value>> {
+    Ok(sqlx::query_scalar::<_, Option<Value>>("SELECT progress FROM task WHERE id = $1").bind(task_id).fetch_optional(pool).await?.flatten())
 }
 
 /// Outcome of `wait_for_terminal`. The dispatcher's task executor

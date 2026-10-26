@@ -212,23 +212,36 @@ pub async fn follow_task(
     project_id: &str,
     task: uuid::Uuid,
 ) -> anyhow::Result<Value> {
-    follow_at(client, &format!("/projects/{project_id}/follow/{task}"), |message| progress.warn(message)).await
+    follow_at(client, &format!("/projects/{project_id}/follow/{task}"), TASK_LOOK, |message| progress.warn(message), async |_| Ok(())).await
 }
+
+/// How long one look at a task waits on the install when it says nothing
+/// along the way.
+pub const TASK_LOOK: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// Follow the task `follow` looks at (a `.../follow/{task}` route) until it
 /// ends, and answer what it ended with: one short look after another, each
-/// waiting at most half a minute on the install, so following never rests
-/// on one long request a gateway would cut, and never ends on its own. A
-/// look the install could not answer (unreachable, restarting, its
-/// gateway cutting it) is said and tried again; a refusal is the task's
-/// own ending, raised; `warn` says a look that failed. Ctrl+C stops
-/// following, never the task.
-pub async fn follow_at(client: &crate::client::DispatcherClient, follow: &str, warn: impl Fn(&str)) -> anyhow::Result<Value> {
-    let path = format!("{follow}?wait_ms=25000");
+/// waiting at most `look` on the install (half a minute at most), so
+/// following never rests on one long request a gateway would cut, and
+/// never ends on its own. `going` hears where the task says it is after
+/// each look that finds it still going. A look the install could not
+/// answer (unreachable, restarting, its gateway cutting it) is said and
+/// tried again; a refusal is the task's own ending, raised; `warn` says a
+/// look that failed. Ctrl+C stops following, never the task.
+pub async fn follow_at(
+    client: &crate::client::DispatcherClient,
+    follow: &str,
+    look: std::time::Duration,
+    warn: impl Fn(&str),
+    mut going: impl AsyncFnMut(Option<Value>) -> anyhow::Result<()>,
+) -> anyhow::Result<Value> {
+    let path = format!("{follow}?wait_ms={}", look.as_millis());
     loop {
         match client.get_json(&path).await {
-            Ok(answer) => match serde_json::from_value(answer).context("read the task's state")? {
-                weft_core::deactivation::Following::Going => {}
+            Ok(answer) => match serde_json::from_value(answer)
+                .context("read the task's state (the install and this CLI disagree on its shape; upgrade one of them)")?
+            {
+                weft_core::deactivation::Following::Going(progress) => going(progress).await?,
                 weft_core::deactivation::Following::Done(value) => return Ok(value),
             },
             Err(e) => {
@@ -401,9 +414,10 @@ mod tests {
         assert_eq!(short(Some(&json!("ééééééééé"))), "éééééééé");
     }
 
-    /// A task is followed look after look until it ends, a look the
-    /// install could not answer (its gateway cutting it) is tried again,
-    /// and what it ended with is the answer.
+    /// A task is followed look after look until it ends, where it says it
+    /// is heard on each look that finds it going, a look the install could
+    /// not answer (its gateway cutting it) is tried again, and what it
+    /// ended with is the answer.
     #[tokio::test]
     async fn a_task_is_followed_in_short_looks_until_it_ends() {
         let looks = Arc::new(Mutex::new(0u32));
@@ -419,7 +433,7 @@ mod tests {
                         *looks
                     };
                     match look {
-                        1 => (axum::http::StatusCode::OK, Json(json!("going"))),
+                        1 => (axum::http::StatusCode::OK, Json(json!({ "going": { "at": "building" } }))),
                         2 => (axum::http::StatusCode::GATEWAY_TIMEOUT, Json(json!({ "error": "cut" }))),
                         _ => (axum::http::StatusCode::OK, Json(json!({ "done": { "moved": 2 } }))),
                     }
@@ -430,10 +444,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = DispatcherClient::new(format!("http://{addr}"), None);
-        let progress = crate::progress::Progress::new(crate::progress::ActionVerb::Resync, true);
-        let task = uuid::Uuid::new_v4();
-        let done = tokio::time::timeout(Duration::from_secs(30), follow_task(&client, &progress, "p", task)).await.unwrap().unwrap();
+        let mut heard = Vec::new();
+        let follow = follow_at(&client, "/projects/p/follow/t", Duration::from_millis(10), |_| {}, async |progress| {
+            heard.push(progress);
+            Ok(())
+        });
+        let done = tokio::time::timeout(Duration::from_secs(30), follow).await.unwrap().unwrap();
         assert_eq!(done, json!({ "moved": 2 }));
+        assert_eq!(heard, [Some(json!({ "at": "building" }))]);
         assert_eq!(*looks.lock().unwrap(), 3, "going, cut and looked at again, done");
     }
 }

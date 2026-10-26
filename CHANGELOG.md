@@ -4,6 +4,19 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## Unreleased
+
+**`weft maintenance off` is faster and shows what it is doing.** It used to
+bring projects back one after another, printing one line and then nothing
+until the end, even when a project's images took many minutes to build. Now
+every project comes back at the same time, and so do the infra copies and
+triggers of different instances in one project. While it runs you see a line
+per project with its step and a clock, plus where each image's build log is.
+Each project's result prints as soon as that project is done. On a local install, the build log now
+fills while the build runs, so `tail -f` on it works and the spinner shows the
+latest line. `weft maintenance on` also shows a spinner while it takes things
+down. Nothing to do on your side.
+
 ## 2026-10-26 (a8eef1b0)
 
 **`weft target export` checks a large program's connections again.** On a

@@ -4,7 +4,7 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## Unreleased
+## 2026-10-26 (a8eef1b0)
 
 **`weft target export` checks a large program's connections again.** On a
 program with many included files, the check that every connection is picked

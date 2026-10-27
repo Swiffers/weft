@@ -596,7 +596,6 @@ impl FakeBroker {
                 applied_spec_hash,
                 applied_at_unix: None,
                 addresses: weft_broker_client::protocol::AppliedEndpoints {
-                    install_urls: endpoints.clone(),
                     urls: endpoints,
                     public_paths: BTreeMap::new(),
                     doors: BTreeMap::new(),

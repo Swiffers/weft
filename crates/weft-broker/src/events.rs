@@ -27,7 +27,7 @@ use weft_core::access::verify::{
 };
 
 use weft_broker_client::protocol::{
-    EventTargetWire, EventVerdict, EventVerifyRequest, ListenerInfraAddress, ListenerInfraAddressRequest, ListenerResolveRequest,
+    EventTargetWire, EventVerdict, EventVerifyRequest, ListenerResolveRequest,
     ListenerResolvedSource, SubscriptionDropRequest, SubscriptionEnsureRequest,
     SubscriptionEnsureResponse,
 };
@@ -45,7 +45,6 @@ pub fn routes() -> Router<Arc<BrokerState>> {
         .route("/v1/access/listener-resolve", post(listener_resolve))
         .route("/v1/access/subscription/ensure", post(subscription_ensure))
         .route("/v1/access/subscription/drop", post(subscription_drop))
-        .route("/v1/infra/listener-address", post(listener_infra_address))
         // The receive surface the dispatcher forwards raw pushes to.
         .route("/v1/events/verify", post(events_verify))
 }
@@ -119,60 +118,6 @@ async fn listener_resolve(
     .map_err(crate::handlers::store_err)?;
     // The store's answer IS the wire shape: one definition, no copy.
     Ok(Json(source))
-}
-
-/// POST /v1/infra/listener-address: where the listener reaches an
-/// address a trigger was given (`ListenerInfraAddressRequest`), and
-/// whether it is an infra endpoint, whose address can move (a local
-/// unit's port on the machine moves when the unit is made again), so the
-/// listener asks again after a connect to it fails. Listener role only,
-/// and only for a signal it holds, or a cancelled wait whose last call it
-/// is sending: the project comes off that signal's row (or that call's
-/// task), so only that project's infra is looked at.
-async fn listener_infra_address(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<ListenerInfraAddressRequest>,
-) -> Result<Json<ListenerInfraAddress>, ApiError> {
-    listener_only(&caller)?;
-    let held = crate::held_signals::signal_held_project(&state.pool, &req.signal_token).await.map_err(internal)?;
-    let project = match held {
-        Some(project) => project,
-        None => crate::held_signals::cancel_call_project(&state.pool, &req.signal_token)
-            .await
-            .map_err(internal)?
-            .ok_or((StatusCode::NOT_FOUND, "no signal is held under this token, and no last call of it is being sent".to_string()))?,
-    };
-    let rows: Vec<(Value, Value)> =
-        sqlx::query_as("SELECT endpoints_json, install_endpoints_json FROM infra_node WHERE project_id = $1")
-            .bind(project)
-            .fetch_all(&state.pool)
-            .await
-            .map_err(|e| internal(anyhow::anyhow!("read the project's infra endpoints: {e}")))?;
-    Ok(Json(match install_authority(&req.authority, &rows) {
-        Some(authority) => ListenerInfraAddress { authority, is_infra: true },
-        None => ListenerInfraAddress { authority: req.authority, is_infra: false },
-    }))
-}
-
-/// The `host:port` weft's roles reach an endpoint at, for the one the
-/// workers reach at `authority`: the same endpoint's entry in the other
-/// map. `None` when no endpoint is at `authority`.
-fn install_authority(authority: &str, rows: &[(Value, Value)]) -> Option<String> {
-    rows.iter().find_map(|(workers, install)| {
-        let name = workers
-            .as_object()?
-            .iter()
-            .find(|(_, url)| url.as_str().map(authority_of) == Some(authority))?
-            .0;
-        install.get(name)?.as_str().map(|url| authority_of(url).to_string())
-    })
-}
-
-/// The `host:port` of an endpoint address (`http://wi-db-1a2b:5432`).
-fn authority_of(url: &str) -> &str {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    rest.split(['/', '?', '#']).next().unwrap_or(rest)
 }
 
 fn parse_access_id(raw: &str) -> Result<uuid::Uuid, ApiError> {
@@ -835,19 +780,6 @@ pub(crate) async fn decode_jwt<T: serde::de::DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
-    /// A worker's address for an endpoint becomes the install's address
-    /// for the same endpoint; anything else is left alone.
-    #[test]
-    fn a_workers_endpoint_address_becomes_the_installs() {
-        let rows = vec![
-            (serde_json::json!({ "api": "http://wi-svc-aa-svc:8080" }), serde_json::json!({ "api": "http://127.0.0.1:49153" })),
-            (serde_json::json!({ "sql": "http://wi-db-bb-db:5432", "http": "http://wi-db-bb-db:8765" }), serde_json::json!({ "sql": "http://127.0.0.1:49200", "http": "http://127.0.0.1:49201" })),
-        ];
-        assert_eq!(install_authority("wi-db-bb-db:8765", &rows).as_deref(), Some("127.0.0.1:49201"));
-        assert_eq!(install_authority("wi-svc-aa-svc:8080", &rows).as_deref(), Some("127.0.0.1:49153"));
-        assert_eq!(install_authority("example.com:443", &rows), None);
-        assert_eq!(authority_of("https://h:1/events?x=1"), "h:1");
-    }
     use super::*;
 
     /// With several receiving apps, a token is held to the app whose

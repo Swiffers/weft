@@ -1,5 +1,5 @@
 //! In-depth Layer-4 coverage of the runtime-file UPLOAD path, exercised through
-//! real node code running in real worker containers against the real broker + real
+//! real node code running in real worker processes against the real broker + real
 //! object store (SeaweedFS in the local emulation). This is the one layer that
 //! proves the multipart upload machinery inside `ctx.storage` end to end: the
 //! per-part presigned URLs (with their SIGNED exact Content-Length) are accepted

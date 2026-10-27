@@ -156,7 +156,15 @@ address (a webhook, a submitted form, a provider's push), an answer to a run
 waiting on a person, and an event a listener picks up itself (a schedule's tick, a
 message on a connection it holds). Listeners keep listening behind a door that
 holds, so a schedule held for two hours has two hours of ticks waiting when it
-comes back. A caller waiting on a route for its answer cannot be held, so
+comes back. Behind a door that refuses, or once its window ended, the
+listeners stop, and what arrives meanwhile is never caught up. That goes for
+a trigger that keeps its place in what it reads too (a poll's cursor in its
+feed, the files a folder watch last saw): when it listens again, because you
+switched it back on or ran `weft deactivate` on it again with `--door take`
+or `hide`, it starts from its source as it finds it, so nothing that came
+behind the refusing door fires.
+What such a trigger missed while weft itself was down (stopped, the machine
+off, `weft maintenance on`) it catches up from where it left off. A caller waiting on a route for its answer cannot be held, so
 whatever the door, it is answered `503` with a `Retry-After` at once, and a
 client that retries gets through once the trigger is back.
 
@@ -179,7 +187,7 @@ with answers you do not pick, or only some of them:
 |---|---|---|---|
 | `weft rm` | `refuse` | `drop` | `cancel` |
 | The health check, when infra a trigger reads breaks | `take` | `keep` | `cancel`, since those runs cannot go on without the infra |
-| `weft maintenance on`, before an update ([updating weft](cli.md#updating-weft)) | `take` | `keep` | `wait`, or `cancel` with `--running cancel` |
+| `weft maintenance on`, before an update ([updating weft](cli.md#updating-weft)) | `refuse`, so nothing starts on the version being replaced; a trigger that keeps its place in what it reads still catches up from it once `weft maintenance off` brings it back, since the pause was weft's and nobody refused anything | `keep` | `wait`, or `cancel` with `--running cancel` |
 
 ### Bringing them back
 

@@ -1,11 +1,17 @@
-//! Operator keys, per install, kept at `~/.config/weft/credentials.toml`.
+//! The operator key a request carries.
 //!
-//! A key belongs to the PERSON, never to the project: `weft.toml` names
-//! the targets and is committed, and this file says what this person may
-//! do on each. Entries are keyed by the dispatcher URL rather than the
-//! target's name, because two projects may call the same install by
-//! different names, and one name (`prod`) means different installs in
-//! different projects.
+//! Every install on this machine keeps its own key among its secrets
+//! (`weft_core::signal_token::INSTALL_KEY_SECRET` in its `secrets.env`),
+//! and a request to the address one answers at carries that key: nobody
+//! logs in to an install on their own machine.
+//!
+//! Any other install's key belongs to the PERSON, never to the project,
+//! kept at `~/.config/weft/credentials.toml`: `weft.toml` names the
+//! targets and is committed, and this file says what this person may do on
+//! each. Entries are keyed by the dispatcher URL rather than the target's
+//! name, because two projects may call the same install by different
+//! names, and one name (`prod`) means different installs in different
+//! projects.
 //!
 //! CI has no such file: it passes the key as `WEFT_OPERATOR_KEY`, which
 //! wins over the file for a command that names a remote target with
@@ -62,26 +68,58 @@ impl Credentials {
 /// The key a request to `url` carries (see [`resolve_key`]); `on` is the
 /// target name the command was given with `--on`, if any.
 pub fn operator_key_for(url: &str, on: Option<&str>) -> Result<Option<String>> {
-    resolve_key(std::env::var(OPERATOR_KEY_ENV).ok(), &load()?, url, on)
+    resolve_key(std::env::var(OPERATOR_KEY_ENV).ok(), &load()?, url, on, local_key)
 }
 
-/// `WEFT_OPERATOR_KEY` when it is set, non-empty, and the command named a
-/// remote target (`on` is a name other than the local one); else this
-/// person's stored key for that install; else none (the local install
-/// needs none). Given its inputs, so the rule is testable without
+/// The install on this machine that answers at `url`: the one the folder
+/// this command runs from picks ([`weft_core::infra::Install::from_env`]),
+/// else any other install whose files are in weft's data folder, each at
+/// the public port it saved (`weft_core::ports::local_public_url_of`), so
+/// the editor pointed at a named install's address finds that install.
+/// `None` for an address no install here answers at; a named install
+/// never started answers nowhere.
+pub fn this_machines_install(url: &str) -> Result<Option<weft_core::infra::Install>> {
+    let wanted = url_key(url)?;
+    let here = weft_core::infra::Install::from_env().ok();
+    let others = crate::commands::daemon::Install::every_on(&weft_core::infra::data_dir())?.into_iter().map(|install| install.id);
+    for install in here.into_iter().chain(others) {
+        let Ok(local) = weft_core::ports::local_public_url_of(&install) else { continue };
+        if url_key(&local)? == wanted {
+            return Ok(Some(install));
+        }
+    }
+    Ok(None)
+}
+
+/// The own key of the install on this machine answering at `url`
+/// ([`this_machines_install`]). An install whose secrets name no key was
+/// last started by a weft from before the local key, which asks for none,
+/// so a request to it carries none: the CLI an update installs asks the
+/// running install `weft maintenance check` before restarting it.
+pub(crate) fn local_key(url: &str) -> Result<Option<String>> {
+    let Some(install) = this_machines_install(url)? else { return Ok(None) };
+    install.secret_if_written(weft_core::signal_token::INSTALL_KEY_SECRET).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// For a command that named a remote target (`on` is a name other than
+/// the local one), `WEFT_OPERATOR_KEY` when it is set and non-empty.
+/// Otherwise this machine's install's own key when `url` is where one
+/// answers (`local`), whatever the target is called, else this person's
+/// stored key for `url`. Given its inputs, so the rule is testable without
 /// touching the environment or the disk.
 pub fn resolve_key(
     env: Option<String>,
     stored: &Credentials,
     url: &str,
     on: Option<&str>,
+    local: impl FnOnce(&str) -> Result<Option<String>>,
 ) -> Result<Option<String>> {
     let names_remote = on.is_some_and(|name| name != weft_compiler::project::LOCAL_TARGET);
-    if let Some(key) = env.filter(|_| names_remote) {
-        let key = key.trim().to_string();
-        if !key.is_empty() {
-            return Ok(Some(key));
-        }
+    if let Some(key) = env.map(|key| key.trim().to_string()).filter(|key| names_remote && !key.is_empty()) {
+        return Ok(Some(key));
+    }
+    if let Some(key) = local(url)? {
+        return Ok(Some(key));
     }
     Ok(stored.key_for(url)?.map(str::to_string))
 }
@@ -139,23 +177,55 @@ mod tests {
         assert!(!c.remove("https://weft.example.com").unwrap());
     }
 
+    /// This machine's install, answering at 127.0.0.1:14111.
+    fn here(url: &str) -> Result<Option<String>> {
+        Ok((url_key(url)? == "http://127.0.0.1:14111").then(|| "own".to_string()))
+    }
+
+    fn no_local(_: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     #[test]
     fn the_environment_wins_for_a_named_remote_target_and_blank_is_unset() {
         let mut c = Credentials::default();
         c.set("https://x", "stored".into()).unwrap();
         let prod = Some("prod");
-        assert_eq!(resolve_key(Some("ci".into()), &c, "https://x", prod).unwrap().as_deref(), Some("ci"));
-        assert_eq!(resolve_key(Some("  ".into()), &c, "https://x", prod).unwrap().as_deref(), Some("stored"));
-        assert_eq!(resolve_key(None, &c, "https://y", prod).unwrap(), None);
+        assert_eq!(resolve_key(Some("ci".into()), &c, "https://x", prod, no_local).unwrap().as_deref(), Some("ci"));
+        assert_eq!(resolve_key(Some("  ".into()), &c, "https://x", prod, no_local).unwrap().as_deref(), Some("stored"));
+        assert_eq!(resolve_key(None, &c, "https://y", prod, no_local).unwrap(), None);
+        assert_eq!(resolve_key(None, &c, "http://127.0.0.1:14111", prod, here).unwrap().as_deref(), Some("own"), "a named target at this machine's install");
     }
 
     #[test]
-    fn the_environment_never_reaches_an_install_nobody_named() {
-        let c = Credentials::default();
-        // A raw `--dispatcher` address, and the local target, named or not.
+    fn this_machines_install_is_called_with_its_own_key_and_the_environment_never_reaches_it() {
+        let mut c = Credentials::default();
+        c.set("http://127.0.0.1:14111", "stored".into()).unwrap();
+        // The local target, named or not, and a raw `--dispatcher` address
+        // that happens to be where it answers.
         for on in [None, Some("local")] {
-            assert_eq!(resolve_key(Some("ci".into()), &c, "http://127.0.0.1:14111", on).unwrap(), None);
+            assert_eq!(resolve_key(Some("ci".into()), &c, "http://127.0.0.1:14111/", on, here).unwrap().as_deref(), Some("own"));
         }
+        assert_eq!(resolve_key(Some("ci".into()), &c, "http://127.0.0.1:9999", None, here).unwrap(), None, "another address");
+        assert_eq!(resolve_key(None, &c, "http://127.0.0.1:14111", None, |_| Ok(None)).unwrap().as_deref(), Some("stored"), "no local install");
+    }
+
+    /// A named install's address finds that install's own key, however
+    /// the address spells the loopback host, while the command's own
+    /// install is the default one. Sets `HOME`: nextest runs each test in
+    /// its own process.
+    #[test]
+    fn any_install_on_this_machine_is_found_at_its_address() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", home.path());
+        std::env::remove_var(weft_core::infra::INSTALL_ENV);
+        let cell = weft_core::infra::Install::named("cell1").unwrap();
+        let dir = cell.dir();
+        weft_core::ports::InstallPorts { public: 15300, ..weft_core::ports::InstallPorts::DEFAULT }.save(&dir).unwrap();
+        std::fs::write(cell.secrets_path(), format!("{}=wft-cell-key\n", weft_core::signal_token::INSTALL_KEY_SECRET)).unwrap();
+        assert_eq!(this_machines_install("http://localhost:15300/").unwrap(), Some(cell));
+        assert_eq!(local_key("http://127.0.0.1:15300").unwrap().as_deref(), Some("wft-cell-key"));
+        assert_eq!(local_key("http://127.0.0.1:15301").unwrap(), None, "no install answers there");
     }
 
     #[test]

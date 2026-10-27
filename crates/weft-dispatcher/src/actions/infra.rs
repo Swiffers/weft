@@ -588,7 +588,7 @@ async fn infra_status(state: &DispatcherState, project_id: uuid::Uuid) -> Result
             // Coarse UI hint: the first endpoint by name (BTreeMap, so
             // deterministic). Node code resolves a specific endpoint by
             // name via ctx.endpoint(...); this is just a status summary.
-            entry.endpoint_url = row.install_endpoints.values().next().cloned();
+            entry.endpoint_url = row.endpoints.values().next().cloned();
             entry.failure_stage = row.failure_stage.map(|f| f.as_str().to_string());
             entry.notes = row.notes;
         }
@@ -817,7 +817,6 @@ mod tests {
             endpoints: Default::default(),
             public_paths: Default::default(),
             doors: doors.iter().map(|(e, a)| (e.to_string(), a.to_string())).collect(),
-            install_endpoints: Default::default(),
             keep_disks: Vec::new(),
             units: Default::default(),
             notes: Vec::new(),

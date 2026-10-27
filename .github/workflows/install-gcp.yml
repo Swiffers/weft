@@ -155,7 +155,12 @@ jobs:
             echo "no install yet, so nothing to check"
             exit 0
           fi
-          key_secret=$(terraform output -raw bootstrap_operator_key_secret)
+          # The install's own operator key, as in every step below that reads it.
+          # Read before this run applies anything, so from what the last run
+          # left: an install last updated before the key's secret was renamed
+          # names it under its old output, and this run renames it (same key).
+          # SYNC: install_key_secret <-> deploy/terraform/gcp/outputs.tf
+          key_secret=$(terraform output -raw install_key_secret 2>/dev/null || terraform output -raw bootstrap_operator_key_secret)
           if ! gcloud secrets versions access latest --secret "$key_secret" --project "${{ vars.GCP_PROJECT_ID }}" \
               | "$GITHUB_WORKSPACE/target/release/weft" maintenance check --dispatcher "$url" --key-stdin --update "run this workflow again"; then
             echo "::error::the install has something on, so nothing was replaced; the steps to update are just above"
@@ -182,7 +187,7 @@ jobs:
           runtime=()
           [ "$BUILT_HERE" = true ] && runtime=(--runtime-binary target/release/weft-runtime)
           WEFT_IMAGE_REGISTRY="$registry" ./target/release/weft build-images --push "${runtime[@]}" > "$RUNNER_TEMP/refs.txt"
-          # SYNC: `weft build-images` stdout and its order <-> crates/weft-cli/src/images.rs (SharedImages::bare_refs), .github/workflows/release.yml (build + push shared images)
+          # SYNC: `weft build-images` stdout and its order <-> crates/weft-cli/src/images.rs (ReleaseImages::bare_refs), .github/workflows/release.yml (build + push shared images)
           echo "TF_VAR_runtime_image=$(sed -n 1p "$RUNNER_TEMP/refs.txt")" >> "$GITHUB_ENV"
           echo "TF_VAR_builder_base_image=$(sed -n 2p "$RUNNER_TEMP/refs.txt")" >> "$GITHUB_ENV"
 
@@ -303,7 +308,7 @@ jobs:
         working-directory: deploy/terraform/gcp
         run: |
           url=$(terraform output -raw url)
-          key_secret=$(terraform output -raw bootstrap_operator_key_secret)
+          key_secret=$(terraform output -raw install_key_secret)
           gcloud secrets versions access latest --secret "$key_secret" --project "${{ vars.GCP_PROJECT_ID }}" \
             | "$GITHUB_WORKSPACE/target/release/weft" catalog preload --dispatcher "$url" --key-stdin
 
@@ -314,7 +319,7 @@ jobs:
         working-directory: deploy/terraform/gcp
         run: |
           url=$(terraform output -raw url)
-          key_secret=$(terraform output -raw bootstrap_operator_key_secret)
+          key_secret=$(terraform output -raw install_key_secret)
           key_command="gcloud secrets versions access latest --secret $key_secret --project ${{ vars.GCP_PROJECT_ID }}"
           {
             echo "## weft is installed"
@@ -322,7 +327,7 @@ jobs:
             echo "It answers at \`$url\`, with nothing running while nobody uses it."
             echo
             echo "1. In a project: \`weft target add prod $url\`."
-            echo "2. Log in with the first operator key, read straight from Secret Manager on your machine (it never appears in these logs):"
+            echo "2. Log in with the install's own operator key, read straight from Secret Manager on your machine (it never appears in these logs):"
             echo
             echo '```'
             echo "$key_command | weft login prod --key-stdin"

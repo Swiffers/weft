@@ -23,7 +23,7 @@ async fn an_untargeted_run_kicks_every_root() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("aimed_run", disp).await?;
 
-    // The install builds a program's images once: asked again for the
+    // The install builds a program once: asked again for the
     // same program, it has nothing left to build.
     project.weft(&["build", "--json"]).await?;
     let again = project.weft(&["build", "--json"]).await?;

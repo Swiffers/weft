@@ -22,19 +22,9 @@
 //! able to scale to zero, so an idle project costs nothing.
 #![cfg(feature = "e2e")]
 
-use std::sync::Arc;
-
 use serde_json::json;
-use weft_e2e::client::{AuthProvider, Dispatcher};
+use weft_e2e::client::Dispatcher;
 use weft_e2e::{ensure, infra, live, project::Project};
-
-struct OperatorKey(String);
-
-impl AuthProvider for OperatorKey {
-    fn authorization(&self) -> Option<String> {
-        Some(format!("Bearer {}", self.0))
-    }
-}
 
 #[tokio::test]
 async fn a_project_runs_on_a_real_gcp_install_and_idles_at_zero() -> anyhow::Result<()> {
@@ -46,7 +36,7 @@ async fn a_project_runs_on_a_real_gcp_install_and_idles_at_zero() -> anyhow::Res
     };
     let [url, key, gcp_project, region] = <[String; 4]>::try_from(env).expect("four vars requested");
     let disp = Dispatcher::for_install(&url, ensure::install_under_test()?)?
-        .with_auth(Arc::new(OperatorKey(key)));
+        .with_key(key);
     ensure::wait_healthy(&disp).await?;
     let gcloud = |args: Vec<String>| async move {
         let out = tokio::process::Command::new("gcloud").args(&args).output().await?;

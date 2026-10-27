@@ -44,7 +44,9 @@ If you want to know what happens when something fails: the test keeps what it
 made (its projects, its cell if it had one), the runner stops starting new
 tests and lets the running ones finish, and it writes a post-mortem next to the
 log (`<file>::<test>.post-mortem/`: every container of the install, the runtime's
-log, and the logs of the containers of every project the test kept). The
+log, the install's list of the worker processes it runs (`workers/running.json`),
+and the logs of the worker processes and infra containers of every project the
+test kept). The
 install is left as it was, so you can poke at it. What
 the failure kept stays until the next run starts: every run begins by removing
 what earlier failed runs on the same install kept (cells, projects and
@@ -53,12 +55,13 @@ connections the suite made, and the fixture copies), then runs `weft clean
 connections by the ledger every test writes them into while they live
 (`e2e/kept/` in the install's folder), so a run on one branch never removes
 what a run on another kept. The `weft clean` step reaches past the suite: it removes
-every worker image no project of the install references (yours too, once
-nothing runs them), and drops every builder base, node-test image, runtime
-image, standard worker and worker compile cache that no install on the
-machine records using. While some install has no record yet, it removes
-nothing of that kind, and it never removes a cache a build is using right
-now. `--clean` does only this, without bringing the install to
+every worker and infra image no project of the install references (yours too,
+once nothing runs them), the worker programs no install on the machine holds,
+and the shared build crates no build used for 30 days, and it drops every
+runtime image, and every builder base, node-test image, standard worker image
+and image compile cache an older weft left, that no install on the machine
+records using. While some install has no record yet, it removes nothing of
+that kind, and it never removes a cache a build is using right now. `--clean` does only this, without bringing the install to
 current code first, so a failure's runtime is still the one that failed.
 `--failed` re-runs just the tests that did not pass: the ones that failed, the
 ones the stop kept from starting, and, if you pressed Ctrl-C, the ones it cut
@@ -72,7 +75,7 @@ waiting for, then starts when that one ends.
 Every run ends with the same `weft clean --images --all`, pass or fail. When a
 whole run passes, nothing is left behind: every test removed its own projects,
 cells and connections. When some failed, what they kept stays (the reclaim
-keeps every image a project still points at) and the rest goes.
+keeps every worker and image a project still points at) and the rest goes.
 
 ## Credentials, and what the runner provides for you
 
@@ -117,7 +120,7 @@ The rule and its whole list of never-dos live in
 for every part of this repo, not just this suite.
 
 The one thing worth repeating here: time is never a reason to deviate. A
-reinstall is slow (image builds, per-fixture worker compiles), and that is
+reinstall is slow (the runtime image, per-fixture worker compiles), and that is
 expected. Take the slow reproducible path, so a fresh
 machine and CI end up with the same working system you have.
 
@@ -171,7 +174,7 @@ right there; a malformed `src/main.weft` fails at build, not as a test assertion
 
 **If a test needs something the toolkit doesn't have, extend the toolkit
 (`src/`), not the test.** Keep test bodies about WHAT they assert; the HOW (HTTP,
-SQL, Docker) lives in the toolkit so it stays DRY and reviewable.
+SQL, processes) lives in the toolkit so it stays DRY and reviewable.
 
 ### Five minutes, at most
 
@@ -209,7 +212,7 @@ them needs an install to itself. Today that means restarting the runtime
 
 If your test needs that, start a cell: a whole install of its own (its own
 runtime process, Postgres and ports) on the same machine. It starts from the
-images already built, and everything else in the toolkit follows its
+runtime and the standard worker already there, and everything else in the toolkit follows its
 dispatcher there:
 
 ```rust
@@ -217,7 +220,7 @@ use weft_e2e::{platform::Platform, project::Project, Cell};
 
 let cell = Cell::start(1.0).await?;                     // an install of this test's own
 let disp = cell.dispatcher();
-let platform = Platform::connect(&disp).await?;          // this cell's Postgres and containers
+let platform = Platform::connect(&disp).await?;          // this cell's Postgres, worker processes and infra containers
 let mut project = Project::prepare("reach_out_feed", disp.clone()).await?;
 // ... drive, assert ...
 project.finish().await?;
@@ -275,12 +278,15 @@ Driving each trigger kind: **plain** `run::run_and_settle`; **HTTP**
 The toolkit above tests the PROGRAM (what a `.weft` does, via the public API).
 `platform` tests the SYSTEM underneath (which worker served a run, crash
 recovery) by reaching behind the API the way an operator would: it reads the
-install's Postgres, removes worker containers with Docker (`kill_workers`), and
-reads the runtime's log (`wait_for_runtime_log`). **None of it ships**: `platform` + its `sqlx` dep compile only
-under `e2e`, and this crate is never built into an image. Scope is LOCAL
-reliability only (crash and restart on one machine). The API-driving toolkit is
-auth-agnostic (via the `AuthProvider` seam), so a harness that needs tokens can
-reuse it.
+install's Postgres, signals the worker processes the runtime started, found in
+the install's worker registry (`kill_workers`, `stop_workers`), lists infra
+containers with Docker, and reads the runtime's log (`wait_for_runtime_log`).
+**None of it ships**: `platform` + its `sqlx` dep compile only under `e2e`,
+and this crate is never built into anything shipped. Scope is LOCAL
+reliability only (crash and restart on one machine). The API-driving client
+sends a plain operator key: the install's own for an install on this machine
+(`Dispatcher::for_install`), or one a test holds for another, like a cloud
+install (`Dispatcher::with_key`).
 
 No silent retries (a transient failure is a real bug). Always end a
 passing test with `project.finish()`.

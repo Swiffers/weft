@@ -26,7 +26,6 @@ pub mod config;
 pub mod event_context;
 pub mod fire_sink;
 pub mod hold;
-pub mod infra_address;
 pub mod kinds;
 pub mod listener_access;
 pub mod reach;
@@ -35,7 +34,7 @@ pub mod router;
 pub mod socket_engine;
 pub mod stream_engine;
 
-pub use config::ListenerConfig;
+pub use config::{Holders, ListenerConfig};
 pub use router::router;
 
 use std::sync::Arc;

@@ -46,7 +46,7 @@ impl KindHandler for SseSubscribeHandler {
     async fn spawn_task(
         &self,
         spec: &SignalSpec,
-        _kind_state: &Value,
+        _stored: super::RowState,
         ctx: SpawnCtx,
     ) -> Result<Option<JoinHandle<()>>> {
         let sse: SseSubscribe = serde_json::from_value(spec.config.clone())
@@ -188,17 +188,8 @@ fn spawn_loop(
                     continue;
                 }
             };
-            let target = match crate::infra_address::for_listener(&url, &ctx).await {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(target: "weft_listener::sse_subscribe", %url, error = %format!("{e:#}"), "address resolve failed; retrying");
-                    said.down(format!("address resolve failed: {e:#}"));
-                    backoff.wait_then_climb().await;
-                    continue;
-                }
-            };
             let resp = match client
-                .get(&target)
+                .get(&url)
                 .header("Accept", "text/event-stream")
                 .send()
                 .await
@@ -228,7 +219,6 @@ fn spawn_loop(
                 }
                 Err(e) => {
                     warn!(target: "weft_listener::sse_subscribe", %url, error = %e, "connect failed; retrying");
-                    crate::infra_address::unreached(&url, &ctx);
                     said.down(format!("connect failed: {e}"));
                     backoff.wait_then_climb().await;
                     continue;

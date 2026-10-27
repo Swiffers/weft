@@ -55,11 +55,9 @@ pub struct ReferencedImages {
 
 /// `POST /images/prune`: delete from the install's registry every image it
 /// built that nothing references (`weft clean --images`); one project's
-/// when the body names it. Control-plane only, like the referenced set it
-/// deletes against.
+/// when the body names it.
 pub async fn prune_images(
     State(state): State<DispatcherState>,
-    _ops: crate::authenticator::ControlPlaneCaller,
     Json(req): Json<weft_core::images::PruneRequest>,
 ) -> Result<Json<weft_core::images::PruneReport>, (StatusCode, String)> {
     let internal = |what: &str, e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
@@ -68,7 +66,7 @@ pub async fn prune_images(
     // never waits for builds to finish.
     let referenced = {
         let mut conn = state.pg_pool.acquire().await.map_err(|e| internal("referenced images", e.into()))?;
-        crate::build::prune::keep_set(&mut conn, crate::build::prune::ImageScope::All)
+        crate::build::prune::keep_set(&mut conn, crate::build::prune::ImageScope::All, state.builder.images.as_ref())
             .await
             .map_err(|e| internal("referenced images", e))?
     };
@@ -1442,7 +1440,7 @@ pub(crate) fn infra_entries(
         match copies.rows.iter().find(|r| r.node_id == spelled && r.instance.is_none()) {
             Some(row) => infra.push(ProjectInfraEntry {
                 // Coarse UI hint: first endpoint by name (BTreeMap = stable).
-                endpoint_url: row.install_endpoints.values().next().cloned(),
+                endpoint_url: row.endpoints.values().next().cloned(),
                 failure_stage: row.failure_stage.map(|f| f.as_str().to_string()),
                 failure_message: row.failure_message.clone(),
                 progress: copies.progress_of(&spelled, None),
@@ -1986,7 +1984,8 @@ pub(crate) async fn known_instances(state: &DispatcherState, id: uuid::Uuid) -> 
 /// Refuse to turn on triggers the build `project` cannot run
 /// ([`cannot_come_on`]), naming every part they need that does not
 /// compile, so the person is told now rather than by a setup that fails
-/// halfway or by every caller later. Asked of the triggers an activate
+/// halfway or by every caller later, and refuse a program whose nodes need
+/// what the machine lacks (`crate::needs`). Asked of the triggers an activate
 /// switches on, whoever asks, and of the ones a resync puts back (before
 /// it takes any down, and again before it brings each owner back); never
 /// of a re-arm, whose triggers are on and whose change has nothing to do
@@ -2002,10 +2001,10 @@ pub(crate) async fn refuse_unrunnable(
         let saved = saved_for_run(state, id, project, keys_instance(&owned)).await.map_err(Unrunnable::Unchecked)?;
         refused.extend(cannot_come_on(project, &owned, &saved));
     }
-    if refused.is_empty() {
-        return Ok(());
+    if !refused.is_empty() {
+        return Err(Unrunnable::Cannot(refused.join("\n")));
     }
-    Err(Unrunnable::Cannot(refused.join("\n")))
+    crate::needs::refuse_unmet(state, id, project).await
 }
 
 /// Why [`refuse_unrunnable`] did not let triggers come on. The two are
@@ -2019,8 +2018,12 @@ pub(crate) enum Unrunnable {
     /// The build cannot run them: every part they need that does not
     /// compile, one per line.
     Cannot(String),
-    /// The check could not be made: the failed read's status and message.
+    /// The check could not be made: the failed read's (or the machine
+    /// check's) status and message.
     Unchecked((StatusCode, String)),
+    /// The machine lacks what the program's nodes need (`crate::needs`):
+    /// installing it lets the same build through.
+    Lacks(String),
 }
 
 impl From<Unrunnable> for (StatusCode, String) {
@@ -2028,6 +2031,7 @@ impl From<Unrunnable> for (StatusCode, String) {
         match unrunnable {
             Unrunnable::Cannot(why) => (StatusCode::UNPROCESSABLE_ENTITY, why),
             Unrunnable::Unchecked(failed) => failed,
+            Unrunnable::Lacks(why) => (StatusCode::PRECONDITION_FAILED, why),
         }
     }
 }
@@ -2350,6 +2354,7 @@ async fn activate_trigger_setup_window(
     id: uuid::Uuid,
     keys: &[weft_core::activation::ActivationKey],
     activation: uuid::Uuid,
+    previous: &[crate::activation_store::Activation],
     held: ReleaseHeld,
     project: &ProjectDefinition,
     program: &weft_core::project::hash::ProgramIdentity,
@@ -2410,13 +2415,16 @@ async fn activate_trigger_setup_window(
     for key in keys {
         // A trigger its setup skipped (behind a closed gate) arms nothing.
         let Some(capture) = bake.captured.get(&key.trigger) else { continue };
+        // How it stood before this claim says whether it listened while
+        // it was down, which decides what its signal carries over.
+        let before = previous.iter().find(|a| &a.key == key).map(|a| &a.lifecycle);
         let arming = crate::task_kinds::register_signal::RegisterSignalExecutor::arm(state,
             weft_task_store::RegisterSignalPayload {
                 run_id: bake.run_id, node_id: key.trigger.clone(), frames: Vec::new(),
                 spec: capture.spec.clone(), is_resume: false, call_index: 0,
                 port_snapshot: Some(capture.ports.clone()),
                 asked_at_unix_ms: chrono::Utc::now().timestamp_millis(),
-            }).await;
+            }, before).await;
         let error = match arming {
             Ok(done) => {
                 armed.push(done);
@@ -2884,7 +2892,7 @@ async fn activate_owner(
     // activate of those triggers). Rather than hand-roll a rollback at
     // each `?`, the whole window is ONE fallible block with ONE rollback
     // site below. A future step added here can't forget the un-stick.
-    let setup = activate_trigger_setup_window(state, id, keys, activation, held, project, program, rearm).await;
+    let setup = activate_trigger_setup_window(state, id, keys, activation, &previous, held, project, program, rearm).await;
     let urls = match setup {
         Ok(urls) => urls,
         Err(ActivateWindowError { status, msg, rollback }) => {
@@ -4459,7 +4467,6 @@ mod trigger_infra_ready_tests {
             endpoints: Default::default(),
             public_paths: Default::default(),
             doors: Default::default(),
-            install_endpoints: Default::default(),
             keep_disks: Vec::new(),
             units: Default::default(),
             notes: Vec::new(),
@@ -5025,7 +5032,6 @@ mod infra_entries_tests {
             endpoints: Default::default(),
             public_paths: Default::default(),
             doors: Default::default(),
-            install_endpoints: Default::default(),
             keep_disks: Vec::new(),
             units: Default::default(),
             notes: Vec::new(),

@@ -398,6 +398,7 @@ pub(crate) async fn resync(state: &DispatcherState, actor: &Actor, id: uuid::Uui
         require_trigger_infra(state, id, &registered, &owner.keys(&owner.on)).await?;
         refuse_unrunnable(state, id, &runnable, &owner.keys(&owner.on)).await.map_err(|unrunnable| match unrunnable {
             Unrunnable::Cannot(why) => (StatusCode::UNPROCESSABLE_ENTITY, format!("{why}\n{RESYNC_TOOK_NOTHING_DOWN}")),
+            Unrunnable::Lacks(why) => (StatusCode::PRECONDITION_FAILED, format!("{why}\n{RESYNC_TOOK_NOTHING_DOWN}")),
             Unrunnable::Unchecked(failed) => failed,
         })?;
     }

@@ -800,19 +800,6 @@ impl TokenStore for FakeStore {
         Ok(self.inner.lock().unwrap().signal_tokens.get(token_hash).cloned())
     }
 
-    async fn seed_operator_token(&self, tok: &SignalToken) -> anyhow::Result<bool> {
-        let mut g = self.inner.lock().unwrap();
-        let held = g
-            .signal_tokens
-            .values()
-            .any(|t| t.tenant_id == tok.tenant_id && t.kind == weft_core::signal_token::TokenKind::Operator);
-        if held || g.signal_tokens.contains_key(&tok.token_hash) {
-            return Ok(false);
-        }
-        g.signal_tokens.insert(tok.token_hash.clone(), tok.clone());
-        Ok(true)
-    }
-
     async fn list_signal_tokens(&self, tenant: &str) -> anyhow::Result<Vec<SignalToken>> {
         Ok(self
             .inner

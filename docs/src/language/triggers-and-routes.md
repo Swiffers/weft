@@ -127,8 +127,8 @@ things](../running/lifecycles.md).
 ## How a run is kept
 
 Your runs happen inside a worker: a copy of your compiled program, running as
-a Docker container on your machine, or as a Cloud Run service on a cloud
-install. A worker
+a process on your machine, or as a Cloud Run service on a cloud install. A
+worker
 keeps the runs it is working on in its memory. A trigger has inputs that
 decide what happens to those runs: whether they survive their worker dying,
 whether they are written down, how long they are kept once they end, and how
@@ -353,6 +353,60 @@ the route refuses them. A browser is told nothing about a socket refused at
 its opening (it sees only that it closed), so a socket opened without
 credentials keeps trying, at most every 15 seconds.
 
+## Watching a folder
+
+If you want a run each time a file lands in a folder on your machine (a scan,
+a download, an export from another program), use `FolderWatch`:
+
+```weft
+invoice = FolderWatch {
+  folder: "/home/me/Invoices"
+  pattern: "*.pdf"
+  events: ["created"]
+}
+```
+
+Each run gets the file's absolute path on `invoice.path`, what happened to it
+on `invoice.event` (`created`, `changed` or `removed`), and its size on
+`invoice.sizeBytes`, which is absent for a removed file. The worker runs on
+the same machine, so a node downstream opens the path itself.
+
+`folder` has to be an absolute path to a folder that exists when you run
+`weft activate`. `recursive: true` watches the folders under it too, however
+deep. `pattern` matches the file's name only (`*.{pdf,docx}` for either).
+If you leave `events` out, all three fire.
+
+A save or a slow copy that writes one file many times starts one run, sent
+once the file has been quiet for a second. To decide what happened, weft
+compares the file with what it last saw rather than trusting the operating
+system's event, because systems report a save differently: as a write, as a
+rename over the old file, or as a removal followed by a creation.
+
+weft keeps what it last saw in its database, so a file that arrives, changes
+or goes while weft is stopped, while it is in maintenance for an update, or
+while your machine is off still fires once the trigger is back up, the same
+as if weft had been watching. While you have the trigger down behind a door
+that takes or hides, weft keeps watching, and what fires waits for the
+trigger to be back on. Behind a door that refuses, or once a door's
+`--door-for` window ended, nothing is watched: what happened in the folder
+meanwhile never fires, and turning the trigger back on starts it as if for
+the first time. A poll keeps its place in its feed by the same rule; for
+the rule itself, go and read [taking triggers
+down](../running/lifecycles.md#taking-triggers-down-three-questions).
+
+The first time the trigger starts, the files already in the folder fire
+nothing. Changing `folder`, `pattern` or `recursive` counts as a first time;
+changing `events` does not. If weft stops just after a file's run started and
+before it wrote that down, that file fires once more when weft is back. If a
+file's run could not be handed over at all, weft offers it again the next
+time that file changes or the trigger starts.
+
+It only works on a local install, since that is where your folders are. On a
+cloud install, `weft activate` refuses it, with a message that starts `a
+folder watch needs the install to run on the machine the folder is on`. On WSL, a folder under
+`/mnt/<drive>` is refused too, because Windows tells Linux nothing about the
+changes made there: move it under `~/`.
+
 ## Slow callers and messages that cannot be made
 
 Picture a live price page streaming from a `Route`, and a phone on a bad
@@ -415,6 +469,7 @@ Only the ones a provider **pushes** to.
 | Something weft polls | No |
 | A socket weft dials out to | No |
 | A form somebody fills in | No |
+| A folder on your machine | No |
 | A provider pushing events at you | **Yes** |
 | A `Route` or `Socket` that strangers call | **Yes** |
 

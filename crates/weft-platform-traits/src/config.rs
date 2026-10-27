@@ -24,7 +24,6 @@ pub struct InstallConfig {
     #[serde(default)]
     pub install: Install,
     pub platform: PlatformConfig,
-    pub auth: AuthMode,
     /// The stable address people and editors reach the install at.
     #[serde(rename = "publicUrl")]
     pub public_url: String,
@@ -47,7 +46,6 @@ pub struct InstallConfig {
     /// pool.
     #[serde(default)]
     pub holders: HolderSettings,
-    pub build: BuildConfig,
     pub edge: EdgeConfig,
     #[serde(rename = "objectStore")]
     pub object_store: ObjectStoreSettings,
@@ -85,8 +83,8 @@ pub struct LocalPlatform {
     #[serde(rename = "dataDir")]
     pub data_dir: std::path::PathBuf,
     /// The machine's internal port as a container reaches it
-    /// (`http://host.docker.internal:14113`): the base a worker or an
-    /// infra container calls the broker under.
+    /// (`http://host.docker.internal:14113`): the base an infra
+    /// container's agent calls the broker under.
     #[serde(rename = "containerInternalUrl")]
     pub container_internal_url: String,
     /// The image `weft-runtime` runs from (the agent beside every infra
@@ -108,8 +106,9 @@ pub struct LocalPlatform {
     pub project_ports: Option<PortRange>,
     /// Where the internal port is reached from the machine itself
     /// (`http://127.0.0.1:14113`): the base every role answers under, each
-    /// at its own prefix, for a caller in the same process. A container
-    /// reaches it at `container_internal_url`.
+    /// at its own prefix, for a caller on the machine (this process, a
+    /// project's worker). A container reaches it at
+    /// `container_internal_url`.
     #[serde(rename = "internalUrl")]
     pub internal_url: String,
     /// Where devices on this machine's network reach the outside doors
@@ -219,6 +218,10 @@ pub struct GcpPlatform {
     /// The service account Cloud Build runs a project's build as.
     #[serde(rename = "builderServiceAccount")]
     pub builder_service_account: String,
+    /// The prebuilt builder base a project's worker image compiles in
+    /// (`weft build-images` makes it; the install workflow passes its ref).
+    #[serde(rename = "builderBaseImage")]
+    pub builder_base_image: String,
     /// The Cloud Tasks queue what keeps a user's triggers going goes
     /// through (their timers, crons, polls and provider renewals, and a
     /// holder's liveness check), retried with no time limit unless the
@@ -288,18 +291,6 @@ pub struct GcpPlatform {
     pub alerts: bool,
 }
 
-/// How the install authenticates its management API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthMode {
-    /// Loopback-bound: every request is tenant `local`, browser origins
-    /// allowed (the editor's webviews).
-    Local,
-    /// Every management request carries an operator key; the first one
-    /// is `WEFT_BOOTSTRAP_OPERATOR_KEY` when the install holds none.
-    OperatorKeys,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listen {
@@ -358,21 +349,6 @@ impl Default for HolderSettings {
     fn default() -> Self {
         Self { signals_per_copy: Self::default_signals_per_copy() }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BuildConfig {
-    /// How many worker builds compile side by side, each in a compile
-    /// cache of its own.
-    #[serde(rename = "compileLanes")]
-    pub compile_lanes: u32,
-    /// The prebuilt builder a worker image compiles in.
-    #[serde(rename = "builderBaseImage")]
-    pub builder_base_image: String,
-    /// The image a worker runs on when its project names none.
-    #[serde(rename = "runtimeBaseImage")]
-    pub runtime_base_image: String,
 }
 
 /// What the install allows at its public edge.
@@ -455,11 +431,6 @@ pub struct S3StoreSettings {
     /// reach the store at another address than the install does.
     #[serde(default, rename = "publicEndpoint", skip_serializing_if = "Option::is_none")]
     pub public_endpoint: Option<String>,
-    /// The endpoint a project's worker reaches the store at, when it is
-    /// not `endpoint` (a local install: the runtime is a process on the
-    /// machine, a worker a container on the install's Docker network).
-    #[serde(default, rename = "workerEndpoint", skip_serializing_if = "Option::is_none")]
-    pub worker_endpoint: Option<String>,
     /// Whether the open internet reaches the store's presigned URLs.
     #[serde(default, rename = "publicInternet")]
     pub public_internet: bool,
@@ -492,9 +463,9 @@ pub const SECRET_ENV: &[&str] = &[
     "CREDENTIAL_ENCRYPTION_KEY",
     "WEFT_IDENTITY_KEY",
     "WEFT_CALLER_TOKEN_SECRET",
-    "WEFT_BOOTSTRAP_OPERATOR_KEY",
-    "WEFT_OBJECT_STORE_ACCESS_KEY",
-    "WEFT_OBJECT_STORE_SECRET_KEY",
+    weft_core::signal_token::INSTALL_KEY_SECRET,
+    crate::object_store::OBJECT_STORE_ACCESS_KEY_ENV,
+    crate::object_store::OBJECT_STORE_SECRET_KEY_ENV,
 ];
 
 impl InstallConfig {
@@ -540,9 +511,6 @@ impl InstallConfig {
         if self.holders.signals_per_copy == 0 {
             return Err("holders.signalsPerCopy is 0: no holder could take a signal; set it to 1 or more".into());
         }
-        if self.build.compile_lanes == 0 {
-            return Err("build.compileLanes is 0: nothing could compile; set it to 1 or more".into());
-        }
         for role in CoreRole::ALL {
             let placed = self.roles.of(role);
             // Only the holder holds connections between calls, the one
@@ -577,11 +545,6 @@ impl InstallConfig {
             PlatformConfig::Gcp(gcp) => {
                 if gcp.wake_attempts == 0 {
                     return Err("platform.wakeAttempts is 0: no wake could be delivered even once; set it to 1 or more".into());
-                }
-                // `local` trusts every caller as the one local tenant, and a
-                // GCP install's management API is on the internet.
-                if self.auth != AuthMode::OperatorKeys {
-                    return Err("auth is local on a GCP install, which would let anyone on the internet manage it; set auth to operator_keys".into());
                 }
                 if let Some(role) = self.roles.on_machine().first() {
                     return Err(format!(
@@ -685,14 +648,12 @@ pub(crate) mod tests {
                 network_url: None,
                 quick_tunnel_metrics: None,
             })),
-            auth: AuthMode::Local,
             public_url: "http://127.0.0.1:14111".into(),
             internet_url: None,
             roles: RolePlacement::default(),
             role_urls: BTreeMap::new(),
             workers: WorkerOverrides::default(),
             holders: HolderSettings::default(),
-            build: BuildConfig { compile_lanes: 4, builder_base_image: "b".into(), runtime_base_image: "r".into() },
             edge: EdgeConfig { trusted_proxy_hops: ProxyHops { public: 0, outside: 0, domains: 0 }, invalid_tokens_per_minute: Some(30) },
             object_store: ObjectStoreSettings::S3(S3StoreSettings {
                 endpoint: "http://127.0.0.1:8333".into(),
@@ -700,7 +661,6 @@ pub(crate) mod tests {
                 region: "us-east-1".into(),
                 force_path_style: true,
                 public_endpoint: None,
-                worker_endpoint: None,
                 public_internet: false,
             }),
             source: None,
@@ -721,6 +681,7 @@ pub(crate) mod tests {
             artifact_registry: "a".into(),
             build_bucket: "b".into(),
             builder_service_account: "builder@p".into(),
+            builder_base_image: "base".into(),
             tasks_queue: "q".into(),
             wake_attempts: 20,
             ticks_queue: "t".into(),
@@ -737,7 +698,6 @@ pub(crate) mod tests {
             build_machine: None,
             alerts: true,
         }));
-        c.auth = AuthMode::OperatorKeys;
         c.public_url = "https://d.run.app".into();
         for role in [CoreRole::Dispatcher, CoreRole::Broker, CoreRole::Listener, CoreRole::Supervisor] {
             c.roles.set(role, Placement::Serverless);
@@ -855,13 +815,6 @@ pub(crate) mod tests {
         c.roles.set(CoreRole::Supervisor, Placement::Machine);
         c.role_urls.remove(&CoreRole::Supervisor);
         assert!(c.validate().unwrap_err().contains("roles.supervisor is on the machine"));
-    }
-
-    #[test]
-    fn a_gcp_install_refuses_local_auth() {
-        let mut c = gcp();
-        c.auth = AuthMode::Local;
-        assert!(c.validate().unwrap_err().contains("set auth to operator_keys"));
     }
 
     #[test]

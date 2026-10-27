@@ -87,9 +87,6 @@ const COMPILE_CACHE_ARG: &str = "WEFT_COMPILE_CACHE";
 /// (`projects/<p>/serviceAccounts/<email>`).
 fn build_body(req: &BuildRequest, bucket: &str, object: &str, account: &str, machine: Option<&str>) -> Value {
     let mut args = vec!["build".to_string(), "--tag".into(), req.image_ref.clone()];
-    for (k, v) in &req.build_args {
-        args.extend(["--build-arg".into(), format!("{k}={v}")]);
-    }
     // Every Cloud Build runs on a fresh machine, so a build's cache mounts
     // start empty and are gone after it: a worker build compiles where its
     // builder base already compiled, instead of seeding a cache nothing
@@ -102,7 +99,7 @@ fn build_body(req: &BuildRequest, bucket: &str, object: &str, account: &str, mac
         "env": ["DOCKER_BUILDKIT=1"],
         "args": args,
     })];
-    if let Some(path) = &req.result_file {
+    if let weft_core::builds::BuildRecipe::Dockerfile { result_file: Some(path) } = &req.recipe {
         steps.push(result_step(&req.image_ref, path));
     }
     json!({
@@ -209,15 +206,38 @@ fn tar_context(dir: &Path) -> anyhow::Result<Vec<u8>> {
     Ok(archive.into_inner()?.finish()?)
 }
 
+/// A build for a worker packaged as a host binary is refused: workers
+/// here are images ([`ImageBuilder::worker_packaging`]), so one reaching
+/// this builder is a dispatcher that planned for another platform.
+fn refuse_host_recipe(req: &BuildRequest) -> anyhow::Result<()> {
+    match req.recipe {
+        weft_core::builds::BuildRecipe::Dockerfile { .. } => Ok(()),
+        weft_core::builds::BuildRecipe::Host => anyhow::bail!(
+            "build {} of {} asks for a host build, which Cloud Build cannot run: workers on Google Cloud are images, \
+             so the build must be planned as a Dockerfile (the builder's worker packaging is `image`)",
+            req.name,
+            req.image_ref
+        ),
+    }
+}
+
 #[async_trait]
 impl ImageBuilder for CloudBuildImages {
     fn image_ref(&self, tag: &str) -> String {
         format!("{}/{tag}", self.gcp.artifact_registry.trim_end_matches('/'))
     }
 
+    /// Workers run as Cloud Run services, from images compiled FROM the
+    /// builder base the install was set up with.
+    fn worker_packaging(&self) -> weft_core::builds::WorkerPackaging {
+        weft_core::builds::WorkerPackaging::Image { builder: self.gcp.builder_base_image.clone() }
+    }
+
     /// Uploads the whole context before it answers: Cloud Build reads the
-    /// bucket's copy, so `req.staging` goes when this returns.
+    /// bucket's copy, so `req.staging` goes when this returns. Builds only
+    /// a Dockerfile: a recipe compiled on a machine has no machine here.
     async fn start(&self, req: BuildRequest) -> anyhow::Result<BuildHandle> {
+        refuse_host_recipe(&req)?;
         let dir = req.context_dir.clone();
         let bytes = tokio::task::spawn_blocking(move || tar_context(&dir)).await??;
         let object = Self::context_object(&req.name);
@@ -330,22 +350,37 @@ mod tests {
             project_id: uuid::Uuid::from_u128(1),
             tenant: "local".into(),
             context_dir: "/ctx".into(),
+            recipe: weft_core::builds::BuildRecipe::Dockerfile { result_file: None },
             staging: weft_platform_traits::Staging::new(()),
             image_ref: "us-central1-docker.pkg.dev/acme/weft/weft-worker:abc".into(),
-            build_args: vec![("WEFT_COMPILE_LANE".into(), "0".into())],
-            uses: Default::default(),
-            result_file: None,
         };
         let body = build_body(&req, "bucket", "contexts/b1.tar.gz", "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com", None);
         assert_eq!(body["images"][0], req.image_ref);
         let args: Vec<&str> = body["steps"][0]["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
-        assert_eq!(args, ["build", "--tag", req.image_ref.as_str(), "--build-arg", "WEFT_COMPILE_LANE=0", "--build-arg", "WEFT_COMPILE_CACHE=none", "."]);
+        assert_eq!(args, ["build", "--tag", req.image_ref.as_str(), "--build-arg", "WEFT_COMPILE_CACHE=none", "."]);
         assert_eq!(body["serviceAccount"], "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com");
         assert_eq!(body["options"]["logging"], "CLOUD_LOGGING_ONLY", "a build with its own account logs to Cloud Logging");
         assert!(body["options"].get("machineType").is_none(), "Cloud Build's own default machine, the free one");
         assert_eq!(body["steps"].as_array().unwrap().len(), 1, "no result step when no result file is asked");
         let bigger = build_body(&req, "bucket", "contexts/b1.tar.gz", "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com", Some("E2_HIGHCPU_8"));
         assert_eq!(bigger["options"]["machineType"], "E2_HIGHCPU_8");
+    }
+
+    #[test]
+    fn a_host_recipe_is_refused_naming_why() {
+        let mut req = BuildRequest {
+            name: "b1".into(),
+            project_id: uuid::Uuid::from_u128(1),
+            tenant: "local".into(),
+            context_dir: "/ctx".into(),
+            recipe: weft_core::builds::BuildRecipe::Dockerfile { result_file: None },
+            staging: weft_platform_traits::Staging::new(()),
+            image_ref: "us-central1-docker.pkg.dev/acme/weft/weft-worker:abc".into(),
+        };
+        refuse_host_recipe(&req).unwrap();
+        req.recipe = weft_core::builds::BuildRecipe::Host;
+        let e = refuse_host_recipe(&req).unwrap_err().to_string();
+        assert!(e.contains("host build") && e.contains("weft-worker:abc"), "{e}");
     }
 
     /// A build asked for a result file reads it in a step of its own after
@@ -357,11 +392,9 @@ mod tests {
             project_id: uuid::Uuid::from_u128(1),
             tenant: "local".into(),
             context_dir: "/ctx".into(),
+            recipe: weft_core::builds::BuildRecipe::Dockerfile { result_file: Some(weft_core::builds::LEFT_OUT_RECORD_PATH.into()) },
             staging: weft_platform_traits::Staging::new(()),
             image_ref: "us-central1-docker.pkg.dev/acme/weft/weft-worker:abc".into(),
-            build_args: Vec::new(),
-            uses: Default::default(),
-            result_file: Some(weft_core::builds::LEFT_OUT_RECORD_PATH.into()),
         };
         let body = build_body(&req, "bucket", "contexts/b1.tar.gz", "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com", None);
         let steps = body["steps"].as_array().unwrap();

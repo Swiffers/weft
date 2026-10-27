@@ -25,6 +25,7 @@ pub mod infra;
 pub mod infra_card;
 pub mod infra_env;
 pub mod catalog;
+pub mod deps_install;
 pub mod describe_nodes;
 pub mod parse;
 pub mod runs;

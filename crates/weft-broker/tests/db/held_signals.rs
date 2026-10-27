@@ -8,7 +8,7 @@
 use sqlx::PgPool;
 
 use weft_broker::held_signals::{
-    cancel_call_project, give_up, hold, judge_held_fire, release, set_holds, signal_held, signals_held, still_held_by, write_kind_state,
+    give_up, hold, judge_held_fire, release, set_holds, signal_held, signals_held, still_held_by, write_kind_state,
     HeldFire,
 };
 use weft_broker_client::protocol::{HeldNow, HeldServing, ProjectStatus};
@@ -118,31 +118,6 @@ async fn the_listener_holds_what_takes_work_and_never_what_refuses_it(pool: PgPo
 
 /// A run's wait comes back naming the run it answers: its `run_id`
 /// is a real id on the wire, never text the listener has to parse.
-/// A cancelled wait's row is gone, so where the listener reaches an
-/// address in its last call is scoped by the call's task: its project
-/// while the dispatcher sends it (claimed), and nobody's before or after.
-#[sqlx::test]
-async fn a_last_call_names_its_project_only_while_it_is_sent(pool: PgPool) {
-    schema(&pool).await;
-    let id = uuid::Uuid::new_v4();
-    project(&pool, id).await;
-    let task = weft_task_store::tasks::NewTask {
-        kind: weft_task_store::TaskKind::CancelCall,
-        project_id: Some(id),
-        dedup_key: Some(weft_task_store::kinds::cancel_call_key("tok")),
-        run_id: None,
-        tenant_id: "local".into(),
-        payload: serde_json::json!({}),
-    };
-    let queued = weft_task_store::tasks::enqueue_dedup(&pool, task).await.unwrap().id();
-    assert_eq!(cancel_call_project(&pool, "tok").await.unwrap(), None, "queued, not being sent");
-    sqlx::query("UPDATE task SET status = 'claimed' WHERE id = $1").bind(queued).execute(&pool).await.unwrap();
-    assert_eq!(cancel_call_project(&pool, "tok").await.unwrap(), Some(id));
-    assert_eq!(cancel_call_project(&pool, "other").await.unwrap(), None, "another wait's token");
-    sqlx::query("UPDATE task SET status = 'complete' WHERE id = $1").bind(queued).execute(&pool).await.unwrap();
-    assert_eq!(cancel_call_project(&pool, "tok").await.unwrap(), None, "sent");
-}
-
 #[sqlx::test]
 async fn a_held_wait_names_its_run(pool: PgPool) {
     schema(&pool).await;

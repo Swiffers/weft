@@ -1084,7 +1084,7 @@ pub async fn supervisor_infra_nodes(
     use sqlx::Row;
     let rows = sqlx::query(&format!(
         "SELECT node_id, instance_id, copy_id, status, applied_spec_hash, applied_at_unix, \
-                endpoints_json, install_endpoints_json, public_paths_json, doors_json, keep_disks_json, {} AS units, \
+                endpoints_json, public_paths_json, doors_json, keep_disks_json, {} AS units, \
                 health_rules_json, health_rules_json_version \
          FROM infra_node n WHERE project_id = $1 ORDER BY node_id, instance_id NULLS FIRST",
         weft_broker_client::protocol::units_of_copy_sql("n"),
@@ -1139,7 +1139,6 @@ pub async fn supervisor_infra_nodes(
         }
         let addresses = weft_broker_client::protocol::AppliedEndpoints {
             urls: column(&r, "endpoints_json", &node_id)?,
-            install_urls: column(&r, "install_endpoints_json", &node_id)?,
             public_paths: column(&r, "public_paths_json", &node_id)?,
             doors: column(&r, "doors_json", &node_id)?,
         };
@@ -1401,7 +1400,6 @@ async fn write_apply_row(
     let endpoints_json = json("endpoints", serde_json::to_value(&row.addresses.urls))?;
     let public_paths_json = json("public_paths", serde_json::to_value(&row.addresses.public_paths))?;
     let doors_json = json("doors", serde_json::to_value(&row.addresses.doors))?;
-    let install_endpoints_json = json("install_endpoints", serde_json::to_value(&row.addresses.install_urls))?;
     let notes_json = json("notes", serde_json::to_value(&row.notes))?;
     // The INSERT pulls its values FROM the caller's still-claimed
     // apply command so the ownership check and the write share one
@@ -1420,11 +1418,11 @@ async fn write_apply_row(
          (project_id, node_id, instance_id, copy_id, status, \
           failure_stage, failure_message, applied_spec_hash, \
           applied_at_unix, endpoints_json, public_paths_json, doors_json, keep_disks_json, health_rules_json_version, \
-          install_endpoints_json, notes_json, waiting_on, provisioning_since_unix, health_rules_json) \
+          notes_json, waiting_on, provisioning_since_unix, health_rules_json) \
          SELECT $1, $2, $13, $3, $4, NULL, NULL, $5, \
                 CASE WHEN $6 THEN EXTRACT(EPOCH FROM NOW())::BIGINT ELSE NULL END, \
-                $7, $12, $14, $8, $9, $15, $16, NULL, \
-                CASE WHEN $6 THEN NULL ELSE EXTRACT(EPOCH FROM NOW())::BIGINT END, $17 \
+                $7, $12, $14, $8, $9, $15, NULL, \
+                CASE WHEN $6 THEN NULL ELSE EXTRACT(EPOCH FROM NOW())::BIGINT END, $16 \
          FROM infra_lifecycle_command \
          WHERE id = $10 \
            AND project_id = $1 \
@@ -1445,7 +1443,6 @@ async fn write_apply_row(
             endpoints_json     = EXCLUDED.endpoints_json, \
             public_paths_json  = EXCLUDED.public_paths_json, \
             doors_json         = EXCLUDED.doors_json, \
-            install_endpoints_json = EXCLUDED.install_endpoints_json, \
             notes_json         = EXCLUDED.notes_json, \
             keep_disks_json = EXCLUDED.keep_disks_json, \
             health_rules_json  = EXCLUDED.health_rules_json, \
@@ -1469,7 +1466,6 @@ async fn write_apply_row(
     .bind(public_paths_json)
     .bind(instance.map(|m| m.as_str()))
     .bind(doors_json)
-    .bind(install_endpoints_json)
     .bind(notes_json)
     .bind(health_rules_json)
     .execute(&mut *tx)

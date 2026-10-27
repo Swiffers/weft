@@ -1,12 +1,16 @@
 # Publish everything a `./setup.sh` can consume, on every push to the release
 # branch:
 #
-#   - the runtime image and the worker builder base, pushed to ghcr under
-#     their content-addressed tags (the SAME tags a local install computes, so
-#     a clean checkout pulls instead of compiling; any local edit changes the
-#     hash and builds locally), one native build per architecture stitched
-#     into a multi-arch tag,
-#   - CLI and runtime binaries and the .vsix, attached to the rolling `latest`
+#   - the runtime image, the worker builder base and the standard worker
+#     image, pushed to ghcr under their content-addressed tags, one native
+#     build per architecture stitched into a multi-arch tag: a local install
+#     pulls only the runtime image (the SAME tag it computes, so a clean
+#     checkout pulls instead of compiling; any local edit changes the hash
+#     and builds locally), and the builder base and the standard worker image
+#     serve the cloud's worker images,
+#   - CLI and runtime binaries, the standard worker program per machine type
+#     (`weft-worker-<arch>-<os>`, what a local install's projects of only
+#     standard nodes run) and the .vsix, attached to the rolling `latest`
 #     release with a manifest.json naming the exact commit and a sha256 per
 #     asset (setup.sh downloads them when its checkout matches); the browser
 #     zips ride along as the record of what went to the stores and for
@@ -145,7 +149,7 @@ jobs:
       # multi-arch could satisfy the wrong architecture's leg and then
       # be re-pushed as its half. Stdout is the bare refs, captured for
       # the stitch job.
-      # SYNC: `weft build-images` stdout <-> crates/weft-cli/src/images.rs (SharedImages::bare_refs), .github/workflows/install-gcp.yml (build the runtime's images)
+      # SYNC: `weft build-images` stdout <-> crates/weft-cli/src/images.rs (ReleaseImages::bare_refs), .github/workflows/install-gcp.yml (build the runtime's images)
       - name: build + push shared images
         run: |
           "$RUNNER_TEMP/bin/${{ matrix.asset }}" build-images \

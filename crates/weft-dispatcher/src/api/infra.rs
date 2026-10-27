@@ -1185,7 +1185,7 @@ pub(crate) async fn live_endpoint_url(
             format!("infra node '{node}' is {}, so it has nothing to show yet", row.status.as_str()),
         ));
     }
-    row.install_endpoints.get(live_endpoint).cloned().ok_or((
+    row.endpoints.get(live_endpoint).cloned().ok_or((
         StatusCode::NOT_FOUND,
         format!("infra node has no endpoint named '{live_endpoint}' (live_endpoint)"),
     ))
@@ -1561,7 +1561,6 @@ mod tests {
             endpoints: Default::default(),
             public_paths: Default::default(),
             doors: Default::default(),
-            install_endpoints: Default::default(),
             keep_disks: Vec::new(),
             units: Default::default(),
             notes: Vec::new(),

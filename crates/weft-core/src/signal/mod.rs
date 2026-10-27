@@ -61,6 +61,8 @@ pub mod stream_listen;
 pub mod provider_events;
 #[cfg(feature = "runtime")]
 pub mod live_connection;
+#[cfg(feature = "runtime")]
+pub mod folder_watch;
 
 #[cfg(feature = "runtime")]
 pub use auth::PublicEntryAuth;
@@ -72,6 +74,8 @@ pub use timer::{Timer, TimerSpec};
 pub use form::{Form, FormSchema, FormField};
 #[cfg(feature = "runtime")]
 pub use sse_subscribe::SseSubscribe;
+#[cfg(feature = "runtime")]
+pub use folder_watch::{FolderChange, FolderEvent, FolderWatch, NamePattern};
 #[cfg(feature = "runtime")]
 pub use poll_endpoint::{CursorParam, DeltaMode, PollDelta, PollEndpoint, PollFormat, PollMethod};
 #[cfg(feature = "runtime")]
@@ -407,6 +411,7 @@ mod tests {
         assert_eq!(
             tags,
             vec![
+                "folder_watch",
                 "form",
                 "poll_endpoint",
                 "provider_events",

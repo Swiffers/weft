@@ -55,9 +55,10 @@ RUN apt-get update \
        ca-certificates curl build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# What the stdlib packages declare they compile with (`[system.build]`
-# in their deps.toml; rendered by `build::stage_builder_base_context`
-# from the same tables a project's builder stage reads). A project
+# What the stdlib packages declare they compile with (their
+# `[[needs]]` with `stage = "build"` in deps.toml; rendered by
+# `build::stage_builder_base_context` from the same needs a project's
+# builder stage reads). A project
 # FROMing this image installs only the packages its own nodes add.
 {{install_build_system_packages}}
 

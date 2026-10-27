@@ -117,7 +117,9 @@ words = WordCount { text: draft.answer }
 show = Debug { data: words.count }
 ```
 
-`weft run` compiles your node into the program and runs it.
+`weft run` compiles your node into the project's worker program, on your
+machine with your own Rust, and runs it. If you have not installed Rust yet,
+go and read the [install page](../start/install.md).
 
 ## Four things that would have bitten you
 

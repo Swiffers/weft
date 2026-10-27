@@ -136,10 +136,12 @@ installer can exclude this README from the copy.
 
 Prerequisites sit on the machine, not in the template: the `weft` CLI on the
 PATH, Docker, and the local daemon from `setup.sh` in the weft checkout (the
-`weft-running` skill knows how to check and start all of it). The
-specialist's local test tiers build with plain cargo, no docker and no
-weft install, so they additionally need a Rust toolchain on the host; without one
-the specialist reports that blocker instead of pretending.
+`weft-running` skill knows how to check and start all of it). A Rust
+toolchain on the host is needed whenever something compiles there: the
+specialist's local test tiers (plain cargo, no weft install), a live node
+test, a project with nodes of its own or a changed standard node, a build
+with `--referenced`, and the CLI when `setup.sh` builds it from source.
+Without one, the specialist reports that Rust is missing.
 
 ## Maintenance
 

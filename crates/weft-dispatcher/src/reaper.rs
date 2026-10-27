@@ -15,6 +15,8 @@
 
 use std::time::Duration;
 
+use async_trait::async_trait;
+
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn};
 
 use crate::state::DispatcherState;
@@ -90,11 +92,7 @@ pub(crate) const DOOR_WINDOWS: &str = "door_windows";
 /// taking work lets go of its front. Then sleep until the next window
 /// ends, or until an activation changes.
 async fn close_door_windows(state: DispatcherState) -> anyhow::Result<DrainStep> {
-    let let_go = |signals: Vec<crate::store::SignalRegistration>| {
-        let state = state.clone();
-        async move { crate::listener::let_go_of_stopped(&state.pg_pool, &state.listener, &signals).await }
-    };
-    for project_id in close_door_windows_over(&state.pg_pool, let_go).await? {
+    for project_id in close_door_windows_over(&state.pg_pool, &ListenerOf(&state)).await? {
         // Nothing of the project may take work any more: its front goes.
         crate::front::let_go_if_idle(&state, project_id).await?;
     }
@@ -105,25 +103,58 @@ async fn close_door_windows(state: DispatcherState) -> anyhow::Result<DrainStep>
     })
 }
 
-/// Close every door whose window has passed: `let_go` has the listener
-/// let go of its signals and answers the ones it kept (with why), then its
-/// activation stops taking work
-/// (`crate::activation_store::close_door_windows`), whatever the listener
-/// answered: a fire that still arrives is refused by the activation, and a
-/// holder hears it stop taking work (`crate::holders::HELD_SIGNALS_CHANNEL`).
+/// What closing a door window asks of the listener. [`ListenerOf`] in
+/// production; the database tests answer it themselves.
+#[async_trait]
+pub trait DoorWindowListener: Send + Sync {
+    /// Let go of `signals`, answering the ones kept, each with why
+    /// (`crate::listener::let_go_of_stopped`).
+    async fn let_go(&self, signals: &[crate::store::SignalRegistration]) -> anyhow::Result<Vec<(String, String)>>;
+    /// The fresh places of the entry signals `signals` whose kind keeps one
+    /// (`crate::listener::ListenerClient::fresh_places`).
+    async fn fresh_places(&self, signals: &[crate::store::SignalRegistration]) -> anyhow::Result<Vec<crate::store::FreshPlace>>;
+}
+
+/// The install's own listener.
+pub struct ListenerOf<'a>(pub &'a DispatcherState);
+
+#[async_trait]
+impl DoorWindowListener for ListenerOf<'_> {
+    async fn let_go(&self, signals: &[crate::store::SignalRegistration]) -> anyhow::Result<Vec<(String, String)>> {
+        crate::listener::let_go_of_stopped(&self.0.pg_pool, &self.0.listener, signals).await
+    }
+
+    async fn fresh_places(&self, signals: &[crate::store::SignalRegistration]) -> anyhow::Result<Vec<crate::store::FreshPlace>> {
+        self.0.listener.fresh_places(signals).await
+    }
+}
+
+/// How many times a door window's close is asked again when a wake moved
+/// one of its rows in between; running out means its wakes never stop
+/// claiming.
+const CLOSE_ROUNDS: usize = 5;
+
+/// Close every door whose window has passed: the listener lets go of its
+/// signals and answers the ones it kept (with why), then its activation
+/// stops taking work and its entry signals lose their place in what they
+/// read, in one write (`crate::activation_store::close_door_windows`),
+/// whatever the listener answered to the let-go: a fire that still
+/// arrives is refused by the activation, and a holder hears it stop taking
+/// work (`crate::holders::HELD_SIGNALS_CHANNEL`). So nothing that arrived
+/// once the window ended is caught up when the trigger listens again. A
+/// project whose fresh places cannot be had (the listener cannot be
+/// reached) keeps its window open by the flag, refused by the clock all
+/// the same, and fails this pass, naming it; the others close.
 /// A signal the listener kept is marked on its own row
 /// (`crate::listener::note_let_go`) and the listener is told again at each
 /// pass until it lets go (or its trigger takes work again); while any is
 /// marked, its project's `weft status` names it (`Callee::LetGo`). Answers the
 /// projects whose windows ended.
-pub async fn close_door_windows_over<F, Fut>(pool: &sqlx::PgPool, let_go: F) -> anyhow::Result<Vec<uuid::Uuid>>
-where
-    F: Fn(Vec<crate::store::SignalRegistration>) -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<Vec<(String, String)>>>,
-{
+pub async fn close_door_windows_over(pool: &sqlx::PgPool, listener: &dyn DoorWindowListener) -> anyhow::Result<Vec<uuid::Uuid>> {
+    use crate::activation_store::WindowsClosed;
     let again = crate::store::postgres::signals_kept_after_let_go(pool).await?;
     if !again.is_empty() {
-        let kept = let_go(again.clone()).await?;
+        let kept = listener.let_go(&again).await?;
         crate::listener::note_let_go(pool, &again, &kept).await?;
     }
     let mut by_project: std::collections::BTreeMap<uuid::Uuid, Vec<weft_core::activation::ActivationKey>> = Default::default();
@@ -131,11 +162,38 @@ where
         by_project.entry(project_id).or_default().push(key);
     }
     let mut ended_in = Vec::new();
+    let mut not_closed = Vec::new();
     for (project_id, keys) in by_project {
-        let signals = crate::store::postgres::activation_signals(pool, project_id, &keys).await?;
-        let kept = let_go(signals.clone()).await?;
+        let mut signals = crate::store::postgres::activation_signals(pool, project_id, &keys).await?;
+        let kept = listener.let_go(&signals).await?;
         crate::listener::note_let_go(pool, &signals, &kept).await?;
-        let ended = crate::activation_store::close_door_windows(pool, project_id, &keys).await?;
+        let mut round = 0;
+        let ended = loop {
+            round += 1;
+            let entries: Vec<crate::store::SignalRegistration> = signals.iter().filter(|signal| !signal.is_resume).cloned().collect();
+            let places = match listener.fresh_places(&entries).await {
+                Ok(places) => places,
+                Err(e) => break Err(format!("project {project_id}: the places its doors take: {e:#}")),
+            };
+            match crate::activation_store::close_door_windows(pool, project_id, &keys, &places).await? {
+                WindowsClosed::Closed(ended) => break Ok(ended),
+                WindowsClosed::StateMoved if round < CLOSE_ROUNDS => {
+                    signals = crate::store::postgres::activation_signals(pool, project_id, &keys).await?;
+                }
+                WindowsClosed::StateMoved => {
+                    break Err(format!(
+                        "project {project_id}: its signals' state moved under each of {CLOSE_ROUNDS} closes in a row: their wakes keep claiming them"
+                    ))
+                }
+            }
+        };
+        let ended = match ended {
+            Ok(ended) => ended,
+            Err(why) => {
+                not_closed.push(why);
+                continue;
+            }
+        };
         if ended > 0 {
             tracing::info!(
                 target: "weft_dispatcher::reaper",
@@ -164,6 +222,7 @@ where
         );
         weft_task_store::unanswered::failed(pool, weft_task_store::unanswered::Callee::LetGo(project), None, &named.join("; ")).await?.log();
     }
+    anyhow::ensure!(not_closed.is_empty(), "door windows that ended could not close: {}", not_closed.join("; "));
     Ok(ended_in)
 }
 

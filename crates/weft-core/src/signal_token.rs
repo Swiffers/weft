@@ -30,6 +30,15 @@
 
 use sha2::{Digest, Sha256};
 
+/// The secret an install keeps its own operator key under (its
+/// `secrets.env` on a machine, its Secret Manager secret on GCP): the key
+/// the install accepts with no row of its own, until the secret is
+/// rotated, and the one a CLI on the install's own machine reads to call
+/// it.
+// SYNC: INSTALL_KEY_SECRET <-> deploy/terraform/gcp/secrets.tf (local.secrets),
+//       deploy/terraform/gcp/outputs.tf (install_key_secret)
+pub const INSTALL_KEY_SECRET: &str = "WEFT_INSTALL_KEY";
+
 /// The fixed, recognizable prefix every signal token starts with.
 pub const TOKEN_PREFIX: &str = "wft-";
 

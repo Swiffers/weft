@@ -83,12 +83,6 @@ variable "builder_base_image" {
   type        = string
 }
 
-variable "compile_lanes" {
-  description = "How many project builds run side by side (each is one Cloud Build job)."
-  type        = number
-  default     = 2
-}
-
 variable "build_machine" {
   description = "The Cloud Build machine a program's worker image compiles on. Empty is Cloud Build's default machine, which its free build minutes cover; E2_HIGHCPU_8 or E2_HIGHCPU_32 compile faster and are paid by the minute. An image is built once per version of a program, never per worker started."
   type        = string

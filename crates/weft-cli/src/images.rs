@@ -1,16 +1,20 @@
-//! Image naming, build and registry pull/push helpers. Owned by the CLI
-//! so `weft daemon start` makes the images an install runs exist. No
-//! external shell scripts.
+//! Image naming, build and registry pull/push helpers, and the sweeps of
+//! what Docker holds on this machine. Owned by the CLI so `weft daemon
+//! start` makes the runtime image a local install runs exist, and `weft
+//! build-images` makes the images a cloud install runs. No external shell
+//! scripts.
 //!
-//! Every shared image (the runtime, the worker builder base, and the
-//! standard worker every project that uses only the base catalog runs on) is
-//! content-addressed: the tag is a hash of everything the
-//! image is built from, so a present tag IS the right content. Ensuring
-//! one is a three-step ladder: already present locally -> done; pull
-//! the same tag from the registry (CI pushes every tag it builds from a
-//! clean checkout, so an unmodified tree hits this) -> done; otherwise
-//! build locally under the same tag (a modified tree hashes to a tag
-//! the registry has never seen, so local changes always build).
+//! Every image the release publishes is content-addressed: the tag is a
+//! hash of everything the image is built from, so a present tag IS the
+//! right content. A local install uses only the runtime image (what its
+//! runtime and its infra units' agents run); the builder base and the
+//! standard worker image are the cloud's (`weft build-images`, on CI or a
+//! cloud install's runner). Ensuring one is a three-step ladder: already
+//! present locally -> done; pull the same tag from the registry (CI pushes
+//! every tag it builds from a clean checkout, so an unmodified tree hits
+//! this) -> done; otherwise build locally under the same tag (a modified
+//! tree hashes to a tag the registry has never seen, so local changes
+//! always build).
 
 use std::fmt::Write as _;
 use std::os::fd::AsFd;
@@ -183,7 +187,8 @@ pub async fn docker_push(image_ref: &str) -> Result<()> {
 }
 
 
-/// The builder base's content-addressed ref for the current checkout.
+/// The builder base's content-addressed ref for the current checkout: what
+/// a cloud install's worker images compile in.
 pub fn builder_base_ref() -> Result<String> {
     let root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
@@ -192,105 +197,39 @@ pub fn builder_base_ref() -> Result<String> {
     Ok(qualified_ref(weft_compiler::worker_image::BUILDER_BASE_REPO, &short))
 }
 
-/// The key of the BuildKit compile cache the worker builds of the weft
-/// checkout at `weft_root` mount when they build FROM the builder base,
-/// the one a start records. A build after the checkout moved adds its own
-/// key as it starts ([`record_build_uses`], and the runtime's builder
-/// through `weft_core::images::ImageRefs::add_build`).
-pub fn worker_compile_cache_key(weft_root: &Path) -> Result<String> {
-    weft_compiler::hash::compute_worker_cache_key(weft_root, "builder-base")
-}
-
-/// Ensure the shared pre-built worker builder base image exists.
-/// Returns its content-addressed ref. An engine / toolchain bump
-/// produces a fresh tag and per-project worker Dockerfiles
-/// automatically pick it up via their `FROM {{builder_base_image}}`
-/// line.
-///
-/// The base image bakes debian + rustup + the workspace's pinned
-/// toolchain, plus the engine workspace at `/weft/`. Per-project
-/// worker builds FROM this image and skip the apt + rustup install
-/// cycle, paying only per-project costs (per-node apt packages,
-/// cargo fetch + compile inside the shared BuildKit cache mounts).
-///
-/// The base follows the live checkout, which can have moved since the
-/// install started, so it goes into the install's image record before
-/// it is pulled or built: a sweep elsewhere keeps it from then on.
-pub async fn ensure_worker_builder_base() -> Result<String> {
-    let image_ref = builder_base_ref()?;
-    record_build_uses(&weft_core::images::BuildUses { builder_base: Some(image_ref.clone()), compile_cache_key: None }).await?;
-    ensure_builder_base_at(&image_ref, false).await?;
-    Ok(image_ref)
-}
-
-/// Add what a build this CLI runs on the machine's docker uses to the
-/// image record of the install it acts on, before the build starts, so a
-/// sweep elsewhere keeps it. A cleanup holding the record makes this wait
-/// for one removal, on the blocking pool, saying so.
-pub async fn record_build_uses(uses: &weft_core::images::BuildUses) -> Result<()> {
-    let dir = weft_core::infra::Install::from_env().map_err(anyhow::Error::msg)?.dir();
-    let uses = uses.clone();
-    tokio::task::spawn_blocking(move || {
-        weft_core::images::ImageRefs::add_build(&dir, &uses, || eprintln!("waiting for a cleanup to let go of this install's image record"))
-    })
-    .await?
-}
-
 /// Materialize the builder base under `image_ref` (present -> pull ->
-/// build; `rebuild` skips straight to the build, same contract as
-/// `ensure_system_image`). Split from the ref computation so the
-/// release workflow can materialize an arch-suffixed name while
-/// everything local uses the bare one.
-pub async fn ensure_builder_base_at(image_ref: &str, rebuild: bool) -> Result<()> {
+/// build). Split from the ref computation so the release workflow can
+/// materialize an arch-suffixed name.
+pub async fn ensure_builder_base_at(image_ref: &str) -> Result<()> {
     let root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     // The ref is content-addressed (the hash covers every input the
     // build context reads, via `compute_builder_base_hash`), so a
     // present ref IS the right content: no stamp file needed.
-    if rebuild || !image_present(image_ref).await? {
-        // The staging dir is one FIXED path (wiped and rewritten), and
-        // parallel `weft test-node` processes all funnel here, so the
-        // stage-and-build holds an exclusive file lock: the loser
-        // blocks, then finds the ref present and skips. The lock file
-        // lives BESIDE the staging dir (staging wipes the dir itself).
-        // Acquired on the blocking pool: a plain block would freeze
-        // this worker thread's OTHER futures (the sibling system-image
-        // ensures joined with this one) for as long as another weft
-        // process holds the lock.
-        let ctx_dir = root.join(weft_compiler::worker_image::BASE_CONTEXT_DIR);
-        if let Some(parent) = ctx_dir.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // A held lock means another weft process is building the base
-        // (minutes on a clean machine); say so before blocking, or this
-        // process sits silent the whole time.
-        let _lock = hold_file_lock(
-            ctx_dir.with_extension("lock"),
-            "another weft process is building the shared builder base; waiting for it to finish",
-        )
-        .await?;
-        if rebuild || (!image_present(image_ref).await? && !docker_pull(image_ref).await?) {
-            // Stage the base build context: the worker-linked workspace
-            // slice + toolchain pin + generated warm-up crate + the
-            // RENDERED Dockerfile (target-cache key substituted), and
-            // nothing else, so the baked image (and the docker tarball)
-            // carry exactly what the base hash covers. See
-            // `build::stage_builder_base_context`.
-            let install = weft_core::infra::Install::from_env().map_err(anyhow::Error::msg)?;
-            let ctx = weft_compiler::build::stage_builder_base_context(&root, &install)
-                .map_err(|e| anyhow::anyhow!("stage builder-base context: {e}"))?;
-            docker_build(image_ref, &ctx.join("Dockerfile"), &ctx, &[], &[], &[]).await?;
-            let cache = weft_compiler::build::install_cache_key(&root, &install).map_err(|e| anyhow::anyhow!("the builder base's compile cache key: {e}"))?;
-            drop_superseded_install_build_caches(&install, &cache).await;
-        }
+    if image_present(image_ref).await? {
+        return Ok(());
     }
-    // Builder-base images are large (~1GB+: debian + rustup +
-    // staged workspace). Earlier shape GC'd every prior tag after a
-    // fresh ensure, but that races with in-flight per-project
-    // builds: a docker build FROMing an older base ref sees the tag
-    // yanked mid-build. Disk-pressure cleanup is an explicit
-    // `weft clean --images` operation, not an implicit side-effect of
-    // every `weft run`.
+    // The staging dir is one FIXED path (wiped and rewritten), so the
+    // stage-and-build holds an exclusive file lock: a second `weft
+    // build-images` blocks, then finds the ref present and skips. The lock
+    // file lives BESIDE the staging dir (staging wipes the dir itself).
+    let ctx_dir = root.join(weft_compiler::worker_image::BASE_CONTEXT_DIR);
+    let _lock = hold_file_lock(
+        ctx_dir.with_extension("lock"),
+        "another weft process is building the builder base; waiting for it to finish",
+    )
+    .await?;
+    if !image_present(image_ref).await? && !docker_pull(image_ref).await? {
+        // Stage the base build context: the worker-linked workspace
+        // slice + toolchain pin + generated warm-up crate + the
+        // RENDERED Dockerfile (target-cache key substituted), and
+        // nothing else, so the baked image (and the docker tarball)
+        // carry exactly what the base hash covers. See
+        // `build::stage_builder_base_context`.
+        let ctx = weft_compiler::build::stage_builder_base_context(&root)
+            .map_err(|e| anyhow::anyhow!("stage builder-base context: {e}"))?;
+        docker_build(image_ref, &ctx.join("Dockerfile"), &ctx, &[], &[]).await?;
+    }
     Ok(())
 }
 
@@ -392,7 +331,7 @@ pub async fn ensure_runtime_image(image_ref: &str, rebuild: bool, prebuilt: Opti
     let Some(binary) = prebuilt else {
         let install = weft_core::infra::Install::from_env().map_err(anyhow::Error::msg)?;
         let cache = weft_compiler::build::install_cache_key(&root, &install).map_err(|e| anyhow::anyhow!("the runtime's compile cache key: {e}"))?;
-        docker_build(image_ref, &dockerfile, &root, &[], &[format!("{TARGET_CACHE_ARG}={cache}")], &[]).await?;
+        docker_build(image_ref, &dockerfile, &root, &[format!("{TARGET_CACHE_ARG}={cache}")], &[]).await?;
         drop_superseded_install_build_caches(&install, &cache).await;
         return Ok(());
     };
@@ -405,7 +344,6 @@ pub async fn ensure_runtime_image(image_ref: &str, rebuild: bool, prebuilt: Opti
         image_ref,
         &dockerfile,
         &root,
-        &[],
         &["RUNTIME_BINARY=prebuilt".to_string()],
         &[(PREBUILT_CONTEXT, staged.path())],
     )
@@ -429,26 +367,30 @@ pub async fn ensure_runtime_image(image_ref: &str, rebuild: bool, prebuilt: Opti
     Ok(())
 }
 
-/// Every shared image one ensure materialized: the runtime, the builder
-/// base every project's worker compiles on, and the standard worker.
-pub struct SharedImages {
+/// Every image the release publishes (`weft build-images`): the runtime,
+/// which a local install pulls, and the builder base a cloud install's
+/// worker images compile on and the standard worker image a cloud
+/// install's untouched projects run.
+pub struct ReleaseImages {
     pub runtime: String,
     pub builder_base: String,
-    /// The worker built from the whole base catalog. A project whose
-    /// nodes are all base catalog nodes builds to exactly this image
-    /// (its hash names no project), so its first run finds it ready
-    /// instead of compiling.
+    /// The worker image built from the whole base catalog. A cloud
+    /// project whose nodes are all base catalog nodes builds to exactly
+    /// this image (its hash names no project), so its first run finds it
+    /// ready instead of compiling.
     pub worker: String,
 }
 
-impl SharedImages {
+impl ReleaseImages {
     /// The refs the current checkout's content hashes to, touching no
     /// image.
     pub fn current() -> Result<Self> {
-        Ok(Self { runtime: runtime_image_ref()?, builder_base: builder_base_ref()?, worker: standard_worker_ref()? })
+        let builder_base = builder_base_ref()?;
+        let worker = standard_worker_ref(&builder_base)?;
+        Ok(Self { runtime: runtime_image_ref()?, builder_base, worker })
     }
 
-    /// Every bare (unsuffixed) ref, one per shared image.
+    /// Every bare (unsuffixed) ref, one per image.
     /// SYNC: `weft build-images` stdout = one registry-qualified bare
     ///       ref per line, in this order <-> .github/workflows/release.yml
     ///       (build + push shared images; the images-manifest job diffs
@@ -470,76 +412,61 @@ pub fn suffixed_ref(bare: &str, ref_suffix: Option<&str>) -> String {
     }
 }
 
-/// Make the shared images `wanted` names exist locally, the runtime and
-/// the builder base side by side, then the standard worker FROM that
-/// base. With `ref_suffix`, each image is materialized under
-/// `<ref><suffix>` instead of its bare name: the release workflow's
-/// per-architecture halves, checked and pulled by their OWN names.
-/// `prebuilt_runtime` is [`ensure_runtime_image`]'s `prebuilt`. The refs
-/// come in rather than being worked out here, so a start records exactly
-/// what it then builds.
+/// Make the images `wanted` names exist locally, the runtime and the
+/// builder base side by side, then the standard worker FROM that base.
+/// With `ref_suffix`, each image is materialized under `<ref><suffix>`
+/// instead of its bare name: the release workflow's per-architecture
+/// halves, checked and pulled by their OWN names. `prebuilt_runtime` is
+/// [`ensure_runtime_image`]'s `prebuilt`.
 ///
 /// `tokio::join!`, NOT `try_join!`: an early bail would drop the sibling
 /// future while its `docker build` child keeps running detached; join!
 /// lets both finish, then every error is reported together.
-pub async fn ensure_all_shared_images(
-    wanted: &SharedImages,
-    rebuild: bool,
-    ref_suffix: Option<&str>,
-    prebuilt_runtime: Option<&Path>,
-) -> Result<()> {
+pub async fn ensure_release_images(wanted: &ReleaseImages, ref_suffix: Option<&str>, prebuilt_runtime: Option<&Path>) -> Result<()> {
     let (runtime_target, base_target) = (suffixed_ref(&wanted.runtime, ref_suffix), suffixed_ref(&wanted.builder_base, ref_suffix));
-    let (r, b) = tokio::join!(
-        ensure_runtime_image(&runtime_target, rebuild, prebuilt_runtime),
-        ensure_builder_base_at(&base_target, rebuild),
-    );
+    let (r, b) = tokio::join!(ensure_runtime_image(&runtime_target, false, prebuilt_runtime), ensure_builder_base_at(&base_target));
     let failures: Vec<String> = [("runtime", r), ("builder-base", b)]
         .into_iter()
         .filter_map(|(name, res)| res.err().map(|e| format!("{name}: {e:#}")))
         .collect();
-    anyhow::ensure!(failures.is_empty(), "shared image build failed:\n  {}", failures.join("\n  "));
+    anyhow::ensure!(failures.is_empty(), "image build failed:\n  {}", failures.join("\n  "));
     // After the base: the standard worker is built FROM it.
-    ensure_standard_worker(&wanted.worker, &wanted.builder_base, rebuild, ref_suffix)
+    ensure_standard_worker(&suffixed_ref(&wanted.worker, ref_suffix), &base_target)
         .await
         .map_err(|e| anyhow::anyhow!("standard worker: {e:#}"))
 }
 
-/// The standard worker's ref for this checkout:
-/// `<registry>/weft-worker:<hash>` (`weft_compiler::build::standard_worker_hash`).
-pub fn standard_worker_ref() -> Result<String> {
-    let hash = weft_compiler::build::standard_worker_hash()?;
-    Ok(qualified_ref(weft_compiler::build::WORKER_IMAGE_REPO, &hash))
+/// The standard worker image's ref for this checkout, compiled FROM
+/// `builder_base`: `<registry>/weft-worker:<hash>`
+/// (`weft_compiler::build::stock_binary_hash` of an image).
+pub fn standard_worker_ref(builder_base: &str) -> Result<String> {
+    let hash = weft_compiler::build::stock_binary_hash(&weft_core::builds::WorkerPackaging::Image { builder: builder_base.to_string() })?;
+    Ok(qualified_ref(weft_core::builds::WORKER_REPO, &hash))
 }
 
-/// Make the standard worker exist under `image` (present, else pulled,
-/// else built FROM `base`, the builder base this process just ensured).
-/// An install holds it under a name of its own ([`hold_standard_worker`]).
-async fn ensure_standard_worker(image: &str, base: &str, rebuild: bool, suffix: Option<&str>) -> Result<()> {
-    let target = suffixed_ref(image, suffix);
-    if rebuild || (!image_present(&target).await? && !docker_pull(&target).await?) {
-        let stock = weft_compiler::build::StockProject::materialize()?;
-        let bases = weft_compiler::worker_image::BaseImages {
-            builder: suffixed_ref(base, suffix),
-            runtime: weft_compiler::worker_image::DEFAULT_BASE_IMAGE.to_string(),
-        };
-        let build = weft_compiler::build::build_project(
-            &stock.project,
-            &stock.definition,
-            &stock.catalog,
-            // `StockProject::materialize` compiled it from disk.
-            weft_compiler::CompileFs::disk(&stock.project.root),
-            &bases,
-            weft_core::builds::NodeSet::Full,
-            &weft_compiler::hash::DISK,
-        )?;
-        record_build_uses(&build.uses).await?;
-        docker_build_worker(&target, &build.build_context.join("Dockerfile"), &build.build_context, &[]).await?;
-        // Every install uses it as built, reading no record of it
-        // (`ledger::note_shared`), so it must leave nothing out: a stock
-        // node that does not compile fails it here, naming the package.
-        require_whole_worker(&target).await?;
+/// Make the standard worker image exist under `target` (present, else
+/// pulled, else built FROM `base`, the builder base this process just
+/// ensured).
+async fn ensure_standard_worker(target: &str, base: &str) -> Result<()> {
+    if image_present(target).await? || docker_pull(target).await? {
+        return Ok(());
     }
-    Ok(())
+    let stock = weft_compiler::build::StockProject::materialize()?;
+    let build = weft_compiler::build::build_project(
+        &stock.project,
+        &stock.definition,
+        &stock.catalog,
+        // `StockProject::materialize` compiled it from disk.
+        weft_compiler::CompileFs::disk(&stock.project.root),
+        &weft_core::builds::WorkerPackaging::Image { builder: base.to_string() },
+        weft_core::builds::NodeSet::Full,
+        &weft_compiler::hash::DISK,
+    )?;
+    docker_build(target, &build.build_context.join("Dockerfile"), &build.build_context, &[], &[]).await?;
+    // Every install uses it as built, reading no record of it
+    // (`ledger::note_shared`), so it must leave nothing out: a stock
+    // node that does not compile fails it here, naming the package.
+    require_whole_worker(target).await
 }
 
 /// Refuse a worker image whose build left a node package out
@@ -570,25 +497,12 @@ async fn require_whole_worker(image: &str) -> Result<()> {
     Ok(())
 }
 
-/// Give `install` its own name for the standard worker `image`
-/// (`Install::local_image_ref`), the name its builds look for, so a stock
-/// project's build finds it and compiles nothing. The install records it
-/// and removes that name once a newer weft names another standard worker;
-/// the image goes with its last name.
-pub async fn hold_standard_worker(install: &weft_core::infra::Install, image: &str) -> Result<()> {
-    let (repo, tag) = ref_repo_tag(image)?;
-    let held = install.local_image_ref(&format!("{repo}:{tag}"));
-    if held != image && !image_present(&held).await? {
-        let out = docker().args(["tag", image, &held]).output().await?;
-        anyhow::ensure!(out.status.success(), "docker tag {image} {held}: {}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(())
-}
-
-/// One BuildKit record of a worker compile cache mount, as `docker
-/// buildx du --verbose` lists it: there is one per cache key (build
-/// environment and builder), and a key retired by a toolchain bump keeps
-/// its record, and its bytes, until something prunes it.
+/// One BuildKit record of a worker image's compile cache mount, as
+/// `docker buildx du --verbose` lists it: what a `weft build-images` run on
+/// this machine, or an older weft's worker image builds, left. There is
+/// one per cache key (build environment and builder), and a key retired by
+/// a toolchain bump keeps its record, and its bytes, until something
+/// prunes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileCacheRecord {
     pub id: String,
@@ -596,12 +510,13 @@ pub struct CompileCacheRecord {
     /// without the compile lane after it: every lane of a key is that
     /// key's cache.
     pub key: String,
-    /// The compile lane after the key, `None` when the mount id carries
-    /// no lane number.
+    /// The compile lane after the key, on a mount an older weft's worker
+    /// image build made in one of the machine's lanes; `None` when the
+    /// mount id carries no lane (a `weft build-images` cache).
     pub lane: Option<u32>,
-    /// What the mount id carries after the key instead of a lane number
-    /// (empty when nothing): a mount id this build does not make, kept so
-    /// the size report shows its bytes instead of hiding them.
+    /// What the mount id carries after the key that is no lane number: a
+    /// mount id no weft makes, kept so the size report shows its bytes
+    /// instead of hiding them.
     pub unreadable_lane: Option<String>,
     pub size: String,
     /// Whole days since BuildKit last used it, read off its "Last used"
@@ -609,30 +524,31 @@ pub struct CompileCacheRecord {
     pub idle_days: u64,
 }
 
-/// Every worker compile cache mount on this host.
+/// Every worker image compile cache mount on this host.
 pub async fn worker_compile_caches() -> Result<Vec<CompileCacheRecord>> {
     Ok(compile_caches_in(&buildx_du().await?))
 }
 
-/// One BuildKit record of a cache mount that compiles weft's own crates
-/// for one install (the runtime image's, the builder base's), keyed by
-/// `weft_compiler::build::install_cache_key`.
+/// One BuildKit record of a cache mount that compiles weft's own crates:
+/// the runtime image's, keyed by `weft_compiler::build::install_cache_key`
+/// for the install it was built for, and the builder base's, keyed by the
+/// toolchain alone (`weft_compiler::build::builder_base_cache_key`) or, on
+/// one an older weft left, by an install too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallCacheRecord {
     pub id: String,
-    /// Its whole key (`weft_compiler::build::install_cache_key`), empty
-    /// for the runtime's mount from before it had one.
+    /// Its whole key, empty for the runtime's mount from before it had one.
     pub key: String,
     /// The label of the install it is for (`default`, or its name);
-    /// `None` for a mount from before each install had caches of its own.
+    /// `None` for a mount no install owns (a builder base's under this
+    /// weft, or one from before each install had caches of its own).
     pub install: Option<String>,
     pub size: String,
     /// Whether BuildKit may drop it now: `false` while a build mounts it.
     pub reclaimable: bool,
 }
 
-/// Every cache mount on this host that compiles weft's own crates for an
-/// install.
+/// Every cache mount on this host that compiles weft's own crates.
 pub async fn install_build_caches() -> Result<Vec<InstallCacheRecord>> {
     Ok(install_caches_in(&buildx_du().await?))
 }
@@ -735,23 +651,23 @@ fn mount_records_in<'a>(du_verbose: &'a str, prefix: &str) -> Vec<MountRecord<'a
 /// output: those whose mount id starts with `WORKER_CACHE_MOUNT_ID_PREFIX`.
 fn compile_caches_in(du_verbose: &str) -> Vec<CompileCacheRecord> {
     mount_records_in(du_verbose, weft_compiler::worker_image::WORKER_CACHE_MOUNT_ID_PREFIX).into_iter().map(|record| {
-        // `<key>-<lane>`; the key is hex, so the first dash ends it.
+        // `<key>`, or `<key>-<lane>` on an older weft's; the key is hex,
+        // so the first dash ends it.
         let (key, lane, unreadable_lane) = match record.mount.split_once('-') {
             Some((key, suffix)) => match suffix.parse() {
                 Ok(lane) => (key.to_string(), Some(lane), None),
                 Err(_) => (key.to_string(), None, Some(suffix.to_string())),
             },
-            None => (record.mount.to_string(), None, Some(String::new())),
+            None => (record.mount.to_string(), None, None),
         };
         CompileCacheRecord { id: record.id, key, lane, unreadable_lane, size: record.size, idle_days: record.idle_days }
     }).collect()
 }
 
 /// The records in `docker buildx du --verbose` output of the cache mounts
-/// that compile weft's own crates for an install: the runtime's and the
-/// builder base's, each mount id ending in its
-/// `weft_compiler::build::install_cache_key`. The runtime's mount from
-/// before it had a key at all is the prefix without its dash.
+/// that compile weft's own crates: the runtime's and the builder base's,
+/// each mount id ending in its key. The runtime's mount from before it had
+/// a key at all is the prefix without its dash.
 fn install_caches_in(du_verbose: &str) -> Vec<InstallCacheRecord> {
     let runtime = mount_records_in(du_verbose, RUNTIME_CACHE_MOUNT_ID_PREFIX.trim_end_matches('-'))
         .into_iter()
@@ -793,16 +709,14 @@ fn idle_days(last_used: &str) -> u64 {
 }
 
 /// THE one `docker build` invocation, BuildKit on. Every image the CLI
-/// builds (builder base, runtime, worker, infra, node-test)
-/// funnels here. `labels` stamp the `weft.dev/*` filters later GC
-/// selects on (empty for the shared images, which GC by repo+tag).
-/// `named_contexts` are extra build contexts the Dockerfile reads with
-/// `COPY --from=<name>`.
+/// builds (the runtime, and for the release the builder base and the
+/// standard worker image) funnels here; a sweep finds them by repo and
+/// tag. `named_contexts` are extra build contexts the Dockerfile reads
+/// with `COPY --from=<name>`.
 pub(crate) async fn docker_build(
     image_ref: &str,
     dockerfile: &Path,
     context: &Path,
-    labels: &[String],
     build_args: &[String],
     named_contexts: &[(&str, &Path)],
 ) -> Result<()> {
@@ -814,17 +728,14 @@ pub(crate) async fn docker_build(
     // cargo cache mounts the Dockerfiles declare, an unchanged crate
     // set short-circuits to seconds. Deeper source changes are
     // caught by cargo's own fingerprinting inside the cache mount, which
-    // holds one install's build of weft's crates only
-    // (`weft_compiler::build::install_cache_key`), or content-keyed ones:
-    // cargo goes by modification times, which another branch's artifacts
-    // fool.
+    // holds one install's build of the runtime only
+    // (`weft_compiler::build::install_cache_key`), or one keyed by the
+    // toolchain or the content: cargo goes by modification times, which
+    // another branch's artifacts fool.
     let mut cmd = docker();
     cmd.env("DOCKER_BUILDKIT", "1")
         .args(["build", "-t", image_ref, "-f"])
         .arg(dockerfile);
-    for l in labels {
-        cmd.args(["--label", l]);
-    }
     for arg in build_args {
         cmd.args(["--build-arg", arg]);
     }
@@ -838,92 +749,11 @@ pub(crate) async fn docker_build(
     Ok(())
 }
 
-/// Build a node-test image (a Dockerfile from the worker templates, whose
-/// compile cache is split into lanes) on this machine: [`docker_build`]
-/// holding one of this host's compile lanes for the whole build, named to
-/// the build through [`weft_compiler::worker_image::COMPILE_LANE_ARG`].
-/// Project images are built by the install (`weft-dispatcher::build`),
-/// which holds lanes of its own the same way.
-pub(crate) async fn docker_build_worker(
-    image_ref: &str,
-    dockerfile: &Path,
-    context: &Path,
-    labels: &[String],
-) -> Result<()> {
-    let lane = CompileLane::hold().await?;
-    let arg = format!("{}={}", weft_compiler::worker_image::COMPILE_LANE_ARG, lane.number);
-    docker_build(image_ref, dockerfile, context, labels, &[arg], &[]).await
-}
-
-/// How many worker builds compile side by side when nobody says
-/// otherwise. Each lane keeps a compile cache of its own (about 2GB), so
-/// this is also how many of those are kept.
-const DEFAULT_COMPILE_LANES: u32 = 4;
-
-/// Overrides [`DEFAULT_COMPILE_LANES`]: more for a machine that builds
-/// many projects at once (and has the disk), 1 to keep a single cache.
-const COMPILE_LANES_ENV: &str = "WEFT_COMPILE_LANES";
-
-/// One of this host's compile lanes, held (an exclusive lock on its file
-/// under the weft data dir) until dropped. Every weft process on the host
-/// picks from the same lock files, so no two builds hold one lane, and the
-/// compile-cache sweep leaves a held lane's caches alone.
-pub(crate) struct CompileLane {
-    pub(crate) number: u32,
-    _lock: std::fs::File,
-}
-
-impl CompileLane {
-    /// The first free lane, waiting for one to free up when all are held.
-    async fn hold() -> Result<Self> {
-        let lanes = compile_lanes()?;
-        let mut said = false;
-        loop {
-            for number in 0..lanes {
-                if let Some(lane) = Self::try_take(number)? {
-                    return Ok(lane);
-                }
-            }
-            if !said {
-                eprintln!(
-                    "all {lanes} compile lanes are busy with other builds; waiting for one \
-                     ({COMPILE_LANES_ENV} sets how many)"
-                );
-                said = true;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        }
-    }
-
-    /// Lane `number` if no build holds it right now, `None` when one does.
-    pub(crate) fn try_take(number: u32) -> Result<Option<Self>> {
-        let path = crate::commands::daemon::data_dir().join("compile-lanes").join(format!("{number}.lock"));
-        let lock = weft_core::file_lock::try_hold(&path).map_err(|e| anyhow::anyhow!("lock compile lane {number}: {e}"))?;
-        Ok(lock.map(|_lock| Self { number, _lock }))
-    }
-}
-
 /// Hold the machine-wide lock on the file at `path`, waiting (on the
 /// blocking pool, so this thread's other futures keep going) while
 /// another weft process holds it, after saying `waiting` once.
 pub(crate) async fn hold_file_lock(path: PathBuf, waiting: &'static str) -> Result<std::fs::File> {
-    tokio::task::spawn_blocking(move || {
-        weft_core::file_lock::hold(&path, || eprintln!("{waiting}")).map_err(|e| anyhow::anyhow!("lock {}: {e}", path.display()))
-    })
-    .await?
-}
-
-/// How many compile lanes there are: [`COMPILE_LANES_ENV`], or
-/// [`DEFAULT_COMPILE_LANES`]. This host's node-test builds hold one each,
-/// and `weft daemon start` hands the same count to the install's BuildKit.
-pub(crate) fn compile_lanes() -> Result<u32> {
-    match std::env::var(COMPILE_LANES_ENV) {
-        Err(_) => Ok(DEFAULT_COMPILE_LANES),
-        Ok(raw) => match raw.trim().parse::<u32>() {
-            Ok(n) if n >= 1 => Ok(n),
-            _ => anyhow::bail!("{COMPILE_LANES_ENV}={raw:?}: expected a whole number of at least 1"),
-        },
-    }
+    weft_platform_local::lanes::hold(&path, move || eprintln!("{waiting}")).await
 }
 
 /// Directories inside a crate that the image build never compiles, so a change
@@ -997,17 +827,18 @@ pub fn outside_current(current_ref: &str) -> Result<impl Fn(&str, &str) -> bool>
     outside_kept(repo, &[current_ref])
 }
 
-/// The standard workers in `listing` other than the `kept` ones. The
-/// standard worker is the one worker this host pulls or builds under a
-/// registry name, and each weft version names a new one, so every one no
-/// install uses is dead. Only weft's own registry names go: the kept
+/// The standard worker images in `listing` other than the `kept` ones:
+/// what an older weft on this machine pulled or built for its install, or
+/// a `weft build-images` run built, under a registry name. Each weft
+/// version names a new one, so every one no install uses is dead (this
+/// weft's own standard worker is a program, never an image). Only weft's own registry names go: the kept
 /// refs' registries and the one the release publishes to (the copy one
 /// may have been tagged from), never another repository that happens to
 /// be called `weft-worker`. A kept hash is kept under any suffix
 /// (`<hash>-amd64`, the release's per-architecture halves): content
 /// hashes have one length, so no other hash starts with it. An install's
-/// own name for a worker (`Install::local_image_ref`) carries no
-/// registry, and that install reclaims it.
+/// own name for a worker image (`Install::local_image_ref`) carries no
+/// registry, and that install's start reclaims it ([`docker_workers_of`]).
 pub fn stale_standard_workers<'a>(listing: &str, kept: impl IntoIterator<Item = &'a str>) -> Result<Vec<String>> {
     let mut registries = std::collections::BTreeSet::from([DEFAULT_IMAGE_REGISTRY]);
     let mut tags = Vec::new();
@@ -1019,7 +850,7 @@ pub fn stale_standard_workers<'a>(listing: &str, kept: impl IntoIterator<Item = 
             registries.insert(registry);
         }
     }
-    let repos: Vec<String> = registries.iter().map(|r| format!("{r}/{}:", weft_compiler::build::WORKER_IMAGE_REPO)).collect();
+    let repos: Vec<String> = registries.iter().map(|r| format!("{r}/{}:", weft_core::builds::WORKER_REPO)).collect();
     Ok(listing
         .lines()
         .map(str::trim)
@@ -1032,19 +863,20 @@ pub fn stale_standard_workers<'a>(listing: &str, kept: impl IntoIterator<Item = 
         .collect())
 }
 
-/// The label a node-test image carries naming the TAG of the builder
-/// base it was built on, which is how a sweep keeps the node-test images
-/// of every builder base an install uses and drops the rest.
-// SYNC: the label <-> crates/weft-cli/src/commands/test_node/mod.rs (ensure_test_image)
+/// The label an older weft's node-test image carries naming the TAG of
+/// the builder base it was built on, which is how a sweep keeps the
+/// node-test images of every builder base an install uses and drops the
+/// rest. This weft builds no node-test image (a live test's server is a
+/// program compiled on the machine).
 pub const NODE_TEST_BASE_LABEL: &str = "weft.dev/builder-base";
 
-/// The node-test images in `listing` that are not in `kept` (the ones
-/// built on a builder base an install uses, listed through
-/// [`NODE_TEST_BASE_LABEL`]): one built on a base no install uses, or
-/// before images carried the label, is dead.
+/// The node-test images an older weft left in `listing` that are not in
+/// `kept` (the ones built on a builder base an install uses, listed
+/// through [`NODE_TEST_BASE_LABEL`]): one built on a base no install uses,
+/// or before images carried the label, is dead.
 pub fn stale_node_test_images(listing: &str, kept: &str) -> Vec<String> {
     let kept: std::collections::BTreeSet<&str> = kept.lines().map(str::trim).collect();
-    host_images_matching(listing, |r, _| r == weft_compiler::build::NODE_TEST_IMAGE_REPO)
+    host_images_matching(listing, |r, _| r == weft_core::builds::NODE_TEST_REPO)
         .into_iter()
         .filter(|image| !kept.contains(image.as_str()))
         .collect()
@@ -1054,9 +886,8 @@ pub fn stale_node_test_images(listing: &str, kept: &str) -> Vec<String> {
 /// may delete: those whose prefix-stripped `(repo, tag)` parse and
 /// satisfy `condemn`. THE host-side matcher (the runtime image, builder
 /// bases, worker and infra reclaims all pass their own predicate over
-/// the same split), the host sibling of `node_images_matching`, pure
-/// for the same reason: the two matchers decide what a sweep may
-/// delete. Untagged/dangling lines (`<none>:<none>`) parse to a repo no
+/// the same split), pure because it decides what a sweep may delete.
+/// Untagged/dangling lines (`<none>:<none>`) parse to a repo no
 /// weft predicate names.
 pub fn host_images_matching(listing: &str, condemn: impl Fn(&str, &str) -> bool) -> Vec<String> {
     listing
@@ -1175,6 +1006,30 @@ pub fn images_owned_by(listing: &str, owned: impl Fn(&weft_core::infra::Install)
         .collect()
 }
 
+/// The worker images in `listing` under `install`'s own names
+/// (`Install::local_image_ref`: a named install's
+/// `localhost/weft-<name>/...`, the default install's bare names), which a
+/// weft from before workers ran as processes built and nothing on this
+/// machine runs any more. Node-test images are not: that weft named them
+/// bare for every install, and their own sweep takes them by the builder
+/// base they were built on ([`stale_node_test_images`]).
+pub fn docker_workers_of(listing: &str, install: &weft_core::infra::Install) -> Vec<String> {
+    use weft_core::infra::Install;
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|full| {
+            let Some(tag) = Install::tag_of_local_image(full) else { return false };
+            let ours = match Install::owner_of_local_image(full) {
+                Some(owner) => &owner == install,
+                None => install.name().is_none() && tag == *full,
+            };
+            ours && tag.split_once(':').is_some_and(|(repo, version)| version != "<none>" && repo == weft_core::builds::WORKER_REPO)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// Remove every image `install` holds under its own names
 /// ([`images_owned_by`]): the images of an install being taken off this
 /// machine (its worker and infra images, and its names on the shared
@@ -1251,8 +1106,9 @@ ghcr.io/weavemindai/weft-runtime:deployhash
 
 
     /// Records as `docker buildx du --verbose` printed them on a host that
-    /// had built workers under two cache keys, one of them in compile
-    /// lane 2 (captured verbatim, fields this parser ignores trimmed).
+    /// had built worker images under two cache keys, one of them by an
+    /// older weft in compile lane 2, one by `weft build-images` in no lane
+    /// (captured verbatim, fields this parser ignores trimmed).
     #[test]
     fn every_compile_cache_key_is_read_off_the_buildkit_records() {
         let du = "ID:           p490dco22moj9u55682dm3enh\nParents:\n - x\nCreated at:   2026-09-13 17:34:56 +0000 UTC\nMutable:      true\nReclaimable:  true\nShared:       false\nSize:         421.7MB\n\
@@ -1265,7 +1121,7 @@ ghcr.io/weavemindai/weft-runtime:deployhash
                   Description:  cached mount /cache/target with id \"/weft-worker-target-0123456789abcdef-x2\"\nLast used:    2 minutes ago\n";
         assert_eq!(compile_caches_in(du), vec![
             CompileCacheRecord { id: "z5k0h7hhdmaktflss7bsyjs7u".into(), key: "9af3f2c5f9da6eaa".into(), lane: Some(2), unreadable_lane: None, size: "1.982GB".into(), idle_days: 0 },
-            CompileCacheRecord { id: "hve80t8pw8n1ackgqj82wn30e".into(), key: "0123456789abcdef".into(), lane: None, unreadable_lane: Some(String::new()), size: "6.1GB".into(), idle_days: 35 },
+            CompileCacheRecord { id: "hve80t8pw8n1ackgqj82wn30e".into(), key: "0123456789abcdef".into(), lane: None, unreadable_lane: None, size: "6.1GB".into(), idle_days: 35 },
             CompileCacheRecord { id: "q1".into(), key: "0123456789abcdef".into(), lane: None, unreadable_lane: Some("x2".into()), size: "3MB".into(), idle_days: 0 },
         ]);
         assert!(compile_caches_in("ID: c\nSize: 1MB\nDescription: something else\n").is_empty());
@@ -1276,10 +1132,10 @@ ghcr.io/weavemindai/weft-runtime:deployhash
     }
 
     /// The caches that compiled weft's own crates are read with the
-    /// install their key names, or none for a mount from before each
-    /// install had its own (the runtime's unkeyed one, a builder base's
-    /// keyed by the lock alone); a worker cache and a mount that only
-    /// starts like the runtime's are not among them.
+    /// install their key names, or none for a mount no install owns (the
+    /// runtime's unkeyed one, a builder base's keyed by the toolchain); a
+    /// worker cache and a mount that only starts like the runtime's are
+    /// not among them.
     #[test]
     fn every_install_cache_is_read_with_its_install() {
         let record = |id: &str, mount: &str, reclaimable: bool| {
@@ -1447,6 +1303,19 @@ weft-builder-base:0ld0ld
         // loud error, never an everything-condemned sweep.
         assert!(outside_current("weft-runtime").is_err());
         assert!(outside_kept(RUNTIME_REPO, &["weft-builder-base:x"]).is_err());
+    }
+
+    /// An install's worker images are the ones under its own names, never
+    /// a node-test image (shared by every install of the weft that made
+    /// them), a registry's, or another install's.
+    #[test]
+    fn an_installs_docker_workers_are_its_own_named_worker_images() {
+        let listing = "weft-worker:a1\nweft-node-tests:b2\nweft-runtime:r\nweft-infra-pg:x\nghcr.io/weavemindai/weft-worker:s\n\
+            localhost/weft-cell7/weft-worker:c3\nlocalhost/weft-other/weft-worker:d4\nweft-worker:<none>\n";
+        let default = weft_core::infra::Install::default_install();
+        assert_eq!(docker_workers_of(listing, &default), ["weft-worker:a1"]);
+        let cell7 = weft_core::infra::Install::named("cell7").unwrap();
+        assert_eq!(docker_workers_of(listing, &cell7), ["localhost/weft-cell7/weft-worker:c3"]);
     }
 
     /// The node-test images built on a builder base no install uses go,

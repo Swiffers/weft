@@ -1200,7 +1200,8 @@ enum ApplyMode {
 }
 
 /// Where each declared endpoint answers, as the host gives it once the
-/// units run: the address the project's workers use, the front-door path
+/// units run: the address the project's workers and weft's own roles
+/// use, the front-door path
 /// of a `Public` one, and the install-network address of a `SameNetwork`
 /// one.
 async fn endpoint_addresses(
@@ -1211,7 +1212,6 @@ async fn endpoint_addresses(
     for ep in &resolved.spec.endpoints {
         let at = state.host.endpoint(resolved, &ep.name).await?;
         out.urls.insert(ep.name.clone(), at.url);
-        out.install_urls.insert(ep.name.clone(), at.install_url);
         match &ep.expose {
             infra::Expose::Project => {}
             infra::Expose::Public { path } => {

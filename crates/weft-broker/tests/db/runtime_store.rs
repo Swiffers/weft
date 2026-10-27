@@ -36,7 +36,7 @@ fn ask(part_number: i32, size_bytes: u64) -> PartAsk {
 /// `reserve_parts` / `resume_upload` call sites read cleanly. (The External
 /// audience, the editor upload's browser-facing URLs, is exercised at Layer 4
 /// in `weft-e2e/tests/e2e/config_media.rs`.)
-const WORKER: PresignAudience = PresignAudience::Internal;
+const WORKER: PresignAudience = PresignAudience::Install;
 
 /// A worker caller in (tenant t1, project p1, run c1).
 fn worker(tenant: &str, project: &str, run_id: Option<&str>) -> CallerAuth {
@@ -231,7 +231,7 @@ async fn get_via(
     parsed: &weft_core::storage::key::ParsedKey,
     range: Option<weft_core::storage::ByteRange>,
 ) -> Result<(StoredFileMeta, bytes::Bytes), RuntimeStoreError> {
-    let (meta, _url, _) = s.link(parsed, PresignAudience::Internal, None, false).await?;
+    let (meta, _url, _) = s.link(parsed, PresignAudience::Install, None, false).await?;
     let key = parsed.to_key();
     let bytes = match range {
         None => bucket.get(&object_key(&key)).await.unwrap().expect("object present"),

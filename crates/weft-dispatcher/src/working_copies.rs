@@ -149,6 +149,43 @@ pub fn default_copy(copies: &[WorkingCopyRow]) -> Option<&WorkingCopyRow> {
         .or_else(|| copies.iter().find(|c| c.kind == WorkingCopyKind::Program))
 }
 
+/// The folder of `copies` on the machine named `here` a project's worker
+/// runs in when it runs on that machine: the default copy among the
+/// folders there ([`default_copy`]: the most recently changed). `None`
+/// when none of the project's folders is on that machine.
+pub fn folder_on<'a>(copies: &'a [WorkingCopyRow], here: &str) -> Option<&'a str> {
+    let on_machine: Vec<WorkingCopyRow> = copies
+        .iter()
+        .filter(|c| c.kind == WorkingCopyKind::Folder && c.host.as_deref() == Some(here) && c.path.is_some())
+        .cloned()
+        .collect();
+    let chosen = default_copy(&on_machine)?.id;
+    copies.iter().find(|c| c.id == chosen).and_then(|c| c.path.as_deref())
+}
+
+/// Each project's folder on this machine, the one its worker process runs
+/// in ([`folder_on`]), read from the working copies when a worker starts
+/// (`weft_platform_traits::ProjectFolders`, which the local runner asks).
+pub struct FoldersHere {
+    copies: WorkingCopyStore,
+    /// This machine's host name, as folders register it.
+    here: String,
+}
+
+impl FoldersHere {
+    pub fn new(copies: WorkingCopyStore) -> anyhow::Result<Self> {
+        Ok(Self { copies, here: weft_core::working_copy::this_machine().map_err(anyhow::Error::msg)? })
+    }
+}
+
+#[async_trait]
+impl weft_platform_traits::ProjectFolders for FoldersHere {
+    async fn folder(&self, project: uuid::Uuid) -> anyhow::Result<Option<std::path::PathBuf>> {
+        let copies = self.copies.list(project).await?;
+        Ok(folder_on(&copies, &self.here).map(std::path::PathBuf::from))
+    }
+}
+
 /// The head a new working copy starts on: the head of the project's most
 /// recently changed copy, so a folder registered where somebody already
 /// worked carries on from there.
@@ -591,6 +628,17 @@ mod tests {
             created_at: created,
             updated_at: updated,
         }
+    }
+
+    #[test]
+    fn a_worker_runs_in_the_most_recently_changed_folder_on_its_machine() {
+        let older = row(WorkingCopyKind::Folder, 1, 5, None);
+        let newer = row(WorkingCopyKind::Folder, 2, 9, None);
+        let elsewhere = WorkingCopyRow { host: Some("other".into()), ..row(WorkingCopyKind::Folder, 3, 50, None) };
+        let program = row(WorkingCopyKind::Program, 4, 99, None);
+        let copies = [older, newer, elsewhere, program];
+        assert_eq!(folder_on(&copies, "box"), Some("/p2"), "the newest folder on this machine, never another machine's");
+        assert_eq!(folder_on(&copies, "nowhere"), None, "no folder here, and the program copy is no folder");
     }
 
     #[test]

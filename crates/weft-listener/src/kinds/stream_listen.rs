@@ -48,7 +48,7 @@ impl KindHandler for StreamListenHandler {
     async fn spawn_task(
         &self,
         spec: &SignalSpec,
-        _kind_state: &Value,
+        _stored: super::RowState,
         ctx: SpawnCtx,
     ) -> Result<Option<JoinHandle<()>>> {
         let cfg: StreamListen = serde_json::from_value(spec.config.clone())
@@ -56,16 +56,12 @@ impl KindHandler for StreamListenHandler {
         let access = spec.access.clone();
         let fire = ctx.fire.clone();
         let prepare_ctx = ctx.clone();
-        // Every cycle after the first follows a pipe that failed or
-        // dropped: where an infra endpoint is, is asked again.
-        let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let prepare = Box::new(move || {
             let cfg = cfg.clone();
             let access = access.clone();
             let ctx = prepare_ctx.clone();
-            let again = !first.swap(false, std::sync::atomic::Ordering::Relaxed);
             async move {
-                let plan = prepare_cycle(&cfg, &access, &ctx, again).await;
+                let plan = prepare_cycle(&cfg, &access, &ctx).await;
                 if let Err(PrepareError::Fatal(e)) = &plan {
                     ctx.fire.give_up(&format!("{e:#}")).await;
                 }
@@ -117,12 +113,10 @@ impl KindHandler for StreamListenHandler {
 /// is set), interpolate the address and every frame, compile every
 /// pattern. Pattern compilation failing here is fatal (validation
 /// already vouched for them; a spec reaching here broken would spin).
-/// `again` is a cycle after a pipe that failed or dropped.
 async fn prepare_cycle(
     cfg: &StreamListen,
     access: &Option<AccessRef>,
     ctx: &SpawnCtx,
-    again: bool,
 ) -> Result<StreamPlan, PrepareError> {
     let values: BTreeMap<String, String> = match access {
         None => BTreeMap::new(),
@@ -138,10 +132,6 @@ async fn prepare_cycle(
 
     let address = interpolate_frame(&cfg.address, &values)
         .map_err(|e| PrepareError::Fatal(anyhow::anyhow!(e)))?;
-    if again {
-        crate::infra_address::unreached(&address, ctx);
-    }
-    let address = crate::infra_address::for_listener(&address, ctx).await.map_err(PrepareError::Transient)?;
     let script = cfg
         .script
         .iter()

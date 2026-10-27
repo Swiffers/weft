@@ -1,48 +1,39 @@
-//! What a listener process keeps of the broker's answers about where it
-//! connects and as whom, so a connection that drops and comes back, or a
-//! poll that runs again, asks nothing of the broker (and so wakes no
-//! database).
+//! What a listener process keeps of the broker's answers about the
+//! credentials its signals connect with (`crate::listener_access`), so a
+//! connection that drops and comes back, or a poll that runs again, asks
+//! nothing of the broker (and so wakes no database).
 //!
-//! - **Addresses** (`crate::infra_address`), per signal and address: an
-//!   address that is no infra endpoint is the one the trigger was given,
-//!   for good. An infra endpoint's can move (a local unit made again on
-//!   another port), so it is asked again after a connect to it failed. A
-//!   poll's wake carries them to the next (`crate::kinds::WakeBody`), so a
-//!   copy of the listener that just started asks nothing either.
-//! - **Credentials** (`crate::listener_access`), per signal, as one
-//!   registration of it reads its connection: fetched again when the
-//!   outside refused them, before the moment the broker said they stop
-//!   being good, for a new registration of the signal, and, in a holder,
-//!   when a connection was made again or removed (`HolderNote::AccessChanged`, or news it
-//!   may have missed), which drops every one. A copy of the listener that
-//!   is not a holder hears no such news, so a connection that changes
-//!   reaches the signals it serves as a new registration of each. A
-//!   resolve made as a signal is registered, before it has a registration,
-//!   keeps nothing.
+//! Kept per signal, as one registration of it reads its connection:
+//! fetched again when the outside refused them, before the moment the
+//! broker said they stop being good, for a new registration of the
+//! signal, and, in a holder, when a connection was made again or removed
+//! (`HolderNote::AccessChanged`, or news it may have missed), which drops
+//! every one. A copy of the listener that is not a holder hears no such
+//! news, so a connection that changes reaches the signals it serves as a
+//! new registration of each. A resolve made as a signal is registered,
+//! before it has a registration, keeps nothing.
 //!
-//! Both are dropped for a signal this process stops serving, that is
+//! They are dropped for a signal this process stops serving, that is
 //! registered again here, that gave up, or whose wake found its row gone
 //! or registered again ([`Reach::forget`]). A copy of the listener that
 //! serves wakes hears of none of that for a signal whose other wakes went
 //! to other copies, so credentials past the moment they stop being good
-//! are dropped whenever credentials are read or kept, and each map keeps
-//! at most [`KEPT_AT_MOST`] entries, the longest kept going first: what
-//! is dropped is fetched again if it is ever used.
+//! are dropped whenever credentials are read or kept, and at most
+//! [`KEPT_AT_MOST`] are kept, the longest kept going first: what is
+//! dropped is fetched again if it is ever used.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
-use weft_broker_client::protocol::{ListenerInfraAddress, ListenerResolveRequest, ListenerResolvedSource};
+use weft_broker_client::protocol::{ListenerResolveRequest, ListenerResolvedSource};
 
-/// The most entries each map keeps: well past what one copy serves at
+/// The most credentials kept: well past what one copy serves at
 /// once (a holder takes a few hundred signals), so only what no signal
 /// served here uses any more is dropped for room.
 pub const KEPT_AT_MOST: usize = 4096;
 
 #[derive(Default)]
 pub struct Reach {
-    /// By `(signal token, host:port as given)`, with when it was kept.
-    addresses: DashMap<(String, String), (u64, ListenerInfraAddress)>,
     /// By signal token: what one of its registrations fetched.
     credentials: DashMap<String, Kept>,
     /// Counts what is kept, so the longest kept is the lowest.
@@ -83,27 +74,6 @@ impl Reach {
         self.kept.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub fn address(&self, token: &str, authority: &str) -> Option<ListenerInfraAddress> {
-        self.addresses.get(&(token.to_string(), authority.to_string())).map(|a| a.1.clone())
-    }
-
-    pub fn keep_address(&self, token: &str, authority: &str, answer: ListenerInfraAddress) {
-        self.addresses.insert((token.to_string(), authority.to_string()), (self.next_order(), answer));
-        make_room(&self.addresses, |(order, _)| *order);
-    }
-
-    /// Every address kept for signal `token`, by the address given, for a
-    /// wake to carry to whichever copy of the listener handles the next.
-    pub fn addresses_of(&self, token: &str) -> std::collections::BTreeMap<String, ListenerInfraAddress> {
-        self.addresses.iter().filter(|e| e.key().0 == token).map(|e| (e.key().1.clone(), e.value().1.clone())).collect()
-    }
-
-    /// A connect to the address given as `authority` failed: an infra
-    /// endpoint's is asked again next time.
-    pub fn unreached(&self, token: &str, authority: &str) {
-        self.addresses.remove_if(&(token.to_string(), authority.to_string()), |_, (_, a)| a.is_infra);
-    }
-
     /// The credentials registration `registration` of signal `token` keeps
     /// for `req`, while they are still good. What is kept for the signal
     /// and no longer good (past its moment, another registration's) is
@@ -139,7 +109,6 @@ impl Reach {
     /// nothing is kept for it.
     pub fn forget(&self, token: &str) {
         self.credentials.remove(token);
-        self.addresses.retain(|(kept_for, _), _| kept_for != token);
     }
 
     /// A connection was made again or removed somewhere: no credential
@@ -200,18 +169,14 @@ mod tests {
     /// Past the bound, the longest kept go first, so a copy that served
     /// many signals once keeps no more than the bound.
     #[test]
-    fn each_map_keeps_at_most_the_bound_the_longest_kept_going_first() {
+    fn at_most_the_bound_is_kept_the_longest_kept_going_first() {
         let reach = Reach::default();
         for n in 0..=KEPT_AT_MOST {
             reach.keep_credentials(&format!("sig-{n}"), 1, &request(), source(None));
-            reach.keep_address(&format!("sig-{n}"), "h:1", ListenerInfraAddress { authority: "h:1".into(), is_infra: false });
         }
         assert_eq!(reach.credentials.len(), KEPT_AT_MOST);
-        assert_eq!(reach.addresses.len(), KEPT_AT_MOST);
         assert!(reach.credentials("sig-0", 1, &request()).is_none(), "the first kept went");
-        assert!(reach.address("sig-0", "h:1").is_none());
         let last = format!("sig-{KEPT_AT_MOST}");
         assert!(reach.credentials(&last, 1, &request()).is_some());
-        assert!(reach.address(&last, "h:1").is_some());
     }
 }

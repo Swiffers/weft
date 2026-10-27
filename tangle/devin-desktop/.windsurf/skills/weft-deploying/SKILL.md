@@ -200,6 +200,31 @@ minute and a half for the program, plus however long the frontend's build
 takes, plus however long the runs going take to end while `RUNNING` is
 `wait`.
 
+If the cloud build of the project's worker fails, or the cloud refuses a
+program for a missing need, look at the `[build.worker]` section of
+`weft.toml`, which the worker's image on the cloud is built from:
+
+- `base_image`: the image it starts from, `debian:bookworm-slim` when unset.
+- `dockerfile_template`: the path, from the project folder, to a Dockerfile
+  used instead of weft's. A missing file fails the build naming the path.
+  Without the `{{install_runtime_system_packages}}` placeholder in it, every
+  program whose nodes have a `run` need is refused.
+- `package_manager` (`apt`, `dnf`, `apk` or `brew`): how the nodes' needs
+  are installed. It is required when the image's name before its tag
+  (ignoring case) contains none of `debian`, `ubuntu`, `alpine`, `rocky`,
+  `almalinux`, `centos`, `fedora`, `amazonlinux`, `oraclelinux`, `rhel`,
+  `homebrew` or `/brew`, and does not itself start with `python` (so
+  `docker.io/library/python:3.12` needs it and `python:3.12` does not);
+  without it the build fails with `base_image ... is of no family weft
+  knows`. When set, it wins over the family weft reads from the name.
+
+A build that fails with `none matches the project's base image` means a
+node's need has packages for this manager but not for this distro: add a
+`default` (or that distro key) under `[needs.install.<manager>]` in the
+node's `deps.toml`. If any of the three is set, the cloud builds an image
+for this project alone. A local run never builds this image, so a project
+proven on this machine can still fail its cloud build on this section.
+
 ## A project's frontend: `weft frontend`
 
 A frontend is a website that calls the install on its visitors' behalf.

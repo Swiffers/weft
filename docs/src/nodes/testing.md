@@ -231,6 +231,17 @@ weft test-node SlackSendMessage --tier live
 The runner tells you it will spend money and asks. `--yes` skips that, and it
 can remember your answer.
 
+A live test runs on your machine's own install: the runner compiles a test
+server for the node's package with your own Rust and starts it there as a
+program. Pointed at an install that is not on this machine (`--on` a cloud
+install, or `--dispatcher` an address no install here answers at), it
+refuses,
+saying `live node tests run on this machine's own install`. Before it starts
+a test server, it checks what the tested nodes need while they run, and refuses
+with the same header and install line as a refused run when something is missing (for those,
+go and read [what nodes need from your
+machine](../running/cli.md#what-nodes-need-from-your-machine)).
+
 For credentials, `--connection slack=<grant-id>` uses one you already have, and
 `--key slack` takes a throwaway one: each field comes from
 `WEFT_NODE_TEST_SLACK_<FIELD>` if it is set, or a prompt, never from the
@@ -248,13 +259,11 @@ the shell you run `weft test-node` from, and the test reads it with
 `rig.fixture("CHAT_ID")`. If any fixture is missing, the runner lists every
 variable to set, with its label, before it runs anything.
 
-If your node waits on a signal (`ctx.await_signal`), a live test waits for the
-real answer, held in the node's call the way it is in
-[a run that cannot pause](durable-execution.md#when-the-run-cannot-pause). On your
-machine it waits as long as the job behind it takes. On a cloud install the
-whole test has the platform's limit on one request, counted from when the
-test started: on Google Cloud it is stopped 59 minutes in, and a wait still
-held fails saying so.
+If your node waits on a signal (`ctx.await_signal`), a live test keeps the
+node's call open and waits for the real answer, the way [a run that cannot
+pause](durable-execution.md#when-the-run-cannot-pause) does, except that it
+always holds for the longest time allowed, 30 days, whatever `holdSecs` the
+project sets.
 
 ## What to write
 

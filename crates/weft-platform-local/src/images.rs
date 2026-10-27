@@ -1,42 +1,447 @@
-//! Images on the local Docker daemon: built with `docker build`, kept in
-//! the daemon's own image store (no registry; the containers the runner
-//! and the infra host start use them straight from there).
+//! Workers on this machine as programs, and infra images.
+//!
+//! A worker is no image here: it is a program the machine runs as a
+//! process (`runner`), compiled on the machine from the host recipe the
+//! compiler writes (`host_build`) into its folder in the machine's workers
+//! folder (`layout::MachineLayout::workers`), shared by every install on
+//! the machine, each holding it under a name of its own (`held-by/`). A
+//! node package's test server is a program the same way ([`Program`]).
+//! An infra image is built with `docker build` and kept in the Docker
+//! daemon's own image store under the install's own names (no registry;
+//! the infra host's containers use it straight from there).
 //!
 //! A build runs in this process. After a restart, a build it was running
 //! is gone ([`BuildStatus::Gone`]), and the ledger lets the next caller
 //! start it again.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use weft_core::builds::{BuildRecipe, WorkerPackaging, NODE_TEST_REPO, WORKER_REPO};
 use weft_platform_traits::{BuildHandle, BuildRequest, BuildStatus, ImageBuilder, ImageDeleted};
 
 use crate::docker::{self, Docker};
+use crate::host_build::{self, HostBuilt, Toolchain};
+use crate::layout::{InstallLayout, MachineLayout};
 
 /// How many of a failed build's last output lines its failure keeps.
 const FAILURE_LOG_LINES: usize = 60;
 
+/// One of weft's own programs, which a local install runs as a process
+/// where the cloud runs an image: what its ref names. A program's ref is
+/// its bare tag (`weft-worker:<hash>`, `weft-node-tests:<hash>`), the same
+/// for every install: each holds it through a file of its own in the
+/// program's folder, never through a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Program<'a> {
+    /// A project's worker, by its binary hash.
+    Worker(&'a str),
+    /// A node package's test server (`weft_engine::test_runner`), by its
+    /// test hash.
+    NodeTestServer(&'a str),
+}
 
-pub struct DockerImageBuilder {
+impl<'a> Program<'a> {
+    /// The program `image_ref` names; `None` for an image (an infra
+    /// unit's) or a ref no program is spelled as.
+    pub fn of(image_ref: &'a str) -> Option<Self> {
+        let (repo, hash) = image_ref.split_once(':')?;
+        // Never a path out of the folder.
+        if hash.is_empty() || !hash.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return None;
+        }
+        match repo {
+            WORKER_REPO => Some(Self::Worker(hash)),
+            NODE_TEST_REPO => Some(Self::NodeTestServer(hash)),
+            _ => None,
+        }
+    }
+
+    /// Its folder in the machine's workers folder `workers`
+    /// (`MachineLayout::workers`): the program, the record of what its build
+    /// left out, and the installs holding it.
+    pub fn dir(&self, workers: &Path) -> PathBuf {
+        match self {
+            Self::Worker(hash) => workers.join(hash),
+            Self::NodeTestServer(hash) => crate::layout::node_test_servers_in(workers).join(hash),
+        }
+    }
+
+    /// The program file.
+    pub fn file(&self, workers: &Path) -> PathBuf {
+        self.dir(workers).join(host_build::PROGRAM_FILE)
+    }
+
+    /// What it is started with: a worker serves as it is; the test
+    /// program's other subcommands are for running it by hand.
+    // SYNC: the test server's start command <-> crates/weft-engine/src/test_runner.rs (Args::Serve)
+    pub fn args(&self) -> &'static [&'static str] {
+        match self {
+            Self::Worker(_) => &[],
+            Self::NodeTestServer(_) => &["serve"],
+        }
+    }
+}
+
+/// The binary hashes of the worker programs `install` (its label) holds
+/// in the machine's workers folder `workers`.
+pub fn held_workers(workers: &Path, install: &str) -> anyhow::Result<Vec<String>> {
+    programs::held_workers(workers, install)
+}
+
+/// Remove the worker programs in the machine's workers folder `workers`
+/// that nothing uses any more, answering their binary hashes: first every
+/// hold of an install not in `installs` (the labels of the installs on the
+/// machine) goes, then every worker no install holds and no install's
+/// record names as its standard worker (the standard worker of a weft an
+/// update replaced, a removed install's programs). A test server is never
+/// one: the next build of its package replaces it.
+pub fn reclaim_workers(workers: &Path, installs: &[String]) -> anyhow::Result<Vec<String>> {
+    programs::reclaim_workers(workers, installs)
+}
+
+pub struct LocalImageBuilder {
     docker: Arc<dyn Docker>,
-    /// The install whose names the images go under
-    /// (`Install::local_image_ref`).
+    toolchain: Arc<dyn Toolchain>,
+    /// The install whose names the infra images go under
+    /// (`Install::local_image_ref`), and whose label holds its programs.
     install: weft_core::infra::Install,
-    /// The install's folder, whose image record a build adds what it uses
-    /// to (`weft_core::images::ImageRefs::add_build`).
-    install_dir: std::path::PathBuf,
+    /// The install's own folders: its build logs.
+    install_dir: InstallLayout,
+    /// The machine's folders: the worker programs, their compile caches
+    /// and shared crates, which every install shares.
+    machine: MachineLayout,
+    /// How many compile lanes the machine has (`lanes::lane_count`).
+    lanes: u32,
     builds: Arc<parking_lot::Mutex<HashMap<String, Build>>>,
 }
 
 enum Build {
-    Running(tokio::task::AbortHandle),
+    /// Its task, and for a program, the hold this install took on it
+    /// before building: a build released while it runs lets go of it, since
+    /// the task that would have is stopped.
+    Running { task: tokio::task::AbortHandle, hold: Option<ProgramHold> },
     Ended(BuildStatus),
 }
 
-impl DockerImageBuilder {
-    pub fn new(docker: Arc<dyn Docker>, install: weft_core::infra::Install, install_dir: std::path::PathBuf) -> Self {
-        Self { docker, install, install_dir, builds: Arc::default() }
+/// An install's hold on one program ([`programs::hold`]): what
+/// [`programs::let_go`] needs to give it up.
+#[derive(Clone)]
+struct ProgramHold {
+    workers: PathBuf,
+    image_ref: String,
+    label: String,
+}
+
+impl ProgramHold {
+    /// Take the hold ([`programs::hold`]), on the blocking pool.
+    async fn take(&self) -> anyhow::Result<()> {
+        let hold = self.clone();
+        blocking(move || programs::hold(&hold.workers, &hold.image_ref, &hold.label)).await
+    }
+
+    /// Give the hold up ([`programs::let_go`]), on the blocking pool.
+    async fn let_go(self) -> anyhow::Result<ImageDeleted> {
+        blocking(move || programs::let_go(&self.workers, &self.image_ref, &self.label)).await
+    }
+}
+
+impl LocalImageBuilder {
+    pub fn new(
+        docker: Arc<dyn Docker>,
+        toolchain: Arc<dyn Toolchain>,
+        install: weft_core::infra::Install,
+        install_dir: InstallLayout,
+        machine: MachineLayout,
+        lanes: u32,
+    ) -> Self {
+        Self { docker, toolchain, install, install_dir, machine, lanes, builds: Arc::default() }
+    }
+
+    /// This install's hold on the program `image_ref` names.
+    fn hold_of(&self, image_ref: &str) -> ProgramHold {
+        ProgramHold { workers: self.machine.workers(), image_ref: image_ref.to_string(), label: self.install.label_value().to_string() }
+    }
+
+    /// Build the program `req` names from the host recipe in its context,
+    /// in a free lane of the machine (waiting for one), or take the one
+    /// another install already built.
+    async fn start_host(&self, req: BuildRequest) -> anyhow::Result<BuildHandle> {
+        let name = req.name.clone();
+        let hold = self.hold_of(&req.image_ref);
+        let out_dir = Program::of(&hold.image_ref).expect("start routes only a program here").dir(&hold.workers);
+        // This install's hold on the program, taken before anything is
+        // built, so another install letting go of its own meanwhile never
+        // removes the folder under this build.
+        hold.take().await?;
+        if out_dir.join(host_build::PROGRAM_FILE).is_file() {
+            let status = match tokio::fs::read(out_dir.join(host_build::LEFT_OUT_FILE)).await {
+                Ok(record) => BuildStatus::Succeeded { result: Some(record) },
+                Err(e) => BuildStatus::Failed {
+                    reason: format!("the program in {} has no record of what its build left out ({e}); remove the folder to build it again", out_dir.display()),
+                },
+            };
+            self.builds.lock().insert(name.clone(), Build::Ended(status));
+            return Ok(BuildHandle::named(name));
+        }
+        let log = self.install_dir.build_log(&req.image_ref);
+        let (toolchain, machine, lanes, builds, task_name, task_log) =
+            (self.toolchain.clone(), self.machine.clone(), self.lanes, self.builds.clone(), name.clone(), log.clone());
+        // The task's own copy, for a build that fails; the table keeps the
+        // other, for a build released while it runs.
+        let task_hold = hold.clone();
+        let mut table = self.builds.lock();
+        let task = tokio::spawn(async move {
+            let built = host_build::compile(
+                toolchain.as_ref(),
+                &machine,
+                host_build::CompileIn::Lane { lanes },
+                &req.context_dir,
+                out_dir,
+                &task_log,
+                || tracing::info!(target: "weft_platform_local::images", "every compile lane of this machine is busy; a build waits for one"),
+            )
+            .await;
+            // The context is read until the build ends.
+            drop(req.staging);
+            let status = match built {
+                Ok(HostBuilt::Built(record)) => BuildStatus::Succeeded { result: Some(record) },
+                Ok(HostBuilt::Failed(why)) => {
+                    let _ = task_hold.let_go().await;
+                    BuildStatus::Failed {
+                        reason: match tokio::fs::read_to_string(&task_log).await {
+                            Ok(text) => format!("{}\n{why}", tail(&text, FAILURE_LOG_LINES)),
+                            Err(e) => format!("{why}, and its log {} could not be read: {e}", task_log.display()),
+                        },
+                    }
+                }
+                Err(e) => {
+                    let _ = task_hold.let_go().await;
+                    BuildStatus::Failed { reason: format!("{e:#}") }
+                }
+            };
+            if let Some(entry) = builds.lock().get_mut(&task_name) {
+                *entry = Build::Ended(status);
+            }
+        });
+        table.insert(name.clone(), Build::Running { task: task.abort_handle(), hold: Some(hold) });
+        Ok(BuildHandle { external_build_id: name, log_url: Some(log.display().to_string()) })
+    }
+
+    /// `docker build` of the infra image whose Dockerfile is in `req`'s
+    /// context, or the image another install on this daemon already holds
+    /// under the same tag.
+    async fn start_docker(&self, req: BuildRequest) -> anyhow::Result<BuildHandle> {
+        let name = req.name.clone();
+        let image_ref = req.image_ref.clone();
+        let docker = self.docker.clone();
+        let builds = self.builds.clone();
+        let task_name = name.clone();
+        // An image another install on this daemon holds is taken as it is,
+        // with nothing built, and its staging let go of at once.
+        if adopt(docker.as_ref(), &image_ref).await? {
+            self.builds.lock().insert(name.clone(), Build::Ended(BuildStatus::Succeeded { result: None }));
+            return Ok(BuildHandle::named(name));
+        }
+        let log = self.install_dir.build_log(&image_ref);
+        if let Some(dir) = log.parent() {
+            tokio::fs::create_dir_all(dir).await.map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
+        }
+        let args = build_args(&req);
+        // `docker build` reads the context while it runs, after the
+        // request that staged it answered: the build task keeps the
+        // staging until docker is done with it, and an abort (`release`)
+        // drops it with the task; either way the directory goes on a
+        // blocking thread (`Staging`).
+        let staging = req.staging;
+        // Held until the build is registered, so a fast build never
+        // records its end before its start.
+        let mut table = self.builds.lock();
+        let task_log = log.clone();
+        let task = tokio::spawn(async move {
+            // The whole output is the build's log (`BuildHandle::log_url`),
+            // written as docker prints it, so it can be followed while the
+            // build runs.
+            let code = docker.exec_logged(&args, &task_log).await;
+            drop(staging);
+            let status = match code {
+                Ok(0) => BuildStatus::Succeeded { result: None },
+                Ok(_) => BuildStatus::Failed {
+                    reason: match tokio::fs::read_to_string(&task_log).await {
+                        Ok(text) => tail(&text, FAILURE_LOG_LINES),
+                        Err(e) => format!("docker build failed, and its log {} could not be read: {e}", task_log.display()),
+                    },
+                },
+                Err(e) => BuildStatus::Failed { reason: format!("{e:#}") },
+            };
+            if let Some(entry) = builds.lock().get_mut(&task_name) {
+                *entry = Build::Ended(status);
+            }
+        });
+        table.insert(name.clone(), Build::Running { task: task.abort_handle(), hold: None });
+        Ok(BuildHandle { external_build_id: name, log_url: Some(log.display().to_string()) })
+    }
+}
+
+/// Run the blocking `f` (a file lock, a folder walk) off the async runtime.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
+    tokio::task::spawn_blocking(f).await.map_err(|e| anyhow::anyhow!("a blocking step of a build stopped: {e}"))?
+}
+
+/// Which installs hold each program ([`Program`], by its ref): a file per
+/// install in the program's `held-by/` folder, named by the install's
+/// label. A program goes once no install holds it and, for a worker, no
+/// install's image record names it as its standard worker. Every change
+/// happens under one lock on the workers folder, so a build taking its
+/// hold and a removal letting go never cross.
+mod programs {
+    use std::path::{Path, PathBuf};
+
+    use weft_platform_traits::ImageDeleted;
+
+    use super::Program;
+
+    const HELD_BY: &str = "held-by";
+    const LOCK: &str = ".lock";
+
+    fn turn(workers: &Path) -> anyhow::Result<std::fs::File> {
+        let path = workers.join(LOCK);
+        weft_core::file_lock::hold(&path, || {
+            tracing::info!(target: "weft_platform_local::images", "waiting for another install to finish with the machine's worker programs")
+        })
+        .map_err(|e| anyhow::anyhow!("lock {}: {e}", path.display()))
+    }
+
+    fn dir_of(workers: &Path, image_ref: &str) -> anyhow::Result<PathBuf> {
+        Ok(Program::of(image_ref).ok_or_else(|| anyhow::anyhow!("{image_ref} names no program of weft's"))?.dir(workers))
+    }
+
+    /// `install` holds the program `image_ref` names from now on (its
+    /// folder made if missing).
+    pub fn hold(workers: &Path, image_ref: &str, install: &str) -> anyhow::Result<()> {
+        let _turn = turn(workers)?;
+        let held = dir_of(workers, image_ref)?.join(HELD_BY);
+        std::fs::create_dir_all(&held).map_err(|e| anyhow::anyhow!("create {}: {e}", held.display()))?;
+        std::fs::write(held.join(install), b"").map_err(|e| anyhow::anyhow!("write {}: {e}", held.join(install).display()))
+    }
+
+    /// Whether `install` holds the program `program`.
+    pub fn holds(workers: &Path, program: Program<'_>, install: &str) -> bool {
+        program.dir(workers).join(HELD_BY).join(install).is_file()
+    }
+
+    /// The binary hashes of the worker programs `install` holds.
+    pub fn held_workers(workers: &Path, install: &str) -> anyhow::Result<Vec<String>> {
+        let entries = match std::fs::read_dir(workers) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => anyhow::bail!("read {}: {e}", workers.display()),
+        };
+        let mut held = Vec::new();
+        for entry in entries {
+            let name = entry.map_err(|e| anyhow::anyhow!("read {}: {e}", workers.display()))?.file_name().to_string_lossy().to_string();
+            if let Some(Program::Worker(hash)) = Program::of(&format!("{}:{name}", super::WORKER_REPO)) {
+                if holds(workers, Program::Worker(hash), install) {
+                    held.push(hash.to_string());
+                }
+            }
+        }
+        held.sort();
+        Ok(held)
+    }
+
+    /// `install` no longer holds the program `image_ref` names: its
+    /// folder goes when nobody else holds it and, for a worker, no install
+    /// on the machine (`machine_dir`, and each folder of `installs/`)
+    /// names it as its standard worker.
+    pub fn let_go(workers: &Path, image_ref: &str, install: &str) -> anyhow::Result<ImageDeleted> {
+        let machine_dir = workers.parent().expect("the workers folder is in weft's data folder");
+        let program = Program::of(image_ref).ok_or_else(|| anyhow::anyhow!("{image_ref} names no program of weft's"))?;
+        let _turn = turn(workers)?;
+        let dir = program.dir(workers);
+        if !dir.exists() {
+            return Ok(ImageDeleted::Absent);
+        }
+        let mine = dir.join(HELD_BY).join(install);
+        if let Err(e) = std::fs::remove_file(&mine) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                anyhow::bail!("remove {}: {e}", mine.display());
+            }
+        }
+        let others = match std::fs::read_dir(dir.join(HELD_BY)) {
+            Ok(entries) => entries.count(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => anyhow::bail!("read {}: {e}", dir.join(HELD_BY).display()),
+        };
+        let standard = match program {
+            Program::Worker(hash) => a_standard_worker(machine_dir, hash)?,
+            Program::NodeTestServer(_) => false,
+        };
+        if others == 0 && !standard {
+            std::fs::remove_dir_all(&dir).map_err(|e| anyhow::anyhow!("remove {}: {e}", dir.display()))?;
+        }
+        Ok(ImageDeleted::Deleted)
+    }
+
+    /// [`super::reclaim_workers`].
+    pub fn reclaim_workers(workers: &Path, installs: &[String]) -> anyhow::Result<Vec<String>> {
+        let machine_dir = workers.parent().expect("the workers folder is in weft's data folder");
+        if !workers.is_dir() {
+            return Ok(Vec::new());
+        }
+        let _turn = turn(workers)?;
+        let entries = std::fs::read_dir(workers).map_err(|e| anyhow::anyhow!("read {}: {e}", workers.display()))?;
+        let mut removed = Vec::new();
+        for entry in entries {
+            let name = entry.map_err(|e| anyhow::anyhow!("read {}: {e}", workers.display()))?.file_name().to_string_lossy().to_string();
+            let image_ref = format!("{}:{name}", super::WORKER_REPO);
+            let Some(Program::Worker(hash)) = Program::of(&image_ref) else { continue };
+            let dir = Program::Worker(hash).dir(workers);
+            let held = dir.join(HELD_BY);
+            let mut holders = 0;
+            match std::fs::read_dir(&held) {
+                Ok(entries) => {
+                    for holder in entries {
+                        let holder = holder.map_err(|e| anyhow::anyhow!("read {}: {e}", held.display()))?;
+                        if installs.iter().any(|install| holder.file_name().to_str() == Some(install)) {
+                            holders += 1;
+                        } else {
+                            std::fs::remove_file(holder.path()).map_err(|e| anyhow::anyhow!("remove {}: {e}", holder.path().display()))?;
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => anyhow::bail!("read {}: {e}", held.display()),
+            }
+            if holders == 0 && !a_standard_worker(machine_dir, hash)? {
+                std::fs::remove_dir_all(&dir).map_err(|e| anyhow::anyhow!("remove {}: {e}", dir.display()))?;
+                removed.push(hash.to_string());
+            }
+        }
+        removed.sort();
+        Ok(removed)
+    }
+
+    /// Whether any install on the machine names the program `hash` as its
+    /// standard worker (`ImageRefs::standard_worker`).
+    fn a_standard_worker(machine_dir: &Path, hash: &str) -> anyhow::Result<bool> {
+        let tag = format!("{}:{hash}", super::WORKER_REPO);
+        let mut dirs = vec![machine_dir.to_path_buf()];
+        match std::fs::read_dir(machine_dir.join("installs")) {
+            Ok(entries) => dirs.extend(entries.filter_map(Result::ok).map(|e| e.path())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => anyhow::bail!("read {}: {e}", machine_dir.join("installs").display()),
+        }
+        for dir in dirs {
+            if let Some(record) = weft_core::images::ImageRefs::load(&dir)? {
+                if record.standard_worker.rsplit('/').next() == Some(tag.as_str()) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -76,74 +481,14 @@ async fn adopt(docker: &dyn Docker, image_ref: &str) -> anyhow::Result<bool> {
 
 /// `docker build` for `req`.
 fn build_args(req: &BuildRequest) -> Vec<String> {
-    let mut args = vec!["build".to_string(), "--tag".into(), req.image_ref.clone()];
-    for (k, v) in &req.build_args {
-        args.extend(["--build-arg".into(), format!("{k}={v}")]);
-    }
-    args.extend(["--file".into(), req.context_dir.join("Dockerfile").display().to_string()]);
-    args.push(req.context_dir.display().to_string());
-    args
-}
-
-/// How a build that produced `image_ref` ended: `result_file`'s bytes read
-/// out of the image when the request named one, without running it
-/// (`docker create` makes a container that never starts, `docker cp`
-/// copies the file out of it, `docker rm` removes it). A named file the
-/// image lacks fails the build: the request said the image carries it.
-async fn built(docker: &dyn Docker, install: &str, image_ref: &str, result_file: Option<&str>) -> BuildStatus {
-    let Some(path) = result_file else { return BuildStatus::Succeeded { result: None } };
-    match read_from_image(docker, install, image_ref, path).await {
-        Ok(bytes) => BuildStatus::Succeeded { result: Some(bytes) },
-        Err(e) => BuildStatus::Failed { reason: format!("the build produced {image_ref}, but its result {path} could not be read from it: {e:#}") },
-    }
-}
-
-/// The bytes of `path` inside `image_ref`. The copy lands in a temp file
-/// first: `docker cp` to stdout is a tar stream, and the `Docker` trait
-/// hands output back as text.
-///
-/// The container is labelled as the image's result reader
-/// (`docker::roles::BUILD_RESULT`), so one a crash leaves between the
-/// create and the remove is found and removed with its image
-/// (`delete_image`) instead of keeping it in use for good.
-async fn read_from_image(docker: &dyn Docker, install: &str, image_ref: &str, path: &str) -> anyhow::Result<Vec<u8>> {
-    let mut create = vec!["create".to_string()];
-    create.extend(docker::label_args(&std::collections::BTreeMap::from([
-        (docker::labels::INSTALL, install.to_string()),
-        (docker::labels::ROLE, docker::roles::BUILD_RESULT.to_string()),
-        (docker::labels::IMAGE, image_ref.to_string()),
-    ])));
-    // The command is never run; it is there so an image that names none
-    // of its own (`FROM scratch` and a file) can still be created.
-    create.extend([image_ref.to_string(), "weft-never-run".to_string()]);
-    let id = docker::run(docker, create).await?.trim().to_string();
-    let copy = std::env::temp_dir().join(format!("weft-build-result-{}", uuid::Uuid::new_v4().simple()));
-    let read = async {
-        docker::run(docker, vec!["cp".into(), format!("{id}:{path}"), copy.display().to_string()]).await?;
-        tokio::fs::read(&copy).await.map_err(|e| anyhow::anyhow!("read the copy of {path} at {}: {e}", copy.display()))
-    }
-    .await;
-    // Whatever the copy did: a leftover container would keep the image in
-    // use. Removing it failing never hides how the read went.
-    if let Err(e) = docker::remove_containers(docker, std::slice::from_ref(&id)).await {
-        tracing::warn!(target: "weft_platform_local::images", container = %id, error = %format!("{e:#}"), "could not remove the container a build result was read from");
-    }
-    if let Err(e) = tokio::fs::remove_file(&copy).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(target: "weft_platform_local::images", file = %copy.display(), error = %e, "could not remove the copy of a build result");
-        }
-    }
-    read
-}
-
-/// Where this install keeps the log of the build of `image_ref`: one file
-/// per image, which lives as long as the install holds the image
-/// (`delete_image` removes it), so a refusal naming it a month later
-/// still points at a file. The folder is made when missing.
-async fn build_log(install_dir: &std::path::Path, image_ref: &str) -> anyhow::Result<std::path::PathBuf> {
-    let dir = install_dir.join("build-logs");
-    tokio::fs::create_dir_all(&dir).await.map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
-    Ok(dir.join(format!("{}.log", image_ref.replace(['/', ':'], "_"))))
+    vec![
+        "build".to_string(),
+        "--tag".into(),
+        req.image_ref.clone(),
+        "--file".into(),
+        req.context_dir.join("Dockerfile").display().to_string(),
+        req.context_dir.display().to_string(),
+    ]
 }
 
 fn tail(text: &str, lines: usize) -> String {
@@ -152,130 +497,112 @@ fn tail(text: &str, lines: usize) -> String {
 }
 
 #[async_trait]
-impl ImageBuilder for DockerImageBuilder {
-    /// The install's own name for the image (`Install::local_image_ref`).
+impl ImageBuilder for LocalImageBuilder {
+    /// A program's bare tag ([`Program`]); for an infra image, the
+    /// install's own name for it (`Install::local_image_ref`).
     fn image_ref(&self, tag: &str) -> String {
-        self.install.local_image_ref(tag)
+        match Program::of(tag) {
+            Some(_) => tag.to_string(),
+            None => self.install.local_image_ref(tag),
+        }
     }
 
-    /// Takes the image another install on this daemon already holds under
-    /// the same tag when there is one (a name added, nothing built), and
-    /// runs `docker build` otherwise.
+    /// Workers here are programs compiled on the machine, sharing the
+    /// machine's crates.
+    fn worker_packaging(&self) -> WorkerPackaging {
+        self.machine.host_packaging()
+    }
+
+    /// A worker is compiled on the machine (`host_build`), an infra image
+    /// built with `docker build`; either is taken as it is when another
+    /// install already made it.
     async fn start(&self, req: BuildRequest) -> anyhow::Result<BuildHandle> {
-        // Before anything is built or adopted: from here on a machine-wide
-        // sweep elsewhere keeps what this build uses (one already running
-        // holds the record, so this waits until it is done). The compile
-        // cache key follows the live checkout, so it can differ from the one
-        // the install's start recorded; the builder base is the one the
-        // start chose, added again at no cost.
-        let (dir, uses) = (self.install_dir.clone(), req.uses.clone());
-        tokio::task::spawn_blocking(move || {
-            weft_core::images::ImageRefs::add_build(&dir, &uses, || {
-                tracing::info!(target: "weft_platform_local::images", "a build waits for a cleanup to let go of the install's image record")
-            })
-        })
-            .await
-            .map_err(|e| anyhow::anyhow!("record the images a build uses: {e}"))??;
-        let name = req.name.clone();
-        let image_ref = req.image_ref.clone();
-        let docker = self.docker.clone();
-        let builds = self.builds.clone();
-        let task_name = name.clone();
-        let result_file = req.result_file.clone();
-        // An image another install on this daemon holds is taken as it is,
-        // with nothing built, and its staging let go of at once. Its result
-        // is read from it as a build's would be: the same content carries
-        // the same file.
-        let install = self.install.label_value().to_string();
-        if adopt(docker.as_ref(), &image_ref).await? {
-            let status = built(docker.as_ref(), &install, &image_ref, result_file.as_deref()).await;
-            self.builds.lock().insert(name.clone(), Build::Ended(status));
-            return Ok(BuildHandle::named(name));
+        match (&req.recipe, Program::of(&req.image_ref).is_some()) {
+            (BuildRecipe::Host, true) => self.start_host(req).await,
+            (BuildRecipe::Dockerfile { result_file: None }, false) => self.start_docker(req).await,
+            (BuildRecipe::Host, false) => anyhow::bail!(
+                "build {} asks for a host build of {}, which is none of weft's programs: only a worker or a node test server is compiled on the machine",
+                req.name,
+                req.image_ref
+            ),
+            (BuildRecipe::Dockerfile { .. }, true) => anyhow::bail!(
+                "build {} asks for an image of the program {}, but a local install runs weft's programs as processes: \
+                 the build must be planned as a host build (this builder's worker packaging is `host`)",
+                req.name,
+                req.image_ref
+            ),
+            (BuildRecipe::Dockerfile { result_file: Some(file) }, false) => anyhow::bail!(
+                "build {} asks to read {file} out of the image {}, but a local install builds only infra images, which report nothing",
+                req.name,
+                req.image_ref
+            ),
         }
-        let log = build_log(&self.install_dir, &image_ref).await?;
-        let args = build_args(&req);
-        // `docker build` reads the context while it runs, after the
-        // request that staged it answered: the build task keeps the
-        // staging until docker is done with it, and an abort (`release`)
-        // drops it with the task; either way the directory goes on a
-        // blocking thread (`Staging`).
-        let staging = req.staging;
-        // Held until the build is registered, so a fast build never
-        // records its end before its start.
-        let mut table = self.builds.lock();
-        let task_log = log.clone();
-        let task = tokio::spawn(async move {
-            // The whole output is the build's log (`BuildHandle::log_url`),
-            // written as docker prints it, so it can be followed while the
-            // build runs: where a person reads every error of a package
-            // the worker left out, whose record keeps only the first line.
-            let code = docker.exec_logged(&args, &task_log).await;
-            drop(staging);
-            let status = match code {
-                Ok(0) => built(docker.as_ref(), &install, &image_ref, result_file.as_deref()).await,
-                Ok(_) => BuildStatus::Failed {
-                    reason: match tokio::fs::read_to_string(&task_log).await {
-                        Ok(text) => tail(&text, FAILURE_LOG_LINES),
-                        Err(e) => format!("docker build failed, and its log {} could not be read: {e}", task_log.display()),
-                    },
-                },
-                Err(e) => BuildStatus::Failed { reason: format!("{e:#}") },
-            };
-            if let Some(entry) = builds.lock().get_mut(&task_name) {
-                *entry = Build::Ended(status);
-            }
-        });
-        table.insert(name.clone(), Build::Running(task.abort_handle()));
-        Ok(BuildHandle { external_build_id: name, log_url: Some(log.display().to_string()) })
     }
 
     async fn poll(&self, handle: &BuildHandle) -> anyhow::Result<BuildStatus> {
         Ok(match self.builds.lock().get(&handle.external_build_id) {
-            Some(Build::Running(_)) => BuildStatus::Pending,
+            Some(Build::Running { .. }) => BuildStatus::Pending,
             Some(Build::Ended(status)) => status.clone(),
             None => BuildStatus::Gone,
         })
     }
 
+    /// A program is there when its file is and this install holds it
+    /// (one only another install holds is taken by a build, at no cost).
     async fn image_exists(&self, image_ref: &str) -> anyhow::Result<bool> {
+        if let Some(program) = Program::of(image_ref) {
+            let workers = self.machine.workers();
+            return Ok(program.file(&workers).is_file() && programs::holds(&workers, program, self.install.label_value()));
+        }
         Ok(self.docker.exec(&["image".into(), "inspect".into(), image_ref.into()]).await?.success())
     }
 
+    /// A build still running is stopped, and a program's lets go of the
+    /// hold it took (the program folder goes with the last hold, a part
+    /// copied in with it). The dispatcher joins same-image builds of one
+    /// install into one build, so no other build of this install relies on
+    /// that hold.
     async fn release(&self, handle: &BuildHandle) {
-        if let Some(Build::Running(task)) = self.builds.lock().remove(&handle.external_build_id) {
+        let removed = self.builds.lock().remove(&handle.external_build_id);
+        if let Some(Build::Running { task, hold }) = removed {
             task.abort();
+            if let Some(hold) = hold {
+                let image_ref = hold.image_ref.clone();
+                if let Err(e) = hold.let_go().await {
+                    tracing::warn!(target: "weft_platform_local::images", image = %image_ref, error = %format!("{e:#}"), "a released build could not let go of its program, so its folder stays in the machine's workers folder");
+                }
+            }
         }
     }
 
-    /// Removes this install's name for the image (`docker image rm` of
-    /// that name). Docker deletes the image itself only with its last
-    /// name, so an image another install still holds under its own name
-    /// stays for that install.
+    /// Removes this install's name for the image: its hold on a program
+    /// (the program goes with the last one, `programs::let_go`),
+    /// or its Docker name on an infra image (`docker image rm` of that
+    /// name: Docker deletes the image itself only with its last name, so
+    /// an image another install still holds under its own name stays for
+    /// that install).
     async fn delete_image(&self, image_ref: &str) -> anyhow::Result<ImageDeleted> {
-        // A result reader a crash left behind holds the image in use and
-        // nothing else will ever remove it (`read_from_image`).
-        let readers: Vec<String> = docker::containers(
-            self.docker.as_ref(),
-            self.install.label_value(),
-            &[(docker::labels::ROLE, docker::roles::BUILD_RESULT), (docker::labels::IMAGE, image_ref)],
-        )
-        .await?
-        .into_iter()
-        .map(|row| row.name)
-        .collect();
-        docker::remove_containers(self.docker.as_ref(), &readers).await?;
-        let args = vec!["image".to_string(), "rm".into(), image_ref.into()];
-        let out = self.docker.exec(&args).await?;
-        let gone = out.success() || out.stderr.contains("No such image");
-        if gone {
+        let deleted = match Program::of(image_ref) {
+            Some(_) => self.hold_of(image_ref).let_go().await?,
+            None => self.delete_docker_image(image_ref).await?,
+        };
+        if deleted != ImageDeleted::InUse {
             // Its log goes with the install's name for it (`build_log`).
-            let log = build_log(&self.install_dir, image_ref).await?;
+            let log = self.install_dir.build_log(image_ref);
             if let Err(e) = tokio::fs::remove_file(&log).await {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(target: "weft_platform_local::images", log = %log.display(), error = %e, "could not remove a deleted image's build log");
                 }
             }
         }
+        Ok(deleted)
+    }
+}
+
+impl LocalImageBuilder {
+    async fn delete_docker_image(&self, image_ref: &str) -> anyhow::Result<ImageDeleted> {
+        let args = vec!["image".to_string(), "rm".into(), image_ref.into()];
+        let out = self.docker.exec(&args).await?;
         if out.success() {
             Ok(ImageDeleted::Deleted)
         } else if out.stderr.contains("No such image") {
@@ -290,7 +617,8 @@ impl ImageBuilder for DockerImageBuilder {
 
 /// The most BuildKit's cache may hold. Over it, the least recently used
 /// records go first until it fits, so what the last builds used (the
-/// current builder base's layers, the compile caches) is the last to go.
+/// infra images' layers, the runtime image's compile cache) is the last
+/// to go.
 // SYNC: the cap and the prune flags <-> setup.sh (the "bound BuildKit cache" prune)
 pub const BUILD_CACHE_CAP: &str = "20GB";
 
@@ -310,7 +638,7 @@ fn build_cache_bound_args() -> Vec<String> {
 
 /// Keep BuildKit's cache under [`BUILD_CACHE_CAP`], least recently used
 /// first. The same bound `setup.sh` applies, applied while the install
-/// runs, since every project build adds to the cache between installs.
+/// runs, since every infra image build adds to the cache between installs.
 pub async fn bound_build_cache(docker: &dyn Docker) -> anyhow::Result<()> {
     docker::run(docker, build_cache_bound_args()).await.map(|_| ())
 }
@@ -319,6 +647,8 @@ pub async fn bound_build_cache(docker: &dyn Docker) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::docker::fake::FakeDocker;
+    use crate::host_build::fake::FakeToolchain;
+    use weft_core::builds::{HostRecipe, HOST_RECIPE_FILE};
     use weft_platform_traits::Staging;
 
     /// A staged directory, removed when dropped, as the dispatcher's
@@ -331,9 +661,9 @@ mod tests {
         }
     }
 
-    /// A request for a staged context (a Dockerfile and a file it copies)
-    /// that the request holds only through its staging, as a build request
-    /// that answered does.
+    /// A request for an infra image's staged context (a Dockerfile and a
+    /// file it copies) that the request holds only through its staging,
+    /// as a build request that answered does.
     fn req(name: &str) -> BuildRequest {
         let dir = std::env::temp_dir().join(format!("weft-staged-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -344,15 +674,29 @@ mod tests {
             project_id: uuid::Uuid::from_u128(1),
             tenant: "local".into(),
             context_dir: dir.clone(),
+            recipe: BuildRecipe::Dockerfile { result_file: None },
             staging: Staging::new(Staged(dir)),
-            image_ref: "weft-worker:abc".into(),
-            build_args: vec![("WEFT_COMPILE_LANE".into(), "2".into())],
-            uses: Default::default(),
-            result_file: None,
+            image_ref: "weft-infra-pg:abc".into(),
         }
     }
 
-    async fn settled(b: &DockerImageBuilder, h: &BuildHandle) -> BuildStatus {
+    /// A builder whose host builds nobody runs, for the Docker side, with
+    /// its install and machine folders in a temporary folder of its own
+    /// (kept until the returned folder drops), so tests run side by side
+    /// never share a build log.
+    fn docker_builder(docker: Arc<dyn Docker>, install: weft_core::infra::Install) -> (LocalImageBuilder, tempfile::TempDir) {
+        let dirs = tempfile::tempdir().unwrap();
+        (docker_builder_in(docker, install, dirs.path().to_path_buf()), dirs)
+    }
+
+    /// A builder whose host builds nobody runs, on the install folder the
+    /// test reads back.
+    fn docker_builder_in(docker: Arc<dyn Docker>, install: weft_core::infra::Install, install_dir: std::path::PathBuf) -> LocalImageBuilder {
+        let machine = MachineLayout::new(install_dir.join("machine"));
+        LocalImageBuilder::new(docker, Arc::new(FakeToolchain::default()), install, InstallLayout::new(install_dir), machine, 1)
+    }
+
+    async fn settled(b: &LocalImageBuilder, h: &BuildHandle) -> BuildStatus {
         loop {
             match b.poll(h).await.unwrap() {
                 BuildStatus::Pending => tokio::task::yield_now().await,
@@ -391,11 +735,12 @@ mod tests {
     }
 
     /// `docker build` reads the staged context itself, untouched, and the
-    /// build keeps it on disk while it runs, letting go once it ends.
+    /// build keeps it on disk while it runs, letting go once it ends; an
+    /// infra image reports nothing.
     #[tokio::test]
     async fn a_build_runs_docker_build_on_the_staging_it_keeps() {
         let docker = Arc::new(HeldBuilds { docker: FakeDocker::new(), ends: tokio::sync::Semaphore::new(0) });
-        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::default_install(), std::env::temp_dir().join("weft-no-install"));
+        let (b, _dirs) = docker_builder(docker.clone(), weft_core::infra::Install::default_install());
         let first = req("b1");
         let dir = first.context_dir.clone();
         let h = b.start(first).await.unwrap();
@@ -407,7 +752,7 @@ mod tests {
         let call = &docker.docker.calls_to("build")[0];
         assert_eq!(
             call,
-            &["build", "--tag", "weft-worker:abc", "--build-arg", "WEFT_COMPILE_LANE=2", "--file"]
+            &["build", "--tag", "weft-infra-pg:abc", "--file"]
                 .into_iter()
                 .map(String::from)
                 .chain([dir.join("Dockerfile").display().to_string(), dir.display().to_string()])
@@ -417,46 +762,24 @@ mod tests {
         docker.ends.add_permits(1);
         assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: None });
         gone(&dir).await;
+        assert!(docker.docker.calls_to("create").is_empty(), "nothing is read out of an infra image");
 
         docker.docker.fail(&["build"], "error: cargo failed");
         docker.ends.add_permits(1);
         let h = b.start(req("b2")).await.unwrap();
-        assert!(matches!(settled(&b, &h).await, BuildStatus::Failed { reason } if reason.contains("cargo failed")));
+        let ended = settled(&b, &h).await;
+        assert!(matches!(&ended, BuildStatus::Failed { reason } if reason.contains("cargo failed")), "{ended:?}");
 
         b.release(&h).await;
         assert_eq!(b.poll(&h).await.unwrap(), BuildStatus::Gone, "a released build is gone");
         assert_eq!(b.poll(&BuildHandle::named("never")).await.unwrap(), BuildStatus::Gone);
     }
 
-    /// A build adds the builder base and compile cache it uses to its
-    /// install's image record before it starts, so a sweep keeps them.
-    #[tokio::test]
-    async fn a_build_records_what_it_uses_in_its_install() {
-        let install = std::env::temp_dir().join(format!("weft-install-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&install).unwrap();
-        let record = weft_core::images::ImageRefs {
-            runtime: "weft-runtime:r".into(),
-            standard_worker: "weft-worker:w".into(),
-            builder_bases: ["weft-builder-base:b1".to_string()].into(),
-            compile_cache_keys: ["k1".to_string()].into(),
-        };
-        record.save(&install).unwrap();
-        let docker = Arc::new(HeldBuilds { docker: FakeDocker::new(), ends: tokio::sync::Semaphore::new(1) });
-        let b = DockerImageBuilder::new(docker, weft_core::infra::Install::default_install(), install.clone());
-        let mut r = req("b1");
-        r.uses = weft_core::images::BuildUses { builder_base: Some("weft-builder-base:b2".into()), compile_cache_key: Some("k2".into()) };
-        b.start(r).await.unwrap();
-        let now = weft_core::images::ImageRefs::load(&install).unwrap().unwrap();
-        assert_eq!(now.builder_bases, ["weft-builder-base:b1".to_string(), "weft-builder-base:b2".to_string()].into());
-        assert_eq!(now.compile_cache_keys, ["k1".to_string(), "k2".to_string()].into());
-        std::fs::remove_dir_all(&install).unwrap();
-    }
-
     /// A build stopped while it runs lets go of its staging with it.
     #[tokio::test]
     async fn a_stopped_build_lets_go_of_its_staging() {
         let docker = Arc::new(HeldBuilds { docker: FakeDocker::new(), ends: tokio::sync::Semaphore::new(0) });
-        let b = DockerImageBuilder::new(docker, weft_core::infra::Install::default_install(), std::env::temp_dir().join("weft-no-install"));
+        let (b, _dirs) = docker_builder(docker, weft_core::infra::Install::default_install());
         let r = req("b1");
         let dir = r.context_dir.clone();
         let h = b.start(r).await.unwrap();
@@ -472,134 +795,26 @@ mod tests {
     #[tokio::test]
     async fn a_content_another_install_holds_is_named_not_built() {
         let docker = Arc::new(FakeDocker::new());
-        docker.answer(&["image", "ls"], "evil/weft-worker:abc\nweft-worker:abc\n");
-        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::named("cell7").unwrap(), std::env::temp_dir().join("weft-no-install"));
+        docker.answer(&["image", "ls"], "evil/weft-infra-pg:abc\nweft-infra-pg:abc\n");
+        let (b, _dirs) = docker_builder(docker.clone(), weft_core::infra::Install::named("cell7").unwrap());
         let mut r = req("b1");
-        r.image_ref = b.image_ref("weft-worker:abc");
-        assert_eq!(r.image_ref, "localhost/weft-cell7/weft-worker:abc");
+        r.image_ref = b.image_ref("weft-infra-pg:abc");
+        assert_eq!(r.image_ref, "localhost/weft-cell7/weft-infra-pg:abc");
         let dir = r.context_dir.clone();
         let h = b.start(r.clone()).await.unwrap();
         assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: None });
-        assert_eq!(docker.calls_to("tag"), vec![vec!["tag", "weft-worker:abc", "localhost/weft-cell7/weft-worker:abc"]]);
+        assert_eq!(docker.calls_to("tag"), vec![vec!["tag", "weft-infra-pg:abc", "localhost/weft-cell7/weft-infra-pg:abc"]]);
         assert!(docker.calls_to("build").is_empty(), "nothing built");
         assert!(dir.exists(), "the test's own clone still holds it");
 
         let docker = Arc::new(FakeDocker::new());
-        docker.answer(&["image", "ls"], "evil/weft-worker:abc\n");
-        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::named("cell7").unwrap(), std::env::temp_dir().join("weft-no-install"));
+        docker.answer(&["image", "ls"], "evil/weft-infra-pg:abc\n");
+        let (b, _dirs) = docker_builder(docker.clone(), weft_core::infra::Install::named("cell7").unwrap());
         let h = b.start(r).await.unwrap();
         assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: None });
         assert!(docker.calls_to("tag").is_empty(), "an image no install holds is never taken");
         assert_eq!(docker.calls_to("build").len(), 1);
         gone(&dir).await;
-    }
-
-    /// A Docker whose images all carry one file: `docker cp` out of any
-    /// container writes it where the copy was asked to land.
-    struct ImageFile {
-        docker: FakeDocker,
-        bytes: Vec<u8>,
-    }
-
-    impl ImageFile {
-        fn new(bytes: &[u8]) -> Arc<Self> {
-            let docker = FakeDocker::new();
-            docker.answer(&["create"], "c1\n");
-            Arc::new(Self { docker, bytes: bytes.to_vec() })
-        }
-    }
-
-    #[async_trait]
-    impl Docker for ImageFile {
-        async fn exec(&self, args: &[String]) -> anyhow::Result<docker::DockerOutput> {
-            let out = self.docker.exec(args).await?;
-            if out.success() && args.first().is_some_and(|verb| verb == "cp") {
-                std::fs::write(&args[2], &self.bytes).unwrap();
-            }
-            Ok(out)
-        }
-    }
-
-    fn asking_for_the_record(name: &str) -> BuildRequest {
-        let mut r = req(name);
-        r.result_file = Some(weft_core::builds::LEFT_OUT_RECORD_PATH.into());
-        r
-    }
-
-    /// A build that names a result file answers its bytes, read from a
-    /// container that is created, copied out of and removed, never run.
-    #[tokio::test]
-    async fn a_build_answers_the_result_file_it_names() {
-        let docker = ImageFile::new(br#"{"packages":[]}"#);
-        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::default_install(), std::env::temp_dir().join("weft-no-install"));
-        let h = b.start(asking_for_the_record("b1")).await.unwrap();
-        assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(br#"{"packages":[]}"#.to_vec()) });
-        let calls = docker.docker.calls();
-        let verbs: Vec<&str> = calls.iter().map(|c| c[0].as_str()).collect();
-        assert_eq!(verbs, ["image", "build", "create", "cp", "rm"], "built, then read without a start");
-        assert_eq!(
-            calls[2],
-            [
-                "create", "--label", "weft-install=default", "--label", "weft.image=weft-worker:abc", "--label", "weft.role=build-result",
-                "weft-worker:abc", "weft-never-run",
-            ]
-        );
-        assert_eq!(calls[3][1], "c1:/weft-left-out.json");
-        assert!(!std::path::Path::new(&calls[3][2]).exists(), "the copy is removed once read");
-        assert_eq!(calls[4], ["rm", "--force", "c1"]);
-    }
-
-    /// A container that will not go is logged, and never hides a result
-    /// that was read.
-    #[tokio::test]
-    async fn a_failed_removal_keeps_the_result() {
-        let docker = ImageFile::new(b"{}");
-        docker.docker.fail(&["rm"], "Error response from daemon: something odd");
-        let b = DockerImageBuilder::new(docker, weft_core::infra::Install::default_install(), std::env::temp_dir().join("weft-no-install"));
-        let h = b.start(asking_for_the_record("b1")).await.unwrap();
-        assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(b"{}".to_vec()) });
-    }
-
-    /// An image without the result file it was asked for is a failed
-    /// build naming the file, and its container is removed all the same.
-    #[tokio::test]
-    async fn a_missing_result_file_fails_the_build() {
-        let docker = ImageFile::new(b"");
-        docker.docker.fail(&["cp"], "Error response from daemon: Could not find the file /weft-left-out.json in container c1");
-        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::default_install(), std::env::temp_dir().join("weft-no-install"));
-        let h = b.start(asking_for_the_record("b1")).await.unwrap();
-        let BuildStatus::Failed { reason } = settled(&b, &h).await else { panic!("a build without its result succeeded") };
-        assert!(reason.contains("/weft-left-out.json") && reason.contains("Could not find the file"), "{reason}");
-        assert_eq!(docker.docker.calls_to("rm"), vec![vec!["rm", "--force", "c1"]], "removed even though the copy failed");
-    }
-
-    /// A build that names no result file answers none and creates no
-    /// container.
-    #[tokio::test]
-    async fn a_build_naming_no_result_file_answers_none() {
-        let docker = ImageFile::new(b"{}");
-        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::default_install(), std::env::temp_dir().join("weft-no-install"));
-        let h = b.start(req("b1")).await.unwrap();
-        assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: None });
-        assert!(docker.docker.calls_to("create").is_empty());
-    }
-
-    /// An image taken from another install has its result read too.
-    #[tokio::test]
-    async fn an_adopted_image_has_its_result_read() {
-        let docker = ImageFile::new(b"{}");
-        docker.docker.answer(&["image", "ls"], "weft-worker:abc\n");
-        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::named("cell7").unwrap(), std::env::temp_dir().join("weft-no-install"));
-        let mut r = asking_for_the_record("b1");
-        r.image_ref = b.image_ref("weft-worker:abc");
-        let h = b.start(r).await.unwrap();
-        assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(b"{}".to_vec()) });
-        assert!(docker.docker.calls_to("build").is_empty(), "nothing built");
-        let creates = docker.docker.calls_to("create");
-        assert_eq!(creates.len(), 1);
-        assert_eq!(creates[0][creates[0].len() - 2..], ["localhost/weft-cell7/weft-worker:abc", "weft-never-run"]);
-        assert!(creates[0].contains(&format!("{}=cell7", docker::labels::INSTALL)), "{creates:?}");
-        assert_eq!(docker.docker.calls_to("rm").len(), 1);
     }
 
     /// The bound caps every record, least recently used first: `--all`
@@ -611,23 +826,18 @@ mod tests {
         assert_eq!(docker.calls_to("builder")[0], vec!["builder", "prune", "--force", "--all", "--max-used-space", "20GB"]);
     }
 
-    /// A result reader a crash left behind goes with its image, before the
-    /// image's name is removed (it would keep the image in use for good),
-    /// and so does the image's build log.
+    /// Deleting an image removes this install's name for it, and its build
+    /// log with it.
     #[tokio::test]
-    async fn deleting_an_image_removes_its_left_behind_result_readers_and_its_log() {
+    async fn deleting_an_image_removes_its_name_and_its_log() {
         let dir = tempfile::tempdir().unwrap();
         let docker = Arc::new(FakeDocker::new());
-        docker.answer(&["ps"], r#"{"Names":"stray_reader","State":"created","Labels":"weft.role=build-result,weft.image=weft-worker:abc"}"#);
-        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::default_install(), dir.path().to_path_buf());
-        let log = build_log(dir.path(), "weft-worker:abc").await.unwrap();
+        let b = docker_builder_in(docker.clone(), weft_core::infra::Install::default_install(), dir.path().to_path_buf());
+        let log = InstallLayout::new(dir.path()).build_log("weft-infra-pg:abc");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         std::fs::write(&log, "output").unwrap();
-        assert_eq!(b.delete_image("weft-worker:abc").await.unwrap(), ImageDeleted::Deleted);
-        let ps = &docker.calls_to("ps")[0];
-        assert!(ps.contains(&"label=weft.role=build-result".to_string()) && ps.contains(&"label=weft.image=weft-worker:abc".to_string()), "{ps:?}");
-        let verbs: Vec<String> = docker.calls().iter().map(|c| c[0].clone()).collect();
-        assert_eq!(verbs, ["ps", "rm", "image"], "the reader goes first");
-        assert_eq!(docker.calls_to("rm")[0], ["rm", "--force", "stray_reader"]);
+        assert_eq!(b.delete_image("weft-infra-pg:abc").await.unwrap(), ImageDeleted::Deleted);
+        assert_eq!(docker.calls(), vec![vec!["image", "rm", "weft-infra-pg:abc"]]);
         assert!(!log.exists(), "the log goes with the image");
     }
 
@@ -635,7 +845,7 @@ mod tests {
     async fn deleting_an_image_already_gone_is_fine() {
         let docker = Arc::new(FakeDocker::new());
         docker.fail(&["image", "rm"], "Error: No such image: x");
-        let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::default_install(), std::env::temp_dir().join("weft-no-install"));
+        let (b, _dirs) = docker_builder(docker.clone(), weft_core::infra::Install::default_install());
         assert_eq!(b.delete_image("x").await.unwrap(), ImageDeleted::Absent);
         docker.fail(&["image", "inspect"], "Error: No such image: x");
         assert!(!b.image_exists("x").await.unwrap());
@@ -645,7 +855,408 @@ mod tests {
     async fn an_image_a_container_still_runs_from_is_kept() {
         let docker = Arc::new(FakeDocker::new());
         docker.fail(&["image", "rm"], "Error response from daemon: conflict: unable to delete x (must be forced) - container 9bcd46ba4da9 is using its referenced image 0e8952e178ee");
-        let b = DockerImageBuilder::new(docker, weft_core::infra::Install::default_install(), std::env::temp_dir().join("weft-no-install"));
+        let (b, _dirs) = docker_builder(docker, weft_core::infra::Install::default_install());
         assert_eq!(b.delete_image("x").await.unwrap(), ImageDeleted::InUse);
+    }
+
+    /// A machine for host builds: weft's data folder, installs' folders,
+    /// and contexts holding a host recipe.
+    struct HostMachine {
+        machine: tempfile::TempDir,
+        installs: tempfile::TempDir,
+        toolchain: Arc<FakeToolchain>,
+    }
+
+    impl HostMachine {
+        fn new() -> Self {
+            Self { machine: tempfile::tempdir().unwrap(), installs: tempfile::tempdir().unwrap(), toolchain: Arc::new(FakeToolchain::default()) }
+        }
+
+        fn layout(&self) -> MachineLayout {
+            MachineLayout::new(self.machine.path())
+        }
+
+        fn builder(&self, install: &str) -> LocalImageBuilder {
+            self.builder_with(install, self.toolchain.clone())
+        }
+
+        fn builder_with(&self, install: &str, toolchain: Arc<dyn Toolchain>) -> LocalImageBuilder {
+            let dir = self.installs.path().join(install);
+            std::fs::create_dir_all(&dir).unwrap();
+            LocalImageBuilder::new(
+                Arc::new(FakeDocker::new()),
+                toolchain,
+                weft_core::infra::Install::named(install).unwrap(),
+                InstallLayout::new(dir),
+                self.layout(),
+                1,
+            )
+        }
+
+        /// A staged context for the worker `hash`, whose build (when the
+        /// fake toolchain runs it, in lane 0) writes the program and
+        /// `record`.
+        fn request(&self, b: &LocalImageBuilder, hash: &str, record: &[u8]) -> BuildRequest {
+            let ctx = std::env::temp_dir().join(format!("weft-host-{}", uuid::Uuid::new_v4().simple()));
+            let recipe = HostRecipe {
+                crate_dir: ctx.join("crate"),
+                isolate_dir: ctx.join("isolate"),
+                isolate_candidates: ctx.join("crate/isolate.json"),
+                left_out_record: ctx.join("crate/left-out.json"),
+                seed_lock: ctx.join("seed.lock"),
+                binary_name: "weft-worker".into(),
+                cache_gc_script: ctx.join("crate/weft-cache-gc.sh"),
+                cache_retention_days: 30,
+                cache_versions_kept: 3,
+            };
+            for dir in [&recipe.crate_dir, &recipe.isolate_dir] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            std::fs::write(&recipe.seed_lock, "# lock").unwrap();
+            std::fs::write(ctx.join(HOST_RECIPE_FILE), serde_json::to_vec(&recipe).unwrap()).unwrap();
+            let isolate = self.layout().lane_cache(0).join("release/weft-isolate");
+            self.toolchain.makes(&isolate, &recipe.left_out_record, record);
+            self.toolchain.makes(&isolate, self.layout().lane_cache(0).join("release/weft-worker"), b"\x7fELF");
+            BuildRequest {
+                name: format!("b-{hash}"),
+                project_id: uuid::Uuid::from_u128(1),
+                tenant: "local".into(),
+                context_dir: ctx.clone(),
+                recipe: BuildRecipe::Host,
+                staging: Staging::new(Staged(ctx)),
+                image_ref: b.image_ref(&format!("weft-worker:{hash}")),
+            }
+        }
+
+        fn program_dir(&self, hash: &str) -> std::path::PathBuf {
+            Program::Worker(hash).dir(&self.layout().workers())
+        }
+    }
+
+    /// A worker is compiled on the machine: the helper first, then the
+    /// worker through it, both in the worker crate with its lane's cache;
+    /// the program and its record land in the machine's workers folder, the
+    /// record is the build's result, and the cache sweep runs after.
+    #[tokio::test]
+    async fn a_worker_is_compiled_on_the_machine_into_its_folder() {
+        let m = HostMachine::new();
+        let b = m.builder("one");
+        let req = m.request(&b, "abc", br#"{"packages":[]}"#);
+        let (ctx, image) = (req.context_dir.clone(), req.image_ref.clone());
+        assert_eq!(image, "weft-worker:abc", "a program's ref is its bare tag on every install");
+        assert!(!b.image_exists(&image).await.unwrap());
+        let h = b.start(req).await.unwrap();
+        assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(br#"{"packages":[]}"#.to_vec()) });
+        let calls = m.toolchain.calls.lock().clone();
+        let programs: Vec<String> = calls.iter().map(|c| c.program.display().to_string()).collect();
+        let target = m.layout().lane_cache(0);
+        assert_eq!(programs, ["cargo".to_string(), target.join("release/weft-isolate").display().to_string(), "sh".to_string(), "cp".to_string()]);
+        // With no seed on the machine (its standard worker came prebuilt),
+        // the first lane to finish becomes it.
+        assert_eq!(calls[3].args, ["-a".to_string(), format!("{}/.", target.display()), m.layout().seed_cache().display().to_string()]);
+        assert!(m.layout().seed_mark().is_file() && m.layout().lane_mark(0).is_file());
+        assert!(!m.layout().seed_cache().join(".weft-seeded").exists() && !target.join(".weft-seeded").exists(), "the marks are beside the caches, never in them");
+        for c in &calls[..3] {
+            assert_eq!(c.cwd, ctx.join("crate"));
+            assert_eq!(c.env, vec![("CARGO_TARGET_DIR".to_string(), target.display().to_string())]);
+        }
+        assert_eq!(calls[0].args[..3], ["build", "--release", "--manifest-path"]);
+        assert_eq!(calls[0].stdout, Some(ctx.join("cargo-messages.json")), "cargo's messages are what the sweep reads");
+        assert_eq!(calls[2].args[1..2], ["aged"]);
+        assert_eq!(calls[2].args[4..], ["weft-worker", "30", "3"]);
+        assert_eq!(std::fs::read(m.program_dir("abc").join("worker")).unwrap(), b"\x7fELF");
+        assert_eq!(std::fs::read(m.program_dir("abc").join("left-out.json")).unwrap(), br#"{"packages":[]}"#);
+        assert!(b.image_exists(&image).await.unwrap());
+        gone(&ctx).await;
+    }
+
+    /// A toolchain that, at every command, notes whether lane 0 and the
+    /// seed are held by someone (the build that ran it).
+    struct Watching {
+        inner: Arc<FakeToolchain>,
+        machine: MachineLayout,
+        seen: parking_lot::Mutex<Vec<(String, bool, bool)>>,
+    }
+
+    #[async_trait]
+    impl Toolchain for Watching {
+        async fn run(&self, cmd: &host_build::HostCommand, log: &std::path::Path) -> anyhow::Result<i32> {
+            let lane_held = crate::lanes::Lane::try_take(&self.machine, 0).unwrap().is_none();
+            let seed_held = weft_core::file_lock::try_hold(&self.machine.seed_lock()).unwrap().is_none();
+            self.seen.lock().push((cmd.program.display().to_string(), lane_held, seed_held));
+            self.inner.run(cmd, log).await
+        }
+    }
+
+    /// A build holds its lane from the seed copy through the sweep, and
+    /// the seed's lock while it copies the seed (never while it compiles);
+    /// the lane is free once the build ended.
+    #[tokio::test]
+    async fn a_host_build_holds_its_lane_through_the_seed_copy_the_compile_and_the_sweep() {
+        let m = HostMachine::new();
+        std::fs::create_dir_all(m.layout().seed_cache()).unwrap();
+        host_build::mark_seed(&m.layout()).unwrap();
+        let watching = Arc::new(Watching { inner: m.toolchain.clone(), machine: m.layout(), seen: Default::default() });
+        let b = m.builder_with("one", watching.clone());
+        let h = b.start(m.request(&b, "abc", b"{}")).await.unwrap();
+        assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(b"{}".to_vec()) });
+        let seen = watching.seen.lock().clone();
+        let programs: Vec<&str> = seen.iter().map(|(p, _, _)| p.rsplit('/').next().unwrap()).collect();
+        assert_eq!(programs, ["cp", "cargo", "weft-isolate", "sh"], "the cold lane is seeded first");
+        assert!(seen.iter().all(|(_, lane, _)| *lane), "the lane is held at every step: {seen:?}");
+        assert_eq!(seen.iter().map(|(_, _, seed)| *seed).collect::<Vec<_>>(), [true, false, false, false], "the seed only while it is copied");
+        assert!(crate::lanes::Lane::try_take(&m.layout(), 0).unwrap().is_some(), "let go once the build ended");
+    }
+
+    /// A toolchain whose first `cp` fails, as a copy cut short does.
+    struct FirstCopyFails {
+        inner: Arc<FakeToolchain>,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl Toolchain for FirstCopyFails {
+        async fn run(&self, cmd: &host_build::HostCommand, log: &std::path::Path) -> anyhow::Result<i32> {
+            let code = self.inner.run(cmd, log).await?;
+            if cmd.program == std::path::Path::new("cp") && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Ok(1);
+            }
+            Ok(code)
+        }
+    }
+
+    /// A seed copy cut short leaves the lane unmarked, so the next build
+    /// copies the seed again over what it left, and marks the lane once
+    /// that copy is whole.
+    #[tokio::test]
+    async fn a_seed_copy_cut_short_leaves_the_lane_unmarked() {
+        let m = HostMachine::new();
+        std::fs::create_dir_all(m.layout().seed_cache()).unwrap();
+        host_build::mark_seed(&m.layout()).unwrap();
+        let b = m.builder_with("one", Arc::new(FirstCopyFails { inner: m.toolchain.clone(), failed: Default::default() }));
+        let h = b.start(m.request(&b, "abc", b"{}")).await.unwrap();
+        assert!(matches!(settled(&b, &h).await, BuildStatus::Failed { .. }));
+        assert!(!m.layout().lane_mark(0).exists(), "a lane whose copy failed is not warm");
+        let h = b.start(m.request(&b, "abc", b"{}")).await.unwrap();
+        assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(b"{}".to_vec()) });
+        let copies = m.toolchain.calls.lock().iter().filter(|c| c.program == std::path::Path::new("cp")).count();
+        assert_eq!(copies, 2, "copied again");
+        assert!(m.layout().lane_mark(0).is_file());
+    }
+
+    /// A lane that finished a build is warm even when it could not become
+    /// the seed, so its next build never copies a seed over it.
+    #[tokio::test]
+    async fn a_lane_that_built_is_marked_whatever_the_seed_did() {
+        let m = HostMachine::new();
+        m.toolchain.fails("cp");
+        let b = m.builder("one");
+        let h = b.start(m.request(&b, "abc", b"{}")).await.unwrap();
+        assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(b"{}".to_vec()) }, "a seed that cannot be made costs only speed");
+        assert!(!m.layout().seed_mark().exists(), "no seed was made");
+        assert!(m.layout().lane_mark(0).is_file(), "the lane is warm");
+    }
+
+    /// A toolchain whose commands never end, as a long compile.
+    struct NeverEnds;
+
+    #[async_trait]
+    impl Toolchain for NeverEnds {
+        async fn run(&self, _cmd: &host_build::HostCommand, _log: &std::path::Path) -> anyhow::Result<i32> {
+            std::future::pending().await
+        }
+    }
+
+    /// A host build released while it runs lets go of the hold it took, so
+    /// the program's empty folder does not stay held by this install.
+    #[tokio::test]
+    async fn a_released_host_build_lets_go_of_its_program() {
+        let m = HostMachine::new();
+        let b = m.builder_with("one", Arc::new(NeverEnds));
+        let h = b.start(m.request(&b, "abc", b"{}")).await.unwrap();
+        assert!(m.program_dir("abc").join("held-by/one").is_file(), "held while it builds");
+        assert_eq!(b.poll(&h).await.unwrap(), BuildStatus::Pending);
+        b.release(&h).await;
+        assert!(!m.program_dir("abc").exists(), "let go of, and nobody else holds it");
+        assert_eq!(b.poll(&h).await.unwrap(), BuildStatus::Gone);
+    }
+
+    /// The standard worker compiles in the seed itself, holding the seed's
+    /// lock through every step and no lane.
+    #[tokio::test]
+    async fn the_seed_is_compiled_holding_its_own_lock_and_no_lane() {
+        let m = HostMachine::new();
+        let watching = Watching { inner: m.toolchain.clone(), machine: m.layout(), seen: Default::default() };
+        let b = m.builder("one");
+        let req = m.request(&b, "abc", b"{}");
+        let isolate = m.layout().seed_cache().join("release/weft-isolate");
+        m.toolchain.makes(&isolate, req.context_dir.join("crate/left-out.json"), b"{}");
+        m.toolchain.makes(&isolate, m.layout().seed_cache().join("release/weft-worker"), b"\x7fELF");
+        let log = m.machine.path().join("seed.log");
+        let built = host_build::compile(&watching, &m.layout(), host_build::CompileIn::Seed, &req.context_dir, m.program_dir("abc"), &log, || {})
+            .await
+            .unwrap();
+        assert_eq!(built, HostBuilt::Built(b"{}".to_vec()));
+        let seen = watching.seen.lock().clone();
+        assert_eq!(seen.iter().map(|(p, _, _)| p.rsplit('/').next().unwrap()).collect::<Vec<_>>(), ["cargo", "weft-isolate", "sh"], "the seed copies nothing");
+        assert!(seen.iter().all(|(_, lane, seed)| !lane && *seed), "{seen:?}");
+        assert!(m.layout().seed_mark().is_file(), "a seed that left nothing out is whole");
+    }
+
+    /// A program one install built is taken by the next with nothing
+    /// built, and goes from the machine only with the last install holding
+    /// it.
+    #[tokio::test]
+    async fn a_program_is_shared_by_installs_and_goes_with_the_last() {
+        let m = HostMachine::new();
+        let (one, two) = (m.builder("one"), m.builder("two"));
+        let h = one.start(m.request(&one, "abc", b"{}")).await.unwrap();
+        settled(&one, &h).await;
+        let req = m.request(&two, "abc", b"{}");
+        let image = req.image_ref.clone();
+        assert!(!two.image_exists(&image).await.unwrap(), "this install does not hold it yet");
+        let ran = m.toolchain.calls.lock().len();
+        let h = two.start(req).await.unwrap();
+        assert_eq!(settled(&two, &h).await, BuildStatus::Succeeded { result: Some(b"{}".to_vec()) });
+        assert_eq!(m.toolchain.calls.lock().len(), ran, "nothing built");
+        assert!(two.image_exists(&image).await.unwrap());
+
+        assert_eq!(one.delete_image(&image).await.unwrap(), ImageDeleted::Deleted);
+        assert!(m.program_dir("abc").join("worker").exists(), "the other install still holds it");
+        assert!(!one.image_exists(&image).await.unwrap());
+        assert_eq!(two.delete_image(&image).await.unwrap(), ImageDeleted::Deleted);
+        assert!(!m.program_dir("abc").exists(), "gone with the last");
+        assert_eq!(two.delete_image(&image).await.unwrap(), ImageDeleted::Absent);
+    }
+
+    /// The standard worker an install's record names stays, held or not,
+    /// whether the record is this weft's (a program) or an older weft's (a
+    /// registry image of the same hash).
+    #[tokio::test]
+    async fn an_installs_standard_worker_stays() {
+        for named in ["weft-worker:abc", "ghcr.io/weavemindai/weft-worker:abc"] {
+            let m = HostMachine::new();
+            let b = m.builder("one");
+            let h = b.start(m.request(&b, "abc", b"{}")).await.unwrap();
+            settled(&b, &h).await;
+            let two = m.machine.path().join("installs").join("two");
+            std::fs::create_dir_all(&two).unwrap();
+            weft_core::images::ImageRefs {
+                runtime: "weft-runtime:r".into(),
+                standard_worker: named.into(),
+                builder_bases: Default::default(),
+                compile_cache_keys: Default::default(),
+            }
+            .save(&two)
+            .unwrap();
+            b.delete_image("weft-worker:abc").await.unwrap();
+            assert!(m.program_dir("abc").join("worker").exists(), "{named}");
+        }
+    }
+
+    /// A reclaim drops the holds of installs no longer on the machine, then
+    /// every worker nobody holds that no install names as its standard
+    /// worker, and leaves the test servers alone.
+    #[tokio::test]
+    async fn a_reclaim_takes_the_workers_nothing_uses() {
+        let m = HostMachine::new();
+        let one = m.builder("one");
+        let gone = m.builder("gone");
+        for (b, hash) in [(&one, "kept"), (&gone, "orphan")] {
+            let h = b.start(m.request(b, hash, b"{}")).await.unwrap();
+            settled(b, &h).await;
+        }
+        for hash in ["standard", "replaced"] {
+            std::fs::create_dir_all(m.program_dir(hash)).unwrap();
+            std::fs::write(m.program_dir(hash).join("worker"), b"\x7fELF").unwrap();
+        }
+        weft_core::images::ImageRefs {
+            runtime: "weft-runtime:r".into(),
+            standard_worker: "weft-worker:standard".into(),
+            builder_bases: Default::default(),
+            compile_cache_keys: Default::default(),
+        }
+        .save(m.machine.path())
+        .unwrap();
+        let server = m.layout().node_test_servers().join("abc");
+        std::fs::create_dir_all(&server).unwrap();
+
+        let removed = reclaim_workers(&m.layout().workers(), &["one".to_string()]).unwrap();
+        assert_eq!(removed, ["orphan", "replaced"]);
+        assert!(m.program_dir("kept").join("worker").exists() && m.program_dir("standard").join("worker").exists());
+        assert!(server.exists(), "a test server is its package's to replace");
+    }
+
+    /// A build that fails answers its log's last lines, and lets go of the
+    /// folder it held.
+    #[tokio::test]
+    async fn a_failed_host_build_answers_its_log_and_leaves_nothing() {
+        let m = HostMachine::new();
+        let b = m.builder("one");
+        m.toolchain.fails("cargo");
+        let h = b.start(m.request(&b, "abc", b"{}")).await.unwrap();
+        let BuildStatus::Failed { reason } = settled(&b, &h).await else { panic!("a failed cargo succeeded") };
+        assert!(reason.contains("ran cargo") && reason.contains("exit code 1"), "{reason}");
+        assert!(!m.program_dir("abc").exists());
+    }
+
+    /// A worker is compiled here, never built as an image, only a worker
+    /// is compiled, and nothing is read out of an infra image.
+    #[tokio::test]
+    async fn the_recipe_must_fit_the_ref() {
+        let m = HostMachine::new();
+        let b = m.builder("one");
+        let mut req = m.request(&b, "abc", b"{}");
+        req.recipe = BuildRecipe::Dockerfile { result_file: None };
+        let e = format!("{:#}", b.start(req.clone()).await.unwrap_err());
+        assert!(e.contains("host build"), "{e}");
+        req.recipe = BuildRecipe::Host;
+        req.image_ref = "weft-infra-pg:abc".into();
+        let e = format!("{:#}", b.start(req.clone()).await.unwrap_err());
+        assert!(e.contains("none of weft's programs"), "{e}");
+        req.recipe = BuildRecipe::Dockerfile { result_file: Some(weft_core::builds::LEFT_OUT_RECORD_PATH.into()) };
+        let e = format!("{:#}", b.start(req).await.unwrap_err());
+        assert!(e.contains("report nothing"), "{e}");
+        assert_eq!(b.worker_packaging(), WorkerPackaging::Host { shared_crates: m.layout().shared_crates() });
+    }
+
+    /// A program's ref is its bare tag; an install's name on an image (an
+    /// older weft's worker image) is no program, and neither is a path.
+    #[test]
+    fn a_program_ref_is_its_bare_tag() {
+        assert_eq!(Program::of("weft-worker:ab12"), Some(Program::Worker("ab12")));
+        assert_eq!(Program::of("weft-node-tests:cd34"), Some(Program::NodeTestServer("cd34")));
+        assert_eq!(Program::of("localhost/weft-cell7/weft-worker:ab12"), None);
+        assert_eq!(Program::of("ghcr.io/weavemindai/weft-worker:ab12"), None);
+        assert_eq!(Program::of("weft-infra-pg:ab12"), None);
+        assert_eq!(Program::of("weft-worker:.."), None, "never a path out of the folder");
+        assert_eq!(Program::of("weft-node-tests:"), None);
+        let w = std::path::Path::new("/w");
+        assert_eq!(Program::Worker("ab").file(w), std::path::PathBuf::from("/w/ab/worker"));
+        assert_eq!(Program::NodeTestServer("cd").file(w), std::path::PathBuf::from("/w/node-tests/cd/worker"));
+        assert_eq!(Program::Worker("ab").args(), &[] as &[&str]);
+        assert_eq!(Program::NodeTestServer("cd").args(), ["serve"]);
+        let (b, _dirs) = docker_builder(Arc::new(FakeDocker::new()), weft_core::infra::Install::named("cell7").unwrap());
+        assert_eq!(b.image_ref("weft-worker:ab12"), "weft-worker:ab12");
+        assert_eq!(b.image_ref("weft-infra-pg:ab12"), "localhost/weft-cell7/weft-infra-pg:ab12");
+    }
+
+    /// A node test server is compiled on the machine like a worker, into
+    /// its own folder, and goes with the last install holding it.
+    #[tokio::test]
+    async fn a_node_test_server_is_compiled_into_its_own_folder() {
+        let m = HostMachine::new();
+        let b = m.builder("one");
+        let mut req = m.request(&b, "abc", b"{}");
+        req.image_ref = b.image_ref("weft-node-tests:abc");
+        let image = req.image_ref.clone();
+        let h = b.start(req).await.unwrap();
+        assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(b"{}".to_vec()) });
+        let dir = m.layout().node_test_servers().join("abc");
+        assert_eq!(std::fs::read(dir.join("worker")).unwrap(), b"\x7fELF");
+        assert!(!m.program_dir("abc").exists(), "never in a worker's folder");
+        assert!(b.image_exists(&image).await.unwrap());
+        assert_eq!(b.delete_image(&image).await.unwrap(), ImageDeleted::Deleted);
+        assert!(!dir.exists());
     }
 }

@@ -492,6 +492,7 @@ async fn registered_in_store(
         implementations: answer.implementations.clone(),
         left_out: answer.left_out.clone(),
         worker_log: answer.worker_log.clone(),
+        node_needs: answer.node_needs.clone(),
     };
     let infra_images: crate::project_store::InfraImageTags = answer
         .infra_images

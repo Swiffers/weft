@@ -9,25 +9,32 @@
 //! cleanly along their reason for changing:
 //!
 //! - **`compute_binary_hash`**: hashes everything that affects the
-//!   WORKER BINARY's bytes. Drives the worker docker image tag.
+//!   WORKER BINARY's bytes. Names the worker (its image ref, an image on
+//!   the cloud and a program on a local install).
 //!   Inputs:
-//!     - `weft.toml` `[build.worker]` choices (base image, custom
-//!       Dockerfile template). Nothing else in weft.toml reaches the
-//!       binary: every worker compiles as the crate `weft-worker`.
+//!     - for a worker image only, `weft.toml` `[build.worker]` choices
+//!       (base image, custom Dockerfile template). Nothing else in
+//!       weft.toml reaches the binary: every worker compiles as the
+//!       crate `weft-worker`.
 //!     - the SET of referenced node types (the codegen-emitted
 //!       static dispatch table references each by name; adding /
 //!       removing a node TYPE changes the binary, but changing a
 //!       node's config or rewiring edges does NOT).
-//!     - the REFERENCED nodes' package roots (mod.rs, deps.toml,
-//!       shared package files). A change to a node implementation
-//!       (re)compiles the worker.
+//!     - the REFERENCED nodes' packages (mod.rs, deps.toml, shared
+//!       package files), each by its package NAME and content, never
+//!       by where it sits on disk: a project whose `nodes/base_catalog`
+//!       copy matches this weft's standard library names the same
+//!       worker as every other such project
+//!       ([`compute_stock_binary_hash`]). A change to a node
+//!       implementation (re)compiles the worker.
 //!     - worker build environment: the worker crate closure
 //!       (`codegen::worker_workspace_crates`: the workspace crates a
 //!       worker actually links), `Cargo.toml`, `Cargo.lock`,
-//!       `rust-toolchain.toml`, and the builder-base Dockerfile. Any
-//!       engine, toolchain or build-image change invalidates every
-//!       project's worker image; edits to non-worker crates (CLI,
-//!       dispatcher, tests) do not.
+//!       `rust-toolchain.toml`, and for a worker image the builder-base
+//!       Dockerfile and its scripts. Any engine or toolchain change
+//!       invalidates every project's worker, a builder-base change every
+//!       worker image; edits to non-worker crates (CLI, dispatcher,
+//!       tests) do not.
 //!
 //!   NOT hashed: per-node config values, edges, node ids, positions.
 //!   Those live in the `ProjectDefinition` the worker fetches from
@@ -61,14 +68,16 @@
 //!
 //! Two per-PACKAGE hashes cover node-test staleness rather than
 //! project drift, documented on their own functions:
-//! `compute_node_test_hash` (is a package's cached test
-//! binary/image current) and `compute_node_test_outcome_hash` (can a
-//! recorded live-tier pass still be trusted).
+//! `compute_node_test_hash` (is a package's compiled test server
+//! current) and `compute_node_test_outcome_hash` (can a recorded
+//! live-tier pass still be trusted).
 //!
-//! Plus two hashes that are docker-tag plumbing only:
+//! Plus the key of the workspace slice host builds share
+//! (`compute_worker_workspace_key`), and two hashes that are docker-tag
+//! plumbing only:
 //!
 //! - **`compute_image_hash`**: per-image source dir hash. Used as the
-//!   docker image tag suffix with the FULL content hash
+//!   infra image tag suffix with the FULL content hash
 //!   (`weft-infra-<name>:<content_hash>`, assembled by
 //!   `image_set::infra_image_tag`, matching the worker tag's full-hash
 //!   form) so a stale image source produces a fresh image. NOT a drift
@@ -76,9 +85,9 @@
 //!
 //! - **`compute_builder_base_hash`**: global (not per project) hash of
 //!   the worker build environment, tagging the shared
-//!   `weft-builder-base:<hash>` image. Shares its inputs with the
-//!   binary and infra hashes, so an edit to the engine or the
-//!   toolchain moves all three together.
+//!   `weft-builder-base:<hash>` image the cloud's worker images compile
+//!   in. Shares its inputs with the binary and infra hashes, so an edit
+//!   to the engine or the toolchain moves all three together.
 //!
 //! A file enters every digest as its path and its fingerprint (the sha256
 //! of its bytes), never its bytes: a build from a stored version takes the
@@ -178,17 +187,14 @@ mod fs_hashes {
     // SYNC: CACHE_GC_SCRIPT_PATH <-> the include_str! of worker_image::CACHE_GC_SCRIPT
     pub const CACHE_GC_SCRIPT_PATH: &str = "crates/weft-compiler/src/weft-cache-gc.sh";
 
-    /// Fold the worker build environment into `hasher`: the worker crate
-    /// closure (`codegen::worker_workspace_crates`, the ONLY workspace
-    /// crates a worker build links), the workspace manifests + toolchain
-    /// pin, and the builder-base Dockerfile (the image every worker
-    /// compiles inside). Shared by the binary, infra and builder-base
-    /// hashes: a toolchain bump or a builder-base edit must flip all
-    /// three, otherwise `image_present` short-circuits and a stale worker
-    /// keeps running forever. Scoping to the closure (not all of
-    /// `crates/`) is what keeps an edit to the CLI / dispatcher / tests
-    /// from spuriously rebuilding the base + every worker image.
-    fn hash_worker_build_env(hasher: &mut Sha256, weft_root: &Path) -> Result<()> {
+    /// Fold the weft workspace a worker links into `hasher`: the worker
+    /// crate closure (`codegen::worker_workspace_crates`, the ONLY workspace
+    /// crates a worker build links) and the workspace manifest and lock,
+    /// which is exactly what `build::stage_worker_workspace` writes (its
+    /// empty workspace-hack is the same for every weft). Scoping to the
+    /// closure (not all of `crates/`) is what keeps an edit to the CLI /
+    /// dispatcher / tests from rebuilding every worker.
+    fn hash_worker_workspace(hasher: &mut Sha256, weft_root: &Path) -> Result<()> {
         let closure = crate::codegen::worker_workspace_crates(weft_root)
             .map_err(|e| anyhow::anyhow!("worker crate closure: {e}"))?;
         for name in &closure {
@@ -202,13 +208,48 @@ mod fs_hashes {
                 hash_path(hasher, &format!("crates/{name}/{entry_name}"), &entry_path, &DISK)?;
             }
         }
-        for rel in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
-            hash_path(hasher, rel, &weft_root.join(rel), &DISK)?;
-        }
-        for rel in [BUILDER_BASE_DOCKERFILE, BUILDER_BASE_SPLIT_SCRIPT, CACHE_GC_SCRIPT_PATH] {
+        for rel in ["Cargo.toml", "Cargo.lock"] {
             hash_path(hasher, rel, &weft_root.join(rel), &DISK)?;
         }
         Ok(())
+    }
+
+    /// Fold the worker build environment into `hasher`: the workspace a
+    /// worker links ([`hash_worker_workspace`]) and the toolchain pin, and
+    /// with `in_image` (a worker image) the builder base it compiles inside (its
+    /// Dockerfile, its split script and the cache sweep it runs before
+    /// baking). A toolchain bump or a builder-base edit must flip every
+    /// digest an image is named by, otherwise a present image short-circuits
+    /// its build and a stale worker keeps running forever; a worker
+    /// compiled on the machine reads none of the builder base, so an edit
+    /// there rebuilds no program.
+    fn hash_worker_build_env(hasher: &mut Sha256, weft_root: &Path, in_image: bool) -> Result<()> {
+        hash_worker_workspace(hasher, weft_root)?;
+        hash_path(hasher, "rust-toolchain.toml", &weft_root.join("rust-toolchain.toml"), &DISK)?;
+        if in_image {
+            for rel in [BUILDER_BASE_DOCKERFILE, BUILDER_BASE_SPLIT_SCRIPT, CACHE_GC_SCRIPT_PATH] {
+                hash_path(hasher, rel, &weft_root.join(rel), &DISK)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The key naming the worker-linked slice of the weft workspace a host
+    /// build shares with every other on the machine
+    /// (`build::stage_worker_workspace`, under `worker-crates/weft-<key>`):
+    /// a digest of exactly what the slice holds, so a weft whose worker
+    /// crates did not change shares the slice of the one before it.
+    pub fn compute_worker_workspace_key(weft_root: &Path) -> Result<String> {
+        let mut hasher = Sha256::new();
+        // Bump this marker whenever the code that writes the slice changes
+        // (`build::stage_worker_workspace`, `build::write_scoped_workspace_manifest`,
+        // `build::stage_empty_workspace_hack`): the key reads only the crates
+        // and files the slice copies, and `build::write_once` never rewrites a
+        // slice already there, so without the bump every machine keeps the
+        // slice the old code wrote.
+        hasher.update(b"weft-worker-workspace-v1\n");
+        hash_worker_workspace(&mut hasher, weft_root)?;
+        Ok(hex(&hasher.finalize()).chars().take(16).collect())
     }
 
     /// The installation's stdlib packages' dependency declarations. Only
@@ -218,7 +259,7 @@ mod fs_hashes {
     /// add, so a change here makes the baked rlibs and the host compile
     /// cache dead weight. A user project's hashes never read them: its
     /// own `nodes/base_catalog/` deps.toml files are hashed with the rest
-    /// of each referenced package (`hash_package_roots`).
+    /// of each referenced package (`hash_packages`).
     fn hash_installed_stdlib_deps(hasher: &mut Sha256) -> Result<()> {
         let stdlib = weft_catalog::stdlib_root().map_err(|e| anyhow::anyhow!("{e}"))?;
         for path in walk_dir(&stdlib)?.into_iter().filter(|p| p.file_name().is_some_and(|n| n == "deps.toml")) {
@@ -228,22 +269,23 @@ mod fs_hashes {
         Ok(())
     }
 
-    /// Hash everything that compiles into the worker binary. Used as
-    /// the worker docker tag suffix; the dispatcher selects the spawn
-    /// image by this hash.
+    /// Hash everything that compiles into the worker binary: the worker's
+    /// image ref names it by this, and the dispatcher selects the worker a
+    /// run starts on by it.
     ///
-    /// Scoped to exactly the codegen-emitted-static surface: weft.toml's
-    /// `[build.worker]` section, the SET of referenced node TYPES
-    /// (the static dispatch table in `registry.rs` references each by
-    /// name), each referenced node's package root (mod.rs, deps.toml,
-    /// shared files), and the weft workspace (the engine the binary
-    /// links as path deps). NOT hashed: per-node config, edges, ids,
-    /// positions: those land in the `ProjectDefinition` the worker
-    /// fetches at runtime via the broker.
+    /// Scoped to exactly the codegen-emitted-static surface: the SET of
+    /// referenced node TYPES (the static dispatch table in `registry.rs`
+    /// references each by name), each referenced node's package root
+    /// (mod.rs, deps.toml, shared files), the weft workspace (the engine
+    /// the binary links as path deps) and the toolchain, and for a worker
+    /// packaged as an image what the image is built with besides
+    /// (weft.toml's `[build.worker]`, the builder base). NOT hashed:
+    /// per-node config, edges, ids, positions: those land in the
+    /// `ProjectDefinition` the worker fetches at runtime via the broker.
     ///
     /// An unreferenced node can't change the worker binary, so it does
     /// not flip this hash. The same node walked through `weft_catalog`'s
-    /// `is_left_out_of_package_build` policy that `stage_build_context` uses, so
+    /// `is_left_out_of_package_build` policy the build stages with, so
     /// what the binary sees and what we hash agree byte-for-byte.
     pub fn compute_binary_hash(
         definition: &ProjectDefinition,
@@ -251,16 +293,57 @@ mod fs_hashes {
         weft_root: &Path,
         catalog: &FsCatalog,
         node_set: weft_core::builds::NodeSet,
+        packaging: &weft_core::builds::WorkerPackaging,
         fingerprints: &Fingerprints,
     ) -> Result<SourceHash> {
-        let project_root = project.root.as_path();
-        let mut hasher = Sha256::new();
-        // v3: the image keeps the record of the node packages its build
-        // left out (`weft_core::builds::LEFT_OUT_RECORD_PATH`); an image
-        // from before has none to read.
-        hasher.update(b"weft-binary-v3\n");
-        hash_image_recipe(&mut hasher, project, fingerprints)?;
+        let referenced = crate::codegen::node_types_for(definition, catalog, node_set);
+        binary_hash_of(&project.manifest.build.worker, &project.root, &referenced, weft_root, catalog, node_set, packaging, fingerprints)
+    }
 
+    /// The binary hash of the stock worker: what a project with no nodes of
+    /// its own (its `nodes/base_catalog` this weft's standard library,
+    /// unmodified), the default `[build.worker]` and `NodeSet::Full`
+    /// computes with [`compute_binary_hash`], wherever it sits. Every such
+    /// project runs this one worker, built once per weft version and
+    /// packaging.
+    pub fn compute_stock_binary_hash(weft_root: &Path, packaging: &weft_core::builds::WorkerPackaging) -> Result<SourceHash> {
+        let catalog = FsCatalog::discover(&weft_root.join("catalog")).map_err(|e| anyhow::anyhow!("the standard library's catalog: {e}"))?;
+        let node_set = weft_core::builds::NodeSet::Full;
+        let referenced = catalog.iter().map(|e| e.node_type.clone()).collect();
+        // The default `[build.worker]` names no template, so no project
+        // file is read: the root is never looked at.
+        binary_hash_of(&Default::default(), weft_root, &referenced, weft_root, &catalog, node_set, packaging, &DISK)
+    }
+
+    /// [`compute_binary_hash`] over what it reads of a project: its
+    /// `[build.worker]` (with the folder a custom template is read from)
+    /// and the node types the worker compiles in.
+    #[allow(clippy::too_many_arguments)]
+    fn binary_hash_of(
+        worker: &crate::project::WorkerBuildSection,
+        project_root: &Path,
+        referenced: &std::collections::BTreeSet<String>,
+        weft_root: &Path,
+        catalog: &FsCatalog,
+        node_set: weft_core::builds::NodeSet,
+        packaging: &weft_core::builds::WorkerPackaging,
+        fingerprints: &Fingerprints,
+    ) -> Result<SourceHash> {
+        let mut hasher = Sha256::new();
+        // Bump this marker whenever the code that generates the worker
+        // crate changes in a way its inputs below do not show: the
+        // `main.rs` and `registry.rs` templates (`codegen::write_main_rs`,
+        // `codegen::write_registry_rs`) and the package crates `codegen`
+        // renders (`render_package_cargo_toml`, `render_package_lib_rs`).
+        // A worker is named by this hash, so without the bump one built by
+        // the old generator keeps being reused.
+        // v5: a worker compiled on the machine leaves out what only an
+        // image is built with (v4: every package is named by its package
+        // name, never its path).
+        hasher.update(b"weft-binary-v5\n");
+        if in_image(packaging) {
+            hash_image_recipe(&mut hasher, worker, project_root, fingerprints)?;
+        }
         // SET of referenced node TYPES: the dispatch table in registry.rs
         // is generated from this. The ORDER doesn't matter (we sort), and
         // the per-node config values live in main.weft (hashed by the
@@ -268,26 +351,20 @@ mod fs_hashes {
         // The choice itself is hashed too, so the tag says what the
         // image was built AS: `weft status` can tell a full build from
         // a referenced one instead of guessing from the type list.
-        let referenced = crate::codegen::node_types_for(definition, catalog, node_set);
         hasher.update(b"node_set:");
         hasher.update(node_set.hash_marker().as_bytes());
         hasher.update(b"\n");
         hasher.update(b"node_types:\n");
-        for nt in &referenced {
+        for nt in referenced {
             hasher.update(b"  ");
             hasher.update(nt.as_bytes());
             hasher.update(b"\n");
         }
 
-        // Each referenced node's package root: mod.rs + deps.toml +
-        // shared files. A node implementation edit (re)compiles the
-        // binary, so it flips this hash.
-        hash_package_roots(
-            &mut hasher,
-            &catalog.package_roots_for(&referenced),
-            &[project_root, weft_root],
-            fingerprints,
-        )?;
+        // Each referenced node's package: mod.rs + deps.toml + shared
+        // files. A node implementation edit (re)compiles the binary, so
+        // it flips this hash.
+        hash_packages(&mut hasher, &packages_of(catalog, referenced.iter()), fingerprints)?;
 
         // The baked type registry: `write_main_rs` bakes EVERY
         // package's nominal type declarations into the binary (not
@@ -298,8 +375,9 @@ mod fs_hashes {
         hash_type_registry(&mut hasher, catalog);
 
         // Worker build environment: workspace source the binary links
-        // against + the builder-base image it compiles inside.
-        hash_worker_build_env(&mut hasher, weft_root)?;
+        // against, the toolchain, and for an image the builder base it
+        // compiles inside.
+        hash_worker_build_env(&mut hasher, weft_root, in_image(packaging))?;
 
         Ok(hex(&hasher.finalize()))
     }
@@ -312,12 +390,16 @@ mod fs_hashes {
         weft_root: &Path,
         catalog: &FsCatalog,
         node_set: weft_core::builds::NodeSet,
+        packaging: &weft_core::builds::WorkerPackaging,
         fingerprints: &Fingerprints,
     ) -> Result<std::collections::BTreeMap<String, SourceHash>> {
         let mut shared = Sha256::new();
-        shared.update(b"weft-implementation-v1\n");
-        hash_worker_build_env(&mut shared, weft_root)?;
-        hash_image_recipe(&mut shared, project, fingerprints)?;
+        // v3: what the binary hash leaves out for a host build, this does too.
+        shared.update(b"weft-implementation-v3\n");
+        hash_worker_build_env(&mut shared, weft_root, in_image(packaging))?;
+        if in_image(packaging) {
+            hash_image_recipe(&mut shared, &project.manifest.build.worker, &project.root, fingerprints)?;
+        }
         hash_type_registry(&mut shared, catalog);
         // Fingerprints describe the compiled worker, whose type set can be
         // wider than this graph. The types weft gives its own nodes (a
@@ -326,17 +408,17 @@ mod fs_hashes {
         // for every node type its graph holds.
         let mut types = crate::codegen::node_types_for(definition, catalog, node_set);
         types.extend(weft_core::project::own_types::ALL.iter().map(|t| (*t).to_string()));
-        let mut packages: std::collections::BTreeMap<Vec<PathBuf>, SourceHash> = std::collections::BTreeMap::new();
+        let mut packages: std::collections::BTreeMap<Packages, SourceHash> = std::collections::BTreeMap::new();
         let mut result = std::collections::BTreeMap::new();
         for node_type in types {
-            let roots = catalog.package_roots_for(&[node_type.clone()].into_iter().collect());
-            let hash = if let Some(hash) = packages.get(&roots) {
+            let package = packages_of(catalog, std::iter::once(&node_type));
+            let hash = if let Some(hash) = packages.get(&package) {
                 hash.clone()
             } else {
                 let mut hasher = shared.clone();
-                hash_package_roots(&mut hasher, &roots, &[&project.root, weft_root], fingerprints)?;
+                hash_packages(&mut hasher, &package, fingerprints)?;
                 let hash = hex(&hasher.finalize());
-                packages.insert(roots, hash.clone());
+                packages.insert(package, hash.clone());
                 hash
             };
             result.insert(node_type, hash);
@@ -361,18 +443,22 @@ mod fs_hashes {
         }
     }
 
-    /// Hash the image RECIPE a staged build renders through
+    /// Hash the image RECIPE a staged image build renders through
     /// `worker_image::emit`: `weft.toml`'s build choices (base image,
-    /// custom template path) and, when a custom template
-    /// is set, the template file's own content. Shared by the binary
-    /// hash and the node-test hash so every image-naming digest covers
-    /// the same recipe inputs; a base-image or template edit flips
-    /// both instead of silently serving a stale cached image.
-    fn hash_image_recipe(hasher: &mut Sha256, project: &Project, fingerprints: &Fingerprints) -> Result<()> {
-        let project_root = project.root.as_path();
+    /// custom template path) and, when a custom template is set, the
+    /// template file's own content, so a base-image or template edit
+    /// flips the digests a worker image is named by instead of silently
+    /// serving a stale cached image. Read only for a worker packaged as an
+    /// image: a worker compiled on the machine reads none of it.
+    fn hash_image_recipe(
+        hasher: &mut Sha256,
+        worker: &crate::project::WorkerBuildSection,
+        project_root: &Path,
+        fingerprints: &Fingerprints,
+    ) -> Result<()> {
         // Names, IDs and dispatcher addresses do not change executable code.
         hasher.update(b"worker_build:\n");
-        hasher.update(serde_json::to_vec(&project.manifest.build.worker)?);
+        hasher.update(serde_json::to_vec(worker)?);
 
         // A custom Dockerfile template's CONTENT shapes the image too;
         // weft.toml only carries its path, so an edit to the template
@@ -381,7 +467,7 @@ mod fs_hashes {
         // here rather than hashing the absence (which would let the
         // build proceed to a docker failure later with a less obvious
         // cause).
-        if let Some(rel) = &project.manifest.build.worker.dockerfile_template {
+        if let Some(rel) = &worker.dockerfile_template {
             let template_path = project_root.join(rel);
             if !template_path.exists() {
                 anyhow::bail!(
@@ -396,36 +482,43 @@ mod fs_hashes {
         Ok(())
     }
 
-    /// Hash a sorted, deduped set of package roots, each prefixed by its
-    /// path RELATIVE to one of `bases` (the project root or the weft
-    /// root) so a node moving between packages changes the digest while
-    /// moving the whole checkout to another directory does not. Shared
-    /// by the source hash (referenced roots) and the infra hash (closure
-    /// roots): both fold "the node trees that matter" into a digest the
-    /// same way, over the same node-tree walk policy (`walk_dir`).
-    fn hash_package_roots(hasher: &mut Sha256, roots: &[PathBuf], bases: &[&Path], fingerprints: &Fingerprints) -> Result<()> {
-        let mut labeled = std::collections::BTreeMap::new();
-        for root in roots {
-            let label = bases
-                .iter()
-                .enumerate()
-                .find_map(|(index, base)| root.strip_prefix(base).ok().map(|path| format!("{index}/{}", path.to_string_lossy())))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "package root {} is outside the project and weft roots; \
-                         hashing its absolute path would make the digest machine-local",
-                        root.display()
-                    )
-                })?;
-            labeled.insert(label, root);
-        }
-        // Sort by portable labels, not absolute paths whose order can change
-        // when a project and the weft checkout move independently.
-        for (label, root) in labeled {
+    /// Packages by name, each with its root: what a digest folds a set of
+    /// node trees by. The name is the package's identity in its catalog
+    /// (`weft_catalog` refuses two folders with one name), so a package
+    /// reads the same from any folder: a project's `nodes/base_catalog`
+    /// copy names the same packages as the weft checkout's `catalog/`.
+    pub type Packages = std::collections::BTreeMap<String, PathBuf>;
+
+    /// The packages of `node_types`, by name. A type the catalog does
+    /// not serve has no package (the caller validates references).
+    pub fn packages_of<'a>(catalog: &FsCatalog, node_types: impl Iterator<Item = &'a String>) -> Packages {
+        node_types
+            .filter_map(|node_type| catalog.package_of(node_type))
+            .map(|package| (package.name.clone(), package.root.clone()))
+            .collect()
+    }
+
+    /// The package whose root is `root`, alone, or an error naming it.
+    fn package_at(catalog: &FsCatalog, root: &Path) -> Result<Packages> {
+        let package = catalog
+            .packages()
+            .find(|p| p.root == root)
+            .ok_or_else(|| anyhow::anyhow!("no package of this catalog is at {}", root.display()))?;
+        Ok([(package.name.clone(), package.root.clone())].into_iter().collect())
+    }
+
+    /// Hash a set of packages, each by its name and its content (sorted
+    /// by name), never by where it sits: the same package in two
+    /// projects, or in a project and the weft checkout, hashes the same,
+    /// while a node moving between packages changes the digest. Shared by
+    /// every digest that folds "the node trees that matter", over the
+    /// same node-tree walk policy (`walk_dir`).
+    fn hash_packages(hasher: &mut Sha256, packages: &Packages, fingerprints: &Fingerprints) -> Result<()> {
+        for (name, root) in packages {
             hasher.update(b"package:");
-            hasher.update(label.as_bytes());
+            hasher.update(name.as_bytes());
             hasher.update(b"\n");
-            hash_package_root(hasher, &label, root, fingerprints)?;
+            hash_package_root(hasher, name, root, fingerprints)?;
         }
         Ok(())
     }
@@ -443,54 +536,45 @@ mod fs_hashes {
     /// type registry (the test binary bakes EVERY package's type
     /// declarations and resolves this package's port types through
     /// them, so a sibling's type edit changes this package's results).
-    /// Excludes the image recipe and the worker build environment on
-    /// purpose: those rebuild the test image without changing what a
-    /// test does, and live tests spend real provider money.
-    pub fn compute_node_test_outcome_hash(
-        package_root: &Path,
-        bases: &[&Path],
-        catalog: &FsCatalog,
-    ) -> Result<SourceHash> {
+    /// Excludes the worker build environment on purpose: it rebuilds the
+    /// test server without changing what a test does, and live tests spend
+    /// real provider money.
+    pub fn compute_node_test_outcome_hash(package_root: &Path, catalog: &FsCatalog) -> Result<SourceHash> {
         let mut hasher = Sha256::new();
-        hasher.update(b"weft-node-test-outcome-v1\n");
-        hash_package_roots(&mut hasher, std::slice::from_ref(&package_root.to_path_buf()), bases, &DISK)?;
+        hasher.update(b"weft-node-test-outcome-v2\n");
+        hash_packages(&mut hasher, &package_at(catalog, package_root)?, &DISK)?;
         hash_type_registry(&mut hasher, catalog);
         Ok(hex(&hasher.finalize()))
     }
 
-    /// Content hash of ONE package's node-test artifact: the image
-    /// recipe (weft.toml build choices + custom template content, the
-    /// same inputs the binary hash covers), the package's own sources
-    /// (which include every member's `tests.rs`; the package walk
-    /// hashes all files), and the worker build environment the test
-    /// binary compiles against (engine closure, manifests, toolchain,
-    /// builder-base Dockerfile). This is the staleness rule for a
-    /// per-package test binary/image: change the base image, a node, a
-    /// test, or the engine and the hash flips; change nothing and a
-    /// cached artifact is current.
-    pub fn compute_node_test_hash(
-        package_root: &Path,
-        project: &Project,
-        weft_root: &Path,
-        catalog: &FsCatalog,
-    ) -> Result<SourceHash> {
+    /// Content hash of ONE package's node-test server, the program a live
+    /// test runs on the machine: the package's own sources (which include
+    /// every member's `tests.rs`; the package walk hashes all files), the
+    /// catalog's type registry, and the build environment of a program
+    /// compiled on the machine (the workspace it links and the toolchain).
+    /// This is the staleness rule for a package's test server: change a
+    /// node, a test, or the engine and the hash flips; change nothing and
+    /// a compiled server is current.
+    pub fn compute_node_test_hash(package_root: &Path, weft_root: &Path, catalog: &FsCatalog) -> Result<SourceHash> {
         let mut hasher = Sha256::new();
-        // v2: the image starts its test server itself (`CMD ["serve"]`).
-        hasher.update(b"weft-node-test-v2\n");
-        hash_image_recipe(&mut hasher, project, &DISK)?;
-        hash_package_roots(
-            &mut hasher,
-            std::slice::from_ref(&package_root.to_path_buf()),
-            &[project.root.as_path(), weft_root],
-            &DISK,
-        )?;
+        // v4: a test server is a program compiled on the machine, so no
+        // image recipe or builder base (v3: its package is named by its
+        // name, never its path).
+        hasher.update(b"weft-node-test-v4\n");
+        hash_packages(&mut hasher, &package_at(catalog, package_root)?, &DISK)?;
         // The test crate's main.rs bakes the FULL catalog type
         // registry (see the binary hash's identical step): a type
         // edit in a SIBLING package changes this package's test
         // binary, so it must flip this digest too.
         hash_type_registry(&mut hasher, catalog);
-        hash_worker_build_env(&mut hasher, weft_root)?;
+        hash_worker_build_env(&mut hasher, weft_root, false)?;
         Ok(hex(&hasher.finalize()))
+    }
+
+    /// Whether `packaging` builds an image, which is all a digest folds of
+    /// it (a host build's shared folder never reaches the binary).
+    fn in_image(packaging: &weft_core::builds::WorkerPackaging) -> bool {
+        matches!(packaging, weft_core::builds::WorkerPackaging::Image { .. })
     }
 
     /// Hash everything that affects the running infrastructure.
@@ -505,7 +589,7 @@ mod fs_hashes {
         fingerprints: &Fingerprints,
     ) -> Result<SourceHash> {
         let mut hasher = Sha256::new();
-        hasher.update(b"weft-infra-v2\n");
+        hasher.update(b"weft-infra-v3\n");
 
         // Graph definition, scoped to the infra closure: which nodes are
         // infra, what config they carry, and the wires among them. An edit
@@ -525,17 +609,18 @@ mod fs_hashes {
         // shared `.rs` and `package.toml`). Same folding the source hash
         // uses; multiple closure nodes from one package collapse to one
         // root via the helper's dedup.
-        let closure_roots: Vec<PathBuf> = closure
+        let closure_types: Vec<&String> = closure
             .iter()
             .filter_map(|id| project.nodes.iter().find(|n| n.id == *id))
-            .filter_map(|n| catalog.package_of(&n.node_type))
-            .map(|pkg| pkg.root.clone())
+            .map(|n| &n.node_type)
             .collect();
-        hash_package_roots(&mut hasher, &closure_roots, &[project_root, weft_root], fingerprints)?;
+        hash_packages(&mut hasher, &packages_of(catalog, closure_types.into_iter()), fingerprints)?;
 
-        // Worker build environment: engine + core compile into the
-        // worker binary that runs InfraSetup, inside the builder base.
-        hash_worker_build_env(&mut hasher, weft_root)?;
+        // Worker build environment, the whole of it whatever packages the
+        // worker (so a project's infra hash reads the same on every
+        // platform): engine + core compile into the worker binary that
+        // runs InfraSetup.
+        hash_worker_build_env(&mut hasher, weft_root, true)?;
 
         Ok(hex(&hasher.finalize()))
     }
@@ -559,20 +644,19 @@ mod fs_hashes {
         for place in weft_core::project::infra_places(project) {
             let spelled = weft_core::project::address_of(project, &place.id, &place.path);
             let mut hasher = Sha256::new();
-            hasher.update(b"weft-infra-place-v1\n");
+            hasher.update(b"weft-infra-place-v2\n");
             hasher.update(spelled.as_bytes());
             hasher.update(b"\n");
             let closure = upstream_closure(&graph, std::slice::from_ref(&place.id));
             hash_definition_slice(&mut hasher, project, &closure)?;
             hash_path(&mut hasher, "weft.toml", &project_root.join("weft.toml"), fingerprints)?;
-            let roots: Vec<PathBuf> = closure
+            let types: Vec<&String> = closure
                 .iter()
                 .filter_map(|id| project.nodes.iter().find(|n| n.id == *id))
-                .filter_map(|n| catalog.package_of(&n.node_type))
-                .map(|pkg| pkg.root.clone())
+                .map(|n| &n.node_type)
                 .collect();
-            hash_package_roots(&mut hasher, &roots, &[project_root, weft_root], fingerprints)?;
-            hash_worker_build_env(&mut hasher, weft_root)?;
+            hash_packages(&mut hasher, &packages_of(catalog, types.into_iter()), fingerprints)?;
+            hash_worker_build_env(&mut hasher, weft_root, true)?;
             out.insert(spelled, hex(&hasher.finalize()));
         }
         Ok(out)
@@ -602,7 +686,7 @@ mod fs_hashes {
     pub fn compute_builder_base_hash(weft_root: &Path) -> Result<SourceHash> {
         let mut hasher = Sha256::new();
         hasher.update(b"weft-builder-base-v1\n");
-        hash_worker_build_env(&mut hasher, weft_root)?;
+        hash_worker_build_env(&mut hasher, weft_root, true)?;
         hash_installed_stdlib_deps(&mut hasher)?;
         Ok(hex(&hasher.finalize()))
     }
@@ -623,7 +707,7 @@ mod fs_hashes {
         hasher.update(b"builder:");
         hasher.update(builder.as_bytes());
         hasher.update(b"\n");
-        hash_worker_build_env(&mut hasher, weft_root)?;
+        hash_worker_build_env(&mut hasher, weft_root, true)?;
         hash_installed_stdlib_deps(&mut hasher)?;
         Ok(hex(&hasher.finalize()).chars().take(16).collect())
     }
@@ -889,8 +973,8 @@ mod fs_hashes {
                 "groupBoundary":{"groupId":"l","role":"In"}
             })).unwrap());
             for set in [weft_core::builds::NodeSet::Full, weft_core::builds::NodeSet::Referenced] {
-                let before = implementation_hashes(&empty, &project, root, &catalog, set, &DISK).unwrap();
-                let after = implementation_hashes(&looped, &project, root, &catalog, set, &DISK).unwrap();
+                let before = implementation_hashes(&empty, &project, root, &catalog, set, &host(), &DISK).unwrap();
+                let after = implementation_hashes(&looped, &project, root, &catalog, set, &host(), &DISK).unwrap();
                 assert_eq!(before, after, "adding a built-in boundary does not change the worker's implementation map");
                 // Every type weft gives its own nodes, the placeholder a
                 // broken include leaves among them: a program holding one
@@ -901,6 +985,34 @@ mod fs_hashes {
                 }
                 if matches!(set, weft_core::builds::NodeSet::Full) { assert!(before.contains_key("Text")); }
             }
+        }
+
+        /// A program compiled on the machine (its shared folder is never
+        /// read by a digest).
+        fn host() -> weft_core::builds::WorkerPackaging {
+            weft_core::builds::WorkerPackaging::Host { shared_crates: PathBuf::from("/shared") }
+        }
+
+        fn image() -> weft_core::builds::WorkerPackaging {
+            weft_core::builds::WorkerPackaging::Image { builder: "weft-builder-base:b".into() }
+        }
+
+        /// The workspace slice's key is stable, short, and the same whatever
+        /// the packaging around it; a host build and an image of one program
+        /// are named apart, and neither moves with the builder base's ref.
+        #[test]
+        fn the_workspace_key_is_stable_and_programs_and_images_are_named_apart() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+            let key = compute_worker_workspace_key(root).unwrap();
+            assert_eq!(key.len(), 16);
+            assert_eq!(compute_worker_workspace_key(root).unwrap(), key);
+            let host_stock = compute_stock_binary_hash(root, &host()).unwrap();
+            let other_host = weft_core::builds::WorkerPackaging::Host { shared_crates: PathBuf::from("/elsewhere") };
+            assert_eq!(compute_stock_binary_hash(root, &other_host).unwrap(), host_stock, "the shared folder is no input");
+            let image_stock = compute_stock_binary_hash(root, &image()).unwrap();
+            assert_ne!(host_stock, image_stock);
+            let other_base = weft_core::builds::WorkerPackaging::Image { builder: "elsewhere/weft-builder-base:c".into() };
+            assert_eq!(compute_stock_binary_hash(root, &other_base).unwrap(), image_stock, "the base's sources name it, not its ref");
         }
 
         #[test]
@@ -926,7 +1038,7 @@ mod fs_hashes {
             let mut graph: ProjectDefinition = serde_json::from_value(serde_json::json!({
                 "id":project.id(), "nodes":[{"id":"text", "nodeType":"Text", "config":{"value":"before"}, "position":{"x":0,"y":0}}], "edges":[]
             })).unwrap();
-            let hash = |graph: &ProjectDefinition| compute_binary_hash(graph, &project, root, &catalog, weft_core::builds::NodeSet::Full, &DISK).unwrap();
+            let hash = |graph: &ProjectDefinition| compute_binary_hash(graph, &project, root, &catalog, weft_core::builds::NodeSet::Full, &host(), &DISK).unwrap();
             let initial = hash(&graph);
             assert_eq!(hash(&graph), initial);
             graph.nodes[0].config = serde_json::json!({"value":"after"});
@@ -950,7 +1062,7 @@ mod fs_hashes {
             })).unwrap();
             let hash = || {
                 let catalog = crate::build::build_project_catalog(dir.path()).unwrap();
-                compute_binary_hash(&graph, &project, root, &catalog, weft_core::builds::NodeSet::Full, &DISK).unwrap()
+                compute_binary_hash(&graph, &project, root, &catalog, weft_core::builds::NodeSet::Full, &host(), &DISK).unwrap()
             };
             let before = hash();
             let deps = dir.path().join("nodes/base_catalog/http/request/deps.toml");
@@ -960,29 +1072,64 @@ mod fs_hashes {
             assert_ne!(hash(), before);
         }
 
-        fn digest(roots: &[PathBuf], bases: &[&Path]) -> String {
+        /// The digest of `roots`, each package named by its folder.
+        fn digest(roots: &[PathBuf]) -> String {
+            let packages: Packages = roots.iter().map(|root| (root.file_name().unwrap().to_string_lossy().into_owned(), root.clone())).collect();
             let mut hash = Sha256::new();
-            hash_package_roots(&mut hash, roots, bases, &DISK).unwrap();
+            hash_packages(&mut hash, &packages, &DISK).unwrap();
             hex(&hash.finalize())
         }
 
+        /// A package is named by its name and content: the same packages in
+        /// other folders, listed in any order, hash the same.
         #[test]
-        fn moving_checkouts_does_not_change_package_order_or_identity() {
+        fn a_package_hashes_the_same_wherever_it_sits() {
             let temp = tempfile::tempdir().unwrap();
             let mut hashes = Vec::new();
-            for (project_name, weft_name) in [("a-project", "z-weft"), ("z-project", "a-weft")] {
-                let project = temp.path().join(project_name);
-                let weft = temp.path().join(weft_name);
-                let roots = [project.join("nodes/local"), weft.join("catalog/shared")];
+            for (local_at, shared_at) in [("a-project/nodes/local", "z-weft/catalog/shared"), ("z-project/src/deep/local", "a-weft/nodes/base_catalog/shared")] {
+                let roots = [temp.path().join(local_at), temp.path().join(shared_at)];
                 for (root, text) in roots.iter().zip(["local body", "shared helper"]) {
                     std::fs::create_dir_all(root).unwrap();
                     std::fs::write(root.join("mod.rs"), text).unwrap();
                 }
-                let hash = digest(&roots, &[&project, &weft]);
-                assert_eq!(hash, digest(&[roots[1].clone(), roots[0].clone(), roots[0].clone()], &[&project, &weft]));
+                let hash = digest(&roots);
+                assert_eq!(hash, digest(&[roots[1].clone(), roots[0].clone(), roots[0].clone()]));
                 hashes.push(hash);
             }
             assert_eq!(hashes[0], hashes[1]);
+        }
+
+        /// A project whose nodes are this weft's standard library, copied
+        /// in by `weft new`, names the stock worker wherever the project
+        /// sits; an edit to one of its standard nodes names another.
+        #[test]
+        fn a_stdlib_only_project_names_the_stock_worker_wherever_it_sits() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+            let stock = compute_stock_binary_hash(root, &host()).unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let mut projects = Vec::new();
+            for at in ["one", "elsewhere/two"] {
+                let dir = temp.path().join(at);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("weft.toml"), format!("[package]\nname = '{}'\nid = '{}'\n", at.replace('/', "-"), uuid::Uuid::new_v4())).unwrap();
+                crate::project::seed_base_catalog(&dir).unwrap();
+                projects.push(dir);
+            }
+            let hash = |dir: &Path| {
+                let project = Project::load(dir).unwrap();
+                let catalog = crate::build::build_project_catalog(dir).unwrap();
+                let graph: ProjectDefinition = serde_json::from_value(serde_json::json!({
+                    "id":project.id(), "nodes":[{"id":"t", "nodeType":"Text", "config":{}, "position":{"x":0,"y":0}}], "edges":[]
+                })).unwrap();
+                compute_binary_hash(&graph, &project, root, &catalog, weft_core::builds::NodeSet::Full, &host(), &DISK).unwrap()
+            };
+            assert_eq!(hash(&projects[0]), stock, "a stock project computes the stock hash");
+            assert_eq!(hash(&projects[1]), stock, "wherever it sits");
+            let text = projects[1].join("nodes/base_catalog/basic/text/mod.rs");
+            let mut body = std::fs::read_to_string(&text).unwrap();
+            body.push_str("\n// edited in the project\n");
+            std::fs::write(&text, body).unwrap();
+            assert_ne!(hash(&projects[1]), stock, "an edited standard node is no stock worker");
         }
 
         #[test]
@@ -994,7 +1141,7 @@ mod fs_hashes {
                 std::fs::create_dir_all(root).unwrap();
                 std::fs::write(root.join("mod.rs"), "node body").unwrap();
             }
-            let hash = |root: &PathBuf| digest(std::slice::from_ref(root), &[temp.path()]);
+            let hash = |root: &PathBuf| digest(std::slice::from_ref(root));
             let unchanged = hash(&b);
             let mut previous = hash(&a);
             for file in ["helper.rs", "deps.toml"] {
@@ -1020,7 +1167,7 @@ mod fs_hashes {
             let pkg = temp.path().join("nodes/computer");
             std::fs::create_dir_all(pkg.join("click")).unwrap();
             std::fs::write(pkg.join("click/mod.rs"), "node body").unwrap();
-            let hash = || digest(std::slice::from_ref(&pkg), &[temp.path()]);
+            let hash = || digest(std::slice::from_ref(&pkg));
             let before = hash();
             std::fs::write(pkg.join("agent.weft"), "Group {}").unwrap();
             std::fs::write(pkg.join("click/flow.weft"), "Group {}").unwrap();

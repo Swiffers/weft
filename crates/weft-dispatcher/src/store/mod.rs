@@ -460,12 +460,6 @@ pub trait TokenStore: Send + Sync {
     /// can't probe other tenants' tokens).
     async fn revoke_signal_token(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<bool>;
 
-    /// Record `token` (an operator key) only when its tenant holds no
-    /// operator key at all, in one statement, so replicas booting at
-    /// once record it once. The install's bootstrap key: re-seeded after
-    /// every operator key is revoked, never beside a live one. Returns
-    /// whether it was recorded.
-    async fn seed_operator_token(&self, token: &SignalToken) -> anyhow::Result<bool>;
 }
 
 /// The trigger setups (`trigger_setup`, which setup runs are in flight)
@@ -578,8 +572,11 @@ pub struct SignalRegistration {
     /// back at rehydrate time. Empty (`{}`) for most kinds. Timer
     /// uses it to remember absolute `next_fire_at_unix_ms` for
     /// After-style schedules so a listener restart doesn't reset
-    /// the clock. The dispatcher treats this field as opaque
-    /// JSON; only the kind's handler interprets it.
+    /// the clock; a kind that keeps its place in what it reads (a
+    /// poll's cursor, what a folder held) keeps that place here, which
+    /// a door that refuses takes ([`FreshPlace`]), so its rows carry
+    /// nothing of it on their next activation. The dispatcher treats
+    /// this field as opaque JSON; only the kind's handler interprets it.
     pub kind_state: Value,
     /// The kind_state version (the `signal.kind_state_seq` column). On
     /// an insert, the version the registration read the row at (0 for a
@@ -606,6 +603,18 @@ pub enum SignalWrite {
     /// it at (a wake claimed a moment in between), so nothing was
     /// written: read the row again and compute the state again from it.
     StateMoved,
+}
+
+/// The kind state an entry signal's row starts from once its place in what
+/// it reads is gone (a door that refuses), as its kind computed it
+/// (the listener's `/fresh_places`) from the row read at `kind_state_seq`:
+/// written only while the row is still at that version, which it moves one
+/// past.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreshPlace {
+    pub token: String,
+    pub kind_state_seq: i64,
+    pub kind_state: Value,
 }
 
 

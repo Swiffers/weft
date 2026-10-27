@@ -20,6 +20,9 @@ chrono-tz = { workspace = true }
 feed-rs = "2"
 dashmap = "6"
 inventory = { workspace = true }
+# The folder watch kind hears a folder through the operating system's
+# change events (inotify on Linux).
+notify = "8"
 futures-util = "0.3"
 regex = { workspace = true }
 # The KindHandler trait spawns async (a fresh registration may make

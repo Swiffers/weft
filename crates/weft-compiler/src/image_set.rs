@@ -108,7 +108,7 @@ pub fn infra_images(definition: &ProjectDefinition, catalog: &FsCatalog, fingerp
     Ok(out)
 }
 
-/// The registry repo segment for infra images, mirroring `WORKER_IMAGE_REPO`. An
+/// The registry repo segment for infra images, mirroring `weft_core::builds::WORKER_REPO`. An
 /// infra image's bare repo is `weft-infra-<image_name>`; the full bare tag is
 /// `weft-infra-<image_name>:<content_hash>`. ONE source of truth for the infra
 /// tag shape, shared by the CLI (local tag) and the dispatcher (which prepends

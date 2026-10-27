@@ -1,27 +1,33 @@
-//! Worker image codegen.
+//! Worker image codegen: the Dockerfile of a worker packaged as an image
+//! (`weft_core::builds::WorkerPackaging::Image`, a cloud's). A local
+//! install compiles its workers on the machine instead and never reads
+//! any of this but the shared pieces the host build uses too (the cache
+//! sweep, `[build.env]`).
 //!
-//! Given a project (for its `[build.worker]` config) and the set
-//! of referenced node types (for per-node `[system]` package
-//! declarations), emit a multi-stage Dockerfile that builds the
-//! worker container image.
+//! Given a project (for its `[build.worker]` config, a cloud-only
+//! setting) and the set of referenced node types with what each needs,
+//! emit a multi-stage Dockerfile that builds the worker container image.
 //!
 //! Pipeline:
 //!
 //! 1. **Parse the base image.** User's `[build.worker] base_image`
-//!    or the built-in default (`debian:bookworm-slim`). Codegen
+//!    or the built-in default ([`DEFAULT_BASE_IMAGE`]). Codegen
 //!    derives a package manager and a `<distro>_<major>` key from
-//!    the image string. Unknown families fall back to apt +
-//!    default-only lookup.
+//!    the image string (`[build.worker] package_manager` names the
+//!    manager when the family is not one weft knows, which is refused
+//!    otherwise).
 //!
-//! 2. **Walk referenced nodes, collect per-stage packages.** Each
-//!    node's `deps.toml` has `[system.build]` (builder-stage
-//!    packages) and `[system.runtime]` (runtime-stage packages),
-//!    each keyed by manager and distro. Codegen:
+//! 2. **Collect per-stage packages.** Each referenced node's
+//!    `[[needs]]` (`weft_core::needs::Need`, read once by the build) has
+//!    a stage (`build`: the builder stage, `run`: the runtime stage) and
+//!    its packages by manager and distro. Codegen:
 //!    - picks the entry matching the chosen distro_key if present,
 //!    - else the `default` entry,
-//!    - else the node contributes nothing for that stage. Only an
-//!      error if the node had entries for this manager but none
-//!      matched AND no default.
+//!    - else the need contributes nothing to the image. Only an error
+//!      if the need had entries for this manager but none matched AND
+//!      no default. A need with no entry for the image's manager at all
+//!      is left to the machine (`WorkerDockerfile::left_to_machine`), which
+//!      the platform's needs check refuses, never the Dockerfile.
 //!
 //! 3. **Union across nodes, emit the Dockerfile.** Builder stage
 //!    installs build-time packages, fetches rust via rustup (or
@@ -40,7 +46,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use weft_catalog::{BuildStage, FsCatalog, SystemManagerKey};
+use weft_catalog::FsCatalog;
+use weft_core::needs::{NeedStage, NodeNeeds, PackageManager};
 
 use crate::error::{BuildError, BuildResult};
 use crate::project::WorkerBuildSection;
@@ -60,15 +67,18 @@ pub struct WorkerDockerfile {
     /// Builder-base image tag the rendered Dockerfile references.
     /// `Some(tag)` whenever the CHOSEN template (built-in prebuilt OR
     /// a user-supplied custom template) contains the
-    /// `{{builder_base_image}}` token, so the CLI ensures the named
-    /// image exists before invoking `docker build`; `None` when the
-    /// rendered Dockerfile never FROMs it (the from-scratch template,
-    /// or a custom template that builds its own toolchain).
+    /// `{{builder_base_image}}` token, so the image must exist before the
+    /// build (on the cloud the install workflow builds it, `weft
+    /// build-images`); `None` when the rendered Dockerfile never FROMs it
+    /// (the from-scratch template, or a custom template that builds its
+    /// own toolchain), whose build context then carries the weft
+    /// workspace itself.
     pub builder_base: Option<String>,
-    /// The key of the BuildKit compile cache the rendered Dockerfile
-    /// mounts (`{{worker_cache_key}}`), `None` for a custom template that
-    /// mounts none.
-    pub worker_cache_key: Option<String>,
+    /// The stages whose install line the template renders
+    /// (`{{install_build_system_packages}}`,
+    /// `{{install_runtime_system_packages}}`): every stage for a built-in
+    /// template, the ones a custom template names.
+    pub installs_stages: BTreeSet<NeedStage>,
     /// Whether the image keeps the record of the node packages its build
     /// left out at `weft_core::builds::LEFT_OUT_RECORD_PATH`: true for
     /// both built-in templates, false for a custom template, which builds
@@ -76,24 +86,9 @@ pub struct WorkerDockerfile {
     pub writes_left_out_record: bool,
 }
 
-impl WorkerDockerfile {
-    /// The builder base this build is FROM and the compile cache it mounts
-    /// (the key computed from the live checkout, so it moves when the
-    /// checkout does). Whoever runs the build on a machine adds them to its
-    /// install's image record before it starts
-    /// (`weft_core::images::ImageRefs::add_build`), so a sweep elsewhere
-    /// keeps them while it runs and after.
-    pub fn uses(&self) -> weft_core::images::BuildUses {
-        weft_core::images::BuildUses {
-            builder_base: self.builder_base.clone(),
-            compile_cache_key: self.worker_cache_key.clone(),
-        }
-    }
-}
-
 /// Parsed base-image metadata. `manager` drives the install
-/// command; `distro_key` (e.g. `debian_12`) drives per-node
-/// package lookup in each stage's `[system.*]` table.
+/// command; `distro_key` (e.g. `debian_12`) drives the lookup of each
+/// need's packages (`Need::packages_for`).
 #[derive(Debug, Clone)]
 pub struct BaseImage {
     pub raw: String,
@@ -104,45 +99,20 @@ pub struct BaseImage {
     pub distro_key: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PackageManager {
-    Apt,
-    Apk,
-    Yum,
-    Brew,
-}
-
-impl PackageManager {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Apt => "apt",
-            Self::Apk => "apk",
-            Self::Yum => "yum",
-            Self::Brew => "brew",
-        }
-    }
-
-    fn to_catalog_key(self) -> SystemManagerKey {
-        match self {
-            Self::Apt => SystemManagerKey::Apt,
-            Self::Apk => SystemManagerKey::Apk,
-            Self::Yum => SystemManagerKey::Yum,
-            Self::Brew => SystemManagerKey::Brew,
-        }
+/// The key a `deps.toml` names `manager` by (`[needs.install.<key>]`).
+fn manager_key(manager: PackageManager) -> &'static str {
+    match manager {
+        PackageManager::Apt => "apt",
+        PackageManager::Dnf => "dnf",
+        PackageManager::Apk => "apk",
+        PackageManager::Brew => "brew",
     }
 }
 
+/// The image a worker image runs on when its project names no
+/// `[build.worker] base_image`, and the base the builder base's packages
+/// are chosen for.
 pub const DEFAULT_BASE_IMAGE: &str = "debian:bookworm-slim";
-
-/// The two images a worker Dockerfile FROMs unless the project names its
-/// own: the shared pre-built builder base, and the runtime base a project
-/// that sets no `base_image` runs on ([`DEFAULT_BASE_IMAGE`], or the
-/// install's own copy of it, so a build never has to reach Docker Hub).
-#[derive(Debug, Clone)]
-pub struct BaseImages {
-    pub builder: String,
-    pub runtime: String,
-}
 
 /// Weft workspace mount point INSIDE the builder container. The
 /// docker build context copies the language-runtime workspace
@@ -159,11 +129,11 @@ pub const WEFT_MOUNT: &str = "/weft";
 /// place node source comes from: the project owns all its nodes.
 pub const NODES_MOUNT: &str = "/weft/project-nodes";
 
-/// Image repo for the shared pre-built builder base. The CLI
+/// Image repo for the shared pre-built builder base. `weft build-images`
 /// qualifies it with the registry and a short hash of the engine
-/// workspace (`crates/`, `Cargo.toml`, `Cargo.lock`,
-/// `rust-toolchain.toml`), so an engine bump produces a fresh ref, and
-/// stamps the result into each project's worker-Dockerfile `FROM`.
+/// workspace (`crate::hash::compute_builder_base_hash`), so an engine
+/// bump produces a fresh ref; a cloud install's worker Dockerfiles `FROM`
+/// the one it was set up with.
 pub const BUILDER_BASE_REPO: &str = "weft-builder-base";
 
 /// Build-context-relative directory the builder base's worker crate is
@@ -183,49 +153,46 @@ pub const BASE_CONTEXT_DIR: &str = ".weft-base-context";
 /// Emit the Dockerfile for a project's worker image.
 ///
 /// `project_root` is only used to resolve a relative
-/// `dockerfile_template` path. `binary_name` is the generated
-/// crate's binary name so the builder stage knows which binary to
-/// copy over. `referenced` is the set of node types the project
-/// compiles against (from codegen's own walk), and
-/// `referenced_package_roots` lists the catalog subdirectories
-/// the build context must include (the codegen's `#[path]`
-/// includes point at these).
+/// `dockerfile_template` path and each node's in-image path.
+/// `binary_name` is the generated crate's binary name so the builder
+/// stage knows which binary to copy over. `referenced` is the set of node
+/// types the project compiles against (from codegen's own walk), and
+/// `needs` what each of them needs (the build read their `deps.toml`
+/// once, `codegen::node_needs`).
 ///
-/// `bases.builder` is the fully-qualified ref of the shared
-/// pre-built builder-base image, `bases.runtime` the runtime base a
-/// project that names none runs on. The CLI computes it from the
-/// engine workspace hash and ensures the image exists. When the
-/// user's runtime base is debian-family and they haven't supplied a
-/// custom Dockerfile template, the builder stage `FROM`s this image
-/// instead of re-installing rustup / build packages / re-fetching
-/// the cargo registry per project. When no custom template is supplied
-/// AND the runtime base is non-debian, we use the from-scratch template
-/// instead (the builder must match the runtime ABI: glibc base vs musl
-/// base). A user-supplied custom template is used verbatim and bypasses
-/// both built-in templates.
+/// `builder_base` is the fully-qualified ref of the shared pre-built
+/// builder-base image. When the user's runtime base is debian-family and
+/// they haven't supplied a custom Dockerfile template, the builder stage
+/// `FROM`s this image instead of re-installing rustup / build packages /
+/// re-fetching the cargo registry per project. When no custom template
+/// is supplied AND the runtime base is non-debian, we use the
+/// from-scratch template instead (the builder must match the runtime
+/// ABI: glibc base vs musl base). A user-supplied custom template is used
+/// verbatim and bypasses both built-in templates.
 ///
 /// `baked` is what the builder base already installed for the stock
-/// worker ([`crate::build::stock_builder_stage`]): a builder stage that
-/// FROMs the base installs only the packages beyond it, so an untouched
-/// project's build runs no `apt-get update` at all.
+/// worker (`crate::build::StockProject::builder_stage`): a builder stage
+/// that FROMs the base installs only the packages beyond it, so an
+/// untouched project's build runs no `apt-get update` at all.
+#[allow(clippy::too_many_arguments)]
 pub fn emit(
     build: &WorkerBuildSection,
     project_root: &Path,
     catalog: &FsCatalog,
     referenced: &BTreeSet<String>,
+    needs: &NodeNeeds,
     binary_name: &str,
-    bases: &BaseImages,
+    builder_base: &str,
     baked: &BuilderStage,
 ) -> BuildResult<WorkerDockerfile> {
-    let builder_base_ref = bases.builder.as_str();
-    let base_image_str = build.base_image.clone().unwrap_or_else(|| bases.runtime.clone());
-    let base = parse_base_image(&base_image_str);
+    let builder_base_ref = builder_base;
+    let base = base_image_of(build)?;
 
-    let mut build_packages =
-        collect_stage_packages(catalog, referenced, &base, BuildStage::Build)?;
-    let runtime_packages =
-        collect_stage_packages(catalog, referenced, &base, BuildStage::Runtime)?;
-    let build_env = collect_build_env(catalog, referenced, project_root)?;
+    let mut build_packages = collect_stage_packages(needs, &base, NeedStage::Build)?;
+    let runtime_packages = collect_stage_packages(needs, &base, NeedStage::Run)?;
+    let build_env = collect_build_env(catalog, referenced, &|node_type, source_dir| {
+        node_catalog_path(node_type, source_dir, project_root)
+    })?;
 
     // The pre-built base shortcuts the "install rustup + apt
     // build-essential" cycle. It only fits a debian-family runtime
@@ -260,10 +227,9 @@ pub fn emit(
         }
     };
 
-    // The CLI's "ensure the builder base exists" step keys off actual
-    // USAGE: whichever template was chosen (built-in or custom), if it
-    // references `{{builder_base_image}}` the rendered Dockerfile will
-    // FROM that ref and the image must exist before `docker build`.
+    // Whichever template was chosen (built-in or custom), if it references
+    // `{{builder_base_image}}` the rendered Dockerfile FROMs that ref, and
+    // the build context needs no weft workspace of its own.
     let builder_base_out = template
         .contains("{{builder_base_image}}")
         .then(|| builder_base_ref.to_string());
@@ -316,30 +282,57 @@ pub fn emit(
         runtime_packages,
         build_env,
         builder_base: builder_base_out,
-        worker_cache_key: template.contains("{{worker_cache_key}}").then_some(worker_cache_key),
+        installs_stages: [
+            (NeedStage::Build, "{{install_build_system_packages}}"),
+            (NeedStage::Run, "{{install_runtime_system_packages}}"),
+        ]
+        .into_iter()
+        .filter(|(_, token)| template.contains(token))
+        .map(|(stage, _)| stage)
+        .collect(),
         writes_left_out_record: build.dockerfile_template.is_none(),
     })
 }
 
+impl WorkerDockerfile {
+    /// Of `needs` (what each node type the image holds needs), the ones
+    /// the image does not install, which the machine its worker runs on
+    /// has to meet: a need with no packages for the base image's manager
+    /// and distro, or of a stage whose install line the template leaves
+    /// out.
+    pub fn left_to_machine(&self, mut needs: weft_core::needs::NodeNeeds) -> weft_core::needs::NodeNeeds {
+        let distro = (!self.base.distro_key.is_empty()).then_some(self.base.distro_key.as_str());
+        for list in needs.values_mut() {
+            list.retain(|need| !self.installs_stages.contains(&need.stage) || need.packages_for(self.base.manager, distro).is_none());
+        }
+        needs.retain(|_, list| !list.is_empty());
+        needs
+    }
+}
+
 /// What a builder stage needs beyond the toolchain to compile a node
-/// set on the default (debian) base: the union of the nodes' build-stage
-/// system packages and their `[build.env]`, `{{catalog_path}}` already
-/// expanded to the in-container node path.
+/// set on the default (debian) base: the union of the packages of the
+/// nodes' build-stage needs and their `[build.env]`, `{{catalog_path}}`
+/// already expanded to the in-container node path.
 pub struct BuilderStage {
     pub packages: Vec<String>,
     pub env: std::collections::BTreeMap<String, String>,
 }
 
 impl BuilderStage {
+    /// The builder stage of `referenced`, whose needs are `needs`.
     pub fn for_nodes(
         catalog: &FsCatalog,
         referenced: &BTreeSet<String>,
+        needs: &NodeNeeds,
         project_root: &Path,
     ) -> BuildResult<Self> {
-        let base = parse_base_image(DEFAULT_BASE_IMAGE);
+        let base = default_base_image();
         Ok(Self {
-            packages: collect_stage_packages(catalog, referenced, &base, BuildStage::Build)?,
-            env: collect_build_env(catalog, referenced, project_root)?,
+            packages: collect_stage_packages(needs, &base, NeedStage::Build)?,
+            env: collect_build_env(catalog, referenced, &|node_type, source_dir| {
+                node_catalog_path(node_type, source_dir, project_root)
+            })?,
         })
     }
 
@@ -347,81 +340,52 @@ impl BuilderStage {
     /// environment, for the default base's package manager.
     pub fn render(&self) -> (String, String) {
         (
-            render_install_line(parse_base_image(DEFAULT_BASE_IMAGE).manager, &self.packages),
+            render_install_line(default_base_image().manager, &self.packages),
             render_build_env_lines(&self.env),
         )
     }
 }
 
-/// Walk referenced nodes' `[system.<stage>.<manager>]` tables and
-/// compute the union of packages to install. Per-node selection:
-/// distro_key match → `default` fallback → error if the node had
-/// entries on this manager but neither resolved.
-fn collect_stage_packages(
-    catalog: &FsCatalog,
-    referenced: &BTreeSet<String>,
-    base: &BaseImage,
-    stage: BuildStage,
-) -> BuildResult<Vec<String>> {
-    let manager_key = base.manager.to_catalog_key();
+/// The union of packages to install for the image's manager and distro
+/// from the needs of `stage` in `needs`. Per need: distro_key match, else
+/// `default`, else an error if the need had entries for this manager but
+/// neither resolved. A need with no entry for this manager contributes
+/// nothing.
+fn collect_stage_packages(needs: &NodeNeeds, base: &BaseImage, stage: NeedStage) -> BuildResult<Vec<String>> {
+    let distro = (!base.distro_key.is_empty()).then_some(base.distro_key.as_str());
     let mut packages: BTreeSet<String> = BTreeSet::new();
-
-    for node_type in referenced {
-        let Some(deps) = catalog
-            .deps(node_type)
-            .map_err(|e| BuildError::Build(format!("load deps for {node_type}: {e}")))?
-        else {
-            continue;
-        };
-        let stage_pkgs = match stage {
-            BuildStage::Build => &deps.system.build,
-            BuildStage::Runtime => &deps.system.runtime,
-        };
-        let table = stage_pkgs.for_manager(manager_key);
-        if table.is_empty() {
-            continue;
-        }
-        let resolved = if !base.distro_key.is_empty() {
-            table.get(&base.distro_key).or_else(|| table.get("default"))
-        } else {
-            table.get("default")
-        };
-        match resolved {
-            Some(list) => {
-                for p in list {
-                    packages.insert(p.clone());
-                }
-            }
-            None => {
+    for (node_type, list) in needs {
+        for need in list.iter().filter(|need| need.stage == stage) {
+            let Some(table) = need.install.get(&base.manager) else {
+                continue;
+            };
+            let Some(list) = need.packages_for(base.manager, distro) else {
                 let keys: Vec<&String> = table.keys().collect();
-                let stage_name = match stage {
-                    BuildStage::Build => "build",
-                    BuildStage::Runtime => "runtime",
-                };
+                let manager = manager_key(base.manager);
                 return Err(BuildError::Build(format!(
-                    "node '{node_type}' declares [system.{stage_name}.{}] packages for {keys:?} \
+                    "node '{node_type}' needs '{}' with {manager} packages for {keys:?} \
                      but none matches the project's base image '{}' (distro key '{}') \
                      and no 'default' entry is set. Add `default = [...]` or \
-                     `{} = [...]` to the node's deps.toml.",
-                    base.manager.name(),
-                    base.raw,
-                    base.distro_key,
-                    base.distro_key,
+                     `{} = [...]` under [needs.install.{manager}] in the node's deps.toml.",
+                    need.name, base.raw, base.distro_key, base.distro_key,
                 )));
-            }
+            };
+            packages.extend(list.iter().cloned());
         }
     }
     Ok(packages.into_iter().collect())
 }
 
 /// Collect and substitute `[build.env]` across referenced nodes.
-/// `{{catalog_path}}` expands to the node's in-container path under
-/// `NODES_MOUNT` (matches where the build context mounts the project's
-/// nodes). Conflicts on the same variable abort the build.
-fn collect_build_env(
+/// `{{catalog_path}}` expands to `node_path(node_type, source_dir)`: the
+/// node's directory where the build compiles it (its in-container path
+/// under `NODES_MOUNT` for an image, its copy in the machine-wide crate
+/// folder for a host build). Conflicts on the same variable abort the
+/// build.
+pub(crate) fn collect_build_env(
     catalog: &FsCatalog,
     referenced: &BTreeSet<String>,
-    project_root: &Path,
+    node_path: &dyn Fn(&str, &Path) -> BuildResult<String>,
 ) -> BuildResult<std::collections::BTreeMap<String, String>> {
     let mut merged: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
@@ -443,7 +407,7 @@ fn collect_build_env(
                 "node '{node_type}' declares [build.env] but has no source dir"
             )));
         };
-        let catalog_path = node_catalog_path(node_type, source_dir, project_root)?;
+        let catalog_path = node_path(node_type, source_dir)?;
 
         for (k, v) in deps.build.env.iter() {
             let resolved = v.replace("{{catalog_path}}", &catalog_path);
@@ -485,7 +449,7 @@ fn node_catalog_path(
 
 /// Parse a base-image string into a `BaseImage`. Recognizes the
 /// Docker Hub tag conventions for the families we support.
-pub fn parse_base_image(raw: &str) -> BaseImage {
+pub fn parse_base_image(raw: &str) -> Option<BaseImage> {
     let (image, tag) = match raw.rsplit_once(':') {
         Some((i, t)) => (i.to_string(), t.to_string()),
         None => (raw.to_string(), String::new()),
@@ -498,22 +462,22 @@ pub fn parse_base_image(raw: &str) -> BaseImage {
         let distro_key = version
             .map(|v| format!("debian_{v}"))
             .unwrap_or_default();
-        return BaseImage {
+        return Some(BaseImage {
             raw: raw.to_string(),
             manager: PackageManager::Apt,
             distro_key,
-        };
+        });
     }
     if image_lc.ends_with("ubuntu") || image_lc.contains("ubuntu") {
         let version = ubuntu_tag_to_version(&tag_lc);
         let distro_key = version
             .map(|v| format!("ubuntu_{v}"))
             .unwrap_or_default();
-        return BaseImage {
+        return Some(BaseImage {
             raw: raw.to_string(),
             manager: PackageManager::Apt,
             distro_key,
-        };
+        });
     }
 
     if image_lc.ends_with("alpine") || image_lc.contains("alpine") {
@@ -521,11 +485,11 @@ pub fn parse_base_image(raw: &str) -> BaseImage {
         let distro_key = version
             .map(|v| format!("alpine_{v}"))
             .unwrap_or_default();
-        return BaseImage {
+        return Some(BaseImage {
             raw: raw.to_string(),
             manager: PackageManager::Apk,
             distro_key,
-        };
+        });
     }
 
     for (needle, key_prefix) in [
@@ -542,20 +506,20 @@ pub fn parse_base_image(raw: &str) -> BaseImage {
             let distro_key = rhel_family_version(&tag_lc)
                 .map(|v| format!("{key_prefix}_{v}"))
                 .unwrap_or_default();
-            return BaseImage {
+            return Some(BaseImage {
                 raw: raw.to_string(),
-                manager: PackageManager::Yum,
+                manager: PackageManager::Dnf,
                 distro_key,
-            };
+            });
         }
     }
 
     if image_lc.contains("homebrew") || image_lc.contains("/brew") {
-        return BaseImage {
+        return Some(BaseImage {
             raw: raw.to_string(),
             manager: PackageManager::Brew,
             distro_key: String::new(),
-        };
+        });
     }
 
     if image_lc.starts_with("python") {
@@ -573,22 +537,37 @@ pub fn parse_base_image(raw: &str) -> BaseImage {
         } else {
             PackageManager::Apt
         };
-        return BaseImage {
+        return Some(BaseImage {
             raw: raw.to_string(),
             manager,
             distro_key,
-        };
+        });
     }
 
-    tracing::warn!(
-        raw = raw,
-        "unknown base image family; defaulting to apt + default-only package selection. \
-         Set `[build.worker] dockerfile_template` or pick a known base image for more control.",
-    );
-    BaseImage {
-        raw: raw.to_string(),
-        manager: PackageManager::Apt,
-        distro_key: String::new(),
+    None
+}
+
+/// [`DEFAULT_BASE_IMAGE`], a family weft knows.
+fn default_base_image() -> BaseImage {
+    parse_base_image(DEFAULT_BASE_IMAGE).expect("the default base image is a family weft knows")
+}
+
+/// The base image a project's worker image is built on, and how needs
+/// are installed on it: its family read off its name ([`parse_base_image`]),
+/// with `[build.worker] package_manager` deciding the manager when it is
+/// set. An image of no family weft knows, with no package manager named,
+/// is refused: weft would have to guess how to install a need on it.
+pub fn base_image_of(build: &WorkerBuildSection) -> BuildResult<BaseImage> {
+    let raw = build.base_image.clone().unwrap_or_else(|| DEFAULT_BASE_IMAGE.to_string());
+    match (parse_base_image(&raw), build.package_manager) {
+        (Some(base), None) => Ok(base),
+        (Some(base), Some(manager)) => Ok(BaseImage { manager, ..base }),
+        (None, Some(manager)) => Ok(BaseImage { raw, manager, distro_key: String::new() }),
+        (None, None) => Err(BuildError::Build(format!(
+            "weft.toml's [build.worker] base_image {raw:?} is of no family weft knows how to install a node's needs on \
+             (debian, ubuntu, alpine, the rhel family, python, homebrew); name its package manager with \
+             [build.worker] package_manager = \"apt\" (or \"dnf\", \"apk\", \"brew\")"
+        ))),
     }
 }
 
@@ -685,31 +664,32 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
 /// package, emitted at the same paths this build uses and pinned by
 /// the SAME `Cargo.lock`. So this per-project build:
 ///
-/// - compiles into a persistent BuildKit cache per
-///   `{{worker_cache_key}}` (`hash::compute_worker_cache_key`: the build
-///   environment and the builder) and compile lane (below), shared by
-///   every worker build on this host that holds that lane. Each cache
-///   is seeded ONCE from the baked `/weft/target`
-///   (the marker file records a complete seed; a build interrupted
-///   mid-copy seeds again), so the precompiled engine is there from the
-///   first build. After that, cargo's own fingerprints decide what
-///   compiles: a `pkg_<name>` crate whose sources and generated shim are
-///   older than its cached rlib is reused as is, whatever project asked
-///   for it. The seed already holds every stock package compiled, so a
-///   project with one custom or edited node compiles that node and links,
-///   from its very first build on a host. Reuse
-///   across projects rests on each package crate living at a path named
-///   by its content (`/work/pkg_<name>-<slot>`,
-///   `codegen::write_package_crates`: same sources, same slot, shared
-///   rlib; an edited copy of a stock node gets a slot of its own and can
-///   never be mistaken for the stock one) and on every staged package
-///   file carrying the date its content gives it
+/// - on a builder that keeps nothing between builds (a cloud's, where
+///   every build runs on a fresh machine, which says so with
+///   [`COMPILE_CACHE_ARG`]`=none`) compiles in the baked `/weft/target`
+///   itself: seeding a cache that is thrown away would copy the whole
+///   baked target (gigabytes) on every build for nothing, and the sweep,
+///   which only tends a cache kept for later builds, does not run;
+/// - on a builder that keeps its BuildKit caches (`weft build-images`
+///   run on one machine again and again) compiles into a persistent
+///   cache per `{{worker_cache_key}}` (`hash::compute_worker_cache_key`:
+///   the build environment and the builder), seeded ONCE from the baked
+///   `/weft/target` (the marker file records a complete seed; a build
+///   interrupted mid-copy seeds again). After that, cargo's own
+///   fingerprints decide what compiles: a `pkg_<name>` crate whose
+///   sources and generated shim are older than its cached rlib is reused
+///   as is, whatever project asked for it. Reuse across projects rests on
+///   each package crate living at a path named by its content
+///   (`/work/pkg_<name>-<slot>`, `codegen::write_package_crates`: same
+///   sources, same slot, shared rlib; an edited copy of a stock node gets
+///   a slot of its own and can never be mistaken for the stock one) and
+///   on every staged package file carrying the date its content gives it
 ///   (`build::package_source_mtime`), so a package compiled from another
-///   checkout still counts. Every distinct
-///   content compiled keeps its slot's artifacts until no build has
-///   used them for [`WORKER_CACHE_RETENTION_DAYS`] ([`CACHE_GC_SCRIPT`]
-///   runs after every build); `weft clean --images` reports the mount's
-///   size and `weft clean --build-cache` throws it away whole;
+///   checkout still counts. Every distinct content compiled keeps its
+///   slot's artifacts until no build has used them for
+///   [`WORKER_CACHE_RETENTION_DAYS`] ([`CACHE_GC_SCRIPT`] runs after every
+///   such build); the mount is `sharing=locked`, so a second build waits
+///   for the first rather than race it;
 /// - seeds the worker crate's `Cargo.lock` from `{{seed_lock}}`: on the
 ///   builder base, [`BASE_WORKER_LOCK`], the lock the stock worker
 ///   resolved to, so every crate the base compiled resolves to the SAME
@@ -722,21 +702,7 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
 /// The cache mounts at `/cache/target`, never over `/weft/target`: a
 /// mount there would shadow the baked layer the seed copies from. The
 /// registry cache mount keeps the crates.io sources a build fetched
-/// (immutable per version), so a lane downloads a crate once.
-///
-/// Both caches are one per LANE (`{{worker_cache_key}}-<lane>` for the
-/// compile cache), the lane a build-arg ([`COMPILE_LANE_ARG`]) the CLI
-/// fills with a lane it holds for the whole build. Cargo locks a target
-/// directory for a whole build, so one shared cache made every worker
-/// build on a host wait for the one before it (ten builds at once meant
-/// the last waited out nine); each lane is its own directory, seeded
-/// once from the baked layer on its first use, so builds in different
-/// lanes compile side by side and the host keeps at most one cache per
-/// lane. The registry is per lane for the same reason: cargo's lock on
-/// its package cache lives in `$CARGO_HOME`, outside the mount, so two
-/// builds sharing one registry unpack the same crate over each other.
-/// Both mounts are `sharing=locked`, which makes a build given the same
-/// lane as a running one wait for it rather than race it.
+/// (immutable per version), so a builder downloads a crate once.
 ///
 /// `cargo build` (NOT `--locked`): the worker manifest carries extra
 /// path deps (the `pkg_<node>` crates) absent from the seeded
@@ -752,27 +718,18 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
 /// feature), writes their record to `/work/{{left_out_record}}`, and
 /// builds the worker again with only the healthy features. The record is
 /// what the runtime stage copies into the image. The helper is one fixed
-/// package for every project, so after a lane's first build it is a
+/// package for every project, so after a cache's first build it is a
 /// cache hit; a failure no package explains still fails the build.
 ///
 /// Both builds of the helper and every build it runs write cargo's JSON
 /// messages to [`CARGO_MESSAGES_PATH`]: the list of every unit the build
 /// used, which is how the cache sweep after it ([`CACHE_GC_SCRIPT`])
 /// knows what to mark used.
-///
-/// A builder that keeps nothing between builds (a cloud's, where every
-/// build runs on a fresh machine) says so with [`COMPILE_CACHE_ARG`]
-/// `=none`: its cache mount starts empty every time, so seeding it would
-/// copy the whole baked target (gigabytes) on every build only to throw it
-/// away. That build compiles in the baked `/weft/target` itself instead,
-/// which already is everything the seed would have been, and the sweep,
-/// which only tends a cache kept for later builds, does not run.
 const CARGO_BUILD_RUN_FRAGMENT: &str = concat!(
     "ENV CARGO_TARGET_DIR=/cache/target\n",
-    "ARG WEFT_COMPILE_LANE\n",
     "ARG WEFT_COMPILE_CACHE=kept\n",
-    "RUN --mount=type=cache,id=weft-worker-cargo-registry-${WEFT_COMPILE_LANE},target=/root/.cargo/registry,sharing=locked \\\n",
-    "    --mount=type=cache,id=weft-worker-target-{{worker_cache_key}}-${WEFT_COMPILE_LANE},target=/cache/target,sharing=locked \\\n",
+    "RUN --mount=type=cache,id=weft-worker-cargo-registry,target=/root/.cargo/registry,sharing=locked \\\n",
+    "    --mount=type=cache,id=weft-worker-target-{{worker_cache_key}},target=/cache/target,sharing=locked \\\n",
     "    if [ \"$WEFT_COMPILE_CACHE\" = none ] && [ -d /weft/target ]; then export CARGO_TARGET_DIR=/weft/target; \\\n",
     "    elif ! [ -f /cache/target/.weft-seeded ] && [ -d /weft/target ]; then \\\n",
     "      cp -a /weft/target/. /cache/target/ && touch /cache/target/.weft-seeded; fi \\\n",
@@ -801,14 +758,10 @@ pub const BASE_WORKER_LOCK: &str = "/weft/worker.Cargo.lock";
 /// workspace lock its own `COPY weft/` brings.
 const WORKSPACE_LOCK: &str = "/weft/Cargo.lock";
 
-/// The build-arg naming the compile-cache lane a worker build uses (see
-/// [`CARGO_BUILD_RUN_FRAGMENT`]).
-// SYNC: COMPILE_LANE_ARG <-> the `ARG WEFT_COMPILE_LANE` line of CARGO_BUILD_RUN_FRAGMENT above
-pub const COMPILE_LANE_ARG: &str = "WEFT_COMPILE_LANE";
-
 /// The id prefix of the compile cache mounts, as `docker buildx du`
-/// reports them (`with id "/weft-worker-target-<key>-<lane>"`): what a
-/// size report looks for.
+/// reports them (`with id "/weft-worker-target-<key>"`, followed by
+/// `-<lane>` for one an older weft made): what a size report and a sweep
+/// look for.
 pub const WORKER_CACHE_MOUNT_ID_PREFIX: &str = "weft-worker-target-";
 
 /// How long a compiled node package stays in the shared cache after the
@@ -839,14 +792,15 @@ pub const CARGO_MESSAGES_PATH: &str = "/tmp/weft-cargo-messages.json";
 /// unit, the ones cargo reused untouched included), and either drops
 /// everything else (`this-build`, for a cache one build owns: the runtime
 /// image's, the builder base's) or marks the per-project crates used and
-/// expires the ones no build used for a while (`aged`, for the worker
-/// cache every project on a host shares). Its own header says how.
+/// expires the ones no build used for a while (`aged`, for a worker
+/// cache every project on a machine shares). Its own header says how.
 ///
-/// Every built-in-template worker build runs it inside the cache mount,
-/// after the binary is copied out (a custom `dockerfile_template` writes
-/// its own RUN and gets none of this), with
-/// [`WORKER_CACHE_RETENTION_DAYS`] and [`WORKER_CACHE_VERSIONS_KEPT`]. It
-/// can never fail a build (each RUN reports and carries on).
+/// Every worker compiled on a machine runs it in its lane's cache
+/// (`weft_platform_local::host_build`), and every built-in-template worker
+/// image build that keeps its cache runs it inside the mount, after the
+/// binary is copied out (a custom `dockerfile_template` writes its own RUN
+/// and gets none of this), with [`WORKER_CACHE_RETENTION_DAYS`] and
+/// [`WORKER_CACHE_VERSIONS_KEPT`]. It can never fail a build.
 ///
 /// "Used" is stored, for `aged`, on the crate's own files: cargo rewrites
 /// them when it compiles the crate and leaves them alone when it reuses
@@ -988,7 +942,10 @@ fn render_builder_base(manager: PackageManager) -> String {
         .to_string(),
         PackageManager::Apk => "RUN apk add --no-cache ca-certificates curl build-base\n"
         .to_string(),
-        PackageManager::Yum => concat!(
+        // `yum`, not `dnf`, inside an image: every RHEL-family image has
+        // it (on 8 and later it is dnf under its old name), and an older
+        // one has nothing else.
+        PackageManager::Dnf => concat!(
             "RUN yum install -y ca-certificates curl gcc gcc-c++ make \\\n",
             "    && yum clean all\n",
         )
@@ -1010,7 +967,7 @@ fn render_runtime_base(manager: PackageManager) -> String {
         )
         .to_string(),
         PackageManager::Apk => "RUN apk add --no-cache ca-certificates\n".to_string(),
-        PackageManager::Yum => "RUN yum install -y ca-certificates \\\n    && yum clean all\n"
+        PackageManager::Dnf => "RUN yum install -y ca-certificates \\\n    && yum clean all\n"
         .to_string(),
         PackageManager::Brew => String::new(),
     }
@@ -1029,7 +986,7 @@ fn render_install_line(manager: PackageManager, packages: &[String]) -> String {
             "RUN apt-get update \\\n    && apt-get install -y --no-install-recommends {joined} \\\n    && rm -rf /var/lib/apt/lists/*\n",
         ),
         PackageManager::Apk => format!("RUN apk add --no-cache {joined}\n"),
-        PackageManager::Yum => format!(
+        PackageManager::Dnf => format!(
             "RUN yum install -y {joined} \\\n    && yum clean all\n",
         ),
         PackageManager::Brew => format!("RUN brew install {joined}\n"),
@@ -1046,55 +1003,63 @@ mod tests {
 
     #[test]
     fn debian_bookworm_slim_parses_to_debian_12() {
-        let b = parse_base_image("debian:bookworm-slim");
+        let b = parse_base_image("debian:bookworm-slim").unwrap();
         assert_eq!(b.manager, PackageManager::Apt);
         assert_eq!(b.distro_key, "debian_12");
     }
 
     #[test]
     fn debian_trixie_parses_to_debian_13() {
-        let b = parse_base_image("debian:trixie-slim");
+        let b = parse_base_image("debian:trixie-slim").unwrap();
         assert_eq!(b.distro_key, "debian_13");
     }
 
     #[test]
     fn debian_numeric_tag_parses_to_debian_12() {
-        let b = parse_base_image("debian:12-slim");
+        let b = parse_base_image("debian:12-slim").unwrap();
         assert_eq!(b.distro_key, "debian_12");
     }
 
     #[test]
     fn ubuntu_numeric_parses() {
-        let b = parse_base_image("ubuntu:22.04");
+        let b = parse_base_image("ubuntu:22.04").unwrap();
         assert_eq!(b.distro_key, "ubuntu_22_04");
     }
 
     #[test]
     fn alpine_parses() {
-        let b = parse_base_image("alpine:3.19");
+        let b = parse_base_image("alpine:3.19").unwrap();
         assert_eq!(b.manager, PackageManager::Apk);
         assert_eq!(b.distro_key, "alpine_3_19");
     }
 
     #[test]
     fn rocky_linux_parses() {
-        let b = parse_base_image("rockylinux:9-minimal");
-        assert_eq!(b.manager, PackageManager::Yum);
+        let b = parse_base_image("rockylinux:9-minimal").unwrap();
+        assert_eq!(b.manager, PackageManager::Dnf);
         assert_eq!(b.distro_key, "rocky_9");
     }
 
     #[test]
     fn python_image_uses_debian_under_the_hood() {
-        let b = parse_base_image("python:3.13-slim-bookworm");
+        let b = parse_base_image("python:3.13-slim-bookworm").unwrap();
         assert_eq!(b.manager, PackageManager::Apt);
         assert_eq!(b.distro_key, "debian_12");
     }
 
+    /// An image of no family weft knows is refused unless the project
+    /// names its package manager, which then decides; a known one keeps
+    /// its distro with the manager named.
     #[test]
-    fn unknown_image_falls_back_to_apt_no_distro_key() {
-        let b = parse_base_image("registry.example.com/my-org/my-base:abc123");
-        assert_eq!(b.manager, PackageManager::Apt);
-        assert_eq!(b.distro_key, "");
+    fn an_unknown_image_needs_its_package_manager_named() {
+        let build = |base: &str, manager| WorkerBuildSection { base_image: Some(base.into()), dockerfile_template: None, package_manager: manager };
+        assert!(parse_base_image("registry.example.com/my-org/my-base:abc123").is_none());
+        let err = base_image_of(&build("registry.example.com/my-org/my-base:abc123", None)).unwrap_err().to_string();
+        assert!(err.contains("package_manager"), "{err}");
+        let named = base_image_of(&build("registry.example.com/my-org/my-base:abc123", Some(PackageManager::Apk))).unwrap();
+        assert_eq!((named.manager, named.distro_key.as_str()), (PackageManager::Apk, ""));
+        let known = base_image_of(&build("debian:bookworm-slim", Some(PackageManager::Apt))).unwrap();
+        assert_eq!(known.distro_key, "debian_12");
     }
 
     #[test]
@@ -1173,6 +1138,7 @@ mod tests {
         let build = WorkerBuildSection {
             base_image: Some("alpine:3.19".into()),
             dockerfile_template: None,
+            package_manager: None,
         };
         let project_root = std::path::Path::new("/tmp");
         let catalog = weft_catalog::FsCatalog::empty();
@@ -1182,8 +1148,9 @@ mod tests {
             project_root,
             &catalog,
             &referenced,
+            &NodeNeeds::new(),
             "worker_test",
-            &BaseImages { builder: "weft-builder-base:irrelevant".into(), runtime: DEFAULT_BASE_IMAGE.into() },
+            "weft-builder-base:irrelevant",
             &nothing_baked(),
         )
         .expect("emit");
@@ -1213,9 +1180,9 @@ mod tests {
 
     /// A CUSTOM template that references `{{builder_base_image}}`
     /// must report `builder_base = Some(tag)`: the rendered
-    /// Dockerfile FROMs that tag, so the CLI has to ensure the image
-    /// exists. The ensure step keys off actual token usage, not off
-    /// which template branch was taken.
+    /// Dockerfile FROMs that tag, so its context carries no weft
+    /// workspace. This keys off actual token usage, not off which
+    /// template branch was taken.
     #[test]
     fn custom_template_using_builder_base_token_reports_the_tag() {
         use crate::project::WorkerBuildSection;
@@ -1232,6 +1199,7 @@ mod tests {
         let build = WorkerBuildSection {
             base_image: None,
             dockerfile_template: Some("Dockerfile.tpl".into()),
+            package_manager: None,
         };
         let catalog = weft_catalog::FsCatalog::empty();
         let referenced = std::collections::BTreeSet::new();
@@ -1240,15 +1208,16 @@ mod tests {
             &dir,
             &catalog,
             &referenced,
+            &NodeNeeds::new(),
             "worker_test",
-            &BaseImages { builder: "weft-builder-base:cafebabe".into(), runtime: DEFAULT_BASE_IMAGE.into() },
+            "weft-builder-base:cafebabe",
             &nothing_baked(),
         )
         .expect("emit");
         assert_eq!(
             out.builder_base.as_deref(),
             Some("weft-builder-base:cafebabe"),
-            "custom template using the token must report the tag for the CLI ensure step"
+            "custom template using the token must report the tag the build FROMs"
         );
         assert!(out.body.contains("FROM weft-builder-base:cafebabe AS builder"));
         assert!(!out.writes_left_out_record, "a custom template builds its own way and keeps no record");
@@ -1256,8 +1225,7 @@ mod tests {
     }
 
     /// Default debian runtime + no custom template: prebuilt base
-    /// kicks in, `builder_base` is reported back to the CLI so it
-    /// can ensure the named image exists, and the rendered body
+    /// kicks in, `builder_base` is reported back, and the rendered body
     /// FROMs the tag we passed in.
     #[test]
     fn default_debian_runtime_uses_prebuilt_base() {
@@ -1265,6 +1233,7 @@ mod tests {
         let build = WorkerBuildSection {
             base_image: None,
             dockerfile_template: None,
+            package_manager: None,
         };
         let project_root = std::path::Path::new("/tmp");
         let catalog = weft_catalog::FsCatalog::empty();
@@ -1274,8 +1243,9 @@ mod tests {
             project_root,
             &catalog,
             &referenced,
+            &NodeNeeds::new(),
             "worker_test",
-            &BaseImages { builder: "weft-builder-base:abcdef0123456789".into(), runtime: DEFAULT_BASE_IMAGE.into() },
+            "weft-builder-base:abcdef0123456789",
             &nothing_baked(),
         )
         .expect("emit");
@@ -1311,6 +1281,11 @@ mod tests {
         assert!(
             out.body.contains("id=weft-worker-target-") && !out.body.contains("{{worker_cache_key}}"),
             "the cache is named by the substituted key: {}",
+            out.body
+        );
+        assert!(
+            !out.body.contains("WEFT_COMPILE_LANE") && out.body.contains("id=weft-worker-cargo-registry,"),
+            "an image build compiles in no lane of the machine's: {}",
             out.body
         );
         assert!(
@@ -1364,6 +1339,73 @@ mod tests {
             "the sweep runs after the binary is out and can never fail the build: {}",
             out.body
         );
+    }
+
+    /// What a node needs from the machine lands in the image: a run need
+    /// in the runtime stage, a build need in the builder stage, each for
+    /// the image's manager; a need with no entry for that manager adds
+    /// nothing, and an unused node adds nothing at all.
+    #[test]
+    fn a_nodes_needs_install_into_the_stage_they_are_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = crate::codegen::tests::catalog_with_needs(dir.path());
+        let referenced: BTreeSet<String> = ["Run".to_string(), "Plain".to_string()].into();
+        let build = WorkerBuildSection { base_image: Some("debian:bookworm-slim".into()), dockerfile_template: None, package_manager: None };
+        let needs = crate::codegen::node_needs(&referenced, &catalog).unwrap();
+        let out = emit(&build, dir.path(), &catalog, &referenced, &needs, "worker_test", "weft-builder-base:x", &nothing_baked()).expect("emit");
+        assert_eq!(out.runtime_packages, ["python3"]);
+        assert_eq!(out.build_packages, ["libvips-dev"]);
+        let (builder, runtime) = out.body.split_once("\nFROM debian:bookworm-slim\n").expect("two stages");
+        assert!(builder.contains("apt-get install -y --no-install-recommends libvips-dev "), "{builder}");
+        assert!(runtime.contains("apt-get install -y --no-install-recommends python3 "), "{runtime}");
+        assert!(!out.body.contains("ffmpeg") && !out.body.contains(" say"), "{}", out.body);
+
+        let rocky = WorkerBuildSection { base_image: Some("rockylinux:9".into()), dockerfile_template: None, package_manager: None };
+        let out = emit(&rocky, dir.path(), &catalog, &referenced, &needs, "worker_test", "weft-builder-base:x", &nothing_baked()).expect("emit");
+        assert_eq!(out.runtime_packages, ["python3-libs"]);
+        assert!(out.build_packages.is_empty(), "the build need has no dnf entry: {:?}", out.build_packages);
+        assert!(out.body.contains("yum install -y python3-libs"), "{}", out.body);
+    }
+
+    /// What an image leaves to the machine its worker runs on is each need
+    /// it has no packages for on its base, and every need of a stage a
+    /// custom template installs nothing in.
+    #[test]
+    fn an_image_leaves_to_the_machine_only_the_needs_it_does_not_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = crate::codegen::tests::catalog_with_needs(dir.path());
+        let referenced: BTreeSet<String> = ["Run".to_string()].into();
+        let needs = crate::codegen::node_needs(&referenced, &catalog).unwrap();
+        let left = |build: &WorkerBuildSection| -> Vec<String> {
+            let out = emit(build, dir.path(), &catalog, &referenced, &needs, "worker_test", "weft-builder-base:x", &nothing_baked()).expect("emit");
+            out.left_to_machine(needs.clone()).values().flatten().map(|need| need.name.clone()).collect()
+        };
+        assert_eq!(left(&WorkerBuildSection { base_image: Some("debian:bookworm-slim".into()), dockerfile_template: None, package_manager: None }), ["say"]);
+        assert_eq!(left(&WorkerBuildSection { base_image: Some("rockylinux:9".into()), dockerfile_template: None, package_manager: None }), ["libvips", "say"]);
+        std::fs::write(dir.path().join("Dockerfile.custom"), "FROM {{base_image}}\n{{install_runtime_system_packages}}\n").unwrap();
+        let custom = WorkerBuildSection { base_image: Some("debian:bookworm-slim".into()), dockerfile_template: Some("Dockerfile.custom".into()), package_manager: None };
+        assert_eq!(left(&custom), ["libvips", "say"], "the template installs no build stage");
+    }
+
+    /// A need that names packages for the image's manager, none for its
+    /// distro and no default, is an error naming the need and the fix.
+    #[test]
+    fn a_need_with_no_entry_for_the_distro_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = dir.path().join("nodes/old");
+        std::fs::create_dir_all(&node).unwrap();
+        std::fs::write(node.join("metadata.json"), r#"{"type": "Old", "label": "Old", "description": "d", "inputs": [], "outputs": []}"#).unwrap();
+        std::fs::write(node.join("mod.rs"), "// impl\n").unwrap();
+        std::fs::write(node.join("deps.toml"), "[[needs]]\nname = \"python3\"\ncheck = [\"python3\"]\n[needs.install.apt]\ndebian_11 = [\"python3.9\"]\n").unwrap();
+        let catalog = FsCatalog::discover(&dir.path().join("nodes")).unwrap();
+        let build = WorkerBuildSection { base_image: None, dockerfile_template: None, package_manager: None };
+        let old: BTreeSet<String> = ["Old".to_string()].into();
+        let needs = crate::codegen::node_needs(&old, &catalog).unwrap();
+        let err = emit(&build, dir.path(), &catalog, &old, &needs, "worker_test", "weft-builder-base:x", &nothing_baked())
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(err.contains("'python3'") && err.contains("[needs.install.apt]") && err.contains("debian_12"), "{err}");
     }
 
     /// A fake cargo target dir for the sweep: `release/` and the JSON

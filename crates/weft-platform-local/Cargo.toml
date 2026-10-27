@@ -36,6 +36,8 @@ weft-assets = { workspace = true }
 # A folder's change events (`folders`).
 notify = "8"
 hex = "0.4"
+# Signals to worker processes (`processes`).
+libc = "0.2"
 getrandom = "0.2"
 weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 

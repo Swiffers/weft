@@ -486,10 +486,6 @@ impl BrokerEventsClient {
         self.http.post("/v1/access/listener-resolve", req).await
     }
 
-    pub async fn listener_infra_address(&self, req: &ListenerInfraAddressRequest) -> Result<ListenerInfraAddress> {
-        self.http.post("/v1/infra/listener-address", req).await
-    }
-
     pub async fn subscription_ensure(
         &self,
         req: &SubscriptionEnsureRequest,

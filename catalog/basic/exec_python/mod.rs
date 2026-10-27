@@ -80,13 +80,15 @@
 //!   included), and the next script that needs one starts a fresh one.
 //!   The same happens when the engine drops the node body.
 //!
-//! Isolation: the worker the node runs in IS the isolation boundary;
-//! the Python executes there with the same access that worker already
-//! has, and is not sandboxed further (a process of its own keeps a
-//! script that crashes Python from taking the worker with it, nothing
-//! more). Running a project therefore runs
-//! its ExecPython code with that worker's privileges, the same trust
-//! model as running the project's own program.
+//! Isolation: none. The script runs in a `python3` process the worker
+//! starts, with the worker's own user, folder, files, network and
+//! environment; a process of its own keeps a script that crashes Python
+//! from taking the worker with it, nothing more. In the cloud that is
+//! the worker's container. On a local install the worker is a plain
+//! process on the person's machine, so the script can read and write
+//! whatever that person can. Running a project runs its ExecPython code
+//! with exactly that access, the same trust as running the project's own
+//! program.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -393,7 +395,11 @@ impl Interpreters {
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| node_error(format!("could not start Python (`python3`): {e}")))?;
+            .map_err(|e| match e.kind() {
+                // The need its deps.toml declares.
+                std::io::ErrorKind::NotFound => weft::error::need_missing("python3"),
+                _ => node_error(format!("could not start Python (`python3`): {e}")),
+            })?;
         let stdin = child.stdin.take().expect("stdin is piped");
         let stdout = child.stdout.take().expect("stdout is piped");
         Ok(Interpreter { child, stdin, answers: tokio::io::BufReader::new(stdout).lines() })

@@ -234,7 +234,7 @@ fn rig(run_id: &str, broker_base: String) -> Rig {
             // so parallel iterations never share a socket.
             replica: format!("test-listener-{run_id}"),
             holds_here: true,
-            prefer_push: false,
+            holders: weft_listener::Holders::OnThisMachine,
         },
         Arc::new(FakeTasks),
         // The fake broker ignores the bearer.

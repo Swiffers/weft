@@ -62,11 +62,16 @@ impl RunPermits {
     /// The permits the platform that started this worker set
     /// ([`MAX_RUNS_AT_ONCE_ENV`], [`MAX_QUEUE_WAIT_ENV`]). With no most set,
     /// the worker takes as many runs as its memory holds of
-    /// [`MEMORY_PER_RUN`], and never fewer than [`FEWEST_BY_DEFAULT`].
-    pub fn from_env() -> anyhow::Result<Arc<Self>> {
+    /// [`MEMORY_PER_RUN`], and never fewer than [`FEWEST_BY_DEFAULT`]: its
+    /// memory budget's (`crate::busy`), or with none (a process sharing a
+    /// person's machine), the machine's.
+    pub fn from_env(budget: Option<crate::busy::Budget>) -> anyhow::Result<Arc<Self>> {
         let most = match std::env::var(MAX_RUNS_AT_ONCE_ENV) {
             Ok(most) => most.trim().parse::<usize>().map_err(|e| anyhow::anyhow!("{MAX_RUNS_AT_ONCE_ENV} is not a count: {e}"))?,
-            Err(_) => default_most(crate::busy::read().map(|memory| memory.limit)),
+            Err(_) => default_most(match budget {
+                Some(budget) => budget.limit(),
+                None => machine_memory(),
+            }),
         };
         anyhow::ensure!(most > 0, "{MAX_RUNS_AT_ONCE_ENV} is 0: the worker could take no run");
         let wait = std::env::var(MAX_QUEUE_WAIT_ENV).map_err(|_| {
@@ -96,6 +101,36 @@ impl RunPermits {
     }
 }
 
+/// All the memory of the machine the worker runs on, in bytes; `None` when
+/// it cannot be read.
+#[cfg(target_os = "linux")]
+fn machine_memory() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo").ok().as_deref().and_then(total_from_meminfo)
+}
+
+/// All the memory of the machine the worker runs on, in bytes; `None` when
+/// it cannot be read.
+#[cfg(target_os = "macos")]
+fn machine_memory() -> Option<u64> {
+    let mut bytes: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    // SAFETY: `hw.memsize` is a 64-bit number, written into `bytes`, whose
+    // size is passed; nothing is set.
+    let read = unsafe {
+        libc::sysctlbyname(c"hw.memsize".as_ptr(), (&mut bytes as *mut u64).cast(), &mut size, std::ptr::null_mut(), 0)
+    };
+    (read == 0 && size == std::mem::size_of::<u64>()).then_some(bytes)
+}
+
+/// The machine's memory as `/proc/meminfo` gives it (`MemTotal`), in bytes.
+#[cfg(any(target_os = "linux", test))]
+fn total_from_meminfo(meminfo: &str) -> Option<u64> {
+    let kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:")?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok())?;
+    Some(kib * 1024)
+}
+
 /// The default most runs at once for a worker with `memory` bytes (`None`
 /// when it reads none).
 fn default_most(memory: Option<u64>) -> usize {
@@ -105,6 +140,14 @@ fn default_most(memory: Option<u64>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The machine's memory is the total `/proc/meminfo` gives.
+    #[test]
+    fn the_machine_memory_is_its_total() {
+        let meminfo = "MemTotal:        1000 kB\nMemFree:          100 kB\nMemAvailable:     250 kB\n";
+        assert_eq!(total_from_meminfo(meminfo), Some(1000 * 1024));
+        assert_eq!(total_from_meminfo("MemFree: 100 kB\n"), None);
+    }
 
     /// The default follows the memory, a MiB a run, never below the floor.
     #[test]

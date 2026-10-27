@@ -1148,14 +1148,44 @@ in your report and stop, rather than reaching for it from the node.
 [dependencies]
 regex = "1"
 
-[system.runtime.apt]
-debian_12 = ["libpq5"]
+[[needs]]
+name = "ffmpeg"
+check = ["ffmpeg", "-version"]
+[needs.install.apt]
+default = ["ffmpeg"]
+[needs.install.brew]
+default = ["ffmpeg"]
 ```
 
-Sections: `[dependencies]` (cargo), `[build-dependencies]`, `[system.build]`
-/ `[system.runtime]` (OS packages per manager: `apt`, `apk`, `yum`, `brew`,
-keyed by distro like `debian_12`, `ubuntu_24_04`, `alpine_3_19`, or
-`default`), `[build.env]`.
+Sections: `[dependencies]` (cargo), `[build-dependencies]`, `[[needs]]`,
+`[build.env]`. Any other key fails the build, naming it.
+
+A `[[needs]]` entry is one thing the machine the worker runs on must have:
+a program the node starts (the default, `stage = "run"`), or, with `stage =
+"build"`, something its package needs to compile, like a C library's
+headers. `name` is what the user is told, `check` a command that exits 0
+when it is there (its first word looked up on the `PATH`), and
+`[needs.install.<manager>]` the packages that provide it, for `apt`, `dnf`,
+`apk` and `brew`, keyed by distro like `debian_12` or `ubuntu_24_04`, or
+`default`. On a local install a program that uses the node is refused
+before it runs, activates or resyncs when a `run` check fails, naming `weft
+deps-install <NodeType>`; a node it does not use is never checked. A `build` need is not checked before the
+package compiles, so a missing one shows as the package failing to compile
+and being left out. A cloud image installs the same packages, using the entry for its own
+package manager: the one for the image's distro, else that manager's
+`default`. If a `run` need has no entry for the manager, every program
+using the node is refused; if a need has entries for the manager but none
+for the distro and no `default`, the image build fails, so give each
+manager a `default`. The image starts from `debian:bookworm-slim` unless
+the project names another, so give every need an `apt` entry. If the
+project's `weft.toml` sets `[build.worker] base_image` to an image of
+another family, each need also has to carry an entry for that family
+(`apk` for Alpine, `dnf` for the Red Hat family, `brew` for Homebrew); for
+that section, read the `weft-deploying` skill. When the
+node launches the program and it is missing anyway, it fails with
+`weft::error::need_missing("<the need's name>")`, the way `ExecPython` does
+for `python3`, and weft adds the node and how to meet the need on that
+install.
 
 If the package needs a build script, it is a `build.rs` at the package's
 root, and its crates go under `[build-dependencies]` (declaring those with

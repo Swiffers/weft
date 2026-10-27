@@ -421,7 +421,8 @@ impl CloudRunRunner {
     //       crates/weft-platform-local/src/runner.rs (worker_env),
     //       crates/weft-core/src/caller_token.rs (ProjectSecret::from_env),
     //       crates/weft-engine/src/worker.rs (identity_from_env),
-    //       crates/weft-engine/src/test_runner.rs (Args::Serve run_cap_secs, the test server's WEFT_RUN_CAP_SECS)
+    //       crates/weft-engine/src/test_runner.rs (Args::Serve run_cap_secs, the test server's WEFT_RUN_CAP_SECS),
+    //       crates/weft-core/src/needs.rs (NEEDS_FROM_ENV)
     fn container(&self, target: &WorkerTarget) -> Value {
         let secret = self.secret_of(target.project);
         let mut env = vec![
@@ -434,6 +435,7 @@ impl CloudRunRunner {
             // does for the install's own public door.
             json!({ "name": "WEFT_TRUSTED_HOPS", "value": self.edge.trusted_proxy_hops.public.to_string() }),
             json!({ "name": "WEFT_INVALID_TOKENS_PER_MINUTE", "value": weft_platform_traits::config::invalid_tokens_env(self.edge.invalid_tokens_per_minute) }),
+            json!({ "name": weft_core::needs::NEEDS_FROM_ENV, "value": weft_core::needs::NeedsFrom::Image.env_value() }),
         ];
         env.extend(target.settings.worker_env().into_iter().map(|(name, value)| json!({ "name": name, "value": value })));
         if let Some(binary_hash) = &target.binary_hash {
@@ -871,6 +873,7 @@ mod tests {
             artifact_registry: "us-central1-docker.pkg.dev/acme/weft".into(),
             build_bucket: "acme-weft-builds".into(),
             builder_service_account: "weft-builder@acme.iam.gserviceaccount.com".into(),
+            builder_base_image: "base".into(),
             tasks_queue: "weft-wakes".into(),
             wake_attempts: 20,
             ticks_queue: "weft-ticks".into(),

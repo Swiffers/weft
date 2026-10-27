@@ -50,8 +50,8 @@ pub struct InfraNodeRow {
     /// apply attempt to decide skip-vs-roll.
     pub applied_spec_hash: Option<String>,
     pub applied_at_unix: Option<i64>,
-    /// Endpoint name → where the project's workers reach it (a URL, or
-    /// `tcp://host:port`). `BTreeMap`: callers resolve endpoints by
+    /// Endpoint name → where the project's workers and weft's own roles
+    /// reach it (a URL, or `tcp://host:port`). `BTreeMap`: callers resolve endpoints by
     /// name, and a deterministic order keeps any "first" semantics
     /// stable.
     pub endpoints: BTreeMap<String, String>,
@@ -63,9 +63,6 @@ pub struct InfraNodeRow {
     /// Endpoint name → `host:port` a `SameNetwork` endpoint answers at
     /// on the install's network, as its host gave it at apply.
     pub doors: BTreeMap<String, String>,
-    /// Endpoint name → where weft's own roles reach it (the front door,
-    /// the dispatcher reading a unit's `/live`).
-    pub install_endpoints: BTreeMap<String, String>,
     /// Disks (volume names) to KEEP on terminate. Carried from
     /// `InfraSpec.keep_on_terminate` at apply time so the supervisor can
     /// honor it at terminate time (terminate has no access to the spec;
@@ -145,10 +142,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- Endpoint name to the `host:port` a SameNetwork endpoint
             -- answers at on the install's network. Stamped at apply.
             doors_json          JSONB NOT NULL DEFAULT '{}'::jsonb,
-            -- Endpoint name to where weft's own roles reach it (the
-            -- workers' address unless they sit on a network weft's
-            -- roles are not on). Stamped at apply.
-            install_endpoints_json JSONB NOT NULL DEFAULT '{}'::jsonb,
             -- What the host runs differently from what was asked (a
             -- GPU kind it cannot choose), one sentence each. JSON
             -- array. Stamped at apply.
@@ -265,7 +258,7 @@ static ROW_COLUMNS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "project_id, node_id, instance_id, copy_id, status, \
          failure_stage, failure_message, applied_spec_hash, \
-         applied_at_unix, endpoints_json, install_endpoints_json, public_paths_json, doors_json, keep_disks_json, \
+         applied_at_unix, endpoints_json, public_paths_json, doors_json, keep_disks_json, \
          {} AS units, notes_json, waiting_on, provisioning_since_unix, source_hash",
         weft_broker_client::protocol::units_of_copy_sql("infra_node")
     )
@@ -719,12 +712,6 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
                  is not a string-to-string map: {e}"
             )
         })?;
-    let install_endpoints_json: Value = row.try_get("install_endpoints_json")?;
-    let install_endpoints: BTreeMap<String, String> = serde_json::from_value(install_endpoints_json).map_err(|e| {
-        anyhow::anyhow!(
-            "infra_node.install_endpoints_json for project={project_id} node={node_id} is not a string-to-string map: {e}"
-        )
-    })?;
     let keep_disks_json: Value = row.try_get("keep_disks_json")?;
     let keep_disks: Vec<String> = serde_json::from_value(keep_disks_json)
         .map_err(|e| {
@@ -751,7 +738,6 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
         endpoints,
         public_paths,
         doors,
-        install_endpoints,
         keep_disks,
         units,
         notes,
@@ -926,7 +912,6 @@ mod tests {
             endpoints: Default::default(),
             public_paths: Default::default(),
             doors: Default::default(),
-            install_endpoints: Default::default(),
             keep_disks: Vec::new(),
             units: Default::default(),
             notes: Vec::new(),

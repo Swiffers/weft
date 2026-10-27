@@ -174,6 +174,13 @@ impl Install {
     /// An install never started, or a file naming no such line, is an
     /// error saying how to get one.
     pub fn secret(&self, name: &str) -> Result<String, String> {
+        secret_required(&self.secrets_path(), self.env_value(), name)
+    }
+
+    /// [`Install::secret`], with `None` for a file naming no such line: the
+    /// weft that last started the install wrote none (one from before the
+    /// secret existed). An install never started is still an error.
+    pub fn secret_if_written(&self, name: &str) -> Result<Option<String>, String> {
         secret_in(&self.secrets_path(), self.env_value(), name)
     }
 
@@ -326,8 +333,9 @@ const LOCAL_IMAGE_REGISTRY: &str = "localhost";
 
 /// The file in an install's dir holding its secrets
 /// ([`Install::secrets_path`]).
-// SYNC: SECRETS_FILE <-> scripts/run-e2e.sh (WEFT_E2E_DATABASE_URL, read the way env_file_values reads it),
-//       crates/weft-cli/src/commands/daemon.rs (start: the writer)
+// SYNC: SECRETS_FILE <-> scripts/run-e2e.sh (install_secret, read the way env_file_values reads it),
+//       crates/weft-cli/src/commands/daemon.rs (start: the writer; runtime_command: the shell that
+//       starts the runtime sources it)
 pub const SECRETS_FILE: &str = "secrets.env";
 
 /// The secrets file of the install whose files are in `dir`.
@@ -335,9 +343,17 @@ pub fn secrets_file(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join(SECRETS_FILE)
 }
 
-/// The value `name` has in the secrets file at `path`, of the install
-/// `env_value` names (for the messages).
-fn secret_in(path: &std::path::Path, env_value: &str, name: &str) -> Result<String, String> {
+/// [`secret_in`], with a file naming no such line an error saying how to
+/// have it written.
+fn secret_required(path: &std::path::Path, env_value: &str, name: &str) -> Result<String, String> {
+    secret_in(path, env_value, name)?.ok_or_else(|| {
+        format!("{} names no {name}; start the install again with ./setup.sh --daemon from its checkout, which rewrites it", path.display())
+    })
+}
+
+/// The value `name` has in the secrets file at `path`, `None` when no line
+/// names it, of the install `env_value` names (for the messages).
+fn secret_in(path: &std::path::Path, env_value: &str, name: &str) -> Result<Option<String>, String> {
     let body = match std::fs::read_to_string(path) {
         Ok(body) => body,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -348,9 +364,7 @@ fn secret_in(path: &std::path::Path, env_value: &str, name: &str) -> Result<Stri
         }
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
-    env_file_values(&body).remove(name).filter(|v| !v.is_empty()).ok_or_else(|| {
-        format!("{} names no {name}; start the install again with ./setup.sh --daemon from its checkout, which rewrites it", path.display())
-    })
+    Ok(env_file_values(&body).remove(name).filter(|v| !v.is_empty()))
 }
 
 /// The values of an env file (`secrets.env`, `tunnel.env`): one
@@ -363,13 +377,26 @@ pub fn env_file_values(body: &str) -> std::collections::BTreeMap<String, String>
 }
 
 /// Write `bytes` to the file `name` in an install's `dir`, whole: to a
-/// file beside it first, then renamed over it. The editor, the CLI and
-/// setup.sh read an install's files while it starts, and a rename on one
-/// filesystem means they see the old content or the new, never half.
-pub fn write_whole(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+/// file beside it first, created with `mode` (`0o600` for one only its
+/// owner may read, its secrets), then renamed over it. The editor, the
+/// CLI and setup.sh read an install's files while it starts, and a rename
+/// on one filesystem means they see the old content or the new, never
+/// half.
+pub fn write_whole(dir: &std::path::Path, name: &str, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::create_dir_all(dir)?;
     let partial = dir.join(format!("{name}.{}.tmp", std::process::id()));
-    let written = std::fs::write(&partial, bytes).and_then(|()| std::fs::rename(&partial, dir.join(name)));
+    // A partial left by a crash of a process with the same id would keep
+    // its own mode.
+    let _ = std::fs::remove_file(&partial);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&partial)
+        .and_then(|mut file| file.write_all(bytes))
+        .and_then(|()| std::fs::rename(&partial, dir.join(name)));
     if written.is_err() {
         // The save failed either way; this only keeps a stray file out of
         // the install's folder.
@@ -530,10 +557,37 @@ mod tests {
         let path = secrets_file(dir.path());
         assert!(secret_in(&path, "cell1", "WEFT_DATABASE_URL").unwrap_err().contains("never started"));
         std::fs::write(&path, "WEFT_DATABASE_LISTEN_URL=postgres://elsewhere\nWEFT_DATABASE_URL = postgres://weft@127.0.0.1:5433/weft\nEMPTY=\nTWICE=first\nTWICE=last\n").unwrap();
-        assert_eq!(secret_in(&path, "cell1", "WEFT_DATABASE_URL").unwrap(), "postgres://weft@127.0.0.1:5433/weft");
-        assert_eq!(secret_in(&path, "cell1", "TWICE").unwrap(), "last", "the last line naming it wins");
-        assert!(secret_in(&path, "cell1", "EMPTY").unwrap_err().contains("names no EMPTY"));
-        assert!(secret_in(&path, "cell1", "MISSING").unwrap_err().contains("./setup.sh --daemon"));
+        assert_eq!(secret_in(&path, "cell1", "WEFT_DATABASE_URL").unwrap().as_deref(), Some("postgres://weft@127.0.0.1:5433/weft"));
+        assert_eq!(secret_in(&path, "cell1", "TWICE").unwrap().as_deref(), Some("last"), "the last line naming it wins");
+        assert_eq!(secret_in(&path, "cell1", "EMPTY").unwrap(), None, "an empty line names nothing");
+        assert_eq!(secret_in(&path, "cell1", "MISSING").unwrap(), None);
+    }
+
+    /// A secret an install must have is an error naming the file and the
+    /// way to have it written again.
+    #[test]
+    fn a_secret_the_file_does_not_name_says_how_to_get_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = secrets_file(dir.path());
+        std::fs::write(&path, "WEFT_DATABASE_URL=x\nEMPTY=\n").unwrap();
+        assert_eq!(secret_required(&path, "cell1", "WEFT_DATABASE_URL").unwrap(), "x");
+        for name in ["MISSING", "EMPTY"] {
+            let e = secret_required(&path, "cell1", name).unwrap_err();
+            assert!(e.contains(&format!("names no {name}")) && e.contains("./setup.sh --daemon"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_file_is_replaced_whole_with_the_mode_it_is_written_with() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mode_of = |name: &str| std::fs::metadata(dir.path().join(name)).unwrap().permissions().mode() & 0o777;
+        write_whole(dir.path(), SECRETS_FILE, b"A=1\n", 0o600).unwrap();
+        write_whole(dir.path(), SECRETS_FILE, b"A=2\n", 0o600).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join(SECRETS_FILE)).unwrap(), "A=2\n");
+        assert_eq!(mode_of(SECRETS_FILE), 0o600);
+        write_whole(dir.path(), "ports.json", b"{}", 0o644).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2, "no partial file is left beside them");
     }
 
     /// Where the front door could tell no install, a command that asks

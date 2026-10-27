@@ -52,6 +52,9 @@ pub struct DispatcherState {
     pub displays: Arc<crate::display_feeds::DisplayFeeds>,
     /// Where the project's workers run and how to reach them.
     pub runner: Arc<dyn weft_platform_traits::Runner>,
+    /// What the machine the workers run on lacks of what a program's nodes
+    /// need (`crate::needs`).
+    pub needs: Arc<dyn weft_platform_traits::MachineNeeds>,
     /// Where the projects' infrastructure runs: read here for its logs
     /// (the supervisor is what changes it).
     pub host: Arc<dyn weft_platform_traits::InfraHost>,

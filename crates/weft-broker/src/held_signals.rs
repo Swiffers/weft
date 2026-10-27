@@ -46,37 +46,6 @@ pub async fn signal_held(pool: &PgPool, token: &str) -> anyhow::Result<Option<Si
     row.map(decode).transpose().map_err(|e| anyhow::anyhow!("signal row decode: {e}"))
 }
 
-/// The project of one held signal, or `None` when no row with that token
-/// is held: what scopes a listener's question about a signal to that
-/// signal's own project.
-pub async fn signal_held_project(pool: &PgPool, token: &str) -> anyhow::Result<Option<uuid::Uuid>> {
-    let row: Option<(uuid::Uuid,)> = sqlx::query_as(&format!(
-        "SELECT s.project_id FROM signal s {SIGNAL_ACTIVATION_JOIN} \
-         WHERE s.token = $1 AND {ACTIVATION_LISTENS}"
-    ))
-    .bind(token)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(p,)| p))
-}
-
-/// The project of the wait `token` whose run was cancelled and whose last
-/// call is out now (`weft_task_store::TaskKind::CancelCall`, claimed by
-/// the dispatcher sending it through the listener), or `None`: the wait's
-/// row is gone, so the call's task is what scopes the listener's question
-/// about an address in it to that wait's own project, for as long as the
-/// call is being sent and no longer.
-// SYNC: cancel_call_project <-> weft_task_store::kinds::cancel_call_key
-pub async fn cancel_call_project(pool: &PgPool, token: &str) -> anyhow::Result<Option<uuid::Uuid>> {
-    Ok(sqlx::query_scalar(
-        "SELECT project_id FROM task WHERE kind = $1 AND dedup_key = $2 AND status = 'claimed' AND project_id IS NOT NULL LIMIT 1",
-    )
-    .bind(weft_task_store::TaskKind::CancelCall.as_str())
-    .bind(weft_task_store::kinds::cancel_call_key(token))
-    .fetch_optional(pool)
-    .await?)
-}
-
 /// Claim a signal kind's moment: write its durable state at version
 /// `from_seq + 1`, only while the row is still at `from_seq`. Of two
 /// listeners woken for the same moment exactly one wins, and only the

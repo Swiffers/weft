@@ -438,22 +438,16 @@ pub fn fold_synced(synced: &Manifest, report: &BTreeMap<String, Option<String>>)
     out
 }
 
-/// Why the folder at `path` can never be kept in sync on this machine,
-/// or `None` when it can. On WSL, a Windows drive mounted under
-/// `/mnt/<letter>/` reports no file changes to Linux at all, so a save
-/// there would never reach the working copy and the folder would drift
-/// without anybody noticing; it is refused where it is registered.
-pub fn unsyncable_folder(path: &str, on_wsl: bool) -> Option<String> {
-    let mut parts = path.strip_prefix("/mnt/")?.split('/');
-    let drive = parts.next()?;
-    let is_drive = drive.len() == 1 && drive.chars().all(|c| c.is_ascii_alphabetic());
-    (on_wsl && is_drive).then(|| {
-        format!(
-            "{path} is on a Windows drive, and WSL tells Linux nothing of the changes made there, \
-             so weft cannot keep this folder in sync with its working copy. Move the project into \
-             the Linux filesystem (under ~/, for example) and run the command again from there"
-        )
-    })
+/// Whether this machine hears no file changes in the folder at `path`
+/// (`on_wsl`: it runs on WSL, [`on_wsl`]). On WSL, a Windows drive mounted
+/// under `/mnt/<letter>/` reports none to Linux at all, so whatever waits
+/// on changes there (a working copy kept in sync, a folder watch) would
+/// never hear one; each refuses such a folder in its own words.
+pub fn hears_no_changes(path: &str, on_wsl: bool) -> bool {
+    let Some(drive) = path.strip_prefix("/mnt/").and_then(|rest| rest.split('/').next()) else {
+        return false;
+    };
+    on_wsl && drive.len() == 1 && drive.chars().all(|c| c.is_ascii_alphabetic())
 }
 
 /// Whether this process runs on WSL, as its kernel says (read once).
@@ -618,14 +612,13 @@ mod tests {
     }
 
     #[test]
-    fn a_windows_drive_is_refused_only_on_wsl() {
-        let refused = unsyncable_folder("/mnt/c/Users/me/project", true).expect("a Windows drive on WSL");
-        assert!(refused.contains("Linux filesystem") && refused.contains("~/"), "{refused}");
-        assert!(unsyncable_folder("/mnt/D", true).is_some(), "the drive itself");
-        assert_eq!(unsyncable_folder("/mnt/c/Users/me/project", false), None, "a real /mnt/c on Linux is a folder like any other");
-        assert_eq!(unsyncable_folder("/home/me/project", true), None);
-        assert_eq!(unsyncable_folder("/mnt/data/project", true), None, "a mount that is not a drive letter");
-        assert_eq!(unsyncable_folder("/mnt", true), None);
+    fn only_a_windows_drive_on_wsl_hears_no_changes() {
+        assert!(hears_no_changes("/mnt/c/Users/me/project", true), "a Windows drive on WSL");
+        assert!(hears_no_changes("/mnt/D", true), "the drive itself");
+        assert!(!hears_no_changes("/mnt/c/Users/me/project", false), "a real /mnt/c on Linux is a folder like any other");
+        assert!(!hears_no_changes("/home/me/project", true));
+        assert!(!hears_no_changes("/mnt/data/project", true), "a mount that is not a drive letter");
+        assert!(!hears_no_changes("/mnt", true));
     }
 
     #[test]

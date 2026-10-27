@@ -88,9 +88,7 @@ weft_core::wire_enum! {
 pub const MAINTENANCE_LIFT_KEY: &str = "maintenance_lift";
 
 /// The dedup key of the [`TaskKind::CancelCall`] of the wait `token`: one
-/// per wait, so a cancel that runs twice queues its call once. The
-/// broker finds the call's project by it while the call is out.
-// SYNC: cancel_call_key <-> crates/weft-broker/src/held_signals.rs cancel_call_project
+/// per wait, so a cancel that runs twice queues its call once.
 pub fn cancel_call_key(token: &str) -> String {
     format!("cancel_call:{token}")
 }

@@ -364,6 +364,7 @@ mod tests {
             artifact_registry: "a".into(),
             build_bucket: "b".into(),
             builder_service_account: "builder@p".into(),
+            builder_base_image: "base".into(),
             tasks_queue: "wakes".into(),
             wake_attempts: 20,
             ticks_queue: "ticks".into(),

@@ -8,21 +8,22 @@
 //!   - `Authenticator` answers "which tenant is making THIS request", used at
 //!     the HTTP edge to scope and gate every user operation.
 //!
-//! Two authenticators exist. `LocalAuthenticator` answers `local` for every
-//! request with no credential: the local install is bound to loopback, so
-//! whoever reaches it is the person at the machine. `OperatorKeyAuthenticator`
-//! is what a shared install runs: every admin request carries an operator key
-//! (`Authorization: Bearer wft-...`), a row of the signal-token table with
-//! kind `operator`, looked up by its hash on every request, so a revoked key
-//! stops working on the next request on every replica.
+//! Every install, local or cloud, runs `OperatorKeyAuthenticator`: every
+//! admin request carries an operator key (`Authorization: Bearer wft-...`).
+//! One is the install's own, kept among its secrets
+//! (`weft_core::signal_token::INSTALL_KEY_SECRET`) and checked against its
+//! hash, never stored: retired by rotating the secret. Every other is a row
+//! of the signal-token table with kind `operator` (`weft token mint
+//! --operator`, `weft target export`), looked up by its hash on every
+//! request, so a revoked key stops working on the next request on every
+//! replica. A local install is no exception: being on loopback keeps the
+//! internet out, never a web page the person has open (its browser reaches
+//! loopback too).
 //!
 //! The check runs as a LAYER over the whole admin surface
 //! ([`require_caller`]), never per handler: a route added to that surface
 //! without thinking about auth is still behind it. The handler-side
-//! extractors ([`CallerTenant`], [`ControlPlaneCaller`]) only read what the
-//! layer established.
-
-use std::sync::Arc;
+//! extractor ([`CallerTenant`]) only reads what the layer established.
 
 use axum::extract::{FromRequestParts, Request, State};
 use axum::http::request::Parts;
@@ -61,39 +62,36 @@ impl std::fmt::Display for AuthError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
     pub tenant: TenantId,
-    /// Whether the caller may reach cross-tenant ops endpoints that no
-    /// single tenant may see.
-    /// Mirrors the broker's `CallerScope::ControlPlane`.
-    pub control_plane: bool,
 }
 
 /// Authenticates an admin request. `tokens` is where the install keeps its
-/// hashed credentials; an authenticator that needs none ignores it.
+/// hashed credentials.
 #[async_trait::async_trait]
 pub trait Authenticator: Send + Sync {
     async fn authenticate(&self, headers: &HeaderMap, tokens: &dyn TokenStore) -> Result<Caller, AuthError>;
 }
 
-/// The local install's authenticator: every request is tenant `local`, the
-/// control plane. There is no credential to check.
-pub struct LocalAuthenticator;
-
-#[async_trait::async_trait]
-impl Authenticator for LocalAuthenticator {
-    async fn authenticate(&self, _headers: &HeaderMap, _tokens: &dyn TokenStore) -> Result<Caller, AuthError> {
-        Ok(Caller { tenant: TenantId::local(), control_plane: true })
-    }
-}
-
-pub fn local_authenticator() -> Arc<dyn Authenticator> {
-    Arc::new(LocalAuthenticator)
-}
-
-/// A shared install's authenticator: the request's bearer must be an operator
-/// key of the install's one tenant (one team per install). The operator IS the
-/// control plane of its own install.
+/// The install's authenticator: the request's bearer must be the install's
+/// own key or an operator key of the install's one tenant (one team per
+/// install).
 pub struct OperatorKeyAuthenticator {
     pub tenant: TenantId,
+    /// The hash of the install's own key ([`weft_core::signal_token::token_hash`]).
+    install_key_hash: String,
+}
+
+impl OperatorKeyAuthenticator {
+    /// For the install whose own key is `install_key`. An empty one is
+    /// refused: it would let no request in, or every one.
+    pub fn new(tenant: TenantId, install_key: &str) -> anyhow::Result<Self> {
+        let install_key = install_key.trim();
+        anyhow::ensure!(
+            !install_key.is_empty(),
+            "{} is empty: the install has no key of its own to accept",
+            weft_core::signal_token::INSTALL_KEY_SECRET
+        );
+        Ok(Self { tenant, install_key_hash: weft_core::signal_token::token_hash(install_key) })
+    }
 }
 
 #[async_trait::async_trait]
@@ -101,13 +99,16 @@ impl Authenticator for OperatorKeyAuthenticator {
     async fn authenticate(&self, headers: &HeaderMap, tokens: &dyn TokenStore) -> Result<Caller, AuthError> {
         let presented = bearer(headers)?;
         let hash = weft_core::signal_token::token_hash(presented);
+        if hash == self.install_key_hash {
+            return Ok(Caller { tenant: self.tenant.clone() });
+        }
         let row = tokens
             .get_signal_token(&hash)
             .await
             .map_err(|e| AuthError::Invalid(format!("token lookup failed: {e}")))?
             .ok_or_else(|| AuthError::Invalid("unknown token".into()))?;
         check_operator(&row, &self.tenant, crate::lease::now_unix() as u64)?;
-        Ok(Caller { tenant: self.tenant.clone(), control_plane: true })
+        Ok(Caller { tenant: self.tenant.clone() })
     }
 }
 
@@ -155,7 +156,11 @@ pub async fn require_caller(
         }
         Err(e) => {
             tracing::debug!(target: "weft_dispatcher::auth", error = %e, "request rejected");
-            (StatusCode::UNAUTHORIZED, "unauthorized: pass an operator key (`weft login <target>`)")
+            (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized: this install takes an operator key; for a target, `weft login <target>`; for this machine's own \
+                 install, the CLI sends the key in its secrets.env, which `./setup.sh` writes",
+            )
                 .into_response()
         }
     }
@@ -188,27 +193,6 @@ impl FromRequestParts<DispatcherState> for CallerTenant {
         _state: &DispatcherState,
     ) -> Result<Self, Self::Rejection> {
         Ok(CallerTenant(caller_from(parts)?.tenant.clone()))
-    }
-}
-
-/// Marks a handler as control-plane / operator only: it rejects any caller
-/// [`require_caller`] did not establish as control plane with `403`. Used by
-/// cross-tenant ops endpoints (install diagnostics) that no single tenant may
-/// reach.
-pub struct ControlPlaneCaller;
-
-impl FromRequestParts<DispatcherState> for ControlPlaneCaller {
-    type Rejection = (StatusCode, String);
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        _state: &DispatcherState,
-    ) -> Result<Self, Self::Rejection> {
-        if caller_from(parts)?.control_plane {
-            Ok(ControlPlaneCaller)
-        } else {
-            Err((StatusCode::FORBIDDEN, "control-plane only".to_string()))
-        }
     }
 }
 
@@ -333,13 +317,10 @@ mod tests {
         assert_eq!(bearer(&h), Ok("wft-a-b"));
     }
 
-    #[tokio::test]
-    async fn local_answers_local_for_any_request() {
-        let tokens = crate::store::FakeStore::default();
+    fn bearing(key: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert("authorization", "Bearer whatever".parse().unwrap());
-        let caller = LocalAuthenticator.authenticate(&h, &tokens).await.unwrap();
-        assert_eq!(caller, Caller { tenant: TenantId::local(), control_plane: true });
+        h.insert("authorization", format!("Bearer {key}").parse().unwrap());
+        h
     }
 
     #[tokio::test]
@@ -349,11 +330,24 @@ mod tests {
         let mut minted = row(TokenKind::Operator, "local");
         minted.token_hash = weft_core::signal_token::token_hash(&key);
         tokens.mint_signal_token(&minted).await.unwrap();
-        let auth = OperatorKeyAuthenticator { tenant: TenantId::local() };
-        let mut h = HeaderMap::new();
-        h.insert("authorization", format!("Bearer {key}").parse().unwrap());
-        assert!(auth.authenticate(&h, &tokens).await.is_ok());
+        let auth = OperatorKeyAuthenticator::new(TenantId::local(), &weft_core::signal_token::generate_token()).unwrap();
+        assert!(auth.authenticate(&bearing(&key), &tokens).await.is_ok());
         assert!(tokens.revoke_signal_token(minted.id, "local").await.unwrap());
-        assert!(auth.authenticate(&h, &tokens).await.is_err(), "revocation is immediate");
+        assert!(auth.authenticate(&bearing(&key), &tokens).await.is_err(), "revocation is immediate");
+    }
+
+    /// The install's own key is accepted with nothing in the store, and
+    /// the store never learns it; anything else is refused, a missing
+    /// key first of all.
+    #[tokio::test]
+    async fn the_installs_own_key_is_accepted_without_a_row() {
+        let tokens = crate::store::FakeStore::default();
+        let own = weft_core::signal_token::generate_token();
+        let auth = OperatorKeyAuthenticator::new(TenantId::local(), &own).unwrap();
+        assert_eq!(auth.authenticate(&bearing(&own), &tokens).await, Ok(Caller { tenant: TenantId::local() }));
+        assert!(tokens.list_signal_tokens("local").await.unwrap().is_empty());
+        assert!(matches!(auth.authenticate(&bearing("wft-not-it"), &tokens).await, Err(AuthError::Invalid(_))));
+        assert_eq!(auth.authenticate(&HeaderMap::new(), &tokens).await, Err(AuthError::Missing));
+        assert!(OperatorKeyAuthenticator::new(TenantId::local(), "  ").is_err(), "no empty key");
     }
 }

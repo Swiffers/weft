@@ -39,7 +39,6 @@
 //! hop credential, and a browser's socket shows the ticket a worker's door
 //! signed.
 
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -1596,10 +1595,10 @@ fn bound_silence(socket: &socket2::Socket, secs: u64) {
     let secs = if secs > 0 { secs.max(KEEPALIVE_SCHEDULE_SECS) } else { 0 };
     let timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
     // The bound is `TCP_USER_TIMEOUT`, which only Linux and its kin
-    // have. A worker always runs on Linux, in its image; the engine is
-    // built for another system only when `weft test-node` compiles it
-    // natively on the developer's own machine (a Mac), and there the
-    // bound is skipped while the keepalive probes stay on.
+    // have. A worker in a container runs on Linux; one running as a
+    // plain process on a person's Mac (a local install there, or
+    // `weft test-node`) has no such option, and there the bound is
+    // skipped while the keepalive probes stay on.
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "fuchsia", target_os = "cygwin"))]
     if let Err(error) = socket.set_tcp_user_timeout(timeout) {
         tracing::warn!(
@@ -1614,15 +1613,15 @@ fn bound_silence(socket: &socket2::Socket, secs: u64) {
 }
 
 /// Serve the worker's router (its own endpoints and the connection
-/// server) on `0.0.0.0:port` (plain HTTP/WS; TLS terminates in front of
-/// the worker) until `shutdown` resolves.
+/// server) on `listener` (plain HTTP/WS; TLS terminates in front of the
+/// worker, `crate::listen` says where it listens) until `shutdown`
+/// resolves.
 pub async fn serve(
     app: Router,
-    port: u16,
+    listener: tokio::net::TcpListener,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
     tracing::info!(target: "weft_engine::caller_conn", %addr, "worker listening");
     // Each connection's own socket handle reaches its handler as
     // `ConnectInfo<CallerSocket>` (the floor goes on as it is accepted),

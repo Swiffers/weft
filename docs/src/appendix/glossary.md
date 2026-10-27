@@ -266,8 +266,8 @@ down and costs nothing, and a fresh one picks the run up when the answer lands.
 run starts, then back up from where it ends, stopping at a node you started from (`--from`), at a
 trigger nobody fired, and at a node with no inputs.
 
-**Worker.** A container (on your machine) or Cloud Run service (on a cloud
-install) running your compiled program. For how it starts and stops, go and read
+**Worker.** A process (on your machine, in the project's folder) or a Cloud
+Run service (on a cloud install) running your compiled program. For how it starts and stops, go and read
 [the worker](../running/architecture.md#the-worker).
 
 **Working copy.** The install's copy of one place a project's code is

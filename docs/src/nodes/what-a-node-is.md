@@ -93,7 +93,8 @@ For what that buys you, go and read [shared code](packaging.md#shared-code).
 
 Your program's definition is not baked into the binary. The worker fetches it
 by hash at run time, which is why rewiring your graph without touching any Rust
-is a cache hit on the image.
+reuses the worker already compiled (a program on your machine, an image on
+a cloud install).
 
 ## The one macro
 

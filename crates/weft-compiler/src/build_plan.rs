@@ -3,18 +3,21 @@
 //! infra image), and mint each image's ref.
 //!
 //! This is the ONE place that decides WHAT a project version needs, so every
-//! caller agrees byte-for-byte. The one thing a caller supplies is a seam here:
-//!   - `TagPolicy`: how an image ref is NAMED. A ref is either a bare tag or a
-//!     registry-qualified ref; both derive from the SAME content hashes, so the
-//!     identity is identical and only the string form differs.
+//! caller agrees byte-for-byte. The two things a caller supplies are seams here:
+//!   - the platform's `WorkerPackaging`: how the worker is staged (a host build,
+//!     or an image FROM the builder base).
+//!   - `TagPolicy`: how an image ref is NAMED (the platform's image builder: a
+//!     local install's own names, or its registry's); every ref derives from
+//!     the content hashes, so only the string form differs.
 //! Two things are NOT here because they interleave with each caller's own logic:
-//! (1) probing whether a ref is already built (against a container daemon, or a
-//! registry), and (2) the actual build run of the stale set. Each caller
-//! drives its own check-and-build over `plan.images`.
+//! (1) probing whether a ref is already built (the platform's image store), and
+//! (2) the actual build run of the stale set. Each caller drives its own
+//! check-and-build over `plan.images`.
 //!
-//! Because the worker image ref is content-addressed on `binary_hash` (engine +
-//! toolchain + builder-base Dockerfile + referenced node impls + node-type set +
-//! weft.toml build config + deps) and each infra image ref on its own source dir,
+//! Because the worker ref is content-addressed on `binary_hash` (engine +
+//! toolchain + referenced node impls + node-type set + deps, and for an image
+//! the builder base and weft.toml's `[build.worker]`) and each infra image ref
+//! on its own source dir,
 //! recomputing the plan and re-checking presence is the COMPLETE staleness rule:
 //! change the engine (or a node impl, or an infra image's source) and the affected
 //! ref stops matching, so it rebuilds; change nothing and every ref is present, so
@@ -32,8 +35,8 @@ pub enum ImageKind {
 }
 
 /// One image a project version needs, fully resolved: its kind, its content-
-/// addressed ref (via the `TagPolicy`), the docker build context to build it from,
-/// and (infra only) the `(node_id, image_name)` the ref resolves back to so the
+/// addressed ref (via the `TagPolicy`), the build context to build it from and
+/// how ([`PlannedImage::recipe`]), and (infra only) the `(node_id, image_name)` the ref resolves back to so the
 /// caller can record `Image::Local { name } -> ref` for the supervisor.
 #[derive(Debug, Clone)]
 pub struct PlannedImage {
@@ -42,24 +45,19 @@ pub struct PlannedImage {
     /// the content hash via the `TagPolicy`. Always set; whether it is already built
     /// is answered separately by each environment's own presence probe.
     pub image_ref: String,
-    /// The docker build context: the staged worker context dir for the worker, the
+    /// The build context: the staged worker context dir for the worker, the
     /// node's own `images/<name>/` source dir for an infra image.
     pub context_dir: std::path::PathBuf,
+    /// How it is built from `context_dir`: its Dockerfile (every infra image,
+    /// and a worker packaged as an image, with the record the worker's
+    /// image keeps when it keeps one), or the `weft_core::builds::HostRecipe`
+    /// in it (a worker compiled on the machine).
+    pub recipe: weft_core::builds::BuildRecipe,
     /// The declaring node id (infra images only).
     pub node_id: Option<String>,
     /// The image's local name (infra images only); the `Image::Local { name }` the
     /// infra spec references.
     pub image_name: Option<String>,
-    /// What the build uses of what an install keeps on the machine that
-    /// runs it (the worker's builder base and compile cache; nothing for an
-    /// infra image).
-    pub uses: weft_core::images::BuildUses,
-    /// The file the built image keeps for the install to read after the
-    /// build: the worker's record of the node packages it left out
-    /// (`weft_core::builds::LEFT_OUT_RECORD_PATH`) when its Dockerfile
-    /// writes one, `None` for a custom worker template and every infra
-    /// image.
-    pub result_file: Option<String>,
 }
 
 /// The full set of artifacts a compiled project version needs, plus the three
@@ -69,7 +67,7 @@ pub struct BuildPlan {
     /// The compiled `ProjectDefinition`, serialized. Sent to the dispatcher at
     /// register so it stores the exact artifact the hashes describe.
     pub definition_json: String,
-    /// Worker image identity: engine + node impls + build env. The worker ref is
+    /// The worker's identity: engine + node impls + build env. The worker ref is
     /// `TagPolicy::worker_ref(binary_hash)`.
     pub binary_hash: String,
     /// Production fingerprints, kept with this worker image at registration.
@@ -80,13 +78,17 @@ pub struct BuildPlan {
     pub infra_hash: String,
     /// Each infra place's own hash (`crate::hash::compute_infra_place_hashes`).
     pub infra_places: std::collections::BTreeMap<String, String>,
-    /// The worker image plus every infra image, each with its ref + build context.
+    /// The worker plus every infra image, each with its ref + build context.
     pub images: Vec<PlannedImage>,
+    /// What each node type the worker holds needs from the machine it runs
+    /// on (`crate::build::StagedImageBuild::node_needs`), kept with the
+    /// worker.
+    pub node_needs: weft_core::needs::NodeNeeds,
 }
 
-/// How image refs are NAMED. The one naming difference between bare tags (loaded
-/// onto the node) and registry-qualified refs; both feed on the SAME content
-/// hashes so the identity is identical, only the string form differs.
+/// How image refs are NAMED (the platform's image builder answers it); every
+/// name feeds on the SAME content hashes, so the identity is identical and
+/// only the string form differs.
 pub trait TagPolicy {
     /// The worker image ref for a given binary hash.
     fn worker_ref(&self, binary_hash: &str) -> String;
@@ -110,19 +112,19 @@ pub trait TagPolicy {
 ///
 /// Pure + blocking (filesystem); run it on a blocking thread from async
 /// callers. The returned worker `context_dir` lives under a temp dir the caller
-/// must keep alive until it has built the worker image.
+/// must keep alive until it has built the worker.
 pub fn plan_build_from(
     project: &Project,
     definition: &weft_core::project::ProjectDefinition,
     catalog: &weft_catalog::FsCatalog,
     fs: crate::CompileFs,
-    bases: &crate::worker_image::BaseImages,
+    packaging: &weft_core::builds::WorkerPackaging,
     tags: &dyn TagPolicy,
     node_set: weft_core::builds::NodeSet,
     fingerprints: &crate::hash::Fingerprints,
 ) -> BuildResult<BuildPlan> {
     let weft_root = crate::build::resolve_weft_root()?;
-    let implementations = crate::hash::implementation_hashes(definition, project, &weft_root, catalog, node_set, fingerprints)?;
+    let implementations = crate::hash::implementation_hashes(definition, project, &weft_root, catalog, node_set, packaging, fingerprints)?;
 
     let definition_hash = crate::hash::compute_definition_hash(definition)
         .map_err(|e| e.context("compute definition hash"))?;
@@ -134,22 +136,21 @@ pub fn plan_build_from(
     let definition_json = serde_json::to_string(definition)
         .map_err(|e| anyhow::anyhow!("serialize compiled definition: {e}"))?;
 
-    // Stage the worker docker build context (`FROM {{builder_base_image}}`)
-    // from the already-resolved definition. `build_project` does NOT recompile
-    // from source: it validates + codegens this definition, whose `@asset`
-    // refs the caller already resolved into concrete file values.
+    // Stage the worker from the already-resolved definition. `build_project`
+    // does NOT recompile from source: it validates + codegens this
+    // definition, whose `@asset` refs the caller already resolved into
+    // concrete file values.
     let staged =
-        crate::build::build_project(project, definition, catalog, fs, bases, node_set, fingerprints)?;
+        crate::build::build_project(project, definition, catalog, fs, packaging, node_set, fingerprints)?;
     let binary_hash = staged.content_hash.clone();
 
     let mut images = vec![PlannedImage {
         kind: ImageKind::Worker,
         image_ref: tags.worker_ref(&binary_hash),
         context_dir: staged.build_context,
+        recipe: staged.recipe,
         node_id: None,
         image_name: None,
-        uses: staged.uses,
-        result_file: staged.result_file,
     }];
 
     // Every infra image, via the shared enumerator (same set, same content hashes as
@@ -162,15 +163,15 @@ pub fn plan_build_from(
             kind: ImageKind::Infra,
             image_ref: tags.infra_ref(&image_name, &content_hash),
             context_dir: source_dir,
+            recipe: weft_core::builds::BuildRecipe::Dockerfile { result_file: None },
             node_id: Some(node_id),
             image_name: Some(image_name),
-            uses: Default::default(),
-            result_file: None,
         });
     }
 
     Ok(BuildPlan {
         definition_json,
+        node_needs: staged.node_needs,
         binary_hash,
         implementations,
         definition_hash,

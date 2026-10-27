@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use axum::Router;
-use weft_platform_traits::config::{AuthMode, InstallConfig, PlatformConfig};
+use weft_platform_traits::config::{InstallConfig, PlatformConfig};
 use weft_platform_traits::{CoreRole, Placement, Vantage};
 use weft_task_store::drain::DrainLoop;
 
@@ -271,6 +271,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 lock_pool,
                 signals: signals.clone().expect("the dispatcher's process listens"),
                 runner: parts.runner.clone(),
+                needs: parts.needs.clone(),
                 host: parts.host.clone(),
                 images: parts.images.clone(),
                 frontends: parts.frontends.clone(),
@@ -282,12 +283,9 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 // looks; on a machine each looks on its own.
                 booking: serverless.then(|| weft_task_store::drain::Booking::new(pool.clone(), CoreRole::Dispatcher, parts.alarm.clone())),
             },
-            weft_dispatcher::app::Defaults::for_auth(config.auth),
+            weft_dispatcher::app::Defaults::for_install(&secret(weft_core::signal_token::INSTALL_KEY_SECRET)?)?,
         )
         .await?;
-        if config.auth == AuthMode::OperatorKeys {
-            weft_dispatcher::app::seed_bootstrap_operator_key(&state, &secret("WEFT_BOOTSTRAP_OPERATOR_KEY")?).await?;
-        }
         let registry = weft_dispatcher::app::task_registry();
         loops.push((CoreRole::Dispatcher, Loops::Drain(weft_dispatcher::app::drain_loops(&state, registry)?)));
         weft_dispatcher::app::spawn_relays(&state);
@@ -299,7 +297,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 network = Some(weft_dispatcher::api::network_router(state.clone()));
             }
         }
-        let api = weft_dispatcher::api::router(state.clone(), weft_dispatcher::app::cors_for(config.auth));
+        let api = weft_dispatcher::api::router(state.clone());
         let door = weft_dispatcher::door::router(state.clone(), api);
         // The projects that take work answer at their own address again:
         // a machine's fronts went with the install's last process. A
@@ -350,7 +348,10 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             weft_listener::ListenerConfig {
                 replica: replica.clone(),
                 holds_here: runs(CoreRole::Holder),
-                prefer_push: !matches!(config.platform, PlatformConfig::Local(_)),
+                holders: match config.platform {
+                    PlatformConfig::Local(_) => weft_listener::Holders::OnThisMachine,
+                    PlatformConfig::Gcp(_) => weft_listener::Holders::Pool,
+                },
             },
             tasks,
             link,

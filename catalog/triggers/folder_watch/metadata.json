@@ -1,0 +1,95 @@
+{
+  "type": "FolderWatch",
+  "label": "Folder Watch",
+  "description": "Fire a run each time a file in a folder on this machine is created, changed or removed. It works on a local install only, since that is where the folder is: a cloud install refuses it when the trigger is turned on. Each fire carries the file's absolute path, what happened to it, and its size; the run is on the same machine and can open the path itself. Writes to one file with no pause longer than about a second between them are one fire, sent once the file has been quiet that long; a copy that pauses longer fires again when it resumes, as changed. A file that never pauses still fires about every ten seconds. What it last saw is kept, so a file that arrives, changes or goes while weft is stopped or in maintenance fires once the trigger is back up. The first time the trigger starts, and when it comes back from a door that refused, the files already in the folder fire nothing, so nothing that happened behind that door ever fires.",
+  "tags": [
+    "folder",
+    "file",
+    "watch",
+    "local",
+    "trigger"
+  ],
+  "icon": "FolderOpen",
+  "color": "#22c55e",
+  "inputs": [
+    {
+      "name": "folder",
+      "type": "String",
+      "required": true,
+      "label": "Folder",
+      "description": "The folder to watch, as an absolute path. It must exist when the trigger is turned on.",
+      "placeholder": "/home/me/Downloads"
+    },
+    {
+      "name": "recursive",
+      "type": "Boolean",
+      "default": false,
+      "label": "Include subfolders",
+      "description": "Also watch the files in the folders under it, however deep. Off: only the files directly in the folder."
+    },
+    {
+      "name": "pattern",
+      "type": "String",
+      "label": "File name pattern",
+      "description": "Only files whose name matches: `*` is any run of characters, `?` one character, `[abc]` one of a set, `{pdf,docx}` one of several spellings (`*.{pdf,docx}`). Empty: every file.",
+      "placeholder": "*.pdf"
+    },
+    {
+      "name": "events",
+      "type": "List[String]",
+      "label": "Fire on",
+      "widget": {
+        "kind": "multiselect",
+        "options": ["created", "changed", "removed"]
+      },
+      "description": "Which changes fire: created (a file appears, written, copied or moved in), changed (its size or modification time moved), removed (deleted or moved out). Left unset: all three."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "path",
+      "type": "String",
+      "description": "The file's absolute path."
+    },
+    {
+      "name": "event",
+      "type": "String",
+      "description": "What happened to it: created, changed or removed."
+    },
+    {
+      "name": "sizeBytes",
+      "type": "Number",
+      "description": "The file's size in bytes. Absent when it was removed."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          { "kind": "config_nonempty", "field": "folder" },
+          { "kind": "not", "of": { "kind": "config_matches", "field": "folder", "regex": "^/" } }
+        ]
+      },
+      "then": {
+        "message": "FolderWatch '{id}' needs `folder` as an absolute path (one starting with `/`, like /home/me/Downloads).",
+        "field": "folder"
+      }
+    },
+    {
+      "when": { "kind": "config_matches", "field": "pattern", "regex": "/" },
+      "then": {
+        "message": "FolderWatch '{id}' has a `pattern` with a `/`, but it matches a file's name only. Turn on `recursive` to look in the folders under it.",
+        "field": "pattern"
+      }
+    }
+  ],
+  "firesWith": {
+    "path": "String",
+    "event": "String",
+    "sizeBytes?": "Number"
+  },
+  "features": {
+    "isTrigger": true
+  }
+}

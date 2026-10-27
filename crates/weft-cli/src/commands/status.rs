@@ -50,15 +50,21 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                 // current as one built from the referenced set, and the
                 // dispatcher accepts either as "not drifted".
                 use weft_core::builds::NodeSet;
+                // The hash the install computes is for the packaging it
+                // builds with: a program on this machine, an image elsewhere.
+                let packaging = match crate::credentials::this_machines_install(ctx.client()?.base())? {
+                    Some(_) => weft_platform_local::MachineLayout::here().host_packaging(),
+                    None => weft_core::builds::WorkerPackaging::Image { builder: crate::images::builder_base_ref()? },
+                };
                 match resolved {
                     Ok(_) => (
                         or_warn(
                             "the worker code's hash",
-                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Referenced, &weft_compiler::hash::DISK),
+                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Referenced, &packaging, &weft_compiler::hash::DISK),
                         ),
                         or_warn(
                             "the worker code's hash with every node",
-                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full, &weft_compiler::hash::DISK),
+                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full, &packaging, &weft_compiler::hash::DISK),
                         ),
                         or_warn("the project definition's hash", weft_compiler::hash::compute_definition_hash(&def)),
                         Some(weft_core::projects::NamedHashes(weft_core::run_spec::trigger_fingerprints(&def)).encode()),

@@ -173,7 +173,7 @@ and the graph print back.
 
 | Command | What it does |
 |---|---|
-| `weft build` | record this folder's files as a version, then have the install compile that version, resolve its assets, build the worker image (content-addressed) and register it with [the daemon]; the CLI compiles nothing itself. Starts nothing. You never need it while building a program: `weft run`, `weft activate` and `weft resync` build on their own, so running `weft build` before them only builds twice. Its one use is the final deployment, `weft build --referenced`, which ships only the node types the program uses. Also the repair when [the daemon] no longer holds the code a past run ran: registering records the compiled program under its own hash, the one the run names, so unchanged files make the run readable again. Like every command that builds, it records a version, and unchanged files record nothing new |
+| `weft build` | record this folder's files as a version, then have the install compile that version, resolve its assets, build the worker (content-addressed) and register it with [the daemon]; the CLI compiles nothing itself. Starts nothing. You never need it while building a program: `weft run`, `weft activate` and `weft resync` build on their own, so running `weft build` before them only builds twice. Its one use is the final deployment, `weft build --referenced`, which ships only the node types the program uses. Also the repair when [the daemon] no longer holds the code a past run ran: registering records the compiled program under its own hash, the one the run names, so unchanged files make the run readable again. Like every command that builds, it records a version, and unchanged files record nothing new |
 | `weft validate --file src/main.weft < src/main.weft` | strict compile + validate, diagnostics as JSON, nothing runs |
 | `weft run [<example>] [--referenced] [--seed[=<run-id>]] [--root] [--from <node>=<ports-json>]... [--emit <node>=<ports-json>]... [--target <id>]... [--before <id>]... [--group <id>=<ports-json>] [--feed <start>]... [--fire <trigger>=<wake-json>] [--instance <id>] [--check] [--save <name>] [--durable\|--fast] [--keep-for <duration>] [--hold-secs <seconds>]` | build and start one run; `--detach` returns its run id, and without it the command follows the run and exits `0` when it completed, `10` when it failed or was cancelled (`weft wait` has the codes). On a cloud install one stretch of a run lasts an hour at most; a run that pauses whole starts a fresh hour, so split longer work with a pause. `--durable` writes down what the run did before each node that is not `pure` starts, so if its worker dies another one carries the run on, with the node that was running failed, unless it is pure, had sent nothing on and was not reading a stream; `--fast` turns a trigger's `durable` back off. A run started by hand is always recorded, even when its trigger has `recorded` off. `--keep-for` (`30m`, `12h`, `7d`, `forever`) is how long the run is kept once it ends, over the trigger's `keepRunsFor` and the project's `[runs] keep_for`. A run that fires a trigger (`--fire`) is durable or fast the way the trigger's `durable` says and kept as long as its `keepRunsFor` says, and a run that fires nothing is fast; `--durable`, `--fast` and `--keep-for` override either, and `--hold-secs` how long a wait holds while the run cannot pause (a bus between its nodes open) over the trigger's `holdSecs`. `--seed[=<run-id>]` reuses finished work and `--check` only tests whether the run could start; both, with the starts, ends, stand-ins and the refusals they draw, are in the `weft-sdp` skill |
 | `weft checkpoint [<label>]` | record this folder's files as a version under its head and move the head there, no run, no build; `already at <id>` when identical |
@@ -223,10 +223,28 @@ trigger's program before activating, `weft bake`, then `weft run --fire
 ## The build and run flow
 
 `weft run` compiles, registers the project with [the daemon], builds the
-worker image if sources changed (Cargo runs inside Docker, never on the
-host), then fires. Compile failures print `compile failed:` then
-`line:column message` lines. HTTP errors surface [the daemon]'s own message
-verbatim.
+worker if sources changed, then fires. The install does the building, never
+you: on this machine it compiles the worker with the machine's own Rust
+toolchain, and a project whose nodes are all the standard library's,
+unchanged, compiles nothing in a full build (they share the standard
+worker; `--referenced` compiles). A build that fails saying `cargo` is not
+on the PATH means the machine has no Rust: the user installs it from
+rustup.rs and runs `./setup.sh` again. Compile failures print `compile
+failed:` then `line:column message` lines. HTTP errors surface [the
+daemon]'s own message verbatim.
+
+On this machine the worker is a plain process running in the project's
+folder, as the user, so a node reaches their files and the programs on the
+`PATH` the install had when `./setup.sh` last ran. If a node the program uses needs a program the machine lacks,
+`weft run`, `weft activate` and `weft resync` refuse before anything starts
+with `this program uses nodes that need things the machine its workers run on doesn't have:`,
+the node and what it needs, then `install them with:  weft deps-install
+<NodeType>`. Only what a node needs while it runs is checked there; what its
+package needs to compile matters only while it compiles, and `weft
+deps-install` installs both. `weft test-node --tier live` checks the tested
+nodes' run needs the same way before it starts. That command prints the system's install command (`sudo
+apt-get install -y ...`, `brew install ...`) and asks before running it;
+`--print` only prints it, `--yes` runs it without asking.
 
 `weft build` skips [the runtime tier] (a connection not yet picked), so a
 half-wired program still builds. A run is refused before it starts when a

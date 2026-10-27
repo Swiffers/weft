@@ -48,14 +48,22 @@ can reach, and what access they gain.
 ## Where the boundary is
 
 Weft runs the code in the projects you choose to execute. It is not a
-sandbox for running arbitrary untrusted projects. A node deliberately
-reading a file or calling a service with access you gave it is different
-from an outside request making Weft grant access you never intended.
+sandbox for running arbitrary untrusted projects: on your own machine, a
+project's worker is a plain process running as you, in the project's
+folder, so its nodes can read and change whatever you can. A node
+deliberately reading a file or calling a service with access you gave it is
+different from an outside request making Weft grant access you never
+intended.
 
-The local management API also trusts its callers; it is not an authenticated
-public hosting interface. If Weft's public-facing routes or supplied
-configuration accidentally expose those controls, that is something we
-want reported.
+Every install's management API, the local one included, asks each caller
+for an operator key and sends no CORS headers. A local install keeps its own
+key in its `secrets.env`, a file only your user can read. So the key keeps
+web pages and other users of the machine out, but not the programs you run
+yourself. If a web page, a public route or another user of the machine can
+drive the management API without a key, that is something we want
+reported. For how the key works, go and read [the key the install's API
+asks
+for](https://weavemindai.github.io/weft/running/architecture.html#the-key-the-installs-api-asks-for).
 
 Some URLs and tokens grant access to whoever holds them. Using one you were
 given is expected. Being able to obtain someone else's through a Weft leak,

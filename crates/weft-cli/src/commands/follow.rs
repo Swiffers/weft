@@ -343,7 +343,7 @@ mod tests {
             let terminal = event("done", "run_completed", 1);
             let server = server(vec![terminal], vec![], true).await;
             let mut seen = Vec::new();
-            tokio::time::timeout(Duration::from_secs(5), collect(&server.client, FollowTarget::Run("a"), &mut seen)).await.expect("completed history must finish follow").unwrap();
+            collect(&server.client, FollowTarget::Run("a"), &mut seen).await.unwrap();
             assert_eq!(ids(&seen), vec!["done"]);
             assert_eq!(*server.requests.lock().unwrap(), vec!["subscribe", "history"]);
         }
@@ -358,7 +358,7 @@ mod tests {
             let terminal = event("done", "run_completed", 1);
             let server = server(vec![started], vec![terminal], true).await;
             let mut seen = Vec::new();
-            tokio::time::timeout(Duration::from_secs(5), collect(&server.client, FollowTarget::Run("a"), &mut seen)).await.expect("live completion must finish follow").unwrap();
+            collect(&server.client, FollowTarget::Run("a"), &mut seen).await.unwrap();
             assert_eq!(ids(&seen), vec!["start", "done"]);
         }
     );
@@ -371,7 +371,7 @@ mod tests {
             let events = vec![event("done:a", "run_completed", 1), event("done:b", "run_cancelled", 2)];
             let server = server(vec![], events, false).await;
             let mut seen = Vec::new();
-            let err = tokio::time::timeout(Duration::from_secs(5), collect(&server.client, FollowTarget::Project("p"), &mut seen)).await.expect("a closed stream must stop following").unwrap_err();
+            let err = collect(&server.client, FollowTarget::Project("p"), &mut seen).await.unwrap_err();
             assert!(err.to_string().contains("live updates"), "{err}");
             assert_eq!(ids(&seen), vec!["done:a", "done:b"]);
             assert_eq!(*server.requests.lock().unwrap(), vec!["subscribe"]);
@@ -388,7 +388,7 @@ mod tests {
             let terminal = event("row:3", "run_completed", 1);
             let server = server(vec![first.clone()], vec![first, second, terminal], true).await;
             let mut seen = Vec::new();
-            tokio::time::timeout(Duration::from_secs(5), collect(&server.client, FollowTarget::Run("a"), &mut seen)).await.expect("completed follow must return").unwrap();
+            collect(&server.client, FollowTarget::Run("a"), &mut seen).await.unwrap();
             assert_eq!(ids(&seen), vec!["row:1", "row:2", "row:3"]);
         }
     );
@@ -449,7 +449,7 @@ mod tests {
             heard.push(progress);
             Ok(())
         });
-        let done = tokio::time::timeout(Duration::from_secs(30), follow).await.unwrap().unwrap();
+        let done = follow.await.unwrap();
         assert_eq!(done, json!({ "moved": 2 }));
         assert_eq!(heard, [Some(json!({ "at": "building" }))]);
         assert_eq!(*looks.lock().unwrap(), 3, "going, cut and looked at again, done");

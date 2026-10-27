@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 mod client;
 mod credentials;
 mod commands;
+mod host_programs;
 mod image_refs;
 mod startup;
 pub mod images;
@@ -84,8 +85,10 @@ enum Cmd {
         ci: Option<commands::ci::Cloud>,
     },
     /// Have the install record this folder's files as a version, build it
-    /// (compiled there, its images built by the install's BuildKit) and
-    /// register it, without running anything. Also how you put back code
+    /// (compiled there: on a local install its worker compiled on the
+    /// machine and its infra images built by Docker, on the cloud its
+    /// images built by Cloud Build) and register it, without running
+    /// anything. Also how you put back code
     /// the dispatcher no longer has: registering records the compiled
     /// program under its own hash, which is the hash a past run names, so
     /// unchanged files make that run readable again.
@@ -95,13 +98,24 @@ enum Cmd {
         #[arg(long)]
         referenced: bool,
     },
-    /// Make every shared image exist locally: the runtime image (every
-    /// role weft has, in one), the worker builder base and the
-    /// full-library worker, each under its content-addressed registry ref
-    /// (present -> pull -> build). `--push` then pushes every ref to
-    /// its registry; the release workflow runs this on each push to the
-    /// release branch, which is what lets every install pull instead of
-    /// compile.
+    /// Compile the standard worker (every standard-library node) on this
+    /// machine and pack it as one gzipped tar at `--out`, printing its
+    /// binary hash: the program the release publishes per machine type,
+    /// which setup.sh unpacks so a local install's first project compiles
+    /// nothing.
+    #[command(name = "build-standard-worker", hide = true)]
+    BuildStandardWorker {
+        #[arg(long)]
+        out: std::path::PathBuf,
+    },
+    /// Make every image the release publishes exist locally: the runtime
+    /// image (every role weft has, in one), and for the cloud the worker
+    /// builder base and the full-library worker image, each under its
+    /// content-addressed registry ref (present -> pull -> build).
+    /// `--push` then pushes every ref to its registry; the release
+    /// workflow runs this on each push to the release branch, so a local
+    /// install pulls its runtime image instead of compiling it, and a
+    /// cloud install's worker images compile on a ready base.
     #[command(name = "build-images")]
     BuildImages {
         /// Push each ensured ref to its registry (requires a prior
@@ -118,8 +132,7 @@ enum Cmd {
         #[arg(long, value_name = "SUFFIX", allow_hyphen_values = true)]
         push_suffix: Option<String>,
         /// Only print the refs this tree resolves to, one per line,
-        /// touching nothing (no ensure, no docker). What setup.sh
-        /// keys its engine-change sweep on.
+        /// touching nothing (no ensure, no docker).
         #[arg(long, conflicts_with_all = ["push", "push_suffix", "runtime_binary"])]
         print: bool,
         /// Put this `weft-runtime` binary in the runtime image instead of
@@ -193,10 +206,10 @@ enum Cmd {
     },
     /// Print the content hash naming a package's node-test OUTCOME
     /// inputs: the package's own sources plus the catalog's type
-    /// registry. Deliberately narrower than the test image's tag: an
-    /// engine or image-recipe edit rebuilds the image but does not
-    /// move this hash, so a recorded live pass (live tests spend real
-    /// provider money) survives a rebuild. A scripted runner records
+    /// registry. Deliberately narrower than the test server's tag: an
+    /// engine edit recompiles the test server but does not move this
+    /// hash, so a recorded live pass (live tests spend real provider
+    /// money) survives a rebuild. A scripted runner records
     /// it after a fully green live run to skip unchanged packages.
     /// With no target, prints `<package> <hash>` for every
     /// test-declaring package.
@@ -211,8 +224,8 @@ enum Cmd {
     /// tree (`weft tree`).
     ///
     /// Rebuilding while runs are in flight is non-disruptive:
-    /// in-flight work finishes on workers baked from its own image,
-    /// and this run lands on a fresh current-image worker.
+    /// in-flight work finishes on workers of the build it started on,
+    /// and this run lands on a fresh worker of the current build.
     ///
     /// Following the run to its end, it exits with the code `weft wait`
     /// gives that ending (see `weft wait --help`): 0 when the run
@@ -664,6 +677,28 @@ enum Cmd {
         #[command(subcommand)]
         action: InfraAction,
     },
+    /// Install on this machine what nodes need from it (the programs
+    /// they launch, what their packages need to compile), with the
+    /// system's package manager. With no node type: what the program in
+    /// this folder uses and the machine lacks.
+    DepsInstall {
+        /// The node types whose needs to install (several at once).
+        #[arg(value_name = "NODE_TYPE")]
+        node_types: Vec<String>,
+        /// Every node type of the project's catalog, used or not.
+        #[arg(long)]
+        all: bool,
+        /// Only the needs of one stage: `run` (what a node launches) or
+        /// `build` (what its package needs to compile).
+        #[arg(long, value_parser = need_stage)]
+        stage: Option<weft_core::needs::NeedStage>,
+        /// Run the install command without asking.
+        #[arg(long, conflicts_with = "print")]
+        yes: bool,
+        /// Only print the install command.
+        #[arg(long)]
+        print: bool,
+    },
     /// Print the per-project catalog: `--list` for one line per node
     /// type (the way to find a node), `--node <Type> --compact` for
     /// how one node wires, the bare form for the whole catalog as
@@ -910,15 +945,19 @@ enum Cmd {
     /// Subjects:
     ///   (default)         journal cleanup (runs older than --keep-days)
     ///   <UUID>            one run
-    ///   --images          unreferenced worker images for the cwd project
-    ///                     (use --all to span every project, and to drop
-    ///                     the shared images and compile caches no install
-    ///                     on this machine uses, and everything installs
-    ///                     no longer on it left behind)
+    ///   --images          unreferenced workers and infra images for the cwd
+    ///                     project (use --all to span every project, and to
+    ///                     drop the shared images, worker programs and
+    ///                     compile caches no install on this machine uses,
+    ///                     and everything installs no longer on it left
+    ///                     behind)
     ///   --images --build-plane
-    ///                     the builder bases and node-test images no
-    ///                     install on this machine uses
-    ///   --build-cache     drop the docker buildkit cache and the node-test cache
+    ///                     the worker programs no install on this machine
+    ///                     uses, the shared build crates no build staged
+    ///                     for 30 days, and the builder bases and node-test
+    ///                     images an older weft left
+    ///   --build-cache     drop the docker buildkit cache, the node-test cache
+    ///                     and the worker compile caches
     ///   --all             with the journal subject: nuke every run
     ///                     with --images: every project's images
     ///   --project <id>    that project's runs, all of them.
@@ -957,23 +996,28 @@ enum Cmd {
         /// the next clean). Without it they are left to finish.
         #[arg(long)]
         cancel_running: bool,
-        /// Reclaim unreferenced worker images. Cwd-scoped unless
-        /// --all, which spans every project AND drops the builder bases,
-        /// node-test images, runtime images, standard workers and worker
-        /// compile caches that no install on this machine uses (each
-        /// install records its own at `weft daemon start`; while one has
-        /// not, that kind is kept whole).
+        /// Reclaim unreferenced workers and infra images. Cwd-scoped
+        /// unless --all, which spans every project AND drops the runtime
+        /// images and worker programs no install on this machine uses,
+        /// and what an older weft left that none uses (builder bases,
+        /// node-test images, standard worker images, worker image compile
+        /// caches); each install records its own at `weft daemon start`,
+        /// and while one has not, that kind is kept whole.
         #[arg(long, default_value_t = false)]
         images: bool,
-        /// With --images: only the build plane, the builder bases and
-        /// node-test images no install on this machine uses (kept whole
-        /// while an install has not recorded its own). Needs no running
-        /// install; setup.sh runs it after every start.
+        /// With --images: only the build plane, the worker programs no
+        /// install on this machine uses, the shared build crates no build
+        /// staged for 30 days, and the builder bases and node-test images
+        /// an older weft left that no install uses (kept whole while an
+        /// install has not recorded its own). Needs no running install;
+        /// setup.sh runs it after every start.
         #[arg(long, requires = "images", conflicts_with_all = ["all", "build_cache", "run_id"])]
         build_plane: bool,
-        /// Drop every build cache: the docker BuildKit cache and the
-        /// host's node-test cache (heavy: the next build and the next
-        /// `weft test-node` compile the engine and every dependency again).
+        /// Drop every build cache: the docker BuildKit cache, the
+        /// machine's worker compile caches (every lane and the seed, and
+        /// the shared build crates) and the node-test cache (heavy: the
+        /// next build and the next `weft test-node` compile the engine
+        /// and every dependency again).
         #[arg(long, default_value_t = false)]
         build_cache: bool,
         /// Answer the confirmation a journal deletion asks for.
@@ -1478,8 +1522,8 @@ enum DaemonAction {
     /// refresh; `restart` is an alias for the same reconcile.
     #[command(visible_alias = "restart")]
     Start {
-        /// Rebuild the shared images (the runtime and the worker builder
-        /// base) even when present. For when a local image is corrupt or
+        /// Rebuild the runtime image and recompile the standard worker
+        /// program even when present. For when either is corrupt or
         /// hand-modified.
         #[arg(long)]
         rebuild: bool,
@@ -1824,7 +1868,13 @@ impl InfraAction {
     }
 }
 
-/// Full builds are the default; --referenced opts into a graph-specific image.
+/// A need's stage as `--stage` spells it: its own wire name
+/// (`weft_core::needs::NeedStage`), so the two cannot drift.
+fn need_stage(raw: &str) -> Result<weft_core::needs::NeedStage, String> {
+    serde_json::from_value(serde_json::Value::String(raw.to_string())).map_err(|e| e.to_string())
+}
+
+/// Full builds are the default; --referenced opts into a graph-specific worker.
 fn node_set(referenced: bool) -> weft_core::builds::NodeSet {
     if referenced {
         weft_core::builds::NodeSet::Referenced
@@ -2038,6 +2088,7 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
         Cmd::New { name, assistants, remember, ci } => commands::new::run(ctx, name, assistants, remember, ci).await,
         Cmd::Ci { action: CiCmd::Add { cloud } } => commands::ci::add(ctx, cloud).await,
         Cmd::Build { referenced } => commands::build::run(ctx, node_set(referenced)).await,
+        Cmd::BuildStandardWorker { out } => host_programs::pack_standard_program(&out).await,
         Cmd::BuildImages { push, push_suffix, print, runtime_binary } => {
             commands::build::run_build_images(push, push_suffix, print, runtime_binary.as_deref()).await
         }
@@ -2143,6 +2194,9 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
         Cmd::Status => commands::status::run(ctx).await,
         Cmd::Daemon { action } => commands::daemon::run(ctx, action.into(), wanted.map_err(anyhow::Error::msg)?).await,
         Cmd::Infra { action } => action.run(ctx).await,
+        Cmd::DepsInstall { node_types, all, stage, yes, print } => {
+            commands::deps_install::run(ctx, commands::deps_install::DepsInstall { node_types, all, stage, yes, print }).await
+        }
         Cmd::DescribeNodes { list, stdlib, node, compact } => {
             commands::describe_nodes::run(ctx, stdlib, node, compact, list).await
         }
@@ -2221,6 +2275,22 @@ mod command_contract_tests {
     #[test]
     fn the_command_line_holds_together() {
         <Cli as clap::CommandFactory>::command().debug_assert();
+    }
+
+    /// `deps-install --stage` takes a stage by its own name, and refuses
+    /// any other naming the ones it takes.
+    #[test]
+    fn a_stage_is_spelled_by_its_own_name() {
+        let stage = |args: &[&str]| match Cli::try_parse_from([&["weft", "deps-install"][..], args].concat()).map(|cli| cli.command) {
+            Ok(Cmd::DepsInstall { stage, .. }) => Ok(stage),
+            Ok(_) => panic!("deps-install command"),
+            Err(e) => Err(e.to_string()),
+        };
+        assert_eq!(stage(&["--stage", "build"]).unwrap(), Some(weft_core::needs::NeedStage::Build));
+        assert_eq!(stage(&["--stage", "run"]).unwrap(), Some(weft_core::needs::NeedStage::Run));
+        assert_eq!(stage(&[]).unwrap(), None);
+        let refused = stage(&["--stage", "compile"]).unwrap_err();
+        assert!(refused.contains("run") && refused.contains("build"), "{refused}");
     }
 
     /// `--all` is the program's own and every instance's; beside

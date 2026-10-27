@@ -72,11 +72,12 @@ remove_docker_images_by_id() { # label ids [note] [warn_reason]
 
 # Stop every install's runtime and take it off the service manager, so
 # nothing writes while its data goes and nothing comes back at the next
-# login. Covers the default install (`weft-runtime`) and every named one
-# (`weft-<name>-runtime`), and a runtime `weft daemon start` detached
-# without a service manager, which only its pid file names. A pid is
-# signalled only while its command line is that install's runtime (the
-# pid may have been reused by anything since).
+# login, then every worker process each one started. Covers the default
+# install (`weft-runtime`) and every named one (`weft-<name>-runtime`),
+# and a runtime `weft daemon start` detached without a service manager,
+# which only its pid file names. A pid is signalled only while its
+# command line is that install's runtime (the pid may have been reused by
+# anything since).
 # SYNC: service names, pid file, command line <-> crates/weft-cli/src/commands/daemon.rs
 #       (Install::service_name, systemd_unit_path, launchd_plist_path,
 #       pid_path, runtime_command, is_runtime_command_line)
@@ -119,6 +120,67 @@ weft_stop_runtimes() {
     fi
     rm -f "${pidfile}"
   done
+  for dir in "${weft_state_dir}" "${weft_state_dir}"/installs/*; do
+    [[ -d "${dir}" ]] && weft_stop_workers "${dir}"
+  done
+  return 0
+}
+
+# Kill every worker process the install in dir started, with everything
+# each one started (a worker runs in a process group of its own), and
+# remove its log and scratch folder. A runtime that stops leaves its
+# workers running to finish their runs, for its next life to let go, so
+# with the runtime gone for good nothing else would stop them. Read from
+# the install's worker registry (`workers/running.json`) rather than
+# asked of `weft daemon stop`, whose binary may be gone already. A pid
+# another program took since (its start mark differs) is left alone.
+# SYNC: the registry and what a worker leaves <-> crates/weft-platform-local/src/registry.rs
+#       (Entry, Registry::log_of, Registry::scratch_of, stop_all)
+weft_stop_workers() { # dir
+  local file="$1/workers/running.json" line name="" pid="" started stopped=0
+  [[ -e "${file}" ]] || return 0
+  # The registry is written pretty, one field a line, each entry's name
+  # before its pid and its pid before its start mark.
+  while IFS= read -r line; do
+    if [[ "${line}" =~ \"name\":\ *\"([^\"]*)\" ]]; then
+      name="${BASH_REMATCH[1]}"
+    elif [[ "${line}" =~ \"pid\":\ *([0-9]+) ]]; then
+      pid="${BASH_REMATCH[1]}"
+    elif [[ "${line}" =~ \"started\":\ *\"([^\"]*)\" ]]; then
+      started="${BASH_REMATCH[1]}"
+      if [[ -n "${pid}" && -n "${started}" && "$(weft_started_mark "${pid}")" == "${started}" ]]; then
+        kill -KILL -- "-${pid}" 2>/dev/null && stopped=$((stopped + 1))
+      fi
+      if [[ -n "${name}" ]]; then
+        rm -f "$1/workers/logs/${name}.log"
+        rm -rf "$1/workers/scratch/${name}"
+      fi
+      name="" pid=""
+    fi
+  done < "${file}"
+  rm -f "${file}"
+  if [[ ${stopped} -gt 0 ]]; then
+    ok "stopped ${stopped} worker process(es) of ${1}"
+  fi
+}
+
+# The start mark weft keeps for pid: the kernel's start time (the 22nd
+# field of /proc/<pid>/stat) on Linux, `ps`'s start time elsewhere; empty
+# when no process has the pid.
+# SYNC: the start mark <-> crates/weft-platform-local/src/processes.rs (started_mark, start_of_stat)
+weft_started_mark() { # pid
+  local stat rest
+  if [[ "$(uname)" == Linux ]]; then
+    stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+    # Fields 3 onwards, past the program's name (which may hold spaces
+    # and parentheses); the start time is the 20th of them.
+    rest="${stat##*)}"
+    # shellcheck disable=SC2086
+    set -- ${rest}
+    printf '%s' "${20:-}"
+  else
+    ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'
+  fi
 }
 
 # Whether pid runs the runtime of the install whose directory is dir.
@@ -176,18 +238,21 @@ weft_database_before_runs() { # container
 # Delete the database of one install, and everything that only meant
 # something to it: its Postgres container and files (`dir/postgres-data`,
 # owned by Postgres's own user, so removed from a container when a plain
-# rm cannot), the workers and infra units of its projects with their
-# volumes (docker objects carrying the install's label), and its bucket on
-# the object store (every stored file and asset). The install's config,
-# keys and tunnel stay, and its next start builds a fresh database and
-# bucket. Stop its runtime first.
+# rm cannot), the infra units of its projects with their volumes (docker
+# objects carrying the install's label), and its bucket on the object
+# store (every stored file and asset). The install's config, keys and
+# tunnel stay, and its next start builds a fresh database and bucket.
+# Stop its runtime first (`weft daemon stop`, which stops its workers
+# too). The worker programs it held keep its `held-by/<install>` name;
+# `weft clean --images --build-plane` drops only the holds of installs no
+# longer on the machine, so they stay until the install itself goes.
 # SYNC: what an install owns <-> crates/weft-cli/src/commands/daemon.rs (remove, delete_bucket)
 weft_wipe_database() { # postgres-container dir install-label bucket
   local name role v
   docker rm -f -v "$1" >/dev/null 2>&1 || true
   while IFS=$'\t' read -r name role; do
     case "${role}" in
-      worker|long|infra) docker rm -f -v "${name}" >/dev/null 2>&1 || return 1 ;;
+      infra) docker rm -f -v "${name}" >/dev/null 2>&1 || return 1 ;;
     esac
   done < <(docker ps -a --filter "label=weft-install=$3" --format '{{.Names}}\t{{.Label "weft.role"}}')
   for v in $(docker volume ls -q --filter "label=weft-install=$3"); do
@@ -270,9 +335,9 @@ weft_delete_old_cluster() {
 }
 
 # Every container and volume weft started, for every install: what
-# carries the install label (workers, infra units, each install's
-# Postgres, the tunnel), and the fixed names an older weft used before
-# it labelled them, with the object store's data volume.
+# carries the install label (infra units, each install's Postgres, the
+# tunnel), and the fixed names an older weft used before it labelled
+# them, with the object store's data volume.
 # SYNC: weft-object-store <-> crates/weft-cli/src/commands/daemon.rs (OBJECT_STORE_CONTAINER)
 weft_remove_containers_and_volumes() {
   local ids name
@@ -289,7 +354,7 @@ weft_remove_containers_and_volumes() {
       waited=$((waited + 1))
     done
     if [[ -z "$(docker ps -aq --filter "label=${weft_install_label}" 2>/dev/null)" ]]; then
-      ok "removed weft's containers (workers, infra units, databases, the tunnel)"
+      ok "removed weft's containers (infra units, databases, the tunnel)"
     else
       warn "some of weft's containers could not be removed; list them with: docker ps -a --filter label=${weft_install_label}"
     fi

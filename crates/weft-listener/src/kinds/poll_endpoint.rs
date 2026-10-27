@@ -30,7 +30,7 @@ use crate::registry::RegisteredSignal;
 
 use async_trait::async_trait;
 
-use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx, WakeFrom, Woke, Woken};
+use super::{BetweenFires, KindHandler, LiveCtx, RowState, SpawnCtx, WakeFrom, Woke, Woken};
 use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct PollEndpointHandler;
@@ -53,20 +53,38 @@ impl KindHandler for PollEndpointHandler {
         })
     }
 
-    /// The poll state is a FEED CURSOR (what was already delivered),
-    /// not a schedule: a reactivate must carry it forward verbatim.
-    /// Re-priming instead would silently discard everything the feed
-    /// queued while the project was inactive (and on an
-    /// acknowledged-cursor feed like Telegram, actively tell the
-    /// provider to drop it).
-    ///
-    /// A run's wait starts from nothing and pins its first poll at the
-    /// moment it was asked for, so the job it waits on is checked at once.
-    fn compute_initial_state(&self, _spec: &SignalSpec, prior: Option<&Value>, asked_at_unix_ms: i64, is_resume: bool) -> Result<Value> {
-        if is_resume {
-            return Ok(PollState { first_poll_at_ms: Some(asked_at_unix_ms), ..PollState::default() }.to_value());
-        }
-        Ok(prior.cloned().unwrap_or_else(|| Value::Object(serde_json::Map::new())))
+    /// An entry starts unprimed: its first poll primes the cursor
+    /// silently. A run's wait pins its first poll at the moment it was
+    /// asked for, so the job it waits on is checked at once.
+    fn compute_initial_state(&self, _spec: &SignalSpec, asked_at_unix_ms: i64, is_resume: bool) -> Result<Value> {
+        let first_poll_at_ms = is_resume.then_some(asked_at_unix_ms);
+        Ok(PollState { first_poll_at_ms, ..PollState::default() }.to_value())
+    }
+
+    /// The feed a poll reads: where it asks and how, how the answer
+    /// parses and where the cursor sits in it, and the connection that
+    /// signs it. Its cadence, its filters and what a fire carries are not
+    /// part of it: changing them reads the same feed.
+    fn source(&self, spec: &SignalSpec) -> Result<Option<Value>> {
+        let poll: PollEndpoint = serde_json::from_value(spec.config.clone())
+            .map_err(|e| anyhow::anyhow!("malformed poll_endpoint spec: {e}"))?;
+        Ok(Some(serde_json::json!({
+            "url": poll.url,
+            "method": poll.method,
+            "body": poll.body,
+            "format": poll.format,
+            "delta": poll.delta,
+            "connection": spec.access.as_ref().map(|access| &access.id),
+        })))
+    }
+
+    /// The cursor, so what the feed queued since is delivered rather than
+    /// discarded by priming again (on an acknowledged-cursor feed like
+    /// Telegram, priming again would tell the provider to drop it). The
+    /// failure streak is the last registration's, and starts over.
+    fn carry(&self, _spec: &SignalSpec, prior: &Value) -> Result<Value> {
+        let prior = PollState::read(prior)?;
+        Ok(PollState { delta: prior.delta, ..PollState::default() }.to_value())
     }
 
     fn check_resume(&self, spec: &SignalSpec) -> Result<()> {
@@ -112,7 +130,7 @@ impl KindHandler for PollEndpointHandler {
         if woken.is_resume && poll.delta.is_some() {
             return Err(super::for_good(anyhow::anyhow!("a run waiting on a poll_endpoint cannot use delta mode")));
         }
-        poll_once(&poll, &spec.access, woken.state, woken.seq, woken.is_resume, &ctx).await
+        poll_once(&poll, &spec.access, woken.stored, woken.is_resume, &ctx).await
     }
 
     /// A poll's state rides from one wake to the next, and most polls
@@ -306,11 +324,11 @@ async fn store(ctx: &SpawnCtx, seq: i64, next: &PollState) -> Stored {
 async fn poll_once(
     poll: &PollEndpoint,
     access: &Option<weft_core::primitive::AccessRef>,
-    kind_state: Value,
-    seq: i64,
+    stored: RowState,
     is_resume: bool,
     ctx: &SpawnCtx,
 ) -> Result<Option<Woke>> {
+    let RowState { state: kind_state, seq } = stored;
     let url = poll.url.as_str();
     let before = PollState::read(&kind_state).map_err(super::for_good)?;
     if before.resumed {
@@ -351,11 +369,7 @@ async fn poll_once(
             Err(e) if crate::listener_access::answered_for_good(&e) => return Err(super::for_good(e)),
             Err(e) => break 'poll failed("connection resolve failed", format!("{e:#}")),
         };
-        let url = match crate::infra_address::for_listener(url, ctx).await {
-            Ok(u) => u,
-            Err(e) => break 'poll failed("address resolve failed", format!("{e:#}")),
-        };
-        let poll_url = match poll_url(&url, poll.delta.as_ref(), state.as_ref()) {
+        let poll_url = match poll_url(url, poll.delta.as_ref(), state.as_ref()) {
             Ok(u) => u,
             // A primed-but-unreadable cursor must NEVER fall back to the
             // prime value: on a queue-draining feed the prime means
@@ -384,10 +398,7 @@ async fn poll_once(
                 }
                 break 'poll failed("non-success poll", status.to_string());
             }
-            Err(e) => {
-                crate::infra_address::unreached(poll.url.as_str(), ctx);
-                break 'poll failed("poll request failed", e.to_string());
-            }
+            Err(e) => break 'poll failed("poll request failed", e.to_string()),
         };
         let body = match resp.text().await {
             Ok(b) => b,

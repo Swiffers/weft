@@ -116,18 +116,24 @@ pub struct TargetSection {
 pub const LOCAL_TARGET: &str = "local";
 
 /// The one spelling of an install's base address: an http or https URL,
-/// its scheme and host lowercased (the parser does that), with no query,
-/// no fragment and no trailing slash, so `HTTPS://Weft.Example.com/` and
-/// `https://weft.example.com` are the same install everywhere one is
-/// compared or stored (a target's url, a stored key's entry). Anything
-/// else is refused with the reason.
+/// its scheme and host lowercased (the parser does that), an `http`
+/// `localhost` written `127.0.0.1` (where a local install listens; an
+/// `https` one keeps its name, which its certificate is checked against),
+/// with no query, no fragment and no trailing slash, so
+/// `HTTPS://Weft.Example.com/` and `https://weft.example.com`, or
+/// `http://localhost:14111` and `http://127.0.0.1:14111`, are the same
+/// install everywhere one is compared or stored (a target's url, a stored
+/// key's entry, the install answering at an address). Anything else is refused with the reason.
 pub fn normalize_install_url(raw: &str) -> Result<String, String> {
-    let parsed = url::Url::parse(raw).map_err(|e| format!("'{raw}' is not a URL ({e})"))?;
+    let mut parsed = url::Url::parse(raw).map_err(|e| format!("'{raw}' is not a URL ({e})"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(format!("'{raw}' must be an http or https address"));
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(format!("'{raw}' must be the install's base address, with no query or fragment"));
+    }
+    if parsed.scheme() == "http" && parsed.host_str() == Some("localhost") {
+        parsed.set_host(Some("127.0.0.1")).expect("an http address takes an IPv4 host");
     }
     Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
@@ -137,18 +143,25 @@ pub fn normalize_install_url(raw: &str) -> Result<String, String> {
 /// empty, codegen uses the built-in Debian-slim template and
 /// the package manager inferred from it (apt).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildSection {
     #[serde(default)]
     pub worker: WorkerBuildSection,
 }
 
-/// `[build.worker]` customization. Both fields are optional:
+/// `[build.worker]` customization, read only when the worker is built as
+/// a cloud image (a local install's host build never looks at it). Every
+/// key is optional, and a key it does not know is refused:
 ///
 /// - `base_image`: Docker base image. Codegen picks a package
 ///   manager from this string (`debian`/`ubuntu` → apt,
 ///   `alpine` → apk, `rhel`/`centos`/`fedora`/`rocky`/`amazonlinux`
-///   → yum, `homebrew/brew` → brew). Unknown base images fall back
-///   to apt with a warning.
+///   → dnf, `homebrew/brew` → brew), and installs each need's packages
+///   for that manager (`[needs.install.<manager>]`). A base image of no
+///   family weft knows is refused unless `package_manager` names it.
+/// - `package_manager`: how needs are installed on the base image
+///   (`apt`, `dnf`, `apk`, `brew`), deciding over the family read off its
+///   name.
 /// - `dockerfile_template`: path (relative to the project root)
 ///   to a user-provided Dockerfile template. When set, overrides the
 ///   built-in template entirely. Must use the same substitution
@@ -156,11 +169,14 @@ pub struct BuildSection {
 ///   for the canonical token set (kept there so this doc can't drift
 ///   out of sync with what `emit` actually substitutes).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerBuildSection {
     #[serde(default)]
     pub base_image: Option<String>,
     #[serde(default)]
     pub dockerfile_template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_manager: Option<weft_core::needs::PackageManager>,
 }
 
 #[derive(Debug, Clone)]
@@ -528,6 +544,8 @@ mod find_tests {
     fn a_target_url_has_one_spelling() {
         assert_eq!(normalize_install_url("HTTPS://Weft.Example.COM/").unwrap(), "https://weft.example.com");
         assert_eq!(normalize_install_url("http://h:8080/base/").unwrap(), "http://h:8080/base");
+        assert_eq!(normalize_install_url("http://LocalHost:14111/").unwrap(), "http://127.0.0.1:14111");
+        assert_eq!(normalize_install_url("https://LocalHost:14111/").unwrap(), "https://localhost:14111", "a certificate names localhost");
         assert!(normalize_install_url("ftp://x").is_err());
         assert!(normalize_install_url("https://x/?a=1").is_err());
         assert!(normalize_install_url("https://x/#f").is_err());
@@ -566,6 +584,16 @@ mod find_tests {
     fn a_target_with_a_misspelled_key_is_refused() {
         let (_d, p) = project_with("[targets.prod]\nulr = \"https://x\"\n");
         assert!(p.is_err(), "a typo must not leave the target without a url");
+    }
+
+    #[test]
+    fn a_misspelled_build_key_is_refused() {
+        for section in ["[build.worker]\nbaseImage = \"alpine:3.20\"\n", "[build.wroker]\n"] {
+            let (_d, p) = project_with(section);
+            assert!(p.is_err(), "{section}: a typo must not leave the cloud image on its default");
+        }
+        let (_d, p) = project_with("[build.worker]\nbase_image = \"alpine:3.20\"\n");
+        assert_eq!(p.unwrap().manifest.build.worker.base_image.as_deref(), Some("alpine:3.20"));
     }
 
     /// `Project::find` is three-way: a valid manifest loads, a missing manifest is

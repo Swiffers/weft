@@ -31,6 +31,7 @@ use weft_core::instance::InstanceId;
 use weft_core::instance_door::{InstanceField, ValuesChanged};
 use weft_core::storage::Tenanted;
 
+use super::access_store_error;
 use crate::state::DispatcherState;
 
 type ApiError = (StatusCode, String);
@@ -81,7 +82,7 @@ pub async fn fields(State(state): State<DispatcherState>, headers: HeaderMap) ->
     let project = caller_project(&state, &caller).await?;
     let values = weft_access_store::instance_values(&state.pg_pool, &caller.tenant, caller.project, &caller.instance)
         .await
-        .map_err(access_err)?;
+        .map_err(access_store_error)?;
     let picks = crate::api::project::stored_picks(&state, caller.project).await?;
     let mut out = Vec::new();
     let rules = weft_core::rules::RuleContext::new(&project);
@@ -146,7 +147,7 @@ pub async fn list_connections(
     )
     .await
     .map(Json)
-    .map_err(access_err)
+    .map_err(access_store_error)
 }
 
 /// `DELETE /instance/connections/{id}`: forget one of the instance's
@@ -164,7 +165,7 @@ pub async fn delete_connection(
         weft_access_store::GrantOwnerScope::Instance { project_id: caller.project, instance: &caller.instance },
     )
     .await
-    .map_err(access_err)?;
+    .map_err(access_store_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -241,7 +242,7 @@ pub async fn connect_status(
     weft_access_store::take_connect_result(&state.pg_pool, &caller.tenant, &q.state)
         .await
         .map(Json)
-        .map_err(access_err)
+        .map_err(access_store_error)
 }
 
 /// `PUT /instance/values`: give values for fields, and clear others, all at
@@ -359,7 +360,7 @@ pub async fn picker(
         weft_access_store::BeginPicker { for_instance: Some(caller.scope()), access_id, service, script, code, mime_types, grants },
     )
     .await
-    .map_err(access_err)?;
+    .map_err(access_store_error)?;
     let url = format!("{base}/access/picker/{picker_state}");
     Ok(Json(serde_json::json!({ "state": picker_state, "url": url })))
 }
@@ -393,7 +394,7 @@ async fn field_source(
         .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("'{place}.{field}' has no source {index}")))?;
     let values = weft_access_store::instance_values(&state.pg_pool, &caller.tenant, caller.project, &caller.instance)
         .await
-        .map_err(access_err)?;
+        .map_err(access_store_error)?;
     let picks = crate::api::project::stored_picks(state, caller.project).await?;
     let connection = weft_core::instance::lookup_connection(&project, &filled.place, field, &values, &picks)
         .and_then(weft_core::instance::LookupConnection::signing)
@@ -473,11 +474,6 @@ fn plain_failures(mut page: weft_core::program::RunPage) -> weft_core::program::
         }
     }
     page
-}
-
-fn access_err(e: anyhow::Error) -> ApiError {
-    let (status, message) = weft_access_store::client_error(e);
-    (StatusCode::from_u16(status).expect("store status codes are valid"), message)
 }
 
 #[cfg(test)]

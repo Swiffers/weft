@@ -150,6 +150,29 @@ pub struct ResyncResponse {
     pub brought_back: Option<crate::maintenance::ProjectLifted>,
 }
 
+/// Where a resync is, as its task says while it runs: the `going` answer
+/// of `/projects/{id}/follow/{task}`, and what `weft status` shows of a
+/// resync under way. Its task says it each time the runs it waits for
+/// change, and says none once it waits for no more.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResyncProgress {
+    /// The runs going on the old version, oldest first: the new version
+    /// takes over once they end. A run a worker took at its door and has
+    /// not put on record yet is waited for too, and is not named here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waits_for: Vec<RunGoing>,
+}
+
+/// A run going, since `since_unix` (when it started, on the install's
+/// clock).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunGoing {
+    pub run_id: crate::RunId,
+    pub since_unix: i64,
+}
+
 /// How a person reads one owner's triggers: "the program's triggers" or
 /// "instance 'ada''s triggers".
 pub fn whose_triggers(owner: &Owner) -> String {
@@ -164,6 +187,17 @@ mod tests {
     use super::*;
     use crate::instance::InstanceTarget;
     use crate::take_down::Door;
+
+    /// What a resync waits for reads back, camelCase on the wire, and a
+    /// resync that waits for nothing says nothing.
+    #[test]
+    fn where_a_resync_is_reads_back() {
+        let progress = ResyncProgress { waits_for: vec![RunGoing { run_id: uuid::Uuid::nil(), since_unix: 7 }] };
+        let wire = serde_json::to_value(&progress).unwrap();
+        assert_eq!(wire["waitsFor"][0]["sinceUnix"], 7);
+        assert_eq!(serde_json::from_value::<ResyncProgress>(wire).unwrap(), progress);
+        assert_eq!(serde_json::to_value(ResyncProgress::default()).unwrap(), serde_json::json!({}));
+    }
 
     #[test]
     fn a_deactivate_flattens_its_answers_beside_its_scope() {

@@ -106,7 +106,7 @@ pub async fn referenced_images_query(
     // was rebuilt since), and each live worker's (it may be driving a run
     // its door just bore, before anything of it is on record). `$1`
     // narrows every arm to one binary hash; NULL keeps them all.
-    let query = format!(
+    let query = weft_task_store::sql!(
         "SELECT DISTINCT running_binary_hash FROM project \
          WHERE running_binary_hash IS NOT NULL AND running_binary_hash <> '' \
            AND ($1::TEXT IS NULL OR running_binary_hash = $1) \
@@ -121,7 +121,7 @@ pub async fn referenced_images_query(
         alive = weft_task_store::worker_alive!("l"),
     );
     let rows: Vec<(String,)> = if scope.covers_workers() {
-        sqlx::query_as(&query).bind(scope.worker_hash()).fetch_all(&mut *conn).await?
+        sqlx::query_as(query).bind(scope.worker_hash()).fetch_all(&mut *conn).await?
     } else {
         Vec::new()
     };
@@ -190,6 +190,44 @@ pub async fn install(
     let public_url = state.address.stable().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let service_url = state.address.service_url().to_string();
     Ok(Json(weft_core::install::InstallInfo { public_url, service_url, ..state.install_info.clone() }))
+}
+
+/// `GET /install/database`: the roles whose copies waited for a database
+/// connection lately, and what gives the install more
+/// (`weft_task_store::throttle`), for `weft status`.
+pub async fn install_database(
+    State(state): State<DispatcherState>,
+    _caller: CallerTenant,
+) -> Result<Json<weft_core::install::DatabaseLoad>, Refused> {
+    let stretches = weft_task_store::throttle::current(&state.pg_pool)
+        .await
+        .map_err(|e| crate::api::unavailable_or_internal("read whether the database held the install back", e))?;
+    let held_back: Vec<weft_core::install::HeldBack> = stretches
+        .into_iter()
+        .map(|s| weft_core::install::HeldBack {
+            role: s.role,
+            since_unix: s.since_ms / 1000,
+            last_unix: s.last_ms / 1000,
+            waits: s.waits,
+            max_connections: s.max_connections,
+            share: s.share,
+        })
+        .collect();
+    let more = (!held_back.is_empty()).then(|| more_connections(state.install_info.cloud.is_some()).to_string());
+    Ok(Json(weft_core::install::DatabaseLoad { held_back, more }))
+}
+
+/// What gives an install more database connections: a cloud install's
+/// levers on its fork, or, on a local one, nothing to turn (its one
+/// process holds its pools at their most already).
+// SYNC: the levers <-> deploy/terraform/gcp/variables.tf (cloud_sql_tier, cloud_sql_max_connections, dispatcher_max_copies, broker_max_copies)
+fn more_connections(cloud: bool) -> &'static str {
+    match cloud {
+        true => "to give it more, raise WEFT_CLOUD_SQL_TIER on your fork (and WEFT_CLOUD_SQL_MAX_CONNECTIONS with it, if you set one), \
+                 then run the install workflow again; with a database you bring (WEFT_DATABASE_URL), move to a plan of your provider's \
+                 that takes more connections. Each copy then takes a bigger share",
+        false => "the install's one process holds as many connections as it uses at its busiest, so this passes with the load",
+    }
 }
 
 /// `GET /projects` (`weft ps`).
@@ -674,7 +712,7 @@ async fn stored_instance_values(
         let tenant = crate::instance_values::owning_tenant(state, project_id).await?;
         let rows = weft_access_store::instance_values(&state.pg_pool, &tenant, project_id, instance)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read instance values: {e:#}")))?;
+            .map_err(crate::api::access_store_error)?;
         Ok::<_, (StatusCode, String)>(crate::held::OfTenant { tenant, rows })
     };
     let key = (project_id, instance.clone());
@@ -961,33 +999,16 @@ pub(crate) async fn limited_entries(state: &DispatcherState, project_id: uuid::U
 /// weft's own work the project's work waits on that keeps failing: every
 /// role weft cannot wake, every loop of weft's that gave up, stored files
 /// the bucket would not remove, the project's workers, infra, infra
-/// commands, repairs and triggers kept past their hibernation, a resync of
-/// it that stopped with triggers down, and the triggers a resync a person
-/// gave up left down, each said in a person's words.
+/// commands, repairs and triggers kept past their hibernation, and the
+/// triggers a resync a person gave up left down, each said in a person's
+/// words. A resync that stopped with triggers down is not among them: the
+/// project's status says it once, as its resync
+/// (`weft_core::projects::ProjectStatusResponse::resync`), read with the rest
+/// of its state.
 pub(crate) async fn unanswered_for(state: &DispatcherState, project_id: uuid::Uuid) -> Result<Vec<weft_core::projects::Unanswered>, (StatusCode, String)> {
     let failing = weft_task_store::unanswered::failing_for(&state.pg_pool, project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("work that keeps failing: {e:#}")))?;
-    // A resync that stopped with triggers down, read off the project's own
-    // plan of it.
-    let resync = state
-        .projects
-        .resync(project_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the project's resync: {e:#}")))?;
-    let stopped = resync.and_then(|held| {
-        let error = held.standing_still()?;
-        let now = crate::lease::now_unix();
-        let at = held.plan.stopped.as_ref().map_or(now, |stopped| stopped.at_unix);
-        Some(weft_core::projects::Unanswered {
-            what: "a resync of this project stopped with triggers it took down still down; builds wait for it".to_string(),
-            then: crate::task_kinds::resync::what_next(held.plan.stopped.as_ref()),
-            error,
-            since_unix: at,
-            last_unix: at,
-            as_of_unix: now,
-        })
-    });
     let given_up = given_up_resync_left_down(state, project_id).await?;
     Ok(failing
         .into_iter()
@@ -999,7 +1020,6 @@ pub(crate) async fn unanswered_for(state: &DispatcherState, project_id: uuid::Uu
             last_unix: f.last_ms / 1000,
             as_of_unix: f.as_of_ms / 1000,
         })
-        .chain(stopped)
         .chain(given_up)
         .collect())
 }
@@ -1398,6 +1418,7 @@ pub(crate) fn infra_entries(
                 status: row.status.as_str().to_string(),
                 progress: copies.progress_of(&row.node_id, row.instance.as_ref()),
                 behind: desired.infra_behind(&row.node_id, row.source_hash.as_deref()),
+                last_restart: row.last_restart(),
             })
         })
         .chain(copies.starting.iter().filter_map(|(node, instance)| {
@@ -1407,6 +1428,7 @@ pub(crate) fn infra_entries(
                 status: crate::infra_node::InfraNodeStatus::Provisioning.as_str().to_string(),
                 progress: copies.progress_of(node, instance.as_ref()),
                 behind: false,
+                last_restart: None,
             })
         }))
         .collect();
@@ -1427,6 +1449,7 @@ pub(crate) fn infra_entries(
             progress: None,
             behind: false,
             takes_down: Vec::new(),
+            last_restart: None,
         };
         if node.per_instance.is_some() {
             infra.push(ProjectInfraEntry {
@@ -1446,6 +1469,7 @@ pub(crate) fn infra_entries(
                 progress: copies.progress_of(&spelled, None),
                 behind: desired.infra_behind(&spelled, row.source_hash.as_deref()),
                 takes_down,
+                last_restart: row.last_restart(),
                 ..entry(row.status.as_str().to_string())
             }),
             None => infra.push(match copies.status_of(&spelled, None) {
@@ -1475,9 +1499,8 @@ pub(crate) struct ActionSnapshot {
     /// Some trigger that is on is behind the build it is compared with.
     pub any_behind: bool,
     pub transition: crate::project_store::ProjectTransition,
-    /// The project's resync stopped with triggers down, nothing driving it
-    /// (`crate::task_kinds::resync::ResyncState::standing_still`).
-    pub resync_stopped: bool,
+    /// The project's resync, while its transition is `resyncing`.
+    pub resync: Option<crate::task_kinds::resync::ResyncState>,
     pub has_triggers: bool,
     pub has_infra: bool,
     /// Every shared infra node the project's shared triggers' setup reads
@@ -1499,7 +1522,8 @@ impl ActionSnapshot {
             removing: false,
             lifecycle: &self.lifecycle,
             transition: self.transition,
-            resync_stopped: self.resync_stopped,
+            // Stopped with triggers down, nothing driving it.
+            resync_stopped: self.resync.as_ref().is_some_and(|held| held.standing_still().is_some()),
             has_triggers: self.has_triggers,
             has_infra: self.has_infra,
             trigger_infra_ready: self.trigger_infra_ready,
@@ -1536,14 +1560,13 @@ pub(crate) async fn gather_action_snapshot(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("transition: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
-    let resync_stopped = match transition {
+    let resync = match transition {
         crate::project_store::ProjectTransition::Resyncing => state
             .projects
             .resync(id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the project's resync: {e:#}")))?
-            .is_some_and(|held| held.standing_still().is_some()),
-        _ => false,
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the project's resync: {e:#}")))?,
+        _ => None,
     };
     // Every copy as every reader shows it: a start, stop or terminate
     // under way reads as such before the supervisor reaches the row.
@@ -1682,7 +1705,7 @@ pub(crate) async fn gather_action_snapshot(
         any_on,
         any_behind,
         transition,
-        resync_stopped,
+        resync,
         has_triggers,
         has_infra,
         trigger_infra_ready,
@@ -2288,7 +2311,7 @@ pub async fn version_build(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path((id, build)): Path<(uuid::Uuid, uuid::Uuid)>,
-) -> Result<Json<weft_core::builds::VersionBuildState>, (StatusCode, String)> {
+) -> Result<Json<weft_core::builds::VersionBuildState>, Refused> {
     authorize_project(&state, &caller.0, id).await?;
     // The database out of reach is the install unable to serve this right
     // now, never the build's state: a 503, which the caller following the
@@ -2298,7 +2321,7 @@ pub async fn version_build(
         .await
         .map_err(|e| crate::api::unavailable_or_internal("read where the build is", e))?
         .map(Json)
-        .ok_or((StatusCode::NOT_FOUND, format!("no build {build} of this project")))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no build {build} of this project")))
 }
 
 /// `POST /projects/{id}/activate` (`weft activate`): see [`trigger_actions::activate`].
@@ -2334,6 +2357,9 @@ struct ActivateWindowError {
     status: StatusCode,
     msg: String,
     rollback: ActivateRollback,
+    /// The database did not take the step that failed
+    /// (`crate::api::database_did_not_take`): [`ActivateError::Database`].
+    database: bool,
 }
 
 /// The Activating-window of one owner's activation: every step that runs
@@ -2363,10 +2389,18 @@ async fn activate_trigger_setup_window(
     // Failures before the first arm haven't touched signal state beyond
     // dropping what was held (the person's answer), so they only need the
     // triggers put back.
-    let unstick = |(status, msg): (StatusCode, String)| ActivateWindowError {
-        status,
-        msg,
-        rollback: ActivateRollback::Restore,
+    // A step answering 503 is one the database did not take: said as
+    // `database`, so the window's one decision (`activate_owner`) is the
+    // only thing that answers 503, and only once the triggers are back as
+    // the claim found them.
+    let unstick = |(status, msg): (StatusCode, String)| {
+        let database = status == StatusCode::SERVICE_UNAVAILABLE;
+        ActivateWindowError {
+            status: if database { StatusCode::INTERNAL_SERVER_ERROR } else { status },
+            msg,
+            rollback: ActivateRollback::Restore,
+            database,
+        }
     };
 
     // The infra precondition runs FIRST: an activation whose triggers need
@@ -2407,7 +2441,10 @@ async fn activate_trigger_setup_window(
         .activations
         .record_activation_source(id, activation, &bake.program, &bake.source_version, &cuts)
         .await
-        .map_err(|e| unstick((StatusCode::INTERNAL_SERVER_ERROR, format!("record activation source: {e}"))))?;
+        .map_err(|e| ActivateWindowError {
+            database: crate::api::database_did_not_take(&e),
+            ..unstick((StatusCode::INTERNAL_SERVER_ERROR, format!("record activation source: {e:#}")))
+        })?;
     if !recorded {
         return Err(unstick((StatusCode::CONFLICT, format!("activation {activation} no longer owns its triggers"))));
     }
@@ -2432,7 +2469,7 @@ async fn activate_trigger_setup_window(
             }
             Err(error) => error,
         };
-        return Err(take_back_arms(state, if_not_put_back, armed, format!("arm trigger {key}: {error:#}")).await);
+        return Err(take_back_arms(state, if_not_put_back, armed, format!("arm trigger {key}"), error).await);
     }
 
     // Every step that can fail runs before the one delete (the orphan
@@ -2443,7 +2480,7 @@ async fn activate_trigger_setup_window(
     // cannot come up must not fail the activation deleting it.
     let orphans = match orphan_entry_tokens(state, id, project, keys_instance(keys)).await {
         Ok(orphans) => orphans,
-        Err(e) => return Err(take_back_arms(state, if_not_put_back, armed, format!("read orphan entry rows: {e:#}")).await),
+        Err(e) => return Err(take_back_arms(state, if_not_put_back, armed, "read orphan entry rows".into(), e).await),
     };
 
     // Reconcile what the listener holds of this project with the durable
@@ -2451,7 +2488,7 @@ async fn activate_trigger_setup_window(
     // workers are gone). /rehydrate is idempotent, and fails only on this
     // project's own rows.
     if let Err(e) = state.listener.rehydrate(id, &orphans).await {
-        return Err(take_back_arms(state, if_not_put_back, armed, format!("listener rehydrate: {e:#}")).await);
+        return Err(take_back_arms(state, if_not_put_back, armed, "listener rehydrate".into(), e).await);
     }
 
     // The addresses the armed triggers listen at, read before the flip:
@@ -2459,7 +2496,7 @@ async fn activate_trigger_setup_window(
     // rows, so they are not among these keys'.
     let urls = match collect_listener_urls(state, id, keys).await {
         Ok(urls) => urls,
-        Err(e) => return Err(take_back_arms(state, if_not_put_back, armed, format!("collect_listener_urls: {e:#}")).await),
+        Err(e) => return Err(take_back_arms(state, if_not_put_back, armed, "collect_listener_urls".into(), e).await),
     };
 
     // Last, the one step that cannot be taken back once it lands: drop
@@ -2470,8 +2507,8 @@ async fn activate_trigger_setup_window(
     // still there (held, left down by the rehydrate above) and a re-arm
     // is put back like any earlier failure.
     if let Err(e) = drop_orphan_entry_rows(state, id, &orphans, activation).await {
-        let msg = format!("drop the entry rows of triggers the source no longer has ({} row(s), none deleted): {e:#}", orphans.len());
-        return Err(take_back_arms(state, if_not_put_back, armed, msg).await);
+        let what = format!("drop the entry rows of triggers the source no longer has ({} row(s), none deleted)", orphans.len());
+        return Err(take_back_arms(state, if_not_put_back, armed, what, e).await);
     }
 
     // Flip Activating → Active. The claim guards against a concurrent
@@ -2495,13 +2532,14 @@ async fn activate_trigger_setup_window(
         .await
     {
         Ok(ended) => ended.is_some(),
-        Err(e) => return Err(take_back_arms(state, if_not_put_back, armed, format!("end_activating: {e:#}")).await),
+        Err(e) => return Err(take_back_arms(state, if_not_put_back, armed, "end_activating".into(), e).await),
     };
     if !ended {
         return Err(ActivateWindowError {
             status: StatusCode::CONFLICT,
             msg: "activate raced with cancel-activate; the triggers are now down".into(),
             rollback: ActivateRollback::Restore,
+            database: false,
         });
     }
     Ok(urls)
@@ -2530,6 +2568,21 @@ pub(crate) enum ActivateError {
     /// transaction decided it.
     Refused(crate::activation_store::ClaimRefused),
     Failed(StatusCode, String),
+    /// The install's database did not take a step of it (too busy, or out
+    /// of reach: `crate::api::database_did_not_take`), and what the step
+    /// was: the same activation goes through once the database answers.
+    Database(String),
+}
+
+impl ActivateError {
+    /// A step doing `what` that failed with `e`: [`ActivateError::Database`]
+    /// when the database did not take it, a 500 otherwise.
+    fn failed(what: &str, e: anyhow::Error) -> Self {
+        if crate::api::database_did_not_take(&e) {
+            return ActivateError::Database(format!("{what}: the install's database was busy or out of reach ({e:#})"));
+        }
+        ActivateError::Failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"))
+    }
 }
 
 impl From<(StatusCode, String)> for ActivateError {
@@ -2556,6 +2609,7 @@ impl From<ActivateError> for (StatusCode, String) {
                 .into(),
             ),
             ActivateError::Failed(code, message) => (code, message),
+            ActivateError::Database(message) => (StatusCode::SERVICE_UNAVAILABLE, message),
         }
     }
 }
@@ -2645,7 +2699,7 @@ async fn held_picks(
         let tenant = crate::instance_values::owning_tenant(state, project_id).await?;
         let rows = weft_access_store::install_picks(&state.pg_pool, &tenant, project_id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read the install's picks: {e:#}")))?;
+            .map_err(crate::api::access_store_error)?;
         Ok::<_, (StatusCode, String)>(crate::held::OfTenant { tenant, rows })
     };
     match read {
@@ -2871,13 +2925,8 @@ async fn activate_owner(
         .activations
         .try_begin_activating(id, keys, activation, rearm.is_some().then_some(crate::activation_store::ProjectStatus::Active), claimant)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("try_begin_activating: {e}")))?
+        .map_err(|e| ActivateError::failed("try_begin_activating", e))?
         .map_err(ActivateError::Refused)?;
-    // What they hold as they come on, for the answer: read under the
-    // claim, before the window drops any of it.
-    let held_now = crate::store::postgres::held_on(&state.pg_pool, id, keys)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("held work: {e:#}")))?;
     // Won the claim: broadcast it (other tabs' screens flip to "turning
     // on..." without a verb round-trip) and keep the heartbeat fresh for
     // the whole in-process window (resting while its setup run goes) so the
@@ -2892,10 +2941,28 @@ async fn activate_owner(
     // activate of those triggers). Rather than hand-roll a rollback at
     // each `?`, the whole window is ONE fallible block with ONE rollback
     // site below. A future step added here can't forget the un-stick.
-    let setup = activate_trigger_setup_window(state, id, keys, activation, &previous, held, project, program, rearm).await;
-    let urls = match setup {
-        Ok(urls) => urls,
-        Err(ActivateWindowError { status, msg, rollback }) => {
+    let setup = async {
+        // What they hold as they come on, for the answer: read under the
+        // claim, before the window drops any of it, and inside the
+        // rollback's reach, so a read that fails un-sticks the claim too.
+        let held_now = crate::store::postgres::held_on(&state.pg_pool, id, keys).await.map_err(|e| ActivateWindowError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            msg: format!("held work: {e:#}"),
+            rollback: ActivateRollback::Restore,
+            database: crate::api::database_did_not_take(&e),
+        })?;
+        // Held work the window dropped (`ReleaseHeld::Drop`) stays dropped
+        // whatever the rollback puts back, so a step the database did not
+        // take after it is no longer one nothing of the activation ran.
+        let urls = activate_trigger_setup_window(state, id, keys, activation, &previous, held, project, program, rearm)
+            .await
+            .map_err(|e| ActivateWindowError { database: e.database && held != ReleaseHeld::Drop, ..e })?;
+        Ok((held_now, urls))
+    }
+    .await;
+    let (held_now, urls) = match setup {
+        Ok(setup) => setup,
+        Err(ActivateWindowError { status, msg, rollback, database }) => {
             // Single rollback site for the whole window. The mode says
             // how much to undo: put the triggers back as the claim found
             // them (what was armed is already taken back), or turn them off
@@ -2905,6 +2972,7 @@ async fn activate_owner(
             let cause = weft_core::run::CancelCause::Runtime {
                 detail: "the activation failed and rolled back its setup run".into(),
             };
+            let restored = matches!(rollback, ActivateRollback::Restore);
             let rb = match rollback {
                 ActivateRollback::Restore => match state.activations.restore(id, activation, &previous).await {
                     // The reserved run may not have started yet. Cancellation
@@ -2920,6 +2988,7 @@ async fn activate_owner(
                 // decision.
                 ActivateRollback::WipeSignals => wipe_activating_state(state, id, activation, &cause).await,
             };
+            let rolled_back = rb.is_ok();
             if let Err((rb_status, rb_msg)) = rb {
                 tracing::error!(
                     target: "weft_dispatcher::activate",
@@ -2931,7 +3000,14 @@ async fn activate_owner(
             // Broadcast whatever state the rollback landed (down on
             // success, or the still-stuck state the reaper will repair).
             crate::transition::publish_transition_changed(state, id).await;
-            return Err(ActivateError::Failed(status, msg));
+            // Waiting on the database is the answer only when nothing of
+            // the activation is left: the triggers are back as the claim
+            // found them. Turned off, or a rollback that failed, changed
+            // them, which a 503 would hide (`weft_core::install::asks_again`).
+            return Err(match database && restored && rolled_back {
+                true => ActivateError::Database(msg),
+                false => ActivateError::Failed(status, msg),
+            });
         }
     };
     // Past here the activations are Active (the window's final step
@@ -3031,16 +3107,24 @@ async fn drop_orphan_entry_rows(
 /// created goes, a row it replaced is written back and the listener runs
 /// it again) and the triggers are put back as they were. When one cannot
 /// be put back, `if_not_put_back` says what becomes of them (see the
-/// window).
+/// window). `what` is the step that failed, with `error`.
 async fn take_back_arms(
     state: &DispatcherState,
     if_not_put_back: ActivateRollback,
     armed: Vec<crate::task_kinds::register_signal::Armed>,
-    msg: String,
+    what: String,
+    error: anyhow::Error,
 ) -> ActivateWindowError {
     let status = StatusCode::INTERNAL_SERVER_ERROR;
+    // An arm whose lease the database could not renew in time stopped
+    // before its row was written (past that, its bring-up finishes
+    // whatever the lease does), so it is a wait on the database too.
+    let database = crate::api::database_did_not_take(&error) || weft_task_store::locks::lease_lost(&error);
+    let msg = format!("{what}: {error:#}");
     match crate::task_kinds::register_signal::disarm(state.registrations.as_ref(), &state.listener, armed).await {
-        Ok(()) => ActivateWindowError { status, msg, rollback: ActivateRollback::Restore },
+        Ok(()) => ActivateWindowError { status, msg, rollback: ActivateRollback::Restore, database },
+        // What could not be put back stays changed: never the database's
+        // to wait out.
         Err(undo) => {
             let fate = match if_not_put_back {
                 ActivateRollback::Restore => "so the triggers stay down as they were, with what they kept",
@@ -3050,6 +3134,7 @@ async fn take_back_arms(
                 status,
                 msg: format!("{msg}; putting back the triggers armed before it failed, {fate}: {undo:#}"),
                 rollback: if_not_put_back,
+                database: false,
             }
         }
     }
@@ -3282,10 +3367,9 @@ pub(crate) async fn resync_take_down_owner(
     at: usize,
 ) -> Result<(), crate::task_kinds::resync::Halt> {
     use crate::activation_store::ProjectStatus;
-    use crate::task_kinds::resync::{Halt, ResyncWait};
-    let internal = |what: &'static str| move |e: anyhow::Error| Halt::from((StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}")));
+    use crate::task_kinds::resync::{failing, Halt, ResyncWait};
     let owner = plan.owners[at].clone();
-    let rows = state.activations.list(id).await.map_err(internal("activations"))?;
+    let rows = state.activations.list(id).await.map_err(failing("activations"))?;
     let status_of = |trigger: &String| {
         let key = weft_core::activation::ActivationKey::new(trigger.clone(), owner.owner.clone());
         rows.iter().find(|a| a.key == key).map(|a| a.lifecycle.status)
@@ -3305,13 +3389,13 @@ pub(crate) async fn resync_take_down_owner(
         .projects
         .project(id)
         .await
-        .map_err(internal("project"))?
+        .map_err(failing("project"))?
         .ok_or_else(|| Halt::from((StatusCode::NOT_FOUND, "project not found".to_string())))?;
     // Against the registered build, its own hashes beside its own cuts:
     // what the setup brings them to (the request's build is checked
     // against it as they come back on).
-    let binary_hash = state.projects.running_binary_hash(id).await.map_err(internal("running hashes"))?;
-    let definition_hash = state.projects.running_definition_hash(id).await.map_err(internal("running hashes"))?;
+    let binary_hash = state.projects.running_binary_hash(id).await.map_err(failing("running hashes"))?;
+    let definition_hash = state.projects.running_definition_hash(id).await.map_err(failing("running hashes"))?;
     let desired = Desired::registered(state, id, &registered, binary_hash.as_deref(), definition_hash.as_deref()).await.map_err(Halt::from)?;
     let still_on: Vec<&crate::activation_store::Activation> = owner
         .on
@@ -3330,7 +3414,7 @@ pub(crate) async fn resync_take_down_owner(
     let still_on_keys: Vec<weft_core::activation::ActivationKey> = still_on.iter().map(|a| a.key.clone()).collect();
     let tokens: Vec<String> = crate::store::postgres::entry_tokens(&state.pg_pool, id, &still_on_keys)
         .await
-        .map_err(internal("the triggers' entry tokens"))?
+        .map_err(failing("the triggers' entry tokens"))?
         .into_iter()
         .filter(|token| !plan.old_tokens.contains(token))
         .collect();
@@ -3340,7 +3424,7 @@ pub(crate) async fn resync_take_down_owner(
         plan.old_builds.sort();
         plan.old_builds.dedup();
         plan.old_tokens.extend(tokens);
-        if !state.projects.write_resync(id, plan).await.map_err(internal("write down the triggers it takes down"))? {
+        if !state.projects.write_resync(id, plan).await.map_err(failing("write down the triggers it takes down"))? {
             return Err(Halt::Given);
         }
     }
@@ -3361,7 +3445,7 @@ pub(crate) async fn resync_take_down_owner(
         match crate::take_down::take_down(state, id, &target, &take_down, crate::take_down::DownCause::Person, asker).await? {
             crate::take_down::TakenDown::Done(taken) => {
                 plan.held += taken.held;
-                if !state.projects.write_resync(id, plan).await.map_err(internal("write down what the take-down did"))? {
+                if !state.projects.write_resync(id, plan).await.map_err(failing("write down what the take-down did"))? {
                     return Err(Halt::Given);
                 }
             }
@@ -3376,8 +3460,8 @@ pub(crate) async fn resync_take_down_owner(
     // record does not fit that cut fails, saying so, when it resumes.
     if take_down.held == weft_core::take_down::Held::Keep && !owner.down.is_empty() {
         plan.moved_runs +=
-            move_paused_runs(state, id, &registered, &owner.keys(&owner.down)).await.map_err(internal("move the paused runs onto the new build"))?;
-        if !state.projects.write_resync(id, plan).await.map_err(internal("write down the runs moved"))? {
+            move_paused_runs(state, id, &registered, &owner.keys(&owner.down)).await.map_err(failing("move the paused runs onto the new build"))?;
+        if !state.projects.write_resync(id, plan).await.map_err(failing("write down the runs moved"))? {
             return Err(Halt::Given);
         }
     }
@@ -3404,7 +3488,7 @@ pub(crate) async fn resync_bring_back_owner(
         .projects
         .project(id)
         .await
-        .map_err(|e| Halt::from((StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e:#}"))))?
+        .map_err(crate::task_kinds::resync::failing("project"))?
         .ok_or_else(|| Halt::from((StatusCode::NOT_FOUND, "project not found".to_string())))?;
     let down = owner.keys(&owner.down);
     // The infra their setup reads, checked apart so a stop over it waits
@@ -3430,6 +3514,7 @@ pub(crate) async fn resync_bring_back_owner(
         Ok(Json(activated)) => Ok(activated.urls),
         Err(ActivateError::Refused(ClaimRefused::ResyncGone)) => Err(Halt::Given),
         Err(ActivateError::Refused(ClaimRefused::Removing)) => Err(Halt::Removing),
+        Err(ActivateError::Database(error)) => Err(Halt::on_the_database(error)),
         Err(error) => Err(<(StatusCode, String)>::from(error).into()),
     }
 }

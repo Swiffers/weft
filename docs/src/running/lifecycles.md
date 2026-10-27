@@ -286,7 +286,11 @@ If a step fails, the resync tries again 5 seconds later, then 20 seconds after
 that. If steps fail three times during the resync, it stops with the triggers it has not
 brought back still down, and says why: in the answer to `weft resync`, under
 `waiting on weft:` in `weft status`, and as "Resync stopped" on the editor's
-action bar. If it stopped because the infra those triggers read was not
+action bar. If a step fails because the install's database was busy or out
+of reach, it uses none of those three tries: the resync tries it again after
+5, 15, 30 and then 60 seconds, and if the database still cannot take the
+step, the resync stops, then tries again by itself 30 seconds later. If it stopped
+because the infra those triggers read was not
 running, or because an activation of them was still landing, it goes on by
 itself once that infra runs or that activation has landed. Otherwise, once
 you have fixed the cause, `weft resync --resume` (or the bar's Resync button)

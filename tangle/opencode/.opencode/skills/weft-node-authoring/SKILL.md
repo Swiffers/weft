@@ -1178,7 +1178,7 @@ package manager: the one for the image's distro, else that manager's
 `default`. If a `run` need has no entry for the manager, every program
 using the node is refused; if a need has entries for the manager but none
 for the distro and no `default`, the image build fails, so give each
-manager a `default`. The image starts from `debian:bookworm-slim` unless
+manager a `default`. The image starts from `debian:trixie-slim` unless
 the project names another, so give every need an `apt` entry. If the
 project's `weft.toml` sets `[build.worker] base_image` to an image of
 another family, each need also has to carry an entry for that family

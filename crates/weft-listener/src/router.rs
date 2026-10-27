@@ -208,7 +208,7 @@ async fn unregister(
     kinds::unregister(&state, req).await.map_err(|e| {
         let status = match &e {
             kinds::UnregisterError::Unreadable(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            kinds::UnregisterError::UnknownKind(_) => StatusCode::SERVICE_UNAVAILABLE,
+            kinds::UnregisterError::UnknownKind(_) | kinds::UnregisterError::RowUnread(_) => StatusCode::SERVICE_UNAVAILABLE,
             kinds::UnregisterError::TeardownFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, e.to_string())

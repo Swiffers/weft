@@ -26,6 +26,7 @@
 //! could lapse, since nothing announces a claimer that died.
 
 use anyhow::Result;
+use weft_task_store::sql;
 use sqlx::PgPool;
 use weft_broker_client::lifecycle_command::ISSUED_WAKE;
 
@@ -57,7 +58,7 @@ pub fn drain_loop(state: DispatcherState) -> DrainLoop {
 /// When the earliest claim this loop makes runs out (unix seconds, on the
 /// database's clock like the claim): what [`claim_one`] then takes over.
 async fn earliest_claim_lapse(pool: &PgPool) -> Result<Option<i64>> {
-    Ok(sqlx::query_scalar(&format!(
+    Ok(sqlx::query_scalar(sql!(
         "SELECT MIN(claimed_at_unix) + {ttl} FROM infra_lifecycle_command \
          WHERE claimed_by_replica IS NOT NULL AND completed_at_unix IS NULL \
            AND (verb IN ({verbs}) OR drains)",
@@ -185,7 +186,7 @@ async fn drain_then_hand_over(state: &DispatcherState, row: &ClaimedCommand) {
     let scope = crate::drain::DrainScope { project_id: row.project_id, reaching: crate::drain::Reaching::Infra { reach: &reach, tokens: &row.waits_on_tokens } };
     let claim = CommandClaim { id: row.id, replica };
     let ended = tokio::select! {
-        drained = crate::drain::drain(state, &scope, Some(&claim)) => drained,
+        drained = crate::drain::drain(state, &scope, Some(&claim), None) => drained,
         () = cancelled(state, row.id) => {
             let outcome = RunOutcome::Cancelled("cancelled while waiting for the runs reaching it".into());
             // The copies never went down: what went down with them comes
@@ -377,7 +378,7 @@ pub async fn claim_one(pool: &PgPool, claimer_replica: &str) -> Result<Option<Cl
     // so without this a take-down and the recovery right after it could
     // run at once and the take-down land last, leaving the triggers down. An
     // upgrade is not held behind them, nor holds them.
-    let sql = format!(
+    let sql = sql!(
         "UPDATE infra_lifecycle_command \
          SET claimed_by_replica = $1, claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
          WHERE id = ( \
@@ -403,7 +404,7 @@ pub async fn claim_one(pool: &PgPool, claimer_replica: &str) -> Result<Option<Cl
             InfraLifecycleVerb::Reactivate.as_str()
         ),
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sql)
         .bind(claimer_replica)
         .fetch_optional(pool)
         .await?;

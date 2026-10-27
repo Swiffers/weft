@@ -46,6 +46,8 @@ use std::collections::HashMap;
 use futures::future::BoxFuture;
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool, Row};
+
+use crate::sql;
 use weft_core::stored::{apply, current_version, round_trip, Kind, Op, Version};
 
 /// How many rows one batch carries forward.
@@ -81,7 +83,7 @@ pub struct Document {
 /// `from`, so it must give the same result run twice (`ON CONFLICT DO
 /// NOTHING`, a `SET` from the JSON). A column that goes as a whole has no
 /// steps left to run; what it held moves with a
-/// [`crate::schema_guard::DataStep`].
+/// [`crate::DataStep`].
 pub struct Fill {
     pub from: Version,
     pub sql: &'static str,
@@ -217,7 +219,7 @@ async fn bring(mut work: Work<'_>, documents: &[&Document]) -> anyhow::Result<()
             present,
             "document '{}': the table has no such column, and the code still reads it: add it to the \
              table's CREATE TABLE, or, if the column is gone, take it out of the documents and move what it \
-             held with a data step on the group of its new home (`weft_task_store::DataStep`, `Until::Dropped`)",
+             held with a data step on the group of its new home (`weft_task_store::DataStep`, `Until::Dropped(column)`)",
             document.name()
         );
         for from in at(document).unwrap_or(1)..document.version() {
@@ -378,7 +380,7 @@ async fn next_batch(
     let step = document.steps[from as usize - 1];
     if step.is_empty() {
         // Nothing in the JSON changes: the rows only say they took it.
-        let moved = sqlx::query(&format!(
+        let moved = sqlx::query(sql!(
             "UPDATE {table} SET {version_column} = $2 WHERE {version_column} = $1 AND {column} IS NOT NULL"
         ))
         .bind(from)
@@ -419,12 +421,12 @@ async fn next_batch(
         Encoding::Json => format!("{column}::text"),
         Encoding::Zstd { .. } => column.to_string(),
     };
-    let select = format!(
+    let select = sql!(
         "SELECT ARRAY[{key_text}] AS key, {read} AS doc FROM {table} \
          WHERE {version_column} = $1 AND {column} IS NOT NULL {after_clause} ORDER BY {key_list} LIMIT {BATCH} \
          FOR UPDATE"
     );
-    let rows = sqlx::query(&select).bind(from);
+    let rows = sqlx::query(select).bind(from);
     let rows = match &after {
         Some(after) => rows.bind(after),
         None => rows,
@@ -478,12 +480,12 @@ async fn next_batch(
             .map(|(i, (name, ty))| format!("t.{name} = u.k{i}::{ty}"))
             .collect::<Vec<_>>()
             .join(" AND ");
-        let write = format!(
+        let write = sql!(
             "UPDATE {table} AS t SET {column} = (u.doc)::{column_type}, {version_column} = ${} \
              FROM unnest({arrays}, ${doc_param}::{doc_array}) AS u({names}, doc) WHERE {matched}",
             doc_param + 1
         );
-        let mut query = sqlx::query(&write);
+        let mut query = sqlx::query(write);
         for part in &keys_out {
             query = query.bind(part);
         }
@@ -549,7 +551,7 @@ async fn primary_key(tx: &mut PgConnection, table: &str) -> anyhow::Result<Vec<(
 
 /// How many rows are still at `from`.
 async fn count(conn: &mut PgConnection, document: &Document, from: Version) -> anyhow::Result<i64> {
-    Ok(sqlx::query_scalar(&format!(
+    Ok(sqlx::query_scalar(sql!(
         "SELECT count(*) FROM {} WHERE {} = $1 AND {} IS NOT NULL",
         document.table,
         document.version_column(),

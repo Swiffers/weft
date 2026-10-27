@@ -56,6 +56,7 @@ use anyhow::Result;
 use sqlx::postgres::PgPool;
 
 use crate::drain::DB_NOW_MS;
+use crate::sql;
 
 pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
     name: "unanswered_call",
@@ -370,7 +371,7 @@ async fn write<'e>(
     stopped: bool,
     lasted: std::time::Duration,
 ) -> Result<Alerts> {
-    let alerted: Option<sqlx::types::Json<Vec<Alerted>>> = sqlx::query_scalar(&format!(
+    let alerted: Option<sqlx::types::Json<Vec<Alerted>>> = sqlx::query_scalar(sql!(
         "WITH written AS ({write}) SELECT {alerted}",
         write = write_sql("SELECT $1::text AS callee, $2::text AS label, $3::text AS error, $5::bigint AS lasted_ms", "$4::boolean"),
         alerted = alerted_sql("written"),
@@ -537,10 +538,12 @@ pub fn delivery_failed_sql(run: &str) -> String {
 }
 
 /// SQL: whether a queued run of `project_expr` still waits on its
-/// workers, carrying a failure of its delivery ([`delivery_failed_sql`]).
-fn workers_awaited_sql(project_expr: &str) -> String {
+/// workers, carrying a failure of its delivery ([`delivery_failed_sql`]),
+/// the run named by `leaving_expr` (its `run_id`) not counted.
+fn workers_awaited_sql(project_expr: &str, leaving_expr: Option<&str>) -> String {
+    let leaving = leaving_expr.map(|run| format!(" AND waiting.run_id <> {run}")).unwrap_or_default();
     format!(
-        "EXISTS (SELECT 1 FROM run waiting WHERE waiting.project_id = {project_expr} AND waiting.state = 'queued' AND {})",
+        "EXISTS (SELECT 1 FROM run waiting WHERE waiting.project_id = {project_expr} AND waiting.state = 'queued'{leaving} AND {})",
         delivery_failed_sql("waiting"),
     )
 }
@@ -554,7 +557,7 @@ fn workers_through_sql(project_expr: &str, last_ms_expr: &str) -> String {
         "(EXISTS (SELECT 1 FROM run r WHERE r.project_id = {project_expr} \
              AND r.started_at * 1000 > {last_ms_expr} AND r.state <> 'queued') \
          AND NOT {awaited})",
-        awaited = workers_awaited_sql(project_expr),
+        awaited = workers_awaited_sql(project_expr, None),
     )
 }
 
@@ -583,12 +586,24 @@ pub async fn judged_run_columns(pool: &PgPool) -> Result<()> {
 /// waits on them ([`delivery_failed_sql`]). Called by whoever took the
 /// run out of the queue, which read the mark off the row it locked.
 pub async fn delivery_waits_ended<'e>(executor: impl sqlx::PgExecutor<'e>, project: uuid::Uuid) -> Result<()> {
-    sqlx::query(&format!("DELETE FROM unanswered_call WHERE callee = $1 AND NOT {}", workers_awaited_sql("$2")))
-        .bind(Callee::Workers(project).key())
+    sqlx::query(sqlx::AssertSqlSafe(delivery_waits_ended_sql("$1", None)))
         .bind(project)
         .execute(executor)
         .await?;
     Ok(())
+}
+
+/// SQL: the statement of [`delivery_waits_ended`] for project
+/// `project_expr` (a UUID). A writer that takes a run out of the queue
+/// runs it in that same statement, as a data-modifying `WITH` query, so
+/// both commit together; that statement reads the queue as it was before
+/// it, where the run leaving still waits, so `leaving_expr` names it (its
+/// `run_id`) and it is not counted.
+pub fn delivery_waits_ended_sql(project_expr: &str, leaving_expr: Option<&str>) -> String {
+    format!(
+        "DELETE FROM unanswered_call WHERE callee = '{WORKERS_PREFIX}' || ({project_expr})::text AND NOT {}",
+        workers_awaited_sql(project_expr, leaving_expr),
+    )
 }
 
 /// Make the install alert on its stuck failures, with `after` the delay a
@@ -633,7 +648,7 @@ pub async fn answered<'e>(executor: impl sqlx::PgExecutor<'e>, callee: Callee<'_
 /// down of its own work is shown again: every key that holds it up
 /// ([`Callee::project`]).
 pub async fn forget_project<'e>(executor: impl sqlx::PgExecutor<'e>, project: uuid::Uuid) -> Result<()> {
-    sqlx::query(&format!("DELETE FROM unanswered_call WHERE {} = $1::uuid::text", project_part_sql("callee")))
+    sqlx::query(sql!("DELETE FROM unanswered_call WHERE {} = $1::uuid::text", project_part_sql("callee")))
         .bind(project)
         .execute(executor)
         .await?;
@@ -671,7 +686,7 @@ pub async fn unanswered_roles(pool: &PgPool) -> Result<Vec<String>> {
 /// workers while their stretch is not over, its infra, infra commands,
 /// repairs and signals kept past their door's window.
 pub async fn failing_for(pool: &PgPool, project: uuid::Uuid) -> Result<Vec<Failing>> {
-    let rows: Vec<(String, Option<String>, String, i64, i64, i64)> = sqlx::query_as(&format!(
+    let rows: Vec<(String, Option<String>, String, i64, i64, i64)> = sqlx::query_as(sql!(
         "SELECT u.callee, u.label, u.error, u.since_ms, u.last_ms, {DB_NOW_MS} FROM unanswered_call u \
          WHERE {part} IS NULL \
             OR ({part} = $2::uuid::text AND (u.callee <> $1 OR NOT {workers_through})) \

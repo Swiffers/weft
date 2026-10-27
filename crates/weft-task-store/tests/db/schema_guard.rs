@@ -4,10 +4,10 @@
 //! `#[sqlx::test]` (reads `$DATABASE_URL`, creates a random DB, drops it
 //! after).
 
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 
 use weft_task_store::schema_guard::apply_groups_with as apply;
-use weft_task_store::{Migration, Part, SchemaGroup};
+use weft_task_store::{sql, Migration, Part, SchemaGroup};
 
 /// Most of these tests are about the canonical DDL, so they run with no
 /// migrations at all.
@@ -525,9 +525,9 @@ async fn dropping_a_not_null_column_does_not_also_drop_its_constraint(pool: PgPo
     assert!(!sql.contains("big_key_not_null"), "the column takes its NOT NULL constraint with it: {sql}");
 
     // The proof: the plan runs on the OLD table and lands on the new shape.
-    sqlx::raw_sql(&format!("DROP TABLE probe; {old}")).execute(&pool).await.unwrap();
+    sqlx::raw_sql(sql!("DROP TABLE probe; {old}")).execute(&pool).await.unwrap();
     for stmt in &stmts {
-        sqlx::raw_sql(stmt).execute(&pool).await.unwrap_or_else(|e| panic!("{stmt}: {e}"));
+        sqlx::raw_sql(AssertSqlSafe(stmt.as_str())).execute(&pool).await.unwrap_or_else(|e| panic!("{stmt}: {e}"));
     }
     let landed = read_schema(&pool).await.unwrap();
     assert_eq!(
@@ -562,8 +562,8 @@ async fn a_function_gaining_a_defaulted_argument_still_answers_its_old_callers(p
 
     // Back to the old one, and the expand part run on it as a boot runs it:
     // the old arity is answered by the new function.
-    sqlx::raw_sql(&format!("DROP FUNCTION probe_add(integer, integer); {old}")).execute(&pool).await.unwrap();
-    sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+    sqlx::raw_sql(sql!("DROP FUNCTION probe_add(integer, integer); {old}")).execute(&pool).await.unwrap();
+    sqlx::raw_sql(AssertSqlSafe(sql)).execute(&pool).await.unwrap();
     let answered: i32 = sqlx::query_scalar("SELECT probe_add(1)").fetch_one(&pool).await.expect("an older caller's call");
     assert_eq!(answered, 2);
     assert!(weft_task_store::schema_guard::diff_things(&after, "the code", &read_schema(&pool).await.unwrap(), "the database").is_none());
@@ -596,13 +596,13 @@ async fn a_not_null_column_brings_its_own_constraint_and_its_backfill(pool: PgPo
     let contract: Vec<&str> = plan.iter().filter(|p| p.part == Part::Contract).map(|p| p.stmt.as_str()).collect();
     assert_eq!(contract, ["ALTER TABLE probe ALTER COLUMN body_version DROP DEFAULT;"]);
 
-    sqlx::raw_sql(&format!("DROP TABLE probe; DROP TABLE probe_new; {old}; INSERT INTO probe (id) VALUES (1)"))
+    sqlx::raw_sql(sql!("DROP TABLE probe; DROP TABLE probe_new; {old}; INSERT INTO probe (id) VALUES (1)"))
         .execute(&pool)
         .await
         .unwrap();
     for part in [Part::Expand, Part::Contract] {
         for stmt in plan.iter().filter(|p| p.part == part) {
-            sqlx::raw_sql(&stmt.stmt).execute(&pool).await.unwrap_or_else(|e| panic!("{}: {e}", stmt.stmt));
+            sqlx::raw_sql(AssertSqlSafe(stmt.stmt.as_str())).execute(&pool).await.unwrap_or_else(|e| panic!("{}: {e}", stmt.stmt));
         }
     }
     let version: i32 = sqlx::query_scalar("SELECT body_version FROM probe WHERE id = 1").fetch_one(&pool).await.unwrap();
@@ -648,7 +648,7 @@ async fn the_plan_renders_array_and_enum_types_as_runnable_sql(pool: PgPool) {
         .await
         .unwrap();
     for stmt in &stmts {
-        sqlx::raw_sql(stmt).execute(&pool).await.unwrap_or_else(|e| {
+        sqlx::raw_sql(AssertSqlSafe(stmt.as_str())).execute(&pool).await.unwrap_or_else(|e| {
             panic!("planned SQL must run: {e}\n{stmt}");
         });
     }
@@ -665,7 +665,7 @@ async fn the_plan_renders_array_and_enum_types_as_runnable_sql(pool: PgPool) {
 /// holds.
 mod release {
     use super::*;
-    use weft_task_store::schema_guard::{read_schema, settle_release, Settling};
+    use weft_task_store::schema_guard::{read_schema, settle_release, History, Settling};
 
     /// The draft a developer's database ran while the shape was being
     /// decided: the same change `ADD_EXTRA` releases.
@@ -709,7 +709,7 @@ mod release {
         assert_eq!(recorded_ids(&pool).await, vec![DRAFT_EXTRA[0].id.to_string()]);
         let expected = read_schema(&pool).await.unwrap();
 
-        settle_release(&pool, &[&GUARDED_V2], &[], &expected, &release(false)).await.expect("recorded");
+        settle_release(&History::embedded(), &pool, &[&GUARDED_V2], &[], &expected, &release(false)).await.expect("recorded");
         assert_eq!(recorded_ids(&pool).await, vec![ADD_EXTRA[0].id.to_string()]);
         apply(&pool, &[&GUARDED_V2], ADD_EXTRA).await.expect("nothing left to run");
     }
@@ -725,7 +725,7 @@ mod release {
         let expected = read_schema(&pool).await.unwrap();
         sqlx::raw_sql("ALTER TABLE guard_probe DROP COLUMN extra").execute(&pool).await.unwrap();
 
-        settle_release(&pool, &[&GUARDED_V2], &[], &expected, &release(true)).await.expect("ran");
+        settle_release(&History::embedded(), &pool, &[&GUARDED_V2], &[], &expected, &release(true)).await.expect("ran");
         assert!(has_extra_column(&pool).await, "the release ran");
         assert_eq!(recorded_ids(&pool).await, vec![ADD_EXTRA[0].id.to_string()]);
     }
@@ -743,7 +743,7 @@ mod release {
         // draft fails on the column that is there.
         let err = format!(
             "{:#}",
-            settle_release(&pool, &[&GUARDED_V2], &[], &holds, &release(true))
+            settle_release(&History::embedded(), &pool, &[&GUARDED_V2], &[], &holds, &release(true))
                 .await
                 .expect_err("the column exists")
         );
@@ -754,7 +754,7 @@ mod release {
         // refused naming the group, and the row is not written.
         let mut wrong = holds.clone();
         wrong.retain(|t| !t.to_string().contains("extra"));
-        let err = settle_release(&pool, &[&GUARDED_V2], &[], &wrong, &release(false))
+        let err = settle_release(&History::embedded(), &pool, &[&GUARDED_V2], &[], &wrong, &release(false))
             .await
             .expect_err("the shape differs")
             .to_string();
@@ -803,8 +803,9 @@ mod release {
         };
         let settling = release(true);
         let groups = [&GUARDED_V2];
+        let history = History::embedded();
         let (settled, ()) = tokio::join!(
-            settle_release(&pool, &groups, &[], &expected, &settling),
+            settle_release(&history, &pool, &groups, &[], &expected, &settling),
             the_install_keeps_writing,
         );
         settled.expect("the release ran once the table was free");
@@ -880,8 +881,7 @@ mod expand_and_contract {
         seed: &[],
         data_steps: &[DataStep {
             table: "moving_holder",
-            column: "units",
-            until: Until::Dropped,
+            until: Until::Dropped("units"),
             sql: "INSERT INTO moving_unit (holder, name, n) SELECT h.id, u.key, (u.value->>'n')::int \
                   FROM moving_holder h CROSS JOIN LATERAL jsonb_each(h.units) AS u ON CONFLICT DO NOTHING",
         }],
@@ -1041,8 +1041,7 @@ mod filled_before_not_null {
         seed: &[],
         data_steps: &[DataStep {
             table: "fill_probe",
-            column: "tenant",
-            until: Until::NotNull,
+            until: Until::NotNull("tenant"),
             sql: "UPDATE fill_probe p SET tenant = o.tenant FROM fill_owner o WHERE o.id = p.id AND p.tenant IS NULL; \
                   DELETE FROM fill_probe WHERE tenant IS NULL; \
                   INSERT INTO fill_ran DEFAULT VALUES",

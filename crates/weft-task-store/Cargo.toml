@@ -9,6 +9,12 @@ repository.workspace = true
 # The middleware that keeps a process's watch listening while it answers
 # a request (`pg_signal::keep_listening`), for the processes that serve.
 serve = ["dep:axum", "dep:http-body"]
+# Applying the schema: the runner (`schema_guard`), the document carrier
+# (`documents`), the migration generator, and the migration history the
+# build script embeds from `migrations/`. Only the roles that boot a
+# database turn it on; a worker never does, so its build neither reads nor
+# hashes `migrations/` (`[package.metadata.weft]` below).
+migrate = []
 
 [dependencies]
 # Only for stamping a generated migration's file name with the date it was
@@ -24,10 +30,14 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "tls-rustls"] }
+sqlx = { workspace = true, features = ["json", "uuid", "tls-rustls"] }
 tokio = { workspace = true }
 tokio-util = { version = "0.7" }
 tracing = { workspace = true }
+# Hearing sqlx's reports of a slow acquire (`throttle::slow_acquires`).
+tracing-subscriber = { workspace = true }
+# The level sqlx's pool options take (`db::options`).
+log = "0.4"
 url = { workspace = true }
 uuid = { workspace = true }
 # A column of documents stored compressed (`documents::Encoding::Zstd`).
@@ -38,10 +48,11 @@ weft-platform-traits = { workspace = true }
 weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [dev-dependencies]
-# The tests drive `pg_signal::keep_listening`, which is behind `serve`. A
-# dev-dependency on the crate itself turns it on for every test build, so
-# the ordinary run and the database run build the same library.
-weft-task-store = { path = ".", features = ["serve"] }
+# The tests drive `pg_signal::keep_listening`, which is behind `serve`, and
+# the schema, which is behind `migrate`. A dev-dependency on the crate
+# itself turns both on for every test build, so the ordinary run and the
+# database run build the same library.
+weft-task-store = { path = ".", features = ["serve", "migrate"] }
 # Driving `pg_signal::keep_listening` in the database tests (`oneshot`).
 tower = { workspace = true, features = ["util"] }
 # `test-util` enables tokio's paused virtual clock (start_paused +
@@ -53,11 +64,18 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 # the Layer-3 DB-logic tests (claims, reruns, signals, terminal waits,
 # the schema guard). Only nextest's `db` profile runs them
 # (`scripts/run-db-tests.sh`), since without a DATABASE_URL they fail.
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "macros", "migrate"] }
+sqlx = { workspace = true, features = ["json", "uuid", "macros", "migrate"] }
 # The fake alarm the booking tests read the wakes set and cancelled from.
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
-# Counting the alert lines a stuck failure logs (tests/db/unanswered.rs).
-tracing-subscriber = { workspace = true }
+
+# Top-level entries a worker's copy of this crate leaves out
+# (weft_compiler::build::worker_crate_entries, which both stages a worker's
+# build and names it). `migrations/` is read only by the build script under
+# `migrate`, which no worker turns on: a database change is no worker
+# change. A worker build that reached for it would fail on the missing
+# folder, so the exclusion cannot silently drop what a worker compiles.
+[package.metadata.weft]
+left_out_of_workers = ["migrations"]
 
 [lints]
 workspace = true

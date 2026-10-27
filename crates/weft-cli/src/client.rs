@@ -12,6 +12,10 @@ use weft_core::net::EmptyBody;
 pub struct Refused {
     status: reqwest::StatusCode,
     message: String,
+    /// Whether the install gave the answer itself
+    /// ([`weft_core::install::INSTALL_ANSWER_HEADER`]), rather than the
+    /// platform or gateway in front of it.
+    from_install: bool,
     /// What the refusal's marker header says, when it carries one.
     marked: Option<Marked>,
 }
@@ -39,6 +43,12 @@ impl Refused {
     pub fn status(&self) -> reqwest::StatusCode {
         self.status
     }
+
+    /// Whether the install gave this answer itself, rather than the
+    /// platform or gateway in front of it.
+    pub fn is_the_installs(&self) -> bool {
+        self.from_install
+    }
 }
 
 impl std::fmt::Display for Refused {
@@ -52,6 +62,14 @@ impl std::error::Error for Refused {}
 /// The refusal in `e`'s chain, when the install answered one.
 pub fn refusal(e: &anyhow::Error) -> Option<&Refused> {
     e.chain().find_map(|cause| cause.downcast_ref::<Refused>())
+}
+
+/// `answer`, an answer of the install, read as `T`. One that does not
+/// read is the install and this CLI built from different shapes, and the
+/// error says which answer (`what`, as in "read {what}") and what to do.
+pub fn read_answer<T: serde::de::DeserializeOwned>(answer: serde_json::Value, what: &str) -> anyhow::Result<T> {
+    serde_json::from_value(answer)
+        .with_context(|| format!("read {what} (the install and this CLI disagree on its shape; upgrade one of them)"))
 }
 
 /// Whether `e` is a request that failed on its way rather than being
@@ -154,16 +172,6 @@ impl std::error::Error for InstallUnreachable {
 /// the request would hang on it for minutes.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// How long a connection may sit with nothing on it before the system
-/// checks that the other end is still there, and how often after that.
-/// A request held open on a quiet connection (a verb waiting on the
-/// install's answer) keeps its path alive this way, and one whose path
-/// died fails within a minute or so instead of waiting for ever. There is
-/// no limit on a request's whole length: some verbs wait as long as the
-/// person's own work runs.
-const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
-const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-const KEEPALIVE_RETRIES: u32 = 3;
 
 #[derive(Clone)]
 pub struct DispatcherClient {
@@ -184,11 +192,10 @@ impl DispatcherClient {
     pub fn new(base: impl Into<String>, operator_key: Option<String>) -> Self {
         // The one connection setup every request to the install uses,
         // live-update streams included.
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .tcp_keepalive(KEEPALIVE_IDLE)
-            .tcp_keepalive_interval(KEEPALIVE_INTERVAL)
-            .tcp_keepalive_retries(KEEPALIVE_RETRIES)
+        // A connection whose path died fails within a minute or so
+        // (`notice_dead_connections`); a request's whole length has no
+        // limit, since some verbs wait as long as the person's own work runs.
+        let http = weft_core::net::notice_dead_connections(reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT))
             .build()
             .expect("an HTTP client with only timeouts set always builds");
         Self { base: base.into(), target: None, bearer: operator_key.map(|key| Arc::new(RwLock::new(key))), http }
@@ -261,7 +268,41 @@ impl DispatcherClient {
     /// Every request to the install goes out here, so none can leave
     /// without the key: the inner `reqwest::Client` is touched nowhere
     /// else, and every public verb is a thin reading of this response.
+    ///
+    /// An answer saying the install is busy ([`busy_answer`]) is never
+    /// handed back: the same request is sent again after a wait
+    /// ([`busy_wait`]), for as long as it takes, and a line on stderr says
+    /// so ([`say_busy`]). No deadline, since busy means wait. The wait is a
+    /// plain sleep, so Ctrl+C stops the command at once: nothing in this
+    /// path catches it, and a verb that does catch it (`tokio::signal::ctrl_c`
+    /// in a `select!`) drops this request, sleep and all.
     async fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> anyhow::Result<reqwest::Response> {
+        let started = std::time::Instant::now();
+        let mut waits = 0u32;
+        loop {
+            let resp = self.send_once(method.clone(), path, body).await?;
+            let from_install = resp.headers().contains_key(weft_core::install::INSTALL_ANSWER_HEADER);
+            let status = resp.status();
+            if !busy_answer(status, from_install) {
+                return Ok(resp);
+            }
+            let content_type = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_string);
+            // The answer's own words say why; one that cannot be read
+            // still says the install is busy, by its status.
+            let body = resp.text().await.unwrap_or_default();
+            say_busy(&failure_text(status, content_type.as_deref(), &body), started.elapsed());
+            tokio::time::sleep(busy_wait(waits, jitter())).await;
+            waits = waits.saturating_add(1);
+        }
+    }
+
+    /// One try of [`Self::send`].
+    async fn send_once(
         &self,
         method: reqwest::Method,
         path: &str,
@@ -328,6 +369,7 @@ impl DispatcherClient {
         if status.is_success() {
             return Ok(resp);
         }
+        let from_install = resp.headers().contains_key(weft_core::install::INSTALL_ANSWER_HEADER);
         let marked = match status {
             reqwest::StatusCode::CONFLICT if resp.headers().contains_key(weft_core::storage::COMPLETING_HEADER) => {
                 Some(Marked::StoreCompleting)
@@ -342,7 +384,7 @@ impl DispatcherClient {
             .map(str::to_string);
         let body = self.text(resp).await.with_context(|| format!("read the body of a {status} answer"))?;
         let message = failure_text(status, content_type.as_deref(), &body);
-        Err(anyhow::Error::new(Refused { status, message, marked }))
+        Err(anyhow::Error::new(Refused { status, message, from_install, marked }))
     }
 
     pub async fn get_json(&self, path: &str) -> anyhow::Result<serde_json::Value> {
@@ -487,6 +529,89 @@ impl DispatcherClient {
     }
 }
 
+/// How long the first wait before asking a busy install again lasts; each
+/// next one doubles, up to [`BUSY_WAIT_MAX`]. Cloud Run frees a copy of a
+/// service as soon as one of its calls ends, which is often within
+/// moments, so the first look again comes soon.
+const BUSY_WAIT_FIRST: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The longest wait between two asks of a busy install: a few seconds, so
+/// a command goes on soon after the install has room again.
+const BUSY_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Whether an answer with `status` says the install is busy, so the same
+/// request is sent again after a wait, whatever its method: sending it
+/// again is safe, since nothing ran.
+///
+/// - A `429` the install did not give itself (no
+///   [`weft_core::install::INSTALL_ANSWER_HEADER`]; `from_install` false)
+///   is the platform in front of it saying every copy of the service it
+///   may start is busy, before the install ever saw the request. A `429`
+///   the install gave is its own refusal (a caller past a limit), which
+///   waiting a few seconds does not lift: never.
+/// - A `503` the install gave itself: nothing of the request ran, and the
+///   same request goes through later ([`weft_core::install::asks_again`],
+///   the rule the install keeps: it answers `503` for nothing else). Its
+///   database did not take the call, too busy or out of reach for now.
+///
+/// Every other answer is the answer, shown with its words, the platform's
+/// `503` among them: it may be the install down for good, and waiting on
+/// one that never lifts would leave the command saying "busy" forever. A
+/// caller that knows its request is safe to send again and that the
+/// install may be starting up reads the rest itself
+/// (`crate::commands::ensure::look_again_after`).
+// SYNC: busy_answer <-> crates/weft-core/src/install.rs (asks_again)
+pub(crate) fn busy_answer(status: reqwest::StatusCode, from_install: bool) -> bool {
+    match status {
+        reqwest::StatusCode::TOO_MANY_REQUESTS => !from_install,
+        _ => weft_core::install::asks_again(status.as_u16(), from_install),
+    }
+}
+
+/// How long to wait before asking a busy install again, after `waits`
+/// waits already: [`BUSY_WAIT_FIRST`] doubling each time, capped at
+/// [`BUSY_WAIT_MAX`], then cut by `jitter` (`0..1`) to anywhere in its
+/// upper half, so the many calls of one command turned away together (its
+/// uploads, side by side) do not all come back at the same moment.
+pub(crate) fn busy_wait(waits: u32, jitter: f64) -> std::time::Duration {
+    let full = BUSY_WAIT_FIRST.saturating_mul(2u32.saturating_pow(waits)).min(BUSY_WAIT_MAX);
+    full.mul_f64(0.5 + 0.5 * jitter.clamp(0.0, 1.0))
+}
+
+/// A number in `0..1`, different on every call.
+fn jitter() -> f64 {
+    (uuid::Uuid::new_v4().as_u64_pair().0 >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// The line that says the install is busy: what it answered (`answered`),
+/// and, once the request has waited, for how long (`waited`).
+pub(crate) fn busy_line(answered: &str, waited: std::time::Duration) -> String {
+    let so_far = match waited.as_secs() {
+        0 => String::new(),
+        secs => format!("; {} so far", crate::progress::elapsed_text(secs)),
+    };
+    format!("the install is busy, so this command waits and asks again (it answered: {answered}{so_far}; Ctrl+C stops)")
+}
+
+/// Say on stderr that the install is busy ([`busy_line`]), at once the
+/// first time, then at most once every
+/// [`crate::progress::SAY_AGAIN_EVERY`] for the whole process, however
+/// many of its requests are waiting. On stderr, like every warning the
+/// client gives, so `--json` keeps stdout for its output.
+fn say_busy(answered: &str, waited: std::time::Duration) {
+    static SAID: std::sync::LazyLock<std::sync::Mutex<(std::time::Instant, crate::progress::SayAgain)>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new((std::time::Instant::now(), crate::progress::SayAgain::default())));
+    // A poisoned lock only means another request panicked mid-say: the
+    // schedule in it is still whole.
+    let mut said = SAID.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (since, schedule) = &mut *said;
+    let now = since.elapsed();
+    if schedule.due(now) {
+        schedule.said(now);
+        eprintln!("warning: {}", busy_line(answered, waited));
+    }
+}
+
 /// The commit this CLI was built from (`build.rs`), when the build knew it.
 const CLI_COMMIT: Option<&str> = option_env!("WEFT_CLI_COMMIT");
 
@@ -553,19 +678,29 @@ pub(crate) mod fake {
     pub enum Then {
         /// Write these bytes as the answer, then close.
         Answer(&'static str),
+        /// Answer each connection with the next of these, in order, and
+        /// every one after the last with the last.
+        Answers(&'static [&'static str]),
         /// Read the request, then reset the connection without a word.
         Reset,
     }
 
-    /// The address of a stand-in install doing `then` to every request.
+    /// The address of a stand-in install doing `then` to every request
+    /// (its next step, for [`Then::Answers`]).
     pub async fn install(then: Then) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
+            let mut answered = 0usize;
             loop {
                 let Ok((mut conn, _)) = listener.accept().await else { return };
                 let mut request = vec![0u8; 64 * 1024];
                 let _ = conn.read(&mut request).await;
+                let then = match then {
+                    Then::Answers(raws) => Then::Answer(raws[answered.min(raws.len() - 1)]),
+                    other => other,
+                };
+                answered += 1;
                 match then {
                     Then::Answer(raw) => {
                         let _ = conn.write_all(raw.as_bytes()).await;
@@ -575,6 +710,7 @@ pub(crate) mod fake {
                         #[allow(deprecated)]
                         conn.set_linger(Some(std::time::Duration::ZERO)).unwrap();
                     }
+                    Then::Answers(_) => unreachable!("a script was resolved to its answer above"),
                 }
             }
         });
@@ -591,7 +727,94 @@ pub(crate) mod fake {
 mod tests {
     use futures::StreamExt;
     use super::fake::{closed, install, Then};
-    use super::{connection_failed, failure_text, is_loopback_address, refusal, refusal_text, DispatcherClient, InstallUnreachable};
+    use super::{
+        busy_answer, busy_line, busy_wait, connection_failed, failure_text, is_loopback_address, refusal, refusal_text, DispatcherClient,
+        InstallUnreachable, BUSY_WAIT_MAX,
+    };
+    use reqwest::StatusCode;
+
+    /// The platform's 429 is waited out, the install's own never; the
+    /// install's own 503 is waited out, the platform's never; nothing else
+    /// is, from either.
+    #[test]
+    fn only_a_busy_answer_is_asked_again() {
+        assert!(busy_answer(StatusCode::TOO_MANY_REQUESTS, false), "the platform's 429");
+        assert!(!busy_answer(StatusCode::TOO_MANY_REQUESTS, true), "the install's own 429");
+        assert!(busy_answer(StatusCode::SERVICE_UNAVAILABLE, true), "the install's own 503: nothing ran");
+        assert!(!busy_answer(StatusCode::SERVICE_UNAVAILABLE, false), "the platform's 503");
+        for status in [StatusCode::OK, StatusCode::NOT_FOUND, StatusCode::CONFLICT, StatusCode::INTERNAL_SERVER_ERROR, StatusCode::BAD_GATEWAY, StatusCode::GATEWAY_TIMEOUT] {
+            assert!(!busy_answer(status, true), "{status}");
+            assert!(!busy_answer(status, false), "{status}");
+        }
+    }
+
+    /// The wait doubles from a quarter second up to its cap, and the
+    /// jitter keeps it in the upper half of that.
+    #[test]
+    fn a_busy_wait_doubles_up_to_its_cap_within_its_jitter() {
+        let ms = |waits: u32, jitter: f64| busy_wait(waits, jitter).as_millis();
+        assert_eq!([ms(0, 1.0), ms(1, 1.0), ms(2, 1.0), ms(3, 1.0), ms(4, 1.0), ms(5, 1.0)], [250, 500, 1000, 2000, 4000, 4000]);
+        assert_eq!(ms(0, 0.0), 125, "no jitter keeps half");
+        assert_eq!(ms(2, 0.5), 750);
+        assert_eq!(busy_wait(u32::MAX, 1.0), BUSY_WAIT_MAX, "a wait never grows past its cap");
+        assert_eq!(ms(0, 7.0), 250, "a jitter past its range is held to it");
+    }
+
+    #[test]
+    fn a_busy_line_says_what_the_install_answered_and_how_long_it_waited() {
+        assert_eq!(
+            busy_line("rate exceeded", std::time::Duration::ZERO),
+            "the install is busy, so this command waits and asks again (it answered: rate exceeded; Ctrl+C stops)"
+        );
+        assert_eq!(
+            busy_line("the install could not read the build right now; try again shortly", std::time::Duration::from_secs(95)),
+            "the install is busy, so this command waits and asks again (it answered: the install could not read the build \
+             right now; try again shortly; 1m35s so far; Ctrl+C stops)"
+        );
+    }
+
+    /// A request the platform turned away busy, or one the install
+    /// answered 503 itself, is sent again until it is answered, whatever
+    /// its method; the install's own 429, its 500 (a database refusing
+    /// for good), and the platform's 503 are the answer.
+    #[tokio::test]
+    async fn a_busy_install_is_asked_again_and_its_own_refusal_is_not() {
+        const PLATFORM_BUSY: &str = "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 13\r\n\r\nRate exceeded";
+        const ASK_AGAIN: &str = "HTTP/1.1 503 Service Unavailable\r\nx-weft-install: 1\r\ncontent-length: 9\r\n\r\ntry again";
+        const REFUSED_FOR_GOOD: &str =
+            "HTTP/1.1 500 Internal Server Error\r\nx-weft-install: 1\r\ncontent-length: 14\r\n\r\nquota exceeded";
+        const PLATFORM_DOWN: &str = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 11\r\n\r\nunavailable";
+        const ANSWERED: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 7\r\n\r\n{\"a\":1}";
+        let answer = serde_json::json!({ "a": 1 });
+
+        let platform = DispatcherClient::new(install(Then::Answers(&[PLATFORM_BUSY, PLATFORM_BUSY, ANSWERED])).await, None);
+        assert_eq!(platform.post_json("/projects", &serde_json::json!({})).await.unwrap(), answer, "a write is sent again");
+
+        let read = DispatcherClient::new(install(Then::Answers(&[ASK_AGAIN, ANSWERED])).await, None);
+        assert_eq!(read.get_json("/install").await.unwrap(), answer);
+        let write = DispatcherClient::new(install(Then::Answers(&[ASK_AGAIN, ANSWERED])).await, None);
+        assert_eq!(write.post_json("/projects", &serde_json::json!({})).await.unwrap(), answer, "the install's 503 to a write is sent again");
+
+        let limited = DispatcherClient::new(
+            install(Then::Answers(&[
+                "HTTP/1.1 429 Too Many Requests\r\nx-weft-install: 1\r\nretry-after: 30\r\ncontent-length: 14\r\n\r\ntoo many calls",
+                ANSWERED,
+            ]))
+            .await,
+            None,
+        );
+        let e = limited.get_json("/signal/t").await.unwrap_err();
+        assert_eq!(refusal(&e).map(|r| r.status()), Some(StatusCode::TOO_MANY_REQUESTS), "{e:#}");
+
+        let for_good = DispatcherClient::new(install(Then::Answers(&[REFUSED_FOR_GOOD, ANSWERED])).await, None);
+        let e = for_good.get_json("/install").await.unwrap_err();
+        assert_eq!(refusal(&e).map(|r| r.status()), Some(StatusCode::INTERNAL_SERVER_ERROR), "{e:#}");
+        assert_eq!(format!("{e:#}"), "quota exceeded", "the install's 500 is the answer, in its own words");
+
+        let platform_down = DispatcherClient::new(install(Then::Answers(&[PLATFORM_DOWN, ANSWERED])).await, None);
+        let e = platform_down.get_json("/install").await.unwrap_err();
+        assert_eq!(refusal(&e).map(|r| r.status()), Some(StatusCode::SERVICE_UNAVAILABLE), "the platform's 503 is the answer: {e:#}");
+    }
 
     fn unreachable(e: &anyhow::Error) -> bool {
         e.chain().any(|cause| cause.is::<InstallUnreachable>())

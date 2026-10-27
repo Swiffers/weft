@@ -112,7 +112,8 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
             .transpose()
             .context("read the quiesce's answer")?;
         if let Some(quiesced) = quiesced {
-            super::follow::follow_task(&client, &progress, &project_id, quiesced.waiting)
+            // The wait says nothing on the way (`removal_wait`).
+            super::follow::follow_task(&client, &progress, &project_id, quiesced.waiting, async |_| Ok(()))
                 .await
                 .context("waiting for what the removal cancelled to be over")?;
             progress.dispatcher_call_done(serde_json::json!({ "step": "quiesce" }));

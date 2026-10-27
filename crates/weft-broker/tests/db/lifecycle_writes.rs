@@ -129,7 +129,7 @@ async fn put_units(pool: &PgPool, instance: Option<&str>, units: serde_json::Val
 
 /// The shared copy's status and its units, as the readers see them.
 async fn row(pool: &PgPool) -> (String, serde_json::Value) {
-    sqlx::query_as(&format!(
+    sqlx::query_as(weft_task_store::sql!(
         "SELECT n.status, {} FROM infra_node n WHERE n.project_id = $1 AND n.node_id = $2 AND n.instance_id IS NULL",
         weft_broker_client::protocol::units_of_copy_sql("n")
     ))
@@ -153,6 +153,7 @@ fn stamp(replica: &str, command_id: Option<i64>, unit: Option<&str>, status: Sta
         instance: None,
         not_ready_since_unix: None,
         ready_since_unix: None,
+        restart: None,
     }
 }
 
@@ -189,6 +190,46 @@ async fn per_unit_stamp_patches_the_unit_and_rolls_up_the_new_roster(pool: PgPoo
     assert_eq!(units["b"]["status"], "running");
     // The patch kept every other field of the entry.
     assert_eq!(units["a"]["stop_behavior"]["kind"], "stop");
+}
+
+/// A restart the health check saw lands on its unit with the stamp that
+/// carries it, and stays through every stamp that carries none (a look's
+/// next window, a command's per-unit stamp); the next restart replaces
+/// it, and an apply's roster write that starts the unit again clears it.
+#[sqlx::test]
+async fn a_units_restart_is_written_once_and_kept_until_the_next(pool: PgPool) {
+    use weft_core::infra::{LastRestart, RestartCause};
+    schema(&pool).await;
+    lease(&pool, OWNER).await;
+    node_row(&pool, "running", serde_json::json!({ "a": unit("running"), "b": unit("running") })).await;
+    let restart_of = |units: &serde_json::Value, unit: &str| -> Option<LastRestart> {
+        serde_json::from_value(units[unit]["last_restart"].clone()).expect("a restart, or null")
+    };
+
+    let oom = LastRestart { at_unix: 1_000, cause: RestartCause::OutOfMemory };
+    let seen = SupervisorSetStatusRequest { restart: Some(oom.clone()), ..stamp(OWNER, None, Some("a"), Status::Running) };
+    assert_eq!(set_status(&pool, &seen).await.unwrap(), FencedWrite::Applied);
+    let (_, units) = row(&pool).await;
+    assert_eq!(restart_of(&units, "a"), Some(oom.clone()));
+    assert_eq!(restart_of(&units, "b"), None, "only the stamped unit");
+
+    let window = SupervisorSetStatusRequest { not_ready_since_unix: Some(5), ..stamp(OWNER, None, Some("a"), Status::Running) };
+    assert_eq!(set_status(&pool, &window).await.unwrap(), FencedWrite::Applied);
+    let cmd = command(&pool).await;
+    assert_eq!(set_status(&pool, &stamp(OWNER, Some(cmd), Some("a"), Status::Stopping)).await.unwrap(), FencedWrite::Applied);
+    assert_eq!(restart_of(&row(&pool).await.1, "a"), Some(oom), "a stamp with no restart leaves it");
+    complete_command(&pool, &SupervisorCommandCompleteRequest { replica: OWNER.into(), command_id: cmd, error: None, cancelled: false })
+        .await
+        .unwrap();
+
+    let exited = LastRestart { at_unix: 2_000, cause: RestartCause::Exited { code: 3 } };
+    let next = SupervisorSetStatusRequest { restart: Some(exited.clone()), ..stamp(OWNER, None, Some("a"), Status::Running) };
+    assert_eq!(set_status(&pool, &next).await.unwrap(), FencedWrite::Applied);
+    let (_, units) = row(&pool).await;
+    assert_eq!(restart_of(&units, "a"), Some(exited), "the next restart replaces it, its exit code with it");
+
+    put_units(&pool, None, serde_json::json!({ "a": unit("running"), "b": unit("running") })).await;
+    assert_eq!(restart_of(&row(&pool).await.1, "a"), None, "an apply that starts the unit again clears it");
 }
 
 /// Two per-unit stamps of one copy in turn: the second rolls up over the
@@ -542,8 +583,8 @@ async fn an_apply_that_succeeds_stamps_its_copy_with_its_build(pool: PgPool) {
     }
     let run_id = uuid::Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, definition_hash, cut_from, state, last_seq, started_at, spec_version) \
-         VALUES ($1, $2, $3, 'infra_setup', 'project', 'durable', TRUE, 'cut', 'program', 'running', 0, 0, 1)",
+        "INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, definition_hash, binary_hash, cut_from, state, last_seq, started_at, spec_version) \
+         VALUES ($1, $2, $3, 'infra_setup', 'project', 'durable', TRUE, 'cut', 'bin-1', 'program', 'running', 0, 0, 1)",
     )
     .bind(run_id)
     .bind(PROJECT)

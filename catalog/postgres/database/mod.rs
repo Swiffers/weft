@@ -45,6 +45,8 @@ use weft::{
     WeftResult,
 };
 
+use super::postgres::{mistake, MOST_AT_ONCE};
+
 const SQL_PORT: u16 = 5432;
 const CREDENTIAL_PORT: u16 = 8099;
 /// The one disk and its two halves, ordinary subdirectories rather
@@ -131,6 +133,149 @@ fn password_file() -> String {
     format!("{SECRET_PATH}/password")
 }
 
+/// What the machine keeps for everything that is not Postgres, in MiB:
+/// the operating system, Docker and the agent that runs the unit (about
+/// 256 together on the smallest cloud machine), plus the credential
+/// container's 64Mi limit.
+const BESIDE_POSTGRES_MIB: u64 = 256 + 64;
+/// What one connection costs Postgres before it sorts or hashes
+/// anything, in MiB: the server process each connection gets, with its
+/// caches of the tables and plans it has used.
+const PER_CONNECTION_MIB: u64 = 8;
+/// The most connections Postgres takes, however big the machine. Past a
+/// few hundred, Postgres slows down from managing its connections alone,
+/// and the answer to more clients is a pooler in front of it.
+const MOST_CONNECTIONS: u64 = 200;
+/// The background cleaners (`autovacuum_max_workers`, Postgres's
+/// default), each of which may use `maintenance_work_mem` at once.
+const CLEANERS: u64 = 3;
+
+/// Postgres's settings for a machine of `memory`, so it plans for the
+/// memory it actually has. Left at the factory settings, it accepts 100
+/// connections on any machine, and enough of them sorting at once on a
+/// small one runs the machine out of memory: the kernel then kills a
+/// Postgres process, and Postgres restarts and drops every connection,
+/// where a full Postgres would have refused the next one cleanly.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Tuning {
+    /// Postgres's share of the machine: the container's memory limit.
+    pub limit_mib: u64,
+    pub max_connections: u64,
+    pub shared_buffers_mib: u64,
+    pub work_mem_kib: u64,
+    pub maintenance_work_mem_mib: u64,
+    pub effective_cache_size_mib: u64,
+}
+
+impl Tuning {
+    /// The settings, following Postgres's own tuning guidance, inside
+    /// the share of the machine left once [`BESIDE_POSTGRES_MIB`] is
+    /// set aside:
+    ///   - `shared_buffers`, the cache every connection shares: a
+    ///     quarter of the share, the guidance's starting point for a
+    ///     machine that runs a database;
+    ///   - `maintenance_work_mem`, what a vacuum or an index build may
+    ///     use: a sixteenth, between 16MB and the 1GB a vacuum can use at
+    ///     most, held [`CLEANERS`] times over since the cleaners can all
+    ///     run at once;
+    ///   - what is left is the connections': each costs
+    ///     [`PER_CONNECTION_MIB`] plus two `work_mem` (the memory one
+    ///     sort or hash may use, and a hash takes twice that), and the
+    ///     guidance is that every connection using its `work_mem` at
+    ///     once must still fit. At Postgres's own 4MB `work_mem` that is
+    ///     16MB a connection, which sets `max_connections`; the
+    ///     connections' memory is then divided between them, so a
+    ///     machine past [`MOST_CONNECTIONS`] gives each more `work_mem`;
+    ///   - `effective_cache_size`, only a hint to the planner of how
+    ///     much the disk cache holds: three quarters of the share.
+    ///
+    /// `memory` is what the node asks for, which a cloud rounds UP to
+    /// the machine it picks, so the settings never assume more memory
+    /// than there is. Refused when the share holds fewer connections
+    /// than one worker opens ([`MOST_AT_ONCE`]), because that worker's
+    /// own runs would then be refused by the database.
+    pub fn for_machine(memory: &str) -> WeftResult<Tuning> {
+        let Split { share, shared_buffers_mib, maintenance_work_mem_mib, connections_mib, max_connections } = split(memory_mib(memory)?);
+        if max_connections < MOST_AT_ONCE as u64 {
+            mistake!(
+                "memory {memory} leaves Postgres room for {max_connections} connections, fewer than \
+                 the {MOST_AT_ONCE} one worker of the program opens; raise `memory` to {LEAST_MEMORY_MIB}Mi or more"
+            );
+        }
+        let each_kib = connections_mib * 1024 / max_connections;
+        Ok(Tuning {
+            limit_mib: share,
+            max_connections,
+            shared_buffers_mib,
+            work_mem_kib: (each_kib - PER_CONNECTION_MIB * 1024) / 2,
+            maintenance_work_mem_mib,
+            effective_cache_size_mib: share * 3 / 4,
+        })
+    }
+
+    /// The settings as Postgres's command line (the image passes
+    /// arguments that start with `-` to the server).
+    pub fn args(&self) -> Vec<String> {
+        [
+            format!("max_connections={}", self.max_connections),
+            format!("shared_buffers={}MB", self.shared_buffers_mib),
+            format!("work_mem={}kB", self.work_mem_kib),
+            format!("maintenance_work_mem={}MB", self.maintenance_work_mem_mib),
+            format!("effective_cache_size={}MB", self.effective_cache_size_mib),
+        ]
+        .into_iter()
+        .flat_map(|setting| ["-c".to_string(), setting])
+        .collect()
+    }
+}
+
+/// How a machine of `machine_mib` divides between Postgres's uses, as
+/// [`Tuning::for_machine`] lays out: the one formula, which
+/// [`LEAST_MEMORY_MIB`] is read from too.
+struct Split {
+    share: u64,
+    shared_buffers_mib: u64,
+    maintenance_work_mem_mib: u64,
+    connections_mib: u64,
+    max_connections: u64,
+}
+
+const fn split(machine_mib: u64) -> Split {
+    let share = machine_mib.saturating_sub(BESIDE_POSTGRES_MIB);
+    let shared_buffers_mib = share / 4;
+    let maintenance_work_mem_mib = match share / 16 {
+        mib if mib < 16 => 16,
+        mib if mib > 1024 => 1024,
+        mib => mib,
+    };
+    let connections_mib = share.saturating_sub(shared_buffers_mib + CLEANERS * maintenance_work_mem_mib);
+    let fit = connections_mib / (PER_CONNECTION_MIB + 2 * 4);
+    let max_connections = if fit < MOST_CONNECTIONS { fit } else { MOST_CONNECTIONS };
+    Split { share, shared_buffers_mib, maintenance_work_mem_mib, connections_mib, max_connections }
+}
+
+/// The least `memory` the node takes, in MiB: the smallest machine whose
+/// share holds the [`MOST_AT_ONCE`] connections one worker opens. Read
+/// off [`split`], so it moves with the formula; the `memory` input's
+/// description states it too, and a test holds the two together.
+pub const LEAST_MEMORY_MIB: u64 = {
+    let mut mib = BESIDE_POSTGRES_MIB;
+    while split(mib).max_connections < MOST_AT_ONCE as u64 {
+        mib += 1;
+    }
+    mib
+};
+
+/// A memory size as the node's `memory` input writes it (`1Gi`, `512Mi`,
+/// `2G`, `1500M`), in whole MiB, rounded down so nothing is planned for
+/// memory that is not there.
+pub fn memory_mib(raw: &str) -> WeftResult<u64> {
+    match weft::infra::memory_mib(raw) {
+        Some(mib) => Ok(mib.floor() as u64),
+        None => mistake!("memory '{}' is not a size this node reads; write a number followed by Gi, Mi, G or M (1Gi)", raw.trim()),
+    }
+}
+
 #[async_trait]
 impl Node for PostgresDatabaseNode {
     #[cfg(feature = "node-tests")]
@@ -153,7 +298,9 @@ impl Node for PostgresDatabaseNode {
         let reachable: bool = input.get("reachable")?;
         // The machine, as the node's settings size it; the cloud picks
         // its cheapest that holds it.
-        let machine = MachineShape { cpu: input.opt("cpu")?, memory: input.opt("memory")?, kind: input.opt::<String>("machineType")?.filter(|t| !t.trim().is_empty()), gpu: None };
+        let memory: String = input.get("memory")?;
+        let machine = MachineShape { cpu: input.opt("cpu")?, memory: Some(memory.clone()), kind: input.opt::<String>("machineType")?.filter(|t| !t.trim().is_empty()), gpu: None };
+        let tuning = Tuning::for_machine(&memory)?;
 
         let credential = Image::Local { name: "credential".into() };
         Ok(InfraSpec {
@@ -170,6 +317,12 @@ impl Node for PostgresDatabaseNode {
                     Container::new("postgres", Image::Upstream {
                         reference: format!("postgres:{version}-alpine"),
                     })
+                    .with_args(tuning.args())
+                    // Postgres's share of the machine, so going past it
+                    // is an out-of-memory kill of this container that
+                    // the platform can see and name, rather than the
+                    // kernel picking something on a machine that ran out.
+                    .with_limits(Limits { cpu: None, memory: Some(format!("{}Mi", tuning.limit_mib)) })
                     .with_env(vec![
                         EnvEntry::new("POSTGRES_USER", ADMIN_USER),
                         EnvEntry::new("POSTGRES_DB", database.clone()),
@@ -195,13 +348,18 @@ impl Node for PostgresDatabaseNode {
                         // Over TCP, not the unix socket: the entrypoint
                         // runs a temporary socket-only server while it
                         // initialises, so a socket check reports ready
-                        // while port 5432 is still closed.
+                        // while port 5432 is still closed. `-d postgres`
+                        // because without one the check signs in to a
+                        // database named after the user, which does not
+                        // exist, and the server logs that on every check.
                         Probe::exec(vec![
                             "pg_isready".into(),
                             "-h".into(),
                             "127.0.0.1".into(),
                             "-U".into(),
                             ADMIN_USER.into(),
+                            "-d".into(),
+                            "postgres".into(),
                         ])
                         .with_initial_delay(5),
                     ),

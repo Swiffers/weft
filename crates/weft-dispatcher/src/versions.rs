@@ -30,6 +30,8 @@
 //! layer 1 and the handlers only gather and dispatch.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use weft_task_store::sql;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -345,7 +347,7 @@ impl VersionStoreOps for PostgresVersionStore {
     }
 
     async fn version(&self, project: uuid::Uuid, id: &str) -> anyhow::Result<Option<VersionRow>> {
-        let row: Option<VersionTuple> = sqlx::query_as(&format!(
+        let row: Option<VersionTuple> = sqlx::query_as(sql!(
             "SELECT {VERSION_COLUMNS} FROM project_version WHERE project_id = $1 AND id = $2"
         ))
         .bind(project)
@@ -356,7 +358,7 @@ impl VersionStoreOps for PostgresVersionStore {
     }
 
     async fn versions(&self, project: uuid::Uuid) -> anyhow::Result<Vec<VersionRow>> {
-        let rows: Vec<VersionTuple> = sqlx::query_as(&format!(
+        let rows: Vec<VersionTuple> = sqlx::query_as(sql!(
             "SELECT {VERSION_COLUMNS} FROM project_version WHERE project_id = $1 ORDER BY seq ASC"
         ))
         .bind(project)
@@ -410,7 +412,7 @@ impl VersionStoreOps for PostgresVersionStore {
     }
 
     async fn run(&self, run_id: RunId) -> anyhow::Result<Option<RunRow>> {
-        let row: Option<RunTuple> = sqlx::query_as(&format!(
+        let row: Option<RunTuple> = sqlx::query_as(sql!(
             "SELECT {RUN_COLUMNS} FROM run WHERE run_id = $1 AND {IN_TREE}"
         ))
         .bind(run_id)
@@ -420,7 +422,7 @@ impl VersionStoreOps for PostgresVersionStore {
     }
 
     async fn runs(&self, project: uuid::Uuid) -> anyhow::Result<Vec<RunRow>> {
-        let rows: Vec<RunTuple> = sqlx::query_as(&format!(
+        let rows: Vec<RunTuple> = sqlx::query_as(sql!(
             "SELECT {RUN_COLUMNS} FROM run \
              WHERE project_id = $1 AND spec IS NOT NULL AND {IN_TREE} \
              ORDER BY started_at ASC, run_id ASC"

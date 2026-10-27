@@ -3469,7 +3469,7 @@ async fn a_pass_that_marks_then_fails_still_records_the_mark(pool: PgPool) {
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query(&format!(
+    sqlx::query(weft_task_store::sql!(
         "CREATE TRIGGER weft_test_refuse BEFORE UPDATE ON runtime_file FOR EACH ROW \
          WHEN (NEW.key = '{}' AND NEW.status = 'reaping') EXECUTE FUNCTION weft_test_refuse()",
         second.key
@@ -3524,4 +3524,57 @@ async fn a_copied_file_keeps_its_key_version_and_birth(pool: PgPool) {
     let other = s.begin_upload(&copying, &spec(4, bytes.len() as u64), &big()).await.unwrap_err();
     assert!(matches!(&other, RuntimeStoreError::Conflict(why) if why.contains("weft files rm")), "{other:?}");
     assert!(bucket.in_progress_uploads().is_empty(), "a refused begin leaves no upload open");
+}
+
+// ---------- a busy database before the first write ----------
+
+/// A store on `pool`'s database whose one connection the test can hold,
+/// on the same bucket and clock: a call through it that finds the
+/// connection taken gets none within a second.
+async fn on_one_connection(pool: &PgPool, bucket: &Arc<FakeObjectStore>, clock: &Arc<FakeClock>) -> (RuntimeStore, PgPool) {
+    let one = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(1))
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    (RuntimeStore::new(one.clone(), bucket.clone(), clock.clone()), one)
+}
+
+/// A claim of a page's upload that cannot get its first connection has
+/// done nothing, and says so (sent again, it receives the upload); so
+/// does an upload under an identity that cannot look for an expired file
+/// of it first.
+#[sqlx::test]
+async fn a_claim_or_an_identity_upload_with_no_first_connection_says_nothing_was_done(pool: PgPool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let ends = clock.now_unix() + 3600;
+    let (upload, _) = slot_upload_via(&s, &bucket, "s1", ends, MP4, None).await;
+    let into_run = slot_claims("s1", StorageScope::Run, ends);
+    let video = fits("Video");
+    let run = worker("t1", "p1", Some("c1"));
+    let (busy, one) = on_one_connection(&pool, &bucket, &clock).await;
+
+    let taken = one.acquire().await.unwrap();
+    let refused = claim_one(&busy, &run, &into_run, &video).await;
+    assert!(matches!(refused, Err(RuntimeStoreError::BeforeWrites(_))), "{refused:?}");
+    let spec = UploadSpec {
+        scope: &StorageScope::Project,
+        mime: "b",
+        filename: "f",
+        keep: None,
+        declared_size: Some(3),
+        content_hash: None,
+        identity: Some("source:1"),
+        slot: None,
+        imported: None,
+    };
+    let begun = busy.begin_upload(&run, &spec, &big()).await;
+    assert!(matches!(begun, Err(RuntimeStoreError::BeforeWrites(_))), "{begun:?}");
+    assert_eq!(status_of(&pool, &upload).await.as_deref(), Some("uploaded"), "the slot is still open");
+    assert_eq!(bucket.keys(), vec![object_key(&upload)], "no copy was made");
+
+    drop(taken);
+    let received = claim_one(&busy, &run, &into_run, &video).await.unwrap();
+    assert_ne!(received.key, upload, "sent again, it receives the run's own copy");
 }

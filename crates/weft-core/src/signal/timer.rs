@@ -227,7 +227,8 @@ mod tests {
     /// The day the clocks change, a schedule inside the changed hour
     /// still fires exactly once: the first of the two 02:30s in
     /// autumn, and 03:30 on the new clock in spring, where 02:30 does
-    /// not exist. The bare zone would drop both days.
+    /// not exist. The bare zone drops the spring day (cron takes the
+    /// first autumn 02:30 by itself since 0.13).
     #[test]
     fn a_schedule_in_the_changed_hour_fires_once_either_way() {
         let paris = parse_timezone("Europe/Paris").unwrap();
@@ -247,10 +248,10 @@ mod tests {
             ["2026-03-29T01:30:00+00:00", "2026-03-30T00:30:00+00:00", "2026-03-31T00:30:00+00:00"]
         );
         let bare: Vec<String> = schedule
-            .after(&chrono::DateTime::parse_from_rfc3339("2026-10-24T12:00:00Z").unwrap().with_timezone(&paris))
+            .after(&chrono::DateTime::parse_from_rfc3339("2026-03-28T12:00:00Z").unwrap().with_timezone(&paris))
             .take(1)
             .map(|t| t.to_rfc3339())
             .collect();
-        assert_eq!(bare, ["2026-10-26T02:30:00+01:00"], "the bare zone skips the 25th");
+        assert_eq!(bare, ["2026-03-30T02:30:00+02:00"], "the bare zone skips the 29th");
     }
 }

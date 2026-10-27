@@ -138,7 +138,7 @@ enum Cmd {
         /// Put this `weft-runtime` binary in the runtime image instead of
         /// compiling one inside Docker. It must be built from this same
         /// checkout, for this machine, against a glibc no newer than
-        /// Debian bookworm's. The release workflow passes the binary its
+        /// Debian trixie's. The release workflow passes the binary its
         /// CLI job built, so the runtime compiles once per release.
         #[arg(long, value_name = "PATH")]
         runtime_binary: Option<std::path::PathBuf>,

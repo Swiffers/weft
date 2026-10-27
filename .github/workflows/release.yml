@@ -80,7 +80,7 @@ jobs:
   # The runtime image takes the `weft-runtime` its leg just built, so the
   # image carries the very binary the release ships and nothing compiles
   # it a second time inside Docker. That works because these legs run on
-  # Ubuntu 22.04, whose glibc is older than the image's Debian bookworm
+  # Ubuntu 22.04, whose glibc is older than the image's Debian trixie
   # (`weft build-images` starts the binary in the image to make sure).
   linux-binaries:
     name: ${{ matrix.asset }}
@@ -100,7 +100,7 @@ jobs:
           - { runner: ubuntu-22.04-arm, asset: weft-aarch64-linux, arch: arm64 }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/build-binaries
         with:
           asset: ${{ matrix.asset }}
@@ -122,24 +122,24 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The builder base alone is >1GB and the builds run through
       # BuildKit on this disk; the preinstalled Android/.NET/GHC
       # toolchains are dead weight here.
       - name: free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ matrix.asset }}
           path: ${{ runner.temp }}/bin
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ matrix.runtime }}
           path: ${{ runner.temp }}/bin
       # Outside the checkout: the image refs hash the source tree, and the
       # two legs' binaries differ.
       - run: chmod +x "$RUNNER_TEMP"/bin/*
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -155,7 +155,7 @@ jobs:
           "$RUNNER_TEMP/bin/${{ matrix.asset }}" build-images \
             --push-suffix "-${{ matrix.arch }}" \
             --runtime-binary "$RUNNER_TEMP/bin/${{ matrix.runtime }}" > image-refs.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: image-refs-${{ matrix.arch }}
           path: image-refs.txt
@@ -182,7 +182,7 @@ jobs:
           - { runner: macos-15-intel, asset: weft-x86_64-macos }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/build-binaries
         with:
           asset: ${{ matrix.asset }}
@@ -197,11 +197,11 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: image-refs-amd64
           path: refs-amd64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: image-refs-arm64
           path: refs-arm64
@@ -215,7 +215,7 @@ jobs:
             echo "::error::the two architecture legs computed different image refs; both halves are already pushed (orphaned suffixed tags, the bare refs stay absent so users fall back to building). Check for a WEFT_IMAGE_REGISTRY or WEFT_*_IMAGE override differing between runners."
             exit 1
           }
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -288,7 +288,7 @@ jobs:
       pending: ${{ steps.tags.outputs.pending }}
       tags: ${{ steps.tags.outputs.tags }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-node-workspace
         with:
           workspace: extension-vscode
@@ -302,7 +302,7 @@ jobs:
       # working-directory, not `pnpm -C`: dlx spawns the tool in the
       # PROCESS cwd, so with -C vsce would look for package.json at the
       # repo root and refuse.
-      - run: pnpm dlx @vscode/vsce@3.9.2 package --no-dependencies
+      - run: pnpm dlx @vscode/vsce@4.0.0 package --no-dependencies
         working-directory: extension-vscode
       # One stable asset name; the version lives in manifest.json and
       # in the package itself.
@@ -315,7 +315,7 @@ jobs:
           workspace: extension-vscode
           tag-prefix: vscode
           stores: marketplace openvsx
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: weft-vscode.vsix
           path: weft-vscode.vsix
@@ -331,7 +331,7 @@ jobs:
       pending: ${{ steps.tags.outputs.pending }}
       tags: ${{ steps.tags.outputs.tags }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-node-workspace
         with:
           workspace: extension-browser
@@ -348,7 +348,7 @@ jobs:
           workspace: extension-browser
           tag-prefix: browser
           stores: chrome firefox edge
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: browser-zips
           path: extension-browser/build/*.zip
@@ -374,13 +374,13 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Exactly the release payload, by name: the image-refs artifacts
       # (internal plumbing for the stitch job) must never leak into the
       # public asset list. The macOS binaries are release-macos's, even
       # when one happens to be built already, so what this job publishes
       # never depends on which runner was faster.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: weft-*-linux
           path: dist
@@ -388,7 +388,7 @@ jobs:
       # A pattern, so a failed browser job just means fewer files (the
       # manifest then carries no sha for them, which setup-side reads
       # as "not published"): `name:` would fail the whole job instead.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: browser-zips
           path: dist
@@ -464,7 +464,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       # A pattern, so a failed leg just means one file fewer.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: weft-*-macos
           path: dist
@@ -517,7 +517,7 @@ jobs:
       contents: write
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # install: false, so the job pays no workspace install: `pnpm
       # dlx` resolves vsce into its own store and the vsix arrives
       # prebuilt from the artifact.
@@ -525,10 +525,10 @@ jobs:
         with:
           workspace: extension-vscode
           install: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: weft-vscode.vsix
-      - uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -539,7 +539,7 @@ jobs:
       - uses: ./.github/actions/publish-and-record
         with:
           store: the VS Code Marketplace
-          run: pnpm dlx @vscode/vsce@3.9.2 publish --packagePath "$GITHUB_WORKSPACE/weft-vscode.vsix" --azure-credential
+          run: pnpm dlx @vscode/vsce@4.0.0 publish --packagePath "$GITHUB_WORKSPACE/weft-vscode.vsix" --azure-credential
           tag: ${{ fromJSON(needs.vsix.outputs.tags).marketplace }}
 
   publish-openvsx:
@@ -550,12 +550,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-node-workspace
         with:
           workspace: extension-vscode
           install: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: weft-vscode.vsix
       # The namespace must exist before the first publish and creating
@@ -567,7 +567,7 @@ jobs:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: |
           set -euo pipefail
-          out="$(pnpm dlx ovsx@1.1.1 create-namespace weavemind -p "$OVSX_PAT" 2>&1)" \
+          out="$(pnpm dlx ovsx@1.3.0 create-namespace weavemind -p "$OVSX_PAT" 2>&1)" \
             || { grep -qi "already exists" <<<"$out" || { printf '%s\n' "$out" >&2; exit 1; }; }
           printf '%s\n' "$out"
       - uses: ./.github/actions/publish-and-record
@@ -575,7 +575,7 @@ jobs:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         with:
           store: Open VSX
-          run: pnpm dlx ovsx@1.1.1 publish "$GITHUB_WORKSPACE/weft-vscode.vsix"
+          run: pnpm dlx ovsx@1.3.0 publish "$GITHUB_WORKSPACE/weft-vscode.vsix"
           tag: ${{ fromJSON(needs.vsix.outputs.tags).openvsx }}
 
   publish-browser:
@@ -597,11 +597,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-node-workspace
         with:
           workspace: extension-browser
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: browser-zips
           path: extension-browser/build

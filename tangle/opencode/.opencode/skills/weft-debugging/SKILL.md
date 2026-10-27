@@ -294,13 +294,10 @@ node and the wrong value.
      stopped taking work, and what they pick up is refused`: the error names
      each node and why it was kept. weft tells the listener to let go of
      them again at the next change of a trigger.
-   - `a resync of this project stopped with triggers it took down still
-     down; builds wait for it`: the resync failed three times in one go
-     (it tried again 5 s, then 20 s later), and the error is the last failure. Builds are
+   - `resync: stopped with triggers it took down still down: <error>. Next: <what comes next>`, a line of its own in `weft status`: the resync failed three times in one go (it tried again 5 s, then 20 s later; a busy database is waited out longer, 5, 15, 30 then 60 s, before it stops), and the error is the last failure. Builds are
      refused with `cannot build now` until it is settled, and one already
      compiling is not registered. If it stopped on infra those triggers
-     read that was not running, or on an activation still landing, it goes
-     on by itself once that infra runs or that activation has landed. Otherwise, once the cause is fixed,
+     read that was not running, on an activation still landing, or on a busy database, it goes on by itself once that infra runs, that activation has landed or the database has room again. Otherwise, once the cause is fixed,
      `weft resync --resume` takes it up again where it stopped (a plain
      `weft resync` is refused while it is held); `weft cancel-activate`
      with no `--trigger` or `--instance` gives it up, leaves those triggers

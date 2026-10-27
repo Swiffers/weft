@@ -674,6 +674,8 @@ async fn run_on_worker(
         .endpoint(target, weft_platform_traits::Patience::Brief)
         .await
         .context("the platform gave no address for the project's workers")?;
+    // No limit on the call: it is held until the run ends, however long
+    // the person's program runs.
     let resp = state
         .http
         .post(format!("{}/_weft/run/{run_id}", endpoint.base_url.trim_end_matches('/')))

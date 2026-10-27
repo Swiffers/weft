@@ -7,7 +7,8 @@ use weft_core::instance::InstanceId;
 use weft_core::program::instances::InstanceCall;
 use weft_core::program::{ConnectionsForgotten, InstanceHoldings, InstanceTrigger, ProgramCallOutcome, TokensRevoked};
 
-use super::{answered, failed, Actor, Refused};
+use super::{answered, Actor, Refused};
+use crate::api::access_store_error;
 use crate::state::DispatcherState;
 
 /// This area's actions ([`super::names`]).
@@ -41,19 +42,19 @@ pub(crate) async fn program_call(
                 weft_access_store::GrantOwnerScope::Instance { project_id, instance },
             )
             .await
-            .map_err(access_error)?;
+            .map_err(access_store_error)?;
             answered(&grants)
         }
         InstanceCall::ConnectionsForget { instance } => {
             let forgotten = weft_access_store::forget_instance_grants(&state.pg_pool, tenant.as_str(), project_id, instance)
                 .await
-                .map_err(access_error)?;
+                .map_err(access_store_error)?;
             answered(&ConnectionsForgotten { forgotten })
         }
         InstanceCall::ValuesGet { instance } => {
             let values = weft_access_store::instance_values(&state.pg_pool, tenant.as_str(), project_id, instance)
                 .await
-                .map_err(access_error)?;
+                .map_err(access_store_error)?;
             answered(&values)
         }
         InstanceCall::ValuesChange { instance, set, clear } => {
@@ -64,7 +65,7 @@ pub(crate) async fn program_call(
         InstanceCall::TokensRevoke { instance, id } => {
             let revoked = weft_access_store::instance_tokens::revoke(&state.pg_pool, tenant.as_str(), project_id, instance, *id)
                 .await
-                .map_err(failed("revoke tokens"))?;
+                .map_err(access_store_error)?;
             answered(&TokensRevoked { revoked })
         }
     }
@@ -87,20 +88,20 @@ pub(crate) async fn instances(
 ) -> Result<Vec<InstanceHoldings>, Refused> {
     let values = weft_access_store::instance_value_counts(&state.pg_pool, tenant.as_str(), project_id)
         .await
-        .map_err(failed("instance values"))?;
+        .map_err(access_store_error)?;
     let connections = weft_access_store::instance_connection_counts(&state.pg_pool, tenant.as_str(), project_id)
         .await
-        .map_err(failed("instance connections"))?;
+        .map_err(access_store_error)?;
     let tokens = weft_access_store::instance_tokens::counts(&state.pg_pool, tenant.as_str(), project_id, crate::lease::now_unix())
         .await
-        .map_err(failed("instance tokens"))?;
+        .map_err(access_store_error)?;
     let copies = super::infra::observed_copies(state, project_id).await?;
-    let waiting = crate::api::signal::waiting_fires(&state.pg_pool, project_id).await.map_err(failed("waiting fires"))?;
+    let waiting = crate::api::signal::waiting_fires(&state.pg_pool, project_id).await.map_err(|e| crate::api::unavailable_or_internal("read the waiting fires", e))?;
     let triggers: Vec<(InstanceId, InstanceTrigger)> = state
         .activations
         .list(project_id)
         .await
-        .map_err(failed("activations"))?
+        .map_err(|e| crate::api::unavailable_or_internal("read the project's triggers", e))?
         .into_iter()
         .filter_map(|a| {
             let instance = a.key.instance()?.clone();
@@ -120,18 +121,11 @@ pub(crate) async fn instances(
     .bind(project_id)
     .fetch_all(&state.pg_pool)
     .await
-    .map_err(failed("instance runs"))?;
+    .map_err(|e| crate::api::unavailable_or_internal("read the instances' runs", e.into()))?;
     let last_runs = last_runs
         .into_iter()
         .map(|(instance, at)| InstanceId::new(instance).map(|instance| (instance, at)))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("a run holds a broken instance: {e}")))?;
     Ok(InstanceHoldings::merge(values, connections, tokens, copies, triggers, last_runs))
-}
-
-/// A store error as the store answers it on every surface
-/// (`weft_access_store::client_error`).
-fn access_error(e: anyhow::Error) -> Refused {
-    let (status, message) = weft_access_store::client_error(e);
-    (StatusCode::from_u16(status).expect("store status codes are valid"), message)
 }

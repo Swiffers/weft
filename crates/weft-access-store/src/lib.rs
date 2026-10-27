@@ -243,6 +243,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- usable expiry gets this lifetime again. NULL while the
             -- token has no expiry.
             token_lifetime_secs BIGINT,
+            -- Until when one resolution holds the renewal of the token
+            -- (`resolve.rs`, `claim_renewal`): the others wait for what
+            -- it writes, so the provider sees one renewal, and no
+            -- database connection is held across its answer. NULL while
+            -- nobody renews; a connection made again over the row clears
+            -- it, so a renewal in flight never writes over it.
+            renewal_claimed_until TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             -- How many times the connection was made again over this row
@@ -261,6 +268,16 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         CREATE UNIQUE INDEX IF NOT EXISTS access_grant_published
             ON access_grant (tenant_id, project_id, published_by_node, service, instance_id) NULLS NOT DISTINCT
             WHERE published_by_node IS NOT NULL;
+        -- An exclusive-class service (the provider keeps one grant per
+        -- app and account) holds ONE row per owner for an account signed
+        -- in through an app, so a second sign-in, even one landing at the
+        -- same moment as the first, rotates that row instead of leaving
+        -- two (`flows.rs`, `insert_grant`). A pasted credential with no
+        -- app and a node's published connection are not that row.
+        -- SYNC: access_grant_exclusive <-> weft_access_store::flows::insert_grant, weft_access_store::flows::exclusive_row
+        CREATE UNIQUE INDEX IF NOT EXISTS access_grant_exclusive
+            ON access_grant (tenant_id, service, identity, client_id, instance_id, project_id) NULLS NOT DISTINCT
+            WHERE published_by_node IS NULL AND client_id IS NOT NULL AND spec_json->>'grants' = 'exclusive';
         -- An instance's connections, for its picker and its forget.
         CREATE INDEX IF NOT EXISTS access_grant_instance
             ON access_grant (project_id, instance_id) WHERE instance_id IS NOT NULL;
@@ -502,7 +519,67 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             FOR EACH ROW EXECUTE FUNCTION access_notify()"#,
     ],
     seed: &[],
-    data_steps: &[],
+    data_steps: &[EXCLUSIVE_FOLD],
+};
+
+/// Before `access_grant_exclusive` is built on a database from before it,
+/// the rows it would refuse are folded: two sign-ins to one exclusive
+/// account that raced under older code each left a row, and a unique
+/// index over them fails the boot, with rows nobody can mend by hand
+/// (their values are sealed). First an author's row (no instance) that
+/// older code stored with a project is made the tenant-wide one it is
+/// (`project_id` NULL), which is what `flows::exclusive_row` looks up
+/// now; then, per exclusive key, the row written last is kept, with every
+/// permission any of them was granted, and everything naming a row that
+/// goes (a pick, an instance's value, a connect or a chooser in flight, a
+/// finished consent's outcome the editor has yet to collect, a provider
+/// subscription, a signal acting as it) names the kept one before the
+/// rest are deleted. An instance's value, a parked outcome and a signal's
+/// spec name the connection inside their text, so the id is replaced
+/// there as it is (a connection id is a uuid, found nowhere else in it).
+/// Run twice, the second run finds no duplicate and changes nothing.
+// SYNC: the exclusive key <-> access_grant_exclusive (the DDL above), crate::flows::exclusive_row
+// SYNC: what names a grant <-> instance_value, install_pick, access_connect, access_picker, access_connect_result, signal_subscription (the DDL above), crates/weft-dispatcher/src/store/postgres.rs (signal.access_id)
+const EXCLUSIVE_FOLD: weft_task_store::DataStep = weft_task_store::DataStep {
+    table: "access_grant",
+    until: weft_task_store::Until::Indexed("access_grant_exclusive"),
+    sql: r#"
+        UPDATE access_grant SET project_id = NULL
+         WHERE instance_id IS NULL AND project_id IS NOT NULL
+           AND published_by_node IS NULL AND client_id IS NOT NULL AND spec_json->>'grants' = 'exclusive';
+        CREATE TEMP TABLE access_grant_fold AS
+            SELECT id AS gone, first_value(id) OVER exclusive_key AS keep
+              FROM access_grant
+             WHERE published_by_node IS NULL AND client_id IS NOT NULL AND spec_json->>'grants' = 'exclusive'
+            WINDOW exclusive_key AS (PARTITION BY tenant_id, service, identity, client_id, instance_id, project_id
+                           ORDER BY updated_at DESC, id);
+        DELETE FROM access_grant_fold WHERE gone = keep;
+        UPDATE access_grant g SET granted_scopes = (
+            SELECT COALESCE(jsonb_agg(DISTINCT scope ORDER BY scope), '[]'::jsonb)
+              FROM access_grant a CROSS JOIN LATERAL jsonb_array_elements_text(a.granted_scopes) AS scope
+             WHERE a.id = g.id OR a.id IN (SELECT gone FROM access_grant_fold WHERE keep = g.id))
+         WHERE g.id IN (SELECT keep FROM access_grant_fold);
+        UPDATE install_pick p SET grant_id = f.keep FROM access_grant_fold f WHERE p.grant_id = f.gone;
+        UPDATE instance_value v SET grant_id = f.keep, value = replace(v.value::text, f.gone::text, f.keep::text)::jsonb
+          FROM access_grant_fold f WHERE v.grant_id = f.gone;
+        UPDATE access_connect c SET upgrade_grant_id = f.keep FROM access_grant_fold f WHERE c.upgrade_grant_id = f.gone;
+        UPDATE access_picker p SET access_id = f.keep FROM access_grant_fold f WHERE p.access_id = f.gone;
+        UPDATE signal_subscription s SET access_id = f.keep FROM access_grant_fold f WHERE s.access_id = f.gone;
+        UPDATE access_connect_result r SET result_json = replace(r.result_json::text, f.gone::text, f.keep::text)::jsonb
+          FROM access_grant_fold f WHERE strpos(r.result_json::text, f.gone::text) > 0;
+        DO $$
+        BEGIN
+            -- The signal table is the dispatcher's group's, which a
+            -- database holding only the access store's has not.
+            IF to_regclass('signal') IS NOT NULL THEN
+                UPDATE signal s SET access_id = f.keep::text, spec_json = replace(s.spec_json, f.gone::text, f.keep::text)
+                  FROM access_grant_fold f WHERE s.access_id = f.gone::text;
+            END IF;
+        END
+        $$;
+        DELETE FROM access_grant WHERE id IN (SELECT gone FROM access_grant_fold);
+        DROP TABLE access_grant_fold;
+    "#,
 };
 
 /// A connection's `events_recipe_hash` is the hash of the recipe in its

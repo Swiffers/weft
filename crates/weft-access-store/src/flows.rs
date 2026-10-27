@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use weft_task_store::sql;
 
 use weft_core::access::client::{authed_client, base_client, resolve_steps, RefusalKind};
 use weft_core::access::spec::{
@@ -93,7 +94,7 @@ pub async fn list_grants(
     owner: GrantOwnerScope<'_>,
 ) -> anyhow::Result<Vec<GrantSummary>> {
     let (scope_project, scope_instance) = owner.columns();
-    let rows: Vec<ListedRow> = sqlx::query_as(&format!(
+    let rows: Vec<ListedRow> = sqlx::query_as(sql!(
         // Only the value NAMES: the values themselves never leave the
         // store side, and the editor's check needs nothing more.
         "SELECT id, service, project_id, identity, label, granted_scopes,
@@ -176,7 +177,7 @@ pub async fn delete_grant(
     owner: GrantOwnerScope<'_>,
 ) -> anyhow::Result<()> {
     let (scope_project, scope_instance) = owner.columns();
-    let done = sqlx::query(&format!(
+    let done = sqlx::query(sql!(
         "DELETE FROM access_grant WHERE tenant_id = $1 AND id = $2 AND {}",
         owner_scope_sql("$3", "$4"),
     ))
@@ -317,7 +318,7 @@ pub async fn connect_direct(
     if req.door == Door::Shared && !spec.is_oauth() {
         let mut stored = spec.clone();
         stored.acquisition = Acquisition::Runtime {};
-        return insert_grant(pool, tenant, None, NewGrant {
+        return insert_grant(pool, tenant, NewGrant {
             spec: &stored,
             registration: &None,
             project_id: req.project_id,
@@ -391,7 +392,7 @@ pub async fn connect_direct(
     // the reserved capture never stays in the stored values.
     values.remove(GRANTED_PERMISSIONS_CAPTURE);
     let label = Some(connection_name(req.label, &req.registration, spec));
-    insert_grant(pool, tenant, None, NewGrant {
+    insert_grant(pool, tenant, NewGrant {
         spec,
         registration: &req.registration,
         project_id: req.project_id,
@@ -562,53 +563,108 @@ fn storable_values(
     Ok(values)
 }
 
-pub(crate) async fn insert_grant(
+pub(crate) async fn insert_grant(db: impl sqlx::PgExecutor<'_>, tenant: &str, grant: NewGrant<'_>) -> anyhow::Result<CompletedConnect> {
+    write_grant(db, tenant, None, grant)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("a new connection's write answered no row, which only a copy's can"))
+}
+
+/// Write `grant`, copied from another install with what it keeps from
+/// there (`moved`), as a new row (`crate::migrate`). `None` when a
+/// connection to the same exclusive account landed here first (a sign-in
+/// racing the copy, past the copy's own look): the copy is skipped, the
+/// way it is when that row was already there.
+pub(crate) async fn copy_grant(
+    db: impl sqlx::PgExecutor<'_>,
+    tenant: &str,
+    moved: Moved,
+    grant: NewGrant<'_>,
+) -> anyhow::Result<Option<CompletedConnect>> {
+    write_grant(db, tenant, Some(moved), grant).await
+}
+
+/// The one write of a connection's row ([`insert_grant`], [`copy_grant`]):
+/// `None` only for a copy that met an exclusive row.
+async fn write_grant(
     db: impl sqlx::PgExecutor<'_>,
     tenant: &str,
     moved: Option<Moved>,
-    grant: NewGrant<'_>,
-) -> anyhow::Result<CompletedConnect> {
+    mut grant: NewGrant<'_>,
+) -> anyhow::Result<Option<CompletedConnect>> {
     let owner = if grant.platform { CredentialOwner::Platform } else { CredentialOwner::own(grant.instance.clone()) };
     let (expires_at, lifetime_secs) = match &moved {
         Some(moved) => (moved.expires_at, moved.token_lifetime_secs),
         None => life_columns(grant.life),
     };
-    // A node's published connection REPLACES the one it published
-    // before (its key is the node, not the moment), so the same write
-    // serves a first publish and a re-publish. A person's connect has
-    // no such key and always inserts. One statement either way, so the
-    // column list exists once.
+    // Two kinds of connection have a key, and land on the row already
+    // holding it instead of making a second one. A node's published
+    // connection REPLACES the one it published before (its key is the
+    // node, not the moment), so the same write serves a first publish and
+    // a re-publish. A person's sign-in to an exclusive-class service
+    // through an app is the account's one row ([`exclusive_row`]): signing
+    // in again, or two first sign-ins landing at once, rotates that row
+    // the way a reconnect does, its permissions only growing. A copy from
+    // another install keeps the id it had there, so it never lands on
+    // another row: `crate::migrate` looked first, and one that a sign-in
+    // raced past that look writes nothing and answers no row. Anything
+    // else has no key and always inserts. One statement either way, so
+    // the column list exists once.
     //
     // EVERY non-key column is written, not a chosen subset. The row
     // becomes exactly what was just built, so a column added to the
-    // INSERT above can never be quietly left stale on a re-publish
+    // INSERT below can never be quietly left stale on a re-publish
     // (which nothing would catch: the answer returned to the caller
     // reports the new value while the row keeps the old one).
-    let upsert = if grant.published_by_node.is_some() {
-        " ON CONFLICT (tenant_id, project_id, published_by_node, service, instance_id)
-            WHERE published_by_node IS NOT NULL
-          DO UPDATE SET
-             registration_sealed = EXCLUDED.registration_sealed,
-             client_id = EXCLUDED.client_id,
-             spec_json = EXCLUDED.spec_json,
-             spec_json_version = EXCLUDED.spec_json_version,
-             events_recipe_hash = EXCLUDED.events_recipe_hash,
-             values_sealed = EXCLUDED.values_sealed,
-             value_names = EXCLUDED.value_names,
-             granted_scopes = EXCLUDED.granted_scopes,
-             permissions_verified = EXCLUDED.permissions_verified,
-             owner = EXCLUDED.owner,
-             door = EXCLUDED.door,
-             label = EXCLUDED.label,
-             identity = EXCLUDED.identity,
-             provider_account = EXCLUDED.provider_account,
-             expires_at = EXCLUDED.expires_at,
-             token_lifetime_secs = EXCLUDED.token_lifetime_secs,
-             updated_at = now()"
+    // SYNC: the exclusive key <-> crate::GROUP's access_grant_exclusive index, exclusive_row
+    let exclusive_key = "(tenant_id, service, identity, client_id, instance_id, project_id)
+               WHERE published_by_node IS NULL AND client_id IS NOT NULL AND spec_json->>'grants' = 'exclusive'";
+    let exclusive = grant.spec.grants == GrantCoexistence::Exclusive && grant.registration.is_some();
+    let lands_on = if grant.published_by_node.is_some() {
+        Some((
+            "(tenant_id, project_id, published_by_node, service, instance_id) WHERE published_by_node IS NOT NULL",
+            "granted_scopes = EXCLUDED.granted_scopes".to_string(),
+        ))
+    } else if moved.is_none() && exclusive {
+        Some((
+            exclusive_key,
+            // `rotate_grant`'s union (`granted_union_sql`), its columns
+            // named by table: in an upsert a bare one is ambiguous.
+            "granted_scopes = (SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY s), '[]'::jsonb)
+                               FROM (SELECT jsonb_array_elements_text(access_grant.granted_scopes) AS s
+                                     UNION SELECT jsonb_array_elements_text(EXCLUDED.granted_scopes)) merged),
+             reconnects = access_grant.reconnects + 1"
+                .to_string(),
+        ))
     } else {
-        ""
+        None
     };
-    let id: uuid::Uuid = sqlx::query_scalar(&format!(
+    let upsert = match lands_on {
+        None if moved.is_some() && exclusive => format!(" ON CONFLICT {exclusive_key} DO NOTHING"),
+        Some((key, landing)) => format!(
+            " ON CONFLICT {key}
+              DO UPDATE SET
+                 registration_sealed = EXCLUDED.registration_sealed,
+                 client_id = EXCLUDED.client_id,
+                 spec_json = EXCLUDED.spec_json,
+                 spec_json_version = EXCLUDED.spec_json_version,
+                 events_recipe_hash = EXCLUDED.events_recipe_hash,
+                 values_sealed = EXCLUDED.values_sealed,
+                 value_names = EXCLUDED.value_names,
+                 permissions_verified = EXCLUDED.permissions_verified,
+                 owner = EXCLUDED.owner,
+                 door = EXCLUDED.door,
+                 label = EXCLUDED.label,
+                 identity = EXCLUDED.identity,
+                 provider_account = EXCLUDED.provider_account,
+                 expires_at = EXCLUDED.expires_at,
+                 token_lifetime_secs = EXCLUDED.token_lifetime_secs,
+                 renewal_claimed_until = NULL,
+                 updated_at = now(),
+                 {landing}"
+        ),
+        None => String::new(),
+    };
+    let written: Option<(uuid::Uuid, Value)> = sqlx::query_as(sql!(
         "INSERT INTO access_grant
            (id, tenant_id, service, registration_sealed, client_id, project_id, spec_json,
             events_recipe_hash, values_sealed, value_names, granted_scopes,
@@ -616,7 +672,7 @@ pub(crate) async fn insert_grant(
             published_by_node, instance_id, spec_json_version, token_lifetime_secs, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                  $18, $19, $20, $21, $22, COALESCE($23, now())){upsert}
-         RETURNING id"
+         RETURNING id, granted_scopes"
     ))
     .bind(moved.as_ref().map_or_else(uuid::Uuid::new_v4, |m| m.id))
     .bind(tenant)
@@ -641,42 +697,56 @@ pub(crate) async fn insert_grant(
     .bind(weft_core::AccessSpec::STORED.version())
     .bind(lifetime_secs)
     .bind(moved.map(|m| m.created_at))
-    .fetch_one(db)
+    .fetch_optional(db)
     .await?;
+    let Some((id, granted)) = written else { return Ok(None) };
+    grant.granted = scopes_of(&granted);
     let label = grant.label.clone();
-    Ok(completed(id, grant, label))
+    Ok(Some(completed(id, grant, label)))
 }
 
 /// Write `grant` over the existing row `id` in place: an exclusive-class
 /// grant upgraded or signed in again, so every project following it
 /// keeps it. Every column [`insert_grant`] writes is written here too
-/// (the row becomes exactly what was just built), and the reconnect is
-/// counted. Guarded by owner like every write: an instance rotates only
-/// its own row in its project.
+/// (the row becomes exactly what was just built), the reconnect is
+/// counted, and a renewal in flight on the old token is let go so it
+/// cannot write over the new one. The granted permissions are the ones
+/// the row holds and the grant's together, in the same statement: an
+/// exclusive grant only grows, and two sign-ins landing at once both
+/// keep theirs. Guarded by service and owner like every write: an id
+/// naming another provider's row never takes this provider's tokens, and
+/// an instance rotates only its own row in its project.
+///
+/// An upgrade whose consent signed in as another account, one that has
+/// its own exclusive row already, cannot become that account's second
+/// row: it is refused, naming the row to upgrade instead.
 async fn rotate_grant(
-    db: impl sqlx::PgExecutor<'_>,
+    pool: &PgPool,
     tenant: &str,
+    service: &str,
     id: uuid::Uuid,
-    grant: NewGrant<'_>,
+    mut grant: NewGrant<'_>,
 ) -> anyhow::Result<CompletedConnect> {
     let owner = if grant.platform { CredentialOwner::Platform } else { CredentialOwner::own(grant.instance.clone()) };
     let (expires_at, lifetime_secs) = life_columns(grant.life);
-    let rotated = sqlx::query(&format!(
+    let rotated: Result<Option<Value>, sqlx::Error> = sqlx::query_scalar(sql!(
         "UPDATE access_grant
-         SET values_sealed = $3, value_names = $4, granted_scopes = $5,
+         SET values_sealed = $3, value_names = $4, granted_scopes = {union},
              permissions_verified = $6, identity = $7, label = $8, door = $9,
              expires_at = $10, spec_json = $11, registration_sealed = $12,
              client_id = $13, provider_account = $14, events_recipe_hash = $15,
              project_id = $16, spec_json_version = $17, token_lifetime_secs = $18, owner = $19,
-             reconnects = reconnects + 1, updated_at = now()
-         WHERE id = $1 AND tenant_id = $2 AND {}",
-        same_owner_sql("$20", "$16")
+             renewal_claimed_until = NULL, reconnects = reconnects + 1, updated_at = now()
+         WHERE id = $1 AND tenant_id = $2 AND service = $21 AND {owned}
+         RETURNING granted_scopes",
+        union = granted_union_sql("$5"),
+        owned = same_owner_sql("$20", "$16"),
     ))
     .bind(id)
     .bind(tenant)
     .bind(crate::seal_json(&serde_json::to_value(&grant.values)?)?)
     .bind(value_names_of(&grant.values))
-    .bind(serde_json::to_value(&grant.granted)?)
+    .bind(&grant.granted)
     .bind(grant.verified)
     .bind(&grant.identity)
     .bind(&grant.label)
@@ -696,20 +766,66 @@ async fn rotate_grant(
     .bind(lifetime_secs)
     .bind(owner_str(&owner))
     .bind(grant.instance.as_ref().map(|m| m.as_str()))
-    .execute(db)
-    .await?;
-    if rotated.rows_affected() != 1 {
+    .bind(service)
+    .fetch_optional(pool)
+    .await;
+    let rotated = match rotated {
+        // SYNC: access_grant_exclusive <-> crate::GROUP's index, exclusive_row, insert_grant
+        Err(sqlx::Error::Database(e)) if e.constraint() == Some("access_grant_exclusive") => {
+            return Err(signed_in_as_another(pool, tenant, service, &grant).await);
+        }
+        rotated => rotated?,
+    };
+    let Some(granted) = rotated else {
         return Err(AccessError::NotFound.into());
-    }
+    };
+    grant.granted = scopes_of(&granted);
     let label = grant.label.clone();
     Ok(completed(id, grant, label))
+}
+
+/// The refusal of an upgrade that signed in as an account with its own
+/// exclusive row already ([`rotate_grant`]), naming that row.
+async fn signed_in_as_another(pool: &PgPool, tenant: &str, service: &str, grant: &NewGrant<'_>) -> anyhow::Error {
+    let who = grant.identity.as_deref().map_or_else(|| "another account".to_string(), |identity| format!("'{identity}'"));
+    // Only a row made through an app is exclusive, so the grant has one.
+    let client_id = grant.registration.as_ref().map_or("", |r| r.client_id.as_str());
+    let theirs = exclusive_row(pool, tenant, service, grant.identity.as_deref(), client_id, grant.instance.as_ref(), grant.project_id).await;
+    let which = match theirs {
+        Ok(Some(id)) => format!("its own connection {id}"),
+        // Removed since the write met it.
+        Ok(None) => "its own connection".to_string(),
+        Err(e) => format!("its own connection (which could not be looked up: {e:#})"),
+    };
+    AccessError::Invalid(format!(
+        "you signed in as {who}, which already has {which}; this upgrade is for a different account, so upgrade that \
+         connection instead (or sign in as the account this one is for)"
+    ))
+    .into()
+}
+
+/// The SQL value of a row's `granted_scopes` widened by the text array
+/// bound at `param`: every permission either holds, once each. Computed
+/// in the writing statement, so a concurrent widening is never lost.
+fn granted_union_sql(param: &str) -> String {
+    format!(
+        "(SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY s), '[]'::jsonb)
+          FROM (
+              SELECT jsonb_array_elements_text(granted_scopes) AS s
+              UNION
+              SELECT unnest({param}::text[])
+          ) merged)"
+    )
 }
 
 /// The row an exclusive-class service keeps for one account: `tenant`'s
 /// connection to `service` as `identity`, made through the app
 /// `client_id`, of the same owner (an instance's own row in its project,
-/// the author's own). Exclusivity is per app and account, so a row made
-/// through another app is never this one.
+/// the author's own, which no project holds). Exclusivity is per app and
+/// account, so a row made through another app is never this one. The
+/// database holds one at most: [`insert_grant`] lands a second sign-in on
+/// it.
+// SYNC: the exclusive key <-> crate::GROUP's access_grant_exclusive index, insert_grant
 pub(crate) async fn exclusive_row(
     db: impl sqlx::PgExecutor<'_>,
     tenant: &str,
@@ -719,12 +835,12 @@ pub(crate) async fn exclusive_row(
     instance: Option<&weft_core::instance::InstanceId>,
     project_id: Option<uuid::Uuid>,
 ) -> anyhow::Result<Option<uuid::Uuid>> {
-    Ok(sqlx::query_scalar(&format!(
+    Ok(sqlx::query_scalar(
         "SELECT id FROM access_grant
-         WHERE tenant_id = $1 AND service = $2 AND identity IS NOT DISTINCT FROM $3
-           AND client_id = $4 AND {}",
-        same_owner_sql("$5", "$6")
-    ))
+         WHERE tenant_id = $1 AND service = $2 AND identity IS NOT DISTINCT FROM $3 AND client_id = $4
+           AND instance_id IS NOT DISTINCT FROM $5 AND project_id IS NOT DISTINCT FROM $6
+           AND published_by_node IS NULL AND spec_json->>'grants' = 'exclusive'",
+    )
     .bind(tenant)
     .bind(service)
     .bind(identity)
@@ -760,30 +876,22 @@ fn completed(id: uuid::Uuid, grant: NewGrant<'_>, label: Option<String>) -> Comp
     }
 }
 
-/// What an in-place upgrade reads of the row it is about to overwrite.
-#[derive(sqlx::FromRow)]
-struct RowBefore {
-    granted_scopes: Value,
-    /// The app the row was signed in through, sealed; `None` for one
-    /// made by pasting a credential.
-    registration_sealed: Option<String>,
-}
-
-/// The row `id` an in-place upgrade is about to overwrite: the same
-/// tenant, the same service (an id naming another provider's row must
-/// never take this provider's tokens) and the same owner (an instance's
-/// own row in its project, the author's own). Anything else is a clean
-/// miss.
-async fn row_before(
+/// The app the row `id` an in-place upgrade is about to overwrite was
+/// signed in through, sealed (`None` for one made by pasting a
+/// credential). The row must be of the same tenant, the same service (an
+/// id naming another provider's row must never take this provider's
+/// tokens) and the same owner (an instance's own row in its project, the
+/// author's own); anything else is a clean miss.
+async fn upgraded_row_app(
     db: impl sqlx::PgExecutor<'_>,
     tenant: &str,
     service: &str,
     id: uuid::Uuid,
     instance: Option<&weft_core::instance::InstanceId>,
     project_id: Option<uuid::Uuid>,
-) -> anyhow::Result<RowBefore> {
-    let row: Option<RowBefore> = sqlx::query_as(&format!(
-        "SELECT granted_scopes, registration_sealed FROM access_grant \
+) -> anyhow::Result<Option<String>> {
+    let row: Option<Option<String>> = sqlx::query_scalar(sql!(
+        "SELECT registration_sealed FROM access_grant \
          WHERE id = $1 AND tenant_id = $2 AND service = $3 AND {}",
         same_owner_sql("$4", "$5")
     ))
@@ -902,7 +1010,7 @@ pub async fn begin_picker(
     )
     .map_err(|why| AccessError::Invalid(why.into()))?;
     let state = uuid::Uuid::new_v4().simple().to_string();
-    sqlx::query(&format!(
+    sqlx::query(sql!(
         "{pruned}
          INSERT INTO access_picker
              (state, tenant_id, access_id, service, script, code, mime_types, grants, project_id, instance_id)
@@ -1006,19 +1114,12 @@ pub async fn finish_picker(
     if result_json.get("picked").is_some() && !granted.is_empty() {
         // Only the session owner's own row widens: the gate at begin
         // already refused anything else, and the UPDATE says so too.
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "UPDATE access_grant
-             SET granted_scopes = (
-                     SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY s), '[]'::jsonb)
-                     FROM (
-                         SELECT jsonb_array_elements_text(granted_scopes) AS s
-                         UNION
-                         SELECT unnest($3::text[])
-                     ) merged
-                 ),
-                 updated_at = now()
-             WHERE tenant_id = $1 AND id = $2 AND owner = 'their-own' AND {}",
-            same_owner_sql("$4", "$5")
+             SET granted_scopes = {union}, updated_at = now()
+             WHERE tenant_id = $1 AND id = $2 AND owner = 'their-own' AND {owned}",
+            union = granted_union_sql("$3"),
+            owned = same_owner_sql("$4", "$5"),
         ))
         .bind(&tenant)
         .bind(access_id)
@@ -1028,7 +1129,7 @@ pub async fn finish_picker(
         .execute(&mut *tx)
         .await?;
     }
-    sqlx::query(&format!(
+    sqlx::query(sql!(
         "{pruned}
          INSERT INTO access_connect_result (state, tenant_id, result_json)
          VALUES ($1, $2, $3)
@@ -1111,8 +1212,7 @@ pub async fn begin_oauth(
         Some(id) => {
             // Upgrading is the owner's: an instance upgrades its own row,
             // the author theirs.
-            let before = row_before(pool, tenant, &spec.service, id, req.instance.as_ref(), req.project_id).await?;
-            let Some(sealed) = before.registration_sealed else {
+            let Some(sealed) = upgraded_row_app(pool, tenant, &spec.service, id, req.instance.as_ref(), req.project_id).await? else {
                 return Err(AccessError::Invalid(
                     "this connection was made without an app; it cannot be upgraded \
                      through a browser consent"
@@ -1189,7 +1289,7 @@ pub async fn begin_oauth(
         }
     }
 
-    sqlx::query(&format!(
+    sqlx::query(sql!(
         "{pruned}
          INSERT INTO access_connect
            (state, tenant_id, service, registration_sealed, project_id, spec_json, scopes,
@@ -1347,7 +1447,7 @@ async fn complete_oauth_inner(
         chrono::DateTime<chrono::Utc>,
         Option<String>,
     )> = sqlx::query_as(
-        &format!(
+        sql!(
             "{pruned}, claimed AS (
              DELETE FROM access_connect WHERE state = $1
              RETURNING tenant_id, service, registration_sealed, project_id, spec_json, scopes,
@@ -1486,24 +1586,6 @@ async fn finish_connect(
     let identity = resolve_identity(&spec, &values)?;
     let label = Some(registration.label.clone());
 
-    // Where the grant lands:
-    // - explicit upgrade: rotate that row (scope union recorded below);
-    // - exclusive class: rotate the tenant's existing grant for the
-    //   SAME app + account if there is one, because the provider
-    //   structurally rotated it under us anyway; else a fresh shared
-    //   row. Exclusivity is per app + workspace, so the app must match
-    //   too: a row made through a DIFFERENT app (another registered
-    //   tier, or a pasted hand-made bot with no app at all) holds its
-    //   own untouched token and must never be absorbed;
-    // - coexisting class: always a fresh per-project row.
-    let rotate_id: Option<uuid::Uuid> = match upgrade_grant_id {
-        Some(id) => Some(id),
-        None if spec.grants == GrantCoexistence::Exclusive => {
-            exclusive_row(pool, &tenant, &service, identity.as_deref(), &registration.client_id, instance.as_ref(), project_id).await?
-        }
-        None => None,
-    };
-
     // An instance's connection always lives in its project (whatever the
     // service's class); the author's exclusive-class one is shared by
     // every project, the coexisting one belongs to the connecting one.
@@ -1528,22 +1610,21 @@ async fn finish_connect(
         identity: identity.clone(),
         life,
     };
-    match rotate_id {
-        Some(id) => {
-            // Union of scopes: an exclusive grant only ever grows, and
-            // every referencing project follows the row.
-            let before = row_before(pool, &tenant, &service, id, instance.as_ref(), project_id).await?;
-            let mut union = scopes_of(&before.granted_scopes);
-            for s in &granted {
-                if !union.contains(s) {
-                    union.push(s.clone());
-                }
-            }
-            rotate_grant(pool, &tenant, id, grant(union, owner_project)).await
-        }
-        // The same write path a pasted connection and a published one
-        // take: a consent is a third way a connection comes into being.
-        None => insert_grant(pool, &tenant, None, grant(granted, owner_project)).await,
+    // Where the grant lands: an explicit upgrade rotates that row, and
+    // everything else goes through the write a pasted connection and a
+    // published one take (a consent is a third way a connection comes
+    // into being). For an exclusive-class service that write lands on the
+    // tenant's row for the SAME app and account when there is one,
+    // because the provider structurally rotated it under us anyway.
+    // Exclusivity is per app and account, so a row made through a
+    // DIFFERENT app (another registered tier, or a pasted hand-made bot
+    // with no app at all) holds its own untouched token and is never
+    // absorbed. A coexisting service always gets a fresh row.
+    match upgrade_grant_id {
+        // Every referencing project follows the row, whose permissions
+        // only grow (`rotate_grant`).
+        Some(id) => rotate_grant(pool, &tenant, &service, id, grant(granted, owner_project)).await,
+        None => insert_grant(pool, &tenant, grant(granted, owner_project)).await,
     }
 }
 
@@ -2285,7 +2366,6 @@ async fn publish_grant_in(
     let done = insert_grant(
         &mut *conn,
         tenant,
-        None,
         NewGrant {
             spec: &spec,
             registration: &None,
@@ -2657,7 +2737,7 @@ pub fn connection_handle(id: uuid::Uuid, identity: Option<&str>) -> Value {
 /// stay, for the same reason their connections do.
 pub async fn forget_project_access(conn: &mut sqlx::PgConnection, project_id: uuid::Uuid) -> anyhow::Result<()> {
     for table in ["access_connect", "access_picker"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE project_id = $1 AND instance_id IS NOT NULL"))
+        sqlx::query(sql!("DELETE FROM {table} WHERE project_id = $1 AND instance_id IS NOT NULL"))
             .bind(project_id)
             .execute(&mut *conn)
             .await?;

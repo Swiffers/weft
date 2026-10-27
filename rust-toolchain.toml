@@ -10,7 +10,7 @@
 # Every build path follows automatically because they all install
 # rustup with `--default-toolchain none` and let this file select.
 [toolchain]
-channel = "1.94.0"
+channel = "1.99.1"
 profile = "minimal"
 # On top of the minimal profile: clippy for the CI gate and local lint
 # runs, rustfmt for formatting. Installed for THIS pinned toolchain;

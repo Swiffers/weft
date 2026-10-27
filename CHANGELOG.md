@@ -4,6 +4,43 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## Unreleased
+
+**If your cloud install keeps its database on Cloud SQL, the next run of
+the install workflow restarts that database once.** Until now the workflow
+set its `max_connections` to 250 whatever the tier. Now it leaves Cloud
+SQL's own number for the tier (50 on `db-g1-small`) unless you set the
+fork's `WEFT_CLOUD_SQL_MAX_CONNECTIONS`, and every copy of weft's
+dispatcher and broker reads that number when it starts and takes an equal
+share of it. If you want more copies running at once, there are two new
+repository variables, `WEFT_DISPATCHER_MAX_COPIES` (2 when unset) and
+`WEFT_BROKER_MAX_COPIES` (4 when unset); for how the share is worked out,
+go and read [how many connections the install
+takes](https://weavemindai.github.io/weft/running/cloud.html#how-many-connections-the-install-takes).
+
+**If your cloud install runs infra nodes, stop and start each one after
+the update** (`weft infra stop --infra <node>`, then `weft infra start
+--infra <node>`). Their machines still run the agent of the weft that
+started them, and the new weft cannot read its answers: until you do,
+that node shows as failing with the same advice, and the rest of the
+project carries on.
+
+When weft's own database is busy, weft now waits instead of failing:
+requests, runs and resyncs hold back and go on once a connection is free.
+`weft status` says so with a `database: busy` line naming what to raise,
+and the log says it once a minute. When the database cannot be reached
+at all, the log says that rather than that it is busy.
+
+A Postgres infra node now sets Postgres up for its `memory` setting and
+keeps the container to it, so a database short of memory has a process
+killed instead of taking the machine down. When that happens, `weft
+status` and the editor say so and to give it more memory. It now takes at
+least 886Mi; a node set lower is refused when it starts. A query script
+that should give up rather than wait on a lock can start with `SET
+lock_timeout = '5s';`.
+
+If you build weft from source, it now needs Node 22.12 or newer.
+
 ## 2026-10-27 (0.2.276)
 
 **If you have nodes of your own, changed one of the standard library's,

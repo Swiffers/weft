@@ -10,6 +10,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::sql;
+
 /// The channel an event parked for a trigger is announced on, with its
 /// project's id, and an answer handed to a run a worker drives, with that
 /// run (`crate::runs::run_payload`): the dispatcher's drain wakes on it,
@@ -412,7 +414,7 @@ const HEAD_COLUMNS: &str = "token, seq, fire_id, payload, caller, attempts, not_
 /// (backing off, or waiting on something no clock brings): one trigger's
 /// events never overtake each other.
 pub async fn take_head(tx: &mut sqlx::PgConnection, token: &str, now: i64) -> anyhow::Result<Option<Head>> {
-    let row: Option<HeadRow> = sqlx::query_as(&format!(
+    let row: Option<HeadRow> = sqlx::query_as(sql!(
         "SELECT {HEAD_COLUMNS} FROM parked_fire p \
          WHERE p.token = $1 AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = $1) \
            AND p.not_before <= $2 AND p.waits_for IS NULL \
@@ -429,7 +431,7 @@ pub async fn take_head(tx: &mut sqlx::PgConnection, token: &str, now: i64) -> an
 /// [`take_head`] for what something that happened hands over again (an
 /// activation, an instance's values changing, infra coming back).
 pub async fn take_head_now(tx: &mut sqlx::PgConnection, token: &str) -> anyhow::Result<Option<Head>> {
-    let row: Option<HeadRow> = sqlx::query_as(&format!(
+    let row: Option<HeadRow> = sqlx::query_as(sql!(
         "SELECT {HEAD_COLUMNS} FROM parked_fire p \
          WHERE p.token = $1 AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = $1) \
          FOR UPDATE SKIP LOCKED"
@@ -502,7 +504,7 @@ pub fn handed_answers_sql(runs: &str) -> String {
 /// batch resolves).
 pub async fn answers_for<'e, E: sqlx::PgExecutor<'e>>(executor: E, run_id: weft_core::RunId) -> anyhow::Result<Vec<(String, weft_core::primitive::WaitAnswer)>> {
     let rows: Vec<(weft_core::RunId, String, Value, bool, i64)> =
-        sqlx::query_as(&format!("{} ORDER BY seq", handed_answers_sql("$1")))
+        sqlx::query_as(sql!("{} ORDER BY seq", handed_answers_sql("$1")))
             .bind(run_id)
             .fetch_all(executor)
             .await?;

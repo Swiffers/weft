@@ -19,6 +19,7 @@
 //! `weft_task_store::PostgresInfraReader` (NOT from this module).
 
 use anyhow::Result;
+use weft_task_store::sql;
 use serde_json::Value;
 use sqlx::postgres::PgPool;
 use sqlx::Row;
@@ -95,6 +96,15 @@ pub struct InfraNodeRow {
     pub source_hash: Option<String>,
 }
 
+impl InfraNodeRow {
+    /// The latest restart of any of its units' containers since weft last
+    /// started that unit (`UnitRuntime::last_restart`), for the status
+    /// answer.
+    pub fn last_restart(&self) -> Option<weft_core::infra::LastRestart> {
+        self.units.values().filter_map(|u| u.last_restart.as_ref()).max_by_key(|r| r.at_unix).cloned()
+    }
+}
+
 /// Each unit an older weft kept inside its copy's row, in
 /// `infra_node.units_json`, copied into a row of `infra_unit`. An entry
 /// with no `stop_behavior` is a status-only stub an older broker could
@@ -102,8 +112,7 @@ pub struct InfraNodeRow {
 // SYNC: the unit's columns <-> weft_broker_client::protocol::UnitRuntime, units_of_copy_sql, infra_unit (the table below), crates/weft-broker/src/lifecycle_writes.rs (write_units)
 const UNITS_MOVE: weft_task_store::DataStep = weft_task_store::DataStep {
     table: "infra_node",
-    column: "units_json",
-    until: weft_task_store::Until::Dropped,
+    until: weft_task_store::Until::Dropped("units_json"),
     sql: "INSERT INTO infra_unit (project_id, node_id, instance_id, unit, status, stop_behavior, \
               flaky_after_seconds, recovery_after_seconds, not_ready_since_unix, ready_since_unix, image_refs) \
           SELECT n.project_id, n.node_id, n.instance_id, u.key, u.value->>'status', \
@@ -199,7 +208,18 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             ready_since_unix BIGINT,
             -- The image refs its containers run after the apply that
             -- stamped it, which image reclamation keeps.
-            image_refs TEXT[] NOT NULL DEFAULT '{}'
+            image_refs TEXT[] NOT NULL DEFAULT '{}',
+            -- The latest time one of its containers stopped on its own
+            -- and its host brought it back, since weft last started the
+            -- unit (`UnitRuntime::last_restart`): when it stopped (unix
+            -- seconds), why (`RestartCause::as_str`), and the exit code
+            -- when it exited. All NULL when none was seen.
+            last_restart_at_unix BIGINT,
+            -- SYNC: last_restart_cause's values <-> weft_core::infra::RestartCause::as_str
+            last_restart_cause TEXT CHECK (last_restart_cause IN ('out_of_memory', 'exited', 'unknown')),
+            last_restart_exit_code BIGINT,
+            CHECK ((last_restart_at_unix IS NULL) = (last_restart_cause IS NULL)),
+            CHECK ((last_restart_exit_code IS NOT NULL) = (last_restart_cause IS NOT DISTINCT FROM 'exited'))
         )"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_infra_unit_key
              ON infra_unit(project_id, node_id, instance_id, unit) NULLS NOT DISTINCT"#,
@@ -272,7 +292,7 @@ pub async fn get(
     node_id: &str,
     instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<Option<InfraNodeRow>> {
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sql!(
         "SELECT {} FROM infra_node \
          WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
         *ROW_COLUMNS
@@ -295,7 +315,7 @@ pub async fn list_for_project(
     pool: &PgPool,
     project_id: uuid::Uuid,
 ) -> Result<Vec<InfraNodeRow>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sql!(
         "SELECT {} FROM infra_node WHERE project_id = $1 ORDER BY node_id, instance_id NULLS FIRST",
         *ROW_COLUMNS
     ))
@@ -593,7 +613,7 @@ pub async fn pending_ops(
     let mut ops = Vec::new();
     /// id, node_id, verb, instance_id, every_copy, issued_at_unix.
     type CommandRow = (i64, Option<String>, String, Option<String>, bool, i64);
-    let commands: Vec<CommandRow> = sqlx::query_as(&format!(
+    let commands: Vec<CommandRow> = sqlx::query_as(sql!(
         "SELECT id, node_id, verb, instance_id, every_copy, issued_at_unix FROM infra_lifecycle_command \
          WHERE project_id = $1 AND completed_at_unix IS NULL AND verb IN ({verbs})",
         verbs = weft_broker_client::lifecycle_command::SUPERVISOR_VERBS_SQL,

@@ -37,14 +37,32 @@ pub fn start_from_env() -> anyhow::Result<()> {
         tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
         let written = guard.report().build().map_err(anyhow::Error::from).and_then(|report| {
             let file = std::fs::File::create(&out)?;
-            report.flamegraph(file)?;
-            Ok(())
+            draw(&report, file)
         });
         match written {
             Ok(()) => tracing::info!(target: "weft_engine::profile", out = %out.display(), "the CPU profile is written"),
             Err(e) => tracing::error!(target: "weft_engine::profile", out = %out.display(), error = %format!("{e:#}"), "the CPU profile could not be written"),
         }
     });
+    Ok(())
+}
+
+/// `report` drawn as a flame graph into `out`: one line per sampled stack,
+/// its thread first and its outermost call next (`thread;outer;...;inner
+/// count`), which inferno draws. pprof's own drawing does the same through
+/// an inferno that holds a quick-xml with advisories against it.
+fn draw(report: &pprof::Report, out: impl std::io::Write) -> anyhow::Result<()> {
+    let lines: Vec<String> = report
+        .data
+        .iter()
+        .map(|(stack, count)| {
+            let calls = stack.frames.iter().rev().flat_map(|frame| frame.iter().rev()).map(ToString::to_string);
+            let path: Vec<String> = std::iter::once(stack.thread_name_or_id()).chain(calls).collect();
+            format!("{} {count}", path.join(";"))
+        })
+        .collect();
+    anyhow::ensure!(!lines.is_empty(), "nothing was sampled: no stack to draw");
+    inferno::flamegraph::from_lines(&mut inferno::flamegraph::Options::default(), lines.iter().map(String::as_str), out)?;
     Ok(())
 }
 

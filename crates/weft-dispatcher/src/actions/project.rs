@@ -349,6 +349,7 @@ pub(crate) async fn status(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("run counts: {e}")))?,
         unanswered: unanswered_for(state, id).await?,
+        resync: snapshot.resync.as_ref().map(crate::task_kinds::resync::ResyncState::standing),
     })
 }
 
@@ -411,7 +412,7 @@ pub(crate) async fn quiesce(
         .projects
         .mark_removing(id)
         .await
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("could not start removing the project: {e:#}; retry `weft rm`")))?;
+        .map_err(|e| crate::api::unavailable_or_internal("start removing the project", e))?;
     if !marked || !deactivate_project(state, id).await? {
         return Err(StatusError::NotMyProject);
     }
@@ -441,7 +442,7 @@ pub(crate) async fn remove(state: &DispatcherState, actor: &Actor, id: uuid::Uui
         .projects
         .mark_removing(id)
         .await
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("could not start removing the project: {e:#}; retry `weft rm`")))?;
+        .map_err(|e| crate::api::unavailable_or_internal("start removing the project", e))?;
     if !marked {
         // A concurrent rm dropped the row after our gate.
         return Err(StatusError::NotMyProject);
@@ -455,9 +456,13 @@ pub(crate) async fn remove(state: &DispatcherState, actor: &Actor, id: uuid::Uui
     // waited for what it cancelled already (`quiesce`), so both are
     // over at once then; they are here for a removal asked on its own.
     deactivate_project(state, id).await?;
+    // From here on the project is down: part of the removal ran, so a
+    // failure is never the 503 that says nothing did
+    // (`weft_core::install::asks_again`); `weft rm` again goes on from
+    // where it stands.
     last_calls_sent(state, id)
         .await
-        .map_err(|e| StatusError::Other(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}; retry `weft rm`")))?;
+        .map_err(|e| StatusError::Other(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}; retry `weft rm`")))?;
     // The project's OWNING tenant is its `project.tenant_id`, the same source that
     // keyed everything of the project's that lives outside the project row: its
     // stored data, and the connections its nodes published. `tenant_router` is a
@@ -537,7 +542,7 @@ pub(crate) async fn remove(state: &DispatcherState, actor: &Actor, id: uuid::Uui
         .await
         .map_err(|e| {
             (
-                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 // `{e:#}` prints the full anyhow cause chain, so the real reason
                 // (a SQL error, a ledger inconsistency, a missing tree) reaches the
                 // caller instead of just the top wrapper.
@@ -553,7 +558,7 @@ pub(crate) async fn remove(state: &DispatcherState, actor: &Actor, id: uuid::Uui
         .projects
         .remove(id)
         .await
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("could not remove the project: {e:#}; retry `weft rm`")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("could not remove the project: {e:#}; retry `weft rm`")))?;
     match removed {
         Some(signals) => {
             // The listener lets go of what it held for the project.

@@ -11,8 +11,8 @@ runs, triggers, and infra. It listens on `http://127.0.0.1:14111`
 unless the user started it on another port, and the port it really runs
 on is the `public` field of `~/.local/share/weft/ports.json`.
 Every command talks to that one unless it is given `--on <target>`, a cloud
-install named in `weft.toml`, which only the `deployer` does (the
-`weft-deploying` skill). The user's install (`setup.sh`) starts it, once per
+install named in `weft.toml` (the `weft-deploying` skill says what you do
+there yourself and what you ask the user first). The user's install (`setup.sh`) starts it, once per
 machine.
 `weft daemon start`, `stop` and `restart` re-run that install, and a restart
 from a project has wiped shared keys before, so you never run them. A `.env`

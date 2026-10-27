@@ -17,7 +17,7 @@ use axum::{
     extract::{FromRequestParts, State},
     http::{request::Parts, HeaderMap, StatusCode},
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use lru::LruCache;
 use parking_lot::Mutex;
 use sha2::Sha256;
@@ -121,7 +121,7 @@ impl IdentityCache {
     /// defeats the point of hashing tokens.
     pub fn new() -> anyhow::Result<Self> {
         let mut hmac_key = [0u8; 32];
-        getrandom::getrandom(&mut hmac_key)
+        getrandom::fill(&mut hmac_key)
             .map_err(|e| anyhow::anyhow!("OS RNG unavailable for identity cache key: {e}"))?;
         let cap = NonZeroUsize::new(CACHE_CAPACITY).expect("non-zero cache capacity");
         Ok(Self { inner: Mutex::new(LruCache::new(cap)), hmac_key, ttl: Duration::from_secs(30) })
@@ -271,7 +271,7 @@ pub async fn resolve_storage_caller(
                     .bind(parsed)
                     .fetch_optional(&state.pool)
                     .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+                    .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("read a storage caller's run")))?;
                     let Some((run_id_tenant, run_id_project, owner, instance)) = row else {
                         return Err((StatusCode::FORBIDDEN, "no such run is running".into()));
                     };

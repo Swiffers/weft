@@ -12,7 +12,7 @@ name = "computer"
 # `agent.weft` (a default agent) wire all of it, ready to include.
 [dependencies]
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 futures = "0.3"
 serde_json = "1"

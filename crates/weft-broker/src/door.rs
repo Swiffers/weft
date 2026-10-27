@@ -13,6 +13,8 @@
 
 use std::sync::Arc;
 
+use weft_task_store::sql;
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -58,8 +60,8 @@ pub(crate) fn worker(caller: &CallerIdentity) -> Result<(&str, uuid::Uuid, &str)
 
 /// What a trigger's row is read with: everything a door needs to arm it
 /// and how its activation stands.
-fn trigger_select(filter: &str) -> String {
-    format!(
+fn trigger_select(filter: &str) -> sqlx::AssertSqlSafe<String> {
+    sql!(
         "SELECT s.token, s.node_id, s.surface_kind, s.mount_path, s.mount_methods, s.spec_json, s.spec_json_version, \
                 s.auth_kind, s.auth_config, s.port_snapshot, s.definition_hash, s.binary_hash, s.source_version, \
                 s.instance_id, s.held_by, \
@@ -80,7 +82,7 @@ async fn door_triggers(
     Json(_): Json<DoorTriggersRequest>,
 ) -> Resp<DoorTriggers> {
     let (tenant, project, _) = worker(&caller)?;
-    let rows = sqlx::query(&trigger_select("NOT s.is_resume"))
+    let rows = sqlx::query(trigger_select("NOT s.is_resume"))
         .bind(project)
         .fetch_all(&state.pool)
         .await
@@ -104,7 +106,7 @@ async fn door_park_fire(
         Role::Listener => None,
         _ => Some(worker(&caller)?.1),
     };
-    let row = sqlx::query(&format!(
+    let row = sqlx::query(sql!(
         "SELECT s.project_id, s.is_resume, \
                 CASE WHEN p.id IS NULL THEN 'inactive' ELSE COALESCE(a.status, 'active') END AS status, \
                 CASE WHEN p.id IS NULL THEN FALSE ELSE COALESCE(a.accepting_fires, TRUE) END AS accepting_fires, \

@@ -19,7 +19,7 @@ import type {
 	TriggerState,
 } from '../../protocol';
 import { describeOwnerTriggers } from '../../protocol';
-import { describeProgress } from '../../status';
+import { describeProgress, describeRestart } from '../../status';
 
 /// How a badge is painted: `on` green, `off` grey, `busy` a change under
 /// way, `behind` out of date with the source, `held` work waiting on a
@@ -153,13 +153,19 @@ export function infraBadge(entry: InfraPlacementStatus, instanceCopies: Instance
 				: badges.some((b) => b.tone === 'behind')
 					? 'behind'
 					: running > 0 ? 'on' : 'off';
-		const detail = copies.map((c, i) => `${c.instance}: ${badges[i].label}`).join('\n');
+		const detail = copies
+			.flatMap((c, i) => [
+				`${c.instance}: ${badges[i].label}`,
+				...(c.lastRestart ? [`${describeRestart(c.lastRestart, `${c.node} (instance ${c.instance})`)}.`] : []),
+			])
+			.join('\n');
 		return { label: `${running} of ${copies.length} running`, tone, detail };
 	}
 	const badge = infraStatusBadge(entry.status, !!entry.behind);
 	const lines: string[] = [];
 	if (entry.failureMessage) lines.push(`${entry.failureStage ? `${entry.failureStage}: ` : ''}${entry.failureMessage}`);
 	if (entry.progress) lines.push(`${badge.label} ${describeProgress(entry.progress, nowUnix)}`);
+	if (entry.lastRestart) lines.push(`${describeRestart(entry.lastRestart, entry.node)}.`);
 	if (entry.behind) lines.push('Running from older infra than the source holds now. Upgrade brings it up to date.');
 	if (entry.takesDown?.length) lines.push(`Taking it down takes down: ${describeOwnerTriggers(entry.takesDown)}.`);
 	return lines.length ? { ...badge, detail: lines.join('\n') } : badge;

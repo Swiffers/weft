@@ -195,7 +195,7 @@ pub async fn verify_caller(
     // Signature, issuer, audience and expiry. The claims ARE the
     // identity: the program reads `sub`, `email`, roles, whatever the
     // issuer put there, off the request's `caller`.
-    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    let mut validation = weft_core::jwt::Validation::new(weft_core::jwt::Algorithm::RS256);
     validation.set_issuer(&issuers.iter().map(|t| t.0.as_str()).collect::<Vec<_>>());
     validation.set_audience(&[audience]);
     let claims: Value = crate::events::decode_jwt(token, &validation, &jwks_url.0).await?;
@@ -224,18 +224,19 @@ mod tests {
         assert!(names("garbled", &key("t", None)), "a payload naming nothing reaches everything");
     }
 
-    /// jsonwebtoken carries no crypto of its own; a build without a backend
-    /// feature compiles and then panics at the first signature it checks,
-    /// which is how every genuine token once took the broker down.
+    /// jsonwebtoken carries no crypto of its own; a build that hands it none
+    /// compiles and then panics at the first signature it checks, which is
+    /// how every genuine token once took the broker down. `weft_core::jwt`
+    /// hands it ring.
     #[test]
     fn the_jwt_library_has_a_crypto_backend() {
-        let key = jsonwebtoken::EncodingKey::from_secret(b"k");
-        let token = jsonwebtoken::encode(&jsonwebtoken::Header::default(), &serde_json::json!({ "sub": "x", "exp": 4_000_000_000u64 }), &key)
+        let key = weft_core::jwt::EncodingKey::from_secret(b"k");
+        let token = weft_core::jwt::encode(&weft_core::jwt::Header::default(), &serde_json::json!({ "sub": "x", "exp": 4_000_000_000u64 }), &key)
             .expect("signs");
-        let data = jsonwebtoken::decode::<serde_json::Value>(
+        let data = weft_core::jwt::decode::<serde_json::Value>(
             &token,
-            &jsonwebtoken::DecodingKey::from_secret(b"k"),
-            &jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256),
+            &weft_core::jwt::DecodingKey::from_secret(b"k"),
+            &weft_core::jwt::Validation::new(weft_core::jwt::Algorithm::HS256),
         )
         .expect("verifies");
         assert_eq!(data.claims["sub"], "x");

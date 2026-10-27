@@ -57,6 +57,12 @@ struct FakeProvider {
     /// A whole token answer to send instead of the flat one built from
     /// the fields above (a nested answer, an error object on a 200).
     pub token_answer: Mutex<Option<serde_json::Value>>,
+    /// Held by a test to keep every token request from answering until
+    /// it lets go.
+    pub token_gate: tokio::sync::Mutex<()>,
+    /// One permit per token request that arrived, before it waits at
+    /// the gate.
+    pub token_arrived: tokio::sync::Semaphore,
 }
 
 impl FakeProvider {
@@ -71,7 +77,21 @@ impl FakeProvider {
             token_refusal: Mutex::new(None),
             exchange_refusal: Mutex::new(None),
             token_answer: Mutex::new(None),
+            token_gate: tokio::sync::Mutex::new(()),
+            token_arrived: tokio::sync::Semaphore::new(0),
         })
+    }
+
+    /// Hold the token endpoint from now on: every token request from here
+    /// waits until the returned guard is dropped, and only those count as
+    /// arrived (the ones before are forgotten).
+    async fn hold_tokens(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        let gate = self.token_gate.lock().await;
+        let earlier = u32::try_from(self.token_arrived.available_permits()).unwrap();
+        if earlier > 0 {
+            self.token_arrived.try_acquire_many(earlier).unwrap().forget();
+        }
+        gate
     }
 
     /// Serve on an ephemeral port; returns the base URL.
@@ -84,6 +104,8 @@ impl FakeProvider {
                 post(|State(s): State<Arc<FakeProvider>>, body: String| async move {
                     s.calls.lock().unwrap().push(format!("/token {body}"));
                     s.token_requests.fetch_add(1, Ordering::SeqCst);
+                    s.token_arrived.add_permits(1);
+                    let _gate = s.token_gate.lock().await;
                     if let Some(status) = *s.token_refusal.lock().unwrap() {
                         let status = axum::http::StatusCode::from_u16(status).unwrap();
                         return (status, axum::Json(json!({ "error": "refused" })));
@@ -228,14 +250,15 @@ fn oauth_spec(base: &str, grants: &str) -> AccessSpec {
     .unwrap()
 }
 
-/// Begin + complete one consent for `tenant`, returning the grant id.
-async fn full_consent(
+/// Begin one consent for `tenant` through the own door, returning its
+/// state.
+async fn begin_consent(
     pool: &PgPool,
     tenant: &str,
     spec: &AccessSpec,
     scopes: &[&str],
     upgrade: Option<uuid::Uuid>,
-) -> anyhow::Result<GrantSummary> {
+) -> anyhow::Result<String> {
     let started = begin_oauth(
         pool,
         tenant,
@@ -252,13 +275,25 @@ async fn full_consent(
     )
     .await?;
     assert!(started.consent_url.contains("code_challenge"), "{}", started.consent_url);
+    Ok(started.state)
+}
+
+/// Begin + complete one consent for `tenant`, returning the grant id.
+async fn full_consent(
+    pool: &PgPool,
+    tenant: &str,
+    spec: &AccessSpec,
+    scopes: &[&str],
+    upgrade: Option<uuid::Uuid>,
+) -> anyhow::Result<GrantSummary> {
+    let state = begin_consent(pool, tenant, spec, scopes, upgrade).await?;
     // While the consent is open, the poll reads pending.
-    assert!(take_connect_result(pool, tenant, &started.state).await?.is_none());
-    let done = complete_oauth(pool, &started.state, "the-code").await?;
+    assert!(take_connect_result(pool, tenant, &state).await?.is_none());
+    let done = complete_oauth(pool, &state, "the-code").await?;
     // The parked outcome is consumable exactly once, by the owning tenant.
-    let parked = take_connect_result(pool, tenant, &started.state).await?;
+    let parked = take_connect_result(pool, tenant, &state).await?;
     assert!(parked.is_some(), "outcome parked for the editor's poll");
-    let again = take_connect_result(pool, tenant, &started.state).await.unwrap_err();
+    let again = take_connect_result(pool, tenant, &state).await.unwrap_err();
     assert!(matches!(again.downcast_ref::<AccessError>(), Some(AccessError::Gone(_))), "{again}");
     Ok(done.grant)
 }
@@ -669,8 +704,8 @@ async fn refresh_is_lazy_single_flight_and_writes_back_rotated_tokens(pool: PgPo
     *fake.next_refresh.lock().unwrap() = Some("refresh-2".into());
     *fake.expires_in.lock().unwrap() = Some(3600);
 
-    // Parallel resolutions: the row lock is the single-flight, so the
-    // provider sees EXACTLY ONE refresh request.
+    // Parallel resolutions: the renewal's claim on the row is the
+    // single-flight, so the provider sees EXACTLY ONE refresh request.
     let mut handles = Vec::new();
     for _ in 0..4 {
         let pool = pool.clone();
@@ -697,6 +732,178 @@ async fn refresh_is_lazy_single_flight_and_writes_back_rotated_tokens(pool: PgPo
         .cloned()
         .unwrap();
     assert!(refresh_call.contains("refresh_token=refresh-1"), "{refresh_call}");
+}
+
+/// A pool of one connection on `pool`'s database, whose wait for it
+/// gives up after `wait`: what shows a connection held where it must not
+/// be.
+async fn one_connection(pool: &PgPool, wait: std::time::Duration) -> PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(wait)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap()
+}
+
+/// A consent whose token is due a renewal now, and a provider whose next
+/// answer rotates both tokens: what the renewal tests start from.
+async fn due_for_renewal(pool: &PgPool, fake: &FakeProvider, base: &str) -> GrantSummary {
+    let spec = oauth_spec(base, "coexisting");
+    *fake.next_refresh.lock().unwrap() = Some("refresh-1".into());
+    *fake.expires_in.lock().unwrap() = Some(1);
+    let grant = full_consent(pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    expire_now(pool, grant.id).await;
+    *fake.next_token.lock().unwrap() = "tok-fresh".into();
+    *fake.next_refresh.lock().unwrap() = Some("refresh-2".into());
+    *fake.expires_in.lock().unwrap() = Some(3600);
+    grant
+}
+
+/// A renewal holds no database connection while the provider answers:
+/// on a pool of one connection, other work goes through while the
+/// renewal waits on the provider, and so do the resolutions waiting on
+/// that same renewal. The provider still sees one renewal.
+#[sqlx::test]
+async fn a_renewal_holds_no_database_connection_while_the_provider_answers(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let grant = due_for_renewal(&pool, &fake, &base).await;
+    let consent_tokens = fake.token_requests.load(Ordering::SeqCst);
+    let one = one_connection(&pool, std::time::Duration::from_secs(2)).await;
+
+    let gate = fake.hold_tokens().await;
+    let resolves: Vec<_> = (0..3)
+        .map(|_| {
+            let one = one.clone();
+            let id = grant.id;
+            tokio::spawn(async move { resolve_for_worker(&one, TENANT_A, GrantUser::Author, id, "fakeoauth", &[], &[]).await })
+        })
+        .collect();
+    fake.token_arrived.acquire().await.unwrap().forget();
+    let (grants,): (i64,) = sqlx::query_as("SELECT count(*) FROM access_grant")
+        .fetch_one(&one)
+        .await
+        .expect("the one connection is free while the provider answers");
+    assert_eq!(grants, 1);
+    drop(gate);
+
+    for resolve in resolves {
+        let resolved = resolve.await.unwrap().expect("the renewal lands");
+        assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-fresh"));
+    }
+    assert_eq!(fake.token_requests.load(Ordering::SeqCst) - consent_tokens, 1, "one renewal for three resolutions");
+}
+
+/// A renewal whose answer arrives while no database connection can be
+/// had waits for one and writes it: the provider may have retired the
+/// refresh token the row held, so the rotated one is never dropped, and
+/// the next renewal sends it.
+#[sqlx::test]
+async fn a_renewed_token_is_written_once_a_connection_can_be_had(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let grant = due_for_renewal(&pool, &fake, &base).await;
+    let one = one_connection(&pool, std::time::Duration::from_millis(100)).await;
+
+    let gate = fake.hold_tokens().await;
+    let resolve = {
+        let one = one.clone();
+        tokio::spawn(async move { resolve_for_worker(&one, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await })
+    };
+    fake.token_arrived.acquire().await.unwrap().forget();
+    // The answer arrives while the one connection is taken, for several
+    // of the pool's waits.
+    let taken = one.acquire().await.unwrap();
+    drop(gate);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(taken);
+    let resolved = resolve.await.unwrap().expect("the renewal is written once the connection is free");
+    assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-fresh"));
+
+    expire_now(&pool, grant.id).await;
+    resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap();
+    let renewal = fake.calls.lock().unwrap().iter().rfind(|c| c.contains("grant_type=refresh_token")).cloned().unwrap();
+    assert!(renewal.contains("refresh_token=refresh-2"), "{renewal}");
+}
+
+/// Two upgrades of one exclusive connection landing at once both keep
+/// the permission each added: the row's permissions are widened in the
+/// statement that writes the sign-in, never from a read before it.
+#[sqlx::test]
+async fn two_upgrades_landing_at_once_both_keep_their_permissions(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = oauth_spec(&base, "exclusive");
+    let first = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    let write = begin_consent(&pool, TENANT_A, &spec, &["write"], Some(first.id)).await.unwrap();
+    let admin = begin_consent(&pool, TENANT_A, &spec, &["admin"], Some(first.id)).await.unwrap();
+
+    let gate = fake.hold_tokens().await;
+    let completes: Vec<_> = [write, admin]
+        .into_iter()
+        .map(|state| {
+            let pool = pool.clone();
+            tokio::spawn(async move { complete_oauth(&pool, &state, "the-code").await })
+        })
+        .collect();
+    fake.token_arrived.acquire_many(2).await.unwrap().forget();
+    drop(gate);
+    for complete in completes {
+        assert_eq!(complete.await.unwrap().unwrap().grant.id, first.id);
+    }
+
+    let row = list_grants(&pool, TENANT_A, Some("fakeoauth"), weft_access_store::GrantOwnerScope::Author)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|g| g.id == first.id)
+        .unwrap();
+    for scope in ["read", "write", "admin"] {
+        assert!(row.scopes.iter().any(|s| s == scope), "{scope} kept: {:?}", row.scopes);
+    }
+}
+
+/// Two first sign-ins to one exclusive account landing at once leave one
+/// connection: the second lands on the row the first made, the way a
+/// reconnect does (same id, counted as a reconnect, both permissions
+/// kept), never beside it.
+#[sqlx::test]
+async fn two_first_sign_ins_landing_at_once_make_one_connection(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = oauth_spec(&base, "exclusive");
+    let read = begin_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    let write = begin_consent(&pool, TENANT_A, &spec, &["write"], None).await.unwrap();
+
+    let gate = fake.hold_tokens().await;
+    let completes: Vec<_> = [read, write]
+        .into_iter()
+        .map(|state| {
+            let pool = pool.clone();
+            tokio::spawn(async move { complete_oauth(&pool, &state, "the-code").await })
+        })
+        .collect();
+    fake.token_arrived.acquire_many(2).await.unwrap().forget();
+    drop(gate);
+    let mut ids = Vec::new();
+    for complete in completes {
+        ids.push(complete.await.unwrap().unwrap().grant.id);
+    }
+    assert_eq!(ids[0], ids[1], "both sign-ins answer the one connection");
+
+    let rows = list_grants(&pool, TENANT_A, Some("fakeoauth"), weft_access_store::GrantOwnerScope::Author).await.unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    for scope in ["read", "write"] {
+        assert!(rows[0].scopes.iter().any(|s| s == scope), "{scope} kept: {:?}", rows[0].scopes);
+    }
+    let reconnects: i64 =
+        sqlx::query_scalar("SELECT reconnects FROM access_grant WHERE id = $1").bind(ids[0]).fetch_one(&pool).await.unwrap();
+    assert_eq!(reconnects, 1, "the second sign-in counts as a reconnect of the first");
 }
 
 /// A declared renewal call (Meta's long-lived-token exchange shape)
@@ -2859,4 +3066,218 @@ async fn after_exchange_drops_the_exchanges_refresh_token(pool: PgPool) {
     assert_eq!(grant.expires_at, None);
     let resolved = resolve_for_worker(&pool, TENANT_A, GrantUser::Author, grant.id, "fakeoauth", &[], &[]).await.unwrap();
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-long"));
+}
+
+/// A database from before `access_grant_exclusive`, where two sign-ins to
+/// one exclusive account raced and left rows (and older code stored the
+/// author's row with a project), boots: the rows fold into the one written
+/// last, with every permission any of them held, and everything that named
+/// a folded row (by a column, or inside its text) names the kept one before
+/// the index is built. The fold run again changes nothing, and once the
+/// index exists a boot no longer runs it.
+#[sqlx::test]
+async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(pool: PgPool) {
+    const CONTRACT: &str = "20261027T151627_access_grant_whole_identity_one_grant.contract";
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    // The database as it was before the contract part: no index, the
+    // contract still to run.
+    sqlx::raw_sql("DROP INDEX access_grant_exclusive").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM weft_migration WHERE group_name = 'access_grant' AND id = $1")
+        .bind(CONTRACT)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The dispatcher's `signal` table, which an install holds beside the
+    // access store's: only the columns the fold reads and writes.
+    sqlx::raw_sql("CREATE TABLE signal (token TEXT PRIMARY KEY, access_id TEXT, spec_json TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (oldest, older, newest, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let seed = |id: uuid::Uuid, identity: &'static str, project: Option<uuid::Uuid>, scopes: serde_json::Value, age_secs: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO access_grant (id, tenant_id, service, client_id, project_id, spec_json, spec_json_version, \
+                     values_sealed, granted_scopes, identity, updated_at) \
+                 VALUES ($1, $2, 'fakeoauth', 'cid', $3, '{\"grants\": \"exclusive\"}', 1, 'sealed', $4, $5, \
+                     now() - make_interval(secs => $6))",
+            )
+            .bind(id)
+            .bind(TENANT_A)
+            .bind(project)
+            .bind(scopes)
+            .bind(identity)
+            .bind(age_secs as f64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    // Stored with a project by older code: the author's all the same.
+    seed(oldest, "me@example.com", Some(PROJECT_1), json!(["d"]), 300).await;
+    seed(older, "me@example.com", None, json!(["a", "b"]), 200).await;
+    seed(newest, "me@example.com", None, json!(["b", "c"]), 100).await;
+    seed(other, "someone-else@example.com", None, json!(["a"]), 100).await;
+
+    // Every place that names a connection, each pointing at a row that goes.
+    sqlx::query("INSERT INTO install_pick (tenant_id, project_id, node, field, grant_id) VALUES ($1, $2, 'mail', 'access', $3)")
+        .bind(TENANT_A)
+        .bind(PROJECT_1)
+        .bind(older)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO instance_value (tenant_id, project_id, instance_id, node, field, value, grant_id) \
+         VALUES ($1, $2, 'alice', 'mail', 'access', $3, $4)",
+    )
+    .bind(TENANT_A)
+    .bind(PROJECT_1)
+    .bind(json!({"id": oldest.to_string(), "identity": "me@example.com"}))
+    .bind(oldest)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO access_connect (state, tenant_id, service, registration_sealed, spec_json, upgrade_grant_id, redirect_uri) \
+         VALUES ('connect-1', $1, 'fakeoauth', 'sealed', '{}', $2, 'http://localhost/callback')",
+    )
+    .bind(TENANT_A)
+    .bind(oldest)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO access_picker (state, tenant_id, access_id, service, script, code) \
+         VALUES ('picker-1', $1, $2, 'fakeoauth', 'script', 'code')",
+    )
+    .bind(TENANT_A)
+    .bind(older)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO access_connect_result (state, tenant_id, result_json) VALUES ('result-1', $1, $2)")
+        .bind(TENANT_A)
+        .bind(json!({"grant": {"id": older.to_string(), "service": "fakeoauth"}}))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO signal_subscription (id, tenant_id, service, topic, access_id, signal_token, token_sealed) \
+         VALUES ('sub-1', $1, 'fakeoauth', 'mail', $2, 'signal-1', 'sealed')",
+    )
+    .bind(TENANT_A)
+    .bind(older)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO signal (token, access_id, spec_json) VALUES ('signal-1', $1, $2)")
+        .bind(oldest.to_string())
+        .bind(json!({"kind": "mail", "access": {"id": oldest.to_string()}}).to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.expect("the boot folds, then builds the index");
+
+    let rows: Vec<(uuid::Uuid, Option<uuid::Uuid>, serde_json::Value)> = sqlx::query_as(
+        "SELECT id, project_id, granted_scopes FROM access_grant WHERE identity = 'me@example.com'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, vec![(newest, None, json!(["a", "b", "c", "d"]))], "the newest kept, with every permission");
+    let still: i64 = sqlx::query_scalar("SELECT count(*) FROM access_grant WHERE id = $1").bind(other).fetch_one(&pool).await.unwrap();
+    assert_eq!(still, 1, "another account's row is not touched");
+    let pick: uuid::Uuid = sqlx::query_scalar("SELECT grant_id FROM install_pick").fetch_one(&pool).await.unwrap();
+    assert_eq!(pick, newest);
+    let (value_grant, value): (uuid::Uuid, serde_json::Value) =
+        sqlx::query_as("SELECT grant_id, value FROM instance_value").fetch_one(&pool).await.unwrap();
+    assert_eq!((value_grant, value["id"].clone()), (newest, json!(newest.to_string())));
+    let upgrading: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT upgrade_grant_id FROM access_connect").fetch_one(&pool).await.unwrap();
+    assert_eq!(upgrading, Some(newest));
+    let picking: uuid::Uuid = sqlx::query_scalar("SELECT access_id FROM access_picker").fetch_one(&pool).await.unwrap();
+    assert_eq!(picking, newest);
+    let parked: serde_json::Value =
+        sqlx::query_scalar("SELECT result_json FROM access_connect_result").fetch_one(&pool).await.unwrap();
+    assert_eq!(parked, json!({"grant": {"id": newest.to_string(), "service": "fakeoauth"}}));
+    let subscribed: uuid::Uuid = sqlx::query_scalar("SELECT access_id FROM signal_subscription").fetch_one(&pool).await.unwrap();
+    assert_eq!(subscribed, newest);
+    let (signal_access, signal_spec): (Option<String>, String) =
+        sqlx::query_as("SELECT access_id, spec_json FROM signal").fetch_one(&pool).await.unwrap();
+    assert_eq!(signal_access, Some(newest.to_string()));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&signal_spec).unwrap(),
+        json!({"kind": "mail", "access": {"id": newest.to_string()}})
+    );
+    let indexed: bool = sqlx::query_scalar("SELECT to_regclass('access_grant_exclusive') IS NOT NULL").fetch_one(&pool).await.unwrap();
+    assert!(indexed, "the contract part built the index once the rows fit it");
+
+    // The fold run again finds nothing to do.
+    let everything = |pool: PgPool| async move {
+        let mut tables = Vec::new();
+        for table in [
+            "access_grant",
+            "install_pick",
+            "instance_value",
+            "access_connect",
+            "access_picker",
+            "access_connect_result",
+            "signal_subscription",
+            "signal",
+        ] {
+            let rows: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT string_agg(t::text, E'\\n' ORDER BY t::text) FROM {table} t")))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            tables.push((table, rows));
+        }
+        tables
+    };
+    let before = everything(pool.clone()).await;
+    let [fold] = weft_access_store::GROUP.data_steps else { panic!("the access store has one data step, the fold") };
+    sqlx::raw_sql(fold.sql).execute(&pool).await.expect("the fold runs again");
+    assert_eq!(everything(pool.clone()).await, before, "a second fold changes nothing");
+
+    // With the index built, a boot that has schema work (a stale stamp
+    // here) leaves the fold out: an author's row stored with a project,
+    // which the fold would make tenant-wide, stays as it is.
+    let later = uuid::Uuid::new_v4();
+    seed(later, "me@example.com", Some(PROJECT_1), json!(["a"]), 0).await;
+    sqlx::query("UPDATE weft_schema_stamp SET fingerprint = 'stale' WHERE group_name = 'access_grant'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.expect("the boot restamps");
+    let project: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT project_id FROM access_grant WHERE id = $1").bind(later).fetch_one(&pool).await.unwrap();
+    assert_eq!(project, Some(PROJECT_1), "the fold did not run once the index existed");
+}
+
+/// An upgrade whose consent signs in as an account that already has its
+/// own exclusive connection is refused, naming that connection to
+/// upgrade instead, and leaves both rows as they were.
+#[sqlx::test]
+async fn an_upgrade_signed_in_as_an_account_with_its_own_connection_is_refused(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let spec = oauth_spec(&base, "exclusive");
+    // The fake provider always signs in as 'quentin': the first row is
+    // made another account's by hand, so the next sign-in makes quentin's.
+    let theirs = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    sqlx::query("UPDATE access_grant SET identity = 'someone-else' WHERE id = $1").bind(theirs.id).execute(&pool).await.unwrap();
+    let quentins = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
+    assert_ne!(quentins.id, theirs.id);
+
+    let err = full_consent(&pool, TENANT_A, &spec, &["write"], Some(theirs.id)).await.unwrap_err();
+    assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Invalid(_))), "{err:#}");
+    let said = err.to_string();
+    assert!(said.contains("quentin") && said.contains(&quentins.id.to_string()), "{said}");
+    let identity: Option<String> =
+        sqlx::query_scalar("SELECT identity FROM access_grant WHERE id = $1").bind(theirs.id).fetch_one(&pool).await.unwrap();
+    assert_eq!(identity.as_deref(), Some("someone-else"), "the upgraded row is left as it was");
 }

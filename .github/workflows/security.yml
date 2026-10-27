@@ -1,0 +1,38 @@
+# Once a week: the Rust advisories against Cargo.lock, and the version pins
+# Dependabot cannot see (scripts/check-pins.sh). Off every push and pull
+# request on purpose, so no pipeline waits on it; run it by hand from the
+# Actions tab when you want an answer now.
+name: security
+
+on:
+  schedule:
+    # Mondays, 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-advisories:
+    name: rust advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # A prebuilt cargo-audit, so nothing compiles.
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: cargo-audit
+      # Called as `cargo-audit` rather than `cargo audit`: through cargo,
+      # rustup would first install the toolchain rust-toolchain.toml pins,
+      # which reading Cargo.lock does not need.
+      - run: cargo-audit audit --file Cargo.lock
+
+  pins:
+    name: pins Dependabot cannot see
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: scripts/check-pins.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

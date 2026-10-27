@@ -85,7 +85,7 @@ axum = { workspace = true }
 # Optional: only compiled under the `e2e` feature (see [features]). The platform
 # layer (src/platform.rs) connects to the install's Postgres to observe
 # which worker owns a run and what a run stored.
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono"], optional = true }
+sqlx = { workspace = true, features = ["json", "uuid", "chrono"], optional = true }
 
 # Optional: only under `e2e`. Loads the repo root's `.env.local` and `.env`
 # (the files the CLI reads too) so a test that spends on a real key finds it

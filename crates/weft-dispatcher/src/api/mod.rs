@@ -247,6 +247,8 @@ mod public_page;
 fn core_routes(state: DispatcherState) -> Router<DispatcherState> {
     Router::new()
         .route("/install", get(project::install))
+        // Whether the database held the install back lately (`weft status`).
+        .route("/install/database", get(project::install_database))
         .route("/install/domains", get(domains::list).post(domains::add))
         .route("/install/domains/{name}", axum::routing::delete(domains::remove))
         // The install's maintenance (`weft maintenance`): where it stands
@@ -611,14 +613,29 @@ pub fn router(state: DispatcherState) -> Router {
 /// install's tunnel).
 pub fn outside_router(state: DispatcherState) -> Router {
     let hops = TrustedHops(state.edge.trusted_proxy_hops.outside);
-    with_hops(outside_caller_routes(state.clone()), hops).with_state(state)
+    with_hops(marked_as_the_install(outside_caller_routes(state.clone())), hops).with_state(state)
 }
 
 /// The same doors as [`outside_router`], for the listener on the machine's
 /// network address: its callers connect straight to it, so the caller is
 /// the peer and no `X-Forwarded-For` entry is believed.
 pub fn network_router(state: DispatcherState) -> Router {
-    with_hops(outside_caller_routes(state.clone()), TrustedHops(0)).with_state(state)
+    with_hops(marked_as_the_install(outside_caller_routes(state.clone())), TrustedHops(0)).with_state(state)
+}
+
+/// Mark every answer `router` gives as the install's own
+/// ([`weft_core::install::INSTALL_ANSWER_HEADER`]), whatever answered it
+/// (a handler, a layer refusing first, a program's route passed on), so a
+/// caller reads an unmarked answer as the platform's in front of it.
+/// [`router`]'s answers are marked by the door it is served behind
+/// (`crate::door::router`), which answers some calls itself.
+pub(crate) fn marked_as_the_install<S: Clone + Send + Sync + 'static>(router: Router<S>) -> Router<S> {
+    router.layer(axum::middleware::map_response(|mut response: axum::response::Response| async move {
+        response
+            .headers_mut()
+            .insert(weft_core::install::INSTALL_ANSWER_HEADER, axum::http::HeaderValue::from_static("1"));
+        response
+    }))
 }
 
 /// The address this request came in on (`weft_core::net::request_base_url`):
@@ -641,30 +658,163 @@ pub(crate) fn database_unreachable(e: &anyhow::Error) -> bool {
     e.chain().filter_map(|cause| cause.downcast_ref::<sqlx::Error>()).any(weft_task_store::db::unreachable)
 }
 
-/// The answer to a read that failed doing `what`: a 503 the caller asks
-/// again on when the database is out of reach ([`database_unreachable`]),
-/// a 500 naming the failure otherwise, which asking again would not fix.
+/// Whether `e` failed because the database did not take the call: too
+/// busy to give it a connection (`weft_task_store::db::busy`), or out of
+/// reach ([`database_unreachable`]), anywhere in its chain. Nothing of the
+/// call itself is to blame, and the same call goes through once the
+/// database answers. A call that got no connection is said as what kept
+/// it (`weft_task_store::throttle::no_connection`: a busy database as
+/// capacity, an unreachable one as unreachable), so every wait on the
+/// database that goes through here is in the log, at most once a minute.
+/// The one place that decides it, for an answer and for a wait alike.
+// SYNC: database_did_not_take <-> crates/weft-core/src/install.rs (asks_again)
+pub(crate) fn database_did_not_take(e: &anyhow::Error) -> bool {
+    if !(weft_task_store::db::database_busy(e) || database_unreachable(e)) {
+        return false;
+    }
+    if let Some(why) = weft_task_store::db::database_no_connection(e) {
+        weft_task_store::throttle::no_connection(why);
+    }
+    true
+}
+
+/// The answer to a call that failed doing `what`, before anything of the
+/// request it serves took effect: a `503` when the database did not take
+/// it ([`database_did_not_take`]), which the caller sends again as it is
+/// (`weft_core::install::asks_again`), a `500` naming the failure
+/// otherwise, which asking again would not fix. Only a call nothing of
+/// its request ran before (a read, or a request's first write) is
+/// answered through here: a `503` says nothing ran.
+// SYNC: unavailable_or_internal <-> crates/weft-core/src/install.rs (asks_again)
 pub(crate) fn unavailable_or_internal(what: &str, e: anyhow::Error) -> (axum::http::StatusCode, String) {
-    if database_unreachable(&e) {
-        tracing::warn!(target: "weft_dispatcher::api", error = %format!("{e:#}"), "could not {what}: the database is out of reach");
-        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, format!("the install could not {what} right now; try again shortly"));
+    if let Some(answer) = not_taken(what, &e) {
+        return answer;
     }
     tracing::error!(target: "weft_dispatcher::api", error = %format!("{e:#}"), "could not {what}");
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("could not {what}: {e:#}"))
+}
+
+/// A failed access store call (`weft_access_store`: connections, instance
+/// values, install picks, connect and picker sessions) as every dispatcher
+/// surface answers it: a `503` when the database did not take it, decided
+/// and logged as [`unavailable_or_internal`] does, under the same promise
+/// (nothing of the request it serves took effect before it); anything else
+/// through the store's own mapping (`weft_access_store::client_error`: a
+/// refusal the store names keeps its status, the rest is an opaque `500`),
+/// so the dispatcher and the broker answer a store failure alike. Every call
+/// site today is a read, the request's one statement, or a transaction
+/// that rolls back whole on the failure. A call that committed something
+/// before the store failed must never answer `503` through here.
+// SYNC: access_store_error <-> crates/weft-broker/src/handlers.rs (store_err), crates/weft-core/src/install.rs (asks_again)
+pub(crate) fn access_store_error(e: anyhow::Error) -> (axum::http::StatusCode, String) {
+    if let Some(answer) = not_taken("reach its database", &e) {
+        return answer;
+    }
+    let (status, message) = weft_access_store::client_error(e);
+    (axum::http::StatusCode::from_u16(status).expect("store status codes are valid"), message)
+}
+
+/// `answer` for a request part of which had already taken effect before
+/// it failed: a `503` (a later step the database did not take) becomes a
+/// `500`, since a `503` says nothing of the request ran and the caller
+/// would send it again as it is. Every other answer is kept.
+pub(crate) fn after_writes((status, message): (axum::http::StatusCode, String)) -> (axum::http::StatusCode, String) {
+    if status != axum::http::StatusCode::SERVICE_UNAVAILABLE {
+        return (status, message);
+    }
+    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("{message} (part of this request had already gone through before it)"))
+}
+
+/// The `503` for a call doing `what` that the database did not take
+/// ([`database_did_not_take`]), logged; `None` for any other failure.
+fn not_taken(what: &str, e: &anyhow::Error) -> Option<(axum::http::StatusCode, String)> {
+    if !database_did_not_take(e) {
+        return None;
+    }
+    tracing::warn!(target: "weft_dispatcher::api", error = %format!("{e:#}"), "could not {what}: the database is out of reach or too busy");
+    Some((axum::http::StatusCode::SERVICE_UNAVAILABLE, format!("the install could not {what} right now; try again shortly")))
 }
 
 #[cfg(test)]
 mod unavailable_tests {
     use axum::http::StatusCode;
 
+    /// A call the database did not take, too busy or out of reach, is a
+    /// 503 (nothing ran, ask again); any other failure is a 500.
     #[test]
-    fn only_an_unreachable_database_asks_the_caller_again() {
-        let pool_gone = anyhow::Error::from(sqlx::Error::PoolTimedOut).context("read the build");
-        assert_eq!(super::unavailable_or_internal("read the build", pool_gone).0, StatusCode::SERVICE_UNAVAILABLE);
+    fn only_a_database_that_did_not_take_the_call_answers_503() {
+        let status = |e: anyhow::Error| super::unavailable_or_internal("read the build", e).0;
+        assert_eq!(status(anyhow::Error::from(sqlx::Error::PoolTimedOut).context("read the build")), StatusCode::SERVICE_UNAVAILABLE);
+        let full = sqlx::Error::Database(Box::new(TooManyConnections));
+        assert!(weft_task_store::db::busy(&full), "53300 is the database too busy");
+        assert_eq!(status(anyhow::Error::from(full).context("read the build")), StatusCode::SERVICE_UNAVAILABLE);
+        let broken = sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert_eq!(status(anyhow::Error::from(broken)), StatusCode::SERVICE_UNAVAILABLE, "out of reach");
         let undecodable = anyhow::anyhow!("a version build state the ledger does not know: 'odd'");
-        assert_eq!(super::unavailable_or_internal("read the build", undecodable).0, StatusCode::INTERNAL_SERVER_ERROR);
-        let bad_row = anyhow::Error::from(sqlx::Error::RowNotFound);
-        assert_eq!(super::unavailable_or_internal("read the build", bad_row).0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status(undecodable), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status(anyhow::Error::from(sqlx::Error::RowNotFound)), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Once part of a request went through, a later step the database did
+    /// not take is a 500, never a 503 (which says nothing ran); every
+    /// other answer is kept.
+    #[test]
+    fn a_503_after_writes_becomes_a_500() {
+        let busy = super::unavailable_or_internal("read the build", anyhow::Error::from(sqlx::Error::PoolTimedOut));
+        assert_eq!(busy.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(super::after_writes(busy).0, StatusCode::INTERNAL_SERVER_ERROR);
+        let refused = (StatusCode::CONFLICT, "in flight".to_string());
+        assert_eq!(super::after_writes(refused.clone()), refused);
+    }
+
+    /// An access store call the database did not take, too busy or out of
+    /// reach, is a 503 like any other; a refusal the store names keeps its
+    /// status; anything else is the store's opaque 500.
+    #[test]
+    fn an_access_store_call_the_database_did_not_take_answers_503() {
+        let status = |e: anyhow::Error| super::access_store_error(e).0;
+        assert_eq!(status(anyhow::Error::from(sqlx::Error::PoolTimedOut).context("list grants")), StatusCode::SERVICE_UNAVAILABLE, "busy");
+        let full = sqlx::Error::Database(Box::new(TooManyConnections));
+        assert_eq!(status(anyhow::Error::from(full)), StatusCode::SERVICE_UNAVAILABLE, "full");
+        let broken = sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert_eq!(status(anyhow::Error::from(broken)), StatusCode::SERVICE_UNAVAILABLE, "out of reach");
+        assert_eq!(status(weft_access_store::AccessError::NotFound.into()), StatusCode::NOT_FOUND);
+        assert_eq!(status(weft_access_store::AccessError::Gone("expired".into()).into()), StatusCode::GONE);
+        let (code, message) = super::access_store_error(anyhow::Error::from(sqlx::Error::RowNotFound));
+        assert_eq!((code, message.as_str()), (StatusCode::INTERNAL_SERVER_ERROR, "access store error"));
+    }
+
+    /// The database refusing a new connection because it is full (SQLSTATE 53300).
+    #[derive(Debug)]
+    struct TooManyConnections;
+
+    impl std::fmt::Display for TooManyConnections {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("sorry, too many clients already")
+        }
+    }
+
+    impl std::error::Error for TooManyConnections {}
+
+    impl sqlx::error::DatabaseError for TooManyConnections {
+        fn message(&self) -> &str {
+            "sorry, too many clients already"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some("53300".into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
     }
 }
 

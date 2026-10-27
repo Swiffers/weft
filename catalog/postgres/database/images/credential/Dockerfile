@@ -1,7 +1,7 @@
 # Mints the database's password on first boot and hands it over once.
 # Python's standard library only: no dependencies to install, nothing
 # to keep patched beyond the base image itself.
-FROM python:3.12-alpine
+FROM python:3.15-alpine
 
 # `psql`, for the one thing this container does over the database's
 # unix socket: replace a password nobody holds any more (the graph's

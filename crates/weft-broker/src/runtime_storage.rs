@@ -187,14 +187,28 @@ fn map_err(e: RuntimeStoreError) -> ApiError {
         RuntimeStoreError::RemovalIncomplete(m) => (StatusCode::CONFLICT, m),
         // SYNC: replace outcome statuses <-> crates/weft-engine/src/storage.rs WorkerStorage::replace
         RuntimeStoreError::Stale(m) => (StatusCode::PRECONDITION_FAILED, m),
-        // A dropped database connection is said as one (logged with its
-        // cause): asking again is the fix. Anything else is the generic body.
-        RuntimeStoreError::Other(e) => match crate::handlers::unavailable_or_internal(e.context("runtime-store op failed")) {
-            (StatusCode::INTERNAL_SERVER_ERROR, _) => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_STORAGE_ERROR_BODY.to_string()),
-            unavailable => unavailable,
-        },
+        // A database that could not be reached is said as one (logged with
+        // its cause), and "nothing was done" only when the store failed
+        // before its first write, so the caller waits and sends the call
+        // again; past a write, asking again is still the fix, without that
+        // promise. Anything else is the generic body.
+        RuntimeStoreError::BeforeWrites(e) => {
+            opaque(crate::handlers::unavailable_or_internal(e.context("runtime-store op failed")))
+        }
+        RuntimeStoreError::Other(e) => {
+            opaque(crate::handlers::unavailable_after_writes_or_internal(e.context("runtime-store op failed")))
+        }
     };
     ApiError { status, message, completing }
+}
+
+/// A failed database call's answer, with a 500's body replaced by
+/// [`INTERNAL_STORAGE_ERROR_BODY`] (the cause is in the log).
+fn opaque(answer: (StatusCode, String)) -> (StatusCode, String) {
+    match answer {
+        (StatusCode::INTERNAL_SERVER_ERROR, _) => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_STORAGE_ERROR_BODY.to_string()),
+        answer => answer,
+    }
 }
 
 fn unavailable_file_message(key: &str) -> String {
@@ -222,11 +236,6 @@ fn unavailable_file_message(key: &str) -> String {
          waiting. Create the file again and start a new run; to keep a file longer \
          next time, put a Keep File node after the one that made it, or raise its days."
     )
-}
-
-fn map_anyhow(e: anyhow::Error) -> ApiError {
-    tracing::error!(target: "weft_broker::runtime_storage", error = format!("{e:#}"), "runtime-store op failed");
-    (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_STORAGE_ERROR_BODY.to_string()).into()
 }
 
 // ---------- caller resolution ----------
@@ -550,7 +559,7 @@ async fn list_files(
     let caller = worker_caller(&state, &headers).await?;
     let store = &state.runtime_store;
     let prefix = key::prefix_for_list(&caller, &q.scope).map_err(|e| (StatusCode::FORBIDDEN, e))?;
-    let files = store.list(&prefix).await.map_err(map_anyhow)?;
+    let files = store.list(&prefix).await.map_err(map_err)?;
     Ok(Json(ListFilesResponse { files }))
 }
 
@@ -637,7 +646,8 @@ async fn visitor_address(state: &BrokerState, project: uuid::Uuid) -> Result<Opt
         .bind(project)
         .fetch_optional(&state.pool)
         .await
-        .map_err(|e| map_anyhow(anyhow::Error::from(e).context("read the project's visitor address")))
+        // A read, ahead of every write of the call that asks it.
+        .map_err(|e| opaque(crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("read the project's visitor address"))).into())
 }
 
 /// Where a link goes, and whether the open internet opens it. Node code
@@ -1231,7 +1241,7 @@ async fn admin_tenant_list(
     let store = &state.runtime_store;
     let prefix = key::ParsedKey::tenant_prefix(&req.tenant)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let files = store.list(&prefix).await.map_err(map_anyhow)?;
+    let files = store.list(&prefix).await.map_err(map_err)?;
     Ok(Json(ListFilesResponse { files }))
 }
 
@@ -1242,7 +1252,7 @@ async fn admin_tenant_usage(
 ) -> Result<Json<TenantUsage>, ApiError> {
     control_plane(&state, &headers).await?;
     let store = &state.runtime_store;
-    let (file_count, stored_bytes) = store.tenant_usage(&req.tenant).await.map_err(map_anyhow)?;
+    let (file_count, stored_bytes) = store.tenant_usage(&req.tenant).await.map_err(map_err)?;
     Ok(Json(TenantUsage { stored_bytes, file_count }))
 }
 
@@ -1334,7 +1344,7 @@ async fn admin_sweep_run(
 ) -> Result<Json<SweepRunResponse>, ApiError> {
     control_plane(&state, &headers).await?;
     let store = &state.runtime_store;
-    let swept = store.sweep_run(&req.tenant, &req.run_id).await.map_err(map_anyhow)?;
+    let swept = store.sweep_run(&req.tenant, &req.run_id).await.map_err(map_err)?;
     // A row the bucket refused is marked and shown in `weft status` (the one
     // record of it); the run's end is done with either way.
     if !swept.refused.is_empty() {
@@ -1485,6 +1495,235 @@ mod link_route_tests {
     fn a_slot_with_no_upload_says_so() {
         let super::ApiError { status, message, .. } = map_err(RuntimeStoreError::NoUpload("nothing was uploaded".into()));
         assert_eq!((status, message.as_str()), (StatusCode::NOT_FOUND, "nothing was uploaded"));
+    }
+
+    /// A store op may have committed its first steps when a later one gets
+    /// no connection, so it is told to ask again, never that nothing was
+    /// done.
+    #[test]
+    fn a_store_op_without_a_connection_never_says_nothing_was_done() {
+        let super::ApiError { status, message, .. } = map_err(RuntimeStoreError::Other(sqlx::Error::PoolTimedOut.into()));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(message, weft_broker_client::protocol::NOT_DONE);
+    }
+
+    /// A store op that could not get a connection before its first write
+    /// says nothing was done, so the caller waits and sends it again; any
+    /// other failure there keeps the generic body.
+    #[test]
+    fn a_store_op_without_its_first_connection_says_nothing_was_done() {
+        let super::ApiError { status, message, .. } = map_err(RuntimeStoreError::BeforeWrites(sqlx::Error::PoolTimedOut.into()));
+        assert_eq!((status, message.as_str()), (StatusCode::SERVICE_UNAVAILABLE, weft_broker_client::protocol::NOT_DONE));
+        let super::ApiError { status, message, .. } = map_err(RuntimeStoreError::BeforeWrites(sqlx::Error::RowNotFound.into()));
+        assert_eq!((status, message.as_str()), (StatusCode::INTERNAL_SERVER_ERROR, super::INTERNAL_STORAGE_ERROR_BODY));
+    }
+}
+
+// These tests need a real Postgres. A module named `db_tests` is how
+// `.config/nextest.toml` finds database tests inside a library: the
+// default profile leaves them out, the `db` profile runs them.
+#[cfg(test)]
+mod db_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use sqlx::pool::PoolConnection;
+    use sqlx::postgres::PgPoolOptions;
+    use sqlx::{PgPool, Postgres};
+    use weft_core::storage::key::{self, CallerAuth};
+    use weft_core::storage::StorageScope;
+    use weft_platform_traits::clock::FakeClock;
+    use weft_platform_traits::object_store::fake::FakeObjectStore;
+    use weft_platform_traits::object_store::{GetLink, ObjectEntry};
+    use weft_platform_traits::{CopyProgress, ObjectStore, PresignAudience};
+
+    use super::{map_err, ApiError, StatusCode};
+    use crate::entitlement::LocalEntitlementSource;
+    use crate::runtime_store::{BeginUpload, RuntimeStore, RuntimeStoreError, UploadSpec};
+
+    /// The fake bucket, which on its first `delete` takes the one
+    /// connection of `pool` and keeps it: whatever the caller asks of the
+    /// database after that bucket call finds no connection. Dumb injection.
+    struct TakesTheConnectionOnDelete {
+        bucket: FakeObjectStore,
+        pool: PgPool,
+        taken: tokio::sync::Mutex<Option<PoolConnection<Postgres>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for TakesTheConnectionOnDelete {
+        async fn put(&self, key: &str, bytes: Bytes) -> anyhow::Result<()> {
+            self.bucket.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> anyhow::Result<Option<Bytes>> {
+            self.bucket.get(key).await
+        }
+        async fn get_range(&self, key: &str, start: u64, end: u64) -> anyhow::Result<Option<Bytes>> {
+            self.bucket.get_range(key, start, end).await
+        }
+        async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+            self.bucket.exists(key).await
+        }
+        async fn size(&self, key: &str) -> anyhow::Result<Option<u64>> {
+            self.bucket.size(key).await
+        }
+        async fn delete(&self, key: &str) -> anyhow::Result<()> {
+            let mut taken = self.taken.lock().await;
+            if taken.is_none() {
+                *taken = Some(self.pool.acquire().await.expect("the pool's one connection"));
+            }
+            self.bucket.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> anyhow::Result<Vec<ObjectEntry>> {
+            self.bucket.list(prefix).await
+        }
+        async fn presign_get(&self, key: &str, link: &GetLink) -> anyhow::Result<String> {
+            self.bucket.presign_get(key, link).await
+        }
+        async fn create_multipart(&self, key: &str, content_type: &str) -> anyhow::Result<String> {
+            self.bucket.create_multipart(key, content_type).await
+        }
+        async fn copy(&self, from: &str, to: &str, progress: &dyn CopyProgress) -> anyhow::Result<u64> {
+            self.bucket.copy(from, to, progress).await
+        }
+        async fn presign_part(
+            &self,
+            key: &str,
+            upload_id: &str,
+            part_number: i32,
+            part_size: u64,
+            audience: &PresignAudience,
+            ttl_secs: u64,
+        ) -> anyhow::Result<String> {
+            self.bucket.presign_part(key, upload_id, part_number, part_size, audience, ttl_secs).await
+        }
+        async fn upload_part(&self, key: &str, upload_id: &str, part_number: i32, bytes: Bytes) -> anyhow::Result<String> {
+            self.bucket.upload_part(key, upload_id, part_number, bytes).await
+        }
+        async fn complete_multipart(&self, key: &str, upload_id: &str, parts: &[(i32, String)]) -> anyhow::Result<u64> {
+            self.bucket.complete_multipart(key, upload_id, parts).await
+        }
+        async fn abort_multipart(&self, key: &str, upload_id: &str) -> anyhow::Result<()> {
+            self.bucket.abort_multipart(key, upload_id).await
+        }
+        async fn multipart_exists(&self, key: &str, upload_id: &str) -> anyhow::Result<bool> {
+            self.bucket.multipart_exists(key, upload_id).await
+        }
+    }
+
+    /// A delete fences its file's row and commits, removes the object, then
+    /// drops the row. When the last step gets no connection, the first two
+    /// are done (sending the delete again finds no file), so the answer
+    /// asks again without saying nothing was done.
+    #[sqlx::test]
+    async fn a_delete_that_loses_its_connection_after_the_fence_never_says_nothing_was_done(pool: PgPool) {
+        weft_task_store::apply_groups(&pool, &[&crate::runtime_store::GROUP, &weft_task_store::unanswered::GROUP])
+            .await
+            .unwrap();
+        weft_task_store::unanswered::judged_run_columns(&pool).await.unwrap();
+        // One connection, waited for briefly, so the step after the bucket's
+        // delete finds none.
+        let one = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(1))
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let bucket = Arc::new(TakesTheConnectionOnDelete { bucket: FakeObjectStore::new(), pool: one.clone(), taken: Default::default() });
+        let clock = FakeClock::new();
+        // The file is stored through the whole pool; only the delete runs
+        // on the one connection.
+        let stores = RuntimeStore::new(pool.clone(), bucket.clone(), clock.clone());
+        let store = RuntimeStore::new(one.clone(), bucket.clone(), clock);
+        let caller = CallerAuth::Worker { tenant: "t1".into(), project_id: "p1".into(), run_id: Some("c1".into()), instance: None };
+        let spec = UploadSpec {
+            scope: &StorageScope::Project,
+            mime: "text/plain",
+            filename: "empty",
+            keep: None,
+            declared_size: Some(0),
+            content_hash: None,
+            identity: None,
+            slot: None,
+            imported: None,
+        };
+        let entitlements = LocalEntitlementSource::from_env();
+        let BeginUpload::Ready { key, .. } = stores.begin_upload(&caller, &spec, &entitlements).await.unwrap() else {
+            panic!("a uuid-id begin is ready");
+        };
+        stores.complete_upload(&caller, &key).await.unwrap();
+        assert!(!bucket.bucket.is_empty(), "the empty file is an object");
+        let parsed = key::parse_key(&key).unwrap();
+
+        let failed = store.delete(&parsed).await.unwrap_err();
+        let RuntimeStoreError::Other(cause) = &failed else { panic!("a database failure, got {failed:?}") };
+        assert!(
+            cause.chain().any(|e| matches!(e.downcast_ref::<sqlx::Error>(), Some(sqlx::Error::PoolTimedOut))),
+            "the last step got no connection: {cause:#}"
+        );
+        let ApiError { status, message, .. } = map_err(failed);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(message, weft_broker_client::protocol::NOT_DONE);
+
+        // What committed before the failure: the row is fenced and the
+        // object is gone, so the delete sent again finds no file.
+        let status: String = sqlx::query_scalar("SELECT status FROM runtime_file WHERE key = $1").bind(&key).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "reaping");
+        assert!(bucket.bucket.is_empty(), "the object was removed");
+        drop(bucket.taken.lock().await.take());
+        assert!(matches!(store.delete(&parsed).await, Err(RuntimeStoreError::NotFound(_))));
+    }
+
+    /// A delete that cannot get its first connection has done nothing: it
+    /// says so, the caller sends it again, and that one deletes the file.
+    #[sqlx::test]
+    async fn a_delete_with_no_first_connection_says_nothing_was_done(pool: PgPool) {
+        weft_task_store::apply_groups(&pool, &[&crate::runtime_store::GROUP, &weft_task_store::unanswered::GROUP])
+            .await
+            .unwrap();
+        weft_task_store::unanswered::judged_run_columns(&pool).await.unwrap();
+        let one = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(1))
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let bucket = Arc::new(FakeObjectStore::new());
+        let clock = FakeClock::new();
+        let stores = RuntimeStore::new(pool.clone(), bucket.clone(), clock.clone());
+        let store = RuntimeStore::new(one.clone(), bucket.clone(), clock);
+        let caller = CallerAuth::Worker { tenant: "t1".into(), project_id: "p1".into(), run_id: Some("c1".into()), instance: None };
+        let spec = UploadSpec {
+            scope: &StorageScope::Project,
+            mime: "text/plain",
+            filename: "empty",
+            keep: None,
+            declared_size: Some(0),
+            content_hash: None,
+            identity: None,
+            slot: None,
+            imported: None,
+        };
+        let entitlements = LocalEntitlementSource::from_env();
+        let BeginUpload::Ready { key, .. } = stores.begin_upload(&caller, &spec, &entitlements).await.unwrap() else {
+            panic!("a uuid-id begin is ready");
+        };
+        stores.complete_upload(&caller, &key).await.unwrap();
+        let parsed = key::parse_key(&key).unwrap();
+
+        let taken = one.acquire().await.unwrap();
+        let failed = store.delete(&parsed).await.unwrap_err();
+        assert!(matches!(failed, RuntimeStoreError::BeforeWrites(_)), "{failed:?}");
+        let ApiError { status, message, .. } = map_err(failed);
+        assert_eq!((status, message.as_str()), (StatusCode::SERVICE_UNAVAILABLE, weft_broker_client::protocol::NOT_DONE));
+        let status: String = sqlx::query_scalar("SELECT status FROM runtime_file WHERE key = $1").bind(&key).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "active", "nothing of the delete ran");
+        assert!(!bucket.is_empty(), "the object is still there");
+
+        drop(taken);
+        store.delete(&parsed).await.unwrap();
+        assert!(bucket.is_empty(), "the delete sent again removed the file");
     }
 }
 

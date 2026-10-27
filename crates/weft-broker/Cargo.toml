@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-weft-core = { workspace = true, features = ["server"] }
+weft-core = { workspace = true, features = ["server", "jwt"] }
 weft-journal = { workspace = true }
 weft-task-store = { workspace = true, features = ["serve"] }
 weft-access-store = { workspace = true }
@@ -26,30 +26,31 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono"] }
-lru = "0.16"
+sqlx = { workspace = true, features = ["json", "uuid", "chrono"] }
+lru = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 # The events receive surface: raw push bodies travel base64 in the
 # dispatcher's forward, and Google-issued identity tokens are verified
-# against the published key set.
+# against the published key set (`weft_core::jwt`).
 base64 = { workspace = true }
-jsonwebtoken = { workspace = true }
 url = { workspace = true }
-getrandom = "0.2"
+getrandom = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# The database tests build their tables with `apply_groups`.
+weft-task-store = { workspace = true, features = ["migrate"] }
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 futures = { workspace = true }
 # The access-apps file provider's tests write real files.
 tempfile = { workspace = true }
 # `#[sqlx::test]` provisions a fresh isolated DB per test for the Layer-3 suite.
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "migrate"] }
+sqlx = { workspace = true, features = ["macros", "migrate"] }
 # Dev-only, for the provider-declaration resolution suite: the table is
 # written by the dispatcher (`provider_decl::record`, which owns its schema)
 # and read by this crate's `provider_proxy::declared_base_url` as plain SQL

@@ -57,12 +57,13 @@ async fn run_inner(
     let body = DeactivateRequest { choice, scope };
     progress.drain_wait(take_down.running, crate::progress::DrainOn::Deactivate);
     progress.dispatcher_call_start(&path);
-    let answer: DeactivateResponse = serde_json::from_value(client.post_json(&path, &serde_json::to_value(&body)?).await?)
-        .map_err(|e| anyhow::anyhow!("deactivate: the dispatcher's answer does not read as one ({e}); upgrade the dispatcher or this CLI so the versions match"))?;
+    let answer: DeactivateResponse =
+        crate::client::read_answer(client.post_json(&path, &serde_json::to_value(&body)?).await?, "the deactivate's answer")?;
     // The triggers are down; the runs they fired finish on their own
     // version, followed in short looks until they have.
     if let Some(task) = answer.waiting {
-        super::follow::follow_task(&client, progress, &id, task).await?;
+        // The wait says nothing on the way (`take_down_wait`).
+        super::follow::follow_task(&client, progress, &id, task, async |_| Ok(())).await?;
     }
     progress.dispatcher_call_done(serde_json::to_value(&answer)?);
     if !ctx.json() {

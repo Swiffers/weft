@@ -2,7 +2,7 @@
   "name": "weft-vscode",
   "displayName": "Weft",
   "description": "Write Weft programs and watch them run: a live, editable graph of every .weft file, with diagnostics and runs in the editor.",
-  "version": "0.2.276",
+  "version": "0.2.277",
   "publisher": "weavemind",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -30,7 +30,7 @@
   },
   "pricing": "Free",
   "qna": "https://github.com/WeaveMindAI/weft/issues",
-  "packageManager": "pnpm@10.32.1",
+  "packageManager": "pnpm@10.34.9",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -448,8 +448,8 @@
     "tailwind-variants": "^3.3.1",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
-    "vite": "^7.3.6",
-    "vitest": "^4.1.11"
+    "vite": "^7.3.7",
+    "vitest": "^4.1.12"
   },
   "dependencies": {
     "@babel/runtime": "^7.29.7",

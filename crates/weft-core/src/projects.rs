@@ -258,6 +258,29 @@ pub struct ProjectStatusResponse {
     /// Empty when none does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unanswered: Vec<Unanswered>,
+    /// The project's resync, while its transition is `resyncing`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resync: Option<ResyncStanding>,
+}
+
+/// A resync under way, as `weft status` shows it: stopped, with why and
+/// what comes next, or going, with where its task last said it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResyncStanding {
+    /// Set while it stands still with nothing driving it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<ResyncStop>,
+    #[serde(default)]
+    pub progress: crate::deactivation::ResyncProgress,
+}
+
+/// Why a resync stands still, and what comes next, in a person's words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResyncStop {
+    pub error: String,
+    pub then: String,
 }
 
 /// Part of weft's own work that keeps failing, so the work behind it
@@ -405,6 +428,7 @@ pub struct LimitedEntry {
 /// One instance's copy of an infra node in the status answer.
 // SYNC: InstanceInfraEntry <-> packages/weft-graph/src/protocol.ts InstanceInfraEntry
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InstanceInfraEntry {
     pub node: String,
     pub instance: crate::instance::InstanceId,
@@ -417,6 +441,10 @@ pub struct InstanceInfraEntry {
     /// ([`ProjectInfraEntry::behind`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub behind: bool,
+    /// The latest restart of its containers since weft last started it
+    /// ([`ProjectInfraEntry::last_restart`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_restart: Option<crate::infra::LastRestart>,
 }
 
 crate::wire_enum! {
@@ -615,6 +643,12 @@ pub struct ProjectInfraEntry {
     /// shared one), by owner: what taking it down takes down with it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub takes_down: Vec<crate::activation::OwnerTriggers>,
+    /// The latest time one of its copy's containers stopped on its own
+    /// (ran out of memory, exited) and its host brought it back, since
+    /// weft last started the copy: what `weft status` and the editor tell,
+    /// with what to do about it ([`LastRestart::describe`](crate::infra::LastRestart::describe)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_restart: Option<crate::infra::LastRestart>,
 }
 
 // SYNC: ProjectRunsSummary <-> packages/weft-graph/src/status.ts RawStatusPayload.runs

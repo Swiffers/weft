@@ -19,7 +19,7 @@ weft-compiler = { path = "../weft-compiler", features = ["build"] }
 weft-catalog = { workspace = true }
 weft-assets = { workspace = true }
 weft-journal = { workspace = true }
-weft-task-store = { workspace = true, features = ["serve"] }
+weft-task-store = { workspace = true, features = ["serve", "migrate"] }
 weft-access-store = { workspace = true }
 weft-broker-client = { path = "../weft-broker-client" }
 weft-platform-traits = { workspace = true }
@@ -38,7 +38,7 @@ chrono = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono"] }
+sqlx = { workspace = true, features = ["json", "uuid", "chrono"] }
 tokio-tungstenite = { workspace = true }
 sha2 = { workspace = true }
 # The events receiver forwards raw push bodies to the broker base64'd
@@ -62,7 +62,7 @@ weft-dispatcher = { path = ".", features = ["test-helpers"] }
 weft-broker = { path = "../weft-broker" }
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 # `#[sqlx::test]` (macros + migrate) provisions a fresh isolated DB per test.
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono", "macros", "migrate"] }
+sqlx = { workspace = true, features = ["json", "uuid", "chrono", "macros", "migrate"] }
 # `test-util`: the paused virtual clock the wake-loop tests (`pg_wake`)
 # run on, so their safety ticks pass without real waiting.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

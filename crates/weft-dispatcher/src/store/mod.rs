@@ -397,6 +397,13 @@ pub trait SignalStore: Send + Sync {
         tokens: &[String],
     ) -> anyhow::Result<Vec<SignalRegistration>>;
 
+    /// Remove `token`'s row only while it is still the registration
+    /// `generation` (the one a [`SignalWrite::Written`] named), and return
+    /// it. `None` when the row is gone or a later write made it another
+    /// registration, which then owns it: the undo of a registration that
+    /// created its row, which must never remove a later arm's.
+    async fn signal_remove_registration(&self, token: &str, generation: i64) -> anyhow::Result<Option<SignalRegistration>>;
+
     /// Delete the wait `token` of run `run_id`, given up by its run,
     /// and return it for the listener to let go of. A token that is no
     /// wait of that run (an entry trigger, another run's wait, a wait
@@ -594,11 +601,13 @@ pub struct SignalRegistration {
     pub generation: i64,
 }
 
-/// What a [`SignalStore::signal_insert`] did.
+/// What a [`SignalStore::signal_insert`] (or a restore) did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalWrite {
-    /// The row is written, its kind state at a new version.
-    Written,
+    /// The row is written, its kind state at a new version, as the
+    /// registration `generation` (see [`SignalRegistration::generation`]):
+    /// what an undo of this write checks the row still is.
+    Written { generation: i64 },
     /// The row's kind state moved past the version the registration read
     /// it at (a wake claimed a moment in between), so nothing was
     /// written: read the row again and compute the state again from it.

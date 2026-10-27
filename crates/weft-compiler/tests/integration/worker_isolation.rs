@@ -68,7 +68,7 @@ fn read(root: &std::path::Path, rel: &str) -> String {
 fn every_package_is_an_optional_dependency_on_by_default() {
     let (_project, out) = emit_two_packages();
     let toml = read(out.path(), "Cargo.toml");
-    let manifest: toml::Value = toml.parse().expect("the manifest parses");
+    let manifest: toml::Value = toml::from_str(&toml).expect("the manifest parses");
     for ident in ["pkg_format", "pkg_slack"] {
         let dep = &manifest["dependencies"][ident];
         assert_eq!(dep["optional"].as_bool(), Some(true), "{toml}");
@@ -106,7 +106,7 @@ fn the_registry_gates_each_package_and_reads_the_embedded_record() {
 fn a_package_build_script_belongs_to_its_package_crate() {
     let (project, out) = emit_two_packages();
     assert!(!out.path().join("build.rs").exists(), "the worker crate has no build script");
-    let worker: toml::Value = read(out.path(), "Cargo.toml").parse().expect("the manifest parses");
+    let worker: toml::Value = toml::from_str(&read(out.path(), "Cargo.toml")).expect("the manifest parses");
     assert!(worker["package"].get("build").is_none());
     assert!(worker.get("build-dependencies").is_none());
     let crate_dir = |ident: &str| {
@@ -116,12 +116,12 @@ fn a_package_build_script_belongs_to_its_package_crate() {
             .find(|name| name.starts_with(&format!("{ident}-")))
             .unwrap_or_else(|| panic!("no {ident} crate"))
     };
-    let slack: toml::Value = read(&out.path().join(crate_dir("pkg_slack")), "Cargo.toml").parse().expect("slack's manifest parses");
+    let slack: toml::Value = toml::from_str(&read(&out.path().join(crate_dir("pkg_slack")), "Cargo.toml")).expect("slack's manifest parses");
     let script = slack["package"]["build"].as_str().expect("slack's crate builds its script");
     let staged = project.path().join("nodes/slack/build.rs");
     let in_container = format!("{}/{}", weft_compiler::worker_image::NODES_MOUNT, "nodes/slack/build.rs");
     assert!(script == in_container || std::path::Path::new(script) == staged, "{script}");
-    let format: toml::Value = read(&out.path().join(crate_dir("pkg_format")), "Cargo.toml").parse().expect("format's manifest parses");
+    let format: toml::Value = toml::from_str(&read(&out.path().join(crate_dir("pkg_format")), "Cargo.toml")).expect("format's manifest parses");
     assert!(format["package"].get("build").is_none(), "no build.rs, no build script");
 }
 
@@ -148,7 +148,7 @@ fn the_isolation_files_sit_beside_the_crate() {
     assert!((1_577_836_800..1_577_836_800 + 5 * 365 * 24 * 3600).contains(&since_epoch), "{dated:?}");
 
     let helper = out.path().join(weft_compiler::codegen::isolate_dir_name());
-    let manifest: toml::Value = read(&helper, "Cargo.toml").parse().expect("helper manifest parses");
+    let manifest: toml::Value = toml::from_str(&read(&helper, "Cargo.toml")).expect("helper manifest parses");
     assert!(manifest.get("workspace").is_some(), "its own workspace");
     assert_eq!(
         manifest["package"]["name"].as_str(),

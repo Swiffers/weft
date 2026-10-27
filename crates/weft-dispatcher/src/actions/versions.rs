@@ -118,7 +118,7 @@ pub(crate) async fn stamp(
     root: bool,
 ) -> Result<(VersionUpsert, WorkingCopyRow), Refused> {
     let stamped = with_tree_lock(state, project, || async { stamp_locked(state, project, copy, label, root).await }).await?;
-    publish_references(state, project, &[]).await?;
+    publish_references(state, project, &[]).await.map_err(crate::api::after_writes)?;
     Ok(stamped)
 }
 
@@ -384,7 +384,7 @@ pub async fn switch(state: &DispatcherState, actor: &Actor, project: uuid::Uuid,
     })
     .await?;
     announce(state, project, switched.copy.id).await;
-    publish_references(state, project, &[]).await?;
+    publish_references(state, project, &[]).await.map_err(crate::api::after_writes)?;
     Ok(switched)
 }
 
@@ -418,7 +418,7 @@ pub async fn forget(state: &DispatcherState, actor: &Actor, project: uuid::Uuid,
     })
     .await?;
     announce(state, project, copy).await;
-    publish_references(state, project, &[]).await?;
+    publish_references(state, project, &[]).await.map_err(crate::api::after_writes)?;
     Ok(forgotten)
 }
 
@@ -798,7 +798,7 @@ pub async fn prune(
     if !deleted {
         return Ok(PruneResponse { plan, deleted });
     }
-    publish_references(state, project, &[]).await?;
+    publish_references(state, project, &[]).await.map_err(crate::api::after_writes)?;
     // The journals go OUTSIDE the lock: their version rows are already
     // gone, so nothing can decide anything about these runs any more, and
     // a storage wipe per run would hold a pooled connection while every

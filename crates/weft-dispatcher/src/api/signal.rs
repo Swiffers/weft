@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use weft_task_store::sql;
 use axum::{
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
@@ -73,7 +74,7 @@ pub async fn instance_waiting_tokens(
     project_id: uuid::Uuid,
     instance: &weft_core::instance::InstanceId,
 ) -> anyhow::Result<Vec<String>> {
-    Ok(sqlx::query_scalar(&format!(
+    Ok(sqlx::query_scalar(sql!(
         "SELECT s.token FROM signal s {} \
          WHERE s.project_id = $1 AND s.instance_id = $2 \
            AND COALESCE(a.status, 'active') = 'active' \
@@ -389,8 +390,8 @@ impl FireGateInfo {
 /// governs it (`signal.activation_trigger` + `signal.instance_id`, the one
 /// join `SIGNAL_ACTIVATION_JOIN`). No governing activation reads as
 /// live and accepting.
-fn gate_select() -> String {
-    format!(
+fn gate_select() -> sqlx::AssertSqlSafe<String> {
+    sql!(
         "SELECT s.token, s.project_id, s.tenant_id, s.surface_kind, s.auth_kind, \
                 s.is_resume, s.binary_hash, \
                 COALESCE(a.status, 'active') AS status, \
@@ -423,7 +424,7 @@ pub(crate) async fn lookup_signal_routing(
     state: &DispatcherState,
     token: &str,
 ) -> Result<FireGateInfo, (StatusCode, String)> {
-    let row = sqlx::query(&gate_select())
+    let row = sqlx::query(gate_select())
         .bind(token)
         .fetch_optional(&state.pg_pool)
         .await
@@ -973,7 +974,7 @@ pub async fn signals_visible_to(
     // One decoder for a signal row, shared with `PostgresStore`
     // (`row_to_signal`): the SELECT differs (a join and the consumer
     // filters), the columns and the decoding must not.
-    let rows = sqlx::query_as::<_, crate::store::postgres::SignalRow>(&format!(
+    let rows = sqlx::query_as::<_, crate::store::postgres::SignalRow>(sql!(
         concat!("SELECT ", crate::store::postgres::signal_columns!("s."), " \
          FROM signal s {join} \
          WHERE COALESCE(a.fires_visible_to_consumers, TRUE) = TRUE \
@@ -1310,7 +1311,7 @@ async fn read_tenant_routes(pool: &sqlx::PgPool, tenant: &str) -> Result<Vec<Hel
     // activation's standing, read as the fire gate reads it
     // (`gate_select`: no governing activation reads as live and accepting)
     type MountRow = (String, String, Vec<String>, uuid::Uuid, String, String, bool, Option<i64>);
-    let rows: Vec<MountRow> = sqlx::query_as(&format!(
+    let rows: Vec<MountRow> = sqlx::query_as(sql!(
         "SELECT s.token, s.mount_path, s.mount_methods, s.project_id, s.binary_hash, \
                 COALESCE(a.status, 'active'), COALESCE(a.accepting_fires, TRUE), a.fires_deadline_unix \
          FROM signal s {} \

@@ -55,10 +55,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve { config, .. } => Some(weft_platform_traits::InstallConfig::load(config)?),
         Command::UnitAgent { .. } => None,
     };
-    // Every weft crate at info. The alert line is the platform's to write
+    // Every weft crate at info, and sqlx's own warnings (a connection
+    // that broke), never its per-query lines. Its reports of each slow
+    // acquire and each slow statement stay out: under load they come once
+    // a request, which floods the log; `weft_task_store::throttle` counts
+    // the slow acquires and says them once a minute. The alert line is the platform's to write
     // (`platform::alert_lines`), never the ordinary log's.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "weft=info".into())
+        .unwrap_or_else(|_| "weft=info,sqlx=warn,sqlx::pool::acquire=off,sqlx::query=error".into())
         .add_directive(format!("{}=off", weft_platform_traits::ALERT_TARGET).parse()?);
     let lines = match &args.command {
         // A local install's runtime keeps its own log, bounded; anywhere
@@ -74,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(config.as_ref().and_then(weft_runtime::platform::alert_lines))
         .with(lines.with_filter(filter))
+        .with(weft_task_store::throttle::slow_acquires())
         .init();
     match args.command {
         Command::Serve { role, .. } => {

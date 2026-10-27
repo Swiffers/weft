@@ -8,6 +8,8 @@
 
 use std::sync::Arc;
 
+use weft_task_store::sql;
+
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 
@@ -412,8 +414,8 @@ pub(crate) fn transition_held(p: &str, stale_before: &str) -> String {
 /// Land at rest every project in a transition nothing holds any more
 /// ([`transition_held`]): `$1` the oldest heartbeat still alive, `$2` one
 /// project, or NULL for every one. Answers the ids it landed.
-pub(crate) fn settle_transition_sql() -> String {
-    format!(
+pub(crate) fn settle_transition_sql() -> sqlx::AssertSqlSafe<String> {
+    sql!(
         "UPDATE project p SET transition = 'none' \
          WHERE p.transition <> 'none' \
            AND NOT {} \
@@ -814,8 +816,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // command and carries on from there.
         weft_task_store::DataStep {
             table: "project",
-            column: "head_version",
-            until: weft_task_store::Until::Dropped,
+            until: weft_task_store::Until::Dropped("head_version"),
             sql: "INSERT INTO working_copy (id, project_id, kind, head_version, head_run, working_manifest, synced, conflicts, revision, created_at, updated_at) \
                   SELECT gen_random_uuid(), p.id, 'program', p.head_version, p.head_run, \
                          COALESCE((SELECT v.manifest FROM project_version v WHERE v.project_id = p.id AND v.id = p.head_version), '{}'::jsonb), \
@@ -1308,7 +1309,7 @@ impl ProjectStoreOps for PostgresProjectStore {
     async fn try_begin_building(&self, id: uuid::Uuid, stale_before: i64) -> anyhow::Result<bool> {
         let now = crate::lease::now_unix();
         let mut tx = self.pool.begin().await?;
-        let res = sqlx::query(&format!(
+        let res = sqlx::query(sql!(
             "UPDATE project \
              SET transition = 'building', transition_heartbeat_unix = $1 \
              WHERE id = $2 \
@@ -1342,7 +1343,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         // checks it, under the row lock every registration takes
         // (`crate::build::waiting::settle`), so no build lands between the
         // check and the resync holding the project.
-        let sql = format!(
+        let sql = sql!(
             "UPDATE project SET transition = 'resyncing', transition_heartbeat_unix = 0, {} \
              WHERE id = $1 AND transition = 'none' \
                AND ($5::text IS NULL OR running_binary_hash = $5) \
@@ -1353,7 +1354,7 @@ impl ProjectStoreOps for PostgresProjectStore {
             ResyncPlan::ROW
         );
         let entered = plan
-            .row_write(id, &sql)
+            .row_write(id, sql)
             .bind(&plan.build.binary_hash)
             .bind(&plan.build.definition_hash)
             .bind(&plan.build.infra_hash)
@@ -1369,18 +1370,28 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn resync(&self, id: uuid::Uuid) -> anyhow::Result<Option<crate::task_kinds::resync::ResyncState>> {
-        let row: Option<(serde_json::Value, weft_core::stored::Version, Option<uuid::Uuid>, bool)> = sqlx::query_as(
-            "SELECT p.resync, p.resync_version, p.resync_driver, \
-                    EXISTS (SELECT 1 FROM task t WHERE t.tenant_id = p.tenant_id AND t.kind = $2 \
-                            AND t.dedup_key = p.resync_driver::text AND t.status IN ('pending', 'claimed')) \
+        // Whether a task of its drive is pending or claimed, and where that
+        // task last said it is (NULL until it says).
+        let row: Option<(serde_json::Value, weft_core::stored::Version, Option<uuid::Uuid>, bool, Option<serde_json::Value>)> = sqlx::query_as(
+            "WITH driving AS ( \
+                 SELECT t.progress FROM task t JOIN project p ON t.tenant_id = p.tenant_id \
+                 WHERE p.id = $1 AND t.kind = $2 AND t.dedup_key = p.resync_driver::text AND t.status IN ('pending', 'claimed') \
+                 LIMIT 1) \
+             SELECT p.resync, p.resync_version, p.resync_driver, EXISTS (SELECT 1 FROM driving), (SELECT progress FROM driving) \
              FROM project p WHERE p.id = $1 AND p.transition = 'resyncing' AND p.resync IS NOT NULL",
         )
         .bind(id)
         .bind(weft_task_store::TaskKind::Resync.as_str())
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|(json, version, driver, driven)| {
-            Ok(crate::task_kinds::resync::ResyncState { plan: ResyncPlan::stored(id, json, version, driver)?, driven })
+        row.map(|(json, version, driver, driven, progress)| {
+            let plan = ResyncPlan::stored(id, json, version, driver)?;
+            let progress = match progress.filter(|_| driven) {
+                Some(progress) => serde_json::from_value(progress)
+                    .map_err(|e| anyhow::anyhow!("project {id}'s resync task says where it is in a shape this weft does not read: {e}"))?,
+                None => Default::default(),
+            };
+            Ok(crate::task_kinds::resync::ResyncState { plan, driven, progress })
         })
         .transpose()
     }
@@ -1403,8 +1414,8 @@ impl ProjectStoreOps for PostgresProjectStore {
     async fn write_resync(&self, id: uuid::Uuid, plan: &crate::task_kinds::resync::ResyncPlan) -> anyhow::Result<bool> {
         // Only the drive the plan names writes it.
         let sql =
-            format!("UPDATE project SET {} WHERE id = $1 AND transition = 'resyncing' AND resync_driver = $4", ResyncPlan::ROW);
-        let written = plan.row_write(id, &sql).execute(&self.pool).await?;
+            sql!("UPDATE project SET {} WHERE id = $1 AND transition = 'resyncing' AND resync_driver = $4", ResyncPlan::ROW);
+        let written = plan.row_write(id, sql).execute(&self.pool).await?;
         Ok(written.rows_affected() > 0)
     }
 
@@ -1414,7 +1425,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         if plan.stopped.is_some() {
             plan.driver = uuid::Uuid::now_v7();
             plan.stopped = None;
-            plan.row_write(id, &format!("UPDATE project SET {} WHERE id = $1", ResyncPlan::ROW)).execute(&mut *tx).await?;
+            plan.row_write(id, sql!("UPDATE project SET {} WHERE id = $1", ResyncPlan::ROW)).execute(&mut *tx).await?;
         }
         let task = crate::task_kinds::resync::task(tenant, id, plan.driver);
         let task = weft_task_store::tasks::enqueue_dedup_in(&mut tx, task).await?.id();
@@ -1461,8 +1472,8 @@ impl ProjectStoreOps for PostgresProjectStore {
             left_down: crate::task_kinds::resync::left_down(&plan, &rows),
             unreadable: None,
         });
-        let sql = format!("UPDATE project SET transition = 'none', transition_heartbeat_unix = 0, {} WHERE id = $1", ResyncPlan::ROW);
-        plan.row_write(id, &sql).execute(&mut *tx).await?;
+        let sql = sql!("UPDATE project SET transition = 'none', transition_heartbeat_unix = 0, {} WHERE id = $1", ResyncPlan::ROW);
+        plan.row_write(id, sql).execute(&mut *tx).await?;
         // Told with the write: a drive waiting for the runs on the old
         // version, on whichever dispatcher, stops waiting
         // (`crate::task_kinds::resync::given_up`).
@@ -1491,8 +1502,8 @@ impl ProjectStoreOps for PostgresProjectStore {
         };
         let unreadable = crate::task_kinds::resync::UnreadablePlan { error: format!("{error:#}"), document, version };
         let plan = ResyncPlan::given_up_unreadable(unreadable, crate::lease::now_unix());
-        let sql = format!("UPDATE project SET transition = 'none', transition_heartbeat_unix = 0, {} WHERE id = $1", ResyncPlan::ROW);
-        plan.row_write(id, &sql).execute(&mut *tx).await?;
+        let sql = sql!("UPDATE project SET transition = 'none', transition_heartbeat_unix = 0, {} WHERE id = $1", ResyncPlan::ROW);
+        plan.row_write(id, sql).execute(&mut *tx).await?;
         // Told with the write, as a person's give-up is: a drive of the
         // plan waiting for the runs on the old version stops waiting.
         sqlx::query("SELECT pg_notify($1, $2)")
@@ -1535,7 +1546,7 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn settle_transition(&self, project: Option<uuid::Uuid>, stale_before: i64) -> anyhow::Result<Vec<uuid::Uuid>> {
-        Ok(sqlx::query_scalar(&settle_transition_sql()).bind(stale_before).bind(project).fetch_all(&self.pool).await?)
+        Ok(sqlx::query_scalar(settle_transition_sql()).bind(stale_before).bind(project).fetch_all(&self.pool).await?)
     }
 
     async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()> {

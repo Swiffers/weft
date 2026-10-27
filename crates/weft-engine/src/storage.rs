@@ -23,7 +23,10 @@
 //! There is no "ensure the storage exists" handshake and no retry-on-
 //! unreachable dance: the broker is a long-lived install service, always up
 //! like the journal, so an unreachable broker is a real failure surfaced to
-//! the node, not a transient to paper over.
+//! the node, not a transient to paper over. A call the broker turns away
+//! busy (no database connection for it, nothing of it run) is different:
+//! busy means wait, so it is sent again until it goes through, like every
+//! other call to the broker (`WorkerStorage::send`).
 
 use std::sync::Arc;
 
@@ -103,20 +106,15 @@ pub trait WorkerStorageOps: Send + Sync {
     async fn claim_uploads(&self, run_id: RunId, claims: &[(&str, &WeftType)]) -> WeftResult<Vec<Value>>;
 }
 
-/// Map a broker HTTP failure to a node-facing error. A transport failure
-/// (broker unreachable) is a real NodeFiring error: the broker is a core
-/// service, so its absence is a failure to surface, not a transient to retry
-/// silently around.
+/// Map a failure to reach the broker (or the bucket) to a node-facing
+/// error. A transport failure is a real failure of the node: the broker is
+/// a core service, so its absence is surfaced, never retried silently.
 fn http_err(context: &str, e: reqwest::Error) -> WeftError {
     WeftError::NodeFailed(format!("storage: {context}: {e}"))
 }
 
-async fn status_err(context: &str, resp: reqwest::Response) -> WeftError {
-    let status = resp.status();
-    let body = match body_text(context, resp).await {
-        Ok(body) => body,
-        Err(e) => return e,
-    };
+/// A refusal of a storage call, as the node sees it.
+fn refusal(context: &str, status: reqwest::StatusCode, body: String) -> WeftError {
     if status == weft_broker_client::protocol::UNREADABLE_SHAPE {
         return WeftError::NodeFailed(weft_broker_client::WorkerOutdated { path: context.to_string(), said: body }.to_string());
     }
@@ -128,13 +126,51 @@ async fn status_err(context: &str, resp: reqwest::Response) -> WeftError {
     }
 }
 
-/// The body of a broker answer. A body that cannot be read is a failure
-/// of its own, never an empty message.
-async fn body_text(context: &str, resp: reqwest::Response) -> WeftResult<String> {
-    let status = resp.status();
-    resp.text()
-        .await
-        .map_err(|e| WeftError::NodeFailed(format!("storage: {context}: {status}, and its body could not be read: {e}")))
+/// The broker's answer to one storage call, read whole. Every answer is a
+/// small JSON body or none: a file's bytes go to and from the bucket,
+/// never through the broker.
+struct Reply {
+    status: reqwest::StatusCode,
+    /// `upload/complete`'s "still landing" mark
+    /// ([`weft_core::storage::COMPLETING_HEADER`]).
+    completing: bool,
+    body: bytes::Bytes,
+}
+
+impl Reply {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+
+    fn refusal(&self, context: &str) -> WeftError {
+        refusal(context, self.status, self.text())
+    }
+
+    /// The answer's JSON, or the refusal it is.
+    fn answer<T: serde::de::DeserializeOwned>(&self, context: &str) -> WeftResult<T> {
+        if !self.status.is_success() {
+            return Err(self.refusal(context));
+        }
+        serde_json::from_slice(&self.body)
+            .map_err(|e| WeftError::NodeFailed(format!("storage: {context}: the broker's answer does not read: {e}")))
+    }
+
+    /// Nothing, or the refusal it is.
+    fn done(&self, context: &str) -> WeftResult<()> {
+        if !self.status.is_success() {
+            return Err(self.refusal(context));
+        }
+        Ok(())
+    }
+}
+
+/// Whether the broker turned a storage call away busy with nothing of it
+/// run, so it is sent again, like every other call to the broker
+/// (`weft_broker_client::client::while_busy`). Any other 503 may have half
+/// happened and fails the node.
+// SYNC: NOT_DONE <-> crates/weft-broker-client/src/client.rs turned_away
+fn turned_away(sent: &WeftResult<Reply>) -> bool {
+    matches!(sent, Ok(reply) if weft_broker_client::client::answered_busy(reply.status, &reply.body))
 }
 
 /// The statuses a claim answers when the slot is no good for this call
@@ -223,67 +259,63 @@ impl WorkerStorage {
         Ok(req)
     }
 
-    /// GET a broker storage endpoint and deserialize the JSON response.
-    async fn get_json<T: serde::de::DeserializeOwned>(
+    /// Send one storage call to the broker (`request` builds it from the
+    /// client and the endpoint's URL), and again for as long as the broker
+    /// turns it away busy with nothing of it run ([`turned_away`]): no
+    /// deadline, since a node's storage call is the user's work, and the
+    /// waits are said in the log with every other broker call's. Every
+    /// call's body is JSON or nothing, so it is built again as it was.
+    async fn send(
         &self,
-        path: &str,
         run_id: RunId,
+        path: &str,
         what: &str,
-    ) -> WeftResult<T> {
-        let resp = self
-            .authed(self.http.get(self.url(path)), run_id)
-            .await?
-            .send()
-            .await
-            .map_err(|e| http_err(what, e))?;
-        if !resp.status().is_success() {
-            return Err(status_err(what, resp).await);
-        }
-        resp.json().await.map_err(|e| http_err(what, e))
+        request: impl Fn(&reqwest::Client, String) -> reqwest::RequestBuilder + Sync,
+    ) -> WeftResult<Reply> {
+        weft_broker_client::client::while_busy(path, turned_away, || async {
+            let resp = self
+                .authed(request(&self.http, self.url(path)), run_id)
+                .await?
+                .send()
+                .await
+                .map_err(|e| http_err(what, e))?;
+            let status = resp.status();
+            let completing = resp.headers().contains_key(weft_core::storage::COMPLETING_HEADER);
+            let body = resp.bytes().await.map_err(|e| {
+                WeftError::NodeFailed(format!("storage: {what}: {status}, and its body could not be read: {e}"))
+            })?;
+            Ok(Reply { status, completing, body })
+        })
+        .await
+    }
+
+    /// GET a broker storage endpoint and deserialize the JSON response.
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str, run_id: RunId, what: &str) -> WeftResult<T> {
+        self.send(run_id, path, what, |http, url| http.get(url)).await?.answer(what)
     }
 
     /// POST a JSON body to a broker storage endpoint and deserialize the JSON
     /// response. `what` names the op for error context.
-    async fn post_json<B: serde::Serialize + ?Sized, T: serde::de::DeserializeOwned>(
+    async fn post_json<B: serde::Serialize + Sync + ?Sized, T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         run_id: RunId,
         body: &B,
         what: &str,
     ) -> WeftResult<T> {
-        let resp = self
-            .authed(self.http.post(self.url(path)), run_id)
-            .await?
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| http_err(what, e))?;
-        if !resp.status().is_success() {
-            return Err(status_err(what, resp).await);
-        }
-        resp.json().await.map_err(|e| http_err(what, e))
+        self.send(run_id, path, what, |http, url| http.post(url).json(body)).await?.answer(what)
     }
 
     /// POST a JSON body to a broker storage endpoint that answers with no
-    /// content (part-done / abort).
-    async fn post_no_content<B: serde::Serialize + ?Sized>(
+    /// content (part-done / abort / keep).
+    async fn post_no_content<B: serde::Serialize + Sync + ?Sized>(
         &self,
         path: &str,
         run_id: RunId,
         body: &B,
         what: &str,
     ) -> WeftResult<()> {
-        let resp = self
-            .authed(self.http.post(self.url(path)), run_id)
-            .await?
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| http_err(what, e))?;
-        if !resp.status().is_success() {
-            return Err(status_err(what, resp).await);
-        }
-        Ok(())
+        self.send(run_id, path, what, |http, url| http.post(url).json(body)).await?.done(what)
     }
 
     /// Slice the stream into parts and upload them for `key`: reserve each
@@ -381,34 +413,22 @@ impl WorkerStorage {
         let mut delay = std::time::Duration::from_secs(1);
         let mut last = String::new();
         for _ in 0..COMPLETE_ATTEMPTS {
-            let sent = async {
-                self.authed(self.http.post(self.url("/v1/storage/upload/complete")), run_id)
-                    .await?
-                    .json(&request)
-                    .send()
-                    .await
-                    .map_err(|e| http_err("upload complete", e))
-            }
-            .await;
+            // A busy broker is waited out inside `send` and spends no
+            // attempt: nothing of the call ran.
+            let sent = self
+                .send(run_id, "/v1/storage/upload/complete", "upload complete", |http, url| http.post(url).json(&request))
+                .await;
             match sent {
                 Err(e) => last = e.to_string(),
-                Ok(resp) => match complete_step(resp.status(), resp.headers().contains_key(weft_core::storage::COMPLETING_HEADER)) {
-                    CompleteStep::Landed => {
-                        return resp.json().await.map_err(|e| http_err("upload complete", e));
-                    }
-                    CompleteStep::Retry => {
-                        let status = resp.status();
-                        last = match body_text("upload complete", resp).await {
-                            Ok(body) => format!("{status}: {body}"),
-                            Err(e) => e.to_string(),
-                        };
-                    }
+                Ok(reply) => match complete_step(reply.status, reply.completing) {
+                    CompleteStep::Landed => return reply.answer("upload complete"),
+                    CompleteStep::Retry => last = format!("{}: {}", reply.status, reply.text()),
                     CompleteStep::Ended => {
-                        let e = status_err("upload complete", resp).await;
+                        let e = reply.refusal("upload complete");
                         return Err(WeftError::NodeFailed(format!("storage: upload '{key}' was ended by the broker: {e}")));
                     }
                     CompleteStep::Refused => {
-                        let e = status_err("upload complete", resp).await;
+                        let e = reply.refusal("upload complete");
                         self.abort_upload(run_id, key).await;
                         return Err(e);
                     }
@@ -601,26 +621,17 @@ impl WorkerStorageOps for WorkerStorage {
         // file another write holds (409) or that moved on from the
         // version this content was made from (412), before any byte
         // moves.
-        let resp = self
-            .authed(self.http.post(self.url("/v1/storage/upload/replace")), run_id)
-            .await?
-            .json(&weft_core::storage::UploadReplaceRequest {
-                key: key.to_string(),
-                declared_size,
-                expected_version,
-            })
-            .send()
-            .await
-            .map_err(|e| http_err("replace begin", e))?;
+        let request = weft_core::storage::UploadReplaceRequest { key: key.to_string(), declared_size, expected_version };
+        let reply = self
+            .send(run_id, "/v1/storage/upload/replace", "replace begin", |http, url| http.post(url).json(&request))
+            .await?;
         // SYNC: replace outcome statuses <-> crates/weft-broker/src/runtime_storage.rs map_err
-        match resp.status() {
+        match reply.status {
             reqwest::StatusCode::CONFLICT => return Ok(weft_core::storage::ReplaceOutcome::Busy),
             reqwest::StatusCode::PRECONDITION_FAILED => return Ok(weft_core::storage::ReplaceOutcome::Stale),
-            status if !status.is_success() => return Err(status_err("replace begin", resp).await),
             _ => {}
         }
-        let UploadBeginResponse { key: upload_key, part_size, .. } =
-            resp.json().await.map_err(|e| http_err("replace begin", e))?;
+        let UploadBeginResponse { key: upload_key, part_size, .. } = reply.answer("replace begin")?;
         let file = self.drive_or_abort(run_id, &upload_key, part_size, data).await?;
         Ok(weft_core::storage::ReplaceOutcome::Replaced(file))
     }
@@ -633,17 +644,8 @@ impl WorkerStorageOps for WorkerStorage {
     ) -> WeftResult<(StoredFileMeta, ByteStream)> {
         // 1. Ask the broker for the metadata + a presigned GET URL (bumps a kept
         //    file's expiry, 404s a missing file). No bytes through the broker.
-        let resp = self
-            .authed(self.http.get(self.url(&format!("/v1/storage/download-url/{key}"))), run_id)
-            .await?
-            .send()
-            .await
-            .map_err(|e| http_err("download-url", e))?;
-        if !resp.status().is_success() {
-            return Err(status_err("download-url", resp).await);
-        }
         let DownloadUrlResponse { meta, url } =
-            resp.json().await.map_err(|e| http_err("download-url response", e))?;
+            self.get_json(&format!("/v1/storage/download-url/{key}"), run_id, "download-url").await?;
         // 2. Fetch the bytes DIRECTLY from the bucket, applying the Range here so a
         //    partial read never buffers the whole object anywhere.
         let mut req = self.http.get(&url);
@@ -668,8 +670,12 @@ impl WorkerStorageOps for WorkerStorage {
             req = req.header("range", header);
         }
         let bytes_resp = req.send().await.map_err(|e| http_err("download from bucket", e))?;
-        if !bytes_resp.status().is_success() {
-            return Err(status_err("download from bucket", bytes_resp).await);
+        let status = bytes_resp.status();
+        if !status.is_success() {
+            let body = bytes_resp.text().await.map_err(|e| {
+                WeftError::NodeFailed(format!("storage: download from bucket: {status}, and its body could not be read: {e}"))
+            })?;
+            return Err(refusal("download from bucket", status, body));
         }
         let stream: ByteStream = Box::pin(
             bytes_resp
@@ -680,16 +686,7 @@ impl WorkerStorageOps for WorkerStorage {
     }
 
     async fn delete(&self, run_id: RunId, key: &str) -> WeftResult<()> {
-        let resp = self
-            .authed(self.http.delete(self.url(&format!("/v1/storage/files/{key}"))), run_id)
-            .await?
-            .send()
-            .await
-            .map_err(|e| http_err("delete", e))?;
-        if !resp.status().is_success() {
-            return Err(status_err("delete", resp).await);
-        }
-        Ok(())
+        self.send(run_id, &format!("/v1/storage/files/{key}"), "delete", |http, url| http.delete(url)).await?.done("delete")
     }
 
     async fn find(&self, run_id: RunId, scope: &StorageScope, identity: &str) -> WeftResult<Option<StoredFileMeta>> {
@@ -708,32 +705,15 @@ impl WorkerStorageOps for WorkerStorage {
     }
 
     async fn list(&self, run_id: RunId, scope: &StorageScope) -> WeftResult<Vec<StoredFileMeta>> {
-        let resp = self
-            .authed(self.http.get(self.url("/v1/storage/list")), run_id)
-            .await?
-            .query(&[("scope", serde_json::to_string(scope).expect("scope serializes"))])
-            .send()
-            .await
-            .map_err(|e| http_err("list", e))?;
-        if !resp.status().is_success() {
-            return Err(status_err("list", resp).await);
-        }
-        let out: ListFilesResponse = resp.json().await.map_err(|e| http_err("list response", e))?;
+        let scope = [("scope", serde_json::to_string(scope).expect("scope serializes"))];
+        let out: ListFilesResponse =
+            self.send(run_id, "/v1/storage/list", "list", |http, url| http.get(url).query(&scope)).await?.answer("list")?;
         Ok(out.files)
     }
 
     async fn keep(&self, run_id: RunId, key: &str, ttl: KeepTtl) -> WeftResult<()> {
-        let resp = self
-            .authed(self.http.post(self.url("/v1/storage/keep")), run_id)
-            .await?
-            .json(&weft_core::storage::KeepRequest { key: key.to_string(), ttl })
-            .send()
+        self.post_no_content("/v1/storage/keep", run_id, &weft_core::storage::KeepRequest { key: key.to_string(), ttl }, "keep")
             .await
-            .map_err(|e| http_err("keep", e))?;
-        if !resp.status().is_success() {
-            return Err(status_err("keep", resp).await);
-        }
-        Ok(())
     }
 
     async fn link(&self, run_id: RunId, key: &str, ttl_secs: Option<u64>, reach: LinkReach) -> WeftResult<LinkAnswer> {
@@ -785,20 +765,13 @@ impl WorkerStorageOps for WorkerStorage {
         let request = ClaimUploadRequest {
             claims: claims.iter().map(|(slot, fits)| SlotClaim { slot: slot.to_string(), fits: fits.wire_string() }).collect(),
         };
-        let resp = self
-            .authed(self.http.post(self.url("/v1/storage/upload/claim")), run_id)
-            .await?
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| http_err("receive uploads", e))?;
-        if is_slot_refusal(resp.status()) {
-            return Err(WeftError::Input(body_text("receive uploads", resp).await?));
+        let reply = self
+            .send(run_id, "/v1/storage/upload/claim", "receive uploads", |http, url| http.post(url).json(&request))
+            .await?;
+        if is_slot_refusal(reply.status) {
+            return Err(WeftError::Input(reply.text()));
         }
-        if !resp.status().is_success() {
-            return Err(status_err("receive uploads", resp).await);
-        }
-        let answer: ClaimUploadResponse = resp.json().await.map_err(|e| http_err("receive uploads", e))?;
+        let answer: ClaimUploadResponse = reply.answer("receive uploads")?;
         if answer.files.len() != claims.len() {
             return Err(WeftError::NodeFailed(format!(
                 "storage: receive uploads: asked for {} files, the broker answered {}",
@@ -1142,5 +1115,90 @@ mod claim_tests {
 
         let locked = storage.claim_uploads(RunId::nil(), &[("locked", &image)]).await.unwrap_err();
         assert!(matches!(locked, WeftError::NodeFailed(_)), "{locked:?}");
+    }
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use weft_broker_client::protocol::NOT_DONE;
+
+    fn reply(status: reqwest::StatusCode, body: &str) -> WeftResult<Reply> {
+        Ok(Reply { status, completing: false, body: bytes::Bytes::from(body.to_string()) })
+    }
+
+    /// Only the broker's own "nothing was done" is sent again; a 503 that
+    /// may have half happened, any other status, or a broker that could
+    /// not be reached is the call's answer.
+    #[test]
+    fn only_a_storage_call_turned_away_busy_is_sent_again() {
+        assert!(turned_away(&reply(reqwest::StatusCode::SERVICE_UNAVAILABLE, NOT_DONE)));
+        assert!(!turned_away(&reply(reqwest::StatusCode::SERVICE_UNAVAILABLE, "the database connection dropped; ask again")));
+        assert!(!turned_away(&reply(reqwest::StatusCode::INTERNAL_SERVER_ERROR, NOT_DONE)));
+        assert!(!turned_away(&reply(reqwest::StatusCode::OK, "{}")));
+        assert!(!turned_away(&Err(WeftError::NodeFailed("storage: keep: connection refused".into()))));
+    }
+
+    /// A broker whose `keep` turns the first three calls away busy, then
+    /// keeps; whose `delete` answers a 503 that may have half happened;
+    /// and whose `upload/complete` turns the first three away busy, then
+    /// answers the file. Each route counts its calls.
+    async fn broker(calls: Arc<[AtomicU32; 3]>) -> Arc<WorkerStorage> {
+        use axum::response::IntoResponse;
+        let busy = || (StatusCode::SERVICE_UNAVAILABLE, NOT_DONE).into_response();
+        let (keep, delete, complete) = (calls.clone(), calls.clone(), calls);
+        let app = axum::Router::new()
+            .route(
+                "/v1/storage/keep",
+                axum::routing::post(move || async move {
+                    if keep[0].fetch_add(1, Ordering::SeqCst) < 3 { busy() } else { StatusCode::NO_CONTENT.into_response() }
+                }),
+            )
+            .route(
+                "/v1/storage/files/{*key}",
+                axum::routing::delete(move || async move {
+                    delete[1].fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::SERVICE_UNAVAILABLE, "the database connection dropped, or the database is unavailable; ask again")
+                        .into_response()
+                }),
+            )
+            .route(
+                "/v1/storage/upload/complete",
+                axum::routing::post(move || async move {
+                    if complete[2].fetch_add(1, Ordering::SeqCst) < 3 {
+                        busy()
+                    } else {
+                        axum::Json(serde_json::json!({"key": "k"})).into_response()
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let token = weft_broker_client::TokenSource::worker(Arc::new(weft_platform_traits::identity::FixedToken("t".into())), "r1");
+        WorkerStorage::new(format!("http://{addr}"), token)
+    }
+
+    /// A storage call turned away busy waits and goes through, without
+    /// failing the node; one answered a 503 that may have half happened
+    /// fails the node at once, sent once. A completion's busy answers
+    /// spend none of its attempts: it lands on the fourth call.
+    #[tokio::test]
+    async fn a_storage_call_turned_away_busy_waits_until_it_goes_through() {
+        let calls = Arc::new([AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)]);
+        let storage = broker(calls.clone()).await;
+        let run = RunId::nil();
+
+        storage.keep(run, "k", KeepTtl::Never).await.unwrap();
+        assert_eq!(calls[0].load(Ordering::SeqCst), 4);
+
+        let failed = storage.delete(run, "k").await.unwrap_err();
+        assert!(matches!(&failed, WeftError::NodeFailed(why) if why.contains("503")), "{failed:?}");
+        assert_eq!(calls[1].load(Ordering::SeqCst), 1, "a 503 that may have half happened is not sent again");
+
+        assert_eq!(storage.complete_until_landed(run, "k").await.unwrap(), serde_json::json!({"key": "k"}));
+        assert_eq!(calls[2].load(Ordering::SeqCst), 4);
     }
 }

@@ -943,9 +943,9 @@ pub struct Claimed {
 }
 
 /// What a claim reads off the run row: its new epoch, its attempts, its
-/// program, a cancel already asked for, and whether its workers failed it
-/// since its last claim (`run.waited_on_workers`).
-type ClaimedRow = (i32, i32, Option<String>, Option<sqlx::types::Json<CancelCause>>, bool);
+/// program, and a cancel already asked for. All but the cancel are there
+/// exactly when the run was claimed, which a run of no program never is.
+type ClaimedRow = (Option<i32>, Option<i32>, Option<String>, Option<sqlx::types::Json<CancelCause>>);
 
 /// Until when a run claimed or born by a worker at `now` counts as
 /// delivered to that worker though its lease is not written yet
@@ -969,34 +969,43 @@ pub fn delivered_until(now: i64) -> i64 {
 /// the counts, since its tries starting again (a worker coming alive, a
 /// build registering) reset the counts while the failure they counted
 /// is still what `weft status` shows. `None` when it is not queued
-/// (another worker claimed it, it ended, it is not this project's). A claim `owner` holds already is given again
+/// (another worker claimed it, it ended, it is not this project's); an
+/// error, claiming nothing, when it runs no program (a node test's run,
+/// which delivery ends before it reaches a worker). A claim `owner` holds already is given again
 /// under a new epoch: the answer of one that committed may have been lost
 /// on its way, and the worker never drives a run twice (it asks only for
 /// a run it is not driving), so nothing was written under the old epoch.
 pub async fn claim(conn: &mut PgConnection, run_id: RunId, project_id: uuid::Uuid, owner: &str) -> anyhow::Result<Option<Claimed>> {
     // The row is locked first and its mark read off the version the lock
     // waited for (a `busy` that committed meanwhile included), then
-    // cleared by the update, in one statement.
-    let claimed: Option<ClaimedRow> = sqlx::query_as(
-        "WITH was AS (SELECT waited_on_workers FROM run \
+    // cleared by the update, and when it was set, what `weft status` shows
+    // of the project's workers ended, all in one statement: they commit
+    // together, so a claim never stands with that left showing. A run of
+    // no program is found and left as it is, so the claim refuses it
+    // having written nothing: a claim that stood would leave the run with
+    // an owner that never drives it.
+    let claimed: Option<ClaimedRow> = sqlx::query_as(weft_task_store::sql!(
+        "WITH was AS (SELECT waited_on_workers, definition_hash IS NOT NULL AS runs_a_program FROM run \
                       WHERE run_id = $1 AND project_id = $2 AND (state = 'queued' OR (state = 'running' AND owner = $3)) \
-                      FOR UPDATE) \
-         UPDATE run SET state = 'running', owner = $3, epoch = epoch + 1, attempts = attempts + 1, delivered_until = $4, \
-             refusals = 0, unreached = 0, busy_since = NULL, waited_on_workers = FALSE \
-         FROM was WHERE run.run_id = $1 \
-         RETURNING run.epoch, run.attempts, run.definition_hash, run.cancel_requested, was.waited_on_workers",
-    )
+                      FOR UPDATE), \
+         claimed AS (UPDATE run SET state = 'running', owner = $3, epoch = epoch + 1, attempts = attempts + 1, delivered_until = $4, \
+                         refusals = 0, unreached = 0, busy_since = NULL, waited_on_workers = FALSE \
+                      FROM was WHERE run.run_id = $1 AND was.runs_a_program \
+                      RETURNING run.epoch, run.attempts, run.definition_hash, run.cancel_requested, was.waited_on_workers), \
+         ended AS ({ended} AND EXISTS (SELECT 1 FROM claimed WHERE claimed.waited_on_workers)) \
+         SELECT claimed.epoch, claimed.attempts, claimed.definition_hash, claimed.cancel_requested FROM was LEFT JOIN claimed ON TRUE",
+        ended = weft_task_store::unanswered::delivery_waits_ended_sql("$2", Some("$1")),
+    ))
     .bind(run_id)
     .bind(project_id)
     .bind(owner)
     .bind(delivered_until(unix_now()))
     .fetch_optional(&mut *conn)
     .await?;
-    let Some((epoch, attempts, definition_hash, cancel_requested, waited_on_workers)) = claimed else { return Ok(None) };
-    if waited_on_workers {
-        weft_task_store::unanswered::delivery_waits_ended(&mut *conn, project_id).await?;
-    }
-    let definition_hash = definition_hash.ok_or_else(|| anyhow::anyhow!("run {run_id} runs no program, so no worker can claim it"))?;
+    let Some(claimed) = claimed else { return Ok(None) };
+    let (Some(epoch), Some(attempts), Some(definition_hash), cancel_requested) = claimed else {
+        anyhow::bail!("run {run_id} runs no program, so no worker can claim it");
+    };
     let record = read_record(conn, run_id, None).await?;
     Ok(Some(Claimed { epoch, attempts, definition_hash, cancel_requested: cancel_requested.map(|cause| cause.0), record }))
 }

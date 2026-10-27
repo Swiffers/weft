@@ -11,9 +11,11 @@ use tokio::time::{sleep, Duration};
 
 /// Coerce an event's raw text into the JSON fire payload: parse it as JSON,
 /// or wrap the raw text as a JSON string. The fire pipeline is JSON-typed
-/// end to end, so every event source funnels text through here.
-pub fn coerce_text_payload(text: String) -> Value {
-    serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text))
+/// end to end, so every event source funnels text through here. Borrows
+/// the text, so a socket's frame is read where it arrived and only the
+/// raw-string fallback owns a copy.
+pub fn coerce_text_payload(text: &str) -> Value {
+    serde_json::from_str::<Value>(text).unwrap_or_else(|_| Value::String(text.to_owned()))
 }
 
 /// Exponential reconnect backoff, shared by every event source. Starts at

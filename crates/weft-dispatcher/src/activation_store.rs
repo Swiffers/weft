@@ -22,6 +22,8 @@
 
 use std::sync::Arc;
 
+use weft_task_store::sql;
+
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 
@@ -409,7 +411,7 @@ const DOOR_WINDOW_OPEN_SQL: &str = "a.accepting_fires AND a.fires_deadline_unix 
 /// project. Over by the database's clock, the one the listening condition
 /// (`ACTIVATION_LISTENS`) reads.
 pub async fn door_windows_over(pool: &PgPool) -> anyhow::Result<Vec<(uuid::Uuid, ActivationKey)>> {
-    let rows = sqlx::query_as(&format!(
+    let rows = sqlx::query_as(sql!(
         "SELECT a.project_id, a.trigger, a.instance_id FROM trigger_activation a \
          WHERE {DOOR_WINDOW_OPEN_SQL} AND a.fires_deadline_unix < EXTRACT(EPOCH FROM NOW())::BIGINT"
     ))
@@ -445,7 +447,7 @@ pub async fn close_door_windows(
 ) -> anyhow::Result<WindowsClosed> {
     let (triggers, instances) = key_arrays(keys);
     let mut tx = pool.begin().await?;
-    let closed: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
+    let closed: Vec<(String, Option<String>)> = sqlx::query_as(sql!(
         "UPDATE trigger_activation a SET accepting_fires = FALSE, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT \
          WHERE a.project_id = $1 AND {KEYS_JOIN} \
            AND {DOOR_WINDOW_OPEN_SQL} AND a.fires_deadline_unix < EXTRACT(EPOCH FROM NOW())::BIGINT \
@@ -469,7 +471,7 @@ pub async fn close_door_windows(
 
 /// When the earliest door window still open ends, if one is.
 pub async fn next_door_window_end(pool: &PgPool) -> anyhow::Result<Option<i64>> {
-    Ok(sqlx::query_scalar(&format!("SELECT MIN(a.fires_deadline_unix) FROM trigger_activation a WHERE {DOOR_WINDOW_OPEN_SQL}"))
+    Ok(sqlx::query_scalar(sql!("SELECT MIN(a.fires_deadline_unix) FROM trigger_activation a WHERE {DOOR_WINDOW_OPEN_SQL}"))
         .fetch_one(pool)
         .await?)
 }
@@ -498,7 +500,7 @@ async fn end_activating_in(
     // With their entry rows going, an instance's rows go too ([`Forget`]);
     // the rest move to `to`.
     let mut ended: Vec<(String, Option<String>)> = if remove_entries {
-        sqlx::query_as(&format!(
+        sqlx::query_as(sql!(
             "DELETE FROM trigger_activation WHERE {owned} AND instance_id IS NOT NULL RETURNING trigger, instance_id"
         ))
         .bind(project_id)
@@ -869,8 +871,8 @@ impl HeldProject {
         let Some(mut plan) = self.resync else { return Ok(()) };
         let Some(given_up) = plan.given_up.as_mut() else { return Ok(()) };
         if given_up.forget(keys) {
-            let sql = format!("UPDATE project SET {} WHERE id = $1", crate::task_kinds::resync::ResyncPlan::ROW);
-            plan.row_write(project_id, &sql).execute(&mut *tx).await?;
+            let sql = sql!("UPDATE project SET {} WHERE id = $1", crate::task_kinds::resync::ResyncPlan::ROW);
+            plan.row_write(project_id, sql).execute(&mut *tx).await?;
         }
         Ok(())
     }
@@ -878,7 +880,7 @@ impl HeldProject {
 
 /// [`ActivationStoreOps::list`] on the caller's connection.
 pub(crate) async fn list_in(conn: &mut sqlx::PgConnection, project_id: uuid::Uuid) -> anyhow::Result<Vec<Activation>> {
-    let rows: Vec<LifecycleRow> = sqlx::query_as(&format!(
+    let rows: Vec<LifecycleRow> = sqlx::query_as(sql!(
         "SELECT {ROW_COLUMNS} FROM trigger_activation a WHERE a.project_id = $1 ORDER BY a.trigger, a.instance_id NULLS FIRST"
     ))
     .bind(project_id)
@@ -927,7 +929,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         if let Some(refused) = refused {
             return Ok(Err(refused));
         }
-        let before: Vec<LifecycleRow> = sqlx::query_as(&format!(
+        let before: Vec<LifecycleRow> = sqlx::query_as(sql!(
             "SELECT {ROW_COLUMNS} FROM trigger_activation a WHERE a.project_id = $1 AND {KEYS_JOIN} FOR UPDATE"
         ))
         .bind(project_id)
@@ -1146,7 +1148,7 @@ impl ActivationStoreOps for PostgresActivationStore {
                 return Ok(LifecycleWrite::ResyncGone);
             }
         }
-        let activating: Option<(String, Option<String>)> = sqlx::query_as(&format!(
+        let activating: Option<(String, Option<String>)> = sqlx::query_as(sql!(
             "SELECT a.trigger, a.instance_id FROM trigger_activation a \
              WHERE a.project_id = $1 AND a.status = 'activating' AND {KEYS_JOIN} LIMIT 1"
         ))
@@ -1165,7 +1167,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         let keys: Vec<ActivationKey> = match cause {
             DownCause::Person => keys.to_vec(),
             DownCause::Health(_) | DownCause::Infra(_) | DownCause::Maintenance => {
-                let on: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
+                let on: Vec<(String, Option<String>)> = sqlx::query_as(sql!(
                     "SELECT a.trigger, a.instance_id FROM trigger_activation a \
                      WHERE a.project_id = $1 AND a.status = 'active' AND {KEYS_JOIN} FOR UPDATE"
                 ))
@@ -1203,14 +1205,14 @@ impl ActivationStoreOps for PostgresActivationStore {
         let forgotten: Vec<ActivationKey> = keys.iter().filter(|k| forget.forgets(k)).cloned().collect();
         if !forgotten.is_empty() {
             let (triggers, instances) = key_arrays(&forgotten);
-            sqlx::query(&format!("DELETE FROM trigger_activation a WHERE a.project_id = $1 AND {KEYS_JOIN}"))
+            sqlx::query(sql!("DELETE FROM trigger_activation a WHERE a.project_id = $1 AND {KEYS_JOIN}"))
                 .bind(project_id)
                 .bind(&triggers)
                 .bind(&instances)
                 .execute(&mut *tx)
                 .await?;
         }
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "UPDATE trigger_activation a \
              SET status = $4, accepting_fires = $5, fires_visible_to_consumers = $6, \
                  fires_deadline_unix = $7, went_down_with = $8, went_down_by_command = $10, \
@@ -1264,7 +1266,7 @@ impl ActivationStoreOps for PostgresActivationStore {
     }
 
     async fn list_stuck(&self, stale_before: i64) -> anyhow::Result<Vec<StuckActivation>> {
-        let rows: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(&format!(
+        let rows: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(sql!(
             "SELECT DISTINCT a.project_id, a.activating_run_id FROM trigger_activation a \
              WHERE {} AND a.heartbeat_unix < $1",
             held_by_driver_alone()

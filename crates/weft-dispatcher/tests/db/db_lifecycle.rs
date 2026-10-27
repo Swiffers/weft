@@ -14,6 +14,7 @@
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
+use weft_task_store::sql;
 
 use weft_core::activation::ActivationKey;
 use weft_core::instance::{InstanceId, Owner};
@@ -118,7 +119,7 @@ async fn run_column<T>(pool: &PgPool, column: &str, run_id: weft_core::RunId) ->
 where
     T: for<'r> sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres> + Send + Unpin,
 {
-    sqlx::query_scalar(&format!("SELECT {column} FROM run WHERE run_id = $1"))
+    sqlx::query_scalar(sql!("SELECT {column} FROM run WHERE run_id = $1"))
         .bind(run_id)
         .fetch_optional(pool)
         .await
@@ -1119,7 +1120,7 @@ async fn trigger_bake_ownership_publication_and_project_cleanup(pool: PgPool) {
 
 /// How many rows of `table` belong to run `run_id`.
 async fn rows_of(pool: &PgPool, table: &str, run_id: weft_core::RunId) -> i64 {
-    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE run_id = $1"))
+    sqlx::query_scalar(sql!("SELECT COUNT(*) FROM {table} WHERE run_id = $1"))
         .bind(run_id)
         .fetch_one(pool)
         .await
@@ -3043,6 +3044,37 @@ async fn a_rewritten_held_row_lets_its_holder_go(pool: PgPool) {
     assert!(second > first, "a rewrite is a new registration: {first} then {second}");
 }
 
+/// A write names the registration it made, a wake's claim keeps it, and
+/// the undo of a registration removes the row only while it is still that
+/// registration: a later arm's row is never removed under it.
+#[sqlx::test]
+async fn a_registration_is_removed_only_while_the_row_is_still_it(pool: PgPool) {
+    use weft_dispatcher::store::SignalWrite;
+    let (store, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    let SignalWrite::Written { generation: first } = store.signal_insert(&held_signal("sse", id, 0)).await.unwrap() else {
+        panic!("a new row is written")
+    };
+    assert_eq!(store.signal_get("sse").await.unwrap().unwrap().generation, first, "the write names the registration it made");
+    // A wake's claim, as the broker writes it: the version moves, the
+    // registration does not.
+    sqlx::query("UPDATE signal SET kind_state = '{\"next_at\": 6}', kind_state_seq = kind_state_seq + 1 WHERE token = 'sse'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // A later arm registers the row again.
+    let SignalWrite::Written { generation: later } = store.signal_insert(&held_signal("sse", id, 2)).await.unwrap() else {
+        panic!("the later arm lands")
+    };
+    assert_ne!(later, first);
+    assert!(store.signal_remove_registration("sse", first).await.unwrap().is_none(), "the first arm's undo leaves the later row");
+    assert_eq!(store.signal_get("sse").await.unwrap().unwrap().generation, later);
+    let removed = store.signal_remove_registration("sse", later).await.unwrap().expect("the current registration is removed");
+    assert_eq!(removed.token, "sse");
+    assert!(store.signal_get("sse").await.unwrap().is_none());
+}
+
 /// The holders are counted from the held rows a listener holds: a parked
 /// activation's and a signal that holds nothing do not count.
 #[sqlx::test]
@@ -3914,6 +3946,68 @@ async fn a_resync_keeps_builds_and_other_activations_out_until_it_lets_go(pool: 
     assert_eq!(projects.given_up_resync(id).await.unwrap(), None);
 }
 
+/// What `weft status` reads of a resync under way: where its task last
+/// said it is (the runs on the old version it waits for), and nothing of a
+/// task that no longer drives it. One that stopped waiting on the database
+/// keeps that through the store, is among the stops weft takes up again,
+/// and taken up again drives on under a new drive whose task has said
+/// nothing yet.
+#[sqlx::test]
+async fn a_resync_shows_what_it_waits_for_and_a_stop_on_the_database_is_taken_up_again(pool: PgPool) {
+    use weft_core::deactivation::{ResyncProgress, RunGoing};
+    use weft_dispatcher::task_kinds::resync::{task, ResyncOwner, ResyncPlan, ResyncWait, Stopped};
+    let (_store, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    let plan = ResyncPlan {
+        driver: Uuid::new_v4(),
+        owners: vec![ResyncOwner { owner: Owner::Shared, on: vec!["feed".into()], down: vec!["feed".into()] }],
+        take_down: weft_core::TakeDown::DEFAULT,
+        build: weft_core::builds::BuildHashes { binary_hash: Some("bin-A".into()), ..Default::default() },
+        resynced: Vec::new(),
+        urls: Vec::new(),
+        held: Default::default(),
+        old_builds: Vec::new(),
+        old_tokens: Vec::new(),
+        switching: false,
+        runs: 1,
+        moved_runs: 0,
+        off: Vec::new(),
+        stopped: None,
+        given_up: None,
+    };
+    let driving = projects.try_begin_resyncing(id, &plan, task(TENANT, id, plan.driver)).await.unwrap().expect("entered");
+    let held = projects.resync(id).await.unwrap().expect("under way");
+    assert_eq!(held.progress, ResyncProgress::default(), "its task has said nothing yet");
+
+    let waits = ResyncProgress { waits_for: vec![RunGoing { run_id: Uuid::new_v4(), since_unix: 1_760_000_000 }] };
+    weft_task_store::tasks::set_progress(&pool, driving, &serde_json::to_value(&waits).unwrap()).await.unwrap();
+    let held = projects.resync(id).await.unwrap().expect("under way");
+    assert_eq!(held.progress, waits, "what its task said it waits for");
+    assert_eq!(held.standing().progress, waits);
+    assert_eq!(held.standing().stopped, None, "a task drives it");
+
+    // Its task stopped waiting on the database.
+    let at_unix = weft_dispatcher::lease::now_unix();
+    let stop = Stopped { status: 500, error: "busy".into(), at_unix, waits_for: Some(ResyncWait::Database), build_cannot_run: false };
+    assert!(projects.write_resync(id, &ResyncPlan { stopped: Some(stop.clone()), ..plan.clone() }).await.unwrap());
+    sqlx::query("UPDATE task SET status = 'failed', completed_at_unix = $2 WHERE id = $1").bind(driving).bind(at_unix).execute(&pool).await.unwrap();
+    let stored: String = sqlx::query_scalar("SELECT resync->'stopped'->>'waits_for' FROM project WHERE id = $1").bind(id).fetch_one(&pool).await.unwrap();
+    assert_eq!(stored, "database");
+    let held = projects.resync(id).await.unwrap().expect("still held");
+    assert_eq!(held.progress, ResyncProgress::default(), "a task that ended says nothing of where it is");
+    let standing = held.standing();
+    assert_eq!(standing.stopped.as_ref().map(|stop| stop.error.as_str()), Some("busy"));
+    assert!(standing.stopped.unwrap().then.starts_with("it goes on by itself shortly"));
+    let stopped: Vec<_> = projects.stopped_resyncs().await.unwrap().into_iter().map(|(p, plan)| (p, plan.unwrap().stopped)).collect();
+    assert_eq!(stopped, [(id, Some(stop))], "among the stops weft takes up again");
+
+    let resumed = projects.resume_resync(id, TENANT).await.unwrap().expect("held");
+    assert_ne!(resumed, driving);
+    let held = projects.resync(id).await.unwrap().expect("under way again");
+    assert!(held.driven && held.plan.stopped.is_none() && held.progress == ResyncProgress::default(), "{held:?}");
+}
+
 /// A resync whose plan no longer reads can be neither driven, resumed nor
 /// given up by a person, so weft gives it up, for that project alone: the
 /// transition lands, and the record that takes the plan's place keeps the
@@ -3998,7 +4092,7 @@ async fn an_unreadable_resync_plan_holds_back_no_other_stopped_resync(pool: PgPo
         stopped: Some(Stopped { status: 409, error: "infra down".into(), at_unix: 1, waits_for: None, build_cannot_run: false }),
         given_up: None,
     };
-    plan.row_write(good, &format!("UPDATE project SET transition = 'resyncing', {} WHERE id = $1", ResyncPlan::ROW))
+    plan.row_write(good, sql!("UPDATE project SET transition = 'resyncing', {} WHERE id = $1", ResyncPlan::ROW))
         .execute(&pool)
         .await
         .unwrap();

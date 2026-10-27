@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::Router;
 use base64::Engine as _;
-use jsonwebtoken::jwk::JwkSet;
+use weft_core::jwt::jwk::JwkSet;
 use serde_json::Value;
 
 use weft_core::access::events::{check_jwks_url, read_path, EventsSpec, Handshake, VerifyKind};
@@ -32,7 +32,7 @@ use weft_broker_client::protocol::{
     SubscriptionEnsureResponse,
 };
 
-use crate::handlers::internal;
+use crate::handlers::{internal, unavailable_or_internal};
 use crate::auth::{AuthedCaller, Role};
 use crate::state::BrokerState;
 use weft_core::wire_shape::Json;
@@ -160,7 +160,9 @@ async fn subscription_ensure(
         receiver,
     )
     .await
-    .map_err(crate::handlers::store_err)?;
+    // Its subscribe call, its row and its retirement of the old rows
+    // commit one by one (a row written may already be the newest).
+    .map_err(crate::handlers::store_err_after_writes)?;
     Ok(Json(SubscriptionEnsureResponse {
         expires_at_unix: ensured.expires_at.map(|t| t.timestamp()),
     }))
@@ -207,7 +209,7 @@ async fn events_verify(
     // spec recorded never answers for another spec's connections.
     let recipes = weft_access_store::events_recipes_of(&state.pool, &req.service)
         .await
-        .map_err(internal)?;
+        .map_err(unavailable_or_internal)?;
     let candidates: Vec<(String, EventsSpec)> = recipes
         .into_iter()
         .filter_map(|r| r.events.get(&req.topic).cloned().map(|t| (r.recipe_hash, t)))
@@ -281,7 +283,7 @@ async fn verify_and_route(
     let named = match &presented_id {
         Some(id) => weft_access_store::subscription_by_id(&state.pool, id, &req.service, &req.topic)
             .await
-            .map_err(internal)?,
+            .map_err(unavailable_or_internal)?,
         None => None,
     };
 
@@ -296,7 +298,7 @@ async fn verify_and_route(
     let receiver = match uses_receiver_url(&webhook.verify, &receiving_apps) {
         true => {
             let host = req.headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("host")).map(|(_, host)| host.as_str());
-            state.address.arrived_at(host).await.map_err(internal)?.map(|base| receiver_on(&base, &req.service, &req.topic))
+            state.address.arrived_at(host).await.map_err(unavailable_or_internal)?.map(|base| receiver_on(&base, &req.service, &req.topic))
         }
         false => None,
     };
@@ -480,7 +482,7 @@ async fn verify_and_route(
                 recipe_hash,
             )
             .await
-            .map_err(internal)?;
+            .map_err(unavailable_or_internal)?;
             if targets.is_empty() {
                 return Ok(Json(EventVerdict::Drop {
                     reason: "no connection here belongs to that account".into(),
@@ -740,7 +742,7 @@ async fn verify_identity_token(
     issuers: &[String],
     jwks_url: &str,
 ) -> Result<IdentityClaims, VerifyError> {
-    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    let mut validation = weft_core::jwt::Validation::new(weft_core::jwt::Algorithm::RS256);
     validation.set_audience(audiences);
     validation.set_issuer(issuers);
     decode_jwt(token, &validation, jwks_url).await
@@ -753,13 +755,13 @@ async fn verify_identity_token(
 /// claims is theirs.
 pub(crate) async fn decode_jwt<T: serde::de::DeserializeOwned>(
     token: &str,
-    validation: &jsonwebtoken::Validation,
+    validation: &weft_core::jwt::Validation,
     jwks_url: &str,
 ) -> Result<T, VerifyError> {
     // Checked here, on the address about to be fetched: a gated route's
     // comes off its connection's stored values, unknown until now.
     check_jwks_url(jwks_url).map_err(VerifyError::UnusableKeyAddress)?;
-    let header = jsonwebtoken::decode_header(token)
+    let header = weft_core::jwt::decode_header(token)
         .map_err(|e| VerifyError::BadIdentityToken(format!("unreadable header: {e}")))?;
     let kid = header
         .kid
@@ -771,9 +773,9 @@ pub(crate) async fn decode_jwt<T: serde::de::DeserializeOwned>(
     let jwk = jwks
         .find(&kid)
         .ok_or_else(|| VerifyError::BadIdentityToken("unknown signing key".into()))?;
-    let key = jsonwebtoken::DecodingKey::from_jwk(jwk)
+    let key = weft_core::jwt::DecodingKey::from_jwk(jwk)
         .map_err(|e| VerifyError::BadIdentityToken(format!("unusable key: {e}")))?;
-    let data = jsonwebtoken::decode::<T>(token, &key, validation)
+    let data = weft_core::jwt::decode::<T>(token, &key, validation)
         .map_err(|e| VerifyError::BadIdentityToken(format!("{e}")))?;
     Ok(data.claims)
 }
@@ -905,7 +907,7 @@ mod tests {
     /// to be fetched, before anything of the token is read.
     #[tokio::test]
     async fn an_http_key_address_is_refused_before_any_fetch() {
-        let validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        let validation = weft_core::jwt::Validation::new(weft_core::jwt::Algorithm::RS256);
         let err = decode_jwt::<Value>("not.a.token", &validation, "http://issuer.example/jwks.json").await.unwrap_err();
         assert!(matches!(err, VerifyError::UnusableKeyAddress(_)), "{err}");
     }

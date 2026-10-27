@@ -11,6 +11,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use weft_core::infra::wire::{LogStream, LogsFrom};
 use weft_core::infra::{NodeRef, ResolvedNode};
+/// Why a container stopped on its own: weft-core's, which the unit's row
+/// and the status answer carry too.
+pub use weft_core::infra::RestartCause;
 
 /// How one unit is doing, as the host sees it right now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +56,69 @@ pub struct UnitObservation {
     /// The hash of the resolved unit it runs (`ResolvedUnit::hash`).
     pub hash: String,
     pub state: UnitRunState,
+    /// The latest time one of its containers stopped on its own and was
+    /// brought back (or is being brought back) by the host, or had a
+    /// process inside it killed for memory while it ran on (a Postgres
+    /// whose backend was killed restarts them in place), since weft last
+    /// started it; `None` when none was. The same at every look
+    /// until another one happens. Always on the wire, `null` when none:
+    /// a reply without it is from an older weft's agent, and fails to
+    /// read rather than reading as no restart.
+    #[serde(deserialize_with = "present")]
+    pub restart: Option<UnitRestart>,
+}
+
+/// Read an `Option` field that must be on the wire (`null` for none):
+/// serde reads a missing `Option` as `None` unless it is read with a
+/// function of its own.
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    Option::<T>::deserialize(d)
+}
+
+/// One container of a unit stopping on its own and being brought back,
+/// or a process inside it killed for memory while it ran on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitRestart {
+    /// The container, by its name in the unit.
+    pub container: String,
+    /// When it stopped, or the process inside it was killed (unix
+    /// seconds): what names this restart, so a watcher tells a new one
+    /// from one it already saw.
+    pub stopped_at_unix: i64,
+    pub cause: RestartCause,
+    /// How many times the host has brought it back since weft last
+    /// started it.
+    pub count: u32,
+}
+
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    /// The restart is always written, `null` when none, and a reply
+    /// without it (an older agent's) does not read as "no restart".
+    #[test]
+    fn an_observations_restart_round_trips_and_must_be_there() {
+        let seen = UnitObservation {
+            copy_id: "c".into(),
+            unit: "db".into(),
+            hash: "h".into(),
+            state: UnitRunState::Ready,
+            restart: Some(UnitRestart { container: "pg".into(), stopped_at_unix: 7, cause: RestartCause::OutOfMemory, count: 2 }),
+        };
+        let wire = serde_json::to_value(&seen).unwrap();
+        assert_eq!(wire["restart"]["cause"], serde_json::json!({ "kind": "out_of_memory" }));
+        assert_eq!(serde_json::from_value::<UnitObservation>(wire).unwrap(), seen);
+        let none = UnitObservation { restart: None, ..seen };
+        let wire = serde_json::to_value(&none).unwrap();
+        assert!(wire["restart"].is_null());
+        assert_eq!(serde_json::from_value::<UnitObservation>(wire.clone()).unwrap(), none);
+        let mut old = wire;
+        old.as_object_mut().unwrap().remove("restart");
+        let err = serde_json::from_value::<UnitObservation>(old).unwrap_err();
+        assert!(err.to_string().contains("restart"), "{err}");
+    }
 }
 
 #[async_trait]
@@ -171,7 +237,7 @@ pub mod fake {
             self.copies.lock().insert(node.copy_id.clone(), node.clone());
             let mut units = self.units.lock();
             let o = units.entry((node.project, node.copy_id.clone(), unit.to_string())).or_insert_with(|| {
-                UnitObservation { copy_id:node.copy_id.clone(), unit: unit.into(), hash: String::new(), state: UnitRunState::Ready }
+                UnitObservation { copy_id:node.copy_id.clone(), unit: unit.into(), hash: String::new(), state: UnitRunState::Ready, restart: None }
             });
             o.state = state;
         }
@@ -220,7 +286,7 @@ pub mod fake {
             self.copies.lock().insert(node.node.copy_id.clone(), node.node.clone());
             self.units.lock().insert(
                 (node.node.project, node.node.copy_id.clone(), unit.to_string()),
-                UnitObservation { copy_id:node.node.copy_id.clone(), unit: unit.into(), hash, state: UnitRunState::Ready },
+                UnitObservation { copy_id:node.node.copy_id.clone(), unit: unit.into(), hash, state: UnitRunState::Ready, restart: None },
             );
             Ok(())
         }

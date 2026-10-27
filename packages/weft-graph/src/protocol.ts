@@ -1574,6 +1574,28 @@ export interface InstanceInfraEntry {
   progress?: ChangeProgress;
   /// Applied from other infra than the source holds now.
   behind?: boolean;
+  /// The latest restart of its containers since weft last started it.
+  lastRestart?: LastRestart;
+}
+
+/// Why a container of an infra unit stopped on its own (and its host
+/// brought it back).
+// SYNC: RestartCause <-> crates/weft-core/src/infra/status.rs RestartCause
+export type RestartCause =
+  // A process in it was killed for using more memory than it is
+  // allowed: the container's own, or one inside a container that kept
+  // running (a database backend).
+  | { kind: 'out_of_memory' }
+  | { kind: 'exited'; code: number }
+  | { kind: 'unknown' };
+
+/// The latest time a container of an infra copy stopped on its own and
+/// its host brought it back, since weft last started the copy: when it
+/// stopped (unix seconds) and why.
+// SYNC: LastRestart <-> crates/weft-core/src/infra/status.rs LastRestart
+export interface LastRestart {
+  atUnix: number;
+  cause: RestartCause;
 }
 
 /// One copy of an infra node, as an instance's holdings list it.
@@ -2096,9 +2118,15 @@ export type CliPhase =
   /// (unbounded: draining runs). Detail carries `elapsedSeconds`.
   | 'infra_wait'
   /// The call about to be made will wait for the project's running
-  /// runs to finish before it lands. Detail carries `capSeconds`
-  /// when the person set a cap. Sent before the call, because the wait
-  /// happens on the dispatcher: without it the command looks hung.
+  /// runs to finish before it lands. Detail carries `on` (`infra`,
+  /// `resync` or `deactivate`). Sent before the call, because the wait
+  /// happens on the dispatcher: without it the command looks hung. A
+  /// resync sends it again each time the runs it waits for change, with
+  /// `waitsFor`: `{ runId, sinceUnix }` per run on the old version, empty
+  /// once every run named before has ended. A run a worker accepted but
+  /// has not recorded yet is waited for without being listed, so an
+  /// empty list can still be waiting.
+  // SYNC: the drain_wait detail's waitsFor <-> crates/weft-cli/src/progress.rs Progress::resync_waits_for
   | 'drain_wait'
   /// Something the person should know that is not a failure; the verb
   /// carries on and still ends `complete`. Detail carries `message`.
@@ -2301,6 +2329,10 @@ export interface InfraPlacementStatus {
   /// The triggers whose cut contains it (each instance's too, for a
   /// shared one), by owner: what taking it down takes down with it.
   takesDown?: OwnerTriggers[];
+  /// The latest time one of its copy's containers stopped on its own
+  /// (ran out of memory, exited) and its host brought it back, since
+  /// weft last started the copy (`describeRestart` says it).
+  lastRestart?: LastRestart;
 }
 
 /// How far a start, stop or terminate of an infra copy got: since when

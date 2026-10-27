@@ -322,7 +322,7 @@ impl<P: UploadPlane> ContentStore<P> {
             // Every byte sent was hashed on its way: bytes that are not the
             // content the upload was begun for would be refused by the
             // store's complete, so the upload is ended here instead.
-            let sent = format!("{:x}", std::mem::take(&mut bytes.hasher).finalize());
+            let sent = weft_core::project::hash::hex(&std::mem::take(&mut bytes.hasher).finalize());
             if let Some(hash) = hash.as_deref().filter(|hash| sent != *hash) {
                 changed = true;
                 let said = format!(

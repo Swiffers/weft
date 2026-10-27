@@ -35,6 +35,12 @@ one yourself, stop and write: "Wait. The key never passes through me."
 Then hand them the `weft connect` command below, with `--set-env` when the
 value is in their environment.
 
+For a key from another service, the user always runs `weft connect` with
+`--node <node>` (plus `--label`, `--on <target>` when they apply) and types
+the key at its hidden prompt. You never offer them the form that puts the
+key on the command line (`--set`), or any other place to keep it (a secrets
+script of their own, an env file).
+
 ## `weft connect`, the terminal flow
 
 Every Connect panel action exists as a CLI verb, so a user without VS
@@ -78,7 +84,8 @@ The flags the user runs, in the command you hand them:
 
 - `--set name=value` fills an acquisition field; `--set-env NAME=ENV_VAR`
   reads the value from an environment variable so a secret never rides
-  the command line. An explicitly empty `--set` or `--set-env` value is an
+  the command line. A key from another service goes in at the hidden
+  prompt instead, never through `--set`. An explicitly empty `--set` or `--set-env` value is an
   error, not a silent skip.
 - `--label <name>` names the new [connection]; without it, it is named
   after the service (or the app it signs in through). Suggest a name with

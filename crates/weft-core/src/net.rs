@@ -274,6 +274,42 @@ impl EmptyBody for reqwest::RequestBuilder {
     }
 }
 
+/// How long a connection weft holds open may sit with nothing on it before
+/// the system checks that the other end is still there, how often after
+/// that, and how many checks may go unanswered before the connection is
+/// given up. A peer that vanished without a word (its machine restarted,
+/// the network to it broke) sends nothing to say so, and the system's own
+/// checks start only after two hours of silence. These are the socket's
+/// settings, kept by the kernel: nothing is sent on the connection, and a
+/// live peer answers them even while it works on a long request, so only
+/// one that stopped answering is given up on, about a minute after it
+/// stopped. Every client weft makes to its own services, and a database a
+/// Postgres node reaches, use the same numbers. Weft's own connections to
+/// the install's database do not have them yet: sqlx offers no way to set
+/// them, so one whose database went silent is held until the system gives
+/// up on it by itself.
+pub const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+pub const KEEPALIVE_RETRIES: u32 = 3;
+/// How long something sent may go unacknowledged before the system closes
+/// the connection (`TCP_USER_TIMEOUT`). A connection with a request in
+/// flight is not quiet, so the checks above never start on it, and the
+/// system would otherwise resend for about fifteen minutes before giving
+/// up. Once it has passed it also ends the checks above, which is what
+/// makes "about a minute" hold.
+pub const UNANSWERED_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `builder`, with every connection its client makes checked for a dead
+/// path once it goes quiet: a call held open on a quiet connection (a CLI
+/// waiting on the install's answer, the install holding a call to a
+/// worker for a run's whole life) keeps its path alive this way, and one
+/// whose path died (a peer gone without a word) fails within a minute or
+/// so instead of waiting for ever. It puts no limit on a call's whole
+/// length: some wait as long as a person's own work runs.
+pub fn notice_dead_connections(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder.tcp_keepalive(KEEPALIVE_IDLE).tcp_keepalive_interval(KEEPALIVE_INTERVAL).tcp_keepalive_retries(KEEPALIVE_RETRIES)
+}
+
 /// The first value of a header a chain of proxies may list comma-separated.
 fn first_hop(value: &http::HeaderValue) -> Option<&str> {
     let text = value.to_str().ok()?;

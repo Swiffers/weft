@@ -81,7 +81,11 @@ pub struct DesignKeyRequest {
 /// Resolves the runtime's provider keys. Policy lives in the impl.
 /// `pool` is the broker's Postgres, passed in (same shape as
 /// `EntitlementSource`) so a policy can consult runtime state without
-/// holding a second pool.
+/// holding a second pool. The broker answers a database it could not get
+/// a connection to as "nothing was done, send it again"
+/// (`handlers::unavailable_or_internal`), so a source that writes keeps
+/// each call to one statement or one transaction, or to writes that
+/// repeat harmlessly.
 #[async_trait::async_trait]
 pub trait CredentialSource: Send + Sync {
     async fn resolve(&self, pool: &sqlx::PgPool, req: &KeyRequest) -> Result<KeyResolution>;

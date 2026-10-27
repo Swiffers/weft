@@ -31,6 +31,8 @@
 
 use std::time::Duration;
 
+use weft_task_store::sql;
+
 use axum::http::StatusCode;
 use weft_core::door_fire::{UnclockedWait, WaitsOn};
 use weft_task_store::drain::DrainStep;
@@ -91,7 +93,7 @@ pub(crate) async fn drain_waiting_on(state: &DispatcherState, on: UnclockedWait,
 /// whose queue holds an event waiting on `on`: what [`drain_waiting_on`]
 /// drains.
 pub async fn tokens_waiting_on(pool: &sqlx::PgPool, on: UnclockedWait, project: Option<uuid::Uuid>) -> anyhow::Result<Vec<String>> {
-    Ok(sqlx::query_scalar(&format!(
+    Ok(sqlx::query_scalar(sql!(
         "SELECT s.token FROM signal s {} \
          WHERE ($1::uuid IS NULL OR s.project_id = $1) AND COALESCE(a.status, 'active') = 'active' \
            AND EXISTS (SELECT 1 FROM parked_fire p WHERE p.token = s.token AND {})",
@@ -171,7 +173,7 @@ pub(crate) async fn drain_due(state: &DispatcherState) -> anyhow::Result<DrainSt
 /// The heads the sweep would drain: of a trigger that is Active (or that
 /// no activation governs), due at `now`, waiting on no event.
 pub async fn due_tokens(pool: &sqlx::PgPool, now: i64) -> anyhow::Result<Vec<String>> {
-    Ok(sqlx::query_scalar(&format!(
+    Ok(sqlx::query_scalar(sql!(
         "SELECT p.token FROM parked_fire p JOIN signal s ON s.token = p.token {} \
          WHERE COALESCE(a.status, 'active') = 'active' \
            AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = p.token) \
@@ -186,7 +188,7 @@ pub async fn due_tokens(pool: &sqlx::PgPool, now: i64) -> anyhow::Result<Vec<Str
 /// When the earliest head [`due_tokens`] would drain comes due; `None`
 /// when no head waits on a clock.
 pub async fn next_due(pool: &sqlx::PgPool) -> anyhow::Result<Option<i64>> {
-    Ok(sqlx::query_scalar(&format!(
+    Ok(sqlx::query_scalar(sql!(
         "SELECT MIN(p.not_before) FROM parked_fire p JOIN signal s ON s.token = p.token {} \
          WHERE COALESCE(a.status, 'active') = 'active' \
            AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = p.token) \

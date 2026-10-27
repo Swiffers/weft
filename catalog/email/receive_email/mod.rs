@@ -125,9 +125,9 @@ pub async fn fetch_unseen(
     // The server speaks first; its greeting must be consumed before
     // the first command or every later reply is read one answer off.
     match client.read_response().await {
-        Some(Ok(_greeting)) => {}
-        Some(Err(e)) => return Err(format!("reading the server's greeting: {e}")),
-        None => return Err("the server closed the connection before greeting".into()),
+        Ok(Some(_greeting)) => {}
+        Err(e) => return Err(format!("reading the server's greeting: {e}")),
+        Ok(None) => return Err("the server closed the connection before greeting".into()),
     }
     let mut session = client
         .login(user, password)
@@ -195,10 +195,10 @@ fn parse_message(raw: &[u8]) -> Value {
 
 /// An address header as display text: `Name <box@host>` per mailbox,
 /// comma-joined.
-fn address_text(header: Option<&mail_parser::Address<'_>>) -> String {
+fn address_text(header: Option<mail_parser::AddressList<'_>>) -> String {
     let Some(header) = header else { return String::new() };
     header
-        .iter()
+        .mailboxes()
         .map(|a| match (a.name(), a.address()) {
             (Some(name), Some(addr)) => format!("{name} <{addr}>"),
             (None, Some(addr)) => addr.to_string(),

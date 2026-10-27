@@ -55,7 +55,7 @@ pub use frontends::{FrontendHosting, FrontendSite, HostedFrontend};
 pub use holder_pool::HolderPool;
 pub use holders::{AlarmLiveness, HeldCheck, HolderHeard, HolderLiveness, HolderNews, HolderNote, OneProcessHolds, HELD_CHECK_PATH};
 pub use images::{BuildHandle, BuildRequest, BuildStatus, ImageBuilder, ImageDeleted, Staging};
-pub use infra_host::{EndpointAt, InfraHost, UnitObservation, UnitRunState};
+pub use infra_host::{EndpointAt, InfraHost, RestartCause, UnitObservation, UnitRestart, UnitRunState};
 pub use needs::MachineNeeds;
 pub use news::{Listening, MayMiss, News, NewsHeard, NewsKind, RunNews};
 pub use object_store::{

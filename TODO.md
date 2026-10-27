@@ -724,3 +724,59 @@ Facts from Google's docs (2026-10): Cloud Run GPUs are GA (L4 24 GB,
 RTX PRO 6000 96 GB, one per copy, a few regions), scale to zero, start in
 about 5 seconds plus model load, stay warm up to 10 minutes idle, and are
 billed per second of a copy's life with a 1 minute minimum.
+
+## Move to reqwest 0.13
+
+weft is on reqwest 0.12.28; 0.13.5 is current. No RustSec advisory has
+ever been filed against reqwest (checked 2026-10-27), so this is upkeep,
+not a security fix. It waits on minillmlib: the LLM nodes hand weft's
+HTTP client to `minillmlib::with_http_client`
+(`catalog/ai/llm/package.toml`), so both must use the same reqwest, and
+minillmlib 0.6.0 (WeaveMindAI/MiniLLMLibRS) is still on 0.12 with
+reqwest-middleware 0.4. The order: a minillmlib release on reqwest 0.13,
+then weft's reqwest and reqwest-middleware together. reqwest 0.13's
+`rustls` feature brings in aws-lc; staying on ring means its
+`rustls-no-provider` feature and the provider weft installs at startup,
+which test binaries never install, so they need it too.
+
+## Move to rowan 0.17
+
+weft is on rowan 0.16.1; 0.17.0 is current (0.18 is in alpha). No RustSec
+advisory has ever been filed against rowan (checked 2026-10-27), so this
+is upkeep only. 0.17 removes the in-place tree editing weft's editing
+engine is built on (`clone_for_update`, `splice_children`, `detach`: 53
+uses in `crates/weft-compiler/src/edit/ops.rs` and `cst/nodes.rs`), so
+moving means redesigning how edits are applied to a `.weft` file, which
+needs a design first. The pin in the workspace `Cargo.toml` says why it
+stays.
+
+## Move weft's own database layer to tokio-postgres
+
+**Problem.** weft cannot notice that its own database vanished without a
+word (a machine or network path gone, Cloud Run dropping a connection
+idle 10 to 20 minutes): a query in flight hangs until the kernel gives
+up (about 15 minutes) and the idle LISTEN connection is never noticed at
+all. The fix is TCP keepalive plus TCP_USER_TIMEOUT on every connection,
+and Cloud Run says it can only be set by the client library. sqlx, which
+weft uses, has no such option in any release (0.9.0, checked
+2026-10-27) and no official way to reach the socket; the pull request
+that adds it (transact-rs/sqlx#4483) is unreviewed, and two earlier ones
+went nowhere. tokio-postgres has it officially (`keepalives_*`,
+`tcp_user_timeout`), and the Postgres catalog node already uses it with
+the numbers in `weft_core::net`.
+
+**Direction.** Port weft's database code to tokio-postgres plus
+deadpool-postgres: about 750 query sites and 120 transactions in 10
+crates, the LISTEN connection (`pg_signal.rs`) onto tokio-postgres's
+notification stream, the migration runner (`schema_guard.rs`), and what
+this branch built on sqlx's pool: the in-use count and slow-acquire
+signal in `weft_task_store::db` / `throttle`, and the error
+classification (`no_connection`, `unreachable`). Then drop sqlx.
+
+**Ruled out.** Building against the unmerged pull request (a commit that
+can vanish); per-query deadlines (sqlx's untimed ping when a connection
+is handed back holds the slot anyway, and lock waits and LISTEN need
+none); moving only the LISTEN connection (in-flight queries still hang,
+and the database code splits across two libraries). A small in-process
+relay that dials with keepalive and hands sqlx a Unix socket would work
+on sqlx, at the cost of a step on every query.

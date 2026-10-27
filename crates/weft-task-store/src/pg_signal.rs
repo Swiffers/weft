@@ -256,10 +256,14 @@ impl PgSignalWatch {
     /// reconnects on its own (as `listening` says) and every waiter is
     /// told to recheck.
     pub async fn start(connect: &PgConnectOptions, channels: &'static [&'static str], listening: Listening) -> Result<Arc<Self>> {
+        // Its one connection is the listener's for good, so its acquires
+        // say nothing of the database holding the install back: sqlx's
+        // report of a slow one, which `crate::throttle` counts, is off.
         let own = PgPoolOptions::new()
             .max_connections(1)
             .max_lifetime(None)
             .idle_timeout(None)
+            .acquire_slow_level(log::LevelFilter::Off)
             .connect_with(connect.clone().application_name(WATCH_APPLICATION_NAME))
             .await?;
         let listener = listen(&own, channels).await?;

@@ -2,7 +2,7 @@
 # mounts the driver and `nvidia-smi` in when the container is given a GPU.
 # A glibc base, because what it mounts is built for glibc (on alpine the
 # binary is there and does not run).
-FROM python:3.12-slim
+FROM python:3.15-slim
 
 WORKDIR /app
 COPY server.py /app/server.py

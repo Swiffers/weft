@@ -1,7 +1,7 @@
 // Runs the cases of claude-code's specialist_commands hook, adapted to this
 // host, plus OpenCode's own, against .opencode/specialist-commands/decide.ts
 // and the plugin that calls it: `node tests/specialist-commands.test.ts`
-// (Node 23.6 or newer runs TypeScript as is).
+// (Node 22.18 or newer runs TypeScript as is).
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
@@ -86,6 +86,11 @@ const reference: Case[] = [
   ["deployer", "weft workers set --min-instances 1 --on prod", "deny"],
   ["deployer", "weft workers --on prod", "allow"],
   ["deployer", "curl https://x", "deny"],
+  ["deployer", "weft stop abc --on prod", "allow"],
+  ["deployer", "weft run --on prod --target schema --detach", "allow"],
+  ["deployer", "weft wait abc --on prod", "allow"],
+  ["deployer", "weft logs abc --on prod", "allow"],
+  ["deployer", "weft events abc --on prod", "allow"],
   ["red-teamer", "weft describe-nodes --node X --compact", "allow"],
   ["red-teamer", "weft run", "deny"],
   ["frontend-builder", "weft run 'x", "deny"]

@@ -482,9 +482,10 @@ impl S3ObjectStore {
         }
     }
 
-    /// Ensure the slot's bucket exists and is reachable (idempotent). SeaweedFS
-    /// does not auto-create a bucket on first PutObject, so the store creates it
-    /// once at startup; an already-existing / already-owned bucket (the common
+    /// Ensure the slot's bucket exists and is reachable (idempotent). Creating a
+    /// bucket on first PutObject is not something every S3 store does (SeaweedFS
+    /// before 4.01 did not), so the store creates it once at startup; an already-existing /
+    /// already-owned bucket (the common
     /// case, and what every restart hits) is a no-op.
     ///
     /// Fail LOUD (no warn-and-continue): if `head_bucket` succeeds the bucket is

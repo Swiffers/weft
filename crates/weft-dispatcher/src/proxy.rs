@@ -206,6 +206,9 @@ async fn forward_http(
 ) -> Response {
     let (parts, body) = request.into_parts();
     let url = format!("{}{path_and_query}", upstream.base_url.trim_end_matches('/'));
+    // No limit on the call: it lasts as long as what answers it (a
+    // program's route, a frontend, a node's container) and its caller
+    // want, a stream included.
     let mut call = http.request(parts.method, &url);
     for (name, value) in parts.headers.iter().filter(|(name, _)| passed.passes(name)) {
         call = call.header(name, value);
@@ -361,8 +364,8 @@ async fn pump(
 
 fn caller_to_worker(message: CallerMessage) -> Option<WorkerMessage> {
     Some(match message {
-        CallerMessage::Text(text) => WorkerMessage::Text(text.to_string()),
-        CallerMessage::Binary(bytes) => WorkerMessage::Binary(bytes.to_vec()),
+        CallerMessage::Text(text) => WorkerMessage::Text(text.as_str().into()),
+        CallerMessage::Binary(bytes) => WorkerMessage::Binary(bytes),
         CallerMessage::Close(frame) => WorkerMessage::Close(frame.map(|f| tungstenite::protocol::CloseFrame {
             code: f.code.into(),
             reason: f.reason.to_string().into(),
@@ -373,8 +376,8 @@ fn caller_to_worker(message: CallerMessage) -> Option<WorkerMessage> {
 
 fn worker_to_caller(message: WorkerMessage) -> Option<CallerMessage> {
     Some(match message {
-        WorkerMessage::Text(text) => CallerMessage::Text(text.into()),
-        WorkerMessage::Binary(bytes) => CallerMessage::Binary(bytes.into()),
+        WorkerMessage::Text(text) => CallerMessage::Text(text.as_str().into()),
+        WorkerMessage::Binary(bytes) => CallerMessage::Binary(bytes),
         WorkerMessage::Close(frame) => {
             CallerMessage::Close(frame.map(|f| CloseFrame { code: f.code.into(), reason: f.reason.to_string().into() }))
         }

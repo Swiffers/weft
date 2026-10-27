@@ -95,9 +95,24 @@ pub fn dial_config(conn: &OpenedConnection) -> WeftResult<Config> {
         .dbname(conn.value("database")?)
         .user(conn.value("user")?)
         .password(conn.value("password")?)
-        .ssl_mode(ssl_mode);
+        .ssl_mode(ssl_mode)
+        .connect_timeout(CONNECT_WITHIN)
+        // A query waiting on a server that vanished gets no answer and no
+        // error; these give it up about a minute after the server stopped
+        // answering (`weft::net::KEEPALIVE_IDLE` says how), while a live
+        // server's long query still waits as long as it needs.
+        .keepalives(true)
+        .keepalives_idle(weft::net::KEEPALIVE_IDLE)
+        .keepalives_interval(weft::net::KEEPALIVE_INTERVAL)
+        .keepalives_retries(weft::net::KEEPALIVE_RETRIES)
+        .tcp_user_timeout(weft::net::UNANSWERED_FOR);
     Ok(config)
 }
+
+/// How long reaching the database's address may take before the dial
+/// gives up. It bounds the TCP connect alone; the sign-in after it is
+/// covered by the keepalive settings the config sets.
+const CONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The connection half of a dialed client: the future that must be
 /// driven for the client to work.
@@ -108,48 +123,166 @@ type Connection = tokio_postgres::Connection<
 
 /// Dial the wired database: the one handshake behind `connect` and
 /// `connect_listening`, each of which drives the connection its own way.
-async fn dial(conn: &OpenedConnection) -> WeftResult<(tokio_postgres::Client, Connection)> {
-    dial_with(&dial_config(conn)?).await
+async fn dial(ctx: &RunContext, conn: &OpenedConnection) -> WeftResult<(tokio_postgres::Client, Connection)> {
+    dial_with(ctx, &dial_config(conn)?).await
+}
+
+/// The first wait before asking a full database again, doubled on every
+/// refusal up to [`FULL_LONGEST_WAIT`].
+const FULL_FIRST_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+const FULL_LONGEST_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often a worker says it is waiting on a full database: once a
+/// minute at most, with how many runs wait, so a busy minute is one
+/// line rather than one per run.
+const SAY_FULL_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// This worker's runs held back by a full database, counted per run
+/// (from its first refusal until it gets a connection or stops), never
+/// per refused attempt: how many runs were held back is what tells the
+/// person how short the database is.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct FullWaits {
+    /// When this worker last said so.
+    pub(crate) said_at: Option<std::time::Instant>,
+    /// Runs that began waiting since then.
+    pub(crate) began: u64,
+    /// Runs waiting right now.
+    pub(crate) waiting: u64,
+}
+
+static FULL_WAITS: std::sync::Mutex<FullWaits> = std::sync::Mutex::new(FullWaits { said_at: None, began: 0, waiting: 0 });
+
+/// One run waiting on a full database, counted in [`FULL_WAITS`] while
+/// it lives.
+struct HeldBack;
+
+impl HeldBack {
+    fn begin() -> Self {
+        FULL_WAITS.lock().expect("FULL_WAITS poisoned").begin();
+        Self
+    }
+}
+
+impl Drop for HeldBack {
+    fn drop(&mut self) {
+        FULL_WAITS.lock().expect("FULL_WAITS poisoned").waiting -= 1;
+    }
+}
+
+impl FullWaits {
+    pub(crate) fn begin(&mut self) {
+        self.began += 1;
+        self.waiting += 1;
+    }
+
+    /// What to log at `now`, when a minute has passed since the last
+    /// notice; the count of runs that began waiting starts again from
+    /// there.
+    pub(crate) fn notice(&mut self, now: std::time::Instant) -> Option<String> {
+        if self.said_at.is_some_and(|at| now.duration_since(at) < SAY_FULL_EVERY) {
+            return None;
+        }
+        let said = format!(
+            "postgres: the database has no connection free (too many clients); {} run(s) wait for one now, \
+             {} began waiting since the last notice. Runs slow down until one frees up. If this keeps happening, \
+             raise the database's size: on a PostgresDatabase node, raise `memory` (its connection count follows it)",
+            self.waiting, self.began
+        );
+        self.said_at = Some(now);
+        self.began = 0;
+        Some(said)
+    }
 }
 
 /// [`dial`] with the place and the sign-in already read off the
-/// connection.
-async fn dial_with(config: &Config) -> WeftResult<(tokio_postgres::Client, Connection)> {
+/// connection. A database with no connection left to give
+/// (`too_many_connections`) refused before anything ran, so the run
+/// waits for one to free up instead of failing: the size of the database
+/// is a limit to slow down at, and the warning names the lever.
+async fn dial_with(ctx: &RunContext, config: &Config) -> WeftResult<(tokio_postgres::Client, Connection)> {
+    let cancel = ctx.cancellation();
+    let mut wait = FULL_FIRST_WAIT;
+    // Counted once for the run, at its first refusal, and no longer once
+    // it gets a connection or stops.
+    let mut held_back: Option<HeldBack> = None;
+    loop {
+        match open(config).await? {
+            Ok(opened) => return Ok(opened),
+            Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::TOO_MANY_CONNECTIONS) => {
+                if held_back.is_none() {
+                    held_back = Some(HeldBack::begin());
+                }
+                say_full(std::time::Instant::now());
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = cancel.cancelled() => return Err(WeftError::Cancelled),
+                }
+                wait = (wait * 2).min(FULL_LONGEST_WAIT);
+            }
+            Err(e) => return Err(connect_failed(e)),
+        }
+    }
+}
+
+/// Say that runs wait on a full database, when a minute has passed
+/// since the last time.
+fn say_full(now: std::time::Instant) {
+    if let Some(said) = FULL_WAITS.lock().expect("FULL_WAITS poisoned").notice(now) {
+        tracing::warn!("{said}");
+    }
+}
+
+/// One handshake: the outer error is weft's own (the trust settings),
+/// the inner one the database's answer.
+async fn open(config: &Config) -> WeftResult<Result<(tokio_postgres::Client, Connection), tokio_postgres::Error>> {
     // The runtime's own trust settings, not a second opinion: one
     // answer to "which certificates does weft trust", and it pins the
     // crypto provider, which building a config here would leave to
     // whichever one the host binary happened to install.
     let tls_config = weft::net::tls_config().map_err(WeftError::Config)?;
     let tls = tokio_postgres_rustls::MakeRustlsConnect::new((*tls_config).clone());
-    config.connect(tls).await.map_err(|e| {
-        // A handshake failure is the one whose fix is not in the
-        // message the driver gives back, because weft is stricter
-        // than what a provider means by `require`: it checks the
-        // chain and the hostname every time. Said ONLY for that
-        // failure, so a wrong password does not come back with four
-        // lines about certificate authorities.
-        let handshake = e.to_string().starts_with("error performing TLS handshake");
-        let hint = if handshake {
-            ". Weft checks the server's certificate and hostname on every TLS connection, \
-             so a database presenting one that is not signed by a public authority is \
-             refused even where other clients accept it. Such a database has to be \
-             reached over a private network with the connection's TLS setting on \
-             `disable`"
-        } else {
-            ""
-        };
-        WeftError::NodeFailed(format!("postgres: connect: {}{hint}", pg_detail(&e)))
-    })
+    Ok(config.connect(tls).await)
+}
+
+/// A failed handshake as the node's error.
+fn connect_failed(e: tokio_postgres::Error) -> WeftError {
+    // A handshake failure is the one whose fix is not in the message the
+    // driver gives back, because weft is stricter than what a provider
+    // means by `require`: it checks the chain and the hostname every
+    // time. Said ONLY for that failure, so a wrong password does not
+    // come back with four lines about certificate authorities.
+    let handshake = e.to_string().starts_with("error performing TLS handshake");
+    let hint = if handshake {
+        ". Weft checks the server's certificate and hostname on every TLS connection, \
+         so a database presenting one that is not signed by a public authority is \
+         refused even where other clients accept it. Such a database has to be \
+         reached over a private network with the connection's TLS setting on \
+         `disable`"
+    } else {
+        ""
+    };
+    WeftError::NodeFailed(format!("postgres: connect: {}{hint}", pg_detail(&e)))
 }
 
 /// The most runs of one worker that hold a connection to one database at
 /// once. Kept low on purpose: Postgres takes 100 connections by default,
 /// and several workers of a project share them, so 20 each lets a few
-/// workers run side by side without the database refusing anyone. A run
-/// past it waits for one to finish. A proper fix is a pooler in front of
-/// the database (TODO.md, "Several workers of a project can open more
-/// Postgres connections than the database takes").
-const MOST_AT_ONCE: usize = 20;
+/// workers run side by side without the database refusing anyone. A
+/// PostgresDatabase takes fewer on a small machine (24 at its default
+/// 1Gi, see its `memory` input), so there a second worker can find it
+/// full and waits for a connection to free up ([`dial_with`]).
+/// A run past it waits for one to finish. A proper fix is a pooler in
+/// front of the database (TODO.md, "Several workers of a project can open
+/// more Postgres connections than the database takes").
+pub(crate) const MOST_AT_ONCE: usize = 20;
+
+/// How long a returning connection gets to clear its session before it
+/// is let go instead. Clearing is a few short statements a healthy
+/// server answers in milliseconds; a connection that sits longer is one
+/// whose server is gone, and it must not keep its place under
+/// [`MOST_AT_ONCE`] while the kernel works that out.
+const CLEAR_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Connections to one database, signed in once and held by the worker for
 /// its runs to share (`ctx.shared`), instead of dialed and signed in again
@@ -171,24 +304,46 @@ impl Pool {
 /// ([`clear_session`]), unless the connection broke or the run was
 /// cancelled with it in hand (a statement may still be running on it;
 /// closing the connection is what stops it).
+///
+/// SQL reaches it only through its own methods, so every statement a
+/// run sends is seen on the way and the pool knows whether one of them
+/// could have left a transaction open.
 pub struct Pooled {
     client: Option<tokio_postgres::Client>,
     /// Held until the client is back in the pool or let go, so its place
     /// under the pool's limit stays taken while its session is cleared.
     pool: Option<weft::shared::SharedHandle<Pool>>,
     cancel: std::sync::Arc<weft::CancellationFlag>,
+    /// Whether a statement this run sent opens a transaction
+    /// ([`opens_transaction`]), so the one it opened may still be open.
+    may_hold_transaction: bool,
 }
 
-impl std::ops::Deref for Pooled {
-    type Target = tokio_postgres::Client;
-    fn deref(&self) -> &Self::Target {
-        self.client.as_ref().expect("a pooled client is held until it is dropped")
-    }
-}
-
-impl std::ops::DerefMut for Pooled {
-    fn deref_mut(&mut self) -> &mut Self::Target {
+impl Pooled {
+    /// The client, for sending `statements`, noting whether any of them
+    /// opens a transaction.
+    fn sending<'a>(&mut self, statements: impl IntoIterator<Item = &'a str>) -> &mut tokio_postgres::Client {
+        if statements.into_iter().any(opens_transaction) {
+            self.may_hold_transaction = true;
+        }
         self.client.as_mut().expect("a pooled client is held until it is dropped")
+    }
+
+    /// [`query_json`] on this client.
+    pub async fn query_json(&mut self, sql: &str, names: &[String], params: &[Value]) -> WeftResult<Vec<Value>> {
+        query_json(self.sending([sql]), sql, names, params).await
+    }
+
+    /// [`script_json`] on this client.
+    pub async fn script_json(&mut self, head: &[String], last: &str) -> WeftResult<Vec<Value>> {
+        let client = self.sending(head.iter().map(String::as_str).chain([last]));
+        script_json(client, head, last).await
+    }
+
+    /// [`steps_json`] on this client.
+    pub async fn steps_json(&mut self, steps: &[(Statement, Vec<Value>)]) -> WeftResult<Vec<Value>> {
+        let client = self.sending(steps.iter().map(|(s, _)| s.sql.as_str()));
+        steps_json(client, steps).await
     }
 }
 
@@ -198,35 +353,107 @@ impl Drop for Pooled {
         if client.is_closed() || self.cancel.is_cancelled() {
             return;
         }
+        let may_hold_transaction = self.may_hold_transaction;
         tokio::spawn(async move {
-            match clear_session(&client).await {
-                Ok(()) => pool.idle.lock().expect("pool poisoned").push(client),
-                Err(e) => tracing::warn!("postgres: a pooled connection is let go, its session could not be cleared: {e}"),
+            match tokio::time::timeout(CLEAR_WITHIN, clear_session(&client, may_hold_transaction)).await {
+                Ok(Ok(())) => pool.idle.lock().expect("pool poisoned").push(client),
+                Ok(Err(e)) => tracing::warn!("postgres: a pooled connection is let go, its session could not be cleared: {e}"),
+                Err(_) => tracing::warn!(
+                    "postgres: a pooled connection is let go, its database did not answer within {}s while its session was cleared",
+                    CLEAR_WITHIN.as_secs()
+                ),
             }
         });
     }
 }
+
+/// Whether `statement` opens a transaction that outlives it: its first
+/// word, past any comments, is `BEGIN` or `START` (`START TRANSACTION`).
+/// Nothing else can: `COMMIT AND CHAIN` and its kin chain from a
+/// transaction a `BEGIN` already opened, a function or procedure cannot
+/// begin one, and a `BEGIN` inside a `DO` block or a function body is
+/// past the statement's first word. Pure, so the decision is testable.
+///
+/// The statements are split by [`placeholders`], which reads quotes,
+/// comments and dollar bodies the way the server does. Where the two
+/// could still disagree (a database that turned off standard string
+/// quoting), [`clear_session`] asks the server itself whether a
+/// transaction was left open.
+pub fn opens_transaction(statement: &str) -> bool {
+    let mut rest = statement;
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.find('\n').map_or("", |at| &after[at..]);
+        } else if rest.starts_with("/*") {
+            // Nested, the way Postgres nests them.
+            let mut depth = 0usize;
+            let mut at = 0;
+            let bytes = rest.as_bytes();
+            while at < bytes.len() {
+                if bytes[at..].starts_with(b"/*") {
+                    depth += 1;
+                    at += 2;
+                } else if bytes[at..].starts_with(b"*/") {
+                    depth -= 1;
+                    at += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    at += 1;
+                }
+            }
+            rest = &rest[at..];
+        } else {
+            break;
+        }
+    }
+    let word: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$').collect();
+    word.eq_ignore_ascii_case("begin") || word.eq_ignore_ascii_case("start")
+}
+
+/// The column [`clear_session`] reads to find a transaction the run left
+/// open that [`opens_transaction`] did not see coming.
+const LEFT_OPEN: &str = "transaction_left_open";
 
 /// Clear what a run left on a connection's session, so the next run gets
 /// it as a fresh one would be: an open transaction, settings, temporary
 /// tables, cursors, listens, advisory locks, and statements it prepared
 /// in SQL. Everything `DISCARD ALL` does but drop the statements the
 /// driver itself prepared, which it would then find gone.
-async fn clear_session(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
-    client.batch_execute("ROLLBACK").await?;
-    let prepared = client.simple_query("SELECT name FROM pg_prepared_statements WHERE from_sql").await?;
+///
+/// The transaction is rolled back only when the run sent a statement
+/// that opens one: a `ROLLBACK` with nothing open makes the server log a
+/// warning on every run. The same round trip asks the server whether a
+/// transaction is still open after that, by comparing when it began
+/// with when this statement arrived (equal unless one began earlier),
+/// and a connection where one is gets let go: closing it rolls the
+/// transaction back, and the warning names the miss.
+async fn clear_session(client: &tokio_postgres::Client, may_hold_transaction: bool) -> Result<(), String> {
+    let rollback = if may_hold_transaction { "ROLLBACK; " } else { "" };
+    let answer = client
+        .simple_query(&format!(
+            "{rollback}SELECT statement_timestamp() <> transaction_timestamp() AS {LEFT_OPEN}; \
+             SELECT name FROM pg_prepared_statements WHERE from_sql"
+        ))
+        .await
+        .map_err(|e| pg_detail(&e))?;
     let mut reset = String::from(
         "CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; \
          SELECT pg_advisory_unlock_all(); DISCARD PLANS; DISCARD TEMP; DISCARD SEQUENCES;",
     );
-    for message in prepared {
-        if let tokio_postgres::SimpleQueryMessage::Row(row) = message {
-            if let Some(name) = row.get(0) {
-                reset.push_str(&format!(" DEALLOCATE \"{}\";", name.replace('"', "\"\"")));
+    for message in answer {
+        let tokio_postgres::SimpleQueryMessage::Row(row) = message else { continue };
+        if row.columns()[0].name() == LEFT_OPEN {
+            if row.get(0) == Some("t") {
+                return Err("the run left a transaction open through a statement not recognised as opening one".into());
             }
+        } else if let Some(name) = row.get(0) {
+            reset.push_str(&format!(" DEALLOCATE \"{}\";", name.replace('"', "\"\"")));
         }
     }
-    client.batch_execute(&reset).await
+    client.batch_execute(&reset).await.map_err(|e| pg_detail(&e))
 }
 
 /// A client of the database `access` connects to, from the pool this
@@ -239,14 +466,14 @@ pub async fn connect(ctx: &RunContext, access: &weft::access::Access) -> WeftRes
         let idle = pool.idle.lock().expect("pool poisoned").pop();
         match idle {
             Some(client) if !client.is_closed() => {
-                return Ok(Pooled { client: Some(client), pool: Some(pool), cancel: ctx.cancellation() });
+                return Ok(Pooled { client: Some(client), pool: Some(pool), cancel: ctx.cancellation(), may_hold_transaction: false });
             }
             // A connection the server or the network closed since.
             Some(_) => continue,
             None => break,
         }
     }
-    let (client, connection) = dial_with(&pool.config).await?;
+    let (client, connection) = dial_with(ctx, &pool.config).await?;
     // The connection future must be driven for the client to work; it
     // ends when the client drops. A connection failure surfaces on the
     // next query as a loud error, so the task only logs.
@@ -255,7 +482,7 @@ pub async fn connect(ctx: &RunContext, access: &weft::access::Access) -> WeftRes
             tracing::warn!("postgres connection ended: {e}");
         }
     });
-    Ok(Pooled { client: Some(client), pool: Some(pool), cancel: ctx.cancellation() })
+    Ok(Pooled { client: Some(client), pool: Some(pool), cancel: ctx.cancellation(), may_hold_transaction: false })
 }
 
 /// A connection of its own to the wired database, for a run that holds
@@ -263,7 +490,7 @@ pub async fn connect(ctx: &RunContext, access: &weft::access::Access) -> WeftRes
 /// every other run). Its task ends when the client drops or the run is
 /// cancelled.
 pub async fn connect_alone(ctx: &RunContext, conn: &OpenedConnection) -> WeftResult<tokio_postgres::Client> {
-    let (client, connection) = dial(conn).await?;
+    let (client, connection) = dial(ctx, conn).await?;
     let cancel = ctx.cancellation();
     tokio::spawn(async move {
         tokio::select! {
@@ -301,7 +528,7 @@ pub async fn connect_listening(
     channel: &str,
 ) -> WeftResult<(tokio_postgres::Client, tokio::sync::mpsc::UnboundedReceiver<ListenEvent>)> {
     use futures::StreamExt;
-    let (client, mut connection) = dial(conn).await?;
+    let (client, mut connection) = dial(ctx, conn).await?;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel = ctx.cancellation();
     tokio::spawn(async move {
@@ -345,6 +572,9 @@ pub async fn connect_listening(
 /// lives in the source underneath. Printing only the top of the chain
 /// throws away every refusal this module takes care to word, so the
 /// chain is walked and joined.
+///
+/// A connection that closed under a statement says only "connection
+/// closed", so that one gets what happened said plainly.
 fn pg_detail(e: &tokio_postgres::Error) -> String {
     let mut out = e.to_string();
     let mut source = std::error::Error::source(e);
@@ -355,6 +585,12 @@ fn pg_detail(e: &tokio_postgres::Error) -> String {
             out.push_str(&text);
         }
         source = cause.source();
+    }
+    if e.is_closed() {
+        out.push_str(
+            ". The connection to the database was lost before it answered: the database \
+             server went away or stopped answering (it restarted, or the network to it broke)",
+        );
     }
     out
 }
@@ -1105,7 +1341,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
 /// fails rolls the ones before it back, so a half-run script never
 /// leaves the database between two states. Answers the rows of the
 /// LAST statement, the way a script does.
-pub async fn steps_json(
+async fn steps_json(
     client: &mut tokio_postgres::Client,
     steps: &[(Statement, Vec<Value>)],
 ) -> WeftResult<Vec<Value>> {
@@ -1148,7 +1384,7 @@ pub async fn steps_json(
 /// rows are ever read, so it is the only one that has to come back
 /// typed, and running it separately on the SAME session leaves any
 /// transaction the script opened open around it.
-pub async fn script_json(
+async fn script_json(
     client: &tokio_postgres::Client,
     head: &[String],
     last: &str,

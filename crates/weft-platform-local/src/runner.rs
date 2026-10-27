@@ -868,7 +868,7 @@ fn now_unix() -> i64 {
 
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    getrandom::getrandom(&mut buf).expect("the OS random source");
+    getrandom::fill(&mut buf).expect("the OS random source");
     hex::encode(buf)
 }
 

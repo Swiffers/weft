@@ -1,8 +1,8 @@
 //! Background reapers that sweep stale rows. Every copy of the
 //! dispatcher runs all of these, and each sweep runs under its own
-//! install-wide advisory lock (`lease::REAPER_DOMAIN`, keyed by the
-//! reaper's name), so one copy sweeps at a time and a sibling that finds
-//! the lock held skips that turn: N copies cost one sweep, not N. The
+//! install-wide lease (`weft_task_store::locks::with_lease`, named
+//! after the reaper), so one copy sweeps at a time and a sibling that finds
+//! the lease held skips that turn: N copies cost one sweep, not N. The
 //! writes stay idempotent underneath (delete-by-key is a no-op the second
 //! time, task reclaim is conditional), so a sweep that overlaps a request
 //! doing the same work is harmless.
@@ -18,6 +18,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn};
+use weft_task_store::locks::Leased;
 
 use crate::state::DispatcherState;
 
@@ -37,7 +38,7 @@ pub(crate) static ON_DOOR_WINDOW: &[WakeOn] = &[WakeOn::any(crate::holders::HELD
 /// triggers that went down with it, and the events that waited on it. An
 /// activation changing status or a held signal going: a
 /// trigger refused because another claim held it comes back once that
-/// claim ends.
+/// claim ends. Either one: a resync stopped waiting on it goes on.
 pub(crate) static ON_INFRA_RETURNS: &[WakeOn] = &[
     WakeOn::any(crate::held::INFRA_STATUS_CHANNEL),
     WakeOn::any(crate::holders::HELD_SIGNALS_CHANNEL),
@@ -72,7 +73,14 @@ pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
         woken(state, ON_DOOR_WINDOW, DOOR_WINDOWS, DOOR_WINDOWS_LABEL, close_door_windows),
         // An infra copy running again: the triggers its stop took down
         // with it come back, and the events that waited on it go.
-        woken(state, ON_INFRA_RETURNS, "infra_returns", "bring back triggers whose infra returned", crate::api::infra::bring_back_triggers_whose_infra_returned),
+        woken(state, ON_INFRA_RETURNS, INFRA_RETURNS, "bring back triggers whose infra returned", crate::api::infra::bring_back_triggers_whose_infra_returned),
+        // The same wakes take up again a resync stopped on one of those
+        // changes. A loop of its own, so the look booked for a resync
+        // stopped on the database stands whatever else fails on these
+        // wakes: a failed pass keeps no look of its own.
+        woken(state, ON_INFRA_RETURNS, RESYNC_RETURNS, "take up again the resyncs that stopped waiting on infra, an activation or the database", |s| async move {
+            Ok(crate::task_kinds::resync::retry_stopped(&s).await?.map_or(DrainStep::Done, DrainStep::RetryIn))
+        }),
     ];
     // A machine's fronts are its own containers: one that went down is put
     // back, on a free port when another program took its own (and the
@@ -82,6 +90,15 @@ pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
     }
     loops
 }
+
+/// The loop that brings back what waited on infra or on an activation, by
+/// name.
+pub(crate) const INFRA_RETURNS: &str = "infra_returns";
+
+/// The loop that takes up again a resync stopped on infra, an activation
+/// or the database (`crate::task_kinds::resync::retry_stopped`), by name:
+/// a resync that stops waiting on the database books its look.
+pub(crate) const RESYNC_RETURNS: &str = "resync_returns";
 
 /// The door-windows loop, by name.
 pub(crate) const DOOR_WINDOWS: &str = "door_windows";
@@ -242,6 +259,7 @@ where
         let state = state.clone();
         let sweep = sweep.clone();
         async move {
+            // Held by a sibling: it is sweeping now, and this tick is skipped.
             sweep_alone(&state, name, || sweep(state.clone())).await?;
             Ok(DrainStep::Done)
         }
@@ -260,31 +278,36 @@ where
         let state = state.clone();
         let sweep = sweep.clone();
         async move {
-            // A sibling holding the lock is sweeping right now, but it may
-            // have read before the write this wake is for, so look again
-            // shortly (`LOCK_HELD_RETRY`).
-            Ok(sweep_alone(&state, name, || sweep(state.clone()))
-                .await?
-                .unwrap_or(DrainStep::RetryIn(weft_task_store::drain::LOCK_HELD_RETRY)))
+            // A sibling holding the lease is sweeping right now, but it may
+            // have read before the write this wake is for, so this looks
+            // again once the sibling's lease would lapse. Not sooner: a
+            // sweep may run for minutes, and a look every moment would
+            // keep a cloud install's dispatcher woken for all of it. A
+            // sibling still up heard the same write, and its loop sweeps
+            // again once this sweep ends (`drain::run` keeps what it heard
+            // while draining); the look at the lapse is for a sibling that
+            // died holding it.
+            Ok(match sweep_alone(&state, name, || sweep(state.clone())).await? {
+                Leased::Ran(step) => step,
+                Leased::HeldFor(lapses_in) => DrainStep::RetryIn(lapses_in),
+            })
         }
     })
 }
 
-/// Run one sweep while holding the reaper's install-wide lock, or skip
-/// it (`None`) while a sibling replica holds it. The lock is held on the
-/// lock pool: every sweep starts at once when the process boots, and with
-/// the locks on the work pool, more sweeps than it has connections each
-/// held one and waited for another, until every request of the process
-/// timed out.
-async fn sweep_alone<T, F, Fut>(state: &DispatcherState, name: &str, sweep: F) -> anyhow::Result<Option<T>>
+/// Run one sweep as the only run of it install-wide, or skip it while a
+/// sibling replica runs it (`Leased::HeldFor`, how long until its lease
+/// would lapse). A lease row, never a held connection:
+/// a sweep may run for as long as a trigger's setup takes and take locks
+/// of its own on the lock pool, so a lock held for the sweep would hold a
+/// lock connection for nothing the whole time, and with every sweep
+/// starting at once as the process boots, a lock pool as small as the
+/// database's share allows would leave none for the locks the sweeps
+/// themselves wait on.
+async fn sweep_alone<T, F, Fut>(state: &DispatcherState, name: &str, sweep: F) -> anyhow::Result<Leased<T>>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
-    crate::lease::with_advisory_lock(
-        &state.lock_pool,
-        crate::lease::advisory_key(crate::lease::REAPER_DOMAIN, name),
-        sweep,
-    )
-    .await
+    weft_task_store::locks::with_lease(&state.pg_pool, &format!("sweep/{name}"), sweep).await
 }

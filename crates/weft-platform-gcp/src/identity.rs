@@ -33,7 +33,7 @@ const UNKNOWN_KEY_REFETCH: Duration = Duration::from_secs(30);
 
 /// Google's keys as last fetched.
 struct Keys {
-    by_id: HashMap<String, jsonwebtoken::DecodingKey>,
+    by_id: HashMap<String, weft_core::jwt::DecodingKey>,
     fetched: Instant,
     until: Instant,
 }
@@ -97,7 +97,7 @@ impl GoogleIdentity {
         }
     }
 
-    async fn key(&self, kid: &str) -> Result<jsonwebtoken::DecodingKey, IdentityRefused> {
+    async fn key(&self, kid: &str) -> Result<weft_core::jwt::DecodingKey, IdentityRefused> {
         let mut cached = self.keys.lock().await;
         let now = Instant::now();
         if cached.as_ref().is_none_or(|k| k.stale_for(kid, now)) {
@@ -110,7 +110,7 @@ impl GoogleIdentity {
             let set: Set = resp.json().await.map_err(|e| IdentityRefused::Unavailable(e.to_string()))?;
             let mut keys = HashMap::new();
             for k in set.keys {
-                let key = jsonwebtoken::DecodingKey::from_rsa_components(&k.n, &k.e)
+                let key = weft_core::jwt::DecodingKey::from_rsa_components(&k.n, &k.e)
                     .map_err(|e| IdentityRefused::Unavailable(format!("Google published a key weft cannot read: {e}")))?;
                 keys.insert(k.kid, key);
             }
@@ -193,14 +193,14 @@ impl CallerIdentity for GoogleIdentity {
         if bearer.is_empty() {
             return Err(IdentityRefused::Missing);
         }
-        let header = jsonwebtoken::decode_header(bearer).map_err(|e| IdentityRefused::Malformed(e.to_string()))?;
+        let header = weft_core::jwt::decode_header(bearer).map_err(|e| IdentityRefused::Malformed(e.to_string()))?;
         let kid = header.kid.ok_or_else(|| IdentityRefused::Malformed("no key id".into()))?;
         let key = self.key(&kid).await?;
-        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        let mut validation = weft_core::jwt::Validation::new(weft_core::jwt::Algorithm::RS256);
         validation.set_audience(audiences);
         validation.set_issuer(&["https://accounts.google.com", "accounts.google.com"]);
-        let data = jsonwebtoken::decode::<Claims>(bearer, &key, &validation).map_err(|e| {
-            use jsonwebtoken::errors::ErrorKind;
+        let data = weft_core::jwt::decode::<Claims>(bearer, &key, &validation).map_err(|e| {
+            use weft_core::jwt::errors::ErrorKind;
             match e.kind() {
                 ErrorKind::ExpiredSignature => IdentityRefused::Expired,
                 ErrorKind::InvalidSignature => IdentityRefused::BadSignature,

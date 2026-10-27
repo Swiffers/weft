@@ -973,11 +973,9 @@ fn remove_container(view: &FileView, decl: Decl, id: &str) -> Result<(), EditErr
                 moved_src.push_str(&dedent_block(&child.to_string(), &inner_indent));
                 moved_src.push('\n');
             }
-            SyntaxKind::CONNECTION => {
-                if !connection_is_boundary(&child) {
-                    moved_src.push_str(&dedent_block(&child.to_string(), &inner_indent));
-                    moved_src.push('\n');
-                }
+            SyntaxKind::CONNECTION if !connection_is_boundary(&child) => {
+                moved_src.push_str(&dedent_block(&child.to_string(), &inner_indent));
+                moved_src.push('\n');
             }
             // CONFIG_FIELD inside a loop body: dropped on ungroup
             // (loop config has no meaning at file/group scope).

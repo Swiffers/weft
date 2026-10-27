@@ -154,6 +154,12 @@
       {"prefix": "weft workers", "refuse": [["set"]]},
       "weft instances",
       "weft runs",
+      "weft run",
+      "weft logs",
+      "weft events",
+      "weft wait",
+      "weft follow",
+      "weft stop",
       "weft infra upgrade",
       "weft infra look"
     ]

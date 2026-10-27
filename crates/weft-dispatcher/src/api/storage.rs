@@ -72,15 +72,28 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
 /// the blanket 500 `internal` would give: `check` tags these as `StorageNotFound` /
 /// `BrokerRejected` in the error chain. A 4xx the broker chose is a client-actionable
 /// error, so the CLI user should see it, not an opaque 500. Storage out of reach
-/// is a 503 the caller asks again on, as a database out of reach is
-/// ([`crate::api::unavailable_or_internal`]). Everything else is a 500.
+/// is a 502 (the service behind the install failed it), never a 503,
+/// which says the same request goes through later
+/// (`weft_core::install::asks_again`): the object store may be down for
+/// good (a bucket gone, its credentials revoked), and a call to it may
+/// have done part of its work, so a caller shows the answer and the
+/// person asks again once storage is back. The broker turning the call
+/// away busy, with nothing of it run (`crate::storage::StorageBusy`), is
+/// the install's own 503, which the caller sends again as it is. A
+/// caller that wrote something before its storage call failed answers
+/// through `crate::api::after_writes`, so that 503 never says nothing
+/// ran when something did. Everything else is a 500.
+// SYNC: storage_err <-> crates/weft-core/src/install.rs (asks_again)
 pub(crate) fn storage_err(e: anyhow::Error) -> ApiError {
     if e.downcast_ref::<crate::storage::StorageNotFound>().is_some() {
         return (StatusCode::NOT_FOUND, format!("{e:#}")).into();
     }
+    if crate::storage::storage_busy(&e) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "the install's storage is too busy to take this call right now; try again shortly".to_string()).into();
+    }
     if crate::storage::storage_unreachable(&e) {
         tracing::warn!(target: "weft_dispatcher::storage", error = %format!("{e:#}"), "storage is out of reach");
-        return (StatusCode::SERVICE_UNAVAILABLE, "the install could not reach its storage right now; try again shortly".to_string()).into();
+        return (StatusCode::BAD_GATEWAY, "the install could not reach its storage right now; try again shortly".to_string()).into();
     }
     if let Some(rejected) = e.downcast_ref::<crate::storage::BrokerRejected>() {
         // Re-map the broker's own 4xx onto our axum StatusCode. Fall back to 500 if
@@ -368,7 +381,7 @@ mod tests {
     #[test]
     fn storage_err_maps_broker_statuses() {
         // A broker 404 surfaces as 404, a broker 4xx refusal keeps ITS status,
-        // storage out of reach is a 503, and anything else is a 500. This is the branch that
+        // storage out of reach is a 502, and anything else is a 500. This is the branch that
         // decides what the CLI user sees; pin it.
         let nf = anyhow::Error::new(crate::storage::StorageNotFound)
             .context("File expired or was deleted. Upload it again and start a new run.");
@@ -382,9 +395,14 @@ mod tests {
         .context("x");
         assert_eq!(storage_err(rejected).status, StatusCode::FORBIDDEN);
         assert_eq!(storage_err(anyhow::anyhow!("boom")).status, StatusCode::INTERNAL_SERVER_ERROR);
-        // Storage out of reach is asked again on, as a database out of reach is.
+        // Storage out of reach is a 502 the person asks again on once it
+        // is back, never the 503 a caller waits out on its own.
         let down = anyhow::Error::new(crate::storage::StorageUnavailable).context("broker storage wipe returned 503");
-        assert_eq!(storage_err(down).status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(storage_err(down).status, StatusCode::BAD_GATEWAY);
+        // The broker turning the call away busy, nothing of it run, is the
+        // install's own 503, which the CLI waits out.
+        let busy = anyhow::Error::new(crate::storage::StorageBusy).context("broker storage wipe returned 503");
+        assert_eq!(storage_err(busy).status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// The broker's "still completing" marker reaches the caller, so a

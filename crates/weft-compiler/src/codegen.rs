@@ -1084,7 +1084,7 @@ fn parse_manifest(path: &Path) -> BuildResult<toml::Value> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
         BuildError::Build(format!("read manifest {}: {e}", path.display()))
     })?;
-    raw.parse::<toml::Value>()
+    toml::from_str::<toml::Value>(&raw)
         .map_err(|e| BuildError::Build(format!("parse manifest {}: {e}", path.display())))
 }
 

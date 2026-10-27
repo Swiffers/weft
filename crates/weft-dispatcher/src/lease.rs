@@ -32,18 +32,15 @@ pub use weft_task_store::locks::{advisory_key, with_advisory_lock};
 /// REJECT instantly; this lock only stops two verbs from both winning
 /// the flip. Never held across a build, a drain, or user code.
 pub const PROJECT_TRANSITION_DOMAIN: &str = "weft_project_transition";
-/// Serializes a tenant's signal registrations from the route overlap
-/// check to the signal row's insert, install-wide, keyed by tenant id.
-/// The check reads the tenant's mounted routes and the insert writes
-/// one; two routes of one activation register concurrently, and
-/// without this each checked before the other had written, so two
+/// The lease (`weft_task_store::locks::with_lease_waiting`, named
+/// `signal_mount/<tenant>`) that serializes a tenant's signal
+/// registrations from the route overlap check to the signal row's insert,
+/// install-wide. The check reads the tenant's mounted routes and the
+/// insert writes one; two routes of one activation register concurrently,
+/// and without this each checked before the other had written, so two
 /// routes that claim the same call both armed (the e2e `api_overlap`
-/// shape). Held on the lock pool, so a waiter pins no work connection.
-pub const SIGNAL_MOUNT_DOMAIN: &str = "weft_signal_mount";
-/// Serializes each background reaper install-wide, keyed by the
-/// reaper's name, so one dispatcher replica runs a given sweep at a
-/// time and the others skip that turn (see `reaper`).
-pub const REAPER_DOMAIN: &str = "weft_reaper";
+/// shape). A lease, since it is held across the listener's start.
+pub const SIGNAL_MOUNT_LEASE: &str = "signal_mount";
 /// Serializes issuing an upgrade of one owner's copies, keyed by
 /// `<project>/<instance>` (empty instance: the shared copies), so the
 /// in-flight check and the insert are one step install-wide.

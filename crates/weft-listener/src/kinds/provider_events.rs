@@ -496,14 +496,16 @@ struct SocketShare {
     engine: TaskGuard,
     /// The engine resolves as the subscription that started it, so what
     /// the process keeps of the connection is kept under that one's token
-    /// (`crate::reach`) for as long as the share lives, and dropped with it.
+    /// (`crate::reach`) for as long as the share lives, and dropped with it
+    /// (that registration's only: a newer one of the token keeps its own).
     kept_under: String,
+    kept_for: i64,
     reach: Arc<crate::reach::Reach>,
 }
 
 impl Drop for SocketShare {
     fn drop(&mut self) {
-        self.reach.forget(&self.kept_under);
+        self.reach.forget(&self.kept_under, crate::registry::Registrations::UpTo(self.kept_for));
     }
 }
 
@@ -571,6 +573,7 @@ async fn serve_socket(
                 last,
                 engine: TaskGuard::new(engine),
                 kept_under: ctx.fire.token().to_string(),
+                kept_for: ctx.fire.generation(),
                 reach: ctx.reach.clone(),
             }
         });

@@ -8,7 +8,15 @@
 #                         TF_STATE_BUCKET, GCP_WORKLOAD_IDENTITY_PROVIDER,
 #                         GCP_INSTALL_SERVICE_ACCOUNT
 #                         (and optionally WEFT_DATABASE=cloud_sql and
-#                         WEFT_CLOUD_SQL_TIER, below)
+#                         WEFT_CLOUD_SQL_TIER, below, and the sizes below)
+#   optional sizes        WEFT_CLOUD_SQL_MAX_CONNECTIONS (with cloud_sql:
+#                         how many connections its Postgres takes at once;
+#                         unset, Cloud SQL's own number for the tier),
+#                         WEFT_DISPATCHER_MAX_COPIES (the most copies of the
+#                         dispatcher running at once; 2 when unset),
+#                         WEFT_BROKER_MAX_COPIES (the same for the broker;
+#                         4 when unset). Each copy of those two takes an
+#                         equal share of the database's connections.
 #   repository secrets    WEFT_DATABASE_URL (the Postgres the install keeps
 #                         everything in; not needed with the variable
 #                         WEFT_DATABASE set to cloud_sql, which gives the
@@ -39,9 +47,9 @@ concurrency:
 
 jobs:
   install:
-    # 22.04: a runtime built here goes into the runtime image, whose
-    # Debian bookworm has an older glibc than newer Ubuntus link against.
-    runs-on: ubuntu-22.04
+    # 24.04: a runtime built here goes into the runtime image, Debian
+    # trixie, so its glibc (2.39) must not be newer than trixie's (2.41).
+    runs-on: ubuntu-24.04
     # No deadline: a first install builds weft's images, and a run cut
     # mid-apply leaves the Terraform state locked. GitHub's own 6-hour job
     # limit is the only cap.
@@ -75,6 +83,25 @@ jobs:
             echo "::error::the repository secret WEFT_DATABASE_URL is not set: weft needs a Postgres to keep everything in (the cloud chapter of the docs walks through getting one), or set the repository variable WEFT_DATABASE to cloud_sql for one of the install's own"
             exit 1
           fi
+
+      # The optional sizes, handed to Terraform only when set: an unset
+      # repository variable reads as an empty string, which Terraform
+      # refuses for a number, so an unset one leaves Terraform's default.
+      # SYNC: these TF_VAR_* names <-> deploy/terraform/gcp/variables.tf
+      - name: the optional sizes
+        env:
+          CLOUD_SQL_MAX_CONNECTIONS: ${{ vars.WEFT_CLOUD_SQL_MAX_CONNECTIONS }}
+          DISPATCHER_MAX_COPIES: ${{ vars.WEFT_DISPATCHER_MAX_COPIES }}
+          BROKER_MAX_COPIES: ${{ vars.WEFT_BROKER_MAX_COPIES }}
+        run: |
+          set_if_given() {
+            if [ -n "$2" ]; then
+              echo "$1=$2" >> "$GITHUB_ENV"
+            fi
+          }
+          set_if_given TF_VAR_cloud_sql_max_connections "$CLOUD_SQL_MAX_CONNECTIONS"
+          set_if_given TF_VAR_dispatcher_max_copies "$DISPATCHER_MAX_COPIES"
+          set_if_given TF_VAR_broker_max_copies "$BROKER_MAX_COPIES"
 
       - uses: actions/checkout@v7
 

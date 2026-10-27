@@ -201,17 +201,23 @@ async fn takes_work(state: &DispatcherState, project: uuid::Uuid) -> anyhow::Res
     Ok(state.activations.list(project).await?.iter().any(|a| a.lifecycle.standing().arrival(now) != weft_core::arrival::Arrival::Refused))
 }
 
-/// Run `change` holding the project's front lock, across every dispatcher
-/// process (`weft_task_store::locks::with_lock_waiting`, on the lock pool,
-/// so a front taking minutes to start never ties up the connections the
-/// rest of the dispatcher works with).
+/// Run `change` holding the project's front, across every dispatcher
+/// process: a lease (`weft_task_store::locks::with_lease_waiting`), since a
+/// front may take minutes to start or deploy, and a lock held that long
+/// would hold one of the few lock connections the whole time.
 async fn locked<T, F, Fut>(state: &DispatcherState, project: uuid::Uuid, change: F) -> anyhow::Result<T>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
-    let key = weft_task_store::locks::advisory_key("weft-front", &project.to_string());
-    weft_task_store::locks::with_lock_waiting(&state.lock_pool, key, &format!("project {project}'s front"), change).await
+    weft_task_store::locks::with_lease_waiting(
+        &state.pg_pool,
+        &state.signals,
+        &format!("front/{project}"),
+        &format!("project {project}'s front"),
+        change,
+    )
+    .await
 }
 
 /// Keep `address` as the project's; whether it changed.

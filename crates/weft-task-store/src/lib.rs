@@ -26,16 +26,24 @@
 //!     dropped the moment a notification says they changed.
 //!   - `install_address`: the address the install hands out in its
 //!     links, its domain once that domain's certificate is issued.
+//!   - `schema_group`: what a module declares about its tables.
 //!   - `schema_guard`: the schema runner every boot routes its
 //!     `SchemaGroup`s through. It builds a new database from the canonical
 //!     `CREATE TABLE` text and carries an existing one forward with the
 //!     group's migration files.
 //!   - `documents`: the same for the JSON a column holds: the rows an
 //!     older weft wrote, carried to the shape the code reads today.
+//!
+//! `schema_guard` and `documents` are behind the `migrate` feature: only a
+//! role that boots a database applies the schema, and a worker, which
+//! links this crate, must not carry the migration history (see
+//! `schema_group`).
 
 pub mod alarm;
 pub mod announce;
+pub mod budget;
 pub mod db;
+#[cfg(feature = "migrate")]
 pub mod documents;
 pub mod drain;
 pub mod executor;
@@ -48,15 +56,38 @@ pub mod locks;
 pub mod parked_fires;
 pub mod pg_signal;
 pub mod runs;
+pub mod schema_group;
+#[cfg(feature = "migrate")]
 pub mod schema_guard;
 pub mod tasks;
 pub mod terminal;
+pub mod throttle;
 pub mod traits;
 pub mod unanswered;
 pub mod worker_door;
 
+#[cfg(feature = "migrate")]
 pub use documents::{apply_documents, Document};
-pub use schema_guard::{apply_groups, apply_schema, DataStep, Migration, Part, SchemaGroup, Until};
+
+#[doc(hidden)]
+pub use sqlx as __sqlx;
+
+/// A statement put together at run time, `format!`'s arguments in, ready
+/// for `sqlx::query` and its kin: `sqlx::query(sql!("SELECT {columns} FROM
+/// run WHERE run_id = $1"))`. sqlx takes a fixed `&'static str` as it is
+/// and anything built only through `AssertSqlSafe`, so that a statement
+/// with something spliced into it says so where it is written. What is
+/// spliced in is weft's own (a column list, a table name, a fragment of
+/// SQL it wrote); a value from outside always goes through `.bind`.
+#[macro_export]
+macro_rules! sql {
+    ($($format:tt)*) => {
+        $crate::__sqlx::AssertSqlSafe(::std::format!($($format)*))
+    };
+}
+pub use schema_group::{DataStep, SchemaGroup, Until};
+#[cfg(feature = "migrate")]
+pub use schema_guard::{apply_groups, apply_schema, Migration, Part};
 
 pub use executor::{dispatcher_picker_loop, TaskExecutor, TaskRegistry};
 pub use kinds::{FireSignalPayload, RegisterSignalPayload, RemovalWaitPayload, ResyncPayload, RunNodeTestPayload, StopTaggedPayload, TakeDownWaitPayload, TaskKind, WithdrawSignalPayload};

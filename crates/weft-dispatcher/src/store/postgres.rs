@@ -7,6 +7,7 @@
 //! module's [`GROUP`] included) in one pass.
 
 use anyhow::Context;
+use weft_task_store::sql;
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 
@@ -284,7 +285,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             instance_id TEXT,
             fired_by TEXT,
             source_version TEXT,
-            -- NULL for a run of no program (a node test).
+            -- NULL for a run of no program (a node test), and then so is
+            -- `binary_hash`: the two name one program identity, and
+            -- delivery reads one while a claim reads the other.
             definition_hash TEXT,
             -- For a run of a cut, the registered program it was cut from:
             -- the program its triggers arm and its results are held against.
@@ -372,7 +375,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- How long it is kept once it ended, in seconds (NULL: for
             -- ever), and the moment that runs out, set when it ends.
             keep_for BIGINT,
-            keep_until BIGINT
+            keep_until BIGINT,
+            CONSTRAINT run_program_identity_whole
+                CHECK ((definition_hash IS NULL) = (binary_hash IS NULL))
         ) WITH (fillfactor = 85)"#,
         // The listing: a project's runs, newest first.
         r#"CREATE INDEX IF NOT EXISTS run_listing ON run (project_id, started_at DESC)"#,
@@ -1319,7 +1324,7 @@ impl RunStore for PostgresStore {
              AND ($11::text IS NULL OR EXISTS ( \
                      SELECT 1 FROM run_search rs WHERE rs.run_id = r.run_id \
                        AND rs.words @@ websearch_to_tsquery('simple', $11)))";
-        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM run r WHERE {where_clause}"))
+        let total: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM run r WHERE {where_clause}"))
             .bind(tenant)
             .bind(query.project_id)
             .bind(query.started_after.map(|v| v as i64))
@@ -1333,7 +1338,7 @@ impl RunStore for PostgresStore {
             .bind(query.search.as_deref())
             .fetch_one(&self.pool)
             .await?;
-        let rows: Vec<SummaryRow> = sqlx::query_as(&format!(
+        let rows: Vec<SummaryRow> = sqlx::query_as(sql!(
             "SELECT {SUMMARY_COLUMNS} FROM run r \
              WHERE {where_clause} \
                AND ($14::bigint IS NULL OR (r.started_at, r.run_id) < ($14, $15::uuid)) \
@@ -1376,7 +1381,7 @@ impl RunStore for PostgresStore {
     }
 
     async fn run_summary(&self, run_id: RunId) -> anyhow::Result<Option<RunSummary>> {
-        let row: Option<SummaryRow> = sqlx::query_as(&format!("SELECT {SUMMARY_COLUMNS} FROM run r WHERE r.run_id = $1"))
+        let row: Option<SummaryRow> = sqlx::query_as(sql!("SELECT {SUMMARY_COLUMNS} FROM run r WHERE r.run_id = $1"))
             .bind(run_id)
             .fetch_optional(&self.pool)
             .await?;
@@ -1387,7 +1392,7 @@ impl RunStore for PostgresStore {
         &self,
         run_ids: &[RunId],
     ) -> anyhow::Result<std::collections::HashMap<RunId, RunSummary>> {
-        let rows: Vec<SummaryRow> = sqlx::query_as(&format!("SELECT {SUMMARY_COLUMNS} FROM run r WHERE r.run_id = ANY($1)"))
+        let rows: Vec<SummaryRow> = sqlx::query_as(sql!("SELECT {SUMMARY_COLUMNS} FROM run r WHERE r.run_id = ANY($1)"))
             .bind(run_ids)
             .fetch_all(&self.pool)
             .await?;
@@ -1527,7 +1532,7 @@ impl SignalStore for PostgresStore {
         if let Some(version) = &sig.source_version {
             crate::versions::retain_source_version(&mut tx, sig.project_id, version).await?;
         }
-        let query = sqlx::query(&SIGNAL_INSERT)
+        let query = sqlx::query(SIGNAL_INSERT.as_str())
             .bind(&sig.token)
             .bind(&sig.tenant_id)
             .bind(sig.project_id)
@@ -1539,14 +1544,15 @@ impl SignalStore for PostgresStore {
             .bind(sig.activation_trigger.as_deref());
         let written = bind_signal_refreshed(query, sig)?
             .bind(sig.kind_state_seq)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
-        if written.rows_affected() == 0 {
+        let Some(written) = written else {
             tx.rollback().await?;
             return Ok(super::SignalWrite::StateMoved);
-        }
+        };
+        let generation: i64 = sqlx::Row::try_get(&written, "generation")?;
         tx.commit().await?;
-        Ok(super::SignalWrite::Written)
+        Ok(super::SignalWrite::Written { generation })
     }
 
     async fn signal_restore(&self, sig: &SignalRegistration) -> anyhow::Result<super::SignalWrite> {
@@ -1560,15 +1566,16 @@ impl SignalStore for PostgresStore {
                 .await
                 .with_context(|| format!("signal_restore: put signal {} back", sig.token))?;
         }
-        let query = sqlx::query(&SIGNAL_RESTORE).bind(&sig.token);
+        let query = sqlx::query(SIGNAL_RESTORE.as_str()).bind(&sig.token);
         let written = bind_signal_refreshed(query, sig)?
             .bind(sig.kind_state_seq)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await
             .context("signal_restore: put a signal row back")?;
-        if written.rows_affected() == 1 {
+        if let Some(written) = written {
+            let generation: i64 = sqlx::Row::try_get(&written, "generation")?;
             tx.commit().await?;
-            return Ok(super::SignalWrite::Written);
+            return Ok(super::SignalWrite::Written { generation });
         }
         let present: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM signal WHERE token = $1)")
             .bind(&sig.token)
@@ -1612,6 +1619,16 @@ impl SignalStore for PostgresStore {
             return Ok(Vec::new());
         }
         remove_signals(&self.pool, tokens).await
+    }
+
+    async fn signal_remove_registration(&self, token: &str, generation: i64) -> anyhow::Result<Option<SignalRegistration>> {
+        let row: Option<SignalRow> = sqlx::query_as(SIGNAL_DELETE_REGISTRATION_RETURNING)
+            .bind(token)
+            .bind(generation)
+            .fetch_optional(&self.pool)
+            .await
+            .context("signal_remove_registration: read the signal row")?;
+        row.map(row_to_signal).transpose()
     }
 
     async fn signal_withdraw(&self, run_id: RunId, token: &str) -> anyhow::Result<Option<SignalRegistration>> {
@@ -1847,7 +1864,7 @@ async fn erase_run_ids(
     // its queue row, so the erase waits for it there and then removes the
     // entry it wrote.
     for table in ["run_search_queue", "run_search", "run_log", "run"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE run_id = ANY($1)")).bind(run_ids).execute(&mut *tx).await?;
+        sqlx::query(sql!("DELETE FROM {table} WHERE run_id = ANY($1)")).bind(run_ids).execute(&mut *tx).await?;
     }
     // A queued run its workers had failed (busy, refused, not reached)
     // went without reaching one: what `weft status` shows of them goes
@@ -2217,7 +2234,8 @@ fn bind_signal_refreshed<'q>(
 /// ones, then the version the registration read (the row lands one past
 /// it). On a token conflict only the refreshed columns change, and only
 /// while the row is still at that version; the row's holder lets go
-/// ([`LET_GO`]), so the rewritten signal comes up fresh.
+/// ([`LET_GO`]), so the rewritten signal comes up fresh. Answers the
+/// registration (`generation`) the write made, nothing when it did not land.
 static SIGNAL_INSERT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     const IDENTITY: [&str; 9] = [
         "token", "tenant_id", "project_id", "run_id", "node_id", "is_resume", "created_at", "instance_id",
@@ -2231,7 +2249,8 @@ static SIGNAL_INSERT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
     format!(
         "INSERT INTO signal ({columns}, kind_state_seq) VALUES ({values}, ${seq} + 1) \
          ON CONFLICT (token) DO UPDATE SET {set}, kind_state_seq = EXCLUDED.kind_state_seq, {LET_GO} \
-         WHERE signal.kind_state_seq = EXCLUDED.kind_state_seq - 1"
+         WHERE signal.kind_state_seq = EXCLUDED.kind_state_seq - 1 \
+         RETURNING generation"
     )
 });
 
@@ -2245,12 +2264,13 @@ const LET_GO: &str = "held_by = NULL, serving = NULL, held_failed = NULL, let_go
                       generation = nextval('signal_generation_seq')";
 
 /// `signal_restore`: the token ($1), the refreshed columns, then the
-/// version the row must still be at (it moves one past).
+/// version the row must still be at (it moves one past). Answers the
+/// registration it made, like `SIGNAL_INSERT`.
 static SIGNAL_RESTORE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     let refreshed = SIGNAL_REFRESHED_COLUMNS;
     let seq = refreshed.len() + 2;
     let set = refreshed.iter().enumerate().map(|(i, c)| format!("{c} = ${}", i + 2)).collect::<Vec<_>>().join(", ");
-    format!("UPDATE signal SET {set}, kind_state_seq = ${seq} + 1, {LET_GO} WHERE token = $1 AND kind_state_seq = ${seq}")
+    format!("UPDATE signal SET {set}, kind_state_seq = ${seq} + 1, {LET_GO} WHERE token = $1 AND kind_state_seq = ${seq} RETURNING generation")
 });
 
 const SIGNAL_DELETE_BY_RUN_ID_RETURNING: &str =
@@ -2349,6 +2369,10 @@ const HELD_ON_ACTIVATIONS: &str = concat!(
 
 const SIGNAL_DELETE_WAIT_OF_RUN_RETURNING: &str =
     concat!("DELETE FROM signal WHERE token = $1 AND is_resume AND run_id = $2 RETURNING ", signal_columns!(""));
+
+/// One registration of a row, only while the row still is it.
+const SIGNAL_DELETE_REGISTRATION_RETURNING: &str =
+    concat!("DELETE FROM signal WHERE token = $1 AND generation = $2 RETURNING ", signal_columns!(""));
 
 const SIGNAL_DELETE_BY_TOKENS_RETURNING: &str =
     concat!("DELETE FROM signal WHERE token = ANY($1) RETURNING ", signal_columns!(""));

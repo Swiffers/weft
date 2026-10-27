@@ -1,0 +1,71 @@
+# Weekly version bumps, one pull request per ecosystem (and one per
+# ecosystem for security fixes, which Dependabot opens as soon as an
+# advisory lands rather than on the weekly schedule). The pins Dependabot
+# cannot see (image tags inside Rust and shell, tool versions inside
+# commands) are checked by .github/workflows/security.yml.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        applies-to: version-updates
+        patterns: ["*"]
+      cargo-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directories:
+      - /extension-vscode
+      - /extension-browser
+      - /catalog/bailey/bridge/images/bridge
+    schedule:
+      interval: weekly
+    groups:
+      npm:
+        applies-to: version-updates
+        patterns: ["*"]
+      npm-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns: ["*"]
+      github-actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directories:
+      - /deploy/docker
+      - /catalog/*/*/images/*
+    schedule:
+      interval: weekly
+    groups:
+      docker:
+        applies-to: version-updates
+        patterns: ["*"]
+      docker-security:
+        applies-to: security-updates
+        patterns: ["*"]
+
+  - package-ecosystem: terraform
+    directory: /deploy/terraform/gcp
+    schedule:
+      interval: weekly
+    groups:
+      terraform:
+        applies-to: version-updates
+        patterns: ["*"]
+      terraform-security:
+        applies-to: security-updates
+        patterns: ["*"]

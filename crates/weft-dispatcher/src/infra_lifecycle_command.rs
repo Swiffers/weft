@@ -32,6 +32,7 @@
 //!   the one running it dies.
 
 use anyhow::Result;
+use weft_task_store::sql;
 use sqlx::postgres::PgPool;
 
 // `InfraLifecycleVerb` is the wire contract for the `verb` column. It
@@ -797,7 +798,7 @@ pub async fn any_in_flight(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool
     // Only what reaches the shared copies, which the bar starts and stops:
     // one instance's copy booting holds none of the program's own verbs
     // back (a command for every copy names no instance, and counts).
-    let (exists,): (bool,) = sqlx::query_as(&format!(
+    let (exists,): (bool,) = sqlx::query_as(sql!(
         "SELECT EXISTS( \
              SELECT 1 FROM infra_lifecycle_command \
              WHERE project_id = $1 \
@@ -908,7 +909,7 @@ pub async fn request_cancel_owner(
          AND verb IN ({INFRA_WORK_VERBS_SQL})",
     );
     let instance = instance.map(|m| m.as_str());
-    let flagged = sqlx::query(&format!(
+    let flagged = sqlx::query(sql!(
         "UPDATE infra_lifecycle_command SET cancel_requested = TRUE WHERE {owner}"
     ))
     .bind(project_id)
@@ -916,7 +917,7 @@ pub async fn request_cancel_owner(
     .execute(pool)
     .await?
     .rows_affected();
-    let completed = sqlx::query(&format!(
+    let completed = sqlx::query(sql!(
         "UPDATE infra_lifecycle_command \
          SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
              outcome = 'cancelled', \

@@ -209,8 +209,8 @@ pub const NO_SUCH_PROJECT: &str = "this dispatcher holds no project under that i
 /// the caller's tenant. Returns the same `NOT_FOUND` for "no such project" and
 /// "exists but belongs to another tenant" so a caller cannot probe which
 /// project ids exist in other tenants (no existence leak); `SERVICE_UNAVAILABLE`
-/// only when the database is out of reach right now, which a caller may
-/// try again, and `INTERNAL_SERVER_ERROR` for any other failure
+/// only when the database did not take the read right now, which the
+/// caller asks again on, and `INTERNAL_SERVER_ERROR` for any other failure
 /// (`crate::api::unavailable_or_internal`).
 ///
 /// This is the single gate every user-facing, project-scoped handler calls
@@ -260,10 +260,7 @@ pub async fn authorize_run(
         Ok(Some(o)) => o,
         Ok(None) => return Err((StatusCode::NOT_FOUND, "not found".to_string())),
         Err(e) => {
-            return Err(crate::api::unavailable_or_internal(
-                "read who owns this run",
-                e.context(format!("run {run_id}")),
-            ))
+            return Err(crate::api::unavailable_or_internal("read who owns this run", e.context(format!("run {run_id}"))))
         }
     };
     if owner.tenant != caller.as_str() {

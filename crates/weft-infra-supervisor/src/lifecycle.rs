@@ -72,9 +72,11 @@ fn resolve_units(
     use crate::health_engine::{FLAKY_AFTER, RECOVERY_AFTER};
     let mut out = std::collections::BTreeMap::new();
     for u in &spec.units {
-        // A frozen unit also keeps the health window it is in; a
-        // reconciled one starts with none.
-        let (unit_status, image_refs, windows) = if reconciled.contains(&u.name) {
+        // A frozen unit also keeps the health window it is in and its
+        // last restart; a reconciled one starts with neither (weft starts
+        // it again, and a restart the host still reports of it is seen
+        // anew by the next look).
+        let (unit_status, image_refs, windows, last_restart) = if reconciled.contains(&u.name) {
             let mut refs = infra::unit_image_refs(u, node_id, image_tags)?;
             if transitioning {
                 // The apply may not have replaced the unit's old copy
@@ -84,7 +86,7 @@ fn resolve_units(
                     refs.extend(p.image_refs.iter().cloned());
                 }
             }
-            (status, refs, (None, None))
+            (status, refs, (None, None), None)
         } else {
             // Left up / frozen: keep its current status (Running or
             // Flaky) AND the refs its last apply recorded (they can be
@@ -99,7 +101,7 @@ fn resolve_units(
                     u.name
                 )
             })?;
-            (p.status, p.image_refs.clone(), (p.not_ready_since_unix, p.ready_since_unix))
+            (p.status, p.image_refs.clone(), (p.not_ready_since_unix, p.ready_since_unix), p.last_restart.clone())
         };
         out.insert(
             u.name.clone(),
@@ -111,6 +113,7 @@ fn resolve_units(
                 image_refs,
                 not_ready_since_unix: windows.0,
                 ready_since_unix: windows.1,
+                last_restart,
             },
         );
     }
@@ -1256,6 +1259,7 @@ mod tests {
                 image_refs: refs.iter().map(|s| s.to_string()).collect(),
                 not_ready_since_unix: None,
                 ready_since_unix: None,
+                last_restart: None,
             }
         }
 

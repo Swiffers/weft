@@ -99,7 +99,7 @@ impl Install {
             }
         }
         let kept: String = branch.to_ascii_lowercase().chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).collect();
-        let hash = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(branch.as_bytes()));
+        let hash = crate::project::hash::sha256_hex(branch.as_bytes());
         let hash = &hash[..BRANCH_HASH_LEN];
         let mut prefix = kept;
         prefix.truncate(MAX_INSTALL_NAME - BRANCH_HASH_LEN);

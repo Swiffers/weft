@@ -16,6 +16,41 @@ pub const CLI_COMMIT_HEADER: &str = "x-weft-cli-commit";
 /// it compiles projects itself and a CLI from another commit usually works.
 pub const VERSION_NOTE_HEADER: &str = "x-weft-version-note";
 
+/// The response header the install sets on every answer it gives itself,
+/// so a caller can tell weft's own answer (a `429` for a limit a caller
+/// went past) from one the platform in front of it gave in its place
+/// (Cloud Run's `429` when every copy of the service it may start is busy,
+/// sent before weft ever saw the request, so nothing ran). The install's
+/// counterpart of `weft_platform_traits::WORKER_ANSWER_HEADER`.
+pub const INSTALL_ANSWER_HEADER: &str = "x-weft-install";
+
+/// Whether an answer the install gave itself (`from_install`: it carries
+/// [`INSTALL_ANSWER_HEADER`]) with `status` asks the caller to send the
+/// same request again after a wait.
+///
+/// The rule both ends keep: a `503` from the install means exactly
+/// "nothing of this request ran, and the same request goes through
+/// later", whatever its method. Today that is its database not taking the
+/// call (too busy, or out of reach for now), or a worker or an infra
+/// endpoint the call is for still starting. The install answers `503` for
+/// nothing else: a failure that may have done part of its work, or that
+/// waiting does not lift (its database refusing for good, its storage
+/// down), gets another status (`500` for a failure inside the install,
+/// `502` for a service behind it that failed) and keeps its words. So a
+/// caller sends a `503` again, for as long as it takes, and shows every
+/// other answer as it came.
+///
+/// Two answers carry the install's mark without being its own word on
+/// the request, both on the doors a program's outside callers use, which
+/// the CLI never calls: what a program's route or infra endpoint answered,
+/// passed on as it came, and a call to a trigger that is not on
+/// (`crate::arrival::NOT_NOW_FOR_CALLER`, a `503` with a `Retry-After`:
+/// nothing ran, and it goes through once the trigger is on).
+// SYNC: asks_again <-> crates/weft-dispatcher/src/api/mod.rs (database_did_not_take, unavailable_or_internal, access_store_error), crates/weft-dispatcher/src/api/storage.rs (storage_err), crates/weft-cli/src/client.rs (busy_answer)
+pub fn asks_again(status: u16, from_install: bool) -> bool {
+    status == 503 && from_install
+}
+
 // SYNC: InstallInfo <-> crates/weft-dispatcher/src/app.rs (install_info)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -266,9 +301,68 @@ fn check_domain_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `GET /install/database`: whether the install's database held it back
+/// lately: requests that waited for a connection because every one their
+/// copy may hold was in use (`weft_task_store::throttle`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseLoad {
+    /// One entry per role whose copies waited in the last quarter hour.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_back: Vec<HeldBack>,
+    /// What gives the install more connections, in a person's words, when
+    /// it was held back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub more: Option<String>,
+}
+
+/// One role's stretch of waits for a database connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeldBack {
+    pub role: DatabaseHolder,
+    pub since_unix: i64,
+    pub last_unix: i64,
+    /// The waits counted since, every copy of the role together.
+    pub waits: u64,
+    /// What the database said it takes.
+    pub max_connections: u32,
+    /// The connections one copy of the role may hold.
+    pub share: u32,
+}
+
+crate::wire_enum! {
+    /// Whose copies waited for a database connection: the processes that
+    /// open the database. Stored in `database_throttle.role`
+    /// (`weft_task_store::throttle`), which holds no other value.
+    // SYNC: DatabaseHolder <-> crates/weft-task-store/src/throttle.rs (database_throttle's CHECK on role)
+    pub enum DatabaseHolder {
+        /// A local install's one process, which runs every role.
+        Machine = "machine",
+        /// The dispatcher in a process of its own.
+        Dispatcher = "dispatcher",
+        /// The broker in a process of its own.
+        Broker = "broker",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    crate::wire_enum_roundtrip_tests!(DatabaseHolder);
+
+    /// Only a `503` the install gave itself is asked again; the same
+    /// status from the platform in front of it, and every other status
+    /// the install gives, is the answer.
+    #[test]
+    fn only_the_installs_own_503_asks_again() {
+        assert!(asks_again(503, true));
+        assert!(!asks_again(503, false), "the platform's 503");
+        for status in [200, 404, 409, 429, 500, 502, 504, 507] {
+            assert!(!asks_again(status, true), "{status}");
+        }
+    }
 
     #[test]
     fn a_domain_name_is_normalized_and_checked() {

@@ -48,7 +48,10 @@
 # lock, the toolchain pin, the stock worker crate and the stdlib
 # sources. The COPY paths below read from that staged layout.
 
-FROM debian:bookworm-slim AS toolchain
+# A worker built here runs on the default worker base, so both are the
+# same Debian release (a binary needs the glibc it was built with).
+# SYNC: builder base distro <-> crates/weft-compiler/src/worker_image.rs (DEFAULT_BASE_IMAGE)
+FROM debian:trixie-slim AS toolchain
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

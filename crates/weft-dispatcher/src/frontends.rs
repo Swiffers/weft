@@ -19,6 +19,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use sqlx::PgPool;
+use weft_task_store::sql;
 use weft_core::frontend::{AddFrontendRequest, AddedFrontend, Frontend, FrontendHost, FrontendWithToken, Repository, VisitorAddressRequest};
 use weft_core::signal_token::MintTokenRequest;
 use weft_platform_traits::FrontendSite;
@@ -107,7 +108,7 @@ const COLUMNS: &str = "project_id, name, host, repo, repo_id, service, url, toke
 
 /// Every frontend of `project`, by name.
 pub async fn list(pool: &PgPool, project: uuid::Uuid) -> anyhow::Result<Vec<Frontend>> {
-    sqlx::query_as::<_, Row>(&format!("SELECT {COLUMNS} FROM project_frontend WHERE project_id = $1 ORDER BY name"))
+    sqlx::query_as::<_, Row>(sql!("SELECT {COLUMNS} FROM project_frontend WHERE project_id = $1 ORDER BY name"))
         .bind(project)
         .fetch_all(pool)
         .await?
@@ -117,7 +118,7 @@ pub async fn list(pool: &PgPool, project: uuid::Uuid) -> anyhow::Result<Vec<Fron
 }
 
 async fn get<'e>(executor: impl sqlx::PgExecutor<'e>, project: uuid::Uuid, name: &str) -> anyhow::Result<Option<Frontend>> {
-    sqlx::query_as::<_, Row>(&format!("SELECT {COLUMNS} FROM project_frontend WHERE project_id = $1 AND name = $2"))
+    sqlx::query_as::<_, Row>(sql!("SELECT {COLUMNS} FROM project_frontend WHERE project_id = $1 AND name = $2"))
         .bind(project)
         .bind(name)
         .fetch_optional(executor)
@@ -458,7 +459,7 @@ pub(crate) async fn renew_token(
     }
     let minted = mint_token(state, owner, project, name).await?;
     let recorded: anyhow::Result<Row> = async {
-        let row = sqlx::query_as::<_, Row>(&format!(
+        let row = sqlx::query_as::<_, Row>(sql!(
             "UPDATE project_frontend SET pending_token_ids = array_append(pending_token_ids, $3) \
              WHERE project_id = $1 AND name = $2 RETURNING {COLUMNS}"
         ))

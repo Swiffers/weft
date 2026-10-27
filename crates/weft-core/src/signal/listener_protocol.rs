@@ -306,9 +306,10 @@ pub struct UnregisterRequest {
     pub spec: SignalSpec,
     pub kind_state: Value,
     /// The removed row's registration (`signal.generation`), which names
-    /// the wakes it had set, so they are cancelled with it. 0 from an
-    /// older dispatcher, whose wakes were named without one.
-    #[serde(default)]
+    /// the wakes it had set, so they are cancelled with it. The listener
+    /// stops only this registration (or an older one) of the token: a
+    /// token can be registered again, and an unregister that arrives after
+    /// a newer registration came up leaves that one running.
     pub generation: i64,
     /// The token comes back up right after (a registration replaced this
     /// row with one served the other way round): the answer waits for the

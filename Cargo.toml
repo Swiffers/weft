@@ -75,25 +75,37 @@ repository = "https://github.com/WeaveMindAI/weft"
 
 [workspace.dependencies]
 # JWT signing (access-store's MintJwt) and verification (the broker's
-# caller auth). Version 10 carries no crypto of its own: without a backend
-# feature its first sign or verify panics at run time, so the backend is
-# chosen once, here, for every crate.
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+# caller auth, Google's identity tokens). It carries no crypto of its own,
+# and both of its backend features are left off: RustCrypto's pulls the
+# `rsa` crate (an advisory with no fix), aws-lc-rs compiles a C library
+# into the build. `weft_core::jwt` hands it ring instead, and is the only
+# crate that names it.
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"] }
+# The crypto every TLS client here already runs on, used directly where a
+# library takes its crypto from its caller (`weft_core::jwt`).
+ring = "0.17"
 # async + runtime
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 async-trait = "0.1"
 
+# The install's own database. Each crate adds the features it uses.
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres"] }
+# Bounded in-memory caches (the broker's key and token caches).
+lru = "0.19"
+cron = "0.17"
+getrandom = "0.4"
+
 # http
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 # The injectable-client seam for metered paid calls: `ctx.metered_client`
 # returns a `ClientWithMiddleware`, the ecosystem-standard way to hand a
 # library an HTTP client with behavior layered behind it.
 reqwest-middleware = { version = "0.4", features = ["json"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 
 # S3-compatible object storage (the ObjectStore slot: GCS / SeaweedFS / AWS /
 # any S3 endpoint via an endpoint-URL override). rustls so we don't drag in
@@ -111,19 +123,22 @@ aws-smithy-types = "1"
 # serialization
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 # Editing a committed weft.toml in place, comments and order kept
 # (`weft target add`).
-toml_edit = "0.22"
+toml_edit = "0.25"
 # A build context uploaded for Cloud Build as one gzipped tarball
 # (weft-platform-gcp `images`).
 tar = "0.4"
 flate2 = "1"
 # A run's record, compressed by whoever writes it (`weft_journal::stored`):
 # a ping's events are about 2 KB of JSON, which Postgres leaves as it is.
-zstd = "0.13"
+zstd = "0.14"
 
-# lossless concrete syntax tree (the .weft CST: parse, edit, byte-exact round-trip)
+# lossless concrete syntax tree (the .weft CST: parse, edit, byte-exact round-trip).
+# Held at 0.16: 0.17 drops the mutable tree (`clone_for_update`,
+# `splice_children`, `detach`) that every edit in `weft_compiler::edit` is
+# built on.
 rowan = "0.16"
 
 # cli
@@ -150,7 +165,7 @@ bytes = "1"
 # bounds a caller who vanished without saying so.
 socket2 = "0.6"
 regex = "1"
-fancy-regex = "0.11"
+fancy-regex = "0.20"
 inventory = "0.3"
 url = "2"
 # Hidden-echo terminal input for pasted credentials (`weft connect`).
@@ -158,21 +173,21 @@ rpassword = "7"
 # Open the browser on the OAuth consent URL (`weft connect`).
 open = "5"
 terminal_size = "0.4"
-hmac = "0.12"
-aes-gcm = "0.10"
-sha2 = "0.10"
+hmac = "0.13"
+aes-gcm = "0.11"
+sha2 = "0.11"
 # OAuth 1.0a request signing (an AuthStep Sign kind) is HMAC-SHA1 by spec.
-sha1 = "0.10"
+sha1 = "0.11"
 # The readable line diff a file edit records for the inspector.
-similar = "2"
+similar = "3"
 # Asymmetric push-verification schemes (access::verify::VerifyKind::Signature):
 # Ed25519 (Discord's scheme) and ECDSA P-256 (SendGrid's scheme).
-ed25519-dalek = "2"
-p256 = "0.13"
+ed25519-dalek = "3"
+p256 = "0.14"
 tempfile = "3"
-parking_lot = "0.12"
+parking_lot = "0.13"
 filetime = "0.2"
-base64 = "0.22"
+base64 = "0.23"
 # The project worker's allocator (`weft_engine::Jemalloc`, declared by the
 # generated worker `main`): glibc's kept a burst's freed memory for good,
 # so a worker past one read as full while idle. Background threads purge
@@ -180,8 +195,12 @@ base64 = "0.22"
 # Restate's server runs it.
 tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
 # The worker's own CPU profile (`weft_engine::profile`, `WEFT_PROFILE`):
-# sampled with signals, so a machine without `perf` profiles too.
-pprof = { version = "0.15", features = ["flamegraph"] }
+# sampled with signals, so a machine without `perf` profiles too. Its
+# `flamegraph` feature is left off: it draws through inferno 0.11, which
+# holds quick-xml 0.26 (RUSTSEC-2026-0194, -0195); the engine draws with
+# inferno itself.
+pprof = "0.15"
+inferno = { version = "0.12", default-features = false }
 
 # internal workspace crates
 weft-core = { path = "crates/weft-core" }

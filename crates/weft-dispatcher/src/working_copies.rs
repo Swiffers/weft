@@ -19,6 +19,8 @@
 
 use std::sync::Arc;
 
+use weft_task_store::sql;
+
 use async_trait::async_trait;
 use sqlx::PgPool;
 use weft_core::project::hash::Manifest;
@@ -291,7 +293,7 @@ impl PostgresWorkingCopyStore {
 impl WorkingCopyStoreOps for PostgresWorkingCopyStore {
     async fn list(&self, project: uuid::Uuid) -> anyhow::Result<Vec<WorkingCopyRow>> {
         let rows: Vec<RowTuple> =
-            sqlx::query_as(&format!("SELECT {COLUMNS} FROM working_copy WHERE project_id = $1 ORDER BY created_at, id"))
+            sqlx::query_as(sql!("SELECT {COLUMNS} FROM working_copy WHERE project_id = $1 ORDER BY created_at, id"))
                 .bind(project)
                 .fetch_all(&self.pool)
                 .await?;
@@ -299,7 +301,7 @@ impl WorkingCopyStoreOps for PostgresWorkingCopyStore {
     }
 
     async fn get(&self, id: WorkingCopyId) -> anyhow::Result<Option<WorkingCopyRow>> {
-        let row: Option<RowTuple> = sqlx::query_as(&format!("SELECT {COLUMNS} FROM working_copy WHERE id = $1"))
+        let row: Option<RowTuple> = sqlx::query_as(sql!("SELECT {COLUMNS} FROM working_copy WHERE id = $1"))
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -307,7 +309,7 @@ impl WorkingCopyStoreOps for PostgresWorkingCopyStore {
     }
 
     async fn folder(&self, project: uuid::Uuid, host: &str, path: &str) -> anyhow::Result<Option<WorkingCopyRow>> {
-        let row: Option<RowTuple> = sqlx::query_as(&format!(
+        let row: Option<RowTuple> = sqlx::query_as(sql!(
             "SELECT {COLUMNS} FROM working_copy WHERE project_id = $1 AND kind = 'folder' AND host = $2 AND path = $3"
         ))
         .bind(project)
@@ -319,7 +321,7 @@ impl WorkingCopyStoreOps for PostgresWorkingCopyStore {
     }
 
     async fn all_folders(&self) -> anyhow::Result<Vec<WorkingCopyRow>> {
-        let rows: Vec<RowTuple> = sqlx::query_as(&format!("SELECT {COLUMNS} FROM working_copy WHERE kind = 'folder' ORDER BY created_at, id"))
+        let rows: Vec<RowTuple> = sqlx::query_as(sql!("SELECT {COLUMNS} FROM working_copy WHERE kind = 'folder' ORDER BY created_at, id"))
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(row_from).collect()
@@ -341,7 +343,7 @@ impl WorkingCopyStoreOps for PostgresWorkingCopyStore {
     async fn program_copy(&self, project: uuid::Uuid, working: &Manifest, head: &Head, now: u64) -> anyhow::Result<WorkingCopyRow> {
         self.insert(project, WorkingCopyKind::Program, None, working, head, now).await?;
         let row: Option<RowTuple> =
-            sqlx::query_as(&format!("SELECT {COLUMNS} FROM working_copy WHERE project_id = $1 AND kind = 'program'"))
+            sqlx::query_as(sql!("SELECT {COLUMNS} FROM working_copy WHERE project_id = $1 AND kind = 'program'"))
                 .bind(project)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -350,7 +352,7 @@ impl WorkingCopyStoreOps for PostgresWorkingCopyStore {
 
     async fn write(&self, id: WorkingCopyId, write: Write<'_>, now: u64) -> anyhow::Result<Written> {
         let mut tx = self.pool.begin().await?;
-        let row: Option<RowTuple> = sqlx::query_as(&format!("SELECT {COLUMNS} FROM working_copy WHERE id = $1 FOR UPDATE"))
+        let row: Option<RowTuple> = sqlx::query_as(sql!("SELECT {COLUMNS} FROM working_copy WHERE id = $1 FOR UPDATE"))
             .bind(id)
             .fetch_optional(&mut *tx)
             .await?;

@@ -207,7 +207,7 @@ async fn run_rechecked(State(state): State<Arc<BrokerState>>, AuthedCaller(calle
 /// by the read itself (`owner`), so no run is checked one by one.
 pub async fn rechecked(pool: &sqlx::PgPool, replica: &str, project: uuid::Uuid) -> anyhow::Result<RunRecheckedResponse> {
     type Row = (weft_core::RunId, Option<sqlx::types::Json<weft_core::run::CancelCause>>, Option<String>, Option<serde_json::Value>, bool);
-    let rows: Vec<Row> = sqlx::query_as(&format!(
+    let rows: Vec<Row> = sqlx::query_as(weft_task_store::sql!(
         "WITH mine AS ( \
              SELECT run_id, cancel_requested FROM run \
              WHERE owner = $1 AND project_id = $2 AND state = 'running' \

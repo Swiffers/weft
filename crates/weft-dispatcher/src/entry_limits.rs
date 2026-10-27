@@ -152,12 +152,7 @@ pub async fn recent_runs(pool: &PgPool, project: uuid::Uuid, now: i64) -> Result
 /// The `429` a refused call gets: which limit, and when to come back.
 pub fn too_many(refused: Refused) -> axum::response::Response {
     use axum::response::IntoResponse;
-    (
-        axum::http::StatusCode::TOO_MANY_REQUESTS,
-        [(axum::http::header::RETRY_AFTER, refused.retry_after_secs.to_string())],
-        refused.answer(),
-    )
-        .into_response()
+    refused.too_many_answer().into_response()
 }
 
 #[cfg(test)]

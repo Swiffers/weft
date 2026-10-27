@@ -3771,7 +3771,7 @@ mod tests {
     async fn socket_exchange<F, Fut>(
         cfg: CallerRuntimeConfig,
         program: F,
-    ) -> (Vec<String>, Option<tokio_tungstenite::tungstenite::protocol::CloseFrame<'static>>, RunId, Vec<String>)
+    ) -> (Vec<String>, Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>, RunId, Vec<String>)
     where
         F: FnOnce(Arc<LiveCallerConnection>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,

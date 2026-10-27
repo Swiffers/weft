@@ -98,9 +98,11 @@ pub trait BrokerSupervisorOps: Send + Sync {
         failure_stage: Option<weft_broker_client::protocol::FailureStage>,
         failure_message: Option<&str>,
     ) -> Result<WriteOutcome<SupervisorSetStatusResponse>>;
-    /// The health loop's write of one unit: its latched status and the
-    /// window it is in (`UnitRuntime`), fenced on ownership, on no
-    /// command reaching the copy, and on the unit being in the roster.
+    /// The health loop's write of one unit: its latched status, the
+    /// window it is in, and a restart the row does not hold yet
+    /// (`UnitRuntime`; `restart` `None` leaves the row's), fenced on
+    /// ownership, on no command reaching the copy, and on the unit being
+    /// in the roster.
     #[allow(clippy::too_many_arguments)]
     async fn set_unit_health(
         &self,
@@ -112,6 +114,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
         status: weft_broker_client::protocol::InfraNodeStatus,
         not_ready_since_unix: Option<i64>,
         ready_since_unix: Option<i64>,
+        restart: Option<&weft_core::infra::LastRestart>,
     ) -> Result<WriteOutcome<SupervisorSetStatusResponse>>;
     /// Record what the command `command_id` (an apply, a stop, a
     /// terminate) waits on for this copy, for `weft status`.
@@ -273,6 +276,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
                 failure_message: failure_message.map(str::to_string),
                 not_ready_since_unix: None,
                 ready_since_unix: None,
+                restart: None,
             },
         )
         .await
@@ -287,6 +291,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         status: weft_broker_client::protocol::InfraNodeStatus,
         not_ready_since_unix: Option<i64>,
         ready_since_unix: Option<i64>,
+        restart: Option<&weft_core::infra::LastRestart>,
     ) -> Result<WriteOutcome<SupervisorSetStatusResponse>> {
         BrokerSupervisorClient::set_status(
             self,
@@ -302,6 +307,7 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
                 failure_message: None,
                 not_ready_since_unix,
                 ready_since_unix,
+                restart: restart.cloned(),
             },
         )
         .await

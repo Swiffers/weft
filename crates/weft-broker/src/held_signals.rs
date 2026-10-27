@@ -11,6 +11,7 @@
 //! died), which frees it ([`release`]).
 
 use sqlx::{PgPool, Row};
+use weft_task_store::sql;
 use weft_broker_client::protocol::{
     HeldNow, HeldServing, SignalAuthKind, SignalHoldResponse, SignalRowWire, SignalSurfaceKind, ACTIVATION_LISTENS,
     SIGNAL_ACTIVATION_JOIN, STILL_HELD_BY,
@@ -25,7 +26,7 @@ use weft_broker_client::protocol::{
 /// tenants: each row carries its own. `project` narrows it to one
 /// project's rows.
 pub async fn signals_held(pool: &PgPool, project: Option<uuid::Uuid>) -> anyhow::Result<Vec<SignalRowWire>> {
-    let rows = sqlx::query(&format!(
+    let rows = sqlx::query(sql!(
         "{} WHERE {ACTIVATION_LISTENS} AND ($1::uuid IS NULL OR s.project_id = $1)",
         held_select()
     ))
@@ -39,7 +40,7 @@ pub async fn signals_held(pool: &PgPool, project: Option<uuid::Uuid>) -> anyhow:
 /// held (gone, or its activation no longer listens): what the listener
 /// loads a signal it has not seen yet from.
 pub async fn signal_held(pool: &PgPool, token: &str) -> anyhow::Result<Option<SignalRowWire>> {
-    let row = sqlx::query(&format!("{} WHERE s.token = $1 AND {ACTIVATION_LISTENS}", held_select()))
+    let row = sqlx::query(sql!("{} WHERE s.token = $1 AND {ACTIVATION_LISTENS}", held_select()))
     .bind(token)
     .fetch_optional(pool)
     .await?;
@@ -85,7 +86,7 @@ pub async fn hold(
 ) -> anyhow::Result<SignalHoldResponse> {
     let tokens: Vec<&str> = holding.iter().map(|h| h.token.as_str()).collect();
     let mut tx = pool.begin().await?;
-    let kept: Vec<String> = sqlx::query_scalar(&format!(
+    let kept: Vec<String> = sqlx::query_scalar(sql!(
         "SELECT r.token FROM signal r \
          WHERE r.token = ANY($1) AND r.holds AND r.held_by = $2 AND {held} \
          FOR UPDATE OF r",
@@ -109,7 +110,7 @@ pub async fn hold(
         .execute(&mut *tx)
         .await?;
     }
-    let ended: Vec<String> = sqlx::query_scalar(&format!(
+    let ended: Vec<String> = sqlx::query_scalar(sql!(
         "SELECT x.token FROM unnest($1::text[]) AS x(token) WHERE NOT {held}",
         held = activation_held("x"),
     ))
@@ -117,7 +118,7 @@ pub async fn hold(
     .fetch_all(&mut *tx)
     .await?;
     let room = room.map(|r| i64::from(r).saturating_sub(kept.len() as i64).max(0));
-    let taken: Vec<String> = sqlx::query_scalar(&format!(
+    let taken: Vec<String> = sqlx::query_scalar(sql!(
         "WITH free AS ( \
              SELECT r.token FROM signal r \
              WHERE r.holds AND r.held_failed IS NULL AND (r.held_by IS NULL OR r.held_by = $4) \
@@ -137,7 +138,7 @@ pub async fn hold(
     .bind(replica)
     .fetch_all(&mut *tx)
     .await?;
-    let rows = sqlx::query(&format!("{} WHERE s.token = ANY($1)", held_select()))
+    let rows = sqlx::query(sql!("{} WHERE s.token = ANY($1)", held_select()))
         .bind(&taken)
         .fetch_all(&mut *tx)
         .await?;

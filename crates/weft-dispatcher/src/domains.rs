@@ -23,6 +23,8 @@
 //! (`weft_task_store::install_address`).
 
 use std::net::IpAddr;
+
+use weft_task_store::sql;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -323,7 +325,7 @@ pub struct DoorState {
 }
 
 pub async fn door_state(pool: &PgPool) -> Result<DoorState> {
-    let row: Option<(Vec<String>, i64, Option<String>, i32)> = sqlx::query_as(&format!(
+    let row: Option<(Vec<String>, i64, Option<String>, i32)> = sqlx::query_as(sql!(
         "SELECT served, {DB_NOW_MS} - served_at_ms, refused, refusals FROM install_domain_door"
     ))
     .fetch_optional(pool)
@@ -337,7 +339,7 @@ pub async fn door_state(pool: &PgPool) -> Result<DoorState> {
 
 
 async fn record_served(pool: &PgPool, names: &[String]) -> Result<()> {
-    sqlx::query(&format!(
+    sqlx::query(sql!(
         "INSERT INTO install_domain_door (singleton, served, served_at_ms, refused, refusals) VALUES (TRUE, $1, {DB_NOW_MS}, NULL, 0) \
          ON CONFLICT (singleton) DO UPDATE SET served = EXCLUDED.served, served_at_ms = EXCLUDED.served_at_ms, \
              refused = NULL, refusals = 0"

@@ -549,6 +549,7 @@ async fn cancel_going(state: &DispatcherState, id: uuid::Uuid) -> anyhow::Result
 pub(crate) async fn lift(state: &DispatcherState, tenant: &str, task: uuid::Uuid) -> anyhow::Result<LiftReport> {
     let names = project_names(state, tenant).await.map_err(|(_, why)| anyhow::anyhow!(why))?;
     let tell = Telling::on(Some(task));
+    let setups = tokio::sync::Semaphore::new(SETUPS_AT_ONCE);
     let lifts = left(&state.pg_pool).await?;
     futures::future::try_join_all(lifts.iter().map(|lift| async {
         let id = lift.project_id;
@@ -556,7 +557,7 @@ pub(crate) async fn lift(state: &DispatcherState, tenant: &str, task: uuid::Uuid
         // A build that failed brings nothing back: what is recorded waits
         // for a build that runs on this weft.
         if rebuild(state, tenant, id, &mut lifted, &tell).await? {
-            run_steps(state, lift, &mut lifted, &tell).await?;
+            run_steps(state, lift, &mut lifted, &tell, &setups).await?;
         }
         tell.done(&state.pg_pool, lifted).await
     }))
@@ -569,6 +570,9 @@ pub(crate) async fn lift(state: &DispatcherState, tenant: &str, task: uuid::Uuid
     // on infra and a resync stopped on either get their look now.
     if let Err(e) = crate::api::infra::bring_back_triggers_whose_infra_returned(state.clone()).await {
         tracing::error!(target: "weft_dispatcher::maintenance", "the maintenance is lifted, but bringing back what went down with its infra failed; the next change of a copy tries again: {e:#}");
+    }
+    if let Err(e) = crate::task_kinds::resync::retry_stopped(state).await {
+        tracing::error!(target: "weft_dispatcher::maintenance", "the maintenance is lifted, but taking up again the resyncs stopped on its infra failed; the next change of a copy tries again: {e:#}");
     }
     Ok(report)
 }
@@ -585,15 +589,53 @@ pub(crate) async fn bring_back_project(state: &DispatcherState, id: uuid::Uuid) 
     let Some(lift) = left(&state.pg_pool).await?.into_iter().find(|lift| lift.project_id == id) else { return Ok(None) };
     let name = state.projects.get(id).await?.map(|project| project.name).unwrap_or_default();
     let mut lifted = ProjectLifted { id, name, ..Default::default() };
-    run_steps(state, &lift, &mut lifted, &Telling::on(None)).await?;
+    run_steps(state, &lift, &mut lifted, &Telling::on(None), &tokio::sync::Semaphore::new(SETUPS_AT_ONCE)).await?;
     Ok(Some(lifted))
+}
+
+/// How many owners' infra starts and trigger setups a lift runs at once,
+/// across every project it lifts side by side (a resync bringing back what
+/// a lift left runs as many for its one project). Each trigger setup run
+/// holds database connections of the dispatcher for its whole window and
+/// calls the listener, which calls the broker, which takes connections of
+/// its own; an infra start's beginning does the same through the
+/// supervisor. A lift that started every owner of every project at once
+/// ran a small database out of connections, and the setups that could not
+/// get one failed. Four keeps a lift well inside the connections of the
+/// smallest database weft runs on, and still brings a project with many
+/// instances back in a fraction of the time one at a time would.
+///
+/// A turn is held only while connections are: an infra start holds one
+/// for its beginning, never while it waits for its apply to land
+/// ([`start_copies`]), since an apply runs the user's infra and has no
+/// deadline, and four slow ones would hold back every other project of
+/// the lift for as long as they take.
+const SETUPS_AT_ONCE: usize = 4;
+
+/// Run every one of `parts`, at most as many at once as `setups` has
+/// permits, answering each one's output in the order given.
+async fn a_few_at_a_time<T>(setups: &tokio::sync::Semaphore, parts: impl IntoIterator<Item = impl std::future::Future<Output = T>>) -> Vec<T> {
+    futures::future::join_all(parts.into_iter().map(|part| async move {
+        let _turn = setups.acquire().await.expect("a lift's semaphore is never closed");
+        part.await
+    }))
+    .await
 }
 
 /// Bring back `lift` on the build its project has registered, saying in
 /// `lifted` what came back and what did not: every recorded copy first,
-/// every owner's at once, since a trigger's setup reads the infra in its
-/// cut; then every marked trigger, every owner's at once.
-async fn run_steps(state: &DispatcherState, lift: &ProjectLift, lifted: &mut ProjectLifted, tell: &Telling) -> anyhow::Result<()> {
+/// every owner's side by side, since a trigger's setup reads the infra in
+/// its cut; then every marked trigger, every owner's side by side. Owners
+/// take their turn from `setups`, which the projects a lift brings back
+/// side by side share ([`SETUPS_AT_ONCE`]): for a trigger setup the whole
+/// of it, for an infra start its beginning alone.
+async fn run_steps(
+    state: &DispatcherState,
+    lift: &ProjectLift,
+    lifted: &mut ProjectLifted,
+    tell: &Telling,
+    setups: &tokio::sync::Semaphore,
+) -> anyhow::Result<()> {
     let id = lift.project_id;
     if !lift.copies.is_empty() {
         let copies = lift
@@ -602,13 +644,17 @@ async fn run_steps(state: &DispatcherState, lift: &ProjectLift, lifted: &mut Pro
             .flat_map(|(owner, nodes)| nodes.iter().map(|node| CopyRef { node: node.clone(), instance: owner.instance().cloned() }))
             .collect();
         tell.at(&state.pg_pool, lifted, LiftDoing::StartingInfra { copies }).await?;
-        let parts = futures::future::try_join_all(lift.copies.iter().map(|(owner, nodes)| async {
+        // Every owner's side by side: each takes a turn of `setups` only
+        // for its start's beginning (`start_copies`).
+        let parts = futures::future::join_all(lift.copies.iter().map(|(owner, nodes)| async {
             let mut part = ProjectLifted::default();
-            start_copies(state, id, owner.instance(), nodes, &mut part).await?;
+            start_copies(state, id, owner.instance(), nodes, setups, &mut part).await?;
             anyhow::Ok(part)
         }))
-        .await?;
-        parts.into_iter().for_each(|part| lifted.absorb(part));
+        .await;
+        for part in parts {
+            lifted.absorb(part?);
+        }
     }
     if !lift.triggers.is_empty() {
         let triggers = lift
@@ -617,11 +663,14 @@ async fn run_steps(state: &DispatcherState, lift: &ProjectLift, lifted: &mut Pro
             .map(|(owner, triggers)| weft_core::activation::OwnerTriggers { owner: owner.clone(), triggers: triggers.clone() })
             .collect();
         tell.at(&state.pg_pool, lifted, LiftDoing::TurningOn { triggers }).await?;
-        let parts = futures::future::join_all(lift.triggers.iter().map(|(owner, triggers)| async {
-            let mut part = ProjectLifted::default();
-            bring_back(state, id, owner, triggers.clone(), &mut part).await;
-            part
-        }))
+        let parts = a_few_at_a_time(
+            setups,
+            lift.triggers.iter().map(|(owner, triggers)| async {
+                let mut part = ProjectLifted::default();
+                bring_back(state, id, owner, triggers.clone(), &mut part).await;
+                part
+            }),
+        )
         .await;
         parts.into_iter().for_each(|part| lifted.absorb(part));
     }
@@ -727,12 +776,14 @@ async fn rebuild(state: &DispatcherState, tenant: &str, id: uuid::Uuid, lifted: 
 /// Start `nodes`, `instance`'s recorded copies of project `id`, on the
 /// registered build (the one [`rebuild`] just registered), and wait until they land. A copy terminated since, or
 /// one the program no longer has, is skipped and forgotten; one that runs
-/// already is forgotten.
+/// already is forgotten. The start's beginning takes a turn of `setups`;
+/// waiting for it to land takes none ([`SETUPS_AT_ONCE`]).
 async fn start_copies(
     state: &DispatcherState,
     id: uuid::Uuid,
     instance: Option<&InstanceId>,
     nodes: &[String],
+    setups: &tokio::sync::Semaphore,
     lifted: &mut ProjectLifted,
 ) -> anyhow::Result<()> {
     let Some(project) = state.projects.project(id).await? else { return Ok(()) };
@@ -770,9 +821,12 @@ async fn start_copies(
         }
     }
     let started = async {
-        let begun = crate::api::infra::begin_sync(state, id, &Default::default(), instance, &to_start, false, crate::api::infra::SyncKind::Lift)
-            .await
-            .map_err(|e| e.into_parts().1)?;
+        let begun = {
+            let _turn = setups.acquire().await.expect("a lift's semaphore is never closed");
+            crate::api::infra::begin_sync(state, id, &Default::default(), instance, &to_start, false, crate::api::infra::SyncKind::Lift)
+                .await
+                .map_err(|e| e.into_parts().1)?
+        };
         if let Some(begun) = begun {
             crate::api::infra::finish_sync(state, begun).await.map_err(|ended| match ended {
                 crate::api::project::SyncNotLanded::Cancelled(why) => format!("its start was cancelled ({why})"),
@@ -887,4 +941,36 @@ mod tests {
     fn nothing_recorded_is_nothing_to_lift() {
         assert!(plan(Vec::new(), Vec::new()).is_empty());
     }
+
+    weft_core::stress_test!(
+        name: setups_go_a_few_at_a_time_across_every_project,
+        runs: 16,
+        worker_threads: 4,
+        async fn body() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            // Two projects lifted side by side, each with many owners,
+            // sharing one lift's turns: never more setups at once than it
+            // allows, and every one of them runs.
+            let setups = tokio::sync::Semaphore::new(SETUPS_AT_ONCE);
+            let (now, most, ran) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+            let setup = |owner: usize| {
+                let (now, most, ran) = (&now, &most, &ran);
+                async move {
+                    let at_once = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(at_once, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    now.fetch_sub(1, Ordering::SeqCst);
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    owner
+                }
+            };
+            let project = |owners: std::ops::Range<usize>| a_few_at_a_time(&setups, owners.map(setup));
+            let (a, b) = tokio::join!(project(0..10), project(10..25));
+            assert_eq!(a, (0..10).collect::<Vec<_>>(), "each owner's answer, in order");
+            assert_eq!(b, (10..25).collect::<Vec<_>>());
+            assert_eq!(ran.load(Ordering::SeqCst), 25);
+            assert_eq!(most.load(Ordering::SeqCst), SETUPS_AT_ONCE, "the bound holds across both projects, and is reached");
+        }
+    );
 }

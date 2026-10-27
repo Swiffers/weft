@@ -504,8 +504,8 @@ pub async fn stored_result(pool: &PgPool, task_id: Uuid) -> Result<Option<Value>
 /// with its id, in the same statement (`crate::announce`: the
 /// announcement commits with the write, and its caller pokes the flusher).
 /// Returns one row per task it changed.
-fn notify_terminal(update: &str) -> String {
-    format!(
+fn notify_terminal(update: &str) -> sqlx::AssertSqlSafe<String> {
+    crate::sql!(
         "WITH done AS ({update} RETURNING id) SELECT weft_announce('{}', id::text) FROM done",
         crate::terminal::TERMINAL_CHANNEL
     )
@@ -519,7 +519,7 @@ pub async fn complete(
     replica: &str,
     result: Value,
 ) -> Result<()> {
-    let updated = sqlx::query(&notify_terminal(
+    let updated = sqlx::query(notify_terminal(
         "UPDATE task SET status = 'complete', completed_at_unix = $2, claimed_until_unix = NULL, result = $1 \
          WHERE id = $3 AND claimed_by = $4 AND status = 'claimed'",
     ))
@@ -541,7 +541,7 @@ pub async fn complete(
 /// task moved on (claimed / completed) in the meantime: someone IS
 /// handling it, so the caller backs off.
 pub async fn fail_pending(pool: &PgPool, task_id: Uuid, error: &str) -> Result<bool> {
-    let updated = sqlx::query(&notify_terminal(
+    let updated = sqlx::query(notify_terminal(
         r#"UPDATE task
            SET status = 'failed', error = $1, completed_at_unix = $2
            WHERE id = $3 AND status = 'pending'"#,
@@ -564,7 +564,7 @@ pub async fn fail(
     replica: &str,
     error: String,
 ) -> Result<()> {
-    let updated = sqlx::query(&notify_terminal(
+    let updated = sqlx::query(notify_terminal(
         "UPDATE task SET status = 'failed', completed_at_unix = $2, claimed_until_unix = NULL, error = $1 \
          WHERE id = $3 AND claimed_by = $4 AND status = 'claimed'",
     ))

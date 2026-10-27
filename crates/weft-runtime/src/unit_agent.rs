@@ -224,8 +224,11 @@ impl Host {
             None => Some(weft_platform_traits::UnitRunState::Starting { step: "its new version is starting".into() }),
         };
         if let Some(state) = state {
+            // A restart of its containers stays what it was: the apply
+            // says how the unit stands, not what happened to it before.
+            let restart = seen.iter().find(|o| ours(o)).and_then(|o| o.restart.clone());
             seen.retain(|o| !ours(o));
-            seen.push(weft_platform_traits::UnitObservation { copy_id: a.node.node.copy_id.clone(), unit: a.unit.clone(), hash: wanted, state });
+            seen.push(weft_platform_traits::UnitObservation { copy_id: a.node.node.copy_id.clone(), unit: a.unit.clone(), hash: wanted, state, restart });
         }
         Ok(seen)
     }
@@ -233,15 +236,17 @@ impl Host {
     /// Watch how the unit stands, here on its machine where looking costs
     /// nothing, and ask for a look at the project's health each time it
     /// changes (a container stopped, a check started failing or passing
-    /// again, an apply ended). The supervisor looks at infra that runs
-    /// fine only when told to, so an install whose infra runs fine
+    /// again, an apply ended, a container came back on its own: that one
+    /// can come and go between two looks, so it is told by when it
+    /// stopped, which stays until the next one). The supervisor looks at
+    /// infra that runs fine only when told to, so an install whose infra runs fine
     /// wakes nothing; the death of the whole machine is told by the cloud
     /// itself. The first look after the agent starts always asks. A
     /// request that fails is asked again at the next looks, [`ASK_TRIES`]
     /// times in all, and then not until the unit changes again: each try
     /// wakes the broker's database.
     async fn watch(self, broker: std::sync::Arc<weft_broker_client::BrokerInfraClient>) {
-        let mut told: Option<Vec<(String, String, String)>> = None;
+        let mut told: Option<Vec<Stand>> = None;
         let mut tries = 0;
         loop {
             match self.seen().await.map(|seen| Self::stands(&seen)) {
@@ -271,15 +276,22 @@ impl Host {
         }
     }
 
-    /// What a look compares: each unit and the kind of state it is in
-    /// (never the words, which may change between looks of one state).
-    fn stands(seen: &[weft_platform_traits::UnitObservation]) -> Vec<(String, String, String)> {
-        let mut stands: Vec<(String, String, String)> =
-            seen.iter().map(|o| (o.copy_id.clone(), o.unit.clone(), o.state.kind().to_string())).collect();
+    /// What a look compares: each unit, the kind of state it is in
+    /// (never the words, which may change between looks of one state),
+    /// and when its latest restart stopped it.
+    fn stands(seen: &[weft_platform_traits::UnitObservation]) -> Vec<Stand> {
+        let mut stands: Vec<Stand> = seen
+            .iter()
+            .map(|o| (o.copy_id.clone(), o.unit.clone(), o.state.kind(), o.restart.as_ref().map(|r| r.stopped_at_unix)))
+            .collect();
         stands.sort();
         stands
     }
 }
+
+/// One unit as a look compares it ([`Host::stands`]): its copy, its
+/// name, the kind of its state, and when its latest restart stopped it.
+type Stand = (String, String, &'static str, Option<i64>);
 
 /// How often the agent looks at its unit (`Host::watch`). Looking is a
 /// call to the machine's own Docker and the unit's checks, and costs
@@ -418,6 +430,28 @@ mod tests {
         assert!(run_probe(&ProbeKind::Http { path: "/ok".into(), port }, Duration::from_secs(2)).await.ok);
         let down = run_probe(&ProbeKind::Http { path: "/down".into(), port }, Duration::from_secs(2)).await;
         assert_eq!(down.why.as_deref(), Some(format!("GET /down on {port} answered 503").as_str()));
+    }
+
+    /// A restart changes what a look compares once, when the container
+    /// stops, and not again while it runs back as it was; a new stop does.
+    #[test]
+    fn a_restart_is_told_once_by_when_it_stopped() {
+        use weft_platform_traits::{RestartCause, UnitObservation, UnitRestart, UnitRunState};
+        let seen = |state: UnitRunState, stopped: Option<i64>| {
+            vec![UnitObservation {
+                copy_id: "c".into(),
+                unit: "db".into(),
+                hash: "h".into(),
+                state,
+                restart: stopped.map(|at| UnitRestart { container: "pg".into(), stopped_at_unix: at, cause: RestartCause::OutOfMemory, count: 1 }),
+            }]
+        };
+        let before = Host::stands(&seen(UnitRunState::Ready, None));
+        // Back up before the look: the state reads the same, the stop does not.
+        let restarted = Host::stands(&seen(UnitRunState::Ready, Some(100)));
+        assert_ne!(before, restarted);
+        assert_eq!(restarted, Host::stands(&seen(UnitRunState::Ready, Some(100))), "the same restart is not told again");
+        assert_ne!(restarted, Host::stands(&seen(UnitRunState::Ready, Some(160))), "a new stop is");
     }
 
     #[cfg(unix)]

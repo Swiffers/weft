@@ -24,13 +24,14 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
+use weft_task_store::sql;
 use weft_core::migrate::{
     Candidate, ConnectionPick, ExportedConnection, ExportedConnections, ImportedConnection, ImportedConnections, Outcome,
     Selection, TransferKey,
 };
 use weft_core::AppRegistration;
 
-use crate::flows::{insert_grant, Moved, NewGrant};
+use crate::flows::{copy_grant, Moved, NewGrant};
 use crate::{door_of, scopes_of, values_of, AccessError};
 
 /// How long a transfer key may wait for its batch.
@@ -42,7 +43,7 @@ const TRANSFER_KEY_TTL: chrono::Duration = chrono::Duration::minutes(15);
 pub async fn make_transfer_key(pool: &PgPool, tenant: &str) -> anyhow::Result<TransferKey> {
     let (secret, public_key) = crate::transfer::key_pair();
     let key_id = uuid::Uuid::new_v4();
-    sqlx::query(&format!(
+    sqlx::query(sql!(
         "{} INSERT INTO access_transfer_key (id, tenant_id, secret_sealed) VALUES ($2, $3, $4)",
         crate::flows::pruning("access_transfer_key", "$1")
     ))
@@ -223,7 +224,7 @@ fn not_copied(row: &GrantRow) -> Option<String> {
 pub async fn export(pool: &PgPool, tenant: &str, selection: &Selection, public_key: Option<&str>) -> anyhow::Result<ExportedConnections> {
     selection.validate().map_err(AccessError::Invalid)?;
     let rows: Vec<GrantRow> =
-        sqlx::query_as(&format!("SELECT {GRANT_COLUMNS} FROM access_grant WHERE tenant_id = $1 ORDER BY created_at, id"))
+        sqlx::query_as(sql!("SELECT {GRANT_COLUMNS} FROM access_grant WHERE tenant_id = $1 ORDER BY created_at, id"))
             .bind(tenant)
             .fetch_all(pool)
             .await?;
@@ -330,7 +331,7 @@ async fn import_one(
         Ok(readable) => readable,
         Err(why) => return Ok(Outcome::Skipped { why: format!("it does not read on this install ({why}); the two installs may run different wefts") }),
     };
-    let here: Option<GrantRow> = sqlx::query_as(&format!("SELECT {GRANT_COLUMNS} FROM access_grant WHERE id = $1"))
+    let here: Option<GrantRow> = sqlx::query_as(sql!("SELECT {GRANT_COLUMNS} FROM access_grant WHERE id = $1"))
         .bind(grant.id)
         .fetch_optional(&mut **tx)
         .await?;
@@ -380,10 +381,10 @@ async fn import_one(
         });
     }
     crate::resolve::record_events_recipes(&mut **tx, &spec).await?;
-    insert_grant(
+    let copied = copy_grant(
         &mut **tx,
         tenant,
-        Some(Moved { id: grant.id, created_at: grant.created_at, expires_at: grant.expires_at, token_lifetime_secs: grant.token_lifetime_secs }),
+        Moved { id: grant.id, created_at: grant.created_at, expires_at: grant.expires_at, token_lifetime_secs: grant.token_lifetime_secs },
         NewGrant {
             spec: &spec,
             registration: &grant.registration,
@@ -401,5 +402,14 @@ async fn import_one(
         },
     )
     .await?;
-    Ok(Outcome::Copied)
+    Ok(match copied {
+        Some(_) => Outcome::Copied,
+        // A sign-in to the same account landed between the look above
+        // and this write: the same as finding it there.
+        None => Outcome::Skipped {
+            why: "this install already has a connection to that account (signed in while this copy ran), which programs can \
+                  pick instead"
+                .into(),
+        },
+    })
 }

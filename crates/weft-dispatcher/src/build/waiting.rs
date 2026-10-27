@@ -388,7 +388,7 @@ pub(crate) async fn settle(conn: &mut sqlx::PgConnection, project: uuid::Uuid, s
     // in this same transaction when nothing else holds its build, so
     // whoever hears the version registered (its waiter, woken as this
     // commits) never finds the project still building.
-    sqlx::query_scalar::<_, uuid::Uuid>(&crate::project_store::settle_transition_sql())
+    sqlx::query_scalar::<_, uuid::Uuid>(crate::project_store::settle_transition_sql())
         .bind(now - crate::transition::heartbeat_stale_secs())
         .bind(Some(project))
         .fetch_all(&mut *conn)

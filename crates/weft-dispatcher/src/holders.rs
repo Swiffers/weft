@@ -45,13 +45,13 @@ pub(crate) static ON_ACCESS: &[WakeOn] = &[WakeOn::any(ACCESS_REMADE_CHANNEL)];
 /// activation is one a listener holds and that no holder gave up on, the
 /// same rows a holder claims from.
 pub async fn held_count(pool: &sqlx::PgPool) -> anyhow::Result<u64> {
-    let n: i64 = sqlx::query_scalar(&held_count_sql()).fetch_one(pool).await?;
+    let n: i64 = sqlx::query_scalar(held_count_sql()).fetch_one(pool).await?;
     Ok(u64::try_from(n).unwrap_or(0))
 }
 
 /// SQL: [`held_count`]'s count, as one query.
-fn held_count_sql() -> String {
-    format!("SELECT count(*) FROM signal s {SIGNAL_ACTIVATION_JOIN} WHERE s.holds AND s.held_failed IS NULL AND {ACTIVATION_LISTENS}")
+fn held_count_sql() -> sqlx::AssertSqlSafe<String> {
+    weft_task_store::sql!("SELECT count(*) FROM signal s {SIGNAL_ACTIVATION_JOIN} WHERE s.holds AND s.held_failed IS NULL AND {ACTIVATION_LISTENS}")
 }
 
 /// The `holder_pool` table: how many holders weft last set the platform's
@@ -107,7 +107,7 @@ pub async fn size(
 ) -> anyhow::Result<DrainStep> {
     // The count held and the count last set, in one round trip.
     let (held, last_set): (i64, Option<i64>) =
-        sqlx::query_as(&format!("SELECT ({}), (SELECT copies FROM holder_pool)", held_count_sql())).fetch_one(pool).await?;
+        sqlx::query_as(weft_task_store::sql!("SELECT ({}), (SELECT copies FROM holder_pool)", held_count_sql().0)).fetch_one(pool).await?;
     let wanted = weft_platform_traits::holder_pool::copies_for(u64::try_from(held).unwrap_or(0), per_copy);
     if let Some(copies) = resize_to(wanted, last_set.and_then(|n| u32::try_from(n).ok()), set_here.load(Ordering::Acquire)) {
         holders.resize(copies).await?;

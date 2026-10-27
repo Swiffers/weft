@@ -251,17 +251,30 @@ pub const RUNTIME_IMAGE_ENV: &str = "WEFT_RUNTIME_IMAGE";
 /// carries to compile project versions against. `WEFT_RUNTIME_IMAGE`
 /// wins verbatim when set.
 pub fn runtime_image_ref() -> Result<String> {
-    if let Ok(v) = std::env::var(RUNTIME_IMAGE_ENV) {
-        let v = v.trim();
-        if !v.is_empty() {
-            anyhow::ensure!(
-                !v.contains(char::is_whitespace) && !v.contains(['"', '\'']),
-                "{RUNTIME_IMAGE_ENV} is '{v}', which is not a well-formed image ref (whitespace or quotes)"
-            );
-            ref_repo_tag(v).map_err(|e| anyhow::anyhow!("{RUNTIME_IMAGE_ENV}: {e}"))?;
-            return Ok(v.to_string());
-        }
+    if let Some(v) = runtime_image_override()? {
+        return Ok(v);
     }
+    Ok(qualified_ref(RUNTIME_REPO, &short_hex(&runtime_source_hash()?.finalize())))
+}
+
+/// `WEFT_RUNTIME_IMAGE`, when it is set, checked to be a well-formed ref.
+fn runtime_image_override() -> Result<Option<String>> {
+    let Ok(v) = std::env::var(RUNTIME_IMAGE_ENV) else { return Ok(None) };
+    let v = v.trim();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        !v.contains(char::is_whitespace) && !v.contains(['"', '\'']),
+        "{RUNTIME_IMAGE_ENV} is '{v}', which is not a well-formed image ref (whitespace or quotes)"
+    );
+    ref_repo_tag(v).map_err(|e| anyhow::anyhow!("{RUNTIME_IMAGE_ENV}: {e}"))?;
+    Ok(Some(v.to_string()))
+}
+
+/// The hash [`runtime_image_ref`] is cut from, before it is finished:
+/// everything the image is built from in this checkout.
+fn runtime_source_hash() -> Result<Sha256> {
     let root = weft_compiler::build::resolve_weft_root().map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let closure = weft_compiler::codegen::workspace_crate_closure(&root, &[RUNTIME_REPO.to_string()])
         .map_err(|e| anyhow::anyhow!("runtime image crate closure: {e}"))?;
@@ -286,7 +299,150 @@ pub fn runtime_image_ref() -> Result<String> {
     for rel in ["crates", "catalog", weft_compiler::hash::BUILDER_BASE_DOCKERFILE, weft_compiler::hash::BUILDER_BASE_SPLIT_SCRIPT] {
         weft_compiler::hash::hash_path(&mut hasher, &format!("carried:{rel}"), &root.join(rel), &weft_compiler::hash::DISK)?;
     }
-    Ok(qualified_ref(RUNTIME_REPO, &short_hex(&hasher.finalize())))
+    Ok(hasher)
+}
+
+/// The glibc each Debian release the runtime image has been based on
+/// ships, as (major, minor). The release itself is named once, in the
+/// runtime Dockerfile's last `FROM` ([`runtime_image_release`]); a base
+/// this table does not know is refused rather than guessed.
+const DEBIAN_GLIBC: &[(&str, (u32, u32))] = &[("bookworm", (2, 36)), ("trixie", (2, 41))];
+
+/// The Debian release the runtime image runs on, and its glibc: read off
+/// the last `FROM` of the runtime Dockerfile (`FROM debian:trixie-slim`),
+/// the stage the image is.
+fn runtime_image_release(dockerfile: &str) -> Result<(String, (u32, u32))> {
+    let base = dockerfile
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("FROM "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .ok_or_else(|| anyhow::anyhow!("the runtime Dockerfile has no FROM line"))?;
+    let release = base
+        .strip_prefix("debian:")
+        .map(|tag| tag.split('-').next().unwrap_or(tag))
+        .ok_or_else(|| anyhow::anyhow!("the runtime image is based on {base}, not on a Debian release weft knows the glibc of"))?;
+    let glibc = DEBIAN_GLIBC.iter().find(|(name, _)| *name == release).map(|(_, v)| *v).ok_or_else(|| {
+        anyhow::anyhow!("the runtime image is based on Debian {release}, whose glibc is not in DEBIAN_GLIBC (crates/weft-cli/src/images.rs); add it there")
+    })?;
+    Ok((release.to_string(), glibc))
+}
+
+/// [`runtime_image_release`] of this checkout's runtime Dockerfile.
+fn this_runtime_image_release(root: &Path) -> Result<(String, (u32, u32))> {
+    let path = root.join("deploy/docker").join(RUNTIME_DOCKERFILE);
+    let text = std::fs::read_to_string(&path).map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
+    runtime_image_release(&text)
+}
+
+/// This machine's glibc, as (major, minor); `None` when it has none (not
+/// Linux, or a musl Linux), which `getconf` answers by failing.
+fn host_glibc() -> Option<(u32, u32)> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let out = std::process::Command::new("getconf").arg("GNU_LIBC_VERSION").output().ok()?;
+    out.status.success().then(|| parse_glibc(&String::from_utf8_lossy(&out.stdout))).flatten()
+}
+
+/// `glibc 2.41` (what `getconf GNU_LIBC_VERSION` prints) as (2, 41).
+fn parse_glibc(text: &str) -> Option<(u32, u32)> {
+    let version = text.trim().strip_prefix("glibc ")?;
+    let mut parts = version.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// Where a local install's runtime image gets its `weft-runtime`.
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeSource {
+    /// The binary `./setup.sh` just built on this machine, copied in:
+    /// a binary built against a glibc no newer than the image's starts
+    /// there.
+    Host,
+    /// Compiled inside Docker, for the reason given: a binary built here
+    /// may need a glibc symbol the image does not have.
+    CompileInImage(String),
+}
+
+/// Decided up front from this machine's glibc against the image's, so a
+/// binary that could not start in the image is never tried.
+fn runtime_source(host: Option<(u32, u32)>, release: &str, image: (u32, u32)) -> RuntimeSource {
+    let show = |(major, minor): (u32, u32)| format!("{major}.{minor}");
+    match host {
+        Some(host) if host <= image => RuntimeSource::Host,
+        Some(host) => RuntimeSource::CompileInImage(format!(
+            "this machine's glibc {} is newer than the {} of Debian {release}, which the runtime image runs on, \
+             so the weft-runtime built here may not start there",
+            show(host),
+            show(image)
+        )),
+        None => RuntimeSource::CompileInImage(
+            "this machine has no glibc (it is not Linux, or its libc is musl), so the weft-runtime built here \
+             cannot run in the runtime image"
+                .to_string(),
+        ),
+    }
+}
+
+/// The runtime image a local install runs its infra units' agents on,
+/// and how it is made.
+pub struct LocalRuntimeImage {
+    pub image_ref: String,
+    source: RuntimeSource,
+    host_binary: PathBuf,
+}
+
+/// The runtime image for a local install whose runtime is `host_binary`.
+///
+/// When that binary can run in the image ([`runtime_source`]), the image
+/// is built around it, and its tag hashes the binary on top of the
+/// source: a binary built again (another profile, another toolchain on
+/// the host) makes a new image, never a stale one reused under the
+/// source's tag. Otherwise the binary is compiled inside Docker, under
+/// the source's tag ([`runtime_image_ref`]), as the release workflow's
+/// would be. `WEFT_RUNTIME_IMAGE` wins verbatim either way.
+pub fn local_runtime_image(host_binary: &Path) -> Result<LocalRuntimeImage> {
+    let root = weft_compiler::build::resolve_weft_root().map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
+    let (release, image_glibc) = this_runtime_image_release(&root)?;
+    let source = runtime_source(host_glibc(), &release, image_glibc);
+    let image_ref = match (runtime_image_override()?, &source) {
+        (Some(v), _) => v,
+        (None, RuntimeSource::CompileInImage(_)) => runtime_image_ref()?,
+        (None, RuntimeSource::Host) => {
+            let mut hasher = runtime_source_hash()?;
+            weft_compiler::hash::hash_path(&mut hasher, "prebuilt:weft-runtime", host_binary, &weft_compiler::hash::DISK)?;
+            qualified_ref(RUNTIME_REPO, &short_hex(&hasher.finalize()))
+        }
+    };
+    Ok(LocalRuntimeImage { image_ref, source, host_binary: host_binary.to_path_buf() })
+}
+
+impl LocalRuntimeImage {
+    /// Make it exist ([`ensure_runtime_image`]). When it has to be
+    /// compiled inside Docker, why is said once, right before.
+    pub async fn ensure(&self, rebuild: bool) -> Result<()> {
+        match &self.source {
+            RuntimeSource::Host => ensure_runtime_image(&self.image_ref, rebuild, RuntimeBinary::Host(&self.host_binary)).await,
+            RuntimeSource::CompileInImage(why) => {
+                ensure_runtime_image(&self.image_ref, rebuild, RuntimeBinary::Compile { why: Some(why) }).await
+            }
+        }
+    }
+}
+
+/// Where [`ensure_runtime_image`] gets the `weft-runtime` it puts in the
+/// image when it has to build one.
+pub enum RuntimeBinary<'a> {
+    /// Compiled inside Docker, the Dockerfile's `compiled` stage; `why`,
+    /// when given, is said before the compile starts.
+    Compile { why: Option<&'a str> },
+    /// This binary, built from this same checkout outside Docker (the
+    /// release workflow's, under the source's tag).
+    Prebuilt(&'a Path),
+    /// The binary of this machine's own install, under a tag that hashes
+    /// it ([`local_runtime_image`]): no registry holds that tag, so it is
+    /// never pulled.
+    Host(&'a Path),
 }
 
 /// The build context a prebuilt runtime binary rides in, and the file
@@ -310,30 +466,45 @@ const RUNTIME_CACHE_MOUNT_ID_PREFIX: &str = "weft-cargo-target-runtime-";
 /// `rebuild` skips straight to the build, for when a present image is
 /// corrupt or hand-modified.
 ///
-/// With `prebuilt`, the build copies that `weft-runtime` binary in
-/// instead of compiling one. It must be built from this same checkout:
-/// the ref hashes the source, and nothing can check a binary against
-/// it. Whether it RUNS in the image (this machine's architecture, a
-/// glibc no newer than Debian bookworm's) is checked by starting it
-/// there once, and an image it cannot run in is removed, never pushed.
-pub async fn ensure_runtime_image(image_ref: &str, rebuild: bool, prebuilt: Option<&Path>) -> Result<()> {
+/// With [`RuntimeBinary::Prebuilt`], the build copies that `weft-runtime`
+/// binary in instead of compiling one. It must be built from this same
+/// checkout: the ref hashes the source, and nothing can check a binary
+/// against it. Whether it RUNS in the image (this machine's
+/// architecture, a glibc no newer than the image's Debian release) is
+/// checked by starting it there once, and an image it cannot run in is
+/// removed, never pushed.
+pub async fn ensure_runtime_image(image_ref: &str, rebuild: bool, binary: RuntimeBinary<'_>) -> Result<()> {
     if !rebuild {
         if image_present(image_ref).await? {
             eprintln!("image {image_ref} present; skipping");
             return Ok(());
         }
-        if docker_pull(image_ref).await? {
+        if !matches!(binary, RuntimeBinary::Host(_)) && docker_pull(image_ref).await? {
             return Ok(());
         }
     }
     let root = weft_compiler::build::resolve_weft_root().map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let dockerfile = root.join("deploy/docker").join(RUNTIME_DOCKERFILE);
-    let Some(binary) = prebuilt else {
-        let install = weft_core::infra::Install::from_env().map_err(anyhow::Error::msg)?;
-        let cache = weft_compiler::build::install_cache_key(&root, &install).map_err(|e| anyhow::anyhow!("the runtime's compile cache key: {e}"))?;
-        docker_build(image_ref, &dockerfile, &root, &[format!("{TARGET_CACHE_ARG}={cache}")], &[]).await?;
-        drop_superseded_install_build_caches(&install, &cache).await;
-        return Ok(());
+    let (binary, instead) = match binary {
+        RuntimeBinary::Prebuilt(binary) => (binary, "`weft build-images` without --runtime-binary compiles it in the image instead"),
+        // Chosen because this machine's glibc is no newer than the
+        // image's (`runtime_source`), so a refusal here is something
+        // that check does not see.
+        RuntimeBinary::Host(binary) => (
+            binary,
+            "this machine's glibc is no newer than the image's, so something else keeps it from starting \
+             (the reason above); please report it",
+        ),
+        RuntimeBinary::Compile { why } => {
+            if let Some(why) = why {
+                eprintln!("compiling weft-runtime inside Docker for the runtime image: {why}");
+            }
+            let install = weft_core::infra::Install::from_env().map_err(anyhow::Error::msg)?;
+            let cache = weft_compiler::build::install_cache_key(&root, &install).map_err(|e| anyhow::anyhow!("the runtime's compile cache key: {e}"))?;
+            docker_build(image_ref, &dockerfile, &root, &[format!("{TARGET_CACHE_ARG}={cache}")], &[]).await?;
+            drop_superseded_install_build_caches(&install, &cache).await;
+            return Ok(());
+        }
     };
     // Its own context holding only the binary, under the name the
     // Dockerfile copies, whatever the file was called on disk.
@@ -356,10 +527,11 @@ pub async fn ensure_runtime_image(image_ref: &str, rebuild: bool, prebuilt: Opti
             "remove {image_ref} after its runtime failed to start: {}",
             String::from_utf8_lossy(&removed.stderr).trim()
         );
+        let (release, (major, minor)) = this_runtime_image_release(&root)?;
         anyhow::bail!(
             "the prebuilt runtime {} does not run in the image (removed {image_ref}): {}\n\
-             build it for this machine's architecture against a glibc no newer than \
-             Debian bookworm's (Ubuntu 22.04 is), or leave out --runtime-binary to compile it in the image",
+             it has to be built for this machine's architecture against a glibc no newer than \
+             Debian {release}'s ({major}.{minor}; Ubuntu 22.04's is older); {instead}",
             binary.display(),
             String::from_utf8_lossy(&probe.stderr).trim()
         );
@@ -417,14 +589,16 @@ pub fn suffixed_ref(bare: &str, ref_suffix: Option<&str>) -> String {
 /// With `ref_suffix`, each image is materialized under `<ref><suffix>`
 /// instead of its bare name: the release workflow's per-architecture
 /// halves, checked and pulled by their OWN names. `prebuilt_runtime` is
-/// [`ensure_runtime_image`]'s `prebuilt`.
+/// the binary of [`RuntimeBinary::Prebuilt`]; without it the runtime is
+/// compiled in the image.
 ///
 /// `tokio::join!`, NOT `try_join!`: an early bail would drop the sibling
 /// future while its `docker build` child keeps running detached; join!
 /// lets both finish, then every error is reported together.
 pub async fn ensure_release_images(wanted: &ReleaseImages, ref_suffix: Option<&str>, prebuilt_runtime: Option<&Path>) -> Result<()> {
     let (runtime_target, base_target) = (suffixed_ref(&wanted.runtime, ref_suffix), suffixed_ref(&wanted.builder_base, ref_suffix));
-    let (r, b) = tokio::join!(ensure_runtime_image(&runtime_target, false, prebuilt_runtime), ensure_builder_base_at(&base_target));
+    let runtime_binary = prebuilt_runtime.map_or(RuntimeBinary::Compile { why: None }, RuntimeBinary::Prebuilt);
+    let (r, b) = tokio::join!(ensure_runtime_image(&runtime_target, false, runtime_binary), ensure_builder_base_at(&base_target));
     let failures: Vec<String> = [("runtime", r), ("builder-base", b)]
         .into_iter()
         .filter_map(|(name, res)| res.err().map(|e| format!("{name}: {e:#}")))
@@ -1055,6 +1229,52 @@ pub async fn remove_install_images(install: &weft_core::infra::Install) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A binary built on this machine goes into the runtime image when
+    /// this machine's glibc is no newer than the image's, and is compiled
+    /// inside Docker otherwise, saying why; a machine with no glibc
+    /// always compiles inside Docker.
+    #[test]
+    fn the_host_binary_is_used_only_when_its_glibc_fits_the_image() {
+        assert_eq!(runtime_source(Some((2, 41)), "trixie", (2, 41)), RuntimeSource::Host);
+        assert_eq!(runtime_source(Some((2, 35)), "trixie", (2, 41)), RuntimeSource::Host);
+        let RuntimeSource::CompileInImage(why) = runtime_source(Some((2, 42)), "trixie", (2, 41)) else {
+            panic!("a newer glibc compiles in the image")
+        };
+        assert!(why.contains("glibc 2.42 is newer than the 2.41 of Debian trixie"), "{why}");
+        // 2.100 is newer than 2.41: versions compare as numbers.
+        assert!(matches!(runtime_source(Some((2, 100)), "trixie", (2, 41)), RuntimeSource::CompileInImage(_)));
+        assert!(matches!(runtime_source(Some((3, 0)), "trixie", (2, 41)), RuntimeSource::CompileInImage(_)));
+        assert!(matches!(runtime_source(None, "trixie", (2, 41)), RuntimeSource::CompileInImage(_)));
+    }
+
+    #[test]
+    fn glibc_versions_are_read_off_getconf() {
+        assert_eq!(parse_glibc("glibc 2.41\n"), Some((2, 41)));
+        assert_eq!(parse_glibc("glibc 2.39"), Some((2, 39)));
+        assert_eq!(parse_glibc("musl 1.2"), None);
+        assert_eq!(parse_glibc(""), None);
+    }
+
+    /// The image's release is its Dockerfile's last FROM, the stage the
+    /// image is; an earlier stage's base does not count, and a base whose
+    /// glibc is not known is refused.
+    #[test]
+    fn the_image_release_is_the_last_from_of_its_dockerfile() {
+        let text = "FROM rust:1 AS compiled\nFROM ${RUNTIME_BINARY} AS binary\nFROM debian:trixie-slim\nCMD [\"serve\"]\n";
+        assert_eq!(runtime_image_release(text).unwrap(), ("trixie".to_string(), (2, 41)));
+        assert!(runtime_image_release("FROM debian:forky-slim\n").unwrap_err().to_string().contains("Debian forky"));
+        assert!(runtime_image_release("FROM alpine:3\n").is_err());
+        assert!(runtime_image_release("RUN true\n").is_err());
+    }
+
+    /// The real runtime Dockerfile names a release whose glibc is known,
+    /// so `weft daemon start` can always decide.
+    #[test]
+    fn this_checkouts_runtime_image_release_is_known() {
+        let root = weft_compiler::build::resolve_weft_root().unwrap();
+        this_runtime_image_release(&root).unwrap();
+    }
 
     /// An install's images are the ones under its own local names, worker
     /// and infra alike, and its names on the shared images; never another

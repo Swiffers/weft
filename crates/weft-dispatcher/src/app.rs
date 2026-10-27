@@ -89,6 +89,12 @@ pub static DISPATCHER_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     // weft's own calls that keep failing (a role it cannot wake, workers
     // it cannot hand a run to), for `weft status` to show.
     &weft_task_store::unanswered::GROUP,
+    // What one holder across the install holds right now: a sweep
+    // (`crate::reaper`), a project's front, a tenant's signal registrations.
+    &weft_task_store::locks::GROUP,
+    // The stretches in which requests waited for a database connection,
+    // for `weft status` to show.
+    &weft_task_store::throttle::GROUP,
 ];
 
 /// The construction-time policies threaded into `build_state`: who a
@@ -144,7 +150,16 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     crate::build::follow::BUILD_CLAIMED_CHANNEL,
     crate::build::waiting::VERSION_BUILD_ENDED_CHANNEL,
     crate::task_kinds::resync::RESYNC_GIVEN_UP_CHANNEL,
+    weft_task_store::locks::LEASE_RELEASED_CHANNEL,
 ];
+
+/// How long the dispatcher's client may take to open a connection to a
+/// peer (a role, a worker, a store, a node's container) before the call
+/// fails. A peer that is up accepts within milliseconds inside the
+/// install's network and within a few seconds across the internet; an
+/// address that swallows the attempt would otherwise hold the call for
+/// the system's own connect limit, which is minutes.
+const PEER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What the dispatcher is built from: the install's config and what the
 /// runtime process shares among its roles.
@@ -220,11 +235,18 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
     // Every peer this client talks to (the broker and listener roles, an
     // infra unit's `/live` and `/action`, a worker) answers in place; a
     // redirect is a peer trying to send the dispatcher somewhere else, so
-    // none is followed.
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("a default reqwest client builds");
+    // none is followed. An address that swallows the connection attempt
+    // fails within `PEER_CONNECT_TIMEOUT`, and a held call whose path died
+    // within a minute or so (`notice_dead_connections`). The client puts
+    // no limit on a call's whole length: a call to a worker is held for a
+    // run's whole life, and a proxied call lasts as long as its caller
+    // wants. Each short internal call bounds itself where it is made
+    // (`RequestBuilder::timeout`).
+    let http = weft_core::net::notice_dead_connections(
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).connect_timeout(PEER_CONNECT_TIMEOUT),
+    )
+    .build()
+    .expect("a reqwest client with only a redirect policy and timeouts builds");
     let address = Arc::new(weft_task_store::install_address::InstallAddress::follow(
         pool.clone(),
         &signals,
@@ -400,7 +422,8 @@ pub fn loop_wakes() -> Vec<(&'static str, &'static [WakeOn])> {
         ("parked_fires", crate::reaper::ON_PARKED_FIRE),
         ("storage_sweep", crate::reaper::ON_STORAGE_SWEEP),
         (crate::reaper::DOOR_WINDOWS, crate::reaper::ON_DOOR_WINDOW),
-        ("infra_returns", crate::reaper::ON_INFRA_RETURNS),
+        (crate::reaper::INFRA_RETURNS, crate::reaper::ON_INFRA_RETURNS),
+        (crate::reaper::RESYNC_RETURNS, crate::reaper::ON_INFRA_RETURNS),
         ("holders", crate::holders::ON_HELD_SIGNALS),
         (crate::holders::HOLDER_ACCESS, crate::holders::ON_ACCESS),
         ("domains_door", crate::domains::ON_DOMAINS),

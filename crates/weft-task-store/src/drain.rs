@@ -72,6 +72,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::sql;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -462,7 +464,7 @@ impl Booking {
 
     /// [`Self::book_sooner`], `after` from now on the database's clock.
     pub async fn book_sooner_after(&self, name: &str, after: Duration) -> Result<()> {
-        let now: i64 = sqlx::query_scalar(&format!("SELECT {DB_NOW_MS}")).fetch_one(&self.pool).await?;
+        let now: i64 = sqlx::query_scalar(sql!("SELECT {DB_NOW_MS}")).fetch_one(&self.pool).await?;
         self.book_sooner(name, now.saturating_add(millis(after))).await
     }
 
@@ -482,7 +484,7 @@ impl Booking {
     async fn rebook(&self, name: &str, label: Option<&str>, step: Step, rule: Rule) -> Result<()> {
         let role = self.role.as_str();
         let mut tx = self.pool.begin().await?;
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "INSERT INTO role_loop_due (role, loop_name, due_ms, written_ms) VALUES ($1, $2, NULL, {DB_NOW_MS}) \
              ON CONFLICT (role, loop_name) DO NOTHING"
         ))
@@ -491,7 +493,7 @@ impl Booking {
         .execute(&mut *tx)
         .await?;
         let (due, seq, set_again, failures, failure_written, written_ms, now): (Option<i64>, i64, i32, i32, bool, i64, i64) =
-            sqlx::query_as(&format!(
+            sqlx::query_as(sql!(
                 "SELECT due_ms, seq, set_again, failures, failure_written, written_ms, {DB_NOW_MS} FROM role_loop_due \
                  WHERE role = $1 AND loop_name = $2 FOR UPDATE"
             ))
@@ -558,7 +560,7 @@ impl Booking {
             // could not be set): what `weft status` shows is what fails now.
             alerts = unanswered::failed(&mut *tx, callee, label, error).await?;
         }
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "UPDATE role_loop_due SET due_ms = $3, seq = $4, set_again = $5, failures = $6, failure_written = $7, written_ms = {DB_NOW_MS} \
              WHERE role = $1 AND loop_name = $2"
         ))
@@ -634,7 +636,7 @@ pub async fn pass_failed(pool: &PgPool, role: CoreRole, failed: &PassFailed) -> 
     let mut tx = pool.begin().await?;
     let mut alerts = unanswered::Alerts::default();
     for name in &failed.loops {
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "INSERT INTO role_loop_due (role, loop_name, due_ms, written_ms, failure_written) VALUES ($1, $2, {DB_NOW_MS}, {DB_NOW_MS}, TRUE) \
              ON CONFLICT (role, loop_name) DO UPDATE SET failure_written = TRUE"
         ))
@@ -735,7 +737,7 @@ struct ReadDue {
 type DueRow = (i64, Option<String>, Option<i64>, Option<i64>, Option<bool>, Option<bool>);
 
 async fn read_due(pool: &PgPool, role: &str) -> Result<ReadDue> {
-    let rows: Vec<DueRow> = sqlx::query_as(&format!(
+    let rows: Vec<DueRow> = sqlx::query_as(sql!(
         "SELECT c.now_ms, d.loop_name, d.due_ms, d.seq, d.written_ms < c.now_ms - $2, d.failure_written AND d.due_ms IS NULL \
          FROM (SELECT {DB_NOW_MS} AS now_ms) c \
          LEFT JOIN role_loop_due d ON d.role = $1"
@@ -869,7 +871,7 @@ async fn forget(booking: &Booking, loops: &[DrainLoop], unbooked: &[String]) {
     if gone.is_empty() {
         return;
     }
-    if let Err(e) = sqlx::query(&format!(
+    if let Err(e) = sqlx::query(sql!(
         "WITH gone AS (DELETE FROM role_loop_due WHERE role = $1 AND loop_name = ANY($2) RETURNING loop_name) \
          DELETE FROM unanswered_call WHERE callee IN (SELECT {} FROM gone)",
         unanswered::loop_key_sql("$1", "gone.loop_name")
@@ -929,6 +931,12 @@ pub async fn run<F, Fut>(
         Looks::WhileWorking(_) => None,
     };
     let mut sweep = Instant::now() + safety;
+    // The first safety look after the start drain comes at this loop's own
+    // place in its interval ([`phase`]), and each one after it an interval
+    // after the drain before: every loop of a process starts in the same
+    // instant, and without it their looks would all take a connection in
+    // the same millisecond, once an interval, for as long as it runs.
+    let mut first_look = Some(phase(target, safety));
     loop {
         let waited = match &looks {
             Looks::AtSafety => {
@@ -958,7 +966,7 @@ pub async fn run<F, Fut>(
             tracing::error!(target: "weft_task_store::drain", subsystem = target, error = %e, "cannot be woken any more");
             return;
         }
-        sweep = Instant::now() + safety;
+        sweep = Instant::now() + first_look.take().unwrap_or(safety);
         asked = None;
         let busy = match &looks {
             Looks::AtSafety => None,
@@ -984,6 +992,19 @@ pub async fn run<F, Fut>(
         }
         drop(busy);
     }
+}
+
+/// Where in its `safety` interval the loop `name` takes its first look on
+/// a machine's process ([`run`]): a fixed point from the loop's name (its
+/// hash, `crate::locks::fnv1a_64`, the same on every build and every run),
+/// so the loops of a process look one after another across the interval
+/// instead of all at once.
+fn phase(name: &str, safety: Duration) -> Duration {
+    let hash = crate::locks::fnv1a_64(name.bytes());
+    // Whole milliseconds: tokio's timer fires on its millisecond ticks,
+    // so a finer place would only be rounded on the way.
+    let span = u64::try_from(safety.as_millis()).unwrap_or(u64::MAX).max(1);
+    Duration::from_millis(hash % span)
 }
 
 /// Wait until `deadline` at most for a notification that wakes a loop
@@ -1041,6 +1062,39 @@ mod tests {
         tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, LOOP, body));
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(runs.lock().unwrap().len(), 3, "More, More, Done");
+    }
+
+    /// Loops started together on a machine's process take their first
+    /// safety look each at its own place in the interval, the same on
+    /// every run, then an interval after each drain.
+    #[tokio::test(start_paused = true)]
+    async fn loops_started_together_look_each_at_its_own_place_in_the_interval() {
+        let safety = Duration::from_secs(60);
+        let names = ["delivery", "run_ends", "lifecycle_claimer", "dispatcher_picker", "retention", "lapses"];
+        let mut runs = Vec::new();
+        let mut keep = Vec::new();
+        for name in names {
+            let (tx, rx) = broadcast::channel(16);
+            let r = Arc::new(Mutex::new(Vec::new()));
+            tokio::spawn(run(rx.into(), WAKE, safety, Looks::AtSafety, name, scripted(r.clone(), vec![])));
+            runs.push(r);
+            keep.push(tx);
+        }
+        tokio::time::sleep(safety * 2 + Duration::from_millis(1)).await;
+        let mut firsts = Vec::new();
+        for (name, r) in names.iter().zip(&runs) {
+            let r = r.lock().unwrap().clone();
+            let first = phase(name, safety);
+            assert!(first < safety);
+            assert_eq!(r[0], Duration::ZERO, "{name}: the start drain at once");
+            assert_eq!(r[1], first, "{name}: its first look at its place");
+            assert_eq!(r[2], first + safety, "{name}: then an interval after it");
+            firsts.push(first);
+        }
+        assert_eq!(phase("delivery", safety), phase("delivery", safety), "the same place every time");
+        firsts.sort();
+        firsts.dedup_by(|a, b| a.abs_diff(*b) < Duration::from_secs(1));
+        assert_eq!(firsts.len(), names.len(), "no two within a second of each other: {firsts:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1111,7 +1165,8 @@ mod tests {
         tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, LOOP, scripted(runs.clone(), vec![])));
         tokio::time::sleep(Duration::from_secs(61)).await;
         let runs = runs.lock().unwrap().clone();
-        assert_eq!(runs, vec![Duration::ZERO, Duration::from_secs(30), Duration::from_secs(60)]);
+        let first = phase(LOOP, Duration::from_secs(30));
+        assert_eq!(runs, vec![Duration::ZERO, first, first + Duration::from_secs(30)]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1288,7 +1343,7 @@ mod db_tests {
     }
 
     async fn db_now(pool: &PgPool) -> i64 {
-        sqlx::query_scalar(&format!("SELECT {DB_NOW_MS}")).fetch_one(pool).await.unwrap()
+        sqlx::query_scalar(sql!("SELECT {DB_NOW_MS}")).fetch_one(pool).await.unwrap()
     }
 
     fn named(names: &[&str]) -> TickBody {

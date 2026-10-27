@@ -10,6 +10,7 @@
 
 use anyhow::Context as _;
 use sqlx::PgPool;
+use weft_task_store::sql;
 
 use weft_broker_client::lifecycle_command::{
     command_reaches_copy, live_lease_exists, ownable_project, owns_project_predicate, supervisor_work,
@@ -81,7 +82,7 @@ pub async fn sync_ownership(
             Some(_) => Vec::new(),
             None => req.looked.iter().copied().filter(|p| !req.failed.iter().any(|t| t.project_id == *p)).collect(),
         };
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "UPDATE infra_health_look l \
                 SET retry_at_unix = NULL, \
                     failures = CASE WHEN l.project_id = ANY($3) THEN 0 ELSE l.failures END \
@@ -98,7 +99,7 @@ pub async fn sync_ownership(
         .context("take the retries of the projects the supervisor looked at")?;
     }
     if !req.settled.is_empty() {
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "DELETE FROM unanswered_call WHERE callee IN (SELECT {key} FROM unnest($1::uuid[]) AS s)",
             key = infra_key_sql("s"),
         ))
@@ -160,7 +161,7 @@ async fn renew_and_claim(
     // Renew owned leases. A lease that had lapsed comes back as taken on
     // this tick (the self-join reads the row as it was before this
     // statement).
-    let mut claimed: Vec<uuid::Uuid> = sqlx::query_scalar::<_, Option<uuid::Uuid>>(&format!(
+    let mut claimed: Vec<uuid::Uuid> = sqlx::query_scalar::<_, Option<uuid::Uuid>>(sql!(
         "UPDATE infra_owner io \
          SET leased_until_unix = EXTRACT(EPOCH FROM NOW())::BIGINT + $1 \
          FROM infra_owner prior \
@@ -190,7 +191,7 @@ async fn renew_and_claim(
     // booked for the earliest of them (`next_due`), so a batch that took
     // others ahead of one would leave it due at every pass, each booked
     // at once.
-    let sql = format!(
+    let sql = sql!(
         "WITH due AS ({due}), free AS ( \
              SELECT p.id AS project_id, p.tenant_id \
              FROM project p \
@@ -218,7 +219,7 @@ async fn renew_and_claim(
         ownable = ownable_project("p", "$4"),
         leased = live_lease_exists(None, "p.id"),
     );
-    let taken: Vec<uuid::Uuid> = sqlx::query_scalar(&sql)
+    let taken: Vec<uuid::Uuid> = sqlx::query_scalar(sql)
         .bind(replica)
         .bind(weft_broker_client::lifecycle_command::SUPERVISOR_CLAIM_BATCH)
         .bind(lease_secs)
@@ -265,7 +266,7 @@ async fn record_troubles(
     let replica = req.replica.as_str();
     let named: Vec<uuid::Uuid> = req.failed.iter().chain(&req.gave_up).map(|t| t.project_id).collect();
     // (project, removed) of every named project still held or removed.
-    let judged: Vec<(uuid::Uuid, bool)> = sqlx::query_as(&format!(
+    let judged: Vec<(uuid::Uuid, bool)> = sqlx::query_as(sql!(
         "SELECT n.project_id, NOT EXISTS (SELECT 1 FROM project p WHERE p.id = n.project_id) AS removed \
            FROM unnest($2::uuid[]) AS n(project_id) \
           WHERE {owns} OR NOT EXISTS (SELECT 1 FROM project p WHERE p.id = n.project_id)",
@@ -402,7 +403,7 @@ async fn all_failed_over(
     replica: &str,
     listed: bool,
 ) -> anyhow::Result<Vec<(uuid::Uuid, bool)>> {
-    sqlx::query_as(&format!(
+    sqlx::query_as(sql!(
         "SELECT held.project_id, FALSE FROM infra_owner held WHERE {owns} \
          UNION \
          SELECT l.project_id, p.id IS NULL FROM infra_health_look l LEFT JOIN project p ON p.id = l.project_id \
@@ -434,7 +435,7 @@ async fn clear_what_nothing_owns(
     held_projects: &[uuid::Uuid],
     failed: &[uuid::Uuid],
 ) -> anyhow::Result<()> {
-    sqlx::query(&format!(
+    sqlx::query(sql!(
         "WITH stale AS ( \
              SELECT l.project_id, p.id IS NULL AS removed \
                FROM infra_health_look l LEFT JOIN project p ON p.id = l.project_id \
@@ -474,7 +475,7 @@ async fn next_due<'e, E>(executor: E, replica: &str, held_projects: &[uuid::Uuid
 where
     E: sqlx::PgExecutor<'e>,
 {
-    sqlx::query_scalar(&format!("SELECT MIN(d.at) FROM ({due}) d", due = supervisor_due("$1", "$2", "$3")))
+    sqlx::query_scalar(sql!("SELECT MIN(d.at) FROM ({due}) d", due = supervisor_due("$1", "$2", "$3")))
         .bind(replica)
         .bind(held_projects)
         .bind(listed)
@@ -570,7 +571,7 @@ where
     // the project's listening as ONE lifecycle, the aggregate over all its
     // activations, every owner's, and whether any activation it took down
     // itself is still down.
-    let sql = format!(
+    let sql = sql!(
         "SELECT p.id AS project_id, p.tenant_id, \
                 a.status, a.accepting_fires, a.fires_visible_to_consumers, a.fires_deadline_unix, \
                 a.went_down_with, a.went_down_by_command, a.activating_run_id \
@@ -581,7 +582,7 @@ where
          ORDER BY p.id",
         owns = owns_project_predicate("$1", "p.id"),
     );
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sql)
         .bind(replica)
         .fetch_all(executor)
         .await?;
@@ -674,7 +675,7 @@ pub async fn claim_next(
     busy_commands: &[i64],
 ) -> anyhow::Result<Option<SupervisorCommandRow>> {
     use sqlx::Row;
-    let sql = format!(
+    let sql = sql!(
         "WITH spent AS ( \
              UPDATE infra_lifecycle_command c \
              SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, outcome = $4, outcome_message = $5 \
@@ -725,7 +726,7 @@ pub async fn claim_next(
         ),
         alerted = weft_task_store::unanswered::alerted_sql("gave_up"),
     );
-    let row = sqlx::query(&sql)
+    let row = sqlx::query(sql)
         .bind(claimer_replica)
         .bind(busy_commands)
         .bind(SUPERVISOR_GIVE_UP_AFTER as i32)
@@ -920,7 +921,7 @@ pub async fn cancels_for(pool: &PgPool, busy: &[i64], cancelling: &[i64]) -> any
 /// Whether a supervisor command waits on a project no supervisor holds
 /// a live lease over.
 pub async fn unowned_work_waiting(pool: &PgPool) -> anyhow::Result<bool> {
-    let sql = format!(
+    let sql = sql!(
         "SELECT EXISTS ( \
              SELECT 1 FROM infra_lifecycle_command c \
              WHERE {pending} AND NOT {leased} \
@@ -928,7 +929,7 @@ pub async fn unowned_work_waiting(pool: &PgPool) -> anyhow::Result<bool> {
         pending = pending_supervisor_command("c"),
         leased = live_lease_exists(None, "c.project_id"),
     );
-    Ok(sqlx::query_scalar(&sql).fetch_one(pool).await?)
+    Ok(sqlx::query_scalar(sql).fetch_one(pool).await?)
 }
 
 /// A lifecycle command to issue. The tenant is the project's, never
@@ -1097,7 +1098,7 @@ pub enum FencedWrite {
 /// cannot say). Displaced when `replica` no longer holds the
 /// project's `infra_owner` lease, Gone otherwise.
 pub async fn stale_answer(pool: &PgPool, replica: &str, project_id: uuid::Uuid) -> anyhow::Result<FencedWrite> {
-    let owns: bool = sqlx::query_scalar(&format!(
+    let owns: bool = sqlx::query_scalar(sql!(
         "SELECT {owns}",
         owns = owns_project_predicate("$1", "$2"),
     ))
@@ -1185,8 +1186,11 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
     // `$2` the status, `$3` to `$6` the project, the node, the fence's
     // replica and the instance, `$7` the command, and `$8`, `$9` the
     // stamps a unit's health windows run from
-    // (`UnitRuntime::not_ready_since_unix`, `ready_since_unix`). The
-    // second statement's: `$1` to `$3` the copy, `$4` the status (unused
+    // (`UnitRuntime::not_ready_since_unix`, `ready_since_unix`), and
+    // `$10` to `$12` a restart the health check saw first
+    // (`UnitRuntime::last_restart`: when, why, the exit code), which
+    // only a write that carries one changes (`$10` NULL leaves the
+    // unit's as it is). The second statement's: `$1` to `$3` the copy, `$4` the status (unused
     // per unit, where the rollup decides), `$5`, `$6` its failure.
     const SAME_COPY: &str = "u.project_id = f.project_id AND u.node_id = f.node_id AND u.instance_id IS NOT DISTINCT FROM f.instance_id";
     let (unit_fence, units, node_status) = if req.unit.is_some() {
@@ -1195,7 +1199,11 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
               AND u.instance_id IS NOT DISTINCT FROM n.instance_id AND u.unit = $1)",
             format!(
                 "UPDATE infra_unit u SET status = $2::text, not_ready_since_unix = $8::bigint, \
-                 ready_since_unix = $9::bigint FROM fenced f WHERE {SAME_COPY} AND u.unit = $1"
+                 ready_since_unix = $9::bigint, \
+                 last_restart_at_unix = CASE WHEN $10::bigint IS NULL THEN u.last_restart_at_unix ELSE $10 END, \
+                 last_restart_cause = CASE WHEN $10::bigint IS NULL THEN u.last_restart_cause ELSE $11::text END, \
+                 last_restart_exit_code = CASE WHEN $10::bigint IS NULL THEN u.last_restart_exit_code ELSE $12::bigint END \
+                 FROM fenced f WHERE {SAME_COPY} AND u.unit = $1"
             ),
             rollup_sql(
                 "SELECT u.status FROM infra_unit u WHERE u.project_id = n.project_id AND u.node_id = n.node_id \
@@ -1229,8 +1237,9 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
     .replace("{reaches}", &command_reaches_copy("c", "$4", "$6"));
     let unit_key = req.unit.clone().unwrap_or_default();
     let instance = req.instance.as_ref().map(|m| m.as_str());
+    let restart = req.restart.as_ref().filter(|_| req.unit.is_some());
     let mut tx = pool.begin().await?;
-    let fenced: i64 = sqlx::query_scalar(&format!(
+    let fenced: i64 = sqlx::query_scalar(sql!(
         "WITH fenced AS ( \
              SELECT n.project_id, n.node_id, n.instance_id FROM infra_node n \
               WHERE n.project_id = $3 AND n.node_id = $4 \
@@ -1249,6 +1258,9 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
     .bind(req.command_id)
     .bind(req.not_ready_since_unix)
     .bind(req.ready_since_unix)
+    .bind(restart.map(|r| r.at_unix))
+    .bind(restart.map(|r| r.cause.as_str()))
+    .bind(restart.and_then(|r| r.cause.exit_code()))
     .fetch_one(&mut *tx)
     .await?;
     if fenced == 0 {
@@ -1256,7 +1268,7 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
         return stale_answer(pool, &req.replica, req.project_id).await;
     }
     // The node row is ours until commit, so this write reaches it.
-    sqlx::query(&format!(
+    sqlx::query(sql!(
         "UPDATE infra_node n SET status = {node_status}, failure_stage = $5, failure_message = $6{progress} \
           WHERE n.project_id = $1 AND n.node_id = $2 AND n.instance_id IS NOT DISTINCT FROM $3",
         progress = progress(&node_status),
@@ -1295,9 +1307,11 @@ pub async fn write_units(
     }
     let mut insert = sqlx::QueryBuilder::new(
         "INSERT INTO infra_unit (project_id, node_id, instance_id, unit, status, stop_behavior, \
-         flaky_after_seconds, recovery_after_seconds, not_ready_since_unix, ready_since_unix, image_refs) ",
+         flaky_after_seconds, recovery_after_seconds, not_ready_since_unix, ready_since_unix, image_refs, \
+         last_restart_at_unix, last_restart_cause, last_restart_exit_code) ",
     );
     insert.push_values(units, |mut row, (unit, runtime)| {
+        let restart = runtime.last_restart.as_ref();
         row.push_bind(project_id)
             .push_bind(node_id)
             .push_bind(instance)
@@ -1308,7 +1322,10 @@ pub async fn write_units(
             .push_bind(i64::from(runtime.recovery_after_seconds))
             .push_bind(runtime.not_ready_since_unix)
             .push_bind(runtime.ready_since_unix)
-            .push_bind(runtime.image_refs.iter().cloned().collect::<Vec<String>>());
+            .push_bind(runtime.image_refs.iter().cloned().collect::<Vec<String>>())
+            .push_bind(restart.map(|r| r.at_unix))
+            .push_bind(restart.map(|r| r.cause.as_str()))
+            .push_bind(restart.and_then(|r| r.cause.exit_code()));
     });
     insert.build().execute(&mut *tx).await?;
     Ok(())
@@ -1320,7 +1337,7 @@ pub async fn write_units(
 /// must still own the project, all in the UPDATE's own WHERE. The next
 /// stamp that changes the row's status clears it ([`set_status`]).
 pub async fn set_waiting(pool: &PgPool, req: &SupervisorSetWaitingRequest) -> anyhow::Result<FencedWrite> {
-    let res = sqlx::query(&format!(
+    let res = sqlx::query(sql!(
         "UPDATE infra_node SET waiting_on = $1 \
          WHERE project_id = $2 AND node_id = $3 \
            AND instance_id IS NOT DISTINCT FROM $4 AND EXISTS ( \
@@ -1375,7 +1392,7 @@ pub async fn complete_command(
             None => LifecycleOutcome::Succeeded,
         }
     };
-    let written: i64 = sqlx::query_scalar(&format!(
+    let written: i64 = sqlx::query_scalar(sql!(
         "WITH done AS ( \
              UPDATE infra_lifecycle_command \
              SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \

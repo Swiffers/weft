@@ -405,7 +405,7 @@ impl Node for ElevenLabsSpeakNode {
 
         let conn = ctx.open(&account).await?;
         let mut socket = conn.socket(&session.url(&voice)).await?;
-        socket.send(SocketMessage::Text(session.opener().to_string())).await?;
+        socket.send(SocketMessage::text(session.opener().to_string())).await?;
 
         // The live audio bus, opened with the first audio frame (a
         // downstream consumer reads while chunks land) and ended the way
@@ -452,7 +452,7 @@ impl Node for ElevenLabsSpeakNode {
             tokio::select! {
                 _ = keepalive.tick() => {
                     socket
-                        .send(SocketMessage::Text(json!({ "text": " " }).to_string()))
+                        .send(SocketMessage::text(json!({ "text": " " }).to_string()))
                         .await?;
                 }
                 entry = chunks.next() => match entry {
@@ -464,7 +464,7 @@ impl Node for ElevenLabsSpeakNode {
                             if let Some(t) = text_of(p).filter(|t| !t.is_empty()) {
                                 spoke |= t.chars().any(|c| !c.is_whitespace());
                                 socket
-                                    .send(SocketMessage::Text(
+                                    .send(SocketMessage::text(
                                         json!({ "text": t }).to_string(),
                                     ))
                                     .await?;
@@ -506,7 +506,7 @@ impl Node for ElevenLabsSpeakNode {
         // empty-text goodbye flushes whatever is buffered), then
         // drain the session's queued audio until its final frame.
         socket
-            .send(SocketMessage::Text(json!({ "text": "" }).to_string()))
+            .send(SocketMessage::text(json!({ "text": "" }).to_string()))
             .await?;
         let mut finished = false;
         while let Some(msg) = socket.recv().await? {

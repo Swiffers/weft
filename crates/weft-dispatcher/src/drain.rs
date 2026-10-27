@@ -26,6 +26,8 @@
 
 use std::time::Duration;
 
+use weft_task_store::sql;
+
 use tokio::time::Instant;
 
 use weft_core::RunId;
@@ -80,8 +82,15 @@ pub(crate) static WAKE_ON: &[WakeOn] =
 /// command's `claim` renews it at each count to last past the next one,
 /// and counts again within a claim lease, so the claim never runs further
 /// ahead than one lease; it fails once the claim is no longer this
-/// process's.
-pub async fn drain(state: &DispatcherState, scope: &DrainScope<'_>, claim: Option<&crate::lifecycle_claimer::CommandClaim<'_>>) -> anyhow::Result<()> {
+/// process's. With `say`, each count also tells it the runs on record it
+/// waits for, and since when ([`going_since`]: one read more, made only
+/// for a wait somebody follows).
+pub async fn drain(
+    state: &DispatcherState,
+    scope: &DrainScope<'_>,
+    claim: Option<&crate::lifecycle_claimer::CommandClaim<'_>>,
+    say: Option<&dyn SayWaiting>,
+) -> anyhow::Result<()> {
     let started = Instant::now();
     let mut breadcrumb = started + BREADCRUMB_EVERY;
     // Subscribed before the first count, so an ending between the count
@@ -92,6 +101,9 @@ pub async fn drain(state: &DispatcherState, scope: &DrainScope<'_>, claim: Optio
         let left = going(&state.pg_pool, scope.project_id, &reached.door, &reached.all_runs()).await?;
         if left == 0 {
             return Ok(());
+        }
+        if let Some(say) = say {
+            say.going(going_since(&state.pg_pool, &reached.all_runs()).await?).await?;
         }
         let now = Instant::now();
         mark_watched(&state.pg_pool, scope.project_id, &reached.all_runs()).await?;
@@ -135,6 +147,25 @@ pub async fn drain(state: &DispatcherState, scope: &DrainScope<'_>, claim: Optio
     }
 }
 
+/// Who hears what a drain waits for at each count ([`drain`]'s `say`): a
+/// resync saying it on its task for the person following it.
+#[async_trait::async_trait]
+pub trait SayWaiting: Send + Sync {
+    /// The runs on record it waits for now, oldest first.
+    async fn going(&self, runs: Vec<weft_core::deactivation::RunGoing>) -> anyhow::Result<()>;
+}
+
+/// The runs among `runs` that are going (queued or driven), oldest first,
+/// each with when it started.
+pub(crate) async fn going_since(pool: &sqlx::PgPool, runs: &[RunId]) -> anyhow::Result<Vec<weft_core::deactivation::RunGoing>> {
+    let rows: Vec<(RunId, i64)> =
+        sqlx::query_as(sql!("SELECT r.run_id, r.started_at FROM run r WHERE r.run_id = ANY($1) AND {GOING} ORDER BY r.started_at, r.run_id"))
+            .bind(runs)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().map(|(run_id, since_unix)| weft_core::deactivation::RunGoing { run_id, since_unix }).collect())
+}
+
 /// Cancel every run `reach` reaches, but the one that asked (`except`),
 /// for `cause`: the ones going, and the paused ones too when `paused` (a
 /// command that drops what is held). Answers how many going runs it
@@ -158,7 +189,7 @@ pub(crate) async fn cancel_reached(
 /// queued or driven: what a resync waits for, or cancels, before its new
 /// version takes over.
 pub(crate) async fn going_on_builds(state: &DispatcherState, project_id: uuid::Uuid, builds: &[String]) -> anyhow::Result<Vec<RunId>> {
-    Ok(sqlx::query_scalar(&format!("SELECT r.run_id FROM run r WHERE r.project_id = $1 AND r.binary_hash = ANY($2) AND {GOING}"))
+    Ok(sqlx::query_scalar(sql!("SELECT r.run_id FROM run r WHERE r.project_id = $1 AND r.binary_hash = ANY($2) AND {GOING}"))
         .bind(project_id)
         .bind(builds)
         .fetch_all(&state.pg_pool)
@@ -296,7 +327,7 @@ impl Reached {
 pub async fn going(pool: &sqlx::PgPool, project_id: uuid::Uuid, door: &AtTheDoor, runs: &[RunId]) -> anyhow::Result<i64> {
     const ALIVE: &str = weft_task_store::worker_alive!("l");
     let (tokens, builds) = door.filters();
-    let counted: i64 = sqlx::query_scalar(&format!(
+    let counted: i64 = sqlx::query_scalar(sql!(
         "SELECT COALESCE(SUM(f.n::bigint), 0)::bigint FROM worker_lease l \
          CROSS JOIN LATERAL jsonb_each_text(l.in_flight) AS f(token, n) \
          WHERE l.project_id = $1 AND {ALIVE} AND ($2::text[] IS NULL OR f.token = ANY($2)) \
@@ -307,7 +338,7 @@ pub async fn going(pool: &sqlx::PgPool, project_id: uuid::Uuid, door: &AtTheDoor
     .bind(builds)
     .fetch_one(pool)
     .await?;
-    let on_record: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM run r WHERE r.run_id = ANY($1) AND {GOING}"))
+    let on_record: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM run r WHERE r.run_id = ANY($1) AND {GOING}"))
         .bind(runs)
         .fetch_one(pool)
         .await?;
@@ -324,7 +355,7 @@ const GOING: &str = concat!("(r.state = 'queued' OR ", weft_task_store::in_fligh
 /// resumed meanwhile included. Marked when a drain looks, never on a run's
 /// own path.
 pub async fn mark_watched(pool: &sqlx::PgPool, project_id: uuid::Uuid, runs: &[RunId]) -> anyhow::Result<()> {
-    sqlx::query(&format!(
+    sqlx::query(sql!(
         "UPDATE run r SET watch_end = TRUE \
          WHERE r.project_id = $1 AND r.run_id = ANY($2) AND NOT r.watch_end AND (r.state = 'parked' OR {GOING})"
     ))
@@ -348,7 +379,7 @@ pub async fn workers_look(pool: &sqlx::PgPool, project_id: uuid::Uuid, door: &At
     const ALIVE: &str = weft_task_store::worker_alive!("l");
     const HELD: &str = weft_task_store::run_held_until_sql!("r");
     let (tokens, builds) = door.filters();
-    Ok(sqlx::query_scalar(&format!(
+    Ok(sqlx::query_scalar(sql!(
         "SELECT MIN(at) FROM ( \
              SELECT MIN(l.leased_until_unix) AS at FROM worker_lease l \
              WHERE l.project_id = $1 AND {ALIVE} AND ($4::text[] IS NULL OR l.binary_hash = ANY($4)) \

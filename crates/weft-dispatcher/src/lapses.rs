@@ -42,6 +42,8 @@
 
 use std::time::Duration;
 
+use weft_task_store::sql;
+
 use anyhow::Context;
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn};
 use weft_task_store::unanswered::{self, Callee};
@@ -160,7 +162,7 @@ pub async fn earliest_lapse(pool: &sqlx::PgPool, now: i64) -> anyhow::Result<Opt
     let margin = crate::worker_door::lost_margin_secs();
     let stale = crate::transition::heartbeat_stale_secs();
     let rest = weft_task_store::tasks::claim_duration_secs();
-    sqlx::query_scalar(&format!(
+    sqlx::query_scalar(sql!(
         "SELECT MIN(at) FROM ( \
              SELECT MIN({held}) + $2 AS at FROM run r WHERE r.state = 'running' AND NOT ({lost}) \
              UNION ALL SELECT MIN(a.heartbeat_unix) + $3 FROM trigger_activation a WHERE {activation} \
@@ -242,7 +244,7 @@ const RESTING_CLAIMS: &str =
 /// ([`resting_claim_lapses_at`]). Answers how many. Announced as a task
 /// ready by the table's own trigger, through the outbox its caller pokes.
 async fn hand_back_resting_claims(pool: &sqlx::PgPool, now: i64) -> anyhow::Result<u64> {
-    Ok(sqlx::query(&format!(
+    Ok(sqlx::query(sql!(
         "UPDATE task SET status = 'pending', claimed_by = NULL, claimed_until_unix = NULL, claim_rests_on = NULL \
          WHERE id IN (SELECT t.id FROM {RESTING_CLAIMS} AND {} < $1)",
         resting_claim_lapses_at("$2")

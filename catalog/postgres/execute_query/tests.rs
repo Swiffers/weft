@@ -14,7 +14,7 @@ use weft::{FakeRig, Node, NodeManifest, NodeMetadata, NodeTest, RunContext, Weft
 
 use tokio_postgres::types::Type;
 
-use super::super::postgres::{params_of, placeholders, plan, quote_ident, spell_parameters, Plan, Statement};
+use super::super::postgres::{opens_transaction, params_of, placeholders, plan, quote_ident, spell_parameters, Plan, Statement};
 use super::{answer, emit, PostgresExecuteQueryNode};
 
 pub fn tests() -> Vec<NodeTest> {
@@ -25,6 +25,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::basic("placeholders_leave_quotes_comments_and_dollar_bodies_alone", placeholder_quoting),
         NodeTest::basic("placeholders_count_statements_and_refuse_positions", placeholder_statements),
         NodeTest::basic("plan_reads_the_query_as_a_query_or_a_script", plan_mismatches),
+        NodeTest::basic("only_a_statement_that_opens_a_transaction_counts_as_one", opening_statements),
         NodeTest::basic("a_refusal_names_the_port_not_the_position", spelled_parameters),
         NodeTest::basic("placeholders_and_the_metadata_pattern_agree", pattern_agrees),
         NodeTest::basic("a_result_fills_rows_row_and_count", answers),
@@ -105,6 +106,51 @@ fn placeholder_quoting() -> WeftResult<()> {
     // Unclosed quoting is a loud error, not a silent parameter.
     assert!(placeholders("SELECT $$ open").is_err());
     assert!(placeholders("SELECT 'open").is_err());
+    Ok(())
+}
+
+/// What decides whether a pooled connection's session is rolled back
+/// before the next run gets it: a statement that opens a transaction,
+/// however it is spelled, counts; one that only mentions the word, or
+/// ends or chains a transaction a `BEGIN` already opened, does not.
+fn opening_statements() -> WeftResult<()> {
+    for opens in [
+        "BEGIN",
+        "begin",
+        "BEGIN WORK",
+        "BEGIN ISOLATION LEVEL SERIALIZABLE",
+        "START TRANSACTION",
+        "start transaction read only",
+        "  \n\tBEGIN",
+        "-- open it\nBEGIN",
+        "/* a /* nested */ comment */ BEGIN",
+        "/* one */ -- two\n /* three */ START TRANSACTION",
+    ] {
+        assert!(opens_transaction(opens), "{opens:?} opens a transaction");
+    }
+    for stays in [
+        "SELECT 1",
+        "COMMIT",
+        "ROLLBACK",
+        "END",
+        "COMMIT AND CHAIN",
+        "DO $$ BEGIN PERFORM 1; END $$",
+        "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END",
+        "SELECT 'BEGIN'",
+        "-- BEGIN\nSELECT 1",
+        "/* BEGIN */ SELECT 1",
+        "INSERT INTO beginnings (at) VALUES (now())",
+        "begins",
+        "start_time",
+        "",
+    ] {
+        assert!(!opens_transaction(stays), "{stays:?} opens no transaction");
+    }
+    // A script's statements are judged one by one, as they are split.
+    let Plan::Script { head, last } = plan("CREATE TABLE t (x int); BEGIN; INSERT INTO t VALUES (1)")? else {
+        panic!("a script naming no port");
+    };
+    assert!(head.iter().map(String::as_str).chain([last.as_str()]).any(opens_transaction));
     Ok(())
 }
 

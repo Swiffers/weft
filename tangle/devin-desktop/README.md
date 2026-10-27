@@ -83,7 +83,7 @@ steps, on demand, for a user who wants to drive.
 | `.devin/agents/designer.md` | the site's look and motion in `design-lab/`, every page mocked, proven with screenshots and recordings |
 | `.devin/agents/prompt-engineer.md` | writes the program's LLM prompts and tries each on two real inputs through the node that sends it, or hands it over with the trial still to do when that node is not wired yet |
 | `.devin/agents/run-digger.md` | post-mortem only, read-only, never fixes |
-| `.devin/agents/deployer.md` | the only agent that acts on a cloud install |
+| `.devin/agents/deployer.md` | runs the deploy procedure on a cloud install |
 | `.devin/agents/red-teamer.md` | attack only, read-only, never fixes and never runs |
 | `.devin/hooks.v1.json`, `.devin/hooks/validate_weft.py` | the compiler's answer after every edit |
 | `.devin/config.json` | the allow list: writing in the folders the specialists own, the `weft` verbs Tangle and the specialists run, `pnpm`, `node --env-file=.env build`, `kill`; the daemon's lifecycle is left off |

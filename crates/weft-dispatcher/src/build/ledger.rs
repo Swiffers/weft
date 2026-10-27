@@ -15,6 +15,7 @@
 //! seen through, which a dispatcher that scales to zero could not.
 
 use anyhow::{Context, Result};
+use weft_task_store::sql;
 use sqlx::PgPool;
 
 /// What a claim writes into `image_build.held_until`, for a dispatcher of
@@ -455,7 +456,7 @@ pub async fn end_lost_starts(conn: &mut sqlx::PgConnection, lost: LostStarts, no
         LostStarts::Undriven { stale_before } => (None, stale_before),
         LostStarts::Of(project) => (Some(project), 0),
     };
-    let ended = sqlx::query(&format!(
+    let ended = sqlx::query(sql!(
         "UPDATE image_build b SET status = 'failed', finished_at = $1, \
              reason = 'the build ' || b.build_name || ' was never made on the builder: the dispatcher starting it went \
                        away before recording it there. Build again' \
@@ -551,7 +552,7 @@ pub async fn image_states(
 /// Every build running, oldest first; when `project` is given, the ones it
 /// waits on ([`waited_on_by`]).
 pub async fn running(pool: &PgPool, project: Option<uuid::Uuid>) -> Result<Vec<RunningBuild>> {
-    sqlx::query_as(&format!(
+    sqlx::query_as(sql!(
         "SELECT {RUNNING_COLUMNS} FROM image_build b WHERE status = 'running' AND ($1::UUID IS NULL OR {}) \
          ORDER BY started_at, image_ref",
         waited_on_by("$1", "$2")
@@ -668,7 +669,7 @@ pub async fn begin_reclaim(pool: &PgPool, images: &dyn weft_platform_traits::Ima
         .with_context(|| format!("{image_ref} is not an image a prune may reclaim"))?;
     let mut tx = pool.begin().await.context("begin reclaiming an image")?;
     lock_image(&mut tx, image_ref).await?;
-    let claimed: bool = sqlx::query_scalar(&format!(
+    let claimed: bool = sqlx::query_scalar(sql!(
         "SELECT EXISTS (SELECT 1 FROM image_claim c WHERE c.image_ref = $1 AND {}) \
              OR EXISTS (SELECT 1 FROM image_build WHERE image_ref = $1 AND status = 'running')",
         claim_live("c", "$2")
@@ -741,7 +742,7 @@ pub async fn drop_claim(pool: &PgPool, claim: uuid::Uuid) -> Result<()> {
 /// renewing them, its dispatcher gone, and no waiting version keeps them):
 /// they protect nothing any more.
 pub async fn drop_lapsed_claims(pool: &PgPool, now: i64) -> Result<()> {
-    sqlx::query(&format!("DELETE FROM image_claim c WHERE NOT {}", claim_live("c", "$1")))
+    sqlx::query(sql!("DELETE FROM image_claim c WHERE NOT {}", claim_live("c", "$1")))
         .bind(now)
         .execute(pool)
         .await

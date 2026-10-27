@@ -13,9 +13,24 @@
 //! endpoints answer weft's own roles only.
 
 use anyhow::Result;
+use weft_task_store::sql;
 use serde_json::Value;
 
 use crate::role_client::RoleClient;
+
+/// How long a call that only reads what the listener holds may take: a
+/// signal looked up (in the listener's memory, or one row through the
+/// broker) and a kind's pure code run on it (`/live`, `/process`,
+/// `/match_push`, `/wake_by_hand`, `/fresh_places`). Well under a second
+/// on a warm listener, a few seconds on one starting from zero, and the
+/// broker's own wait for a database connection when the database is busy.
+/// The calls that reach outside services through a kind (`/prepare`,
+/// `/start`, `/rehydrate`, `/unregister`, `/cancel_call`: a provider's
+/// webhook set or taken down, a connection opened, the last call of a
+/// cancelled wait) pass no limit: how long a provider takes is not weft's
+/// to bound, and a call cut short there may already have changed things
+/// outside.
+const LISTENER_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct ListenerClient {
@@ -28,15 +43,14 @@ impl ListenerClient {
         Self { role }
     }
 
-    async fn post(&self, route: &str, body: &impl serde::Serialize) -> Result<reqwest::Response> {
-        let resp = self
-            .role
-            .request(reqwest::Method::POST, route)
-            .await?
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("listener {route}: {e}"))?;
+    /// POST `body` to `route`, within `limit` when there is one
+    /// ([`LISTENER_LOOKUP_TIMEOUT`]).
+    async fn post(&self, route: &str, limit: Option<std::time::Duration>, body: &impl serde::Serialize) -> Result<reqwest::Response> {
+        let mut request = self.role.request(reqwest::Method::POST, route).await?.json(body);
+        if let Some(limit) = limit {
+            request = request.timeout(limit);
+        }
+        let resp = request.send().await.map_err(|e| anyhow::anyhow!("listener {route}: {e}"))?;
         Ok(resp)
     }
 
@@ -57,7 +71,7 @@ impl ListenerClient {
         &self,
         req: &weft_core::signal::listener_protocol::PrepareRequest,
     ) -> Result<weft_core::signal::listener_protocol::PrepareResponse> {
-        Ok(Self::ok(self.post("/prepare", req).await?, "/prepare").await?.json().await?)
+        Ok(Self::ok(self.post("/prepare", None, req).await?, "/prepare").await?.json().await?)
     }
 
     /// What the signal's kind is showing (and, for a run's wait, the raw
@@ -69,6 +83,7 @@ impl ListenerClient {
         let resp = self
             .post(
                 "/live",
+                Some(LISTENER_LOOKUP_TIMEOUT),
                 &weft_core::signal::listener_protocol::LiveRequest {
                     token: token.to_string(),
                     address: address.map(str::to_string),
@@ -82,7 +97,7 @@ impl ListenerClient {
     }
 
     pub async fn process(&self, token: &str, payload: &Value) -> Result<weft_core::signal::listener_protocol::ProcessOutcome> {
-        let resp = self.post("/process", &serde_json::json!({ "token": token, "payload": payload })).await?;
+        let resp = self.post("/process", Some(LISTENER_LOOKUP_TIMEOUT), &serde_json::json!({ "token": token, "payload": payload })).await?;
         Ok(Self::ok(resp, "/process").await?.json().await?)
     }
 
@@ -99,6 +114,7 @@ impl ListenerClient {
         let resp = self
             .post(
                 "/match_push",
+                Some(LISTENER_LOOKUP_TIMEOUT),
                 &weft_core::signal::listener_protocol::MatchPushRequest { push: push.clone(), tokens: tokens.to_vec() },
             )
             .await?;
@@ -110,7 +126,7 @@ impl ListenerClient {
     /// kind's own shape, so the listener answers it.
     pub async fn wake_by_hand(&self, token: &str) -> Result<Option<Value>> {
         let resp = self
-            .post("/wake_by_hand", &weft_core::signal::listener_protocol::WakeByHandRequest { token: token.to_string() })
+            .post("/wake_by_hand", Some(LISTENER_LOOKUP_TIMEOUT), &weft_core::signal::listener_protocol::WakeByHandRequest { token: token.to_string() })
             .await?;
         Ok(Self::ok(resp, "/wake_by_hand")
             .await?
@@ -139,7 +155,7 @@ impl ListenerClient {
             None => None,
         };
         let req = weft_core::signal::listener_protocol::StartRequest { token: token.to_string(), mode, replaced };
-        Self::ok(self.post("/start", &req).await?, "/start").await?;
+        Self::ok(self.post("/start", None, &req).await?, "/start").await?;
         Ok(())
     }
 
@@ -148,7 +164,7 @@ impl ListenerClient {
     /// outside service answered it; a refusal or a call that could not
     /// reach the service is an error naming why.
     pub async fn cancel_call(&self, call: &weft_core::signal::listener_protocol::CancelCallRequest) -> Result<()> {
-        Self::ok(self.post("/cancel_call", call).await?, "/cancel_call").await?;
+        Self::ok(self.post("/cancel_call", None, call).await?, "/cancel_call").await?;
         Ok(())
     }
 
@@ -163,7 +179,7 @@ impl ListenerClient {
         }
         let asks = signals.iter().map(|sig| Ok(FreshPlaceAsk { token: sig.token.clone(), spec: sig.spec()? })).collect::<Result<Vec<_>>>()?;
         let answer: FreshPlacesResponse =
-            Self::ok(self.post("/fresh_places", &FreshPlacesRequest { signals: asks }).await?, "/fresh_places").await?.json().await?;
+            Self::ok(self.post("/fresh_places", Some(LISTENER_LOOKUP_TIMEOUT), &FreshPlacesRequest { signals: asks }).await?, "/fresh_places").await?.json().await?;
         answer
             .places
             .into_iter()
@@ -182,14 +198,14 @@ impl ListenerClient {
     /// come up.
     pub async fn rehydrate(&self, project: uuid::Uuid, skip: &[String]) -> Result<()> {
         let req = weft_core::signal::listener_protocol::RehydrateRequest { project, skip: skip.to_vec() };
-        Self::ok(self.post("/rehydrate", &req).await?, "/rehydrate").await?;
+        Self::ok(self.post("/rehydrate", None, &req).await?, "/rehydrate").await?;
         Ok(())
     }
 
     /// Tell the listener `sig`'s row is gone, with what it needs to tear
     /// down what the signal arranged outside.
     pub async fn unregister(&self, sig: &crate::store::SignalRegistration) -> Result<()> {
-        Self::ok(self.post("/unregister", &Self::unregister_request(sig, false)?).await?, "/unregister").await?;
+        Self::ok(self.post("/unregister", None, &Self::unregister_request(sig, false)?).await?, "/unregister").await?;
         Ok(())
     }
 
@@ -204,7 +220,7 @@ impl ListenerClient {
     /// unless it answered that it does not know the row's kind (503),
     /// which it says before touching anything.
     pub async fn unregister_replaced(&self, sig: &crate::store::SignalRegistration) -> Result<bool> {
-        let resp = self.post("/unregister", &Self::unregister_request(sig, true)?).await?;
+        let resp = self.post("/unregister", None, &Self::unregister_request(sig, true)?).await?;
         if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
             let why = resp.text().await.unwrap_or_else(|e| format!("<body read failed: {e}>"));
             tracing::error!(
@@ -328,7 +344,7 @@ pub async fn let_go_of_stopped(
         .collect()
         .await;
     let tokens: Vec<&str> = signals.iter().map(|s| s.token.as_str()).collect();
-    let listening: Vec<(String, uuid::Uuid)> = sqlx::query_as(&format!(
+    let listening: Vec<(String, uuid::Uuid)> = sqlx::query_as(sql!(
         "SELECT s.token, s.project_id FROM signal s {} WHERE s.token = ANY($1) AND {}",
         weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
         weft_broker_client::protocol::ACTIVATION_LISTENS,
@@ -378,7 +394,7 @@ pub async fn note_let_go(pool: &sqlx::PgPool, signals: &[crate::store::SignalReg
     let tokens: Vec<&str> = signals.iter().map(|s| s.token.as_str()).collect();
     let why: Vec<Option<&str>> =
         signals.iter().map(|s| kept.iter().find(|(token, _)| token == &s.token).map(|(_, why)| why.as_str())).collect();
-    sqlx::query(&format!(
+    sqlx::query(sql!(
         "UPDATE signal SET let_go_failed = t.why \
          FROM (SELECT s.token, CASE WHEN {listens} THEN NULL ELSE k.why END AS why \
                FROM unnest($1::text[], $2::text[]) AS k(token, why) JOIN signal s ON s.token = k.token {join}) t \

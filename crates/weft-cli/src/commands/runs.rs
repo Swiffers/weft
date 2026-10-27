@@ -478,29 +478,32 @@ pub async fn clean(
 }
 
 
-/// Reclaim the images builds produce that nothing runs any more (worker
-/// and infra images, node-test leftovers, and under `--all` old builder
-/// bases, runtimes and compile caches). Each layer is its own sweep, none
+/// Reclaim what builds produce that nothing runs any more (workers and
+/// infra images, and under `--all` old runtimes, worker programs, shared
+/// crates and what an older weft left). Each layer is its own sweep, none
 /// gating another (a layer that fails is reported at the end, after every
 /// other layer ran):
 ///
-///   1. The images the install built: it deletes each one its keep-set
-///      does not cover (`POST /images/prune`), the cwd project's or, with
-///      `--all`, every project's. The install is the only one that
-///      deletes them: every build claims the images it relies on until
-///      they are registered, so a prune never takes an image a build just
-///      found or made (it reports it in use), and it forgets what it
-///      deleted from its ledger.
-///   2. Dangling (untagged) leftovers of the node-test images this host
-///      built (`weft test-node`), which the install never saw: those
-///      carrying the cwd project's `weft.dev/project` label, or any value
+///   1. What the install built: it deletes each worker and infra image
+///      its keep-set does not cover (`POST /images/prune`), the cwd
+///      project's or, with `--all`, every project's. The install is the
+///      only one that deletes them: every build claims the images it
+///      relies on until they are registered, so a prune never takes an
+///      image a build just found or made (it reports it in use), and it
+///      forgets what it deleted from its ledger.
+///   2. Dangling (untagged) leftovers of the node-test images an older
+///      weft built (`weft test-node` stamped them with the
+///      `weft.dev/project` label): those of the cwd project, or every one
 ///      with `--all`.
 ///   3. With `--all` only: the shared images no install on this machine
-///      uses (builder bases, node-test images, runtimes, registry-named
-///      standard workers): each engine change mints fresh ones, and every
-///      install on the machine may run a different version
-///      ([`crate::image_refs`]).
-///   4. With `--all` only: the worker compile caches no install uses.
+///      uses (runtimes, and what an older weft left: builder bases,
+///      node-test images, registry-named standard worker images): each
+///      engine change mints fresh ones, and every install on the machine
+///      may run a different version ([`crate::image_refs`]).
+///   4. With `--all` only: the worker programs no install uses and the
+///      shared build crates no build staged lately, then the worker image
+///      compile caches no install uses (an older weft's, or a `weft
+///      build-images` run's).
 ///   5. With `--all` only: the caches that compiled weft's own crates for
 ///      an install no longer on this machine.
 ///   6. With `--all` only: the images an install no longer on this
@@ -534,18 +537,20 @@ async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     layer("dangling node-test leftovers", dangling_prune(&scope).await);
     if all {
         let data = super::daemon::data_dir();
-        for kind in SharedImages::ALL {
+        for kind in SharedImageKind::ALL {
             layer(kind.layer(), unused_image_sweep(&data, kind).await);
         }
+        layer("unused worker programs and shared build crates", unused_worker_files(&weft_platform_local::MachineLayout::new(&data)));
         layer("unused compile caches", unused_compile_cache_sweep(&data).await);
         layer("compile caches of removed installs", removed_install_cache_sweep(&data).await);
         layer("images of removed installs", removed_install_image_sweep(&data).await);
     }
-    // The compile cache every worker build shares is not an image, but it
-    // is disk, so it is never invisible. Reading its size is not a reclaim:
-    // a failure to read it is said, never counted against the sweep.
+    // The compile caches every build shares are not images, but they are
+    // disk, so they are never invisible. Reading their size is not a
+    // reclaim: a failure to read it is said, never counted against the
+    // sweep.
     if let Err(error) = report_compile_cache_size().await {
-        eprintln!("could not read the worker compile cache size: {error:#}");
+        eprintln!("could not read the compile caches' size: {error:#}");
     }
     if failures.is_empty() {
         return Ok(());
@@ -592,10 +597,11 @@ enum Scope {
     Project(uuid::Uuid),
 }
 
-/// Layer 2: dangling (untagged) leftovers of this host's node-test builds,
-/// through the `weft.dev/project` label `weft test-node` stamps on them.
+/// Layer 2: dangling (untagged) leftovers of the node-test images an
+/// older weft's `weft test-node` built on this machine, through the
+/// `weft.dev/project` label it stamped on them. This weft stamps nothing:
+/// a live test's server is a program.
 async fn dangling_prune(scope: &Scope) -> anyhow::Result<()> {
-    // SYNC: the label <-> crates/weft-cli/src/commands/test_node/mod.rs (the node-test image labels)
     let filter = match scope {
         Scope::All => "label=weft.dev/project".to_string(),
         Scope::Project(id) => format!("label=weft.dev/project={id}"),
@@ -611,39 +617,67 @@ async fn dangling_prune(scope: &Scope) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `weft clean --images --build-plane`: the builder bases and node-test
-/// images no install on this machine uses, the part of layer 3 that
-/// needs no running install (setup.sh runs it after every start, so an
-/// engine change leaves nothing of the version it replaced). Fails only
-/// when docker cannot be asked.
+/// `weft clean --images --build-plane`: the worker programs and shared
+/// crates nothing uses, and the builder bases and node-test images an
+/// older weft left that no install on this machine uses: the part of
+/// layers 3 and 4 that needs no running install (setup.sh runs it after
+/// every start, so an engine change leaves nothing of the version it
+/// replaced). Fails only when docker cannot be asked.
 pub async fn clean_build_plane() -> anyhow::Result<()> {
     let data = super::daemon::data_dir();
-    for kind in SharedImages::BUILD_PLANE {
+    for kind in SharedImageKind::BUILD_PLANE {
         unused_image_sweep(&data, kind).await?;
+    }
+    unused_worker_files(&weft_platform_local::MachineLayout::new(&data))
+}
+
+/// The files host builds leave on the machine that nothing uses any more:
+/// the worker programs no install holds or names as its standard worker
+/// (the standard worker of a weft an update replaced, a removed install's
+/// programs), and the shared crates no build staged for
+/// `WORKER_CACHE_RETENTION_DAYS` (the sources of a package since edited,
+/// the workspace of a weft since updated). Needs no running install.
+fn unused_worker_files(machine: &weft_platform_local::MachineLayout) -> anyhow::Result<()> {
+    let installs: Vec<String> = super::daemon::Install::every_on(machine.root())?.iter().map(|i| i.id.label_value().to_string()).collect();
+    let workers = weft_platform_local::images::reclaim_workers(&machine.workers(), &installs)?;
+    if workers.is_empty() {
+        println!("no unused worker programs");
+    } else {
+        println!("removed {} unused worker program(s)", workers.len());
+    }
+    let days = weft_compiler::worker_image::WORKER_CACHE_RETENTION_DAYS;
+    let crates = weft_compiler::build::reclaim_shared_crates(&machine.shared_crates(), std::time::Duration::from_secs(u64::from(days) * 24 * 3600))?;
+    if crates.is_empty() {
+        println!("no shared build crates unused for {days} days");
+    } else {
+        println!("removed {} shared build crate(s) unused for {days} days", crates.len());
     }
     Ok(())
 }
 
-/// The kinds of shared image a machine-wide sweep reclaims: the refs each
-/// install records ([`crate::image_refs`]: its start writes one of each,
-/// and its builds add the builder bases they pick), and
-/// nothing evicts the previous one implicitly (an implicit sweep would
-/// race a build FROMing it or a unit agent running it), so an explicit
-/// clean is where they go. Whatever no install's record names is dead.
+/// The kinds of shared image a machine-wide sweep reclaims, by the refs
+/// each install records ([`crate::image_refs`]: this weft's start writes
+/// its runtime; an older weft's start and builds also record the builder
+/// bases and standard worker images it uses). Nothing evicts the previous
+/// one implicitly (an implicit sweep would race a build FROMing it or a
+/// unit agent running it), so an explicit clean is where they go.
+/// Whatever no install's record names is dead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SharedImages {
-    /// `weft-builder-base:<hash>`, about 1.4GB each.
+enum SharedImageKind {
+    /// `weft-builder-base:<hash>`, about 1.4GB each: an older weft's
+    /// workers compiled on it, and a `weft build-images` run builds it.
     BuilderBase,
-    /// `weft-node-tests:<hash>`, kept by the builder base they were
-    /// built on.
+    /// `weft-node-tests:<hash>`, an older weft's, kept by the builder
+    /// base they were built on.
     NodeTests,
     Runtime,
-    /// The registry-named standard workers; an install's own name for
-    /// one is in its ledger, and layer 1 reclaims it.
+    /// The registry-named standard worker images an older weft or a
+    /// `weft build-images` run left; an install's own name for one is
+    /// reclaimed by that install's start.
     StandardWorker,
 }
 
-impl SharedImages {
+impl SharedImageKind {
     /// Every kind, the order `--all` sweeps them in.
     const ALL: [Self; 4] = [Self::BuilderBase, Self::NodeTests, Self::Runtime, Self::StandardWorker];
     /// The kinds `--build-plane` sweeps.
@@ -681,7 +715,7 @@ impl SharedImages {
 
 /// Remove the images of `kind` no install in `records` uses, or nothing
 /// at all while one has not recorded what it uses (saying which).
-async fn unused_image_sweep(data_dir: &std::path::Path, kind: SharedImages) -> anyhow::Result<()> {
+async fn unused_image_sweep(data_dir: &std::path::Path, kind: SharedImageKind) -> anyhow::Result<()> {
     // Held from the look at the records through the removal it decides
     // (`crate::image_refs::Records`).
     let records = crate::image_refs::every_install(data_dir).await?;
@@ -695,13 +729,13 @@ async fn unused_image_sweep(data_dir: &std::path::Path, kind: SharedImages) -> a
     let listing = crate::images::host_image_listing(&[]).await?;
     let kept_refs: Vec<&str> = kept.iter().map(String::as_str).collect();
     let stale = match kind {
-        SharedImages::BuilderBase => crate::images::host_images_matching(
+        SharedImageKind::BuilderBase => crate::images::host_images_matching(
             &listing,
             crate::images::outside_kept(weft_compiler::worker_image::BUILDER_BASE_REPO, &kept_refs)?,
         ),
-        SharedImages::Runtime => crate::images::host_images_matching(&listing, crate::images::outside_kept(crate::images::RUNTIME_REPO, &kept_refs)?),
-        SharedImages::StandardWorker => crate::images::stale_standard_workers(&listing, kept_refs)?,
-        SharedImages::NodeTests => {
+        SharedImageKind::Runtime => crate::images::host_images_matching(&listing, crate::images::outside_kept(crate::images::RUNTIME_REPO, &kept_refs)?),
+        SharedImageKind::StandardWorker => crate::images::stale_standard_workers(&listing, kept_refs)?,
+        SharedImageKind::NodeTests => {
             let mut built_on_kept = String::new();
             for base in kept_refs {
                 let (_, tag) = crate::images::ref_repo_tag(base)?;
@@ -718,60 +752,82 @@ async fn unused_image_sweep(data_dir: &std::path::Path, kind: SharedImages) -> a
     Ok(())
 }
 
-/// What the two compile caches on this host take on disk and how to
-/// drop each: the node-test cache `weft test-node` builds into, and the
-/// worker compile caches image builds share, per cache key and lane.
+/// What the compile caches on this machine take on disk and how to drop
+/// each: the machine's worker compile caches every host build compiles in
+/// (every lane and the seed) with the crates they share, the node-test
+/// cache `weft test-node` builds into, and the BuildKit worker compile
+/// caches only an older weft or a `weft build-images` run leaves.
 async fn report_compile_cache_size() -> anyhow::Result<()> {
+    let machine = weft_platform_local::MachineLayout::here();
+    let gb = |bytes: u64| bytes as f64 / 1024.0 / 1024.0 / 1024.0;
+    let lanes = dir_size(&machine.compile_caches())?;
+    let crates = dir_size(&machine.shared_crates())?;
+    println!(
+        "worker compile caches: {:.1}GB in {} (every lane and the seed), and {:.1}GB of shared crates in {}; a build drops the \
+         per-project crates no build on this machine has linked for {} days, `weft clean --images --all` (the last step of \
+         `setup.sh`) the shared crates no build staged for as long, `weft clean --build-cache` drops everything now",
+        gb(lanes),
+        machine.compile_caches().display(),
+        gb(crates),
+        machine.shared_crates().display(),
+        weft_compiler::worker_image::WORKER_CACHE_RETENTION_DAYS
+    );
     match super::test_node::cache_size_bytes()? {
         None => println!("node-test cache: nothing built on this host"),
         Some(bytes) => println!(
             "node-test cache: {:.1}GB; it wipes itself past WEFT_TEST_CACHE_CAP_GB (6 by default), \
              `weft rm --local` drops one project's slice, `weft clean --build-cache` drops it whole",
-            bytes as f64 / 1024.0 / 1024.0 / 1024.0
+            gb(bytes)
         ),
     }
     let caches = crate::images::worker_compile_caches().await?;
     if caches.is_empty() {
-        println!("worker compile cache: no BuildKit record (nothing built on this host, or already pruned)");
         return Ok(());
     }
     let sizes: Vec<String> = caches.iter().map(|cache| {
         let mut line = if cache.idle_days == 0 { cache.size.clone() } else { format!("{} (unused for {} days)", cache.size, cache.idle_days) };
-        if cache.lane.is_none() {
-            line.push_str(&format!(" ({})", compile_cache_lane(cache)));
+        if let Some(lane) = compile_cache_lane(cache) {
+            line.push_str(&format!(" ({lane})"));
         }
         line
     }).collect();
     println!(
-        "worker compile cache: {} across {} cache(s) (one per key and compile lane); a build drops the per-project crates no build on this host \
-         has linked for {} days, `weft clean --images --all` (the last step of `setup.sh`) drops every key no install on this machine \
-         uses, `weft clean --build-cache` drops everything now",
+        "BuildKit worker image compile caches (an older weft's, or a `weft build-images` run's): {} across {} cache(s); \
+         `weft clean --images --all` drops every key no install on this machine uses, `weft clean --build-cache` drops everything now",
         sizes.join(" + "),
         caches.len(),
-        weft_compiler::worker_image::WORKER_CACHE_RETENTION_DAYS
     );
     Ok(())
 }
 
-/// Layer 4 (`--all` only): the worker compile caches no install uses.
-/// The key changes with the build environment or the builder, and
-/// nothing mounts an old one again unless an install goes back to it, so
-/// its own sweep never runs; this is the only thing that reclaims it.
-/// Every lane of a key an install records stays (its start recorded it,
-/// or one of its builds picked it); every lane of any other key goes, at
-/// once. While an install has not recorded its keys, nothing goes.
+/// The bytes every file under `dir` takes, 0 when there is no `dir`.
+fn dir_size(dir: &std::path::Path) -> anyhow::Result<u64> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    super::test_node::dir_size_bytes(dir).with_context(|| format!("measure {}", dir.display()))
+}
+
+/// Layer 4 (`--all` only): the BuildKit worker image compile caches no
+/// install uses: what an older weft's worker image builds (which record
+/// their keys in their install's record) or a `weft build-images` run
+/// (which records none) left. The key changes with the build environment
+/// or the builder, and nothing mounts an old one again unless an install
+/// goes back to it, so its own sweep never runs; this is the only thing
+/// that reclaims it. Every lane of a key an install records stays; every
+/// lane of any other key goes, at once. While an install has not recorded
+/// its keys, nothing goes.
 ///
-/// A lane a build on this machine holds right now (its lock file under
-/// the data dir) is skipped whatever its key, and the sweep holds each
-/// lane it drops from, so no CLI build (a node test, the standard worker)
-/// starts on it mid-drop. An install's own builds pick their lanes in its
-/// database, out of this sweep's sight; what keeps their caches is the
-/// key each build adds to its install's record before it starts.
+/// A lane a build on this machine holds right now (its lock file, the one
+/// an older weft's image builds and this weft's host builds both take,
+/// `weft_platform_local::lanes`) is skipped whatever its key, and the
+/// sweep holds each lane it drops from, so no build starts on it mid-drop.
 async fn unused_compile_cache_sweep(data_dir: &std::path::Path) -> anyhow::Result<()> {
     fn keys(r: &weft_core::images::ImageRefs) -> Vec<&str> {
         r.compile_cache_keys.iter().map(String::as_str).collect()
     }
-    let mut lanes: std::collections::BTreeMap<u32, Option<crate::images::CompileLane>> = std::collections::BTreeMap::new();
+    let machine = weft_platform_local::MachineLayout::new(data_dir);
+    let mut lanes: std::collections::BTreeMap<u32, Option<weft_platform_local::lanes::Lane>> = std::collections::BTreeMap::new();
     let mut failures = Vec::new();
     for cache in crate::images::worker_compile_caches().await?.iter() {
         // The records are looked at again for each cache, and held through
@@ -788,18 +844,18 @@ async fn unused_compile_cache_sweep(data_dir: &std::path::Path) -> anyhow::Resul
         if kept.contains(&cache.key) {
             continue;
         }
-        let lane = compile_cache_lane(cache);
+        let lane = compile_cache_lane(cache).map(|lane| format!(", {lane}")).unwrap_or_default();
         if let Some(number) = cache.lane {
             let taken = match lanes.entry(number) {
                 std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::btree_map::Entry::Vacant(e) => e.insert(crate::images::CompileLane::try_take(number)?),
+                std::collections::btree_map::Entry::Vacant(e) => e.insert(weft_platform_local::lanes::Lane::try_take(&machine, number)?),
             };
             if taken.is_none() {
-                println!("keeping a worker compile cache no install uses (key {}, {lane}, {}): a build holds that lane right now", cache.key, cache.size);
+                println!("keeping a worker image compile cache no install uses (key {}{lane}, {}): a build holds that lane right now", cache.key, cache.size);
                 continue;
             }
         }
-        println!("dropping a worker compile cache no install uses (key {}, {lane}, {})", cache.key, cache.size);
+        println!("dropping a worker image compile cache no install uses (key {}{lane}, {})", cache.key, cache.size);
         if let Err(error) = crate::images::prune_build_record(&cache.id).await {
             failures.push(format!("{error:#}"));
         }
@@ -810,18 +866,23 @@ async fn unused_compile_cache_sweep(data_dir: &std::path::Path) -> anyhow::Resul
 
 /// Layer 5 (`--all` only): the caches that compiled weft's own crates (the
 /// runtime image's, the builder base's) for an install no longer on this
-/// machine, and those from before each install had its own, which no
-/// install builds in any more. `weft daemon remove` drops an install's as
-/// it goes; this takes what an install removed otherwise left (by an older
-/// weft, or by hand). A cache a build mounts right now is kept and said.
+/// machine, and those no install owns but this checkout's builder base
+/// (one from before each install had its own, a builder base's under a
+/// toolchain this checkout no longer pins). `weft daemon remove` drops an
+/// install's as it goes; this takes what an install removed otherwise left
+/// (by an older weft, or by hand). A cache a build mounts right now is
+/// kept and said.
 async fn removed_install_cache_sweep(data_dir: &std::path::Path) -> anyhow::Result<()> {
     let installs: Vec<String> = super::daemon::Install::every_on(data_dir)?.iter().map(|i| i.id.label_value().to_string()).collect();
+    let root = weft_compiler::build::resolve_weft_root().map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
+    let base_key = weft_compiler::build::builder_base_cache_key(&root).map_err(|e| anyhow::anyhow!("the builder base's compile cache key: {e}"))?;
     let mut failures = Vec::new();
     for cache in crate::images::install_build_caches().await? {
         let whose = match &cache.install {
             Some(install) if installs.contains(install) => continue,
             Some(install) => format!("of install '{install}', which is no longer on this machine"),
-            None => "from before each install had its own".to_string(),
+            None if cache.key == base_key => continue,
+            None => "no install owns, under a key this checkout no longer builds in".to_string(),
         };
         if !cache.reclaimable {
             println!("keeping a compile cache {whose} ({}): a build mounts it right now", cache.size);
@@ -856,24 +917,37 @@ async fn removed_install_image_sweep(data_dir: &std::path::Path) -> anyhow::Resu
 }
 
 /// Which lane a compile cache's record names, in words: its number, or
-/// that the record has none or names something else.
-fn compile_cache_lane(cache: &crate::images::CompileCacheRecord) -> String {
+/// what it names that is no lane; `None` for one in no lane.
+fn compile_cache_lane(cache: &crate::images::CompileCacheRecord) -> Option<String> {
     match (cache.lane, cache.unreadable_lane.as_deref()) {
-        (Some(lane), _) => format!("lane {lane}"),
-        (None, Some("") | None) => format!("record {} has no lane number", cache.id),
-        (None, Some(suffix)) => format!("record {} has lane '{suffix}', not a number", cache.id),
+        (Some(lane), _) => Some(format!("lane {lane}")),
+        (None, Some(suffix)) => Some(format!("record {} has lane '{suffix}', not a number", cache.id)),
+        (None, None) => None,
     }
 }
 
 /// `docker buildx prune` reclaims BuildKit's intermediate layers.
 /// This is the heavy reclaim: cargo deps, intermediate Rust compile
 /// state, etc. The next build will re-download deps and re-link. The
-/// host's node-test cache goes with it: it is the same kind of thing
-/// (compiled engine plus dependencies, re-made by the next build), and
-/// "drop every build cache" should mean every one.
+/// host's node-test cache and the machine's worker compile caches go
+/// with it (every lane and the seed, and the crates the builds share):
+/// they are the same kind of thing (compiled engine plus dependencies,
+/// re-made by the next build), and "drop every build cache" should mean
+/// every one.
 async fn clean_build_cache() -> anyhow::Result<()> {
     println!("dropping the node-test cache (the next `weft test-node` builds cold)…");
     super::test_node::wipe_cache()?;
+    let machine = weft_platform_local::MachineLayout::here();
+    println!("dropping the worker compile caches (the next build of a project's own nodes compiles everything)…");
+    // Held until every folder is gone, so no build compiles in what goes.
+    let _held = weft_platform_local::lanes::hold_every_cache(&machine, || println!("waiting for the builds compiling right now to end…")).await?;
+    for dir in [machine.compile_caches(), machine.shared_crates()] {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => anyhow::bail!("remove {}: {e}", dir.display()),
+        }
+    }
     println!("pruning docker BuildKit cache (next build will be slower)…");
     let status = crate::images::docker()
         .args(["buildx", "prune", "--force"])

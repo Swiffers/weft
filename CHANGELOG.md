@@ -4,6 +4,127 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-10-27 (0.2.276)
+
+**If you have nodes of your own, changed one of the standard library's,
+build with `--referenced` or run live node tests, install Rust before you run
+`./setup.sh`.** On your machine weft now compiles a project's worker, and a
+live test's server, with your own Rust, and the install finds it on the
+`PATH` you run `./setup.sh` with. Get it from [rustup.rs](https://rustup.rs/).
+Those builds compile side by side in up to four compile caches of about 2GB
+each under `~/.local/share/weft/worker-target/`, plus one more they all
+start from, shared by every install on the machine. If you want more or fewer, set `WEFT_COMPILE_LANES` in the
+shell you run `./setup.sh` and `weft` from.
+
+**The install on your machine now asks for a key.** Until now any web page
+open in your browser, and anyone else on your machine, could drive your
+local install's API without a credential. Now it asks every caller for an
+operator key, as a cloud install always has, and a web page can neither send
+it one nor read its answers. `./setup.sh` gives the install a key of its
+own. The CLI reads that key by itself and the editor extension asks the CLI
+for it, so you never log in, and `weft login` refuses an install on this machine. If you set
+the editor's `weft.dispatcherUrl` to another install on this machine, the
+editor sends that install's key. If a script of yours calls the local API by hand, it now has to send
+`Authorization: Bearer <key>`: for where the key lives, go and read [the key
+the install's API asks
+for](https://weavemindai.github.io/weft/running/architecture.html#the-key-the-installs-api-asks-for).
+Routes, fire URLs, the browser extension and your frontends use their own
+tokens and are not affected.
+
+**After `weft maintenance off`, run `weft catalog update` and then `weft
+resync` in each project's folder.** The `[system.build]` and
+`[system.runtime]` tables of a node's `deps.toml` are gone, and a
+`deps.toml` that still has one fails the whole build, naming the node type.
+Each project's copy of the standard library (`nodes/base_catalog/`) still
+has one, in `ExecPython`, so `weft maintenance off` cannot build those
+projects and leaves them down. `weft catalog update` replaces the copy with
+this weft's (any edit you made in there is lost), and `weft resync` builds
+the project and brings back what maintenance took down. Add `--on <target>`
+to the resync for a project on a cloud install.
+
+**A node of your own that declares system packages has to move to
+`[[needs]]` too.** What used to read
+
+```toml
+[system.runtime.apt]
+default = ["python3"]
+```
+
+now reads
+
+```toml
+[[needs]]
+name = "python3"
+check = ["python3", "--version"]
+[needs.install.apt]
+default = ["python3"]
+[needs.install.brew]
+default = ["python"]
+```
+
+`check` is a command that exits 0 when the machine has it. If the package
+needs something to compile (the old `[system.build]`), add `stage =
+"build"`. If you had a `yum` entry, name it `dnf`. For the whole shape, go and read [what a node
+needs from the
+machine](https://weavemindai.github.io/weft/nodes/packaging.html#what-a-node-needs-from-the-machine).
+
+**Every project's worker is built once more after the update**, because a
+worker is now named by its node packages' names and contents rather than by
+where they sit. The `weft resync` that brings a project back does that
+build. A project with no nodes of its own (built without `--referenced`)
+compiles nothing. On your machine it runs the standard worker that
+`./setup.sh` downloads with the release. On a branch, or a commit with no
+release, `./setup.sh` builds the CLI from source, and the install then
+compiles the standard worker once when it starts, with the Rust that build
+already needs. On a cloud install all such projects share one image, built
+once, unless the project sets `[build.worker]`. That setting
+(`base_image`, `dockerfile_template`) now shapes a cloud install's images
+only: a build on your machine ignores it.
+
+**Your programs run on your machine, not in a container.** On a local
+install a project's worker is now a plain process in the project's folder,
+so its nodes can open your files and start the programs you have installed.
+They run as you, so a project can read and change whatever you can. A
+cloud install keeps running workers as containers. On your machine,
+infrastructure nodes, the database and the file store still run in
+Docker. The update removes the worker containers and images the old weft
+left in Docker, and from then on `./setup.sh` also removes the worker
+programs nothing uses any more, an older weft's standard worker among them.
+A worker's log (under `workers/logs/` in the install's folder) is deleted
+when the worker stops; if one dies while it runs, its last lines go to `weft
+daemon logs`.
+
+**New: `weft deps-install`.** When a node your program uses needs a program
+your machine does not have, `weft run`, `weft activate` and `weft resync`
+now refuse before anything starts and name the command to run, like `weft
+deps-install ExecPython`. It shows the install command for your system and
+runs it once you say yes. For its flags, go and read [the
+CLI](https://weavemindai.github.io/weft/running/cli.html#what-nodes-need-from-your-machine).
+
+**New: `FolderWatch`.** A trigger that starts a run each time a file is
+created, changed or removed in a folder on your machine, with the file's
+path. It works on a local install only. What happens in the folder while
+weft is stopped or in maintenance fires once the trigger is back, and what
+happens while you have the trigger down behind a door that refuses never
+does. For how it behaves, go and read [watching a
+folder](https://weavemindai.github.io/weft/language/triggers-and-routes.html#watching-a-folder).
+
+**A poll trigger brought back from behind a door that refuses, or after its
+`--door-for` window ended, now starts from wherever its feed is.** Before,
+it delivered everything the feed had queued since its cursor. If weft itself
+was stopped or in maintenance, the trigger still delivers what its feed
+queued meanwhile once it is back.
+
+**On a cloud install, the operator key the install workflow gave you now
+lives in a secret named `<name>-install-key`.** The install workflow renames
+it by itself and the key stays the same, so nothing changes for you unless a
+script of yours reads the old `<name>-bootstrap-operator-key` secret by name.
+The key is the install's own, read from that secret, so `weft token revoke`
+cannot retire it. `weft token ls` still lists a key named `bootstrap`: that
+is the row an older weft wrote for the same key. Revoke it if you want the
+list to hold only keys you minted; the install's key keeps working through
+its secret either way.
+
 ## 2026-10-26 (caf76429)
 
 **`weft maintenance off` is faster and shows what it is doing.** It used to

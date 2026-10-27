@@ -29,10 +29,11 @@ open at [github.com/WeaveMindAI/weft](https://github.com/WeaveMindAI/weft).
 The extension talks to the weft runtime on your machine. If you have
 not installed it yet, read
 [the install guide](https://weavemindai.github.io/weft/start/install.html);
-it is one script. The extension connects to the port your install saved
-in `~/.local/share/weft/ports.json` (`http://127.0.0.1:14111` unless you
-moved it), and follows it if the install restarts on another one. The
-`weft.dispatcherUrl` setting points it elsewhere.
+it is one script. The extension asks the `weft` command for your install's
+address (`http://127.0.0.1:14111` for the default install) and its key, and
+picks up the new address if the install restarts on another port. If you want
+it on another install of this machine, set `weft.dispatcherUrl` to that
+install's address, and the extension sends that install's own key.
 
 ## What it does on your machine
 

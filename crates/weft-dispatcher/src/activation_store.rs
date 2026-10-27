@@ -81,6 +81,9 @@ impl From<weft_core::run_spec::TriggerCut> for RecordedCut {
 /// `UpgradeInFlight`: the write was an upgrade's take-down, and an upgrade
 /// of the same copies is still in flight (its command): nothing was
 /// written.
+/// `StateMoved`: one of the [`SignalsGoing::Places`] rows moved past the
+/// version its fresh state was computed from (a wake claimed in between):
+/// nothing was written, and the caller computes them again.
 #[derive(Debug, Clone)]
 pub enum LifecycleWrite {
     Applied {
@@ -101,6 +104,7 @@ pub enum LifecycleWrite {
     NotFound,
     ResyncGone,
     UpgradeInFlight(i64),
+    StateMoved,
 }
 
 /// What takes triggers down, when it is not a person: the mark a guarded
@@ -153,12 +157,24 @@ impl Claimant {
 /// rows and what they govern leave together: a retry after a failure later
 /// on never finds a row gone and its signals still registered.
 #[derive(Debug, Clone, Copy)]
-pub enum SignalsGoing {
+pub enum SignalsGoing<'a> {
     /// Nothing. A door that holds goes on listening, and what it hears
     /// waits for the trigger to be back on (`weft_core::arrival`); a door
-    /// that refuses (or whose window ended) stops listening while its rows
-    /// stay for its next activation (`weft_broker_client::protocol::ACTIVATION_LISTENS`).
+    /// that refuses stops listening while its rows stay for its next
+    /// activation (`weft_broker_client::protocol::ACTIVATION_LISTENS`),
+    /// each place in a source among them taken ([`Self::Places`]), except
+    /// under weft's own maintenance: nobody refused anything, so what came
+    /// meanwhile is caught up.
     Kept,
+    /// Nothing, and the written activations' entry signals listed lose
+    /// their place in what they read (a poll's cursor, what a folder
+    /// held): a door that refuses with what is held kept stops listening
+    /// while its rows stay, and they carry nothing of what came behind it
+    /// on their next activation, or whatever else brings them up. Each is
+    /// written only while its row is still at the version its fresh state
+    /// was computed from ([`crate::store::FreshPlace`]); one that moved
+    /// fails the whole write ([`LifecycleWrite::StateMoved`]).
+    Places(&'a [crate::store::FreshPlace]),
     /// The arrivals held on the written activations' entry signals
     /// (`parked_fire`): a take-down that drops what is held while its door
     /// goes on taking. The paused runs the take-down cancels drop their
@@ -322,8 +338,8 @@ pub trait ActivationStoreOps: Send + Sync {
     /// Set the lifecycle of every row among `keys`, GUARDED: refused while
     /// any of them is activating (cancel the activation first) or while
     /// the project is building. Keys with no row are skipped: there is
-    /// nothing listening to take down. `signals` names what is deleted in
-    /// the same transaction, and `forget` the instances' rows that go with
+    /// nothing listening to take down. `signals` names what is deleted (or
+    /// which places go) in the same transaction, and `forget` the instances' rows that go with
     /// it. With `resync`, the write is that resync drive's take-down
     /// (`crate::task_kinds::resync`), and goes through only while that
     /// drive holds the project, decided under the same project row lock a
@@ -336,7 +352,7 @@ pub trait ActivationStoreOps: Send + Sync {
         project_id: uuid::Uuid,
         keys: &[ActivationKey],
         lifecycle: &ActivationLifecycle,
-        signals: SignalsGoing,
+        signals: SignalsGoing<'_>,
         forget: Forget,
         cause: DownCause<'_>,
         resync: Option<uuid::Uuid>,
@@ -402,24 +418,53 @@ pub async fn door_windows_over(pool: &PgPool) -> anyhow::Result<Vec<(uuid::Uuid,
     project_keys(rows)
 }
 
+/// What [`close_door_windows`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsClosed {
+    /// This many doors closed, their places taken.
+    Closed(u64),
+    /// A row among the places moved past the version its fresh state was
+    /// computed from (a wake claimed in between): nothing was written, and
+    /// the caller computes them again.
+    StateMoved,
+}
+
 /// Close the doors of `keys` of `project_id` whose window is over: they
-/// stop taking work. The arrival rule and the listening condition already
-/// read the deadline against the clock; the flip is what is announced
-/// (holder sizing, the routes). One activated again meanwhile no longer
-/// matches and is left alone. Answers how many it closed.
-pub async fn close_door_windows(pool: &PgPool, project_id: uuid::Uuid, keys: &[ActivationKey]) -> anyhow::Result<u64> {
+/// stop taking work, and their entry signals lose their place in what
+/// they read, in the same transaction: `places` are their fresh states
+/// (`crate::store::FreshPlace`), each written only while its row is still
+/// at the version it was computed from. The arrival rule and the
+/// listening condition already read the deadline against the clock; the
+/// flip is what is announced (holder sizing, the routes). One activated
+/// again meanwhile no longer matches and is left alone, places included.
+pub async fn close_door_windows(
+    pool: &PgPool,
+    project_id: uuid::Uuid,
+    keys: &[ActivationKey],
+    places: &[crate::store::FreshPlace],
+) -> anyhow::Result<WindowsClosed> {
     let (triggers, instances) = key_arrays(keys);
-    Ok(sqlx::query(&format!(
+    let mut tx = pool.begin().await?;
+    let closed: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
         "UPDATE trigger_activation a SET accepting_fires = FALSE, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT \
          WHERE a.project_id = $1 AND {KEYS_JOIN} \
-           AND {DOOR_WINDOW_OPEN_SQL} AND a.fires_deadline_unix < EXTRACT(EPOCH FROM NOW())::BIGINT"
+           AND {DOOR_WINDOW_OPEN_SQL} AND a.fires_deadline_unix < EXTRACT(EPOCH FROM NOW())::BIGINT \
+         RETURNING a.trigger, a.instance_id"
     ))
     .bind(project_id)
     .bind(&triggers)
     .bind(&instances)
-    .execute(pool)
-    .await?
-    .rows_affected())
+    .fetch_all(&mut *tx)
+    .await?;
+    let closed = owned_keys(closed)?;
+    let tokens = crate::store::postgres::entry_tokens(&mut *tx, project_id, &closed).await?;
+    let taken: Vec<crate::store::FreshPlace> = places.iter().filter(|place| tokens.contains(&place.token)).cloned().collect();
+    if !crate::store::postgres::write_fresh_places(&mut *tx, &taken).await? {
+        tx.rollback().await?;
+        return Ok(WindowsClosed::StateMoved);
+    }
+    tx.commit().await?;
+    Ok(WindowsClosed::Closed(closed.len() as u64))
 }
 
 /// When the earliest door window still open ends, if one is.
@@ -1073,7 +1118,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         project_id: uuid::Uuid,
         keys: &[ActivationKey],
         lifecycle: &ActivationLifecycle,
-        signals: SignalsGoing,
+        signals: SignalsGoing<'_>,
         forget: Forget,
         cause: DownCause<'_>,
         resync: Option<uuid::Uuid>,
@@ -1189,6 +1234,13 @@ impl ActivationStoreOps for PostgresActivationStore {
         .await?;
         let unlisten = match signals {
             SignalsGoing::Kept => Vec::new(),
+            SignalsGoing::Places(places) => {
+                if !crate::store::postgres::write_fresh_places(&mut *tx, places).await? {
+                    tx.rollback().await?;
+                    return Ok(LifecycleWrite::StateMoved);
+                }
+                Vec::new()
+            }
             SignalsGoing::HeldArrivals => {
                 crate::store::postgres::drop_held_arrivals(&mut *tx, project_id, keys).await?;
                 Vec::new()
@@ -1419,7 +1471,7 @@ impl ActivationStoreOps for FakeActivationStore {
         project_id: uuid::Uuid,
         keys: &[ActivationKey],
         lifecycle: &ActivationLifecycle,
-        _signals: SignalsGoing,
+        _signals: SignalsGoing<'_>,
         forget: Forget,
         cause: DownCause<'_>,
         _resync: Option<uuid::Uuid>,

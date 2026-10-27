@@ -344,6 +344,44 @@ async fn a_park_keeps_its_signals_listening(pool: PgPool) {
     assert!(store.signal_get("parked-entry").await.unwrap().is_some(), "and its signal stays stored");
 }
 
+/// A door that refuses takes the place an entry signal keeps in what it
+/// reads in the write that sets the door, and only while the row is still
+/// at the version that place was computed from: a wake that claimed in
+/// between refuses the whole write, the door included, so it is asked
+/// again.
+#[sqlx::test]
+async fn a_refusing_door_takes_the_place_only_from_the_row_it_was_computed_from(pool: PgPool) {
+    use weft_dispatcher::store::FreshPlace;
+    let (store, projects) = setup(&pool).await;
+    let activations = PostgresActivationStore::new(pool.clone());
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    activate_with_entry(&activations, &store, id, "polled-entry").await;
+    let at = store.signal_get("polled-entry").await.unwrap().expect("armed").kind_state_seq;
+    let refused = ActivationLifecycle::refused();
+
+    let stale = [FreshPlace { token: "polled-entry".into(), kind_state_seq: at - 1, kind_state: json!({ "fresh": true }) }];
+    let moved = activations
+        .set_lifecycle_guarded(id, &[feed_key()], &refused, SignalsGoing::Places(&stale), Forget::Nothing, DownCause::Person, None)
+        .await
+        .unwrap();
+    assert!(matches!(moved, LifecycleWrite::StateMoved), "{moved:?}");
+    assert_eq!(activations.list(id).await.unwrap()[0].lifecycle.status, ProjectStatus::Active, "nothing was written, the door included");
+    assert_eq!(store.signal_get("polled-entry").await.unwrap().unwrap().kind_state_seq, at);
+
+    let fresh = [FreshPlace { token: "polled-entry".into(), kind_state_seq: at, kind_state: json!({ "fresh": true }) }];
+    let written = activations
+        .set_lifecycle_guarded(id, &[feed_key()], &refused, SignalsGoing::Places(&fresh), Forget::Nothing, DownCause::Person, None)
+        .await
+        .unwrap();
+    let LifecycleWrite::Applied { unlisten, .. } = written else { panic!("applied: {written:?}") };
+    assert!(unlisten.is_empty(), "the rows stay for the next activation");
+    let row = store.signal_get("polled-entry").await.unwrap().expect("kept");
+    assert_eq!(row.kind_state, json!({ "fresh": true }), "the place is gone");
+    assert_eq!(row.kind_state_seq, at + 1, "and a wake's claim at the old version fails");
+    assert_eq!(activations.list(id).await.unwrap()[0].lifecycle.status, ProjectStatus::Inactive);
+}
+
 /// An infra take-down issues its commands in the write that takes the
 /// triggers down, and marks them with the first: nothing claims a command
 /// while a trigger reading its copies still listens, and no trigger is
@@ -523,13 +561,125 @@ fn hidden_until(deadline_unix: i64) -> ActivationLifecycle {
     ActivationLifecycle { fires_deadline_unix: Some(deadline_unix), ..ActivationLifecycle::down(&take_down, 0) }
 }
 
+/// The listener's side of closing door windows, answered by a test: it
+/// writes down what it was told to let go of, keeps every one of them
+/// with `keeps` when set, and gives every entry signal it is asked about
+/// the fresh place `place` when set (none otherwise), or cannot be
+/// reached for places when `unreachable`.
+#[derive(Default)]
+struct Doors {
+    asked: std::sync::Mutex<Vec<String>>,
+    keeps: Option<&'static str>,
+    place: Option<serde_json::Value>,
+    unreachable: bool,
+}
+
+#[async_trait::async_trait]
+impl weft_dispatcher::reaper::DoorWindowListener for Doors {
+    async fn let_go(&self, signals: &[SignalRegistration]) -> anyhow::Result<Vec<(String, String)>> {
+        self.asked.lock().unwrap().extend(signals.iter().map(|s| s.token.clone()));
+        Ok(match self.keeps {
+            Some(why) => signals.iter().map(|s| (s.token.clone(), why.to_string())).collect(),
+            None => Vec::new(),
+        })
+    }
+
+    async fn fresh_places(&self, signals: &[SignalRegistration]) -> anyhow::Result<Vec<weft_dispatcher::store::FreshPlace>> {
+        anyhow::ensure!(!self.unreachable, "the listener cannot be reached");
+        Ok(match &self.place {
+            Some(place) => signals
+                .iter()
+                .map(|s| weft_dispatcher::store::FreshPlace { token: s.token.clone(), kind_state_seq: s.kind_state_seq, kind_state: place.clone() })
+                .collect(),
+            None => Vec::new(),
+        })
+    }
+}
+
+/// A door window that ends takes the place its entry signals keep in what
+/// they read in the write that closes it, only while each row is still at
+/// the version its place was computed from, and only for the windows that
+/// close: a place computed from a row a wake moved since closes nothing,
+/// and one for a trigger whose window is still open is not written.
+#[sqlx::test]
+async fn a_window_that_ends_takes_the_places_with_the_close(pool: PgPool) {
+    use weft_dispatcher::activation_store::{close_door_windows, door_windows_over, WindowsClosed};
+    use weft_dispatcher::store::FreshPlace;
+    let (store, projects) = setup(&pool).await;
+    let activations = PostgresActivationStore::new(pool.clone());
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    let (over, open) = (feed_key(), ActivationKey::new("reads", Owner::Shared));
+    let setup_run_id = Uuid::new_v4();
+    assert!(activations.try_begin_activating(id, &[over.clone(), open.clone()], setup_run_id, None, Claimant::Anyone).await.unwrap().is_ok());
+    store.signal_insert(&governed_entry("feed-entry", id, setup_run_id)).await.unwrap();
+    let mut reads = entry_signal("reads-entry", id);
+    reads.activation_trigger = Some("reads".into());
+    reads.setup_run_id = Some(setup_run_id);
+    reads.node_id = "reads".into();
+    store.signal_insert(&reads).await.unwrap();
+    activations.end_activating(id, setup_run_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
+    for (key, deadline) in [(&over, 100), (&open, i64::MAX / 2)] {
+        activations
+            .set_lifecycle_guarded(id, std::slice::from_ref(key), &hidden_until(deadline), SignalsGoing::Kept, Forget::Nothing, DownCause::Person, None)
+            .await
+            .unwrap();
+    }
+    let seq = |token: &'static str| {
+        let store = &store;
+        async move { store.signal_get(token).await.unwrap().expect("kept").kind_state_seq }
+    };
+    let (feed_at, reads_at) = (seq("feed-entry").await, seq("reads-entry").await);
+    let place = |token: &str, at: i64| FreshPlace { token: token.into(), kind_state_seq: at, kind_state: json!({ "fresh": true }) };
+    let keys = [over.clone(), open.clone()];
+
+    let moved = close_door_windows(&pool, id, &keys, &[place("feed-entry", feed_at - 1)]).await.unwrap();
+    assert_eq!(moved, WindowsClosed::StateMoved);
+    assert_eq!(door_windows_over(&pool).await.unwrap(), vec![(id, over.clone())], "nothing closed");
+
+    let closed = close_door_windows(&pool, id, &keys, &[place("feed-entry", feed_at), place("reads-entry", reads_at)]).await.unwrap();
+    assert_eq!(closed, WindowsClosed::Closed(1));
+    let feed = store.signal_get("feed-entry").await.unwrap().expect("kept");
+    assert_eq!((feed.kind_state, feed.kind_state_seq), (json!({ "fresh": true }), feed_at + 1), "the closed window's place is gone");
+    let reads = store.signal_get("reads-entry").await.unwrap().expect("kept");
+    assert_eq!((reads.kind_state, reads.kind_state_seq), (json!({}), reads_at), "the open window keeps its place");
+}
+
+/// The sweep closes a window with the places the listener gives, and a
+/// project whose places cannot be had keeps its window open and fails the
+/// pass, naming it.
+#[sqlx::test]
+async fn the_sweep_closes_a_window_only_with_its_places(pool: PgPool) {
+    use weft_dispatcher::activation_store::door_windows_over;
+    use weft_dispatcher::reaper::close_door_windows_over;
+    let (store, projects) = setup(&pool).await;
+    let activations = PostgresActivationStore::new(pool.clone());
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    activate_with_entry(&activations, &store, id, "feed-entry").await;
+    activations
+        .set_lifecycle_guarded(id, &[feed_key()], &hidden_until(100), SignalsGoing::Kept, Forget::Nothing, DownCause::Person, None)
+        .await
+        .unwrap();
+
+    let unreachable = Doors { unreachable: true, ..Doors::default() };
+    let failed = close_door_windows_over(&pool, &unreachable).await.unwrap_err();
+    assert!(format!("{failed:#}").contains(&id.to_string()), "names the project: {failed:#}");
+    assert_eq!(door_windows_over(&pool).await.unwrap(), vec![(id, feed_key())], "its window stays to close");
+
+    let listener = Doors { place: Some(json!({ "fresh": true })), ..Doors::default() };
+    assert_eq!(close_door_windows_over(&pool, &listener).await.unwrap(), vec![id]);
+    assert!(door_windows_over(&pool).await.unwrap().is_empty());
+    assert_eq!(store.signal_get("feed-entry").await.unwrap().expect("kept").kind_state, json!({ "fresh": true }));
+}
+
 /// A door that holds for a while takes work until its window ends, then
 /// refuses: the close flips only the windows that are over, keeps the row
 /// (so `weft activate` brings it back), and says when the next window
 /// still open ends.
 #[sqlx::test]
 async fn a_door_stops_taking_work_once_its_window_ends(pool: PgPool) {
-    use weft_dispatcher::activation_store::{close_door_windows, door_windows_over, next_door_window_end};
+    use weft_dispatcher::activation_store::{close_door_windows, door_windows_over, next_door_window_end, WindowsClosed};
     let (_store, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
@@ -549,9 +699,13 @@ async fn a_door_stops_taking_work_once_its_window_ends(pool: PgPool) {
     // The windows are over by the database's clock: one in the past, one
     // far ahead.
     assert_eq!(door_windows_over(&pool).await.unwrap(), vec![(id, over.clone())]);
-    assert_eq!(close_door_windows(&pool, id, &[over.clone(), open.clone()]).await.unwrap(), 1, "only the window that is over closes");
+    assert_eq!(
+        close_door_windows(&pool, id, &[over.clone(), open.clone()], &[]).await.unwrap(),
+        WindowsClosed::Closed(1),
+        "only the window that is over closes"
+    );
     assert!(door_windows_over(&pool).await.unwrap().is_empty(), "taking no work, it is over no longer");
-    assert_eq!(close_door_windows(&pool, id, std::slice::from_ref(&over)).await.unwrap(), 0, "a window closes once");
+    assert_eq!(close_door_windows(&pool, id, std::slice::from_ref(&over), &[]).await.unwrap(), WindowsClosed::Closed(0), "a window closes once");
     let listed = activations.list(id).await.unwrap();
     let lifecycle = |key: &ActivationKey| listed.iter().find(|a| &a.key == key).expect("kept").lifecycle.clone();
     assert!(!lifecycle(&over).accepting_fires, "the window that is over takes no more work");
@@ -581,10 +735,8 @@ async fn a_refused_let_go_still_ends_the_window_and_is_written_down(pool: PgPool
     let window_over = hidden_until(100);
     activations.set_lifecycle_guarded(id, std::slice::from_ref(&key), &window_over, SignalsGoing::Kept, Forget::Nothing, DownCause::Person, None).await.unwrap();
 
-    let kept = |signals: Vec<SignalRegistration>| async move {
-        anyhow::Ok(signals.into_iter().map(|s| (s.token, "the listener is down".to_string())).collect::<Vec<_>>())
-    };
-    assert_eq!(close_door_windows_over(&pool, kept).await.unwrap(), vec![id]);
+    let kept = Doors { keeps: Some("the listener is down"), ..Doors::default() };
+    assert_eq!(close_door_windows_over(&pool, &kept).await.unwrap(), vec![id]);
     assert!(door_windows_over(&pool).await.unwrap().is_empty(), "the window closed whatever the listener answered");
     assert_eq!(next_door_window_end(&pool).await.unwrap(), None, "nothing to look at again");
     let marked = || {
@@ -602,16 +754,9 @@ async fn a_refused_let_go_still_ends_the_window_and_is_written_down(pool: PgPool
     // The next pass tells the listener again about the kept signal; once
     // it lets go, the mark and the failure go.
     activations.set_lifecycle_guarded(id, std::slice::from_ref(&later), &window_over, SignalsGoing::Kept, Forget::Nothing, DownCause::Person, None).await.unwrap();
-    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let let_go = |signals: Vec<SignalRegistration>| {
-        let asked = asked.clone();
-        async move {
-            asked.lock().unwrap().extend(signals.into_iter().map(|s| s.token));
-            anyhow::Ok(Vec::<(String, String)>::new())
-        }
-    };
-    assert_eq!(close_door_windows_over(&pool, let_go).await.unwrap(), vec![id]);
-    assert!(asked.lock().unwrap().contains(&"tok-feed".to_string()), "the kept signal is let go of again");
+    let let_go = Doors::default();
+    assert_eq!(close_door_windows_over(&pool, &let_go).await.unwrap(), vec![id]);
+    assert!(let_go.asked.lock().unwrap().contains(&"tok-feed".to_string()), "the kept signal is let go of again");
     assert_eq!(marked().await, None);
     let left: i64 = sqlx::query_scalar("SELECT count(*) FROM unanswered_call").fetch_one(&pool).await.unwrap();
     assert_eq!(left, 0);

@@ -3,11 +3,11 @@
 //! what none of them uses.
 //!
 //! Each install keeps its own record ([`ImageRefs`], in its folder): its
-//! start writes it, its builds add to it, and a sweep keeps the union of
-//! every install's. An install with no record (one last started by an
-//! older weft, or one whose first start has not written it yet) could be
-//! using anything, so while one exists the sweep removes nothing of that
-//! kind and says which install to start.
+//! start writes it (and an older weft's builds add to it), and a sweep
+//! keeps the union of every install's. An install with no record (one
+//! whose first start has not written it yet) could be using anything, so
+//! while one exists the sweep removes nothing of that kind and says which
+//! install to start.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -23,11 +23,10 @@ pub struct Recorded {
     pub refs: Option<ImageRefs>,
 }
 
-/// Every install's record, held: no install's build adds to its record
-/// and no start replaces one while this lives
-/// ([`ImageRefs::load_held`]). A sweep holds it from its last look at the
-/// records through the removal that look decided, and no longer: a build
-/// waits at most one removal.
+/// Every install's record, held: no start replaces one (and no older
+/// weft's build adds to one) while this lives ([`ImageRefs::load_held`]).
+/// A sweep holds it from its last look at the records through the removal
+/// that look decided, and no longer: a start waits at most one removal.
 pub struct Records {
     pub installs: Vec<Recorded>,
     _held: Vec<std::fs::File>,
@@ -47,7 +46,7 @@ pub async fn every_install(data_dir: &Path) -> Result<Records> {
     for install in crate::commands::daemon::Install::every_on(data_dir)? {
         let (dir, label) = (install.dir.clone(), install.id.label_value().to_string());
         let (refs, held) = tokio::task::spawn_blocking(move || {
-            ImageRefs::load_held(&dir, || eprintln!("waiting for the image record of install '{label}': a build or another cleanup holds it"))
+            ImageRefs::load_held(&dir, || eprintln!("waiting for the image record of install '{label}': a start or another cleanup holds it"))
         })
         .await??;
         if refs.is_none() && !install.dir.exists() {

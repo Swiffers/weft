@@ -100,8 +100,9 @@ pub trait InfraHost: Send + Sync {
     /// what the supervisor sweeps for copies that are gone for good.
     async fn copies(&self) -> anyhow::Result<Vec<NodeRef>>;
 
-    /// Where `endpoint` of `node` answers for the project's workers (a
-    /// URL, or `tcp://host:port`), and for a `SameNetwork` endpoint the
+    /// Where `endpoint` of `node` answers for the project's workers and
+    /// weft's own roles (a URL, or `tcp://host:port`), and for a
+    /// `SameNetwork` endpoint the
     /// address on the install's network.
     async fn endpoint(&self, node: &ResolvedNode, endpoint: &str) -> anyhow::Result<EndpointAt>;
 
@@ -116,11 +117,8 @@ pub trait InfraHost: Send + Sync {
 /// Where one endpoint answers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointAt {
-    /// For the project's own workers.
+    /// For the project's own workers and for weft's own roles.
     pub url: String,
-    /// For weft's own roles (the same as `url` unless the workers sit on
-    /// a network weft's roles are not on).
-    pub install_url: String,
     /// For callers on the install's network, for a `SameNetwork` endpoint.
     pub same_network: Option<String>,
 }
@@ -264,7 +262,6 @@ pub mod fake {
         async fn endpoint(&self, node: &ResolvedNode, endpoint: &str) -> anyhow::Result<EndpointAt> {
             Ok(EndpointAt {
                 url: format!("http://{}.{endpoint}.fake", node.node.copy_id),
-                install_url: format!("http://{}.{endpoint}.install.fake", node.node.copy_id),
                 same_network: Some(format!("{}.{endpoint}.fake:1", node.node.copy_id)),
             })
         }

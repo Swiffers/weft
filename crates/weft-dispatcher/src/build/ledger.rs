@@ -1,8 +1,9 @@
 //! The `image_build` ledger: one row per image ref, naming the build
 //! running for it and how it ended.
 //!
-//! The build runs on the platform's builder (a `docker build` on a local
-//! install, a Cloud Build on GCP). The row is how everybody finds it: a
+//! The build runs on the platform's builder (on a local install a worker
+//! compiled on the machine or an infra image's `docker build`, a Cloud
+//! Build on GCP). The row is how everybody finds it: a
 //! second verb needing the same image joins the running build instead of
 //! starting another, and the version build waiting on it reads its end
 //! here (`super::waiting`, `image_states`).
@@ -49,10 +50,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- (Cloud Build does): NULL until the start recorded it, and
             -- nobody asks the builder about a build without one.
             builder_id TEXT,
-            -- The compile lane a worker build holds (see
-            -- weft_compiler::worker_image::COMPILE_LANE_ARG); NULL for an
-            -- image that compiles nothing.
-            lane INTEGER,
             -- SYNC: the statuses <-> weft_core::projects::BuildState
             status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'cancelled')),
             reason TEXT,
@@ -68,10 +65,12 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- keeps one at an address.
             log_url TEXT,
             -- What a worker build left out because it did not compile
-            -- (weft_core::builds::LeftOut, as JSON), read from the built
-            -- image once it succeeded; NULL for an image with nothing to
-            -- report (an infra image, a custom worker template) and for
-            -- every build that has not succeeded.
+            -- (weft_core::builds::LeftOut, as JSON), the result its build
+            -- reported once it succeeded (the record beside a program
+            -- compiled on the machine, or read from a built image); NULL
+            -- for an image with nothing to report (an infra image, a
+            -- custom worker template) and for every build that has not
+            -- succeeded.
             left_out TEXT
         )"#,
         // One row per image a project's running version names, and when
@@ -114,10 +113,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 /// What a dispatcher does about one image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
-    /// Nothing is building it: start `name`, in `lane` (a worker build;
-    /// none for an image that compiles nothing). The row is already
-    /// written, so a sibling sees the build before it starts.
-    Start { name: String, lane: Option<u32> },
+    /// Nothing is building it: start `name`. The row is already written,
+    /// so a sibling sees the build before it starts.
+    Start { name: String },
     /// A build is running for it, minted as `name`: the project waits on
     /// that one.
     /// `ours` when this same project started it, so a cancel of this
@@ -164,7 +162,6 @@ pub async fn claim(
     image_ref: &str,
     project_id: uuid::Uuid,
     tenant: &str,
-    lanes: Option<u32>,
     now: i64,
 ) -> Result<Claim> {
     let built_before: Option<(String, String)> = sqlx::query_as("SELECT status, build_name FROM image_build WHERE image_ref = $1")
@@ -215,10 +212,6 @@ pub async fn claim(
         tx.commit().await.context("commit the build claim")?;
         return Ok(claim);
     }
-    let lane = match lanes {
-        Some(lanes) => Some(pick_lane(&mut tx, lanes).await?),
-        None => None,
-    };
     let name = build_name();
     // Announced in the same statement (delivered when it commits), so the
     // build loop watches the build from its first moment: one whose
@@ -226,20 +219,19 @@ pub async fn claim(
     // its project's heartbeat goes stale (`end_lost_starts`), even on an
     // install that was asleep.
     sqlx::query(
-        "INSERT INTO image_build (image_ref, project_id, tenant_id, build_name, builder_id, lane, status, reason, \
+        "INSERT INTO image_build (image_ref, project_id, tenant_id, build_name, builder_id, status, reason, \
                                   held_until, started_at, finished_at, log_url, failing_since) \
-         VALUES ($1, $2, $3, $4, NULL, $5, 'running', NULL, $6, $7, NULL, NULL, NULL) \
+         VALUES ($1, $2, $3, $4, NULL, 'running', NULL, $5, $6, NULL, NULL, NULL) \
          ON CONFLICT (image_ref) DO UPDATE SET project_id = EXCLUDED.project_id, tenant_id = EXCLUDED.tenant_id, \
-             build_name = EXCLUDED.build_name, builder_id = NULL, lane = EXCLUDED.lane, status = 'running', \
+             build_name = EXCLUDED.build_name, builder_id = NULL, status = 'running', \
              reason = NULL, held_until = EXCLUDED.held_until, started_at = EXCLUDED.started_at, \
              finished_at = NULL, log_url = NULL, failing_since = NULL \
-         RETURNING pg_notify($8, image_ref)",
+         RETURNING pg_notify($7, image_ref)",
     )
     .bind(image_ref)
     .bind(project_id)
     .bind(tenant)
     .bind(&name)
-    .bind(lane.map(|l| l as i32))
     .bind(now + OLDER_READERS_START_HOLD_SECS)
     .bind(now)
     .bind(super::follow::BUILD_CLAIMED_CHANNEL)
@@ -247,7 +239,7 @@ pub async fn claim(
     .await
     .context("record the build")?;
     tx.commit().await.context("commit the build claim")?;
-    Ok(Claim::Start { name, lane })
+    Ok(Claim::Start { name })
 }
 
 /// Refuse, inside `tx`, once `project`'s build was cancelled (its
@@ -323,23 +315,6 @@ async fn lock_image(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, image_ref: &
         .await
         .context("lock the image's build row")?;
     Ok(())
-}
-
-/// The least busy lane: builds in different lanes compile side by side.
-async fn pick_lane(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, lanes: u32) -> Result<u32> {
-    let busy: Vec<(i32, i64)> =
-        sqlx::query_as("SELECT lane, COUNT(*) FROM image_build WHERE status = 'running' AND lane IS NOT NULL GROUP BY lane")
-            .fetch_all(&mut **tx)
-            .await
-            .context("count the busy lanes")?;
-    Ok(least_busy_lane(lanes, &busy))
-}
-
-/// The lane with the fewest running builds, the lowest on a tie.
-pub fn least_busy_lane(lanes: u32, busy: &[(i32, i64)]) -> u32 {
-    (0..lanes.max(1))
-        .min_by_key(|lane| busy.iter().find(|(l, _)| *l as u32 == *lane).map(|(_, n)| *n).unwrap_or(0))
-        .unwrap_or(0)
 }
 
 /// A build's name: DNS-clean, unique, and recognizable.
@@ -626,13 +601,13 @@ pub async fn unused_images(pool: &PgPool) -> Result<Vec<String>> {
 
 /// Record an image the install did not build itself but keeps in its
 /// registry: the standard worker the install's image step made ready
-/// (`weft_compiler::build::standard_worker_hash`), under the nil project.
+/// (`weft_compiler::build::stock_binary_hash`), under the nil project.
 /// Recorded, it is reclaimed like any image once a newer weft names
 /// another standard worker. Recording it twice changes nothing.
 pub async fn note_shared(pool: &PgPool, image_ref: &str, now: i64) -> Result<()> {
     sqlx::query(
-        "INSERT INTO image_build (image_ref, project_id, tenant_id, build_name, lane, status, held_until, started_at, finished_at) \
-         VALUES ($1, $2, '', 'shared', NULL, 'succeeded', 0, $3, $3) ON CONFLICT (image_ref) DO NOTHING",
+        "INSERT INTO image_build (image_ref, project_id, tenant_id, build_name, status, held_until, started_at, finished_at) \
+         VALUES ($1, $2, '', 'shared', 'succeeded', 0, $3, $3) ON CONFLICT (image_ref) DO NOTHING",
     )
     .bind(image_ref)
     .bind(uuid::Uuid::nil())
@@ -688,7 +663,7 @@ pub enum Reclaim {
 /// never neither. The prune's own keep-set was read before its loop and
 /// can predate that registration, so it cannot stand in for the reference
 /// check here.
-pub async fn begin_reclaim(pool: &PgPool, image_ref: &str, now: i64) -> Result<Reclaim> {
+pub async fn begin_reclaim(pool: &PgPool, images: &dyn weft_platform_traits::ImageBuilder, image_ref: &str, now: i64) -> Result<Reclaim> {
     let scope = super::prune::ImageScope::of(image_ref)
         .with_context(|| format!("{image_ref} is not an image a prune may reclaim"))?;
     let mut tx = pool.begin().await.context("begin reclaiming an image")?;
@@ -706,7 +681,7 @@ pub async fn begin_reclaim(pool: &PgPool, image_ref: &str, now: i64) -> Result<R
     if claimed {
         return Ok(Reclaim::Claimed);
     }
-    if super::prune::keep_set(&mut tx, scope).await?.references(scope) {
+    if super::prune::keep_set(&mut tx, scope, images).await?.references(scope) {
         return Ok(Reclaim::Referenced);
     }
     Ok(Reclaim::Free(tx))
@@ -829,15 +804,6 @@ pub async fn image_uses(pool: &PgPool) -> Result<Vec<ImageUse>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_least_busy_lane_is_picked_lowest_first() {
-        assert_eq!(least_busy_lane(4, &[]), 0);
-        assert_eq!(least_busy_lane(4, &[(0, 1)]), 1);
-        assert_eq!(least_busy_lane(4, &[(0, 1), (1, 1), (2, 1), (3, 1)]), 0);
-        assert_eq!(least_busy_lane(2, &[(0, 3), (1, 1)]), 1);
-        assert_eq!(least_busy_lane(0, &[]), 0, "no lanes configured is one lane");
-    }
 
     #[test]
     fn a_build_name_is_a_dns_label() {

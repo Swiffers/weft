@@ -256,8 +256,7 @@ async fn the_lift_rebuilds_from_the_version_the_running_build_came_from(pool: Pg
         context_dir: "/tmp/ctx".into(),
         node_id: None,
         image_name: None,
-        uses: Default::default(),
-        result_file: None,
+        recipe: weft_core::builds::BuildRecipe::Dockerfile { result_file: None },
     }];
     let version = Version {
         name: "shop".into(),
@@ -276,16 +275,15 @@ async fn the_lift_rebuilds_from_the_version_the_running_build_came_from(pool: Pg
             worker_image: worker.into(),
             left_out: Vec::new(),
             worker_log: None,
+            node_needs: Default::default(),
         },
         images: vec![worker.into()],
         ask: projects.next_build_ask(id).await.unwrap(),
     };
     let fake = Arc::new(FakeImageBuilder::new());
     let builder = VersionBuilder {
-        bases: weft_compiler::worker_image::BaseImages { builder: "reg:5000/base:1".into(), runtime: "debian:bookworm-slim".into() },
         images: fake.clone(),
         pool: pool.clone(),
-        compile_lanes: 1,
         prunes: Default::default(),
         blobs: weft_dispatcher::build::blob_cache::BlobCache::in_temp_dir(),
     };

@@ -238,10 +238,16 @@ impl FireSignalSink {
         self.signals.write_kind_state(token, kind_state, from_seq).await
     }
 
+    /// The kind's durable state on signal `token`'s row and the version it
+    /// is at, `None` when no held signal goes by that token.
+    pub async fn kind_state_of(&self, token: &str) -> Result<Option<crate::kinds::RowState>> {
+        Ok(self.signals.get_held(token).await?.map(|row| crate::kinds::RowState { state: row.kind_state, seq: row.kind_state_seq }))
+    }
+
     /// Give up registration `generation` of signal `token` for good: the
     /// row says why (and lets go of its holder), and whatever runs under
-    /// the token here stops, keeping nothing of where it connects or as
-    /// whom (`crate::reach`). It stops here even when the row could not be
+    /// the token here stops, keeping none of the credentials it connected
+    /// with (`crate::reach`). It stops here even when the row could not be
     /// written, which is the error answered; a connection held here then
     /// stays this process's claim until its next look writes it
     /// (`Registry::unrecorded`), and any other signal's is its caller's to

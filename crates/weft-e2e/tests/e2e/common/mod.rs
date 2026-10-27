@@ -145,7 +145,7 @@ pub async fn run_status(disp: &Dispatcher, run_id: Uuid) -> anyhow::Result<Strin
 /// The push happens after `wait_for_subscriber` confirms a connection is reading,
 /// so a single push is delivered (not lost on a stale reader). We then wait the
 /// FULL worker-settle deadline for the run to appear, because a trigger fire
-/// cold-starts a worker (spawn + image pull + fold + run) and is legitimately
+/// cold-starts a worker (spawn + fold + run) and is legitimately
 /// slow. We do NOT re-push on a short timeout: pushing again while the first push's
 /// run is still cold-starting would start a SECOND run and make the
 /// "exactly one new run" contract fail. A second push is attempted ONLY after

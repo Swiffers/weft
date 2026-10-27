@@ -39,6 +39,7 @@
 //!     consulted for entry-mode (`is_resume = false`).
 
 pub mod event_source;
+pub mod folder_watch;
 pub mod sse_subscribe;
 pub mod poll_endpoint;
 pub mod provider_events;
@@ -61,7 +62,7 @@ use parking_lot::Mutex;
 
 use crate::config::ListenerConfig;
 use crate::event_context::FireContext;
-use weft_core::signal::listener_protocol::{MatchedPush, ProcessOutcome, ProcessTarget, PushEvent, StartMode};
+use weft_core::signal::listener_protocol::{MatchedPush, PriorRow, ProcessOutcome, ProcessTarget, PushEvent, StartMode};
 use crate::registry::{RegisteredSignal, ServingState, TaskGuard, Transport};
 
 /// Everything a kind's work on one signal runs with, bundled: the
@@ -85,7 +86,7 @@ pub struct SpawnCtx {
     /// Told each time the serving state changes, so a holder says it
     /// (`crate::hold`): the row is where another process reads it.
     pub said: Arc<tokio::sync::Notify>,
-    /// Where this process connects and as whom, as the broker last said.
+    /// The credentials this process connects with, as the broker last said.
     pub reach: Arc<crate::reach::Reach>,
 }
 
@@ -138,13 +139,20 @@ pub struct Woken {
     /// When it arrived, or its moment when it arrived a little before it
     /// (within what counts as on time).
     pub now_ms: i64,
-    /// The signal's durable state as read just now, and the write-fence
-    /// version it is at.
-    pub state: Value,
-    pub seq: i64,
+    /// The signal's durable state as read just now.
+    pub stored: RowState,
     /// True when the signal is a parked run's wait (`await_signal`)
     /// rather than an entry trigger, read off the row like the state.
     pub is_resume: bool,
+}
+
+/// A signal's durable state as its row holds it, and the write-fence
+/// version it is at: whoever acts on it writes the next version from
+/// `seq` ([`FireContext::claim_kind_state`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowState {
+    pub state: Value,
+    pub seq: i64,
 }
 
 /// What a wake leaves: the state the signal now stands at, and the row
@@ -209,7 +217,7 @@ pub trait KindHandler: Send + Sync {
 
     /// For a `Wakes` kind: handle one wake. A wake may arrive late,
     /// twice, or after the thing it was set for changed, so the kind
-    /// recomputes from `woken.state` whether anything is due, CLAIMS the
+    /// recomputes from `woken.stored` whether anything is due, CLAIMS the
     /// moment through [`FireContext::claim_kind_state`] before acting (so
     /// of two copies woken for it, one acts), fires through `ctx.fire`,
     /// and answers the state it now stands at (for its next wake), or
@@ -247,41 +255,44 @@ pub trait KindHandler: Send + Sync {
         false
     }
 
-    /// Compute the initial opaque state to persist on the signal row
-    /// at register time. Default: empty object. Kinds that need to
-    /// survive a listener restart return values keyed by their own
-    /// schema (Timer: `{"next_fire_at_unix_ms": <abs unix>}` for After,
-    /// `{}` for Cron/At since those are wall-clock-absolute).
+    /// The state a new signal's row starts from when nothing is carried
+    /// over ([`prepare_signal`] decides that). Default: an empty object. A
+    /// kind that keeps something across a listener restart keys it its
+    /// own way (Timer: the next moment it fires, `{"next_fire_at_unix_ms":
+    /// <unix ms>}`, or `{}` once nothing is left to fire).
     ///
-    /// **Persistence policy**: what this returns replaces the stored
-    /// state, and moves the row to a new version, only while the row is
-    /// still at the version `prior` was read at (`signal_insert` is a
-    /// compare-and-set). A wake that claimed a moment in between moved
-    /// the version, so the dispatcher reads the row again and asks
-    /// again; a wake claiming after the registration finds the version
-    /// moved and loses. Either way the registration's state is computed
-    /// from the state it replaces.
-    ///
-    /// `prior` is the previously-persisted state when the reused entry
-    /// token already has a row (None on first registration). Timer
-    /// IGNORES it
-    /// (reactivate is a fresh schedule by design); a kind whose state
-    /// is a feed cursor (poll_endpoint) returns it forward so a
-    /// deactivate/activate cycle never re-primes and silently
-    /// discards what arrived in between.
+    /// What a registration computes replaces the stored state, and moves
+    /// the row to a new version, only while the row is still at the
+    /// version it was read at (`signal_insert` is a compare-and-set). A
+    /// wake that claimed a moment in between moved the version, so the
+    /// dispatcher reads the row again and asks again; a wake claiming
+    /// after the registration finds the version moved and loses.
     ///
     /// `asked_at_unix_ms` is when the registration was asked for (the
     /// node's `await_signal`, or the activation), for a kind whose state
     /// counts from that moment. `is_resume` says which of the two it is,
     /// for a kind that behaves differently while a run waits on it.
-    fn compute_initial_state(
-        &self,
-        _spec: &SignalSpec,
-        _prior: Option<&Value>,
-        _asked_at_unix_ms: i64,
-        _is_resume: bool,
-    ) -> Result<Value> {
+    fn compute_initial_state(&self, _spec: &SignalSpec, _asked_at_unix_ms: i64, _is_resume: bool) -> Result<Value> {
         Ok(Value::Object(serde_json::Map::new()))
+    }
+
+    /// For a kind that keeps its place in what it reads (a feed's cursor,
+    /// what a folder held): what identifies that source in `spec`, so a
+    /// registration again can tell whether it reads the same one. `None`,
+    /// the default, for a kind with no place to keep. A kind with a source
+    /// keeps nothing [`Self::settle`] decides in its state: a door that
+    /// refuses gives it [`Self::compute_initial_state`]'s state, without
+    /// settling again ([`fresh_place`]).
+    fn source(&self, _spec: &SignalSpec) -> Result<Option<Value>> {
+        Ok(None)
+    }
+
+    /// For a kind with a [`Self::source`]: the state a registration again
+    /// starts from when [`prepare_signal`] carries over `prior`, the state
+    /// of the row it replaces. It keeps the place and nothing else (no
+    /// failure count, nothing about how the last registration was served).
+    fn carry(&self, _spec: &SignalSpec, _prior: &Value) -> Result<Value> {
+        anyhow::bail!("the '{}' kind names a source it reads from but says nothing of what it carries over", self.tag())
     }
 
     /// Refuse a spec this kind cannot serve as a parked run's wait
@@ -297,12 +308,13 @@ pub trait KindHandler: Send + Sync {
     /// an unserviceable one) so the start surfaces a 400 and activation
     /// fails loudly instead of minting a dead trigger.
     ///
-    /// `kind_state` is the opaque blob persisted on the row at
-    /// register time (or read back from the row on restore).
+    /// `stored` is the kind's state as the row holds it (written at
+    /// register time, or by the task itself since), and the write-fence
+    /// version it is at.
     async fn spawn_task(
         &self,
         _spec: &SignalSpec,
-        _kind_state: &Value,
+        _stored: RowState,
         _ctx: SpawnCtx,
     ) -> Result<Option<JoinHandle<()>>> {
         Ok(None)
@@ -458,15 +470,14 @@ pub struct Prepared {
 /// dispatcher has committed the row, so whatever it starts (a wake, a
 /// held connection) always finds its row.
 ///
-/// `prior_kind_state` is the state the row already holds when the token
-/// is reused (an entry across reactivates), so a kind whose state is a
-/// feed cursor carries it forward instead of re-priming.
-/// `asked_at_unix_ms` is when the registration was asked for.
+/// `prior` is the row already under the token, when there is one; what
+/// it carries over is decided by [`carried`], the same way for every
+/// kind. `asked_at_unix_ms` is when the registration was asked for.
 pub async fn prepare_signal(
     state: &crate::ListenerState,
     identity: SignalIdentity,
     for_instance: Option<weft_core::instance::InstanceScope>,
-    prior_kind_state: Option<&Value>,
+    prior: Option<&PriorRow>,
     asked_at_unix_ms: i64,
 ) -> Result<Prepared> {
     let SignalIdentity { token, tenant_id, node_id, is_resume, run_id, spec } = identity;
@@ -495,7 +506,10 @@ pub async fn prepare_signal(
         );
     }
     let routing = handler.compute_routing(&spec)?;
-    let computed = handler.compute_initial_state(&spec, prior_kind_state, asked_at_unix_ms, is_resume)?;
+    let computed = match carried(handler, &spec, is_resume, prior)? {
+        Some(prior) => handler.carry(&spec, prior)?,
+        None => handler.compute_initial_state(&spec, asked_at_unix_ms, is_resume)?,
+    };
     // Settling may look at the signal's connection, through the broker,
     // as the signal itself would once up; its slot shows nothing, and it
     // has no registration yet to give up on, nor to keep what it fetched for.
@@ -516,6 +530,43 @@ pub async fn prepare_signal(
     };
     let rendered = handler.render(&token, &signal)?;
     Ok(Prepared { routing, kind_state, rendered, holds })
+}
+
+/// The state of the replaced row `prior` a registration of `spec` carries
+/// over, decided once here for every kind: only an entry's (a run's wait
+/// starts afresh), only when its trigger listened the whole time the row
+/// was not served ([`PriorRow::listened`]), and only for a kind that keeps
+/// its place in a source ([`KindHandler::source`]) when the source is the
+/// one the row read. So what arrived while the trigger listened is caught
+/// up from where it left off, what arrived behind a door that refused
+/// never is, and a trigger pointed at another feed or folder starts there
+/// fresh. `None`: the kind starts fresh ([`KindHandler::compute_initial_state`]).
+fn carried<'a>(handler: &dyn KindHandler, spec: &SignalSpec, is_resume: bool, prior: Option<&'a PriorRow>) -> Result<Option<&'a Value>> {
+    let Some(prior) = prior.filter(|prior| !is_resume && prior.listened && prior.spec.kind == spec.kind) else {
+        return Ok(None);
+    };
+    let Some(source) = handler.source(spec)? else {
+        return Ok(None);
+    };
+    let before = handler.source(&prior.spec).map_err(|e| e.context("reading the source of the row this registration replaces"))?;
+    Ok((before.as_ref() == Some(&source)).then_some(&prior.kind_state))
+}
+
+/// The state an entry signal of `spec` starts from once its place in what
+/// it reads is gone, at `now_unix_ms`: a trigger that stops listening
+/// behind a door that refuses loses it there, so whatever brings the
+/// signal up later starts from its source as it finds it. Only for a kind
+/// that keeps such a place ([`KindHandler::source`]); `None` for any other
+/// kind, whose state stays as it is (a timer keeps its schedule). It is
+/// the state a fresh registration computes
+/// ([`KindHandler::compute_initial_state`]), unsettled (see
+/// [`KindHandler::source`]).
+pub fn fresh_place(spec: &SignalSpec, now_unix_ms: i64) -> Result<Option<Value>> {
+    let handler = handler_or_err(&spec.kind)?;
+    if handler.source(spec)?.is_none() {
+        return Ok(None);
+    }
+    handler.compute_initial_state(spec, now_unix_ms, false).map(Some)
 }
 
 /// Bring a row up: a signal that holds a connection gets its task started
@@ -555,7 +606,6 @@ pub async fn bring_up(state: &crate::ListenerState, row: weft_broker_client::pro
                 generation: Some(row.generation),
                 set_again: 0,
                 row: None,
-                addresses: Default::default(),
                 ended: false,
             };
             match wake(state, woken).await? {
@@ -577,7 +627,8 @@ pub async fn bring_up(state: &crate::ListenerState, row: weft_broker_client::pro
             // lost the row (to another holder, or to a registration that no
             // longer holds) delivers nothing from then on.
             ctx.fire = ctx.fire.held_by(state.config.replica.clone());
-            let Some(task) = handler.spawn_task(&spec, &row.kind_state, ctx).await? else {
+            let stored = RowState { state: row.kind_state.clone(), seq: row.kind_state_seq };
+            let Some(task) = handler.spawn_task(&spec, stored, ctx).await? else {
                 anyhow::bail!(
                     "the '{}' kind holds a connection but started no task; its `between_fires` \
                      and its `spawn_task` disagree",
@@ -716,8 +767,8 @@ impl std::fmt::Display for UnregisterError {
 }
 
 /// Stop holding `token`: drop its registry entry (which aborts its task),
-/// stop counting it down or given up here, drop what the process keeps of
-/// where it connects and as whom (`crate::reach`), and have its kind tear down
+/// stop counting it down or given up here, drop the credentials the process
+/// keeps for it (`crate::reach`), and have its kind tear down
 /// what it holds outside this process (a provider-side subscription),
 /// detached and loud in logs on failure. Its wakes are its caller's to
 /// cancel ([`unregister`]). Answers the teardown's task, for a caller
@@ -851,10 +902,6 @@ pub struct WakeBody {
     /// reads nothing, and writes only what changed for good.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row: Option<weft_broker_client::protocol::SignalRowWire>,
-    /// With the row, where the signal's addresses are, as the broker said
-    /// (`crate::reach`), by the address given.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub addresses: std::collections::BTreeMap<String, weft_broker_client::protocol::ListenerInfraAddress>,
     /// Set by [`cancel_wakes`] under the name of a wake it cancelled, so a
     /// wake of the same registration being handled right now finds the name
     /// taken when it sets its next one there, and its chain ends. It does
@@ -906,11 +953,10 @@ pub async fn arm_next_wake(
         generation: Some(row.generation),
         set_again: 0,
         row: None,
-        addresses: Default::default(),
         ended: false,
     };
     if handler.wakes_from_body() && row_is_written {
-        let carried = WakeBody { row: Some(row.clone()), addresses: state.reach.addresses_of(&row.token), ..body.clone() };
+        let carried = WakeBody { row: Some(row.clone()), ..body.clone() };
         if serde_json::to_vec(&carried)?.len() <= state.alarm.largest_body() {
             body = carried;
         }
@@ -948,7 +994,6 @@ pub async fn cancel_wakes(state: &crate::ListenerState, token: &str, generation:
             generation: Some(generation),
             set_again: 0,
             row: None,
-            addresses: Default::default(),
             ended: true,
         };
         let wake = signal_wake(token, generation, 0, at, serde_json::to_value(ended)?);
@@ -1116,7 +1161,7 @@ pub async fn wake(state: &crate::ListenerState, body: WakeBody) -> Result<Option
     // Set again, it is one that reads its row at its moment: a cancel
     // names only the wakes the row's state names.
     let again = || {
-        let again = WakeBody { set_again: body.set_again + 1, row: None, addresses: Default::default(), ..body.clone() };
+        let again = WakeBody { set_again: body.set_again + 1, row: None, ..body.clone() };
         Ok(signal_wake(&again.token, again.generation.unwrap_or(0), again.set_again, aimed_at_ms, serde_json::to_value(&again)?))
     };
     if let Some(set) = weft_platform_traits::alarm::set_again_if_early(&*state.alarm, aimed_at_ms, again).await {
@@ -1126,9 +1171,6 @@ pub async fn wake(state: &crate::ListenerState, body: WakeBody) -> Result<Option
     // A wake inside the tolerance counts as arriving at its moment, so the
     // next moment its kind picks is after this one.
     let now_ms = now_unix_ms().max(aimed_at_ms);
-    for (authority, answer) in body.addresses {
-        state.reach.keep_address(&body.token, &authority, answer);
-    }
     let row = match body.row {
         Some(row) => row,
         None => match state.signals.get_held(&body.token).await? {
@@ -1161,7 +1203,7 @@ pub async fn wake(state: &crate::ListenerState, body: WakeBody) -> Result<Option
     // `bring_up`), so its serving slot lives for this one wake.
     let serving = Arc::new(Mutex::new(ServingState::default()));
     let ctx = spawn_ctx(state, &row.token, row.generation, &row.tenant_id, row.for_instance.clone(), &spec, false, serving);
-    let woken = Woken { aimed_at_ms, now_ms, state: row.kind_state.clone(), seq: row.kind_state_seq, is_resume: row.is_resume };
+    let woken = Woken { aimed_at_ms, now_ms, stored: RowState { state: row.kind_state.clone(), seq: row.kind_state_seq }, is_resume: row.is_resume };
     let after = match handler.on_wake(&spec, woken, ctx).await {
         Ok(Some(after)) => after,
         Ok(None) => return Ok(None),
@@ -1350,7 +1392,7 @@ pub fn last_answer(sig: &RegisteredSignal) -> Option<weft_core::signal::listener
 
 /// Send the last call of a wait whose run was cancelled
 /// (`weft_core::signal::cancel_call`), once, as the wait's connection, to
-/// the address the listener reaches it at (an infra endpoint's included).
+/// the address it names.
 /// The wait's row is gone: everything comes with the request, and nothing
 /// fetched for it is kept past the call. An error says why the call did
 /// not go through, a refusal naming the status and what the service said.
@@ -1375,12 +1417,12 @@ async fn send_cancel_call(
     use anyhow::Context;
     use weft_core::signal::CancelMethod;
     let (client, _) = crate::listener_access::client_for(access, ctx).await?;
-    let url = crate::infra_address::for_listener(&call.url, ctx).await?;
+    let url = call.url.as_str();
     let request = match call.method {
-        CancelMethod::Post => client.post(&url),
-        CancelMethod::Put => client.put(&url),
-        CancelMethod::Patch => client.patch(&url),
-        CancelMethod::Delete => client.delete(&url),
+        CancelMethod::Post => client.post(url),
+        CancelMethod::Put => client.put(url),
+        CancelMethod::Patch => client.patch(url),
+        CancelMethod::Delete => client.delete(url),
     };
     let request = match &call.body {
         Some(body) => request.json(body),
@@ -1627,6 +1669,23 @@ mod tests {
             "every signal kind weft-core ships needs a handler here, and a handler here \
              needs a kind in core; whichever side is longer is the side that moved"
         );
+    }
+
+    /// A door that refuses takes a poll's cursor and a folder watch's
+    /// snapshot (each then primes silently on its first look), and leaves a
+    /// timer's schedule alone.
+    #[test]
+    fn a_place_in_a_source_goes_and_a_schedule_stays() {
+        use weft_core::signal::{to_spec, PollEndpoint, Timer, TimerSpec};
+        let poll: PollEndpoint = serde_json::from_value(serde_json::json!({
+            "url": "https://feed.test/items", "interval_secs": 60, "delta": { "items": "items", "cursor_field": "id" }
+        }))
+        .unwrap();
+        assert_eq!(fresh_place(&to_spec(poll), 1_000).unwrap(), Some(serde_json::json!({})), "a poll starts unprimed");
+        let watch: weft_core::signal::FolderWatch = serde_json::from_value(serde_json::json!({ "folder": "/srv/inbox" })).unwrap();
+        assert_eq!(fresh_place(&to_spec(watch), 1_000).unwrap(), Some(serde_json::json!({})), "a folder watch has seen nothing");
+        let timer = to_spec(Timer { spec: TimerSpec::After { duration_ms: 60_000 } });
+        assert_eq!(fresh_place(&timer, 1_000).unwrap(), None, "a timer has no place in a source");
     }
 
     // ----- What a trigger shows -------------------------------------

@@ -102,9 +102,12 @@ async function httpError(method: string, path: string, res: Response): Promise<H
 // Tracked separately from this slice; each new endpoint should
 // still go through this client for the moment.
 export class DispatcherClient {
-  /// The operator key a request to a remote install carries; the local
-  /// install needs none.
+  /// The operator key every request carries: the local install's own, or
+  /// this person's for a target.
   private operatorKey: string | undefined;
+  /// Whether the install is a target of the project rather than this
+  /// machine's own.
+  private remote = false;
   /// Where requests go, or `null` while there is no address to go to (a
   /// named install never started); then every request fails with
   /// `unavailable`, and the extension stays up until an address appears.
@@ -116,13 +119,15 @@ export class DispatcherClient {
   private readonly installListeners: Array<() => void> = [];
 
   /// Point every request, and every stream, at another install: the
-  /// local one (no key) or a target of the project with its operator
-  /// key. Streams reconnect there through `onInstallChange`.
-  setInstall(url: string, operatorKey: string | undefined, unreachableHint?: string) {
-    this.unreachableHint = unreachableHint;
-    if (url === this.baseUrl && operatorKey === this.operatorKey) return;
-    this.baseUrl = url;
-    this.operatorKey = operatorKey;
+  /// local one or a target of the project (`remote`), with the operator
+  /// key its requests carry. Streams reconnect there through
+  /// `onInstallChange`.
+  setInstall(install: { url: string; operatorKey: string | undefined; remote: boolean; unreachableHint?: string }) {
+    this.unreachableHint = install.unreachableHint;
+    if (install.url === this.baseUrl && install.operatorKey === this.operatorKey && install.remote === this.remote) return;
+    this.baseUrl = install.url;
+    this.operatorKey = install.operatorKey;
+    this.remote = install.remote;
     for (const listener of this.installListeners) listener();
   }
 
@@ -133,6 +138,7 @@ export class DispatcherClient {
     if (this.baseUrl === null) return;
     this.baseUrl = null;
     this.operatorKey = undefined;
+    this.remote = false;
     for (const listener of this.installListeners) listener();
   }
 
@@ -170,10 +176,10 @@ export class DispatcherClient {
     return this.baseUrl;
   }
 
-  /// A remote install is one reached with an operator key (a cloud
-  /// install); the local one is reached without.
+  /// Whether the install is a target of the project (a cloud install)
+  /// rather than this machine's own.
   isRemote(): boolean {
-    return this.operatorKey !== undefined;
+    return this.remote;
   }
 
   async get<T>(path: string, signal?: AbortSignal): Promise<T> {

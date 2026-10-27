@@ -112,6 +112,8 @@ pub struct EngineClients {
     pub door_broker: Arc<dyn crate::door::DoorBroker>,
     /// What the worker holds for its runs to share (`weft_core::shared`).
     pub shared: Arc<weft_core::shared::Shared>,
+    /// Where the worker gets what its nodes need ([`ProcessSettings::needs_from`]).
+    pub needs_from: weft_core::needs::NeedsFrom,
 }
 
 /// How this worker process runs, read from its environment
@@ -122,18 +124,25 @@ pub struct ProcessSettings {
     /// How long a thing its runs share (`ctx.shared`) stays once nothing
     /// uses it: the project's `shared_idle_seconds` worker lever.
     pub shared_idle: std::time::Duration,
+    /// Where this worker gets what its nodes need, which a need a node
+    /// finds missing is met by (`weft_core::needs::NeedsFrom`).
+    pub needs_from: weft_core::needs::NeedsFrom,
 }
 
 impl ProcessSettings {
-    /// The writer's settings (`WriterSettings::from_env`) and the shared
-    /// idle window, which every platform sets
-    /// (`weft_platform_traits::SHARED_IDLE_ENV`): a worker started
-    /// without it was started wrong, and says so.
+    /// The writer's settings (`WriterSettings::from_env`), the shared idle
+    /// window and where the worker's needs come from, which every
+    /// platform sets (`weft_platform_traits::SHARED_IDLE_ENV`,
+    /// `weft_core::needs::NEEDS_FROM_ENV`): a worker started without them
+    /// was started wrong, and says so.
     pub fn from_env() -> anyhow::Result<Self> {
         let env = weft_platform_traits::SHARED_IDLE_ENV;
         let raw = std::env::var(env).map_err(|_| anyhow::anyhow!("{env} is not set; the platform that started this worker sets it from the project's shared_idle_seconds"))?;
         let seconds: u64 = raw.trim().parse().map_err(|e| anyhow::anyhow!("{env} is not a whole number of seconds: {e}"))?;
-        Ok(Self { writer: crate::journal_writer::WriterSettings::from_env()?, shared_idle: std::time::Duration::from_secs(seconds) })
+        let env = weft_core::needs::NEEDS_FROM_ENV;
+        let raw = std::env::var(env).map_err(|_| anyhow::anyhow!("{env} is not set; the platform that started this worker sets it"))?;
+        let needs_from = weft_core::needs::NeedsFrom::from_env_value(&raw).map_err(anyhow::Error::msg)?;
+        Ok(Self { writer: crate::journal_writer::WriterSettings::from_env()?, shared_idle: std::time::Duration::from_secs(seconds), needs_from })
     }
 }
 
@@ -275,6 +284,7 @@ impl EngineClients {
                 project_id,
             ),
             writer,
+            needs_from: settings.needs_from,
         })
     }
 }
@@ -2698,7 +2708,7 @@ impl ContextHandle for RunnerHandle {
         declared_size: u64,
         range: Option<weft_core::storage::ByteRange>,
     ) -> WeftResult<(weft_core::storage::StoredFileMeta, weft_core::storage::ByteStream)> {
-        // Fetch the external URL directly (worker-side, isolated). A byte range
+        // Fetch the external URL directly, from the worker. A byte range
         // is passed through as a Range header so a piecewise read never buffers
         // the whole resource; a server that ignores Range simply returns the
         // full body (the caller's range logic still slices correctly).

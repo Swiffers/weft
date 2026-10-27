@@ -314,6 +314,8 @@ pub async fn run(state: &DispatcherState, actor: &Actor, id: uuid::Uuid, body: &
     // for the bar's unaimed button), the way it leaves the trigger facts
     // to `require_trigger_infra`.
     crate::api::project::require_run_infra(state, id, &authored.program, spec.instance.as_ref()).await?;
+    // What the nodes this run reaches need from the machine.
+    crate::needs::refuse_unmet(state, id, &authored.program).await?;
     let settings = spec.settings.over(kept_by_trigger).map_err(|why| refused(&weft_core::run_spec::Refusal::error(why)))?;
 
     // What the run reuses, and what it runs.

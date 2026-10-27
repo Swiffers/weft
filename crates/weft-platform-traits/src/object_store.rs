@@ -68,26 +68,22 @@ fn copy_source(bucket: &str, key: &str) -> String {
     format!("{bucket}/{}", encode_key(key))
 }
 
-/// Which network the presigned URL will be used FROM. A signature is bound to
-/// the host in the URL, so the store must sign for the host the caller can reach.
-/// The audiences differ only when the bucket sits behind a split-horizon setup
-/// (a browser reaches it at a public host; an internal worker reaches it at the
-/// internal host); a local install's SeaweedFS is exactly that case. A store
-/// every caller reaches at one address (Cloud Storage) signs the same URL for
-/// all of them.
+/// Where the presigned URL will be used FROM. A signature is bound to the
+/// host in the URL, so the store must sign for the host the caller can
+/// reach. A store with a public endpoint beside the one weft does its I/O
+/// on (`objectStore.publicEndpoint`) signs a person's link for the public
+/// one; a store every caller reaches at one address (Cloud Storage) signs
+/// the same URL for all of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PresignAudience {
     /// A person's own machine (the CLI, the editor, a browser beside the
     /// install): sign for the public endpoint (`objectStore.publicEndpoint`).
     External,
-    /// A project's worker running node code: sign for the endpoint workers
-    /// reach the store at (`objectStore.workerEndpoint`), or the runtime's
-    /// own I/O endpoint when they reach it at the same address.
-    Internal,
-    /// weft's own runtime reading for itself (the dispatcher reading a
-    /// version's file, the broker hashing an upload): sign for the endpoint
-    /// the runtime does its own I/O on.
-    Runtime,
+    /// The install itself: weft's own runtime reading for itself (the
+    /// dispatcher reading a version's file, the broker hashing an upload)
+    /// or a project's worker running node code. Sign for the endpoint the
+    /// runtime does its own I/O on, which the workers reach it at too.
+    Install,
     /// Somebody who reaches the store through the install's forwarder
     /// ([`FILES_DOOR`]) at `base` (`https://<tunnel>`, or a site that passes
     /// `/weft/...` on: `https://shop.example/weft`): sign for `base`'s host,
@@ -359,16 +355,17 @@ pub struct ObjectStoreConfig {
     /// presign against `endpoint_url` directly. For local dev / e2e this is the
     /// host-forwarded SeaweedFS address.
     pub public_endpoint_url: Option<String>,
-    /// The endpoint a project's worker reaches the store at, when it
-    /// differs from `endpoint_url` (a local worker is a container, and the
-    /// runtime a process on the machine: `127.0.0.1` means a different
-    /// place to each).
-    pub worker_endpoint_url: Option<String>,
 }
+
+/// The environment variables the object store's key pair reaches the
+/// runtime by.
+// SYNC: the object store's key names <-> scripts/run-e2e.sh (reads both from the install's secrets.env)
+pub const OBJECT_STORE_ACCESS_KEY_ENV: &str = "WEFT_OBJECT_STORE_ACCESS_KEY";
+pub const OBJECT_STORE_SECRET_KEY_ENV: &str = "WEFT_OBJECT_STORE_SECRET_KEY";
 
 impl ObjectStoreConfig {
     /// The store the install config names, with its credentials read from
-    /// `WEFT_OBJECT_STORE_ACCESS_KEY` and `WEFT_OBJECT_STORE_SECRET_KEY`
+    /// [`OBJECT_STORE_ACCESS_KEY_ENV`] and [`OBJECT_STORE_SECRET_KEY_ENV`]
     /// (secrets reach the process through its environment). Missing
     /// credentials are an error naming them: object storage is a hard
     /// dependency, never a silent default.
@@ -383,11 +380,10 @@ impl ObjectStoreConfig {
             endpoint_url: settings.endpoint.clone(),
             bucket: settings.bucket.clone(),
             region: settings.region.clone(),
-            access_key_id: secret("WEFT_OBJECT_STORE_ACCESS_KEY")?,
-            secret_access_key: secret("WEFT_OBJECT_STORE_SECRET_KEY")?,
+            access_key_id: secret(OBJECT_STORE_ACCESS_KEY_ENV)?,
+            secret_access_key: secret(OBJECT_STORE_SECRET_KEY_ENV)?,
             force_path_style: settings.force_path_style,
             public_endpoint_url: settings.public_endpoint.clone(),
-            worker_endpoint_url: settings.worker_endpoint.clone(),
         })
     }
 }
@@ -410,10 +406,6 @@ pub struct S3ObjectStore {
     /// endpoint (the endpoint is already public): presign against the main
     /// `client`.
     presign_client: Option<aws_sdk_s3::Client>,
-    /// A client whose endpoint is the one workers reach the store at, used
-    /// ONLY to presign for them. `None` when workers reach it at the I/O
-    /// endpoint.
-    worker_client: Option<aws_sdk_s3::Client>,
     bucket: String,
 }
 
@@ -486,11 +478,6 @@ impl S3ObjectStore {
                 .as_ref()
                 .filter(|p| p.as_str() != cfg.endpoint_url)
                 .map(|p| client_for(p)),
-            worker_client: cfg
-                .worker_endpoint_url
-                .as_ref()
-                .filter(|p| p.as_str() != cfg.endpoint_url)
-                .map(|p| client_for(p)),
             bucket: cfg.bucket.clone(),
         }
     }
@@ -545,15 +532,12 @@ impl S3ObjectStore {
     ///   - External (a person's machine): the public-endpoint client when
     ///     one is configured, else the I/O client (a bucket whose endpoint is
     ///     already publicly reachable).
-    ///   - Internal (a project's worker): the worker-endpoint client when
-    ///     one is configured, else the I/O client.
-    ///   - Runtime: the I/O client.
+    ///   - Install (weft's runtime, a project's worker): the I/O client.
     ///   - Forwarded: the I/O client, signed for the base's origin.
     fn signer(&self, audience: &PresignAudience) -> Result<(&aws_sdk_s3::Client, Option<String>)> {
         Ok(match audience {
             PresignAudience::External => (self.presign_client.as_ref().unwrap_or(&self.client), None),
-            PresignAudience::Internal => (self.worker_client.as_ref().unwrap_or(&self.client), None),
-            PresignAudience::Runtime => (&self.client, None),
+            PresignAudience::Install => (&self.client, None),
             PresignAudience::Forwarded { base } => (&self.client, Some(base_origin(base)?)),
         })
     }
@@ -1151,8 +1135,7 @@ pub mod fake {
     fn fake_origin(audience: &PresignAudience) -> String {
         match audience {
             PresignAudience::External => "fake-object-store://external".into(),
-            PresignAudience::Internal => "fake-object-store://internal".into(),
-            PresignAudience::Runtime => "fake-object-store://runtime".into(),
+            PresignAudience::Install => "fake-object-store://install".into(),
             PresignAudience::Forwarded { base } => format!("{}/{FILES_DOOR}", base.trim_end_matches('/')),
         }
     }
@@ -1371,8 +1354,9 @@ mod tests {
     use super::*;
 
     /// Each audience is signed for the endpoint that caller reaches the
-    /// store at: a browser the public one, a worker the one on its
-    /// network, and the runtime relaying a file link its own.
+    /// store at: a browser the public one, the install (its runtime and
+    /// its workers) the one the runtime does its I/O on, and a forwarded
+    /// link the forwarder's base.
     #[tokio::test]
     async fn each_audience_is_signed_for_its_own_endpoint() {
         let store = S3ObjectStore::clients(&ObjectStoreConfig {
@@ -1383,7 +1367,6 @@ mod tests {
             secret_access_key: "s".into(),
             force_path_style: true,
             public_endpoint_url: Some("https://files.example.com".into()),
-            worker_endpoint_url: Some("http://weft-object-store:8333".into()),
         })
         .await;
         let url = |audience| {
@@ -1391,8 +1374,7 @@ mod tests {
             async move { store.presign_get("a/b", &link(audience)).await.unwrap() }
         };
         assert!(url(PresignAudience::External).await.starts_with("https://files.example.com/weft/a/b?"));
-        assert!(url(PresignAudience::Internal).await.starts_with("http://weft-object-store:8333/weft/a/b?"));
-        assert!(url(PresignAudience::Runtime).await.starts_with("http://127.0.0.1:14115/weft/a/b?"));
+        assert!(url(PresignAudience::Install).await.starts_with("http://127.0.0.1:14115/weft/a/b?"));
         assert!(url(PresignAudience::Forwarded { base: "https://shop.example/weft".into() })
             .await
             .starts_with("https://shop.example/weft/files/a/b?"));
@@ -1417,7 +1399,6 @@ mod tests {
             secret_access_key: "s".into(),
             force_path_style: true,
             public_endpoint_url: Some(public.into()),
-            worker_endpoint_url: None,
         }
     }
 
@@ -1563,11 +1544,11 @@ mod tests {
         let store = FakeObjectStore::new();
         let id = store.create_multipart("k", "text/plain").await.unwrap();
         let u1 = store
-            .presign_part("k", &id, 1, 3, &PresignAudience::Internal, 600)
+            .presign_part("k", &id, 1, 3, &PresignAudience::Install, 600)
             .await
             .unwrap();
         let u2 = store
-            .presign_part("k", &id, 2, 2, &PresignAudience::Internal, 600)
+            .presign_part("k", &id, 2, 2, &PresignAudience::Install, 600)
             .await
             .unwrap();
         // Land them out of order; completion order comes from the part list.
@@ -1590,7 +1571,7 @@ mod tests {
         let store = FakeObjectStore::new();
         let id = store.create_multipart("k", "text/plain").await.unwrap();
         let url = store
-            .presign_part("k", &id, 1, 3, &PresignAudience::Internal, 600)
+            .presign_part("k", &id, 1, 3, &PresignAudience::Install, 600)
             .await
             .unwrap();
         let err = store.put_part(&url, Bytes::from_static(b"toolong")).unwrap_err();
@@ -1604,7 +1585,7 @@ mod tests {
         let store = FakeObjectStore::new();
         let id = store.create_multipart("k", "text/plain").await.unwrap();
         let url = store
-            .presign_part("k", &id, 1, 1, &PresignAudience::Internal, 600)
+            .presign_part("k", &id, 1, 1, &PresignAudience::Install, 600)
             .await
             .unwrap();
         store.put_part(&url, Bytes::from_static(b"x")).unwrap();
@@ -1620,7 +1601,7 @@ mod tests {
         let store = FakeObjectStore::new();
         let id = store.create_multipart("k", "text/plain").await.unwrap();
         let url = store
-            .presign_part("k", &id, 1, 1, &PresignAudience::Internal, 600)
+            .presign_part("k", &id, 1, 1, &PresignAudience::Install, 600)
             .await
             .unwrap();
         store.put_part(&url, Bytes::from_static(b"x")).unwrap();
@@ -1638,7 +1619,7 @@ mod tests {
         let id = store.create_multipart("k", "text/plain").await.unwrap();
         for n in [1i32, 3] {
             let url = store
-                .presign_part("k", &id, n, 2, &PresignAudience::Internal, 600)
+                .presign_part("k", &id, n, 2, &PresignAudience::Install, 600)
                 .await
                 .unwrap();
             store.put_part(&url, Bytes::from_static(b"xy")).unwrap();

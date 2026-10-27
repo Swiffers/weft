@@ -451,7 +451,7 @@ pub async fn find_folder(state: &DispatcherState, actor: &Actor, project: uuid::
 /// of wherever somebody last worked on the project; after that, the copy
 /// it already is. A local install runs on the person's machine and keeps
 /// the folder in sync from there, so it refuses a folder it could never
-/// hear changes in ([`weft_core::working_copy::unsyncable_folder`]).
+/// hear changes in ([`weft_core::working_copy::hears_no_changes`]).
 pub async fn register_folder(state: &DispatcherState, actor: &Actor, project: uuid::Uuid, request: &RegisterFolder) -> Result<WorkingState, Refused> {
     operator_only(actor, "weft.working_copies.register_folder")?;
     actor.may_act_on(state, project).await?;
@@ -459,8 +459,16 @@ pub async fn register_folder(state: &DispatcherState, actor: &Actor, project: uu
         return Err((StatusCode::BAD_REQUEST, format!("'{}' on '{}' is not a folder's absolute path on a machine", request.path, request.host)));
     }
     let local = state.install_info.cloud.is_none();
-    if let Some(why) = weft_core::working_copy::unsyncable_folder(&request.path, local && weft_core::working_copy::on_wsl()) {
-        return Err((StatusCode::BAD_REQUEST, why));
+    if weft_core::working_copy::hears_no_changes(&request.path, local && weft_core::working_copy::on_wsl()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} is on a Windows drive, and WSL tells Linux nothing of the changes made there, \
+                 so weft cannot keep this folder in sync with its working copy. Move the project into \
+                 the Linux filesystem (under ~/, for example) and run the command again from there",
+                request.path
+            ),
+        ));
     }
     validate_manifest(&request.manifest)?;
     if let Some(row) = state.working_copies.folder(project, &request.host, &request.path).await.map_err(|e| internal("working copy", e))? {

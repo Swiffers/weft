@@ -27,7 +27,7 @@ import { registerStreamingEditApi } from './streamingEdits';
 import { canonicalPath, weftPositionToVsCode } from './locations';
 import { afterTabModelSettles, isReviewDoc, textTabsForPath } from './tabs';
 import { ActionBarStore } from './actionBarState';
-import { fetchRunningSource, installAccess, listTargets, onArgs, type InstallTarget } from './installs';
+import { fetchRunningSource, installAccess, listTargets, localAccess, onArgs, type InstallTarget } from './installs';
 
 import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/projects';
 import { RunsProvider, RunNode, VersionRunNode, VersionNode, type RunSummary } from './sidebar/runs';
@@ -40,7 +40,7 @@ import { ProjectEventStream } from './projectEvents';
 import { Presence } from './presence';
 import type { ActionVerb, ActionErrorDetails, CliEvent, RunCheck, SourceLocation } from '../../packages/weft-graph/src/protocol';
 import { LOCAL_INSTALL } from '../../packages/weft-graph/src/protocol';
-import { installDir, localAddress, RETIRED_DEFAULT_URL, unreachableHint, whichCli, type WhichCli } from './localInstall';
+import { installDir, RETIRED_DEFAULT_URL, settingAddress, unreachableHint, whichCli, type WhichCli } from './localInstall';
 import {
   emptyActionAvailability,
   parseRunning,
@@ -49,19 +49,19 @@ import {
 } from '../../packages/weft-graph/src/status';
 import type { GoingRun } from '../../packages/weft-graph/src/status';
 
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
   // Which `weft` this window runs, and so which install it talks to:
   // settled before anything spawns the CLI or reads the address.
   const cli = whichCli(context.extensionMode === vscode.ExtensionMode.Development, context.extensionPath);
   chooseCli(cli);
-  if ('error' in cli) void vscode.window.showErrorMessage(`weft: ${cli.error}`);
 
   const dispatcher = new DispatcherClient();
-  // Before any provider asks it anything. With no address (a named
-  // install never started) the extension still activates: requests fail
-  // with the reason, and the ports.json watcher below points it again
-  // once the install starts.
-  pointAtLocal(dispatcher, cli);
+  // Before any provider asks it anything. With no address (no CLI, a
+  // named install never started) the extension still activates: requests
+  // fail with the reason, which is shown, and the ports.json watcher
+  // below points it again once the install starts.
+  await readLocal(cli);
+  pointAtLocal(dispatcher);
 
   // One warm `weft parse-server` for the whole extension. Both the graph
   // view (live graph) and diagnostics (Problems panel) parse/validate
@@ -376,7 +376,7 @@ export function activate(context: vscode.ExtensionContext) {
     install = { projectId, name: LOCAL_INSTALL, version: null, diskVersion: null, root: null };
     installError = null;
     stopWatchingFolder();
-    pointAtLocal(dispatcher, cli);
+    pointAtLocal(dispatcher);
   }
 
   /// The install `projectId` is looked at on: every read and verb for it
@@ -387,7 +387,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   function postInstallView(): void {
     graphView.setInstallView({
-      installs: installTargets.map((t) => ({ name: t.name, loggedIn: t.name === LOCAL_INSTALL || t.loggedIn })),
+      installs: installTargets.map((t) => ({ name: t.name, loggedIn: t.loggedIn })),
       active: pinnedProject ? installOf(pinnedProject.id) : LOCAL_INSTALL,
       version: install.version,
       diskVersion: install.diskVersion,
@@ -455,7 +455,7 @@ export function activate(context: vscode.ExtensionContext) {
         if (!stillPinned()) return;
         autoFollow.setProject(project.id);
         graphView.forgetRunVersion();
-        dispatcher.setInstall(access.url, access.operatorKey);
+        dispatcher.setInstall({ url: access.url, operatorKey: access.operatorKey, remote: true });
         install = { projectId: project.id, name, version: running.version, diskVersion: null, root: running.dir };
         await graphView.showInstall(doc, project.id, { name, root: running.dir });
         watchFolderOnRemote(project);
@@ -1699,10 +1699,12 @@ export function activate(context: vscode.ExtensionContext) {
   attachDiagnostics(context, parseServer);
 
   // Only the local install's address is a setting or a saved port; a
-  // target's is its project's.
-  const followLocalAddress = () => {
+  // target's is its project's. Asked again whichever install the window
+  // looks at, and put on the client only while that is the local one.
+  const followLocalAddress = async () => {
+    await readLocal(cli);
     if (pinnedProject && installOf(pinnedProject.id) !== LOCAL_INSTALL) return;
-    pointAtLocal(dispatcher, cli);
+    pointAtLocal(dispatcher);
   };
 
   context.subscriptions.push(
@@ -1711,7 +1713,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.workspace.onDidChangeConfiguration((e) => {
       // Only the local install's address is a setting; a target's is
       // its project's.
-      if (e.affectsConfiguration('weft.dispatcherUrl')) followLocalAddress();
+      if (e.affectsConfiguration('weft.dispatcherUrl')) void followLocalAddress();
     }),
   );
   // A `weft daemon start` on another port while VS Code is open moves
@@ -1721,8 +1723,8 @@ export function activate(context: vscode.ExtensionContext) {
     const watcher = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(vscode.Uri.file(installDir(cli.env)), 'ports.json'),
     );
-    watcher.onDidCreate(followLocalAddress);
-    watcher.onDidChange(followLocalAddress);
+    watcher.onDidCreate(() => void followLocalAddress());
+    watcher.onDidChange(() => void followLocalAddress());
     context.subscriptions.push(watcher);
   }
 
@@ -1737,25 +1739,45 @@ let retiredSettingNoticed = false;
 // The last "no local address" reason shown, so the same one is shown once.
 let lastUnavailableShown: string | undefined;
 
-// Point `dispatcher` at the local install: the setting when somebody set
-// it, else the port the install saved. The setting has no default in
-// package.json so that an unset one reads as undefined here. With no
-// address, the client is left unavailable with the reason and the
-// person is told, never pointed somewhere else. The install is the one
-// this window's `weft` acts on (`cli.env`); with no CLI there is none.
-function pointAtLocal(dispatcher: DispatcherClient, cli: WhichCli): void {
+/// The local install as the CLI last answered (`localAccess`): where it
+/// answers, the key a request there carries and where that address came
+/// from, or why there is none.
+type LocalAnswer = { url: string; operatorKey: string | undefined; unreachableHint: string } | { error: string };
+
+let localAnswer: LocalAnswer = { error: 'weft: no install to talk to yet' };
+// How many times the local install was asked about, so an answer that
+// arrives after a later question's is dropped.
+let localAsked = 0;
+
+// Ask the CLI where the local install answers: the setting when somebody
+// set it, else the port the install saved. The setting has no default in
+// package.json so that an unset one reads as undefined here. The install
+// is the one this window's `weft` acts on (`cli.env`); with no CLI there
+// is none.
+async function readLocal(cli: WhichCli): Promise<void> {
+  const asked = ++localAsked;
   if ('error' in cli) {
-    dispatcher.setUnavailable(`weft: ${cli.error}`);
+    localAnswer = { error: `weft: ${cli.error}` };
     return;
   }
   const setting = vscode.workspace.getConfiguration('weft').get<string>('dispatcherUrl');
-  const address = localAddress(setting, cli.env);
-  if (address.ignoredSetting && !retiredSettingNoticed) {
+  if (setting === RETIRED_DEFAULT_URL && !retiredSettingNoticed) {
     retiredSettingNoticed = true;
     void noticeRetiredSetting();
   }
-  if ('error' in address) {
-    const reason = `weft: ${address.error}`;
+  const access = await localAccess(settingAddress(setting), cli.env);
+  if (asked !== localAsked) return;
+  localAnswer = 'error' in access
+    ? { error: `weft: ${access.error}` }
+    : { url: access.url, operatorKey: access.operatorKey ?? undefined, unreachableHint: unreachableHint(setting, cli.env) };
+}
+
+// Point `dispatcher` at the local install, as last read (`readLocal`).
+// With no address, the client is left unavailable with the reason and
+// the person is told, never pointed somewhere else.
+function pointAtLocal(dispatcher: DispatcherClient): void {
+  if ('error' in localAnswer) {
+    const reason = localAnswer.error;
     dispatcher.setUnavailable(reason);
     // Said once per reason: switching back to local again with the same
     // missing address must not pop the same error each time.
@@ -1766,7 +1788,7 @@ function pointAtLocal(dispatcher: DispatcherClient, cli: WhichCli): void {
     return;
   }
   lastUnavailableShown = undefined;
-  dispatcher.setInstall(address.url, undefined, unreachableHint(setting, cli.env));
+  dispatcher.setInstall({ ...localAnswer, remote: false });
 }
 
 // The setting holds the old default, which no install answers on: it is

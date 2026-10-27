@@ -808,7 +808,6 @@ impl InfraHost for ComputeInfraHost {
         match &ep.target {
             EndpointTarget::External { url } => Ok(EndpointAt {
                 url: url.clone(),
-                install_url: url.clone(),
                 same_network: matches!(ep.expose, Expose::SameNetwork)
                     .then(|| url.split_once("://").map_or(url.as_str(), |(_, r)| r).split('/').next().unwrap_or_default().to_string()),
             }),
@@ -826,7 +825,6 @@ impl InfraHost for ComputeInfraHost {
                 let ip = internal_ip(&machine).ok_or_else(|| anyhow::anyhow!("the machine of '{unit}' has no address yet"))?;
                 Ok(EndpointAt {
                     url: format!("http://{ip}:{number}"),
-                    install_url: format!("http://{ip}:{number}"),
                     same_network: matches!(ep.expose, Expose::SameNetwork).then(|| format!("{ip}:{number}")),
                 })
             }

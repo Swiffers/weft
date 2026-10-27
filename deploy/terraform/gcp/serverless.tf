@@ -32,6 +32,7 @@ locals {
       artifactRegistry         = local.images_registry
       buildBucket              = google_storage_bucket.builds.name
       builderServiceAccount    = google_service_account.builder.email
+      builderBaseImage         = var.builder_base_image
       tasksQueue               = google_cloud_tasks_queue.wakes.name
       wakeAttempts             = var.wake_attempts
       ticksQueue               = google_cloud_tasks_queue.ticks.name
@@ -49,7 +50,6 @@ locals {
       # SYNC: alerts <-> alerts.tf (count = var.alerts_enabled)
       alerts = var.alerts_enabled
     }
-    auth      = "operator_keys"
     publicUrl = local.role_urls["dispatcher"]
     roles = merge(
       { for r in local.serverless_roles : r => "serverless" },
@@ -58,11 +58,6 @@ locals {
     roleUrls = local.role_urls
     holders = {
       signalsPerCopy = var.signals_per_holder
-    }
-    build = {
-      compileLanes     = var.compile_lanes
-      builderBaseImage = var.builder_base_image
-      runtimeBaseImage = "debian:bookworm-slim"
     }
     edge = {
       # A caller's address, counted from the right of X-Forwarded-For

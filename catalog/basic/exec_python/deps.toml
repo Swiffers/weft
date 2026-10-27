@@ -1,14 +1,21 @@
 # ExecPython runs each script in a `python3` process the worker starts
-# (see mod.rs), so the worker image needs the interpreter and its
-# standard library at runtime, and nothing at build time.
+# (see mod.rs), so the machine the worker runs on needs the interpreter
+# and its standard library, and nothing at build time.
 
 [dependencies]
 
-[system.runtime.apt]
+[[needs]]
+name = "python3"
+check = ["python3", "--version"]
+
+[needs.install.apt]
 default = ["python3"]
 
-[system.runtime.apk]
+[needs.install.dnf]
 default = ["python3"]
 
-[system.runtime.yum]
+[needs.install.apk]
 default = ["python3"]
+
+[needs.install.brew]
+default = ["python"]

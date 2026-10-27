@@ -3,10 +3,26 @@
 This gets you a weft runtime on your own machine, the `weft` command, and the
 graph editor in VS Code. It is mostly waiting, so keep reading while it runs.
 
-One tool has to be there first: [Docker](https://docs.docker.com/get-docker/).
-weft's runtime is a program on your machine, and everything it starts (your
-programs, their databases and servers) runs in Docker containers next to it.
-If Docker is missing, the installer stops and prints the link to install it.
+[Docker](https://docs.docker.com/get-docker/) has to be there first.
+weft's runtime is a program on your machine. Its database, its file store and
+the infrastructure your programs ask for (a database, a model server) run in
+Docker containers next to it, and your programs themselves run as plain
+processes, each in its project's folder. If Docker is missing, the installer
+stops and prints the link to install it.
+
+You also need [Rust](https://rustup.rs/) whenever weft has to compile
+something on your machine: a project with nodes of its own or with a
+standard node you edited (under `nodes/base_catalog/`), a project you build
+with `--referenced`, a live node test, and `./setup.sh --rebuild`. The
+install itself needs it on a branch's install, which always builds the CLI
+and the standard worker from source. The default install needs it whenever
+it cannot use what CI published for your exact checkout: you have local
+changes, CI has not finished building the commit you just pulled, you passed
+`--debug` or `--from-source`, or the release has nothing for your kind of
+machine. The installer says which one it hit, then compiles what it could
+not download.
+For which projects compile and which share the standard worker, go and read
+[the worker](../running/architecture.md#the-worker).
 
 The installer is a bash script, so on Windows run it inside WSL.
 

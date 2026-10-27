@@ -28,8 +28,8 @@ use crate::state::BrokerState;
 
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
-    /// The base URLs callers address the broker by (a worker in a
-    /// container and a role on the machine may use different ones). A
+    /// The base URLs callers address the broker by (a caller in a
+    /// container and one on the machine may use different ones). A
     /// platform whose tokens name their audience checks it against these.
     pub audiences: Vec<String>,
 }

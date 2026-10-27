@@ -208,4 +208,11 @@ impl FireContext {
     pub async fn claim_kind_state(&self, kind_state: Value, from_seq: i64) -> anyhow::Result<bool> {
         self.sink.claim_kind_state(&self.token, kind_state, from_seq).await
     }
+
+    /// The kind's state as the row holds it now and the version it is at,
+    /// `None` when the signal is gone: for a task that no longer knows
+    /// whether its last write landed.
+    pub async fn kind_state_now(&self) -> anyhow::Result<Option<crate::kinds::RowState>> {
+        self.sink.kind_state_of(&self.token).await
+    }
 }

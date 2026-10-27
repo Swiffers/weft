@@ -64,7 +64,7 @@ struct Queue {
     down: std::sync::atomic::AtomicBool,
 }
 
-async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queue: Arc<Queue>, asked: Arc<std::sync::atomic::AtomicUsize>) -> String {
+async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queue: Arc<Queue>) -> String {
     use axum::routing::post;
     use std::sync::atomic::Ordering;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -194,23 +194,6 @@ async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queu
                 }
             }),
         )
-        // An address on a `wi-` host is an infra endpoint, reached on the
-        // same port of the machine; every other is reached as it is. Each
-        // ask is counted.
-        .route(
-            "/v1/infra/listener-address",
-            post(move |axum::Json(req): axum::Json<Value>| {
-                let asked = asked.clone();
-                async move {
-                    asked.fetch_add(1, Ordering::SeqCst);
-                    let authority = req["authority"].as_str().unwrap();
-                    axum::Json(match authority.strip_prefix("wi-").and_then(|a| a.split_once(':')) {
-                        Some((_, port)) => json!({ "authority": format!("127.0.0.1:{port}"), "is_infra": true }),
-                        None => json!({ "authority": authority, "is_infra": false }),
-                    })
-                }
-            }),
-        )
         // A signal given up on, as `held_signals::give_up` writes it: only
         // the registration it names, and its holder lets go.
         .route(
@@ -288,8 +271,6 @@ struct Rig {
     rows: Rows,
     landing: Landing,
     get_held: Arc<GetHeld>,
-    /// How often the listener asked where an address is.
-    asked: Arc<std::sync::atomic::AtomicUsize>,
     /// The fake broker's address.
     broker: String,
 }
@@ -320,20 +301,19 @@ async fn rig(holds_here: bool) -> Rig {
     let landing: Landing = Arc::default();
     let get_held: Arc<GetHeld> = Arc::default();
     let queue = Arc::new(Queue::default());
-    let asked: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
-    let broker = spawn_broker(rows.clone(), landing.clone(), get_held.clone(), queue.clone(), asked.clone()).await;
+    let broker = spawn_broker(rows.clone(), landing.clone(), get_held.clone(), queue.clone()).await;
     let tasks = Arc::new(FakeTasks::default());
     let doors = Arc::new(FakeDoors::default());
     let alarm = Arc::new(FakeAlarm::new());
     let state = ListenerState::new(
-        ListenerConfig { replica: "test-listener".into(), holds_here, prefer_push: false },
+        ListenerConfig { replica: "test-listener".into(), holds_here, holders: weft_listener::Holders::OnThisMachine },
         tasks.clone(),
         link(&broker),
         alarm.clone(),
         doors.clone(),
         holders(),
     );
-    Rig { state, tasks, doors, queue, alarm, rows, landing, get_held, asked, broker }
+    Rig { state, tasks, doors, queue, alarm, rows, landing, get_held, broker }
 }
 
 fn identity(token: &str, spec: weft_core::primitive::SignalSpec) -> SignalIdentity {
@@ -367,7 +347,7 @@ fn now_ms() -> i64 {
 /// A wake for `token` at `due_at_ms` that carries nothing: it reads the
 /// row, as a wake set before registrations were numbered does.
 fn due(token: &str, due_at_ms: i64) -> WakeBody {
-    WakeBody { token: token.into(), due_at_ms, generation: None, set_again: 0, row: None, addresses: Default::default(), ended: false }
+    WakeBody { token: token.into(), due_at_ms, generation: None, set_again: 0, row: None, ended: false }
 }
 
 /// The last wake the alarm was asked to set for `token`, as the listener
@@ -971,23 +951,18 @@ fn cancel_request(spec: weft_core::primitive::SignalSpec) -> weft_core::signal::
     weft_core::signal::listener_protocol::CancelCallRequest { token: "wait".into(), tenant_id: "tenant-a".into(), for_instance: None, spec }
 }
 
-/// The last call goes once, with its verb and body, to the address the
-/// listener reaches it at, through the listener's own door. An infra
-/// endpoint's address is asked of the broker like a poll's is.
+/// The last call goes once, with its verb and body, to the address it
+/// names, through the listener's own door.
 #[tokio::test]
 async fn a_cancelled_waits_last_call_goes_once_with_its_verb_and_body() {
     let rig = rig(false).await;
     let (target, calls) = spawn_cancel_target(202).await;
     let base = serve(rig.state.clone()).await;
-    let port = target.rsplit(':').next().unwrap();
     let mut spec = job_wait(&format!("{target}/status"));
-    // Named the way a worker reaches an infra unit: the broker answers
-    // the address the listener reaches it at.
-    spec.on_cancel = Some(weft_core::signal::CancelCall::post(format!("http://wi-studio:{port}/jobs/7/cancel")).with_body(json!({ "reason": "cancelled" })));
+    spec.on_cancel = Some(weft_core::signal::CancelCall::post(format!("{target}/jobs/7/cancel")).with_body(json!({ "reason": "cancelled" })));
     let resp = reqwest::Client::new().post(format!("{base}/cancel_call")).json(&cancel_request(spec)).send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT, "{:?}", resp.text().await);
     assert_eq!(*calls.lock().unwrap(), vec![("POST".to_string(), "/jobs/7/cancel".to_string(), json!({ "reason": "cancelled" }))]);
-    assert_eq!(rig.asked.load(std::sync::atomic::Ordering::SeqCst), 1, "the infra address was asked of the broker");
 }
 
 /// A service that refuses the last call fails it, naming the call, the
@@ -1444,7 +1419,7 @@ impl weft_listener::kinds::KindHandler for RecordingHold {
     async fn spawn_task(
         &self,
         spec: &weft_core::primitive::SignalSpec,
-        _kind_state: &Value,
+        _stored: weft_listener::kinds::RowState,
         _ctx: weft_listener::kinds::SpawnCtx,
     ) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
         record(spec, format!("spawn {}", spec.config["n"]));
@@ -1742,24 +1717,22 @@ fn delta_poll(url: &str) -> weft_core::primitive::SignalSpec {
 }
 
 /// A poll that finds nothing new, handled by a listener that just
-/// started, asks the broker nothing: its row and where its address is
-/// ride its wake, and it writes nothing.
+/// started, asks the broker nothing: its row rides its wake, and it
+/// writes nothing.
 #[tokio::test]
 async fn an_empty_poll_with_its_state_in_the_wake_makes_no_broker_call() {
     let rig = rig(false).await;
     register(&rig, "poll", &delta_poll(&spawn_steady_feed().await), now_ms()).await.unwrap();
     wake(&rig.state, last_wake(&rig, "poll")).await.unwrap();
     assert_eq!(rig.rows.lock().unwrap()["poll"]["kind_state"], json!({ "delta": { "cursor": 7 } }), "the first poll primed");
-    let (reads, asked, seq) = (
+    let (reads, seq) = (
         rig.get_held.reads.load(std::sync::atomic::Ordering::SeqCst),
-        rig.asked.load(std::sync::atomic::Ordering::SeqCst),
         rig.rows.lock().unwrap()["poll"]["kind_state_seq"].clone(),
     );
 
     let copy = fresh_listener(&rig);
     wake(&copy, last_wake(&rig, "poll")).await.unwrap();
     assert_eq!(rig.get_held.reads.load(std::sync::atomic::Ordering::SeqCst), reads, "no row read");
-    assert_eq!(rig.asked.load(std::sync::atomic::Ordering::SeqCst), asked, "no address asked");
     assert_eq!(rig.rows.lock().unwrap()["poll"]["kind_state_seq"], seq, "nothing written");
     assert!(rig.doors.fired.lock().unwrap().is_empty());
     assert_eq!(rig.alarm.wakes_for("signal:poll").len(), 3, "and the next poll is set");
@@ -1882,36 +1855,28 @@ async fn a_poll_registered_again_carries_its_new_spec_and_its_old_wakes_are_canc
     assert!(rig.alarm.cancelled().iter().any(|w| w.name() == latest.name()), "an unregister cancels its wake");
 }
 
-/// A held connection to an address that is no infra endpoint asks where it
-/// is once, and its reconnects ask the broker nothing; one to an infra
-/// endpoint asks again after each failed connect. What it says changes
+/// A held connection's reconnects read no row, and what it says changes
 /// once as it drops, not at every attempt.
 #[tokio::test]
-async fn reconnects_ask_the_broker_only_where_an_infra_endpoint_is() {
+async fn reconnects_read_no_row_and_say_it_once() {
     // A port nothing listens on, which refuses at once.
     let closed = {
         let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         taken.local_addr().unwrap().port()
     };
-    let reconnect = |url: String| async move {
-        let rig = rig(true).await;
-        let written = row("sse", &sse_at(&url), json!({}), 1);
-        rig.rows.lock().unwrap().insert("sse".into(), written.clone());
-        weft_listener::registry::hold(&rig.state, serde_json::from_value(written).unwrap(), StartMode::New).await.unwrap();
-        let reads = rig.get_held.reads.load(std::sync::atomic::Ordering::SeqCst);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let said = rig.state.registry.get("sse").unwrap().serving.lock().status.clone();
-        assert!(said.starts_with("reconnecting since"), "{said}");
-        // Four tries: at once, then after 1, 2 and 4 seconds.
-        tokio::time::sleep(std::time::Duration::from_millis(7_500)).await;
-        assert_eq!(rig.state.registry.get("sse").unwrap().serving.lock().status, said, "said once, not per attempt");
-        assert_eq!(rig.get_held.reads.load(std::sync::atomic::Ordering::SeqCst), reads, "{url}: no row read");
-        rig.asked.load(std::sync::atomic::Ordering::SeqCst)
-    };
-    let (public, infra) =
-        tokio::join!(reconnect(format!("http://127.0.0.1:{closed}/events")), reconnect(format!("http://wi-feed:{closed}/events")));
-    assert_eq!(public, 1, "asked once, whatever the reconnects");
-    assert!(infra >= 3, "asked again after each failed connect: {infra}");
+    let url = format!("http://127.0.0.1:{closed}/events");
+    let rig = rig(true).await;
+    let written = row("sse", &sse_at(&url), json!({}), 1);
+    rig.rows.lock().unwrap().insert("sse".into(), written.clone());
+    weft_listener::registry::hold(&rig.state, serde_json::from_value(written).unwrap(), StartMode::New).await.unwrap();
+    let reads = rig.get_held.reads.load(std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let said = rig.state.registry.get("sse").unwrap().serving.lock().status.clone();
+    assert!(said.starts_with("reconnecting since"), "{said}");
+    // Four tries: at once, then after 1, 2 and 4 seconds.
+    tokio::time::sleep(std::time::Duration::from_millis(7_500)).await;
+    assert_eq!(rig.state.registry.get("sse").unwrap().serving.lock().status, said, "said once, not per attempt");
+    assert_eq!(rig.get_held.reads.load(std::sync::atomic::Ordering::SeqCst), reads, "no row read");
 }
 
 /// The project's worker, as the listener hands it events: records each

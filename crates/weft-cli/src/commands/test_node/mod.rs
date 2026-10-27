@@ -10,10 +10,12 @@
 //!
 //! The live tier runs the PRODUCTION credential path (connection
 //! resolution, relaying, metering, billing), which only exists next to
-//! the broker, so live tests always run on a local install: the CLI
-//! builds the per-package test image into this machine's Docker, which
-//! the install runs it from, asks the install to run one test per call
-//! (`/projects/{id}/node-tests/run`), and polls the outcome. Live
+//! the broker, so live tests always run on this machine's own install:
+//! the CLI compiles each package's test server as a program on this
+//! machine (no Docker), in the machine's workers folder where the
+//! install's runner starts it from, checks the machine meets what the
+//! tested nodes need while they run, asks the install to run one test per
+//! call (`/projects/{id}/node-tests/run`), and polls the outcome. Live
 //! needs the project registered with the dispatcher (cost has to
 //! attribute to something) and a grant for each test's declared
 //! service.
@@ -207,14 +209,14 @@ pub fn hash(ctx: Ctx, target: Option<String>) -> Result<()> {
             // argument surface matches `weft test-node`.
             let targets = resolve_targets(&catalog, Some(&t))?;
             let package = &targets.first().expect("resolve_targets errors instead of empty").name;
-            let hash = weft_compiler::build::node_test_cache_hash(project, &catalog, package)
+            let hash = weft_compiler::build::node_test_cache_hash(&catalog, package)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("{hash}");
         }
         None => {
             for target in resolve_targets(&catalog, None)? {
                 let hash =
-                    weft_compiler::build::node_test_cache_hash(project, &catalog, &target.name)
+                    weft_compiler::build::node_test_cache_hash(&catalog, &target.name)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                 println!("{} {hash}", target.name);
             }
@@ -309,7 +311,7 @@ fn bound_build_cache(root: &std::path::Path, cap_bytes: u64) -> Result<()> {
 /// Total bytes of every file under `root`, following no symlinks (a
 /// target dir symlinked onto another disk is still that disk's
 /// problem, and following one could wander out of the tree).
-fn dir_size_bytes(root: &std::path::Path) -> std::io::Result<u64> {
+pub(crate) fn dir_size_bytes(root: &std::path::Path) -> std::io::Result<u64> {
     let mut total = 0;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -438,7 +440,6 @@ fn list_tests(binary: &PathBuf) -> Result<Vec<NodeTestsListing>> {
 /// produces all the missing binaries, each is asked, and its answer
 /// stored.
 fn cached_listings(
-    project: &weft_compiler::project::Project,
     catalog: &FsCatalog,
     targets: &[TargetPackage],
     build_dirs: &weft_compiler::build::TestBuildDirs,
@@ -457,7 +458,7 @@ fn cached_listings(
         if listings.contains_key(&target.name) {
             continue;
         }
-        let hash = weft_compiler::build::node_test_cache_hash(project, catalog, &target.name)
+        let hash = weft_compiler::build::node_test_cache_hash(catalog, &target.name)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let path = build_dirs.crates_root.join("listings").join(format!(
             "{}.json",
@@ -586,7 +587,6 @@ async fn run_live(
     args: &TestNodeArgs,
     reports: &mut Vec<TestReport>,
 ) -> Result<()> {
-    let project = ctx.project()?;
     // Discover the live tests per target package (through each
     // package's listing: the registry is the single source, read via
     // the hash-keyed cache so unchanged packages skip the build).
@@ -596,7 +596,7 @@ async fn run_live(
     // once, BEFORE any consent prompt, grant, or run. (The test server's
     // `rig.fixture` read stays the runtime backstop.)
     let mut missing_fixtures: Vec<String> = Vec::new();
-    let listings = cached_listings(project, catalog, targets, build_dirs, workspace)?;
+    let listings = cached_listings(catalog, targets, build_dirs, workspace)?;
     for target in targets {
         for node in &listings[&target.name] {
             if target.node_filter.as_deref().is_some_and(|f| f != node.node_type) {
@@ -648,9 +648,22 @@ async fn run_live(
             missing_fixtures.join("\n")
         );
     }
+    let client = ctx.client()?;
+    // The test server is compiled here and runs as a program on this
+    // machine, which only this machine's own install starts programs on;
+    // and what the tested nodes need while they run is on this machine.
+    // Both settled before any consent, grant or run.
+    let Some(install) = crate::credentials::this_machines_install(client.base())? else {
+        bail!(
+            "live node tests run on this machine's own install: the test server is compiled on this machine and \
+             runs here as a program, which {} cannot start. Run them without `--on` or `--dispatcher`, from a \
+             folder whose install is this machine's (`weft daemon which` says which).",
+            client.base()
+        );
+    };
+    refuse_unmet_needs(catalog, &runs).await?;
     ensure_live_consent(args)?;
 
-    let client = ctx.client()?;
     let project_id = super::resolve_project_id(ctx, None)?;
 
     // Resolve every service's connection in TWO phases: first a pure
@@ -792,7 +805,7 @@ async fn run_live(
     // message says to check it.)
     let mut ephemeral_grants: Vec<uuid::Uuid> = Vec::new();
     let result = if prepared.is_empty() {
-        run_live_tests(ctx, catalog, &project_id, &runs, &connections, &fixtures, args.parallel, reports).await
+        run_live_tests(ctx, &install, catalog, &project_id, &runs, &connections, &fixtures, args.parallel, reports).await
     } else {
         let create_and_run = async {
             for (service, key) in prepared {
@@ -800,7 +813,7 @@ async fn run_live(
                 ephemeral_grants.push(id);
                 connections.insert(service, id);
             }
-            run_live_tests(ctx, catalog, &project_id, &runs, &connections, &fixtures, args.parallel, reports).await
+            run_live_tests(ctx, &install, catalog, &project_id, &runs, &connections, &fixtures, args.parallel, reports).await
         };
         tokio::select! {
             r = create_and_run => r,
@@ -1063,6 +1076,7 @@ async fn create_ephemeral_grant(ctx: &Ctx, key: PreparedKey) -> Result<uuid::Uui
 
 async fn run_live_tests(
     ctx: &Ctx,
+    install: &weft_core::infra::Install,
     catalog: &FsCatalog,
     project_id: &str,
     runs: &[LiveRun],
@@ -1073,27 +1087,16 @@ async fn run_live_tests(
 ) -> Result<()> {
     let client = ctx.client()?;
     let project = ctx.project()?;
-    // The test image is built into THIS machine's Docker, which only a
-    // local install runs images from.
-    let install: weft_core::install::InstallInfo =
-        serde_json::from_value(client.get_json("/install").await?).context("read the install's description")?;
-    if install.cloud.is_some() {
-        bail!(
-            "live node tests run on a local install: the test image is built into this machine's Docker, which {} \
-             cannot reach. Target a local install and run them there.",
-            client.base()
-        );
-    }
 
-    // One image per involved package, content-addressed and skipped
-    // when already present.
-    let mut images: BTreeMap<String, String> = BTreeMap::new();
+    // One test server per involved package, content-addressed and
+    // skipped when already present, by its ref.
+    let mut servers: BTreeMap<String, String> = BTreeMap::new();
     let packages: std::collections::BTreeSet<&str> =
         runs.iter().map(|r| r.package.as_str()).collect();
     for package in packages {
-        images.insert(
+        servers.insert(
             package.to_string(),
-            ensure_test_image(project, catalog, package).await?,
+            ensure_test_server(install, project, catalog, package).await?,
         );
     }
 
@@ -1144,8 +1147,8 @@ async fn run_live_tests(
                 // A broken resolve invariant here must fail the RUN,
                 // never panic: the caller still has ephemeral grants
                 // to delete after the batch settles.
-                let image = images.get(&run.package).cloned().with_context(|| {
-                    format!("no test image resolved for package '{}'", run.package)
+                let image = servers.get(&run.package).cloned().with_context(|| {
+                    format!("no test server resolved for package '{}'", run.package)
                 });
                 let connection = connections.get(&run.service).cloned().with_context(|| {
                     format!("no connection resolved for service '{}'", run.service)
@@ -1259,110 +1262,183 @@ async fn run_one_live_test(
 /// its breadcrumb checked.
 const RUN_HOLD: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Build the package's content-addressed test image into this machine's
-/// Docker, skipping on a tag hit (the same skip rule worker images use).
-async fn ensure_test_image(
+/// Refuse the live runs `runs` when this machine lacks what one of the
+/// node types they test needs while it runs (`weft_platform_local::LocalNeeds`,
+/// the check an install makes before it starts a program), naming the
+/// `weft deps-install` that installs it.
+async fn refuse_unmet_needs(catalog: &FsCatalog, runs: &[LiveRun]) -> Result<()> {
+    use weft_platform_traits::MachineNeeds as _;
+    let mut wanted = Vec::new();
+    let packages: std::collections::BTreeSet<&str> = runs.iter().map(|r| r.package.as_str()).collect();
+    for package in packages {
+        let needs = weft_compiler::build::package_run_needs(catalog, package).map_err(|e| anyhow::anyhow!("{e}"))?;
+        wanted.extend(tested_needs(&needs, runs.iter().filter(|r| r.package == package).map(|r| r.node.as_str())));
+    }
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let needs = weft_platform_local::LocalNeeds;
+    let missing = needs.missing(&wanted).await?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    bail!("{}", weft_core::needs::refusal(&missing, needs.needs_from()))
+}
+
+/// The needs in `needs` of the node types `tested` names, one row per need,
+/// each naming its node type as the node a test runs.
+fn tested_needs<'a>(needs: &weft_core::needs::NodeNeeds, tested: impl Iterator<Item = &'a str>) -> Vec<weft_core::needs::NodeNeed> {
+    let tested: std::collections::BTreeSet<&str> = tested.collect();
+    needs
+        .iter()
+        .filter(|(node_type, _)| tested.contains(node_type.as_str()))
+        .flat_map(|(node_type, list)| {
+            list.iter().map(|need| weft_core::needs::NodeNeed { node_type: node_type.clone(), nodes: vec![node_type.clone()], need: need.clone() })
+        })
+        .collect()
+}
+
+/// Make the package's test server a program on this machine
+/// (`weft_platform_local::images::Program::NodeTestServer`), in the
+/// machine's workers folder where the install's runner starts it from:
+/// compiled here, in a free compile lane, when its content is not there
+/// yet, its log under the install's build logs. Answers its ref,
+/// `weft-node-tests:<test hash>`.
+async fn ensure_test_server(
+    install: &weft_core::infra::Install,
     project: &weft_compiler::project::Project,
     catalog: &FsCatalog,
     package: &str,
 ) -> Result<String> {
-    let builder_base = crate::images::ensure_worker_builder_base().await?;
-    let artifact = tokio::task::block_in_place(|| {
-        weft_compiler::build::build_test_artifact(
-            project,
-            catalog,
-            package,
-            &weft_compiler::worker_image::BaseImages {
-                builder: builder_base.clone(),
-                runtime: weft_compiler::worker_image::DEFAULT_BASE_IMAGE.to_string(),
-            },
-        )
-    })
-    .map_err(|e| anyhow::anyhow!("stage test image for '{package}': {e}"))?;
-    let tag = weft_compiler::build::node_test_image_tag(&artifact.content_hash);
-
-    if !crate::images::image_present(&tag).await? {
-        // The package rides its own label so the stale-image GC can
-        // scope to "this package's older test images": every package's
-        // test image shares the one scratch project id, so the project
-        // label alone would make packages evict each other's images.
-        // The builder base's tag is how a machine-wide sweep keeps the
-        // test images of every base an install still uses.
-        let (_, base_tag) = crate::images::ref_repo_tag(&builder_base)?;
-        crate::images::record_build_uses(&artifact.uses).await?;
-        crate::images::docker_build_worker(
-            &tag,
-            &artifact.build_context.join("Dockerfile"),
-            &artifact.build_context,
-            // SYNC: weft.dev/project <-> crates/weft-cli/src/commands/runs.rs (dangling_prune)
-            &[
-                format!("weft.dev/project={}", project.id()),
-                format!("weft.dev/node-test-package={package}"),
-                format!("{}={base_tag}", crate::images::NODE_TEST_BASE_LABEL),
-            ],
-        )
-        .await?;
+    use weft_platform_local::host_build;
+    let hash = weft_compiler::build::node_test_content_hash(catalog, package)
+        .map_err(|e| anyhow::anyhow!("the test server's hash for '{package}': {e}"))?;
+    let image = weft_compiler::build::node_test_image_tag(&hash);
+    let machine = weft_platform_local::MachineLayout::here();
+    let workers = machine.workers();
+    let program = weft_platform_local::images::Program::of(&image)
+        .with_context(|| format!("{image} names no test server (`weft_core::builds::NODE_TEST_REPO`)"))?;
+    let dir = program.dir(&workers);
+    let file = program.file(&workers);
+    let owner = test_server_owner(project, package);
+    let servers = machine.node_test_servers();
+    // Its folder is named by the package's content, so another project may
+    // have compiled it already: claimed under the owners' lock, which keeps
+    // a claim and another project's removal of the folder from crossing.
+    let owners_lock = workers.join(TEST_SERVER_OWNERS_LOCK);
+    let waiting = "another weft is updating the machine's test servers; waiting for it";
+    {
+        let _turn = crate::images::hold_file_lock(owners_lock.clone(), waiting).await?;
+        if claim_test_server(&servers, &dir, &file, &owner)? {
+            return Ok(image);
+        }
     }
-    // Test images are content-addressed per package-source version and
-    // pile up fast across a suite run; drop this PACKAGE's stale ones
-    // now that its fresh tag is ensured (package-scoped: every package
-    // shares the one scratch project id). Test servers are short-lived
-    // and never restart from an old tag, so beyond the fresh tag
-    // nothing is referenced by design: a tag a still-running server
-    // uses refuses its remove and survives.
-    gc_stale_test_images(
-        &tag,
-        &[
-            format!("weft.dev/project={}", project.id()),
-            format!("weft.dev/node-test-package={package}"),
-        ],
-    )
-    .await?;
-    Ok(tag)
+    let staged = tokio::task::block_in_place(|| {
+        weft_compiler::build::build_test_artifact(project, catalog, package, &machine.shared_crates())
+    })
+    .map_err(|e| anyhow::anyhow!("stage the test server for '{package}': {e}"))?;
+    anyhow::ensure!(
+        staged.content_hash == hash,
+        "the test server for '{package}' staged as {}, not {hash}: its sources changed while it was staged; run it again",
+        staged.content_hash
+    );
+    let log = weft_platform_local::InstallLayout::new(install.dir()).build_log(&image);
+    eprintln!("compiling the test server for '{package}' on this machine (its log: {})", log.display());
+    match crate::host_programs::compile(&staged, dir.clone(), &log, crate::host_programs::any_lane()?).await? {
+        // Its one package is what it tests, so a package that does not
+        // compile fails the build itself, never a record of it.
+        host_build::HostBuilt::Built(_) => {}
+        host_build::HostBuilt::Failed(reason) => {
+            bail!("the test server for '{package}' did not compile: {reason}\nits log: {}", log.display())
+        }
+    }
+    let _turn = crate::images::hold_file_lock(owners_lock, waiting).await?;
+    // A folder with no owner is never removed, so the one just compiled is
+    // still there.
+    anyhow::ensure!(
+        claim_test_server(&servers, &dir, &file, &owner)?,
+        "the test server for '{package}' was compiled into {}, and is not there any more; run it again",
+        dir.display()
+    );
+    Ok(image)
 }
 
-/// Drop a package's STALE test images once its fresh `tag` is ensured:
-/// every tag of `tag`'s repo carrying ALL the given `weft.dev/*` labels
-/// except `tag` itself, then the matching dangling leftovers. Test images are
-/// content-addressed, one per package-source version, and nothing ever
-/// untags the old ones, so without this the pile grows with every edit.
-///
-/// Nothing beyond `tag` is kept: a test server is short-lived and never
-/// restarts from an old tag, and one a still-running server uses refuses
-/// its remove and survives.
-///
-/// Best effort once the tag is understood (a docker hiccup never fails
-/// a test run), silent on stdout (docker's `Untagged:` chatter would
-/// land in the middle of a `--json` event stream), and the shared
-/// BuildKit layer cache is untouched, so rebuilding a dropped tag stays
-/// warm.
-async fn gc_stale_test_images(tag: &str, labels: &[String]) -> Result<()> {
-    let condemn = crate::images::outside_current(tag)?;
-    let filters: Vec<String> = labels.iter().map(|l| format!("label={l}")).collect();
-    let mut list = crate::images::docker();
-    list.arg("images");
-    for f in &filters {
-        list.args(["--filter", f]);
+/// The file in a test server's folder naming, one per line, each project
+/// and package it tests ([`test_server_owner`]): several projects may share
+/// one, since its folder is named by the package's content. It is how the
+/// next build of a package finds the servers it replaces.
+const TEST_SERVER_OWNER_FILE: &str = "tests";
+
+/// The lock, in the machine's workers folder, every change to the test
+/// servers' owner files, and every removal of a server, is made under.
+const TEST_SERVER_OWNERS_LOCK: &str = "node-tests.lock";
+
+fn test_server_owner(project: &weft_compiler::project::Project, package: &str) -> String {
+    format!("{} {package}", project.id())
+}
+
+/// The owners in `dir`'s owner file, `None` when it has none.
+fn test_server_owners(dir: &std::path::Path) -> Result<Option<Vec<String>>> {
+    let path = dir.join(TEST_SERVER_OWNER_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text.lines().filter(|line| !line.is_empty()).map(str::to_string).collect())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
     }
-    list.args(["--format", "{{.Repository}}:{{.Tag}}"]);
-    let Ok(out) = list.output().await else { return Ok(()) };
-    if !out.status.success() {
-        return Ok(());
+}
+
+/// Write `owners` as `dir`'s owner file, whole (beside it, then renamed),
+/// so a reader never sees half of it.
+fn write_test_server_owners(dir: &std::path::Path, owners: &[String]) -> Result<()> {
+    let body: String = owners.iter().map(|owner| format!("{owner}\n")).collect();
+    weft_core::infra::write_whole(dir, TEST_SERVER_OWNER_FILE, body.as_bytes(), 0o644)
+        .with_context(|| format!("write {}", dir.join(TEST_SERVER_OWNER_FILE).display()))
+}
+
+/// Claim the test server in `fresh` for `owner`, once its program `file`
+/// is there: `owner` is added to its owner file (when not there yet), then
+/// [`drop_stale_test_servers`] lets go of the ones it replaces. `false`, and
+/// nothing changed, when the program is not there. The caller holds
+/// [`TEST_SERVER_OWNERS_LOCK`].
+fn claim_test_server(servers: &std::path::Path, fresh: &std::path::Path, file: &std::path::Path, owner: &str) -> Result<bool> {
+    if !file.is_file() {
+        return Ok(false);
     }
-    let stale = crate::images::host_images_matching(&String::from_utf8_lossy(&out.stdout), &condemn);
-    if stale.is_empty() {
-        return Ok(());
+    let mut owners = test_server_owners(fresh)?.unwrap_or_default();
+    if !owners.iter().any(|of| of == owner) {
+        owners.push(owner.to_string());
+        write_test_server_owners(fresh, &owners)?;
     }
-    // No `-f`: a tag docker refuses to drop (an image a host container
-    // still runs) keeps it, where force would untag it anyway and
-    // strand the container's restart.
-    let _ = crate::images::docker().args(["rmi"]).args(&stale).output().await;
-    let mut prune = crate::images::docker();
-    prune.args(["image", "prune", "--force", "--filter", "dangling=true"]);
-    for f in &filters {
-        prune.args(["--filter", f]);
+    drop_stale_test_servers(servers, fresh, owner)?;
+    Ok(true)
+}
+
+/// Let go, for `owner`, of every test server in `servers` but `fresh`: one
+/// is compiled per version of a package's sources, and `owner` asks for an
+/// older one no more. Its line leaves each other server's owner file, and a
+/// server is removed once no owner is left in it; one another project still
+/// tests with stays. A folder with no owner file is not one this command
+/// made, and stays. The caller holds [`TEST_SERVER_OWNERS_LOCK`].
+fn drop_stale_test_servers(servers: &std::path::Path, fresh: &std::path::Path, owner: &str) -> Result<()> {
+    let entries = match std::fs::read_dir(servers) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", servers.display())),
+    };
+    for entry in entries {
+        let dir = entry.with_context(|| format!("read {}", servers.display()))?.path();
+        if dir == fresh || !dir.is_dir() {
+            continue;
+        }
+        let Some(mut owners) = test_server_owners(&dir)? else { continue };
+        let before = owners.len();
+        owners.retain(|of| of != owner);
+        match (owners.len() == before, owners.is_empty()) {
+            (true, _) => {}
+            (false, true) => std::fs::remove_dir_all(&dir).with_context(|| format!("remove the old test server {}", dir.display()))?,
+            (false, false) => write_test_server_owners(&dir, &owners)?,
+        }
     }
-    let _ = prune.output().await;
     Ok(())
 }
 
@@ -1410,6 +1486,82 @@ mod tests {
         file_of(&root.join("deps/a"), 2000);
         bound_build_cache(&root, 0).unwrap();
         assert!(root.join("deps/a").exists());
+    }
+
+    /// A package's fresh test server replaces its older ones, and leaves
+    /// every other package's, and any folder it did not make, alone.
+    #[test]
+    fn a_fresh_test_server_drops_only_its_packages_older_ones() {
+        let servers = tempfile::tempdir().unwrap();
+        let server = |hash: &str, owner: Option<&str>| {
+            let dir = servers.path().join(hash);
+            file_of(&dir.join("worker"), 1);
+            if let Some(owner) = owner {
+                std::fs::write(dir.join(TEST_SERVER_OWNER_FILE), owner).unwrap();
+            }
+            dir
+        };
+        let fresh = server("new", Some("p llm"));
+        let old = server("old", Some("p llm"));
+        let sibling = server("sib", Some("p format"));
+        let other_project = server("far", Some("q llm"));
+        let unknown = server("odd", None);
+        drop_stale_test_servers(servers.path(), &fresh, "p llm").unwrap();
+        assert!(fresh.exists() && !old.exists());
+        assert!(sibling.exists() && other_project.exists() && unknown.exists());
+        drop_stale_test_servers(&servers.path().join("absent"), &fresh, "p llm").unwrap();
+    }
+
+    /// Two projects testing the same package share its server: one moving
+    /// to a new version takes only its own line out of the old server, which
+    /// stays for the other, and is removed once the other moves on too.
+    #[test]
+    fn a_shared_test_server_stays_until_its_last_owner_moves_on() {
+        let servers = tempfile::tempdir().unwrap();
+        let server = |hash: &str| {
+            let dir = servers.path().join(hash);
+            file_of(&dir.join("worker"), 1);
+            dir
+        };
+        let shared = server("v1");
+        assert!(claim_test_server(servers.path(), &shared, &shared.join("worker"), "p llm").unwrap());
+        // The second project finds it compiled, and is recorded too, once.
+        assert!(claim_test_server(servers.path(), &shared, &shared.join("worker"), "q llm").unwrap());
+        assert!(claim_test_server(servers.path(), &shared, &shared.join("worker"), "q llm").unwrap());
+        assert_eq!(test_server_owners(&shared).unwrap().unwrap(), ["p llm", "q llm"]);
+
+        let p_next = server("v2");
+        assert!(claim_test_server(servers.path(), &p_next, &p_next.join("worker"), "p llm").unwrap());
+        assert_eq!(test_server_owners(&shared).unwrap().unwrap(), ["q llm"]);
+
+        let q_next = server("v3");
+        assert!(claim_test_server(servers.path(), &q_next, &q_next.join("worker"), "q llm").unwrap());
+        assert!(!shared.exists() && p_next.exists() && q_next.exists());
+    }
+
+    /// A folder whose program is not there is not claimed, and nothing is
+    /// written into it or removed around it.
+    #[test]
+    fn a_test_server_without_its_program_is_not_claimed() {
+        let servers = tempfile::tempdir().unwrap();
+        let old = servers.path().join("old");
+        file_of(&old.join("worker"), 1);
+        std::fs::write(old.join(TEST_SERVER_OWNER_FILE), "p llm\n").unwrap();
+        let missing = servers.path().join("new");
+        assert!(!claim_test_server(servers.path(), &missing, &missing.join("worker"), "p llm").unwrap());
+        assert!(!missing.exists() && old.exists());
+    }
+
+    /// Only the needs of a node type a run tests are asked about, each
+    /// row naming its node type.
+    #[test]
+    fn only_the_tested_node_types_needs_are_asked() {
+        let need = |name: &str| weft_core::needs::Need { name: name.into(), stage: weft_core::needs::NeedStage::Run, check: vec![name.into()], install: Default::default() };
+        let needs: weft_core::needs::NodeNeeds = [("ExecPython".to_string(), vec![need("python3")]), ("Ffmpeg".to_string(), vec![need("ffmpeg")])].into();
+        let rows = tested_needs(&needs, ["ExecPython", "ExecPython", "Plain"].into_iter());
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].node_type.as_str(), rows[0].nodes.as_slice(), rows[0].need.name.as_str()), ("ExecPython", &["ExecPython".to_string()][..], "python3"));
+        assert!(tested_needs(&needs, std::iter::empty()).is_empty());
     }
 
     #[test]

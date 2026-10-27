@@ -1,8 +1,9 @@
 //! `weft-isolate`: builds a worker crate so that one node package that does
-//! not compile costs only its own node types, never the whole image.
+//! not compile costs only its own node types, never the whole worker.
 //!
 //! Emitted by codegen as a standalone package beside the worker crate
-//! (`codegen::write_isolation`) and run by the image build in the crate's
+//! (`codegen::write_isolation`) and run by the worker build (an image's
+//! builder stage, or a host build on the machine) in the crate's
 //! directory: `weft-isolate <isolate.json> <left-out.json> <cargo messages>`. Every package
 //! crate is an optional dependency of the worker behind a feature of its
 //! own, all of them on by default, and carries its package's build script
@@ -26,8 +27,8 @@
 //!    fails the whole build instead: cargo stopped for a reason outside
 //!    the package (the registry or the network unreachable, the machine
 //!    out of disk or memory), and leaving it out would bake that outage
-//!    into an image every later build with the same sources reuses. A
-//!    failed build produces no image, so the next one tries again.
+//!    into a worker every later build with the same sources reuses. A
+//!    failed build produces no worker, so the next one tries again.
 //! 3. It builds the worker again with only the kept packages' features.
 //!
 //! Every JSON message cargo writes in either build is appended to the
@@ -150,7 +151,7 @@ struct Decision {
     healthy: Vec<String>,
 }
 
-// The image build runs this as its own program; weft-compiler compiles the
+// A worker build runs this as its own program; weft-compiler compiles the
 // same file as a module (for `Candidates` and the tests), where nothing
 // calls `main`. Allowing it here keeps everything `main` reaches counted as
 // used, so a function nothing reaches at all still warns.
@@ -499,7 +500,7 @@ fn nothing_traced(unbuilt: &[&str]) -> String {
         "cargo stopped before printing an error that traces to any node package{which}, so no package is left out and the \
          build fails. This is usually something outside the project's code, like crates.io or the network being unreachable, \
          or the build machine running out of disk or memory: cargo's own output above, in the build log, says which. Once \
-         that is over, build again: a failed build leaves no image behind, so the next one tries every package again."
+         that is over, build again: a failed build leaves no worker behind, so the next one tries every package again."
     )
 }
 
@@ -733,7 +734,7 @@ not a message
     /// A package cargo built no library for, with no error anywhere it
     /// reaches (crates.io down, the network gone mid-build), is never left
     /// out: the build fails naming it and saying to build again, so no
-    /// image keeps the outage. The same holds when cargo built nothing at
+    /// worker keeps the outage. The same holds when cargo built nothing at
     /// all, and when another package beside it is left out for a real
     /// error.
     #[test]

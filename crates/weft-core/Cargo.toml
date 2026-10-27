@@ -119,6 +119,7 @@ test-helpers = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
+toml = { workspace = true }
 
 [lints]
 workspace = true

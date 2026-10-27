@@ -144,8 +144,9 @@ The whole thing is a runnable project in [`examples/whatsapp-support-bot/`](exam
 ## Try it
 
 You need [Docker](https://docs.docker.com/get-docker/), and
-[Rust](https://rustup.rs/) if the installer has to build the CLI itself (it
-tells you when). The installer sets up weft's runtime on your machine, the
+[Rust](https://rustup.rs/) once weft has something to compile on your
+machine, such as nodes of your own; for when exactly, go and read [the
+install page](https://weavemindai.github.io/weft/start/install.html). The installer sets up weft's runtime on your machine, the
 `weft` command and the VS Code extension. The extension also installs from
 the store in VS Code
 forks such as Devin Desktop. We are working on a CLI-only version, support for other IDEs and a cloud hosted version. If the extension does not install

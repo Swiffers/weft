@@ -211,18 +211,12 @@ pub trait ProjectStorage: Send + Sync {
 }
 
 /// Everything a build needs that belongs to the install rather than the
-/// request: the base images, the platform's builder and image store, the
-/// image ledger, and how many worker builds may compile side by side.
+/// request: the platform's builder and image store (which also says how
+/// the platform packages a worker), and the image ledger.
 #[derive(Clone)]
 pub struct VersionBuilder {
-    /// The prebuilt builder a worker compiles in, and the image it runs
-    /// on when its project names none.
-    pub bases: weft_compiler::worker_image::BaseImages,
     pub images: Arc<dyn ImageBuilder>,
     pub pool: sqlx::PgPool,
-    /// How many worker builds compile side by side, each in a compile
-    /// cache of its own (`weft_compiler::worker_image::COMPILE_LANE_ARG`).
-    pub compile_lanes: u32,
     /// The reclaims registered builds asked for (`prune::AfterBuildPrunes`).
     pub prunes: Arc<prune::AfterBuildPrunes>,
     /// The version files this replica fetched before (`blob_cache`).
@@ -262,7 +256,7 @@ impl VersionBuilder {
         let files = Arc::new(source::VersionFiles::new(root.clone(), source.manifest.clone(), storage.clone(), tenant.to_string()));
 
         let node_set = source.inputs.node_set;
-        let bases = self.bases.clone();
+        let packaging = self.images.worker_packaging();
         let images = self.images.clone();
         // The compile and the staging are blocking filesystem work.
         let (mut compiled, catalog, project) = tokio::task::spawn_blocking(move || source::compile(&root, files))
@@ -283,7 +277,7 @@ impl VersionBuilder {
                 &catalog,
                 // `source::compile` read the project from disk.
                 weft_compiler::CompileFs::disk(&project.root),
-                &bases,
+                &packaging,
                 &ImageTags(images.as_ref()),
                 node_set,
                 &fingerprints,
@@ -320,6 +314,7 @@ impl VersionBuilder {
                 worker_image,
                 left_out: Vec::new(),
                 worker_log: None,
+                node_needs: plan.node_needs,
             },
             images,
             ask,
@@ -369,7 +364,7 @@ impl VersionBuilder {
             // reports one: one a failed read left in the registry, or one
             // nothing here built, is built again, never run with its gaps
             // unknown (registration reads that record, `ledger::left_out`).
-            let recorded = image.kind == weft_compiler::build_plan::ImageKind::Worker || image.result_file.is_some();
+            let recorded = image.kind == weft_compiler::build_plan::ImageKind::Worker;
             let there = self.images.image_exists(&image.image_ref).await?
                 && (!recorded || ledger::succeeded(&self.pool, &image.image_ref).await?);
             if !there {
@@ -495,12 +490,11 @@ impl VersionBuilder {
         tenant: &str,
     ) -> Result<Option<(weft_core::builds::ImageBuild, bool)>> {
         let now = crate::lease::now_unix();
-        let lanes = (image.kind == weft_compiler::build_plan::ImageKind::Worker).then_some(self.compile_lanes);
-        let claim = ledger::claim(&self.pool, self.images.as_ref(), &image.image_ref, project_id, tenant, lanes, now).await?;
+        let claim = ledger::claim(&self.pool, self.images.as_ref(), &image.image_ref, project_id, tenant, now).await?;
         let stoppable = claim.stoppable();
         let name = match claim {
-            ledger::Claim::Start { name, lane } => {
-                self.start(image, staging, project_id, tenant, &name, lane).await?;
+            ledger::Claim::Start { name } => {
+                self.start(image, staging, project_id, tenant, &name).await?;
                 name
             }
             ledger::Claim::Join { name, .. } => name,
@@ -536,10 +530,10 @@ impl VersionBuilder {
         waiting::cancel(&self.pool, project).await
     }
 
-    /// Start the build `name` of `image` (in `lane`, for a worker), whose
-    /// row the ledger already holds, and record the builder's id for it. A
-    /// start that fails is recorded as the build's end; a build made whose
-    /// id cannot be recorded is stopped.
+    /// Start the build `name` of `image`, whose row the ledger already
+    /// holds, and record the builder's id for it. A start that fails is
+    /// recorded as the build's end; a build made whose id cannot be
+    /// recorded is stopped.
     async fn start(
         &self,
         image: &weft_compiler::build_plan::PlannedImage,
@@ -547,12 +541,7 @@ impl VersionBuilder {
         project_id: uuid::Uuid,
         tenant: &str,
         name: &str,
-        lane: Option<u32>,
     ) -> Result<()> {
-        let build_args = match lane {
-            Some(lane) => vec![(weft_compiler::worker_image::COMPILE_LANE_ARG.to_string(), lane.to_string())],
-            None => Vec::new(),
-        };
         let request = BuildRequest {
             name: name.to_string(),
             project_id,
@@ -560,9 +549,7 @@ impl VersionBuilder {
             context_dir: image.context_dir.clone(),
             staging: staging.clone(),
             image_ref: image.image_ref.clone(),
-            build_args,
-            uses: image.uses.clone(),
-            result_file: image.result_file.clone(),
+            recipe: image.recipe.clone(),
         };
         let handle = match self.images.start(request).await {
             Ok(handle) => handle,

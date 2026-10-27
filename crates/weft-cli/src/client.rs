@@ -171,9 +171,9 @@ pub struct DispatcherClient {
     /// The target this install was named by (`--on <target>`), for an
     /// error that has to say which install did not answer.
     target: Option<String>,
-    /// The bearer every request carries: the operator key, when this
-    /// person holds one for the install (see `crate::credentials`; the
-    /// local install needs none), or an instance token (`with_bearer`).
+    /// The bearer every request carries: the operator key (see
+    /// `crate::credentials`: this machine's install's own, or the one this
+    /// person holds for another), or an instance token (`with_bearer`).
     /// Shared by every clone, so `replace_bearer` reaches all of them:
     /// that is how a command outlives one instance token.
     bearer: Option<Arc<RwLock<String>>>,

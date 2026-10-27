@@ -176,10 +176,10 @@ upgrade only what changed in weft compiles again.
 When it finishes, its last step (in the run's summary, and in its log for
 `gh run view <id> --log`) gives you the install's address, a Cloud Run
 address like `https://weft-role-dispatcher-123456789.us-west1.run.app`, and
-the line that logs you in with the first operator key: the password your CLI
-uses to act on the install. The key is kept in Secret Manager and never
-printed in the workflow's logs; that line reads it on your machine (it needs
-`gcloud`) and hands it straight to `weft login`, below.
+the line that logs you in with the install's own operator key: the
+password your CLI uses to act on the install. The key is kept in Secret
+Manager and never printed in the workflow's logs; that line reads it on your
+machine (it needs `gcloud`) and hands it straight to `weft login`, below.
 
 The address works at once, over HTTPS, with no extra charge. If you want a
 name of your own instead, see [your own domain](#your-own-domain), which
@@ -330,7 +330,7 @@ the install workflow.
 
 weft generates the rest of its secrets itself: the key your saved
 connections are encrypted with, the key live callers' tickets are signed
-with, and the first operator key. The encryption key is made once and kept
+with, and the install's own operator key. The encryption key is made once and kept
 in the Terraform state, in the `$PROJECT-weft-state` bucket, and copied
 into Secret Manager, which is where weft's services read it. If it is ever
 lost or replaced, every saved connection stops working and has to be made
@@ -460,7 +460,13 @@ with `--key-stdin`), checks it against the install, and keeps it in `~/.config/w
 can read. If a teammate needs their own key, run
 `weft token mint --operator --on prod` and send them what it prints. To see
 the keys you have handed out, run `weft token ls --on prod`, and to cancel
-one right away, `weft token revoke <id> --on prod`.
+one right away, `weft token revoke <id> --on prod`. The install's own key,
+the one the workflow gave you, is not among them: it is no row in the
+install's database but its secret in Secret Manager (`<name>-install-key`),
+so it works until that secret changes, and `weft token revoke` cannot retire
+it. An install set up before that also lists it under the name `bootstrap`,
+a row an older weft wrote for the same key: revoking that row is up to you,
+and the key keeps working through its secret either way.
 
 Every command takes `--on` the same way: `weft status --on prod`,
 `weft runs --on prod`, `weft logs <run-id> --on prod`. Without it, a

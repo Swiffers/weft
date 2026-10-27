@@ -2,10 +2,13 @@
 //!
 //! There is no cloud to vouch for anyone on a laptop, so the install holds
 //! one key (`WEFT_IDENTITY_KEY`, 32 bytes, written when the install is
-//! created) and signs a short token per principal with it: one for its own
-//! roles, and one per worker it starts (handed to that worker's container
-//! at start). Verifying is checking the signature and the expiry. A worker
-//! never sees the key, so it cannot mint a token for anyone but itself.
+//! created, kept in the install's `secrets.env`) and signs a short token
+//! per principal with it: one for its own roles, and one per worker it
+//! starts (in that worker's environment at start). Verifying is checking
+//! the signature and the expiry. A worker's environment carries the token
+//! and none of the runtime's secrets, the key included, but a local worker
+//! is a process running as the person, so it can read whatever the person
+//! can, the install's `secrets.env` among them.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

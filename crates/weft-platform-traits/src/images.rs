@@ -1,11 +1,15 @@
-//! Building images and keeping them: the platform's image store.
+//! Building what a project runs and keeping it: the platform's image
+//! store.
 //!
-//! Every image weft runs (a project's worker, an infra node's own image,
-//! a node-test image) is built inside the install from a staged context
-//! and named by its content, so an image already present is the same bytes
-//! a build would make and its build is skipped. Where images are built and
-//! kept is the platform's: the local Docker daemon, or a cloud's build
-//! service pushing to its registry.
+//! Everything weft builds for a project (its worker, an infra node's own
+//! image) is built inside the install from a staged context and named by
+//! its content, so an artifact already present is the same bytes a build
+//! would make and its build is skipped. Where it is built and kept is the
+//! platform's: a cloud's build service pushing images to its registry, or
+//! a local install, which compiles a worker as a program on the machine
+//! and builds an infra image with the local Docker daemon. Either way it
+//! is named by an image ref (`weft_core::builds::WORKER_REPO` says what one
+//! names where).
 //!
 //! Building is split in two so a build outlives whoever started it:
 //! `start` launches it and answers the builder's own id for it (which the
@@ -35,6 +39,11 @@ pub trait ImageBuilder: Send + Sync {
     /// has in this platform's store. A pure function of the tag.
     fn image_ref(&self, tag: &str) -> String;
 
+    /// How this platform makes a project's worker: an image a container
+    /// runtime runs (a cloud), or a program the machine runs as a process
+    /// (a local install). The compiler stages the worker for it.
+    fn worker_packaging(&self) -> weft_core::builds::WorkerPackaging;
+
     /// Launch the build of a staged context, producing `req.image_ref`.
     /// Returns as soon as it runs; the build goes on on its own. The
     /// context stays on disk exactly as long as somebody holds
@@ -63,31 +72,23 @@ pub trait ImageBuilder: Send + Sync {
     async fn delete_image(&self, image_ref: &str) -> anyhow::Result<ImageDeleted>;
 }
 
-/// A staged build context to build. `context_dir` holds a `Dockerfile`
-/// and everything it copies; `image_ref` is the content-addressed target
-/// (from [`ImageBuilder::image_ref`]); `name` is the build's name, minted
-/// by the caller and recorded before the build starts.
+/// A staged build context to build. `context_dir` holds what `recipe`
+/// reads (a `Dockerfile` and everything it copies, or the host recipe);
+/// `image_ref` is the content-addressed target (from
+/// [`ImageBuilder::image_ref`]); `name` is the build's name, minted by the
+/// caller and recorded before the build starts.
 #[derive(Debug, Clone)]
 pub struct BuildRequest {
     pub name: String,
     pub project_id: uuid::Uuid,
     pub tenant: String,
     pub context_dir: PathBuf,
+    /// How the context is built, and for a Dockerfile, the file inside the
+    /// image whose bytes are the build's result.
+    pub recipe: weft_core::builds::BuildRecipe,
     /// What keeps `context_dir` on disk ([`Staging`]).
     pub staging: Staging,
     pub image_ref: String,
-    /// `ARG`s the Dockerfile declares (the worker's compile lane).
-    pub build_args: Vec<(String, String)>,
-    /// What the build uses of what an install keeps on the machine that
-    /// runs it: a builder on a machine adds it to its install's image
-    /// record before it builds, a cloud builder keeps nothing there.
-    pub uses: weft_core::images::BuildUses,
-    /// A file inside the built image whose bytes are the build's result
-    /// (`weft_core::builds::LEFT_OUT_RECORD_PATH` for a worker): read
-    /// once the build succeeded, without running the image, and handed
-    /// back on [`BuildStatus::Succeeded`]. A build whose image lacks it
-    /// failed. `None` for an image with nothing to report.
-    pub result_file: Option<String>,
 }
 
 /// What keeps a staged build context on disk: the context exists while
@@ -153,8 +154,9 @@ impl BuildHandle {
 pub enum BuildStatus {
     /// Still running; poll again later.
     Pending,
-    /// Produced `image_ref`, with the bytes of the request's
-    /// `result_file` when it named one.
+    /// Produced `image_ref`, with the build's result when it has one: the
+    /// bytes of the Dockerfile recipe's `result_file`, or the record a host
+    /// build writes of what it left out.
     Succeeded { result: Option<Vec<u8>> },
     /// The build failed; `reason` is the builder's error.
     Failed { reason: String },
@@ -245,6 +247,10 @@ impl ImageBuilder for FakeImageBuilder {
         format!("fake.registry/{tag}")
     }
 
+    fn worker_packaging(&self) -> weft_core::builds::WorkerPackaging {
+        weft_core::builds::WorkerPackaging::Image { builder: "fake.registry/weft-builder-base:fake".into() }
+    }
+
     async fn start(&self, req: BuildRequest) -> anyhow::Result<BuildHandle> {
         let mut inner = self.inner.lock().unwrap();
         let id = if inner.names_its_own { format!("{}-id", req.name) } else { req.name.clone() };
@@ -316,11 +322,9 @@ mod tests {
                 project_id: uuid::Uuid::from_u128(0x100),
                 tenant: "t".into(),
                 context_dir: PathBuf::from("/tmp/ctx"),
+                recipe: weft_core::builds::BuildRecipe::Dockerfile { result_file: None },
                 staging: Staging::new(()),
                 image_ref: "reg/weft-worker:x".into(),
-                build_args: Vec::new(),
-                uses: Default::default(),
-                result_file: None,
             })
             .await
             .unwrap();

@@ -698,6 +698,7 @@
             door_broker: crate::door::fake::FakeDoorBroker::new(Vec::new()),
             shared: weft_core::shared::Shared::new(std::time::Duration::MAX),
             steering: Arc::new(NoopSteering),
+            needs_from: weft_core::needs::NeedsFrom::Machine,
         }
     }
 

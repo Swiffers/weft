@@ -105,9 +105,10 @@ pub use crate::node::ERROR_PORT;
 
 /// The message a failed body hands to [`ERROR_PORT`] if it is caught,
 /// or `None` for a failure that is never caught. An outcome of the
-/// firing (a [`WeftError::NodeFailed`], a [`WeftError::Runtime`], or a
-/// wait it gave up, [`WeftError::WaitGaveUp`]) may be caught; a bad
-/// config, input or type, a suspension and a cancel
+/// firing (a [`WeftError::NodeFailed`], a [`WeftError::Runtime`], a
+/// wait it gave up, [`WeftError::WaitGaveUp`], or a need the machine
+/// lost since the program was checked, [`WeftError::NeedMissing`]) may
+/// be caught; a bad config, input or type, a suspension and a cancel
 /// never are: those are the program's own shape or the runtime's
 /// control flow, never an outcome to route around. A failure that
 /// never came from a body (a panic, an infra apply that failed) is not
@@ -119,6 +120,7 @@ pub fn catchable_message(error: &WeftError) -> Option<String> {
     match error {
         WeftError::NodeFailed(message) | WeftError::WaitGaveUp(message) => Some(message.clone()),
         WeftError::Runtime(error) => Some(format!("{error:#}")),
+        WeftError::NeedMissing(_) => Some(error.to_string()),
         WeftError::Config(_)
         | WeftError::Input(_)
         | WeftError::Type(_)
@@ -127,6 +129,32 @@ pub fn catchable_message(error: &WeftError) -> Option<String> {
         | WeftError::WaitSkipped(_)
         | WeftError::Cancelled => None,
     }
+}
+
+/// What a failed body of node `node` (of type `node_type`) says to the
+/// person: the error's own words, except a need of its own the node found
+/// missing ([`WeftError::NeedMissing`]), said with the node's type and the
+/// way to meet it where its worker gets its needs from
+/// (`crate::needs::missing_at_run`).
+pub fn failure_message(error: &WeftError, node_type: &str, node: &str, needs_from: crate::needs::NeedsFrom) -> String {
+    match error {
+        WeftError::NeedMissing(need) => crate::needs::missing_at_run(node_type, node, need, needs_from),
+        other => other.to_string(),
+    }
+}
+
+/// A failed body of node `node` (of type `node_type`) in words: what the
+/// run records ([`failure_message`]) and, when it may be caught
+/// ([`catchable_message`]), what [`ERROR_PORT`] gets. A missing need is
+/// caught in the words the run would record, so a program that passes it
+/// on keeps the node's type and the way to meet it.
+pub fn node_failure(error: &WeftError, node_type: &str, node: &str, needs_from: crate::needs::NeedsFrom) -> (String, Option<String>) {
+    let message = failure_message(error, node_type, node, needs_from);
+    let catchable = match error {
+        WeftError::NeedMissing(_) => Some(message.clone()),
+        other => catchable_message(other),
+    };
+    (message, catchable)
 }
 
 /// Whether a failure goes to [`ERROR_PORT`] instead of stopping the
@@ -1763,9 +1791,8 @@ impl EndpointHandle {
     /// The address the project's own workers reach this endpoint at. No
     /// broker call; the URL was resolved by `ctx.endpoint(name)`. A
     /// signal given this address (a `PollEndpoint` a run parks on, an
-    /// `SseSubscribe`) works too: the listener asks the broker for the
-    /// same endpoint's address as weft's own roles reach it before every
-    /// connect (`weft_listener::infra_address`).
+    /// `SseSubscribe`) works too: every platform gives an endpoint one
+    /// address, which the listener reaches as the workers do.
     pub fn url(&self) -> &str {
         &self.url
     }
@@ -2202,10 +2229,11 @@ impl StorageHandle {
 
     /// The one read dispatch behind `get` / `get_range`: route the handle
     /// to the bucket (a `key`) or an external fetch (a `url`). A
-    /// url-backed file is fetched directly by the worker, which is safe
-    /// because that fetch only ever runs inside the isolated worker (the
-    /// same reason `put_from_url` is safe). The node-facing surface is
-    /// identical either way.
+    /// url-backed file is fetched directly by the worker, never by one of
+    /// weft's services, so an arbitrary URL reaches only what the
+    /// program's own code could already reach (the same reason
+    /// `put_from_url` takes any URL). The node-facing surface is identical
+    /// either way.
     async fn get_with_range(
         &self,
         file: &crate::storage::FileHandle,
@@ -2773,9 +2801,10 @@ pub trait ContextHandle: Send + Sync {
 
     /// Stream the bytes of a file that lives at an external URL (a file value
     /// whose handle is a `url`, not a bucket `key`). The worker GETs the URL
-    /// directly and streams the body out; the fetch happens only inside the
-    /// isolated worker (never a trusted service), so an arbitrary URL is safe
-    /// here for the same reason `storage_put_from_url` is. `declared` carries
+    /// directly and streams the body out; the fetch happens only in the
+    /// worker (never in one of weft's services), so an arbitrary URL reaches
+    /// only what the program's own code could already reach, the same as
+    /// `storage_put_from_url`. `declared` carries
     /// the marker's mime/filename/size for the returned meta; the response's
     /// own Content-Type wins for the actual byte stream's kind. Lives on the
     /// trait (not `StorageHandle`) because the HTTP client is an engine
@@ -2890,6 +2919,7 @@ mod caught_failure_tests {
             (WeftError::NodeFailed("x".into()), true),
             (WeftError::WaitGaveUp("x".into()), true),
             (WeftError::Runtime(anyhow::anyhow!("x")), true),
+            (WeftError::NeedMissing("x".into()), true),
             (WeftError::Suspended { token: "x".into() }, false),
             (WeftError::WaitSkipped("x".into()), false),
             (WeftError::Config("x".into()), false),
@@ -2909,11 +2939,23 @@ mod caught_failure_tests {
                     let caught = caught_failure(catchable_message(&error), opened_a_stream, wired);
                     assert_eq!(caught.is_some(), outcome && !opened_a_stream && wired, "{error:?} stream={opened_a_stream} wired={wired}");
                     if let Some(message) = caught {
-                        assert_eq!(message, "x");
+                        assert_eq!(message, if matches!(error, WeftError::NeedMissing(_)) { error.to_string() } else { "x".into() });
                     }
                 }
             }
         }
+    }
+
+    /// A missing need is caught in the words the run records: the node's
+    /// type and the way to meet the need, not only what is missing.
+    #[test]
+    fn a_caught_missing_need_keeps_its_node_and_remedy() {
+        let error = WeftError::NeedMissing("python3".into());
+        let (message, catchable) = super::node_failure(&error, "ExecPython", "greet", crate::needs::NeedsFrom::Machine);
+        assert_eq!(catchable.as_deref(), Some(message.as_str()));
+        assert!(message.contains("ExecPython") && message.contains("deps-install"), "{message}");
+        let (_, caught) = super::node_failure(&WeftError::NodeFailed("x".into()), "ExecPython", "greet", crate::needs::NeedsFrom::Machine);
+        assert_eq!(caught.as_deref(), Some("x"));
     }
 }
 

@@ -24,8 +24,8 @@
 # until its test OUTCOME inputs move: the package's own code (nodes,
 # tests, shared package files) or the catalog's type registry (a
 # sibling's type edit changes how this package's ports resolve).
-# Engine / image-recipe edits rebuild the test image but do not
-# invalidate a recorded pass (live tests cost real money).
+# Engine edits recompile the test server but do not invalidate a
+# recorded pass (live tests cost real money).
 # `--retest` forces the recorded packages to run anyway.
 #
 # The suite runs inside a scratch project (target/node-tests, created on
@@ -89,7 +89,7 @@ fi
 
 # The installed weft resolves its stdlib through WEFT_REPO_ROOT first:
 # pin it to this checkout so the scratch project's base catalog (and the
-# test images) are built from the code being tested, not from wherever
+# test servers) are built from the code being tested, not from wherever
 # the binary was installed.
 export WEFT_REPO_ROOT="$REPO_ROOT"
 
@@ -241,7 +241,7 @@ if [ "$LIVE" = 1 ]; then
   fi
   # The dispatcher only runs node tests for a registered project; a
   # first `weft run` registers it (and proves the build pipeline).
-  # Content-addressed images make this cheap after the first time; the
+  # Content-addressed workers make this cheap after the first time; the
   # first time compiles the worker, so it takes the build slot too.
   register_project() { (cd "$PROJECT_DIR" && weft run); }
   with_build_slot register_project || exit 1
@@ -251,8 +251,8 @@ fi
 # Live tests cost real provider money, so a package whose code has not
 # moved since its last fully green live run is skipped. Identity is
 # `weft node-test-hash`: the package's own files (nodes, tests, shared
-# package files) plus the catalog's type registry; engine / recipe
-# edits rebuild the image but never re-spend a recorded pass.
+# package files) plus the catalog's type registry; engine edits
+# recompile the test server but never re-spend a recorded pass.
 # Recorded ONLY after a run
 # that covered the package's whole live tier (never under --test);
 # `--retest` ignores recorded passes for this run.

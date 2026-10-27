@@ -96,11 +96,15 @@ Per node, and every section is optional.
 [dependencies]
 reqwest = { workspace = true }
 
-[system.runtime.apt]
+[[needs]]
+name = "ffmpeg"
+check = ["ffmpeg", "-version"]
+
+[needs.install.apt]
 default = ["ffmpeg"]
 
-[system.build.apt]
-debian_12 = ["pkg-config", "libssl-dev"]
+[needs.install.brew]
+default = ["ffmpeg"]
 
 [build.env]
 SOME_PATH = "{{catalog_path}}/vendor"
@@ -110,16 +114,64 @@ SOME_PATH = "{{catalog_path}}/vendor"
 |---|---|
 | `[dependencies]` | Cargo crates this node needs |
 | `[build-dependencies]` | Cargo crates for the package's `build.rs` (see [a build script](#a-build-script)) |
-| `[system.build.<manager>]` | OS packages needed to **compile**, thrown away before the runtime image is sealed |
-| `[system.runtime.<manager>]` | OS packages needed to **run** |
-| `[build.env]` | Environment during `cargo build`. `{{catalog_path}}` expands to your node's folder inside the builder |
+| `[[needs]]` | Something the machine has to have: a program the node starts, or a library its package needs to compile (see [what a node needs from the machine](#what-a-node-needs-from-the-machine)) |
+| `[build.env]` | Environment during `cargo build`. `{{catalog_path}}` expands to the path of your node's folder inside the build |
 
-Managers are `apt`, `apk`, `yum` and `brew`. Under each, a key per distribution
-like `debian_12` or `alpine_3_19`, or `default` for all of them. weft looks for
-the exact key, falls back to `default`, and fails only when neither is there.
+Any other section fails the build, with an error naming the node type and the
+key.
 
 `[build.env]` only sets variables. If you need build logic, write a build
 script.
+
+## What a node needs from the machine
+
+If your node starts a program (`python3`, `ffmpeg`), or its package needs a
+library to compile, that has to be on the machine the worker runs on, which
+on a local install is your own computer. Declare each one with a
+`[[needs]]` entry:
+
+| Key | What it says |
+|---|---|
+| `name` | Required. What the user is told the node needs |
+| `check` | Required. A command that exits 0 when the need is met. Its first word is looked up on the `PATH`, and a check still running after ten seconds counts as unmet |
+| `stage` | `"run"` (the default) for what the node starts while it runs, `"build"` for what its package needs to compile, like a C library's headers |
+| `[needs.install.<manager>]` | The packages that meet it. Managers are `apt` (Debian, Ubuntu), `dnf` (Fedora, RHEL), `apk` (Alpine) and `brew` (macOS) |
+
+Under each manager, `default` names the packages for every system that
+manager serves. A key made of the `ID` and `VERSION_ID` from
+`/etc/os-release`, dots turned to underscores (`debian_12`,
+`ubuntu_24_04`, `fedora_40`), names them for one system whose package names
+differ. weft looks for that exact key first and falls back to `default`.
+
+A local install runs the `run` checks of a program's nodes before the
+program runs, activates or resyncs, and refuses it when one fails. For what
+the person sees then, and how `weft deps-install` fixes it, go and read
+[what nodes need from your
+machine](../running/cli.md#what-nodes-need-from-your-machine). Nothing
+checks a `build` need before your package compiles, though: if one is
+missing, the package fails to compile and the build leaves it out (see
+[when a package does not compile](#when-a-package-does-not-compile)).
+
+On a cloud install the worker is an image, and its build installs the same
+packages: `run` needs into the image the worker runs in, `build` needs into
+the one that compiles it, with the entry for the image's package manager.
+The image starts from `debian:bookworm-slim` unless the project's
+`weft.toml` names another in `[build.worker] base_image` (for that setting,
+go and read [the worker](../running/architecture.md#the-worker)), so the
+entry is usually `apt`. If your `apt` entry has keys but neither
+`debian_12` nor `default`, the cloud build fails naming the node. If a need
+has no entry for the image's package manager at all, nothing on a cloud
+install can provide it, so a cloud install refuses any program that uses
+that node. The same goes for every `run` need when
+the project's own `[build.worker] dockerfile_template` drops weft's
+`{{install_runtime_system_packages}}` line, which is where those packages
+are installed.
+
+If the program is gone by the time your node starts it (somebody
+uninstalled it after the check), fail with
+`weft::error::need_missing("<the need's name>")`, the way `ExecPython` does
+for `python3`. weft adds your node and the way to meet the need on that
+install, so the person reads the same lines a refused run shows.
 
 ## A build script
 

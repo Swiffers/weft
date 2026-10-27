@@ -1310,14 +1310,11 @@ pub struct SupervisorSetAppliedResponse {}
 /// on its `infra_node` row.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppliedEndpoints {
-    /// Endpoint name to where the project's workers reach it.
+    /// Endpoint name to where the project's workers and weft's own roles
+    /// (the front door passing a `Public` endpoint on, the dispatcher
+    /// reading a unit's `/live`) reach it.
     #[serde(rename = "endpoints")]
     pub urls: std::collections::BTreeMap<String, String>,
-    /// Endpoint name to where weft's own roles reach it (the front door
-    /// passing a `Public` endpoint on, the dispatcher reading a unit's
-    /// `/live`). The same address as the workers' unless the workers sit
-    /// on a network weft's roles are not on (a local install).
-    pub install_urls: std::collections::BTreeMap<String, String>,
     /// Endpoint name to the path it answers at on the front door, for
     /// `Public` endpoints only (`weft_core::infra::public_path`).
     pub public_paths: std::collections::BTreeMap<String, String>,
@@ -2069,36 +2066,6 @@ pub struct ListenerResolveRequest {
     pub required_values: Vec<String>,
 }
 
-/// Where the listener reaches an address a trigger was given. A trigger
-/// wired from an infra node gets the address the project's WORKERS reach
-/// the endpoint at, and the listener is one of weft's own roles, which
-/// may sit on another network (a local install's runtime runs on the
-/// machine, the workers in Docker's network). The broker answers with the
-/// same endpoint's address for weft's roles, or the address unchanged
-/// when it is no infra endpoint of the signal's project.
-// SYNC: ListenerInfraAddress <-> crates/weft-broker/src/events.rs (listener_infra_address)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListenerInfraAddressRequest {
-    /// The signal the listener is connecting for. The broker reads its
-    /// project off the held row (or, for a cancelled wait whose last call
-    /// is being sent, off that call's task), so the answer looks at that
-    /// project's infra alone, and any other token is refused.
-    pub signal_token: String,
-    /// `host:port`, as the trigger's URL or address names it.
-    pub authority: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListenerInfraAddress {
-    pub authority: String,
-    /// Whether the address is one of the project's infra endpoints
-    /// (translated for weft's roles). An infra endpoint's address can
-    /// move (a local unit made again on another port), so the listener
-    /// asks again after a connect to it fails; any other address is
-    /// the one given, for good.
-    pub is_infra: bool,
-}
-
 /// Give up on a signal for good (`signal/give_up`): it could not come up
 /// after its retries, or its wake can never be handled (a spec or state
 /// nothing can read, a kind no listener knows). Written once with why,
@@ -2752,7 +2719,6 @@ mod supervisor_protocol_tests {
                     "status": "running",
                     "applied_spec_hash": "deadbeef",
                     "endpoints": { "api": "http://x.svc:8080" },
-                    "install_urls": { "api": "http://127.0.0.1:41234" },
                     "public_paths": { "api": "/infra/p/wn-abc-tgi-12/hooks" },
                     "doors": { "sql": "10.0.0.7:5432" },
                     "keep_disks": ["model-cache"],
@@ -2773,7 +2739,6 @@ mod supervisor_protocol_tests {
         let resp: SupervisorInfraNodesResponse = serde_json::from_value(json).unwrap();
         assert_eq!(resp.nodes[0].health_rules.as_ref().unwrap()[0].when.units_named(), vec!["main"]);
         assert_eq!(resp.nodes[0].addresses.urls.get("api").unwrap(), "http://x.svc:8080");
-        assert_eq!(resp.nodes[0].addresses.install_urls.get("api").unwrap(), "http://127.0.0.1:41234");
         assert_eq!(resp.nodes[0].addresses.public_paths.get("api").unwrap(), "/infra/p/wn-abc-tgi-12/hooks");
         assert_eq!(resp.nodes[0].addresses.doors.get("sql").unwrap(), "10.0.0.7:5432");
         assert_eq!(resp.nodes[0].units.get("main").unwrap().status, InfraNodeStatus::Running);
@@ -2814,7 +2779,6 @@ mod supervisor_protocol_tests {
             applied_spec_hash: "deadbeef".into(),
             addresses: AppliedEndpoints {
                 urls: [("api".to_string(), "http://x".to_string())].into(),
-                install_urls: [("api".to_string(), "http://127.0.0.1:40001".to_string())].into(),
                 public_paths: [("api".to_string(), "/infra/p/wn-abc-tgi-12/hooks".to_string())].into(),
                 doors: [("sql".to_string(), "10.0.0.7:5432".to_string())].into(),
             },

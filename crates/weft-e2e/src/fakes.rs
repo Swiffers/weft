@@ -1,21 +1,11 @@
 //! Throwaway servers for triggers the system dials OUT to.
 //!
 //! `PollFake` and `SseFake` serve the `PollEndpoint` and `SseSubscribe`
-//! kinds, which the LISTENER dials, and it runs in the install's runtime
-//! process on the host; the other fakes are dialled by node code in a
-//! WORKER container. To test them, the
-//! rig stands up a tiny server both can connect to, then drives events from
-//! the test.
-//!
-//! ## Reachability
-//!
-//! A server bound on the test host's `127.0.0.1` is NOT reachable from a
-//! container. The address both sides reach is the gateway of the install's
-//! Docker network (`weft`): the host owns that address, and every worker
-//! sits on that network. So a fake:
-//!   - binds on `0.0.0.0:<port>` on the host, and
-//!   - advertises its URL as `http://<gateway-ip>:<port>`, which the test
-//!     injects into the fixture's trigger URL.
+//! kinds, which the listener dials from the install's runtime process; the
+//! other fakes are dialled by node code in a worker, a process on the same
+//! machine. So each fake binds an ephemeral port on `127.0.0.1` and
+//! advertises `http://127.0.0.1:<port>`, which the test puts in the
+//! fixture, then drives events from the test.
 
 use std::sync::Arc;
 
@@ -41,17 +31,14 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Bind a fake's listener: discover the host's address on the network, bind
-/// `0.0.0.0:<ephemeral>` on the host, and return the gateway IP, the bound
-/// listener, and the chosen port. The single place the bind + gateway dance
-/// lives, so the four fakes don't each restate it.
-async fn bind_host(what: &str) -> Result<(String, TcpListener, u16)> {
-    let gateway = host_address().await?;
-    let listener = TcpListener::bind(("0.0.0.0", 0))
+/// Bind a fake's listener on an ephemeral loopback port, and return the
+/// URL it answers at with the bound listener.
+async fn bind_host(what: &str) -> Result<(String, TcpListener)> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .with_context(|| format!("bind {what} fake"))?;
-    let port = listener.local_addr()?.port();
-    Ok((gateway, listener, port))
+    let at = listener.local_addr()?;
+    Ok((format!("http://{at}"), listener))
 }
 
 /// Spawn an axum app on a bound listener, returning an abort-on-drop handle.
@@ -63,21 +50,6 @@ fn serve_axum(listener: TcpListener, app: Router) -> AbortOnDrop {
     }))
 }
 
-/// The gateway of the install's Docker network: the host's own address on
-/// that network, which the runtime and every worker reach.
-pub async fn host_address() -> Result<String> {
-    let args = ["network", "inspect", weft_platform_local::docker::NETWORK, "--format", "{{range .IPAM.Config}}{{.Gateway}}{{end}}"];
-    let out = tokio::process::Command::new("docker").args(args).output().await.context("spawn docker")?;
-    if !out.status.success() {
-        bail!("docker {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
-    }
-    let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if ip.is_empty() {
-        bail!("the install's Docker network has no gateway; is the install up?");
-    }
-    Ok(ip)
-}
-
 /// A fake HTTP endpoint the listener POLLS (`PollEndpoint`). Each poll returns
 /// the current body; the test sets the body to drive what the next poll fires.
 pub struct PollFake {
@@ -87,16 +59,16 @@ pub struct PollFake {
 }
 
 impl PollFake {
-    /// Bind a poll fake on an ephemeral host port and return it. `base_url` is
+    /// Bind a poll fake on an ephemeral loopback port and return it. `base_url` is
     /// the reachable URL to put in the fixture's `PollEndpoint.url`.
     pub async fn start(initial_body: &str) -> Result<Self> {
         let body = Arc::new(Mutex::new(initial_body.to_string()));
-        let (gateway, listener, port) = bind_host("poll").await?;
+        let (base_url, listener) = bind_host("poll").await?;
         let app = Router::new()
             .route("/poll", get(poll_handler))
             .with_state(body.clone());
         Ok(Self {
-            base_url: format!("http://{gateway}:{port}"),
+            base_url,
             body,
             _server: serve_axum(listener, app),
         })
@@ -146,14 +118,14 @@ impl JobFake {
     pub async fn start(pending: usize, result: &str) -> Result<Self> {
         let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let cancels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (gateway, listener, port) = bind_host("job").await?;
+        let (base_url, listener) = bind_host("job").await?;
         let state = JobState { reads: reads.clone(), cancels: cancels.clone(), pending, result: Arc::new(result.to_string()) };
         let app = Router::new()
             .route("/status", get(job_status))
             .route("/cancel", axum::routing::put(job_cancel))
             .with_state(state);
         Ok(Self {
-            base_url: format!("http://{gateway}:{port}"),
+            base_url,
             reads,
             cancels,
             _server: serve_axum(listener, app),
@@ -220,10 +192,10 @@ impl ChatFake {
     /// and `tool_calls` for a turn that calls tools), answered in order.
     pub async fn start(replies: Vec<serde_json::Value>) -> Result<Self> {
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let (gateway, listener, port) = bind_host("chat").await?;
+        let (base_url, listener) = bind_host("chat").await?;
         let state = ChatState { script: Arc::new(replies), requests: requests.clone() };
         let app = Router::new().route("/chat/completions", axum::routing::post(chat_completion)).with_state(state);
-        Ok(Self { base_url: format!("http://{gateway}:{port}"), requests, _server: serve_axum(listener, app) })
+        Ok(Self { base_url, requests, _server: serve_axum(listener, app) })
     }
 
     /// The base URL a `CustomProvider` takes.
@@ -307,12 +279,12 @@ impl BytesFake {
     /// Serve `content` (as `application/octet-stream`) at `<url>()`.
     pub async fn start(content: Vec<u8>) -> Result<Self> {
         let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (gateway, listener, port) = bind_host("bytes").await?;
+        let (base_url, listener) = bind_host("bytes").await?;
         let app = Router::new()
             .route("/bytes", get(bytes_handler))
             .with_state(BytesState { body: Arc::new(content), served: served.clone() });
         Ok(Self {
-            base_url: format!("http://{gateway}:{port}"),
+            base_url,
             served,
             _server: serve_axum(listener, app),
         })
@@ -367,13 +339,13 @@ impl QueueFake {
             reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             units,
         };
-        let (gateway, listener, port) = bind_host("queue").await?;
+        let (base_url, listener) = bind_host("queue").await?;
         let app = Router::new()
             .route("/submit", axum::routing::post(queue_submit))
             .route("/result/{id}", get(queue_result))
             .with_state(state.clone());
         Ok(Self {
-            base_url: format!("http://{gateway}:{port}"),
+            base_url,
             state,
             _server: serve_axum(listener, app),
         })
@@ -458,12 +430,12 @@ impl HangingBytesFake {
         if sent >= declared {
             bail!("HangingBytesFake needs sent ({sent}) < declared ({declared}) to interrupt");
         }
-        let (gateway, listener, port) = bind_host("hanging-bytes").await?;
+        let (base_url, listener) = bind_host("hanging-bytes").await?;
         let app = Router::new()
             .route("/bytes", get(hanging_handler))
             .with_state(HangingState { sent, declared });
         Ok(Self {
-            base_url: format!("http://{gateway}:{port}"),
+            base_url,
             _server: serve_axum(listener, app),
         })
     }
@@ -535,12 +507,12 @@ impl SseFake {
             tx,
             reading: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
-        let (gateway, listener, port) = bind_host("sse").await?;
+        let (base_url, listener) = bind_host("sse").await?;
         let app = Router::new()
             .route("/events", get(sse_handler))
             .with_state(state.clone());
         Ok(Self {
-            base_url: format!("http://{gateway}:{port}"),
+            base_url,
             state,
             _server: serve_axum(listener, app),
         })

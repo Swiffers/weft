@@ -3,6 +3,8 @@
 //! once instead of once per file. nextest still runs each test in its own
 //! process.
 
+mod carry;
+mod folder_watch;
 mod provider_events;
 mod stream_listen;
 mod wakes;

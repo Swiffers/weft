@@ -2038,7 +2038,7 @@ impl RuntimeStore {
             key,
             &[PartAsk { part_number, size_bytes: size }],
             entitlements,
-            &PresignAudience::Internal,
+            &PresignAudience::Install,
         )
         .await?;
         let etag = self

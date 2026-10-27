@@ -200,6 +200,25 @@ pub(crate) fn ambiguous_route<'a>(
     })
 }
 
+/// Whether an entry's trigger listened the whole time its row was not
+/// served, from how its activation stood just before the claim that arms
+/// it again (`before`, `None` when it was never activated), at `now_unix`:
+/// it was on, or down behind a door that still holds what arrives
+/// (`weft_core::arrival`), or down for `weft maintenance on`. A door that
+/// refuses, or whose window ended, listened to nothing. Maintenance's door
+/// refuses too, but nobody refused anything: it is weft's own pause, so
+/// what arrived meanwhile is caught up like any other downtime of weft's.
+/// A door that refuses takes the places of its rows as it is set
+/// (`crate::take_down::places_go`), and one whose window ends as the
+/// reaper closes it (`crate::reaper::close_door_windows_over`); this is
+/// what still holds between a window's end by the clock and that close,
+/// which a claim made in between keeps from matching. Pure.
+pub(crate) fn listened_while_down(before: Option<&crate::activation_store::ActivationLifecycle>, now_unix: i64) -> bool {
+    let Some(before) = before else { return false };
+    before.went_down == Some(weft_broker_client::activation::WentDown::Maintenance)
+        || before.standing().arrival(now_unix) != weft_core::arrival::Arrival::Refused
+}
+
 #[async_trait]
 impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
     async fn execute(&self, state: &DispatcherState, task: &Task) -> Result<Value> {
@@ -221,7 +240,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             // else writes a run its worker drives.
             return Ok(serde_json::to_value(weft_core::primitive::RegisterSignalResult::Captured { node_id })?);
         }
-        let token = Self::arm(state, payload).await?.token;
+        let token = Self::arm(state, payload, None).await?.token;
         Ok(serde_json::to_value(weft_core::primitive::RegisterSignalResult::Registered { token })?)
     }
 }
@@ -230,7 +249,17 @@ impl RegisterSignalExecutor {
     /// Arm a captured entry or a live suspension through the same path.
     /// The answer says what the arm did to the row, so a caller whose
     /// later step fails can take it back ([`disarm`]).
-    pub(crate) async fn arm(state: &DispatcherState, mut payload: RegisterSignalPayload) -> Result<Armed> {
+    ///
+    /// `before` is how an entry's activation stood just before the claim
+    /// that arms it (`None` for a resume, and for a trigger never
+    /// activated): whether the row it replaces was listened for the whole
+    /// time is read off it ([`listened_while_down`]).
+    pub(crate) async fn arm(
+        state: &DispatcherState,
+        mut payload: RegisterSignalPayload,
+        before: Option<&crate::activation_store::ActivationLifecycle>,
+    ) -> Result<Armed> {
+        let listened = listened_while_down(before, crate::lease::now_unix());
         let run_id = payload.run_id;
 
         // Per-kind validation: each `Signal` impl owns its rules
@@ -335,9 +364,17 @@ impl RegisterSignalExecutor {
                 let (token, prior) =
                     read_prior(state.registrations.as_ref(), resume_token.as_deref(), project_id, &place, instance.as_ref()).await?;
                 let prior_seq = prior.as_ref().map_or(0, |row| row.kind_state_seq);
-                // A resume starts its kind state afresh; an entry carries
-                // its row's forward (a feed cursor keeps its place).
-                let prior_kind_state = prior.as_ref().filter(|row| !row.is_resume).map(|row| row.kind_state.clone());
+                // What the new row carries over of this one is the
+                // listener's to decide, the same way for every kind.
+                let prior_row = match &prior {
+                    Some(row) => Some(weft_core::signal::listener_protocol::PriorRow {
+                        spec: serde_json::from_str(&row.spec_json)
+                            .with_context(|| format!("signal {token}'s row holds a spec that does not read"))?,
+                        kind_state: row.kind_state.clone(),
+                        listened,
+                    }),
+                    None => None,
+                };
                 let prepared = state
                     .listener
                     .prepare(&weft_core::signal::listener_protocol::PrepareRequest {
@@ -348,7 +385,7 @@ impl RegisterSignalExecutor {
                         is_resume: payload.is_resume,
                         run_id: resume_run_id,
                         source: weft_core::signal::listener_protocol::PrepareSource {
-                            prior_kind_state,
+                            prior: prior_row,
                             asked_at_unix_ms: payload.asked_at_unix_ms,
                         },
                         for_instance: instance
@@ -1119,6 +1156,33 @@ mod tests {
         assert!(j.signal_get("fresh").await.unwrap().is_none());
         assert_eq!(*listener.forgotten.lock().unwrap(), vec!["fresh"]);
         assert_eq!(j.signal_get("old").await.unwrap().unwrap().spec_json, prior.spec_json);
+    }
+
+    /// A trigger listened while it was down when its door held what
+    /// arrived (within its window), or when weft's maintenance took it
+    /// down; never behind a door that refused, past its window, or when it
+    /// was never activated.
+    #[test]
+    fn a_trigger_listened_while_down_only_behind_a_door_that_held_or_for_maintenance() {
+        use super::listened_while_down;
+        use crate::activation_store::ActivationLifecycle;
+        use weft_broker_client::activation::WentDown;
+        use weft_core::take_down::{Door, Held, Running, TakeDown};
+        let down = |door: Door, door_for_minutes: Option<u32>| {
+            ActivationLifecycle::down(&TakeDown { door, door_for_minutes, held: Held::Keep, running: Running::Wait }, 0)
+        };
+        assert!(listened_while_down(Some(&ActivationLifecycle::active()), 10), "on: a re-arm");
+        assert!(listened_while_down(Some(&down(Door::Take, None)), 10), "a door that takes");
+        assert!(listened_while_down(Some(&down(Door::Hide, None)), 10), "a door that hides");
+        assert!(listened_while_down(Some(&down(Door::Take, Some(1))), 60), "within the door's window");
+        assert!(!listened_while_down(Some(&down(Door::Take, Some(1))), 61), "past the door's window");
+        assert!(!listened_while_down(Some(&down(Door::Refuse, None)), 10), "a door that refuses");
+        let maintenance = ActivationLifecycle { went_down: Some(WentDown::Maintenance), ..down(Door::Refuse, None) };
+        assert!(listened_while_down(Some(&maintenance), 10), "weft's own maintenance, whose door refuses");
+        let health = ActivationLifecycle { went_down: Some(WentDown::Health), ..down(Door::Refuse, None) };
+        assert!(!listened_while_down(Some(&health), 10), "any other refusing door listened to nothing");
+        assert!(!listened_while_down(Some(&ActivationLifecycle::registered()), 10), "never switched on");
+        assert!(!listened_while_down(None, 10), "never activated");
     }
 
     #[test]

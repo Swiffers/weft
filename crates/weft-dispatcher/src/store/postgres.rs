@@ -1719,27 +1719,6 @@ impl TokenStore for PostgresStore {
         row.map(row_to_signal_token).transpose()
     }
 
-    async fn seed_operator_token(&self, tok: &SignalToken) -> anyhow::Result<bool> {
-        anyhow::ensure!(tok.kind == weft_core::signal_token::TokenKind::Operator, "only an operator key is seeded");
-        let res = sqlx::query(
-            "INSERT INTO signal_token \
-             (id, token_hash, recognizer, tenant_id, name, created_at, kind) \
-             SELECT $1, $2, $3, $4, $5, $6, 'operator' \
-             WHERE NOT EXISTS ( \
-                 SELECT 1 FROM signal_token WHERE tenant_id = $4 AND kind = 'operator') \
-             ON CONFLICT (token_hash) DO NOTHING",
-        )
-        .bind(tok.id)
-        .bind(&tok.token_hash)
-        .bind(&tok.recognizer)
-        .bind(&tok.tenant_id)
-        .bind(&tok.name)
-        .bind(tok.created_at as i64)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
     async fn list_signal_tokens(&self, tenant: &str) -> anyhow::Result<Vec<SignalToken>> {
         let rows: Vec<SignalTokenRow> = sqlx::query_as(
             "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
@@ -2077,6 +2056,34 @@ pub async fn drop_held_arrivals<'e>(
         .await
         .context("drop the arrivals held on the activations")?
         .rows_affected())
+}
+
+/// Give each of `places`' rows its fresh kind state, each only while the
+/// row is still at the version its state was computed from, which the
+/// write moves one past (so a wake's claim taken at the old version
+/// fails). Answers whether every one landed; when one did not (a wake
+/// claimed in between, or the row went), the caller rolls back and
+/// computes them again.
+pub(crate) async fn write_fresh_places(executor: impl sqlx::PgExecutor<'_>, places: &[crate::store::FreshPlace]) -> anyhow::Result<bool> {
+    if places.is_empty() {
+        return Ok(true);
+    }
+    let tokens: Vec<&str> = places.iter().map(|p| p.token.as_str()).collect();
+    let seqs: Vec<i64> = places.iter().map(|p| p.kind_state_seq).collect();
+    let states: Vec<&serde_json::Value> = places.iter().map(|p| &p.kind_state).collect();
+    let written = sqlx::query(
+        "UPDATE signal s SET kind_state = p.kind_state, kind_state_seq = s.kind_state_seq + 1 \
+         FROM unnest($1::text[], $2::bigint[], $3::jsonb[]) AS p(token, seq, kind_state) \
+         WHERE s.token = p.token AND s.kind_state_seq = p.seq",
+    )
+    .bind(&tokens)
+    .bind(&seqs)
+    .bind(&states)
+    .execute(executor)
+    .await
+    .context("give the signals a fresh place")?
+    .rows_affected();
+    Ok(written == places.len() as u64)
 }
 
 /// Delete the entry signals of the activations `keys` (their arrivals

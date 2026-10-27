@@ -19,7 +19,7 @@
 //!   - this install's fixture copies under the temp directory
 //!     ([`crate::project::fixture_copies_dir`]);
 //!   - and, once those are gone, `weft clean --images --all`, which is NOT
-//!     limited to e2e: it removes every worker image no project of the
+//!     limited to e2e: it removes every worker program no project of the
 //!     install references (yours included, once nothing runs them), and
 //!     the builder bases, node-test images, runtime images, standard
 //!     workers and worker compile caches that no install on the machine

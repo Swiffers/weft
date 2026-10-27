@@ -35,6 +35,7 @@ pub struct ProgramCode {
     pub implementations: std::collections::BTreeMap<String, String>,
     pub left_out: Vec<weft_core::builds::LeftOutPackage>,
     pub worker_log: Option<String>,
+    pub node_needs: weft_core::needs::NodeNeeds,
 }
 
 /// The project's running version as a run of it needs it: its identity,
@@ -44,6 +45,8 @@ pub struct RunningProgram {
     pub identity: weft_core::project::hash::ProgramIdentity,
     pub left_out: Vec<weft_core::builds::LeftOutPackage>,
     pub worker_log: Option<String>,
+    /// What each node type its worker holds needs from the machine.
+    pub node_needs: weft_core::needs::NodeNeeds,
 }
 
 /// Backing store for project metadata, implemented by
@@ -576,9 +579,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     //
     // running_binary_hash / running_definition_hash /
     // running_infra_hash drive drift detection + image tagging:
-    //   - running_binary_hash: worker docker image tag suffix.
-    //     Flips on engine / node-impl / node-type-set / weft.toml
-    //     edits; selects the image when spawning a fresh process.
+    //   - running_binary_hash: names the worker program (its image's
+    //     tag in the cloud, its folder on a machine). Flips on engine /
+    //     node-impl / node-type-set / weft.toml edits; selects the
+    //     program when starting a fresh worker.
     //   - running_definition_hash: identifies the runtime project
     //     shape (topology + configs). Workers fetch the
     //     definition at run claim time keyed by
@@ -769,6 +773,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             left_out JSONB NOT NULL DEFAULT '[]',
             -- Where that build's log is read, for their full errors.
             worker_log TEXT,
+            -- What each node type the worker holds needs from the machine
+            -- (weft_core::needs::NodeNeeds): a program using one whose
+            -- need is unmet is refused before it starts.
+            node_needs JSONB NOT NULL DEFAULT '{}',
             PRIMARY KEY (project_id, binary_hash)
         )"#,
         r#"CREATE TABLE IF NOT EXISTS project_definition (
@@ -1004,11 +1012,19 @@ impl ProjectStoreOps for PostgresProjectStore {
             // build's record), so a registration of the same worker again
             // says the same; it is taken as the latest registration says.
             let inserted = sqlx::query(
-                "INSERT INTO project_code (project_id, binary_hash, implementations, left_out, worker_log) VALUES ($1, $2, $3, $4, $5) \
+                "INSERT INTO project_code (project_id, binary_hash, implementations, left_out, worker_log, node_needs) VALUES ($1, $2, $3, $4, $5, $6) \
                  ON CONFLICT (project_id, binary_hash) DO UPDATE SET implementations = EXCLUDED.implementations, \
-                 left_out = EXCLUDED.left_out, worker_log = EXCLUDED.worker_log \
+                 left_out = EXCLUDED.left_out, worker_log = EXCLUDED.worker_log, node_needs = EXCLUDED.node_needs \
                  WHERE project_code.implementations = EXCLUDED.implementations"
-            ).bind(id).bind(binary).bind(encoded).bind(serde_json::to_value(&code.left_out)?).bind(&code.worker_log).execute(&mut *tx).await?;
+            )
+            .bind(id)
+            .bind(binary)
+            .bind(encoded)
+            .bind(serde_json::to_value(&code.left_out)?)
+            .bind(&code.worker_log)
+            .bind(serde_json::to_value(&code.node_needs)?)
+            .execute(&mut *tx)
+            .await?;
             anyhow::ensure!(inserted.rows_affected() == 1, "worker hash {binary} already has different implementation fingerprints");
         }
         // Runnable stamp + infra tags in ONE statement inside this same tx, so a
@@ -1068,17 +1084,18 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn running_program(&self, id: uuid::Uuid) -> anyhow::Result<Option<RunningProgram>> {
-        let row: Option<(String, String, serde_json::Value, serde_json::Value, Option<String>)> = sqlx::query_as(
-            "SELECT p.running_definition_hash, p.running_binary_hash, c.implementations, c.left_out, c.worker_log \
+        let row: Option<(String, String, serde_json::Value, serde_json::Value, Option<String>, serde_json::Value)> = sqlx::query_as(
+            "SELECT p.running_definition_hash, p.running_binary_hash, c.implementations, c.left_out, c.worker_log, c.node_needs \
              FROM project p JOIN project_code c ON c.project_id = p.id AND c.binary_hash = p.running_binary_hash \
              WHERE p.id = $1 AND p.running_definition_hash IS NOT NULL"
         ).bind(id).fetch_optional(&self.pool).await?;
-        row.map(|(definition_hash, binary_hash, implementations, left_out, worker_log)| Ok(RunningProgram {
+        row.map(|(definition_hash, binary_hash, implementations, left_out, worker_log, node_needs)| Ok(RunningProgram {
             identity: weft_core::project::hash::ProgramIdentity {
                 definition_hash, binary_hash, implementations: serde_json::from_value(implementations)?,
             },
             left_out: serde_json::from_value(left_out)?,
             worker_log,
+            node_needs: serde_json::from_value(node_needs)?,
         })).transpose()
     }
 

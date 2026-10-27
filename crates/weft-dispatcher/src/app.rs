@@ -12,11 +12,10 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use tracing::info;
-use weft_platform_traits::config::{AuthMode, InstallConfig};
+use weft_platform_traits::config::InstallConfig;
 use weft_platform_traits::CoreRole;
 use weft_task_store::drain::{DrainLoop, WakeOn};
 
-use crate::authenticator::local_authenticator;
 use crate::store::postgres::PostgresStore;
 use crate::listener::ListenerClient;
 use crate::role_client::RoleClient;
@@ -105,17 +104,15 @@ pub struct Defaults {
 }
 
 impl Defaults {
-    /// The install's policies for its auth mode: one tenant `local`, every
-    /// request authenticated as it on a local install, by an operator key
-    /// on a shared one.
-    pub fn for_auth(auth: AuthMode) -> Self {
-        let authenticator: Arc<dyn crate::authenticator::Authenticator> = match auth {
-            AuthMode::Local => local_authenticator(),
-            AuthMode::OperatorKeys => {
-                Arc::new(crate::authenticator::OperatorKeyAuthenticator { tenant: crate::tenant::TenantId::local() })
-            }
-        };
-        Self { authenticator, tenant_router: tenant::local_router(), project_reclaimer: default_reclaimer() }
+    /// The install's policies: one tenant `local`, every management
+    /// request authenticated by an operator key (`install_key` the
+    /// install's own), on a local install as on a cloud one.
+    pub fn for_install(install_key: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            authenticator: Arc::new(crate::authenticator::OperatorKeyAuthenticator::new(crate::tenant::TenantId::local(), install_key)?),
+            tenant_router: tenant::local_router(),
+            project_reclaimer: default_reclaimer(),
+        })
     }
 }
 
@@ -163,6 +160,7 @@ pub struct DispatcherSettings<'a> {
     /// [`DISPATCHER_CHANNELS`].
     pub signals: Arc<weft_task_store::pg_signal::PgSignalWatch>,
     pub runner: Arc<dyn weft_platform_traits::Runner>,
+    pub needs: Arc<dyn weft_platform_traits::MachineNeeds>,
     pub host: Arc<dyn weft_platform_traits::InfraHost>,
     pub images: Arc<dyn weft_platform_traits::ImageBuilder>,
     pub frontends: Arc<dyn weft_platform_traits::FrontendHosting>,
@@ -186,6 +184,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         lock_pool,
         signals,
         runner,
+        needs,
         host,
         images,
         frontends,
@@ -213,13 +212,8 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
     // process's).
     let addresses = config.role_addresses(config.roles.of(CoreRole::Dispatcher).vantage());
     let builder = Arc::new(crate::build::VersionBuilder {
-        bases: weft_compiler::worker_image::BaseImages {
-            builder: config.build.builder_base_image.clone(),
-            runtime: config.build.runtime_base_image.clone(),
-        },
         images,
         pool: pool.clone(),
-        compile_lanes: config.build.compile_lanes,
         prunes: Default::default(),
         blobs: crate::build::blob_cache::BlobCache::in_temp_dir(),
     });
@@ -248,6 +242,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         signals,
         displays,
         runner,
+        needs,
         host,
         frontends,
         domains,
@@ -482,49 +477,6 @@ where
         }
         std::process::exit(1);
     });
-}
-
-/// Record the install's bootstrap operator key (`WEFT_BOOTSTRAP_OPERATOR_KEY`)
-/// unless an operator key already exists (see `TokenStore::seed_operator_token`).
-/// Only a shared install has one.
-pub async fn seed_bootstrap_operator_key(state: &DispatcherState, key: &str) -> anyhow::Result<()> {
-    use weft_core::signal_token as names;
-    let key = key.trim();
-    anyhow::ensure!(
-        !key.is_empty(),
-        "WEFT_BOOTSTRAP_OPERATOR_KEY is empty: a shared install needs its first operator key"
-    );
-    let token = crate::store::SignalToken {
-        id: uuid::Uuid::new_v4(),
-        kind: weft_core::signal_token::TokenKind::Operator,
-        token_hash: names::token_hash(key),
-        recognizer: names::recognizer(key),
-        tenant_id: crate::tenant::TenantId::local().as_str().to_string(),
-        name: Some("bootstrap".into()),
-        allowed_projects: Vec::new(),
-        allowed_tags: Vec::new(),
-        allowed_displays: Vec::new(),
-        all_displays: false,
-        created_at: crate::lease::now_unix() as u64,
-        instance: None,
-        expires_at: None,
-    };
-    if state.tokens.seed_operator_token(&token).await.context("seed the bootstrap operator key")? {
-        info!("recorded the install's bootstrap operator key ({})", token.recognizer);
-    }
-    Ok(())
-}
-
-/// The CORS policy of the management surface for an auth mode: a local
-/// install answers the editor's webviews and extension (browser origins no
-/// allowlist can enumerate); a shared install answers no browser origin (a
-/// frontend calls it from its server, and the editor is not a browser
-/// origin).
-pub fn cors_for(auth: AuthMode) -> tower_http::cors::CorsLayer {
-    match auth {
-        AuthMode::Local => crate::api::permissive_cors(),
-        AuthMode::OperatorKeys => tower_http::cors::CorsLayer::new(),
-    }
 }
 
 #[cfg(test)]

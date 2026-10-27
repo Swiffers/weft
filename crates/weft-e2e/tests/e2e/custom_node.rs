@@ -17,15 +17,14 @@ async fn custom_node_compiles_and_runs() -> anyhow::Result<()> {
     project.finish().await
 }
 
-/// The worker images a project's builds leave behind stay bounded: after
-/// three edits of its node, its current image and the one before remain,
+/// The worker programs a project's builds leave behind stay bounded: after
+/// three edits of its node, its current program and the one before remain,
 /// and the oldest is reclaimed without anybody cleaning.
 #[tokio::test]
-async fn a_projects_older_worker_images_are_reclaimed_after_each_build() -> anyhow::Result<()> {
+async fn a_projects_older_worker_programs_are_reclaimed_after_each_build() -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     let disp = ensure::up().await?;
-    // The repo this install's worker images are named under.
-    let repo = disp.install().local_image_ref("weft-worker:x").trim_end_matches(":x").to_string();
+    let platform = weft_e2e::platform::Platform::connect(&disp).await?;
     let mut project = Project::prepare("custom_node", disp).await?;
     let node = project.dir().join("nodes/multiply/mod.rs");
     let original = std::fs::read_to_string(&node)?;
@@ -34,25 +33,22 @@ async fn a_projects_older_worker_images_are_reclaimed_after_each_build() -> anyh
         std::fs::write(&node, format!("{original}\n// edit {edit}\n"))?;
         let out = project.weft(&["build"]).await?;
         let short = out
-            .split("on worker image ")
+            .split("on worker ")
             .nth(1)
             .and_then(|rest| rest.split_whitespace().next())
-            .ok_or_else(|| anyhow::anyhow!("`weft build` named no worker image: {out}"))?
+            .ok_or_else(|| anyhow::anyhow!("`weft build` named no worker: {out}"))?
             .to_string();
         builds.push(short);
     }
-    anyhow::ensure!(builds[0] != builds[1] && builds[1] != builds[2], "each edit builds a new image: {builds:?}");
-    let tags = || async {
-        let out = tokio::process::Command::new("docker").args(["images", &repo, "--format", "{{.Tag}}"]).output().await?;
-        anyhow::Ok(String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect::<Vec<_>>())
-    };
+    anyhow::ensure!(builds[0] != builds[1] && builds[1] != builds[2], "each edit builds a new program: {builds:?}");
+    let tags = || async { platform.worker_programs() };
     let has = |tags: &[String], short: &str| tags.iter().any(|t| t.starts_with(short));
     // The reclaim runs in the first gap between the install's builds, so
     // on a busy install (the whole suite at once) it can wait a while:
     // whatever the three builds left of the test's time, keeping enough
     // for the run and the cleanup after it.
     let wait = weft_e2e::time_left(started, std::time::Duration::from_secs(60));
-    weft_e2e::poll_until("the oldest build's image to be reclaimed", wait, std::time::Duration::from_secs(1), || async {
+    weft_e2e::poll_until("the oldest build's program to be reclaimed", wait, std::time::Duration::from_secs(1), || async {
         let now = tags().await?;
         Ok((!has(&now, &builds[0])).then_some(()))
     })

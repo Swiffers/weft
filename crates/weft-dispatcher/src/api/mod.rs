@@ -238,15 +238,13 @@ mod public_page;
 /// route added here is authenticated whether or not its handler asks who is
 /// calling.
 ///
-/// `cors` is a COMPOSITION-TIME input, never a baked-in constant, so the right
-/// browser-origin policy for the tenant/admin surface is chosen where the router
-/// is assembled: [`permissive_cors`] when browsers hit this surface directly
-/// (the loopback-bound local install), or `CorsLayer::new()` (no CORS headers
-/// at all) on a shared install, where a frontend calls from its own server.
-/// The outside-caller surface ([`outside_caller_routes`]: fire URLs, signal
-/// tokens, live connect, public mounts) is exempt: its callers are
-/// cross-origin by design, so it always carries [`permissive_cors`].
-fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherState> {
+/// It answers no browser origin, on a local install as on a cloud one: no
+/// web page may drive the install, and its callers (the CLI, the editor's
+/// extension host, a frontend's server) are not browsers. The
+/// outside-caller surface ([`outside_caller_routes`]: fire URLs, signal
+/// tokens, live connect, public mounts) is apart: its callers are
+/// cross-origin by design, so it carries [`permissive_cors`].
+fn core_routes(state: DispatcherState) -> Router<DispatcherState> {
     Router::new()
         .route("/install", get(project::install))
         .route("/install/domains", get(domains::list).post(domains::add))
@@ -430,7 +428,6 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
             state.clone(),
             crate::authenticator::require_caller,
         ))
-        .layer(cors)
         .merge(outside_caller_routes(state))
 }
 
@@ -440,8 +437,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
 /// itself (capability token in the path, bearer signal token, per-signal auth
 /// gate), so the caller's ORIGIN is irrelevant and permissive CORS is part of
 /// the surface contract, attached here rather than left to composition. The
-/// composition-time `cors` on [`core_routes`] governs only the tenant/admin
-/// surface.
+/// management surface ([`core_routes`]) answers no browser origin.
 // SYNC: the doors <-> packages/weft-connect/src/server/passthrough.ts PASSED_DOORS
 fn outside_caller_routes(state: DispatcherState) -> Router<DispatcherState> {
     Router::new()
@@ -573,16 +569,17 @@ fn outside_caller_routes(state: DispatcherState) -> Router<DispatcherState> {
         .layer(permissive_cors())
 }
 
-/// A permissive browser-origin policy: any origin, any method, any header. Right
-/// for a localhost-only dispatcher whose browser callers include the extension
-/// popup / task page (origins like `moz-extension://<id>` or
-/// `chrome-extension://<id>`, which no allowlist can enumerate). A publicly
-/// exposed surface wants a tight `CorsLayer` instead.
+/// The outside doors' browser-origin policy: any origin, any method, any
+/// header. Every door checks its own credential (a token in the path, a
+/// bearer signal token), so the caller's origin does not matter, and its
+/// callers include the browser extension (`moz-extension://<id>`,
+/// `chrome-extension://<id>`, which no allowlist can enumerate) and the
+/// pages a person's frontend serves.
 ///
 /// Every response header is exposed to the page (a live route's program
 /// sets its own), and a preflight is remembered for a day, so a page
 /// calling a route asks once rather than before every call.
-pub fn permissive_cors() -> CorsLayer {
+fn permissive_cors() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
@@ -591,11 +588,11 @@ pub fn permissive_cors() -> CorsLayer {
         .max_age(std::time::Duration::from_secs(24 * 3600))
 }
 
-/// Build the dispatcher router, bound to `state`, with `cors` on the admin
-/// surface (see [`core_routes`]).
-pub fn router(state: DispatcherState, cors: CorsLayer) -> Router {
+/// Build the dispatcher router, bound to `state`: the management surface
+/// and the outside doors (see [`core_routes`]).
+pub fn router(state: DispatcherState) -> Router {
     let hops = TrustedHops(state.edge.trusted_proxy_hops.public);
-    let routes = core_routes(cors, state.clone())
+    let routes = core_routes(state.clone())
         .layer(axum::middleware::from_fn_with_state(state.clone(), note_cli_version))
         // Every call may write, and a write made while the process's watch
         // is quiet would be announced to nobody, so each holds the watch

@@ -376,7 +376,7 @@ async fn upload_parts(
             &req.key,
             &req.parts,
             state.entitlements.as_ref(),
-            &PresignAudience::Internal,
+            &PresignAudience::Install,
         )
         .await
         .map_err(map_err)?;
@@ -400,7 +400,7 @@ fn callers_own_parts(sender: PartSender) -> Result<(), ApiError> {
 fn admin_parts_audience(sender: PartSender) -> PresignAudience {
     match sender {
         PartSender::Caller => PresignAudience::External,
-        PartSender::Runtime => PresignAudience::Runtime,
+        PartSender::Runtime => PresignAudience::Install,
     }
 }
 
@@ -447,7 +447,7 @@ async fn upload_resume(
     callers_own_parts(req.sender)?;
     let store = &state.runtime_store;
     let (part_size, missing, reserved_bytes) = store
-        .resume_upload(&caller, &req.key, state.entitlements.as_ref(), &PresignAudience::Internal)
+        .resume_upload(&caller, &req.key, state.entitlements.as_ref(), &PresignAudience::Install)
         .await
         .map_err(map_err)?;
     Ok(Json(UploadResumeResponse { part_size, missing, reserved_bytes }))
@@ -479,7 +479,7 @@ async fn download_url(
     let parsed = wall(&caller, &key)?;
     let (meta, url, _) = state
         .runtime_store
-        .link(&parsed, PresignAudience::Internal, None, false)
+        .link(&parsed, PresignAudience::Install, None, false)
         .await
         .map_err(map_err)?;
     Ok(Json(DownloadUrlResponse { meta, url }))
@@ -663,7 +663,7 @@ where
     Fut: std::future::Future<Output = anyhow::Result<Option<String>>>,
 {
     if reach == LinkReach::Internal {
-        return Ok((PresignAudience::Internal, store_public));
+        return Ok((PresignAudience::Install, store_public));
     }
     if store_public {
         return Ok((PresignAudience::External, true));
@@ -1284,7 +1284,7 @@ async fn admin_link(
     // opens when it reaches the store.
     let (audience, public) = match &req.reader {
         LinkReader::Person => (PresignAudience::External, state.object_store_public_internet),
-        LinkReader::Runtime => (PresignAudience::Runtime, state.object_store_public_internet),
+        LinkReader::Runtime => (PresignAudience::Install, state.object_store_public_internet),
         LinkReader::Outside { .. } => link_route(&state, LinkReach::External, granted.visitor_address.clone()).await?,
     };
     let url = state.runtime_store.sign_link(&granted, audience).await.map_err(map_err)?;
@@ -1426,7 +1426,7 @@ mod link_route_tests {
         for store_public in [false, true] {
             let (read, ask) = internet(tunnel());
             let route = route_link(LinkReach::Internal, store_public, Some("https://shop.example".into()), OWN, ask).await.unwrap();
-            assert_eq!(route, (PresignAudience::Internal, store_public));
+            assert_eq!(route, (PresignAudience::Install, store_public));
             assert!(!read.load(std::sync::atomic::Ordering::SeqCst));
         }
     }

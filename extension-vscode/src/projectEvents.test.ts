@@ -60,7 +60,7 @@ describe('a reconnecting stream while the person is away', () => {
     const { client, pause, stream } = rig();
     pause.set(true);
     stream.setPath('/events/project/p');
-    client.setInstall('https://elsewhere.example.com', 'key');
+    client.setInstall({ url: 'https://elsewhere.example.com', operatorKey: 'key', remote: true });
     expect(client.subscriptions).toHaveLength(0);
     pause.set(false);
     expect(client.subscriptions.map((s) => s.path)).toEqual(['/events/project/p']);

@@ -6,8 +6,9 @@
 //! which starts first and holds it; every container of the unit joins it,
 //! so they reach each other on `127.0.0.1`, and the agent answers the
 //! unit's readiness checks from inside it. The agent's container is on
-//! the install's Docker network under the unit's name, which is how a
-//! worker or another unit reaches the unit's ports.
+//! the install's Docker network under the unit's name, which is how
+//! another unit reaches the unit's ports; a project's worker, a process on
+//! the machine, reaches them where the agent publishes them (`Publish`).
 //!
 //! Disks are Docker volumes named after the copy, kept across stop and
 //! upgrade and removed by terminate (except those the node keeps on
@@ -84,7 +85,7 @@ pub enum AgentIdentity {
 }
 
 /// A unit agent's broker token never expires on its own: the agent's
-/// container is the credential's life, like a local worker's.
+/// container is the credential's life, like a local worker's process.
 const AGENT_TOKEN_LIFE_SECS: i64 = 100 * 365 * 24 * 3600;
 
 impl AgentBroker {
@@ -129,11 +130,10 @@ pub enum DiskBacking {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Publish {
     /// Every port, on loopback at a port Docker picks (a laptop): weft's
-    /// runtime is a process on the machine, off the Docker network the
-    /// workers reach the unit on, and it reaches the unit here. Loopback
-    /// is the machine's own, which a local install trusts whole (its
-    /// management API answers there without a key), so this opens
-    /// nothing a local process could not already do.
+    /// runtime and the project's workers are processes on the machine,
+    /// off the Docker network, and they reach the unit here. Another
+    /// program of this machine's can reach a loopback port too, which is
+    /// why a unit's own credentials (a database password) guard it.
     Loopback,
     /// Every port of every container, on every interface at the same
     /// number (a cloud machine running one unit: the workers and the
@@ -630,7 +630,6 @@ impl InfraHost for LocalInfraHost {
         match &ep.target {
             EndpointTarget::External { url } => Ok(EndpointAt {
                 url: url.clone(),
-                install_url: url.clone(),
                 same_network: matches!(ep.expose, Expose::SameNetwork).then(|| host_port(url).to_string()),
             }),
             EndpointTarget::Unit { unit, container, port } => {
@@ -646,12 +645,14 @@ impl InfraHost for LocalInfraHost {
                     }
                     Publish::AllPorts => format!("{agent}:{port}"),
                 };
-                let install_url = match self.cfg.publish {
+                // On a laptop the workers and weft's runtime are processes
+                // on the machine, so they reach the unit on loopback.
+                let url = match self.cfg.publish {
                     Publish::Loopback => format!("http://{on_machine}"),
-                    Publish::AllPorts => url.clone(),
+                    Publish::AllPorts => url,
                 };
                 let same_network = matches!(ep.expose, Expose::SameNetwork).then_some(on_machine);
-                Ok(EndpointAt { url, install_url, same_network })
+                Ok(EndpointAt { url, same_network })
             }
         }
     }

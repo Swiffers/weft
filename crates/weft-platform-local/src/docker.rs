@@ -1,6 +1,6 @@
 //! The local Docker daemon, reached through the `docker` command.
 //!
-//! Every local implementation (workers, infra, images) talks to Docker
+//! Every local implementation that runs containers (infra, images) talks to Docker
 //! through [`Docker`], so the decisions (which container to start, with
 //! what, when to stop it) are tested against a fake that records the
 //! arguments, and only [`DockerCli`] runs anything.
@@ -111,22 +111,12 @@ pub mod labels {
     pub const COPY: &str = "weft.copy";
     pub const UNIT: &str = "weft.unit";
     pub const UNIT_HASH: &str = "weft.unit-hash";
-    /// On a worker container: which life of the process that started it
-    /// (`LocalRunner`), so a restarted process tells its own workers from
-    /// the ones an earlier life left running.
-    pub const LIFE: &str = "weft.life";
 }
 
 /// The values of [`labels::ROLE`]: what a container is for.
 pub mod roles {
-    /// Serves a project's program.
-    pub const WORKER: &str = "worker";
     /// Part of an infra node's unit.
     pub const INFRA: &str = "infra";
-    /// Made from a built image only to copy its build's result out, never
-    /// started (`images::read_from_image`), and removed right after; one a
-    /// crash left behind goes with its image (`images::delete_image`).
-    pub const BUILD_RESULT: &str = "build-result";
 }
 
 /// `--label k=v` for each label.
@@ -201,8 +191,7 @@ impl ContainerRow {
 }
 
 /// Remove the named containers, running or not. Removing one already gone,
-/// or one Docker is already removing (a worker the idle sweep is taking
-/// down), is not an error.
+/// or one Docker is already removing, is not an error.
 pub async fn remove_containers(docker: &dyn Docker, names: &[String]) -> anyhow::Result<()> {
     if names.is_empty() {
         return Ok(());
@@ -217,51 +206,16 @@ pub async fn remove_containers(docker: &dyn Docker, names: &[String]) -> anyhow:
     }
 }
 
-/// Stop the named containers the way a platform replaces a process: told
-/// to stop (`SIGTERM`), given `grace_secs` to exit on their own, killed
-/// after that. One already gone is no error.
-pub async fn stop(docker: &dyn Docker, names: &[String], grace_secs: u64) -> anyhow::Result<()> {
-    if names.is_empty() {
-        return Ok(());
-    }
-    let mut args = vec!["stop".to_string(), "--time".into(), grace_secs.to_string()];
-    args.extend(names.iter().cloned());
-    let out = docker.exec(&args).await?;
-    if out.success() || out.stderr.contains("No such container") {
-        Ok(())
-    } else {
-        out.ok(&args).map(|_| ())
-    }
-}
-
-/// Tell the named running containers to stop, as a platform tells a
-/// process it is about to replace (`SIGTERM`), and leave them to exit in
-/// their own time: a worker hands its durable runs back and lets its fast
-/// runs end first. One already gone, or already stopped, is not an error.
-pub async fn ask_to_stop(docker: &dyn Docker, names: &[String]) -> anyhow::Result<()> {
-    if names.is_empty() {
-        return Ok(());
-    }
-    let mut args = vec!["kill".to_string(), "--signal".into(), "TERM".into()];
-    args.extend(names.iter().cloned());
-    let out = docker.exec(&args).await?;
-    if out.success() || out.stderr.contains("No such container") || out.stderr.contains("is not running") {
-        Ok(())
-    } else {
-        out.ok(&args).map(|_| ())
-    }
-}
-
 /// `--add-host` naming the machine `host.docker.internal`: what a container
-/// that calls weft's internal port (a worker, the agent beside an infra
-/// unit) reaches it under. Docker Desktop knows the name on its own; a
+/// that calls weft's internal port (the agent beside an infra unit)
+/// reaches it under. Docker Desktop knows the name on its own; a
 /// Linux engine only through this.
 pub fn host_gateway_args() -> [String; 2] {
     ["--add-host".into(), "host.docker.internal:host-gateway".into()]
 }
 
-/// The network every container weft starts joins, so a worker reaches an
-/// infra container by name and an infra container reaches another.
+/// The network every container weft starts joins, so an infra container
+/// reaches another by name.
 pub const NETWORK: &str = "weft";
 
 /// Create [`NETWORK`] when it does not exist yet.
@@ -342,16 +296,16 @@ mod tests {
     #[tokio::test]
     async fn a_container_already_going_counts_as_removed() {
         let docker = fake::FakeDocker::new();
-        docker.fail(&["rm"], "Error response from daemon: removal of container weft-w-1 is already in progress");
-        remove_containers(&docker, &["weft-w-1".into()]).await.unwrap();
+        docker.fail(&["rm"], "Error response from daemon: removal of container weft-u-pg-1 is already in progress");
+        remove_containers(&docker, &["weft-u-pg-1".into()]).await.unwrap();
     }
 
     #[test]
     fn a_ps_line_is_read_with_its_labels() {
-        let row = ContainerRow::parse(r#"{"Names":"weft-w-1","State":"running","Labels":"weft.project=p,weft.role=worker"}"#).unwrap();
-        assert_eq!(row.name, "weft-w-1");
+        let row = ContainerRow::parse(r#"{"Names":"weft-u-pg-1","State":"running","Labels":"weft.project=p,weft.role=infra"}"#).unwrap();
+        assert_eq!(row.name, "weft-u-pg-1");
         assert_eq!(row.state, "running");
-        assert_eq!(row.label(labels::ROLE), Some("worker"));
+        assert_eq!(row.label(labels::ROLE), Some(roles::INFRA));
         assert!(ContainerRow::parse("not json").is_err());
     }
 

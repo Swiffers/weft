@@ -152,6 +152,30 @@ impl ListenerClient {
         Ok(())
     }
 
+    /// The fresh kind state of each of the entry signals `signals` whose
+    /// kind keeps a place in what it reads, read at the version each was
+    /// read at: what a door that refuses writes on them
+    /// (`crate::activation_store::SignalsGoing::Places`).
+    pub async fn fresh_places(&self, signals: &[crate::store::SignalRegistration]) -> Result<Vec<crate::store::FreshPlace>> {
+        use weft_core::signal::listener_protocol::{FreshPlaceAsk, FreshPlacesRequest, FreshPlacesResponse};
+        if signals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let asks = signals.iter().map(|sig| Ok(FreshPlaceAsk { token: sig.token.clone(), spec: sig.spec()? })).collect::<Result<Vec<_>>>()?;
+        let answer: FreshPlacesResponse =
+            Self::ok(self.post("/fresh_places", &FreshPlacesRequest { signals: asks }).await?, "/fresh_places").await?.json().await?;
+        answer
+            .places
+            .into_iter()
+            .map(|place| {
+                let read = signals.iter().find(|sig| sig.token == place.token).ok_or_else(|| {
+                    anyhow::anyhow!("the listener answered a fresh place for signal {}, which was not asked", place.token)
+                })?;
+                Ok(crate::store::FreshPlace { token: place.token, kind_state_seq: read.kind_state_seq, kind_state: place.kind_state })
+            })
+            .collect()
+    }
+
     /// Tell the listener to reconcile what it holds of `project` with
     /// the durable signal table, leaving the signals in `skip` down.
     /// Idempotent. Fails naming each of the project's rows that could not

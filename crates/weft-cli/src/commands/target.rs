@@ -78,16 +78,17 @@ pub async fn run(ctx: Ctx, action: TargetAction) -> Result<()> {
             }
             // Whether a command `--on <name>` would carry a key: decided
             // once, by the same rule a request uses, and shown both ways.
-            let rows: Vec<(String, String, bool)> = rows
+            let rows: Vec<(String, String, bool, bool)> = rows
                 .into_iter()
                 .map(|(name, url)| {
-                    let logged_in = credentials::resolve_key(env.clone(), &stored, &url, Some(&name))?.is_some();
-                    Ok((name, url, logged_in))
+                    let logged_in = credentials::resolve_key(env.clone(), &stored, &url, Some(&name), credentials::local_key)?.is_some();
+                    let here = credentials::this_machines_install(&url)?.is_some();
+                    Ok((name, url, logged_in, here))
                 })
                 .collect::<Result<_>>()?;
             if ctx.json_out(&serde_json::json!(rows
                 .iter()
-                .map(|(name, url, logged_in)| serde_json::json!({
+                .map(|(name, url, logged_in, _)| serde_json::json!({
                     "name": name,
                     "url": url,
                     "loggedIn": logged_in,
@@ -96,11 +97,12 @@ pub async fn run(ctx: Ctx, action: TargetAction) -> Result<()> {
             {
                 return Ok(());
             }
-            for (name, url, logged_in) in rows {
-                let login = if logged_in {
-                    "  (logged in)".to_string()
-                } else if name == LOCAL_TARGET {
+            for (name, url, logged_in, here) in rows {
+                // An install of this machine carries its own key, unsaid.
+                let login = if here {
                     String::new()
+                } else if logged_in {
+                    "  (logged in)".to_string()
                 } else {
                     format!("  (not logged in: weft login {name})")
                 };
@@ -112,7 +114,8 @@ pub async fn run(ctx: Ctx, action: TargetAction) -> Result<()> {
 }
 
 /// `weft target key`: the address and operator key a request with the
-/// same `--on` carries, for the editor, which talks to the install itself.
+/// same `--on` or `--dispatcher` carries (with neither, the local
+/// install's), for the editor, which talks to the install itself.
 pub fn key(ctx: &Ctx) -> Result<()> {
     let (url, operator_key) = ctx.install_access()?;
     // SYNC: the answer <-> extension-vscode/src/installs.ts InstallAccess
@@ -126,6 +129,16 @@ pub fn key(ctx: &Ctx) -> Result<()> {
 pub async fn login(ctx: Ctx, name: String, key_stdin: bool) -> Result<()> {
     let project = ctx.project()?;
     let url = project.target_url(&name).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // A command on an install of this machine carries that install's own
+    // key, never a stored one, whatever the target is called.
+    if let Some(install) = credentials::this_machines_install(&url)? {
+        anyhow::bail!(
+            "{url} is this machine's install '{}', and every command on it carries its own key, read from {}; \
+             there is nothing to log in to",
+            install.env_value(),
+            install.secrets_path().display()
+        );
+    }
     let key = if key_stdin {
         let mut line = String::new();
         std::io::stdin().read_line(&mut line).context("read the key from stdin")?;

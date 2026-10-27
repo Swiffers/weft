@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use weft_compiler::build::WORKER_IMAGE_REPO;
+use weft_core::builds::WORKER_REPO;
 use weft_core::images::PruneReport;
 
 /// One build request's claim on the images it relies on, from its first
@@ -177,7 +177,7 @@ impl<'a> ImageScope<'a> {
     /// other image (a base image, a ref with no tag), which no prune takes.
     pub fn of(image_ref: &'a str) -> Option<Self> {
         let (repo, tag) = repository_and_tag(image_ref)?;
-        if repo == WORKER_IMAGE_REPO {
+        if repo == WORKER_REPO {
             Some(Self::Worker(tag))
         } else if repo.starts_with("weft-infra-") {
             Some(Self::Infra(image_ref))
@@ -247,18 +247,24 @@ impl KeepSet {
 /// The keep-set restricted to `scope`, read on `conn`: the whole of it
 /// before a prune picks candidates, and one image's part again under that
 /// image's lock right before deleting it (`ledger::begin_reclaim`), since a
-/// build may have registered the image in between.
-pub async fn keep_set(conn: &mut sqlx::PgConnection, scope: ImageScope<'_>) -> Result<KeepSet> {
+/// build may have registered the image in between. The standard worker it
+/// keeps is the one `images` packages workers as.
+pub async fn keep_set(conn: &mut sqlx::PgConnection, scope: ImageScope<'_>, images: &dyn weft_platform_traits::ImageBuilder) -> Result<KeepSet> {
     let referenced = crate::api::project::referenced_images_query(conn, scope).await?;
     let mut worker_hashes: BTreeSet<String> = referenced.worker_hashes.into_iter().collect();
     if scope.covers_workers() {
-        let standard = weft_compiler::build::standard_worker_hash()
-            .map_err(|e| anyhow::anyhow!("the standard worker's hash: {e}"))?;
+        let standard = standard_worker_hash(images)?;
         if scope.worker_hash().is_none_or(|only| only == standard) {
             worker_hashes.insert(standard);
         }
     }
     Ok(KeepSet { worker_hashes, infra_refs: referenced.infra_refs.into_iter().collect() })
+}
+
+/// The binary hash of this weft's standard worker as `images` packages it
+/// (`weft_compiler::build::stock_binary_hash`).
+fn standard_worker_hash(images: &dyn weft_platform_traits::ImageBuilder) -> Result<String> {
+    weft_compiler::build::stock_binary_hash(&images.worker_packaging()).map_err(|e| anyhow::anyhow!("the standard worker's hash: {e}"))
 }
 
 /// How many of a project's earlier builds stay beside the current one,
@@ -399,12 +405,11 @@ impl AfterBuildPrunes {
 /// still runs or a build in progress claims. Every pass takes the unused
 /// ones, so one a container still ran from last time goes on a later one.
 async fn reclaim(state: &crate::state::DispatcherState, projects: &BTreeSet<uuid::Uuid>) -> Result<PruneReport> {
-    let keep = keep_set(&mut *state.pg_pool.acquire().await.context("a connection to read the keep-set")?, ImageScope::All).await?;
+    let images = state.builder.images.as_ref();
+    let keep = keep_set(&mut *state.pg_pool.acquire().await.context("a connection to read the keep-set")?, ImageScope::All, images).await?;
     // The standard worker a newer weft replaced goes too: the current one
     // is recorded (and kept by the keep-set), earlier ones are not kept.
-    let standard = state.builder.images.image_ref(&weft_compiler::build::worker_image_tag(
-        &weft_compiler::build::standard_worker_hash().map_err(|e| anyhow::anyhow!("the standard worker's hash: {e}"))?,
-    ));
+    let standard = images.image_ref(&weft_compiler::build::worker_image_tag(&standard_worker_hash(images)?));
     if state.builder.images.image_exists(&standard).await? {
         super::ledger::note_shared(&state.pg_pool, &standard, crate::lease::now_unix()).await?;
     }
@@ -442,7 +447,7 @@ pub async fn prune(
     for image_ref in candidates {
         // Held until the image is deleted and forgotten: a build claiming
         // it waits here, then finds it gone (the module doc).
-        let mut tx = match super::ledger::begin_reclaim(pool, &image_ref, crate::lease::now_unix()).await? {
+        let mut tx = match super::ledger::begin_reclaim(pool, images, &image_ref, crate::lease::now_unix()).await? {
             super::ledger::Reclaim::Free(tx) => tx,
             super::ledger::Reclaim::Claimed => {
                 report.in_use.push(image_ref);

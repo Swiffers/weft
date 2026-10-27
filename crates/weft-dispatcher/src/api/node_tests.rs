@@ -6,8 +6,9 @@
 //!   POST /projects/{id}/node-tests/run      -> { taskId }
 //!   GET  /projects/{id}/node-tests/runs/{task} -> { status, report?, error? }
 //!
-//! The caller supplies the per-package test image ref (it built or
-//! ensured the image; the dispatcher runs it verbatim). Basic/fake
+//! The caller supplies the per-package test server's ref (it built or
+//! ensured the program on this machine; the dispatcher runs it
+//! verbatim). Basic/fake
 //! tiers normally run without any of this (the test binary runs where
 //! the caller is); this surface exists for LIVE tests, whose
 //! credential path only exists next to the broker.

@@ -204,11 +204,11 @@ warnings and inherited-node markers, stop and write: "Wait. What actually
 ran?" Then read them; never assume a requested endpoint was reusable.
 
 Builds include the whole catalog by default. The unchanged standard
-library uses a shared, finished worker image, so no project compilation is
-needed when that image is installed or published. Node edits, added nodes,
-or custom build settings need their own image, and building it compiles
-only the nodes no earlier build on this machine compiled. Adding an
-unchanged catalog node or editing graph configuration needs no new image,
+library uses a shared, finished worker (the standard worker), so no
+project compilation is needed once it is on the machine. Node edits, added
+nodes, or custom build settings need their own worker, and building it
+compiles only the nodes no earlier build on this machine compiled. Adding an
+unchanged catalog node or editing graph configuration needs no new worker,
 so you use ordinary `weft run` while iterating. `--referenced` opts into a
 separate, reduced build compiling only the graph's node types, which can
 rebuild when those types change; implementation edits still rebuild.

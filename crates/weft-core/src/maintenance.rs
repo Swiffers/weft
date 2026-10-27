@@ -47,6 +47,10 @@ impl MaintenanceOnRequest {
     /// work and nothing of it starts or keeps a worker (one of a build from
     /// before the update) until the lift switches it back on; what it held
     /// already is kept, and runs after the lift; the runs going as asked.
+    /// The pause is weft's own, not a refusal anybody made, so a trigger
+    /// that keeps its place in what it reads (a poll's cursor) catches up
+    /// from it once the lift brings it back (the dispatcher's
+    /// `listened_while_down`).
     pub fn take_down(&self) -> TakeDown {
         TakeDown { door: Door::Refuse, door_for_minutes: None, held: Held::Keep, running: self.running() }
     }

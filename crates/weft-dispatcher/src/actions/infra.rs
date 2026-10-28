@@ -158,6 +158,9 @@ pub(crate) async fn start(state: &DispatcherState, actor: &Actor, project_id: uu
     let asked = owners.len();
     let registered = load_project(state, project_id).await?;
     let mut refused: Vec<(Option<InstanceId>, Refused)> = Vec::new();
+    // Whether an owner's start went ahead: then the answer is no longer
+    // one nothing of the request ran.
+    let mut any_started = false;
     for instance in owners {
         let Some(nodes) = machinery::owner_nodes(&registered, &request.instances, &request.nodes, instance.as_ref()) else { continue };
         let started: Result<(), Refused> = async {
@@ -170,8 +173,9 @@ pub(crate) async fn start(state: &DispatcherState, actor: &Actor, project_id: uu
             Ok(())
         }
         .await;
-        if let Err(e) = started {
-            refused.push((instance, e));
+        match started {
+            Ok(()) => any_started = true,
+            Err(e) => refused.push((instance, e)),
         }
     }
     if asked == 1 {
@@ -179,6 +183,7 @@ pub(crate) async fn start(state: &DispatcherState, actor: &Actor, project_id: uu
             return Err(e);
         }
     }
+    let answer = |e: Refused| if any_started { crate::api::after_writes(e) } else { e };
     if let Some((_, (status, _))) = refused.first() {
         let status = *status;
         let lines: Vec<String> = refused
@@ -188,9 +193,9 @@ pub(crate) async fn start(state: &DispatcherState, actor: &Actor, project_id: uu
                 None => format!("the program's own infra: {message}"),
             })
             .collect();
-        return Err((status, format!("some copies did not start:\n  {}", lines.join("\n  "))));
+        return Err(answer((status, format!("some copies did not start:\n  {}", lines.join("\n  ")))));
     }
-    infra_status(state, project_id).await
+    infra_status(state, project_id).await.map_err(answer)
 }
 
 /// A program's start of one copy, returning once the start is queued (its
@@ -525,7 +530,9 @@ pub(crate) struct ObservedCopy {
 /// start is bringing up that have none yet.
 pub(crate) async fn read_copies(state: &DispatcherState, project_id: uuid::Uuid) -> Result<Vec<ObservedCopy>, Refused> {
     let project = load_project(state, project_id).await?;
-    let copies = infra_node::observe(&state.pg_pool, project_id, &project).await.map_err(failed("infra copies"))?;
+    let copies = infra_node::observe(&state.pg_pool, project_id, &project)
+        .await
+        .map_err(|e| crate::api::unavailable_or_internal("read the infra copies", e))?;
     let starting: Vec<ObservedCopy> = copies
         .starting
         .iter()
@@ -588,7 +595,7 @@ async fn infra_status(state: &DispatcherState, project_id: uuid::Uuid) -> Result
             // Coarse UI hint: the first endpoint by name (BTreeMap, so
             // deterministic). Node code resolves a specific endpoint by
             // name via ctx.endpoint(...); this is just a status summary.
-            entry.endpoint_url = row.install_endpoints.values().next().cloned();
+            entry.endpoint_url = row.endpoints.values().next().cloned();
             entry.failure_stage = row.failure_stage.map(|f| f.as_str().to_string());
             entry.notes = row.notes;
         }
@@ -817,7 +824,6 @@ mod tests {
             endpoints: Default::default(),
             public_paths: Default::default(),
             doors: doors.iter().map(|(e, a)| (e.to_string(), a.to_string())).collect(),
-            install_endpoints: Default::default(),
             keep_disks: Vec::new(),
             units: Default::default(),
             notes: Vec::new(),

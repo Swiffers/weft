@@ -136,10 +136,6 @@ async fn spawn_broker() -> String {
             }))
         }),
     )
-    .route(
-        "/v1/infra/listener-address",
-        post(|axum::Json(req): axum::Json<Value>| async move { axum::Json(json!({ "authority": req["authority"], "is_infra": false })) }),
-    )
     // An entry's event goes straight to its project's worker
     // (`FakeDoors`).
     .route(
@@ -185,7 +181,7 @@ fn listener_state(run_id: &str, broker_base: String, doors: Arc<FakeDoors>) -> L
         ListenerConfig {
             replica: format!("test-listener-{run_id}"),
             holds_here: true,
-            prefer_push: false,
+            holders: weft_listener::Holders::OnThisMachine,
         },
         Arc::new(FakeTasks),
         // The fake broker ignores the bearer.

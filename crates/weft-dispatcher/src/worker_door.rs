@@ -6,6 +6,7 @@
 //! lost, and [`sweep_lost_runs`] lets go of it.
 
 use anyhow::{Context, Result};
+use weft_task_store::db::Client as _;
 
 /// How far past its lease a worker's runs are left alone before they are
 /// read as lost: a worker that missed a few ticks under load is not gone.
@@ -45,17 +46,18 @@ pub async fn sweep_lost_runs(state: &crate::state::DispatcherState, now: i64) ->
     let mut failed = Vec::new();
     let mut after: Option<weft_core::RunId> = None;
     loop {
-        let lost: Vec<(weft_core::RunId, uuid::Uuid, String, bool)> = sqlx::query_as(concat!(
-            "SELECT r.run_id, r.project_id, r.keeping, r.cancel_requested IS NOT NULL FROM run r WHERE ",
-            lost_run!("$1"),
-            " AND ($3::UUID IS NULL OR r.run_id > $3) ORDER BY r.run_id LIMIT $2"
-        ))
-        .bind(lapsed_before)
-        .bind(LOST_BATCH)
-        .bind(after)
-        .fetch_all(&state.pg_pool)
-        .await
-        .context("find runs whose worker went away")?;
+        let lost: Vec<(weft_core::RunId, uuid::Uuid, String, bool)> = state
+            .pg_pool
+            .all(
+                concat!(
+                    "SELECT r.run_id, r.project_id, r.keeping, r.cancel_requested IS NOT NULL FROM run r WHERE ",
+                    lost_run!("$1"),
+                    " AND ($3::UUID IS NULL OR r.run_id > $3) ORDER BY r.run_id LIMIT $2"
+                ),
+                &[&lapsed_before, &LOST_BATCH, &after],
+            )
+            .await
+            .context("find runs whose worker went away")?;
         let full = lost.len() as i64 == LOST_BATCH;
         after = lost.last().map(|(run_id, _, _, _)| *run_id);
         let_go_of(state, lost, lapsed_before, &mut failed).await;

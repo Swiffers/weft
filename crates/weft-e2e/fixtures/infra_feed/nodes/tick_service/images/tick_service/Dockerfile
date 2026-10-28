@@ -1,5 +1,5 @@
 # The tick stream: Python's standard library only, no build step.
-FROM python:3.12-alpine
+FROM python:3.15-alpine
 
 WORKDIR /app
 COPY server.py /app/server.py

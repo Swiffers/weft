@@ -370,12 +370,7 @@ async fn wait_for_command(
             .with_context(|| format!("waiting on infra {verb} command {command_id}"))?;
         // A status that does not read fails loud: a missing `done` read
         // as "not done" would loop forever (the wait is unbounded).
-        let status: CommandStatus = serde_json::from_value(resp).map_err(|e| {
-            anyhow::anyhow!(
-                "infra {verb}: the command status does not read ({e}); upgrade the dispatcher \
-                 (or this CLI) so the versions match"
-            )
-        })?;
+        let status: CommandStatus = crate::client::read_answer(resp, &format!("the status of the infra {verb} command"))?;
         if status.done {
             match status.outcome {
                 Some(CommandOutcome::Succeeded) => return Ok(()),

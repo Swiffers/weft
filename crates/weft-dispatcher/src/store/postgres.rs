@@ -8,7 +8,7 @@
 
 use anyhow::Context;
 use async_trait::async_trait;
-use sqlx::postgres::PgPool;
+use weft_task_store::db::{self, Client, FromRow, Pool};
 
 use weft_core::RunId;
 
@@ -24,7 +24,7 @@ use weft_core::program::{RunPage, RunSummary, RunStatus};
 /// one pool: their tables share transactions (a cancel strips the run's
 /// signals, an answer writes its run), so one value implements all four.
 pub struct PostgresStore {
-    pool: PgPool,
+    pool: Pool,
 }
 
 /// The `run.phase` column as a phase. The column is NOT NULL and only
@@ -54,7 +54,6 @@ const SUMMARY_COLUMNS: &str = concat!(
 );
 
 /// One run's summary columns ([`SUMMARY_COLUMNS`]).
-#[derive(sqlx::FromRow)]
 struct SummaryRow {
     run_id: RunId,
     project_id: uuid::Uuid,
@@ -65,11 +64,30 @@ struct SummaryRow {
     ended_at: Option<i64>,
     outcome: Option<String>,
     error: Option<String>,
-    cancel_cause: Option<sqlx::types::Json<weft_core::run::CancelCause>>,
+    cancel_cause: Option<db::Json<weft_core::run::CancelCause>>,
     skipped: i32,
     instance_id: Option<String>,
-    #[sqlx(rename = "coalesce")]
     tags: Vec<String>,
+}
+
+impl FromRow for SummaryRow {
+    fn from_row(row: db::Row) -> db::Result<Self> {
+        Ok(Self {
+            run_id: row.try_get("run_id")?,
+            project_id: row.try_get("project_id")?,
+            entry_node: row.try_get("entry_node")?,
+            phase: row.try_get("phase")?,
+            state: row.try_get("state")?,
+            started_at: row.try_get("started_at")?,
+            ended_at: row.try_get("ended_at")?,
+            outcome: row.try_get("outcome")?,
+            error: row.try_get("error")?,
+            cancel_cause: row.try_get("cancel_cause")?,
+            skipped: row.try_get("skipped")?,
+            instance_id: row.try_get("instance_id")?,
+            tags: row.try_get("coalesce")?,
+        })
+    }
 }
 
 impl SummaryRow {
@@ -112,13 +130,13 @@ impl PostgresStore {
     /// Wrap an EXISTING pool. Pure: the schema (this crate's [`GROUP`]
     /// included) is applied once, before construction, by the boot's one
     /// schema pass.
-    pub fn from_pool(pool: PgPool) -> Self {
+    pub fn from_pool(pool: Pool) -> Self {
         Self { pool }
     }
 
     /// Expose the inner pool for sibling modules (lease manager,
     /// EventBus pub/sub) so they can share connections.
-    pub fn pool(&self) -> &PgPool {
+    pub fn pool(&self) -> &Pool {
         &self.pool
     }
 }
@@ -134,41 +152,31 @@ impl PostgresStore {
 /// is touched, the order every writer of a run takes them in. The caller
 /// pokes the outbox once it commits.
 pub(crate) async fn answer_in(
-    tx: &mut sqlx::PgConnection,
+    tx: &impl Client,
     token: &str,
     answer: &weft_core::primitive::WaitAnswer,
     from: AnswerFrom,
 ) -> anyhow::Result<Answered> {
-    let run: Option<Option<RunId>> = sqlx::query_scalar("SELECT run_id FROM signal WHERE token = $1 AND is_resume")
-        .bind(token)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let run: Option<Option<RunId>> = tx.scalar_opt("SELECT run_id FROM signal WHERE token = $1 AND is_resume", &[&token]).await?;
     let Some(run) = run else { return Ok(Answered::Gone) };
     let run_id = run.with_context(|| format!("the wait {token} names no run"))?;
-    let locked = weft_journal::record::lock_in(&mut *tx, run_id).await?;
+    let locked = weft_journal::record::lock_in(tx, run_id).await?;
     if from == AnswerFrom::Sender {
         // An answer queued while the run's trigger was not live is the
         // wait's one answer (its sender was told so): the queue's drain
         // hands it over, and this one finds the wait answered. The signal's
         // row is locked first, and `park` holds that lock while it queues
         // one, so one queued meanwhile is seen here.
-        let signal: Option<i32> = sqlx::query_scalar("SELECT 1 FROM signal WHERE token = $1 AND is_resume FOR UPDATE")
-            .bind(token)
-            .fetch_optional(&mut *tx)
+        let signal: Option<i32> = tx.scalar_opt("SELECT 1 FROM signal WHERE token = $1 AND is_resume FOR UPDATE", &[&token]).await?;
+        let queued: bool = tx
+            .scalar("SELECT EXISTS (SELECT 1 FROM parked_fire WHERE token = $1 AND is_resume AND run_id IS NULL)", &[&token])
             .await?;
-        let queued: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM parked_fire WHERE token = $1 AND is_resume AND run_id IS NULL)",
-        )
-        .bind(token)
-        .fetch_one(&mut *tx)
-        .await?;
         if signal.is_none() || queued {
             return Ok(Answered::Gone);
         }
     }
-    let Some(row) = sqlx::query_as::<_, SignalRow>(SIGNAL_DELETE_RESUME_BY_TOKEN_RETURNING)
-        .bind(token)
-        .fetch_optional(&mut *tx)
+    let Some(row) = tx
+        .opt::<SignalRow>(SIGNAL_DELETE_RESUME_BY_TOKEN_RETURNING, &[&token])
         .await
         .context("answer a wait: read its signal row")?
     else {
@@ -177,11 +185,11 @@ pub(crate) async fn answer_in(
     let consumed = row_to_signal(row)?;
     let Some(locked) = locked.filter(|locked| locked.state != "ended") else { return Ok(Answered::RunEnded { consumed }) };
     if locked.owner.is_some() {
-        weft_task_store::parked_fires::hand_answer_in(&mut *tx, token, run_id, answer).await?;
+        weft_task_store::parked_fires::hand_answer_in(tx, token, run_id, answer).await?;
         return Ok(Answered::Reached { consumed });
     }
     let resolved = RunEvent::wait_answered(run_id, token.to_string(), answer.clone(), crate::lease::now_unix() as u64);
-    match weft_journal::record::append_locked_in(&mut *tx, run_id, &locked, std::slice::from_ref(&resolved), weft_journal::record::DISPATCHER, Then::Queued).await? {
+    match weft_journal::record::append_locked_in(tx, run_id, &locked, std::slice::from_ref(&resolved), weft_journal::record::DISPATCHER, Then::Queued).await? {
         Appended::At(_) => Ok(Answered::Reached { consumed }),
         other => anyhow::bail!("run {run_id} was locked with no owner, yet its answer was not written: {other:?}"),
     }
@@ -203,17 +211,17 @@ pub(crate) enum AnswerFrom {
 /// definition of that list (`cancel_terminal_events`). Answers the
 /// per-node count written.
 async fn cancel_unowned_in(
-    tx: &mut sqlx::PgConnection,
+    tx: &impl Client,
     run_id: RunId,
     locked: &weft_journal::record::Locked,
     program: Option<&weft_core::ProjectDefinition>,
     cause: &weft_core::run::CancelCause,
 ) -> anyhow::Result<usize> {
-    let events = weft_journal::record::read_record(&mut *tx, run_id, None).await?.events(run_id).map_err(anyhow::Error::msg)?;
+    let events = weft_journal::record::read_record(tx, run_id, None).await?.events(run_id).map_err(anyhow::Error::msg)?;
     let now = crate::lease::now_unix() as u64;
     let writes = crate::api::run::cancel_terminal_events(run_id, &events, program, cause, now)?;
     let node_cancellations = writes.iter().filter(|write| matches!(write, RunEvent::NodeCancelled { .. })).count();
-    match weft_journal::record::append_locked_in(&mut *tx, run_id, locked, &writes, weft_journal::record::DISPATCHER, Then::Stays).await? {
+    match weft_journal::record::append_locked_in(tx, run_id, locked, &writes, weft_journal::record::DISPATCHER, Then::Stays).await? {
         Appended::At(_) => Ok(node_cancellations),
         other => anyhow::bail!("run {run_id} was locked with no owner, yet its cancel was not written: {other:?}"),
     }
@@ -284,7 +292,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             instance_id TEXT,
             fired_by TEXT,
             source_version TEXT,
-            -- NULL for a run of no program (a node test).
+            -- NULL for a run of no program (a node test), and then so is
+            -- `binary_hash`: the two name one program identity, and
+            -- delivery reads one while a claim reads the other.
             definition_hash TEXT,
             -- For a run of a cut, the registered program it was cut from:
             -- the program its triggers arm and its results are held against.
@@ -372,7 +382,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- How long it is kept once it ended, in seconds (NULL: for
             -- ever), and the moment that runs out, set when it ends.
             keep_for BIGINT,
-            keep_until BIGINT
+            keep_until BIGINT,
+            CONSTRAINT run_program_identity_whole
+                CHECK ((definition_hash IS NULL) = (binary_hash IS NULL))
         ) WITH (fillfactor = 85)"#,
         // The listing: a project's runs, newest first.
         r#"CREATE INDEX IF NOT EXISTS run_listing ON run (project_id, started_at DESC)"#,
@@ -998,17 +1010,16 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 #[async_trait]
 impl BakeStore for PostgresStore {
     async fn is_trigger_setup_pending(&self, run_id: RunId) -> anyhow::Result<bool> {
-        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM trigger_setup WHERE run_id = $1)")
-            .bind(run_id).fetch_one(&self.pool).await?)
+        Ok(self.pool.scalar("SELECT EXISTS (SELECT 1 FROM trigger_setup WHERE run_id = $1)", &[&run_id]).await?)
     }
 
     async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&super::TriggerBake>) -> anyhow::Result<Option<super::UnreadablePriorBake>> {
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
         let mut lost = None;
-        let owner: Option<(uuid::Uuid,)> = sqlx::query_as(
-            "DELETE FROM trigger_setup WHERE run_id = $1 RETURNING project_id",
-        ).bind(run_id).fetch_optional(&mut *tx).await?;
-        if let (Some((project_id,)), Some(bake)) = (owner, bake) {
+        let owner: Option<uuid::Uuid> =
+            tx.scalar_opt("DELETE FROM trigger_setup WHERE run_id = $1 RETURNING project_id", &[&run_id]).await?;
+        if let (Some(project_id), Some(bake)) = (owner, bake) {
             anyhow::ensure!(bake.project_id == project_id && bake.run_id == run_id, "bake does not belong to its setup");
             let instance = bake.instance.as_ref().map(|m| m.as_str());
             let digest = bake.program.digest();
@@ -1018,10 +1029,13 @@ impl BakeStore for PostgresStore {
             // keeps nothing a refresh could carry, and refusing would leave
             // the setup unable ever to land. What it held for the others is
             // gone, which the answer says.
-            let prior: Option<(String, weft_core::stored::Version)> = sqlx::query_as(
-                "SELECT bake_json, bake_json_version FROM trigger_bake \
-                 WHERE project_id = $1 AND instance_id IS NOT DISTINCT FROM $2 AND program_hash = $3 FOR UPDATE",
-            ).bind(project_id).bind(instance).bind(&digest).fetch_optional(&mut *tx).await?;
+            let prior: Option<(String, weft_core::stored::Version)> = tx
+                .opt(
+                    "SELECT bake_json, bake_json_version FROM trigger_bake \
+                     WHERE project_id = $1 AND instance_id IS NOT DISTINCT FROM $2 AND program_hash = $3 FOR UPDATE",
+                    &[&project_id, &instance, &digest],
+                )
+                .await?;
             let merged = match prior {
                 Some((json, version)) => match super::TriggerBake::STORED.decode(json.as_str(), version) {
                     Ok(prior) => prior.refreshed_by(bake),
@@ -1033,10 +1047,12 @@ impl BakeStore for PostgresStore {
                 },
                 None => bake.clone(),
             };
-            sqlx::query("INSERT INTO trigger_bake (project_id, instance_id, program_hash, bake_json, bake_json_version) VALUES ($1, $2, $3, $4, $5) \
-                ON CONFLICT (project_id, instance_id, program_hash) DO UPDATE SET bake_json = EXCLUDED.bake_json, bake_json_version = EXCLUDED.bake_json_version")
-                .bind(project_id).bind(instance).bind(&digest)
-                .bind(serde_json::to_string(&merged)?).bind(super::TriggerBake::STORED.version()).execute(&mut *tx).await?;
+            tx.execute(
+                "INSERT INTO trigger_bake (project_id, instance_id, program_hash, bake_json, bake_json_version) VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (project_id, instance_id, program_hash) DO UPDATE SET bake_json = EXCLUDED.bake_json, bake_json_version = EXCLUDED.bake_json_version",
+                &[&project_id, &instance, &digest, &serde_json::to_string(&merged)?, &super::TriggerBake::STORED.version()],
+            )
+            .await?;
         }
         tx.commit().await?;
         Ok(lost)
@@ -1044,10 +1060,13 @@ impl BakeStore for PostgresStore {
 
     async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Vec<super::TriggerBake>> {
         let instance = instance.map(|m| m.as_str());
-        let rows: Vec<(String, weft_core::stored::Version, String)> = sqlx::query_as(
-            "SELECT bake_json, bake_json_version, program_hash FROM trigger_bake WHERE project_id = $1 AND instance_id IS NOT DISTINCT FROM $2",
-        )
-            .bind(project_id).bind(instance).fetch_all(&self.pool).await?;
+        let rows: Vec<(String, weft_core::stored::Version, String)> = self
+            .pool
+            .all(
+                "SELECT bake_json, bake_json_version, program_hash FROM trigger_bake WHERE project_id = $1 AND instance_id IS NOT DISTINCT FROM $2",
+                &[&project_id, &instance],
+            )
+            .await?;
         rows.into_iter()
             .map(|(value, version, program)| {
                 Ok(super::TriggerBake::STORED
@@ -1061,8 +1080,9 @@ impl BakeStore for PostgresStore {
 #[async_trait]
 impl RunStore for PostgresStore {
     async fn append(&self, run_id: RunId, events: &[RunEvent], then: Then) -> anyhow::Result<Appended> {
-        let mut tx = self.pool.begin().await?;
-        let appended = weft_journal::record::append_unowned_in(&mut tx, run_id, events, weft_journal::record::DISPATCHER, then).await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        let appended = weft_journal::record::append_unowned_in(&tx, run_id, events, weft_journal::record::DISPATCHER, then).await?;
         tx.commit().await?;
         if matches!(appended, Appended::At(_)) {
             // The write announced its row (and its ending, its storage
@@ -1076,8 +1096,8 @@ impl RunStore for PostgresStore {
         &self,
         run_id: RunId,
     ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<RunEvent>>, Vec<String>)> {
-        let mut conn = self.pool.acquire().await?;
-        let record = weft_journal::record::read_record(&mut conn, run_id, None).await?;
+        let conn = self.pool.get().await?;
+        let record = weft_journal::record::read_record(&conn, run_id, None).await?;
         let (rows, bad) = record.decode_lossy(run_id);
         Ok((rows.into_iter().map(|row| crate::events::IdentifiedEvent::recorded(row.seq, row.index, row.event)).collect(), bad))
     }
@@ -1088,9 +1108,10 @@ impl RunStore for PostgresStore {
         let RunEvent::RunStarted { project_id, phase, .. } = birth else {
             anyhow::bail!("run {run_id} is queued with a row that is not its birth");
         };
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
         // Its project's row is checked by the insert itself.
-        if !weft_journal::record::insert_queued_in(&mut tx, &queued).await? {
+        if !weft_journal::record::insert_queued_in(&tx, &queued).await? {
             return Ok(false);
         }
         // A trigger setup is queued only while the activation that asked
@@ -1098,21 +1119,16 @@ impl RunStore for PostgresStore {
         // wins), and is recorded as in flight.
         if *phase == weft_core::context::Phase::TriggerSetup {
             if for_activation {
-                let owned: bool = sqlx::query_scalar(
-                    "SELECT EXISTS (SELECT 1 FROM trigger_activation \
-                     WHERE project_id = $1 AND activating_run_id = $2 AND status = 'activating' FOR UPDATE)",
-                )
-                .bind(project_id)
-                .bind(run_id)
-                .fetch_one(&mut *tx)
-                .await?;
+                let owned: bool = tx
+                    .scalar(
+                        "SELECT EXISTS (SELECT 1 FROM trigger_activation \
+                         WHERE project_id = $1 AND activating_run_id = $2 AND status = 'activating' FOR UPDATE)",
+                        &[project_id, &run_id],
+                    )
+                    .await?;
                 anyhow::ensure!(owned, "activation {run_id} ended before its trigger setup could start");
             }
-            sqlx::query("INSERT INTO trigger_setup (project_id, run_id) VALUES ($1, $2)")
-                .bind(project_id)
-                .bind(run_id)
-                .execute(&mut *tx)
-                .await?;
+            tx.execute("INSERT INTO trigger_setup (project_id, run_id) VALUES ($1, $2)", &[project_id, &run_id]).await?;
         }
         tx.commit().await?;
         Ok(true)
@@ -1124,37 +1140,37 @@ impl RunStore for PostgresStore {
         program: Option<&weft_core::ProjectDefinition>,
         cause: &weft_core::run::CancelCause,
     ) -> anyhow::Result<CancelWrite> {
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
         // The run's row first: the one lock every writer of a run takes,
         // in the same order.
-        let locked = weft_journal::record::lock_in(&mut tx, run_id).await?;
+        let locked = weft_journal::record::lock_in(&tx, run_id).await?;
         // The wake signals go: a fire that resolves its signal row after
         // this commits finds nothing to wake. The run is cancelled, so each
         // wait's last call is queued with them.
-        let (removed, cancel_calls) = remove_run_waits_in(&mut tx, run_id, true).await.context("cancel_run")?;
+        let (removed, cancel_calls) = remove_run_waits_in(&tx, run_id, true).await.context("cancel_run")?;
         let mut write = CancelWrite { removed, cancel_calls, ..CancelWrite::default() };
         match locked {
             Some(locked) if locked.state == "ended" => {}
             Some(locked) if locked.owner.is_some() => {
-                sqlx::query("UPDATE run SET cancel_requested = $2 WHERE run_id = $1")
-                    .bind(run_id)
-                    .bind(sqlx::types::Json(cause))
-                    .execute(&mut *tx)
-                    .await?;
+                tx.execute("UPDATE run SET cancel_requested = $2 WHERE run_id = $1", &[&run_id, &db::Json(cause)]).await?;
                 // Announced, and the install's news for the copy holding
                 // the line of the run's worker (`weft_task_store::announce`).
                 // SYNC: 'cancel' <-> weft_task_store::announce::kind_named
-                sqlx::query("SELECT pg_notify($1, $2), weft_tell($3, $4, 'cancel')")
-                    .bind(weft_task_store::runs::CANCEL_CHANNEL)
-                    .bind(weft_task_store::runs::run_payload(locked.project_id, run_id))
-                    .bind(locked.project_id)
-                    .bind(run_id)
-                    .execute(&mut *tx)
-                    .await?;
+                tx.execute(
+                    "SELECT pg_notify($1, $2), weft_tell($3, $4, 'cancel')",
+                    &[
+                        &weft_task_store::runs::CANCEL_CHANNEL,
+                        &weft_task_store::runs::run_payload(locked.project_id, run_id),
+                        &locked.project_id,
+                        &run_id,
+                    ],
+                )
+                .await?;
                 write.requested = true;
             }
             Some(locked) => {
-                write.node_cancellations = Some(cancel_unowned_in(&mut tx, run_id, &locked, program, cause).await?);
+                write.node_cancellations = Some(cancel_unowned_in(&tx, run_id, &locked, program, cause).await?);
             }
             None => {}
         }
@@ -1172,21 +1188,19 @@ impl RunStore for PostgresStore {
         lapsed_before: i64,
         program: Option<&weft_core::ProjectDefinition>,
     ) -> anyhow::Result<Lost> {
-        let mut tx = self.pool.begin().await?;
-        let Some(mut locked) = weft_journal::record::lock_in(&mut tx, run_id).await? else { return Ok(Lost::NotLost) };
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        let Some(mut locked) = weft_journal::record::lock_in(&tx, run_id).await? else { return Ok(Lost::NotLost) };
         if locked.owner.is_none() || locked.state != "running" {
             return Ok(Lost::NotLost);
         }
         // Its owner still holds it (`weft_task_store::run_held_until_sql!`).
-        let (held,): (bool,) = sqlx::query_as(concat!(
-            "SELECT ",
-            weft_task_store::run_held_until_sql!("r"),
-            " >= $2 FROM run r WHERE r.run_id = $1"
-        ))
-        .bind(run_id)
-        .bind(lapsed_before)
-        .fetch_one(&mut *tx)
-        .await?;
+        let held: bool = tx
+            .scalar(
+                concat!("SELECT ", weft_task_store::run_held_until_sql!("r"), " >= $2 FROM run r WHERE r.run_id = $1"),
+                &[&run_id, &lapsed_before],
+            )
+            .await?;
         if held {
             return Ok(Lost::NotLost);
         }
@@ -1196,35 +1210,30 @@ impl RunStore for PostgresStore {
         // off its claim (and one for a project being removed, whose
         // workers were just killed).
         if let Some(cause) = locked.cancel_requested.take() {
-            sqlx::query("UPDATE run SET owner = NULL, epoch = epoch + 1, delivered_until = NULL WHERE run_id = $1")
-                .bind(run_id)
-                .execute(&mut *tx)
-                .await?;
+            tx.execute("UPDATE run SET owner = NULL, epoch = epoch + 1, delivered_until = NULL WHERE run_id = $1", &[&run_id]).await?;
             locked.owner = None;
-            cancel_unowned_in(&mut tx, run_id, &locked, program, &cause.0).await?;
+            cancel_unowned_in(&tx, run_id, &locked, program, &cause.0).await?;
             tx.commit().await?;
             weft_task_store::announce::committed(&self.pool);
             return Ok(Lost::Ended);
         }
         let durable = locked.keeping == weft_core::run_settings::Keeping::Durable.as_str();
-        sqlx::query(
+        tx.execute(
             "UPDATE run SET owner = NULL, epoch = epoch + 1, delivered_until = NULL, \
-                 state = CASE WHEN $2 THEN 'queued' ELSE state END WHERE run_id = $1",
+                 state = CASE WHEN $2::boolean THEN 'queued' ELSE state END WHERE run_id = $1",
+            &[&run_id, &durable],
         )
-            .bind(run_id)
-            .bind(durable)
-            .execute(&mut *tx)
-            .await?;
+        .await?;
         locked.owner = None;
         let lost = if durable {
             locked.state = "queued".into();
             // The answers handed to it while it ran go on its record now.
-            if !weft_journal::record::resolve_handed_in(&mut tx, run_id, &locked, weft_journal::record::DISPATCHER).await? {
-                weft_journal::record::notify_queued_in(&mut tx, locked.project_id).await?;
+            if !weft_journal::record::resolve_handed_in(&tx, run_id, &locked, weft_journal::record::DISPATCHER).await? {
+                weft_journal::record::notify_queued_in(&tx, locked.project_id).await?;
             }
             Lost::Requeued
         } else {
-            cancel_unowned_in(&mut tx, run_id, &locked, program, &weft_core::run::CancelCause::fast_run_lost()).await?;
+            cancel_unowned_in(&tx, run_id, &locked, program, &weft_core::run::CancelCause::fast_run_lost()).await?;
             Lost::Ended
         };
         tx.commit().await?;
@@ -1234,13 +1243,14 @@ impl RunStore for PostgresStore {
 
     async fn run_owner(&self, run_id: RunId) -> anyhow::Result<Option<RunOwner>> {
         type OwnerRow = (uuid::Uuid, String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<String>);
-        let row: Option<OwnerRow> = sqlx::query_as(
-            "SELECT project_id, tenant_id, instance_id, fired_by, phase, definition_hash, cut_from, binary_hash, source_version \
-             FROM run WHERE run_id = $1",
-        )
-                .bind(run_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<OwnerRow> = self
+            .pool
+            .opt(
+                "SELECT project_id, tenant_id, instance_id, fired_by, phase, definition_hash, cut_from, binary_hash, source_version \
+                 FROM run WHERE run_id = $1",
+                &[&run_id],
+            )
+            .await?;
         row.map(|(project_id, tenant, instance, fired_by, phase, definition_hash, cut_from, binary_hash, source_version)| {
             Ok(RunOwner {
                 project_id,
@@ -1266,12 +1276,9 @@ impl RunStore for PostgresStore {
         // code the fake runs: lines of parallel firings reach the record
         // in whatever order they ran, so the record's order is not the
         // order they were written in.
-        let mut conn = self.pool.acquire().await?;
-        let record = weft_journal::record::read_record(&mut conn, run_id, None).await?;
-        let written_at: Vec<(i32, i64)> = sqlx::query_as("SELECT seq, written_at FROM run_log WHERE run_id = $1")
-            .bind(run_id)
-            .fetch_all(&mut *conn)
-            .await?;
+        let conn = self.pool.get().await?;
+        let record = weft_journal::record::read_record(&conn, run_id, None).await?;
+        let written_at: Vec<(i32, i64)> = conn.all("SELECT seq, written_at FROM run_log WHERE run_id = $1", &[&run_id]).await?;
         let mut entries: Vec<LogEntry> = Vec::new();
         for row in &record.rows {
             match weft_journal::stored::decode(run_id, &row.events, row.events_version) {
@@ -1319,43 +1326,43 @@ impl RunStore for PostgresStore {
              AND ($11::text IS NULL OR EXISTS ( \
                      SELECT 1 FROM run_search rs WHERE rs.run_id = r.run_id \
                        AND rs.words @@ websearch_to_tsquery('simple', $11)))";
-        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM run r WHERE {where_clause}"))
-            .bind(tenant)
-            .bind(query.project_id)
-            .bind(query.started_after.map(|v| v as i64))
-            .bind(query.started_before.map(|v| v as i64))
-            .bind(query.phase.map(|p| p.as_str()))
-            .bind(query.entry_node.as_deref())
-            .bind(query.status.map(|s| s.as_str()))
-            .bind(query.instance.as_ref().map(|m| m.as_str()))
-            .bind(query.tag.as_deref())
-            .bind(query.node.as_deref())
-            .bind(query.search.as_deref())
-            .fetch_one(&self.pool)
+        let started_after = query.started_after.map(|v| v as i64);
+        let started_before = query.started_before.map(|v| v as i64);
+        let phase = query.phase.map(|p| p.as_str());
+        let status = query.status.map(|s| s.as_str());
+        let instance = query.instance.as_ref().map(|m| m.as_str());
+        let filters: [db::Param; 11] = [
+            &tenant,
+            &query.project_id,
+            &started_after,
+            &started_before,
+            &phase,
+            &query.entry_node,
+            &status,
+            &instance,
+            &query.tag,
+            &query.node,
+            &query.search,
+        ];
+        let total: i64 = self.pool.scalar(&format!("SELECT COUNT(*) FROM run r WHERE {where_clause}"), &filters).await?;
+        let limit = query.limit as i64;
+        let offset = query.offset as i64;
+        let below_started = query.below.map(|(started, _)| started as i64);
+        let below_run = query.below.map(|(_, run_id)| run_id);
+        let mut params = filters.to_vec();
+        params.extend([&limit as db::Param, &offset, &below_started, &below_run]);
+        let rows: Vec<SummaryRow> = self
+            .pool
+            .all(
+                &format!(
+                    "SELECT {SUMMARY_COLUMNS} FROM run r \
+                     WHERE {where_clause} \
+                       AND ($14::bigint IS NULL OR (r.started_at, r.run_id) < ($14, $15::uuid)) \
+                     ORDER BY r.started_at DESC, r.run_id DESC LIMIT $12 OFFSET $13"
+                ),
+                &params,
+            )
             .await?;
-        let rows: Vec<SummaryRow> = sqlx::query_as(&format!(
-            "SELECT {SUMMARY_COLUMNS} FROM run r \
-             WHERE {where_clause} \
-               AND ($14::bigint IS NULL OR (r.started_at, r.run_id) < ($14, $15::uuid)) \
-             ORDER BY r.started_at DESC, r.run_id DESC LIMIT $12 OFFSET $13"
-        ))
-        .bind(tenant)
-        .bind(query.project_id)
-        .bind(query.started_after.map(|v| v as i64))
-        .bind(query.started_before.map(|v| v as i64))
-        .bind(query.phase.map(|p| p.as_str()))
-        .bind(query.entry_node.as_deref())
-        .bind(query.status.map(|s| s.as_str()))
-        .bind(query.instance.as_ref().map(|m| m.as_str()))
-        .bind(query.tag.as_deref())
-        .bind(query.node.as_deref())
-        .bind(query.search.as_deref())
-        .bind(query.limit as i64)
-        .bind(query.offset as i64)
-        .bind(query.below.map(|(started, _)| started as i64))
-        .bind(query.below.map(|(_, run_id)| run_id))
-        .fetch_all(&self.pool)
-        .await?;
         let runs = rows.into_iter().map(SummaryRow::summary).collect::<anyhow::Result<_>>()?;
         Ok(RunPage { runs, total: total.max(0) as u64 })
     }
@@ -1365,21 +1372,19 @@ impl RunStore for PostgresStore {
         // and dashes, but the escape keeps a stray `%` or `_` from widening
         // the match.
         let pattern = format!("{}%", prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
-        Ok(sqlx::query_scalar(
-            "SELECT run_id FROM run WHERE tenant_id = $1 AND kind = 'project' AND run_id::text LIKE $2 \
-             ORDER BY started_at DESC LIMIT 2",
-        )
-        .bind(tenant)
-        .bind(pattern)
-        .fetch_all(&self.pool)
-        .await?)
+        Ok(self
+            .pool
+            .scalars(
+                "SELECT run_id FROM run WHERE tenant_id = $1 AND kind = 'project' AND run_id::text LIKE $2 \
+                 ORDER BY started_at DESC LIMIT 2",
+                &[&tenant, &pattern],
+            )
+            .await?)
     }
 
     async fn run_summary(&self, run_id: RunId) -> anyhow::Result<Option<RunSummary>> {
-        let row: Option<SummaryRow> = sqlx::query_as(&format!("SELECT {SUMMARY_COLUMNS} FROM run r WHERE r.run_id = $1"))
-            .bind(run_id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row: Option<SummaryRow> =
+            self.pool.opt(&format!("SELECT {SUMMARY_COLUMNS} FROM run r WHERE r.run_id = $1"), &[&run_id]).await?;
         row.map(SummaryRow::summary).transpose()
     }
 
@@ -1387,10 +1392,8 @@ impl RunStore for PostgresStore {
         &self,
         run_ids: &[RunId],
     ) -> anyhow::Result<std::collections::HashMap<RunId, RunSummary>> {
-        let rows: Vec<SummaryRow> = sqlx::query_as(&format!("SELECT {SUMMARY_COLUMNS} FROM run r WHERE r.run_id = ANY($1)"))
-            .bind(run_ids)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows: Vec<SummaryRow> =
+            self.pool.all(&format!("SELECT {SUMMARY_COLUMNS} FROM run r WHERE r.run_id = ANY($1)"), &[&run_ids]).await?;
         rows.into_iter().map(|row| row.summary().map(|summary| (summary.run_id, summary))).collect()
     }
 
@@ -1400,13 +1403,14 @@ impl RunStore for PostgresStore {
     ) -> anyhow::Result<Vec<(RunId, weft_core::context::Phase)>> {
         // Oldest first, ties broken on the id: the editor follows the last
         // one as the latest run.
-        let rows: Vec<(RunId, String)> = sqlx::query_as(
-            "SELECT run_id, phase FROM run WHERE project_id = $1 AND kind = 'project' AND state IN ('queued', 'running') \
-             ORDER BY started_at ASC, run_id ASC",
-        )
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<(RunId, String)> = self
+            .pool
+            .all(
+                "SELECT run_id, phase FROM run WHERE project_id = $1 AND kind = 'project' AND state IN ('queued', 'running') \
+                 ORDER BY started_at ASC, run_id ASC",
+                &[&project_id],
+            )
+            .await?;
         Ok(rows.into_iter().map(|(run_id, phase)| (run_id, phase_from_column(&phase))).collect())
     }
 
@@ -1422,41 +1426,43 @@ impl RunStore for PostgresStore {
         &self,
         project_id: uuid::Uuid,
     ) -> anyhow::Result<std::collections::HashSet<RunId>> {
-        let rows: Vec<RunId> = sqlx::query_scalar("SELECT run_id FROM run WHERE project_id = $1 AND state IN ('ended', 'parked')")
-            .bind(project_id)
-            .fetch_all(&self.pool)
+        let rows: Vec<RunId> = self
+            .pool
+            .scalars("SELECT run_id FROM run WHERE project_id = $1 AND state IN ('ended', 'parked')", &[&project_id])
             .await?;
         Ok(rows.into_iter().collect())
     }
 
     async fn delete_run(&self, run_id: RunId) -> anyhow::Result<Vec<SignalRegistration>> {
-        let mut tx = self.pool.begin().await?;
-        let removed = erase_run_ids(&mut tx, &[run_id]).await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        let removed = erase_run_ids(&tx, &[run_id]).await?;
         tx.commit().await?;
         Ok(removed)
     }
 
     async fn erase_expired(&self, now: i64, limit: i64) -> anyhow::Result<(usize, Vec<SignalRegistration>)> {
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
         // SYNC: the erase predicate <-> next_expiry
-        let run_ids: Vec<RunId> = sqlx::query_scalar(
-            "SELECT run_id FROM run WHERE state = 'ended' AND keep_until < $1 \
-                 AND NOT (watch_end OR holds_signals) \
-             ORDER BY keep_until LIMIT $2 FOR UPDATE SKIP LOCKED",
-        )
-        .bind(now)
-        .bind(limit)
-        .fetch_all(&mut *tx)
-        .await?;
-        let removed = erase_run_ids(&mut tx, &run_ids).await?;
+        let run_ids: Vec<RunId> = tx
+            .scalars(
+                "SELECT run_id FROM run WHERE state = 'ended' AND keep_until < $1 \
+                     AND NOT (watch_end OR holds_signals) \
+                 ORDER BY keep_until LIMIT $2 FOR UPDATE SKIP LOCKED",
+                &[&now, &limit],
+            )
+            .await?;
+        let removed = erase_run_ids(&tx, &run_ids).await?;
         tx.commit().await?;
         Ok((run_ids.len(), removed))
     }
 
     async fn next_expiry(&self) -> anyhow::Result<Option<i64>> {
         // SYNC: the erase predicate <-> erase_expired
-        Ok(sqlx::query_scalar("SELECT MIN(keep_until) FROM run WHERE state = 'ended' AND NOT (watch_end OR holds_signals)")
-            .fetch_one(&self.pool)
+        Ok(self
+            .pool
+            .scalar("SELECT MIN(keep_until) FROM run WHERE state = 'ended' AND NOT (watch_end OR holds_signals)", &[])
             .await?)
     }
 }
@@ -1464,8 +1470,9 @@ impl RunStore for PostgresStore {
 #[async_trait]
 impl SignalStore for PostgresStore {
     async fn answer(&self, token: &str, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<Answered> {
-        let mut tx = self.pool.begin().await?;
-        let answered = answer_in(&mut tx, token, answer, AnswerFrom::Sender).await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        let answered = answer_in(&tx, token, answer, AnswerFrom::Sender).await?;
         tx.commit().await?;
         weft_task_store::announce::committed(&self.pool);
         // An answer that reached its run may have been handed to the
@@ -1492,13 +1499,14 @@ impl SignalStore for PostgresStore {
         // row one past so a wake's claim taken at the old version fails.
         // A claim that landed first moved the row: nothing is written and
         // the caller recomputes from the new state (`StateMoved`).
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
         // A wait is its run's: the run's row first (the lock every writer
         // of a run takes first, and written before the run registers
         // anything), and none for a run already ended, whose ending found
         // no signal to take down.
         if let Some(run) = sig.run_id.filter(|_| sig.is_resume) {
-            match weft_journal::record::lock_in(&mut tx, run).await? {
+            match weft_journal::record::lock_in(&tx, run).await? {
                 None => anyhow::bail!("run {run} has no record, so its wait '{}' cannot be registered", sig.node_id),
                 Some(locked) if locked.state == "ended" => {
                     anyhow::bail!("run {run} ended before its wait '{}' could be registered", sig.node_id)
@@ -1510,43 +1518,34 @@ impl SignalStore for PostgresStore {
             // Arm only while THIS activation still owns the trigger's row:
             // a cancelled or superseded activation must not arm over the
             // one that replaced it.
-            let owned: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM trigger_activation \
-                 WHERE project_id = $1 AND trigger = $2 AND instance_id IS NOT DISTINCT FROM $3 \
-                   AND status = 'activating' AND activating_run_id = $4 FOR UPDATE)",
-            )
-            .bind(sig.project_id)
-            .bind(&sig.node_id)
-            .bind(sig.instance.as_ref().map(|m| m.as_str()))
-            .bind(setup)
-            .fetch_one(&mut *tx)
-            .await?;
+            let instance = sig.instance.as_ref().map(|m| m.as_str());
+            let owned: bool = tx
+                .scalar(
+                    "SELECT EXISTS (SELECT 1 FROM trigger_activation \
+                     WHERE project_id = $1 AND trigger = $2 AND instance_id IS NOT DISTINCT FROM $3 \
+                       AND status = 'activating' AND activating_run_id = $4 FOR UPDATE)",
+                    &[&sig.project_id, &sig.node_id, &instance, &setup],
+                )
+                .await?;
             anyhow::ensure!(!sig.is_resume && owned,
                 "activation ended before trigger '{}' could be armed", sig.node_id);
         }
         if let Some(version) = &sig.source_version {
-            crate::versions::retain_source_version(&mut tx, sig.project_id, version).await?;
+            crate::versions::retain_source_version(&tx, sig.project_id, version).await?;
         }
-        let query = sqlx::query(&SIGNAL_INSERT)
-            .bind(&sig.token)
-            .bind(&sig.tenant_id)
-            .bind(sig.project_id)
-            .bind(sig.run_id)
-            .bind(&sig.node_id)
-            .bind(sig.is_resume)
-            .bind(crate::lease::now_unix())
-            .bind(sig.instance.as_ref().map(|m| m.as_str()))
-            .bind(sig.activation_trigger.as_deref());
-        let written = bind_signal_refreshed(query, sig)?
-            .bind(sig.kind_state_seq)
-            .execute(&mut *tx)
-            .await?;
-        if written.rows_affected() == 0 {
+        let created_at = crate::lease::now_unix();
+        let instance = sig.instance.as_ref().map(|m| m.as_str());
+        let refreshed = SignalRefreshed::of(sig)?;
+        let mut params: Vec<db::Param> =
+            vec![&sig.token, &sig.tenant_id, &sig.project_id, &sig.run_id, &sig.node_id, &sig.is_resume, &created_at, &instance, &sig.activation_trigger];
+        params.extend(refreshed.params());
+        params.push(&sig.kind_state_seq);
+        let Some(generation) = tx.scalar_opt::<i64>(SIGNAL_INSERT.as_str(), &params).await? else {
             tx.rollback().await?;
             return Ok(super::SignalWrite::StateMoved);
-        }
+        };
         tx.commit().await?;
-        Ok(super::SignalWrite::Written)
+        Ok(super::SignalWrite::Written { generation })
     }
 
     async fn signal_restore(&self, sig: &SignalRegistration) -> anyhow::Result<super::SignalWrite> {
@@ -1554,37 +1553,31 @@ impl SignalStore for PostgresStore {
         // same compare-and-set on kind_state_seq, and the same hold on
         // the source version it names: a version pruned since the row
         // was replaced is refused rather than pointed at.
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
         if let Some(version) = &sig.source_version {
-            crate::versions::retain_source_version(&mut tx, sig.project_id, version)
+            crate::versions::retain_source_version(&tx, sig.project_id, version)
                 .await
                 .with_context(|| format!("signal_restore: put signal {} back", sig.token))?;
         }
-        let query = sqlx::query(&SIGNAL_RESTORE).bind(&sig.token);
-        let written = bind_signal_refreshed(query, sig)?
-            .bind(sig.kind_state_seq)
-            .execute(&mut *tx)
-            .await
-            .context("signal_restore: put a signal row back")?;
-        if written.rows_affected() == 1 {
+        let refreshed = SignalRefreshed::of(sig)?;
+        let mut params: Vec<db::Param> = vec![&sig.token];
+        params.extend(refreshed.params());
+        params.push(&sig.kind_state_seq);
+        let written = tx.scalar_opt::<i64>(SIGNAL_RESTORE.as_str(), &params).await.context("signal_restore: put a signal row back")?;
+        if let Some(generation) = written {
             tx.commit().await?;
-            return Ok(super::SignalWrite::Written);
+            return Ok(super::SignalWrite::Written { generation });
         }
-        let present: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM signal WHERE token = $1)")
-            .bind(&sig.token)
-            .fetch_one(&mut *tx)
-            .await?;
+        let present: bool = tx.scalar("SELECT EXISTS (SELECT 1 FROM signal WHERE token = $1)", &[&sig.token]).await?;
         tx.rollback().await?;
         anyhow::ensure!(present, "signal {} has no row to restore", sig.token);
         Ok(super::SignalWrite::StateMoved)
     }
 
     async fn signal_get(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>> {
-        let row: Option<SignalRow> = sqlx::query_as(SIGNAL_SELECT_WHERE_TOKEN)
-            .bind(token)
-            .fetch_optional(&self.pool)
-            .await
-            .context("signal_get: read a signal row")?;
+        let row: Option<SignalRow> =
+            self.pool.opt(SIGNAL_SELECT_WHERE_TOKEN, &[&token]).await.context("signal_get: read a signal row")?;
         row.map(row_to_signal).transpose()
     }
 
@@ -1594,11 +1587,10 @@ impl SignalStore for PostgresStore {
         node: &str,
         instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<Option<SignalRegistration>> {
-        let row: Option<SignalRow> = sqlx::query_as(SIGNAL_SELECT_ENTRY_AT_PLACE)
-            .bind(project_id)
-            .bind(node)
-            .bind(instance.map(|m| m.as_str()))
-            .fetch_optional(&self.pool)
+        let instance = instance.map(|m| m.as_str());
+        let row: Option<SignalRow> = self
+            .pool
+            .opt(SIGNAL_SELECT_ENTRY_AT_PLACE, &[&project_id, &node, &instance])
             .await
             .context("signal_entry_at: read a signal row")?;
         row.map(row_to_signal).transpose()
@@ -1614,20 +1606,28 @@ impl SignalStore for PostgresStore {
         remove_signals(&self.pool, tokens).await
     }
 
+    async fn signal_remove_registration(&self, token: &str, generation: i64) -> anyhow::Result<Option<SignalRegistration>> {
+        let row: Option<SignalRow> = self
+            .pool
+            .opt(SIGNAL_DELETE_REGISTRATION_RETURNING, &[&token, &generation])
+            .await
+            .context("signal_remove_registration: read the signal row")?;
+        row.map(row_to_signal).transpose()
+    }
+
     async fn signal_withdraw(&self, run_id: RunId, token: &str) -> anyhow::Result<Option<SignalRegistration>> {
-        let row: Option<SignalRow> = sqlx::query_as(SIGNAL_DELETE_WAIT_OF_RUN_RETURNING)
-            .bind(token)
-            .bind(run_id)
-            .fetch_optional(&self.pool)
+        let row: Option<SignalRow> = self
+            .pool
+            .opt(SIGNAL_DELETE_WAIT_OF_RUN_RETURNING, &[&token, &run_id])
             .await
             .context("signal_withdraw: read the signal row")?;
         row.map(row_to_signal).transpose()
     }
 
     async fn signal_list_for_run_id(&self, run_id: RunId) -> anyhow::Result<Vec<SignalRegistration>> {
-        let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_SELECT_WHERE_RUN_ID_RESUME)
-            .bind(run_id)
-            .fetch_all(&self.pool)
+        let rows: Vec<SignalRow> = self
+            .pool
+            .all(SIGNAL_SELECT_WHERE_RUN_ID_RESUME, &[&run_id])
             .await
             .context("signal_list_for_run_id: read a signal row")?;
         rows.into_iter().map(row_to_signal).collect()
@@ -1637,9 +1637,9 @@ impl SignalStore for PostgresStore {
         &self,
         project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<SignalRegistration>> {
-        let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_SELECT_WHERE_PROJECT)
-            .bind(project_id)
-            .fetch_all(&self.pool)
+        let rows: Vec<SignalRow> = self
+            .pool
+            .all(SIGNAL_SELECT_WHERE_PROJECT, &[&project_id])
             .await
             .context("signal_list_for_project: read a signal row")?;
         rows.into_iter().map(row_to_signal).collect()
@@ -1649,7 +1649,8 @@ impl SignalStore for PostgresStore {
         &self,
         run_id: RunId,
     ) -> anyhow::Result<Vec<SignalRegistration>> {
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
         // Whether the run was cancelled, which a wait registered after the
         // cancel (or a lost fast run, ended cancelled with its waits left
         // for here) needs to send its last call. Read, never locked: the
@@ -1659,12 +1660,11 @@ impl SignalStore for PostgresStore {
         // The outcome alone decides: a cancel asked of a run that finished
         // before its worker saw it left the run completed or failed, and
         // its waits send nothing.
-        let cancelled: bool = sqlx::query_scalar("SELECT COALESCE(outcome = 'cancelled', FALSE) FROM run WHERE run_id = $1")
-        .bind(run_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .unwrap_or(false);
-        let (removed, _) = remove_run_waits_in(&mut tx, run_id, cancelled).await.context("signal_remove_for_run_id")?;
+        let cancelled: bool = tx
+            .scalar_opt("SELECT COALESCE(outcome = 'cancelled', FALSE) FROM run WHERE run_id = $1", &[&run_id])
+            .await?
+            .unwrap_or(false);
+        let (removed, _) = remove_run_waits_in(&tx, run_id, cancelled).await.context("signal_remove_for_run_id")?;
         tx.commit().await?;
         weft_task_store::announce::committed(&self.pool);
         Ok(removed)
@@ -1681,86 +1681,66 @@ impl SignalStore for PostgresStore {
 #[async_trait]
 impl TokenStore for PostgresStore {
     async fn mint_signal_token(&self, tok: &SignalToken) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO signal_token \
-             (id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-              allowed_displays, all_displays, created_at, instance_id, expires_at, kind) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
-        )
-        .bind(tok.id)
-        .bind(&tok.token_hash)
-        .bind(&tok.recognizer)
-        .bind(&tok.tenant_id)
-        .bind(&tok.name)
-        .bind(&tok.allowed_projects)
-        .bind(&tok.allowed_tags)
-        .bind(&tok.allowed_displays)
-        .bind(tok.all_displays)
         // Store the caller-stamped mint time verbatim (the handler set it from
         // the canonical clock), so postgres and the fake agree.
-        .bind(tok.created_at as i64)
-        .bind(tok.instance.as_ref().map(|m| m.as_str()))
-        .bind(tok.expires_at.map(|at| at as i64))
-        .bind(tok.kind.as_str())
-        .execute(&self.pool)
-        .await?;
+        let created_at = tok.created_at as i64;
+        let instance = tok.instance.as_ref().map(|m| m.as_str());
+        let expires_at = tok.expires_at.map(|at| at as i64);
+        self.pool
+            .execute(
+                "INSERT INTO signal_token \
+                 (id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
+                  allowed_displays, all_displays, created_at, instance_id, expires_at, kind) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                &[
+                    &tok.id,
+                    &tok.token_hash,
+                    &tok.recognizer,
+                    &tok.tenant_id,
+                    &tok.name,
+                    &tok.allowed_projects,
+                    &tok.allowed_tags,
+                    &tok.allowed_displays,
+                    &tok.all_displays,
+                    &created_at,
+                    &instance,
+                    &expires_at,
+                    &tok.kind.as_str(),
+                ],
+            )
+            .await?;
         Ok(())
     }
 
     async fn get_signal_token(&self, token_hash: &str) -> anyhow::Result<Option<SignalToken>> {
-        let row: Option<SignalTokenRow> = sqlx::query_as(
-            "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-                    allowed_displays, all_displays, created_at, instance_id, expires_at, kind \
-             FROM signal_token WHERE token_hash = $1",
-        )
-        .bind(token_hash)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<SignalTokenRow> = self
+            .pool
+            .opt(
+                "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
+                        allowed_displays, all_displays, created_at, instance_id, expires_at, kind \
+                 FROM signal_token WHERE token_hash = $1",
+                &[&token_hash],
+            )
+            .await?;
         row.map(row_to_signal_token).transpose()
     }
 
-    async fn seed_operator_token(&self, tok: &SignalToken) -> anyhow::Result<bool> {
-        anyhow::ensure!(tok.kind == weft_core::signal_token::TokenKind::Operator, "only an operator key is seeded");
-        let res = sqlx::query(
-            "INSERT INTO signal_token \
-             (id, token_hash, recognizer, tenant_id, name, created_at, kind) \
-             SELECT $1, $2, $3, $4, $5, $6, 'operator' \
-             WHERE NOT EXISTS ( \
-                 SELECT 1 FROM signal_token WHERE tenant_id = $4 AND kind = 'operator') \
-             ON CONFLICT (token_hash) DO NOTHING",
-        )
-        .bind(tok.id)
-        .bind(&tok.token_hash)
-        .bind(&tok.recognizer)
-        .bind(&tok.tenant_id)
-        .bind(&tok.name)
-        .bind(tok.created_at as i64)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
     async fn list_signal_tokens(&self, tenant: &str) -> anyhow::Result<Vec<SignalToken>> {
-        let rows: Vec<SignalTokenRow> = sqlx::query_as(
-            "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-                    allowed_displays, all_displays, created_at, instance_id, expires_at, kind \
-             FROM signal_token WHERE tenant_id = $1 ORDER BY created_at DESC",
-        )
-        .bind(tenant)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<SignalTokenRow> = self
+            .pool
+            .all(
+                "SELECT id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
+                        allowed_displays, all_displays, created_at, instance_id, expires_at, kind \
+                 FROM signal_token WHERE tenant_id = $1 ORDER BY created_at DESC",
+                &[&tenant],
+            )
+            .await?;
         rows.into_iter().map(row_to_signal_token).collect()
     }
 
     async fn revoke_signal_token(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<bool> {
-        let res = sqlx::query(
-            "DELETE FROM signal_token WHERE id = $1 AND tenant_id = $2",
-        )
-        .bind(id)
-        .bind(tenant)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
+        let deleted = self.pool.execute("DELETE FROM signal_token WHERE id = $1 AND tenant_id = $2", &[&id, &tenant]).await?;
+        Ok(deleted > 0)
     }
 }
 
@@ -1773,15 +1753,12 @@ impl TokenStore for PostgresStore {
 /// cancel however it went (registered after the cancel, or ended with its
 /// run lost). Answers the waits removed and how many calls were queued.
 async fn remove_run_waits_in(
-    tx: &mut sqlx::PgConnection,
+    tx: &impl Client,
     run_id: RunId,
     cancelled: bool,
 ) -> anyhow::Result<(Vec<SignalRegistration>, usize)> {
-    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_RUN_ID_RETURNING)
-        .bind(run_id)
-        .fetch_all(&mut *tx)
-        .await
-        .context("strip the run's signals: read a signal row")?;
+    let rows: Vec<SignalRow> =
+        tx.all(SIGNAL_DELETE_BY_RUN_ID_RETURNING, &[&run_id]).await.context("strip the run's signals: read a signal row")?;
     let removed: Vec<SignalRegistration> = rows.into_iter().map(row_to_signal).collect::<anyhow::Result<_>>()?;
     let cancel_calls = match cancelled {
         true => queue_cancel_calls_in(tx, &removed).await?,
@@ -1794,7 +1771,7 @@ async fn remove_run_waits_in(
 /// that carries one (`weft_task_store::TaskKind::CancelCall`), for waits
 /// just taken down because their run was cancelled. Answers how many it
 /// queued (a call already queued for the same wait is not queued again).
-async fn queue_cancel_calls_in(tx: &mut sqlx::PgConnection, waits: &[SignalRegistration]) -> anyhow::Result<usize> {
+async fn queue_cancel_calls_in(tx: &impl Client, waits: &[SignalRegistration]) -> anyhow::Result<usize> {
     let mut queued = 0;
     for wait in waits {
         let call = match wait.cancel_call() {
@@ -1819,7 +1796,7 @@ async fn queue_cancel_calls_in(tx: &mut sqlx::PgConnection, waits: &[SignalRegis
             tenant_id: wait.tenant_id.clone(),
             payload: serde_json::to_value(&call).context("a last call's payload")?,
         };
-        let outcome = weft_task_store::tasks::enqueue_dedup_in(&mut *tx, task).await.context("queue a last call")?;
+        let outcome = weft_task_store::tasks::enqueue_dedup_in(tx, task).await.context("queue a last call")?;
         if matches!(outcome, weft_task_store::tasks::DedupOutcome::Inserted(_)) {
             queued += 1;
         }
@@ -1837,7 +1814,7 @@ async fn queue_cancel_calls_in(tx: &mut sqlx::PgConnection, waits: &[SignalRegis
 /// removed, because a listener process holds each of those in RAM and only
 /// the caller can tell it to let go.
 async fn erase_run_ids(
-    tx: &mut sqlx::PgConnection,
+    tx: &impl Client,
     run_ids: &[RunId],
 ) -> anyhow::Result<Vec<SignalRegistration>> {
     if run_ids.is_empty() {
@@ -1848,27 +1825,26 @@ async fn erase_run_ids(
     // waits holds the row, then its signal). The same read names the
     // projects of the queued runs that carried a failure of their delivery
     // (`run.waited_on_workers`, which only a queued run carries).
-    let failed: Vec<Option<uuid::Uuid>> = sqlx::query_scalar(
-        "SELECT CASE WHEN waited_on_workers THEN project_id END \
-         FROM run WHERE run_id = ANY($1) ORDER BY run_id FOR UPDATE",
-    )
-    .bind(run_ids)
-    .fetch_all(&mut *tx)
-    .await?;
-    sqlx::query("DELETE FROM trigger_setup WHERE run_id = ANY($1)").bind(run_ids).execute(&mut *tx).await?;
-    weft_journal::tags::delete_for_run_ids(&mut *tx, run_ids).await?;
-    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_RESUME_BY_RUN_IDS_RETURNING)
-        .bind(run_ids)
-        .fetch_all(&mut *tx)
+    let failed: Vec<Option<uuid::Uuid>> = tx
+        .scalars(
+            "SELECT CASE WHEN waited_on_workers THEN project_id END \
+             FROM run WHERE run_id = ANY($1) ORDER BY run_id FOR UPDATE",
+            &[&run_ids],
+        )
+        .await?;
+    tx.execute("DELETE FROM trigger_setup WHERE run_id = ANY($1)", &[&run_ids]).await?;
+    weft_journal::tags::delete_for_run_ids(tx, run_ids).await?;
+    let rows: Vec<SignalRow> = tx
+        .all(SIGNAL_DELETE_RESUME_BY_RUN_IDS_RETURNING, &[&run_ids])
         .await
         .context("erase runs: read a resume signal row")?;
     let removed = rows.into_iter().map(row_to_signal).collect::<anyhow::Result<Vec<_>>>()?;
-    sqlx::query("DELETE FROM parked_fire WHERE run_id = ANY($1)").bind(run_ids).execute(&mut *tx).await?;
+    tx.execute("DELETE FROM parked_fire WHERE run_id = ANY($1)", &[&run_ids]).await?;
     // The queue before the entries: a search building a run's entry holds
     // its queue row, so the erase waits for it there and then removes the
     // entry it wrote.
     for table in ["run_search_queue", "run_search", "run_log", "run"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE run_id = ANY($1)")).bind(run_ids).execute(&mut *tx).await?;
+        tx.execute(&format!("DELETE FROM {table} WHERE run_id = ANY($1)"), &[&run_ids]).await?;
     }
     // A queued run its workers had failed (busy, refused, not reached)
     // went without reaching one: what `weft status` shows of them goes
@@ -1876,7 +1852,7 @@ async fn erase_run_ids(
     // on them.
     let failed: std::collections::BTreeSet<uuid::Uuid> = failed.into_iter().flatten().collect();
     for project in failed {
-        weft_task_store::unanswered::delivery_waits_ended(&mut *tx, project).await?;
+        weft_task_store::unanswered::delivery_waits_ended(tx, project).await?;
     }
     Ok(removed)
 }
@@ -1886,23 +1862,20 @@ async fn erase_run_ids(
 /// which removed the project row first, so its history goes rather than
 /// being orphaned (once the row is gone nothing could reach it). Answers
 /// how many runs went, and the resume signals that went with them.
-pub(crate) async fn erase_project_runs(tx: &mut sqlx::PgConnection, project_id: uuid::Uuid) -> anyhow::Result<(usize, Vec<SignalRegistration>)> {
-    let run_ids: Vec<RunId> = sqlx::query_scalar("SELECT run_id FROM run WHERE project_id = $1")
-        .bind(project_id)
-        .fetch_all(&mut *tx)
-        .await?;
+pub(crate) async fn erase_project_runs(tx: &impl Client, project_id: uuid::Uuid) -> anyhow::Result<(usize, Vec<SignalRegistration>)> {
+    let run_ids: Vec<RunId> = tx.scalars("SELECT run_id FROM run WHERE project_id = $1", &[&project_id]).await?;
     // Removing the project ends the runs it had not ended yet (a run whose
     // cancel its worker had not written when the worker was retired):
     // their waits go out like a cancelled run's, with their last calls.
     // A run that ended any other way sends none.
-    let cut_short: std::collections::HashSet<RunId> = sqlx::query_scalar(
-        "SELECT run_id FROM run WHERE project_id = $1 AND (state <> 'ended' OR outcome = 'cancelled')",
-    )
-    .bind(project_id)
-    .fetch_all(&mut *tx)
-    .await?
-    .into_iter()
-    .collect();
+    let cut_short: std::collections::HashSet<RunId> = tx
+        .scalars::<RunId>(
+            "SELECT run_id FROM run WHERE project_id = $1 AND (state <> 'ended' OR outcome = 'cancelled')",
+            &[&project_id],
+        )
+        .await?
+        .into_iter()
+        .collect();
     let removed = erase_run_ids(tx, &run_ids).await?;
     let cut_short_waits: Vec<SignalRegistration> =
         removed.iter().filter(|wait| wait.run_id.is_some_and(|run| cut_short.contains(&run))).cloned().collect();
@@ -1910,12 +1883,10 @@ pub(crate) async fn erase_project_runs(tx: &mut sqlx::PgConnection, project_id: 
     Ok((run_ids.len(), removed))
 }
 
-pub(crate) async fn remove_project_signals<'e>(
-    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
-    project_id: uuid::Uuid,
-) -> anyhow::Result<Vec<SignalRegistration>> {
-    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_PROJECT_RETURNING)
-        .bind(project_id).fetch_all(executor).await
+pub(crate) async fn remove_project_signals(db: &impl Client, project_id: uuid::Uuid) -> anyhow::Result<Vec<SignalRegistration>> {
+    let rows: Vec<SignalRow> = db
+        .all(SIGNAL_DELETE_BY_PROJECT_RETURNING, &[&project_id])
+        .await
         .context("remove project signals: read a signal row")?;
     rows.into_iter().map(row_to_signal).collect()
 }
@@ -1923,15 +1894,13 @@ pub(crate) async fn remove_project_signals<'e>(
 /// Every signal of the project but the waits of `except` (the run that
 /// asked for a whole-project take-down keeps its own), deleted and handed
 /// back for the listener cleanup.
-pub async fn remove_project_signals_except<'e>(
-    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+pub async fn remove_project_signals_except(
+    db: &impl Client,
     project_id: uuid::Uuid,
     except: Option<RunId>,
 ) -> anyhow::Result<Vec<SignalRegistration>> {
-    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_PROJECT_EXCEPT_RETURNING)
-        .bind(project_id)
-        .bind(except)
-        .fetch_all(executor)
+    let rows: Vec<SignalRow> = db
+        .all(SIGNAL_DELETE_BY_PROJECT_EXCEPT_RETURNING, &[&project_id, &except])
         .await
         .context("remove project signals: read a signal row")?;
     rows.into_iter().map(row_to_signal).collect()
@@ -1939,17 +1908,14 @@ pub async fn remove_project_signals_except<'e>(
 
 /// Every signal the activations `keys` govern: their entry signals and
 /// the waits of the runs their triggers fired.
-pub(crate) async fn activation_signals<'e>(
-    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+pub(crate) async fn activation_signals(
+    db: &impl Client,
     project_id: uuid::Uuid,
     keys: &[weft_core::activation::ActivationKey],
 ) -> anyhow::Result<Vec<SignalRegistration>> {
     let (triggers, instances) = crate::activation_store::key_arrays(keys);
-    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_SELECT_BY_ACTIVATIONS)
-        .bind(project_id)
-        .bind(&triggers)
-        .bind(&instances)
-        .fetch_all(executor)
+    let rows: Vec<SignalRow> = db
+        .all(SIGNAL_SELECT_BY_ACTIVATIONS, &[&project_id, &triggers, &instances])
         .await
         .context("activation signals: read a signal row")?;
     rows.into_iter().map(row_to_signal).collect()
@@ -1957,29 +1923,26 @@ pub(crate) async fn activation_signals<'e>(
 
 /// The entry tokens of `keys`' triggers (their resume signals left out):
 /// what their workers count at the door for them (`crate::drain`).
-pub(crate) async fn entry_tokens<'e>(
-    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+pub(crate) async fn entry_tokens(
+    db: &impl Client,
     project_id: uuid::Uuid,
     keys: &[weft_core::activation::ActivationKey],
 ) -> anyhow::Result<Vec<String>> {
-    Ok(activation_signals(executor, project_id, keys).await?.into_iter().filter(|signal| !signal.is_resume).map(|signal| signal.token).collect())
+    Ok(activation_signals(db, project_id, keys).await?.into_iter().filter(|signal| !signal.is_resume).map(|signal| signal.token).collect())
 }
 
 /// The work held on the activations `keys`: the arrivals queued on their
 /// entry signals (events, calls) and the runs their triggers fired that
 /// are paused on a wait (an answer queued for one goes with it). What a
 /// take-down keeps or drops, and what an activation releases.
-pub async fn held_on<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
+pub async fn held_on(
+    db: &impl Client,
     project_id: uuid::Uuid,
     keys: &[weft_core::activation::ActivationKey],
 ) -> anyhow::Result<weft_core::projects::HeldWork> {
     let (triggers, instances) = crate::activation_store::key_arrays(keys);
-    let (arrivals, paused): (i64, i64) = sqlx::query_as(HELD_ON_ACTIVATIONS)
-        .bind(project_id)
-        .bind(&triggers)
-        .bind(&instances)
-        .fetch_one(executor)
+    let (arrivals, paused): (i64, i64) = db
+        .one(HELD_ON_ACTIVATIONS, &[&project_id, &triggers, &instances])
         .await
         .context("count the work held on the activations")?;
     Ok(weft_core::projects::HeldWork { arrivals: arrivals.max(0) as u64, paused: paused.max(0) as u64 })
@@ -1989,25 +1952,25 @@ pub async fn held_on<'e>(
 /// activation: [`held_on`] for all of them at once, for the project's
 /// status.
 pub async fn held_by_activation(
-    pool: &sqlx::PgPool,
+    pool: &Pool,
     project_id: uuid::Uuid,
 ) -> anyhow::Result<std::collections::BTreeMap<weft_core::activation::ActivationKey, weft_core::projects::HeldWork>> {
-    let arrivals: Vec<(String, Option<String>, i64)> = sqlx::query_as(
-        "SELECT s.activation_trigger, s.instance_id, COUNT(*)::bigint FROM parked_fire p JOIN signal s ON s.token = p.token \
-         WHERE s.project_id = $1 AND s.activation_trigger IS NOT NULL AND NOT s.is_resume GROUP BY s.activation_trigger, s.instance_id",
-    )
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .context("count the arrivals held on the project's activations")?;
-    let paused: Vec<(String, Option<String>, i64)> = sqlx::query_as(
-        "SELECT fired_by, instance_id, COUNT(*)::bigint FROM run \
-         WHERE project_id = $1 AND state = 'parked' AND fired_by IS NOT NULL GROUP BY fired_by, instance_id",
-    )
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .context("count the paused runs of the project's activations")?;
+    let arrivals: Vec<(String, Option<String>, i64)> = pool
+        .all(
+            "SELECT s.activation_trigger, s.instance_id, COUNT(*)::bigint FROM parked_fire p JOIN signal s ON s.token = p.token \
+             WHERE s.project_id = $1 AND s.activation_trigger IS NOT NULL AND NOT s.is_resume GROUP BY s.activation_trigger, s.instance_id",
+            &[&project_id],
+        )
+        .await
+        .context("count the arrivals held on the project's activations")?;
+    let paused: Vec<(String, Option<String>, i64)> = pool
+        .all(
+            "SELECT fired_by, instance_id, COUNT(*)::bigint FROM run \
+             WHERE project_id = $1 AND state = 'parked' AND fired_by IS NOT NULL GROUP BY fired_by, instance_id",
+            &[&project_id],
+        )
+        .await
+        .context("count the paused runs of the project's activations")?;
     let key = |trigger: String, instance: Option<String>| -> anyhow::Result<weft_core::activation::ActivationKey> {
         let instance = instance.map(weft_core::instance::InstanceId::new).transpose().map_err(anyhow::Error::msg)?;
         Ok(weft_core::activation::ActivationKey::new(trigger, weft_core::instance::Owner::from_instance(instance)))
@@ -2029,31 +1992,27 @@ pub async fn held_by_activation(
 /// ended meanwhile, or is on that build already (a resync's task run
 /// again), is left as it is. Answers how many moved.
 pub async fn move_paused_runs(
-    pool: &sqlx::PgPool,
+    pool: &Pool,
     runs: &[weft_core::RunId],
     program: &weft_journal::record::RunsProgram,
     binary_hash: &str,
     source_version: &str,
 ) -> anyhow::Result<u64> {
-    let mut tx = pool.begin().await?;
-    let moved = sqlx::query(
-        "UPDATE run SET binary_hash = $2, definition_hash = $3, cut_from = $4, source_version = $5 \
-         WHERE run_id = ANY($1) AND state = 'parked' \
-           AND (binary_hash IS DISTINCT FROM $2 OR definition_hash IS DISTINCT FROM $3)",
-    )
-    .bind(runs)
-    .bind(binary_hash)
-    .bind(program.definition_hash())
-    .bind(program.cut_from())
-    .bind(source_version)
-    .execute(&mut *tx)
-    .await
-    .context("move the paused runs onto the new build")?
-    .rows_affected();
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let moved = tx
+        .execute(
+            "UPDATE run SET binary_hash = $2, definition_hash = $3, cut_from = $4, source_version = $5 \
+             WHERE run_id = ANY($1) AND state = 'parked' \
+               AND (binary_hash IS DISTINCT FROM $2 OR definition_hash IS DISTINCT FROM $3)",
+            &[&runs, &binary_hash, &program.definition_hash(), &program.cut_from(), &source_version],
+        )
+        .await
+        .context("move the paused runs onto the new build")?;
     // The cut is kept only once a run names it, so a move that moved
     // nothing keeps no program nobody runs.
     if moved > 0 {
-        weft_journal::record::insert_cut_in(&mut tx, program).await.context("keep the cut the moved runs run")?;
+        weft_journal::record::insert_cut_in(&tx, program).await.context("keep the cut the moved runs run")?;
     }
     tx.commit().await?;
     Ok(moved)
@@ -2063,48 +2022,61 @@ pub async fn move_paused_runs(
 /// take-down dropping what is held while its door goes on taking. The
 /// signals stay, and so do the answers queued for the waits of the runs
 /// their triggers fired (a paused one's go as it is cancelled).
-pub async fn drop_held_arrivals<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
+pub async fn drop_held_arrivals(
+    db: &impl Client,
     project_id: uuid::Uuid,
     keys: &[weft_core::activation::ActivationKey],
 ) -> anyhow::Result<u64> {
     let (triggers, instances) = crate::activation_store::key_arrays(keys);
-    Ok(sqlx::query(HELD_ARRIVALS_DELETE)
-        .bind(project_id)
-        .bind(&triggers)
-        .bind(&instances)
-        .execute(executor)
+    db.execute(HELD_ARRIVALS_DELETE, &[&project_id, &triggers, &instances])
         .await
-        .context("drop the arrivals held on the activations")?
-        .rows_affected())
+        .context("drop the arrivals held on the activations")
+}
+
+/// Give each of `places`' rows its fresh kind state, each only while the
+/// row is still at the version its state was computed from, which the
+/// write moves one past (so a wake's claim taken at the old version
+/// fails). Answers whether every one landed; when one did not (a wake
+/// claimed in between, or the row went), the caller rolls back and
+/// computes them again.
+pub(crate) async fn write_fresh_places(db: &impl Client, places: &[crate::store::FreshPlace]) -> anyhow::Result<bool> {
+    if places.is_empty() {
+        return Ok(true);
+    }
+    let tokens: Vec<&str> = places.iter().map(|p| p.token.as_str()).collect();
+    let seqs: Vec<i64> = places.iter().map(|p| p.kind_state_seq).collect();
+    let states: Vec<&serde_json::Value> = places.iter().map(|p| &p.kind_state).collect();
+    let written = db
+        .execute(
+            "UPDATE signal s SET kind_state = p.kind_state, kind_state_seq = s.kind_state_seq + 1 \
+             FROM unnest($1::text[], $2::bigint[], $3::jsonb[]) AS p(token, seq, kind_state) \
+             WHERE s.token = p.token AND s.kind_state_seq = p.seq",
+            &[&tokens, &seqs, &states],
+        )
+        .await
+        .context("give the signals a fresh place")?;
+    Ok(written == places.len() as u64)
 }
 
 /// Delete the entry signals of the activations `keys` (their arrivals
 /// go with them), handed back for the listener cleanup. The waits of the
 /// runs their triggers fired stay with those runs.
-pub(crate) async fn remove_entry_signals<'e>(
-    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+pub(crate) async fn remove_entry_signals(
+    db: &impl Client,
     project_id: uuid::Uuid,
     keys: &[weft_core::activation::ActivationKey],
 ) -> anyhow::Result<Vec<SignalRegistration>> {
     let (triggers, instances) = crate::activation_store::key_arrays(keys);
-    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_ENTRIES_BY_ACTIVATIONS_RETURNING)
-        .bind(project_id)
-        .bind(&triggers)
-        .bind(&instances)
-        .fetch_all(executor)
+    let rows: Vec<SignalRow> = db
+        .all(SIGNAL_DELETE_ENTRIES_BY_ACTIVATIONS_RETURNING, &[&project_id, &triggers, &instances])
         .await
         .context("remove the activations' entry signals: read a signal row")?;
     rows.into_iter().map(row_to_signal).collect()
 }
 
-pub(crate) async fn remove_signals<'e>(
-    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
-    tokens: &[String],
-) -> anyhow::Result<Vec<SignalRegistration>> {
-    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_TOKENS_RETURNING)
-        .bind(tokens).fetch_all(executor).await
-        .context("remove signals: read a signal row")?;
+pub(crate) async fn remove_signals(db: &impl Client, tokens: &[String]) -> anyhow::Result<Vec<SignalRegistration>> {
+    let rows: Vec<SignalRow> =
+        db.all(SIGNAL_DELETE_BY_TOKENS_RETURNING, &[&tokens]).await.context("remove signals: read a signal row")?;
     rows.into_iter().map(row_to_signal).collect()
 }
 
@@ -2152,12 +2124,12 @@ const SIGNAL_SELECT_ENTRY_AT_PLACE: &str = concat!(
 );
 
 /// The columns a registration writes over a row it replaces (and a
-/// restore writes back), in the order [`bind_signal_refreshed`] binds
+/// restore writes back), in the order [`SignalRefreshed::params`] hands
 /// them. `kind_state_seq` is not among them: each statement moves it one
 /// past the version it compares against. The row's identity (token,
 /// tenant, project, instance, run, node, is_resume, trigger) and its
 /// parked fires are never among them.
-// SYNC: SIGNAL_REFRESHED_COLUMNS <-> bind_signal_refreshed (same order)
+// SYNC: SIGNAL_REFRESHED_COLUMNS <-> SignalRefreshed::params (same order)
 //       <-> store/fake.rs `copy_refreshed`
 const SIGNAL_REFRESHED_COLUMNS: [&str; 18] = [
     "spec_json",
@@ -2180,37 +2152,59 @@ const SIGNAL_REFRESHED_COLUMNS: [&str; 18] = [
     "holds",
 ];
 
-/// Bind a registration's [`SIGNAL_REFRESHED_COLUMNS`] values, in order.
-fn bind_signal_refreshed<'q>(
-    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
-    sig: &'q SignalRegistration,
-) -> anyhow::Result<sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>> {
-    Ok(query
-        .bind(&sig.spec_json)
-        .bind(weft_core::primitive::SignalSpec::STORED.version())
-        .bind(sig.program.as_ref().map(serde_json::to_value).transpose()?)
-        .bind(weft_core::project::hash::ProgramIdentity::STORED.version())
-        .bind(sig.setup_run_id)
-        .bind(&sig.source_version)
-        .bind(sig.access_id.as_deref())
-        .bind(sig.consumer_kind.as_deref())
-        .bind(&sig.tags)
-        .bind(sig.port_snapshot.as_ref())
-        .bind(sig.consumer_payload.as_ref().map(serde_json::to_string).transpose()?)
-        .bind(&sig.surface_kind)
-        .bind(sig.mount_path.as_deref())
-        .bind(&sig.mount_methods)
-        .bind(&sig.auth_kind)
-        .bind(sig.auth_config.as_ref())
-        .bind(&sig.kind_state)
-        .bind(sig.holds))
+/// A registration's [`SIGNAL_REFRESHED_COLUMNS`] values, with the ones
+/// written in another form than the registration holds them made.
+struct SignalRefreshed<'s> {
+    sig: &'s SignalRegistration,
+    spec_json_version: weft_core::stored::Version,
+    program_json: Option<serde_json::Value>,
+    program_json_version: weft_core::stored::Version,
+    consumer_payload: Option<String>,
+}
+
+impl<'s> SignalRefreshed<'s> {
+    fn of(sig: &'s SignalRegistration) -> anyhow::Result<Self> {
+        Ok(Self {
+            sig,
+            spec_json_version: weft_core::primitive::SignalSpec::STORED.version(),
+            program_json: sig.program.as_ref().map(serde_json::to_value).transpose()?,
+            program_json_version: weft_core::project::hash::ProgramIdentity::STORED.version(),
+            consumer_payload: sig.consumer_payload.as_ref().map(serde_json::to_string).transpose()?,
+        })
+    }
+
+    /// The values, in [`SIGNAL_REFRESHED_COLUMNS`] order.
+    fn params(&self) -> [db::Param<'_>; 18] {
+        let sig = self.sig;
+        [
+            &sig.spec_json,
+            &self.spec_json_version,
+            &self.program_json,
+            &self.program_json_version,
+            &sig.setup_run_id,
+            &sig.source_version,
+            &sig.access_id,
+            &sig.consumer_kind,
+            &sig.tags,
+            &sig.port_snapshot,
+            &self.consumer_payload,
+            &sig.surface_kind,
+            &sig.mount_path,
+            &sig.mount_methods,
+            &sig.auth_kind,
+            &sig.auth_config,
+            &sig.kind_state,
+            &sig.holds,
+        ]
+    }
 }
 
 /// `signal_insert`: the nine identity columns ($1..$9), the refreshed
 /// ones, then the version the registration read (the row lands one past
 /// it). On a token conflict only the refreshed columns change, and only
 /// while the row is still at that version; the row's holder lets go
-/// ([`LET_GO`]), so the rewritten signal comes up fresh.
+/// ([`LET_GO`]), so the rewritten signal comes up fresh. Answers the
+/// registration (`generation`) the write made, nothing when it did not land.
 static SIGNAL_INSERT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     const IDENTITY: [&str; 9] = [
         "token", "tenant_id", "project_id", "run_id", "node_id", "is_resume", "created_at", "instance_id",
@@ -2222,9 +2216,10 @@ static SIGNAL_INSERT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
     let values = (1..seq).map(|i| format!("${i}")).collect::<Vec<_>>().join(", ");
     let set = refreshed.iter().map(|c| format!("{c} = EXCLUDED.{c}")).collect::<Vec<_>>().join(", ");
     format!(
-        "INSERT INTO signal ({columns}, kind_state_seq) VALUES ({values}, ${seq} + 1) \
+        "INSERT INTO signal ({columns}, kind_state_seq) VALUES ({values}, ${seq}::bigint + 1) \
          ON CONFLICT (token) DO UPDATE SET {set}, kind_state_seq = EXCLUDED.kind_state_seq, {LET_GO} \
-         WHERE signal.kind_state_seq = EXCLUDED.kind_state_seq - 1"
+         WHERE signal.kind_state_seq = EXCLUDED.kind_state_seq - 1 \
+         RETURNING generation"
     )
 });
 
@@ -2238,12 +2233,13 @@ const LET_GO: &str = "held_by = NULL, serving = NULL, held_failed = NULL, let_go
                       generation = nextval('signal_generation_seq')";
 
 /// `signal_restore`: the token ($1), the refreshed columns, then the
-/// version the row must still be at (it moves one past).
+/// version the row must still be at (it moves one past). Answers the
+/// registration it made, like `SIGNAL_INSERT`.
 static SIGNAL_RESTORE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     let refreshed = SIGNAL_REFRESHED_COLUMNS;
     let seq = refreshed.len() + 2;
     let set = refreshed.iter().enumerate().map(|(i, c)| format!("{c} = ${}", i + 2)).collect::<Vec<_>>().join(", ");
-    format!("UPDATE signal SET {set}, kind_state_seq = ${seq} + 1, {LET_GO} WHERE token = $1 AND kind_state_seq = ${seq}")
+    format!("UPDATE signal SET {set}, kind_state_seq = ${seq}::bigint + 1, {LET_GO} WHERE token = $1 AND kind_state_seq = ${seq} RETURNING generation")
 });
 
 const SIGNAL_DELETE_BY_RUN_ID_RETURNING: &str =
@@ -2275,9 +2271,9 @@ const SIGNAL_SELECT_BY_ACTIVATIONS: &str =
 
 /// Every signal the listener kept after it was told to let go of it
 /// (`signal.let_go_failed`, `crate::listener::note_let_go`).
-pub(crate) async fn signals_kept_after_let_go(pool: &sqlx::PgPool) -> anyhow::Result<Vec<SignalRegistration>> {
-    let rows: Vec<SignalRow> = sqlx::query_as(concat!("SELECT ", signal_columns!(""), " FROM signal WHERE let_go_failed IS NOT NULL"))
-        .fetch_all(pool)
+pub(crate) async fn signals_kept_after_let_go(pool: &Pool) -> anyhow::Result<Vec<SignalRegistration>> {
+    let rows: Vec<SignalRow> = pool
+        .all(concat!("SELECT ", signal_columns!(""), " FROM signal WHERE let_go_failed IS NOT NULL"), &[])
         .await
         .context("signals kept after a let-go: read a signal row")?;
     rows.into_iter().map(row_to_signal).collect()
@@ -2285,9 +2281,9 @@ pub(crate) async fn signals_kept_after_let_go(pool: &sqlx::PgPool) -> anyhow::Re
 
 /// Every signal whose connection changed or went since its registration
 /// began (`signal.access_stale`).
-pub async fn signals_with_stale_access(pool: &sqlx::PgPool) -> anyhow::Result<Vec<SignalRegistration>> {
-    let rows: Vec<SignalRow> = sqlx::query_as(concat!("SELECT ", signal_columns!(""), " FROM signal WHERE access_stale ORDER BY token"))
-        .fetch_all(pool)
+pub async fn signals_with_stale_access(pool: &Pool) -> anyhow::Result<Vec<SignalRegistration>> {
+    let rows: Vec<SignalRow> = pool
+        .all(concat!("SELECT ", signal_columns!(""), " FROM signal WHERE access_stale ORDER BY token"), &[])
         .await
         .context("signals whose connection changed: read a signal row")?;
     rows.into_iter().map(row_to_signal).collect()
@@ -2300,27 +2296,25 @@ pub async fn signals_with_stale_access(pool: &sqlx::PgPool) -> anyhow::Result<Ve
 /// (`held_failed`) is forgotten: the connection made again is what it was
 /// waiting for. Answers the new row, or `None` when it moved since it was read (registered
 /// again, gone, or no longer marked), which is then not this caller's.
-pub async fn reregister_for_access(pool: &sqlx::PgPool, stale: &SignalRegistration) -> anyhow::Result<Option<SignalRegistration>> {
-    let row: Option<SignalRow> = sqlx::query_as(concat!(
-        "UPDATE signal SET generation = nextval('signal_generation_seq'), kind_state_seq = kind_state_seq + 1, held_failed = NULL \
-         WHERE token = $1 AND generation = $2 AND access_stale RETURNING ",
-        signal_columns!("")
-    ))
-    .bind(&stale.token)
-    .bind(stale.generation)
-    .fetch_optional(pool)
-    .await
-    .context("register again a signal whose connection changed")?;
+pub async fn reregister_for_access(pool: &Pool, stale: &SignalRegistration) -> anyhow::Result<Option<SignalRegistration>> {
+    let row: Option<SignalRow> = pool
+        .opt(
+            concat!(
+                "UPDATE signal SET generation = nextval('signal_generation_seq'), kind_state_seq = kind_state_seq + 1, held_failed = NULL \
+                 WHERE token = $1 AND generation = $2 AND access_stale RETURNING ",
+                signal_columns!("")
+            ),
+            &[&stale.token, &stale.generation],
+        )
+        .await
+        .context("register again a signal whose connection changed")?;
     row.map(row_to_signal).transpose()
 }
 
 /// The listener brought registration `generation` of `token` up, or
 /// answered why it could not (its own retries own it then): its mark goes.
-pub async fn access_taken_afresh(pool: &sqlx::PgPool, token: &str, generation: i64) -> anyhow::Result<()> {
-    sqlx::query("UPDATE signal SET access_stale = FALSE WHERE token = $1 AND generation = $2")
-        .bind(token)
-        .bind(generation)
-        .execute(pool)
+pub async fn access_taken_afresh(pool: &Pool, token: &str, generation: i64) -> anyhow::Result<()> {
+    pool.execute("UPDATE signal SET access_stale = FALSE WHERE token = $1 AND generation = $2", &[&token, &generation])
         .await
         .context("clear the mark of a signal registered again for its connection")?;
     Ok(())
@@ -2343,6 +2337,10 @@ const HELD_ON_ACTIVATIONS: &str = concat!(
 const SIGNAL_DELETE_WAIT_OF_RUN_RETURNING: &str =
     concat!("DELETE FROM signal WHERE token = $1 AND is_resume AND run_id = $2 RETURNING ", signal_columns!(""));
 
+/// One registration of a row, only while the row still is it.
+const SIGNAL_DELETE_REGISTRATION_RETURNING: &str =
+    concat!("DELETE FROM signal WHERE token = $1 AND generation = $2 RETURNING ", signal_columns!(""));
+
 const SIGNAL_DELETE_BY_TOKENS_RETURNING: &str =
     concat!("DELETE FROM signal WHERE token = ANY($1) RETURNING ", signal_columns!(""));
 
@@ -2356,9 +2354,8 @@ const SIGNAL_DELETE_RESUME_BY_TOKEN_RETURNING: &str = concat!(
     signal_columns!("")
 );
 
-/// Row shape for signal SELECTs. `FromRow` (not a tuple) because
-/// the row exceeds sqlx's 16-tuple cap.
-#[derive(sqlx::FromRow)]
+/// Row shape for signal SELECTs ([`signal_columns!`]): a struct, since
+/// the row is wider than a tuple reads.
 pub(crate) struct SignalRow {
     pub(crate) setup_run_id: Option<uuid::Uuid>,
     pub(crate) source_version: Option<String>,
@@ -2388,6 +2385,41 @@ pub(crate) struct SignalRow {
     pub(crate) kind_state_seq: i64,
     pub(crate) holds: bool,
     pub(crate) generation: i64,
+}
+
+impl FromRow for SignalRow {
+    fn from_row(row: db::Row) -> db::Result<Self> {
+        Ok(Self {
+            setup_run_id: row.try_get("setup_run_id")?,
+            source_version: row.try_get("source_version")?,
+            program_json: row.try_get("program_json")?,
+            program_json_version: row.try_get("program_json_version")?,
+            token: row.try_get("token")?,
+            tenant_id: row.try_get("tenant_id")?,
+            project_id: row.try_get("project_id")?,
+            run_id: row.try_get("run_id")?,
+            node_id: row.try_get("node_id")?,
+            is_resume: row.try_get("is_resume")?,
+            spec_json: row.try_get("spec_json")?,
+            spec_json_version: row.try_get("spec_json_version")?,
+            access_id: row.try_get("access_id")?,
+            consumer_kind: row.try_get("consumer_kind")?,
+            tags: row.try_get("tags")?,
+            port_snapshot: row.try_get("port_snapshot")?,
+            consumer_payload: row.try_get("consumer_payload")?,
+            surface_kind: row.try_get("surface_kind")?,
+            mount_path: row.try_get("mount_path")?,
+            mount_methods: row.try_get("mount_methods")?,
+            instance_id: row.try_get("instance_id")?,
+            activation_trigger: row.try_get("activation_trigger")?,
+            auth_kind: row.try_get("auth_kind")?,
+            auth_config: row.try_get("auth_config")?,
+            kind_state: row.try_get("kind_state")?,
+            kind_state_seq: row.try_get("kind_state_seq")?,
+            holds: row.try_get("holds")?,
+            generation: row.try_get("generation")?,
+        })
+    }
 }
 
 pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration> {
@@ -2462,15 +2494,13 @@ pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration
 /// Revoke every instance token of `project_id`: an instance token acts in
 /// its one project, so it outlives a removed project as nothing anybody
 /// could use.
-pub(crate) async fn revoke_project_instance_tokens<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
-    project_id: uuid::Uuid,
-) -> anyhow::Result<u64> {
-    Ok(sqlx::query("DELETE FROM signal_token WHERE instance_id IS NOT NULL AND allowed_projects = ARRAY[$1]::uuid[]")
-        .bind(project_id)
-        .execute(executor)
-        .await?
-        .rows_affected())
+pub(crate) async fn revoke_project_instance_tokens(db: &impl Client, project_id: uuid::Uuid) -> anyhow::Result<u64> {
+    Ok(db
+        .execute(
+            "DELETE FROM signal_token WHERE instance_id IS NOT NULL AND allowed_projects = ARRAY[$1::uuid]",
+            &[&project_id],
+        )
+        .await?)
 }
 
 /// The `signal_token` SELECT row shape (id, token_hash, recognizer, tenant_id,

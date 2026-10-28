@@ -6,11 +6,10 @@
 //! own stamped owner that `authenticator::authorize_run` reads. A query
 //! that lost its tenant filter fails here.
 //!
-//! Same rig as `db_lifecycle.rs`: `#[sqlx::test]` hands each test a fresh
+//! Same rig as `db_lifecycle.rs`: `#[weft_db_macros::test]` hands each test a fresh
 //! database, and the real boot-time migration path builds the schema.
 
 use chrono::Utc;
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use weft_core::ProjectDefinition;
@@ -20,11 +19,12 @@ use weft_dispatcher::store::{RunListQuery, RunStore, SignalToken, TokenStore};
 use weft_dispatcher::tenant::TenantId;
 use weft_journal::record::Queued;
 use weft_journal::RunEvent;
+use weft_task_store::db::Pool;
 
 const TENANT_A: &str = "tenant-a";
 const TENANT_B: &str = "tenant-b";
 
-async fn setup(pool: &PgPool) -> (PostgresStore, weft_dispatcher::ProjectStore) {
+async fn setup(pool: &Pool) -> (PostgresStore, weft_dispatcher::ProjectStore) {
     weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
     let store = PostgresStore::from_pool(pool.clone());
     let projects: weft_dispatcher::ProjectStore =
@@ -109,8 +109,8 @@ fn token(hash: &str, tenant: &str) -> SignalToken {
     }
 }
 
-#[sqlx::test]
-async fn list_projects_is_scoped_to_the_caller_tenant(pool: PgPool) {
+#[weft_db_macros::test]
+async fn list_projects_is_scoped_to_the_caller_tenant(pool: Pool) {
     let (_, projects) = setup(&pool).await;
     let (a1, a2, b1) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     register(&projects, a1, "a-one", TENANT_A).await.expect("register a1");
@@ -128,8 +128,8 @@ async fn list_projects_is_scoped_to_the_caller_tenant(pool: PgPool) {
 /// `authorize_project` authorizes iff `tenant_for(id) == caller`: the
 /// primitive returns the true owner, and a missing project reads as
 /// nothing (the gate answers 404 for both it and a foreign one).
-#[sqlx::test]
-async fn tenant_for_drives_the_per_resource_gate(pool: PgPool) {
+#[weft_db_macros::test]
+async fn tenant_for_drives_the_per_resource_gate(pool: Pool) {
     let (_, projects) = setup(&pool).await;
     let a1 = Uuid::new_v4();
     register(&projects, a1, "a-one", TENANT_A).await.expect("register");
@@ -140,8 +140,8 @@ async fn tenant_for_drives_the_per_resource_gate(pool: PgPool) {
 
 /// Tenant B may not re-register tenant A's project id to seize it: the
 /// upsert's conflict guard refuses the collision, and A's ownership stands.
-#[sqlx::test]
-async fn cross_tenant_project_id_takeover_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn cross_tenant_project_id_takeover_is_refused(pool: Pool) {
     let (_, projects) = setup(&pool).await;
     let shared = Uuid::new_v4();
     register(&projects, shared, "a-owned", TENANT_A).await.expect("register");
@@ -159,8 +159,8 @@ async fn cross_tenant_project_id_takeover_is_refused(pool: PgPool) {
 
 /// Each tenant's listing holds its own runs only, and asking for the
 /// other tenant's project by id finds nothing either.
-#[sqlx::test]
-async fn list_runs_is_scoped_to_the_caller_tenant(pool: PgPool) {
+#[weft_db_macros::test]
+async fn list_runs_is_scoped_to_the_caller_tenant(pool: Pool) {
     let (store, projects) = setup(&pool).await;
     let (proj_a, proj_b) = (Uuid::new_v4(), Uuid::new_v4());
     register(&projects, proj_a, "a", TENANT_A).await.expect("register a");
@@ -182,8 +182,8 @@ async fn list_runs_is_scoped_to_the_caller_tenant(pool: PgPool) {
 /// The run gate reads the owner off the run's own row, with no project
 /// store in reach: the owner is authorized, and a stranger gets the same
 /// 404 an unknown run gets.
-#[sqlx::test]
-async fn the_run_gate_reads_the_runs_own_owner(pool: PgPool) {
+#[weft_db_macros::test]
+async fn the_run_gate_reads_the_runs_own_owner(pool: Pool) {
     let (store, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     register(&projects, project, "a", TENANT_A).await.expect("register");
@@ -201,8 +201,8 @@ async fn the_run_gate_reads_the_runs_own_owner(pool: PgPool) {
     assert_eq!(unknown, axum::http::StatusCode::NOT_FOUND, "no existence leak");
 }
 
-#[sqlx::test]
-async fn signal_tokens_are_scoped_to_the_caller_tenant(pool: PgPool) {
+#[weft_db_macros::test]
+async fn signal_tokens_are_scoped_to_the_caller_tenant(pool: Pool) {
     let (store, _) = setup(&pool).await;
     let tok_a = token("hash-a", TENANT_A);
     let tok_b = token("hash-b", TENANT_B);

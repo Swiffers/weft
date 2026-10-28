@@ -12,11 +12,11 @@
 //! drawn from the ECDH secret between the ephemeral key and the
 //! recipient's with HKDF-SHA256, salted with both public keys.
 
-use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::aead::{Aead, Generate, KeyInit, Nonce};
+use aes_gcm::Aes256Gcm;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+use p256::elliptic_curve::sec1::ToSec1Point as _;
 use p256::{PublicKey, SecretKey};
 
 const POINT_SIZE: usize = 65;
@@ -26,8 +26,8 @@ const INFO: &[u8] = b"weft connections transfer v1";
 /// A fresh key pair: the secret half as bytes (to be kept sealed), and
 /// the public half as the text a source seals to.
 pub fn key_pair() -> (Vec<u8>, String) {
-    let secret = SecretKey::random(&mut OsRng);
-    let public = BASE64.encode(secret.public_key().to_encoded_point(false).as_bytes());
+    let secret = SecretKey::generate();
+    let public = BASE64.encode(secret.public_key().to_sec1_point(false).as_bytes());
     (secret.to_bytes().to_vec(), public)
 }
 
@@ -47,10 +47,10 @@ pub fn seal_to(public: &str, plain: &[u8]) -> anyhow::Result<String> {
     let recipient = BASE64.decode(public.trim()).map_err(|e| anyhow::anyhow!("the target install's key is not base64: {e}"))?;
     let recipient_key =
         PublicKey::from_sec1_bytes(&recipient).map_err(|_| anyhow::anyhow!("the target install's key is not a P-256 public key"))?;
-    let ephemeral = SecretKey::random(&mut OsRng);
-    let ephemeral_public = ephemeral.public_key().to_encoded_point(false);
+    let ephemeral = SecretKey::generate();
+    let ephemeral_public = ephemeral.public_key().to_sec1_point(false);
     let cipher = shared_cipher(&ephemeral.to_nonzero_scalar(), &recipient_key, ephemeral_public.as_bytes(), &recipient);
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let nonce = Nonce::<Aes256Gcm>::generate();
     let ct = cipher.encrypt(&nonce, plain).expect("AES-GCM encryption cannot fail");
     let mut out = Vec::with_capacity(POINT_SIZE + NONCE_SIZE + ct.len());
     out.extend_from_slice(ephemeral_public.as_bytes());
@@ -69,9 +69,10 @@ pub fn open_with(secret: &[u8], sealed: &str) -> anyhow::Result<Vec<u8>> {
     let (nonce, ct) = rest.split_at(NONCE_SIZE);
     let ephemeral_key =
         PublicKey::from_sec1_bytes(ephemeral).map_err(|_| anyhow::anyhow!("the sealed connections name no P-256 key"))?;
-    let recipient = secret.public_key().to_encoded_point(false);
+    let recipient = secret.public_key().to_sec1_point(false);
     let cipher = shared_cipher(&secret.to_nonzero_scalar(), &ephemeral_key, ephemeral, recipient.as_bytes());
-    cipher.decrypt(Nonce::from_slice(nonce), ct).map_err(|_| {
+    let nonce = Nonce::<Aes256Gcm>::try_from(nonce).expect("split at the nonce's size");
+    cipher.decrypt(&nonce, ct).map_err(|_| {
         anyhow::anyhow!("the sealed connections do not open with this install's transfer key: they were sealed to another one, or changed on the way")
     })
 }

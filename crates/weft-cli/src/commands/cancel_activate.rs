@@ -32,9 +32,7 @@ async fn run_inner(
     let path = format!("/projects/{id}/cancel-activate");
     progress.dispatcher_call_start(&path);
     let answer = client.post_json(&path, &serde_json::to_value(&scope)?).await?;
-    let answer: weft_core::activation::CancelActivateResponse = serde_json::from_value(answer).map_err(|e| {
-        anyhow::anyhow!("cancel-activate: the dispatcher's answer does not read as one ({e}); upgrade the dispatcher or this CLI so the versions match")
-    })?;
+    let answer: weft_core::activation::CancelActivateResponse = crate::client::read_answer(answer, "the cancel-activate's answer")?;
     progress.dispatcher_call_done(serde_json::json!({ "projectId": id, "resyncGivenUp": answer.resync_given_up }));
     progress.complete(&said(&id, answer.resync_given_up.as_deref()));
     Ok(())

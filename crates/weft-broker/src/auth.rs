@@ -17,19 +17,20 @@ use axum::{
     extract::{FromRequestParts, State},
     http::{request::Parts, HeaderMap, StatusCode},
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use lru::LruCache;
 use parking_lot::Mutex;
 use sha2::Sha256;
 use weft_platform_traits::identity::{Principal, REPLICA_HEADER, ROLE_HEADER};
 use weft_platform_traits::CoreRole;
+use weft_task_store::db::Client as _;
 
 use crate::state::BrokerState;
 
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
-    /// The base URLs callers address the broker by (a worker in a
-    /// container and a role on the machine may use different ones). A
+    /// The base URLs callers address the broker by (a caller in a
+    /// container and one on the machine may use different ones). A
     /// platform whose tokens name their audience checks it against these.
     pub audiences: Vec<String>,
 }
@@ -121,7 +122,7 @@ impl IdentityCache {
     /// defeats the point of hashing tokens.
     pub fn new() -> anyhow::Result<Self> {
         let mut hmac_key = [0u8; 32];
-        getrandom::getrandom(&mut hmac_key)
+        getrandom::fill(&mut hmac_key)
             .map_err(|e| anyhow::anyhow!("OS RNG unavailable for identity cache key: {e}"))?;
         let cap = NonZeroUsize::new(CACHE_CAPACITY).expect("non-zero cache capacity");
         Ok(Self { inner: Mutex::new(LruCache::new(cap)), hmac_key, ttl: Duration::from_secs(30) })
@@ -265,13 +266,11 @@ pub async fn resolve_storage_caller(
                         run_id.parse().map_err(|e| (StatusCode::BAD_REQUEST, format!("not a run id: {e}")))?;
                     // The worker writes a run's record before any call that
                     // names it, so the row is there.
-                    let row = sqlx::query_as::<_, (String, uuid::Uuid, Option<String>, Option<String>)>(
-                        "SELECT tenant_id, project_id, owner, instance_id FROM run WHERE run_id = $1 AND state = 'running'",
-                    )
-                    .bind(parsed)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+                    let row: Option<(String, uuid::Uuid, Option<String>, Option<String>)> = state
+                        .pool
+                        .opt("SELECT tenant_id, project_id, owner, instance_id FROM run WHERE run_id = $1 AND state = 'running'", &[&parsed])
+                        .await
+                        .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("read a storage caller's run")))?;
                     let Some((run_id_tenant, run_id_project, owner, instance)) = row else {
                         return Err((StatusCode::FORBIDDEN, "no such run is running".into()));
                     };

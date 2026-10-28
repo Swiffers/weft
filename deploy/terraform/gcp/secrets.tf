@@ -18,18 +18,29 @@ resource "random_id" "caller_token_secret" {
   byte_length = 32
 }
 
-resource "random_password" "bootstrap_operator_key" {
+# The install's own operator key, accepted with no row of its own until
+# its secret is rotated (`weft_core::signal_token::INSTALL_KEY_SECRET`).
+resource "random_password" "install_key" {
   length  = 48
   special = false
+}
+
+# Its name before it was the install's key: moved, so its value (the key
+# every operator of the install holds) stays what it was.
+moved {
+  from = random_password.bootstrap_operator_key
+  to   = random_password.install_key
 }
 
 locals {
   secrets = merge(
     {
-      WEFT_DATABASE_URL           = local.database_url
-      CREDENTIAL_ENCRYPTION_KEY   = random_bytes.sealing_key.base64
-      WEFT_CALLER_TOKEN_SECRET    = random_id.caller_token_secret.hex
-      WEFT_BOOTSTRAP_OPERATOR_KEY = random_password.bootstrap_operator_key.result
+      WEFT_DATABASE_URL         = local.database_url
+      CREDENTIAL_ENCRYPTION_KEY = random_bytes.sealing_key.base64
+      WEFT_CALLER_TOKEN_SECRET  = random_id.caller_token_secret.hex
+      # SYNC: WEFT_INSTALL_KEY <-> crates/weft-core/src/signal_token.rs (INSTALL_KEY_SECRET),
+      #       outputs.tf (install_key_secret)
+      WEFT_INSTALL_KEY = random_password.install_key.result
     },
     # Only when the database's address goes through a pooler (never the
     # install's own Cloud SQL, reached directly).

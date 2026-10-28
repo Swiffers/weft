@@ -155,6 +155,47 @@ the install stays on the old database and running the workflow again starts
 over. Then `weft maintenance off --on prod`. Once you are happy with it, you
 can delete the `WEFT_DATABASE_URL` secret and the old database.
 
+#### How many connections the install takes
+
+A Postgres database only takes so many connections at once (its
+`max_connections`: 50 on Cloud SQL's `db-g1-small`). Each copy of weft's
+dispatcher and broker asks the database for that number when it starts. It
+leaves out the connections the database keeps for its superusers, and 3
+more for anyone else (your `psql`, say), then splits the rest evenly among
+the most copies the install may run: 2 dispatchers and 4 brokers unless you
+change it. On `db-g1-small` that leaves 44, split six ways: 7 each, with
+the 2 left over unused. All the copies together therefore never ask for
+more than the database takes.
+When every connection of a copy is in use, its next request waits its turn,
+and `weft status` says so (see [when something goes
+wrong](#when-something-goes-wrong)). Each copy logs `sized the database
+pools to this copy's share` when it starts, with its numbers.
+
+If you want the install to handle more at once, raise `WEFT_CLOUD_SQL_TIER`
+to a larger machine, which takes more connections. If you would rather pick
+the number yourself, set `WEFT_CLOUD_SQL_MAX_CONNECTIONS`. The workflow
+refuses a number below 25, and with the default copy limits a copy does not
+start below 42. Unset, Cloud SQL uses its own number for the tier; once you
+set it, it stays at your number whatever the tier, so raise it along with the tier. Setting
+or changing it restarts the database once, the next time the workflow runs.
+
+If you want more copies of the dispatcher or the broker running at once,
+raise `WEFT_DISPATCHER_MAX_COPIES` (2 when unset) or
+`WEFT_BROKER_MAX_COPIES` (4 when unset). Every copy then gets a smaller
+share, so give the database more connections first: a broker copy needs a
+share of at least 6 and a dispatcher copy 5, and one whose share is smaller
+refuses to start, with a log line that names the numbers and these
+variables.
+
+These are repository variables on your fork, like the ones above, so
+merging a new weft into the fork keeps them. After you change one, run the
+install workflow again.
+
+If you bring your own database, each share comes from that database's
+`max_connections`, which a pooler's address (Neon's, say) reports too. If
+the install waits on it too often, move to a plan of your provider's that
+takes more connections, or lower the two copy limits.
+
 ### OAuth apps of your own (optional)
 
 If your programs sign in to services through OAuth apps of your own
@@ -176,10 +217,10 @@ upgrade only what changed in weft compiles again.
 When it finishes, its last step (in the run's summary, and in its log for
 `gh run view <id> --log`) gives you the install's address, a Cloud Run
 address like `https://weft-role-dispatcher-123456789.us-west1.run.app`, and
-the line that logs you in with the first operator key: the password your CLI
-uses to act on the install. The key is kept in Secret Manager and never
-printed in the workflow's logs; that line reads it on your machine (it needs
-`gcloud`) and hands it straight to `weft login`, below.
+the line that logs you in with the install's own operator key: the
+password your CLI uses to act on the install. The key is kept in Secret
+Manager and never printed in the workflow's logs; that line reads it on your
+machine (it needs `gcloud`) and hands it straight to `weft login`, below.
 
 The address works at once, over HTTPS, with no extra charge. If you want a
 name of your own instead, see [your own domain](#your-own-domain), which
@@ -330,7 +371,7 @@ the install workflow.
 
 weft generates the rest of its secrets itself: the key your saved
 connections are encrypted with, the key live callers' tickets are signed
-with, and the first operator key. The encryption key is made once and kept
+with, and the install's own operator key. The encryption key is made once and kept
 in the Terraform state, in the `$PROJECT-weft-state` bucket, and copied
 into Secret Manager, which is where weft's services read it. If it is ever
 lost or replaced, every saved connection stops working and has to be made
@@ -460,7 +501,13 @@ with `--key-stdin`), checks it against the install, and keeps it in `~/.config/w
 can read. If a teammate needs their own key, run
 `weft token mint --operator --on prod` and send them what it prints. To see
 the keys you have handed out, run `weft token ls --on prod`, and to cancel
-one right away, `weft token revoke <id> --on prod`.
+one right away, `weft token revoke <id> --on prod`. The install's own key,
+the one the workflow gave you, is not among them: it is no row in the
+install's database but its secret in Secret Manager (`<name>-install-key`),
+so it works until that secret changes, and `weft token revoke` cannot retire
+it. An install set up before that also lists it under the name `bootstrap`,
+a row an older weft wrote for the same key: revoking that row is up to you,
+and the key keeps working through its secret either way.
 
 Every command takes `--on` the same way: `weft status --on prod`,
 `weft runs --on prod`, `weft logs <run-id> --on prod`. Without it, a
@@ -713,6 +760,42 @@ waiting for it to start.
   LISTEN"**: `WEFT_DATABASE_URL` goes through a pooler. Add a direct address
   of the same database as the `WEFT_DATABASE_LISTEN_URL` secret ([a
   database](#a-database)) and run the install workflow again.
+- **`weft status` shows a `database: busy` line**: in the last 15 minutes,
+  requests waited more than a second for a database connection because
+  every connection of a copy was in use. The line says how many times, when, what the
+  database takes and each copy's share, for example `database: busy. Since
+  14:02 UTC, requests waited 42 times for a database connection, the last at
+  14:20 UTC (the database takes 50 connections, and each copy of the broker
+  holds at most 7)`, followed by what gives the install more. The waiting
+  copy's log says `requests are waiting for a database connection` at the
+  first wait, then at most once a minute with the count. The CLI may print
+  `warning: the install is busy, so this command waits and asks again`
+  (also when Cloud Run has no free copy of a service), at most every 30
+  seconds. If the command only reads, or Cloud Run had no free copy, it
+keeps asking until the install answers, and Ctrl+C stops it. If
+  you see the line often, give the install more connections ([how many
+  connections the install takes](#how-many-connections-the-install-takes)).
+- **A copy of the dispatcher or broker does not start, and its log says
+  `this copy's share is ... and it needs at least ...`**: the copy limits
+  split the database's connections too thin. On Cloud SQL, raise the tier
+  (and `WEFT_CLOUD_SQL_MAX_CONNECTIONS` with it, if you set one); on a
+  database you brought, move to a plan that takes more connections. Either
+  way you can instead lower `WEFT_DISPATCHER_MAX_COPIES` or
+  `WEFT_BROKER_MAX_COPIES`. Then run the install workflow again.
+- **`weft resync` or `weft status` says `the new version takes over once 2
+  runs on the old one end`**: the resync waits for the runs still going on
+  the old version, however long they take, and names them. `weft stop
+  <run>` ends one now; `weft cancel-activate` gives the resync up and leaves
+  its triggers down. Ctrl+C only stops following: the resync goes on.
+- **`weft status` says `resync: stopped with triggers it took down still
+  down`**: the line gives why, then `Next:` with what to do. If the
+  database was busy or out of reach, or the resync waits on infra or an
+  activation still landing, it goes on by itself. If its build cannot run
+  the triggers, `Next:` says to fix the source, give the resync up with
+  `weft cancel-activate`, and run `weft activate`. Otherwise fix the cause
+  and run `weft resync --resume`, or give it up with `weft cancel-activate`.
+  For how a resync retries, go and read
+  [resync](lifecycles.md#resync).
 - **A trigger that keeps a connection open shows "waiting for a holder to
   take it" on its node**: a running holder with room takes it as soon as
   weft tells the holders the trigger is there; otherwise weft is starting

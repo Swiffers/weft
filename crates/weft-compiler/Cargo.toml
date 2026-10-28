@@ -51,8 +51,8 @@ weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack", option
 
 [features]
 default = ["build"]
-# The image-build path: codegen (emit a cargo crate), the worker Dockerfile, and
-# the docker build invocation. Pulls weft-core's runtime layer (codegen names
+# The build path: codegen (emit a cargo crate), the host build and the worker
+# Dockerfile staging, and the build hashes. Pulls weft-core's runtime layer (codegen names
 # the runtime `Node`/`NodeCatalog`) + filetime (native). The browser WASM parse
 # build turns this off; it needs only parse + enrich + validate.
 build = ["weft-core/runtime", "dep:filetime", "dep:weft-catalog", "dep:tempfile", "dep:weft-workspace-hack"]

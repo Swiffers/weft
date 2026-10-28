@@ -1,8 +1,8 @@
-# The CLI and the runtime it installs, built on this runner and uploaded
-# as two artifacts, for release.yml's linux and macos jobs. A local
+# The CLI, the runtime it installs and the standard worker, built on this
+# runner and uploaded as three artifacts, for release.yml's linux and macos jobs. A local
 # install runs `weft-runtime` as a process next to `weft`.
 name: build-binaries
-description: build weft + weft-runtime in release mode and upload both as artifacts
+description: build weft + weft-runtime in release mode and the standard worker, and upload all three as artifacts
 inputs:
   asset:
     description: >-
@@ -17,7 +17,7 @@ runs:
     # third-party toolchain action).
     - shell: bash
       run: rustup toolchain install
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
     # SYNC: the runtime asset name (weft- -> weft-runtime-) <-> setup.sh
     #       (prebuilt artifacts block: runtime_asset)
     - shell: bash
@@ -29,13 +29,29 @@ runs:
         cp target/release/weft "$ASSET"
         cp target/release/weft-runtime "weft-runtime-${ASSET#weft-}"
         echo "RUNTIME_ASSET=weft-runtime-${ASSET#weft-}" >> "$GITHUB_ENV"
-    - uses: actions/upload-artifact@v4
+    # The standard worker as a program for this machine type: what a local
+    # install's projects run when their nodes are all the standard
+    # library's, so setup.sh downloads it and a first run compiles nothing.
+    # SYNC: the worker asset name (weft- -> weft-worker-) and its layout <->
+    #       setup.sh (install_prebuilt_standard_worker), crates/weft-cli/src/host_programs.rs (pack_standard_program)
+    - shell: bash
+      env:
+        ASSET: ${{ inputs.asset }}
+      run: |
+        ./target/release/weft build-standard-worker --out "weft-worker-${ASSET#weft-}"
+        echo "WORKER_ASSET=weft-worker-${ASSET#weft-}" >> "$GITHUB_ENV"
+    - uses: actions/upload-artifact@v7
       with:
         name: ${{ inputs.asset }}
         path: ${{ inputs.asset }}
         if-no-files-found: error
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v7
       with:
         name: ${{ env.RUNTIME_ASSET }}
         path: ${{ env.RUNTIME_ASSET }}
+        if-no-files-found: error
+    - uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.WORKER_ASSET }}
+        path: ${{ env.WORKER_ASSET }}
         if-no-files-found: error

@@ -3,7 +3,7 @@
 //! worker dies; parked work must survive).
 //!
 //! Shape: reuse the `human_form` fixture (an event starts a flow that suspends
-//! at a HumanQuery). While suspended, KILL the worker container from the host (a
+//! at a HumanQuery). While suspended, KILL the worker process from the host (a
 //! fake crash). Then answer the form: the resume task is NOT pinned to the dead
 //! worker,
 //! so a worker (fresh, re-seeded from the journal) picks it up and completes.
@@ -49,7 +49,7 @@ async fn worker_crash_resumes_on_fresh_worker() -> anyhow::Result<()> {
 
     // Wait until the run is genuinely parked at the form (the worker has
     // registered the suspension), THEN kill its worker to fake a crash. We kill
-    // every worker container of the project; an empty kill set would mean the
+    // every worker process of the project; an empty kill set would mean the
     // worker already idle-exited (also a valid resume path), but we assert at
     // least one was live so this test exercises the abrupt-crash path on
     // purpose, not by accident.
@@ -112,7 +112,7 @@ async fn a_paused_run_whose_build_cannot_start_ends_once_naming_the_way_back() -
     let run_id = run::wait_for_triggered_run(&disp, &pid, &before, Duration::from_secs(60)).await?;
     let review = human::wait_for_form_by_node(&disp, &pid, "review").await?;
 
-    // A's image, read off the worker running it.
+    // A's program, read off the worker running it.
     let hash = platform.run_binary_hash(&run_id).await?;
     let images = platform.worker_images(&pid).await?;
     let old = images

@@ -45,7 +45,8 @@ use std::collections::HashMap;
 
 use futures::future::BoxFuture;
 use serde_json::Value;
-use sqlx::{PgConnection, PgPool, Row};
+
+use crate::db::{Client, Param, Pool, Transaction};
 use weft_core::stored::{apply, current_version, round_trip, Kind, Op, Version};
 
 /// How many rows one batch carries forward.
@@ -81,7 +82,7 @@ pub struct Document {
 /// `from`, so it must give the same result run twice (`ON CONFLICT DO
 /// NOTHING`, a `SET` from the JSON). A column that goes as a whole has no
 /// steps left to run; what it held moves with a
-/// [`crate::schema_guard::DataStep`].
+/// [`crate::DataStep`].
 pub struct Fill {
     pub from: Version,
     pub sql: &'static str,
@@ -89,7 +90,7 @@ pub struct Fill {
 
 /// What a [`Document`] re-derives once its rows are at today's version,
 /// given the transaction that brought them there.
-pub type Rederive = for<'c> fn(&'c mut PgConnection) -> Rederived<'c>;
+pub type Rederive = for<'c> fn(&'c Transaction<'c>) -> Rederived<'c>;
 
 /// The work a [`Rederive`] hands back.
 pub type Rederived<'c> = BoxFuture<'c, anyhow::Result<()>>;
@@ -171,16 +172,17 @@ impl Document {
 /// own (under the schema's advisory lock, given up and tried again when
 /// it meets writes holding the table), a release on a working database
 /// runs every batch in the one transaction it already holds the lock in.
+#[derive(Clone, Copy)]
 enum Work<'a> {
-    Boot(&'a PgPool),
-    Within(&'a mut PgConnection),
+    Boot(&'a Pool),
+    Within(&'a Transaction<'a>),
 }
 
 /// Bring every column `documents` names to the version this build reads,
 /// each batch its own transaction. Run between the schema's expand and
 /// contract parts (`crate::schema_guard::apply_schema`), before any role
 /// serves.
-pub async fn apply_documents(pool: &PgPool, documents: &[&Document]) -> anyhow::Result<()> {
+pub async fn apply_documents(pool: &Pool, documents: &[&Document]) -> anyhow::Result<()> {
     bring(Work::Boot(pool), documents).await
 }
 
@@ -188,18 +190,18 @@ pub async fn apply_documents(pool: &PgPool, documents: &[&Document]) -> anyhow::
 /// schema's advisory lock: every batch runs in it, and nothing commits
 /// until the caller does (a release on a working database,
 /// `crate::schema_guard::settle_release`).
-pub(crate) async fn apply_documents_within(conn: &mut PgConnection, documents: &[&Document]) -> anyhow::Result<()> {
-    bring(Work::Within(conn), documents).await
+pub(crate) async fn apply_documents_within(tx: &Transaction<'_>, documents: &[&Document]) -> anyhow::Result<()> {
+    bring(Work::Within(tx), documents).await
 }
 
-async fn bring(mut work: Work<'_>, documents: &[&Document]) -> anyhow::Result<()> {
+async fn bring(work: Work<'_>, documents: &[&Document]) -> anyhow::Result<()> {
     if documents.is_empty() {
         return Ok(());
     }
     validate(documents)?;
-    let recorded = match &mut work {
-        Work::Boot(pool) => recorded(&mut *pool.acquire().await?).await?,
-        Work::Within(conn) => recorded(conn).await?,
+    let recorded = match work {
+        Work::Boot(pool) => recorded(pool).await?,
+        Work::Within(tx) => recorded(tx).await?,
     };
     let at = |d: &Document| recorded.get(&(d.table.to_string(), d.column.to_string())).copied();
     for document in documents {
@@ -209,32 +211,32 @@ async fn bring(mut work: Work<'_>, documents: &[&Document]) -> anyhow::Result<()
     }
     for document in documents.iter().filter(|d| at(d) != Some(d.version())) {
         let (table, column) = (document.table, document.column);
-        let present = match &mut work {
-            Work::Boot(pool) => crate::schema_guard::column_present(&mut *pool.acquire().await?, table, column).await?,
-            Work::Within(conn) => crate::schema_guard::column_present(conn, table, column).await?,
+        let present = match work {
+            Work::Boot(pool) => crate::schema_guard::column_present(pool, table, column).await?,
+            Work::Within(tx) => crate::schema_guard::column_present(tx, table, column).await?,
         };
         anyhow::ensure!(
             present,
             "document '{}': the table has no such column, and the code still reads it: add it to the \
              table's CREATE TABLE, or, if the column is gone, take it out of the documents and move what it \
-             held with a data step on the group of its new home (`weft_task_store::DataStep`, `Until::Dropped`)",
+             held with a data step on the group of its new home (`weft_task_store::DataStep`, `Until::Dropped(column)`)",
             document.name()
         );
         for from in at(document).unwrap_or(1)..document.version() {
-            carry(&mut work, document, from).await?;
+            carry(&work, document, from).await?;
         }
-        match &mut work {
+        match work {
             Work::Boot(pool) => {
-                let pool: &PgPool = pool;
                 crate::schema_guard::while_contended(|| async move {
-                    let mut tx = crate::schema_guard::locked_tx(pool).await?;
-                    record(&mut tx, document).await?;
+                    let mut conn = pool.get().await?;
+                    let tx = crate::schema_guard::locked_tx(&mut conn).await?;
+                    record(&tx, document).await?;
                     tx.commit().await?;
                     Ok(())
                 })
                 .await?
             }
-            Work::Within(conn) => record(conn, document).await?,
+            Work::Within(tx) => record(tx, document).await?,
         }
     }
     Ok(())
@@ -270,15 +272,13 @@ fn validate(documents: &[&Document]) -> anyhow::Result<()> {
 /// The version each column was last carried to, read without a lock: the
 /// one thing a boot with nothing to do pays. The ledger is the schema
 /// guard's own table, so it is there once the schema is.
-async fn recorded(conn: &mut PgConnection) -> anyhow::Result<HashMap<(String, String), Version>> {
-    Ok(sqlx::query_as::<_, (String, String, Version)>(
-        "SELECT table_name, column_name, version FROM weft_document_version",
-    )
-    .fetch_all(conn)
-    .await?
-    .into_iter()
-    .map(|(table, column, version)| ((table, column), version))
-    .collect())
+async fn recorded(db: &impl Client) -> anyhow::Result<HashMap<(String, String), Version>> {
+    Ok(db
+        .all::<(String, String, Version)>("SELECT table_name, column_name, version FROM weft_document_version", &[])
+        .await?
+        .into_iter()
+        .map(|(table, column, version)| ((table, column), version))
+        .collect())
 }
 
 /// A column carried to a version this build does not know was carried by
@@ -297,27 +297,27 @@ fn refuse_newer(document: &Document, at: Version) -> anyhow::Result<()> {
 
 /// Carry every row of `document` at version `from` to `from + 1`, batch by
 /// batch (see the module doc).
-async fn carry(work: &mut Work<'_>, document: &Document, from: Version) -> anyhow::Result<()> {
+async fn carry(work: &Work<'_>, document: &Document, from: Version) -> anyhow::Result<()> {
     let mut after: Option<Vec<String>> = None;
     let mut first = true;
     let mut moved = 0usize;
     let mut of: Option<i64> = None;
     loop {
-        let batch = match work {
+        let batch = match *work {
             Work::Boot(pool) => {
-                let pool: &PgPool = pool;
                 crate::schema_guard::while_contended(|| {
                     let after = after.clone();
                     async move {
-                        let mut tx = crate::schema_guard::locked_tx(pool).await?;
-                        let batch = next_batch(&mut tx, document, from, first, after).await?;
+                        let mut conn = pool.get().await?;
+                        let tx = crate::schema_guard::locked_tx(&mut conn).await?;
+                        let batch = next_batch(&tx, document, from, first, after).await?;
                         tx.commit().await?;
                         Ok(batch)
                     }
                 })
                 .await?
             }
-            Work::Within(conn) => next_batch(conn, document, from, first, after.clone()).await?,
+            Work::Within(tx) => next_batch(tx, document, from, first, after.clone()).await?,
         };
         first = false;
         let Batch { rows, last } = batch;
@@ -330,9 +330,9 @@ async fn carry(work: &mut Work<'_>, document: &Document, from: Version) -> anyho
         let of = match of {
             Some(of) => of,
             None => {
-                let left = match work {
-                    Work::Boot(pool) => count(&mut *pool.acquire().await?, document, from).await?,
-                    Work::Within(conn) => count(conn, document, from).await?,
+                let left = match *work {
+                    Work::Boot(pool) => count(pool, document, from).await?,
+                    Work::Within(tx) => count(tx, document, from).await?,
                 };
                 *of.insert(left + moved as i64)
             }
@@ -357,10 +357,10 @@ struct Batch {
     last: Option<Vec<String>>,
 }
 
-/// One batch of one step, on a connection whose transaction holds the
-/// schema's advisory lock. The step's fills run in its first one.
+/// One batch of one step, in a transaction that holds the schema's
+/// advisory lock. The step's fills run in its first one.
 async fn next_batch(
-    tx: &mut PgConnection,
+    tx: &Transaction<'_>,
     document: &Document,
     from: Version,
     first: bool,
@@ -370,7 +370,7 @@ async fn next_batch(
     let version_column = document.version_column();
     if first {
         for fill in document.fills.iter().filter(|f| f.from == from) {
-            sqlx::raw_sql(fill.sql).execute(&mut *tx).await.map_err(|e| {
+            tx.batch_execute(fill.sql).await.map_err(|e| {
                 anyhow::anyhow!("{}: the fill before the step from version {from} failed: {e}", document.name())
             })?;
         }
@@ -378,25 +378,23 @@ async fn next_batch(
     let step = document.steps[from as usize - 1];
     if step.is_empty() {
         // Nothing in the JSON changes: the rows only say they took it.
-        let moved = sqlx::query(&format!(
-            "UPDATE {table} SET {version_column} = $2 WHERE {version_column} = $1 AND {column} IS NOT NULL"
-        ))
-        .bind(from)
-        .bind(from + 1)
-        .execute(&mut *tx)
-        .await?;
-        return Ok(Batch { rows: moved.rows_affected() as usize, last: None });
+        let moved = tx
+            .execute(
+                &format!("UPDATE {table} SET {version_column} = $2 WHERE {version_column} = $1 AND {column} IS NOT NULL"),
+                &[&from, &(from + 1)],
+            )
+            .await?;
+        return Ok(Batch { rows: moved as usize, last: None });
     }
 
-    let keys = primary_key(&mut *tx, table).await?;
-    let column_type: String = sqlx::query_scalar(
-        "SELECT format_type(atttypid, atttypmod) FROM pg_attribute \
-         WHERE attrelid = $1::regclass AND attname = $2 AND NOT attisdropped",
-    )
-    .bind(table)
-    .bind(column)
-    .fetch_one(&mut *tx)
-    .await?;
+    let keys = primary_key(tx, table).await?;
+    let column_type: String = tx
+        .scalar(
+            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute \
+             WHERE attrelid = $1::text::regclass AND attname = $2 AND NOT attisdropped",
+            &[&table, &column],
+        )
+        .await?;
     let key_list = keys.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", ");
     let key_text = keys.iter().map(|(name, _)| format!("{name}::text")).collect::<Vec<_>>().join(", ");
     // The walk goes on from the last row's key, as text: each part cast
@@ -424,13 +422,10 @@ async fn next_batch(
          WHERE {version_column} = $1 AND {column} IS NOT NULL {after_clause} ORDER BY {key_list} LIMIT {BATCH} \
          FOR UPDATE"
     );
-    let rows = sqlx::query(&select).bind(from);
     let rows = match &after {
-        Some(after) => rows.bind(after),
-        None => rows,
-    }
-    .fetch_all(&mut *tx)
-    .await?;
+        Some(after) => tx.query(&select, &[&from, after]).await?,
+        None => tx.query(&select, &[&from]).await?,
+    };
 
     // The rows are locked until the batch commits, so a write the code
     // makes meanwhile (at today's version) waits, and is never written
@@ -444,7 +439,7 @@ async fn next_batch(
         let key: Vec<String> = row.try_get("key")?;
         let what = || format!("{table}.{column} row ({})", key.join(", "));
         let mut doc: Value = match document.encoding {
-            Encoding::Json => serde_json::from_str(&row.try_get::<String, _>("doc")?),
+            Encoding::Json => serde_json::from_str(&row.try_get::<_, String>("doc")?),
             Encoding::Zstd { .. } => {
                 let bytes: Vec<u8> = row.try_get("doc")?;
                 let json = zstd::stream::decode_all(&bytes[..]).map_err(|e| anyhow::anyhow!("{}: does not decompress: {e}", what()))?;
@@ -483,15 +478,14 @@ async fn next_batch(
              FROM unnest({arrays}, ${doc_param}::{doc_array}) AS u({names}, doc) WHERE {matched}",
             doc_param + 1
         );
-        let mut query = sqlx::query(&write);
-        for part in &keys_out {
-            query = query.bind(part);
-        }
-        let query = match document.encoding {
-            Encoding::Json => query.bind(&texts),
-            Encoding::Zstd { .. } => query.bind(&packed),
-        };
-        query.bind(from + 1).execute(&mut *tx).await?;
+        let to = from + 1;
+        let mut params: Vec<Param> = keys_out.iter().map(|part| part as Param).collect();
+        params.push(match document.encoding {
+            Encoding::Json => &texts,
+            Encoding::Zstd { .. } => &packed,
+        });
+        params.push(&to);
+        tx.execute(&write, &params).await?;
     }
     let more = rows.len() as i64 == BATCH;
     Ok(Batch { rows: rows.len(), last: if more { last } else { None } })
@@ -499,14 +493,13 @@ async fn next_batch(
 
 /// Record `document` at today's version, once every step has run, re-deriving
 /// what derives from it in the same transaction.
-async fn record(tx: &mut PgConnection, document: &Document) -> anyhow::Result<()> {
-    let at: Option<Version> = sqlx::query_scalar(
-        "SELECT version FROM weft_document_version WHERE table_name = $1 AND column_name = $2",
-    )
-    .bind(document.table)
-    .bind(document.column)
-    .fetch_optional(&mut *tx)
-    .await?;
+async fn record(tx: &Transaction<'_>, document: &Document) -> anyhow::Result<()> {
+    let at: Option<Version> = tx
+        .scalar_opt(
+            "SELECT version FROM weft_document_version WHERE table_name = $1 AND column_name = $2",
+            &[&document.table, &document.column],
+        )
+        .await?;
     if let Some(at) = at {
         // A newer weft may have booted since this one read the record.
         refuse_newer(document, at)?;
@@ -515,47 +508,46 @@ async fn record(tx: &mut PgConnection, document: &Document) -> anyhow::Result<()
         }
     }
     if let Some(rederive) = document.rederive {
-        rederive(&mut *tx)
+        rederive(tx)
             .await
             .map_err(|e| e.context(format!("{}: re-derive what other columns hold of it", document.name())))?;
     }
-    sqlx::query(
+    tx.execute(
         "INSERT INTO weft_document_version (table_name, column_name, version) VALUES ($1, $2, $3) \
          ON CONFLICT (table_name, column_name) DO UPDATE SET version = EXCLUDED.version",
+        &[&document.table, &document.column, &document.version()],
     )
-    .bind(document.table)
-    .bind(document.column)
-    .bind(document.version())
-    .execute(&mut *tx)
     .await?;
     Ok(())
 }
 
 /// The primary key's columns of `table`, in key order, with their types:
 /// what a batch walks the rows in, and finds each one again by.
-async fn primary_key(tx: &mut PgConnection, table: &str) -> anyhow::Result<Vec<(String, String)>> {
-    let keys: Vec<(String, String)> = sqlx::query_as(
-        "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) \
-         FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
-         WHERE i.indrelid = $1::regclass AND i.indisprimary \
-         ORDER BY array_position(i.indkey::int2[], a.attnum)",
-    )
-    .bind(table)
-    .fetch_all(&mut *tx)
-    .await?;
+async fn primary_key(db: &impl Client, table: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let keys: Vec<(String, String)> = db
+        .all(
+            "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) \
+             FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+             WHERE i.indrelid = $1::text::regclass AND i.indisprimary \
+             ORDER BY array_position(i.indkey::int2[], a.attnum)",
+            &[&table],
+        )
+        .await?;
     anyhow::ensure!(!keys.is_empty(), "table '{table}' holds documents and has no primary key to walk its rows by");
     Ok(keys)
 }
 
 /// How many rows are still at `from`.
-async fn count(conn: &mut PgConnection, document: &Document, from: Version) -> anyhow::Result<i64> {
-    Ok(sqlx::query_scalar(&format!(
-        "SELECT count(*) FROM {} WHERE {} = $1 AND {} IS NOT NULL",
-        document.table,
-        document.version_column(),
-        document.column
-    ))
-    .bind(from)
-    .fetch_one(conn)
-    .await?)
+async fn count(db: &impl Client, document: &Document, from: Version) -> anyhow::Result<i64> {
+    Ok(db
+        .scalar(
+            &format!(
+                "SELECT count(*) FROM {} WHERE {} = $1 AND {} IS NOT NULL",
+                document.table,
+                document.version_column(),
+                document.column
+            ),
+            &[&from],
+        )
+        .await?)
 }

@@ -34,8 +34,39 @@ pub struct ServingState {
     pub transport: Option<Transport>,
 }
 
+/// Which registrations of a token a stop reaches. A token can be
+/// registered again (a resume's token is fixed), so a stop sent for one
+/// registration can arrive after a newer one came up under the same
+/// token; it must leave that newer one running, and its outside teardown
+/// (keyed by the token) untouched. Generations come from one sequence,
+/// so a newer registration always has a larger one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registrations {
+    /// Whatever runs under the token: the caller stops it as the token's
+    /// holder, not as one registration (another holder took it, this
+    /// process stops, or the holder's claim on the row ended).
+    All,
+    /// Registration `g` and any older one: a newer one stays.
+    UpTo(i64),
+}
+
+impl Registrations {
+    /// Whether a stop of these registrations reaches registration
+    /// `generation`.
+    pub fn cover(self, generation: i64) -> bool {
+        match self {
+            Registrations::All => true,
+            Registrations::UpTo(g) => generation <= g,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RegisteredSignal {
+    /// The registration this is (`signal.generation`): a stop sent for an
+    /// older one leaves it ([`Registrations`]). `crate::reach::UNREGISTERED`
+    /// for a signal being registered, which has none yet.
+    pub generation: i64,
     pub spec: SignalSpec,
     pub node_id: String,
     /// Tenant this signal belongs to. The listener holds signals from
@@ -138,6 +169,8 @@ impl Drop for RunningLoop {
 /// again while a loop sleeps gets a new loop and the old one ends: one
 /// loop per token, never two.
 struct Down {
+    /// The registration that could not come up.
+    generation: i64,
     reason: String,
     owner: u64,
     /// Whether its row holds a connection, so that a holder counts it
@@ -166,8 +199,32 @@ impl Registry {
         self.inner.get(token).map(|r| r.clone())
     }
 
-    pub fn remove(&self, token: &str) -> Option<RegisteredSignal> {
-        self.inner.remove(token).map(|(_, v)| v)
+    /// Take `token`'s entry out, when it is one of `which`.
+    pub fn remove(&self, token: &str, which: Registrations) -> Option<RegisteredSignal> {
+        self.inner.remove_if(token, |_, sig| which.cover(sig.generation)).map(|(_, v)| v)
+    }
+
+    /// The registration newer than `generation` this process runs, counts
+    /// down or still has a give-up to write for under `token`, when there
+    /// is one: a bring-up of `generation` then arrived late and leaves it
+    /// be, and an unregister of `generation` runs no outside teardown
+    /// keyed by the token (it still stops `generation`'s own entry, which
+    /// runs on while a newer one is only down; `crate::kinds::unregister`).
+    pub fn newer_than(&self, token: &str, generation: i64) -> Option<i64> {
+        let entry = self.inner.get(token).map(|s| s.generation);
+        let down = self.down.get(token).map(|d| d.generation);
+        let unrecorded = self.unrecorded.get(token).map(|g| g.generation);
+        [entry, down, unrecorded].into_iter().flatten().filter(|g| *g > generation).max()
+    }
+
+    /// Whether registration `generation` itself is here under `token`:
+    /// running, counted down, or with a give-up still to write. An older
+    /// one lingering here does not count (`crate::kinds::unregister` then
+    /// tears `generation` down from its removed row).
+    pub fn present(&self, token: &str, generation: i64) -> bool {
+        self.inner.get(token).is_some_and(|s| s.generation == generation)
+            || self.down.get(token).is_some_and(|d| d.generation == generation)
+            || self.unrecorded.get(token).is_some_and(|g| g.generation == generation)
     }
 
     pub fn list(&self) -> Vec<(String, RegisteredSignal)> {
@@ -187,11 +244,12 @@ impl Registry {
         self.down.iter().filter(|e| e.value().holds).map(|e| e.key().clone()).collect()
     }
 
-    /// Stop counting `token` as down: it came up, or its row is gone.
-    /// Its retry loop sees this at its next turn and ends. When it was
-    /// down, whether its row holds a connection.
-    pub fn clear_down(&self, token: &str) -> Option<bool> {
-        self.down.remove(token).map(|(_, down)| down.holds)
+    /// Stop counting `token` as down when the registration down is one of
+    /// `which`: it came up, or its row is gone. Its retry loop sees this
+    /// at its next turn and ends. When it was down, whether its row holds
+    /// a connection.
+    pub fn clear_down(&self, token: &str, which: Registrations) -> Option<bool> {
+        self.down.remove_if(token, |_, down| which.cover(down.generation)).map(|(_, down)| down.holds)
     }
 
     /// Every held signal given up on here whose give-up is still to be
@@ -209,10 +267,10 @@ impl Registry {
         self.unrecorded.insert(token.to_string(), gave_up);
     }
 
-    /// `token`'s give-up was written, or the signal is no longer this
-    /// process's to give up on (it ended, or changed hands).
-    pub(crate) fn drop_unrecorded(&self, token: &str) {
-        self.unrecorded.remove(token);
+    /// `token`'s give-up of one of `which` was written, or the signal is no
+    /// longer this process's to give up on (it ended, or changed hands).
+    pub(crate) fn drop_unrecorded(&self, token: &str, which: Registrations) {
+        self.unrecorded.remove_if(token, |_, gave_up| which.cover(gave_up.generation));
     }
 
     /// Whether the retry loop `owner` still owns `token`'s down entry.
@@ -269,6 +327,7 @@ pub async fn held_in(registry: &Registry, signals: &weft_broker_client::BrokerSi
         false => ServingState::default(),
     };
     Ok(Some(RegisteredSignal {
+        generation: row.generation,
         spec,
         node_id: row.node_id.clone(),
         tenant_id: row.tenant_id.clone(),
@@ -349,10 +408,22 @@ async fn hold_once(
     row: weft_broker_client::protocol::SignalRowWire,
     mode: StartMode,
 ) -> anyhow::Result<()> {
-    let token = row.token.clone();
-    if mode == StartMode::Restore && state.registry.get(&token).is_some() {
+    let (token, generation) = (row.token.clone(), row.generation);
+    // A restore leaves what runs as it is only when it is this
+    // registration or a newer one; an older one still running (a newer
+    // registration failed before displacing it) is displaced by the
+    // bring-up below.
+    if mode == StartMode::Restore && state.registry.get(&token).is_some_and(|s| s.generation >= generation) {
         return Ok(());
     }
+    // A newer registration of the token came up (or is counted down, or
+    // given up on) while this row was on its way: the row is stale, and
+    // bringing it up would displace the newer one.
+    if let Some(newer) = state.registry.newer_than(&token, generation) {
+        tracing::debug!(target: "weft_listener", token = %token, generation, newer, "a bring-up of an older registration arrived late; the newer one stays");
+        return Ok(());
+    }
+    let mine = Registrations::UpTo(generation);
     if let Err(e) = crate::kinds::bring_up(state, row, mode).await {
         // A put-back that cannot come up must not leave the replacement
         // it was undoing running: the row no longer says that spec. The
@@ -360,11 +431,11 @@ async fn hold_once(
         // loop's restore finds nothing running and brings the put-back
         // row up.
         if mode == StartMode::PutBack {
-            crate::kinds::stop_held(state, &token).await;
+            crate::kinds::stop_held(state, &token, mine).await;
         }
         return Err(e);
     }
-    state.registry.clear_down(&token);
+    state.registry.clear_down(&token, mine);
     if state.registry.get(&token).is_none() {
         // Not a held connection: nothing of it stays here to let go.
         return Ok(());
@@ -374,7 +445,7 @@ async fn hold_once(
         match state.signals.get_held(&token).await {
             Ok(Some(_)) => return Ok(()),
             Ok(None) => {
-                crate::kinds::forget(state, &token);
+                crate::kinds::forget(state, &token, mine);
                 tracing::info!(target: "weft_listener", token = %token, "a signal's row went while it came up; its task is stopped");
                 return Ok(());
             }
@@ -412,21 +483,33 @@ pub async fn start(
 }
 
 /// Count `row`'s signal as down with `reason`, starting its retry loop
-/// unless one already owns the entry (then only the reason is updated, and
-/// that loop stays the owner).
+/// unless one already owns the entry for the same registration (then only
+/// the reason is updated, and that loop stays the owner). An entry for an
+/// older registration is replaced, and its loop ends at its next turn
+/// (it would only find the row registered again and stop retrying, leaving
+/// this one down for good); a failure of an older registration than the
+/// one counted down arrived late and changes nothing.
 fn mark_down(state: &crate::ListenerState, row: weft_broker_client::protocol::SignalRowWire, reason: String) {
-    tracing::error!(target: "weft_listener", token = %row.token, reason = %reason, "a signal is down; retrying it");
-    match state.registry.down.entry(row.token.clone()) {
-        dashmap::Entry::Occupied(mut e) => {
-            e.get_mut().reason = reason;
-        }
-        dashmap::Entry::Vacant(e) => {
-            let owner = state.registry.down_loops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            e.insert(Down { reason, owner, holds: row.holds });
-            let running = RunningLoop::start(&state.registry.retry_loops_running);
-            tokio::spawn(retry_down(state.clone(), row, owner, running));
+    let generation = row.generation;
+    let mut entry = state.registry.down.entry(row.token.clone());
+    if let dashmap::Entry::Occupied(e) = &entry {
+        let counted = e.get().generation;
+        if counted > generation {
+            tracing::debug!(target: "weft_listener", token = %row.token, generation, newer = counted, "an older registration's failure to come up arrived late; the newer one is the one counted down");
+            return;
         }
     }
+    tracing::error!(target: "weft_listener", token = %row.token, reason = %reason, "a signal is down; retrying it");
+    if let dashmap::Entry::Occupied(e) = &mut entry {
+        if e.get().generation == generation {
+            e.get_mut().reason = reason;
+            return;
+        }
+    }
+    let owner = state.registry.down_loops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    entry.insert(Down { generation, reason, owner, holds: row.holds });
+    let running = RunningLoop::start(&state.registry.retry_loops_running);
+    tokio::spawn(retry_down(state.clone(), row, owner, running));
 }
 
 /// Bring a down row back ([`DOWN_RETRIES`]), each try from the row as it
@@ -458,7 +541,7 @@ async fn retry_down(state: crate::ListenerState, row: weft_broker_client::protoc
         };
         match start(&state, row.clone(), StartMode::Restore).await {
             // A held connection is up once this process took it.
-            Ok(()) if !row.holds || state.registry.get(&token).is_some() => {
+            Ok(()) if !row.holds || state.registry.get(&token).is_some_and(|s| s.generation >= row.generation) => {
                 tracing::info!(target: "weft_listener", token = %token, "a down signal is back up");
                 return;
             }

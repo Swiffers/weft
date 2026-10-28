@@ -5,27 +5,24 @@
 //! "of two listeners woken for the same moment exactly one acts" lives in
 //! the write's WHERE, so only the statements themselves can prove them.
 
-use sqlx::PgPool;
+use weft_task_store::db::{Client as _, Pool, Session};
 
 use weft_broker::held_signals::{
-    cancel_call_project, give_up, hold, judge_held_fire, release, set_holds, signal_held, signals_held, still_held_by, write_kind_state,
+    give_up, hold, judge_held_fire, release, set_holds, signal_held, signals_held, still_held_by, write_kind_state,
     HeldFire,
 };
 use weft_broker_client::protocol::{HeldNow, HeldServing, ProjectStatus};
 
-async fn schema(pool: &PgPool) {
+async fn schema(pool: &Pool) {
     weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
 }
 
-async fn project(pool: &PgPool, id: uuid::Uuid) {
-    sqlx::query(
+async fn project(pool: &Pool, id: uuid::Uuid) {
+    pool.execute(
         "INSERT INTO project (id, name, tenant_id, status, project_json, updated_at, project_json_version, resync_version, running_build_inputs_version) \
          VALUES ($1, $2, 'local', 'registered', '{}', 0, $3, 1, 1)",
+        &[&id, &id.to_string(), &weft_core::ProjectDefinition::STORED.version()],
     )
-    .bind(id)
-    .bind(id.to_string())
-    .bind(weft_core::ProjectDefinition::STORED.version())
-    .execute(pool)
     .await
     .expect("project row");
 }
@@ -33,27 +30,21 @@ async fn project(pool: &PgPool, id: uuid::Uuid) {
 /// One entry signal governed by its own trigger's activation, in
 /// `status`; the node id is the token, since a project holds one entry
 /// row per node.
-async fn signal(pool: &PgPool, token: &str, project_id: uuid::Uuid, status: ProjectStatus) {
-    sqlx::query(
+async fn signal(pool: &Pool, token: &str, project_id: uuid::Uuid, status: ProjectStatus) {
+    pool.execute(
         "INSERT INTO trigger_activation \
            (project_id, trigger, status, accepting_fires, fires_visible_to_consumers, updated_at, activation_program_version) \
          VALUES ($1, $2, $3, TRUE, TRUE, 0, 1)",
+        &[&project_id, &token, &status.as_str()],
     )
-    .bind(project_id)
-    .bind(token)
-    .bind(status.as_str())
-    .execute(pool)
     .await
     .expect("activation row");
-    sqlx::query(
+    pool.execute(
         "INSERT INTO signal (token, tenant_id, project_id, node_id, is_resume, spec_json, created_at, activation_trigger, \
          spec_json_version, program_json_version) \
          VALUES ($1, 'local', $2, $1, FALSE, '{}', 0, $1, $3, 1)",
+        &[&token, &project_id, &weft_core::primitive::SignalSpec::STORED.version()],
     )
-    .bind(token)
-    .bind(project_id)
-    .bind(weft_core::primitive::SignalSpec::STORED.version())
-    .execute(pool)
     .await
     .expect("signal row");
 }
@@ -66,10 +57,8 @@ const HIDING: uuid::Uuid = uuid::Uuid::from_u128(0xf);
 
 /// Take the activation of `token` down with its door refusing, and no
 /// window.
-async fn refuse(pool: &PgPool, token: &str) {
-    sqlx::query("UPDATE trigger_activation SET status = 'inactive', accepting_fires = FALSE, fires_deadline_unix = NULL WHERE trigger = $1")
-        .bind(token)
-        .execute(pool)
+async fn refuse(pool: &Pool, token: &str) {
+    pool.execute("UPDATE trigger_activation SET status = 'inactive', accepting_fires = FALSE, fires_deadline_unix = NULL WHERE trigger = $1", &[&token])
         .await
         .expect("refuse");
 }
@@ -78,8 +67,8 @@ async fn refuse(pool: &PgPool, token: &str) {
 /// set up, or down with its door taking or hiding what arrives within its
 /// window: what those hear waits for the trigger to be back), and never one
 /// whose door refuses or whose window is over.
-#[sqlx::test]
-async fn the_listener_holds_what_takes_work_and_never_what_refuses_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn the_listener_holds_what_takes_work_and_never_what_refuses_it(pool: Pool) {
     schema(&pool).await;
     for id in [ACTIVE, ACTIVATING, TAKING, REFUSING, HIDING] {
         project(&pool, id).await;
@@ -91,12 +80,12 @@ async fn the_listener_holds_what_takes_work_and_never_what_refuses_it(pool: PgPo
     refuse(&pool, "refusing").await;
     for (token, deadline) in [("in_window", i64::MAX / 2), ("past_window", 1)] {
         signal(&pool, token, HIDING, ProjectStatus::Inactive).await;
-        sqlx::query("UPDATE trigger_activation SET fires_visible_to_consumers = FALSE, fires_deadline_unix = $2 WHERE trigger = $1")
-            .bind(token)
-            .bind(deadline)
-            .execute(&pool)
-            .await
-            .unwrap();
+        pool.execute(
+            "UPDATE trigger_activation SET fires_visible_to_consumers = FALSE, fires_deadline_unix = $2 WHERE trigger = $1",
+            &[&token, &deadline],
+        )
+        .await
+        .unwrap();
     }
 
     let mut tokens: Vec<String> = signals_held(&pool, None).await.expect("query").into_iter().map(|r| r.token).collect();
@@ -118,45 +107,17 @@ async fn the_listener_holds_what_takes_work_and_never_what_refuses_it(pool: PgPo
 
 /// A run's wait comes back naming the run it answers: its `run_id`
 /// is a real id on the wire, never text the listener has to parse.
-/// A cancelled wait's row is gone, so where the listener reaches an
-/// address in its last call is scoped by the call's task: its project
-/// while the dispatcher sends it (claimed), and nobody's before or after.
-#[sqlx::test]
-async fn a_last_call_names_its_project_only_while_it_is_sent(pool: PgPool) {
-    schema(&pool).await;
-    let id = uuid::Uuid::new_v4();
-    project(&pool, id).await;
-    let task = weft_task_store::tasks::NewTask {
-        kind: weft_task_store::TaskKind::CancelCall,
-        project_id: Some(id),
-        dedup_key: Some(weft_task_store::kinds::cancel_call_key("tok")),
-        run_id: None,
-        tenant_id: "local".into(),
-        payload: serde_json::json!({}),
-    };
-    let queued = weft_task_store::tasks::enqueue_dedup(&pool, task).await.unwrap().id();
-    assert_eq!(cancel_call_project(&pool, "tok").await.unwrap(), None, "queued, not being sent");
-    sqlx::query("UPDATE task SET status = 'claimed' WHERE id = $1").bind(queued).execute(&pool).await.unwrap();
-    assert_eq!(cancel_call_project(&pool, "tok").await.unwrap(), Some(id));
-    assert_eq!(cancel_call_project(&pool, "other").await.unwrap(), None, "another wait's token");
-    sqlx::query("UPDATE task SET status = 'complete' WHERE id = $1").bind(queued).execute(&pool).await.unwrap();
-    assert_eq!(cancel_call_project(&pool, "tok").await.unwrap(), None, "sent");
-}
-
-#[sqlx::test]
-async fn a_held_wait_names_its_run(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_held_wait_names_its_run(pool: Pool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
     let run = uuid::Uuid::now_v7();
-    sqlx::query(
+    pool.execute(
         "INSERT INTO signal (token, tenant_id, project_id, run_id, node_id, is_resume, spec_json, created_at, \
          spec_json_version, program_json_version) \
          VALUES ('wait', 'local', $1, $2, 'hold', TRUE, '{}', 0, $3, 1)",
+        &[&ACTIVE, &run, &weft_core::primitive::SignalSpec::STORED.version()],
     )
-    .bind(ACTIVE)
-    .bind(run)
-    .bind(weft_core::primitive::SignalSpec::STORED.version())
-    .execute(&pool)
     .await
     .expect("wait row");
     let held = signal_held(&pool, "wait").await.expect("query").expect("held");
@@ -165,8 +126,8 @@ async fn a_held_wait_names_its_run(pool: PgPool) {
     assert_eq!(signals_held(&pool, Some(ACTIVE)).await.expect("query")[0].run_id, Some(run));
 }
 
-#[sqlx::test]
-async fn a_kind_state_claim_has_one_winner(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_kind_state_claim_has_one_winner(pool: Pool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
     signal(&pool, "tick", ACTIVE, ProjectStatus::Active).await;
@@ -186,7 +147,7 @@ async fn a_kind_state_claim_has_one_winner(pool: PgPool) {
 }
 
 /// A held signal: a row a holder takes.
-async fn held_signal(pool: &PgPool, token: &str, project_id: uuid::Uuid, status: ProjectStatus) {
+async fn held_signal(pool: &Pool, token: &str, project_id: uuid::Uuid, status: ProjectStatus) {
     signal(pool, token, project_id, status).await;
     set_holds(pool, token, true).await.expect("mark held");
 }
@@ -204,8 +165,8 @@ fn tokens(rows: &[weft_broker_client::protocol::SignalRowWire]) -> Vec<String> {
 /// Two holders share the held signals: each takes only what no live
 /// holder claims, up to its room, and never a refusing trigger's or one
 /// that holds nothing.
-#[sqlx::test]
-async fn holders_take_disjoint_shares_within_their_room(pool: PgPool) {
+#[weft_db_macros::test]
+async fn holders_take_disjoint_shares_within_their_room(pool: Pool) {
     schema(&pool).await;
     for id in [ACTIVE, REFUSING] {
         project(&pool, id).await;
@@ -232,8 +193,8 @@ async fn holders_take_disjoint_shares_within_their_room(pool: PgPool) {
 /// says what each connection does, loses it when its check goes off (it
 /// stopped pushing it: it died) to the next holder that looks, and gives
 /// up its claims when it stops.
-#[sqlx::test]
-async fn a_claim_lives_until_let_go_or_the_check(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_claim_lives_until_let_go_or_the_check(pool: Pool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
     held_signal(&pool, "sse", ACTIVE, ProjectStatus::Active).await;
@@ -270,8 +231,8 @@ async fn a_claim_lives_until_let_go_or_the_check(pool: PgPool) {
 
 /// A row that stops holding (its kind decides otherwise now) lets its
 /// holder go, and a held row the holder holds is never taken by it twice.
-#[sqlx::test]
-async fn a_row_that_stops_holding_lets_its_holder_go(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_row_that_stops_holding_lets_its_holder_go(pool: Pool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
     held_signal(&pool, "sse", ACTIVE, ProjectStatus::Active).await;
@@ -286,16 +247,16 @@ async fn a_row_that_stops_holding_lets_its_holder_go(pool: PgPool) {
 /// Of what a holder holds, a row that is gone or whose activation takes no
 /// work any more has ended; a row still held by it is kept (one down with
 /// its door taking included), and none is two of these.
-#[sqlx::test]
-async fn a_gone_or_refusing_row_has_ended(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_gone_or_refusing_row_has_ended(pool: Pool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
     for t in ["kept", "taking", "gone", "refusing"] {
         held_signal(&pool, t, ACTIVE, ProjectStatus::Active).await;
     }
     hold(&pool, "h1", &[], None, &[]).await.unwrap();
-    sqlx::query("DELETE FROM signal WHERE token = 'gone'").execute(&pool).await.unwrap();
-    sqlx::query("UPDATE trigger_activation SET status = 'inactive' WHERE trigger = 'taking'").execute(&pool).await.unwrap();
+    pool.execute("DELETE FROM signal WHERE token = 'gone'", &[]).await.unwrap();
+    pool.execute("UPDATE trigger_activation SET status = 'inactive' WHERE trigger = 'taking'", &[]).await.unwrap();
     refuse(&pool, "refusing").await;
     let look = hold(&pool, "h1", &holding(&["kept", "taking", "gone", "refusing"]), None, &[]).await.unwrap();
     let mut kept = look.kept.clone();
@@ -309,8 +270,8 @@ async fn a_gone_or_refusing_row_has_ended(pool: PgPool) {
 
 /// A holder that restarted under its own name takes its claims back at
 /// once, without waiting for them to lapse.
-#[sqlx::test]
-async fn a_holder_back_under_its_name_takes_its_claims_back(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_holder_back_under_its_name_takes_its_claims_back(pool: Pool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
     held_signal(&pool, "sse", ACTIVE, ProjectStatus::Active).await;
@@ -322,32 +283,35 @@ async fn a_holder_back_under_its_name_takes_its_claims_back(pool: PgPool) {
 /// A dead holder's check frees every claim it held, and each one freed is
 /// announced (`signal_held_on_release`), so the holders' pool is sized
 /// again and the other holders look.
-#[sqlx::test]
-async fn the_check_releases_a_dead_holders_rows_and_announces(pool: PgPool) {
+#[weft_db_macros::test]
+async fn the_check_releases_a_dead_holders_rows_and_announces(pool: Pool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
     for t in ["a", "b"] {
         held_signal(&pool, t, ACTIVE, ProjectStatus::Active).await;
     }
     assert_eq!(hold(&pool, "h1", &[], None, &[]).await.unwrap().taken.len(), 2);
-    let mut heard = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
-    heard.listen("weft_held_signals").await.unwrap();
+    let mut heard = Session::connect(pool.config()).await.unwrap();
+    heard.listen(["weft_held_signals"]).await.unwrap();
     assert_eq!(release(&pool, "h1").await.unwrap(), 2);
-    tokio::time::timeout(std::time::Duration::from_secs(10), heard.recv()).await.expect("announced in time").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), heard.notified())
+        .await
+        .expect("announced in time")
+        .unwrap()
+        .expect("the session is open");
     assert_eq!(release(&pool, "h1").await.unwrap(), 0, "a second check frees nothing");
 }
 
 /// A row registered again under its holder (the registration lets its
 /// holder go) is taken back by that holder in the same look that finds it
 /// no longer kept, so the new registration is served at once.
-#[sqlx::test]
-async fn a_rewrite_under_a_holder_is_taken_back_in_the_same_look(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_rewrite_under_a_holder_is_taken_back_in_the_same_look(pool: Pool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
     held_signal(&pool, "sse", ACTIVE, ProjectStatus::Active).await;
     hold(&pool, "h1", &[], None, &[]).await.unwrap();
-    sqlx::query("UPDATE signal SET held_by = NULL, serving = NULL, generation = nextval('signal_generation_seq') WHERE token = 'sse'")
-        .execute(&pool)
+    pool.execute("UPDATE signal SET held_by = NULL, serving = NULL, generation = nextval('signal_generation_seq') WHERE token = 'sse'", &[])
         .await
         .unwrap();
     let look = hold(&pool, "h1", &holding(&["sse"]), None, &[]).await.unwrap();
@@ -357,8 +321,8 @@ async fn a_rewrite_under_a_holder_is_taken_back_in_the_same_look(pool: PgPool) {
 
 /// A signal given up on is shown with why, never taken, only for the
 /// registration it names, and a decision made again clears it.
-#[sqlx::test]
-async fn a_given_up_row_is_shown_and_never_taken(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_given_up_row_is_shown_and_never_taken(pool: Pool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
     held_signal(&pool, "sse", ACTIVE, ProjectStatus::Active).await;
@@ -378,14 +342,14 @@ async fn a_given_up_row_is_shown_and_never_taken(pool: PgPool) {
 
 /// A caller with no replica (the listener) gives up a held signal only
 /// while no holder claims it.
-#[sqlx::test]
-async fn a_caller_with_no_replica_gives_up_only_an_unclaimed_held_row(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_caller_with_no_replica_gives_up_only_an_unclaimed_held_row(pool: Pool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
     held_signal(&pool, "claimed", ACTIVE, ProjectStatus::Active).await;
     let claimed = hold(&pool, "h1", &[], None, &[]).await.unwrap().taken.remove(0);
     held_signal(&pool, "free", ACTIVE, ProjectStatus::Active).await;
-    let free: i64 = sqlx::query_scalar("SELECT generation FROM signal WHERE token = 'free'").fetch_one(&pool).await.unwrap();
+    let free: i64 = pool.scalar("SELECT generation FROM signal WHERE token = 'free'", &[]).await.unwrap();
     assert!(!give_up(&pool, "claimed", claimed.generation, "why", None).await.unwrap(), "a claimed one is its holder's");
     assert!(still_held_by(&pool, "claimed", "h1").await.unwrap());
     assert!(give_up(&pool, "free", free, "why", None).await.unwrap(), "nobody claims this one");
@@ -393,14 +357,14 @@ async fn a_caller_with_no_replica_gives_up_only_an_unclaimed_held_row(pool: PgPo
 }
 
 /// A look that says nothing new and finds nothing to take writes nothing.
-#[sqlx::test]
-async fn a_look_that_says_nothing_writes_nothing(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_look_that_says_nothing_writes_nothing(pool: Pool) {
     schema(&pool).await;
     project(&pool, ACTIVE).await;
     held_signal(&pool, "sse", ACTIVE, ProjectStatus::Active).await;
     hold(&pool, "h1", &[], None, &[]).await.unwrap();
     let version = || async {
-        sqlx::query_scalar::<_, String>("SELECT xmin::text FROM signal WHERE token = 'sse'").fetch_one(&pool).await.unwrap()
+        pool.scalar::<String>("SELECT xmin::text FROM signal WHERE token = 'sse'", &[]).await.unwrap()
     };
     let before = version().await;
     let look = hold(&pool, "h1", &holding(&["sse"]), None, &[]).await.unwrap();

@@ -19,8 +19,8 @@
 //! per seal. There is no key rotation: changing the key strands every
 //! sealed row, so rotate by reconnecting.
 
-use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::aead::{Aead, Generate, KeyInit, Nonce};
+use aes_gcm::Aes256Gcm;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 
@@ -59,7 +59,7 @@ fn cipher() -> &'static Aes256Gcm {
 }
 
 fn seal_bytes(plain: &[u8]) -> String {
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let nonce = Nonce::<Aes256Gcm>::generate();
     let ct = cipher().encrypt(&nonce, plain).expect("AES-GCM encryption cannot fail");
     let mut combined = Vec::with_capacity(NONCE_SIZE + ct.len());
     combined.extend_from_slice(&nonce);
@@ -75,7 +75,8 @@ fn open_bytes(sealed: &str) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("sealed credential data is too short to carry a nonce");
     }
     let (nonce, ct) = combined.split_at(NONCE_SIZE);
-    cipher().decrypt(Nonce::from_slice(nonce), ct).map_err(|_| {
+    let nonce = Nonce::<Aes256Gcm>::try_from(nonce).expect("split at the nonce's size");
+    cipher().decrypt(&nonce, ct).map_err(|_| {
         anyhow::anyhow!(
             "stored credential data does not open under the current \
              CREDENTIAL_ENCRYPTION_KEY; if the key changed, the sealed rows it \

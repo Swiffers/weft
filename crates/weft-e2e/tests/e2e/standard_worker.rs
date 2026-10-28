@@ -10,18 +10,14 @@ async fn a_stock_project_runs_on_the_ready_standard_worker() -> anyhow::Result<(
     let disp = ensure::up().await?;
     let install = disp.install().clone();
     let mut project = Project::prepare("plain", disp).await?;
-    let printed = project.weft(&["build-images", "--print"]).await?;
-    let standard = printed
-        .lines()
-        .find(|l| l.contains("weft-worker:"))
-        .ok_or_else(|| anyhow::anyhow!("build-images --print names no standard worker: {printed}"))?;
-    let hash = standard.rsplit(':').next().unwrap_or_default().to_string();
-    let held = install.local_image_ref(&format!("weft-worker:{hash}"));
-    let present = tokio::process::Command::new("docker").args(["image", "inspect", &held]).output().await?;
-    anyhow::ensure!(present.status.success(), "the install made {held} ready when it started");
+    let record = weft_core::images::ImageRefs::load(&install.dir())?
+        .ok_or_else(|| anyhow::anyhow!("the install recorded no images when it started"))?;
+    let hash = record.standard_worker.rsplit(':').next().unwrap_or_default().to_string();
+    let program = weft_platform_local::images::Program::Worker(&hash).file(&weft_platform_local::MachineLayout::here().workers());
+    anyhow::ensure!(program.is_file(), "the install made the standard worker {} ready when it started", program.display());
 
     let out = project.weft(&["build"]).await?;
-    anyhow::ensure!(out.contains(&format!("on worker image {}", &hash[..16])), "a stock project builds to the standard worker: {out}");
+    anyhow::ensure!(out.contains(&format!("on worker {}", &hash[..16])), "a stock project builds to the standard worker: {out}");
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
     project.finish().await

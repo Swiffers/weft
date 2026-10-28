@@ -564,7 +564,7 @@ mod tests {
         obs.on_chunk(&bytes[200..]);
         let observed = obs.end(false);
 
-        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
 
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let follow_up = FollowUp { http: &http, base_url: "http://unused.test", shared: &shared };
@@ -588,7 +588,7 @@ mod tests {
         obs.on_status(200);
         obs.on_chunk(body.as_bytes());
         let observed = obs.end(false);
-        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let follow_up = FollowUp { http: &http, base_url: "http://unused.test", shared: &shared };
         let cost = meter().resolve("embeddings", observed, follow_up).await;
@@ -611,7 +611,7 @@ mod tests {
         obs.on_status(200);
         obs.on_chunk(body.as_bytes());
         let observed = obs.end(false);
-        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let follow_up = FollowUp { http: &http, base_url: "http://unused.test", shared: &shared };
         let cost = meter().resolve("rerank", observed, follow_up).await;
@@ -633,7 +633,7 @@ mod tests {
         let mut obs = meter().observe("chat/completions", "", b"");
         obs.on_status(200);
         obs.on_chunk(body.as_bytes());
-        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let cost = meter()
             .resolve("chat/completions", obs.end(false), FollowUp { http: &http, base_url: "http://u.test", shared: &shared })
@@ -660,7 +660,7 @@ mod tests {
         obs.on_chunk(&bytes[90..]);
         let observed = obs.end(false);
 
-        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
 
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let cost = meter()
@@ -676,7 +676,7 @@ mod tests {
         let mut obs = meter().observe("chat/completions", "", b"");
         obs.on_status(401);
         obs.on_chunk(br#"{"error":{"message":"invalid key","code":401}}"#);
-        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let cost = meter()
             .resolve("chat/completions", obs.end(false), FollowUp { http: &http, base_url: "http://u.test", shared: &shared })
@@ -689,7 +689,7 @@ mod tests {
     #[tokio::test]
     async fn an_unanchored_interrupt_is_unknown_not_zero() {
         let obs = meter().observe("chat/completions", "", b"");
-        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let cost = meter()
             .resolve("chat/completions", obs.end(true), FollowUp { http: &http, base_url: "http://u.test", shared: &shared })

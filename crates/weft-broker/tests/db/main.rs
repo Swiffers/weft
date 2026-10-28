@@ -12,4 +12,5 @@ mod lifecycle_writes;
 mod old_shapes;
 mod program_tokens;
 mod record_batch;
+mod run_claim;
 mod runtime_store;

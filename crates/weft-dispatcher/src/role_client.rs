@@ -69,7 +69,7 @@ mod tests {
 
     fn client() -> RoleClient {
         let tokens: Arc<dyn IdentityTokens> = Arc::new(weft_platform_traits::FixedToken("t".into()));
-        RoleClient::new(CoreRole::Broker, "http://127.0.0.1:9000/".into(), tokens, reqwest::Client::new())
+        RoleClient::new(CoreRole::Broker, "http://127.0.0.1:9000/".into(), tokens, weft_core::net::http_client().build().unwrap())
     }
 
     /// A path built from a request's values reaches only the role's own

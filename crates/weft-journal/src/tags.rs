@@ -19,6 +19,7 @@
 //! one second would let both live, or both die).
 
 use weft_core::RunId;
+use weft_task_store::db::{self, Client};
 
 /// One live run carrying a tag, as the selector reads it: which
 /// run, and the sequence its tag row got.
@@ -32,15 +33,12 @@ pub struct TaggedRun {
 /// Re-tagging an existing (run, tag) keeps the original row (and its
 /// `seq`): a body replayed after a durable wait lands on the same state,
 /// and a tag's position in the order is the FIRST time the run claimed it.
-pub async fn tag_run_in(conn: &mut sqlx::PgConnection, run_id: RunId, tags: &[String], at_unix: u64) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO run_tag (run_id, tag, tagged_at_unix) SELECT $1, t, $3 FROM unnest($2::text[]) AS t \
+pub async fn tag_run_in(db: &impl Client, run_id: RunId, tags: &[String], at_unix: u64) -> db::Result<()> {
+    db.execute(
+        "INSERT INTO run_tag (run_id, tag, tagged_at_unix) SELECT $1::uuid, t, $3::bigint FROM unnest($2::text[]) AS t \
          ON CONFLICT (run_id, tag) DO NOTHING",
+        &[&run_id, &tags, &(at_unix as i64)],
     )
-    .bind(run_id)
-    .bind(tags)
-    .bind(at_unix as i64)
-    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -57,37 +55,21 @@ pub const TAGS_LATERAL: &str =
 /// tag rows must never outlive the run they select on, or a half-applied
 /// delete leaves exactly the row set `live_tagged_runs` matches for
 /// a run that is gone.
-pub async fn delete_for_run_ids(tx: &mut sqlx::PgConnection, run_ids: &[RunId]) -> Result<u64, sqlx::Error> {
-    let res = sqlx::query("DELETE FROM run_tag WHERE run_id = ANY($1)")
-        .bind(run_ids)
-        .execute(&mut *tx)
-        .await?;
-    Ok(res.rows_affected())
+pub async fn delete_for_run_ids(tx: &impl Client, run_ids: &[RunId]) -> db::Result<u64> {
+    tx.execute("DELETE FROM run_tag WHERE run_id = ANY($1)", &[&run_ids]).await
 }
 
 /// The `seq` of `run_id`'s `tag` row, if the run carries that tag.
-pub async fn tag_seq<'e, E: sqlx::PgExecutor<'e>>(
-    executor: E,
-    run_id: RunId,
-    tag: &str,
-) -> Result<Option<i64>, sqlx::Error> {
-    let row: Option<(i64,)> =
-        sqlx::query_as("SELECT seq FROM run_tag WHERE run_id = $1 AND tag = $2")
-            .bind(run_id)
-            .bind(tag)
-            .fetch_optional(executor)
-            .await?;
-    Ok(row.map(|(s,)| s))
+pub async fn tag_seq(db: &impl Client, run_id: RunId, tag: &str) -> db::Result<Option<i64>> {
+    db.scalar_opt("SELECT seq FROM run_tag WHERE run_id = $1 AND tag = $2", &[&run_id, &tag]).await
 }
 
 /// The highest `seq` any tag row has, or 0 when the table is empty. The
 /// anchor for a `Keep` stop by a run that never carried the tag: every
 /// row written so far is below `max + 1`, every row written from now on
 /// is not.
-pub async fn max_tag_seq<'e, E: sqlx::PgExecutor<'e>>(executor: E) -> Result<i64, sqlx::Error> {
-    let (max,): (Option<i64>,) = sqlx::query_as("SELECT MAX(seq) FROM run_tag")
-        .fetch_one(executor)
-        .await?;
+pub async fn max_tag_seq(db: &impl Client) -> db::Result<i64> {
+    let max: Option<i64> = db.scalar("SELECT MAX(seq) FROM run_tag", &[]).await?;
     Ok(max.unwrap_or(0))
 }
 
@@ -96,20 +78,15 @@ pub async fn max_tag_seq<'e, E: sqlx::PgExecutor<'e>>(executor: E) -> Result<i64
 /// ordering and self rules are applied afterwards by
 /// [`select_stop_targets`], which is pure, so the SQL stays a plain read
 /// and the rule has a layer-1 test.
-pub async fn live_tagged_runs<'e, E: sqlx::PgExecutor<'e>>(
-    executor: E,
-    project_id: uuid::Uuid,
-    tag: &str,
-) -> Result<Vec<TaggedRun>, sqlx::Error> {
-    let rows: Vec<(RunId, i64)> = sqlx::query_as(
-        "SELECT et.run_id, et.seq FROM run_tag et JOIN run r ON r.run_id = et.run_id \
-         WHERE r.project_id = $1 AND et.tag = $2 AND r.kind = 'project' AND r.state <> 'ended' \
-         ORDER BY et.seq ASC",
-    )
-    .bind(project_id)
-    .bind(tag)
-    .fetch_all(executor)
-    .await?;
+pub async fn live_tagged_runs(db: &impl Client, project_id: uuid::Uuid, tag: &str) -> db::Result<Vec<TaggedRun>> {
+    let rows: Vec<(RunId, i64)> = db
+        .all(
+            "SELECT et.run_id, et.seq FROM run_tag et JOIN run r ON r.run_id = et.run_id \
+             WHERE r.project_id = $1 AND et.tag = $2 AND r.kind = 'project' AND r.state <> 'ended' \
+             ORDER BY et.seq ASC",
+            &[&project_id, &tag],
+        )
+        .await?;
     Ok(rows.into_iter().map(|(run_id, seq)| TaggedRun { run_id, seq }).collect())
 }
 

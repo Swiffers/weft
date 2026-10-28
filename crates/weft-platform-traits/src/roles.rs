@@ -103,7 +103,8 @@ pub enum Vantage {
     /// The local install's own process.
     Machine,
     /// Anywhere else on the install's private network: a role in a
-    /// process of its own, a worker, an infra container.
+    /// process of its own, an infra container, and on a cloud a worker
+    /// (a local worker is a process on the machine, so `Machine`).
     Private,
     /// Outside the private network (a cloud's queue delivering a wake):
     /// a role's own public address, or a local install's public port.

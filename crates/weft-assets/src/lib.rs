@@ -146,7 +146,7 @@ pub fn hash_reader_peeking(mut r: impl Read) -> Result<(String, u64, Vec<u8>)> {
         hasher.update(&buf[..n]);
         total += n as u64;
     }
-    Ok((format!("{:x}", hasher.finalize()), total, head))
+    Ok((weft_core::project::hash::hex(&hasher.finalize()), total, head))
 }
 
 /// One file hashed and ready to publish: what [`publish_hashed`] needs

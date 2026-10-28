@@ -31,6 +31,7 @@ use weft_e2e::access::{catalog_spec, SeededGrant};
 use weft_e2e::ensure::{self, env_group_or_skip, env_or_skip};
 use weft_e2e::platform::Platform;
 use weft_e2e::{project::Project, run, SettledRun};
+use weft_task_store::db::{Client as _, Pool};
 
 /// Sign a synthetic Slack push exactly as Slack signs (the v0 scheme
 /// over `v0:{timestamp}:{body}`), with the shipped recipe's own scheme.
@@ -57,7 +58,7 @@ fn slack_signature(signing_secret: &str, timestamp: i64, body: &str) -> String {
 /// service recipe the receiver reads (normally recorded when a
 /// project's access node renders; the seed writes it directly).
 async fn seed_slack_grant(
-    pool: &sqlx::PgPool,
+    pool: &Pool,
     client_id: &str,
 ) -> Result<(uuid::Uuid, SeededGrant)> {
     let spec = catalog_spec("slack", "access")?;
@@ -70,35 +71,31 @@ async fn seed_slack_grant(
     let recipe_hash = weft_access_store::events_recipe_hash(&events)
         .context("the slack recipe declares events")?;
     let grant_id = uuid::Uuid::new_v4();
-    sqlx::query(
+    pool.execute(
         "INSERT INTO access_grant
            (id, tenant_id, service, registration_sealed, client_id, project_id, spec_json,
             events_recipe_hash, values_sealed, granted_scopes, permissions_verified,
             identity, provider_account, spec_json_version)
          VALUES ($1, 'local', 'slack', $2, $3, NULL, $4, $5, $6, '[]', FALSE, 'events-e2e',
                  'T0E2E', $7)",
+        &[
+            &grant_id,
+            &weft_access_store::seal_json(&json!({ "label": "E2E app", "client_id": client_id }))?,
+            &client_id,
+            &spec,
+            &recipe_hash,
+            &weft_access_store::seal_json(&json!({ "token": "xoxb-never-used", "teamId": "T0E2E" }))?,
+            &weft_core::AccessSpec::STORED.version(),
+        ],
     )
-    .bind(grant_id)
-    .bind(weft_access_store::seal_json(&json!({ "label": "E2E app", "client_id": client_id }))?)
-    .bind(client_id)
-    .bind(&spec)
-    .bind(&recipe_hash)
-    .bind(weft_access_store::seal_json(
-        &json!({ "token": "xoxb-never-used", "teamId": "T0E2E" }),
-    )?)
-    .bind(weft_core::AccessSpec::STORED.version())
-    .execute(pool)
     .await?;
     let seeded = SeededGrant::new(pool.clone(), grant_id)?;
-    sqlx::query(
+    pool.execute(
         "INSERT INTO service_events_recipe (service, recipe_hash, events_json, events_json_version)
          VALUES ('slack', $1, $2, $3)
          ON CONFLICT (service, recipe_hash) DO UPDATE SET updated_at = now()",
+        &[&recipe_hash, &serde_json::to_value(&events)?, &weft_core::access::events::STORED_EVENTS.version()],
     )
-    .bind(&recipe_hash)
-    .bind(serde_json::to_value(&events)?)
-    .bind(weft_core::access::events::STORED_EVENTS.version())
-    .execute(pool)
     .await?;
     Ok((grant_id, seeded))
 }
@@ -171,7 +168,7 @@ async fn a_signed_synthetic_slack_event_fires_the_trigger() -> Result<()> {
     })
     .to_string();
     let base = disp.base();
-    let http = reqwest::Client::new();
+    let http = weft_core::net::http_client().build()?;
     let events_url = format!("{base}/events/slack/messages");
     let status = post_signed(&http, &events_url, &signing_secret, &body).await?;
     anyhow::ensure!(status.is_success(), "the signed push was refused: {status}");
@@ -277,14 +274,10 @@ async fn a_signed_interactivity_push_resumes_the_parked_run() -> Result<()> {
     let run_id = run::start(&mut project).await?;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let parked: Option<(String,)> = sqlx::query_as(
-            "SELECT token FROM signal \
-             WHERE project_id = $1 AND node_id = 'wait' AND is_resume",
-        )
-        .bind(pid)
-        .fetch_optional(&pool)
-        .await
-        .context("poll for the parked resume signal")?;
+        let parked: Option<String> = pool
+            .scalar_opt("SELECT token FROM signal WHERE project_id = $1 AND node_id = 'wait' AND is_resume", &[&pid])
+            .await
+            .context("poll for the parked resume signal")?;
         if parked.is_some() {
             break;
         }
@@ -314,7 +307,7 @@ async fn a_signed_interactivity_push_resumes_the_parked_run() -> Result<()> {
         .append_pair("payload", &serde_json::to_string(&payload)?)
         .finish();
     let base = disp.base();
-    let http = reqwest::Client::new();
+    let http = weft_core::net::http_client().build()?;
     let events_url = format!("{base}/events/slack/interactions");
     let timestamp = chrono::Utc::now().timestamp();
     let signature = slack_signature(&signing_secret, timestamp, &body);
@@ -407,7 +400,8 @@ async fn slack_app_socket_receives_a_real_workspace_message() -> Result<()> {
         )
         .await?;
     let marker = format!("weft-e2e-app-{}", uuid::Uuid::new_v4());
-    let resp: Value = reqwest::Client::new()
+    let resp: Value = weft_core::net::http_client()
+        .build()?
         .post("https://slack.com/api/chat.postMessage")
         .bearer_auth(&bot_token)
         .json(&json!({ "channel": channel, "text": marker }))

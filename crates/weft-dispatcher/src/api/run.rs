@@ -17,6 +17,7 @@ use weft_core::program::runs::{EventsRequest, LogsRequest, OutputsRequest, PageM
 use weft_core::program::{DeletedRun, ResolvedRun, RunDetail, RunPage};
 use weft_core::run::CancelCause;
 use weft_core::RunId;
+use weft_task_store::db::Client as _;
 
 use crate::actions::{run_admin, Actor};
 use crate::authenticator::{authorize_run, CallerTenant};
@@ -411,13 +412,10 @@ pub async fn program_for_cancel(
 /// still in flight. Used both for cancel-dedup and as the source of
 /// truth when the in-RAM event bus drops events (broadcast `Lagged`).
 pub(crate) async fn terminal_outcome(
-    pool: &sqlx::PgPool,
+    pool: &weft_task_store::db::Pool,
     run_id: RunId,
 ) -> anyhow::Result<Option<TerminalOutcome>> {
-    let outcome: Option<Option<String>> = sqlx::query_scalar("SELECT outcome FROM run WHERE run_id = $1")
-        .bind(run_id)
-        .fetch_optional(pool)
-        .await?;
+    let outcome: Option<Option<String>> = pool.scalar_opt("SELECT outcome FROM run WHERE run_id = $1", &[&run_id]).await?;
     Ok(outcome.flatten().map(|outcome| match outcome.as_str() {
         "completed" => TerminalOutcome::Completed,
         "cancelled" => TerminalOutcome::Cancelled,

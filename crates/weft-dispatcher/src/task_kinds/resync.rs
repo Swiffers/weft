@@ -43,7 +43,11 @@
 //!
 //! A step that fails is tried again a couple of times, a little later each
 //! time; then the resync stops, with why written into its plan for `weft
-//! status`, and the plan keeps holding the transition. A step refused
+//! status`, and the plan keeps holding the transition. A step that failed
+//! because the install's database was busy or out of reach spends none of
+//! those tries: it waits for the database a while longer
+//! ([`DATABASE_WAITS`]), then stops waiting on it ([`ResyncWait::Database`]),
+//! and the stop is taken up again once the database answers. A step refused
 //! because the build cannot run the triggers it brings back (a part they
 //! need does not compile) stops it at once: every try, and every resume,
 //! runs that same build ([`Stopped::build_cannot_run`]). A stop that waits
@@ -53,7 +57,7 @@
 //! --resume`; `weft cancel-activate` gives it up, leaving the triggers it
 //! had not brought back down, and says which.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -70,6 +74,29 @@ use crate::state::DispatcherState;
 /// How long a resync waits before it tries a step that failed again, after
 /// each failure but the last, which stops it.
 const RETRY_WAITS: [u64; 2] = [5, 20];
+
+/// How long a resync waits before it tries again a step that failed
+/// because the install's database was busy or out of reach, after each
+/// such failure but the last, which stops it waiting on the database
+/// ([`ResyncWait::Database`]). Kept apart from [`RETRY_WAITS`]: the step
+/// did not fail, the database did not take it, and a busy database is
+/// waited out, which takes longer than a blip.
+const DATABASE_WAITS: [u64; 4] = [5, 15, 30, 60];
+
+/// How long a caller that waits on the database with no stop to fall back
+/// on (a request setting triggers up again after a pick changed,
+/// `crate::install_picks`) waits before trying again for the `waited`th
+/// time: the resync's own waits ([`DATABASE_WAITS`]), the last repeated for
+/// as long as the database does not take it.
+pub(crate) fn database_wait(waited: usize) -> std::time::Duration {
+    let secs = DATABASE_WAITS.get(waited).or(DATABASE_WAITS.last()).copied().expect("the database waits are not empty");
+    weft_core::time_scale::scaled(std::time::Duration::from_secs(secs))
+}
+
+/// How long after a resync stopped waiting on the database it is taken up
+/// again ([`retry_stopped`]): long enough for the load that refused it to
+/// pass, so taking it up again does not land on the same crowd.
+const DATABASE_LOOK_AGAIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The steps a stored [`ResyncPlan`] takes from the shape an older weft
 /// wrote; `weft_core::stored` says how they run.
@@ -103,16 +130,22 @@ impl ResyncPlan {
     /// [`Self::row_write`].
     pub const ROW: &'static str = "resync = $2, resync_version = $3, resync_driver = $4";
 
-    /// The write of this plan to project `project`'s row: `sql`, which
-    /// sets [`Self::ROW`] and names the project as `$1` (binds of its own
-    /// follow, from `$5`), with the plan's JSON, its version and its
-    /// drive bound.
-    pub fn row_write<'q>(
-        &'q self,
+    /// Write this plan to project `project`'s row, for how many rows it
+    /// touched: `sql`, which sets [`Self::ROW`] and names the project as
+    /// `$1`, with the plan's JSON, its version and its drive given, and
+    /// `more` as `$5` onward.
+    pub async fn row_write(
+        &self,
+        db: &impl weft_task_store::db::Client,
         project: uuid::Uuid,
-        sql: &'q str,
-    ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
-        sqlx::query(sql).bind(project).bind(sqlx::types::Json(self)).bind(Self::STORED.version()).bind(self.driver)
+        sql: &str,
+        more: &[weft_task_store::db::Param<'_>],
+    ) -> weft_task_store::db::Result<u64> {
+        let json = weft_task_store::db::Json(self);
+        let version = Self::STORED.version();
+        let row: [weft_task_store::db::Param<'_>; 4] = [&project, &json, &version, &self.driver];
+        let params: Vec<_> = row.into_iter().chain(more.iter().copied()).collect();
+        db.execute(sql, &params).await
     }
 }
 
@@ -339,6 +372,7 @@ pub fn what_next(stopped: Option<&Stopped>) -> String {
     let by_itself = match stopped.waits_for {
         Some(ResyncWait::Infra) => "it goes on by itself once the infra those triggers read runs; ",
         Some(ResyncWait::Activation) => "it goes on by itself once that activation has landed; ",
+        Some(ResyncWait::Database) => "it goes on by itself shortly, once the install's database answers again; ",
         None => "",
     };
     format!("{by_itself}{TAKE_UP_OR_GIVE_UP}")
@@ -363,6 +397,9 @@ pub enum ResyncWait {
     Infra,
     /// An activation of its triggers is still landing.
     Activation,
+    /// The install's database was too busy to take a step, or out of
+    /// reach (`weft_task_store::db::busy`, `weft_task_store::db::unreachable`).
+    Database,
 }
 
 /// The resync a project holds, and whether a task drives it now.
@@ -370,6 +407,9 @@ pub enum ResyncWait {
 pub struct ResyncState {
     pub plan: ResyncPlan,
     pub driven: bool,
+    /// Where the task driving it last said it is (nothing while none
+    /// drives it, or before it says).
+    pub progress: weft_core::deactivation::ResyncProgress,
 }
 
 impl ResyncState {
@@ -383,6 +423,17 @@ impl ResyncState {
             Some(stopped) => stopped.error.clone(),
             None => "its task ended without recording why; the dispatcher's log has it".to_string(),
         })
+    }
+
+    /// How `weft status` shows it: why it stands still and what comes
+    /// next, or where its task last said it is.
+    pub fn standing(&self) -> weft_core::projects::ResyncStanding {
+        weft_core::projects::ResyncStanding {
+            stopped: self
+                .standing_still()
+                .map(|error| weft_core::projects::ResyncStop { error, then: what_next(self.plan.stopped.as_ref()) }),
+            progress: self.progress.clone(),
+        }
     }
 }
 
@@ -407,9 +458,10 @@ impl TaskExecutor<DispatcherState> for ResyncExecutor {
     async fn execute(&self, state: &DispatcherState, task: &Task) -> Result<Value> {
         let id = task.project_id.ok_or_else(|| anyhow::anyhow!("a resync task names no project"))?;
         let weft_task_store::ResyncPayload { driver } = serde_json::from_value(task.payload.clone())?;
-        let mut tries = RETRY_WAITS.iter();
+        let mut tries = Tries::default();
+        let progress = TaskProgress::new(state.pg_pool.clone(), task.id);
         loop {
-            match advance(state, id, driver).await {
+            match advance(state, id, driver, &progress).await {
                 Ok(done) => return Ok(serde_json::to_value(done)?),
                 Err(Halt::Given) => {
                     anyhow::bail!(
@@ -420,28 +472,75 @@ impl TaskExecutor<DispatcherState> for ResyncExecutor {
                     anyhow::bail!("the resync stood down: {}", weft_core::projects::PROJECT_BEING_REMOVED)
                 }
                 Err(Halt::Failed(failure)) => {
-                    if let Some(wait) = wait_before_trying_again(&mut tries, &failure) {
+                    if let Some(wait) = tries.wait_before_trying_again(&failure) {
                         tracing::warn!(target: "weft_dispatcher::resync", project_id = %id, error = %failure.error, "a resync step failed; trying it again");
                         tokio::time::sleep(weft_core::time_scale::scaled(std::time::Duration::from_secs(wait))).await;
                         continue;
                     }
-                    stop(state, id, driver, &failure).await?;
-                    anyhow::bail!("{}", failure.error);
+                    // Once it stops, this drive is over: the row says
+                    // `stopped` from the first try at the stop on, so a
+                    // resume may start another drive at any moment, and
+                    // this one must never drive again beside it.
+                    stop_until_taken(id, || stop(state, id, driver, &failure)).await?;
+                    anyhow::bail!("{}", failure.error)
                 }
             }
         }
     }
 }
 
-/// How many seconds to wait before trying `failure`'s step again, `tries`
-/// holding the waits left; `None` when it is not tried again: its tries ran
-/// out, or its build cannot run the triggers, which fails the same way on
-/// every try.
-fn wait_before_trying_again<'a>(tries: &mut impl Iterator<Item = &'a u64>, failure: &Failure) -> Option<u64> {
-    if failure.build_cannot_run {
-        return None;
+/// Run `stop` until it lands. Busy means wait: a stop nobody could read
+/// would leave the resync standing with no why, and one whose look was
+/// not booked would never be taken up, so a stop the database did not take
+/// waits on the database and is tried again (writing the plan again is
+/// harmless). Only the stop is tried again, never the drive. Any other
+/// failure of the stop is the answer.
+async fn stop_until_taken<F, Fut>(id: uuid::Uuid, mut stop: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    loop {
+        match stop().await {
+            Err(e) if crate::api::database_did_not_take(&e) => {
+                tracing::warn!(
+                    target: "weft_dispatcher::resync",
+                    project_id = %id, error = %format!("{e:#}"),
+                    "the database did not take the resync's stop; waiting on it and trying again"
+                );
+                tokio::time::sleep(weft_core::time_scale::scaled(DATABASE_LOOK_AGAIN)).await;
+            }
+            stopped => return stopped,
+        }
     }
-    tries.next().copied()
+}
+
+/// The waits a drive of a resync has left before it stops: one count for
+/// steps that failed, one for steps the database did not take.
+#[derive(Debug, Default)]
+struct Tries {
+    failed: usize,
+    database: usize,
+}
+
+impl Tries {
+    /// How many seconds to wait before trying `failure`'s step again;
+    /// `None` when it is not tried again: the waits of its kind ran out
+    /// ([`RETRY_WAITS`], or [`DATABASE_WAITS`] for a step the database did
+    /// not take, which spends none of the others), or its build cannot run
+    /// the triggers, which fails the same way on every try.
+    fn wait_before_trying_again(&mut self, failure: &Failure) -> Option<u64> {
+        if failure.build_cannot_run {
+            return None;
+        }
+        let (waits, spent): (&[u64], &mut usize) = match failure.waits_for {
+            Some(ResyncWait::Database) => (&DATABASE_WAITS, &mut self.database),
+            _ => (&RETRY_WAITS, &mut self.failed),
+        };
+        let wait = waits.get(*spent).copied()?;
+        *spent += 1;
+        Some(wait)
+    }
 }
 
 /// Why a resync did not finish ([`advance`], one owner's
@@ -472,6 +571,27 @@ impl Halt {
     pub(crate) fn waiting(wait: ResyncWait, (status, error): (StatusCode, String)) -> Self {
         Halt::Failed(Failure { status, error, waits_for: Some(wait), build_cannot_run: false })
     }
+
+    /// A step that failed doing `what` with `e`: one that waits on the
+    /// database when the database was busy or out of reach
+    /// (`crate::api::database_did_not_take`), an ordinary failure otherwise.
+    pub(crate) fn failed(what: &str, e: anyhow::Error) -> Self {
+        if crate::api::database_did_not_take(&e) {
+            let error = format!("{what}: the install's database was busy or out of reach ({e:#})");
+            return Halt::on_the_database(error);
+        }
+        Halt::from((StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}")))
+    }
+
+    /// A step the database did not take, saying `error`: it waits on the
+    /// database. Its status is a 500, never a 503: what a resync stopped
+    /// with is the answer to whoever follows it, the same on every look,
+    /// and a 503 says the same request goes through later
+    /// (`weft_core::install::asks_again`), which would keep a follower
+    /// asking a stop that never changes.
+    pub(crate) fn on_the_database(error: String) -> Self {
+        Halt::waiting(ResyncWait::Database, (StatusCode::INTERNAL_SERVER_ERROR, error))
+    }
 }
 
 /// A step refused because the resync's build cannot run the triggers it
@@ -481,27 +601,41 @@ impl Halt {
 impl From<Unrunnable> for Halt {
     fn from(unrunnable: Unrunnable) -> Self {
         let build_cannot_run = matches!(unrunnable, Unrunnable::Cannot(_));
-        let (status, error) = unrunnable.into();
-        Halt::Failed(Failure { status, error, waits_for: None, build_cannot_run })
+        match <(StatusCode, String)>::from(unrunnable).into() {
+            Halt::Failed(failure) => Halt::Failed(Failure { build_cannot_run, ..failure }),
+            other => other,
+        }
     }
 }
 
+/// A step that answered a 503 was one the database did not take, nothing
+/// of it ran (`weft_core::install::asks_again`): it waits on the database
+/// ([`Halt::on_the_database`]). Any other answer is an ordinary failure.
 impl From<(StatusCode, String)> for Halt {
     fn from((status, error): (StatusCode, String)) -> Self {
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            return Halt::on_the_database(error);
+        }
         Halt::Failed(Failure { status, error, waits_for: None, build_cannot_run: false })
     }
 }
 
-fn internal(what: &'static str) -> impl Fn(anyhow::Error) -> Halt {
-    move |e| Halt::from((StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}")))
+/// [`Halt::failed`] doing `what`, for a `map_err`.
+pub(crate) fn failing(what: &'static str) -> impl Fn(anyhow::Error) -> Halt {
+    move |e| Halt::failed(what, e)
 }
 
 /// Resync every owner not brought back yet under `driver`, writing each
 /// into the plan as it comes back, then end the resync, which lands the
 /// transition at rest. A drive that ended already (its task is run again
 /// after its end) answers as it ended.
-async fn advance(state: &DispatcherState, id: uuid::Uuid, driver: uuid::Uuid) -> Result<weft_core::deactivation::ResyncResponse, Halt> {
-    let (mut plan, under_way) = state.projects.drive(id, driver).await.map_err(internal("read the resync"))?.ok_or(Halt::Given)?;
+async fn advance(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    driver: uuid::Uuid,
+    progress: &TaskProgress,
+) -> Result<weft_core::deactivation::ResyncResponse, Halt> {
+    let (mut plan, under_way) = state.projects.drive(id, driver).await.map_err(failing("read the resync"))?.ok_or(Halt::Given)?;
     if !under_way {
         return Ok(plan.answer());
     }
@@ -525,9 +659,9 @@ async fn advance(state: &DispatcherState, id: uuid::Uuid, driver: uuid::Uuid) ->
                 return Err(in_context(&plan, at, halt));
             }
         }
-        let_the_old_version_finish(state, id, &mut plan).await?;
+        let_the_old_version_finish(state, id, &mut plan, progress).await?;
         plan.switching = true;
-        if !state.projects.write_resync(id, &plan).await.map_err(internal("write down that the old version is done"))? {
+        if !state.projects.write_resync(id, &plan).await.map_err(failing("write down that the old version is done"))? {
             return Err(Halt::Given);
         }
     }
@@ -539,11 +673,11 @@ async fn advance(state: &DispatcherState, id: uuid::Uuid, driver: uuid::Uuid) ->
         };
         plan.urls.extend(back);
         plan.resynced.push(plan.owners[at].owner.clone());
-        if !state.projects.write_resync(id, &plan).await.map_err(internal("write down the owners resynced"))? {
+        if !state.projects.write_resync(id, &plan).await.map_err(failing("write down the owners resynced"))? {
             return Err(Halt::Given);
         }
     }
-    if !state.projects.end_resync(id, driver).await.map_err(internal("end the resync"))? {
+    if !state.projects.end_resync(id, driver).await.map_err(failing("end the resync"))? {
         return Err(Halt::Given);
     }
     crate::transition::publish_transition_changed(state, id).await;
@@ -597,44 +731,94 @@ async fn look_again_for_health_downs(state: &DispatcherState, id: uuid::Uuid) ->
 /// under `running: cancel`, then waited for, however long that takes, so
 /// the new version takes over only once the old one has nothing left
 /// running (`crate::drain`). A run paused on a wait is not going; one that
-/// resumes meanwhile is waited for too. `weft stop <run>` ends one now;
+/// resumes meanwhile is waited for too. While it waits it says on its
+/// task which runs it waits for and since when ([`TaskProgress`]), and
+/// that it waits for none once they ended. `weft stop <run>` ends one now;
 /// `weft cancel-activate` gives the resync up, which ends this wait at
 /// once ([`given_up`]).
-async fn let_the_old_version_finish(state: &DispatcherState, id: uuid::Uuid, plan: &mut ResyncPlan) -> Result<(), Halt> {
+async fn let_the_old_version_finish(state: &DispatcherState, id: uuid::Uuid, plan: &mut ResyncPlan, progress: &TaskProgress) -> Result<(), Halt> {
     let keys: Vec<ActivationKey> = plan.owners.iter().flat_map(|owner| owner.keys(&owner.down)).collect();
     let target = crate::take_down::TakeDownTarget::Activations(keys.clone());
-    let live = crate::take_down::live_runs(state, id).await.map_err(internal("the runs going"))?;
+    let live = crate::take_down::live_runs(state, id).await.map_err(failing("the runs going"))?;
     let mut going: Vec<weft_core::RunId> =
         crate::take_down::affected_runs(&target, &live, None).into_iter().filter(|run| !run.suspended).map(|run| run.run_id).collect();
     if !plan.old_builds.is_empty() {
-        going.extend(crate::drain::going_on_builds(state, id, &plan.old_builds).await.map_err(internal("the runs on the old version"))?);
+        going.extend(crate::drain::going_on_builds(state, id, &plan.old_builds).await.map_err(failing("the runs on the old version"))?);
     }
     going.sort();
     going.dedup();
     plan.runs = plan.runs.max(going.len() as u64);
-    if !state.projects.write_resync(id, plan).await.map_err(internal("write down the runs on the old version"))? {
+    if !state.projects.write_resync(id, plan).await.map_err(failing("write down the runs on the old version"))? {
         return Err(Halt::Given);
     }
     if plan.take_down.running == weft_core::take_down::Running::Cancel {
         let user = weft_core::run::CancelCause::User;
         let cancelled: Vec<(weft_core::RunId, &weft_core::run::CancelCause)> = going.iter().map(|run| (*run, &user)).collect();
-        crate::api::run::cancel_run_ids(state, &cancelled).await.map_err(internal("cancel the runs on the old version"))?;
+        crate::api::run::cancel_run_ids(state, &cancelled).await.map_err(failing("cancel the runs on the old version"))?;
     }
     let fired = crate::drain::DrainScope { project_id: id, reaching: crate::drain::Reaching::Fired { keys: &keys, tokens: &plan.old_tokens } };
     let builds = crate::drain::DrainScope { project_id: id, reaching: crate::drain::Reaching::Builds(&plan.old_builds) };
     let finished = async {
-        crate::drain::drain(state, &fired, None).await?;
+        crate::drain::drain(state, &fired, None, Some(progress)).await?;
         if !plan.old_builds.is_empty() {
-            crate::drain::drain(state, &builds, None).await?;
+            crate::drain::drain(state, &builds, None, Some(progress)).await?;
         }
-        anyhow::Ok(())
+        progress.waits_for(Vec::new()).await
     };
     tokio::select! {
-        finished = finished => finished.map_err(internal("wait for the runs on the old version")),
+        finished = finished => finished.map_err(failing("wait for the runs on the old version")),
         given = given_up(state, id, plan.driver) => match given {
             Ok(()) => Err(Halt::Given),
-            Err(e) => Err(internal("follow the resync while it waits")(e)),
+            Err(e) => Err(failing("follow the resync while it waits")(e)),
         },
+    }
+}
+
+/// Where a resync says on its task what it waits for
+/// ([`weft_core::deactivation::ResyncProgress`]), which `weft resync`
+/// shows while it follows and `weft status` shows beside the resync. It
+/// writes only when what it waits for changed since it last said it.
+pub(crate) struct TaskProgress {
+    pool: weft_task_store::db::Pool,
+    task: uuid::Uuid,
+    said: tokio::sync::Mutex<Said>,
+}
+
+impl TaskProgress {
+    fn new(pool: weft_task_store::db::Pool, task: uuid::Uuid) -> Self {
+        Self { pool, task, said: tokio::sync::Mutex::new(Said::default()) }
+    }
+
+    /// It waits for `runs` now (none: it waits for no run any more).
+    async fn waits_for(&self, runs: Vec<weft_core::deactivation::RunGoing>) -> Result<()> {
+        let mut said = self.said.lock().await;
+        let Some(progress) = said.news(runs) else { return Ok(()) };
+        weft_task_store::tasks::set_progress(&self.pool, self.task, &serde_json::to_value(&progress)?).await?;
+        said.last = Some(progress.waits_for);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::drain::SayWaiting for TaskProgress {
+    async fn going(&self, runs: Vec<weft_core::deactivation::RunGoing>) -> Result<()> {
+        self.waits_for(runs).await
+    }
+}
+
+/// What a resync last said on its task it waits for.
+#[derive(Debug, Default)]
+struct Said {
+    /// `None` until it said anything.
+    last: Option<Vec<weft_core::deactivation::RunGoing>>,
+}
+
+impl Said {
+    /// What to say when it waits for `runs`: nothing when that is what it
+    /// said last. The first time it is always said: a task run again (its
+    /// process died) finds on its row what the run before said.
+    fn news(&self, runs: Vec<weft_core::deactivation::RunGoing>) -> Option<weft_core::deactivation::ResyncProgress> {
+        (self.last.as_ref() != Some(&runs)).then_some(weft_core::deactivation::ResyncProgress { waits_for: runs })
     }
 }
 
@@ -673,6 +857,22 @@ async fn stop(state: &DispatcherState, id: uuid::Uuid, driver: uuid::Uuid, failu
     };
     state.projects.write_resync(id, &ResyncPlan { stopped: Some(stopped), ..plan }).await?;
     crate::transition::publish_transition_changed(state, id).await;
+    // Nothing announces a database that answers again: the loop that takes
+    // stops up again ([`retry_stopped`]) is booked to look then. A machine's
+    // loop looks on its own safety tick. The stop is not done until the look
+    // is booked: a booking the database did not take fails the stop, and the
+    // caller waits on the database and stops again (writing the plan again
+    // is harmless), since a stop with no look booked would sit on a cloud
+    // install until a person resumed it.
+    if failure.waits_for == Some(ResyncWait::Database) {
+        if let Some(booking) = &state.booking {
+            let look = weft_core::time_scale::scaled(DATABASE_LOOK_AGAIN);
+            booking
+                .book_sooner_after(crate::reaper::RESYNC_RETURNS, look)
+                .await
+                .context("book the look that takes up a resync stopped waiting on the database")?;
+        }
+    }
     Ok(())
 }
 
@@ -682,6 +882,10 @@ async fn stop(state: &DispatcherState, id: uuid::Uuid, driver: uuid::Uuid, failu
 /// status changing, an activation changing status:
 /// `crate::api::infra::bring_back_triggers_whose_infra_returned`), so a
 /// resync waiting on them goes on without a person. A stop that waits on
+/// the database is taken up again once [`DATABASE_LOOK_AGAIN`] has passed
+/// since it stopped, the read of it having gone through: answers when the
+/// next of those is due, for the caller's loop to look again then, and
+/// `None` while none waits (nothing is booked). A stop that waits on
 /// nothing that comes back by itself is left for `weft resync --resume`.
 ///
 /// A resync whose plan no longer reads can never be driven, resumed or
@@ -690,11 +894,19 @@ async fn stop(state: &DispatcherState, id: uuid::Uuid, driver: uuid::Uuid, failu
 /// (`crate::project_store::ProjectStoreOps::give_up_unreadable_resync`).
 /// A project whose retry fails (the store, on the way) is named in the
 /// error once every other project was looked at.
-pub(crate) async fn retry_stopped(state: &DispatcherState) -> Result<()> {
+pub(crate) async fn retry_stopped(state: &DispatcherState) -> Result<Option<std::time::Duration>> {
     let mut failed = Vec::new();
+    let mut next: Option<std::time::Duration> = None;
+    let now = crate::lease::now_unix();
     for (id, plan) in state.projects.stopped_resyncs().await? {
         let retried = match plan {
-            Ok(plan) => retry_if_back(state, id, &plan).await,
+            Ok(plan) => match database_look_in(plan.stopped.as_ref(), now) {
+                Some(later) => {
+                    next = next.into_iter().chain([later]).min();
+                    Ok(())
+                }
+                None => retry_if_back(state, id, &plan).await,
+            },
             Err(unreadable) => give_up_unreadable(state, id, &unreadable).await,
         };
         if let Err(e) = retried {
@@ -702,7 +914,16 @@ pub(crate) async fn retry_stopped(state: &DispatcherState) -> Result<()> {
         }
     }
     anyhow::ensure!(failed.is_empty(), "taking stopped resyncs up again failed: {}", failed.join("; "));
-    Ok(())
+    Ok(next)
+}
+
+/// How long until a resync `stopped` waiting on the database is taken up
+/// again, at `now_unix`: `None` when it is due now, or when its stop waits
+/// on something else.
+fn database_look_in(stopped: Option<&Stopped>, now_unix: i64) -> Option<std::time::Duration> {
+    let stopped = stopped.filter(|stopped| stopped.waits_for == Some(ResyncWait::Database))?;
+    let due = stopped.at_unix.saturating_add(weft_core::time_scale::scaled(DATABASE_LOOK_AGAIN).as_secs() as i64);
+    (due > now_unix).then(|| std::time::Duration::from_secs((due - now_unix) as u64))
 }
 
 /// Give up project `id`'s resync, whose plan did not read (`unreadable`).
@@ -727,6 +948,8 @@ async fn give_up_unreadable(state: &DispatcherState, id: uuid::Uuid, unreadable:
 async fn retry_if_back(state: &DispatcherState, id: uuid::Uuid, plan: &ResyncPlan) -> Result<()> {
     let back = match plan.stopped.as_ref().and_then(|stopped| stopped.waits_for) {
         None => false,
+        // The read of its plan went through: the database answers.
+        Some(ResyncWait::Database) => true,
         Some(ResyncWait::Activation) => {
             let keys: Vec<ActivationKey> = plan.remaining().iter().flat_map(|owner| owner.keys(&owner.on)).collect();
             !state
@@ -783,6 +1006,12 @@ pub fn left_down(plan: &ResyncPlan, rows: &[crate::activation_store::Activation]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weft_task_store::db;
+
+    /// A call that got no connection, for `why`.
+    fn no_connection(why: db::NoConnection) -> anyhow::Error {
+        db::Error::NoConnection { why, refused: None }.into()
+    }
 
     fn plan() -> ResyncPlan {
         let ada = Owner::Instance(weft_core::instance::InstanceId::new("ada").unwrap());
@@ -891,11 +1120,11 @@ mod tests {
     #[test]
     fn a_build_that_cannot_run_is_not_tried_again_and_offers_what_works() {
         let failure = |build_cannot_run| Failure { status: StatusCode::UNPROCESSABLE_ENTITY, error: "no".into(), waits_for: None, build_cannot_run };
-        let mut tries = RETRY_WAITS.iter();
-        assert_eq!(wait_before_trying_again(&mut tries, &failure(false)), Some(RETRY_WAITS[0]));
-        assert_eq!(wait_before_trying_again(&mut tries, &failure(true)), None, "never tried again");
-        assert_eq!(wait_before_trying_again(&mut tries, &failure(false)), Some(RETRY_WAITS[1]), "it spent no try");
-        assert_eq!(wait_before_trying_again(&mut tries, &failure(false)), None, "the tries ran out");
+        let mut tries = Tries::default();
+        assert_eq!(tries.wait_before_trying_again(&failure(false)), Some(RETRY_WAITS[0]));
+        assert_eq!(tries.wait_before_trying_again(&failure(true)), None, "never tried again");
+        assert_eq!(tries.wait_before_trying_again(&failure(false)), Some(RETRY_WAITS[1]), "it spent no try");
+        assert_eq!(tries.wait_before_trying_again(&failure(false)), None, "the tries ran out");
 
         let stopped = |build_cannot_run, waits_for| Stopped { status: 422, error: "no".into(), at_unix: 1, waits_for, build_cannot_run };
         let next = what_next(Some(&stopped(true, None)));
@@ -923,12 +1152,129 @@ mod tests {
         let unchecked = failed(Unrunnable::Unchecked((StatusCode::INTERNAL_SERVER_ERROR, "infra_node: connection reset".into())).into());
         assert!(!unchecked.build_cannot_run, "a store failure is not the build's");
         assert_eq!((unchecked.status, unchecked.error.as_str()), (StatusCode::INTERNAL_SERVER_ERROR, "infra_node: connection reset"));
-        assert_eq!(wait_before_trying_again(&mut RETRY_WAITS.iter(), &unchecked), Some(RETRY_WAITS[0]), "tried again");
+        assert_eq!(Tries::default().wait_before_trying_again(&unchecked), Some(RETRY_WAITS[0]), "tried again");
+        // A read the database did not take answered 503: it waits on the
+        // database, and what it would stop with is no 503.
+        let busy = failed(Unrunnable::Unchecked((StatusCode::SERVICE_UNAVAILABLE, "the install could not read the running build right now".into())).into());
+        assert_eq!((busy.waits_for, busy.status, busy.build_cannot_run), (Some(ResyncWait::Database), StatusCode::INTERNAL_SERVER_ERROR, false));
 
         let cannot = failed(Unrunnable::Cannot("node `auth` did not compile".into()).into());
         assert!(cannot.build_cannot_run);
         assert_eq!(cannot.status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(wait_before_trying_again(&mut RETRY_WAITS.iter(), &cannot), None, "never tried again");
+        assert_eq!(Tries::default().wait_before_trying_again(&cannot), None, "never tried again");
+    }
+
+    /// A step the database did not take (its pool had no connection for
+    /// it, the database was full or out of reach) waits on the database:
+    /// it spends none of the tries a step that failed has, and has waits of
+    /// its own, after which it stops waiting on the database. Any other
+    /// failure of a read is an ordinary failed step.
+    #[test]
+    fn a_step_the_database_did_not_take_waits_on_the_database() {
+        let failed = |halt: Halt| match halt {
+            Halt::Failed(failure) => failure,
+            _ => panic!("a failed read is a failed step"),
+        };
+        let busy = failed(Halt::failed("read the resync", no_connection(db::NoConnection::Busy).context("project 1")));
+        assert_eq!(busy.waits_for, Some(ResyncWait::Database));
+        assert_eq!(busy.status, StatusCode::INTERNAL_SERVER_ERROR, "a stop is never a 503: following it asks the same again");
+        assert!(busy.error.starts_with("read the resync: the install's database was busy or out of reach"), "{}", busy.error);
+        let gone = failed(failing("end the resync")(no_connection(db::NoConnection::Closed)));
+        assert_eq!(gone.waits_for, Some(ResyncWait::Database), "a database out of reach is waited on too");
+        let broken = failed(Halt::failed("read the resync", anyhow::Error::from(db::Error::NoRow)));
+        assert_eq!((broken.waits_for, broken.status), (None, StatusCode::INTERNAL_SERVER_ERROR));
+
+        let mut tries = Tries::default();
+        for wait in DATABASE_WAITS {
+            assert_eq!(tries.wait_before_trying_again(&busy), Some(wait));
+        }
+        assert_eq!(tries.wait_before_trying_again(&broken), Some(RETRY_WAITS[0]), "the database's waits spent no try of a failed step");
+        assert_eq!(tries.wait_before_trying_again(&busy), None, "its waits ran out: it stops waiting on the database");
+
+        let stopped = Stopped { status: 500, error: "busy".into(), at_unix: 1, waits_for: Some(ResyncWait::Database), build_cannot_run: false };
+        assert_eq!(serde_json::to_value(&stopped).unwrap()["waits_for"], "database");
+        let next = what_next(Some(&stopped));
+        assert!(next.starts_with("it goes on by itself shortly, once the install's database answers again; "), "{next}");
+        assert!(next.contains("`weft resync --resume` tries it again"), "{next}");
+    }
+
+    /// A caller that waits on the database with no stop to fall back on
+    /// waits as a resync does, and keeps waiting the longest of those waits
+    /// for as long as the database does not take it.
+    #[test]
+    fn a_wait_on_the_database_with_no_stop_keeps_its_longest_wait() {
+        let secs = |s: u64| weft_core::time_scale::scaled(std::time::Duration::from_secs(s));
+        for (waited, wait) in DATABASE_WAITS.iter().enumerate() {
+            assert_eq!(database_wait(waited), secs(*wait));
+        }
+        let longest = secs(*DATABASE_WAITS.last().unwrap());
+        assert_eq!(database_wait(DATABASE_WAITS.len()), longest);
+        assert_eq!(database_wait(usize::MAX), longest);
+    }
+
+    /// A stop that waits on the database is taken up again once its look
+    /// is due, and until then says how long is left; any other stop is not
+    /// the database's to time.
+    #[test]
+    fn a_stop_on_the_database_is_looked_at_again_when_due() {
+        let look = weft_core::time_scale::scaled(DATABASE_LOOK_AGAIN).as_secs() as i64;
+        let stopped = |waits_for| Stopped { status: 500, error: "busy".into(), at_unix: 1000, waits_for, build_cannot_run: false };
+        let database = stopped(Some(ResyncWait::Database));
+        if look > 0 {
+            assert_eq!(database_look_in(Some(&database), 1000), Some(std::time::Duration::from_secs(look as u64)));
+            assert_eq!(database_look_in(Some(&database), 999 + look), Some(std::time::Duration::from_secs(1)));
+        }
+        assert_eq!(database_look_in(Some(&database), 1000 + look), None, "due: taken up again now");
+        assert_eq!(database_look_in(Some(&stopped(Some(ResyncWait::Infra))), 1000), None);
+        assert_eq!(database_look_in(Some(&stopped(None)), 1000), None);
+        assert_eq!(database_look_in(None, 1000), None);
+    }
+
+    /// A resync says what it waits for the first time, and then only when
+    /// that changed: a count that finds the same runs writes nothing.
+    #[test]
+    fn a_resync_says_what_it_waits_for_only_when_it_changed() {
+        let run = |n: u128| weft_core::deactivation::RunGoing { run_id: uuid::Uuid::from_u128(n), since_unix: n as i64 };
+        let mut said = Said::default();
+        let first = said.news(vec![run(1), run(2)]).expect("the first time is said");
+        assert_eq!(first.waits_for, [run(1), run(2)]);
+        said.last = Some(first.waits_for);
+        assert_eq!(said.news(vec![run(1), run(2)]), None, "the same runs: nothing to write");
+        assert_eq!(said.news(vec![run(2)]).map(|news| news.waits_for), Some(vec![run(2)]), "one ended");
+        said.last = Some(vec![run(2)]);
+        assert_eq!(said.news(Vec::new()).map(|news| news.waits_for), Some(Vec::new()), "none left is said");
+        assert_eq!(Said::default().news(Vec::new()).map(|news| news.waits_for), Some(Vec::new()), "said once even when none ran");
+    }
+
+    /// A stop the database did not take (its booking refused for a full
+    /// pool) is tried again on its own until it lands, and any other
+    /// failure of it is the answer at once: only the stop is tried again,
+    /// never the drive.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_the_database_did_not_take_is_tried_again_alone() {
+        let tries = std::cell::Cell::new(0);
+        let landed = stop_until_taken(uuid::Uuid::nil(), || {
+            tries.set(tries.get() + 1);
+            let attempt = tries.get();
+            async move {
+                if attempt < 3 {
+                    return Err(no_connection(db::NoConnection::Busy).context("book the look"));
+                }
+                Ok(())
+            }
+        })
+        .await;
+        assert!(landed.is_ok(), "{landed:?}");
+        assert_eq!(tries.get(), 3, "tried until it landed, and not once more");
+
+        let tries = std::cell::Cell::new(0);
+        let broken = stop_until_taken(uuid::Uuid::nil(), || {
+            tries.set(tries.get() + 1);
+            async { Err(anyhow::Error::from(db::Error::NoRow)) }
+        })
+        .await;
+        assert!(broken.is_err());
+        assert_eq!(tries.get(), 1, "a stop that failed otherwise is not tried again");
     }
 
     /// The task names the drive it carries, and two drives are two tasks.

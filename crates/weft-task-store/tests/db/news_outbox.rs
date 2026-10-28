@@ -12,12 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlx::PgPool;
+use weft_task_store::db::{Client as _, Pool};
 use weft_platform_traits::{Listening, News, NewsHeard, NewsKind, RunNews};
 
 /// The crate's schema, and where a refusal of the news is written down
 /// (with the run columns every write of a failure reads).
-async fn setup(pool: &PgPool) {
+async fn setup(pool: &Pool) {
     support::setup(pool).await;
     weft_task_store::apply_groups(pool, &[&weft_task_store::unanswered::GROUP]).await.expect("unanswered schema");
     weft_task_store::unanswered::judged_run_columns(pool).await.expect("the run columns");
@@ -71,14 +71,14 @@ impl News for Flaky {
     }
 }
 
-async fn tell(pool: &PgPool, run: u128) -> RunNews {
+async fn tell(pool: &Pool, run: u128) -> RunNews {
     let news = RunNews { project: uuid::Uuid::from_u128(1), run: uuid::Uuid::from_u128(run), kind: NewsKind::Cancel };
-    sqlx::query("SELECT weft_tell($1, $2, 'cancel')").bind(news.project).bind(news.run).execute(pool).await.unwrap();
+    pool.execute("SELECT weft_tell($1, $2, 'cancel')", &[&news.project, &news.run]).await.unwrap();
     news
 }
 
-async fn waiting(pool: &PgPool) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM weft_news").fetch_one(pool).await.unwrap()
+async fn waiting(pool: &Pool) -> i64 {
+    pool.scalar("SELECT COUNT(*) FROM weft_news", &[]).await.unwrap()
 }
 
 async fn until(what: &str, holds: impl AsyncFn() -> bool) {
@@ -93,8 +93,8 @@ async fn until(what: &str, holds: impl AsyncFn() -> bool) {
 
 /// News waiting goes out in one call per batch, once, and is then taken
 /// out of the outbox.
-#[sqlx::test]
-async fn waiting_news_goes_out_in_one_call_and_once(pool: PgPool) {
+#[weft_db_macros::test]
+async fn waiting_news_goes_out_in_one_call_and_once(pool: Pool) {
     setup(&pool).await;
     let batch = vec![tell(&pool, 2).await, tell(&pool, 3).await, tell(&pool, 4).await];
     let bus = Flaky::failing(0);
@@ -107,8 +107,8 @@ async fn waiting_news_goes_out_in_one_call_and_once(pool: PgPool) {
 
 /// A batch refused is told again as it was, from memory: news written
 /// meanwhile is not read into it, and goes out after it.
-#[sqlx::test]
-async fn a_refused_batch_is_told_again_without_reading_the_database(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_refused_batch_is_told_again_without_reading_the_database(pool: Pool) {
     setup(&pool).await;
     let first = tell(&pool, 2).await;
     let bus = Flaky::failing(2);
@@ -123,8 +123,8 @@ async fn a_refused_batch_is_told_again_without_reading_the_database(pool: PgPool
 
 /// A commit that left no news costs no look at the news: only a write that
 /// left some says so, and that wakes the teller.
-#[sqlx::test]
-async fn only_a_write_that_left_news_wakes_the_teller(pool: PgPool) {
+#[weft_db_macros::test]
+async fn only_a_write_that_left_news_wakes_the_teller(pool: Pool) {
     setup(&pool).await;
     let bus = Flaky::failing(0);
     weft_task_store::announce::tell_news_through(&pool, bus.clone());
@@ -140,8 +140,8 @@ async fn only_a_write_that_left_news_wakes_the_teller(pool: PgPool) {
 
 /// A bus that refuses everything holds up none of the database's own
 /// announcements: they go out at once, while the news waits.
-#[sqlx::test]
-async fn a_bus_that_refuses_holds_up_no_announcement(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_bus_that_refuses_holds_up_no_announcement(pool: Pool) {
     setup(&pool).await;
     tell(&pool, 2).await;
     let bus = Flaky::failing(usize::MAX);
@@ -149,7 +149,7 @@ async fn a_bus_that_refuses_holds_up_no_announcement(pool: PgPool) {
     until("the bus refused", async || bus.fails.load(Ordering::SeqCst) < usize::MAX).await;
     let watch = support::signals(&pool).await;
     let mut heard = watch.subscribe();
-    sqlx::query("SELECT weft_announce($1, 'x')").bind(weft_task_store::tasks::TASK_READY_CHANNEL).execute(&pool).await.unwrap();
+    pool.execute("SELECT weft_announce($1, 'x')", &[&weft_task_store::tasks::TASK_READY_CHANNEL]).await.unwrap();
     weft_task_store::announce::committed(&pool);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     assert!(
@@ -159,12 +159,12 @@ async fn a_bus_that_refuses_holds_up_no_announcement(pool: PgPool) {
     assert_eq!(waiting(&pool).await, 1, "the news still waits");
 }
 
-async fn refusal_written(pool: &PgPool) -> bool {
-    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM unanswered_call WHERE callee = 'news:')").fetch_one(pool).await.unwrap()
+async fn refusal_written(pool: &Pool) -> bool {
+    pool.scalar("SELECT EXISTS (SELECT 1 FROM unanswered_call WHERE callee = 'news:')", &[]).await.unwrap()
 }
 
-async fn refused(pool: &PgPool) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM weft_news WHERE refused_at IS NOT NULL").fetch_one(pool).await.unwrap()
+async fn refused(pool: &Pool) -> i64 {
+    pool.scalar("SELECT COUNT(*) FROM weft_news WHERE refused_at IS NOT NULL", &[]).await.unwrap()
 }
 
 /// A batch the bus keeps refusing is tried a few times, then marked
@@ -173,8 +173,8 @@ async fn refused(pool: &PgPool) -> i64 {
 /// again; the refused news is then tried one piece per call, so the one
 /// piece the bus will never take refuses only itself, and once it goes
 /// out the refusal written down is cleared.
-#[sqlx::test]
-async fn refused_news_never_travels_with_new_news_nor_holds_it_up(pool: PgPool) {
+#[weft_db_macros::test]
+async fn refused_news_never_travels_with_new_news_nor_holds_it_up(pool: Pool) {
     setup(&pool).await;
     let mut first = Vec::new();
     for run in 2..=101 {
@@ -214,20 +214,19 @@ async fn refused_news_never_travels_with_new_news_nor_holds_it_up(pool: PgPool) 
 /// A look on an install whose bus never refused anything reads the new
 /// news and nothing more: the refused path, and its install-wide lock, is
 /// taken only once a refusal exists.
-#[sqlx::test]
-async fn a_look_with_nothing_refused_never_takes_the_refused_path(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_look_with_nothing_refused_never_takes_the_refused_path(pool: Pool) {
     setup(&pool).await;
     // Count the calls to the refused path instead of making them.
-    sqlx::raw_sql(
+    pool.batch_execute(
         "CREATE TABLE refused_looks (n INT); \
          CREATE OR REPLACE FUNCTION weft_news_refused(p_limit BIGINT, p_skip BIGINT[], p_callee TEXT) \
              RETURNS TABLE (seq BIGINT, project_id UUID, run_id UUID, kind TEXT) AS $$ \
              BEGIN INSERT INTO refused_looks VALUES (1); RETURN; END; $$ LANGUAGE plpgsql",
     )
-    .execute(&pool)
     .await
     .unwrap();
-    let refused_looks = async || -> i64 { sqlx::query_scalar("SELECT COUNT(*) FROM refused_looks").fetch_one(&pool).await.unwrap() };
+    let refused_looks = async || -> i64 { pool.scalar("SELECT COUNT(*) FROM refused_looks", &[]).await.unwrap() };
     let first = tell(&pool, 2).await;
     let bus = Flaky::failing(0);
     weft_task_store::announce::tell_news_through(&pool, bus.clone());
@@ -248,8 +247,8 @@ async fn a_look_with_nothing_refused_never_takes_the_refused_path(pool: PgPool) 
 /// A refusal written down while no refused news is left (another process
 /// told it meanwhile) is cleared by the next look, even one that finds no
 /// news at all.
-#[sqlx::test]
-async fn an_empty_look_clears_a_refusal_no_news_is_left_for(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_empty_look_clears_a_refusal_no_news_is_left_for(pool: Pool) {
     setup(&pool).await;
     weft_task_store::unanswered::failed(&pool, weft_task_store::unanswered::Callee::News, None, "the bus is away").await.unwrap().log();
     assert!(refusal_written(&pool).await);

@@ -51,8 +51,9 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use anyhow::Result;
-use sqlx::postgres::{PgConnectOptions, PgListener, PgPool, PgPoolOptions};
 use tokio::sync::broadcast;
+
+use crate::db::{Client as _, Session};
 
 /// What a waiter hears: one notification, or "every waiter should look
 /// at its row again" because notifications may have been lost.
@@ -255,13 +256,9 @@ impl PgSignalWatch {
     /// cannot be made or cannot listen; after that, the listener
     /// reconnects on its own (as `listening` says) and every waiter is
     /// told to recheck.
-    pub async fn start(connect: &PgConnectOptions, channels: &'static [&'static str], listening: Listening) -> Result<Arc<Self>> {
-        let own = PgPoolOptions::new()
-            .max_connections(1)
-            .max_lifetime(None)
-            .idle_timeout(None)
-            .connect_with(connect.clone().application_name(WATCH_APPLICATION_NAME))
-            .await?;
+    pub async fn start(connect: &crate::db::Config, channels: &'static [&'static str], listening: Listening) -> Result<Arc<Self>> {
+        let mut own = connect.clone();
+        own.application_name(WATCH_APPLICATION_NAME);
         let listener = listen(&own, channels).await?;
         let (tx, template) = broadcast::channel(FANOUT_CAPACITY);
         let told = tx.downgrade();
@@ -482,13 +479,13 @@ fn wakes(heard: &Heard, concerns: &impl Fn(&str, &str) -> bool) -> bool {
     }
 }
 
-async fn listen(own: &PgPool, channels: &[&'static str]) -> Result<PgListener> {
-    let mut listener = PgListener::connect_with(own).await?;
-    // A dropped connection is handed back as such ([`hear`]), never made
-    // again behind weft's back: the pump decides whether to listen again,
-    // and a process with nothing busy must not wake a sleeping database.
-    listener.eager_reconnect(false);
-    listener.listen_all(channels.iter().copied().chain([PROBE_CHANNEL])).await?;
+/// A session of its own at `own`, listening on every one of `channels`.
+/// It is never made again behind weft's back: when it drops, the pump
+/// decides whether to listen again, and a process with nothing busy must
+/// not wake a sleeping database.
+async fn listen(own: &crate::db::Config, channels: &[&'static str]) -> Result<Session> {
+    let mut listener = Session::connect(own).await?;
+    listener.listen(channels.iter().copied().chain([PROBE_CHANNEL])).await?;
     prove_it_hears(&mut listener).await?;
     Ok(listener)
 }
@@ -497,12 +494,12 @@ async fn listen(own: &PgPool, channels: &[&'static str]) -> Result<PgListener> {
 /// pooler that runs each statement on whichever server connection is free
 /// leaves the `LISTEN` on one and the notification on another, and the
 /// session never hears anything.
-async fn prove_it_hears(listener: &mut PgListener) -> Result<()> {
+async fn prove_it_hears(listener: &mut Session) -> Result<()> {
     let payload = uuid::Uuid::new_v4().to_string();
-    sqlx::query("SELECT pg_notify($1, $2)").bind(PROBE_CHANNEL).bind(&payload).execute(&mut *listener).await?;
+    listener.execute("SELECT pg_notify($1, $2)", &[&PROBE_CHANNEL, &payload]).await?;
     let heard = tokio::time::timeout(PROBE_WAIT, async {
         loop {
-            match listener.try_recv().await? {
+            match listener.notified().await? {
                 Some(n) if n.channel() == PROBE_CHANNEL && n.payload() == payload => return anyhow::Ok(()),
                 Some(_) => {}
                 None => anyhow::bail!("the listening connection dropped while proving it can hear"),
@@ -522,8 +519,8 @@ async fn prove_it_hears(listener: &mut PgListener) -> Result<()> {
 }
 
 async fn pump(
-    mut listener: PgListener,
-    own: PgPool,
+    mut listener: Session,
+    own: crate::db::Config,
     channels: &'static [&'static str],
     tx: broadcast::Sender<Heard>,
     listening: Arc<AtomicBool>,
@@ -531,13 +528,9 @@ async fn pump(
 ) {
     loop {
         let e = hear(&mut listener, channels, &tx).await;
-        // The listener only recovers by itself from a few kinds of
-        // dropped socket, and keeps a connection that failed any other
-        // way (a reset, a protocol error), which would fail the same way
-        // on every call. So a fresh one, then everyone looks at their
-        // row, since nothing was heard meanwhile. The old listener goes
-        // first: it holds the one connection its pool allows, and a new
-        // one could never get it while it lives.
+        // A fresh session, then everyone looks at their row, since nothing
+        // was heard meanwhile. The old one is closed first, so the process
+        // never holds two.
         drop(listener);
         listening.store(false, Ordering::Release);
         let _ = tx.send(Heard::Lost);
@@ -598,13 +591,13 @@ async fn wait_for_work(demand: &Demand) {
 
 /// Fan out what `listener` hears until it fails, and hand back why.
 async fn hear(
-    listener: &mut PgListener,
+    listener: &mut Session,
     channels: &'static [&'static str],
     tx: &broadcast::Sender<Heard>,
-) -> sqlx::Error {
+) -> anyhow::Error {
     loop {
         // No receiver is fine on every send: nobody is waiting right now.
-        match listener.try_recv().await {
+        match listener.notified().await {
             Ok(Some(notification)) if notification.channel() == PROBE_CHANNEL => {}
             Ok(Some(notification)) => {
                 match channels.iter().find(|c| **c == notification.channel()) {
@@ -618,13 +611,12 @@ async fn hear(
                     ),
                 }
             }
-            // The connection dropped. The listener would make a fresh one
-            // on its next call, unannounced and without proving it hears,
-            // so it is handed back as a failure: the pump says the
-            // connection is lost, listens again the way it first did, and
-            // tells everyone to look again.
-            Ok(None) => return sqlx::Error::Io(std::io::Error::other("the listening connection dropped")),
-            Err(e) => return e,
+            // The connection closed, or broke (a database that went
+            // silent is given up on within about a minute, `crate::db::config`):
+            // the pump says the connection is lost, listens again the way
+            // it first did, and tells everyone to look again.
+            Ok(None) => return anyhow::anyhow!("the listening connection closed"),
+            Err(e) => return e.into(),
         }
     }
 }

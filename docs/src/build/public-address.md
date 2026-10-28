@@ -47,8 +47,11 @@ token, which is made to be pasted.
 
 Your dispatcher's real API, your projects, your journal and your runs are not
 on that port at all, so nothing arriving through the tunnel can reach them.
-They stay on `127.0.0.1:14111`, which has no authentication of its own and
-listens on your machine only.
+They stay on `127.0.0.1:14111` (the default install's address; `weft daemon
+which` gives another's), which listens on your machine only, asks
+every caller for an operator key and sends no CORS headers. For
+how that key works, go and read [the key the install's API asks
+for](../running/architecture.md#the-key-the-installs-api-asks-for).
 
 ## Find your address
 

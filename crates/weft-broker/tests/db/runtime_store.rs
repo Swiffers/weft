@@ -12,8 +12,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::PgPool;
-
 use weft_broker::entitlement::{Entitlement, EntitlementSource};
 use weft_broker::runtime_store::{
     charged_bytes_for, BeginUpload, RuntimeStore, RuntimeStoreError, UploadSpec,
@@ -24,6 +22,7 @@ use weft_core::storage::{bytes_stream, ByteRange, KeepTtl, PartAsk, StorageScope
 use weft_platform_traits::clock::{Clock, FakeClock};
 use weft_platform_traits::object_store::fake::FakeObjectStore;
 use weft_platform_traits::{CopyProgress, ObjectStore, PresignAudience};
+use weft_task_store::db::{Client as _, Pool, Session, Transaction};
 
 /// Every contract test here drives the WORKER upload path, whose part URLs are
 /// presigned for the internal (Internal) endpoint. Named once so the many
@@ -36,7 +35,7 @@ fn ask(part_number: i32, size_bytes: u64) -> PartAsk {
 /// `reserve_parts` / `resume_upload` call sites read cleanly. (The External
 /// audience, the editor upload's browser-facing URLs, is exercised at Layer 4
 /// in `weft-e2e/tests/e2e/config_media.rs`.)
-const WORKER: PresignAudience = PresignAudience::Internal;
+const WORKER: PresignAudience = PresignAudience::Install;
 
 /// A worker caller in (tenant t1, project p1, run c1).
 fn worker(tenant: &str, project: &str, run_id: Option<&str>) -> CallerAuth {
@@ -64,11 +63,11 @@ impl EntitlementSource for TestEntitlements {
     }
     async fn account_used_bytes(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &Transaction<'_>,
         tenant: &str,
         now: i64,
     ) -> anyhow::Result<u64> {
-        let mine = charged_bytes_for(&mut **tx, tenant, now).await?;
+        let mine = charged_bytes_for(tx, tenant, now).await?;
         Ok(mine.saturating_add(self.extra_other_plane_bytes))
     }
 }
@@ -83,7 +82,7 @@ fn big() -> TestEntitlements {
     budget(Entitlement::from_disk_bytes(1 << 40)) // 1 TiB
 }
 
-async fn store(pool: &PgPool) -> (Arc<RuntimeStore>, Arc<FakeObjectStore>, Arc<FakeClock>) {
+async fn store(pool: &Pool) -> (Arc<RuntimeStore>, Arc<FakeObjectStore>, Arc<FakeClock>) {
     weft_task_store::apply_groups(pool, &[&weft_broker::runtime_store::GROUP, &weft_task_store::unanswered::GROUP])
         .await
         .unwrap();
@@ -107,8 +106,11 @@ async fn sweep(s: &RuntimeStore, tenant: &str, run: &str) -> (u64, u64) {
 }
 
 /// One pass of the expiry loop: how many rows it removed.
-async fn expire(s: &RuntimeStore, pool: &PgPool) -> u64 {
-    let rows = || async { sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM runtime_file").fetch_one(pool).await.unwrap() };
+async fn expire(s: &RuntimeStore, pool: &Pool) -> u64 {
+    let rows = || async {
+        let rows: i64 = pool.scalar("SELECT COUNT(*) FROM runtime_file", &[]).await.unwrap();
+        rows
+    };
     let before = rows().await;
     s.expire().await.unwrap();
     (before - rows().await) as u64
@@ -231,7 +233,7 @@ async fn get_via(
     parsed: &weft_core::storage::key::ParsedKey,
     range: Option<weft_core::storage::ByteRange>,
 ) -> Result<(StoredFileMeta, bytes::Bytes), RuntimeStoreError> {
-    let (meta, _url, _) = s.link(parsed, PresignAudience::Internal, None, false).await?;
+    let (meta, _url, _) = s.link(parsed, PresignAudience::Install, None, false).await?;
     let key = parsed.to_key();
     let bytes = match range {
         None => bucket.get(&object_key(&key)).await.unwrap().expect("object present"),
@@ -247,8 +249,8 @@ async fn get_via(
     Ok((meta, bytes))
 }
 
-#[sqlx::test]
-async fn put_then_get_round_trips_and_records_metadata(pool: PgPool) {
+#[weft_db_macros::test]
+async fn put_then_get_round_trips_and_records_metadata(pool: Pool) {
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let meta = put_via(&s, &bucket, &w, &StorageScope::Run, "text/plain", "hi.txt", None, &big(), body(b"hello"))
@@ -279,8 +281,8 @@ async fn put_then_get_round_trips_and_records_metadata(pool: PgPool) {
 /// asked for twice is one file and one upload, another project asking
 /// for the same source is its own file, and a begin racing an upload
 /// of the same identity is a conflict rather than a second file.
-#[sqlx::test]
-async fn an_identified_put_stores_one_file_per_scope(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_identified_put_stores_one_file_per_scope(pool: Pool) {
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let spec = |identity: Option<&'static str>| UploadSpec {
@@ -332,8 +334,8 @@ async fn an_identified_put_stores_one_file_per_scope(pool: PgPool) {
     ));
 }
 
-#[sqlx::test]
-async fn an_empty_file_round_trips_as_a_direct_empty_object(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_empty_file_round_trips_as_a_direct_empty_object(pool: Pool) {
     // An empty object is NOT a multipart part (S3 rejects an empty part): it
     // uploads ZERO parts, and `complete` writes the object directly. Assert the
     // file exists, is empty, AND that no multipart upload lingers (the empty
@@ -350,8 +352,8 @@ async fn an_empty_file_round_trips_as_a_direct_empty_object(pool: PgPool) {
     assert!(bytes.is_empty());
 }
 
-#[sqlx::test]
-async fn a_zero_byte_part_reservation_is_rejected(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_zero_byte_part_reservation_is_rejected(pool: Pool) {
     // The store must never reserve a zero-byte part (S3 would reject it at
     // complete). An empty file goes through zero parts instead.
     let (s, _bucket, _c) = store(&pool).await;
@@ -363,8 +365,8 @@ async fn a_zero_byte_part_reservation_is_rejected(pool: PgPool) {
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
 }
 
-#[sqlx::test]
-async fn a_multi_part_upload_assembles_in_order(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_multi_part_upload_assembles_in_order(pool: Pool) {
     // A payload larger than one part exercises the real slicing: full parts of
     // exactly part_size plus a short final part, assembled in order.
     let (s, bucket, _clock) = store(&pool).await;
@@ -383,8 +385,8 @@ async fn a_multi_part_upload_assembles_in_order(pool: PgPool) {
     assert!(bucket.in_progress_uploads().is_empty());
 }
 
-#[sqlx::test]
-async fn wall_denies_cross_run_id_get(pool: PgPool) {
+#[weft_db_macros::test]
+async fn wall_denies_cross_run_id_get(pool: Pool) {
     let (s, bucket, _c) = store(&pool).await;
     let w1 = worker("t1", "p1", Some("c1"));
     let meta = put_via(&s, &bucket, &w1, &StorageScope::Run, "text/plain", "f", None, &big(), body(b"x"))
@@ -401,8 +403,8 @@ async fn wall_denies_cross_run_id_get(pool: PgPool) {
     assert!(weft_core::storage::key::check_key_access(&w2, &parsed).is_err());
 }
 
-#[sqlx::test]
-async fn quota_rejects_over_file_count_and_over_declared_bytes(pool: PgPool) {
+#[weft_db_macros::test]
+async fn quota_rejects_over_file_count_and_over_declared_bytes(pool: Pool) {
     let (s, bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     // file cap 2, byte cap 100 (a hand-built entitlement, not via the floor rule).
@@ -430,8 +432,8 @@ async fn quota_rejects_over_file_count_and_over_declared_bytes(pool: PgPool) {
     assert_eq!(s.tenant_usage("t2").await.unwrap(), (0, 0), "nothing charged");
 }
 
-#[sqlx::test]
-async fn other_plane_bytes_count_against_the_same_cap(pool: PgPool) {
+#[weft_db_macros::test]
+async fn other_plane_bytes_count_against_the_same_cap(pool: Pool) {
     // The disk cap is one account-wide budget: bytes charged in ANOTHER plane
     // (here 95, via the source's account_used_bytes) shrink what this plane may
     // accept, and they are read UNDER THE LOCK inside begin/reserve, not
@@ -455,8 +457,8 @@ async fn other_plane_bytes_count_against_the_same_cap(pool: PgPool) {
     assert!(matches!(err, RuntimeStoreError::QuotaExceeded(_)), "{err:?}");
 }
 
-#[sqlx::test]
-async fn a_streaming_upload_that_crosses_the_cap_is_aborted(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_streaming_upload_that_crosses_the_cap_is_aborted(pool: Pool) {
     // Unknown-length stream: each part is charged as it is reserved. The
     // reservation that would cross the cap aborts the WHOLE upload: multipart
     // gone from the bucket, row gone, reservation freed.
@@ -479,8 +481,8 @@ async fn a_streaming_upload_that_crosses_the_cap_is_aborted(pool: PgPool) {
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
 }
 
-#[sqlx::test]
-async fn a_part_with_the_wrong_byte_count_is_rejected_by_the_signed_length(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_part_with_the_wrong_byte_count_is_rejected_by_the_signed_length(pool: Pool) {
     // The quota lock itself: the URL is signed for an exact size, so a body of
     // any other length is rejected by the bucket and nothing lands.
     let (s, bucket, _c) = store(&pool).await;
@@ -497,8 +499,8 @@ async fn a_part_with_the_wrong_byte_count_is_rejected_by_the_signed_length(pool:
     bucket.put_part(&parts[0].url, body(b"12345")).unwrap();
 }
 
-#[sqlx::test]
-async fn part_sizes_must_slice_the_declared_total_exactly(pool: PgPool) {
+#[weft_db_macros::test]
+async fn part_sizes_must_slice_the_declared_total_exactly(pool: Pool) {
     let (s, _bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let (key, _ps) = begin_via(&s, &w, &StorageScope::Project, "b", "f", None, &big(), Some(10))
@@ -514,8 +516,8 @@ async fn part_sizes_must_slice_the_declared_total_exactly(pool: PgPool) {
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
 }
 
-#[sqlx::test]
-async fn resume_re_presigns_exactly_the_missing_parts(pool: PgPool) {
+#[weft_db_macros::test]
+async fn resume_re_presigns_exactly_the_missing_parts(pool: Pool) {
     // Stream two parts; land only the second. Resume must offer exactly the
     // first (size preserved), and completing before it lands must fail loud.
     let (s, bucket, _c) = store(&pool).await;
@@ -558,8 +560,8 @@ async fn resume_re_presigns_exactly_the_missing_parts(pool: PgPool) {
     assert_eq!(&assembled[..part_size as usize], &head[..], "parts in order");
 }
 
-#[sqlx::test]
-async fn record_part_is_idempotent_and_rejects_unreserved_parts(pool: PgPool) {
+#[weft_db_macros::test]
+async fn record_part_is_idempotent_and_rejects_unreserved_parts(pool: Pool) {
     let (s, bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let (key, _ps) = begin_via(&s, &w, &StorageScope::Project, "b", "f", None, &big(), Some(3))
@@ -576,8 +578,8 @@ async fn record_part_is_idempotent_and_rejects_unreserved_parts(pool: PgPool) {
     s.complete_upload(&w, &key).await.unwrap();
 }
 
-#[sqlx::test]
-async fn abort_frees_the_reservation(pool: PgPool) {
+#[weft_db_macros::test]
+async fn abort_frees_the_reservation(pool: Pool) {
     // A declared upload charges at begin; abort must free the charge so the
     // tenant can immediately begin again under the same cap. Abort is
     // idempotent, and aborting a COMPLETED file is refused (delete instead).
@@ -604,8 +606,8 @@ async fn abort_frees_the_reservation(pool: PgPool) {
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
 }
 
-#[sqlx::test]
-async fn terminate_sweep_lingers_unkept_and_spares_kept(pool: PgPool) {
+#[weft_db_macros::test]
+async fn terminate_sweep_lingers_unkept_and_spares_kept(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     // two run files: one kept, one not.
@@ -637,8 +639,8 @@ async fn terminate_sweep_lingers_unkept_and_spares_kept(pool: PgPool) {
     assert!(matches!(get_via(&s, &bucket, &scratch_parsed, None).await, Err(RuntimeStoreError::NotFound(_))));
 }
 
-#[sqlx::test]
-async fn a_link_outlives_terminate_and_the_file_goes_after_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_link_outlives_terminate_and_the_file_goes_after_it(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let file = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "img", None, &big(), body(b"png"))
@@ -669,8 +671,8 @@ async fn a_link_outlives_terminate_and_the_file_goes_after_it(pool: PgPool) {
 /// for again within the window is the same link, for every asker, and a
 /// new one after it; each works at least as long as asked from when it
 /// was asked, and answers as a download of the file under its type.
-#[sqlx::test]
-async fn the_same_file_gets_the_same_link_within_its_window(pool: PgPool) {
+#[weft_db_macros::test]
+async fn the_same_file_gets_the_same_link_within_its_window(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let file = put_via(&s, &bucket, &w, &StorageScope::Project, "video/mp4", "clip.mp4", None, &big(), body(b"v"))
@@ -704,8 +706,8 @@ async fn the_same_file_gets_the_same_link_within_its_window(pool: PgPool) {
     ));
 }
 
-#[sqlx::test]
-async fn no_expiry_write_shortens_a_file_below_its_live_link(pool: PgPool) {
+#[weft_db_macros::test]
+async fn no_expiry_write_shortens_a_file_below_its_live_link(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     // A kept file on a SHORT keep TTL, carrying a LONG-lived link.
@@ -739,8 +741,8 @@ async fn no_expiry_write_shortens_a_file_below_its_live_link(pool: PgPool) {
     assert_eq!(expire(&s, &pool).await, 1, "past the link cover the file dies normally");
 }
 
-#[sqlx::test]
-async fn keep_then_expiry_sweep_reclaims_after_ttl(pool: PgPool) {
+#[weft_db_macros::test]
+async fn keep_then_expiry_sweep_reclaims_after_ttl(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let f = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "f", Some(KeepTtl::Secs { secs: 100 }), &big(), body(b"x"))
@@ -761,8 +763,8 @@ async fn keep_then_expiry_sweep_reclaims_after_ttl(pool: PgPool) {
     assert!(matches!(get_via(&s, &bucket, &parsed, None).await, Err(RuntimeStoreError::NotFound(_))));
 }
 
-#[sqlx::test]
-async fn keep_default_resolves_to_default_ttl(pool: PgPool) {
+#[weft_db_macros::test]
+async fn keep_default_resolves_to_default_ttl(pool: Pool) {
     let (s, bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let f = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "f", Some(KeepTtl::Default), &big(), body(b"x"))
@@ -772,8 +774,8 @@ async fn keep_default_resolves_to_default_ttl(pool: PgPool) {
     assert!(f.expires_at_unix.is_some());
 }
 
-#[sqlx::test]
-async fn keep_never_has_no_expiry(pool: PgPool) {
+#[weft_db_macros::test]
+async fn keep_never_has_no_expiry(pool: Pool) {
     // KeepTtl::Never must resolve to NO expiry (ttl None -> expires_at None), so a
     // "keep forever" file is never silently reclaimed by the expiry sweep.
     let (s, bucket, _c) = store(&pool).await;
@@ -785,8 +787,8 @@ async fn keep_never_has_no_expiry(pool: PgPool) {
     assert_eq!(f.expires_at_unix, None);
 }
 
-#[sqlx::test]
-async fn list_is_scoped_and_wipe_prefix_clears_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn list_is_scoped_and_wipe_prefix_clears_it(pool: Pool) {
     let (s, bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     put_via(&s, &bucket, &w, &StorageScope::Project, "b", "a", None, &big(), body(b"a")).await.unwrap();
@@ -802,8 +804,8 @@ async fn list_is_scoped_and_wipe_prefix_clears_it(pool: PgPool) {
     assert_eq!(s.tenant_usage("t1").await.unwrap().0, 1); // the run file remains
 }
 
-#[sqlx::test]
-async fn assemble_concatenates_existing_objects_into_an_asset(pool: PgPool) {
+#[weft_db_macros::test]
+async fn assemble_concatenates_existing_objects_into_an_asset(pool: Pool) {
     let (s, bucket, _c) = store(&pool).await;
     let w = acting("t1");
 
@@ -854,16 +856,12 @@ async fn assemble_concatenates_existing_objects_into_an_asset(pool: PgPool) {
         Err(RuntimeStoreError::Invalid(_))
     ));
     assert_eq!(s.list(prefix).await.unwrap().len(), 1, "only the first asset exists");
-    let pending: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM runtime_file WHERE status = 'pending'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let pending: i64 = pool.scalar("SELECT COUNT(*) FROM runtime_file WHERE status = 'pending'", &[]).await.unwrap();
     assert_eq!(pending, 0, "failed assembly left no reservation");
 }
 
-#[sqlx::test]
-async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: PgPool) {
+#[weft_db_macros::test]
+async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: Pool) {
     let (s, bucket, _c) = store(&pool).await;
     let w = acting("t1");
     let sha = sha256_hex(b"weft");
@@ -919,12 +917,12 @@ async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: Pg
     // begin is told so (the marked "ask again" refusal), not that the key
     // is being cleared: the asset lands in a moment, and the caller waits
     // for it by its hash.
-    sqlx::query("UPDATE runtime_file SET status = 'completing' WHERE key = $1").bind(&key).execute(&pool).await.unwrap();
+    pool.execute("UPDATE runtime_file SET status = 'completing' WHERE key = $1", &[&key]).await.unwrap();
     assert!(
         matches!(s.begin_upload(&w, &asset_spec(Some(sha_static)), &big()).await, Err(RuntimeStoreError::Completing(_))),
         "a begin that meets a completing upload of the same content is told to wait"
     );
-    sqlx::query("UPDATE runtime_file SET status = 'pending' WHERE key = $1").bind(&key).execute(&pool).await.unwrap();
+    pool.execute("UPDATE runtime_file SET status = 'pending' WHERE key = $1", &[&key]).await.unwrap();
 
     upload_parts(&s, &bucket, &w, &key, part_size, &bytes::Bytes::from_static(b"weft"), &big())
         .await
@@ -951,8 +949,8 @@ async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: Pg
 /// upload to it: bytes that hash to anything else are refused at complete,
 /// naming the file and both hashes, and leave neither a row nor an object,
 /// so the key is free for the right bytes, which then complete.
-#[sqlx::test]
-async fn an_asset_whose_bytes_are_not_its_hash_is_refused_and_leaves_nothing(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_asset_whose_bytes_are_not_its_hash_is_refused_and_leaves_nothing(pool: Pool) {
     let (s, bucket, _c) = store(&pool).await;
     let w = acting("t1");
     let sha = sha256_hex(b"weft");
@@ -976,7 +974,7 @@ async fn an_asset_whose_bytes_are_not_its_hash_is_refused_and_leaves_nothing(poo
     for named in ["assets/word.txt", sha.as_str(), sha256_hex(b"waft").as_str()] {
         assert!(why.contains(named), "the refusal names {named}: {why}");
     }
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_file").fetch_one(&pool).await.unwrap();
+    let rows: i64 = pool.scalar("SELECT COUNT(*) FROM runtime_file", &[]).await.unwrap();
     assert_eq!(rows, 0, "the refused upload left no row");
     assert!(bucket.keys().is_empty(), "the refused upload left no object: {:?}", bucket.keys());
     assert_eq!(s.tenant_usage("t1").await.unwrap(), (0, 0), "nothing is charged");
@@ -991,8 +989,8 @@ async fn an_asset_whose_bytes_are_not_its_hash_is_refused_and_leaves_nothing(poo
     assert_eq!(bucket.get(&object_key(&key)).await.unwrap().as_deref(), Some(&b"weft"[..]));
 }
 
-#[sqlx::test]
-async fn delete_removes_and_a_link_requires_the_file(pool: PgPool) {
+#[weft_db_macros::test]
+async fn delete_removes_and_a_link_requires_the_file(pool: Pool) {
     let (s, bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let f = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "f", None, &big(), body(b"x")).await.unwrap();
@@ -1052,8 +1050,8 @@ async fn asset_via(s: &RuntimeStore, bucket: &FakeObjectStore, tenant: &str, id:
     s.complete_upload(&caller, &key).await.unwrap()
 }
 
-#[sqlx::test]
-async fn asset_lifetime_keeps_current_and_expires_removed_files_after_last_access(pool: PgPool) {
+#[weft_db_macros::test]
+async fn asset_lifetime_keeps_current_and_expires_removed_files_after_last_access(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let old = asset_via(&s, &bucket, "t1", 1).await;
     let current = asset_via(&s, &bucket, "t1", 2).await;
@@ -1080,8 +1078,8 @@ async fn asset_lifetime_keeps_current_and_expires_removed_files_after_last_acces
     assert!(bucket.get(&object_key(&current.key)).await.unwrap().is_some());
 }
 
-#[sqlx::test]
-async fn an_asset_the_sync_never_publishes_expires_on_its_own(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_asset_the_sync_never_publishes_expires_on_its_own(pool: Pool) {
     // The build failed after the transfer: nothing ever referenced the
     // upload, so it counts down from completion. Publishing clears it.
     let (s, bucket, clock) = store(&pool).await;
@@ -1099,8 +1097,8 @@ async fn an_asset_the_sync_never_publishes_expires_on_its_own(pool: PgPool) {
     assert!(bucket.get(&object_key(&published.key)).await.unwrap().is_some());
 }
 
-#[sqlx::test]
-async fn asset_lifetime_removing_last_reference_and_restoring_it_are_both_supported(pool: PgPool) {
+#[weft_db_macros::test]
+async fn asset_lifetime_removing_last_reference_and_restoring_it_are_both_supported(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let file = asset_via(&s, &bucket, "t1", 1).await;
     let parsed = weft_core::storage::key::parse_key(&file.key).unwrap();
@@ -1120,8 +1118,8 @@ async fn asset_lifetime_removing_last_reference_and_restoring_it_are_both_suppor
 /// One content is one file per tenant: a second project storing it uploads
 /// nothing, the tenant pays for it once, and another tenant's copy of the
 /// same bytes is that tenant's own file.
-#[sqlx::test]
-async fn an_asset_is_stored_and_charged_once_per_tenant(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_asset_is_stored_and_charged_once_per_tenant(pool: Pool) {
     let (s, bucket, _) = store(&pool).await;
     let first = asset_via(&s, &bucket, "t1", 1).await;
     assert_eq!(first.key, asset_key("t1", 1));
@@ -1163,8 +1161,8 @@ async fn an_asset_is_stored_and_charged_once_per_tenant(pool: PgPool) {
 
 /// An asset lives while any project of its tenant references it: one
 /// project dropping it leaves it pinned, the last one starts its countdown.
-#[sqlx::test]
-async fn an_asset_lives_while_any_project_references_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_asset_lives_while_any_project_references_it(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let shared = asset_via(&s, &bucket, "t1", 1).await;
     let parsed = weft_core::storage::key::parse_key(&shared.key).unwrap();
@@ -1186,8 +1184,8 @@ async fn an_asset_lives_while_any_project_references_it(pool: PgPool) {
     assert!(bucket.get(&object_key(&shared.key)).await.unwrap().is_none());
 }
 
-#[sqlx::test]
-async fn asset_references_are_walled_by_tenant_and_preserve_node_selected_ttls(pool: PgPool) {
+#[weft_db_macros::test]
+async fn asset_references_are_walled_by_tenant_and_preserve_node_selected_ttls(pool: Pool) {
     let (s, bucket, _) = store(&pool).await;
     let own = asset_via(&s, &bucket, "t1", 1).await;
     let foreign = asset_via(&s, &bucket, "t2", 2).await;
@@ -1214,23 +1212,23 @@ async fn asset_references_are_walled_by_tenant_and_preserve_node_selected_ttls(p
 
 /// Wiping a whole tenant takes its asset references with its assets, so
 /// nothing is left claiming files that are gone.
-#[sqlx::test]
-async fn a_tenant_wipe_drops_its_asset_references(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_tenant_wipe_drops_its_asset_references(pool: Pool) {
     let (s, bucket, _) = store(&pool).await;
     let own = asset_via(&s, &bucket, "t1", 1).await;
     let other = asset_via(&s, &bucket, "t2", 1).await;
     s.set_asset_references("t1", "p1", std::slice::from_ref(&own.key), &[]).await.unwrap();
     s.set_asset_references("t2", "p1", std::slice::from_ref(&other.key), &[]).await.unwrap();
     assert_eq!(s.wipe_prefix("t1/").await.unwrap(), 1);
-    let left: Vec<String> = sqlx::query_scalar("SELECT key FROM asset_reference ORDER BY key").fetch_all(&pool).await.unwrap();
+    let left: Vec<String> = pool.scalars("SELECT key FROM asset_reference ORDER BY key", &[]).await.unwrap();
     assert_eq!(left, vec![other.key]);
 }
 
 /// A kept file (one an older version names) that is gone is reported,
 /// not fatal: the build's own file is pinned and the missing key comes
 /// back so the caller can say which version lost it.
-#[sqlx::test]
-async fn asset_lifetime_missing_kept_file_is_reported_and_pins_the_rest(pool: PgPool) {
+#[weft_db_macros::test]
+async fn asset_lifetime_missing_kept_file_is_reported_and_pins_the_rest(pool: Pool) {
     let (s, bucket, _) = store(&pool).await;
     let own = asset_via(&s, &bucket, "t1", 1).await;
     let gone = format!("t1/asset/{}", "f".repeat(64));
@@ -1240,8 +1238,8 @@ async fn asset_lifetime_missing_kept_file_is_reported_and_pins_the_rest(pool: Pg
     assert_eq!(s.meta(&parsed).await.unwrap().expires_at_unix, None, "the build's own file is pinned");
 }
 
-#[sqlx::test]
-async fn asset_lifetime_missing_current_file_does_not_retire_other_files(pool: PgPool) {
+#[weft_db_macros::test]
+async fn asset_lifetime_missing_current_file_does_not_retire_other_files(pool: Pool) {
     let (s, bucket, _) = store(&pool).await;
     let own = asset_via(&s, &bucket, "t1", 1).await;
     s.set_asset_references("t1", "p1", std::slice::from_ref(&own.key), &[]).await.unwrap();
@@ -1254,8 +1252,8 @@ async fn asset_lifetime_missing_current_file_does_not_retire_other_files(pool: P
     assert_eq!(s.meta(&parsed).await.unwrap().expires_at_unix, None);
 }
 
-#[sqlx::test]
-async fn a_lifetime_expires_a_project_file_like_a_kept_one(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_lifetime_expires_a_project_file_like_a_kept_one(pool: Pool) {
     // Expiry works in every scope a node writes: a project file stored with
     // a lifetime expires once nobody touched it for that long, an access
     // renews it, and it never carries the run-only keep flag.
@@ -1290,8 +1288,8 @@ async fn a_lifetime_expires_a_project_file_like_a_kept_one(pool: PgPool) {
     assert_eq!((cleared.keep_ttl_secs, cleared.expires_at_unix), (None, None));
 }
 
-#[sqlx::test]
-async fn an_asset_takes_no_node_lifetime(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_asset_takes_no_node_lifetime(pool: Pool) {
     let (s, _bucket, _c) = store(&pool).await;
     let w = acting("t1");
     let err = begin_via(&s, &w, &StorageScope::Asset, "b", "f", Some(KeepTtl::Default), &big(), Some(1))
@@ -1300,8 +1298,8 @@ async fn an_asset_takes_no_node_lifetime(pool: PgPool) {
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
 }
 
-#[sqlx::test]
-async fn replace_overwrites_the_file_in_place(pool: PgPool) {
+#[weft_db_macros::test]
+async fn replace_overwrites_the_file_in_place(pool: Pool) {
     // Same key, name, type and lifetime; new content and size. The old
     // bytes stay readable until the new ones land, the charge follows the
     // new size, and no second file is left behind.
@@ -1332,8 +1330,8 @@ async fn replace_overwrites_the_file_in_place(pool: PgPool) {
     assert_eq!(s.tenant_usage("t1").await.unwrap(), (1, 10), "one file, charged at its new size");
 }
 
-#[sqlx::test]
-async fn a_retried_replacement_complete_answers_with_the_replaced_file(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_retried_replacement_complete_answers_with_the_replaced_file(pool: Pool) {
     // The replacement's own row is gone once it folds, so the retry has
     // to find the file it became, at the version it made.
     let (s, bucket, _c) = store(&pool).await;
@@ -1394,12 +1392,12 @@ async fn completion_held(
     (task, release)
 }
 
-async fn status_of(pool: &PgPool, key: &str) -> Option<String> {
-    sqlx::query_scalar("SELECT status FROM runtime_file WHERE key = $1").bind(key).fetch_optional(pool).await.unwrap()
+async fn status_of(pool: &Pool, key: &str) -> Option<String> {
+    pool.scalar_opt("SELECT status FROM runtime_file WHERE key = $1", &[&key]).await.unwrap()
 }
 
-#[sqlx::test]
-async fn concurrent_completions_move_the_version_once(pool: PgPool) {
+#[weft_db_macros::test]
+async fn concurrent_completions_move_the_version_once(pool: Pool) {
     // The second complete arrives while the first is mid-way: it finds the
     // upload already gone from the bucket, reads the object, and folds; the
     // first then finds the fold done and answers with it.
@@ -1420,8 +1418,8 @@ async fn concurrent_completions_move_the_version_once(pool: PgPool) {
     assert_eq!(completes() - before, 1, "the bucket is never asked to complete an upload twice");
 }
 
-#[sqlx::test]
-async fn an_abort_during_a_completion_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_abort_during_a_completion_is_refused(pool: Pool) {
     // Once a completion has claimed the upload the bucket may already hold
     // its object: an abort then is refused instead of removing the row.
     let (s, bucket, _c) = store(&pool).await;
@@ -1442,8 +1440,8 @@ async fn an_abort_during_a_completion_is_refused(pool: PgPool) {
     assert_eq!(get_via(&s, &bucket, &parsed, None).await.unwrap().1, body(b"fresh"));
 }
 
-#[sqlx::test]
-async fn a_delete_during_a_replacement_completion_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_delete_during_a_replacement_completion_is_refused(pool: Pool) {
     let (s, bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let (f, key) = replacement_ready(&s, &bucket, &w, b"old", b"new").await;
@@ -1461,8 +1459,8 @@ async fn a_delete_during_a_replacement_completion_is_refused(pool: PgPool) {
     assert!(bucket.get(&object_key(&f.key)).await.unwrap().is_none(), "no object outlives its row");
 }
 
-#[sqlx::test]
-async fn a_resumed_reserve_during_a_completion_is_refused_at_once(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_resumed_reserve_during_a_completion_is_refused_at_once(pool: Pool) {
     // The completion holds no lock across the bucket call, so the tenant's
     // other uploads and this one's reservations never wait on it.
     let (s, bucket, _c) = store(&pool).await;
@@ -1484,8 +1482,8 @@ async fn a_resumed_reserve_during_a_completion_is_refused_at_once(pool: PgPool) 
     assert_eq!(task.await.unwrap().unwrap().size_bytes, 3);
 }
 
-#[sqlx::test]
-async fn a_dropped_completion_the_bucket_finished_is_recovered(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_dropped_completion_the_bucket_finished_is_recovered(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let (f, key) = replacement_ready(&s, &bucket, &w, b"old", b"new").await;
@@ -1506,8 +1504,8 @@ async fn a_dropped_completion_the_bucket_finished_is_recovered(pool: PgPool) {
     assert_eq!(s.complete_upload(&w, &key).await.unwrap().version, 2);
 }
 
-#[sqlx::test]
-async fn a_run_upload_landing_after_its_run_ended_lingers(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_run_upload_landing_after_its_run_ended_lingers(pool: Pool) {
     // The run ends while the upload is completing and the bucket is
     // unreachable for it; it lands later, and it carries
     // the same linger deadline as the run's other files.
@@ -1516,12 +1514,7 @@ async fn a_run_upload_landing_after_its_run_ended_lingers(pool: PgPool) {
     let (key, part_size) =
         begin_via(&s, &w, &StorageScope::Run, "b", "f", None, &big(), Some(3)).await.unwrap();
     upload_parts(&s, &bucket, &w, &key, part_size, &body(b"abc"), &big()).await.unwrap();
-    sqlx::query("UPDATE runtime_file SET status = 'completing', progressed_at_unix = $2 WHERE key = $1")
-        .bind(&key)
-        .bind(clock.now_unix())
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute("UPDATE runtime_file SET status = 'completing', progressed_at_unix = $2 WHERE key = $1", &[&key, &clock.now_unix()]).await.unwrap();
     let ended = clock.now_unix();
     bucket.fail_next_complete();
     sweep(&s, "t1", "c1").await;
@@ -1529,27 +1522,19 @@ async fn a_run_upload_landing_after_its_run_ended_lingers(pool: PgPool) {
     // Landed afterwards (a retried complete; the stale-claim sweep folds
     // the same way), it keeps the linger deadline the run's end stamped.
     s.complete_upload(&w, &key).await.unwrap();
-    let expires: Option<i64> = sqlx::query_scalar("SELECT expires_at_unix FROM runtime_file WHERE key = $1 AND status = 'active'")
-        .bind(&key)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let expires: Option<i64> =
+        pool.scalar("SELECT expires_at_unix FROM runtime_file WHERE key = $1 AND status = 'active'", &[&key]).await.unwrap();
     assert_eq!(expires, Some(ended + RUN_LINGER_TTL_SECS));
 }
 
-#[sqlx::test]
-async fn a_dropped_completion_before_the_bucket_is_recovered(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_dropped_completion_before_the_bucket_is_recovered(pool: Pool) {
     // Claimed, then the process died before asking the bucket: the sweep
     // finds the multipart still open and completes it.
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let key = upload_ready(&s, &bucket, &w, b"abc").await;
-    sqlx::query("UPDATE runtime_file SET status = 'completing', progressed_at_unix = $2 WHERE key = $1")
-        .bind(&key)
-        .bind(clock.now_unix())
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute("UPDATE runtime_file SET status = 'completing', progressed_at_unix = $2 WHERE key = $1", &[&key, &clock.now_unix()]).await.unwrap();
     clock.advance(Duration::from_secs(CLAIM_LEASE_SECS as u64 + 1));
     s.expire().await.unwrap();
     assert_eq!(status_of(&pool, &key).await.as_deref(), Some("active"));
@@ -1557,8 +1542,8 @@ async fn a_dropped_completion_before_the_bucket_is_recovered(pool: PgPool) {
     assert_eq!(get_via(&s, &bucket, &parsed, None).await.unwrap().1, body(b"abc"));
 }
 
-#[sqlx::test]
-async fn a_completion_the_bucket_cannot_account_for_is_ended(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_completion_the_bucket_cannot_account_for_is_ended(pool: Pool) {
     // The multipart is gone but no object of the right size is there (it
     // was aborted outside weft): the verdict is final, the upload is
     // reaped and its reservation freed. A replaced file whose object was
@@ -1568,17 +1553,8 @@ async fn a_completion_the_bucket_cannot_account_for_is_ended(pool: PgPool) {
     let (f, replacement) = replacement_ready(&s, &bucket, &w, b"old", b"newer").await;
     let fresh = upload_ready(&s, &bucket, &w, b"abc").await;
     for key in [&replacement, &fresh] {
-        let upload_id: String = sqlx::query_scalar("SELECT upload_id FROM runtime_file WHERE key = $1")
-            .bind(key)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE runtime_file SET status = 'completing', progressed_at_unix = $2 WHERE key = $1")
-            .bind(key)
-            .bind(clock.now_unix())
-            .execute(&pool)
-            .await
-            .unwrap();
+        let upload_id: String = pool.scalar("SELECT upload_id FROM runtime_file WHERE key = $1", &[key]).await.unwrap();
+        pool.execute("UPDATE runtime_file SET status = 'completing', progressed_at_unix = $2 WHERE key = $1", &[key, &clock.now_unix()]).await.unwrap();
         let object = if key == &fresh { object_key(key) } else { object_key(&f.key) };
         bucket.abort_multipart(&object, &upload_id).await.unwrap();
         assert!(matches!(s.complete_upload(&w, key).await, Err(RuntimeStoreError::Lost(_))));
@@ -1589,8 +1565,8 @@ async fn a_completion_the_bucket_cannot_account_for_is_ended(pool: PgPool) {
     assert_eq!(charged_bytes_for(&pool, "t1", clock.now_unix()).await.unwrap(), 3, "only the old file is charged");
 }
 
-#[sqlx::test]
-async fn a_refused_completion_stays_completing_until_the_sweep_ends_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_refused_completion_stays_completing_until_the_sweep_ends_it(pool: Pool) {
     // Never back to 'pending': another drive may be landing it. The live
     // caller hears "completing"; the expiry loop, its look booked at the
     // claim's lapse, gives the verdict with no call of the tenant's.
@@ -1616,8 +1592,8 @@ async fn a_refused_completion_stays_completing_until_the_sweep_ends_it(pool: PgP
     assert_eq!(charged_bytes_for(&pool, "t1", clock.now_unix()).await.unwrap(), 0);
 }
 
-#[sqlx::test]
-async fn a_size_mismatched_completion_removes_rows_before_bytes(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_size_mismatched_completion_removes_rows_before_bytes(pool: Pool) {
     // A part whose bytes differ from its reservation (only a bucket anomaly
     // could do it; here a direct part upload skips the signed length).
     let (s, bucket, clock) = store(&pool).await;
@@ -1633,8 +1609,8 @@ async fn a_size_mismatched_completion_removes_rows_before_bytes(pool: PgPool) {
     assert_eq!(charged_bytes_for(&pool, "t1", clock.now_unix()).await.unwrap(), 0);
 }
 
-#[sqlx::test]
-async fn an_abandoned_replacement_leaves_the_file_untouched(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_abandoned_replacement_leaves_the_file_untouched(pool: Pool) {
     // Aborted, or reaped by a sweep: the upload goes, the file it was
     // replacing keeps its object and its bytes.
     let (s, bucket, _c) = store(&pool).await;
@@ -1657,8 +1633,8 @@ async fn an_abandoned_replacement_leaves_the_file_untouched(pool: PgPool) {
     assert!(matches!(s.complete_upload(&w, &swept).await, Err(RuntimeStoreError::NotFound(_))));
 }
 
-#[sqlx::test]
-async fn an_edit_from_an_old_version_is_refused_and_one_write_runs_at_a_time(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_edit_from_an_old_version_is_refused_and_one_write_runs_at_a_time(pool: Pool) {
     let (s, bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let f = put_via(&s, &bucket, &w, &StorageScope::Project, "application/json", "chat.json", None, &big(), body(b"[]"))
@@ -1681,8 +1657,8 @@ async fn an_edit_from_an_old_version_is_refused_and_one_write_runs_at_a_time(poo
     assert_eq!(get_via(&s, &bucket, &parsed, None).await.unwrap().1, body(b"[1,2]"), "both writes landed, in order");
 }
 
-#[sqlx::test]
-async fn replace_refuses_what_it_cannot_overwrite(pool: PgPool) {
+#[weft_db_macros::test]
+async fn replace_refuses_what_it_cannot_overwrite(pool: Pool) {
     let (s, bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     // A file that is not there.
@@ -1704,8 +1680,8 @@ async fn replace_refuses_what_it_cannot_overwrite(pool: PgPool) {
     assert_eq!(s.tenant_usage("t1").await.unwrap(), (0, 0), "nothing is left charged");
 }
 
-#[sqlx::test]
-async fn an_in_flight_upload_is_invisible_until_completed(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_in_flight_upload_is_invisible_until_completed(pool: Pool) {
     // begin reserves a 'pending' row. Before complete, the file must NOT be
     // visible (not in list, get/presign 404) even though a row exists.
     let (s, bucket, _c) = store(&pool).await;
@@ -1725,8 +1701,8 @@ async fn an_in_flight_upload_is_invisible_until_completed(pool: PgPool) {
     assert_eq!(s.list(&prefix).await.unwrap().len(), 1, "completed file is listed");
 }
 
-#[sqlx::test]
-async fn upload_verbs_reject_a_key_begin_never_minted(pool: PgPool) {
+#[weft_db_macros::test]
+async fn upload_verbs_reject_a_key_begin_never_minted(pool: Pool) {
     // A worker cannot touch an upload the broker never opened: reserving,
     // recording, resuming, and completing an unknown key all fail loud.
     let (s, _bucket, _c) = store(&pool).await;
@@ -1742,8 +1718,8 @@ async fn upload_verbs_reject_a_key_begin_never_minted(pool: PgPool) {
     assert!(matches!(err, RuntimeStoreError::NotFound(_)), "{err:?}");
 }
 
-#[sqlx::test]
-async fn an_abandoned_upload_is_ended_by_the_expiry_loop_after_grace(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_abandoned_upload_is_ended_by_the_expiry_loop_after_grace(pool: Pool) {
     use weft_broker::runtime_store::PENDING_RESERVE_GRACE_SECS;
     let lapse = PART_LINK_SECS + PENDING_RESERVE_GRACE_SECS as u64;
     // A crashed upload: begin + land a part, never complete. The reservation
@@ -1778,8 +1754,8 @@ async fn an_abandoned_upload_is_ended_by_the_expiry_loop_after_grace(pool: PgPoo
     assert!(bucket.in_progress_uploads().is_empty(), "multipart aborted");
 }
 
-#[sqlx::test]
-async fn progress_defers_the_abandoned_reap(pool: PgPool) {
+#[weft_db_macros::test]
+async fn progress_defers_the_abandoned_reap(pool: Pool) {
     use weft_broker::runtime_store::PENDING_RESERVE_GRACE_SECS;
     // A slow but MOVING upload (parts keep landing) is never reaped mid-flight:
     // each reservation refreshes the progress clock the reap keys on.
@@ -1796,8 +1772,8 @@ async fn progress_defers_the_abandoned_reap(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
-async fn terminate_sweep_reaps_an_abandoned_run_upload(pool: PgPool) {
+#[weft_db_macros::test]
+async fn terminate_sweep_reaps_an_abandoned_run_upload(pool: Pool) {
     // The common case: an run-scoped upload crashes mid-flight. The terminate
     // sweep for that run aborts the multipart and frees everything
     // immediately (no grace).
@@ -1823,8 +1799,8 @@ async fn bytes_stream_helper_round_trips() {
     assert_eq!(out, b);
 }
 
-#[sqlx::test]
-async fn complete_retry_after_success_is_idempotent(pool: PgPool) {
+#[weft_db_macros::test]
+async fn complete_retry_after_success_is_idempotent(pool: Pool) {
     // A lost-response retry of complete on an already-finalized key returns
     // the existing metadata unchanged and never touches the object.
     let (s, bucket, _clock) = store(&pool).await;
@@ -1838,8 +1814,8 @@ async fn complete_retry_after_success_is_idempotent(pool: PgPool) {
     assert!(bucket.get(&object_key(&first.key)).await.unwrap().is_some(), "object untouched");
 }
 
-#[sqlx::test]
-async fn a_completed_file_is_immutable(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_completed_file_is_immutable(pool: Pool) {
     // No upload verb can touch a finalized file: its upload state is gone.
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
@@ -1854,8 +1830,8 @@ async fn a_completed_file_is_immutable(pool: PgPool) {
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
 }
 
-#[sqlx::test]
-async fn wipe_prefix_does_not_touch_a_sibling_run_id_prefix(pool: PgPool) {
+#[weft_db_macros::test]
+async fn wipe_prefix_does_not_touch_a_sibling_run_id_prefix(pool: Pool) {
     // The trailing-slash invariant the wall rests on: sweeping run `c1` must
     // never match a sibling run whose name merely starts with `c1`.
     let (s, bucket, _clock) = store(&pool).await;
@@ -1875,8 +1851,8 @@ async fn wipe_prefix_does_not_touch_a_sibling_run_id_prefix(pool: PgPool) {
     assert_eq!(s.meta(&sibling).await.unwrap().expires_at_unix, None, "sibling run c1x untouched");
 }
 
-#[sqlx::test]
-async fn concurrent_begins_cannot_blow_past_the_byte_cap(pool: PgPool) {
+#[weft_db_macros::test]
+async fn concurrent_begins_cannot_blow_past_the_byte_cap(pool: Pool) {
     // The byte-quota check and the reservation are atomic under the tenant
     // lock AT BEGIN: with a cap admitting only one of two declared uploads,
     // exactly one begin wins, before any byte could move.
@@ -1903,8 +1879,8 @@ async fn concurrent_begins_cannot_blow_past_the_byte_cap(pool: PgPool) {
     assert!(bytes <= 10, "charged {bytes} within the cap");
 }
 
-#[sqlx::test]
-async fn one_failing_row_does_not_block_the_others(pool: PgPool) {
+#[weft_db_macros::test]
+async fn one_failing_row_does_not_block_the_others(pool: Pool) {
     // A reap can keep failing (the bucket refuses one object). The fenced
     // three-step reap (row -> 'reaping', reap bucket, delete row) leaves a
     // residue nothing orphans: the object and a row still pointing at it,
@@ -1939,11 +1915,7 @@ async fn one_failing_row_does_not_block_the_others(pool: PgPool) {
     );
     assert_eq!(status_of(&pool, &fine.key).await, None, "the other expired file went");
     assert_eq!(status_of(&pool, &stuck.key).await.as_deref(), Some("reaping"));
-    let error: Option<String> = sqlx::query_scalar("SELECT reap_error FROM runtime_file WHERE key = $1")
-        .bind(&stuck.key)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let error: Option<String> = pool.scalar("SELECT reap_error FROM runtime_file WHERE key = $1", &[&stuck.key]).await.unwrap();
     assert!(error.unwrap().contains("injected delete failure"), "marked with why");
     // Nothing is orphaned, and the row is locked out of reads and keeps.
     assert!(bucket.keys().contains(&format!("runtime/{}", stuck.key)));
@@ -1952,11 +1924,8 @@ async fn one_failing_row_does_not_block_the_others(pool: PgPool) {
     let failing = |callee: &'static str| {
         let pool = pool.clone();
         async move {
-            sqlx::query_scalar::<_, String>("SELECT error FROM unanswered_call WHERE callee = $1")
-                .bind(callee)
-                .fetch_optional(&pool)
-                .await
-                .unwrap()
+            let error: Option<String> = pool.scalar_opt("SELECT error FROM unanswered_call WHERE callee = $1", &[&callee]).await.unwrap();
+            error
         }
     };
     let shown = failing("reaps:").await.expect("the failed reap is written down");
@@ -1983,18 +1952,13 @@ async fn one_failing_row_does_not_block_the_others(pool: PgPool) {
 /// A reap a call holds the claim of books the expiry loop's look at the
 /// claim's lapse, so a reap whose process died is finished then; a pass
 /// before the lapse leaves it to its call.
-#[sqlx::test]
-async fn a_live_reap_claim_books_a_look_at_its_lapse(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_live_reap_claim_books_a_look_at_its_lapse(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let f = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "f", None, &big(), body(b"xyz")).await.unwrap();
     // A reap fenced the row, then its process died.
-    sqlx::query("UPDATE runtime_file SET status = 'reaping', progressed_at_unix = $2 WHERE key = $1")
-        .bind(&f.key)
-        .bind(clock.now_unix())
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute("UPDATE runtime_file SET status = 'reaping', progressed_at_unix = $2 WHERE key = $1", &[&f.key, &clock.now_unix()]).await.unwrap();
     assert_eq!(
         s.expire().await.unwrap(),
         weft_task_store::drain::DrainStep::RetryIn(Duration::from_secs(CLAIM_LEASE_SECS as u64 + 1)),
@@ -2010,18 +1974,13 @@ async fn a_live_reap_claim_books_a_look_at_its_lapse(pool: PgPool) {
 /// while that call reaps it, and still books the look at the claim's
 /// lapse, so a call that dies mid-reap does not leave it waiting on an
 /// unrelated wake.
-#[sqlx::test]
-async fn a_failed_reap_taken_over_books_a_look_at_its_lapse(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_failed_reap_taken_over_books_a_look_at_its_lapse(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let f = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "f", None, &big(), body(b"xyz")).await.unwrap();
     // A reap failed and marked the row, then a call fenced it again and died.
-    sqlx::query("UPDATE runtime_file SET status = 'reaping', reap_error = 'the bucket refused', progressed_at_unix = $2 WHERE key = $1")
-        .bind(&f.key)
-        .bind(clock.now_unix())
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute("UPDATE runtime_file SET status = 'reaping', reap_error = 'the bucket refused', progressed_at_unix = $2 WHERE key = $1", &[&f.key, &clock.now_unix()]).await.unwrap();
     assert_eq!(
         s.expire().await.unwrap(),
         weft_task_store::drain::DrainStep::RetryIn(Duration::from_secs(CLAIM_LEASE_SECS as u64 + 1)),
@@ -2032,20 +1991,15 @@ async fn a_failed_reap_taken_over_books_a_look_at_its_lapse(pool: PgPool) {
 /// A wipe takes over a row whose reap failed at once, and fails naming a
 /// row another call is reaping right now instead of saying everything
 /// went.
-#[sqlx::test]
-async fn a_wipe_takes_a_failed_reap_and_fails_on_a_live_one(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_wipe_takes_a_failed_reap_and_fails_on_a_live_one(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let failed = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "failed", None, &big(), body(b"xyz")).await.unwrap();
     let live = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "live", None, &big(), body(b"xyz")).await.unwrap();
     bucket.fail_next_deletes(&format!("runtime/{}", failed.key), 1);
     assert!(s.delete(&weft_core::storage::key::parse_key(&failed.key).unwrap()).await.is_err(), "the bucket refused");
-    sqlx::query("UPDATE runtime_file SET status = 'reaping', progressed_at_unix = $2 WHERE key = $1")
-        .bind(&live.key)
-        .bind(clock.now_unix())
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute("UPDATE runtime_file SET status = 'reaping', progressed_at_unix = $2 WHERE key = $1", &[&live.key, &clock.now_unix()]).await.unwrap();
     let wiped = s.wipe_prefix("t1/").await.expect_err("a row another call is reaping is left");
     assert!(matches!(wiped, RuntimeStoreError::Completing(_)), "only a live claim is left: ask again: {wiped:?}");
     assert!(format!("{wiped:#}").contains("wiped 1 files") && format!("{wiped:#}").contains("1 another removal in progress holds"), "{wiped:#}");
@@ -2057,8 +2011,8 @@ async fn a_wipe_takes_a_failed_reap_and_fails_on_a_live_one(pool: PgPool) {
 /// A replacement landing on a file the expiry loop left out of its look
 /// (its replacement was completing) rings the loop, so the file's renewed
 /// expiry gets a look booked.
-#[sqlx::test]
-async fn a_replacement_landing_rings_the_expiry_loop(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_replacement_landing_rings_the_expiry_loop(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let f = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "f", Some(KeepTtl::Secs { secs: 10 }), &big(), body(b"old"))
@@ -2073,12 +2027,12 @@ async fn a_replacement_landing_rings_the_expiry_loop(pool: PgPool) {
         weft_task_store::drain::DrainStep::RetryIn(Duration::from_secs(CLAIM_LEASE_SECS as u64 + 1 - 11)),
         "the file is left out while it is replaced: the look is at the completion's lapse"
     );
-    let mut heard = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
-    heard.listen(weft_broker::runtime_store::FILE_EXPIRY_CHANNEL).await.unwrap();
+    let mut heard = Session::connect(pool.config()).await.unwrap();
+    heard.listen([weft_broker::runtime_store::FILE_EXPIRY_CHANNEL]).await.unwrap();
     release.send(()).unwrap();
     let replaced = task.await.unwrap().unwrap();
     assert_eq!(replaced.expires_at_unix, Some(clock.now_unix() + 10));
-    tokio::time::timeout(Duration::from_secs(10), heard.recv()).await.expect("rung").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), heard.notified()).await.expect("rung").unwrap();
     assert_eq!(
         s.expire().await.unwrap(),
         weft_task_store::drain::DrainStep::RetryIn(Duration::from_secs(11)),
@@ -2086,8 +2040,8 @@ async fn a_replacement_landing_rings_the_expiry_loop(pool: PgPool) {
     );
 }
 
-#[sqlx::test]
-async fn naming_a_part_twice_reserves_it_once(pool: PgPool) {
+#[weft_db_macros::test]
+async fn naming_a_part_twice_reserves_it_once(pool: Pool) {
     // Two publishes of the same content upload IDENTICAL bytes (the key is
     // the content's hash), and they used to each ask for "the next part",
     // between them reserve more parts than the file has, and both fail on a
@@ -2107,11 +2061,7 @@ async fn naming_a_part_twice_reserves_it_once(pool: PgPool) {
     assert_eq!(second[0].offset_bytes, 0);
     // One row, so the reserved total still slices the declared size and the
     // upload can be completed.
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_file_part WHERE key = $1")
-        .bind(&key)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let rows: i64 = pool.scalar("SELECT COUNT(*) FROM runtime_file_part WHERE key = $1", &[&key]).await.unwrap();
     assert_eq!(rows, 1, "asking twice reserved once");
 
     // Either URL lands the part, and the upload completes.
@@ -2121,8 +2071,8 @@ async fn naming_a_part_twice_reserves_it_once(pool: PgPool) {
     assert_eq!(meta.size_bytes, 9);
 }
 
-#[sqlx::test]
-async fn a_stream_part_is_charged_once_however_often_it_is_named(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_stream_part_is_charged_once_however_often_it_is_named(pool: Pool) {
     // A stream is charged per part as it is reserved, so a re-ask must not
     // charge again: a retry would otherwise inch the tenant's usage up every
     // time.
@@ -2136,8 +2086,8 @@ async fn a_stream_part_is_charged_once_however_often_it_is_named(pool: PgPool) {
     assert_eq!(s.tenant_usage("t1").await.unwrap().1, after_first, "charged once");
 }
 
-#[sqlx::test]
-async fn reserved_stream_part_size_cannot_change(pool: PgPool) {
+#[weft_db_macros::test]
+async fn reserved_stream_part_size_cannot_change(pool: Pool) {
     let (s, _bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let (key, part_size) = begin_via(&s, &w, &StorageScope::Project, "b", "stream", None, &big(), None).await.unwrap();
@@ -2149,8 +2099,8 @@ async fn reserved_stream_part_size_cannot_change(pool: PgPool) {
     assert_eq!(missing[0].size_bytes, 1);
 }
 
-#[sqlx::test]
-async fn known_size_parts_keep_their_offsets_when_reserved_out_of_order(pool: PgPool) {
+#[weft_db_macros::test]
+async fn known_size_parts_keep_their_offsets_when_reserved_out_of_order(pool: Pool) {
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let (key, part_size) = begin_via(&s, &w, &StorageScope::Project, "b", "large", None, &big(), Some(20 * 1024 * 1024)).await.unwrap();
@@ -2182,8 +2132,8 @@ async fn known_size_parts_keep_their_offsets_when_reserved_out_of_order(pool: Pg
 /// loop removes it: no read, list or identity lookup finds it, a keep or
 /// an access does not bring it back, and it counts for nothing against the
 /// tenant's quota or file cap.
-#[sqlx::test]
-async fn an_expired_file_is_gone_before_the_loop_removes_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_expired_file_is_gone_before_the_loop_removes_it(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let spec = UploadSpec {
@@ -2211,11 +2161,7 @@ async fn an_expired_file_is_gone_before_the_loop_removes_it(pool: PgPool) {
     assert!(s.list(&prefix).await.unwrap().is_empty(), "not listed");
     assert!(s.find_identity(&w, &StorageScope::Project, "source:1").await.unwrap().is_none(), "not found by identity");
     assert_eq!(s.tenant_usage("t1").await.unwrap(), (0, 0), "counted for nothing");
-    let expires: Option<i64> = sqlx::query_scalar("SELECT expires_at_unix FROM runtime_file WHERE key = $1")
-        .bind(&file.key)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let expires: Option<i64> = pool.scalar("SELECT expires_at_unix FROM runtime_file WHERE key = $1", &[&file.key]).await.unwrap();
     assert_eq!(expires, file.expires_at_unix, "nothing moved its expiry");
 
     // Storing the same source again takes its place.
@@ -2227,11 +2173,11 @@ async fn an_expired_file_is_gone_before_the_loop_removes_it(pool: PgPool) {
 /// The end of a run stamps its files' linger, which rings the expiry loop
 /// once (a later stamp is covered by that ring), and the loop's pass books
 /// its next look at the linger's end.
-#[sqlx::test]
-async fn a_linger_stamp_books_the_loop_at_its_end(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_linger_stamp_books_the_loop_at_its_end(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
-    let mut heard = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
-    heard.listen(weft_broker::runtime_store::FILE_EXPIRY_CHANNEL).await.unwrap();
+    let mut heard = Session::connect(pool.config()).await.unwrap();
+    heard.listen([weft_broker::runtime_store::FILE_EXPIRY_CHANNEL]).await.unwrap();
     for run in ["c1", "c2"] {
         let w = worker("t1", "p1", Some(run));
         put_via(&s, &bucket, &w, &StorageScope::Run, "b", "out", None, &big(), body(b"x")).await.unwrap();
@@ -2239,14 +2185,14 @@ async fn a_linger_stamp_books_the_loop_at_its_end(pool: PgPool) {
     // Starting an upload rings for the moment it would count as abandoned
     // (a part link's life plus the reserve grace, past the linger): heard
     // first, so the ring below is the linger stamp's own.
-    while tokio::time::timeout(Duration::from_millis(500), heard.recv()).await.is_ok() {}
+    while tokio::time::timeout(Duration::from_millis(500), heard.notified()).await.is_ok() {}
     assert_eq!(sweep(&s, "t1", "c1").await, (0, 1));
     let end = clock.now_unix() + RUN_LINGER_TTL_SECS;
-    tokio::time::timeout(Duration::from_secs(10), heard.recv()).await.expect("rung").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), heard.notified()).await.expect("rung").unwrap();
     clock.advance(Duration::from_secs(1));
     assert_eq!(sweep(&s, "t1", "c2").await, (0, 1));
     assert!(
-        tokio::time::timeout(Duration::from_millis(500), heard.recv()).await.is_err(),
+        tokio::time::timeout(Duration::from_millis(500), heard.notified()).await.is_err(),
         "a later linger end is covered by the first ring"
     );
     assert_eq!(
@@ -2258,8 +2204,8 @@ async fn a_linger_stamp_books_the_loop_at_its_end(pool: PgPool) {
 
 /// A link handed out for a lingering file keeps the file past the linger
 /// for as long as the link lives.
-#[sqlx::test]
-async fn a_link_keeps_a_lingering_file_for_its_life(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_link_keeps_a_lingering_file_for_its_life(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let file = put_via(&s, &bucket, &w, &StorageScope::Run, "b", "out", None, &big(), body(b"x")).await.unwrap();
@@ -2346,8 +2292,8 @@ async fn slot_upload_via(
 /// An upload through a slot waits, unread by anyone, until a run receives
 /// it: then it is that run's file in the slot's scope, the same run asking
 /// again gets the same file, and another run is refused.
-#[sqlx::test]
-async fn a_slots_upload_is_received_once(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_slots_upload_is_received_once(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let ends = clock.now_unix() + 3600;
     let (key, _) = slot_upload_via(&s, &bucket, "s1", ends, MP4, None).await;
@@ -2370,8 +2316,8 @@ async fn a_slots_upload_is_received_once(pool: PgPool) {
 }
 
 /// Two runs receiving the same upload at once: exactly one gets it.
-#[sqlx::test]
-async fn two_runs_at_once_receive_a_slots_upload_once(pool: PgPool) {
+#[weft_db_macros::test]
+async fn two_runs_at_once_receive_a_slots_upload_once(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let ends = clock.now_unix() + 3600;
     slot_upload_via(&s, &bucket, "s1", ends, MP4, None).await;
@@ -2384,8 +2330,8 @@ async fn two_runs_at_once_receive_a_slots_upload_once(pool: PgPool) {
 
 /// A run-scoped slot's upload becomes a file of the run that receives it,
 /// copied inside the bucket, and the upload it came from goes.
-#[sqlx::test]
-async fn a_run_scoped_upload_moves_into_the_run(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_run_scoped_upload_moves_into_the_run(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let ends = clock.now_unix() + 3600;
     let (key, _) = slot_upload_via(&s, &bucket, "s1", ends, MP4, None).await;
@@ -2401,8 +2347,8 @@ async fn a_run_scoped_upload_moves_into_the_run(pool: PgPool) {
 }
 
 /// An upload nobody receives goes when its slot ends.
-#[sqlx::test]
-async fn an_unreceived_upload_goes_with_its_slot(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_unreceived_upload_goes_with_its_slot(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let ends = clock.now_unix() + 100;
     slot_upload_via(&s, &bucket, "s1", ends, MP4, None).await;
@@ -2417,8 +2363,8 @@ async fn an_unreceived_upload_goes_with_its_slot(pool: PgPool) {
 
 /// Bytes that are not what the slot accepts are refused as they land,
 /// and the upload goes.
-#[sqlx::test]
-async fn an_upload_of_another_type_is_refused_and_goes(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_upload_of_another_type_is_refused_and_goes(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let ends = clock.now_unix() + 3600;
     let refused = typed_slot_upload(&s, &bucket, "s1", ends, "Video", "video/mp4", b"just some text, not a video").await;
@@ -2434,8 +2380,8 @@ async fn an_upload_of_another_type_is_refused_and_goes(pool: PgPool) {
 /// loop's drive, which holds it to the slot's type just as the page's complete
 /// does: bytes that are not what the slot accepts never wait to be
 /// received, and the upload goes.
-#[sqlx::test]
-async fn a_slot_upload_landed_by_a_drive_is_held_to_its_type(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_slot_upload_landed_by_a_drive_is_held_to_its_type(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let ends = clock.now_unix() + 3600;
     let page = worker("t1", "p1", None);
@@ -2472,8 +2418,8 @@ async fn a_slot_upload_landed_by_a_drive_is_held_to_its_type(pool: PgPool) {
 /// Content weft hashed itself is matched when a page states the same
 /// sha256: the upload is made from it inside the bucket and no part is
 /// sent. A hash nobody computed matches nothing.
-#[sqlx::test]
-async fn the_same_content_is_not_uploaded_twice(pool: PgPool) {
+#[weft_db_macros::test]
+async fn the_same_content_is_not_uploaded_twice(pool: Pool) {
     use sha2::Digest;
     let (s, bucket, clock) = store(&pool).await;
     let ends = clock.now_unix() + 3600;
@@ -2500,8 +2446,8 @@ async fn the_same_content_is_not_uploaded_twice(pool: PgPool) {
 
 /// A copy is made inside the bucket into the asked scope, a new file with
 /// the source's name, type and bytes.
-#[sqlx::test]
-async fn a_copy_is_a_new_file_made_inside_the_bucket(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_copy_is_a_new_file_made_inside_the_bucket(pool: Pool) {
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let source = put_via(&s, &bucket, &w, &StorageScope::Run, "image/png", "a.png", None, &big(), body(b"PNG!")).await.unwrap();
@@ -2551,8 +2497,8 @@ async fn typed_slot_upload(
 /// none: one refused slot (named as the call sent it) leaves the others
 /// open, with no copy left of a run-scoped one, for a corrected call. A
 /// slot named twice is one file.
-#[sqlx::test]
-async fn a_claim_of_several_slots_receives_all_or_none(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_claim_of_several_slots_receives_all_or_none(pool: Pool) {
     use weft_broker::runtime_store::ClaimedSlot;
     let (s, bucket, clock) = store(&pool).await;
     let ends = clock.now_unix() + 3600;
@@ -2580,8 +2526,8 @@ async fn a_claim_of_several_slots_receives_all_or_none(pool: PgPool) {
 
 /// An empty file has no first bytes to read: a slot that takes any file
 /// lands it, and one that takes only images refuses it.
-#[sqlx::test]
-async fn an_empty_slot_upload_lands_for_any_file_and_is_refused_for_an_image(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_empty_slot_upload_lands_for_any_file_and_is_refused_for_an_image(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let ends = clock.now_unix() + 3600;
     let (key, claims) = typed_slot_upload(&s, &bucket, "s1", ends, "File", "", b"").await.unwrap();
@@ -2594,8 +2540,8 @@ async fn an_empty_slot_upload_lands_for_any_file_and_is_refused_for_an_image(poo
 /// A file that does not fit the place it is sent to is refused before it
 /// is received: the slot stays open, and a call sending it where it fits
 /// receives it (a container as the half the place takes).
-#[sqlx::test]
-async fn a_claim_into_a_place_the_file_does_not_fit_leaves_the_slot_open(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_claim_into_a_place_the_file_does_not_fit_leaves_the_slot_open(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let ends = clock.now_unix() + 3600;
     let (key, claims) = typed_slot_upload(&s, &bucket, "s1", ends, "Media", "video/mp4", MP4).await.unwrap();
@@ -2609,8 +2555,8 @@ async fn a_claim_into_a_place_the_file_does_not_fit_leaves_the_slot_open(pool: P
 /// A begin or a check through a slot is refused past the slot's largest,
 /// and past the largest file the store takes, before anything is
 /// reserved; a check reserves nothing either way.
-#[sqlx::test]
-async fn a_slot_refuses_a_file_heavier_than_it_takes(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_slot_refuses_a_file_heavier_than_it_takes(pool: Pool) {
     let (s, _bucket, clock) = store(&pool).await;
     let page = worker("t1", "p1", None);
     let slot = weft_broker::runtime_store::SlotUpload { sid: "s1", ends_unix: clock.now_unix() + 3600, max_bytes: 10, accepts: "Video", sha256: None };
@@ -2638,8 +2584,8 @@ async fn a_slot_refuses_a_file_heavier_than_it_takes(pool: PgPool) {
 
 /// A copy is of a stored file only: an upload still on its way up, or one
 /// waiting to be received, is not one.
-#[sqlx::test]
-async fn a_copy_of_a_file_not_stored_yet_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_copy_of_a_file_not_stored_yet_is_refused(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let (pending, _) = begin_via(&s, &w, &StorageScope::Project, "image/png", "a.png", None, &big(), Some(4)).await.unwrap();
@@ -2653,8 +2599,8 @@ async fn a_copy_of_a_file_not_stored_yet_is_refused(pool: PgPool) {
 
 /// A copy that lands another size than the source's is ended: nothing
 /// stays stored or reserved for it.
-#[sqlx::test]
-async fn a_copy_of_another_size_than_reserved_is_ended(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_copy_of_another_size_than_reserved_is_ended(pool: Pool) {
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let source = put_via(&s, &bucket, &w, &StorageScope::Run, "image/png", "a.png", None, &big(), body(b"PNG!")).await.unwrap();
@@ -2665,15 +2611,15 @@ async fn a_copy_of_another_size_than_reserved_is_ended(pool: PgPool) {
 }
 
 /// A copy whose bucket copy fails leaves no row and no reserved bytes.
-#[sqlx::test]
-async fn a_failed_bucket_copy_leaves_nothing_behind(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_failed_bucket_copy_leaves_nothing_behind(pool: Pool) {
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let source = put_via(&s, &bucket, &w, &StorageScope::Run, "image/png", "a.png", None, &big(), body(b"PNG!")).await.unwrap();
     bucket.delete(&object_key(&source.key)).await.unwrap();
     let parsed = weft_core::storage::key::parse_key(&source.key).unwrap();
     assert!(s.copy_file(&w, &parsed, &StorageScope::Project, None, None, &big()).await.is_err());
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_file").fetch_one(&pool).await.unwrap();
+    let rows: i64 = pool.scalar("SELECT COUNT(*) FROM runtime_file", &[]).await.unwrap();
     assert_eq!(rows, 1, "only the source's row");
     assert_eq!(s.tenant_usage("t1").await.unwrap(), (1, 4));
 }
@@ -2681,8 +2627,8 @@ async fn a_failed_bucket_copy_leaves_nothing_behind(pool: PgPool) {
 /// A copy is charged like any file: one past the quota is refused, and
 /// one naming an identity the scope holds answers that file and copies
 /// nothing.
-#[sqlx::test]
-async fn a_copy_is_held_to_the_quota_and_to_its_identity(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_copy_is_held_to_the_quota_and_to_its_identity(pool: Pool) {
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let source = put_via(&s, &bucket, &w, &StorageScope::Run, "image/png", "a.png", None, &big(), body(b"PNG!")).await.unwrap();
@@ -2702,8 +2648,8 @@ async fn a_copy_is_held_to_the_quota_and_to_its_identity(pool: PgPool) {
 
 /// A copy carries the source's content hash: the same bytes, matched by
 /// a later page sending them.
-#[sqlx::test]
-async fn a_copy_keeps_the_content_hash(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_copy_keeps_the_content_hash(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let (uploaded, _) = slot_upload_via(&s, &bucket, "s1", clock.now_unix() + 3600, MP4, None).await;
     s.hash_upload(&uploaded).await.unwrap();
@@ -2714,11 +2660,8 @@ async fn a_copy_keeps_the_content_hash(pool: PgPool) {
     let hash = |key: String| {
         let pool = pool.clone();
         async move {
-            sqlx::query_scalar::<_, Option<String>>("SELECT content_sha256 FROM runtime_file WHERE key = $1")
-                .bind(key)
-                .fetch_one(&pool)
-                .await
-                .unwrap()
+            let hash: Option<String> = pool.scalar("SELECT content_sha256 FROM runtime_file WHERE key = $1", &[&key]).await.unwrap();
+            hash
         }
     };
     let source_hash = hash(received.key.clone()).await;
@@ -2729,8 +2672,8 @@ async fn a_copy_keeps_the_content_hash(pool: PgPool) {
 /// A run asking again for a file it received is handed it only where it
 /// fits as the type it was received as: one file is one type, so a
 /// container received as audio is refused for a video place.
-#[sqlx::test]
-async fn a_received_file_asked_for_again_is_held_to_its_type(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_received_file_asked_for_again_is_held_to_its_type(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let ends = clock.now_unix() + 3600;
     let (key, claims) = typed_slot_upload(&s, &bucket, "s1", ends, "Media", "video/mp4", MP4).await.unwrap();
@@ -2749,8 +2692,8 @@ async fn a_received_file_asked_for_again_is_held_to_its_type(pool: PgPool) {
 /// A check through a slot whose upload is already on its way up, or
 /// landed, is accepted whatever the tenant's caps: the begin carries on
 /// with that upload and reserves nothing new.
-#[sqlx::test]
-async fn a_check_on_a_slot_that_holds_an_upload_is_accepted(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_check_on_a_slot_that_holds_an_upload_is_accepted(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let ends = clock.now_unix() + 3600;
     slot_upload_via(&s, &bucket, "s1", ends, MP4, None).await;
@@ -2889,7 +2832,7 @@ impl ObjectStore for HeldCopyBucket {
 }
 
 /// [`store`] over a bucket whose copies a test can pause.
-async fn store_with_held_copies(pool: &PgPool) -> (Arc<RuntimeStore>, Arc<HeldCopyBucket>, Arc<FakeObjectStore>, Arc<FakeClock>) {
+async fn store_with_held_copies(pool: &Pool) -> (Arc<RuntimeStore>, Arc<HeldCopyBucket>, Arc<FakeObjectStore>, Arc<FakeClock>) {
     let (_, inner, clock) = store(pool).await;
     let bucket = Arc::new(HeldCopyBucket { inner: inner.clone(), hold: Default::default() });
     (Arc::new(RuntimeStore::new(pool.clone(), bucket.clone(), clock.clone())), bucket, inner, clock)
@@ -2898,8 +2841,8 @@ async fn store_with_held_copies(pool: &PgPool) -> (Arc<RuntimeStore>, Arc<HeldCo
 /// While a copy fills its upload, the upload is claimed: a page beginning
 /// its slot again is told it is completing, never handed the multipart
 /// the copy aborted.
-#[sqlx::test]
-async fn a_slot_begun_again_while_its_copy_runs_is_told_it_is_completing(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_slot_begun_again_while_its_copy_runs_is_told_it_is_completing(pool: Pool) {
     use sha2::Digest;
     let (s, held, bucket, clock) = store_with_held_copies(&pool).await;
     let ends = clock.now_unix() + 3600;
@@ -2935,8 +2878,8 @@ async fn a_slot_begun_again_while_its_copy_runs_is_told_it_is_completing(pool: P
 /// A copy whose upload was ended while it ran (its claim lapsed and the
 /// expiry loop took the copy for dead) deletes the object it made: no object
 /// stays that no row points at.
-#[sqlx::test]
-async fn a_copy_whose_upload_was_reaped_while_it_ran_leaves_nothing(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_copy_whose_upload_was_reaped_while_it_ran_leaves_nothing(pool: Pool) {
     let (s, held, bucket, clock) = store_with_held_copies(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let source = put_via(&s, &bucket, &w, &StorageScope::Run, "image/png", "a.png", None, &big(), body(b"PNG!")).await.unwrap();
@@ -2953,20 +2896,20 @@ async fn a_copy_whose_upload_was_reaped_while_it_ran_leaves_nothing(pool: PgPool
     let (copied, ()) = tokio::join!(held.running(s.copy_file(&w, &parsed, &StorageScope::Project, None, None, &ents)), meanwhile);
     assert!(copied.is_err(), "{copied:?}");
     assert_eq!(bucket.keys(), vec![object_key(&source.key)], "only the source's object");
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_file").fetch_one(&pool).await.unwrap();
+    let rows: i64 = pool.scalar("SELECT COUNT(*) FROM runtime_file", &[]).await.unwrap();
     assert_eq!(rows, 1, "only the source's row");
 }
 
 /// A copy whose upload a drive landed while it ran (the claim lapsed and
 /// the expiry loop found the copy whole) answers the file that drive landed,
 /// with the source's content hash.
-#[sqlx::test]
-async fn a_copy_landed_by_a_drive_while_it_ran_answers_that_file(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_copy_landed_by_a_drive_while_it_ran_answers_that_file(pool: Pool) {
     let (s, held, bucket, clock) = store_with_held_copies(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let source = put_via(&s, &bucket, &w, &StorageScope::Run, "image/png", "a.png", None, &big(), body(b"PNG!")).await.unwrap();
     let hash = "ab".repeat(32);
-    sqlx::query("UPDATE runtime_file SET content_sha256 = $2 WHERE key = $1").bind(&source.key).bind(&hash).execute(&pool).await.unwrap();
+    pool.execute("UPDATE runtime_file SET content_sha256 = $2 WHERE key = $1", &[&source.key, &hash]).await.unwrap();
     let parsed = weft_core::storage::key::parse_key(&source.key).unwrap();
     let (entered, release) = held.hold_next_copy(CopyHold::After);
     let meanwhile = async {
@@ -2982,15 +2925,15 @@ async fn a_copy_landed_by_a_drive_while_it_ran_answers_that_file(pool: PgPool) {
     assert_eq!((copy.size_bytes, copy.mime_type.as_str()), (4, "image/png"));
     assert_eq!(bucket.get(&object_key(&copy.key)).await.unwrap().as_deref(), Some(&b"PNG!"[..]));
     let copied_hash: Option<String> =
-        sqlx::query_scalar("SELECT content_sha256 FROM runtime_file WHERE key = $1").bind(&copy.key).fetch_one(&pool).await.unwrap();
+        pool.scalar("SELECT content_sha256 FROM runtime_file WHERE key = $1", &[&copy.key]).await.unwrap();
     assert_eq!(copied_hash.as_deref(), Some(hash.as_str()));
 }
 
 /// A copy that keeps reporting pieces done keeps its claim: each report
 /// renews the claim's stamp, so an expiry pass a whole lease after the copy
 /// began, and less than one after its last report, leaves it running.
-#[sqlx::test]
-async fn a_copy_that_keeps_reporting_progress_is_never_taken_for_dead(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_copy_that_keeps_reporting_progress_is_never_taken_for_dead(pool: Pool) {
     let (s, held, bucket, clock) = store_with_held_copies(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let source = put_via(&s, &bucket, &w, &StorageScope::Run, "image/png", "a.png", None, &big(), body(b"PNG!")).await.unwrap();
@@ -3000,11 +2943,9 @@ async fn a_copy_that_keeps_reporting_progress_is_never_taken_for_dead(pool: PgPo
     let copy_row = || {
         let (pool, source) = (pool.clone(), source.key.clone());
         async move {
-            sqlx::query_as::<_, (String, i64)>("SELECT status, progressed_at_unix FROM runtime_file WHERE key <> $1")
-                .bind(source)
-                .fetch_one(&pool)
-                .await
-                .unwrap()
+            let row: (String, i64) =
+                pool.one("SELECT status, progressed_at_unix FROM runtime_file WHERE key <> $1", &[&source]).await.unwrap();
+            row
         }
     };
     let meanwhile = async {
@@ -3043,8 +2984,8 @@ fn slot_spec<'a>(filename: &'a str, size: u64, sha256: Option<&'a str>, ends: i6
 /// A slot carries on only with the file it holds: begun or checked again
 /// for another file (another name, size, or stated sha256 than the one
 /// weft hashed), it is refused, naming the file it holds.
-#[sqlx::test]
-async fn a_slot_begun_again_for_another_file_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_slot_begun_again_for_another_file_is_refused(pool: Pool) {
     use sha2::Digest;
     let (s, bucket, clock) = store(&pool).await;
     let ends = clock.now_unix() + 3600;
@@ -3067,8 +3008,8 @@ async fn a_slot_begun_again_for_another_file_is_refused(pool: PgPool) {
 /// A run-scoped claim holds its slot's upload while it copies it into the
 /// run: the slot ending meanwhile waits for the claim, which lands the
 /// file, and the upload it came from goes.
-#[sqlx::test]
-async fn a_slot_ending_while_a_run_claim_copies_waits_for_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_slot_ending_while_a_run_claim_copies_waits_for_it(pool: Pool) {
     let (s, held, bucket, clock) = store_with_held_copies(&pool).await;
     let ends = clock.now_unix() + 100;
     let (upload, _) = slot_upload_via(&s, &bucket, "s1", ends, MP4, None).await;
@@ -3097,8 +3038,8 @@ async fn a_slot_ending_while_a_run_claim_copies_waits_for_it(pool: PgPool) {
 /// then lands is deleted, even while the ended copy's row is still being
 /// removed: the slot's upload stays, and a call again receives it into a
 /// copy of its own at once.
-#[sqlx::test]
-async fn a_run_claim_whose_copy_was_ended_leaves_nothing_and_the_slot_open(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_run_claim_whose_copy_was_ended_leaves_nothing_and_the_slot_open(pool: Pool) {
     let (s, held, bucket, clock) = store_with_held_copies(&pool).await;
     let ends = clock.now_unix() + 3600;
     let (upload, _) = slot_upload_via(&s, &bucket, "s1", ends, MP4, None).await;
@@ -3134,16 +3075,16 @@ async fn a_run_claim_whose_copy_was_ended_leaves_nothing_and_the_slot_open(pool:
 }
 
 /// The key of the row of a run's copy of `upload` being made.
-async fn copy_of(pool: &PgPool, upload: &str) -> String {
-    sqlx::query_scalar("SELECT key FROM runtime_file WHERE receives = $1").bind(upload).fetch_one(pool).await.unwrap()
+async fn copy_of(pool: &Pool, upload: &str) -> String {
+    pool.scalar("SELECT key FROM runtime_file WHERE receives = $1", &[&upload]).await.unwrap()
 }
 
 /// A run-scoped claim whose broker died mid-copy leaves the row of its
 /// copy, which holds the slot's upload. The expiry loop books a look at
 /// the copy's lapse and, with no tenant call at all, ends the copy then;
 /// the upload, its slot over, goes in the same pass, and nothing is left.
-#[sqlx::test]
-async fn a_run_copy_whose_claim_died_is_ended_by_the_expiry_loop(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_run_copy_whose_claim_died_is_ended_by_the_expiry_loop(pool: Pool) {
     let (s, held, bucket, clock) = store_with_held_copies(&pool).await;
     let ends = clock.now_unix() + 100;
     let (upload, _) = slot_upload_via(&s, &bucket, "s1", ends, MP4, None).await;
@@ -3173,8 +3114,8 @@ async fn a_run_copy_whose_claim_died_is_ended_by_the_expiry_loop(pool: PgPool) {
 /// An upload landing while the claim copies another slot's upload, after
 /// the claim looked at it, is copied in a second round of the same call:
 /// the claim receives both, and never answers to call again.
-#[sqlx::test]
-async fn a_run_claim_receives_an_upload_that_landed_while_it_copied(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_run_claim_receives_an_upload_that_landed_while_it_copied(pool: Pool) {
     let (s, held, bucket, clock) = store_with_held_copies(&pool).await;
     let ends = clock.now_unix() + 3600;
     let (first, _) = slot_upload_via(&s, &bucket, "s1", ends, MP4, None).await;
@@ -3221,8 +3162,8 @@ async fn a_run_claim_receives_an_upload_that_landed_while_it_copied(pool: PgPool
 /// copy of their own: the first to commit receives the slot, the other
 /// answers that same file (its copy failed as the upload went under it)
 /// and removes its own copy. Neither fails.
-#[sqlx::test]
-async fn a_run_claiming_a_slot_twice_at_once_gets_one_file(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_run_claiming_a_slot_twice_at_once_gets_one_file(pool: Pool) {
     let (s, held, bucket, clock) = store_with_held_copies(&pool).await;
     let ends = clock.now_unix() + 3600;
     let (upload, _) = slot_upload_via(&s, &bucket, "s1", ends, MP4, None).await;
@@ -3239,7 +3180,7 @@ async fn a_run_claiming_a_slot_twice_at_once_gets_one_file(pool: PgPool) {
     let (held_claim, first) = tokio::join!(held.running(claim_one(&s, &run, &claims, &video)), meanwhile);
     assert_eq!(held_claim.unwrap().key, first.key, "the same file");
     assert_eq!(bucket.keys(), vec![object_key(&first.key)], "only the received file's object");
-    let rows: Vec<String> = sqlx::query_scalar("SELECT key FROM runtime_file").fetch_all(&pool).await.unwrap();
+    let rows: Vec<String> = pool.scalars("SELECT key FROM runtime_file", &[]).await.unwrap();
     assert_eq!(rows, vec![first.key.clone()], "only the received file's row");
     assert_eq!(status_of(&pool, &upload).await, None);
 }
@@ -3247,8 +3188,8 @@ async fn a_run_claiming_a_slot_twice_at_once_gets_one_file(pool: PgPool) {
 /// A reap the bucket refuses for good leaves its row marked: still
 /// charged and shown in `weft status`, and with no look booked for it, so
 /// the expiry loop never wakes for it, however often a pass runs.
-#[sqlx::test]
-async fn a_marked_reap_that_keeps_failing_books_no_look(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_marked_reap_that_keeps_failing_books_no_look(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let f = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "f", None, &big(), body(b"xyz")).await.unwrap();
@@ -3266,8 +3207,8 @@ async fn a_marked_reap_that_keeps_failing_books_no_look(pool: PgPool) {
 /// once each: one the bucket now removes frees the space and the begin
 /// goes through; one it still refuses leaves the begin refused, tried
 /// only once.
-#[sqlx::test]
-async fn a_begin_over_quota_retries_a_marked_reap_once(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_begin_over_quota_retries_a_marked_reap_once(pool: Pool) {
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let tight = budget(Entitlement::from_disk_bytes(5));
@@ -3287,8 +3228,8 @@ async fn a_begin_over_quota_retries_a_marked_reap_once(pool: PgPool) {
 /// A wipe takes a marked row at once, goes on past a row whose reap the
 /// bucket refuses, and names that row (with the bucket's words) apart from
 /// one another call is removing right now.
-#[sqlx::test]
-async fn a_wipe_goes_past_a_failing_reap_and_names_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_wipe_goes_past_a_failing_reap_and_names_it(pool: Pool) {
     let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let file = |name: &'static str| {
@@ -3299,12 +3240,7 @@ async fn a_wipe_goes_past_a_failing_reap_and_names_it(pool: PgPool) {
     bucket.fail_next_deletes(&object_key(&marked.key), 1);
     assert!(s.delete(&weft_core::storage::key::parse_key(&marked.key).unwrap()).await.is_err(), "the bucket refused");
     bucket.fail_next_deletes(&object_key(&refusing.key), 1);
-    sqlx::query("UPDATE runtime_file SET status = 'reaping', progressed_at_unix = $2 WHERE key = $1")
-        .bind(&live.key)
-        .bind(clock.now_unix())
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute("UPDATE runtime_file SET status = 'reaping', progressed_at_unix = $2 WHERE key = $1", &[&live.key, &clock.now_unix()]).await.unwrap();
     let wiped = s.wipe_prefix("t1/").await.expect_err("two rows are left");
     assert!(matches!(wiped, RuntimeStoreError::RemovalIncomplete(_)), "{wiped:?}");
     let wiped = format!("{wiped:#}");
@@ -3312,7 +3248,7 @@ async fn a_wipe_goes_past_a_failing_reap_and_names_it(pool: PgPool) {
     assert!(wiped.contains("1 the storage bucket refused to remove") && wiped.contains(&refusing.key), "{wiped}");
     assert!(!wiped.contains("injected delete failure"), "the bucket's words stay off the answer: {wiped}");
     let why: Option<String> =
-        sqlx::query_scalar("SELECT reap_error FROM runtime_file WHERE key = $1").bind(&refusing.key).fetch_one(&pool).await.unwrap();
+        pool.scalar("SELECT reap_error FROM runtime_file WHERE key = $1", &[&refusing.key]).await.unwrap();
     assert!(why.is_some_and(|w| w.contains("injected delete failure")), "kept on the row");
     assert!(wiped.contains("1 another removal in progress holds"), "{wiped}");
     assert_eq!((status_of(&pool, &marked.key).await, status_of(&pool, &fine.key).await), (None, None));
@@ -3323,8 +3259,8 @@ async fn a_wipe_goes_past_a_failing_reap_and_names_it(pool: PgPool) {
 /// A claim copying several run-scoped slots holds one lease for all its
 /// copies: a small copy finished first is renewed while a long one after
 /// it runs, so the expiry loop never ends it, and the claim receives both.
-#[sqlx::test]
-async fn a_run_claim_of_several_slots_holds_every_copy_while_one_runs(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_run_claim_of_several_slots_holds_every_copy_while_one_runs(pool: Pool) {
     let (s, held, bucket, clock) = store_with_held_copies(&pool).await;
     let ends = clock.now_unix() + 3600;
     slot_upload_via(&s, &bucket, "s1", ends, MP4, None).await;
@@ -3352,7 +3288,7 @@ async fn a_run_claim_of_several_slots_holds_every_copy_while_one_runs(pool: PgPo
         clock.advance(Duration::from_secs(CLAIM_LEASE_SECS as u64 - 1));
         s.expire().await.unwrap();
         let copying: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM runtime_file WHERE status = 'completing'").fetch_one(&pool).await.unwrap();
+            pool.scalar("SELECT COUNT(*) FROM runtime_file WHERE status = 'completing'", &[]).await.unwrap();
         assert_eq!(copying, 2, "both copies are still held");
         second_done.send(()).unwrap();
     };
@@ -3367,8 +3303,8 @@ async fn a_run_claim_of_several_slots_holds_every_copy_while_one_runs(pool: PgPo
 /// Resuming an upload signs fresh part links, and a PUT may start on them
 /// until they die: the resume is progress, so the upload is not abandoned
 /// a lapse after its last reservation but a lapse after the resume.
-#[sqlx::test]
-async fn a_resume_defers_the_abandoned_reap(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_resume_defers_the_abandoned_reap(pool: Pool) {
     use weft_broker::runtime_store::PENDING_RESERVE_GRACE_SECS;
     let lapse = PART_LINK_SECS + PENDING_RESERVE_GRACE_SECS as u64;
     let (s, _bucket, clock) = store(&pool).await;
@@ -3388,8 +3324,8 @@ async fn a_resume_defers_the_abandoned_reap(pool: PgPool) {
 /// A delete the bucket refuses says so in its own kind of answer (the
 /// file is gone from listings, marked in `weft status`), and deleting the
 /// same key again tries its removal again.
-#[sqlx::test]
-async fn a_delete_the_bucket_refuses_says_so_and_deleting_again_retries(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_delete_the_bucket_refuses_says_so_and_deleting_again_retries(pool: Pool) {
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let f = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "f", None, &big(), body(b"xyz")).await.unwrap();
@@ -3406,8 +3342,8 @@ async fn a_delete_the_bucket_refuses_says_so_and_deleting_again_retries(pool: Pg
 /// A begin short of space retries its tenant's marked reaps in order and
 /// stops at the first the bucket still refuses: the rest are left for a
 /// later need, untried.
-#[sqlx::test]
-async fn a_begin_over_quota_stops_at_the_first_refused_marked_reap(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_begin_over_quota_stops_at_the_first_refused_marked_reap(pool: Pool) {
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let tight = budget(Entitlement { disk_bytes_cap: 7, file_cap: 10 });
@@ -3430,8 +3366,8 @@ async fn a_begin_over_quota_stops_at_the_first_refused_marked_reap(pool: PgPool)
 /// The end-of-run sweep answers a row the bucket refuses among its
 /// refused instead of failing (the row stays marked, the one record of it
 /// in `weft status`), and the next sweep of that run retries it.
-#[sqlx::test]
-async fn a_sweep_answers_a_refused_row_and_the_next_sweep_retries_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_sweep_answers_a_refused_row_and_the_next_sweep_retries_it(pool: Pool) {
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let (key, _) = begin_via(&s, &w, &StorageScope::Run, "b", "f", None, &big(), Some(6)).await.unwrap();
@@ -3443,7 +3379,7 @@ async fn a_sweep_answers_a_refused_row_and_the_next_sweep_retries_it(pool: PgPoo
     assert!(swept.refused.len() == 1 && swept.refused[0].contains(&key), "{:?}", swept.refused);
     assert_eq!(status_of(&pool, &key).await.as_deref(), Some("reaping"), "left marked");
     let shown: Option<String> =
-        sqlx::query_scalar("SELECT error FROM unanswered_call WHERE callee = 'reaps:'").fetch_optional(&pool).await.unwrap();
+        pool.scalar_opt("SELECT error FROM unanswered_call WHERE callee = 'reaps:'", &[]).await.unwrap();
     assert!(shown.is_some_and(|e| e.contains(&key)), "the one record of it");
     assert_eq!(sweep(&s, "t1", "c1").await, (1, 0), "retried and removed");
     assert_eq!(status_of(&pool, &key).await, None);
@@ -3452,8 +3388,8 @@ async fn a_sweep_answers_a_refused_row_and_the_next_sweep_retries_it(pool: PgPoo
 /// A pass over many rows that marks a row and then meets a database error
 /// still writes the marked row down for `weft status` before it answers
 /// the error: a marked row books no look, so nothing else would soon.
-#[sqlx::test]
-async fn a_pass_that_marks_then_fails_still_records_the_mark(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_pass_that_marks_then_fails_still_records_the_mark(pool: Pool) {
     let (s, bucket, _clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let a = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "a", None, &big(), body(b"xyz")).await.unwrap();
@@ -3462,26 +3398,24 @@ async fn a_pass_that_marks_then_fails_still_records_the_mark(pool: PgPool) {
     // then fencing the second meets a database error.
     let (first, second) = if a.key < b.key { (a, b) } else { (b, a) };
     bucket.fail_next_deletes(&object_key(&first.key), 1);
-    sqlx::query(
+    pool.batch_execute(
         "CREATE FUNCTION weft_test_refuse() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'staged database error'; END $$ \
          LANGUAGE plpgsql",
     )
-    .execute(&pool)
     .await
     .unwrap();
-    sqlx::query(&format!(
+    pool.batch_execute(&format!(
         "CREATE TRIGGER weft_test_refuse BEFORE UPDATE ON runtime_file FOR EACH ROW \
          WHEN (NEW.key = '{}' AND NEW.status = 'reaping') EXECUTE FUNCTION weft_test_refuse()",
         second.key
     ))
-    .execute(&pool)
     .await
     .unwrap();
     let wiped = s.wipe_prefix("t1/").await;
     assert!(matches!(wiped, Err(RuntimeStoreError::Other(_))), "{wiped:?}");
     assert_eq!(status_of(&pool, &first.key).await.as_deref(), Some("reaping"), "marked");
     let shown: Option<String> =
-        sqlx::query_scalar("SELECT error FROM unanswered_call WHERE callee = 'reaps:'").fetch_optional(&pool).await.unwrap();
+        pool.scalar_opt("SELECT error FROM unanswered_call WHERE callee = 'reaps:'", &[]).await.unwrap();
     assert!(shown.is_some_and(|e| e.contains(&first.key)), "the mark is written down");
 }
 
@@ -3489,8 +3423,8 @@ async fn a_pass_that_marks_then_fails_still_records_the_mark(pool: PgPool) {
 /// tenant), its version and its birth; the same copy begun again is
 /// already there; anything else under the key is refused. Only the
 /// tenant's copying caller may name a key like that.
-#[sqlx::test]
-async fn a_copied_file_keeps_its_key_version_and_birth(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_copied_file_keeps_its_key_version_and_birth(pool: Pool) {
     use weft_broker::runtime_store::ImportedFile;
     let (s, bucket, _clock) = store(&pool).await;
     let copying = CallerAuth::Copying { tenant: "t2".into() };
@@ -3524,4 +3458,52 @@ async fn a_copied_file_keeps_its_key_version_and_birth(pool: PgPool) {
     let other = s.begin_upload(&copying, &spec(4, bytes.len() as u64), &big()).await.unwrap_err();
     assert!(matches!(&other, RuntimeStoreError::Conflict(why) if why.contains("weft files rm")), "{other:?}");
     assert!(bucket.in_progress_uploads().is_empty(), "a refused begin leaves no upload open");
+}
+
+// ---------- a busy database before the first write ----------
+
+/// A store on `pool`'s database whose one connection the test can hold,
+/// on the same bucket and clock: a call through it that finds the
+/// connection taken gets none within a second.
+async fn on_one_connection(pool: &Pool, bucket: &Arc<FakeObjectStore>, clock: &Arc<FakeClock>) -> (RuntimeStore, Pool) {
+    let one = Pool::open(pool.config().clone(), 1, Duration::from_secs(1), weft_task_store::db::Waits::Expected);
+    (RuntimeStore::new(one.clone(), bucket.clone(), clock.clone()), one)
+}
+
+/// A claim of a page's upload that cannot get its first connection has
+/// done nothing, and says so (sent again, it receives the upload); so
+/// does an upload under an identity that cannot look for an expired file
+/// of it first.
+#[weft_db_macros::test]
+async fn a_claim_or_an_identity_upload_with_no_first_connection_says_nothing_was_done(pool: Pool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let ends = clock.now_unix() + 3600;
+    let (upload, _) = slot_upload_via(&s, &bucket, "s1", ends, MP4, None).await;
+    let into_run = slot_claims("s1", StorageScope::Run, ends);
+    let video = fits("Video");
+    let run = worker("t1", "p1", Some("c1"));
+    let (busy, one) = on_one_connection(&pool, &bucket, &clock).await;
+
+    let taken = one.get().await.unwrap();
+    let refused = claim_one(&busy, &run, &into_run, &video).await;
+    assert!(matches!(refused, Err(RuntimeStoreError::BeforeWrites(_))), "{refused:?}");
+    let spec = UploadSpec {
+        scope: &StorageScope::Project,
+        mime: "b",
+        filename: "f",
+        keep: None,
+        declared_size: Some(3),
+        content_hash: None,
+        identity: Some("source:1"),
+        slot: None,
+        imported: None,
+    };
+    let begun = busy.begin_upload(&run, &spec, &big()).await;
+    assert!(matches!(begun, Err(RuntimeStoreError::BeforeWrites(_))), "{begun:?}");
+    assert_eq!(status_of(&pool, &upload).await.as_deref(), Some("uploaded"), "the slot is still open");
+    assert_eq!(bucket.keys(), vec![object_key(&upload)], "no copy was made");
+
+    drop(taken);
+    let received = claim_one(&busy, &run, &into_run, &video).await.unwrap();
+    assert_ne!(received.key, upload, "sent again, it receives the run's own copy");
 }

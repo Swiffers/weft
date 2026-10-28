@@ -279,16 +279,10 @@ pub async fn picks_move(state: &DispatcherState, actor: &Actor, project: uuid::U
 /// `project` (an empty refusal when nothing), asked before a deploy so its
 /// activation is not where the gaps are found. `program` is the caller's
 /// own compile, since it is asked before the install has built it.
-pub async fn picks_check(
-    state: &DispatcherState,
-    actor: &Actor,
-    project: uuid::Uuid,
-    program: &weft_core::ProjectDefinition,
-) -> Result<weft_core::run_spec::Refusal, Refused> {
-    operator_only(actor, "weft.picks.check")?;
+pub async fn picks_kept(state: &DispatcherState, actor: &Actor, project: uuid::Uuid) -> Result<weft_core::picks::Kept, Refused> {
+    operator_only(actor, "weft.picks.kept")?;
     actor.may_act_on(state, project).await?;
-    let gaps = crate::install_picks::activation_picks(state, project, program).await?;
-    Ok(gaps.err().unwrap_or_default())
+    crate::install_picks::kept(state, project).await
 }
 
 // ---- signal tokens ----------------------------------------------------

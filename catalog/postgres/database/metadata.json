@@ -59,7 +59,7 @@
       "type": "String",
       "default": "1Gi",
       "label": "Memory",
-      "description": "Memory, a number followed by Gi, Mi, G or M (`1Gi`). Sized with `cpu`; a local install does not cap the container."
+      "description": "Memory, a number followed by Gi, Mi, G or M (`1Gi`). It takes at least 886Mi, the least that holds the 20 connections one worker of the program opens. Sized with `cpu`. Postgres is set up for it: 320Mi stays with the machine and the rest is Postgres's, so at 1Gi it takes 24 connections, at 2Gi 60, at 4Gi 132 (200 at most). Each worker of the program opens up to 20, so a second worker or an outside client (a frontend) beside one wants 2Gi. If the database is killed for running out of memory, or refuses a connection with `too many clients`, raise `memory`. A local install uses the same settings and caps the container the same way."
     },
     {
       "name": "machineType",

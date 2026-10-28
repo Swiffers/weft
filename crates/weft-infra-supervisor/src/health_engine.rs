@@ -180,6 +180,23 @@ pub fn evaluate_node_health(
     NodeDecision { next, desired_status, event }
 }
 
+/// Pure: the restart this look saw of a unit (`seen`, the host's latest
+/// one) that its row does not hold yet (`recorded`), to write onto the
+/// unit once; `None` when there is none or the row holds it already. A
+/// restart is told from the next by when it stopped, so a cause the host
+/// reads differently at a later look (its memory of why is gone) does not
+/// rewrite it, and nothing is written at the looks in between.
+pub fn restart_to_record(
+    seen: Option<&weft_platform_traits::UnitRestart>,
+    recorded: Option<&weft_core::infra::LastRestart>,
+) -> Option<weft_core::infra::LastRestart> {
+    let seen = seen?;
+    if recorded.is_some_and(|r| r.at_unix == seen.stopped_at_unix) {
+        return None;
+    }
+    Some(weft_core::infra::LastRestart { at_unix: seen.stopped_at_unix, cause: seen.cause.clone() })
+}
+
 fn secs(d: Duration) -> i64 {
     i64::try_from(d.as_secs()).unwrap_or(i64::MAX)
 }
@@ -372,6 +389,7 @@ mod tests {
             image_refs: Default::default(),
             not_ready_since_unix: None,
             ready_since_unix: Some(T),
+            last_restart: None,
         };
         assert_eq!(
             NodeHealthState::of(&unit),
@@ -479,6 +497,28 @@ mod tests {
             assert_eq!(r.event, edge, "at T+{}", at - T);
             s = r.next;
         }
+    }
+
+    // ---------- restart_to_record: once per restart ----------
+
+    /// A restart is written the first time a look sees it, and never at
+    /// the looks after, even when the host no longer knows why it
+    /// happened; the next one is written again.
+    #[test]
+    fn a_restart_is_recorded_once() {
+        use weft_core::infra::{LastRestart, RestartCause};
+        let seen = |at: i64, cause: RestartCause| weft_platform_traits::UnitRestart { container: "pg".into(), stopped_at_unix: at, cause, count: 1 };
+        let oom = LastRestart { at_unix: T, cause: RestartCause::OutOfMemory };
+        assert_eq!(restart_to_record(None, None), None, "no restart");
+        assert_eq!(restart_to_record(None, Some(&oom)), None, "a restart the host no longer reports stays as recorded");
+        assert_eq!(restart_to_record(Some(&seen(T, RestartCause::OutOfMemory)), None), Some(oom.clone()), "first seen");
+        assert_eq!(restart_to_record(Some(&seen(T, RestartCause::OutOfMemory)), Some(&oom)), None, "seen again");
+        assert_eq!(restart_to_record(Some(&seen(T, RestartCause::Unknown)), Some(&oom)), None, "the same restart, its cause forgotten");
+        assert_eq!(
+            restart_to_record(Some(&seen(T + 60, RestartCause::Exited { code: 1 })), Some(&oom)),
+            Some(LastRestart { at_unix: T + 60, cause: RestartCause::Exited { code: 1 } }),
+            "the next one"
+        );
     }
 
     // ---------- observe_unit: unknown vs vanished ----------

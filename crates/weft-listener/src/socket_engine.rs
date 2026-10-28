@@ -242,7 +242,7 @@ pub fn spawn(
                                 // and the fire path may be slower.
                                 for rule in &plan.replies {
                                     if let Some(frame) = rule.reply_to(&payload) {
-                                        if let Err(e) = write.send(Message::Text(frame)).await {
+                                        if let Err(e) = write.send(Message::Text(frame.into())).await {
                                             warn!(target: "weft_listener::socket_engine", kind = target, error = %e, "reply send failed");
                                         }
                                     }
@@ -277,7 +277,7 @@ pub fn spawn(
 pub fn inbound_payload(msg: Message) -> Option<Value> {
     use base64::Engine as _;
     match msg {
-        Message::Text(t) => Some(crate::kinds::event_source::coerce_text_payload(t)),
+        Message::Text(t) => Some(crate::kinds::event_source::coerce_text_payload(t.as_str())),
         Message::Binary(b) => Some(Value::String(
             base64::engine::general_purpose::STANDARD.encode(b),
         )),

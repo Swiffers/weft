@@ -8,7 +8,6 @@
 //! literal frames and reply rules in the spec.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -51,7 +50,7 @@ impl KindHandler for SocketListenHandler {
     async fn spawn_task(
         &self,
         spec: &SignalSpec,
-        _kind_state: &Value,
+        _stored: super::RowState,
         ctx: SpawnCtx,
     ) -> Result<Option<JoinHandle<()>>> {
         let cfg: SocketListen = serde_json::from_value(spec.config.clone())
@@ -59,18 +58,11 @@ impl KindHandler for SocketListenHandler {
         let access = spec.access.clone();
         let fire = ctx.fire.clone();
         let prepare_ctx = ctx.clone();
-        // Every cycle after the first follows a connection that failed or
-        // dropped: where an infra endpoint is, is asked again.
-        let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let prepare = Box::new(move || {
             let cfg = cfg.clone();
             let access = access.clone();
             let ctx = prepare_ctx.clone();
-            let again = !first.swap(false, std::sync::atomic::Ordering::Relaxed);
             async move {
-                if again {
-                    crate::infra_address::unreached(&cfg.url, &ctx);
-                }
                 let plan = prepare_cycle(&cfg, &access, &ctx).await;
                 if let Err(PrepareError::Fatal(e)) = &plan {
                     ctx.fire.give_up(&format!("{e:#}")).await;
@@ -146,7 +138,7 @@ async fn prepare_cycle(
     };
 
     let url = match (&cfg.minted.connect, access) {
-        (None, _) => crate::infra_address::for_listener(&cfg.url, ctx).await.map_err(PrepareError::Transient)?,
+        (None, _) => cfg.url.clone(),
         (Some(_), Some(_)) => socket_engine::mint_signed_in(&cfg.minted, &values, fresh, ctx).await?,
         (Some(_), None) => socket_engine::mint_socket_url(&cfg.minted, &values).await?,
     };
@@ -174,7 +166,8 @@ fn prepare_frame(
     Ok(Some(match frame {
         SocketFrame::Text { body } => Message::Text(
             interpolate_frame(body, values)
-                .map_err(|e| PrepareError::Fatal(anyhow::anyhow!(e)))?,
+                .map_err(|e| PrepareError::Fatal(anyhow::anyhow!(e)))?
+                .into(),
         ),
         SocketFrame::Binary { base64 } => {
             let bytes = base64::engine::general_purpose::STANDARD
@@ -184,7 +177,7 @@ fn prepare_frame(
                         "socket_listen binary frame is not valid base64: {e}"
                     ))
                 })?;
-            Message::Binary(bytes)
+            Message::Binary(bytes.into())
         }
     }))
 }
@@ -237,6 +230,6 @@ mod tests {
             inbound_payload(Message::Text("hello".into())).unwrap(),
             Value::String("hello".into())
         );
-        assert!(inbound_payload(Message::Ping(vec![])).is_none());
+        assert!(inbound_payload(Message::Ping(Default::default())).is_none());
     }
 }

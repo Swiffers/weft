@@ -25,7 +25,7 @@
 //! so it is picked up again the moment it is back. A pass that fails is
 //! logged with its folder, and the next change tries again. A folder this
 //! machine can never hear changes in (a Windows drive under WSL,
-//! `weft_core::working_copy::unsyncable_folder`) is said once and never
+//! `weft_core::working_copy::hears_no_changes`) is said once and never
 //! watched.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,7 +40,7 @@ use tokio::time::Instant;
 use weft_assets::sync::{sync_folder, FolderCopies, FolderCopy, Notice, Synced};
 use weft_assets::tree::{walk_takes, HashCache};
 use weft_core::project::coverage::is_conflict_copy;
-use weft_core::working_copy::{on_wsl, unsyncable_folder, WorkingCopyId};
+use weft_core::working_copy::{hears_no_changes, on_wsl, WorkingCopyId};
 
 /// How long a folder stays quiet after a change before its pass: long
 /// enough that a burst of saves is one pass, short enough that a save is
@@ -203,13 +203,16 @@ impl Service {
 
     /// Start keeping one folder.
     fn keep(&mut self, copy: FolderCopy) {
-        let refused = unsyncable_folder(&copy.root.to_string_lossy(), on_wsl());
-        let watch = match &refused {
-            Some(why) => {
-                tracing::error!(target: "weft_platform_local::folders", copy = %copy.id, folder = %copy.root.display(), "{why}");
+        let watch = match hears_no_changes(&copy.root.to_string_lossy(), on_wsl()) {
+            true => {
+                tracing::error!(
+                    target: "weft_platform_local::folders", copy = %copy.id, folder = %copy.root.display(),
+                    "the folder is on a Windows drive, and WSL tells Linux nothing of the changes made there, so it is not \
+                     kept in sync with its working copy; move the project into the Linux filesystem (under ~/, for example)"
+                );
                 None
             }
-            None => match self.watcher(&copy) {
+            false => match self.watcher(&copy) {
                 Ok(watcher) => Some(Watch { watcher, dirs: BTreeSet::new() }),
                 Err(e) => {
                     tracing::error!(target: "weft_platform_local::folders", copy = %copy.id, folder = %copy.root.display(), error = %format!("{e:#}"), "could not watch the folder; it is not kept in sync");

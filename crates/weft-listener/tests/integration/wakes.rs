@@ -64,7 +64,7 @@ struct Queue {
     down: std::sync::atomic::AtomicBool,
 }
 
-async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queue: Arc<Queue>, asked: Arc<std::sync::atomic::AtomicUsize>) -> String {
+async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queue: Arc<Queue>) -> String {
     use axum::routing::post;
     use std::sync::atomic::Ordering;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -194,23 +194,6 @@ async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queu
                 }
             }),
         )
-        // An address on a `wi-` host is an infra endpoint, reached on the
-        // same port of the machine; every other is reached as it is. Each
-        // ask is counted.
-        .route(
-            "/v1/infra/listener-address",
-            post(move |axum::Json(req): axum::Json<Value>| {
-                let asked = asked.clone();
-                async move {
-                    asked.fetch_add(1, Ordering::SeqCst);
-                    let authority = req["authority"].as_str().unwrap();
-                    axum::Json(match authority.strip_prefix("wi-").and_then(|a| a.split_once(':')) {
-                        Some((_, port)) => json!({ "authority": format!("127.0.0.1:{port}"), "is_infra": true }),
-                        None => json!({ "authority": authority, "is_infra": false }),
-                    })
-                }
-            }),
-        )
         // A signal given up on, as `held_signals::give_up` writes it: only
         // the registration it names, and its holder lets go.
         .route(
@@ -235,7 +218,7 @@ async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queu
                 let get_held = get_held.clone();
                 async move {
                     get_held.reads.fetch_add(1, Ordering::SeqCst);
-                    let failing = get_held.failing.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+                    let failing = get_held.failing.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
                     if failing.is_ok() {
                         return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
                     }
@@ -254,7 +237,7 @@ async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queu
                 let landing = landing.clone();
                 let writes = writes.clone();
                 async move {
-                    if writes.failing_writes.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+                    if writes.failing_writes.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
                         return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
                     }
                     let mut rows = rows.lock().unwrap();
@@ -288,8 +271,6 @@ struct Rig {
     rows: Rows,
     landing: Landing,
     get_held: Arc<GetHeld>,
-    /// How often the listener asked where an address is.
-    asked: Arc<std::sync::atomic::AtomicUsize>,
     /// The fake broker's address.
     broker: String,
 }
@@ -320,20 +301,19 @@ async fn rig(holds_here: bool) -> Rig {
     let landing: Landing = Arc::default();
     let get_held: Arc<GetHeld> = Arc::default();
     let queue = Arc::new(Queue::default());
-    let asked: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
-    let broker = spawn_broker(rows.clone(), landing.clone(), get_held.clone(), queue.clone(), asked.clone()).await;
+    let broker = spawn_broker(rows.clone(), landing.clone(), get_held.clone(), queue.clone()).await;
     let tasks = Arc::new(FakeTasks::default());
     let doors = Arc::new(FakeDoors::default());
     let alarm = Arc::new(FakeAlarm::new());
     let state = ListenerState::new(
-        ListenerConfig { replica: "test-listener".into(), holds_here, prefer_push: false },
+        ListenerConfig { replica: "test-listener".into(), holds_here, holders: weft_listener::Holders::OnThisMachine },
         tasks.clone(),
         link(&broker),
         alarm.clone(),
         doors.clone(),
         holders(),
     );
-    Rig { state, tasks, doors, queue, alarm, rows, landing, get_held, asked, broker }
+    Rig { state, tasks, doors, queue, alarm, rows, landing, get_held, broker }
 }
 
 fn identity(token: &str, spec: weft_core::primitive::SignalSpec) -> SignalIdentity {
@@ -367,7 +347,7 @@ fn now_ms() -> i64 {
 /// A wake for `token` at `due_at_ms` that carries nothing: it reads the
 /// row, as a wake set before registrations were numbered does.
 fn due(token: &str, due_at_ms: i64) -> WakeBody {
-    WakeBody { token: token.into(), due_at_ms, generation: None, set_again: 0, row: None, addresses: Default::default(), ended: false }
+    WakeBody { token: token.into(), due_at_ms, generation: None, set_again: 0, row: None, ended: false }
 }
 
 /// The last wake the alarm was asked to set for `token`, as the listener
@@ -971,23 +951,18 @@ fn cancel_request(spec: weft_core::primitive::SignalSpec) -> weft_core::signal::
     weft_core::signal::listener_protocol::CancelCallRequest { token: "wait".into(), tenant_id: "tenant-a".into(), for_instance: None, spec }
 }
 
-/// The last call goes once, with its verb and body, to the address the
-/// listener reaches it at, through the listener's own door. An infra
-/// endpoint's address is asked of the broker like a poll's is.
+/// The last call goes once, with its verb and body, to the address it
+/// names, through the listener's own door.
 #[tokio::test]
 async fn a_cancelled_waits_last_call_goes_once_with_its_verb_and_body() {
     let rig = rig(false).await;
     let (target, calls) = spawn_cancel_target(202).await;
     let base = serve(rig.state.clone()).await;
-    let port = target.rsplit(':').next().unwrap();
     let mut spec = job_wait(&format!("{target}/status"));
-    // Named the way a worker reaches an infra unit: the broker answers
-    // the address the listener reaches it at.
-    spec.on_cancel = Some(weft_core::signal::CancelCall::post(format!("http://wi-studio:{port}/jobs/7/cancel")).with_body(json!({ "reason": "cancelled" })));
-    let resp = reqwest::Client::new().post(format!("{base}/cancel_call")).json(&cancel_request(spec)).send().await.unwrap();
+    spec.on_cancel = Some(weft_core::signal::CancelCall::post(format!("{target}/jobs/7/cancel")).with_body(json!({ "reason": "cancelled" })));
+    let resp = weft_core::net::http_client().build().unwrap().post(format!("{base}/cancel_call")).json(&cancel_request(spec)).send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT, "{:?}", resp.text().await);
     assert_eq!(*calls.lock().unwrap(), vec![("POST".to_string(), "/jobs/7/cancel".to_string(), json!({ "reason": "cancelled" }))]);
-    assert_eq!(rig.asked.load(std::sync::atomic::Ordering::SeqCst), 1, "the infra address was asked of the broker");
 }
 
 /// A service that refuses the last call fails it, naming the call, the
@@ -1397,7 +1372,7 @@ async fn a_row_marked_down_again_keeps_one_retry_loop() {
     };
     bring_up().await.expect_err("down");
     assert_eq!(rig.state.registry.retry_loops_running(), 1);
-    rig.state.registry.clear_down("sse");
+    rig.state.registry.clear_down("sse", weft_listener::registry::Registrations::All);
     bring_up().await.expect_err("down again");
 
     // Past the first loop's first wait, it has seen the entry is not its own.
@@ -1407,12 +1382,35 @@ async fn a_row_marked_down_again_keeps_one_retry_loop() {
     assert!(rig.state.registry.down_reason("sse").is_some());
 }
 
+/// A newer registration of a token that cannot come up while an older one
+/// is counted down gets a retry loop of its own; the older one's loop
+/// ends, rather than finding the row registered again and leaving the
+/// newer one down with nothing retrying it.
+#[tokio::test(start_paused = true)]
+async fn a_newer_registration_marked_down_gets_its_own_retry_loop() {
+    let rig = rig(true).await;
+    let bring_up = |generation: i64| {
+        let mut written = row("sse", &unreadable_sse(), json!({}), 1);
+        written["generation"] = json!(generation);
+        rig.rows.lock().unwrap().insert("sse".into(), written.clone());
+        weft_listener::registry::hold(&rig.state, serde_json::from_value(written).unwrap(), StartMode::Restore)
+    };
+    bring_up(1).await.expect_err("down");
+    bring_up(2).await.expect_err("the newer one is down too");
+
+    let first_wait = weft_core::time_scale::scaled(std::time::Duration::from_secs(5));
+    tokio::time::sleep(first_wait + std::time::Duration::from_millis(500)).await;
+    assert_eq!(rig.state.registry.retry_loops_running(), 1, "the newer one's loop, alone");
+    assert!(rig.state.registry.down_reason("sse").is_some(), "the newer one is still counted down");
+}
+
 // ---------- Replacing a held connection ----------
 
 /// A held kind that records, in order, each task it starts (by the spec's
 /// `n`) and each outside teardown it is asked for, under the spec's
 /// `test`: the tests of this binary share one process under `cargo test`,
-/// so one log per test keeps them from reading each other's entries.
+/// so one log per test keeps them from reading each other's entries. A
+/// spec with `"wakes": true` wakes instead of holding (and sets no wake).
 struct RecordingHold;
 
 static RECORDED: Mutex<std::collections::BTreeMap<String, Vec<String>>> = Mutex::new(std::collections::BTreeMap::new());
@@ -1433,8 +1431,11 @@ impl weft_listener::kinds::KindHandler for RecordingHold {
         RECORDING_TAG
     }
 
-    fn between_fires(&self, _spec: &weft_core::primitive::SignalSpec, _kind_state: &serde_json::Value) -> anyhow::Result<weft_listener::kinds::BetweenFires> {
-        Ok(weft_listener::kinds::BetweenFires::Holds)
+    fn between_fires(&self, spec: &weft_core::primitive::SignalSpec, _kind_state: &serde_json::Value) -> anyhow::Result<weft_listener::kinds::BetweenFires> {
+        Ok(match spec.config["wakes"].as_bool() {
+            Some(true) => weft_listener::kinds::BetweenFires::Wakes,
+            _ => weft_listener::kinds::BetweenFires::Holds,
+        })
     }
 
     fn compute_routing(&self, _spec: &weft_core::primitive::SignalSpec) -> anyhow::Result<weft_core::primitive::SignalRouting> {
@@ -1444,7 +1445,7 @@ impl weft_listener::kinds::KindHandler for RecordingHold {
     async fn spawn_task(
         &self,
         spec: &weft_core::primitive::SignalSpec,
-        _kind_state: &Value,
+        _stored: weft_listener::kinds::RowState,
         _ctx: weft_listener::kinds::SpawnCtx,
     ) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
         record(spec, format!("spawn {}", spec.config["n"]));
@@ -1507,7 +1508,7 @@ async fn replacing_a_held_connection_tears_the_displaced_one_down_first() {
     }
     assert_eq!(recorded("replacing"), ["spawn 1", "unregister 1", "spawn 2"]);
 
-    weft_listener::kinds::forget(&rig.state, "rec");
+    weft_listener::kinds::forget(&rig.state, "rec", weft_listener::registry::Registrations::All);
     wait_for(|| recorded("replacing").len() == 4).await;
     assert_eq!(recorded("replacing")[3], "unregister 2");
     assert!(rig.state.registry.get("rec").is_none());
@@ -1526,7 +1527,7 @@ async fn a_bring_up_right_after_forget_waits_for_the_old_teardown() {
         .await
         .unwrap();
 
-    weft_listener::kinds::forget(&rig.state, "rec");
+    weft_listener::kinds::forget(&rig.state, "rec", weft_listener::registry::Registrations::All);
     let second = row("rec", &recording_spec("bring_up", 2), json!({}), 2);
     rig.rows.lock().unwrap().insert("rec".into(), second.clone());
     weft_listener::registry::hold(&rig.state, serde_json::from_value(second).unwrap(), weft_core::signal::listener_protocol::StartMode::New)
@@ -1534,6 +1535,223 @@ async fn a_bring_up_right_after_forget_waits_for_the_old_teardown() {
         .unwrap();
     assert_eq!(recorded("bring_up"), ["spawn 1", "unregister 1", "spawn 2"]);
     assert!(rig.state.registry.get("rec").is_some(), "the new connection runs");
+}
+
+/// `row`, as registration `generation` of its token.
+fn row_of(generation: i64, token: &str, spec: &weft_core::primitive::SignalSpec) -> Value {
+    let mut written = row(token, spec, json!({}), 1);
+    written["generation"] = json!(generation);
+    written
+}
+
+/// A token can be registered again (a resume's token is fixed), so an
+/// unregister or a bring-up of an older registration can arrive after a
+/// newer one came up under the same token: the newer one keeps running,
+/// and its outside teardown (keyed by the token) is not run. The newer
+/// one's own unregister stops it and tears it down.
+#[tokio::test]
+async fn a_late_unregister_or_bring_up_of_an_older_registration_leaves_the_newer_one() {
+    let rig = rig(true).await;
+    let newer = row_of(7, "rec", &recording_spec("late", 2));
+    rig.rows.lock().unwrap().insert("rec".into(), newer.clone());
+    weft_listener::registry::hold(&rig.state, serde_json::from_value(newer).unwrap(), StartMode::New).await.unwrap();
+    assert_eq!(recorded("late"), ["spawn 2"]);
+
+    let removed = |generation: i64, n: u32| weft_core::signal::listener_protocol::UnregisterRequest {
+        token: "rec".into(),
+        tenant_id: "tenant-a".into(),
+        spec: recording_spec("late", n),
+        kind_state: json!({}),
+        generation,
+        // The answer waits for any teardown, so what is recorded is final.
+        reused: true,
+    };
+    weft_listener::kinds::unregister(&rig.state, removed(5, 1)).await.unwrap();
+    assert_eq!(recorded("late"), ["spawn 2"], "nothing stopped, nothing torn down");
+    assert_eq!(rig.state.registry.get("rec").map(|s| s.generation), Some(7), "the newer one runs");
+
+    let older = row_of(5, "rec", &recording_spec("late", 1));
+    weft_listener::registry::hold(&rig.state, serde_json::from_value(older).unwrap(), StartMode::PutBack).await.unwrap();
+    assert_eq!(recorded("late"), ["spawn 2"], "the stale row neither displaced nor replaced it");
+    assert_eq!(rig.state.registry.get("rec").map(|s| s.generation), Some(7));
+
+    weft_listener::kinds::unregister(&rig.state, removed(7, 2)).await.unwrap();
+    assert_eq!(recorded("late"), ["spawn 2", "unregister 2"]);
+    assert!(rig.state.registry.get("rec").is_none());
+}
+
+/// A newer registration that failed to come up before displacing the
+/// older one (counted down, retried) does not count as come up: the
+/// older one's unregister stops it and tears it down, and the newer one's
+/// retry, finding nothing of its own running, brings it up and clears
+/// its down entry.
+#[tokio::test(start_paused = true)]
+async fn an_unregister_stops_an_older_registration_while_a_newer_one_is_down() {
+    let rig = rig(true).await;
+    let older = row_of(1, "rec", &recording_spec("newer_down", 1));
+    rig.rows.lock().unwrap().insert("rec".into(), older.clone());
+    weft_listener::registry::hold(&rig.state, serde_json::from_value(older).unwrap(), StartMode::New).await.unwrap();
+    assert_eq!(recorded("newer_down"), ["spawn 1"]);
+
+    let newer = row_of(3, "rec", &recording_spec("newer_down", 3));
+    let mut broken = newer.clone();
+    broken["spec_json"] = json!("not json");
+    rig.rows.lock().unwrap().insert("rec".into(), broken.clone());
+    weft_listener::registry::hold(&rig.state, serde_json::from_value(broken).unwrap(), StartMode::Restore)
+        .await
+        .expect_err("the newer one cannot come up");
+    assert!(rig.state.registry.down_reason("rec").is_some(), "the newer one is counted down");
+    assert_eq!(rig.state.registry.get("rec").map(|s| s.generation), Some(1), "the older one still runs");
+
+    let removed = weft_core::signal::listener_protocol::UnregisterRequest {
+        token: "rec".into(),
+        tenant_id: "tenant-a".into(),
+        spec: recording_spec("newer_down", 1),
+        kind_state: json!({}),
+        generation: 1,
+        // The answer waits for any teardown, so what is recorded is final.
+        reused: true,
+    };
+    weft_listener::kinds::unregister(&rig.state, removed).await.unwrap();
+    assert_eq!(recorded("newer_down"), ["spawn 1", "unregister 1"], "the older one is stopped and torn down");
+    assert!(rig.state.registry.get("rec").is_none());
+    assert!(rig.state.registry.down_reason("rec").is_some(), "the newer one is still counted down");
+
+    // The newer row now reads well: its retry brings it up.
+    rig.rows.lock().unwrap().insert("rec".into(), newer);
+    let reads = rig.get_held.reads.load(std::sync::atomic::Ordering::SeqCst);
+    next_try(&rig, 5, reads + 1).await;
+    tokio::time::resume();
+    wait_for(|| rig.state.registry.retry_loops_running() == 0).await;
+    assert_eq!(recorded("newer_down"), ["spawn 1", "unregister 1", "spawn 3"]);
+    assert_eq!(rig.state.registry.get("rec").map(|s| s.generation), Some(3), "the newer one runs");
+    assert!(rig.state.registry.down_reason("rec").is_none(), "no longer counted down");
+}
+
+/// `recording_spec` of a registration that wakes: it never holds, so it
+/// comes up on whichever listener a wake reaches.
+fn waking_spec(test: &str, n: u32) -> weft_core::primitive::SignalSpec {
+    let mut spec = recording_spec(test, n);
+    spec.config["wakes"] = json!(true);
+    spec
+}
+
+/// The unregister of registration `generation`, `n` of `test`, waking,
+/// answered once its teardowns ended.
+fn waking_removed(token: &str, test: &str, generation: i64, n: u32) -> weft_core::signal::listener_protocol::UnregisterRequest {
+    weft_core::signal::listener_protocol::UnregisterRequest {
+        token: token.into(),
+        tenant_id: "tenant-a".into(),
+        spec: waking_spec(test, n),
+        kind_state: json!({}),
+        generation,
+        reused: true,
+    }
+}
+
+/// An older registration lingering here (a held one still running, a
+/// leftover counted down) does not stand in for the removed one: a
+/// registration that wakes and came up on a sibling listener is torn
+/// down from its removed row once, and the leftover is stopped beside it.
+#[tokio::test]
+async fn an_unregister_tears_down_its_own_registration_past_an_older_leftover() {
+    let rig = rig(true).await;
+    let older = row_of(1, "rec", &recording_spec("own_past_older", 1));
+    rig.rows.lock().unwrap().insert("rec".into(), older.clone());
+    weft_listener::registry::hold(&rig.state, serde_json::from_value(older).unwrap(), StartMode::New).await.unwrap();
+
+    weft_listener::kinds::unregister(&rig.state, waking_removed("rec", "own_past_older", 2, 2)).await.unwrap();
+    let mut torn = recorded("own_past_older");
+    torn.sort();
+    assert_eq!(torn, ["spawn 1", "unregister 1", "unregister 2"], "the leftover stopped, the removed one torn down once");
+    assert!(rig.state.registry.get("rec").is_none());
+
+    let mut broken = row_of(1, "down", &recording_spec("own_past_down", 1));
+    broken["spec_json"] = json!("not json");
+    rig.rows.lock().unwrap().insert("down".into(), broken.clone());
+    weft_listener::registry::hold(&rig.state, serde_json::from_value(broken).unwrap(), StartMode::Restore)
+        .await
+        .expect_err("the older one cannot come up");
+    assert!(rig.state.registry.down_reason("down").is_some());
+
+    weft_listener::kinds::unregister(&rig.state, waking_removed("down", "own_past_down", 2, 2)).await.unwrap();
+    assert_eq!(recorded("own_past_down"), ["unregister 2"], "the removed one torn down once");
+    assert!(rig.state.registry.down_reason("down").is_none(), "the leftover is no longer counted down");
+}
+
+/// The same unregister while a newer registration of the token is counted
+/// down here: the older leftover is still stopped, but no teardown keyed
+/// by the token runs for the removed one, and the newer one stays.
+#[tokio::test(start_paused = true)]
+async fn an_unregister_past_an_older_leftover_leaves_a_newer_one_down() {
+    let rig = rig(true).await;
+    let older = row_of(1, "rec", &recording_spec("own_newer_down", 1));
+    rig.rows.lock().unwrap().insert("rec".into(), older.clone());
+    weft_listener::registry::hold(&rig.state, serde_json::from_value(older).unwrap(), StartMode::New).await.unwrap();
+    let mut broken = row_of(3, "rec", &recording_spec("own_newer_down", 3));
+    broken["spec_json"] = json!("not json");
+    rig.rows.lock().unwrap().insert("rec".into(), broken.clone());
+    weft_listener::registry::hold(&rig.state, serde_json::from_value(broken).unwrap(), StartMode::Restore)
+        .await
+        .expect_err("the newer one cannot come up");
+
+    weft_listener::kinds::unregister(&rig.state, waking_removed("rec", "own_newer_down", 2, 2)).await.unwrap();
+    assert_eq!(recorded("own_newer_down"), ["spawn 1", "unregister 1"], "only the leftover is stopped");
+    assert!(rig.state.registry.get("rec").is_none());
+    assert!(rig.state.registry.down_reason("rec").is_some(), "the newer one is still counted down");
+}
+
+/// A late unregister of registration 2 reaching a listener that knows
+/// nothing of its token, while registration 3 runs on a sibling listener
+/// (the row listens at 3), tears nothing down: the teardown is keyed by
+/// the token and would cancel what 3 arranged outside. With the row gone,
+/// or still at 2, it tears down once. A row that cannot be read fails the
+/// unregister and touches nothing.
+#[tokio::test]
+async fn a_stale_unregister_leaves_a_newer_registration_on_a_sibling_listener() {
+    let rig = rig(true).await;
+    let stale = |test: &str| weft_core::signal::listener_protocol::UnregisterRequest { reused: false, ..waking_removed("rec", test, 2, 2) };
+
+    rig.rows.lock().unwrap().insert("rec".into(), row_of(3, "rec", &waking_spec("stale_newer", 3)));
+    weft_listener::kinds::unregister(&rig.state, stale("stale_newer")).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(recorded("stale_newer").is_empty(), "the newer one's outside arrangement stays");
+
+    rig.get_held.failing.store(1, std::sync::atomic::Ordering::SeqCst);
+    rig.rows.lock().unwrap().remove("rec");
+    let err = weft_listener::kinds::unregister(&rig.state, stale("stale_unread")).await.expect_err("the row read failed");
+    assert!(matches!(err, weft_listener::kinds::UnregisterError::RowUnread(_)), "{err}");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(recorded("stale_unread").is_empty(), "nothing torn down blind");
+
+    weft_listener::kinds::unregister(&rig.state, stale("stale_gone")).await.unwrap();
+    wait_for(|| !recorded("stale_gone").is_empty()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(recorded("stale_gone"), ["unregister 2"], "a row gone tears down once");
+
+    rig.rows.lock().unwrap().insert("rec".into(), row_of(2, "rec", &waking_spec("stale_same", 2)));
+    weft_listener::kinds::unregister(&rig.state, stale("stale_same")).await.unwrap();
+    wait_for(|| !recorded("stale_same").is_empty()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(recorded("stale_same"), ["unregister 2"], "a row still at the removed one tears down once");
+}
+
+/// An older registration lingering here is stopped by that same stale
+/// unregister, but not torn down outside, since the token's row listens
+/// at a newer registration a sibling listener runs.
+#[tokio::test]
+async fn a_stale_unregister_stops_a_leftover_without_tearing_down_a_newer_one() {
+    let rig = rig(true).await;
+    let older = row_of(1, "rec", &recording_spec("stale_leftover", 1));
+    rig.rows.lock().unwrap().insert("rec".into(), older.clone());
+    weft_listener::registry::hold(&rig.state, serde_json::from_value(older).unwrap(), StartMode::New).await.unwrap();
+    rig.rows.lock().unwrap().insert("rec".into(), row_of(3, "rec", &waking_spec("stale_leftover", 3)));
+
+    let stale = weft_core::signal::listener_protocol::UnregisterRequest { reused: false, ..waking_removed("rec", "stale_leftover", 2, 2) };
+    weft_listener::kinds::unregister(&rig.state, stale).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(recorded("stale_leftover"), ["spawn 1"], "the leftover stopped here, nothing torn down");
+    assert!(rig.state.registry.get("rec").is_none());
 }
 
 /// A held signal registered again in a process that already holds it is
@@ -1647,7 +1865,7 @@ async fn a_wake_body_that_can_never_be_read_is_dropped_with_a_success_and_logged
 
     let rig = rig(false).await;
     let base = serve(rig.state.clone()).await;
-    let http = reqwest::Client::new();
+    let http = weft_core::net::http_client().build().unwrap();
     for body in ["not json at all", r#"{"at_unix_ms": 1, "body": {"tok": "x"}}"#] {
         let answer = http.post(format!("{base}/wake")).body(body).send().await.unwrap();
         assert_eq!(answer.status(), 200, "{body}");
@@ -1663,7 +1881,9 @@ async fn a_wake_body_that_can_never_be_read_is_dropped_with_a_success_and_logged
 /// Post `call` to the listener's `/wake` at `base` as the alarm's
 /// delivery that had `answered` answered ones before it, and no others.
 async fn post_wake(base: &str, call: &Value, answered: u32) -> reqwest::Response {
-    reqwest::Client::new()
+    weft_core::net::http_client()
+        .build()
+        .unwrap()
         .post(format!("{base}/wake"))
         .header(FakeAlarm::ANSWERED_HEADER, answered)
         .header(FakeAlarm::TRIED_HEADER, answered)
@@ -1695,7 +1915,7 @@ async fn a_readable_wake_that_fails_answers_424_for_a_retry_until_its_last_deliv
     assert_eq!(said["dropped"], true, "{said}");
     assert!(rig.rows.lock().unwrap()["tok"]["held_failed"].is_string(), "the row says why");
 
-    let unsaid = reqwest::Client::new().post(format!("{base}/wake")).json(&call).send().await.unwrap();
+    let unsaid = weft_core::net::http_client().build().unwrap().post(format!("{base}/wake")).json(&call).send().await.unwrap();
     assert_eq!(unsaid.status(), 400);
     assert!(unsaid.text().await.unwrap().contains(FakeAlarm::ANSWERED_HEADER));
 }
@@ -1723,7 +1943,7 @@ async fn a_wake_that_can_never_be_handled_gives_its_signal_up_and_is_dropped() {
     let given_up = rig.rows.lock().unwrap()["poll"]["held_failed"].clone();
     assert!(given_up.as_str().unwrap().contains("poll_endpoint state"), "{given_up}");
     assert!(rig.alarm.wakes_for("signal:poll").is_empty(), "nothing more is set");
-    let live = reqwest::Client::new().post(format!("{base}/live")).json(&json!({ "token": "poll" })).send().await.unwrap();
+    let live = weft_core::net::http_client().build().unwrap().post(format!("{base}/live")).json(&json!({ "token": "poll" })).send().await.unwrap();
     let shown = live.text().await.unwrap();
     assert!(shown.contains("stopped:"), "its node says why: {shown}");
 }
@@ -1742,24 +1962,22 @@ fn delta_poll(url: &str) -> weft_core::primitive::SignalSpec {
 }
 
 /// A poll that finds nothing new, handled by a listener that just
-/// started, asks the broker nothing: its row and where its address is
-/// ride its wake, and it writes nothing.
+/// started, asks the broker nothing: its row rides its wake, and it
+/// writes nothing.
 #[tokio::test]
 async fn an_empty_poll_with_its_state_in_the_wake_makes_no_broker_call() {
     let rig = rig(false).await;
     register(&rig, "poll", &delta_poll(&spawn_steady_feed().await), now_ms()).await.unwrap();
     wake(&rig.state, last_wake(&rig, "poll")).await.unwrap();
     assert_eq!(rig.rows.lock().unwrap()["poll"]["kind_state"], json!({ "delta": { "cursor": 7 } }), "the first poll primed");
-    let (reads, asked, seq) = (
+    let (reads, seq) = (
         rig.get_held.reads.load(std::sync::atomic::Ordering::SeqCst),
-        rig.asked.load(std::sync::atomic::Ordering::SeqCst),
         rig.rows.lock().unwrap()["poll"]["kind_state_seq"].clone(),
     );
 
     let copy = fresh_listener(&rig);
     wake(&copy, last_wake(&rig, "poll")).await.unwrap();
     assert_eq!(rig.get_held.reads.load(std::sync::atomic::Ordering::SeqCst), reads, "no row read");
-    assert_eq!(rig.asked.load(std::sync::atomic::Ordering::SeqCst), asked, "no address asked");
     assert_eq!(rig.rows.lock().unwrap()["poll"]["kind_state_seq"], seq, "nothing written");
     assert!(rig.doors.fired.lock().unwrap().is_empty());
     assert_eq!(rig.alarm.wakes_for("signal:poll").len(), 3, "and the next poll is set");
@@ -1861,7 +2079,7 @@ async fn a_poll_registered_again_carries_its_new_spec_and_its_old_wakes_are_canc
     rig.rows.lock().unwrap().insert("poll".into(), again);
     let base = serve(rig.state.clone()).await;
     let start = json!({ "token": "poll", "mode": "new", "replaced": { "spec": old, "kind_state": {}, "generation": 1 } });
-    let answer = reqwest::Client::new().post(format!("{base}/start")).json(&start).send().await.unwrap();
+    let answer = weft_core::net::http_client().build().unwrap().post(format!("{base}/start")).json(&start).send().await.unwrap();
     assert_eq!(answer.status(), 204, "{}", answer.text().await.unwrap());
 
     assert!(rig.alarm.cancelled().iter().any(|w| w.name() == first.name()), "the old registration's wake is cancelled");
@@ -1882,36 +2100,28 @@ async fn a_poll_registered_again_carries_its_new_spec_and_its_old_wakes_are_canc
     assert!(rig.alarm.cancelled().iter().any(|w| w.name() == latest.name()), "an unregister cancels its wake");
 }
 
-/// A held connection to an address that is no infra endpoint asks where it
-/// is once, and its reconnects ask the broker nothing; one to an infra
-/// endpoint asks again after each failed connect. What it says changes
+/// A held connection's reconnects read no row, and what it says changes
 /// once as it drops, not at every attempt.
 #[tokio::test]
-async fn reconnects_ask_the_broker_only_where_an_infra_endpoint_is() {
+async fn reconnects_read_no_row_and_say_it_once() {
     // A port nothing listens on, which refuses at once.
     let closed = {
         let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         taken.local_addr().unwrap().port()
     };
-    let reconnect = |url: String| async move {
-        let rig = rig(true).await;
-        let written = row("sse", &sse_at(&url), json!({}), 1);
-        rig.rows.lock().unwrap().insert("sse".into(), written.clone());
-        weft_listener::registry::hold(&rig.state, serde_json::from_value(written).unwrap(), StartMode::New).await.unwrap();
-        let reads = rig.get_held.reads.load(std::sync::atomic::Ordering::SeqCst);
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let said = rig.state.registry.get("sse").unwrap().serving.lock().status.clone();
-        assert!(said.starts_with("reconnecting since"), "{said}");
-        // Four tries: at once, then after 1, 2 and 4 seconds.
-        tokio::time::sleep(std::time::Duration::from_millis(7_500)).await;
-        assert_eq!(rig.state.registry.get("sse").unwrap().serving.lock().status, said, "said once, not per attempt");
-        assert_eq!(rig.get_held.reads.load(std::sync::atomic::Ordering::SeqCst), reads, "{url}: no row read");
-        rig.asked.load(std::sync::atomic::Ordering::SeqCst)
-    };
-    let (public, infra) =
-        tokio::join!(reconnect(format!("http://127.0.0.1:{closed}/events")), reconnect(format!("http://wi-feed:{closed}/events")));
-    assert_eq!(public, 1, "asked once, whatever the reconnects");
-    assert!(infra >= 3, "asked again after each failed connect: {infra}");
+    let url = format!("http://127.0.0.1:{closed}/events");
+    let rig = rig(true).await;
+    let written = row("sse", &sse_at(&url), json!({}), 1);
+    rig.rows.lock().unwrap().insert("sse".into(), written.clone());
+    weft_listener::registry::hold(&rig.state, serde_json::from_value(written).unwrap(), StartMode::New).await.unwrap();
+    let reads = rig.get_held.reads.load(std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let said = rig.state.registry.get("sse").unwrap().serving.lock().status.clone();
+    assert!(said.starts_with("reconnecting since"), "{said}");
+    // Four tries: at once, then after 1, 2 and 4 seconds.
+    tokio::time::sleep(std::time::Duration::from_millis(7_500)).await;
+    assert_eq!(rig.state.registry.get("sse").unwrap().serving.lock().status, said, "said once, not per attempt");
+    assert_eq!(rig.get_held.reads.load(std::sync::atomic::Ordering::SeqCst), reads, "no row read");
 }
 
 /// The project's worker, as the listener hands it events: records each

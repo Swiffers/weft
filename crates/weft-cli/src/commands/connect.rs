@@ -164,8 +164,7 @@ async fn move_picks(ctx: &Ctx, client: &DispatcherClient, from: &str, to: &str, 
     let project_id = ctx.project()?.id();
     let body = weft_core::picks::MovePicks { from: from.to_string(), to: to.to_string() };
     let answer = client.post_json(&format!("/projects/{project_id}/picks/move"), &serde_json::to_value(&body)?).await?;
-    let moved: weft_core::picks::PicksMoved = serde_json::from_value(answer)
-        .context("read the install's answer to the move; upgrade the dispatcher or this CLI so the versions match")?;
+    let moved: weft_core::picks::PicksMoved = crate::client::read_answer(answer, "the install's answer to the move")?;
     if json {
         println!("{}", serde_json::to_value(&moved)?);
         return Ok(());
@@ -565,8 +564,8 @@ async fn instance_connect(cx: &Connecting<'_>, opts: &ConnectOpts) -> Result<()>
 /// What the instance picked for `target`'s connection field, read off
 /// the instance door's own list of the fields it fills.
 async fn instance_pick(door: &DispatcherClient, target: &AccessTarget) -> Result<Pick> {
-    let fields: Vec<weft_core::instance_door::InstanceField> = serde_json::from_value(door.get_json("/instance/fields").await?)
-        .context("read the instance's fields; upgrade the dispatcher or this CLI so the versions match")?;
+    let fields: Vec<weft_core::instance_door::InstanceField> =
+        crate::client::read_answer(door.get_json("/instance/fields").await?, "the instance's fields")?;
     let node = target.spelling();
     let value = fields.into_iter().find(|f| f.node == node && f.field == target.input).and_then(|f| f.value);
     Ok(match value {
@@ -1325,9 +1324,7 @@ impl Connecting<'_> {
             }
         };
         let answer = self.client.put_json(&path, &body).await?;
-        Ok(serde_json::from_value::<weft_core::instance_door::ValuesChanged>(answer)
-            .context("read the install's answer to the change; upgrade the dispatcher or this CLI so the versions match")?
-            .rearmed)
+        Ok(crate::client::read_answer::<weft_core::instance_door::ValuesChanged>(answer, "the install's answer to the change")?.rearmed)
     }
 
     /// Re-run the browser sign-in on the stored connection `id`, in

@@ -14,6 +14,9 @@ use weft_platform_traits::{Alarm, CallerIdentity, IdentityTokens, ImageBuilder, 
 pub struct Parts {
     pub runner: Arc<dyn Runner>,
     pub images: Arc<dyn ImageBuilder>,
+    /// Which of a program's nodes' needs the machine its workers run on
+    /// lacks.
+    pub needs: Arc<dyn weft_platform_traits::MachineNeeds>,
     pub host: Arc<dyn InfraHost>,
     pub alarm: Arc<dyn Alarm>,
     /// Where a project's frontend runs, when the install hosts it.
@@ -41,7 +44,7 @@ const IDLE_SWEEP: Duration = Duration::from_secs(30);
 /// (`weft_platform_local::bound_build_cache`).
 const BUILD_CACHE_BOUND: Duration = Duration::from_secs(6 * 3600);
 
-pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyhow::Result<Parts> {
+pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Pool>) -> anyhow::Result<Parts> {
     match &config.platform {
         PlatformConfig::Local(local) => {
             let pool = pool.context("a local install's process runs every role, so it holds the database")?;
@@ -49,20 +52,25 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyho
             let identity = Arc::new(weft_platform_local::LocalIdentity::from_env()?);
             let scratch = local.data_dir.join("run");
             let runner = Arc::new(weft_platform_local::LocalRunner::new(
-                docker.clone(),
+                Arc::new(weft_platform_local::MachineProcesses),
+                Arc::new(weft_dispatcher::working_copies::FoldersHere::new(Arc::new(
+                    weft_dispatcher::working_copies::PostgresWorkingCopyStore::new(pool.clone()),
+                ))?),
                 identity.clone(),
                 Arc::new(weft_platform_traits::SystemClock),
                 weft_platform_local::LocalRunnerConfig {
-                    broker_url: config.role_addresses(Vantage::Private).broker,
+                    // A worker is a process on the machine.
+                    broker_url: config.role_addresses(Vantage::Machine).broker,
                     install_secret: crate::install_secret()?,
                     idle_stop: local.worker_idle_stop(),
-                    scratch_dir: scratch.clone(),
-                    install: config.install.clone(),
+                    install: weft_platform_local::InstallLayout::new(local.data_dir.clone()),
+                    workers_dir: weft_platform_local::MachineLayout::here().workers(),
+                    machine_env: machine_env()?,
                     time_scale: weft_core::time_scale::factor(),
                     edge: config.edge,
                     project_ip: local.listen.public.ip(),
                 },
-            ));
+            )?);
             let gpu = weft_platform_local::LocalInfraHost::detect_gpu(docker.as_ref()).await?;
             let host = Arc::new(weft_platform_local::LocalInfraHost::new(
                 docker.clone(),
@@ -73,8 +81,8 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyho
                     disks: weft_platform_local::DiskBacking::Volumes,
                     publish: weft_platform_local::Publish::Loopback,
                     install: config.install.clone(),
-                    // A unit's agent sits on the workers' network, so it
-                    // reaches the broker where they do.
+                    // A unit's agent is a container, so it reaches the
+                    // broker where containers do.
                     agent_broker: weft_platform_local::AgentBroker {
                         url: config.role_addresses(Vantage::Private).broker,
                         identity: weft_platform_local::AgentIdentity::Minted(identity.clone()),
@@ -90,7 +98,15 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyho
             let cache_docker = docker.clone();
             Ok(Parts {
                 runner,
-                images: Arc::new(weft_platform_local::DockerImageBuilder::new(docker, config.install.clone(), local.data_dir.clone())),
+                images: Arc::new(weft_platform_local::LocalImageBuilder::new(
+                    docker,
+                    Arc::new(weft_platform_local::MachineToolchain),
+                    config.install.clone(),
+                    weft_platform_local::InstallLayout::new(local.data_dir.clone()),
+                    weft_platform_local::MachineLayout::here(),
+                    weft_platform_local::lanes::lane_count()?,
+                )),
+                needs: Arc::new(weft_platform_local::LocalNeeds),
                 host,
                 alarm,
                 frontends: Arc::new(weft_platform_local::NoFrontendHosting),
@@ -140,6 +156,7 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyho
                     crate::install_secret()?,
                 )),
                 images: Arc::new(weft_platform_gcp::CloudBuildImages::new(google.clone(), gcp.clone())?),
+                needs: Arc::new(weft_platform_gcp::ImageNeeds),
                 host: Arc::new(weft_platform_gcp::ComputeInfraHost::new(
                     google.clone(),
                     gcp.clone(),
@@ -161,6 +178,22 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyho
             })
         }
     }
+}
+
+/// What a local worker gets of this process's environment: the `PATH`
+/// that finds the person's programs (the one the needs check looks on) and
+/// `HOME`. Both are there in any process a person or their service
+/// manager starts; one missing is said.
+fn machine_env() -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    ["PATH", "HOME"]
+        .into_iter()
+        .map(|name| {
+            let value = std::env::var(name).ok().filter(|v| !v.is_empty()).with_context(|| {
+                format!("{name} is not set in the runtime's environment, and a local worker gets the machine's {name} to find the person's programs")
+            })?;
+            Ok((name.to_string(), value))
+        })
+        .collect()
 }
 
 /// Where this process writes the line weft logs when its own work is stuck

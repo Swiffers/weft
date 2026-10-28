@@ -23,7 +23,7 @@ use base64::Engine as _;
 // Both signature crates re-export the same `signature` crate's
 // Verifier trait, so this one import serves ed25519 and ECDSA.
 use ed25519_dalek::Verifier as _;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use p256::pkcs8::DecodePublicKey as _;
 use serde_json::Value;
 use sha1::Sha1;

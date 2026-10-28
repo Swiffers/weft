@@ -23,6 +23,7 @@ use weft_core::program::{
     RunPage, RunStatus, RunSummary, StillGoing, MAX_RUNS_PAGE,
 };
 use weft_core::RunId;
+use weft_task_store::db::Client as _;
 
 use super::{failed, Actor, Refused};
 use crate::api::run::{cancel_run_id, clean_run, list_query};
@@ -735,28 +736,26 @@ pub async fn delete(state: &DispatcherState, actor: &Actor, run_id: RunId) -> Re
 /// run's instance is its run row's, born with the run and never changed.
 pub async fn costs(state: &DispatcherState, actor: &Actor, project_id: uuid::Uuid, filter: &CostFilter) -> Result<Vec<CostRecord>, Refused> {
     actor.may_act_on(state, project_id).await?;
-    let runs: Vec<(RunId, Option<String>)> = sqlx::query_as(
-        "SELECT run_id, instance_id FROM run \
-         WHERE project_id = $1 \
-           AND ($2::text IS NULL OR instance_id = $2) \
-           AND ($3::uuid IS NULL OR run_id = $3) \
-           AND ($4::bigint IS NULL OR ended_at IS NULL OR ended_at >= $4) \
-         ORDER BY started_at, run_id",
-    )
-    .bind(project_id)
-    .bind(filter.instance.as_ref().map(|m| m.as_str()))
-    .bind(filter.run)
-    .bind(filter.since_unix.map(|s| s as i64))
-    .fetch_all(&state.pg_pool)
-    .await
-    .map_err(failed("costs"))?;
+    let runs: Vec<(RunId, Option<String>)> = state
+        .pg_pool
+        .all(
+            "SELECT run_id, instance_id FROM run \
+             WHERE project_id = $1 \
+               AND ($2::text IS NULL OR instance_id = $2) \
+               AND ($3::uuid IS NULL OR run_id = $3) \
+               AND ($4::bigint IS NULL OR ended_at IS NULL OR ended_at >= $4) \
+             ORDER BY started_at, run_id",
+            &[&project_id, &filter.instance.as_ref().map(|m| m.as_str()), &filter.run, &filter.since_unix.map(|s| s as i64)],
+        )
+        .await
+        .map_err(failed("costs"))?;
     let project = state.projects.project(project_id).await.map_err(failed("project"))?;
     let mut out = Vec::new();
     let mut reported = Vec::new();
     for (run_id, instance) in runs {
         let record = {
-            let mut conn = state.pg_pool.acquire().await.map_err(failed("costs"))?;
-            weft_journal::record::read_record(&mut conn, run_id, None).await.map_err(failed("cost record"))?
+            let conn = state.pg_pool.get().await.map_err(failed("costs"))?;
+            weft_journal::record::read_record(&conn, run_id, None).await.map_err(failed("cost record"))?
         };
         let events = record.events(run_id).map_err(failed("cost record"))?;
         reported.push(events.into_iter().map(move |event| (run_id, event, instance.clone())));

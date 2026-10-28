@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use sqlx::PgPool;
+use weft_task_store::db::Pool;
 use weft_task_store::pg_signal::PgSignalWatch;
 use weft_task_store::tasks;
 
@@ -14,14 +14,14 @@ pub const CHANNELS: &[&str] = &[tasks::TASK_READY_CHANNEL, weft_task_store::term
 
 /// A signal watch on the test database, listening on [`CHANNELS`].
 #[allow(dead_code)]
-pub async fn signals(pool: &PgPool) -> Arc<PgSignalWatch> {
-    PgSignalWatch::start(&pool.connect_options(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.expect("start the signal watch")
+pub async fn signals(pool: &Pool) -> Arc<PgSignalWatch> {
+    PgSignalWatch::start(pool.config(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.expect("start the signal watch")
 }
 
 /// The task `replica` claims next (`tasks::claim_next`), `None` when
 /// nothing is claimable.
 #[allow(dead_code)]
-pub async fn claimed_task(pool: &PgPool, replica: &str) -> anyhow::Result<Option<tasks::Task>> {
+pub async fn claimed_task(pool: &Pool, replica: &str) -> anyhow::Result<Option<tasks::Task>> {
     Ok(match tasks::claim_next(pool, replica).await? {
         tasks::Claim::Task(task) => Some(task),
         tasks::Claim::Dry { .. } => None,
@@ -29,7 +29,7 @@ pub async fn claimed_task(pool: &PgPool, replica: &str) -> anyhow::Result<Option
 }
 
 /// Apply the task and worker-process schema to a fresh test database.
-pub async fn setup(pool: &PgPool) {
+pub async fn setup(pool: &Pool) {
     weft_task_store::apply_groups(pool, &[&weft_task_store::announce::GROUP, &weft_task_store::worker_door::GROUP, &tasks::GROUP])
         .await
         .expect("tasks schema");

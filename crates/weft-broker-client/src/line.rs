@@ -149,8 +149,11 @@ const IDLE_LOOK: Duration = Duration::from_secs(5);
 pub enum LineError {
     /// The call never left this process: the line was down for the
     /// call's whole wait. Nothing landed, so it is safe to send again.
+    /// `busy` when the last try to open the line was turned away because
+    /// every copy of the broker the platform may run was busy (HTTP 429):
+    /// it passes once the load does.
     #[error("the broker could not be reached for {waited:?} (line: {why})")]
-    NotSent { waited: Duration, why: String },
+    NotSent { waited: Duration, why: String, busy: bool },
     /// The line broke after the call was written: it may have landed.
     #[error("the line to the broker broke after the call was sent: {0}")]
     Dropped(String),
@@ -305,7 +308,7 @@ struct LinkInner {
 
 impl BrokerLink {
     pub fn new(base_url: impl Into<String>, token: TokenSource) -> Self {
-        let http = reqwest::Client::builder()
+        let http = weft_core::net::http_client()
             .timeout(DEFAULT_CALL_WAIT.to_answer)
             .build()
             .expect("reqwest client builds");
@@ -355,18 +358,18 @@ impl BrokerLink {
     }
 
     /// Call `path` with the JSON `body`, waiting as `wait` says.
-    pub async fn call(&self, path: &str, body: Vec<u8>, wait: CallWait) -> Result<Answer, anyhow::Error> {
-        self.call_as(path, "application/json", &[], body, wait).await
+    pub async fn call(&self, path: &str, body: impl AsRef<[u8]>, wait: CallWait) -> Result<Answer, anyhow::Error> {
+        self.call_as(path, "application/json", &[], body.as_ref(), wait).await
     }
 
     /// Call `path` with `body` as raw bytes (a batch of records,
     /// `weft_journal::frame`) and the extra `headers`, waiting as `wait`
     /// says.
-    pub async fn call_bytes(&self, path: &str, headers: &[(&str, &str)], body: Vec<u8>, wait: CallWait) -> Result<Answer, anyhow::Error> {
-        self.call_as(path, "application/octet-stream", headers, body, wait).await
+    pub async fn call_bytes(&self, path: &str, headers: &[(&str, &str)], body: impl AsRef<[u8]>, wait: CallWait) -> Result<Answer, anyhow::Error> {
+        self.call_as(path, "application/octet-stream", headers, body.as_ref(), wait).await
     }
 
-    async fn call_as(&self, path: &str, content_type: &str, extra: &[(&str, &str)], body: Vec<u8>, wait: CallWait) -> Result<Answer, anyhow::Error> {
+    async fn call_as(&self, path: &str, content_type: &str, extra: &[(&str, &str)], body: &[u8], wait: CallWait) -> Result<Answer, anyhow::Error> {
         let bearer = self.inner.token.read(&self.inner.base_url).await?;
         let mut headers = vec![
             ("authorization".to_string(), format!("Bearer {bearer}")),
@@ -484,6 +487,9 @@ struct Line {
     listening: Arc<AtomicBool>,
     /// Why the line is down, while it is.
     down: Mutex<Option<String>>,
+    /// Whether the last try to open it was turned away busy
+    /// ([`LineError::NotSent`]'s `busy`).
+    turned_away: AtomicBool,
     /// When the broker cuts the open line, if it said it would.
     cut: tokio::sync::watch::Sender<Option<Cut>>,
 }
@@ -508,6 +514,7 @@ impl Line {
             notices,
             listening: Arc::new(AtomicBool::new(false)),
             down: Mutex::new(Some("not opened yet".into())),
+            turned_away: AtomicBool::new(false),
             cut: tokio::sync::watch::channel(None).0,
         });
         let task = keep_open(link, Arc::downgrade(&line), ids, closed, idle_after);
@@ -518,9 +525,9 @@ impl Line {
         line
     }
 
-    async fn call(&self, path: &str, headers: Vec<(String, String)>, body: Vec<u8>, wait: CallWait) -> Result<Answer, LineError> {
+    async fn call(&self, path: &str, headers: Vec<(String, String)>, body: &[u8], wait: CallWait) -> Result<Answer, LineError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let frame = frame(&CallHead { id, path: path.to_string(), headers }, &body);
+        let frame = frame(&CallHead { id, path: path.to_string(), headers }, body);
         let (answer, answered) = oneshot::channel();
         self.calls.lock().expect("line calls").insert(id, Waiting { frame: Some(frame), answer });
         // A caller that stops waiting (its own timeout, a cancelled task)
@@ -550,6 +557,7 @@ impl Line {
                 return Err(LineError::NotSent {
                     waited: to_send,
                     why: self.down.lock().expect("line down").clone().unwrap_or_else(|| "busy".into()),
+                    busy: self.turned_away.load(Ordering::Acquire),
                 });
             }
         }
@@ -719,6 +727,7 @@ async fn keep_open(
             Ok(socket) => {
                 retry = RECONNECT_FIRST;
                 *held.down.lock().expect("line down") = None;
+                held.turned_away.store(false, Ordering::Release);
                 let opens = Opens { base_url: &base_url, token: &token };
                 match serve(socket, opening, &held, first.take(), &mut outbox, &mut closed, idle_after, opens).await {
                     Served::LetGo => return,
@@ -751,8 +760,17 @@ async fn keep_open(
             }
             Err(e) => {
                 let why = format!("{e:#}");
-                tracing::warn!(target: "weft_broker_client::line", error = %why, retry_in_ms = retry.as_millis() as u64, "could not open the line to the broker");
+                let busy = turned_away_busy(&e);
+                if busy {
+                    // Every copy of the broker in use: counted and said with
+                    // the calls turned away, once a minute at most, rather
+                    // than at every try (one every few seconds, per line).
+                    crate::client::say_turned_away("the line to the broker");
+                } else {
+                    tracing::warn!(target: "weft_broker_client::line", error = %why, retry_in_ms = retry.as_millis() as u64, "could not open the line to the broker");
+                }
                 *held.down.lock().expect("line down") = Some(why);
+                held.turned_away.store(busy, Ordering::Release);
                 drop(held);
                 tokio::select! {
                     () = tokio::time::sleep(retry) => {}
@@ -762,6 +780,19 @@ async fn keep_open(
             }
         }
     }
+}
+
+/// Whether a try to open the line was turned away because every copy of
+/// the broker the platform may run is busy: Cloud Run answers 429 when the
+/// service is at its most copies and none has room, without handing the
+/// request to any.
+fn turned_away_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<tokio_tungstenite::tungstenite::Error>(),
+            Some(tokio_tungstenite::tungstenite::Error::Http(response)) if response.status().as_u16() == 429
+        )
+    })
 }
 
 /// How one open line ended.
@@ -790,14 +821,10 @@ async fn connect(base_url: &str, token: &TokenSource) -> anyhow::Result<Socket> 
         true => Some(tokio_tungstenite::Connector::Rustls(weft_core::net::tls_config().map_err(anyhow::Error::msg)?)),
         false => None,
     };
-    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-        // The broker's answers are as large as what it reads back (a
-        // run's whole journal); it is weft's own, so nothing caps them
-        // that would not cap the same answer as a request.
-        max_message_size: None,
-        max_frame_size: None,
-        ..Default::default()
-    };
+    // The broker's answers are as large as what it reads back (a run's
+    // whole journal); it is weft's own, so nothing caps them that would
+    // not cap the same answer as a request.
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default().max_message_size(None).max_frame_size(None);
     let (socket, _) = tokio_tungstenite::connect_async_tls_with_config(request, Some(config), true, connector).await?;
     Ok(socket)
 }
@@ -1038,7 +1065,7 @@ async fn serve(
             }
             _ = ping.tick() => {
                 pong_due.get_or_insert_with(|| tokio::time::Instant::now() + PONG_WAIT);
-                write(&mut sink, Message::Ping(Vec::new()), "pinging").await
+                write(&mut sink, Message::Ping(Default::default()), "pinging").await
             }
             _ = tokio::time::sleep_until(pong_deadline), if pong_due.is_some() => {
                 Err(format!("the broker said nothing for {PONG_WAIT:?} after a ping"))
@@ -1060,7 +1087,7 @@ async fn serve(
 
 /// The `Follow` a line opens with.
 fn follow() -> Message {
-    Message::Text(serde_json::to_string(&Notice::Follow).expect("a notice serializes"))
+    Message::Text(serde_json::to_string(&Notice::Follow).expect("a notice serializes").into())
 }
 
 /// Hand the answer framed in `bytes` to its call.
@@ -1078,12 +1105,12 @@ async fn write_out(sink: &mut Sink, line: &Line, out: Out) -> Result<(), String>
     match out {
         // A call whose caller gave up has no frame left to write.
         Out::Call(id) => match line.take_frame(id) {
-            Some(frame) => write(sink, Message::Binary(frame), "writing a call").await,
+            Some(frame) => write(sink, Message::Binary(frame.into()), "writing a call").await,
             None => Ok(()),
         },
         Out::Forget(id) => {
             let forget = serde_json::to_string(&Notice::Forget { id }).expect("a notice serializes");
-            write(sink, Message::Text(forget), "forgetting a call").await
+            write(sink, Message::Text(forget.into()), "forgetting a call").await
         }
         Out::Wake => Ok(()),
         Out::Replace(_) => unreachable!("a replacement is asked of the open line, never written on it"),
@@ -1174,7 +1201,7 @@ mod tests {
                             message = socket.next() => match message {
                                 Some(Ok(Message::Text(text))) if serde_json::from_str::<Notice>(&text).unwrap() == Notice::Follow => {
                                     let following = Notice::Following { listening: true, max_age_secs: Some(3600) };
-                                    socket.send(Message::Text(serde_json::to_string(&following).unwrap())).await.unwrap();
+                                    socket.send(Message::Text(serde_json::to_string(&following).unwrap().into())).await.unwrap();
                                 }
                                 Some(Ok(Message::Binary(bytes))) => {
                                     let (head, _) = unframe::<CallHead>(&bytes).unwrap();
@@ -1184,7 +1211,7 @@ mod tests {
                                         continue;
                                     }
                                     let answer = frame(&AnswerHead { id: head.id, status: 200 }, number.to_string().as_bytes());
-                                    socket.send(Message::Binary(answer)).await.unwrap();
+                                    socket.send(Message::Binary(answer.into())).await.unwrap();
                                 }
                                 Some(Ok(Message::Close(_))) => {
                                     closed.fetch_add(1, Ordering::SeqCst);
@@ -1195,12 +1222,12 @@ mod tests {
                             },
                             Some(push) = pushed.recv() => match push {
                                 Push::Notice(notice) => {
-                                    socket.send(Message::Text(serde_json::to_string(&notice).unwrap())).await.unwrap();
+                                    socket.send(Message::Text(serde_json::to_string(&notice).unwrap().into())).await.unwrap();
                                 }
                                 Push::AnswerHeld => {
                                     let id = held.take().expect("a call is held");
                                     let answer = frame(&AnswerHead { id, status: 200 }, number.to_string().as_bytes());
-                                    socket.send(Message::Binary(answer)).await.unwrap();
+                                    socket.send(Message::Binary(answer.into())).await.unwrap();
                                 }
                             },
                         }
@@ -1417,9 +1444,20 @@ pub mod server {
             .merge(api)
     }
 
-    /// The upgrade, sized for the line's largest message.
+    /// How much the broker reads of a line at a time. A line is mostly
+    /// idle, and the read buffer is allocated in full as the line opens
+    /// (tungstenite's own default is 128 KiB), so an idle line costs about
+    /// this plus a few KiB of tasks and channels: with up to
+    /// `deploy/terraform/gcp/serverless.tf`'s `broker_concurrency` lines on
+    /// one copy, that is what keeps them all in a copy's memory. A larger
+    /// message is read in more pieces; it still arrives whole.
+    // SYNC: LINE_READ_BUFFER <-> deploy/terraform/gcp/serverless.tf (local.broker_concurrency)
+    pub const LINE_READ_BUFFER: usize = 16 * 1024;
+
+    /// The upgrade, sized for the line's largest message, read
+    /// [`LINE_READ_BUFFER`] at a time.
     pub fn upgrade(ws: WebSocketUpgrade) -> WebSocketUpgrade {
-        ws.max_message_size(MAX_MESSAGE).max_frame_size(MAX_MESSAGE)
+        ws.max_message_size(MAX_MESSAGE).max_frame_size(MAX_MESSAGE).read_buffer_size(LINE_READ_BUFFER)
     }
 
     /// Serve one line: run each call through `api` and frame its answer

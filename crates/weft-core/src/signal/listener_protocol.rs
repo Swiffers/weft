@@ -68,21 +68,35 @@ pub struct PrepareRequest {
     pub for_instance: Option<crate::instance::InstanceScope>,
 }
 
-/// Where a registration's kind_state starts from: the kind computes
-/// routing and its initial state; `prior_kind_state` carries the token's
-/// previously-persisted state when the row already exists (entry tokens
-/// are reused across reactivates), so a kind whose state is a feed cursor
-/// can carry it forward instead of re-priming and silently discarding
-/// everything that arrived while the project was inactive.
+/// Where a registration's kind_state starts from: fresh, or from the row
+/// it replaces. The listener decides which, the same way for every kind
+/// (`weft_listener::kinds::prepare_signal`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrepareSource {
+    /// The row already under the token, when there is one (an entry's
+    /// token is reused each time its trigger is armed again; a resume's
+    /// row is there when its registration is retried).
     #[serde(default)]
-    pub prior_kind_state: Option<serde_json::Value>,
+    pub prior: Option<PriorRow>,
     /// When the registration was asked for, in ms since the epoch: the
     /// moment a node called `await_signal`, or the activation. A relative
     /// wait counts from here, so the trip through the dispatcher to the
     /// listener is not added to it.
     pub asked_at_unix_ms: i64,
+}
+
+/// The row a registration replaces, as much of it as deciding what to
+/// carry over takes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriorRow {
+    pub spec: SignalSpec,
+    pub kind_state: Value,
+    /// Whether its trigger listened the whole time since this row was last
+    /// served: it was on, or down behind a door that takes or hides what
+    /// arrives, or down for weft's own maintenance. A door that refused,
+    /// or whose window ended, did not listen, and what arrived behind it
+    /// is never caught up.
+    pub listened: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,8 +106,8 @@ pub struct PrepareResponse {
     /// auth_kind, auth_config onto the signal row. No secret ever
     /// rides here: a gated route names the connection that holds it.
     pub routing: SignalRouting,
-    /// Opaque per-kind state the kind starts from (or carries forward
-    /// from `PrepareSource::prior_kind_state`). The dispatcher writes it
+    /// Opaque per-kind state the kind starts from (fresh, or carried from
+    /// `PrepareSource::prior`). The dispatcher writes it
     /// on the signal row; a listener that restarts reads it back off the
     /// row (`list_held`), so stateful kinds (Timer) keep their schedule.
     /// `{}` for kinds that don't need it.
@@ -108,6 +122,35 @@ pub struct PrepareResponse {
     /// on the row, where a holder claims it and the number of holders is
     /// counted from.
     pub holds: bool,
+}
+
+/// Body for `POST /fresh_places` on the listener: the entry signals whose
+/// trigger stops listening behind a door that refuses, each by its token
+/// and spec. Nothing starts and nothing is held.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreshPlacesRequest {
+    pub signals: Vec<FreshPlaceAsk>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreshPlaceAsk {
+    pub token: String,
+    pub spec: SignalSpec,
+}
+
+/// Answer to `POST /fresh_places`: the state each asked signal whose kind
+/// keeps its place in a source (a poll's cursor, what a folder held)
+/// starts from with that place gone. A signal of any other kind is not
+/// listed: its state stays as it is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreshPlacesResponse {
+    pub places: Vec<FreshPlace>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreshPlace {
+    pub token: String,
+    pub kind_state: Value,
 }
 
 /// Body for `POST /rehydrate` on the listener: bring up every held
@@ -263,9 +306,10 @@ pub struct UnregisterRequest {
     pub spec: SignalSpec,
     pub kind_state: Value,
     /// The removed row's registration (`signal.generation`), which names
-    /// the wakes it had set, so they are cancelled with it. 0 from an
-    /// older dispatcher, whose wakes were named without one.
-    #[serde(default)]
+    /// the wakes it had set, so they are cancelled with it. The listener
+    /// stops only this registration (or an older one) of the token: a
+    /// token can be registered again, and an unregister that arrives after
+    /// a newer registration came up leaves that one running.
     pub generation: i64,
     /// The token comes back up right after (a registration replaced this
     /// row with one served the other way round): the answer waits for the
@@ -438,19 +482,27 @@ mod tests {
             is_resume: false,
             run_id: Some(uuid::Uuid::nil()),
             source: PrepareSource {
-                prior_kind_state: Some(serde_json::json!({"cursor": 42})),
+                prior: Some(PriorRow { spec: spec(), kind_state: serde_json::json!({"cursor": 42}), listened: true }),
                 asked_at_unix_ms: 1_700_000_000_123,
             },
             for_instance: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["tenant_id"], "acme");
-        assert_eq!(json["source"]["prior_kind_state"]["cursor"], 42);
-        let back: PrepareRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(json["source"]["prior"]["kind_state"]["cursor"], 42);
+        assert_eq!(json["source"]["prior"]["listened"], true);
+        assert_eq!(json["source"]["prior"]["spec"]["kind"], "timer");
+        let back: PrepareRequest = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(back.tenant_id, "acme");
         assert_eq!(back.token, "tok-1");
-        assert_eq!(back.source.prior_kind_state.unwrap()["cursor"], 42);
+        let prior = back.source.prior.unwrap();
+        assert_eq!((prior.kind_state["cursor"].as_i64(), prior.listened, prior.spec.kind.as_str()), (Some(42), true, "timer"));
         assert_eq!(back.source.asked_at_unix_ms, 1_700_000_000_123);
+        // A prior row must say whether its trigger listened: read as
+        // either, it would carry or drop a place on a guess.
+        let mut unsaid = json;
+        unsaid["source"]["prior"].as_object_mut().unwrap().remove("listened");
+        assert!(serde_json::from_value::<PrepareRequest>(unsaid).is_err());
     }
 
     /// A request must say when it was asked for: without it a relative

@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use weft_core::frames::LoopFrames;
 use weft_core::signal as core_signal;
 use weft_core::signal::listener_protocol::StartMode;
+use weft_task_store::db::Client as _;
 use weft_task_store::executor::TaskExecutor;
 use weft_task_store::tasks::Task;
 use weft_task_store::RegisterSignalPayload;
@@ -200,6 +201,25 @@ pub(crate) fn ambiguous_route<'a>(
     })
 }
 
+/// Whether an entry's trigger listened the whole time its row was not
+/// served, from how its activation stood just before the claim that arms
+/// it again (`before`, `None` when it was never activated), at `now_unix`:
+/// it was on, or down behind a door that still holds what arrives
+/// (`weft_core::arrival`), or down for `weft maintenance on`. A door that
+/// refuses, or whose window ended, listened to nothing. Maintenance's door
+/// refuses too, but nobody refused anything: it is weft's own pause, so
+/// what arrived meanwhile is caught up like any other downtime of weft's.
+/// A door that refuses takes the places of its rows as it is set
+/// (`crate::take_down::places_go`), and one whose window ends as the
+/// reaper closes it (`crate::reaper::close_door_windows_over`); this is
+/// what still holds between a window's end by the clock and that close,
+/// which a claim made in between keeps from matching. Pure.
+pub(crate) fn listened_while_down(before: Option<&crate::activation_store::ActivationLifecycle>, now_unix: i64) -> bool {
+    let Some(before) = before else { return false };
+    before.went_down == Some(weft_broker_client::activation::WentDown::Maintenance)
+        || before.standing().arrival(now_unix) != weft_core::arrival::Arrival::Refused
+}
+
 #[async_trait]
 impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
     async fn execute(&self, state: &DispatcherState, task: &Task) -> Result<Value> {
@@ -221,7 +241,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             // else writes a run its worker drives.
             return Ok(serde_json::to_value(weft_core::primitive::RegisterSignalResult::Captured { node_id })?);
         }
-        let token = Self::arm(state, payload).await?.token;
+        let token = Self::arm(state, payload, None).await?.token;
         Ok(serde_json::to_value(weft_core::primitive::RegisterSignalResult::Registered { token })?)
     }
 }
@@ -230,7 +250,17 @@ impl RegisterSignalExecutor {
     /// Arm a captured entry or a live suspension through the same path.
     /// The answer says what the arm did to the row, so a caller whose
     /// later step fails can take it back ([`disarm`]).
-    pub(crate) async fn arm(state: &DispatcherState, mut payload: RegisterSignalPayload) -> Result<Armed> {
+    ///
+    /// `before` is how an entry's activation stood just before the claim
+    /// that arms it (`None` for a resume, and for a trigger never
+    /// activated): whether the row it replaces was listened for the whole
+    /// time is read off it ([`listened_while_down`]).
+    pub(crate) async fn arm(
+        state: &DispatcherState,
+        mut payload: RegisterSignalPayload,
+        before: Option<&crate::activation_store::ActivationLifecycle>,
+    ) -> Result<Armed> {
+        let listened = listened_while_down(before, crate::lease::now_unix());
         let run_id = payload.run_id;
 
         // Per-kind validation: each `Signal` impl owns its rules
@@ -316,11 +346,15 @@ impl RegisterSignalExecutor {
         // registrations run one at a time install-wide: the check reads the
         // rows the insert writes, so two routes registering at once would
         // each pass the check before the other's row existed and both arm
-        // (`chat/{a}` next to `chat/{b}`). The lock comes from the lock
-        // pool, so it pins no work connection.
-        let mount_key = crate::lease::advisory_key(crate::lease::SIGNAL_MOUNT_DOMAIN, tenant.as_str());
+        // (`chat/{a}` next to `chat/{b}`). A lease, not a lock: it is held
+        // across the listener's start, which may wait on a provider's
+        // subscribe, and a lock held that long would hold one of the few
+        // lock connections the whole time.
+        let mount = format!("{}/{tenant}", crate::lease::SIGNAL_MOUNT_LEASE);
         let waiting_for = format!("tenant {tenant}'s route registrations");
-        weft_task_store::locks::with_lock_waiting(&state.lock_pool, mount_key, &waiting_for, || async move {
+        let brought_up: std::sync::Mutex<Option<tokio::task::JoinHandle<Result<Armed>>>> = std::sync::Mutex::new(None);
+        let brought_up_slot = &brought_up;
+        let leased = weft_task_store::locks::with_lease_waiting(&state.pg_pool, &state.signals, &mount, &waiting_for, || async move {
             // The row's kind state is computed from the state it replaces,
             // and written only while the row is still at the version that
             // state was read at (`signal_insert` is a compare-and-set). A
@@ -330,14 +364,22 @@ impl RegisterSignalExecutor {
             // signal's wakes never stop claiming, which is a bug to see.
             const ROUNDS: usize = 5;
             let mut round = 0;
-            let (token, prior, holds) = loop {
+            let (token, prior, holds, generation) = loop {
                 round += 1;
                 let (token, prior) =
                     read_prior(state.registrations.as_ref(), resume_token.as_deref(), project_id, &place, instance.as_ref()).await?;
                 let prior_seq = prior.as_ref().map_or(0, |row| row.kind_state_seq);
-                // A resume starts its kind state afresh; an entry carries
-                // its row's forward (a feed cursor keeps its place).
-                let prior_kind_state = prior.as_ref().filter(|row| !row.is_resume).map(|row| row.kind_state.clone());
+                // What the new row carries over of this one is the
+                // listener's to decide, the same way for every kind.
+                let prior_row = match &prior {
+                    Some(row) => Some(weft_core::signal::listener_protocol::PriorRow {
+                        spec: serde_json::from_str(&row.spec_json)
+                            .with_context(|| format!("signal {token}'s row holds a spec that does not read"))?,
+                        kind_state: row.kind_state.clone(),
+                        listened,
+                    }),
+                    None => None,
+                };
                 let prepared = state
                     .listener
                     .prepare(&weft_core::signal::listener_protocol::PrepareRequest {
@@ -348,7 +390,7 @@ impl RegisterSignalExecutor {
                         is_resume: payload.is_resume,
                         run_id: resume_run_id,
                         source: weft_core::signal::listener_protocol::PrepareSource {
-                            prior_kind_state,
+                            prior: prior_row,
                             asked_at_unix_ms: payload.asked_at_unix_ms,
                         },
                         for_instance: instance
@@ -394,7 +436,7 @@ impl RegisterSignalExecutor {
                     })
                     .await?;
                 match written {
-                    crate::store::SignalWrite::Written => break (token, prior, holds),
+                    crate::store::SignalWrite::Written { generation } => break (token, prior, holds, generation),
                     crate::store::SignalWrite::StateMoved if round < ROUNDS => continue,
                     crate::store::SignalWrite::StateMoved => anyhow::bail!(
                         "signal {token}'s state moved under each of {ROUNDS} registrations in a row: \
@@ -403,75 +445,135 @@ impl RegisterSignalExecutor {
                 }
             };
 
-            // The row is committed, so whatever the signal starts (its
-            // first wake, its held connection) finds it. A signal that
-            // cannot come up is undone: a row this call created goes, and
-            // the listener forgets whatever part of it did come up; a row
-            // it replaced goes back to what the listener still runs.
-            let undo = match prior {
-                None => ArmUndo::Created,
-                Some(prior) => ArmUndo::Replaced(Box::new(prior)),
-            };
-            // A replaced row served the other way round (held where the
-            // new one is not, or the reverse) is unregistered first, from
-            // its own spec and state: bringing the new row up never reaches
-            // the old serving, so nothing else would tear down what it
-            // arranged outside (a wake's provider subscription). A held
-            // connection in this process stops here; one a holder elsewhere
-            // runs lost its claim when the row was written, so the broker
-            // refuses its fires from then on and it stops at its next look.
-            let served_otherwise = matches!(&undo, ArmUndo::Replaced(prior) if prior.holds != holds);
-            let stopped = match &undo {
-                ArmUndo::Replaced(prior) if served_otherwise => state.listener.unregister_replaced(prior).await,
-                _ => Ok(false),
-            };
-            // Whether the replaced row may have been stopped, so an undo
-            // brings it back up (harmless when it was not: a put-back
-            // re-arms a wake that subscribes only when nothing is live, or
-            // retakes a held row). Only a row the listener could not read,
-            // or whose kind it does not know, was surely left untouched.
-            let untouched = match &stopped {
-                Ok(stopped) => !stopped,
-                Err(e) => e
-                    .downcast_ref::<crate::listener::ListenerRefused>()
-                    .is_some_and(|r| r.status == reqwest::StatusCode::SERVICE_UNAVAILABLE),
-            };
-            let replaced_stopped = served_otherwise && !untouched;
-            let replaced = match &undo {
-                ArmUndo::Replaced(prior) => Some(prior.as_ref()),
-                ArmUndo::Created => None,
-            };
-            let started = match stopped {
-                Ok(_) => state.listener.start(&token, StartMode::New, replaced).await,
-                Err(e) => Err(e.context("stopping the row it replaces, which was served the other way")),
-            };
-            if let Err(e) = started {
-                // A start that failed left the listener on what it ran
-                // before, so a replaced row goes back without a restart
-                // (unless a wake ran the new row meanwhile, see
-                // `undo_registration`). A replaced row it was told to stop
-                // is brought back up.
-                let restart = if replaced_stopped { Restart::Yes } else { Restart::No };
-                undo_arm(state.registrations.as_ref(), &state.listener, &token, undo, restart).await.map_err(|undo_err| {
-                    anyhow::anyhow!(
-                        "signal {token} could not start ({e:#}), and undoing its registration failed too, \
-                         so its row may not match what the listener runs until the trigger is \
-                         deactivated or the run ends: {undo_err:#}"
-                    )
-                })?;
-                return Err(e);
-            }
-
-            Ok(Armed { token, undo })
+            // The row is written, so from here on the arm is not stopped
+            // half-way, even when the lease is lost (a database too slow
+            // to renew it): a replaced row already stopped and the new one
+            // not started would be a signal nobody runs, which a later arm
+            // does not repair (its prior is then the new row, so it never
+            // stops the old serving). So the rest runs on a task of its
+            // own, which this waits for while the lease is held. The lease
+            // kept the overlap check and the write together; what is left
+            // touches only this token's row, and only while it is still
+            // the registration this wrote (`generation`): the task that
+            // called this can be dropped (its claim lost) while the rest
+            // runs on, and its retry may arm the row again meanwhile.
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+            let rest = bring_up(state.registrations.clone(), state.listener.clone(), token, generation, prior, holds);
+            *brought_up_slot.lock().expect("the slot is never poisoned") = Some(tokio::spawn(async move {
+                let armed = rest.await;
+                let _ = done_tx.send(());
+                armed
+            }));
+            // An error only when the task panicked, which its handle says.
+            let _ = done_rx.await;
+            Ok(())
         })
-        .await
+        .await;
+        // The arm's answer is the bringing-up's whenever the row was
+        // written; the lease's error only when it never was.
+        let handle = brought_up.into_inner().expect("the slot is never poisoned");
+        match (leased, handle) {
+            (leased, Some(handle)) => {
+                if let Err(e) = leased {
+                    tracing::warn!(
+                        target: "weft_dispatcher::register_signal",
+                        error = %format!("{e:#}"),
+                        "the registration lease was lost after the signal's row was written; bringing it up all the same"
+                    );
+                }
+                match handle.await {
+                    Ok(armed) => armed,
+                    Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+                    Err(join) => Err(anyhow::anyhow!("bringing up the signal's row was cancelled: {join}")),
+                }
+            }
+            (Err(e), None) => Err(e),
+            (Ok(()), None) => unreachable!("the lease's work ends only after it handed over the bringing-up"),
+        }
     }
+}
+
+/// Bring up the signal [`RegisterSignalExecutor::arm`] just wrote (`token`
+/// as the registration `generation`, replacing `prior` when there was a
+/// row, served held or not as `holds` says), undoing the row when it
+/// cannot come up and nothing has registered it again since.
+async fn bring_up(
+    registrations: std::sync::Arc<dyn crate::store::SignalStore>,
+    listener: crate::listener::ListenerClient,
+    token: String,
+    generation: i64,
+    prior: Option<crate::store::SignalRegistration>,
+    holds: bool,
+) -> Result<Armed> {
+    // The row is committed, so whatever the signal starts (its
+    // first wake, its held connection) finds it. A signal that
+    // cannot come up is undone: a row this call created goes, and
+    // the listener forgets whatever part of it did come up; a row
+    // it replaced goes back to what the listener still runs.
+    let undo = match prior {
+        None => ArmUndo::Created,
+        Some(prior) => ArmUndo::Replaced(Box::new(prior)),
+    };
+    // A replaced row served the other way round (held where the
+    // new one is not, or the reverse) is unregistered first, from
+    // its own spec and state: bringing the new row up never reaches
+    // the old serving, so nothing else would tear down what it
+    // arranged outside (a wake's provider subscription). A held
+    // connection in this process stops here; one a holder elsewhere
+    // runs lost its claim when the row was written, so the broker
+    // refuses its fires from then on and it stops at its next look.
+    let served_otherwise = matches!(&undo, ArmUndo::Replaced(prior) if prior.holds != holds);
+    let stopped = match &undo {
+        ArmUndo::Replaced(prior) if served_otherwise => listener.unregister_replaced(prior).await,
+        _ => Ok(false),
+    };
+    // Whether the replaced row may have been stopped, so an undo
+    // brings it back up (harmless when it was not: a put-back
+    // re-arms a wake that subscribes only when nothing is live, or
+    // retakes a held row). Only a row the listener could not read,
+    // or whose kind it does not know, was surely left untouched.
+    let untouched = match &stopped {
+        Ok(stopped) => !stopped,
+        Err(e) => e
+            .downcast_ref::<crate::listener::ListenerRefused>()
+            .is_some_and(|r| r.status == reqwest::StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let replaced_stopped = served_otherwise && !untouched;
+    let replaced = match &undo {
+        ArmUndo::Replaced(prior) => Some(prior.as_ref()),
+        ArmUndo::Created => None,
+    };
+    let started = match stopped {
+        Ok(_) => listener.start(&token, StartMode::New, replaced).await,
+        Err(e) => Err(e.context("stopping the row it replaces, which was served the other way")),
+    };
+    if let Err(e) = started {
+        // A start that failed left the listener on what it ran
+        // before, so a replaced row goes back without a restart
+        // (unless a wake ran the new row meanwhile, see
+        // `undo_registration`). A replaced row it was told to stop
+        // is brought back up.
+        let restart = if replaced_stopped { Restart::Yes } else { Restart::No };
+        undo_arm(registrations.as_ref(), &listener, &token, generation, undo, restart).await.map_err(|undo_err| {
+            anyhow::anyhow!(
+                "signal {token} could not start ({e:#}), and undoing its registration failed too, \
+                 so its row may not match what the listener runs until the trigger is \
+                 deactivated or the run ends: {undo_err:#}"
+            )
+        })?;
+        return Err(e);
+    }
+
+    Ok(Armed { token, generation, undo })
 }
 
 /// A signal [`RegisterSignalExecutor::arm`] armed, and how to take it back.
 #[derive(Debug, Clone)]
 pub(crate) struct Armed {
     pub token: String,
+    /// The registration the arm wrote: taking it back touches the row
+    /// only while it is still this one.
+    pub generation: i64,
     pub undo: ArmUndo,
 }
 
@@ -526,8 +628,8 @@ pub(crate) async fn disarm(
     armed: Vec<Armed>,
 ) -> Result<()> {
     let mut failed = Vec::new();
-    for Armed { token, undo } in armed.into_iter().rev() {
-        if let Err(e) = undo_arm(registrations, listener, &token, undo, Restart::Yes).await {
+    for Armed { token, generation, undo } in armed.into_iter().rev() {
+        if let Err(e) = undo_arm(registrations, listener, &token, generation, undo, Restart::Yes).await {
             failed.push(format!("signal {token}: {e:#}"));
         }
     }
@@ -539,6 +641,7 @@ async fn undo_arm(
     registrations: &dyn crate::store::SignalStore,
     listener: &dyn SignalHolder,
     token: &str,
+    generation: i64,
     undo: ArmUndo,
     restart: Restart,
 ) -> Result<()> {
@@ -546,8 +649,15 @@ async fn undo_arm(
         ArmUndo::Created => None,
         ArmUndo::Replaced(prior) => Some(*prior),
     };
-    match undo_registration(registrations, token, prior, restart).await? {
+    match undo_registration(registrations, token, generation, prior, restart).await? {
         Undone::Removed(removed) => listener.unregister_many(&removed).await,
+        // A later arm owns the row and what the listener runs of it; both
+        // stay its.
+        Undone::Superseded => tracing::debug!(
+            target: "weft_dispatcher::register_signal",
+            %token, generation,
+            "not taking back registration {generation} of signal {token}: a later arm registered it again and owns it"
+        ),
         // A put-back: whatever the listener runs under the token came from
         // the replacement, so it is replaced (and its wakes cancelled); the
         // row ran before this arm, so a failure bringing it back is the
@@ -593,6 +703,10 @@ enum Undone {
     /// the restored row up again to match it (see [`undo_registration`]):
     /// the replacement it runs instead, as it last read.
     Restored { rerun: Option<Box<crate::store::SignalRegistration>> },
+    /// The row is no longer the registration being undone: a later arm
+    /// (a retry of the task, a new activation) wrote it again, so it and
+    /// what the listener runs of it are left as they are.
+    Superseded,
 }
 
 /// Undo a registration whose row is written. `prior` is the row it
@@ -614,14 +728,27 @@ enum Undone {
 /// next wake from it; bringing the prior row up sets the wake its own
 /// state asks for). With `Restart::No` and nothing moved, the listener
 /// still runs exactly the prior row.
+///
+/// All of it only while the row is still the registration `generation`
+/// this undoes: a wake's claim moves the row's version but never its
+/// registration, while every write that registers it again (another arm,
+/// a restore, a registration afresh for its connection) moves both. A row
+/// registered again since belongs to that later write (`Superseded`). The
+/// removal checks the registration in its own statement; the restore
+/// checks it on the row it read, and its compare-and-set on the version
+/// refuses a write that registered the row again after that read.
 async fn undo_registration(
     registrations: &dyn crate::store::SignalStore,
     token: &str,
+    generation: i64,
     prior: Option<crate::store::SignalRegistration>,
     restart: Restart,
 ) -> Result<Undone> {
     let Some(prior) = prior else {
-        return Ok(Undone::Removed(registrations.signal_remove_many(&[token.to_string()]).await?));
+        return Ok(match registrations.signal_remove_registration(token, generation).await? {
+            Some(removed) => Undone::Removed(vec![removed]),
+            None => Undone::Superseded,
+        });
     };
     // The row this registration wrote sits one past the version it read.
     let written_seq = prior.kind_state_seq + 1;
@@ -631,10 +758,13 @@ async fn undo_registration(
             .signal_get(token)
             .await?
             .with_context(|| format!("signal {token}'s row vanished before it could be put back"))?;
+        if current.generation != generation {
+            return Ok(Undone::Superseded);
+        }
         let rerun = restart == Restart::Yes || current.kind_state_seq != written_seq;
         let restored = crate::store::SignalRegistration { kind_state_seq: current.kind_state_seq, ..prior.clone() };
         match registrations.signal_restore(&restored).await? {
-            crate::store::SignalWrite::Written => return Ok(Undone::Restored { rerun: rerun.then(|| Box::new(current)) }),
+            crate::store::SignalWrite::Written { .. } => return Ok(Undone::Restored { rerun: rerun.then(|| Box::new(current)) }),
             crate::store::SignalWrite::StateMoved => continue,
         }
     }
@@ -675,18 +805,18 @@ async fn refuse_unarmable_route(
     // project's routes are never in play.
     let mount = weft_core::route::SharedMount::new(tenant, project_id);
     let mine = weft_core::route::RoutePattern::parse(path).map_err(anyhow::Error::msg)?;
-    let others: Vec<RegisteredRoute> = sqlx::query_as::<_, (String, Vec<String>, String)>(
-        "SELECT mount_path, mount_methods, node_id \
-         FROM signal \
-         WHERE project_id = $1 AND mount_path IS NOT NULL AND node_id <> $2",
-    )
-    .bind(project_id)
-    .bind(place)
-    .fetch_all(&state.pg_pool)
-    .await?
-    .into_iter()
-    .map(|(mp, ms, node_id)| RegisteredRoute { pattern: mount.pattern_of(&mp), methods: ms, node_id })
-    .collect();
+    let others: Vec<RegisteredRoute> = state
+        .pg_pool
+        .all::<(String, Vec<String>, String)>(
+            "SELECT mount_path, mount_methods, node_id \
+             FROM signal \
+             WHERE project_id = $1 AND mount_path IS NOT NULL AND node_id <> $2",
+            &[&project_id, &place],
+        )
+        .await?
+        .into_iter()
+        .map(|(mp, ms, node_id)| RegisteredRoute { pattern: mount.pattern_of(&mp), methods: ms, node_id })
+        .collect();
     if let Some(taken) = ambiguous_route(&mine, methods, &others) {
         let method_words = |m: &[String]| if m.is_empty() { "any method".to_string() } else { m.join("/") };
         anyhow::bail!(
@@ -901,6 +1031,14 @@ mod tests {
 
     const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(0x100);
 
+    /// The registration a write that had to land made.
+    async fn written(j: &FakeStore, row: &crate::store::SignalRegistration) -> i64 {
+        let SignalWrite::Written { generation } = j.signal_insert(row).await.unwrap() else {
+            panic!("signal {}'s write did not land", row.token)
+        };
+        generation
+    }
+
     /// An entry registered at a place with no row mints its token and
     /// replaces nothing; at a place already armed it reuses the row's
     /// token and names that row as the one it replaces.
@@ -924,12 +1062,53 @@ mod tests {
     #[tokio::test]
     async fn undoing_a_created_row_removes_it() {
         let j = FakeStore::new();
-        j.signal_insert(&registration("tok")).await.unwrap();
-        let Undone::Removed(removed) = undo_registration(&j, "tok", None, Restart::No).await.unwrap() else {
+        let generation = written(&j, &registration("tok")).await;
+        // A wake's claim moves the row's version, never its registration.
+        j.claim_kind_state("tok", serde_json::json!({ "next_at": 6 }));
+        let Undone::Removed(removed) = undo_registration(&j, "tok", generation, None, Restart::No).await.unwrap() else {
             panic!("a created row is removed");
         };
         assert_eq!(removed.len(), 1);
         assert!(j.signal_get("tok").await.unwrap().is_none());
+    }
+
+    /// The task that armed a row was dropped (its claim lost) while its
+    /// bringing-up ran on; its retry armed the row again; then the first
+    /// one's start failed. Its undo finds the row registered again and
+    /// leaves it, and what the listener runs of it, to the retry: a
+    /// created row is not removed, a replaced one is not put back.
+    #[tokio::test]
+    async fn an_undo_leaves_a_row_a_later_arm_registered_again() {
+        let j = FakeStore::new();
+        let listener = Recorder::default();
+        // Created: the first attempt wrote the row, the retry replaced it.
+        let first = written(&j, &registration("tok")).await;
+        let mut retry = j.signal_get("tok").await.unwrap().unwrap();
+        retry.spec_json = r#"{"retry":true}"#.into();
+        written(&j, &retry).await;
+        super::undo_arm(&j, &listener, "tok", first, ArmUndo::Created, Restart::No).await.unwrap();
+        let row = j.signal_get("tok").await.unwrap().expect("the retry's row stays");
+        assert_eq!(row.spec_json, r#"{"retry":true}"#);
+
+        // Replaced: the first attempt replaced `live`, the retry replaced
+        // the first attempt's row.
+        let mut live = registration("old");
+        live.node_id = "m".into();
+        live.spec_json = r#"{"old":true}"#.into();
+        written(&j, &live).await;
+        let prior = j.signal_get("old").await.unwrap().unwrap();
+        let mut next = prior.clone();
+        next.spec_json = r#"{"new":true}"#.into();
+        let first = written(&j, &next).await;
+        let mut retry = j.signal_get("old").await.unwrap().unwrap();
+        retry.spec_json = r#"{"retry":true}"#.into();
+        let retried = written(&j, &retry).await;
+        super::undo_arm(&j, &listener, "old", first, ArmUndo::Replaced(Box::new(prior)), Restart::Yes).await.unwrap();
+        let row = j.signal_get("old").await.unwrap().unwrap();
+        assert_eq!((row.spec_json.as_str(), row.generation), (r#"{"retry":true}"#, retried), "the retry's row, untouched");
+
+        assert!(listener.started.lock().unwrap().is_empty(), "the listener is not told to put anything back");
+        assert!(listener.forgotten.lock().unwrap().is_empty(), "nor to forget anything");
     }
 
     /// A row the failed registration replaced goes back exactly to what
@@ -948,10 +1127,10 @@ mod tests {
         replacing.mount_path = Some("/t/new".into());
         replacing.kind_state = serde_json::json!({ "cursor": 0 });
         replacing.kind_state_seq = prior.kind_state_seq;
-        assert_eq!(j.signal_insert(&replacing).await.unwrap(), SignalWrite::Written);
+        let generation = written(&j, &replacing).await;
 
         assert!(matches!(
-            undo_registration(&j, "tok", Some(prior.clone()), Restart::No).await.unwrap(),
+            undo_registration(&j, "tok", generation, Some(prior.clone()), Restart::No).await.unwrap(),
             Undone::Restored { rerun: None }
         ));
         let row = j.signal_get("tok").await.unwrap().unwrap();
@@ -976,13 +1155,13 @@ mod tests {
         replacing.spec_json = r#"{"new":true}"#.into();
         replacing.kind_state = serde_json::json!({ "next_at": 5 });
         replacing.kind_state_seq = prior.kind_state_seq;
-        j.signal_insert(&replacing).await.unwrap();
+        let generation = written(&j, &replacing).await;
         // A wake reads the new row and claims its next moment.
-        let mut claimed = j.signal_get("tok").await.unwrap().unwrap();
-        claimed.kind_state = serde_json::json!({ "next_at": 6 });
-        j.signal_insert(&claimed).await.unwrap();
+        j.claim_kind_state("tok", serde_json::json!({ "next_at": 6 }));
 
-        let Undone::Restored { rerun: Some(replacement) } = undo_registration(&j, "tok", Some(prior.clone()), Restart::No).await.unwrap() else {
+        let Undone::Restored { rerun: Some(replacement) } =
+            undo_registration(&j, "tok", generation, Some(prior.clone()), Restart::No).await.unwrap()
+        else {
             panic!("the listener runs the prior row again")
         };
         assert_eq!(replacement.kind_state, serde_json::json!({ "next_at": 6 }), "over the replacement as the wake left it");
@@ -1005,13 +1184,14 @@ mod tests {
         replacing.spec_json = r#"{"new":true}"#.into();
         replacing.kind_state = serde_json::json!({ "next_at": 5 });
         replacing.kind_state_seq = prior.kind_state_seq;
-        j.signal_insert(&replacing).await.unwrap();
+        let generation = written(&j, &replacing).await;
         // The running replacement claims its next moment.
-        let mut claimed = j.signal_get("tok").await.unwrap().unwrap();
-        claimed.kind_state = serde_json::json!({ "next_at": 6 });
-        j.signal_insert(&claimed).await.unwrap();
+        j.claim_kind_state("tok", serde_json::json!({ "next_at": 6 }));
 
-        undo_registration(&j, "tok", Some(prior.clone()), Restart::Yes).await.unwrap();
+        assert!(matches!(
+            undo_registration(&j, "tok", generation, Some(prior.clone()), Restart::Yes).await.unwrap(),
+            Undone::Restored { rerun: Some(_) }
+        ));
         let row = j.signal_get("tok").await.unwrap().unwrap();
         assert_eq!(row.spec_json, prior.spec_json);
         assert_eq!(row.kind_state, prior.kind_state);
@@ -1067,13 +1247,13 @@ mod tests {
         let listener = Recorder { refuse: vec!["t2".into()], ..Recorder::default() };
 
         // Key 1 arms and starts.
-        assert_eq!(j.signal_insert(&rearm(&priors[0])).await.unwrap(), SignalWrite::Written);
+        let generation = written(&j, &rearm(&priors[0])).await;
         listener.start("t1", StartMode::New, Some(&priors[0])).await.unwrap();
-        let armed = vec![Armed { token: "t1".into(), undo: ArmUndo::Replaced(Box::new(priors[0].clone())) }];
+        let armed = vec![Armed { token: "t1".into(), generation, undo: ArmUndo::Replaced(Box::new(priors[0].clone())) }];
         // Key 2 is written, fails to start, and undoes itself.
-        assert_eq!(j.signal_insert(&rearm(&priors[1])).await.unwrap(), SignalWrite::Written);
+        let generation = written(&j, &rearm(&priors[1])).await;
         assert!(listener.start("t2", StartMode::New, Some(&priors[1])).await.is_err());
-        super::undo_arm(&j, &listener, "t2", ArmUndo::Replaced(Box::new(priors[1].clone())), super::Restart::No).await.unwrap();
+        super::undo_arm(&j, &listener, "t2", generation, ArmUndo::Replaced(Box::new(priors[1].clone())), Restart::No).await.unwrap();
 
         disarm(&j, &listener, armed).await.unwrap();
 
@@ -1104,21 +1284,48 @@ mod tests {
         let prior = j.signal_get("old").await.unwrap().unwrap();
         let mut next = prior.clone();
         next.spec_json = r#"{"new":true}"#.into();
-        j.signal_insert(&next).await.unwrap();
+        let replaced = written(&j, &next).await;
         let mut fresh = registration("fresh");
         fresh.node_id = "b".into();
-        j.signal_insert(&fresh).await.unwrap();
+        let created = written(&j, &fresh).await;
 
         let listener = Recorder { refuse: vec!["old".into()], ..Recorder::default() };
         let armed = vec![
-            Armed { token: "old".into(), undo: ArmUndo::Replaced(Box::new(prior.clone())) },
-            Armed { token: "fresh".into(), undo: ArmUndo::Created },
+            Armed { token: "old".into(), generation: replaced, undo: ArmUndo::Replaced(Box::new(prior.clone())) },
+            Armed { token: "fresh".into(), generation: created, undo: ArmUndo::Created },
         ];
         let error = disarm(&j, &listener, armed).await.unwrap_err();
         assert!(format!("{error:#}").contains("signal old"), "{error:#}");
         assert!(j.signal_get("fresh").await.unwrap().is_none());
         assert_eq!(*listener.forgotten.lock().unwrap(), vec!["fresh"]);
         assert_eq!(j.signal_get("old").await.unwrap().unwrap().spec_json, prior.spec_json);
+    }
+
+    /// A trigger listened while it was down when its door held what
+    /// arrived (within its window), or when weft's maintenance took it
+    /// down; never behind a door that refused, past its window, or when it
+    /// was never activated.
+    #[test]
+    fn a_trigger_listened_while_down_only_behind_a_door_that_held_or_for_maintenance() {
+        use super::listened_while_down;
+        use crate::activation_store::ActivationLifecycle;
+        use weft_broker_client::activation::WentDown;
+        use weft_core::take_down::{Door, Held, Running, TakeDown};
+        let down = |door: Door, door_for_minutes: Option<u32>| {
+            ActivationLifecycle::down(&TakeDown { door, door_for_minutes, held: Held::Keep, running: Running::Wait }, 0)
+        };
+        assert!(listened_while_down(Some(&ActivationLifecycle::active()), 10), "on: a re-arm");
+        assert!(listened_while_down(Some(&down(Door::Take, None)), 10), "a door that takes");
+        assert!(listened_while_down(Some(&down(Door::Hide, None)), 10), "a door that hides");
+        assert!(listened_while_down(Some(&down(Door::Take, Some(1))), 60), "within the door's window");
+        assert!(!listened_while_down(Some(&down(Door::Take, Some(1))), 61), "past the door's window");
+        assert!(!listened_while_down(Some(&down(Door::Refuse, None)), 10), "a door that refuses");
+        let maintenance = ActivationLifecycle { went_down: Some(WentDown::Maintenance), ..down(Door::Refuse, None) };
+        assert!(listened_while_down(Some(&maintenance), 10), "weft's own maintenance, whose door refuses");
+        let health = ActivationLifecycle { went_down: Some(WentDown::Health), ..down(Door::Refuse, None) };
+        assert!(!listened_while_down(Some(&health), 10), "any other refusing door listened to nothing");
+        assert!(!listened_while_down(Some(&ActivationLifecycle::registered()), 10), "never switched on");
+        assert!(!listened_while_down(None, 10), "never activated");
     }
 
     #[test]

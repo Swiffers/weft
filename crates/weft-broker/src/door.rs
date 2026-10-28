@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::Router;
 use serde_json::Value;
-use sqlx::Row;
+use weft_task_store::db::{self, Client, Pool, Row};
 
 use weft_broker_client::protocol::{
     ArmedEntry, DoorEntry, DoorInstanceToken, DoorInstanceTokenRequest, DoorLetGo, DoorLetGoRequest, DoorParkRequest, DoorParked,
@@ -80,9 +80,9 @@ async fn door_triggers(
     Json(_): Json<DoorTriggersRequest>,
 ) -> Resp<DoorTriggers> {
     let (tenant, project, _) = worker(&caller)?;
-    let rows = sqlx::query(&trigger_select("NOT s.is_resume"))
-        .bind(project)
-        .fetch_all(&state.pool)
+    let rows = state
+        .pool
+        .query(&trigger_select("NOT s.is_resume"), &[&project])
         .await
         .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read the project's triggers")))?;
     let mount = weft_core::route::SharedMount::new(tenant, project);
@@ -104,18 +104,21 @@ async fn door_park_fire(
         Role::Listener => None,
         _ => Some(worker(&caller)?.1),
     };
-    let row = sqlx::query(&format!(
-        "SELECT s.project_id, s.is_resume, \
-                CASE WHEN p.id IS NULL THEN 'inactive' ELSE COALESCE(a.status, 'active') END AS status, \
-                CASE WHEN p.id IS NULL THEN FALSE ELSE COALESCE(a.accepting_fires, TRUE) END AS accepting_fires, \
-                a.fires_deadline_unix \
-         FROM signal s LEFT JOIN project p ON p.id = s.project_id {SIGNAL_ACTIVATION_JOIN} \
-         WHERE s.token = $1"
-    ))
-    .bind(&req.token)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a trigger")))?;
+    let row: Option<Row> = state
+        .pool
+        .opt(
+            &format!(
+                "SELECT s.project_id, s.is_resume, \
+                        CASE WHEN p.id IS NULL THEN 'inactive' ELSE COALESCE(a.status, 'active') END AS status, \
+                        CASE WHEN p.id IS NULL THEN FALSE ELSE COALESCE(a.accepting_fires, TRUE) END AS accepting_fires, \
+                        a.fires_deadline_unix \
+                 FROM signal s LEFT JOIN project p ON p.id = s.project_id {SIGNAL_ACTIVATION_JOIN} \
+                 WHERE s.token = $1"
+            ),
+            &[&req.token],
+        )
+        .await
+        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a trigger")))?;
     let Some(row) = row else { return Ok(Json(DoorParked::Gone)) };
     let read = || -> anyhow::Result<(uuid::Uuid, bool, weft_core::arrival::Standing)> {
         let status: String = row.try_get("status")?;
@@ -142,8 +145,9 @@ async fn door_park_fire(
             return Err((StatusCode::FORBIDDEN, "an event parked in another holder's name".into()));
         }
     }
-    let now = sqlx::query_scalar::<_, i64>("SELECT EXTRACT(EPOCH FROM NOW())::BIGINT")
-        .fetch_one(&state.pool)
+    let now: i64 = state
+        .pool
+        .scalar("SELECT EXTRACT(EPOCH FROM NOW())::BIGINT", &[])
         .await
         .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read the database's clock")))?;
     if standing.arrival(now) == weft_core::arrival::Arrival::Refused {
@@ -166,10 +170,10 @@ async fn door_park_fire(
 
 /// One trigger as its signal row arms it: a public entry with a mount is
 /// a route somebody calls, which must take a caller on the line.
-fn door_trigger(row: &sqlx::postgres::PgRow, mount: weft_core::route::SharedMount<'_>) -> anyhow::Result<DoorTrigger> {
+fn door_trigger(row: &Row, mount: weft_core::route::SharedMount<'_>) -> anyhow::Result<DoorTrigger> {
     let node_id: String = row.try_get("node_id")?;
     let surface_kind: String = row.try_get("surface_kind")?;
-    let route = match row.try_get::<Option<String>, _>("mount_path")? {
+    let route = match row.try_get::<_, Option<String>>("mount_path")? {
         Some(mount_path) if surface_kind == "public_entry" => Some(DoorMount {
             pattern: mount.pattern_of(&mount_path),
             methods: row.try_get("mount_methods")?,
@@ -187,7 +191,7 @@ fn door_trigger(row: &sqlx::postgres::PgRow, mount: weft_core::route::SharedMoun
 
 /// The entry a trigger leads to, or why work for it cannot be served. A
 /// route (`caller`) must also take a caller on the line.
-fn armed_entry(row: &sqlx::postgres::PgRow, node_id: &str, caller: bool) -> anyhow::Result<DoorEntry> {
+fn armed_entry(row: &Row, node_id: &str, caller: bool) -> anyhow::Result<DoorEntry> {
     let unservable = |status: StatusCode, why: String| DoorEntry::Unservable { status: status.as_u16(), why };
     let status: String = row.try_get("status")?;
     let status = weft_core::projects::ProjectStatus::parse(&status)
@@ -198,14 +202,14 @@ fn armed_entry(row: &sqlx::postgres::PgRow, node_id: &str, caller: bool) -> anyh
         fires_deadline_unix: row.try_get("fires_deadline_unix")?,
     };
     let (Some(definition_hash), Some(binary_hash)) =
-        (row.try_get::<Option<String>, _>("definition_hash")?, row.try_get::<Option<String>, _>("binary_hash")?)
+        (row.try_get::<_, Option<String>>("definition_hash")?, row.try_get::<_, Option<String>>("binary_hash")?)
     else {
         return Ok(unservable(
             StatusCode::PRECONDITION_REQUIRED,
             format!("trigger '{node_id}' has no armed code identity; activate it again"),
         ));
     };
-    let Some(source_version) = row.try_get::<Option<String>, _>("source_version")? else {
+    let Some(source_version) = row.try_get::<_, Option<String>>("source_version")? else {
         return Ok(unservable(
             StatusCode::PRECONDITION_REQUIRED,
             format!("trigger '{node_id}' has no original source version; activate it again"),
@@ -226,15 +230,15 @@ fn armed_entry(row: &sqlx::postgres::PgRow, node_id: &str, caller: bool) -> anyh
         }
     }
     let instance = row
-        .try_get::<Option<String>, _>("instance_id")?
+        .try_get::<_, Option<String>>("instance_id")?
         .map(weft_core::instance::InstanceId::new)
         .transpose()
         .map_err(|e| anyhow::anyhow!("corrupt signal.instance_id: {e}"))?;
     Ok(DoorEntry::Armed(Box::new(ArmedEntry {
         spec,
         auth_kind: row.try_get("auth_kind")?,
-        auth_config: row.try_get::<Option<Value>, _>("auth_config")?,
-        port_snapshot: row.try_get::<Option<Value>, _>("port_snapshot")?,
+        auth_config: row.try_get::<_, Option<Value>>("auth_config")?,
+        port_snapshot: row.try_get::<_, Option<Value>>("port_snapshot")?,
         definition_hash,
         binary_hash,
         source_version,
@@ -275,13 +279,11 @@ async fn door_instance_token(
     let hash = weft_core::signal_token::token_hash(req.token.trim());
     // tenant, projects it may open, instance, expiry, kind
     type TokenRow = (String, Vec<uuid::Uuid>, Option<String>, Option<i64>, String);
-    let row: Option<TokenRow> = sqlx::query_as(
-        "SELECT tenant_id, allowed_projects, instance_id, expires_at, kind FROM signal_token WHERE token_hash = $1",
-    )
-    .bind(&hash)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read an instance token")))?;
+    let row: Option<TokenRow> = state
+        .pool
+        .opt("SELECT tenant_id, allowed_projects, instance_id, expires_at, kind FROM signal_token WHERE token_hash = $1", &[&hash])
+        .await
+        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read an instance token")))?;
     let refused = || (StatusCode::UNAUTHORIZED, "this is not an instance token of this project".to_string());
     let Some((token_tenant, projects, instance, expires_at, kind)) = row else { return Err(refused()) };
     let now = chrono::Utc::now().timestamp();
@@ -311,22 +313,30 @@ async fn door_tick(
     let (tenant, project, replica) = worker(&caller)?;
     let now = chrono::Utc::now().timestamp();
     let (keys, hits): (Vec<String>, Vec<i64>) = req.counts.iter().map(|c| (c.key.clone(), c.hits)).unzip();
-    let answer: Value = sqlx::query_scalar("SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
-        .bind(replica)
-        .bind(project)
-        .bind(tenant)
-        .bind(&req.binary_hash)
-        .bind(weft_task_store::worker_door::lease_until(
-            now,
-            weft_core::time_scale::scaled_secs(weft_task_store::worker_door::WORKER_LEASE_SECS),
-            req.vouch_until,
-        ))
-        .bind(sqlx::types::Json(&req.in_flight))
-        .bind(req.window_start)
-        .bind(&keys)
-        .bind(&hits)
-        .bind(req.shortens)
-        .fetch_one(&state.pool)
+    let leased_until = weft_task_store::worker_door::lease_until(
+        now,
+        weft_core::time_scale::scaled_secs(weft_task_store::worker_door::WORKER_LEASE_SECS),
+        req.vouch_until,
+    );
+    // `$10` is typed: the previous release's tick, kept while an upgrade
+    // rolls out, takes the same first nine arguments.
+    let answer: Value = state
+        .pool
+        .scalar(
+            "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::boolean)",
+            &[
+                &replica,
+                &project,
+                &tenant,
+                &req.binary_hash,
+                &leased_until,
+                &db::Json(&req.in_flight),
+                &req.window_start,
+                &keys,
+                &hits,
+                &req.shortens,
+            ],
+        )
         .await
         .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("tick")))?;
     let tick: DoorTick =
@@ -368,9 +378,10 @@ pub struct DoorWorker<'a> {
 /// and a queued one the delivery that hands it to a worker. Answers
 /// whether the run was that worker's to let go of, or already let go of (a
 /// retry whose first answer was lost).
-pub async fn let_go(pool: &sqlx::PgPool, worker: DoorWorker<'_>, run_id: weft_core::RunId, why: LetGo) -> anyhow::Result<bool> {
-    let mut tx = pool.begin().await?;
-    let Some(locked) = weft_journal::record::lock_in(&mut tx, run_id).await? else { return Ok(false) };
+pub async fn let_go(pool: &Pool, worker: DoorWorker<'_>, run_id: weft_core::RunId, why: LetGo) -> anyhow::Result<bool> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let Some(locked) = weft_journal::record::lock_in(&tx, run_id).await? else { return Ok(false) };
     if locked.project_id != worker.project {
         return Ok(false);
     }
@@ -392,23 +403,19 @@ pub async fn let_go(pool: &sqlx::PgPool, worker: DoorWorker<'_>, run_id: weft_co
     if locked.owner.as_deref() != Some(worker.replica) || locked.state != "running" {
         return Ok(false);
     }
-    sqlx::query("UPDATE run SET state = $2, owner = NULL, delivered_until = NULL WHERE run_id = $1")
-        .bind(run_id)
-        .bind(to)
-        .execute(&mut *tx)
-        .await?;
+    tx.execute("UPDATE run SET state = $2, owner = NULL, delivered_until = NULL WHERE run_id = $1", &[&run_id, &to]).await?;
     let locked = weft_journal::record::Locked { state: to.to_string(), owner: None, ..locked };
     // An answer handed to the run while its worker drove it, and not taken
     // before it let go, goes on its record now, and the run is queued to
     // carry on with it.
-    let resolved = weft_journal::record::resolve_handed_in(&mut tx, run_id, &locked, worker.replica).await?;
+    let resolved = weft_journal::record::resolve_handed_in(&tx, run_id, &locked, worker.replica).await?;
     match to {
         _ if resolved => {}
-        "queued" => weft_journal::record::notify_queued_in(&mut tx, worker.project).await?,
+        "queued" => weft_journal::record::notify_queued_in(&tx, worker.project).await?,
         // Parked for good, not queued again at once with an answer it was
         // handed: whoever follows the run hears that it now waits (`weft
         // wait --waiting-for-input`), which no record row would tell them.
-        _ => notify_parked_in(&mut tx, worker.project, run_id).await?,
+        _ => notify_parked_in(&tx, worker.project, run_id).await?,
     }
     tx.commit().await?;
     weft_task_store::announce::committed(pool);
@@ -418,7 +425,7 @@ pub async fn let_go(pool: &sqlx::PgPool, worker: DoorWorker<'_>, run_id: weft_co
 /// Announce on the caller's transaction that `run_id` of `project` parked
 /// (`DispatcherEvent::RunParked`), so it is heard only if the park
 /// commits. Every dispatcher pushes it to whoever follows the project.
-async fn notify_parked_in(conn: &mut sqlx::PgConnection, project: uuid::Uuid, run_id: weft_core::RunId) -> anyhow::Result<()> {
+async fn notify_parked_in(db: &impl Client, project: uuid::Uuid, run_id: weft_core::RunId) -> anyhow::Result<()> {
     let parked = weft_core::live_event::DispatcherEvent::RunParked { run_id, project_id: project };
-    weft_task_store::runs::announce_event(conn, &weft_core::live_event::IdentifiedEvent::transient(parked)).await
+    weft_task_store::runs::announce_event(db, &weft_core::live_event::IdentifiedEvent::transient(parked)).await
 }

@@ -34,6 +34,7 @@ use weft_core::instance::InstanceId;
 use weft_core::projects::HeldWork;
 use weft_core::take_down::{Door, Held, Running, TakeDown};
 use weft_core::RunId;
+use weft_task_store::db::Client as _;
 
 pub use crate::activation_store::DownCause;
 use crate::activation_store::{ActivationLifecycle, Forget, LifecycleWrite, ProjectStatus, SignalsGoing};
@@ -176,25 +177,64 @@ pub fn runs_to_cancel<'a>(take_down: &TakeDown, affected: &[&'a RunFacts]) -> Ve
 /// of the project when it is removed, every signal the activations govern
 /// when their door refuses with nothing kept, only what they hold when the
 /// door goes on taking but what is held is dropped, nothing otherwise.
-pub fn signals_going(target: &TakeDownTarget, take_down: &TakeDown, asked_by: Option<RunId>) -> SignalsGoing {
+/// A door that refuses with what is held kept takes `places` too, the
+/// fresh state of each entry signal that keeps a place in what it reads
+/// (asked of the listener when [`places_go`] says so, empty otherwise).
+pub fn signals_going<'a>(target: &TakeDownTarget, take_down: &TakeDown, asked_by: Option<RunId>, places: &'a [crate::store::FreshPlace]) -> SignalsGoing<'a> {
     match (target, take_down.door, take_down.held) {
         (TakeDownTarget::WholeProject, _, _) => SignalsGoing::Project { except: asked_by },
         (TakeDownTarget::Activations(_), Door::Refuse, Held::Drop) => SignalsGoing::Activations,
         (TakeDownTarget::Activations(_), _, Held::Drop) => SignalsGoing::HeldArrivals,
+        (TakeDownTarget::Activations(_), Door::Refuse, Held::Keep) if !places.is_empty() => SignalsGoing::Places(places),
         (TakeDownTarget::Activations(_), _, Held::Keep) => SignalsGoing::Kept,
     }
+}
+
+/// Whether a take-down takes the places its triggers' entry signals keep
+/// in what they read (a poll's cursor, what a folder held), so nothing that
+/// arrives behind its door is ever caught up: a door that refuses with
+/// what is held kept (one that drops it deletes the signals). Not weft's
+/// own maintenance, whose door refuses while nobody refused anything: what
+/// came meanwhile is caught up once it is lifted.
+pub fn places_go(target: &TakeDownTarget, take_down: &TakeDown, cause: &DownCause<'_>) -> bool {
+    matches!(target, TakeDownTarget::Activations(_))
+        && take_down.door == Door::Refuse
+        && take_down.held == Held::Keep
+        && !matches!(cause, DownCause::Maintenance)
+}
+
+/// The fresh places of the entry signals of `keys` whose kind keeps one
+/// ([`places_go`]), each read at the version its row stands at.
+async fn fresh_places(state: &DispatcherState, project_id: uuid::Uuid, keys: &[ActivationKey]) -> anyhow::Result<Vec<crate::store::FreshPlace>> {
+    let entries: Vec<crate::store::SignalRegistration> = crate::store::postgres::activation_signals(&state.pg_pool, project_id, keys)
+        .await?
+        .into_iter()
+        .filter(|signal| !signal.is_resume)
+        .collect();
+    state.listener.fresh_places(&entries).await
+}
+
+/// Whether a take-down's door makes triggers listen again that did not
+/// (`before`, how they stood): one that refused, or whose window ended,
+/// was let go of by the listener, so a door that takes or hides from now
+/// on has their signals brought up again. Pure.
+fn listens_again(before: &[&ActivationLifecycle], landing: &ActivationLifecycle, now_unix: i64) -> bool {
+    use weft_core::arrival::Arrival;
+    landing.standing().arrival(now_unix) != Arrival::Refused
+        && before.iter().any(|lifecycle| lifecycle.standing().arrival(now_unix) == Arrival::Refused)
 }
 
 /// Every run of the project that has not ended, with what a take-down
 /// needs to know.
 pub(crate) async fn live_runs(state: &DispatcherState, project_id: uuid::Uuid) -> anyhow::Result<Vec<RunFacts>> {
-    let rows: Vec<(RunId, Option<String>, Option<String>, bool)> = sqlx::query_as(
-        "SELECT run_id, instance_id, fired_by, state = 'parked' FROM run \
-         WHERE project_id = $1 AND state <> 'ended' ORDER BY started_at, run_id",
-    )
-    .bind(project_id)
-    .fetch_all(&state.pg_pool)
-    .await?;
+    let rows: Vec<(RunId, Option<String>, Option<String>, bool)> = state
+        .pg_pool
+        .all(
+            "SELECT run_id, instance_id, fired_by, state = 'parked' FROM run \
+             WHERE project_id = $1 AND state <> 'ended' ORDER BY started_at, run_id",
+            &[&project_id],
+        )
+        .await?;
     rows.into_iter()
         .map(|(run_id, instance, fired_by, suspended)| {
             let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("run {run_id} holds a broken instance: {e}"))?;
@@ -209,10 +249,12 @@ pub(crate) async fn live_runs(state: &DispatcherState, project_id: uuid::Uuid) -
 /// Refused for a target that is mid-activation (cancel that first) or a
 /// project mid-build. The lifecycle write comes first, guarded, so a
 /// refused write leaves nothing done: it sets the door, deletes what goes
-/// with it ([`signals_going`]), counts what was held and issues an infra
-/// cause's commands, in one transaction. Then the listeners let go of the
-/// signals that went, and the runs the answers reach are cancelled
-/// ([`runs_to_cancel`]). Activations of which none has a row take nothing
+/// with it and takes the places a refusing door takes ([`signals_going`]),
+/// counts what was held and issues an infra cause's commands, in one
+/// transaction. Then the listeners let go of the signals that went (or
+/// stopped listening), or bring up again those a door that takes now
+/// listens for ([`listens_again`]), and the runs the answers reach are
+/// cancelled ([`runs_to_cancel`]). Activations of which none has a row take nothing
 /// down: only an infra cause's commands are issued.
 pub async fn take_down(
     state: &DispatcherState,
@@ -260,20 +302,46 @@ pub async fn take_down(
     // 1. The door, and what goes with it, in one guarded write: when it is
     // refused (a trigger began activating, a build started) or the project
     // is gone, nothing has been cancelled, deleted or issued yet.
-    let landing = ActivationLifecycle::down(take_down, crate::lease::now_unix());
-    let signals = signals_going(target, take_down, asked_by);
-    let (keys, tokens, unlisten, held, commands) = match state
-        .activations
-        .set_lifecycle_guarded(project_id, &keys, &landing, signals, Forget::of(take_down, &cause), cause, asker.resync())
-        .await
-        .map_err(|e| internal("set lifecycle", e))?
-    {
-        LifecycleWrite::Applied { keys: taken, tokens, unlisten, held, commands } => (taken, tokens, unlisten, held, commands),
-        LifecycleWrite::NotFound => return Ok(TakenDown::ProjectGone),
-        LifecycleWrite::ResyncGone => return Ok(TakenDown::ResyncGone),
-        LifecycleWrite::UpgradeInFlight(command) => return Err(crate::infra_lifecycle_command::upgrade_in_flight_refusal(command)),
-        LifecycleWrite::Rejected { blocker } => {
-            return Err((StatusCode::CONFLICT, format!("cannot take triggers down: {blocker}; cancel it first")));
+    let now = crate::lease::now_unix();
+    let landing = ActivationLifecycle::down(take_down, now);
+    let before: Vec<&ActivationLifecycle> = existing.iter().filter(|a| keys.contains(&a.key)).map(|a| &a.lifecycle).collect();
+    let reopens = listens_again(&before, &landing, now);
+    // A door that refuses takes the places its entry signals keep, in the
+    // same write: each fresh place is computed from its row as read, and
+    // written only while the row is still there, so a wake claiming in
+    // between has this ask again. Each round lost is a claim some wake
+    // made, so running out of rounds means its wakes never stop claiming.
+    const ROUNDS: usize = 5;
+    let takes_places = places_go(target, take_down, &cause);
+    let mut round = 0;
+    let (keys, tokens, unlisten, held, commands, rows_stay) = loop {
+        round += 1;
+        let places = match takes_places {
+            true => fresh_places(state, project_id, &keys).await.map_err(|e| internal("the places the door takes", e))?,
+            false => Vec::new(),
+        };
+        let signals = signals_going(target, take_down, asked_by, &places);
+        let rows_stay = matches!(signals, SignalsGoing::Kept | SignalsGoing::Places(_));
+        match state
+            .activations
+            .set_lifecycle_guarded(project_id, &keys, &landing, signals, Forget::of(take_down, &cause), cause, asker.resync())
+            .await
+            .map_err(|e| internal("set lifecycle", e))?
+        {
+            LifecycleWrite::Applied { keys: taken, tokens, unlisten, held, commands } => break (taken, tokens, unlisten, held, commands, rows_stay),
+            LifecycleWrite::StateMoved if round < ROUNDS => continue,
+            LifecycleWrite::StateMoved => {
+                return Err(internal(
+                    "set lifecycle",
+                    anyhow::anyhow!("the signals' state moved under each of {ROUNDS} take-downs in a row: their wakes keep claiming them"),
+                ))
+            }
+            LifecycleWrite::NotFound => return Ok(TakenDown::ProjectGone),
+            LifecycleWrite::ResyncGone => return Ok(TakenDown::ResyncGone),
+            LifecycleWrite::UpgradeInFlight(command) => return Err(crate::infra_lifecycle_command::upgrade_in_flight_refusal(command)),
+            LifecycleWrite::Rejected { blocker } => {
+                return Err((StatusCode::CONFLICT, format!("cannot take triggers down: {blocker}; cancel it first")));
+            }
         }
     };
     // Every one it was aimed at was down already (taken down since it was
@@ -291,7 +359,7 @@ pub async fn take_down(
     // way it does when a door's window ends (`crate::reaper`), and what it
     // could not let go of is marked for the door-windows loop to tell it
     // again.
-    if take_down.door == Door::Refuse && matches!(signals, SignalsGoing::Kept) && !keys.is_empty() {
+    if take_down.door == Door::Refuse && rows_stay && !keys.is_empty() {
         let kept = crate::store::postgres::activation_signals(&state.pg_pool, project_id, &keys)
             .await
             .map_err(|e| internal("the signals to let go of", e))?;
@@ -299,6 +367,16 @@ pub async fn take_down(
             .await
             .map_err(|e| internal("let go of the signals", e))?;
         crate::listener::note_let_go(&state.pg_pool, &kept, &refused).await.map_err(|e| internal("note the let-go", e))?;
+    }
+    // A door that takes or hides from now on, over triggers the listener
+    // let go of behind a door that refused: their signals come up again (a
+    // wake set, a held connection), from the state their rows hold (the
+    // refusing door took their places, `places_go`). A signal that cannot
+    // come up is retried by the listener meanwhile.
+    if reopens && !keys.is_empty() {
+        state.listener.rehydrate(project_id, &[]).await.map_err(|e| {
+            internal("the door takes again, but not every signal of the project came up (`weft activate` brings them up)", e)
+        })?;
     }
 
     // 2 and 3. What is held that runs (the paused runs), and what is
@@ -427,16 +505,55 @@ mod tests {
     fn what_goes_with_the_door_follows_the_door_and_held() {
         let keys = TakeDownTarget::Activations(vec![ActivationKey::new("door", Owner::Shared)]);
         let defaults = TakeDown::DEFAULT;
-        assert!(matches!(signals_going(&keys, &defaults, None), SignalsGoing::Kept));
-        assert!(matches!(signals_going(&keys, &TakeDown { held: Held::Drop, ..defaults }, None), SignalsGoing::HeldArrivals));
-        assert!(matches!(signals_going(&keys, &TakeDown::REMOVE, None), SignalsGoing::Activations));
+        let places = [crate::store::FreshPlace { token: "poll".into(), kind_state_seq: 3, kind_state: serde_json::json!({}) }];
+        assert!(matches!(signals_going(&keys, &defaults, None, &[]), SignalsGoing::Kept));
+        assert!(matches!(signals_going(&keys, &TakeDown { held: Held::Drop, ..defaults }, None, &[]), SignalsGoing::HeldArrivals));
+        assert!(matches!(signals_going(&keys, &TakeDown::REMOVE, None, &[]), SignalsGoing::Activations));
         let refused_kept = TakeDown { door: Door::Refuse, ..defaults };
-        assert!(matches!(signals_going(&keys, &refused_kept, None), SignalsGoing::Kept), "a refusing door keeps what it held for later");
+        assert!(matches!(signals_going(&keys, &refused_kept, None, &[]), SignalsGoing::Kept), "a refusing door keeps what it held for later");
+        assert!(
+            matches!(signals_going(&keys, &refused_kept, None, &places), SignalsGoing::Places(p) if p == places),
+            "and takes the places its signals keep in what they read"
+        );
         let asker = Some(RunId::from_u128(7));
         assert!(matches!(
-            signals_going(&TakeDownTarget::WholeProject, &TakeDown::REMOVE, asker),
+            signals_going(&TakeDownTarget::WholeProject, &TakeDown::REMOVE, asker, &[]),
             SignalsGoing::Project { except: Some(e) } if e == RunId::from_u128(7)
         ));
+    }
+
+    /// Only a door that refuses with what is held kept takes the places in
+    /// what its triggers read: a door that holds goes on listening, one
+    /// that drops what is held deletes the signals, a removal takes
+    /// everything, and weft's own maintenance refuses while nobody refused
+    /// anything.
+    #[test]
+    fn only_a_refusing_door_that_keeps_what_is_held_takes_the_places() {
+        let keys = TakeDownTarget::Activations(vec![ActivationKey::new("feed", Owner::Shared)]);
+        let refused_kept = TakeDown { door: Door::Refuse, ..TakeDown::DEFAULT };
+        assert!(places_go(&keys, &refused_kept, &DownCause::Person));
+        assert!(!places_go(&keys, &refused_kept, &DownCause::Maintenance), "the maintenance catches up once lifted");
+        assert!(!places_go(&keys, &TakeDown::DEFAULT, &DownCause::Person), "a door that takes listens on");
+        assert!(!places_go(&keys, &TakeDown { door: Door::Hide, ..TakeDown::DEFAULT }, &DownCause::Person), "a door that hides listens on");
+        assert!(!places_go(&keys, &TakeDown::REMOVE, &DownCause::Person), "the signals go");
+        assert!(!places_go(&TakeDownTarget::WholeProject, &refused_kept, &DownCause::Person), "the project goes");
+    }
+
+    /// A door that takes or hides over a trigger that refused (or whose
+    /// window ended) brings its signals up again; one that was listening
+    /// already, or a door that still refuses, does not.
+    #[test]
+    fn a_door_that_takes_again_brings_the_refused_signals_back_up() {
+        let refused = ActivationLifecycle::down(&TakeDown { door: Door::Refuse, ..TakeDown::DEFAULT }, 10);
+        let taking = ActivationLifecycle::down(&TakeDown::DEFAULT, 10);
+        let hiding = ActivationLifecycle::down(&TakeDown { door: Door::Hide, ..TakeDown::DEFAULT }, 10);
+        let window_over = ActivationLifecycle::down(&TakeDown { door_for_minutes: Some(1), ..TakeDown::DEFAULT }, 10);
+        assert!(listens_again(&[&refused], &taking, 20));
+        assert!(listens_again(&[&refused], &hiding, 20));
+        assert!(listens_again(&[&taking, &window_over], &taking, 200), "a window that ended let go of its signals");
+        assert!(!listens_again(&[&taking], &taking, 20), "it listened already");
+        assert!(!listens_again(&[&ActivationLifecycle::active()], &taking, 20), "it was on");
+        assert!(!listens_again(&[&refused], &refused, 20), "the door still refuses");
     }
 
     #[test]

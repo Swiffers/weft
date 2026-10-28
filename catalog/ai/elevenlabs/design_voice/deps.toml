@@ -1,4 +1,4 @@
 # The previews arrive base64 in the JSON answer, and a reference
 # recording goes out the same way.
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"

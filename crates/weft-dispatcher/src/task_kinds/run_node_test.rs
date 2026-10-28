@@ -122,6 +122,8 @@ async fn call_test_server(
             fixtures: &payload.fixtures,
         }),
     };
+    // No limit on the call: it runs the node's own code, as long as the
+    // test the person wrote takes.
     let resp = state
         .http
         .post(format!("{}/_weft/test", endpoint.base_url.trim_end_matches('/')))

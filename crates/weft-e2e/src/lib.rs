@@ -1,7 +1,7 @@
 //! # weft-e2e: the Layer-4 end-to-end test rig
 //!
 //! This crate drives a REAL running weft install (the runtime process and
-//! the worker containers it starts) and asserts behavior through the dispatcher's public
+//! the worker processes it starts) and asserts behavior through the dispatcher's public
 //! API, exactly as a user or the outside world would. It is the Layer-4 tier
 //! of the testing pyramid: real binaries, real network, real backing services.
 //!
@@ -45,14 +45,14 @@
 //!
 //! The API-driving toolkit ([`client::Dispatcher`] + the modules built on it:
 //! [`run`], [`assert`], [`event`], [`storage`], [`signal`], [`live`]) is
-//! deliberately auth-agnostic: `Dispatcher` carries an optional
-//! [`client::AuthProvider`] (None here, where there is no login). A harness that
-//! needs tokens can depend on THIS crate and reuse that toolkit, injecting a
-//! provider that signs a token per request (everything API + token, no CLI). What
-//! stays specific to this harness and is NOT reused: [`ensure`] and [`cell`]
-//! (installs on kind), `platform` (kind/Postgres direct), and
-//! [`project::Project`] (shells out to the `weft` CLI). This harness is
-//! unauthenticated by construction (its authenticator only ever issues `local`).
+//! deliberately auth-agnostic: `Dispatcher` carries the operator key it
+//! sends (the install's own key here, read from its secrets). A harness that
+//! holds another key can depend on THIS crate and reuse that toolkit, handing
+//! it its key ([`client::Dispatcher::with_key`]; everything API + token, no
+//! CLI). What stays specific to this harness and
+//! is NOT reused: [`ensure`] and [`cell`] (installs on this machine),
+//! `platform` (Postgres direct), and [`project::Project`] (shells out to the
+//! `weft` CLI).
 
 pub mod access;
 pub mod assert;
@@ -73,8 +73,8 @@ pub mod kept;
 pub mod live;
 // The platform layer reaches behind the public API (direct Postgres + Docker)
 // to observe and drive what the SYSTEM does underneath a program. It needs the
-// install's Postgres, so it (and its `sqlx` dep) compile ONLY under `e2e`. None
-// of it ships; see the module docs.
+// install's Postgres, so it compiles ONLY under `e2e`. None of it ships; see
+// the module docs.
 #[cfg(feature = "e2e")]
 pub mod platform;
 pub mod project;

@@ -58,6 +58,11 @@ pub struct BuiltProgram {
     /// it left out (the record keeps only the first line of each).
     #[serde(rename = "workerLog", default, skip_serializing_if = "Option::is_none")]
     pub worker_log: Option<String>,
+    /// What each node type the worker holds needs from the machine it runs
+    /// on (`crate::needs::NodeNeeds`): a program that uses one whose need
+    /// the machine does not meet is refused before it starts.
+    #[serde(rename = "nodeNeeds", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub node_needs: crate::needs::NodeNeeds,
 }
 
 impl BuiltProgram {
@@ -71,9 +76,91 @@ impl BuiltProgram {
     }
 }
 
-/// Where a worker image keeps the record of the node packages its build
-/// left out ([`LeftOut`]): the install reads it from the built image
-/// without running it, and never trusts a record from anywhere else.
+/// The repository part of a worker's image ref (`weft-worker:<binary
+/// hash>`). An image ref is the name a platform's image builder gives a
+/// build (`weft_platform_traits::ImageBuilder::image_ref`): on the cloud
+/// it names an image in the install's registry; on a local install a
+/// worker's and a test server's ref names a program compiled on the
+/// machine (`weft_platform_local::images::Program`), and an infra image's
+/// an image in the Docker daemon.
+pub const WORKER_REPO: &str = "weft-worker";
+
+/// The repository part of a node package's test server's ref
+/// (`weft-node-tests:<test hash>`), a program on the machine that runs
+/// the live test.
+pub const NODE_TEST_REPO: &str = "weft-node-tests";
+
+/// How a platform makes a project's worker, answered by its image
+/// builder (`weft_platform_traits::ImageBuilder::worker_packaging`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerPackaging {
+    /// An image a container runtime runs (a cloud), compiled FROM
+    /// `builder`, the prebuilt builder base the install was set up with.
+    Image { builder: String },
+    /// A program the machine runs as a process, compiled on it (a local
+    /// install). Every such build on the machine shares `shared_crates`:
+    /// the worker-linked slice of the weft workspace and every package
+    /// crate, each written once.
+    Host { shared_crates: std::path::PathBuf },
+}
+
+/// How one planned artifact is built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildRecipe {
+    /// `docker build` (or a cloud builder) of the Dockerfile in the build's
+    /// context: every infra image, and a worker packaged as an image.
+    /// `result_file` is a file inside the built image whose bytes are the
+    /// build's result (`LEFT_OUT_RECORD_PATH` for a worker built from a
+    /// built-in template), read once the build succeeded without running
+    /// the image; `None` for an image with nothing to report (an infra
+    /// image, a worker from a custom template).
+    Dockerfile { result_file: Option<String> },
+    /// Compiled on the machine from the [`HostRecipe`] in the build's
+    /// context ([`HOST_RECIPE_FILE`]): a worker packaged as a host program,
+    /// whose recipe names its record.
+    Host,
+}
+
+/// The file in a host build's context that says how to build it.
+pub const HOST_RECIPE_FILE: &str = "host-recipe.json";
+
+/// How a worker is compiled on the machine that runs it, written by the
+/// compiler (`weft_compiler::build`) into the build's context and run by
+/// the machine's image builder (`weft_platform_local::images`): the same
+/// steps a worker image's builder stage takes (`weft-isolate`, then the
+/// binary and the record of what it left out), with the machine's own
+/// toolchain and compile cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostRecipe {
+    /// The worker crate: the folder holding its `Cargo.toml`.
+    pub crate_dir: std::path::PathBuf,
+    /// The `weft-isolate` helper crate's folder, built first and run to
+    /// build the worker.
+    pub isolate_dir: std::path::PathBuf,
+    /// The candidates file `weft-isolate` reads (its `isolate.json`).
+    pub isolate_candidates: std::path::PathBuf,
+    /// Where the build writes the record of the node packages it left out
+    /// ([`LeftOut`]).
+    pub left_out_record: std::path::PathBuf,
+    /// The lock file copied beside both crates before they build, so every
+    /// worker resolves the dependencies weft was tested with.
+    pub seed_lock: std::path::PathBuf,
+    /// The worker binary's name under `<target>/release/`.
+    pub binary_name: String,
+    /// The compile cache sweep (`weft-cache-gc.sh`).
+    pub cache_gc_script: std::path::PathBuf,
+    /// How many days an unused compiled piece stays in the cache.
+    pub cache_retention_days: u32,
+    /// How many versions of one piece the cache keeps.
+    pub cache_versions_kept: u32,
+}
+
+/// Where a worker image (a cloud's) keeps the record of the node packages
+/// its build left out ([`LeftOut`]): the install reads it from the built
+/// image without running it, and never trusts a record from anywhere
+/// else. A worker compiled on the machine keeps its record beside the
+/// program instead.
 // SYNC: LEFT_OUT_RECORD_PATH <-> crates/weft-compiler/src/worker_image.rs (RUNTIME_STAGE_FRAGMENT, the record's COPY line)
 pub const LEFT_OUT_RECORD_PATH: &str = "/weft-left-out.json";
 
@@ -427,6 +514,7 @@ mod tests {
             worker_image: "r/weft-worker:b".into(),
             left_out: vec![LeftOutPackage { package: "media".into(), node_types: vec!["Resize".into()], error: "error[E0308]".into() }],
             worker_log: Some("https://log/1".into()),
+            node_needs: Default::default(),
         };
         let wire = serde_json::to_value(&built).unwrap();
         for key in ["binaryHash", "definitionHash", "infraHash", "infraImages", "replacedInfraImages", "infraPlaces", "workerImage", "leftOut", "workerLog"] {

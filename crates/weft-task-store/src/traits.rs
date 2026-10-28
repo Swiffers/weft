@@ -21,10 +21,9 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-use sqlx::postgres::PgPool;
-use sqlx::Row;
 use uuid::Uuid;
 
+use crate::db::{Client as _, Json, Pool};
 use crate::pg_signal::PgSignalWatch;
 use crate::tasks::{DedupOutcome, NewTask, TaskOutcome};
 
@@ -41,7 +40,7 @@ pub trait TaskStoreClient: Send + Sync {
 // ---------- Postgres impls ----------
 
 pub struct PostgresTaskStoreClient {
-    pool: PgPool,
+    pool: Pool,
     /// The process's one `LISTEN` connection, which every wait here
     /// sleeps on.
     signals: Arc<PgSignalWatch>,
@@ -51,7 +50,7 @@ impl PostgresTaskStoreClient {
     /// `signals` must listen on the channels this client's waits sleep
     /// on, [`crate::tasks::TASK_READY_CHANNEL`] and
     /// [`crate::terminal::TERMINAL_CHANNEL`].
-    pub fn new(pool: PgPool, signals: Arc<PgSignalWatch>) -> Result<Self> {
+    pub fn new(pool: Pool, signals: Arc<PgSignalWatch>) -> Result<Self> {
         signals.require(crate::tasks::TASK_READY_CHANNEL)?;
         signals.require(crate::terminal::TERMINAL_CHANNEL)?;
         Ok(Self { pool, signals })
@@ -67,7 +66,7 @@ impl PostgresTaskStoreClient {
         crate::tasks::claim_next(&self.pool, replica).await
     }
 
-    pub fn pool(&self) -> &PgPool {
+    pub fn pool(&self) -> &Pool {
         &self.pool
     }
 }
@@ -119,11 +118,11 @@ pub trait InfraReader: Send + Sync {
 }
 
 pub struct PostgresInfraReader {
-    pool: PgPool,
+    pool: Pool,
 }
 
 impl PostgresInfraReader {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: Pool) -> Self {
         Self { pool }
     }
 }
@@ -147,14 +146,13 @@ impl PostgresInfraReader {
         node_id: &str,
         instance: Option<&weft_core::instance::InstanceId>,
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
-        let saved: Option<sqlx::types::Json<std::collections::BTreeMap<String, serde_json::Value>>> = sqlx::query_scalar(
-            "SELECT baked_json FROM infra_node WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
-        )
-        .bind(project_id)
-        .bind(node_id)
-        .bind(instance.map(|i| i.as_str()))
-        .fetch_optional(&self.pool)
-        .await?;
+        let saved: Option<Json<std::collections::BTreeMap<String, serde_json::Value>>> = self
+            .pool
+            .scalar_opt(
+                "SELECT baked_json FROM infra_node WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
+                &[&project_id, &node_id, &instance.map(|i| i.as_str())],
+            )
+            .await?;
         Ok(saved.map(|saved| saved.0).unwrap_or_default())
     }
 
@@ -168,16 +166,15 @@ impl PostgresInfraReader {
         instance: Option<&weft_core::instance::InstanceId>,
         endpoint_name: &str,
     ) -> Result<Option<StoredEndpoint>> {
-        let row = sqlx::query(
-            "SELECT endpoints_json, public_paths_json FROM infra_node \
-             WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3 \
-               AND status = 'running'",
-        )
-        .bind(project_id)
-        .bind(node_id)
-        .bind(instance.map(|m| m.as_str()))
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = self
+            .pool
+            .opt::<crate::db::Row>(
+                "SELECT endpoints_json, public_paths_json FROM infra_node \
+                 WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3 \
+                   AND status = 'running'",
+                &[&project_id, &node_id, &instance.map(|m| m.as_str())],
+            )
+            .await?;
         let Some(row) = row else {
             return Ok(None);
         };

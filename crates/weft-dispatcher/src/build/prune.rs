@@ -19,7 +19,7 @@
 //! referenced set names them. So each build claims every image it plans
 //! before it looks for any ([`ImageHold`], rows in `image_claim`), and a
 //! prune spares every claimed image. The check and the delete happen
-//! under that image's lock (`ledger::begin_reclaim`), the same lock a
+//! under that image's lock (`ledger::decide_reclaim`), the same lock a
 //! claim takes, so a claim lands either before the check (the image is
 //! spared) or after the delete (the build finds it gone and builds it
 //! again). The same check re-reads whether anything references that one
@@ -32,8 +32,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use weft_task_store::db::{Client, Pool};
 
-use weft_compiler::build::WORKER_IMAGE_REPO;
+use weft_core::builds::WORKER_REPO;
 use weft_core::images::PruneReport;
 
 /// One build request's claim on the images it relies on, from its first
@@ -49,7 +50,7 @@ use weft_core::images::PruneReport;
 /// while its builds run), which keeps it alive while it waits. A hold
 /// dropped without either (the request was abandoned) lets go on its own.
 pub struct ImageHold {
-    pool: sqlx::PgPool,
+    pool: Pool,
     id: uuid::Uuid,
     /// The project whose build request this is.
     project: uuid::Uuid,
@@ -62,7 +63,7 @@ pub struct ImageHold {
 }
 
 impl ImageHold {
-    pub fn new(pool: &sqlx::PgPool, project: uuid::Uuid) -> Self {
+    pub fn new(pool: &Pool, project: uuid::Uuid) -> Self {
         let id = uuid::Uuid::new_v4();
         let renew_pool = pool.clone();
         let renewer = tokio::spawn(async move {
@@ -160,7 +161,7 @@ pub fn prunable(built: &[String], keep: &KeepSet) -> Vec<String> {
 
 /// Which images a referenced-images read covers: every one (the keep-set a
 /// prune starts from), or the one image a prune is about to delete, re-read
-/// under that image's lock (`ledger::begin_reclaim`). Both go through the
+/// under that image's lock (`ledger::decide_reclaim`). Both go through the
 /// same query (`crate::api::project::referenced_images_query`), so "what is
 /// referenced" has one definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,7 +178,7 @@ impl<'a> ImageScope<'a> {
     /// other image (a base image, a ref with no tag), which no prune takes.
     pub fn of(image_ref: &'a str) -> Option<Self> {
         let (repo, tag) = repository_and_tag(image_ref)?;
-        if repo == WORKER_IMAGE_REPO {
+        if repo == WORKER_REPO {
             Some(Self::Worker(tag))
         } else if repo.starts_with("weft-infra-") {
             Some(Self::Infra(image_ref))
@@ -246,19 +247,25 @@ impl KeepSet {
 
 /// The keep-set restricted to `scope`, read on `conn`: the whole of it
 /// before a prune picks candidates, and one image's part again under that
-/// image's lock right before deleting it (`ledger::begin_reclaim`), since a
-/// build may have registered the image in between.
-pub async fn keep_set(conn: &mut sqlx::PgConnection, scope: ImageScope<'_>) -> Result<KeepSet> {
+/// image's lock right before deleting it (`ledger::decide_reclaim`), since a
+/// build may have registered the image in between. The standard worker it
+/// keeps is the one `images` packages workers as.
+pub async fn keep_set(conn: &impl Client, scope: ImageScope<'_>, images: &dyn weft_platform_traits::ImageBuilder) -> Result<KeepSet> {
     let referenced = crate::api::project::referenced_images_query(conn, scope).await?;
     let mut worker_hashes: BTreeSet<String> = referenced.worker_hashes.into_iter().collect();
     if scope.covers_workers() {
-        let standard = weft_compiler::build::standard_worker_hash()
-            .map_err(|e| anyhow::anyhow!("the standard worker's hash: {e}"))?;
+        let standard = standard_worker_hash(images)?;
         if scope.worker_hash().is_none_or(|only| only == standard) {
             worker_hashes.insert(standard);
         }
     }
     Ok(KeepSet { worker_hashes, infra_refs: referenced.infra_refs.into_iter().collect() })
+}
+
+/// The binary hash of this weft's standard worker as `images` packages it
+/// (`weft_compiler::build::stock_binary_hash`).
+fn standard_worker_hash(images: &dyn weft_platform_traits::ImageBuilder) -> Result<String> {
+    weft_compiler::build::stock_binary_hash(&images.worker_packaging()).map_err(|e| anyhow::anyhow!("the standard worker's hash: {e}"))
 }
 
 /// How many of a project's earlier builds stay beside the current one,
@@ -399,12 +406,11 @@ impl AfterBuildPrunes {
 /// still runs or a build in progress claims. Every pass takes the unused
 /// ones, so one a container still ran from last time goes on a later one.
 async fn reclaim(state: &crate::state::DispatcherState, projects: &BTreeSet<uuid::Uuid>) -> Result<PruneReport> {
-    let keep = keep_set(&mut *state.pg_pool.acquire().await.context("a connection to read the keep-set")?, ImageScope::All).await?;
+    let images = state.builder.images.as_ref();
+    let keep = keep_set(&state.pg_pool.get().await.context("a connection to read the keep-set")?, ImageScope::All, images).await?;
     // The standard worker a newer weft replaced goes too: the current one
     // is recorded (and kept by the keep-set), earlier ones are not kept.
-    let standard = state.builder.images.image_ref(&weft_compiler::build::worker_image_tag(
-        &weft_compiler::build::standard_worker_hash().map_err(|e| anyhow::anyhow!("the standard worker's hash: {e}"))?,
-    ));
+    let standard = images.image_ref(&weft_compiler::build::worker_image_tag(&standard_worker_hash(images)?));
     if state.builder.images.image_exists(&standard).await? {
         super::ledger::note_shared(&state.pg_pool, &standard, crate::lease::now_unix()).await?;
     }
@@ -428,9 +434,9 @@ async fn reclaim(state: &crate::state::DispatcherState, projects: &BTreeSet<uuid
 ///
 /// `keep` only narrows the candidates: it was read before the loop, and a
 /// build may register one of them as running since. The deciding check
-/// is `ledger::begin_reclaim`'s, under the image's lock.
+/// is `ledger::decide_reclaim`'s, under the image's lock.
 pub async fn prune(
-    pool: &sqlx::PgPool,
+    pool: &Pool,
     images: &dyn weft_platform_traits::ImageBuilder,
     runner: &dyn weft_platform_traits::Runner,
     built: &[String],
@@ -442,8 +448,10 @@ pub async fn prune(
     for image_ref in candidates {
         // Held until the image is deleted and forgotten: a build claiming
         // it waits here, then finds it gone (the module doc).
-        let mut tx = match super::ledger::begin_reclaim(pool, &image_ref, crate::lease::now_unix()).await? {
-            super::ledger::Reclaim::Free(tx) => tx,
+        let mut conn = pool.get().await.context("begin reclaiming an image")?;
+        let tx = conn.transaction().await.context("begin reclaiming an image")?;
+        match super::ledger::decide_reclaim(&tx, images, &image_ref, crate::lease::now_unix()).await? {
+            super::ledger::Reclaim::Free => {}
             super::ledger::Reclaim::Claimed => {
                 report.in_use.push(image_ref);
                 continue;
@@ -451,7 +459,7 @@ pub async fn prune(
             // Registered since `keep` was read: it runs now, so it stays,
             // exactly as if the keep-set had named it.
             super::ledger::Reclaim::Referenced => continue,
-        };
+        }
         let deleted = match runner.forget_image(&image_ref).await {
             Ok(()) => images.delete_image(&image_ref).await,
             Err(e) => Err(e),
@@ -460,7 +468,7 @@ pub async fn prune(
             // Not there to delete (a build that failed before its push):
             // only its row goes, and nothing is reported removed.
             Ok(gone @ (weft_platform_traits::ImageDeleted::Deleted | weft_platform_traits::ImageDeleted::Absent)) => {
-                let forgotten = match super::ledger::forget(&mut tx, &image_ref).await {
+                let forgotten = match super::ledger::forget(&tx, &image_ref).await {
                     Ok(()) => tx.commit().await.context("commit forgetting a deleted image"),
                     Err(e) => Err(e),
                 };

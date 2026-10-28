@@ -16,7 +16,7 @@ working on the codebase.
 ## Set up
 
 Go check [Install](https://weavemindai.github.io/weft/start/install.html).
-As a contributor you additionally need [Node 20 or
+As a contributor you additionally need [Node 22.12 or
 newer](https://nodejs.org/en/download) and [pnpm](https://pnpm.io/installation)
 (`npm i -g pnpm`) to build the extensions from source and running the tests.
 
@@ -72,7 +72,7 @@ pnpm -C packages/weft-syntax test                              # the .weft gramm
 pnpm -C extension-vscode test                                  # the VS Code extension
 pnpm -C extension-vscode run compile                           # its type check, webview included
 node --test catalog/bailey/bridge/images/bridge/src/*.test.js  # the WhatsApp bridge
-node --test tangle/kilo-code/tests/*.test.ts                   # Kilo Code's Tangle plugin (Node 23.6 or later)
+node --test tangle/kilo-code/tests/*.test.ts                   # Kilo Code's Tangle plugin (Node 22.18 or later)
 pnpm -C extension-browser exec tsc --noEmit                    # the browser extension's type check
 pnpm -C extension-browser check                                # and its Svelte check
 ```
@@ -389,18 +389,21 @@ with the old arguments fails loudly (no such function), and the arguments you
 added need no `DEFAULT`.
 
 If the rows already there need something done before the second file runs,
-give the group whose tables the data lands in a `DataStep`: the table and
-column it waits on, what the second file does to that column (`until`), and an
-SQL statement that does the work. If you drop a column whose content has to
-live on somewhere else, the step copies it there, `until: Until::Dropped`
-(`UNITS_MOVE` in `crates/weft-dispatcher/src/infra_node.rs` is one). If you add
-a NOT NULL column the rows already there have to be filled in from somewhere,
-the step fills it, `until: Until::NotNull` (`TENANT_OF_QUEUED` in
-`crates/weft-dispatcher/src/search_index.rs` takes each queued run's tenant
-from its run, and drops a row whose run is gone). The boot runs it just before
+give the group whose tables the data lands in a `DataStep`: its table, what the
+second file is about to do (`until`, which names the column or index it waits
+on), and an SQL statement that does the work. If you drop a column whose
+content has to live on somewhere else, the step copies it there,
+`until: Until::Dropped("<column>")` (`UNITS_MOVE` in
+`crates/weft-dispatcher/src/infra_node.rs` is one). If you add a NOT NULL
+column the rows already there have to be filled in from somewhere, the step
+fills it, `until: Until::NotNull("<column>")`. If you add a unique index the
+rows already there might break, the step merges them first,
+`until: Until::Indexed("<index>")` (`EXCLUSIVE_FOLD` in
+`crates/weft-access-store/src/lib.rs` is one). The boot runs it just before
 the pending `.contract.sql` files, in the same transaction, with its table
-locked, and only while the column is still there or still nullable. Nothing
-records that it ran, so the statement has to give the same result run twice
+locked, and only while the column is still there or still nullable, or the
+index not built yet. Nothing records that it ran, so the statement has to give
+the same result run twice
 (`ON CONFLICT DO NOTHING`, a `SET` on the rows still `NULL`).
 
 If you renamed a column or a table, say so. The diff alone sees a column going

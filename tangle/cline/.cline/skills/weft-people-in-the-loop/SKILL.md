@@ -12,7 +12,7 @@ submits to start a run instead. A parked question reaches people through the
 weft browser extension:
 
 1. Build it once: `./setup.sh --browser --no-sign` in the weft checkout
-   (needs Node 20+ and pnpm; the default install skips it because signing
+   (needs Node 22.12+ and pnpm; the default install skips it because signing
    is slow).
 2. Load it: Chrome-family, "Load unpacked" from `chrome://extensions`
    picking the folder under `extension-browser/build/`; Firefox, a

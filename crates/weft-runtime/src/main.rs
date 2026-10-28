@@ -55,10 +55,15 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve { config, .. } => Some(weft_platform_traits::InstallConfig::load(config)?),
         Command::UnitAgent { .. } => None,
     };
-    // Every weft crate at info. The alert line is the platform's to write
-    // (`platform::alert_lines`), never the ordinary log's.
+    // Every weft crate at info, and the database libraries' own warnings
+    // (`tokio_postgres`, and `deadpool`, which also covers
+    // `deadpool_postgres`), never their per-statement lines. A slow wait
+    // for a connection is the pools' own to count
+    // (`weft_task_store::throttle`), said once a minute. The alert line is
+    // the platform's to write (`platform::alert_lines`), never the
+    // ordinary log's.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "weft=info".into())
+        .unwrap_or_else(|_| "weft=info,tokio_postgres=warn,deadpool=warn".into())
         .add_directive(format!("{}=off", weft_platform_traits::ALERT_TARGET).parse()?);
     let lines = match &args.command {
         // A local install's runtime keeps its own log, bounded; anywhere

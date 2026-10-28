@@ -119,35 +119,22 @@ fn staged_slack_project() -> tempfile::TempDir {
     project_dir
 }
 
-/// Container mode roots every include at the image's nodes mount; the
-/// arm that ships in images gets its own pin, not just Local's.
+/// A node-test crate compiles on the machine, never in an image: asking
+/// for one in container mode is refused, naming the package.
 #[test]
-fn container_mode_includes_are_mount_rooted() {
+fn a_test_crate_is_never_emitted_for_an_image() {
     let project_dir = staged_slack_project();
     let catalog = FsCatalog::discover(&project_dir.path().join("nodes")).expect("discover");
     let dir = tempfile::tempdir().expect("temp dir");
-    emit_test_crate(
+    let err = emit_test_crate(
         dir.path(),
         &catalog,
         "slack",
         &EmitPaths::Container { project_root: project_dir.path().to_path_buf() },
     )
-    .expect("emit");
-    let lib_rs = std::fs::read_to_string(package_dir(dir.path(), "pkg_slack").join("src/lib.rs")).unwrap();
-    assert!(
-        lib_rs.contains("/weft/project-nodes/nodes/slack/send_message/mod.rs"),
-        "container includes are mount-rooted:\n{lib_rs}"
-    );
-    // The container crate builds alone inside its image, so it is its
-    // own workspace with its own toolchain pin, and it carries the
-    // cache sweep the image's `cargo build` RUN calls after linking.
-    let root_toml = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
-    assert!(root_toml.contains("[workspace]"), "{root_toml}");
-    assert!(dir.path().join("rust-toolchain.toml").is_file(), "toolchain pinned");
-    assert!(
-        dir.path().join(weft_compiler::worker_image::CACHE_GC_SCRIPT_NAME).is_file(),
-        "the cache sweep rides in the test crate like it does in the worker crate"
-    );
+    .expect_err("refused")
+    .to_string();
+    assert!(err.contains("'slack'") && err.contains("image"), "{err}");
 }
 
 /// The package crate's directory is named by its content: the same
@@ -198,15 +185,14 @@ fn re_emission_wipes_stale_files() {
     assert!(package_dir(dir.path(), "pkg_slack").is_dir());
 }
 
-/// The test hash is the image's staleness rule: stable on unchanged
-/// inputs, flipped by a package source edit AND by an image-recipe
-/// edit (weft.toml's build choices shape the image bytes).
+/// The test hash is the test server's staleness rule: stable on
+/// unchanged inputs, flipped by a package source edit and a sibling's type
+/// edit, and left alone by what only an image is built with (weft.toml's
+/// `[build.worker]`): a test server is a program compiled on the machine.
 #[test]
-fn node_test_hash_tracks_sources_and_recipe() {
+fn node_test_hash_tracks_sources_not_the_image_recipe() {
     let project_dir = staged_slack_project();
     let weft_root = weft_catalog::weft_repo_root().expect("weft root");
-    let project =
-        weft_compiler::project::Project::load(project_dir.path()).expect("project loads");
     let package_root = project_dir.path().join("nodes").join("slack");
     // A SIBLING package, for the type-registry flip below.
     copy_dir(
@@ -218,10 +204,10 @@ fn node_test_hash_tracks_sources_and_recipe() {
     };
 
     let h1 =
-        weft_compiler::hash::compute_node_test_hash(&package_root, &project, &weft_root, &catalog())
+        weft_compiler::hash::compute_node_test_hash(&package_root, &weft_root, &catalog())
             .expect("hash");
     let h2 =
-        weft_compiler::hash::compute_node_test_hash(&package_root, &project, &weft_root, &catalog())
+        weft_compiler::hash::compute_node_test_hash(&package_root, &weft_root, &catalog())
             .expect("hash again");
     assert_eq!(h1, h2, "unchanged inputs = a cache hit");
 
@@ -230,7 +216,7 @@ fn node_test_hash_tracks_sources_and_recipe() {
     let original = std::fs::read_to_string(&probe).expect("read api.rs");
     std::fs::write(&probe, format!("{original}\n// probe edit\n")).expect("edit");
     let h3 =
-        weft_compiler::hash::compute_node_test_hash(&package_root, &project, &weft_root, &catalog())
+        weft_compiler::hash::compute_node_test_hash(&package_root, &weft_root, &catalog())
             .expect("hash after source edit");
     assert_ne!(h1, h3, "a node source edit must flip the test hash");
 
@@ -245,24 +231,21 @@ fn node_test_hash_tracks_sources_and_recipe() {
     std::fs::write(&sibling_meta, serde_json::to_string_pretty(&parsed).unwrap())
         .expect("edit sibling metadata");
     let h3b =
-        weft_compiler::hash::compute_node_test_hash(&package_root, &project, &weft_root, &catalog())
+        weft_compiler::hash::compute_node_test_hash(&package_root, &weft_root, &catalog())
             .expect("hash after sibling type edit");
     assert_ne!(h3, h3b, "a sibling package's type declaration must flip the test hash");
 
-    // An image-recipe edit (weft.toml) flips it too: the base image
-    // shapes the image the tests run in.
+    // An image-recipe edit (weft.toml) does not: no image is built.
     std::fs::write(
         project_dir.path().join("weft.toml"),
         "[package]\nid = \"00000000-0000-0000-0000-000000000001\"\nname = \"probe\"\n\n\
          [build.worker]\nbase_image = \"debian:trixie-slim\"\n",
     )
     .expect("edit weft.toml");
-    let project =
-        weft_compiler::project::Project::load(project_dir.path()).expect("project reloads");
     let h4 =
-        weft_compiler::hash::compute_node_test_hash(&package_root, &project, &weft_root, &catalog())
+        weft_compiler::hash::compute_node_test_hash(&package_root, &weft_root, &catalog())
             .expect("hash after recipe edit");
-    assert_ne!(h3b, h4, "a build-recipe edit must flip the test hash");
+    assert_eq!(h3b, h4, "an image-recipe edit leaves a test server alone");
 }
 
 /// An unknown package is a loud error naming the known set.
@@ -343,11 +326,11 @@ fn worker_emission_declares_but_never_enables_node_tests() {
     let dir = tempfile::tempdir().expect("temp dir");
     weft_compiler::codegen::emit(
         &project,
-        project_dir.path(),
         dir.path(),
         &catalog,
         "probe",
         weft_core::builds::NodeSet::Referenced,
+        &weft_compiler::codegen::EmitPaths::Container { project_root: project_dir.path().to_path_buf() },
     )
     .expect("worker emission");
 

@@ -45,7 +45,7 @@ pub struct HttpWorkerDoors {
 
 impl HttpWorkerDoors {
     pub fn new(secret: Vec<u8>) -> Arc<Self> {
-        Arc::new(Self { http: reqwest::Client::new(), secret })
+        Arc::new(Self { http: weft_core::net::http_client().build().expect("reqwest client"), secret })
     }
 }
 
@@ -238,10 +238,16 @@ impl FireSignalSink {
         self.signals.write_kind_state(token, kind_state, from_seq).await
     }
 
+    /// The kind's durable state on signal `token`'s row and the version it
+    /// is at, `None` when no held signal goes by that token.
+    pub async fn kind_state_of(&self, token: &str) -> Result<Option<crate::kinds::RowState>> {
+        Ok(self.signals.get_held(token).await?.map(|row| crate::kinds::RowState { state: row.kind_state, seq: row.kind_state_seq }))
+    }
+
     /// Give up registration `generation` of signal `token` for good: the
     /// row says why (and lets go of its holder), and whatever runs under
-    /// the token here stops, keeping nothing of where it connects or as
-    /// whom (`crate::reach`). It stops here even when the row could not be
+    /// the token here stops, keeping none of the credentials it connected
+    /// with (`crate::reach`). It stops here even when the row could not be
     /// written, which is the error answered; a connection held here then
     /// stays this process's claim until its next look writes it
     /// (`Registry::unrecorded`), and any other signal's is its caller's to
@@ -251,11 +257,14 @@ impl FireSignalSink {
             .signals
             .give_up(&weft_broker_client::protocol::SignalGiveUpRequest { token: token.to_string(), generation, reason: reason.to_string() })
             .await;
-        let was_down_holding = self.registry.clear_down(token) == Some(true);
-        let holding_here = self.registry.remove(token).is_some() || was_down_holding;
-        self.reach.forget(token);
+        // Only this registration (or an older one) stops: a newer one of
+        // the token that came up here since is not what was given up on.
+        let mine = crate::registry::Registrations::UpTo(generation);
+        let was_down_holding = self.registry.clear_down(token, mine) == Some(true);
+        let holding_here = self.registry.remove(token, mine).is_some() || was_down_holding;
+        self.reach.forget(token, mine);
         match &written {
-            Ok(()) => self.registry.drop_unrecorded(token),
+            Ok(()) => self.registry.drop_unrecorded(token, mine),
             Err(_) if holding_here => {
                 self.registry.keep_unrecorded(token, crate::registry::GaveUp { generation, reason: reason.to_string() });
                 self.said.notify_one();

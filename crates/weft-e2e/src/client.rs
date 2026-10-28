@@ -24,27 +24,17 @@ use anyhow::{bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-/// Mints the bearer a request authenticates with. With no auth, the default is
-/// `None` (no `Authorization` header). A harness that needs a token injects a
-/// provider that signs a fresh Ed25519 JWT for the tenant under test: every call
-/// carries a signed token, no CLI. Sync (JWT signing is sync) and called per
-/// request so a short-lived token is always fresh. `Send + Sync` so a
-/// `Dispatcher` stays cheaply cloneable + usable across the rig's spawned tasks.
-pub trait AuthProvider: Send + Sync {
-    /// The `Authorization` header VALUE for the next request (e.g.
-    /// `"Bearer <jwt>"`), or `None` for an unauthenticated call.
-    fn authorization(&self) -> Option<String>;
-}
-
 /// Thin HTTP client over the dispatcher's public API. Clone is cheap
-/// (reqwest::Client is an Arc internally; the auth provider is an Arc).
+/// (reqwest::Client is an Arc internally).
 #[derive(Clone)]
 pub struct Dispatcher {
     base: String,
     http: reqwest::Client,
-    /// Mints the per-request bearer. `None` => unauthenticated; `Some` => a
-    /// harness signs a token per call.
-    auth: Option<std::sync::Arc<dyn AuthProvider>>,
+    /// The operator key every request sends (`Authorization: Bearer
+    /// <key>`): the install's own key for an install on this machine
+    /// ([`Dispatcher::for_install`]), or one a test holds for another (a
+    /// cloud install, [`Dispatcher::with_key`]).
+    key: String,
     /// Which install on this machine this dispatcher belongs to: the
     /// install under test, or a test cell ([`crate::cell::Cell`]). What reaches
     /// behind the API (the platform layer, the `weft` CLI) follows it to
@@ -53,7 +43,7 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
-    /// Build an UNAUTHENTICATED client for the install under test
+    /// Build a client for the install under test
     /// ([`crate::ensure::install_under_test`]), at the address its
     /// `ports.json` gives (the CLI's own resolution). The address always
     /// comes from that install, so one test never drives two installs. The
@@ -67,16 +57,18 @@ impl Dispatcher {
         Self::for_install(&base, install)
     }
 
-    /// An UNAUTHENTICATED client for the dispatcher of `install`, answering
-    /// at `base`.
+    /// A client for the dispatcher of `install`, answering at `base`, each
+    /// call carrying the install's own key (read from its secrets, the way
+    /// the CLI on this machine reads it).
     pub fn for_install(base: &str, install: weft_core::infra::Install) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        let http = weft_core::net::http_client()
             .build()
             .context("build reqwest client")?;
+        let key = install.secret(weft_core::signal_token::INSTALL_KEY_SECRET).map_err(anyhow::Error::msg)?;
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
             http,
-            auth: None,
+            key,
             install,
         })
     }
@@ -86,22 +78,17 @@ impl Dispatcher {
         &self.install
     }
 
-    /// A clone of this client that authenticates every request via `auth`. A
-    /// harness that needs tokens builds the base client, then attaches a
-    /// per-tenant signer; unauthenticated tests never call this.
-    pub fn with_auth(mut self, auth: std::sync::Arc<dyn AuthProvider>) -> Self {
-        self.auth = Some(auth);
+    /// A clone of this client that sends operator key `key` instead (one
+    /// for a cloud install).
+    pub fn with_key(mut self, key: String) -> Self {
+        self.key = key;
         self
     }
 
-    /// Apply the auth header (if any) to a request builder. Every verb routes
-    /// through here so an authed client signs uniformly and an unauthed one
-    /// adds nothing.
+    /// Apply the auth header to a request builder. Every verb routes
+    /// through here, so every call is signed the same way.
     fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self.auth.as_ref().and_then(|a| a.authorization()) {
-            Some(value) => req.header("authorization", value),
-            None => req,
-        }
+        req.header("authorization", format!("Bearer {}", self.key))
     }
 
     /// The base URL (no trailing slash), e.g. for building sub-URLs the rig

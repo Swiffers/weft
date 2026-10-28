@@ -160,7 +160,7 @@ mod tests {
     /// unknown instead of booking page-rate money for it.
     #[tokio::test]
     async fn resolve_refuses_to_price_a_non_ocr_route() {
-        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let observed = ObservedCall {
             interrupted: false,
@@ -189,7 +189,7 @@ mod tests {
     /// metadata.
     #[tokio::test]
     async fn resolve_prices_by_the_reported_model() {
-        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let resolve = |model: Value| {
             let observed = ObservedCall {

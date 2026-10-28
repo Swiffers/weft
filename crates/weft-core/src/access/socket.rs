@@ -17,17 +17,31 @@ use crate::error::WeftResult;
 /// One WebSocket frame's payload, as a node sends or receives it.
 /// Control frames (ping/pong) are handled by the transport and never
 /// surface here; a Close ends the stream (`recv` returns `None`).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Both shapes hold shared bytes ([`bytes::Bytes`]), the same the
+/// transport reads into and writes from, so a frame passes between the
+/// node and the socket without being copied, either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SocketMessage {
-    Text(String),
-    Binary(Vec<u8>),
+    Text(SocketText),
+    Binary(bytes::Bytes),
 }
 
 impl SocketMessage {
+    /// A text frame of `text` (a `String` moves in without a copy).
+    pub fn text(text: impl Into<SocketText>) -> Self {
+        SocketMessage::Text(text.into())
+    }
+
+    /// A binary frame of `bytes` (a `Vec<u8>` moves in without a copy).
+    pub fn binary(bytes: impl Into<bytes::Bytes>) -> Self {
+        SocketMessage::Binary(bytes.into())
+    }
+
     /// The payload bytes, whichever frame shape carries them.
     pub fn as_bytes(&self) -> &[u8] {
         match self {
-            SocketMessage::Text(s) => s.as_bytes(),
+            SocketMessage::Text(text) => text.as_str().as_bytes(),
             SocketMessage::Binary(b) => b,
         }
     }
@@ -36,7 +50,7 @@ impl SocketMessage {
     /// (JSON realtime APIs): a binary frame refuses loudly with its
     /// byte count, never flattened into an empty string that would
     /// report as a blank parse error downstream.
-    pub fn into_text(self) -> WeftResult<String> {
+    pub fn into_text(self) -> WeftResult<SocketText> {
         match self {
             SocketMessage::Text(text) => Ok(text),
             SocketMessage::Binary(bytes) => Err(crate::error::WeftError::NodeFailed(format!(
@@ -44,6 +58,94 @@ impl SocketMessage {
                 bytes.len()
             ))),
         }
+    }
+}
+
+/// A text frame's payload: UTF-8 held as shared bytes. Reads as a `&str`
+/// (it derefs to one). Every way to make one either checks the bytes are
+/// UTF-8 or starts from a string, so [`SocketText::as_str`] never checks
+/// again.
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
+pub struct SocketText(bytes::Bytes);
+
+impl SocketText {
+    /// `bytes` as text, refused when they are not UTF-8.
+    pub fn from_utf8(bytes: bytes::Bytes) -> Result<Self, std::str::Utf8Error> {
+        std::str::from_utf8(&bytes)?;
+        Ok(Self(bytes))
+    }
+
+    /// `bytes` as text, without checking them: for a transport whose own
+    /// type already guarantees them UTF-8 (a WebSocket library's text
+    /// frame), so a received frame is not scanned twice.
+    ///
+    /// # Safety
+    ///
+    /// `bytes` must be valid UTF-8.
+    pub unsafe fn from_utf8_unchecked(bytes: bytes::Bytes) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_str(&self) -> &str {
+        // SAFETY: every constructor checks the bytes are UTF-8, starts
+        // from a string, or (`from_utf8_unchecked`) is given that duty by
+        // its caller; the bytes never change after.
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
+
+    /// The UTF-8 bytes, shared, for a transport to write.
+    pub fn into_bytes(self) -> bytes::Bytes {
+        self.0
+    }
+}
+
+impl std::ops::Deref for SocketText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for SocketText {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<String> for SocketText {
+    fn from(text: String) -> Self {
+        Self(bytes::Bytes::from(text))
+    }
+}
+
+impl From<&str> for SocketText {
+    fn from(text: &str) -> Self {
+        Self(bytes::Bytes::copy_from_slice(text.as_bytes()))
+    }
+}
+
+impl std::fmt::Debug for SocketText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl std::fmt::Display for SocketText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<str> for SocketText {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for SocketText {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
     }
 }
 
@@ -107,9 +209,25 @@ mod tests {
     /// byte count instead of flattening to an empty string.
     #[test]
     fn into_text_refuses_binary_frames() {
-        assert_eq!(SocketMessage::Text("{}".into()).into_text().unwrap(), "{}");
-        let err = SocketMessage::Binary(vec![0, 1, 2]).into_text().unwrap_err();
+        assert_eq!(SocketMessage::text("{}").into_text().unwrap(), "{}");
+        let err = SocketMessage::binary(vec![0, 1, 2]).into_text().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("3-byte binary frame"), "{msg}");
+    }
+
+    /// A node's string or buffer becomes a frame without being copied,
+    /// and bytes that are not UTF-8 never become text.
+    #[test]
+    fn a_frame_holds_what_it_was_given_without_a_copy() {
+        let text = String::from("{\"type\":\"hello\"}");
+        let at = text.as_ptr();
+        let SocketMessage::Text(frame) = SocketMessage::text(text) else { panic!("a text frame") };
+        assert_eq!(frame.as_str().as_ptr(), at);
+        assert_eq!(frame.clone().into_bytes().as_ptr(), at, "the bytes a transport writes are the same");
+        let buffer = vec![1u8, 2, 3];
+        let at = buffer.as_ptr();
+        assert_eq!(SocketMessage::binary(buffer).as_bytes().as_ptr(), at);
+        assert!(SocketText::from_utf8(bytes::Bytes::from_static(&[0xff, 0xfe])).is_err());
+        assert_eq!(SocketText::from_utf8(bytes::Bytes::from_static(b"ok")).unwrap(), "ok");
     }
 }

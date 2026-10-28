@@ -136,8 +136,9 @@ internet. It bills every hour it runs, even while nobody uses the install
 user's yes. On a yes you make no Neon project: set the fork's repository
 variable `WEFT_DATABASE` to `cloud_sql` (`gh variable set WEFT_DATABASE --body
 cloud_sql --repo <fork>`), leave the `WEFT_DATABASE_URL` secret out, and the
-install workflow makes the database itself. Its size is the variable
-`WEFT_CLOUD_SQL_TIER`, `db-g1-small` (a small shared machine) when unset.
+install workflow makes the database itself. Its size is the repository
+variable `WEFT_CLOUD_SQL_TIER`, `db-g1-small` (a small shared machine) when
+unset; for changing it later, go and read the weft-cloud-install skill.
 
 An install already on Neon can move to its own Cloud SQL later, with its
 data: `weft maintenance on --on <target>`, the same `WEFT_DATABASE` variable,

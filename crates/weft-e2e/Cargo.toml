@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 # Layer-4 end-to-end test rig. This crate drives a REAL running weft install
-# (the runtime process and the worker containers it starts) and asserts behavior through the
+# (the runtime process and the worker processes it starts) and asserts behavior through the
 # public API, exactly as a user / the outside world would. Because it needs the
 # install up, the tests are gated behind the `e2e` feature, OFF by default: the
 # whole library and its tests compile under `cargo test --workspace`, but the
@@ -28,18 +28,15 @@ required-features = ["e2e"]
 [features]
 # OFF by default. Gates the live-install test bodies and the runtime they need.
 # Without it the crate still type-checks (the toolkit is always compiled) but no
-# test touches an install. `sqlx` is pulled in ONLY here: the platform layer
-# reads the install's Postgres directly (a host-side, test-only reach-behind the
-# public API, never shipped), so its weight lands solely on the e2e build, not
-# on `cargo test --workspace`.
-e2e = ["dep:sqlx", "dep:dotenvy"]
+# test touches an install.
+e2e = ["dep:dotenvy"]
 
 [dependencies]
 # Light real types reused for the wire-shape safety net. weft-core is
 # dependency-light and owns the wire types themselves: every replay row is
 # decoded as `weft_core::live_event::LiveEvent` (src/run.rs `fetch_replay`),
 # so a shape the dispatcher and weft-core disagree on fails the test. We do
-# NOT depend on weft-dispatcher (heavy: sqlx), which would drag the server's
+# NOT depend on weft-dispatcher, which would drag the server's
 # whole tree into the test build for types weft-core already has.
 weft-core = { workspace = true }
 # The structured `.weft` editor (`EditOp::SetConfig`), so a test sets a node's
@@ -54,15 +51,15 @@ weft-catalog = { workspace = true }
 # The drift-backstop / refresh e2es (tests/e2e/accesses.rs) additionally seed
 # grant rows directly in the store's Postgres (WEFT_E2E_DATABASE_URL):
 # there is deliberately no HTTP door that writes arbitrary grants. Rides
-# the platform layer's sqlx (below) with json/uuid/chrono row types.
-# The store crate itself joins for its sealing (a seeded row's secret
+# the platform layer's connection (below). The store crate itself joins for its sealing (a seeded row's secret
 # columns must be sealed exactly as the store writes them).
 weft-access-store = { workspace = true }
 # The install config a cell's start writes, read back for the port its
 # runtime answers on.
 weft-platform-traits = { workspace = true }
-# The container labels and role values the local platform stamps, read
-# back to find a project's containers.
+# The infra container labels the local platform stamps, read back to find
+# a project's units, and the worker registry its runtime keeps, read back
+# to find a project's worker processes.
 weft-platform-local = { workspace = true }
 chrono = { workspace = true }
 
@@ -77,13 +74,14 @@ toml = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
 anyhow = { workspace = true }
+tempfile = { workspace = true }
 tracing = { workspace = true }
 axum = { workspace = true }
 
-# Optional: only compiled under the `e2e` feature (see [features]). The platform
-# layer (src/platform.rs) connects to the install's Postgres to observe
-# which worker owns a run and what a run stored.
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono"], optional = true }
+# The platform layer (src/platform.rs) connects to the install's Postgres
+# to observe which worker owns a run and what a run stored, the way the
+# install itself connects.
+weft-task-store = { workspace = true }
 
 # Optional: only under `e2e`. Loads the repo root's `.env.local` and `.env`
 # (the files the CLI reads too) so a test that spends on a real key finds it

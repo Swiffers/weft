@@ -98,7 +98,7 @@ pub struct WorkerConfig {
     /// This process's replica id: names the runs it drives, and the
     /// records it writes.
     pub replica: String,
-    /// The program this worker runs (its image's binary hash): its door
+    /// The program this worker runs (its binary hash): its door
     /// serves the routes armed for it.
     pub binary_hash: String,
     /// What the install allows at its public edge.
@@ -1090,6 +1090,11 @@ async fn run_handler(State(state): State<ServerState>, headers: HeaderMap, Path(
 pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config: WorkerConfig) -> Result<()> {
     weft_core::net::install_crypto_provider();
     weft_core::time_scale::announce();
+    // The port first: a worker that cannot have it ends here, before it
+    // takes anything on.
+    let listener = crate::listen::bind(config.port).await?;
+    let budget = crate::busy::Budget::of_cgroup();
+    tracing::info!(target: "weft_engine::worker", ?budget, "this worker's memory budget");
     let door = crate::door::Door::new(
         config.project_id,
         config.tenant_id.clone(),
@@ -1097,7 +1102,7 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
         clients.door_broker.clone(),
         config.edge,
         config.secret.clone(),
-        crate::door::RunPermits::from_env()?,
+        crate::door::RunPermits::from_env(budget)?,
     );
     // The line is held open while runs are driven (the line watch) and
     // while records wait to be written (the writer's own calls); idle, it
@@ -1128,7 +1133,7 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
         canceller: Arc::new(RegistryCanceller { cancels: worker.cancels.clone() }),
         starter: Arc::new(LiveStarter { worker: worker.clone() }),
     }));
-    let app = app.layer(axum::middleware::from_fn_with_state(crate::busy::MemoryGuard::sampling(), crate::busy::refuse_when_busy));
+    let app = app.layer(axum::middleware::from_fn_with_state(crate::busy::MemoryGuard::start(budget), crate::busy::refuse_when_busy));
     // Told to stop, or nearing the cut of its line while its runs only
     // wait, the worker hands its recorded runs back and takes no new call,
     // while the calls it holds go on to their end. While it works, its line
@@ -1138,7 +1143,7 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
     let stopping = worker.stopping.clone();
     crate::caller_conn::serve(
         app.layer(axum::middleware::map_response(mark_worker_answer)),
-        config.port,
+        listener,
         async move { stopping.cancelled().await },
     )
     .await?;

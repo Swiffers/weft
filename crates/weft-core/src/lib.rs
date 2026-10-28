@@ -52,8 +52,11 @@ pub mod live;
 pub mod live_event;
 pub mod maintenance;
 pub mod migrate;
+pub mod needs;
 pub mod picks;
 pub mod ports;
+#[cfg(feature = "jwt")]
+pub mod jwt;
 #[cfg(feature = "runtime")]
 pub mod liveness;
 #[cfg(feature = "runtime")]

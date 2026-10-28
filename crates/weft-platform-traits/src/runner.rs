@@ -9,8 +9,8 @@
 //! `weft_engine::worker_server`).
 //!
 //! What differs per platform is only where that HTTP server lives and how
-//! to get an address for it, which is what this trait answers: a local
-//! container started on demand, or a Cloud Run service.
+//! to get an address for it, which is what this trait answers: a process
+//! on the machine started on demand, or a Cloud Run service.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -24,13 +24,37 @@ use weft_core::workers::WorkerSettings;
 pub struct WorkerTarget {
     pub tenant: String,
     pub project: uuid::Uuid,
-    /// The worker image to run (content-addressed by its binary hash).
+    /// The worker to run, by its image ref (content-addressed by its
+    /// binary hash): an image on the cloud, a program compiled on the
+    /// machine on a local install (`weft_core::builds::WORKER_REPO`).
     pub image: String,
-    /// The program's binary the image holds, whose routes the worker
+    /// The program's binary the worker holds, whose routes the worker
     /// serves; `None` for a node-test server, which serves no routes.
     pub binary_hash: Option<String>,
     pub settings: WorkerSettings,
 }
+
+/// Where each project's folder is on this machine: its folder working
+/// copy's path, when that working copy is on this machine. A platform
+/// whose workers run as processes on the machine runs each in its
+/// project's folder, and asks only when it starts one.
+#[async_trait]
+pub trait ProjectFolders: Send + Sync {
+    /// `project`'s folder on this machine; `None` when it has none here.
+    async fn folder(&self, project: uuid::Uuid) -> anyhow::Result<Option<std::path::PathBuf>>;
+}
+
+/// The exit code a worker ends with when it cannot listen on its port
+/// because another program holds it, after printing
+/// [`WORKER_PORT_TAKEN_LINE`]: how a runner that started it on a port it
+/// was asked for tells a taken port ([`PortTaken`]) from any other end.
+/// The worker's own bind (`weft_engine::listen`) prints and exits with these.
+pub const WORKER_PORT_TAKEN_EXIT: i32 = 98;
+
+/// The line a worker prints, followed by its address, when its port is
+/// held by another program, just before it exits with
+/// [`WORKER_PORT_TAKEN_EXIT`].
+pub const WORKER_PORT_TAKEN_LINE: &str = "weft worker: the port is held by another program:";
 
 /// The header weft's own calls to a worker carry their credential in.
 ///
@@ -168,8 +192,8 @@ impl PlatformRefused {
 }
 
 /// The answer [`Runner::endpoint`] gives when the workers of the build
-/// asked for cannot run at all: started, they exit (a local container, a
-/// Cloud Run revision that failed), or the build's image is gone. A definite answer about that build, which no
+/// asked for cannot run at all: started, they exit (a local process, a
+/// Cloud Run revision that failed), or the build's program is gone. A definite answer about that build, which no
 /// retry changes: what runs on it ends at once and says so, rather than
 /// waiting for a worker that will never come. [`WorkerWontStart::is`]
 /// recognizes it.
@@ -305,8 +329,7 @@ pub trait Runner: Send + Sync {
     async fn let_front_go(&self, project: uuid::Uuid) -> anyhow::Result<()>;
 
     /// Kill every worker the project has, outright (the runs on them die
-    /// with them), and remove what runs them (a service, stopped
-    /// containers). What removing a project does before it erases a row:
+    /// with them), and remove what runs them (a service). What removing a project does before it erases a row:
     /// a worker left alive would keep serving from what it remembers of a
     /// project that is gone. An error names what still runs and how to
     /// stop it by hand. Idempotent.
@@ -316,7 +339,7 @@ pub trait Runner: Send + Sync {
     /// are gone (on a cloud, the account its workers ran as). Idempotent.
     async fn retire(&self, tenant: &str, project: uuid::Uuid) -> anyhow::Result<()>;
 
-    /// Remove what the platform keeps running from `image` (a container,
+    /// Remove what the platform keeps running from `image` (a process,
     /// a service revision), for an image about to be deleted because
     /// nothing references it. Idempotent.
     async fn forget_image(&self, image: &str) -> anyhow::Result<()>;
@@ -336,6 +359,30 @@ pub mod fake {
         KillWorkers { project: uuid::Uuid },
         Retire { project: uuid::Uuid },
         ForgetImage(String),
+    }
+
+    /// Answers the folders it was given; a project it was not given has
+    /// none.
+    #[derive(Default)]
+    pub struct FakeProjectFolders {
+        folders: Mutex<std::collections::HashMap<uuid::Uuid, std::path::PathBuf>>,
+    }
+
+    impl FakeProjectFolders {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn set(&self, project: uuid::Uuid, folder: impl Into<std::path::PathBuf>) {
+            self.folders.lock().insert(project, folder.into());
+        }
+    }
+
+    #[async_trait]
+    impl ProjectFolders for FakeProjectFolders {
+        async fn folder(&self, project: uuid::Uuid) -> anyhow::Result<Option<std::path::PathBuf>> {
+            Ok(self.folders.lock().get(&project).cloned())
+        }
     }
 
     /// Records every call; hands out `base_url` as the endpoint.

@@ -11,7 +11,7 @@
 //! `infra_units_move`.)
 
 use serde_json::Value;
-use sqlx::PgPool;
+use weft_task_store::db::{Client as _, Pool};
 
 fn samples(document: &str, version: i32) -> Vec<Value> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -31,8 +31,8 @@ fn old_recipe_hash(events: &Value) -> String {
 /// before the units and the resync's drive moved out of where they were.
 pub(crate) const OLDER_WEFT_HAD: &str = "20261020T134642_infra_lifecycle_command_health_commands";
 
-#[sqlx::test]
-async fn a_database_an_older_weft_filled_boots_and_every_row_reads(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_database_an_older_weft_filled_boots_and_every_row_reads(pool: Pool) {
     weft_task_store::schema_guard::build_as_of(&pool, &weft_runtime::schema::groups(), |m| m.id <= OLDER_WEFT_HAD)
         .await
         .unwrap();
@@ -45,45 +45,33 @@ async fn a_database_an_older_weft_filled_boots_and_every_row_reads(pool: PgPool)
     for (id, service, spec, hash) in
         [(slack_id, "slack", slack, Some(old_hash.clone())), (hmac_id, "hmac_auth", hmac, None)]
     {
-        sqlx::query(
+        pool.execute(
             "INSERT INTO access_grant (id, tenant_id, service, client_id, spec_json, values_sealed, \
              provider_account, events_recipe_hash) VALUES ($1, 'local', $2, 'cid', $3, '', 'T123', $4)",
+            &[&id, &service, spec, &hash],
         )
-        .bind(id)
-        .bind(service)
-        .bind(spec)
-        .bind(hash)
-        .execute(&pool)
         .await
         .unwrap();
     }
-    sqlx::query("INSERT INTO service_events_recipe (service, recipe_hash, events_json) VALUES ('slack', $1, $2)")
-        .bind(&old_hash)
-        .bind(slack_events)
-        .execute(&pool)
+    pool.execute("INSERT INTO service_events_recipe (service, recipe_hash, events_json) VALUES ('slack', $1, $2)", &[&old_hash, slack_events])
         .await
         .unwrap();
     let project_id = uuid::Uuid::new_v4();
     let program = &samples("project_definition.project_json", 1)[0];
-    sqlx::query(
+    pool.execute(
         "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix) \
          VALUES ($1, 'the-hash-it-was-made-under', $2, 0)",
+        &[&project_id, &program.to_string()],
     )
-    .bind(project_id)
-    .bind(program.to_string())
-    .execute(&pool)
     .await
     .unwrap();
     // A resync under way, its drive inside its JSON.
     let resync = &samples("project.resync", 1)[0];
-    sqlx::query(
+    pool.execute(
         "INSERT INTO project (id, name, status, project_json, updated_at, tenant_id, transition, resync) \
          VALUES ($1, 'p', 'registered', $2, 0, 'local', 'resyncing', $3)",
+        &[&project_id, &program.to_string(), resync],
     )
-    .bind(project_id)
-    .bind(program.to_string())
-    .bind(resync)
-    .execute(&pool)
     .await
     .unwrap();
     weft_runtime::schema::apply(&pool).await.unwrap();
@@ -92,11 +80,7 @@ async fn a_database_an_older_weft_filled_boots_and_every_row_reads(pool: PgPool)
         let pool = pool.clone();
         async move {
             let (spec, version): (Value, i32) =
-                sqlx::query_as("SELECT spec_json, spec_json_version FROM access_grant WHERE id = $1")
-                    .bind(id)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+                pool.one("SELECT spec_json, spec_json_version FROM access_grant WHERE id = $1", &[&id]).await.unwrap();
             assert_eq!(version, weft_core::AccessSpec::STORED.version(), "the row was carried");
             weft_core::AccessSpec::STORED.decode(spec, version).expect("the connection's recipe reads")
         }
@@ -117,27 +101,23 @@ async fn a_database_an_older_weft_filled_boots_and_every_row_reads(pool: PgPool)
         .unwrap();
     assert_eq!(routed.iter().map(|t| t.id).collect::<Vec<_>>(), vec![slack_id]);
     let hmac_hash: Option<String> =
-        sqlx::query_scalar("SELECT events_recipe_hash FROM access_grant WHERE id = $1").bind(hmac_id).fetch_one(&pool).await.unwrap();
+        pool.scalar("SELECT events_recipe_hash FROM access_grant WHERE id = $1", &[&hmac_id]).await.unwrap();
     assert_eq!(hmac_hash, None);
 
     // The program reads, under the hash it was made under.
-    let (json, version): (String, i32) = sqlx::query_as(
-        "SELECT project_json, project_json_version FROM project_definition \
-         WHERE project_id = $1 AND definition_hash = 'the-hash-it-was-made-under'",
-    )
-    .bind(project_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (json, version): (String, i32) = pool
+        .one(
+            "SELECT project_json, project_json_version FROM project_definition \
+             WHERE project_id = $1 AND definition_hash = 'the-hash-it-was-made-under'",
+            &[&project_id],
+        )
+        .await
+        .unwrap();
     weft_core::project::ProjectDefinition::STORED.decode(json.as_str(), version).expect("the program reads");
 
     // The resync's drive moved to its own column.
     let (plan, plan_version, driver): (Value, i32, Option<uuid::Uuid>) =
-        sqlx::query_as("SELECT resync, resync_version, resync_driver FROM project WHERE id = $1")
-            .bind(project_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        pool.one("SELECT resync, resync_version, resync_driver FROM project WHERE id = $1", &[&project_id]).await.unwrap();
     assert_eq!(driver.map(|d| d.to_string()).as_deref(), resync["driver"].as_str());
     assert!(plan.get("driver").is_none(), "{plan}");
     let plan = weft_dispatcher::task_kinds::resync::ResyncPlan::stored(project_id, plan, plan_version, driver).expect("the plan reads");

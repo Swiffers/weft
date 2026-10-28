@@ -64,7 +64,13 @@ parking_lot = { workspace = true }
 # would change every binary that links the engine, tests included.
 tikv-jemallocator = { workspace = true }
 pprof = { workspace = true }
+inferno = { workspace = true }
 weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
+
+# The reading of the machine's memory on a Mac
+# (`door::permits::machine_memory`), where there is no `/proc`.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [features]
 test-helpers = []

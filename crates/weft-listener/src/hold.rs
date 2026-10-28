@@ -294,7 +294,10 @@ async fn look(state: &ListenerState, want: &[String], mode: StartMode) -> anyhow
         said.remove(&now.token);
         if ended.contains(&now.token) {
             tracing::info!(target: "weft_listener::hold", token = %now.token, "a held signal ended; stopping it and what it arranged outside");
-            crate::kinds::forget(state, &now.token);
+            // The claim that ended is whatever this holder held under the
+            // token: looks run one at a time, and only a look brings a
+            // held signal up here, so nothing newer came up since.
+            crate::kinds::forget(state, &now.token, crate::registry::Registrations::All);
         } else {
             tracing::info!(target: "weft_listener::hold", token = %now.token, "a held signal is no longer this holder's; stopping it here");
             crate::kinds::stop_here(state, &now.token);

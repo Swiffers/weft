@@ -43,6 +43,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
+use weft_task_store::db::{Client as _, Pool};
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn};
 use weft_task_store::unanswered::{self, Callee};
 
@@ -108,7 +109,7 @@ async fn look(state: &DispatcherState) -> anyhow::Result<DrainStep> {
 /// failed repairs are next tried again ([`REPAIR_RETRIES`], counted from
 /// the start of each project's stretch of failures), `None` when none is
 /// still in its retries.
-async fn write_down(pool: &sqlx::PgPool, failed: Vec<RepairFailed>) -> anyhow::Result<Option<i64>> {
+async fn write_down(pool: &Pool, failed: Vec<RepairFailed>) -> anyhow::Result<Option<i64>> {
     let mut by_project: std::collections::BTreeMap<uuid::Uuid, Vec<String>> = std::collections::BTreeMap::new();
     for repair in failed {
         by_project.entry(repair.project_id).or_default().push(repair.error);
@@ -156,28 +157,26 @@ fn next_retry(failing_for: i64) -> Option<i64> {
 /// a run that ended ([`resting_claim_lapses_at`]). `None` when nothing is
 /// held. Holds already past are what the look before repaired, so only
 /// those ahead count, and a look always books ahead.
-pub async fn earliest_lapse(pool: &sqlx::PgPool, now: i64) -> anyhow::Result<Option<i64>> {
+pub async fn earliest_lapse(pool: &Pool, now: i64) -> anyhow::Result<Option<i64>> {
     let margin = crate::worker_door::lost_margin_secs();
     let stale = crate::transition::heartbeat_stale_secs();
     let rest = weft_task_store::tasks::claim_duration_secs();
-    sqlx::query_scalar(&format!(
-        "SELECT MIN(at) FROM ( \
-             SELECT MIN({held}) + $2 AS at FROM run r WHERE r.state = 'running' AND NOT ({lost}) \
-             UNION ALL SELECT MIN(a.heartbeat_unix) + $3 FROM trigger_activation a WHERE {activation} \
-             UNION ALL SELECT MIN(p.transition_heartbeat_unix) + $3 FROM project p WHERE {transition} \
-             UNION ALL SELECT MIN({claim}) FROM {RESTING_CLAIMS} \
-         ) lapses WHERE at >= $1",
-        held = weft_task_store::run_held_until_sql!("r"),
-        lost = crate::worker_door::lost_run!("$1 - $2"),
-        activation = crate::activation_store::held_by_driver_alone(),
-        transition = crate::project_store::held_by_driver_alone("p"),
-        claim = resting_claim_lapses_at("$4"),
-    ))
-    .bind(now)
-    .bind(margin)
-    .bind(stale)
-    .bind(rest)
-    .fetch_one(pool)
+    pool.scalar::<Option<i64>>(
+        &format!(
+            "SELECT MIN(at) FROM ( \
+                 SELECT MIN({held}) + $2 AS at FROM run r WHERE r.state = 'running' AND NOT ({lost}) \
+                 UNION ALL SELECT MIN(a.heartbeat_unix) + $3 FROM trigger_activation a WHERE {activation} \
+                 UNION ALL SELECT MIN(p.transition_heartbeat_unix) + $3 FROM project p WHERE {transition} \
+                 UNION ALL SELECT MIN({claim}) FROM {RESTING_CLAIMS} \
+             ) lapses WHERE at >= $1",
+            held = weft_task_store::run_held_until_sql!("r"),
+            lost = crate::worker_door::lost_run!("$1 - $2"),
+            activation = crate::activation_store::held_by_driver_alone(),
+            transition = crate::project_store::held_by_driver_alone("p"),
+            claim = resting_claim_lapses_at("$4"),
+        ),
+        &[&now, &margin, &stale, &rest],
+    )
     .await
     .context("read the earliest lapse")
 }
@@ -241,18 +240,17 @@ const RESTING_CLAIMS: &str =
 /// Put back to be claimed every task whose resting claim lapsed
 /// ([`resting_claim_lapses_at`]). Answers how many. Announced as a task
 /// ready by the table's own trigger, through the outbox its caller pokes.
-async fn hand_back_resting_claims(pool: &sqlx::PgPool, now: i64) -> anyhow::Result<u64> {
-    Ok(sqlx::query(&format!(
-        "UPDATE task SET status = 'pending', claimed_by = NULL, claimed_until_unix = NULL, claim_rests_on = NULL \
-         WHERE id IN (SELECT t.id FROM {RESTING_CLAIMS} AND {} < $1)",
-        resting_claim_lapses_at("$2")
-    ))
-    .bind(now)
-    .bind(weft_task_store::tasks::claim_duration_secs())
-    .execute(pool)
+async fn hand_back_resting_claims(pool: &Pool, now: i64) -> anyhow::Result<u64> {
+    pool.execute(
+        &format!(
+            "UPDATE task SET status = 'pending', claimed_by = NULL, claimed_until_unix = NULL, claim_rests_on = NULL \
+             WHERE id IN (SELECT t.id FROM {RESTING_CLAIMS} AND {} < $1)",
+            resting_claim_lapses_at("$2")
+        ),
+        &[&now, &weft_task_store::tasks::claim_duration_secs()],
+    )
     .await
-    .context("hand back the claims whose claimant went away")?
-    .rows_affected())
+    .context("hand back the claims whose claimant went away")
 }
 
 /// Book a look `after` seconds from now, unless one is booked by then:

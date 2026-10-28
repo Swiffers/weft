@@ -5,7 +5,9 @@
 //!
 //!   POST /prepare      compute a new signal's row (routing, kind
 //!                      state, consumer payload); starts nothing
-//!   POST /start        bring up a signal whose row was just committed
+//!   POST /fresh_places the state entry signals start from once a door
+//!                      that refuses takes their place in what they read
+//!   POST /start       bring up a signal whose row was just committed
 //!                      (its first wake; its held connection, where this
 //!                      process holds)
 //!   POST /unregister   drop a removed signal's held connection and
@@ -42,7 +44,7 @@ use serde_json::Value;
 use crate::kinds;
 use crate::ListenerState;
 use weft_core::signal::listener_protocol::{
-    LiveRequest, LiveResponse, MatchPushRequest, MatchPushResponse, ProcessOutcome, ProcessRequest,
+    FreshPlace, FreshPlacesRequest, FreshPlacesResponse, LiveRequest, LiveResponse, MatchPushRequest, MatchPushResponse, ProcessOutcome, ProcessRequest,
     PrepareRequest, PrepareResponse, StartRequest, UnregisterRequest, WakeByHandRequest, WakeByHandResponse,
 };
 
@@ -50,6 +52,7 @@ pub fn router(state: ListenerState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/prepare", post(prepare))
+        .route("/fresh_places", post(fresh_places))
         .route("/start", post(start))
         .route("/unregister", post(unregister))
         .route("/process", post(process))
@@ -95,7 +98,7 @@ async fn prepare(
     State(state): State<ListenerState>,
     Json(req): Json<PrepareRequest>,
 ) -> Result<Json<PrepareResponse>, (StatusCode, String)> {
-    let weft_core::signal::listener_protocol::PrepareSource { prior_kind_state, asked_at_unix_ms } = req.source;
+    let weft_core::signal::listener_protocol::PrepareSource { prior, asked_at_unix_ms } = req.source;
     let for_instance = req.for_instance;
     let prepared = kinds::prepare_signal(
         &state,
@@ -108,7 +111,7 @@ async fn prepare(
             spec: req.spec,
         },
         for_instance,
-        prior_kind_state.as_ref(),
+        prior.as_ref(),
         asked_at_unix_ms,
     )
     .await
@@ -121,6 +124,21 @@ async fn prepare(
         rendered: prepared.rendered.unwrap_or(Value::Null),
         holds: prepared.holds,
     }))
+}
+
+/// The state each of the asked entry signals starts from with its place in
+/// what it reads gone, for the ones whose kind keeps such a place
+/// ([`kinds::fresh_place`]). A spec its kind cannot read is a 400.
+async fn fresh_places(Json(req): Json<FreshPlacesRequest>) -> Result<Json<FreshPlacesResponse>, (StatusCode, String)> {
+    let now_unix_ms = chrono::Utc::now().timestamp_millis();
+    let mut places = Vec::new();
+    for ask in req.signals {
+        let fresh = kinds::fresh_place(&ask.spec, now_unix_ms).map_err(|e| (StatusCode::BAD_REQUEST, format!("signal {}: {e:#}", ask.token)))?;
+        if let Some(kind_state) = fresh {
+            places.push(FreshPlace { token: ask.token, kind_state });
+        }
+    }
+    Ok(Json(FreshPlacesResponse { places }))
 }
 
 /// Bring up a signal the dispatcher just registered or put back (see
@@ -190,7 +208,7 @@ async fn unregister(
     kinds::unregister(&state, req).await.map_err(|e| {
         let status = match &e {
             kinds::UnregisterError::Unreadable(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            kinds::UnregisterError::UnknownKind(_) => StatusCode::SERVICE_UNAVAILABLE,
+            kinds::UnregisterError::UnknownKind(_) | kinds::UnregisterError::RowUnread(_) => StatusCode::SERVICE_UNAVAILABLE,
             kinds::UnregisterError::TeardownFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, e.to_string())

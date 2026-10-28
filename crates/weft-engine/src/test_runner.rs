@@ -43,7 +43,7 @@ enum Args {
     },
     /// Serve `POST /_weft/test` (one test per request, live included)
     /// and `GET /_weft/tests` as the install's test runner, until stopped.
-    // SYNC: Args::Serve <-> crates/weft-compiler/src/build.rs (test_server_dockerfile)
+    // SYNC: Args::Serve <-> crates/weft-platform-local/src/images.rs (Program::args)
     Serve {
         #[arg(long, env = "WEFT_BROKER_URL")]
         broker_url: String,
@@ -444,7 +444,7 @@ async fn serve(catalog: &'static dyn NodeCatalog, live: LiveEnv, door: crate::wo
         .route("/_weft/healthz", axum::routing::get(|| async { StatusCode::OK }))
         .with_state(Served { catalog, live: std::sync::Arc::new(live), door })
         .layer(axum::middleware::map_response(crate::worker::mark_worker_answer));
-    let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from(([0, 0, 0, 0], port))).await?;
+    let listener = crate::listen::bind(port).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }

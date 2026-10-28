@@ -397,6 +397,13 @@ pub trait SignalStore: Send + Sync {
         tokens: &[String],
     ) -> anyhow::Result<Vec<SignalRegistration>>;
 
+    /// Remove `token`'s row only while it is still the registration
+    /// `generation` (the one a [`SignalWrite::Written`] named), and return
+    /// it. `None` when the row is gone or a later write made it another
+    /// registration, which then owns it: the undo of a registration that
+    /// created its row, which must never remove a later arm's.
+    async fn signal_remove_registration(&self, token: &str, generation: i64) -> anyhow::Result<Option<SignalRegistration>>;
+
     /// Delete the wait `token` of run `run_id`, given up by its run,
     /// and return it for the listener to let go of. A token that is no
     /// wait of that run (an entry trigger, another run's wait, a wait
@@ -460,12 +467,6 @@ pub trait TokenStore: Send + Sync {
     /// can't probe other tenants' tokens).
     async fn revoke_signal_token(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<bool>;
 
-    /// Record `token` (an operator key) only when its tenant holds no
-    /// operator key at all, in one statement, so replicas booting at
-    /// once record it once. The install's bootstrap key: re-seeded after
-    /// every operator key is revoked, never beside a live one. Returns
-    /// whether it was recorded.
-    async fn seed_operator_token(&self, token: &SignalToken) -> anyhow::Result<bool>;
 }
 
 /// The trigger setups (`trigger_setup`, which setup runs are in flight)
@@ -578,8 +579,11 @@ pub struct SignalRegistration {
     /// back at rehydrate time. Empty (`{}`) for most kinds. Timer
     /// uses it to remember absolute `next_fire_at_unix_ms` for
     /// After-style schedules so a listener restart doesn't reset
-    /// the clock. The dispatcher treats this field as opaque
-    /// JSON; only the kind's handler interprets it.
+    /// the clock; a kind that keeps its place in what it reads (a
+    /// poll's cursor, what a folder held) keeps that place here, which
+    /// a door that refuses takes ([`FreshPlace`]), so its rows carry
+    /// nothing of it on their next activation. The dispatcher treats
+    /// this field as opaque JSON; only the kind's handler interprets it.
     pub kind_state: Value,
     /// The kind_state version (the `signal.kind_state_seq` column). On
     /// an insert, the version the registration read the row at (0 for a
@@ -597,15 +601,29 @@ pub struct SignalRegistration {
     pub generation: i64,
 }
 
-/// What a [`SignalStore::signal_insert`] did.
+/// What a [`SignalStore::signal_insert`] (or a restore) did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalWrite {
-    /// The row is written, its kind state at a new version.
-    Written,
+    /// The row is written, its kind state at a new version, as the
+    /// registration `generation` (see [`SignalRegistration::generation`]):
+    /// what an undo of this write checks the row still is.
+    Written { generation: i64 },
     /// The row's kind state moved past the version the registration read
     /// it at (a wake claimed a moment in between), so nothing was
     /// written: read the row again and compute the state again from it.
     StateMoved,
+}
+
+/// The kind state an entry signal's row starts from once its place in what
+/// it reads is gone (a door that refuses), as its kind computed it
+/// (the listener's `/fresh_places`) from the row read at `kind_state_seq`:
+/// written only while the row is still at that version, which it moves one
+/// past.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreshPlace {
+    pub token: String,
+    pub kind_state_seq: i64,
+    pub kind_state: Value,
 }
 
 

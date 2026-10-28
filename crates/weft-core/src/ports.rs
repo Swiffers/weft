@@ -11,9 +11,7 @@
 //! `ports.json` ([`InstallPorts`]), which is where the CLI looks for it.
 //! `WEFT_SEAWEED_PORT` moves the object store, which all installs share.
 //!
-//! SYNC: these numbers <-> extension-vscode/src/localInstall.ts
-//! (DEFAULT_LOCAL_URL),
-//! extension-browser/src/entrypoints/popup/App.svelte (the bare-token
+//! SYNC: these numbers <-> extension-browser/src/entrypoints/popup/App.svelte (the bare-token
 //! default), and the prose that names them: docs/src/**,
 //! tangle/*/ (skills and personas), README files, CHANGELOG.md.
 
@@ -63,7 +61,6 @@ pub const LOCAL_PUBLIC_URL: &str = "http://127.0.0.1:14111";
 /// Saved for every install, the default one included, so a port moved
 /// once stays moved: the address is the file's, never whatever the
 /// environment of the latest command happens to say.
-// SYNC: the file's shape <-> extension-vscode/src/localInstall.ts (localInstallUrl reads `public`)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InstallPorts {
     pub public: u16,
@@ -153,7 +150,7 @@ impl InstallPorts {
     /// Written whole ([`crate::infra::write_whole`]): the editor's watcher,
     /// the CLI and setup.sh read this file while an install starts.
     pub fn save(&self, dir: &std::path::Path) -> std::io::Result<()> {
-        crate::infra::write_whole(dir, PORTS_FILE, &serde_json::to_vec(self)?)
+        crate::infra::write_whole(dir, PORTS_FILE, &serde_json::to_vec(self)?, 0o644)
     }
 
     /// The address the API and dashboard answer on.

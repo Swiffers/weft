@@ -38,7 +38,8 @@ async fn a_trigger_comes_back_after_the_maintenance() -> anyhow::Result<()> {
     let status = project.weft(&["maintenance"]).await?;
     assert!(status.contains("in maintenance since") && status.contains("'feed'"), "it says what the lift brings back:\n{status}");
 
-    project.weft(&["maintenance", "off"]).await?;
+    let off = project.weft(&["maintenance", "off"]).await?;
+    assert!(off.contains("turned on 'feed'") && off.contains("the maintenance is lifted"), "it says what came back:\n{off}");
     weft_e2e::status::wait_until_status(&disp, &pid, "active", Duration::from_secs(60)).await?;
     feed.wait_for_subscriber(Duration::from_secs(60)).await?;
     let before = run::runs(&disp, &pid).await?;

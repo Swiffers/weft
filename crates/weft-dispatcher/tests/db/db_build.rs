@@ -4,13 +4,12 @@
 //! ended, and the build transition that version holds until then, driven
 //! through the builder with a fake `ImageBuilder`.
 //!
-//! Same rig as `db_versions.rs`: `#[sqlx::test]` hands each test a fresh
+//! Same rig as `db_versions.rs`: `#[weft_db_macros::test]` hands each test a fresh
 //! database; the dispatcher's whole schema is applied as a boot does.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use sqlx::PgPool;
 use weft_compiler::build_plan::{ImageKind, PlannedImage};
 use weft_core::builds::{BuiltProgram, BuildsUnderway, ImageBuild, VersionBuildStatus};
 use weft_core::projects::BuildState;
@@ -19,26 +18,22 @@ use weft_dispatcher::build::prune::{ImageHold, ImageScope, KeepSet};
 use weft_dispatcher::build::waiting::{self, Registrar};
 use weft_dispatcher::build::{follow, BuildGate, Version, VersionBuild, VersionBuilder};
 use weft_platform_traits::{BuildStatus, FakeImageBuilder, ImageBuilder, Staging};
+use weft_task_store::db::{Client as _, Pool, Session};
 
 const TENANT: &str = "local";
 
-async fn setup(pool: &PgPool) {
+async fn setup(pool: &Pool) {
     weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
 }
 
-fn builder(pool: &PgPool, images: Arc<FakeImageBuilder>) -> VersionBuilder {
+fn builder(pool: &Pool, images: Arc<FakeImageBuilder>) -> VersionBuilder {
     builder_on(pool, images)
 }
 
-fn builder_on(pool: &PgPool, images: Arc<dyn ImageBuilder>) -> VersionBuilder {
+fn builder_on(pool: &Pool, images: Arc<dyn ImageBuilder>) -> VersionBuilder {
     VersionBuilder {
-        bases: weft_compiler::worker_image::BaseImages {
-            builder: "reg:5000/base:1".into(),
-            runtime: "debian:bookworm-slim".into(),
-        },
         images,
         pool: pool.clone(),
-        compile_lanes: 2,
         prunes: Default::default(),
         blobs: weft_dispatcher::build::blob_cache::BlobCache::in_temp_dir(),
     }
@@ -51,8 +46,7 @@ fn image(kind: ImageKind, image_ref: &str) -> PlannedImage {
         context_dir: "/tmp/ctx".into(),
         node_id: None,
         image_name: None,
-        uses: Default::default(),
-        result_file: None,
+        recipe: weft_core::builds::BuildRecipe::Dockerfile { result_file: None },
     }
 }
 
@@ -92,6 +86,7 @@ fn version_asked(project: uuid::Uuid, binary: &str, images: &[PlannedImage], ask
                 .unwrap_or_default(),
             left_out: Vec::new(),
             worker_log: None,
+            node_needs: Default::default(),
         },
         images: refs,
         ask,
@@ -101,7 +96,7 @@ fn version_asked(project: uuid::Uuid, binary: &str, images: &[PlannedImage], ask
 /// Ask for `project`'s version `binary` of `images`, as a build request does.
 async fn ask(
     builder: &VersionBuilder,
-    pool: &PgPool,
+    pool: &Pool,
     project: uuid::Uuid,
     binary: &str,
     images: &[PlannedImage],
@@ -143,23 +138,19 @@ fn gate() -> Arc<Gate> {
 }
 
 /// How the row of `image_ref` stands.
-async fn status_of(pool: &PgPool, image_ref: &str) -> String {
-    sqlx::query_scalar("SELECT status FROM image_build WHERE image_ref = $1")
-        .bind(image_ref)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+async fn status_of(pool: &Pool, image_ref: &str) -> String {
+    pool.scalar("SELECT status FROM image_build WHERE image_ref = $1", &[&image_ref]).await.unwrap()
 }
 
 /// Where the build `name` of `image_ref` stands, as a caller following it
 /// reads it.
-async fn build_state(pool: &PgPool, image_ref: &str, name: &str) -> weft_core::projects::BuildStateResponse {
+async fn build_state(pool: &Pool, image_ref: &str, name: &str) -> weft_core::projects::BuildStateResponse {
     let states = ledger::image_states(pool, &[ImageBuild { image: image_ref.into(), name: name.into() }]).await.unwrap();
     states.into_iter().next().unwrap().state
 }
 
 /// How `project`'s version build `id` stands.
-async fn version_state(pool: &PgPool, project: uuid::Uuid, id: uuid::Uuid) -> weft_core::builds::VersionBuildState {
+async fn version_state(pool: &Pool, project: uuid::Uuid, id: uuid::Uuid) -> weft_core::builds::VersionBuildState {
     waiting::state(pool, project, id).await.unwrap().expect("the version build is on record")
 }
 
@@ -169,7 +160,7 @@ fn crate_now() -> i64 {
 
 /// Project rows registered under the test tenant, and the store the build
 /// transition and registrations go through.
-async fn project_store(pool: &PgPool, ids: &[uuid::Uuid]) -> weft_dispatcher::ProjectStore {
+async fn project_store(pool: &Pool, ids: &[uuid::Uuid]) -> weft_dispatcher::ProjectStore {
     let projects: weft_dispatcher::ProjectStore = Arc::new(weft_dispatcher::PostgresProjectStore::new(pool.clone()));
     for id in ids {
         let empty = serde_json::from_value(serde_json::json!({ "id": id, "nodes": [], "edges": [] })).unwrap();
@@ -187,19 +178,19 @@ async fn transition_of(projects: &weft_dispatcher::ProjectStore, id: uuid::Uuid)
     projects.transition(id).await.unwrap().unwrap().as_str()
 }
 
-async fn running_binary(pool: &PgPool, project: uuid::Uuid) -> Option<String> {
-    sqlx::query_scalar("SELECT running_binary_hash FROM project WHERE id = $1").bind(project).fetch_one(pool).await.unwrap()
+async fn running_binary(pool: &Pool, project: uuid::Uuid) -> Option<String> {
+    pool.scalar("SELECT running_binary_hash FROM project WHERE id = $1", &[&project]).await.unwrap()
 }
 
-async fn claims_of(pool: &PgPool, claim: uuid::Uuid) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM image_claim WHERE claim_id = $1").bind(claim).fetch_one(pool).await.unwrap()
+async fn claims_of(pool: &Pool, claim: uuid::Uuid) -> i64 {
+    pool.scalar("SELECT count(*) FROM image_claim WHERE claim_id = $1", &[&claim]).await.unwrap()
 }
 
 /// Images already in the registry are not built, and the gate is never
 /// entered: a build of an unchanged project never serializes, and the
 /// request registers at once.
-#[sqlx::test]
-async fn present_images_are_skipped_without_the_gate(pool: PgPool) {
+#[weft_db_macros::test]
+async fn present_images_are_skipped_without_the_gate(pool: Pool) {
     setup(&pool).await;
     let fake = Arc::new(FakeImageBuilder::new());
     fake.set_image_exists("reg:5000/weft-worker:a");
@@ -213,11 +204,11 @@ async fn present_images_are_skipped_without_the_gate(pool: PgPool) {
     assert_eq!(gate.begun.load(Ordering::SeqCst), 0);
 }
 
-/// A stale image is started once, in a lane, and the request answers with
+/// A stale image is started once, and the request answers with
 /// the version waiting on it while it still runs, never waiting for its
 /// end; the build loop's look records the end later.
-#[sqlx::test]
-async fn a_stale_image_is_started_and_answered_before_it_ends(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_stale_image_is_started_and_answered_before_it_ends(pool: Pool) {
     setup(&pool).await;
     let fake = Arc::new(FakeImageBuilder::new());
     let gate = gate();
@@ -231,7 +222,6 @@ async fn a_stale_image_is_started_and_answered_before_it_ends(pool: PgPool) {
     let starts = fake.starts();
     assert_eq!(starts.len(), 1, "one build per ref, however often the plan names it");
     assert_eq!(underway.images, [ImageBuild { image: image_ref.into(), name: starts[0].name.clone() }]);
-    assert_eq!(starts[0].build_args, vec![("WEFT_COMPILE_LANE".to_string(), "0".to_string())]);
     assert_eq!(gate.begun.load(Ordering::SeqCst), 1);
     assert!(gate.let_go.load(Ordering::SeqCst), "let go once the version is written down");
     assert_eq!(status_of(&pool, image_ref).await, "running", "answered while it runs");
@@ -245,8 +235,8 @@ async fn a_stale_image_is_started_and_answered_before_it_ends(pool: PgPool) {
 /// A version whose builds all succeed registers by itself on the build
 /// loop's next pass: the project runs it, the claim on its images goes,
 /// and the caller following it reads it registered, with the program.
-#[sqlx::test]
-async fn a_waiting_version_registers_by_itself_once_its_builds_succeed(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_waiting_version_registers_by_itself_once_its_builds_succeed(pool: Pool) {
     setup(&pool).await;
     let project = uuid::Uuid::new_v4();
     let projects = project_store(&pool, &[project]).await;
@@ -271,7 +261,7 @@ async fn a_waiting_version_registers_by_itself_once_its_builds_succeed(pool: PgP
     assert_eq!(state.images[0].state.state, Some(BuildState::Succeeded));
     assert_eq!(running_binary(&pool, project).await.as_deref(), Some("self"));
     assert_eq!(claims_of(&pool, underway.build).await, 0, "the claim goes with the registration");
-    let uses: i64 = sqlx::query_scalar("SELECT count(*) FROM image_use WHERE project_id = $1").bind(project).fetch_one(&pool).await.unwrap();
+    let uses: i64 = pool.scalar("SELECT count(*) FROM image_use WHERE project_id = $1", &[&project]).await.unwrap();
     assert_eq!(uses, 2, "its images are the project's running version");
 }
 
@@ -280,8 +270,8 @@ async fn a_waiting_version_registers_by_itself_once_its_builds_succeed(pool: PgP
 /// image already built registers with the same packages left out, so the
 /// cached image refuses the same runs. A record that does not read fails
 /// the build instead of registering a worker whose gaps nobody refuses.
-#[sqlx::test]
-async fn a_worker_left_out_record_is_kept_and_read_back_when_the_image_is_reused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_worker_left_out_record_is_kept_and_read_back_when_the_image_is_reused(pool: Pool) {
     setup(&pool).await;
     let (first, second) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     let projects = project_store(&pool, &[first, second]).await;
@@ -322,7 +312,10 @@ async fn a_worker_left_out_record_is_kept_and_read_back_when_the_image_is_reused
     // built again: its gaps are unknown.
     let unknown = "reg:5000/weft-worker:unrecorded";
     fake.set_image_exists(unknown);
-    let recorded = PlannedImage { result_file: Some(weft_core::builds::LEFT_OUT_RECORD_PATH.into()), ..image(ImageKind::Worker, unknown) };
+    let recorded = PlannedImage {
+        recipe: weft_core::builds::BuildRecipe::Dockerfile { result_file: Some(weft_core::builds::LEFT_OUT_RECORD_PATH.into()) },
+        ..image(ImageKind::Worker, unknown)
+    };
     let asked = ask(&builder(&pool, fake.clone()), &pool, second, "unrecorded", &[recorded], gate()).await.unwrap();
     assert!(matches!(asked, VersionBuild::Waiting(_)), "built again rather than run with its gaps unknown");
 
@@ -336,8 +329,8 @@ async fn a_worker_left_out_record_is_kept_and_read_back_when_the_image_is_reused
 
 /// A version an image build of which failed ends failed, naming every
 /// failed image and why, and never registers.
-#[sqlx::test]
-async fn a_failed_image_build_ends_its_version_failed(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_failed_image_build_ends_its_version_failed(pool: Pool) {
     setup(&pool).await;
     let project = uuid::Uuid::new_v4();
     let projects = project_store(&pool, &[project]).await;
@@ -365,8 +358,8 @@ async fn a_failed_image_build_ends_its_version_failed(pool: PgPool) {
 
 /// A newer ask of another version supersedes the one waiting, and the
 /// older one never registers over it, even when its builds end last.
-#[sqlx::test]
-async fn a_newer_ask_supersedes_the_waiting_version(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_newer_ask_supersedes_the_waiting_version(pool: Pool) {
     setup(&pool).await;
     let project = uuid::Uuid::new_v4();
     let projects = project_store(&pool, &[project]).await;
@@ -408,13 +401,13 @@ async fn a_newer_ask_supersedes_the_waiting_version(pool: PgPool) {
 /// `image_ref` built, as a request that found it there finds it: a build
 /// of it succeeded on record, which registration reads what it left out
 /// from (`ledger::left_out`).
-async fn built_on_record(pool: &PgPool, image_ref: &str) {
+async fn built_on_record(pool: &Pool, image_ref: &str) {
     ledger::note_shared(pool, image_ref, crate_now()).await.unwrap();
 }
 
 /// Register `project`'s version `binary` as a request whose ask is `ask`
 /// and that found every image; `false` when it must not land.
-async fn register_asked(pool: &PgPool, projects: &weft_dispatcher::ProjectStore, project: uuid::Uuid, binary: &str, ask: i64) -> bool {
+async fn register_asked(pool: &Pool, projects: &weft_dispatcher::ProjectStore, project: uuid::Uuid, binary: &str, ask: i64) -> bool {
     let hold = ImageHold::new(pool, project);
     let worker = format!("reg:5000/weft-worker:{binary}");
     built_on_record(pool, &worker).await;
@@ -427,7 +420,7 @@ async fn register_asked(pool: &PgPool, projects: &weft_dispatcher::ProjectStore,
 
 /// Ask for `project`'s version `binary` as its `ask`th build, which waits
 /// on the image build it starts.
-async fn wait_asked(pool: &PgPool, fake: &Arc<FakeImageBuilder>, project: uuid::Uuid, binary: &str, ask: i64) -> BuildsUnderway {
+async fn wait_asked(pool: &Pool, fake: &Arc<FakeImageBuilder>, project: uuid::Uuid, binary: &str, ask: i64) -> BuildsUnderway {
     let images = [image(ImageKind::Worker, &format!("reg:5000/weft-worker:{binary}"))];
     waiting_on(
         builder(pool, fake.clone())
@@ -442,8 +435,8 @@ async fn wait_asked(pool: &PgPool, fake: &Arc<FakeImageBuilder>, project: uuid::
 /// either finished: the waiting one ends `registered` when it is the same
 /// version, `superseded` when it was asked before, and keeps waiting (to
 /// register over this one) when it was asked after.
-#[sqlx::test]
-async fn an_ask_that_registers_settles_the_waiting_version(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_ask_that_registers_settles_the_waiting_version(pool: Pool) {
     setup(&pool).await;
     let project = uuid::Uuid::new_v4();
     let projects = project_store(&pool, &[project]).await;
@@ -493,8 +486,8 @@ async fn an_ask_that_registers_settles_the_waiting_version(pool: PgPool) {
 /// request whose ask came before finds the newer one registered and
 /// registers nothing, and a version asked before that only now waits is
 /// written down superseded.
-#[sqlx::test]
-async fn an_older_ask_never_lands_over_a_registered_newer_one(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_older_ask_never_lands_over_a_registered_newer_one(pool: Pool) {
     setup(&pool).await;
     let project = uuid::Uuid::new_v4();
     let projects = project_store(&pool, &[project]).await;
@@ -519,12 +512,12 @@ async fn an_older_ask_never_lands_over_a_registered_newer_one(pool: PgPool) {
 /// No version registers while a resync holds the project, the one whose
 /// images were all there already included: the registration is refused
 /// as a resync's, and lands once the resync let go.
-#[sqlx::test]
-async fn no_version_registers_while_a_resync_holds_the_project(pool: PgPool) {
+#[weft_db_macros::test]
+async fn no_version_registers_while_a_resync_holds_the_project(pool: Pool) {
     setup(&pool).await;
     let project = uuid::Uuid::new_v4();
     let projects = project_store(&pool, &[project]).await;
-    sqlx::query("UPDATE project SET transition = 'resyncing' WHERE id = $1").bind(project).execute(&pool).await.unwrap();
+    pool.execute("UPDATE project SET transition = 'resyncing' WHERE id = $1", &[&project]).await.unwrap();
     let ask = projects.next_build_ask(project).await.unwrap();
     built_on_record(&pool, "reg:5000/weft-worker:under-resync").await;
     let version = version_asked(project, "under-resync", &[image(ImageKind::Worker, "reg:5000/weft-worker:under-resync")], ask);
@@ -534,23 +527,23 @@ async fn no_version_registers_while_a_resync_holds_the_project(pool: PgPool) {
     assert!(waiting::ResyncHolds::is(&refused), "{refused:#}");
     // Letting go of the claim failing too keeps the refusal a resync's
     // (the request answers 409), the release's failure added to it.
-    let closed = sqlx::postgres::PgPoolOptions::new().connect_with((*pool.connect_options()).clone()).await.unwrap();
+    let closed = Pool::open(pool.config().clone(), 1, std::time::Duration::from_secs(5), weft_task_store::db::Waits::Expected);
     let hold = ImageHold::new(&closed, project);
-    closed.close().await;
+    closed.close();
     let refused = waiting::register_version(projects.as_ref(), &pool, project, TENANT, &version, Registrar::Request { hold })
         .await
         .expect_err("refused under the resync");
     assert!(waiting::ResyncHolds::is(&refused), "{refused:#}");
     assert!(format!("{refused:#}").contains("letting go of the build's claim on its images failed too"), "{refused:#}");
     assert_eq!(running_binary(&pool, project).await, None);
-    sqlx::query("UPDATE project SET transition = 'none' WHERE id = $1").bind(project).execute(&pool).await.unwrap();
+    pool.execute("UPDATE project SET transition = 'none' WHERE id = $1", &[&project]).await.unwrap();
     assert!(register_asked(&pool, &projects, project, "under-resync", ask).await, "lands once it let go");
 }
 
 /// A version waiting behind a newer one still waiting is written down
 /// superseded, and the newer one keeps waiting.
-#[sqlx::test]
-async fn an_older_ask_never_supersedes_a_newer_waiting_one(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_older_ask_never_supersedes_a_newer_waiting_one(pool: Pool) {
     setup(&pool).await;
     let project = uuid::Uuid::new_v4();
     let projects = project_store(&pool, &[project]).await;
@@ -565,8 +558,8 @@ async fn an_older_ask_never_supersedes_a_newer_waiting_one(pool: PgPool) {
 
 /// Two requests that both found every image, registering at once, leave
 /// the project on the newer ask's version, whichever commits first.
-#[sqlx::test]
-async fn two_concurrent_registrations_leave_the_newer_ask(pool: PgPool) {
+#[weft_db_macros::test]
+async fn two_concurrent_registrations_leave_the_newer_ask(pool: Pool) {
     setup(&pool).await;
     let project = uuid::Uuid::new_v4();
     let projects = project_store(&pool, &[project]).await;
@@ -586,8 +579,8 @@ async fn two_concurrent_registrations_leave_the_newer_ask(pool: PgPool) {
 /// A waiting version whose stored rows no longer read ends failed with
 /// why, rather than keeping the build loop awake and its project building
 /// for ever.
-#[sqlx::test]
-async fn a_waiting_version_that_no_longer_reads_ends_failed(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_waiting_version_that_no_longer_reads_ends_failed(pool: Pool) {
     setup(&pool).await;
     let (garbled_images, garbled_program) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     let projects = project_store(&pool, &[garbled_images, garbled_program]).await;
@@ -597,16 +590,12 @@ async fn a_waiting_version_that_no_longer_reads_ends_failed(pool: PgPool) {
     ] {
         assert!(projects.try_begin_building(project, stale_before()).await.unwrap());
         projects.release_driver(project).await.unwrap();
-        sqlx::query(
+        pool.execute(
             "INSERT INTO version_build (id, ask, project_id, tenant_id, project_name, manifest, program, images, waits_on, \
                                         state, asked_at) \
              VALUES ($1, 1, $1, $2, 'p', '{}', $3, '{}', $4, 'waiting', 0)",
+            &[&project, &TENANT, &program, &waits_on],
         )
-        .bind(project)
-        .bind(TENANT)
-        .bind(program)
-        .bind(waits_on)
-        .execute(&pool)
         .await
         .unwrap();
     }
@@ -614,7 +603,7 @@ async fn a_waiting_version_that_no_longer_reads_ends_failed(pool: PgPool) {
     assert!(!advanced.waiting && advanced.failed.is_empty() && advanced.registered.is_empty());
     for (project, says) in [(garbled_images, "do not read"), (garbled_program, "does not read")] {
         let (state, reason): (String, Option<String>) =
-            sqlx::query_as("SELECT state, reason FROM version_build WHERE id = $1").bind(project).fetch_one(&pool).await.unwrap();
+            pool.one("SELECT state, reason FROM version_build WHERE id = $1", &[&project]).await.unwrap();
         assert_eq!(state, "failed");
         assert!(reason.as_deref().is_some_and(|r| r.contains(says)), "{reason:?}");
     }
@@ -627,18 +616,15 @@ async fn a_waiting_version_that_no_longer_reads_ends_failed(pool: PgPool) {
 
 /// The build loop forgets version builds that ended over an hour ago, and
 /// a removed project's go with it, a waiting one's claim included.
-#[sqlx::test]
-async fn ended_and_removed_version_builds_are_forgotten(pool: PgPool) {
+#[weft_db_macros::test]
+async fn ended_and_removed_version_builds_are_forgotten(pool: Pool) {
     setup(&pool).await;
     let (old, removed) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     let projects = project_store(&pool, &[]).await;
     let fake = Arc::new(FakeImageBuilder::new());
     let ended = waiting_on(ask(&builder(&pool, fake.clone()), &pool, old, "ended", &[image(ImageKind::Worker, "reg:5000/weft-worker:ended")], gate()).await.unwrap());
     builder(&pool, fake.clone()).cancel_project(old).await.unwrap();
-    sqlx::query("UPDATE version_build SET ended_at = ended_at - $2 WHERE id = $1")
-        .bind(ended.build)
-        .bind(waiting::ENDED_KEPT_SECS + 1)
-        .execute(&pool)
+    pool.execute("UPDATE version_build SET ended_at = ended_at - $2 WHERE id = $1", &[&ended.build, &(waiting::ENDED_KEPT_SECS + 1)])
         .await
         .unwrap();
     waiting::advance(&pool, projects.as_ref()).await.unwrap();
@@ -653,8 +639,8 @@ async fn ended_and_removed_version_builds_are_forgotten(pool: PgPool) {
 /// The same version asked again while it waits (a rerun after Ctrl+C)
 /// joins it: the same version build, the same image build, never a second
 /// start, and the rerun's own claim let go.
-#[sqlx::test]
-async fn a_rerun_of_the_same_version_joins_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_rerun_of_the_same_version_joins_it(pool: Pool) {
     setup(&pool).await;
     let project = uuid::Uuid::new_v4();
     let fake = Arc::new(FakeImageBuilder::new());
@@ -674,33 +660,33 @@ async fn a_rerun_of_the_same_version_joins_it(pool: PgPool) {
     assert_eq!(fake.starts().len(), 1, "never started twice");
     assert_eq!(claims_of(&pool, rerun_claim).await, 0, "the rerun's own claim goes");
     assert_eq!(claims_of(&pool, first.build).await, 1);
-    let waiting: i64 = sqlx::query_scalar("SELECT count(*) FROM version_build WHERE project_id = $1").bind(project).fetch_one(&pool).await.unwrap();
+    let waiting: i64 = pool.scalar("SELECT count(*) FROM version_build WHERE project_id = $1", &[&project]).await.unwrap();
     assert_eq!(waiting, 1);
 }
 
 /// A failed build's reason is what a caller following it reads, and a
 /// later build of the same ref starts afresh.
-#[sqlx::test]
-async fn a_failed_build_names_its_reason_and_can_be_retried(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_failed_build_names_its_reason_and_can_be_retried(pool: Pool) {
     setup(&pool).await;
     let fake = Arc::new(FakeImageBuilder::new());
     let project = uuid::Uuid::new_v4();
     let image_ref = "reg:5000/weft-infra-x:c";
     let underway = waiting_on(ask(&builder(&pool, fake.clone()), &pool, project, "c", &[image(ImageKind::Infra, image_ref)], gate()).await.unwrap());
-    assert!(fake.starts()[0].build_args.is_empty(), "an infra image has no compile lane");
+    assert_eq!(fake.starts()[0].recipe, weft_core::builds::BuildRecipe::Dockerfile { result_file: None }, "an infra image reports nothing");
     fake.set_poll_result(&underway.images[0].name, BuildStatus::Failed { reason: "cargo: error[E0425]".into() });
     follow::look(&pool, fake.as_ref()).await.unwrap();
     let state = build_state(&pool, image_ref, &underway.images[0].name).await;
     assert_eq!(state.state, Some(BuildState::Failed));
     assert!(state.reason.as_deref().is_some_and(|r| r.contains("E0425")), "{state:?}");
-    let claim = ledger::claim(&pool, fake.as_ref(), image_ref, uuid::Uuid::new_v4(), TENANT, Some(2), 0).await.unwrap();
+    let claim = ledger::claim(&pool, fake.as_ref(), image_ref, uuid::Uuid::new_v4(), TENANT, 0).await.unwrap();
     assert!(matches!(claim, Claim::Start { .. }), "{claim:?}");
 }
 
 /// Once the project's build is cancelled, an image claim is refused: a
 /// request claiming after the cancel starts nothing, and fails cancelled.
-#[sqlx::test]
-async fn a_claim_after_a_cancel_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_claim_after_a_cancel_is_refused(pool: Pool) {
     setup(&pool).await;
     let project = uuid::Uuid::new_v4();
     let projects = project_store(&pool, &[project]).await;
@@ -712,20 +698,20 @@ async fn a_claim_after_a_cancel_is_refused(pool: PgPool) {
     };
     assert!(weft_dispatcher::build::cancelled(&e), "{e:#}");
     assert!(fake.starts().is_empty());
-    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM image_build").fetch_one(&pool).await.unwrap();
+    let rows: i64 = pool.scalar("SELECT count(*) FROM image_build", &[]).await.unwrap();
     assert_eq!(rows, 0, "nothing claimed");
 }
 
 /// A second project asking for an image another one is building joins
 /// that build (no second start, the same build answered), and its cancel
 /// leaves the other's build running while its own waiting version ends.
-#[sqlx::test]
-async fn a_shared_build_is_joined_and_never_stopped_by_the_joiner(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_shared_build_is_joined_and_never_stopped_by_the_joiner(pool: Pool) {
     setup(&pool).await;
     let first = uuid::Uuid::new_v4();
     let fake = Arc::new(FakeImageBuilder::new());
     let image_ref = "reg:5000/weft-worker:e";
-    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, first, TENANT, Some(2), crate_now()).await.unwrap() else {
+    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, first, TENANT, crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
     let joiner = uuid::Uuid::new_v4();
@@ -740,8 +726,8 @@ async fn a_shared_build_is_joined_and_never_stopped_by_the_joiner(pool: PgPool) 
 
 /// Two projects asking at once for one image start one build and each
 /// waits on it; once it ends, both versions register.
-#[sqlx::test]
-async fn every_waiter_on_one_build_registers_at_its_end(pool: PgPool) {
+#[weft_db_macros::test]
+async fn every_waiter_on_one_build_registers_at_its_end(pool: Pool) {
     setup(&pool).await;
     let (a_project, b_project) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     let projects = project_store(&pool, &[a_project, b_project]).await;
@@ -767,12 +753,12 @@ async fn every_waiter_on_one_build_registers_at_its_end(pool: PgPool) {
 
 /// A build nobody follows any more is seen through by the next look: the
 /// build loop records its end from the builder's answer.
-#[sqlx::test]
-async fn a_build_nobody_follows_is_seen_through_by_the_next_look(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_build_nobody_follows_is_seen_through_by_the_next_look(pool: Pool) {
     setup(&pool).await;
     let fake = Arc::new(FakeImageBuilder::new());
     let image_ref = "reg:5000/weft-worker:f";
-    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, uuid::Uuid::new_v4(), TENANT, Some(2), crate_now()).await.unwrap() else {
+    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, uuid::Uuid::new_v4(), TENANT, crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
     assert!(ledger::started(&pool, image_ref, &name, &weft_platform_traits::BuildHandle::named(name.clone())).await.unwrap());
@@ -787,8 +773,8 @@ async fn a_build_nobody_follows_is_seen_through_by_the_next_look(pool: PgPool) {
 /// A builder that names its builds itself (Cloud Build does) is asked
 /// about each under its own name, never the one weft minted: asking under
 /// the minted one would find nothing for ever.
-#[sqlx::test]
-async fn a_build_the_builder_named_is_followed_under_that_name(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_build_the_builder_named_is_followed_under_that_name(pool: Pool) {
     setup(&pool).await;
     let fake = Arc::new(FakeImageBuilder::new());
     fake.name_builds_itself();
@@ -806,15 +792,15 @@ async fn a_build_the_builder_named_is_followed_under_that_name(pool: PgPool) {
 /// away mid-start) ends failed by name, and a start that lands on a row
 /// no longer its build's (ended or cancelled meanwhile) frees what it made
 /// instead of leaving it running with nothing tracking it.
-#[sqlx::test]
-async fn a_start_that_never_lands_ends_and_a_late_one_is_freed(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_start_that_never_lands_ends_and_a_late_one_is_freed(pool: Pool) {
     setup(&pool).await;
     let fake = Arc::new(FakeImageBuilder::new());
     let image_ref = "reg:5000/weft-worker:s";
     let project = uuid::Uuid::new_v4();
     let projects = project_store(&pool, &[project]).await;
     assert!(projects.try_begin_building(project, stale_before()).await.unwrap());
-    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, project, TENANT, Some(2), crate_now()).await.unwrap() else {
+    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, project, TENANT, crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
     projects.release_driver(project).await.unwrap();
@@ -827,7 +813,7 @@ async fn a_start_that_never_lands_ends_and_a_late_one_is_freed(pool: PgPool) {
     assert!(!ledger::started(&pool, image_ref, &name, &handle).await.unwrap(), "the row is no longer that build's");
 
     let image_ref = "reg:5000/weft-worker:t";
-    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, uuid::Uuid::new_v4(), TENANT, Some(2), crate_now()).await.unwrap() else {
+    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, uuid::Uuid::new_v4(), TENANT, crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
     assert_eq!(ledger::cancel(&pool, image_ref, &name, crate_now()).await.unwrap(), Some(None), "cancelled before it was made");
@@ -836,24 +822,24 @@ async fn a_start_that_never_lands_ends_and_a_late_one_is_freed(pool: PgPool) {
 
 /// A builder that keeps failing to answer about a build is given up on:
 /// the build ends failed with its words, instead of running for ever.
-#[sqlx::test]
-async fn a_build_its_builder_never_answers_about_is_given_up(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_build_its_builder_never_answers_about_is_given_up(pool: Pool) {
     setup(&pool).await;
     let fake = Arc::new(FakeImageBuilder::new());
     let image_ref = "reg:5000/weft-worker:u";
-    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, uuid::Uuid::new_v4(), TENANT, Some(2), crate_now()).await.unwrap() else {
+    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, uuid::Uuid::new_v4(), TENANT, crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
     assert!(ledger::started(&pool, image_ref, &name, &weft_platform_traits::BuildHandle::named(name.clone())).await.unwrap());
     fake.fail_polls(&name);
     follow::look(&pool, fake.as_ref()).await.unwrap();
     assert_eq!(status_of(&pool, image_ref).await, "running", "one unanswered look is looked at again");
-    sqlx::query("UPDATE image_build SET failing_since = failing_since - $2 WHERE image_ref = $1")
-        .bind(image_ref)
-        .bind(ledger::UNANSWERED_GIVE_UP_SECS + 1)
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute(
+        "UPDATE image_build SET failing_since = failing_since - $2 WHERE image_ref = $1",
+        &[&image_ref, &(ledger::UNANSWERED_GIVE_UP_SECS + 1)],
+    )
+    .await
+    .unwrap();
     follow::look(&pool, fake.as_ref()).await.unwrap();
     let state = build_state(&pool, image_ref, &name).await;
     assert_eq!(state.state, Some(BuildState::Failed), "given up on");
@@ -862,12 +848,12 @@ async fn a_build_its_builder_never_answers_about_is_given_up(pool: PgPool) {
 
 /// A build its builder no longer knows ends failed by name instead of
 /// being waited on for ever.
-#[sqlx::test]
-async fn a_build_its_builder_lost_fails_by_name(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_build_its_builder_lost_fails_by_name(pool: Pool) {
     setup(&pool).await;
     let fake = Arc::new(FakeImageBuilder::new());
     let image_ref = "reg:5000/weft-worker:l";
-    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, uuid::Uuid::new_v4(), TENANT, Some(2), crate_now()).await.unwrap() else {
+    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, uuid::Uuid::new_v4(), TENANT, crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
     assert!(ledger::started(&pool, image_ref, &name, &weft_platform_traits::BuildHandle::named(name.clone())).await.unwrap());
@@ -882,15 +868,15 @@ async fn a_build_its_builder_lost_fails_by_name(pool: PgPool) {
 /// answered with it at once, and the build loop never calls it gone
 /// while its starter still drives it, though the builder knows nothing of
 /// it yet.
-#[sqlx::test]
-async fn a_joined_build_still_being_made_is_never_called_gone(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_joined_build_still_being_made_is_never_called_gone(pool: Pool) {
     setup(&pool).await;
     let fake = Arc::new(FakeImageBuilder::new());
     let image_ref = "reg:5000/weft-worker:j";
     let starter = uuid::Uuid::new_v4();
     let projects = project_store(&pool, &[starter]).await;
     assert!(projects.try_begin_building(starter, stale_before()).await.unwrap());
-    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, starter, TENANT, Some(2), crate_now()).await.unwrap() else {
+    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, starter, TENANT, crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
     // The starter has not created the process yet: it polls as gone.
@@ -907,29 +893,29 @@ async fn a_joined_build_still_being_made_is_never_called_gone(pool: PgPool) {
 /// A verb that found the image missing while another verb's build of it
 /// was running, and claims it only once that build succeeded, builds
 /// nothing: the image is there.
-#[sqlx::test]
-async fn a_claim_after_the_build_succeeded_builds_nothing(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_claim_after_the_build_succeeded_builds_nothing(pool: Pool) {
     setup(&pool).await;
     let fake = FakeImageBuilder::new();
     let image_ref = "reg:5000/weft-worker:k";
-    let Claim::Start { name, .. } = ledger::claim(&pool, &fake, image_ref, uuid::Uuid::new_v4(), TENANT, Some(2), crate_now()).await.unwrap() else {
+    let Claim::Start { name, .. } = ledger::claim(&pool, &fake, image_ref, uuid::Uuid::new_v4(), TENANT, crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
     ledger::finish(&pool, image_ref, &name, ledger::Outcome::Succeeded(None), crate_now()).await.unwrap();
     fake.set_image_exists(image_ref);
-    let late = ledger::claim(&pool, &fake, image_ref, uuid::Uuid::new_v4(), TENANT, Some(2), crate_now()).await.unwrap();
+    let late = ledger::claim(&pool, &fake, image_ref, uuid::Uuid::new_v4(), TENANT, crate_now()).await.unwrap();
     assert!(matches!(late, Claim::Built), "{late:?}");
 }
 
 /// An image the ledger records as built but the registry no longer holds
 /// (deleted by hand, or by the registry's cleanup policy) is built again
 /// instead of skipped for ever.
-#[sqlx::test]
-async fn a_built_image_the_registry_lost_is_built_again(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_built_image_the_registry_lost_is_built_again(pool: Pool) {
     setup(&pool).await;
     let fake = Arc::new(FakeImageBuilder::new());
     let image_ref = "reg:5000/weft-worker:lost";
-    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, uuid::Uuid::new_v4(), TENANT, Some(2), crate_now()).await.unwrap() else {
+    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, uuid::Uuid::new_v4(), TENANT, crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
     ledger::finish(&pool, image_ref, &name, ledger::Outcome::Succeeded(None), crate_now()).await.unwrap();
@@ -942,14 +928,14 @@ async fn a_built_image_the_registry_lost_is_built_again(pool: PgPool) {
 }
 
 /// Racing claims of one ref start it exactly once.
-#[sqlx::test]
-async fn racing_claims_start_one_build(pool: PgPool) {
+#[weft_db_macros::test]
+async fn racing_claims_start_one_build(pool: Pool) {
     setup(&pool).await;
     let mut claims = Vec::new();
     for _ in 0..20 {
         let p = pool.clone();
         claims.push(tokio::spawn(async move {
-            ledger::claim(&p, &FakeImageBuilder::new(), "reg:5000/weft-worker:g", uuid::Uuid::new_v4(), TENANT, Some(4), 0).await.unwrap()
+            ledger::claim(&p, &FakeImageBuilder::new(), "reg:5000/weft-worker:g", uuid::Uuid::new_v4(), TENANT, 0).await.unwrap()
         }));
     }
     let mut starts = 0;
@@ -964,8 +950,8 @@ async fn racing_claims_start_one_build(pool: PgPool) {
 /// A prune spares an image a build in progress claims (it found the
 /// image and has not registered it yet), and takes it once the claim is
 /// let go, without waiting on any other build.
-#[sqlx::test]
-async fn a_prune_spares_an_image_a_build_claims(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_prune_spares_an_image_a_build_claims(pool: Pool) {
     setup(&pool).await;
     let fake = FakeImageBuilder::new();
     let runner = weft_platform_traits::FakeRunner::new("http://w");
@@ -993,8 +979,8 @@ async fn a_prune_spares_an_image_a_build_claims(pool: PgPool) {
 /// The images a waiting version runs are spared by a prune for as long as
 /// it waits, however long ago its request's lease ran out, and are a
 /// prune's to judge once it ended.
-#[sqlx::test]
-async fn a_waiting_versions_images_are_spared_until_it_ends(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_waiting_versions_images_are_spared_until_it_ends(pool: Pool) {
     setup(&pool).await;
     let project = uuid::Uuid::new_v4();
     let fake = Arc::new(FakeImageBuilder::new());
@@ -1005,7 +991,7 @@ async fn a_waiting_versions_images_are_spared_until_it_ends(pool: PgPool) {
     let images = [image(ImageKind::Worker, &found), image(ImageKind::Infra, "reg:5000/weft-infra-db:building")];
     let underway = waiting_on(ask(&builder(&pool, fake.clone()), &pool, project, "spared", &images, gate()).await.unwrap());
     // As if the request answered long ago: its lease ran out.
-    sqlx::query("UPDATE image_claim SET holder_until = 0").execute(&pool).await.unwrap();
+    pool.execute("UPDATE image_claim SET holder_until = 0", &[]).await.unwrap();
     let candidates = std::slice::from_ref(&found);
     let spared = weft_dispatcher::build::prune::prune(&pool, fake.as_ref(), &runner, candidates, &KeepSet::default()).await.unwrap();
     assert_eq!(spared.in_use, std::slice::from_ref(&found), "spared while the version waits");
@@ -1020,27 +1006,25 @@ async fn a_waiting_versions_images_are_spared_until_it_ends(pool: PgPool) {
 /// and let go of the claim, all between the keep-set read and the prune
 /// reaching that image, so only the re-check under the image's lock sees
 /// that it runs now.
-#[sqlx::test]
-async fn a_prune_spares_an_image_registered_after_its_keep_set(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_prune_spares_an_image_registered_after_its_keep_set(pool: Pool) {
     setup(&pool).await;
     let fake = FakeImageBuilder::new();
     let runner = weft_platform_traits::FakeRunner::new("http://w");
     let image_ref = "reg:5000/weft-worker:registered".to_string();
     ledger::note_shared(&pool, &image_ref, crate_now()).await.unwrap();
-    let stale = weft_dispatcher::build::prune::keep_set(&mut pool.acquire().await.unwrap(), ImageScope::All)
+    let stale = weft_dispatcher::build::prune::keep_set(&pool.get().await.unwrap(), ImageScope::All, &fake)
         .await
         .unwrap();
     assert!(!stale.worker_hashes.contains("registered"), "read before the build registers it");
     let hold = ImageHold::new(&pool, uuid::Uuid::new_v4());
     hold.claim(std::slice::from_ref(&image_ref)).await.unwrap();
-    sqlx::query(
+    pool.execute(
         "INSERT INTO project (id, name, status, project_json, updated_at, tenant_id, running_binary_hash, \
          project_json_version, resync_version, running_build_inputs_version) \
          VALUES ($1, 'p', 'inactive', '{}', 0, 't', 'registered', $2, 1, 1)",
+        &[&uuid::Uuid::new_v4(), &weft_core::ProjectDefinition::STORED.version()],
     )
-    .bind(uuid::Uuid::new_v4())
-    .bind(weft_core::ProjectDefinition::STORED.version())
-    .execute(&pool)
     .await
     .unwrap();
     hold.confirm().await.unwrap();
@@ -1056,15 +1040,15 @@ async fn a_prune_spares_an_image_registered_after_its_keep_set(pool: PgPool) {
 /// that image in the registry, and a prune takes it like any other; a
 /// failed build that pushed nothing is only forgotten. A build running
 /// for an image is never pruned, whatever its row said before.
-#[sqlx::test]
-async fn a_prune_takes_what_failed_and_cancelled_builds_left(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_prune_takes_what_failed_and_cancelled_builds_left(pool: Pool) {
     setup(&pool).await;
     let fake = FakeImageBuilder::new();
     let runner = weft_platform_traits::FakeRunner::new("http://w");
     let end = |image_ref: &'static str, outcome: ledger::Outcome| {
         let (pool, fake) = (pool.clone(), &fake);
         async move {
-            let Claim::Start { name, .. } = ledger::claim(&pool, fake, image_ref, uuid::Uuid::new_v4(), TENANT, Some(2), crate_now()).await.unwrap() else {
+            let Claim::Start { name, .. } = ledger::claim(&pool, fake, image_ref, uuid::Uuid::new_v4(), TENANT, crate_now()).await.unwrap() else {
                 panic!("the first claim starts")
             };
             ledger::finish(&pool, image_ref, &name, outcome, crate_now()).await.unwrap();
@@ -1077,7 +1061,7 @@ async fn a_prune_takes_what_failed_and_cancelled_builds_left(pool: PgPool) {
     fake.set_image_exists(pushed);
     fake.set_image_exists(cancelled);
     let running = "reg:5000/weft-worker:running";
-    let Claim::Start { .. } = ledger::claim(&pool, &fake, running, uuid::Uuid::new_v4(), TENANT, Some(2), crate_now()).await.unwrap() else {
+    let Claim::Start { .. } = ledger::claim(&pool, &fake, running, uuid::Uuid::new_v4(), TENANT, crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
     let candidates = ledger::built_images(&pool, None).await.unwrap();
@@ -1095,11 +1079,12 @@ async fn a_prune_takes_what_failed_and_cancelled_builds_left(pool: PgPool) {
 /// The build transition outlives the request that entered it: once the
 /// request let go, the version waiting on its builds holds it, a settle
 /// leaves it while that version waits (a build ending is not enough), and
-/// the first settle after the version registered lands it at rest. A
+/// the registration lands it at rest itself, in its own transaction, so
+/// whoever hears the version registered finds the project runnable. A
 /// project waiting on a build another project started is held the same
 /// way.
-#[sqlx::test]
-async fn a_waiting_version_holds_the_transition_until_it_registers(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_waiting_version_holds_the_transition_until_it_registers(pool: Pool) {
     setup(&pool).await;
     let (own, joiner) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     let projects = project_store(&pool, &[own, joiner]).await;
@@ -1122,18 +1107,14 @@ async fn a_waiting_version_holds_the_transition_until_it_registers(pool: PgPool)
     assert_eq!(transition_of(&projects, own).await, "building");
 
     waiting::advance(&pool, projects.as_ref()).await.unwrap();
-    let mut settled = projects.settle_transition(None, stale_before()).await.unwrap();
-    settled.sort();
-    let mut both = vec![own, joiner];
-    both.sort();
-    assert_eq!(settled, both, "both registered: both at rest");
-    assert_eq!(transition_of(&projects, own).await, "none");
+    assert_eq!(transition_of(&projects, own).await, "none", "registered: at rest with no settle after");
+    assert_eq!(transition_of(&projects, joiner).await, "none");
 }
 
 /// A request asking again while its version waits enters the transition
 /// and joins it; a request still starting builds keeps every other out.
-#[sqlx::test]
-async fn a_request_joins_a_waiting_version_but_never_a_live_start(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_request_joins_a_waiting_version_but_never_a_live_start(pool: Pool) {
     setup(&pool).await;
     let id = uuid::Uuid::new_v4();
     let projects = project_store(&pool, &[id]).await;
@@ -1152,14 +1133,14 @@ async fn a_request_joins_a_waiting_version_but_never_a_live_start(pool: PgPool) 
 /// A cancel stops the builds the project started, leaves the ones another
 /// project started running, ends its waiting version cancelled, and the
 /// transition lands at rest.
-#[sqlx::test]
-async fn a_cancel_stops_own_builds_and_ends_the_waiting_version(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_cancel_stops_own_builds_and_ends_the_waiting_version(pool: Pool) {
     setup(&pool).await;
     let (id, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     let projects = project_store(&pool, &[id]).await;
     let fake = Arc::new(FakeImageBuilder::new());
     let (mine, theirs) = ("reg:5000/weft-worker:mine", "reg:5000/weft-worker:theirs");
-    let Claim::Start { .. } = ledger::claim(&pool, fake.as_ref(), theirs, other, TENANT, Some(2), crate_now()).await.unwrap() else {
+    let Claim::Start { .. } = ledger::claim(&pool, fake.as_ref(), theirs, other, TENANT, crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
     assert!(projects.try_begin_building(id, stale_before()).await.unwrap());
@@ -1190,20 +1171,24 @@ async fn a_cancel_stops_own_builds_and_ends_the_waiting_version(pool: PgPool) {
 /// wakes, so a build whose starter went away mid-start is ended once its
 /// project's heartbeat stops, and its project leaves the build transition
 /// instead of staying building for ever.
-#[sqlx::test]
-async fn a_claimed_build_wakes_the_loop_and_a_dead_start_lets_its_project_go(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_claimed_build_wakes_the_loop_and_a_dead_start_lets_its_project_go(pool: Pool) {
     setup(&pool).await;
     let id = uuid::Uuid::new_v4();
     let projects = project_store(&pool, &[id]).await;
     let fake = FakeImageBuilder::new();
     let image_ref = "reg:5000/weft-worker:dead-start";
-    let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
-    listener.listen(follow::BUILD_CLAIMED_CHANNEL).await.unwrap();
+    let mut listener = Session::connect(pool.config()).await.unwrap();
+    listener.listen([follow::BUILD_CLAIMED_CHANNEL]).await.unwrap();
     assert!(projects.try_begin_building(id, stale_before()).await.unwrap());
-    let Claim::Start { name, .. } = ledger::claim(&pool, &fake, image_ref, id, TENANT, Some(2), crate_now()).await.unwrap() else {
+    let Claim::Start { name, .. } = ledger::claim(&pool, &fake, image_ref, id, TENANT, crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
-    let woke = tokio::time::timeout(std::time::Duration::from_secs(10), listener.recv()).await.expect("the claim announces itself").unwrap();
+    let woke = tokio::time::timeout(std::time::Duration::from_secs(10), listener.notified())
+        .await
+        .expect("the claim announces itself")
+        .unwrap()
+        .expect("the session stays open");
     assert_eq!(woke.payload(), image_ref);
     // Its starter dies here: the request's heartbeat stops, and nothing
     // ever records the build on the builder or writes its version down.
@@ -1217,18 +1202,22 @@ async fn a_claimed_build_wakes_the_loop_and_a_dead_start_lets_its_project_go(poo
 
 /// A version written down as waiting wakes the build loop as it commits,
 /// so one whose builds already ended registers at once.
-#[sqlx::test]
-async fn a_waiting_version_wakes_the_loop(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_waiting_version_wakes_the_loop(pool: Pool) {
     setup(&pool).await;
     let id = uuid::Uuid::new_v4();
     let fake = Arc::new(FakeImageBuilder::new());
-    let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
-    listener.listen(follow::BUILD_CLAIMED_CHANNEL).await.unwrap();
+    let mut listener = Session::connect(pool.config()).await.unwrap();
+    listener.listen([follow::BUILD_CLAIMED_CHANNEL]).await.unwrap();
     let image_ref = "reg:5000/weft-worker:wakes";
     let underway = waiting_on(ask(&builder(&pool, fake.clone()), &pool, id, "wakes", &[image(ImageKind::Worker, image_ref)], gate()).await.unwrap());
     let mut payloads = Vec::new();
     while payloads.len() < 2 {
-        let woke = tokio::time::timeout(std::time::Duration::from_secs(10), listener.recv()).await.expect("announced").unwrap();
+        let woke = tokio::time::timeout(std::time::Duration::from_secs(10), listener.notified())
+            .await
+            .expect("announced")
+            .unwrap()
+            .expect("the session stays open");
         payloads.push(woke.payload().to_string());
     }
     assert_eq!(payloads, [image_ref.to_string(), underway.build.to_string()], "the claim, then the version");
@@ -1238,14 +1227,14 @@ async fn a_waiting_version_wakes_the_loop(pool: PgPool) {
 /// started lets go of its claim, writes no version down, and its project
 /// lands at rest while that build runs on. A request abandoned midway (its
 /// hold dropped) lets go the same way.
-#[sqlx::test]
-async fn a_failed_request_lets_go_of_its_claim_and_its_project(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_failed_request_lets_go_of_its_claim_and_its_project(pool: Pool) {
     setup(&pool).await;
     let (id, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     let projects = project_store(&pool, &[id]).await;
     let fake = Arc::new(FakeImageBuilder::new());
     let image_ref = "reg:5000/weft-worker:theirs-still";
-    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, other, TENANT, Some(2), crate_now()).await.unwrap() else {
+    let Claim::Start { name, .. } = ledger::claim(&pool, fake.as_ref(), image_ref, other, TENANT, crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
     assert!(ledger::started(&pool, image_ref, &name, &weft_platform_traits::BuildHandle::named(name.clone())).await.unwrap());
@@ -1263,7 +1252,7 @@ async fn a_failed_request_lets_go_of_its_claim_and_its_project(pool: PgPool) {
     assert!(weft_dispatcher::build::cancelled(&e), "{e:#}");
     projects.release_driver(id).await.unwrap();
     let claims = || async {
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM image_claim WHERE project_id = $1").bind(id).fetch_one(&pool).await.unwrap()
+        pool.scalar::<i64>("SELECT count(*) FROM image_claim WHERE project_id = $1", &[&id]).await.unwrap()
     };
     for _ in 0..500 {
         if claims().await == 0 {
@@ -1293,8 +1282,8 @@ async fn a_failed_request_lets_go_of_its_claim_and_its_project(pool: PgPool) {
 /// ended by the next look, and its project settles at once instead of
 /// staying building; a start whose project a live request still drives is
 /// left alone, though the builder knows nothing of it yet either.
-#[sqlx::test]
-async fn a_start_nobody_drives_ends_at_once_and_a_driven_one_is_left(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_start_nobody_drives_ends_at_once_and_a_driven_one_is_left(pool: Pool) {
     setup(&pool).await;
     let (live, dead) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     let projects = project_store(&pool, &[live, dead]).await;
@@ -1303,19 +1292,14 @@ async fn a_start_nobody_drives_ends_at_once_and_a_driven_one_is_left(pool: PgPoo
     let mut names = Vec::new();
     for (project, image_ref) in [(live, live_ref), (dead, dead_ref)] {
         assert!(projects.try_begin_building(project, stale_before()).await.unwrap());
-        let Claim::Start { name, .. } = ledger::claim(&pool, &fake, image_ref, project, TENANT, Some(2), crate_now()).await.unwrap() else {
+        let Claim::Start { name, .. } = ledger::claim(&pool, &fake, image_ref, project, TENANT, crate_now()).await.unwrap() else {
             panic!("the first claim starts")
         };
         names.push(name);
     }
     // The dead project's request stopped bumping a while ago, without ever
     // letting go.
-    sqlx::query("UPDATE project SET transition_heartbeat_unix = $2 WHERE id = $1")
-        .bind(dead)
-        .bind(stale_before() - 1)
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute("UPDATE project SET transition_heartbeat_unix = $2 WHERE id = $1", &[&dead, &(stale_before() - 1)]).await.unwrap();
     assert!(follow::look(&pool, &fake).await.unwrap());
     let ended = build_state(&pool, dead_ref, &names[1]).await;
     assert_eq!(ended.state, Some(BuildState::Failed), "{ended:?}");
@@ -1331,27 +1315,27 @@ async fn a_start_nobody_drives_ends_at_once_and_a_driven_one_is_left(pool: PgPoo
 /// starts the image again under a new name rather than joining a start
 /// nothing will finish; the dead start, should it ever land, finds the row
 /// no longer its own. Another project joins the new start.
-#[sqlx::test]
-async fn a_takeover_ends_the_lost_starts_it_takes_over(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_takeover_ends_the_lost_starts_it_takes_over(pool: Pool) {
     setup(&pool).await;
     let (id, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     let projects = project_store(&pool, &[id]).await;
     let fake = FakeImageBuilder::new();
     let image_ref = "reg:5000/weft-worker:retaken";
     assert!(projects.try_begin_building(id, stale_before()).await.unwrap());
-    let Claim::Start { name: lost, .. } = ledger::claim(&pool, &fake, image_ref, id, TENANT, Some(2), crate_now()).await.unwrap() else {
+    let Claim::Start { name: lost, .. } = ledger::claim(&pool, &fake, image_ref, id, TENANT, crate_now()).await.unwrap() else {
         panic!("the first claim starts")
     };
     // The request died: its heartbeat went stale, and the next one enters.
-    sqlx::query("UPDATE project SET transition_heartbeat_unix = $2 WHERE id = $1").bind(id).bind(stale_before() - 1).execute(&pool).await.unwrap();
+    pool.execute("UPDATE project SET transition_heartbeat_unix = $2 WHERE id = $1", &[&id, &(stale_before() - 1)]).await.unwrap();
     assert!(projects.try_begin_building(id, stale_before()).await.unwrap());
     let ended = build_state(&pool, image_ref, &lost).await;
     assert_eq!(ended.state, Some(BuildState::Failed), "ended as the new request entered: {ended:?}");
-    let again = ledger::claim(&pool, &fake, image_ref, id, TENANT, Some(2), crate_now()).await.unwrap();
+    let again = ledger::claim(&pool, &fake, image_ref, id, TENANT, crate_now()).await.unwrap();
     let Claim::Start { name: fresh, .. } = again else { panic!("started again, not joined: {again:?}") };
     assert_ne!(fresh, lost);
     assert!(!ledger::started(&pool, image_ref, &lost, &weft_platform_traits::BuildHandle::named(lost.clone())).await.unwrap());
-    let joined = ledger::claim(&pool, &fake, image_ref, other, TENANT, Some(2), crate_now()).await.unwrap();
+    let joined = ledger::claim(&pool, &fake, image_ref, other, TENANT, crate_now()).await.unwrap();
     assert_eq!(joined, Claim::Join { name: fresh, ours: false });
 }
 
@@ -1367,6 +1351,9 @@ struct HeldStart {
 impl ImageBuilder for HeldStart {
     fn image_ref(&self, tag: &str) -> String {
         self.inner.image_ref(tag)
+    }
+    fn worker_packaging(&self) -> weft_core::builds::WorkerPackaging {
+        self.inner.worker_packaging()
     }
     async fn start(&self, req: weft_platform_traits::BuildRequest) -> anyhow::Result<weft_platform_traits::BuildHandle> {
         self.entered.notify_one();
@@ -1402,8 +1389,8 @@ async fn until<F: std::future::Future<Output = bool>>(mut ready: impl FnMut() ->
 /// the builder's id and writes the version down as waiting on it, so the
 /// install still registers it once it is built. The gate is let go once
 /// that is done, with nobody waiting.
-#[sqlx::test]
-async fn a_start_finishes_when_its_request_is_dropped(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_start_finishes_when_its_request_is_dropped(pool: Pool) {
     setup(&pool).await;
     let fake = Arc::new(FakeImageBuilder::new());
     let held = Arc::new(HeldStart { inner: fake.clone(), entered: Default::default(), go: Default::default() });
@@ -1421,13 +1408,11 @@ async fn a_start_finishes_when_its_request_is_dropped(pool: PgPool) {
     until(|| async { gate.let_go.load(Ordering::SeqCst) }).await;
     let starts = fake.starts();
     assert_eq!(starts.len(), 1, "the build was made");
-    let builder_id: Option<String> =
-        sqlx::query_scalar("SELECT builder_id FROM image_build WHERE image_ref = $1").bind(image_ref).fetch_one(&pool).await.unwrap();
+    let builder_id: Option<String> = pool.scalar("SELECT builder_id FROM image_build WHERE image_ref = $1", &[&image_ref]).await.unwrap();
     assert_eq!(builder_id, Some(starts[0].name.clone()), "and its id on the builder recorded");
     assert_eq!(status_of(&pool, image_ref).await, "running");
     assert!(fake.releases().is_empty(), "nothing freed: the build loop follows it");
-    let waiting: Vec<String> =
-        sqlx::query_scalar("SELECT state FROM version_build WHERE project_id = $1").bind(project).fetch_all(&pool).await.unwrap();
+    let waiting: Vec<String> = pool.scalars("SELECT state FROM version_build WHERE project_id = $1", &[&project]).await.unwrap();
     assert_eq!(waiting, ["waiting"], "the version waits on it with nobody asking");
     assert!(gate.let_go.load(Ordering::SeqCst), "the gate is let go once the start is done, with nobody waiting");
 }
@@ -1435,8 +1420,8 @@ async fn a_start_finishes_when_its_request_is_dropped(pool: PgPool) {
 /// A cancel that comes while the starts run is honoured even when the
 /// request that started them is gone: the version is refused, and what
 /// the start made is stopped, as it would be with the request there.
-#[sqlx::test]
-async fn a_cancel_during_a_start_whose_request_is_dropped_stops_its_build(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_cancel_during_a_start_whose_request_is_dropped_stops_its_build(pool: Pool) {
     setup(&pool).await;
     let project = uuid::Uuid::new_v4();
     let projects = project_store(&pool, &[project]).await;
@@ -1457,7 +1442,7 @@ async fn a_cancel_during_a_start_whose_request_is_dropped_stops_its_build(pool: 
     until(|| async { gate.let_go.load(Ordering::SeqCst) }).await;
     assert_eq!(status_of(&pool, image_ref).await, "cancelled", "the cancel reached the build");
     assert_eq!(fake.releases().len(), 1, "and the build on the builder was freed");
-    let versions: i64 = sqlx::query_scalar("SELECT count(*) FROM version_build").fetch_one(&pool).await.unwrap();
+    let versions: i64 = pool.scalar("SELECT count(*) FROM version_build", &[]).await.unwrap();
     assert_eq!(versions, 0, "no version written down after the cancel");
 }
 
@@ -1465,8 +1450,8 @@ async fn a_cancel_during_a_start_whose_request_is_dropped_stops_its_build(pool: 
 /// builds (its dispatcher could not renew it in time, so a prune may have
 /// taken an image it found) fails loudly, writes no version down, and
 /// stops what it started.
-#[sqlx::test]
-async fn a_lapsed_claim_is_never_passed_to_a_waiting_version(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_lapsed_claim_is_never_passed_to_a_waiting_version(pool: Pool) {
     setup(&pool).await;
     let project = uuid::Uuid::new_v4();
     let fake = Arc::new(FakeImageBuilder::new());
@@ -1477,11 +1462,11 @@ async fn a_lapsed_claim_is_never_passed_to_a_waiting_version(pool: PgPool) {
         async move { ask(&builder, &pool, project, "lapsed", &[image(ImageKind::Worker, image_ref)], gate()).await }
     });
     held.entered.notified().await;
-    sqlx::query("UPDATE image_claim SET holder_until = 0").execute(&pool).await.unwrap();
+    pool.execute("UPDATE image_claim SET holder_until = 0", &[]).await.unwrap();
     held.go.notify_one();
     let e = request.await.unwrap().expect_err("the request fails");
     assert!(format!("{e:#}").contains("lapsed"), "{e:#}");
-    let versions: i64 = sqlx::query_scalar("SELECT count(*) FROM version_build").fetch_one(&pool).await.unwrap();
+    let versions: i64 = pool.scalar("SELECT count(*) FROM version_build", &[]).await.unwrap();
     assert_eq!(versions, 0, "no version written down");
     assert_eq!(status_of(&pool, image_ref).await, "cancelled", "what it started is stopped");
 }

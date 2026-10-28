@@ -5,7 +5,7 @@
 //! saying so.
 #![cfg(feature = "e2e")]
 
-use weft_e2e::platform::{Platform, Role};
+use weft_e2e::platform::Platform;
 use weft_e2e::{ensure, infra, project::Project, run};
 
 /// Whether this machine's Docker can hand a container a GPU.
@@ -27,7 +27,7 @@ async fn an_infra_node_that_asks_for_a_gpu_sees_it() -> anyhow::Result<()> {
 
     infra::start_and_wait_running(&mut project, "gpu").await?;
     let pid = project.id();
-    anyhow::ensure!(!platform.containers_for_project(&pid, Role::Infra).await?.is_empty(), "the unit runs");
+    anyhow::ensure!(!platform.infra_containers_for_project(&pid).await?.is_empty(), "the unit runs");
 
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
@@ -36,7 +36,7 @@ async fn an_infra_node_that_asks_for_a_gpu_sees_it() -> anyhow::Result<()> {
     anyhow::ensure!(seen.starts_with("GPU 0:"), "the container sees no GPU: {seen:?}");
 
     infra::terminate_and_wait_gone(&project, "gpu").await?;
-    let left = platform.containers_for_project(&pid, Role::Infra).await?;
+    let left = platform.infra_containers_for_project(&pid).await?;
     anyhow::ensure!(left.is_empty(), "terminating removes the unit, left: {left:?}");
     project.finish().await
 }

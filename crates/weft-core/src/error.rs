@@ -14,6 +14,16 @@ pub enum WeftError {
     #[error("node failed: {0}")]
     NodeFailed(String),
 
+    /// Something the node's package declares it needs from the machine
+    /// (a `[[needs]]` entry of its `deps.toml`, by its `name`) is missing
+    /// where the worker runs: [`need_missing`]. The engine says it with
+    /// the node's type and the way to meet it on that platform
+    /// (`crate::context::failure_message`). Like any outcome of the
+    /// firing, a wired `_error` catches it: the program was checked
+    /// before it started, so this is the machine changing under a run.
+    #[error("the machine this worker runs on lacks {0}, which this node needs")]
+    NeedMissing(String),
+
     /// The node called a suspension primitive; the worker should
     /// record the suspension (already done via the ContextHandle)
     /// and exit. On wake, a new worker picks up from the resume
@@ -62,6 +72,14 @@ pub type WeftResult<T> = Result<T, WeftError>;
 /// `_error` wired, because the fix is in the program.
 pub fn node_error(message: impl std::fmt::Display) -> WeftError {
     WeftError::NodeFailed(message.to_string())
+}
+
+/// The failure of a node that finds a need of its own missing as it runs
+/// (a program it launches is not there), named as its `deps.toml` names it
+/// (`[[needs]] name`). The node says only what is missing; how to meet it
+/// is the platform's to say ([`WeftError::NeedMissing`]).
+pub fn need_missing(need: impl std::fmt::Display) -> WeftError {
+    WeftError::NeedMissing(need.to_string())
 }
 
 /// Fail the node now with this message. The statement door for a

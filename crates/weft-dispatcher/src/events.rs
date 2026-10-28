@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use sqlx::PgPool;
+use weft_task_store::db::Pool;
 use tokio::sync::{broadcast, RwLock};
 
 /// The event types are weft-core's, so the CLI reads the same rows.
@@ -43,7 +43,7 @@ pub struct EventBus {
     /// wired; in that case `publish` skips the NOTIFY step and
     /// behaves like `publish_local` (the absence of cross-process fanout
     /// is the caller's responsibility to choose by passing None).
-    pool: Option<PgPool>,
+    pool: Option<Pool>,
 }
 
 impl Default for EventBus {
@@ -62,7 +62,7 @@ impl EventBus {
     /// [`weft_task_store::runs::EVENTS_CHANNEL`]) and is
     /// pushed into the local broadcast.
     pub fn with_notify(
-        pool: PgPool,
+        pool: Pool,
         signals: &weft_task_store::pg_signal::PgSignalWatch,
     ) -> anyhow::Result<Self> {
         signals.require(weft_task_store::runs::EVENTS_CHANNEL)?;

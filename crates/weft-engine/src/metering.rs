@@ -825,7 +825,7 @@ pub fn connection_client(
 fn follow_up_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        weft_core::net::http_client()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -1603,7 +1603,7 @@ pub(crate) mod tests {
         // production composition builds (auth-free here; the test meter
         // makes no follow-up call).
         let follow_up = FollowUpLane {
-            http: reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
+            http: reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build(),
             shared: weft_core::shared::Shared::new(std::time::Duration::MAX),
         };
         let middleware = MeteringMiddleware {
@@ -1612,7 +1612,7 @@ pub(crate) mod tests {
             follow_up,
             sink: Arc::new(sink),
         };
-        let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+        let client = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap())
             .with(middleware)
             .build();
         (client, tasks, pending)
@@ -1722,12 +1722,12 @@ pub(crate) mod tests {
                 // with the meter injected directly since the global
                 // registry is keyed by the shipped services.
                 let follow_up = FollowUpLane {
-                    http: reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+                    http: reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap())
                         .with(weft_core::access::client::AuthMiddleware::new(steps.clone()))
                         .build(),
                     shared: weft_core::shared::Shared::new(std::time::Duration::MAX),
                 };
-                reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+                reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap())
                     .with(MeteringMiddleware {
                         meter: Some(meter),
                         relay_url: None,
@@ -2031,7 +2031,7 @@ pub(crate) mod tests {
         });
         let meter: &'static TestMeter = Box::leak(Box::new(TestMeter { base: "http://provider.test/api/v1", fixed_usd: None }));
         let follow_up = FollowUpLane {
-            http: reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
+            http: reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build(),
             shared: weft_core::shared::Shared::new(Duration::MAX),
         };
         let tap = TapStream {
@@ -2546,7 +2546,7 @@ mod open_charge_tests {
     }
 
     fn http() -> reqwest_middleware::ClientWithMiddleware {
-        reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build()
+        reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build()
     }
 
     fn lane() -> FollowUpLane {
@@ -2994,7 +2994,7 @@ mod open_charge_tests {
         let tasks = Arc::new(RecordedCosts::default());
         let pending = PendingCostRecords::new();
         let sink = sink(tasks.clone(), pending.clone());
-        let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+        let client = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap())
             .with(MeteringMiddleware {
                 meter: Some(&UNPRICEABLE),
                 relay_url: None,

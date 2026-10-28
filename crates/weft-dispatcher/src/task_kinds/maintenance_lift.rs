@@ -36,7 +36,7 @@ pub struct MaintenanceLiftExecutor;
 #[async_trait]
 impl TaskExecutor<DispatcherState> for MaintenanceLiftExecutor {
     async fn execute(&self, state: &DispatcherState, task: &Task) -> Result<Value> {
-        let report = crate::maintenance::lift(state, &task.tenant_id).await?;
+        let report = crate::maintenance::lift(state, &task.tenant_id, task.id).await?;
         Ok(serde_json::to_value(report)?)
     }
 }

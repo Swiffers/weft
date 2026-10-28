@@ -61,7 +61,7 @@ impl LiveWs {
     pub async fn send_json(&mut self, value: &Value) -> Result<()> {
         let text = serde_json::to_string(value).context("serialize ws message")?;
         self.stream
-            .send(Message::Text(text))
+            .send(Message::Text(text.into()))
             .await
             .context("ws send")
     }
@@ -154,7 +154,7 @@ pub async fn http_request(
     body: Option<Vec<u8>>,
 ) -> Result<(reqwest::StatusCode, reqwest::header::HeaderMap, Vec<u8>)> {
     let url = format!("{}/connect/{}", disp.base(), mount_path.trim_start_matches('/'));
-    let client = reqwest::Client::new();
+    let client = weft_core::net::http_client().build()?;
     let mut req = client.request(method.clone(), &url);
     for (k, v) in headers {
         req = req.header(*k, *v);
@@ -184,7 +184,7 @@ pub struct BrowserCall {
 
 pub async fn browser_post_json(disp: &Dispatcher, mount_path: &str, origin: &str, body: &Value) -> Result<BrowserCall> {
     let url = format!("{}/connect/{}", disp.base(), mount_path.trim_start_matches('/'));
-    let client = reqwest::Client::new();
+    let client = weft_core::net::http_client().build()?;
     let preflight = client
         .request(reqwest::Method::OPTIONS, &url)
         .header("origin", origin)
@@ -214,7 +214,7 @@ pub async fn stream_first_chunk_then_hang_up(
     mount_path: &str,
 ) -> Result<Vec<u8>> {
     let url = format!("{}/connect/{}", disp.base(), mount_path.trim_start_matches('/'));
-    let client = reqwest::Client::new();
+    let client = weft_core::net::http_client().build()?;
     let mut resp = client
         .get(&url)
         .send()
@@ -321,7 +321,7 @@ pub struct SilentCaller {
 // SYNC: the ticket answer's shape <-> crates/weft-engine/src/door/mod.rs (the ticket answer), packages/weft-connect/src/core/socket.ts (socketAddress)
 pub async fn ticket(disp: &Dispatcher, mount_path: &str, headers: &[(&str, &str)]) -> Result<String> {
     let url = format!("{}/connect/{}", disp.base(), mount_path.trim_start_matches('/'));
-    let mut req = reqwest::Client::new().get(&url);
+    let mut req = weft_core::net::http_client().build()?.get(&url);
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
@@ -360,7 +360,7 @@ pub async fn http_post(disp: &Dispatcher, mount_path: &str, body: &Value) -> Res
         disp.base(),
         mount_path.trim_start_matches('/')
     );
-    let client = reqwest::Client::new();
+    let client = weft_core::net::http_client().build()?;
     let resp = client
         .post(&url)
         .json(body)

@@ -4,7 +4,7 @@
 //! file, or a node that keeps a big value in memory, can take far more
 //! than another. Past its memory the platform kills the whole worker, and
 //! every run on it dies with it. So a worker refuses to start more work
-//! while its memory is past [`FULL_ABOVE`] of its limit, answering `503`
+//! while its memory is past [`FULL_ABOVE`] of its budget, answering `503`
 //! with a `Retry-After`: an outside caller is told to try again in a
 //! moment, and a run weft hands it is handed again on the next delivery.
 //! Runs already going are never touched. Everything else that fills up
@@ -12,14 +12,17 @@
 //! byte budget, `crate::journal_writer`): waiting does not free memory a
 //! run already holds, which is why this one guard refuses.
 //!
-//! The limit is the container's own (its cgroup's `memory.max`); a
-//! container whose cgroup sets none (a local install caps no container)
-//! and one that shows no cgroup at all (a sandbox) read the machine's own
-//! from `/proc/meminfo`. The cgroup counts memory the process holds
-//! whether or not it is in use, which is honest because the worker's
-//! allocator hands freed memory back to the system (the generated worker
-//! binary runs on jemalloc). The reading is taken by a sampler every
-//! [`SAMPLE_EVERY`], never on a request's path.
+//! The budget is settled once, when the worker starts ([`Budget`]): its
+//! container's own limit (its cgroup's `memory.max`) when it runs in a
+//! container that sets one. Without one, the worker has no budget and the
+//! guard never refuses: a worker running as a plain process on a person's
+//! machine shares that machine with everything else on it, and the other
+//! apps filling the memory is no reason for it to turn its runs away. The
+//! cgroup counts
+//! memory the process holds whether or not it is in use, which is honest
+//! because the worker's allocator hands freed memory back to the system
+//! (the generated worker binary runs on jemalloc). The reading is taken by
+//! a sampler every [`SAMPLE_EVERY`], never on a request's path.
 
 use std::sync::Arc;
 
@@ -37,6 +40,12 @@ const RETRY_AFTER_SECS: u64 = 1;
 /// How often the sampler reads the memory.
 const SAMPLE_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// A container's cgroup files, v2 then v1: its usage and its limit.
+const CGROUPS: [(&str, &str); 2] = [
+    ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
+    ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+];
+
 /// How much memory is in use and how much there is, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Memory {
@@ -51,59 +60,61 @@ impl Memory {
     }
 }
 
-/// The container's memory as its cgroup (v2, then v1) counts it, or the
-/// machine's own where the cgroup sets no limit or there is none (a
-/// sandbox, whose machine is its own); `None` when it cannot be read.
-pub fn read() -> Option<Memory> {
-    let file = |path: &str| std::fs::read_to_string(path).ok();
-    for (current, max) in [
-        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
-        ("/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
-    ] {
-        if std::path::Path::new(max).exists() {
-            let (current, max) = (file(current), file(max));
-            if current.is_none() || max.is_none() {
-                // The cgroup is there and cannot be read: the guard cannot
-                // see the memory, which is said once rather than per request.
-                static SAID: std::sync::Once = std::sync::Once::new();
-                SAID.call_once(|| {
-                    tracing::warn!(
-                        target: "weft_engine::busy",
-                        "this container's memory cgroup cannot be read, so a worker nearly out of memory does not turn new work away"
-                    )
-                });
-                return None;
-            }
-            match from_cgroup(current, max) {
-                Some(memory) => return Some(memory),
-                // No limit on the container: the machine's is the one.
-                None => break,
-            }
-        }
-    }
-    file("/proc/meminfo").as_deref().and_then(from_meminfo)
+/// A worker's memory budget: its container's cgroup, read from these
+/// files (usage, limit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    current: &'static str,
+    max: &'static str,
 }
 
-/// A cgroup's reading: its usage and its limit, when it sets one (`max`,
-/// or cgroup v1's huge "no limit" number, sets none).
+impl Budget {
+    /// This worker's budget: its container's limited cgroup, or `None`
+    /// when it runs in none.
+    pub fn of_cgroup() -> Option<Self> {
+        limited_cgroup()
+    }
+
+    /// How many bytes the budget allows; `None` when its cgroup cannot be
+    /// read.
+    pub fn limit(&self) -> Option<u64> {
+        self.read().map(|memory| memory.limit)
+    }
+
+    /// The memory now, against this budget; `None` when it cannot be read.
+    pub fn read(&self) -> Option<Memory> {
+        let file = |path: &str| std::fs::read_to_string(path).ok();
+        from_cgroup(file(self.current), file(self.max))
+    }
+}
+
+/// The container's cgroup (v2, then v1), when it sets a limit (`max`, or
+/// cgroup v1's huge "no limit" number, sets none).
+fn limited_cgroup() -> Option<Budget> {
+    let file = |path: &str| std::fs::read_to_string(path).ok();
+    for (current, max) in CGROUPS {
+        if !std::path::Path::new(max).exists() {
+            continue;
+        }
+        let (used, limit) = (file(current), file(max));
+        if used.is_none() || limit.is_none() {
+            tracing::warn!(
+                target: "weft_engine::busy",
+                "this container's memory cgroup cannot be read, so a worker nearly out of memory does not turn new work away"
+            );
+            return None;
+        }
+        return from_cgroup(used, limit).map(|_| Budget { current, max });
+    }
+    None
+}
+
+/// A cgroup's reading: its usage and its limit, when it sets one.
 fn from_cgroup(current: Option<String>, max: Option<String>) -> Option<Memory> {
     let used = current?.trim().parse::<u64>().ok()?;
     let limit = max?.trim().parse::<u64>().ok()?;
     // cgroup v1 says "no limit" with a number near the largest it holds.
     (limit < 1 << 60).then_some(Memory { used, limit })
-}
-
-/// The machine's reading from `/proc/meminfo`: all of it, and all of it
-/// less what is available.
-fn from_meminfo(meminfo: &str) -> Option<Memory> {
-    let kib = |name: &str| {
-        meminfo
-            .lines()
-            .find_map(|line| line.strip_prefix(name)?.trim().strip_suffix("kB")?.trim().parse::<u64>().ok())
-    };
-    let total = kib("MemTotal:")? * 1024;
-    let available = kib("MemAvailable:")? * 1024;
-    Some(Memory { used: total.saturating_sub(available), limit: total })
 }
 
 /// Whether the worker's memory is nearly full, as its sampler last read
@@ -114,10 +125,12 @@ pub struct MemoryGuard {
 }
 
 impl MemoryGuard {
-    /// A guard whose sampler reads the memory every [`SAMPLE_EVERY`] for as
-    /// long as the guard is held.
-    pub fn sampling() -> Arc<Self> {
+    /// A guard for this worker's [`Budget`]: sampled every
+    /// [`SAMPLE_EVERY`] for as long as the guard is held, or never full
+    /// (and never sampled) when the worker has no budget.
+    pub fn start(budget: Option<Budget>) -> Arc<Self> {
         let guard = Arc::new(Self::default());
+        let Some(budget) = budget else { return guard };
         let held = Arc::downgrade(&guard);
         tokio::spawn(async move {
             let mut every = tokio::time::interval(SAMPLE_EVERY);
@@ -125,7 +138,7 @@ impl MemoryGuard {
             loop {
                 every.tick().await;
                 let Some(guard) = held.upgrade() else { return };
-                guard.sample(read());
+                guard.sample(budget.read());
             }
         });
         guard
@@ -204,12 +217,6 @@ mod tests {
         assert_eq!(from_cgroup(Some("100\n".into()), Some("max\n".into())), None);
         assert_eq!(from_cgroup(Some("100".into()), Some("9223372036854771712".into())), None, "cgroup v1's no limit");
         assert_eq!(from_cgroup(None, Some("1000".into())), None);
-    }
-
-    #[test]
-    fn meminfo_reads_total_and_available() {
-        let meminfo = "MemTotal:        1000 kB\nMemFree:          100 kB\nMemAvailable:     250 kB\n";
-        assert_eq!(from_meminfo(meminfo), Some(Memory { used: 750 * 1024, limit: 1000 * 1024 }));
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! matching kinds by hand.
 //!
 //! The view's job is NARROW and deliberate: it lets the edit ops RESOLVE a
-//! target by scoped id (`grp.child`) and locate the subtree to mutate. It does
+//! target by scoped id (`grp.child`) and locate the subtree to edit. It does
 //! NOT reproduce the flatten/`ProjectDefinition` projection: the parse-server
 //! re-parses the edited source through the existing `compile_lenient`/`flatten` path to
 //! render the graph (see `edit_envelope` in `weft-cli`). One flatten, not two.
@@ -17,7 +17,8 @@
 //! boundary ids, are flatten-side concerns; this module works in the
 //! as-written `grp.port` form.)
 
-use super::kind::{SyntaxKind, SyntaxNode, SyntaxToken};
+use super::kind::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
+use super::tree::{Handle, Tree};
 
 /// Macro: define a `#[repr(transparent)]` typed wrapper over `SyntaxNode` for a
 /// single `SyntaxKind`, with `cast`/`syntax` and a by-kind child finder.
@@ -42,6 +43,15 @@ macro_rules! typed_node {
             /// The underlying untyped node.
             pub fn syntax(&self) -> &SyntaxNode {
                 &self.0
+            }
+        }
+
+        impl Handle for $name {
+            fn element(&self) -> SyntaxElement {
+                self.0.element()
+            }
+            fn from_element(element: SyntaxElement) -> Option<Self> {
+                element.into_node().and_then(Self::cast)
             }
         }
     };
@@ -169,6 +179,15 @@ impl Decl {
             Decl::Include(_) => None,
             Decl::InlineNode(x) => child(x.syntax(), SyntaxKind::BODY).and_then(Body::cast),
         }
+    }
+}
+
+impl Handle for Decl {
+    fn element(&self) -> SyntaxElement {
+        self.syntax().element()
+    }
+    fn from_element(element: SyntaxElement) -> Option<Self> {
+        element.into_node().and_then(Decl::cast)
     }
 }
 
@@ -378,20 +397,28 @@ pub enum Resolution {
 /// The SAME id the lowering writes (`source_id` flows to `lower_group`), so the
 /// typed view and `flatten` agree on every scoped id with no rename pass.
 pub struct FileView<'a> {
-    file: &'a WeftFile,
+    tree: &'a Tree,
     /// `None` for the project's entry file, which may hold no anonymous
     /// group (the parse refuses one), so no anon-group prefix ever forms.
     source_id: Option<&'a str>,
 }
 
 impl<'a> FileView<'a> {
-    pub fn new(file: &'a WeftFile, source_id: Option<&'a str>) -> Self {
-        Self { file, source_id }
+    /// A view over `tree`, whose root is a WEFT_FILE. Every query reads the
+    /// tree's newest version, so a query after an edit sees the edit.
+    pub fn new(tree: &'a Tree, source_id: Option<&'a str>) -> Self {
+        Self { tree, source_id }
     }
 
-    /// The underlying typed file root, for direct tree mutation by the edit ops.
-    pub fn file(&self) -> &'a WeftFile {
-        self.file
+    /// The tree under edit, for the edit ops.
+    pub fn tree(&self) -> &'a Tree {
+        self.tree
+    }
+
+    /// The typed file root of the newest version. An edit splices the root's
+    /// children, never the root itself, so it stays a WEFT_FILE.
+    pub fn file(&self) -> WeftFile {
+        WeftFile(self.tree.root())
     }
 
     pub fn source_id(&self) -> Option<&'a str> {
@@ -447,9 +474,10 @@ impl<'a> FileView<'a> {
     }
 
     /// The full scoped id of `decl` (dot-joined enclosing group labels + local
-    /// id), or None if it isn't found in the tree.
+    /// id), or None if it isn't in the tree. `decl` may be read from an older
+    /// version: it is found again in the newest one first.
     pub fn scoped_id_of(&self, decl: &Decl) -> Option<String> {
-        let want = decl.syntax().clone();
+        let want = self.tree.now(decl)?.syntax().clone();
         let mut found = None;
         self.walk_decls(&mut |scoped, d| {
             if *d.syntax() == want {
@@ -502,7 +530,7 @@ impl<'a> FileView<'a> {
             all_ids.insert(scoped.to_string());
         });
         let mut out = Vec::new();
-        self.walk_scoped(self.file.syntax(), &mut Vec::new(), &mut |scope, node| {
+        self.walk_scoped(self.file().syntax(), &mut Vec::new(), &mut |scope, node| {
             if !matches!(node.kind(), SyntaxKind::NODE_DECL | SyntaxKind::INLINE_EXPR) {
                 return;
             }
@@ -538,7 +566,7 @@ impl<'a> FileView<'a> {
 
     /// Walk every declaration, invoking `f(scoped_id, decl)`.
     fn walk_decls(&self, f: &mut impl FnMut(&str, &Decl)) {
-        self.walk_scoped(self.file.syntax(), &mut Vec::new(), &mut |scope, node| {
+        self.walk_scoped(self.file().syntax(), &mut Vec::new(), &mut |scope, node| {
             if let Some(decl) = Decl::cast(node.clone()) {
                 f(&scoped_with(scope, &self.decl_local(&decl)), &decl);
             }
@@ -549,7 +577,7 @@ impl<'a> FileView<'a> {
     /// with the enclosing group-label chain. Connections live directly under
     /// WEFT_FILE or a group BODY.
     fn walk_connections(&self, f: &mut impl FnMut(&[String], &SyntaxNode)) {
-        self.walk_scoped(self.file.syntax(), &mut Vec::new(), &mut |scope, node| {
+        self.walk_scoped(self.file().syntax(), &mut Vec::new(), &mut |scope, node| {
             if node.kind() == SyntaxKind::CONNECTION {
                 f(scope, node);
             }
@@ -660,16 +688,16 @@ fn endpoint_resolves_to(ep: &Endpoint, scope: &[String], all_ids: &std::collecti
 mod tests {
     use super::*;
     use crate::cst::parse;
-    use crate::cst::kind::SyntaxElement;
+    use crate::cst::tree::green_of;
 
-    fn file(src: &str) -> WeftFile {
-        WeftFile::cast(parse(src)).expect("root is WEFT_FILE")
+    fn file(src: &str) -> Tree {
+        Tree::new(parse(src))
     }
 
     /// A `FileView` over `f` with a placeholder source id. These tests use NAMED
     /// top-level groups, so the anon-group `source_id` is never exercised; the
     /// anon-prefix behaviour is covered by `parser_tests` against `flatten`.
-    fn view(f: &WeftFile) -> FileView<'_> {
+    fn view(f: &Tree) -> FileView<'_> {
         FileView::new(f, Some("Untitled"))
     }
 
@@ -785,31 +813,30 @@ mod tests {
     }
 
     #[test]
-    fn spike_mutation_primitives_work() {
-        // Prove the rowan mutation path end-to-end before building ops on it:
-        // clone_for_update -> splice a freshly-built subtree into a body before
-        // its `}` -> serialize round-trips with the insertion.
-        use crate::cst::parse;
-        let root = parse("g = Group() {\n  a = Text {}\n}\n").clone_for_update();
-        let file = WeftFile::cast(root).unwrap();
-        let g = match view(&file).resolve_decl("g") {
+    fn spike_edit_primitives_work() {
+        // Prove the rowan edit path end-to-end before building ops on it:
+        // splice a freshly-parsed subtree into a body before its `}` -> the new
+        // version serializes with the insertion, and a handle read before the
+        // splice is found again after it.
+        let tree = file("g = Group() {\n  a = Text {}\n}\n");
+        let g = match view(&tree).resolve_decl("g") {
             Resolution::Found(Decl::Group(g)) => g,
             _ => panic!(),
         };
         let body = g.body().unwrap();
         let brace = body.close_brace().unwrap();
-        // Build the element run to insert: "  b = Debug {}\n" parsed, its tokens
-        // lifted as mutable elements.
-        let snippet = parse("  b = Debug {}\n").clone_for_update();
-        let inserted: Vec<SyntaxElement> = snippet.children_with_tokens().collect();
-        // splice before the close brace: the brace's index within the BODY.
-        let at = brace.index();
-        body.syntax().splice_children(at..at, inserted);
-        let out = file.syntax().to_string();
+        // Build the element run to insert: "  b = Debug {}\n" parsed, its
+        // elements lifted as green.
+        let snippet = parse("  b = Debug {}\n");
+        let inserted = snippet.children_with_tokens().map(|e| green_of(&e)).collect();
+        tree.insert_before(&brace, inserted);
+        let out = tree.root().to_string();
         assert!(out.contains("b = Debug {}"), "spliced child present: {out}");
         assert!(out.contains("a = Text {}"), "original child kept: {out}");
+        let body_now = tree.now(&body).expect("the body survives the splice");
+        assert_eq!(body_now.syntax().to_string(), "{\n  a = Text {}\n  b = Debug {}\n}");
         // structurally re-parses and the new child resolves
-        let reparsed = WeftFile::cast(parse(&out)).unwrap();
+        let reparsed = file(&out);
         assert!(matches!(view(&reparsed).resolve_decl("g.b"), Resolution::Found(_)), "{out}");
     }
 

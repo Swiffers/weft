@@ -116,6 +116,19 @@ pub struct Unit {
     pub health: UnitHealth,
 }
 
+/// A memory size as `MachineShape::memory` and a container's limit write
+/// it (`4Gi`, `512Mi`, `2G`, `1500M`), in MiB, unrounded: a platform
+/// sizing a machine rounds up, a node planning what fits rounds down.
+/// `None` when it is not one.
+pub fn memory_mib(raw: &str) -> Option<f64> {
+    let raw = raw.trim();
+    // A gigabyte (10^9 bytes) is about 953.7 MiB.
+    [("Gi", 1024.0), ("Mi", 1.0), ("G", 1e9 / 1048576.0), ("M", 1e6 / 1048576.0)]
+        .into_iter()
+        .find_map(|(suffix, per)| raw.strip_suffix(suffix).map(|n| n.parse::<f64>().ok().map(|n| n * per)))
+        .flatten()
+}
+
 /// The machine a unit needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -38,6 +38,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use weft_task_store::db::Client as _;
 
 use crate::actions::{self, Actor, Refused};
 use crate::api::project::StatusError;
@@ -739,7 +740,7 @@ async fn apply_sync(
     // running the subworkflow so the new shape is the only thing
     // alive afterwards. Hard error: leaking stale infra is silently
     // worse than asking the user to retry.
-    reap_orphans(state, id).await?;
+    let reaped = reap_orphans(state, id).await?;
 
     // UNDER the per-project transition lock (short; two concurrent syncs
     // serialize here and the second is rejected by the in-flight
@@ -748,7 +749,9 @@ async fn apply_sync(
     // it. Its wait happens OUTSIDE the lock ([`finish_sync`]): user code
     // upstream of infra nodes may legitimately be slow, and no lock is
     // held across it.
-    let started: Result<Option<crate::api::project::InfraSetupRun>, (StatusCode, String)> =
+    // The lock's own failure outside, the start's answer inside.
+    type Started = Result<Result<Option<crate::api::project::InfraSetupRun>, (StatusCode, String)>, (StatusCode, String)>;
+    let started: Started =
         crate::lease::with_project_transition_lock(&state.lock_pool, id, || async {
             // Under the lock `weft maintenance on` takes after recording
             // the maintenance, before it reads the copies: a start either
@@ -767,8 +770,10 @@ async fn apply_sync(
             Ok(crate::api::project::start_infra_setup(state, id, instance, places).await)
         })
         .await
-        .map_err(|e| crate::lease::lock_answer("project transition lock", e))?;
-    Ok(started?.map(|run| BegunSync { run }))
+        .map_err(|e| crate::lease::lock_answer("project transition lock", e));
+    // Orphans terminated above are a part of the request that went through.
+    let answer = |e: (StatusCode, String)| if reaped { crate::api::after_writes(e) } else { e };
+    Ok(started.map_err(answer)?.map_err(answer)?.map(|run| BegunSync { run }))
 }
 
 /// The rest of a sync: wait for its InfraSetup to land.
@@ -790,17 +795,20 @@ pub(crate) async fn finish_sync(state: &DispatcherState, begun: BegunSync) -> Re
 /// Also woken when an activation ends or a held signal goes, so one
 /// refused because another claim held its trigger comes back once that
 /// claim ends. Then the queued events that waited on infra are handed over
-/// again, and a stopped resync waiting on either change is taken up again
-/// (`crate::task_kinds::resync::retry_stopped`). One project's failure
-/// holds back no other's: every project is looked at, and the pass fails
-/// (to be tried again) naming each failure once all of them were.
+/// again. A stopped resync waiting on the same changes is taken up by a
+/// loop of its own on the same wakes (`crate::reaper::RESYNC_RETURNS`).
+/// One project's failure holds back no other's: every project is looked
+/// at, and the pass fails (to be tried again) naming each failure once all
+/// of them were.
 pub(crate) async fn bring_back_triggers_whose_infra_returned(state: DispatcherState) -> anyhow::Result<weft_task_store::drain::DrainStep> {
     // SYNC: 'infra' <-> weft_broker_client::activation::DownWith::Infra
-    let marked: Vec<uuid::Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT project_id FROM trigger_activation WHERE went_down_with = 'infra' AND status = 'inactive'",
-    )
-    .fetch_all(&state.pg_pool)
-    .await?;
+    let marked: Vec<uuid::Uuid> = state
+        .pg_pool
+        .scalars(
+            "SELECT DISTINCT project_id FROM trigger_activation WHERE went_down_with = 'infra' AND status = 'inactive'",
+            &[],
+        )
+        .await?;
     let mut failed = Vec::new();
     for id in marked {
         if let Err(e) = bring_back_what_went_down_with_infra(&state, id).await {
@@ -811,9 +819,6 @@ pub(crate) async fn bring_back_triggers_whose_infra_returned(state: DispatcherSt
     // copies as they are now, and waits again if one is still down.
     if let Err(e) = crate::parked_drain::drain_waiting_on(&state, weft_core::door_fire::UnclockedWait::Infra, None).await {
         failed.push(format!("handing over the events that waited on infra: {e:#}"));
-    }
-    if let Err(e) = crate::task_kinds::resync::retry_stopped(&state).await {
-        failed.push(format!("{e:#}"));
     }
     anyhow::ensure!(failed.is_empty(), "{}", failed.join("; "));
     Ok(weft_task_store::drain::DrainStep::Done)
@@ -1081,6 +1086,8 @@ pub(crate) async fn press_live(
     let endpoint_url = live_endpoint_url(state, id, node, instance).await?;
     use weft_core::infra::action::{action_request, ACTION_PATH};
     let action_url = format!("{}{ACTION_PATH}", endpoint_url.trim_end_matches('/'));
+    // No limit on the press: it runs the container's own action, which a
+    // person pressed and waits on.
     let resp = state
         .http
         .post(&action_url)
@@ -1185,7 +1192,7 @@ pub(crate) async fn live_endpoint_url(
             format!("infra node '{node}' is {}, so it has nothing to show yet", row.status.as_str()),
         ));
     }
-    row.install_endpoints.get(live_endpoint).cloned().ok_or((
+    row.endpoints.get(live_endpoint).cloned().ok_or((
         StatusCode::NOT_FOUND,
         format!("infra node has no endpoint named '{live_endpoint}' (live_endpoint)"),
     ))
@@ -1275,7 +1282,7 @@ async fn issue_per_nodes(
 async fn reap_orphans(
     state: &DispatcherState,
     id: uuid::Uuid,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<bool, (StatusCode, String)> {
     let project = state
         .projects
         .project(id)
@@ -1298,7 +1305,7 @@ async fn reap_orphans(
         .map(|r| (r.node_id, r.instance))
         .collect();
     if orphans.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let tenant = state
         .tenant_router
@@ -1405,7 +1412,7 @@ async fn reap_orphans(
             ),
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Project deletion entry point. Called by `weft rm`.
@@ -1561,7 +1568,6 @@ mod tests {
             endpoints: Default::default(),
             public_paths: Default::default(),
             doors: Default::default(),
-            install_endpoints: Default::default(),
             keep_disks: Vec::new(),
             units: Default::default(),
             notes: Vec::new(),

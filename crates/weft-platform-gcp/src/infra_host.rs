@@ -522,15 +522,34 @@ fn parse_cpus(raw: &str) -> anyhow::Result<f64> {
     }
 }
 
+/// What the agent on `machine` (running a unit of `node`) said of its
+/// unit. One that does not read is an agent an older weft started: a
+/// machine boots the current agent only from its next start, so the unit
+/// reads as failed with a message saying to stop and start the node
+/// (`failed` builds that unit's observation). Failing that one unit, not
+/// the project's whole observation, is deliberate: every other node keeps
+/// being observed, and the stop the message names (which observes the
+/// project first) goes through.
+fn agent_observations(
+    machine: &str,
+    node: &str,
+    printed: &[u8],
+    failed: impl FnOnce(UnitRunState) -> UnitObservation,
+) -> Vec<UnitObservation> {
+    serde_json::from_slice(printed).unwrap_or_else(|e| {
+        vec![failed(UnitRunState::Failed {
+            why: format!(
+                "the agent on machine '{machine}' answered in a shape this weft does not read ({e}): it is an older weft's agent. \
+                 Stop and start the node so the machine boots this weft's: `weft infra stop --infra {node}` then \
+                 `weft infra start --infra {node}` (with `--instance <id>` for an instance's copy)"
+            ),
+        })]
+    })
+}
+
 fn parse_mb(raw: &str) -> anyhow::Result<u32> {
-    let raw = raw.trim();
-    // In MiB: a gigabyte (10^9 bytes) is about 953.7 MiB.
-    for (suffix, per) in [("Gi", 1024.0), ("Mi", 1.0), ("G", 1e9 / 1048576.0), ("M", 1e6 / 1048576.0)] {
-        if let Some(n) = raw.strip_suffix(suffix) {
-            return Ok((n.parse::<f64>().map_err(|_| anyhow::anyhow!("'{raw}' is not a memory size"))? * per).ceil() as u32);
-        }
-    }
-    anyhow::bail!("'{raw}' is not a memory size (write it like 512Mi or 4Gi)")
+    let mib = weft_core::infra::memory_mib(raw).ok_or_else(|| anyhow::anyhow!("'{}' is not a memory size (write it like 512Mi or 4Gi)", raw.trim()))?;
+    Ok(mib.ceil() as u32)
 }
 
 /// A disk size in whole GB (`10Gi`, `500Mi` rounds up to 1).
@@ -748,10 +767,17 @@ impl InfraHost for ComputeInfraHost {
                 anyhow::anyhow!("machine '{}' is labeled for project {project} but carries no '{MD_UNIT}' metadata", name_of(&m))
             })?;
             let hash = a.node.unit(&a.unit).map(|u| u.hash.clone()).unwrap_or_default();
-            let at = |state| UnitObservation { copy_id: a.node.node.copy_id.clone(), unit: a.unit.clone(), hash: hash.clone(), state };
+            // What the machine says alone, with no agent to read its
+            // containers: no restart of theirs is known.
+            let at = |state| UnitObservation { copy_id: a.node.node.copy_id.clone(), unit: a.unit.clone(), hash: hash.clone(), state, restart: None };
             match m.get("status").and_then(Value::as_str) {
                 Some("RUNNING") => match self.agent(&m, reqwest::Method::GET, HOST_OBSERVE).await {
-                    Ok(resp) => out.extend(resp.json::<Vec<UnitObservation>>().await?),
+                    // A reply cut off mid-body is the agent not answering,
+                    // for this machine alone.
+                    Ok(resp) => match resp.bytes().await {
+                        Ok(printed) => out.extend(agent_observations(name_of(&m), &a.node.node.node, &printed, at)),
+                        Err(e) => out.push(at(agent_silent(m.get("lastStartTimestamp").and_then(Value::as_str), chrono::Utc::now(), &e.into()))),
+                    },
                     // Its agent answers as soon as the machine has booted, and
                     // says from there what it is doing; past a boot's time,
                     // an agent that does not answer is a fault to name.
@@ -808,7 +834,6 @@ impl InfraHost for ComputeInfraHost {
         match &ep.target {
             EndpointTarget::External { url } => Ok(EndpointAt {
                 url: url.clone(),
-                install_url: url.clone(),
                 same_network: matches!(ep.expose, Expose::SameNetwork)
                     .then(|| url.split_once("://").map_or(url.as_str(), |(_, r)| r).split('/').next().unwrap_or_default().to_string()),
             }),
@@ -826,7 +851,6 @@ impl InfraHost for ComputeInfraHost {
                 let ip = internal_ip(&machine).ok_or_else(|| anyhow::anyhow!("the machine of '{unit}' has no address yet"))?;
                 Ok(EndpointAt {
                     url: format!("http://{ip}:{number}"),
-                    install_url: format!("http://{ip}:{number}"),
                     same_network: matches!(ep.expose, Expose::SameNetwork).then(|| format!("{ip}:{number}")),
                 })
             }
@@ -845,6 +869,23 @@ impl InfraHost for ComputeInfraHost {
 
 #[cfg(test)]
 mod tests {
+    /// An older agent's reply (no `restart`) fails that machine's unit
+    /// alone, with a message naming how to get this weft's agent onto the
+    /// machine; a current one reads as it says.
+    #[test]
+    fn an_older_agents_observation_fails_its_unit_saying_to_stop_and_start_the_node() {
+        let at = |state| UnitObservation { copy_id: "c".into(), unit: "main".into(), hash: "h".into(), state, restart: None };
+        let current = r#"[{"copy_id":"c","unit":"main","hash":"h","state":{"kind":"ready"},"restart":null}]"#;
+        assert_eq!(agent_observations("m-1", "db", current.as_bytes(), at), vec![at(UnitRunState::Ready)]);
+        let old = r#"[{"copy_id":"c","unit":"main","hash":"h","state":{"kind":"ready"}}]"#;
+        let seen = agent_observations("m-1", "db", old.as_bytes(), at);
+        let [UnitObservation { copy_id, unit, state: UnitRunState::Failed { why }, .. }] = seen.as_slice() else {
+            panic!("an older agent fails its one unit: {seen:?}")
+        };
+        assert_eq!((copy_id.as_str(), unit.as_str()), ("c", "main"));
+        assert!(why.contains("m-1") && why.contains("`weft infra stop --infra db`") && why.contains("`weft infra start --infra db`"), "{why}");
+    }
+
     use super::*;
     use weft_core::infra::{Gpu, MachineShape, Unit};
 

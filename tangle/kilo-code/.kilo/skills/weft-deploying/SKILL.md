@@ -18,9 +18,16 @@ url = "https://weft-role-dispatcher-123456789.us-central1.run.app"
 given `--on <target>` (or `WEFT_DISPATCHER_URL` is set in its environment,
 which you never do), and no setting makes another target the default.
 
-Only the `deployer` specialist passes `--on`.
-You never do: when the user asks for anything on a cloud install, you
-dispatch the deployer with what they asked, and relay its report.
+The `deployer` specialist runs the deploy procedure: a deploy, a rollback,
+setting up the deploy workflow, a failed cloud build. You dispatch it with
+what the user asked, and relay its report. The rest you may do on a cloud
+install yourself, with `--on <target>` on every command: read what is there
+(`weft status`, `weft runs`, `weft logs`, `weft events`), run, resync, start
+infra. Before anything that stops or turns off something on a cloud install
+(stopping a run, `weft deactivate`, `weft infra stop` or `terminate`, `weft
+cancel-activate`), ask the user first, in one plain sentence that says what
+will stop. When a program there is failing, stuck or slow for the people
+using it, read the weft-incidents skill.
 
 If weft is not on the user's cloud yet, or they want to upgrade or resize
 it, Tangle reads the weft-cloud-install skill and does it in
@@ -177,8 +184,13 @@ folder:
    When this machine already holds them, you copy them across first with
    `weft migrate connections` (the weft-cloud-install skill, "Moving an app
    from this machine"): the user never makes them again.
-6. If the program has infrastructure (a database, a bridge), `weft infra
-   start --on prod`. It builds the program for prod first, on the
+6. If the program has infrastructure (a database, a bridge), size it before
+   its first start on this target. Each infra node has its size settings
+   (a database node's `cpu` and `memory`, 0.25 CPU and `1Gi` when unset,
+   which on a cloud install is the smallest machine): ask the user what the
+   database will carry (how many people, how much data, how busy), propose
+   a size, and set it on the node. It can change later: the setting, then
+   `weft infra upgrade --on prod`. Then `weft infra start --on prod`. It builds the program for prod first, on the
    install's builder (the worker and every piece's image, about 2 minutes
    the first time, nothing when they are built already), then brings each
    piece up: on GCP each boots a machine of its own, about 2 to 3 minutes,
@@ -200,6 +212,34 @@ Then the user runs the workflow from the repository's Actions tab: about a
 minute and a half for the program, plus however long the frontend's build
 takes, plus however long the runs going take to end while `RUNNING` is
 `wait`.
+
+If the cloud build of the project's worker fails, or the cloud refuses a
+program for a missing need, look at the `[build.worker]` section of
+`weft.toml`, which the worker's image on the cloud is built from:
+
+- `base_image`: the image it starts from, `debian:trixie-slim` when unset.
+  On any Debian 13 (trixie) image the build starts from weft's prebuilt
+  compiler image; on any other, an older Debian included, it installs Rust
+  and compiles the worker inside that image, which takes longer.
+- `dockerfile_template`: the path, from the project folder, to a Dockerfile
+  used instead of weft's. A missing file fails the build naming the path.
+  Without the `{{install_runtime_system_packages}}` placeholder in it, every
+  program whose nodes have a `run` need is refused.
+- `package_manager` (`apt`, `dnf`, `apk` or `brew`): how the nodes' needs
+  are installed. It is required when the image's name before its tag
+  (ignoring case) contains none of `debian`, `ubuntu`, `alpine`, `rocky`,
+  `almalinux`, `centos`, `fedora`, `amazonlinux`, `oraclelinux`, `rhel`,
+  `homebrew` or `/brew`, and does not itself start with `python` (so
+  `docker.io/library/python:3.12` needs it and `python:3.12` does not);
+  without it the build fails with `base_image ... is of no family weft
+  knows`. When set, it wins over the family weft reads from the name.
+
+A build that fails with `none matches the project's base image` means a
+node's need has packages for this manager but not for this distro: add a
+`default` (or that distro key) under `[needs.install.<manager>]` in the
+node's `deps.toml`. If any of the three is set, the cloud builds an image
+for this project alone. A local run never builds this image, so a project
+proven on this machine can still fail its cloud build on this section.
 
 ## A project's frontend: `weft frontend`
 
@@ -294,6 +334,10 @@ new trigger cannot be turned on before that resync, go and read the
 `weft-running` skill, "Taking triggers down, and bringing them back". Pass
 `--held drop` or `--door refuse` on prod only when the user says so: both
 throw away work.
+
+After a deploy, if the program has a setup step to run against the
+target (a `weft run --on prod --target <group>` the project uses for its
+database schema, say), run it.
 
 Every target keeps its own versions: `weft tree --on prod` lists what was
 deployed there. To roll back, put an older one's files back in the folder

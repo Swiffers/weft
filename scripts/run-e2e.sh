@@ -216,36 +216,43 @@ fi
 # SYNC: secrets.env <-> crates/weft-core/src/infra/install.rs (SECRETS_FILE, Install::secret,
 #       env_file_values: the parser of record), crates/weft-cli/src/commands/daemon.rs (secrets:
 #       the writer)
-if [ -z "${WEFT_E2E_DATABASE_URL:-}" ]; then
-  SECRETS="$INSTALL_DIR/secrets.env"
+SECRETS="$INSTALL_DIR/secrets.env"
+# install_secret <name>: the value <name> has in the install's secrets,
+# failing (non-zero, with the reason on stderr) when the file is missing or
+# names no value for it. Called inside `$(...)`, so every caller adds
+# `|| exit 1`: an exit in there would end only the subshell.
+install_secret() {
   if [ ! -f "$SECRETS" ]; then
     echo "$SECRETS does not exist; is the install up? (./setup.sh --daemon)" >&2
-    exit 1
+    return 1
   fi
-  WEFT_E2E_DATABASE_URL="$(awk '
+  local value
+  value="$(awk -v want="$1" '
     { eq = index($0, "=") }
     eq > 0 {
       key = substr($0, 1, eq - 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
-      if (key == "WEFT_DATABASE_URL") { value = substr($0, eq + 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", value) }
+      if (key == want) { value = substr($0, eq + 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", value) }
     }
     END { print value }' "$SECRETS")"
-  if [ -z "$WEFT_E2E_DATABASE_URL" ]; then
-    echo "$SECRETS names no WEFT_DATABASE_URL; is the install up? (./setup.sh --daemon)" >&2
-    exit 1
+  if [ -z "$value" ]; then
+    echo "$SECRETS names no $1; start the install again with ./setup.sh --daemon, which writes it" >&2
+    return 1
   fi
+  printf '%s\n' "$value"
+}
+if [ -z "${WEFT_E2E_DATABASE_URL:-}" ]; then
+  WEFT_E2E_DATABASE_URL="$(install_secret WEFT_DATABASE_URL)" || exit 1
   export WEFT_E2E_DATABASE_URL
 fi
 
-# An S3 store: the machine already runs one ('weft-object-store', on
-# weft's Docker network, local-dev identities, shared by every install); a
-# bucket of the install's own in it serves the S3 tests, so two installs'
-# runs never share one: `weft-e2e` for the default install,
-# `weft-e2e-<name>` for a branch's. The endpoint is dialled by the WORKER running
-# the node under test, a container on that same network, so it names the
-# store by its address there: a private IP, which a stored connection base
-# may reach over plain http (a container name is not one).
-# SYNC: the store's address on the network <-> crates/weft-cli/src/commands/daemon.rs
-#       (OBJECT_STORE_CONTAINER, worker_endpoint)
+# An S3 store: the machine already runs one ('weft-object-store', its keys
+# made once per machine, shared by every install); a bucket of the install's
+# own in it serves the S3 tests, so two installs' runs never share one:
+# `weft-e2e` for the default install, `weft-e2e-<name>` for a branch's. The
+# endpoint is dialled by the WORKER running the node under test, a process on
+# this machine, so it is the store's loopback address, which a stored
+# connection base may reach over plain http.
+# SYNC: the store's published port <-> crates/weft-cli/src/commands/daemon.rs (ensure_object_store)
 if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ]; then
   if [ -z "$(docker ps -q -f name='^weft-object-store$')" ]; then
     echo "no running weft-object-store container; is the install up?" >&2
@@ -264,11 +271,19 @@ if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ]; then
     printf '%s\n' "$BUCKET_OUT" >&2
     exit 1
   fi
-  STORE_IP="$(docker inspect weft-object-store --format '{{(index .NetworkSettings.Networks "weft").IPAddress}}')"
-  export WEFT_E2E_S3_ENDPOINT="http://$STORE_IP:8333"
+  STORE_AT="$(docker port weft-object-store 8333/tcp | grep -m1 '^127\.0\.0\.1:' || true)"
+  if [ -z "$STORE_AT" ]; then
+    echo "the weft-object-store container publishes no loopback port; start the install again with ./setup.sh --daemon, which recreates it" >&2
+    exit 1
+  fi
+  export WEFT_E2E_S3_ENDPOINT="http://$STORE_AT"
   export WEFT_E2E_S3_REGION="us-east-1"
-  export WEFT_E2E_S3_ACCESS_KEY_ID="weft-local"
-  export WEFT_E2E_S3_SECRET_ACCESS_KEY="weft-local-dev-secret"
+  # The store's keys, made once per machine, handed to every install among
+  # its secrets.
+  # SYNC: the store's key names <-> crates/weft-platform-traits/src/object_store.rs (OBJECT_STORE_ACCESS_KEY_ENV, OBJECT_STORE_SECRET_KEY_ENV)
+  WEFT_E2E_S3_ACCESS_KEY_ID="$(install_secret WEFT_OBJECT_STORE_ACCESS_KEY)" || exit 1
+  WEFT_E2E_S3_SECRET_ACCESS_KEY="$(install_secret WEFT_OBJECT_STORE_SECRET_KEY)" || exit 1
+  export WEFT_E2E_S3_ACCESS_KEY_ID WEFT_E2E_S3_SECRET_ACCESS_KEY
   export WEFT_E2E_S3_BUCKET="$BUCKET"
 fi
 
@@ -343,15 +358,19 @@ mkdir -p "$RUN_DIR"
 
 # What the install looked like when a test failed, next to its log: every
 # container, the runtime's log of the install under test and of any cell
-# the failed test kept, and the logs of the kept projects' containers.
+# the failed test kept, its worker registry, and the logs of the kept
+# projects' worker processes and infra containers.
 # SYNC: labels weft-install, weft.project <-> crates/weft-platform-local/src/docker.rs
+# SYNC: workers/running.json, workers/logs/<name>.log, weft-w-<project>- <->
+#       crates/weft-platform-local/src/registry.rs (Registry::log_of),
+#       crates/weft-platform-local/src/runner.rs (worker_name_prefix)
 post_mortem() {
   local t="$1" dir="$RUN_DIR/$1.post-mortem"
   mkdir -p "$dir"
   docker ps -a --filter label=weft-install \
     --format '{{.Names}}\t{{.Status}}\t{{.Label "weft.role"}}\t{{.Label "weft.project"}}' >"$dir/containers.txt" 2>&1
   tail -n 5000 "$INSTALL_DIR/runtime.log" >"$dir/runtime.log" 2>&1
-  local cell cell_dir
+  local installs=("$INSTALL_DIR") cell cell_dir
   # Every cell and project the test made, as it says the moment it makes
   # one: a test stopped for running too long never reaches the lines its
   # guards print when they drop.
@@ -361,14 +380,25 @@ post_mortem() {
     # install under test's WHICH_* stay as they are).
     if cell_dir="$(weft_which "$REPO_ROOT" "$INSTALL_WEFT" "$cell" && printf '%s' "$WHICH_DIR")"; then
       tail -n 5000 "$cell_dir/runtime.log" >"$dir/runtime-$cell.log" 2>&1
+      installs+=("$cell_dir")
     else
       echo "could not ask weft where cell $cell lives" >"$dir/runtime-$cell.log"
     fi
   done
-  # The containers of every project the test kept, while they still run
-  # (an idle worker is removed, taking its log with it).
-  local project name
+  # Which worker processes each install runs, and the logs of every
+  # project the test kept, while they are there: a worker that stopped
+  # once idle is forgotten, its log removed with it, and an infra
+  # container's log goes with the container.
+  local install project name log
+  for install in "${installs[@]}"; do
+    [ -f "$install/workers/running.json" ] && cp "$install/workers/running.json" "$dir/running-$(basename "$install").json"
+  done
   for project in $(sed -n "s/^weft-e2e: made project '[^']*' (\([0-9a-f-]*\)).*/\1/p" "$RUN_DIR/$t.log" | sort -u); do
+    for install in "${installs[@]}"; do
+      for log in "$install/workers/logs/weft-w-${project//-/}-"*.log; do
+        [ -f "$log" ] && tail -n 5000 "$log" >"$dir/$(basename "$log")" 2>&1
+      done
+    done
     for name in $(docker ps -a --filter "label=weft.project=$project" --format '{{.Names}}' 2>/dev/null); do
       docker logs --tail 5000 "$name" >"$dir/$name.log" 2>&1
     done
@@ -536,11 +566,11 @@ echo ""
 printf 'the tests ran in %dm%02ds\n' $(( ELAPSED / 60 )) $(( ELAPSED % 60 ))
 
 # Reclaim what the run left, pass or fail: a passing test removed what it
-# made, so its fixtures' worker images now reference nothing; a failed
-# test kept its projects, and the reclaim keeps every image a project
-# still points at. The same pass drops the worker compile cache this
-# checkout moved off, which a long session of rebuilds otherwise piles up
-# by the tens of gigabytes.
+# made, so nothing references its fixtures' worker programs any more; a
+# failed test kept its projects, and the reclaim keeps every program a
+# project still points at. The same pass drops the worker compile caches
+# no install on the machine uses, which a long session of rebuilds
+# otherwise piles up by the tens of gigabytes.
 RECLAIMED=1
 without_machine_locks "$INSTALL_WEFT" clean --images --all >"$E2E_DIR/reclaim.log" 2>&1 || RECLAIMED=0
 if [ $RECLAIMED -eq 0 ]; then

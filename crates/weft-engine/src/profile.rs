@@ -1,7 +1,8 @@
 //! A worker's own CPU profile, for measuring where its time goes: set
 //! `WEFT_PROFILE` to a number of seconds and the worker samples every one of
 //! its threads for that long from the moment it starts, then writes a flame
-//! graph to `WEFT_PROFILE_OUT` (`/tmp/weft-worker-profile.svg` unless set).
+//! graph to `WEFT_PROFILE_OUT` (`weft-worker-profile.svg` in the worker's
+//! scratch folder, `crate::scratch`, unless set).
 //! Sampled with signals, so it needs no `perf` on the machine. Unset, nothing
 //! is sampled.
 
@@ -11,7 +12,8 @@ pub const PROFILE_ENV: &str = "WEFT_PROFILE";
 /// Where the flame graph is written.
 pub const PROFILE_OUT_ENV: &str = "WEFT_PROFILE_OUT";
 
-const DEFAULT_OUT: &str = "/tmp/weft-worker-profile.svg";
+/// The flame graph's name in the scratch folder, unless `WEFT_PROFILE_OUT` is set.
+const DEFAULT_NAME: &str = "weft-worker-profile.svg";
 
 /// How often each thread is sampled.
 const SAMPLES_PER_SECOND: i32 = 997;
@@ -21,25 +23,46 @@ const SAMPLES_PER_SECOND: i32 = 997;
 pub fn start_from_env() -> anyhow::Result<()> {
     let Ok(secs) = std::env::var(PROFILE_ENV) else { return Ok(()) };
     let secs: u64 = secs.trim().parse().map_err(|e| anyhow::anyhow!("{PROFILE_ENV} is not a number of seconds: {e}"))?;
-    let out = std::env::var(PROFILE_OUT_ENV).unwrap_or_else(|_| DEFAULT_OUT.to_string());
+    let out = match std::env::var_os(PROFILE_OUT_ENV) {
+        Some(out) => std::path::PathBuf::from(out),
+        None => crate::scratch::dir()?.join(DEFAULT_NAME),
+    };
     let guard = pprof::ProfilerGuardBuilder::default()
         .frequency(SAMPLES_PER_SECOND)
         .blocklist(&["libc", "libgcc", "pthread", "vdso"])
         .build()
         .map_err(|e| anyhow::anyhow!("the CPU profile could not start: {e}"))?;
-    tracing::info!(target: "weft_engine::profile", secs, %out, "sampling this worker's CPU");
+    tracing::info!(target: "weft_engine::profile", secs, out = %out.display(), "sampling this worker's CPU");
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
         let written = guard.report().build().map_err(anyhow::Error::from).and_then(|report| {
             let file = std::fs::File::create(&out)?;
-            report.flamegraph(file)?;
-            Ok(())
+            draw(&report, file)
         });
         match written {
-            Ok(()) => tracing::info!(target: "weft_engine::profile", %out, "the CPU profile is written"),
-            Err(e) => tracing::error!(target: "weft_engine::profile", %out, error = %format!("{e:#}"), "the CPU profile could not be written"),
+            Ok(()) => tracing::info!(target: "weft_engine::profile", out = %out.display(), "the CPU profile is written"),
+            Err(e) => tracing::error!(target: "weft_engine::profile", out = %out.display(), error = %format!("{e:#}"), "the CPU profile could not be written"),
         }
     });
+    Ok(())
+}
+
+/// `report` drawn as a flame graph into `out`: one line per sampled stack,
+/// its thread first and its outermost call next (`thread;outer;...;inner
+/// count`), which inferno draws. pprof's own drawing does the same through
+/// an inferno that holds a quick-xml with advisories against it.
+fn draw(report: &pprof::Report, out: impl std::io::Write) -> anyhow::Result<()> {
+    let lines: Vec<String> = report
+        .data
+        .iter()
+        .map(|(stack, count)| {
+            let calls = stack.frames.iter().rev().flat_map(|frame| frame.iter().rev()).map(ToString::to_string);
+            let path: Vec<String> = std::iter::once(stack.thread_name_or_id()).chain(calls).collect();
+            format!("{} {count}", path.join(";"))
+        })
+        .collect();
+    anyhow::ensure!(!lines.is_empty(), "nothing was sampled: no stack to draw");
+    inferno::flamegraph::from_lines(&mut inferno::flamegraph::Options::default(), lines.iter().map(String::as_str), out)?;
     Ok(())
 }
 

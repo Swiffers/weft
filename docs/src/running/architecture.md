@@ -181,21 +181,118 @@ worker CPU, and a local install does not stop it as idle.
 
 ## The worker
 
-A worker is one compiled program, serving many runs at once. It runs from an
-image named after a hash of its contents, so two projects that compile to the
-same thing share an image.
+A worker runs one compiled program and serves many runs at once. The
+program is named after a hash of what went into it, such as weft's engine, the Rust
+version weft pins, and each node package by its name and its content (never by
+where the package sits in the project). So two projects that compile to the
+same thing share one program, and every project whose nodes are all the
+standard library's, unchanged, runs the same one: the standard worker. A
+project built with `--referenced` compiles a program of its own, since it
+leaves out the nodes it does not use.
 
-On your machine a worker is a Docker container, one per project and build of its program;
-changing the project's worker settings (`weft workers set`) starts a fresh one
-for the calls that follow. The one at the project's address runs for as long
+On your machine a worker is a plain process, and it runs in the project's
+folder, so its nodes open your files and start your programs the way
+anything else you run does. If the project has several folders on this
+machine (two checkouts of it, say), the worker runs in the one changed most
+recently. Every worker program lives in `~/.local/share/weft/workers/<hash>/`,
+where every install on the machine finds it, and one that has to be compiled
+is compiled there with your own Rust toolchain. The standard worker is there before any project asks for it:
+for the default install, `./setup.sh` downloads it along with the published
+CLI when your checkout is exactly a commit CI has built for this kind of
+machine, and otherwise (on a branch's install too) the install compiles it
+once when it starts. A project with nodes of
+its own compiles them, and reuses whatever earlier builds on this machine
+already compiled. If you have not installed Rust yet, go and read the
+[install page](../start/install.md).
+
+A project's build and a live node test's server each compile in a compile
+lane: a compile cache of its own, about 2GB, under
+`~/.local/share/weft/worker-target/`, shared by every install on the
+machine. Every lane starts from a copy of
+`~/.local/share/weft/worker-target/seed/` (one more cache of the same size),
+so a project's first build compiles only its own nodes. The seed is the
+cache this machine compiled the standard worker in, or, when the standard
+worker was downloaded, a copy of the first lane to finish a build: that one
+first build compiles everything once. There are four lanes, and a fifth build waits
+for one to be free. A project's build says so in the runtime's log (`weft
+daemon logs`), `every compile lane of this machine is busy; a build waits
+for one`, and a live test on your terminal, `every compile lane of this
+machine is busy with other builds; waiting for one (WEFT_COMPILE_LANES sets
+how many)`. If you want more builds at once and have the disk, set
+`WEFT_COMPILE_LANES` in every shell you run `./setup.sh` or `weft daemon
+start` from, since each start hands the install whatever that shell has,
+and in the shells you run `weft test-node` from, since the CLI compiles test
+servers itself.
+
+If you want to spend less disk, `WEFT_COMPILE_LANES=1` keeps one lane and
+the seed. Builds then take turns: when several agents ask for builds at
+once, one compiles and the others wait for the lane, then compile only what
+the build before them did not already leave in it. A build of a program
+this machine already has takes no lane at all, and neither does a run, so
+running code is never held up. Two asks for the same build of one project
+are one build, which both wait on. After each build in a lane, weft keeps
+only the three newest compiled versions of each node package and of the
+worker, and drops any of them no build has used for 30 days.
+
+On a cloud install the worker is an image instead, and the `[build.worker]`
+section of `weft.toml` says how that image is built:
+
+- `base_image`: the image it starts from, `debian:trixie-slim` unless you
+  name another.
+- `dockerfile_template`: the path, from the project's folder, to a
+  Dockerfile weft uses instead of its own. It has to keep the `{{...}}`
+  placeholders weft's own Dockerfile uses, and if it drops
+  `{{install_runtime_system_packages}}`, the cloud refuses every program
+  whose nodes need a program installed.
+- `package_manager`: how your nodes' needs are installed on it (`apt`,
+  `dnf`, `apk` or `brew`). weft guesses it from the image's name, so if the
+  name does not say Debian, Ubuntu, Alpine, a Red Hat family distro, Python
+  or Homebrew, set it, or the build is refused. When you set it, it wins
+  over the guess.
+
+If a project sets any of the three, the cloud builds an image just for it,
+even when all its nodes come from weft's standard library. On your machine the section does
+nothing, because the worker runs with whatever the machine has. If your
+machine is missing something your nodes need, `weft deps-install` installs
+it. If you also deploy the project, leave the section in: the cloud reads
+it from this same `weft.toml`.
+
+A worker gets none of the runtime's environment except `PATH` and `HOME`,
+so a variable you exported in your shell (an API key, say) never reaches
+your nodes. That `PATH` is the one your shell had when you last ran
+`./setup.sh` (or `weft daemon start`). If you install a program into a
+folder that was not on it then, run `./setup.sh` again for the workers to
+find it.
+
+If you want to see what a worker printed, it is in
+`workers/logs/weft-w-<project id without dashes>-<more>.log` in the
+install's folder (`~/.local/share/weft` for the default install), while the
+worker runs. weft deletes that file, and the folder the worker keeps its
+temporary files in (`workers/scratch/<the same name>`), every time it stops
+a worker, whatever the reason. A worker that fails
+to start has its last lines in the error instead. For one that dies while it
+runs, weft notices the next time it calls it or comes to stop it as idle,
+and copies its last lines into the runtime's log (`weft daemon logs`) under
+`a worker had ended on its own before weft stopped it`. One still running
+but not answering is stopped and started again, with its last lines under
+`a worker stopped answering; starting it again`.
+
+If the project has no folder on this machine (none at all, or only on
+another machine), its worker does not start, and the error says `project <id>
+has no folder on this machine, and a worker on a local install runs in its
+project's folder; open the project from its folder on this machine`.
+
+On your machine there is one worker per project, program and worker
+settings; changing the project's worker settings (`weft workers set`) starts
+a fresh one for the calls that follow. The one at the project's address runs for as long
 as any of the project's triggers takes work. Any other starts when a run needs
 it and stops after thirty seconds with nothing to do, unless the project keeps
 copies warm with `weft workers set --min-instances`. To change the thirty seconds, set
 `platform.workerIdleStopSeconds` in the install's `config.json`
 (`~/.local/share/weft/config.json`) and restart the daemon.
 
-On a cloud install a worker is a Cloud Run service. Cloud Run starts more
-copies of it when calls pile up and removes idle ones when it decides to,
+On a cloud install a worker is a Cloud Run service, run from an image
+built in the cloud. Cloud Run starts more copies of it when calls pile up and removes idle ones when it decides to,
 down to none, so a project nobody calls costs nothing. If you keep copies
 warm with `--min-instances`, those are billed even while idle. If you want to
 change how many calls Cloud Run sends one copy at once (`--concurrency`), the most
@@ -554,21 +651,51 @@ requests, so a big file never holds up the calls behind it.
 
 The broker checks every request. The caller proves who it is with a token its
 platform gave it: on your machine, one the runtime signed when it started the
-container; on a cloud install, one Google signed for the account the caller
+worker; on a cloud install, one Google signed for the account the caller
 runs as, weft's own or the program's. The broker works out from that token
 whose install the caller belongs to and which role it plays, and it checks
 that the caller may touch what it asked for. Your
-program's worker runs untrusted node code, so it never gets a database
-connection.
+program's worker runs node code that anyone may have written, so weft gives it no
+database connection, and the broker lets it touch its own project only. On
+your own machine that is no wall: the worker runs as you, and can read
+whatever you can, the install's `secrets.env` included.
 
 The broker also handles storage and connection work, including OAuth exchanges
 and subscription setup. Your worker calls providers itself, so a slow provider
 never holds up the broker for everyone else.
 
-On your machine, the API the CLI talks to has no password: anything that can
-reach it can do what a project owner can. It only answers programs on your own
-machine (`127.0.0.1`). For the rest of the boundaries, go and read the
-[security policy](https://github.com/WeaveMindAI/weft/blob/main/SECURITY.md).
+### The key the install's API asks for
+
+The API the CLI and the editor talk to (registering projects, building,
+running, connections, infra) asks every caller for an operator key, on your
+machine as on a cloud install. It also sends no CORS headers, so a web page
+open in your browser can neither send it a key nor read what it answers.
+
+On your own machine you never log in, though. When the install is set up it
+makes a key of its own, `WEFT_INSTALL_KEY` in its `secrets.env`, a
+file only your user can read (`~/.local/share/weft/secrets.env` for the
+default install; `weft daemon which` prints another install's folder). The
+CLI reads it from there whenever it calls an install on this machine,
+whatever the target is called, so `weft login` refuses one: there is
+nothing to log in to. The editor gets the
+key by asking the CLI (`weft target key`). If you call the API from a script
+of your own, send `Authorization: Bearer <that key>`; without it, or with a
+key the install does not know, the answer is `401` with ``unauthorized:
+this install takes an operator key; for a target, `weft login <target>`;
+for this machine's own install, the CLI sends the key in its secrets.env,
+which `./setup.sh` writes``.
+
+This key lives in `secrets.env`, not in the install's database, so `weft
+token ls` does not list it and `weft token revoke` cannot retire it. If you
+want a new one, delete its line from `secrets.env` and run `./setup.sh`
+again. The keys you mint with `weft
+token mint --operator` are rows, and those you can list and revoke.
+
+The addresses other people call check their own credential instead, and
+answer any origin: a fire URL checks the token inside it, the browser
+extension sends its signal token, a frontend's calls carry the frontend's
+token, and a route asks for whatever its auth says. For the rest of the boundaries, go and read the [security
+policy](https://github.com/WeaveMindAI/weft/blob/main/SECURITY.md).
 
 ## What happens when something dies
 
@@ -656,14 +783,13 @@ of the program is stopping; try again in a moment`, so the client can retry
 and reach another copy.
 
 If you restart the daemon on your own machine, the new daemon sends the same
-`SIGTERM` to every worker the old one left running and removes each once it
+`SIGTERM` to every worker the old one left running and forgets each once it
 has exited, so their runs go the same way. When the new daemon sets up a
 project's own address again, it kills that project's old workers 10 seconds
 after sending them `SIGTERM`, so the new worker can open its port.
-If you would rather not wait for an old worker to exit, `docker rm
---force <container>` stops it now, and the runs still on it end as if it had
-died; the daemon's log (`~/.local/share/weft/runtime.log`) names each such
-container.
+If you would rather not wait for an old worker to exit, `kill -9 <pid>`
+stops it now, and the runs still on it end as if it had died; the daemon's
+log (`~/.local/share/weft/runtime.log`) names each such worker with its pid.
 
 If a worker cannot get a batch of records written (the broker errors or never
 answers), the runs in that batch end failed (for why, go and read [why a
@@ -686,7 +812,8 @@ runs sits behind one of them.
 |---|---|
 | `Runner` | How a program's workers are started and reached |
 | `InfraHost` | Where infrastructure units run, and how they are watched |
-| `ImageBuilder` | How staged source becomes a runnable image |
+| `ImageBuilder` | How staged source becomes a worker (a program on your machine, an image on a cloud install) or an infrastructure image |
+| `MachineNeeds` | Which of the things a program's nodes need are missing on the machine its workers run on, and what the refusal tells the person to do about them |
 | `Alarm` | How a wake set for later is delivered |
 | `CallerIdentity` | Who is calling an internal endpoint |
 | `IdentityTokens` | How a role proves who it is to another |
@@ -701,7 +828,8 @@ machine. GCP has its own (`GcsObjectStore`), because it reaches Cloud Storage
 as the runtime's own service account and has Google sign the links, so no key
 exists for an organization's policy to forbid.
 
-Two platforms exist: `weft-platform-local` (Docker on your machine) and
+Two platforms exist: `weft-platform-local` (your machine: workers as
+processes; infrastructure, the database and the object store in Docker) and
 `weft-platform-gcp` (Cloud Run, Compute Engine, Cloud Build, Cloud Tasks). The
 install's config names one, and `crates/weft-runtime/src/platform.rs` is the
 one place that reads which.

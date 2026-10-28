@@ -15,6 +15,8 @@ dotenvy = "0.15"
 weft-core = { workspace = true }
 # The install config a local install writes for its runtime.
 weft-platform-traits = { workspace = true }
+# The host build of a worker or a node-test server on this machine.
+weft-platform-local = { workspace = true }
 weft-assets = { workspace = true }
 weft-compiler = { workspace = true }
 weft-catalog = { workspace = true }

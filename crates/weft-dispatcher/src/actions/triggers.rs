@@ -257,8 +257,12 @@ pub(crate) async fn bake(state: &DispatcherState, actor: &Actor, id: uuid::Uuid,
     let keys = resolve_scope(state, id, &project, &request.scope).await?;
     let mut baked = Vec::new();
     for (_, keys) in keys_by_owner(&keys) {
-        prepare_trigger_setup(state, id, &project, &keys).await?;
-        baked.push(run_trigger_setup(state, id, &project, &keys, &program, None, None).await?.summary());
+        // Once an owner's setup ran, a later one the database did not take
+        // is no longer a request nothing of which ran.
+        let answer = |e: Refused| if baked.is_empty() { e } else { crate::api::after_writes(e) };
+        prepare_trigger_setup(state, id, &project, &keys).await.map_err(answer)?;
+        let setup = run_trigger_setup(state, id, &project, &keys, &program, None, None).await.map_err(answer)?;
+        baked.push(setup.summary());
     }
     Ok(BakeAnswer { baked, broken: project.broken.clone() })
 }
@@ -398,6 +402,7 @@ pub(crate) async fn resync(state: &DispatcherState, actor: &Actor, id: uuid::Uui
         require_trigger_infra(state, id, &registered, &owner.keys(&owner.on)).await?;
         refuse_unrunnable(state, id, &runnable, &owner.keys(&owner.on)).await.map_err(|unrunnable| match unrunnable {
             Unrunnable::Cannot(why) => (StatusCode::UNPROCESSABLE_ENTITY, format!("{why}\n{RESYNC_TOOK_NOTHING_DOWN}")),
+            Unrunnable::Lacks(why) => (StatusCode::PRECONDITION_FAILED, format!("{why}\n{RESYNC_TOOK_NOTHING_DOWN}")),
             Unrunnable::Unchecked(failed) => failed,
         })?;
     }

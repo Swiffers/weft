@@ -25,6 +25,7 @@
 //! booked to look.
 
 use weft_core::RunId;
+use weft_task_store::db::{self, Client, FromRow, Row};
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn, SAFETY_POLL_INTERVAL};
 
 use crate::state::DispatcherState;
@@ -55,20 +56,21 @@ async fn handle_endings(state: &DispatcherState) -> anyhow::Result<DrainStep> {
     // The earliest erase time of the runs unflagged.
     let mut erased_at: Option<i64> = None;
     loop {
-        let page: Vec<RunId> = sqlx::query_scalar(
-            "SELECT run_id FROM run WHERE state = 'ended' AND (watch_end OR holds_signals) \
-               AND ($1::uuid IS NULL OR run_id > $1) ORDER BY run_id LIMIT $2",
-        )
-        .bind(after)
-        .bind(PAGE)
-        .fetch_all(&state.pg_pool)
-        .await?;
+        let page: Vec<RunId> = state
+            .pg_pool
+            .scalars(
+                "SELECT run_id FROM run WHERE state = 'ended' AND (watch_end OR holds_signals) \
+                   AND ($1::uuid IS NULL OR run_id > $1) ORDER BY run_id LIMIT $2",
+                &[&after, &PAGE],
+            )
+            .await?;
         for run_id in &page {
-            let mut tx = state.pg_pool.begin().await?;
-            let Some(ending) = take_flagged(&mut tx, *run_id).await? else { continue };
+            let mut conn = state.pg_pool.get().await?;
+            let tx = conn.transaction().await?;
+            let Some(ending) = take_flagged(&tx, *run_id).await? else { continue };
             let handled = handle_ending(state, &ending).await;
             if handled.done != Jobs::default() {
-                let kept = clear_flags(&mut tx, ending.run_id, handled.done).await?;
+                let kept = clear_flags(&tx, ending.run_id, handled.done).await?;
                 tx.commit().await?;
                 erased_at = kept.into_iter().chain(erased_at).min();
                 watched |= handled.done.watch_end;
@@ -154,7 +156,7 @@ struct Handled {
 }
 
 /// An ended run whose ending still has work left (see the module doc).
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Flagged {
     pub run_id: RunId,
     pub project_id: uuid::Uuid,
@@ -166,34 +168,44 @@ pub struct Flagged {
     pub holds_signals: bool,
 }
 
+impl FromRow for Flagged {
+    fn from_row(row: Row) -> db::Result<Self> {
+        Ok(Self {
+            run_id: row.try_get("run_id")?,
+            project_id: row.try_get("project_id")?,
+            instance_id: row.try_get("instance_id")?,
+            watch_end: row.try_get("watch_end")?,
+            holds_signals: row.try_get("holds_signals")?,
+        })
+    }
+}
+
 /// The ended run `run_id`, still flagged, locked for the caller's
 /// transaction (`FOR UPDATE SKIP LOCKED`: one another dispatcher holds is
 /// left to it). Read off the row, so an announcement lost on the way loses
 /// nothing.
-pub async fn take_flagged(conn: &mut sqlx::PgConnection, run_id: RunId) -> anyhow::Result<Option<Flagged>> {
-    Ok(sqlx::query_as(
-        "SELECT run_id, project_id, instance_id, watch_end, holds_signals FROM run \
-         WHERE run_id = $1 AND state = 'ended' AND (watch_end OR holds_signals) FOR UPDATE SKIP LOCKED",
-    )
-    .bind(run_id)
-    .fetch_optional(conn)
-    .await?)
+pub async fn take_flagged(db: &impl Client, run_id: RunId) -> anyhow::Result<Option<Flagged>> {
+    Ok(db
+        .opt(
+            "SELECT run_id, project_id, instance_id, watch_end, holds_signals FROM run \
+             WHERE run_id = $1 AND state = 'ended' AND (watch_end OR holds_signals) FOR UPDATE SKIP LOCKED",
+            &[&run_id],
+        )
+        .await?)
 }
 
 /// The jobs `done` of run `run_id` are done: their flags go, the flag of a
 /// job not done stays. Answers until when the run is kept once no flag is
 /// left (`None`: for ever, or a flag is left): retention left it alone
 /// while it was flagged, so no look it booked counts it.
-pub async fn clear_flags(conn: &mut sqlx::PgConnection, run_id: RunId, done: Jobs) -> anyhow::Result<Option<i64>> {
-    Ok(sqlx::query_scalar(
-        "UPDATE run SET watch_end = watch_end AND NOT $2, holds_signals = holds_signals AND NOT $3 \
-         WHERE run_id = $1 RETURNING CASE WHEN watch_end OR holds_signals THEN NULL ELSE keep_until END",
-    )
-    .bind(run_id)
-    .bind(done.watch_end)
-    .bind(done.holds_signals)
-    .fetch_one(conn)
-    .await?)
+pub async fn clear_flags(db: &impl Client, run_id: RunId, done: Jobs) -> anyhow::Result<Option<i64>> {
+    Ok(db
+        .scalar(
+            "UPDATE run SET watch_end = watch_end AND NOT $2, holds_signals = holds_signals AND NOT $3 \
+             WHERE run_id = $1 RETURNING CASE WHEN watch_end OR holds_signals THEN NULL ELSE keep_until END",
+            &[&run_id, &done.watch_end, &done.holds_signals],
+        )
+        .await?)
 }
 
 /// Bake the trigger setup `ending` from its record, when it is one
@@ -329,7 +341,7 @@ fn capture(
 ) -> anyhow::Result<Capture> {
     let program = match program {
         Ok(program) => program,
-        Err(e) if e.downcast_ref::<sqlx::Error>().is_some() => return Err(e),
+        Err(e) if e.downcast_ref::<db::Error>().is_some() => return Err(e),
         Err(e) => return Ok(Capture::Unreadable(e)),
     };
     Ok(match crate::store::TriggerBake::from_events(events, &program) {
@@ -347,9 +359,10 @@ mod tests {
     /// unreadable; a record whose program cannot be named is unreadable.
     #[test]
     fn only_the_record_itself_makes_a_capture_unreadable() {
-        let dropped = anyhow::Error::from(sqlx::Error::PoolTimedOut).context("look up the run's program");
+        let dropped = anyhow::Error::from(db::Error::NoConnection { why: db::NoConnection::Busy, refused: None })
+            .context("look up the run's program");
         let failed = capture(&[], Err(dropped)).expect_err("a store failure is the pass's");
-        assert!(failed.downcast_ref::<sqlx::Error>().is_some(), "{failed:#}");
+        assert!(failed.downcast_ref::<db::Error>().is_some(), "{failed:#}");
         let unnamed = anyhow::anyhow!("the run's history does not start with a birth naming its program");
         assert!(matches!(capture(&[], Err(unnamed)), Ok(Capture::Unreadable(_))));
     }

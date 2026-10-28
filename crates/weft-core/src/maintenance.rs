@@ -47,6 +47,10 @@ impl MaintenanceOnRequest {
     /// work and nothing of it starts or keeps a worker (one of a build from
     /// before the update) until the lift switches it back on; what it held
     /// already is kept, and runs after the lift; the runs going as asked.
+    /// The pause is weft's own, not a refusal anybody made, so a trigger
+    /// that keeps its place in what it reads (a poll's cursor) catches up
+    /// from it once the lift brings it back (the dispatcher's
+    /// `listened_while_down`).
     pub fn take_down(&self) -> TakeDown {
         TakeDown { door: Door::Refuse, door_for_minutes: None, held: Held::Keep, running: self.running() }
     }
@@ -237,12 +241,101 @@ pub struct ProjectLifted {
     pub failed: Vec<String>,
 }
 
+impl ProjectLifted {
+    /// Take in what one part of the project's lift did (one owner's
+    /// copies, one owner's triggers), lifted beside the others.
+    pub fn absorb(&mut self, part: ProjectLifted) {
+        self.started.extend(part.started);
+        self.turned_on.extend(part.turned_on);
+        self.skipped.extend(part.skipped);
+        self.failed.extend(part.failed);
+    }
+}
+
+/// Where a lift is, as its task says while it runs (the `going` answer of
+/// `/install/maintenance/follow/{task}`): the projects it is done with, and
+/// the step each project it lifts now is on (they go side by side).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiftProgress {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub done: Vec<ProjectLifted>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub going: Vec<LiftAt>,
+}
+
+/// The step a lift is on, in one project, since `since_unix`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiftAt {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub since_unix: i64,
+    pub doing: LiftDoing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "step", rename_all = "snake_case")]
+pub enum LiftDoing {
+    /// Building the project again on this weft; `build` once its images
+    /// build, read at `/projects/{id}/builds/{build}`.
+    Building {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<uuid::Uuid>,
+    },
+    /// Starting these copies, every owner's at once.
+    StartingInfra { copies: Vec<CopyRef> },
+    /// Turning these back on, every owner's at once.
+    TurningOn { triggers: Vec<OwnerTriggers> },
+}
+
+impl LiftDoing {
+    /// The step in words, as the follower says it.
+    pub fn words(&self) -> String {
+        match self {
+            LiftDoing::Building { .. } => "building it again on this weft".into(),
+            LiftDoing::StartingInfra { copies } => {
+                format!("starting infra {}", copies.iter().map(|copy| copy.node.as_str()).collect::<Vec<_>>().join(", "))
+            }
+            // Counted: a program can have dozens.
+            LiftDoing::TurningOn { triggers } => {
+                let n: usize = triggers.iter().map(|owned| owned.triggers.len()).sum();
+                format!("turning on {n} {}", if n == 1 { "trigger" } else { "triggers" })
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn weft(verb: &str) -> String {
         format!("weft {verb} --on cloud")
+    }
+
+    #[test]
+    fn where_a_lift_is_reads_back_and_says_its_step() {
+        let progress = LiftProgress {
+            done: vec![ProjectLifted { id: uuid::Uuid::nil(), name: "feeds".into(), rebuilt: true, ..Default::default() }],
+            going: vec![LiftAt {
+                id: uuid::Uuid::nil(),
+                name: "media".into(),
+                since_unix: 7,
+                doing: LiftDoing::Building { build: Some(uuid::Uuid::nil()) },
+            }],
+        };
+        let wire = serde_json::to_value(&progress).unwrap();
+        assert_eq!(wire["going"][0]["doing"]["step"], "building");
+        assert_eq!(wire["going"][0]["sinceUnix"], 7);
+        assert_eq!(serde_json::from_value::<LiftProgress>(wire).unwrap(), progress);
+        let copies = vec![CopyRef { node: "studio".into(), instance: None }, CopyRef { node: "db".into(), instance: None }];
+        assert_eq!(LiftDoing::StartingInfra { copies }.words(), "starting infra studio, db");
+        let triggers = |owner, n: usize| OwnerTriggers { owner, triggers: (0..n).map(|i| format!("t{i}")).collect() };
+        let ada = crate::instance::Owner::Instance(crate::instance::InstanceId::new("ada").unwrap());
+        let every_owner = vec![triggers(crate::instance::Owner::Shared, 64), triggers(ada.clone(), 1)];
+        assert_eq!(LiftDoing::TurningOn { triggers: every_owner }.words(), "turning on 65 triggers", "every owner's, counted");
+        assert_eq!(LiftDoing::TurningOn { triggers: vec![triggers(ada, 1)] }.words(), "turning on 1 trigger");
     }
 
     #[test]

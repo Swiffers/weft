@@ -64,7 +64,8 @@ async fn instance_door(
     token: &str,
     body: Option<&Value>,
 ) -> anyhow::Result<(reqwest::StatusCode, String)> {
-    let mut req = reqwest::Client::new()
+    let mut req = weft_core::net::http_client()
+        .build()?
         .request(method, format!("{}/instance/{path}", disp.base()))
         .bearer_auth(token);
     if let Some(body) = body {
@@ -233,7 +234,8 @@ async fn an_instance_picks_its_connection_and_runs_with_it() -> anyhow::Result<(
         live::http_json(&disp, Method::POST, &format!("{base}/open"), &[("Weft-Instance", "ada")], &json!({ "text": "x" })).await?;
     let body = String::from_utf8_lossy(&body);
     anyhow::ensure!(status == 400 && body.contains("honoured only on a route gated by a connection"), "{status}: {body}");
-    let (status, bare) = reqwest::Client::new()
+    let (status, bare) = weft_core::net::http_client()
+        .build()?
         .post(format!("{}/{base}/open", disp.base()))
         .header("Weft-Instance", "ada")
         .json(&json!({ "text": "x" }))

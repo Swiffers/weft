@@ -5,11 +5,11 @@
 use std::net::SocketAddr;
 
 use serde_json::json;
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use weft_core::ProjectDefinition;
 use weft_dispatcher::project_ports::ProjectPorts;
+use weft_task_store::db::{Client as _, Pool};
 
 async fn project(projects: &weft_dispatcher::ProjectStore) -> Uuid {
     let id = Uuid::new_v4();
@@ -26,8 +26,8 @@ async fn free_port() -> u16 {
     tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port()
 }
 
-#[sqlx::test]
-async fn a_named_port_is_refused_while_taken_and_kept_once_given(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_named_port_is_refused_while_taken_and_kept_once_given(pool: Pool) {
     weft_task_store::apply_groups(&pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
     let projects: weft_dispatcher::ProjectStore = std::sync::Arc::new(weft_dispatcher::PostgresProjectStore::new(pool.clone()));
     let (a, b) = (project(&projects).await, project(&projects).await);
@@ -53,7 +53,7 @@ async fn a_named_port_is_refused_while_taken_and_kept_once_given(pool: PgPool) {
     // A project's own kept port, its front down, that another program
     // took meanwhile: refused like any taken port.
     let kept = held_port;
-    sqlx::query("UPDATE project SET api_port = $2 WHERE id = $1").bind(a).bind(i32::from(kept)).execute(&pool).await.unwrap();
+    pool.execute("UPDATE project SET api_port = $2 WHERE id = $1", &[&a, &i32::from(kept)]).await.unwrap();
     let refused = ports.check_asked(&pool, a, kept).await.unwrap().expect("its front is down and a program holds it");
     assert!(refused.contains("another program"), "{refused}");
 }

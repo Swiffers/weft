@@ -10,7 +10,7 @@
 //! holder keeps pushing ahead of itself fires because it stopped (it
 //! died), which frees it ([`release`]).
 
-use sqlx::{PgPool, Row};
+use weft_task_store::db::{Client as _, Pool, Row};
 use weft_broker_client::protocol::{
     HeldNow, HeldServing, SignalAuthKind, SignalHoldResponse, SignalRowWire, SignalSurfaceKind, ACTIVATION_LISTENS,
     SIGNAL_ACTIVATION_JOIN, STILL_HELD_BY,
@@ -24,57 +24,19 @@ use weft_broker_client::protocol::{
 /// longer listens, so they never come out of this query. Mixed
 /// tenants: each row carries its own. `project` narrows it to one
 /// project's rows.
-pub async fn signals_held(pool: &PgPool, project: Option<uuid::Uuid>) -> anyhow::Result<Vec<SignalRowWire>> {
-    let rows = sqlx::query(&format!(
-        "{} WHERE {ACTIVATION_LISTENS} AND ($1::uuid IS NULL OR s.project_id = $1)",
-        held_select()
-    ))
-    .bind(project)
-    .fetch_all(pool)
-    .await?;
+pub async fn signals_held(pool: &Pool, project: Option<uuid::Uuid>) -> anyhow::Result<Vec<SignalRowWire>> {
+    let rows = pool
+        .query(&format!("{} WHERE {ACTIVATION_LISTENS} AND ($1::uuid IS NULL OR s.project_id = $1)", held_select()), &[&project])
+        .await?;
     rows.into_iter().map(decode).collect::<anyhow::Result<Vec<_>>>().map_err(|e| anyhow::anyhow!("signal row decode: {e}"))
 }
 
 /// One held signal by its token, or `None` when no row with that token is
 /// held (gone, or its activation no longer listens): what the listener
 /// loads a signal it has not seen yet from.
-pub async fn signal_held(pool: &PgPool, token: &str) -> anyhow::Result<Option<SignalRowWire>> {
-    let row = sqlx::query(&format!("{} WHERE s.token = $1 AND {ACTIVATION_LISTENS}", held_select()))
-    .bind(token)
-    .fetch_optional(pool)
-    .await?;
+pub async fn signal_held(pool: &Pool, token: &str) -> anyhow::Result<Option<SignalRowWire>> {
+    let row: Option<Row> = pool.opt(&format!("{} WHERE s.token = $1 AND {ACTIVATION_LISTENS}", held_select()), &[&token]).await?;
     row.map(decode).transpose().map_err(|e| anyhow::anyhow!("signal row decode: {e}"))
-}
-
-/// The project of one held signal, or `None` when no row with that token
-/// is held: what scopes a listener's question about a signal to that
-/// signal's own project.
-pub async fn signal_held_project(pool: &PgPool, token: &str) -> anyhow::Result<Option<uuid::Uuid>> {
-    let row: Option<(uuid::Uuid,)> = sqlx::query_as(&format!(
-        "SELECT s.project_id FROM signal s {SIGNAL_ACTIVATION_JOIN} \
-         WHERE s.token = $1 AND {ACTIVATION_LISTENS}"
-    ))
-    .bind(token)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(p,)| p))
-}
-
-/// The project of the wait `token` whose run was cancelled and whose last
-/// call is out now (`weft_task_store::TaskKind::CancelCall`, claimed by
-/// the dispatcher sending it through the listener), or `None`: the wait's
-/// row is gone, so the call's task is what scopes the listener's question
-/// about an address in it to that wait's own project, for as long as the
-/// call is being sent and no longer.
-// SYNC: cancel_call_project <-> weft_task_store::kinds::cancel_call_key
-pub async fn cancel_call_project(pool: &PgPool, token: &str) -> anyhow::Result<Option<uuid::Uuid>> {
-    Ok(sqlx::query_scalar(
-        "SELECT project_id FROM task WHERE kind = $1 AND dedup_key = $2 AND status = 'claimed' AND project_id IS NOT NULL LIMIT 1",
-    )
-    .bind(weft_task_store::TaskKind::CancelCall.as_str())
-    .bind(weft_task_store::kinds::cancel_call_key(token))
-    .fetch_optional(pool)
-    .await?)
 }
 
 /// Claim a signal kind's moment: write its durable state at version
@@ -83,17 +45,15 @@ pub async fn cancel_call_project(pool: &PgPool, token: &str) -> anyhow::Result<O
 /// winner acts on it; a registration that rewrote the row since the read
 /// moved its version, so a claim from before it loses. Returns whether
 /// the row was written.
-pub async fn write_kind_state(pool: &PgPool, token: &str, kind_state: &serde_json::Value, from_seq: i64) -> anyhow::Result<bool> {
-    let res = sqlx::query(
-        "UPDATE signal SET kind_state = $2::jsonb, kind_state_seq = $3 + 1 \
-         WHERE token = $1 AND kind_state_seq = $3",
-    )
-    .bind(token)
-    .bind(kind_state)
-    .bind(from_seq)
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected() > 0)
+pub async fn write_kind_state(pool: &Pool, token: &str, kind_state: &serde_json::Value, from_seq: i64) -> anyhow::Result<bool> {
+    let written = pool
+        .execute(
+            "UPDATE signal SET kind_state = $2::jsonb, kind_state_seq = $3 + 1 \
+             WHERE token = $1 AND kind_state_seq = $3",
+            &[&token, kind_state, &from_seq],
+        )
+        .await?;
+    Ok(written > 0)
 }
 
 /// One look of holder `replica`: name which of the `holding` it still
@@ -108,70 +68,62 @@ pub async fn write_kind_state(pool: &PgPool, token: &str, kind_state: &serde_jso
 /// nothing. In one transaction, and the take skips rows a sibling is
 /// taking, so two holders never take one signal.
 pub async fn hold(
-    pool: &PgPool,
+    pool: &Pool,
     replica: &str,
     holding: &[HeldNow],
     room: Option<u32>,
     want: &[String],
 ) -> anyhow::Result<SignalHoldResponse> {
     let tokens: Vec<&str> = holding.iter().map(|h| h.token.as_str()).collect();
-    let mut tx = pool.begin().await?;
-    let kept: Vec<String> = sqlx::query_scalar(&format!(
-        "SELECT r.token FROM signal r \
-         WHERE r.token = ANY($1) AND r.holds AND r.held_by = $2 AND {held} \
-         FOR UPDATE OF r",
-        held = activation_held("r"),
-    ))
-    .bind(&tokens)
-    .bind(replica)
-    .fetch_all(&mut *tx)
-    .await?;
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let kept: Vec<String> = tx
+        .scalars(
+            &format!(
+                "SELECT r.token FROM signal r \
+                 WHERE r.token = ANY($1) AND r.holds AND r.held_by = $2 AND {held} \
+                 FOR UPDATE OF r",
+                held = activation_held("r"),
+            ),
+            &[&tokens, &replica],
+        )
+        .await?;
     let said: Vec<&HeldNow> = holding.iter().filter(|h| h.serving.is_some() && kept.contains(&h.token)).collect();
     if !said.is_empty() {
         let said_tokens: Vec<&str> = said.iter().map(|h| h.token.as_str()).collect();
         let servings: Vec<serde_json::Value> =
             said.iter().filter_map(|h| h.serving.as_ref()).map(serde_json::to_value).collect::<Result<_, _>>()?;
-        sqlx::query(
+        tx.execute(
             "UPDATE signal r SET serving = x.serving \
              FROM unnest($1::text[], $2::jsonb[]) AS x(token, serving) WHERE r.token = x.token",
+            &[&said_tokens, &servings],
         )
-        .bind(&said_tokens)
-        .bind(&servings)
-        .execute(&mut *tx)
         .await?;
     }
-    let ended: Vec<String> = sqlx::query_scalar(&format!(
-        "SELECT x.token FROM unnest($1::text[]) AS x(token) WHERE NOT {held}",
-        held = activation_held("x"),
-    ))
-    .bind(&tokens)
-    .fetch_all(&mut *tx)
-    .await?;
-    let room = room.map(|r| i64::from(r).saturating_sub(kept.len() as i64).max(0));
-    let taken: Vec<String> = sqlx::query_scalar(&format!(
-        "WITH free AS ( \
-             SELECT r.token FROM signal r \
-             WHERE r.holds AND r.held_failed IS NULL AND (r.held_by IS NULL OR r.held_by = $4) \
-               AND NOT (r.token = ANY($1)) AND {held} \
-             ORDER BY (r.token = ANY($2)) DESC, r.created_at \
-             LIMIT $3 \
-             FOR UPDATE OF r SKIP LOCKED \
-         ) \
-         UPDATE signal s SET held_by = $4, serving = NULL \
-         FROM free WHERE s.token = free.token \
-         RETURNING s.token",
-        held = activation_held("r"),
-    ))
-    .bind(&kept)
-    .bind(want)
-    .bind(room)
-    .bind(replica)
-    .fetch_all(&mut *tx)
-    .await?;
-    let rows = sqlx::query(&format!("{} WHERE s.token = ANY($1)", held_select()))
-        .bind(&taken)
-        .fetch_all(&mut *tx)
+    let ended: Vec<String> = tx
+        .scalars(&format!("SELECT x.token FROM unnest($1::text[]) AS x(token) WHERE NOT {held}", held = activation_held("x")), &[&tokens])
         .await?;
+    let room = room.map(|r| i64::from(r).saturating_sub(kept.len() as i64).max(0));
+    let taken: Vec<String> = tx
+        .scalars(
+            &format!(
+                "WITH free AS ( \
+                     SELECT r.token FROM signal r \
+                     WHERE r.holds AND r.held_failed IS NULL AND (r.held_by IS NULL OR r.held_by = $4) \
+                       AND NOT (r.token = ANY($1)) AND {held} \
+                     ORDER BY (r.token = ANY($2)) DESC, r.created_at \
+                     LIMIT $3 \
+                     FOR UPDATE OF r SKIP LOCKED \
+                 ) \
+                 UPDATE signal s SET held_by = $4, serving = NULL \
+                 FROM free WHERE s.token = free.token \
+                 RETURNING s.token",
+                held = activation_held("r"),
+            ),
+            &[&kept, &want, &room, &replica],
+        )
+        .await?;
+    let rows = tx.query(&format!("{} WHERE s.token = ANY($1)", held_select()), &[&taken]).await?;
     tx.commit().await?;
     let taken = rows.into_iter().map(decode).collect::<anyhow::Result<Vec<_>>>().map_err(|e| anyhow::anyhow!("signal row decode: {e}"))?;
     Ok(SignalHoldResponse { kept, ended, taken })
@@ -179,8 +131,8 @@ pub async fn hold(
 
 /// Whether `token`'s row is still held under `replica`'s claim
 /// ([`STILL_HELD_BY`]).
-pub async fn still_held_by(pool: &PgPool, token: &str, replica: &str) -> anyhow::Result<bool> {
-    Ok(sqlx::query_scalar(STILL_HELD_BY).bind(token).bind(replica).fetch_one(pool).await?)
+pub async fn still_held_by(pool: &Pool, token: &str, replica: &str) -> anyhow::Result<bool> {
+    Ok(pool.scalar(STILL_HELD_BY, &[&token, &replica]).await?)
 }
 
 /// What becomes of a fire as it arrives from `sender` (the calling
@@ -205,7 +157,7 @@ pub fn sent_by_its_holder(sender: Option<&str>, held_by: &str) -> bool {
 }
 
 pub async fn judge_held_fire(
-    pool: &PgPool,
+    pool: &Pool,
     sender: Option<&str>,
     fire: &weft_task_store::kinds::FireSignalPayload,
 ) -> anyhow::Result<HeldFire> {
@@ -222,16 +174,14 @@ pub async fn judge_held_fire(
 /// Record whether `token` keeps a connection open, as its kind decides
 /// now. A row that stops holding lets its holder go with it, and what was
 /// given up on it is forgotten, so the decision runs again.
-pub async fn set_holds(pool: &PgPool, token: &str, holds: bool) -> anyhow::Result<()> {
-    sqlx::query(
+pub async fn set_holds(pool: &Pool, token: &str, holds: bool) -> anyhow::Result<()> {
+    pool.execute(
         "UPDATE signal SET holds = $2, \
                 held_by = CASE WHEN $2 THEN held_by END, serving = CASE WHEN $2 THEN serving END, \
                 held_failed = NULL \
          WHERE token = $1",
+        &[&token, &holds],
     )
-    .bind(token)
-    .bind(holds)
-    .execute(pool)
     .await?;
     Ok(())
 }
@@ -240,12 +190,8 @@ pub async fn set_holds(pool: &PgPool, token: &str, holds: bool) -> anyhow::Resul
 /// at its next look: the holder letting go as it stops, or its check
 /// firing because it stopped pushing it (it died). The row's trigger
 /// announces each one freed (`signal_held_on_release`). How many it freed.
-pub async fn release(pool: &PgPool, replica: &str) -> anyhow::Result<u64> {
-    Ok(sqlx::query("UPDATE signal SET held_by = NULL, serving = NULL WHERE held_by = $1")
-        .bind(replica)
-        .execute(pool)
-        .await?
-        .rows_affected())
+pub async fn release(pool: &Pool, replica: &str) -> anyhow::Result<u64> {
+    Ok(pool.execute("UPDATE signal SET held_by = NULL, serving = NULL WHERE held_by = $1", &[&replica]).await?)
 }
 
 /// Write down that the listener or a holder gave up on `token`'s
@@ -254,19 +200,16 @@ pub async fn release(pool: &PgPool, replica: &str) -> anyhow::Result<u64> {
 /// held one, only by the holder whose claim it is (`caller_replica`); a
 /// caller with no replica gives up a held one only while nobody claims it.
 /// Whether it was written.
-pub async fn give_up(pool: &PgPool, token: &str, generation: i64, reason: &str, caller_replica: Option<&str>) -> anyhow::Result<bool> {
-    let res = sqlx::query(
-        "UPDATE signal SET held_failed = $3, held_by = NULL, serving = NULL \
-         WHERE token = $1 AND generation = $2 AND held_failed IS NULL \
-           AND (NOT holds OR held_by IS NOT DISTINCT FROM $4::text)",
-    )
-    .bind(token)
-    .bind(generation)
-    .bind(reason)
-    .bind(caller_replica)
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected() > 0)
+pub async fn give_up(pool: &Pool, token: &str, generation: i64, reason: &str, caller_replica: Option<&str>) -> anyhow::Result<bool> {
+    let written = pool
+        .execute(
+            "UPDATE signal SET held_failed = $3, held_by = NULL, serving = NULL \
+             WHERE token = $1 AND generation = $2 AND held_failed IS NULL \
+               AND (NOT holds OR held_by IS NOT DISTINCT FROM $4::text)",
+            &[&token, &generation, &reason, &caller_replica],
+        )
+        .await?;
+    Ok(written > 0)
 }
 
 /// Whether the token `row.token` names a signal row that a listener holds
@@ -298,7 +241,7 @@ fn held_select() -> String {
 // try_get on a NOT NULL column should never fail; if it does the row
 // shape has drifted from the schema. Surface that loudly rather than
 // silently returning empty strings to the listener.
-fn decode(r: sqlx::postgres::PgRow) -> anyhow::Result<SignalRowWire> {
+fn decode(r: Row) -> anyhow::Result<SignalRowWire> {
     let surface_str: String = r.try_get("surface_kind")?;
     let surface_kind = SignalSurfaceKind::parse(&surface_str)
         .ok_or_else(|| anyhow::anyhow!("unknown surface_kind '{surface_str}'"))?;
@@ -328,7 +271,7 @@ fn decode(r: sqlx::postgres::PgRow) -> anyhow::Result<SignalRowWire> {
         kind_state_seq: r.try_get("kind_state_seq")?,
         holds: r.try_get("holds")?,
         serving: r
-            .try_get::<Option<serde_json::Value>, _>("serving")?
+            .try_get::<_, Option<serde_json::Value>>("serving")?
             .map(serde_json::from_value::<HeldServing>)
             .transpose()
             .map_err(|e| anyhow::anyhow!("corrupt signal.serving: {e}"))?,

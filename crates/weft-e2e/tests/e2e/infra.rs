@@ -3,7 +3,7 @@
 #![cfg(feature = "e2e")]
 
 use serde_json::json;
-use weft_e2e::platform::{Platform, Role};
+use weft_e2e::platform::Platform;
 use weft_e2e::{display, ensure, infra, project::Project, run, SettledRun};
 
 #[tokio::test]
@@ -31,7 +31,7 @@ out.data = scope.status
     let endpoint = infra::start_and_wait_running(&mut project, "scope.svc").await?;
     eprintln!("mini_service endpoint: {endpoint}");
     let pid = project.id();
-    let running = platform.containers_for_project(&pid, Role::Infra).await?;
+    let running = platform.infra_containers_for_project(&pid).await?;
     anyhow::ensure!(!running.is_empty(), "a running infra node has containers on this machine");
     let setups = run::runs(project.dispatcher(), &project.id()).await?;
     anyhow::ensure!(setups.len() == 1, "one infra setup, got {setups:?}");
@@ -68,7 +68,7 @@ out.data = scope.status
 
     // Terminate and assert the node is actually gone (cleanup happened).
     infra::terminate_and_wait_gone(&project, "scope.svc").await?;
-    let left = platform.containers_for_project(&pid, Role::Infra).await?;
+    let left = platform.infra_containers_for_project(&pid).await?;
     anyhow::ensure!(left.is_empty(), "terminating removes the node's containers, left: {left:?}");
     project.write_file("src/main.weft", r#"
 scope = Loop(values: List[Number]) -> (statuses: List[String | Null]) {
@@ -128,7 +128,10 @@ out.data = svc.status
     // The door carries the service's own protocol, so the sidecar's own
     // route answers through it. This is the whole promise: a client that
     // is not a weft node talking to the program's infrastructure.
-    let body = reqwest::get(format!("http://{address}/outputs"))
+    let body = weft_core::net::http_client()
+        .build()?
+        .get(format!("http://{address}/outputs"))
+        .send()
         .await?
         .error_for_status()?
         .text()
@@ -170,7 +173,10 @@ out.data = svc.status
         .ok_or_else(|| anyhow::anyhow!("the public endpoint names its address: {status}"))?;
     let path = &address[address.find("/infra/").ok_or_else(|| anyhow::anyhow!("not a door address: {address}"))?..];
     anyhow::ensure!(path.ends_with("/svc"), "the node's own path closes the address: {address}");
-    let body = reqwest::get(format!("{}{path}/outputs", disp.base().trim_end_matches('/')))
+    let body = weft_core::net::http_client()
+        .build()?
+        .get(format!("{}{path}/outputs", disp.base().trim_end_matches('/')))
+        .send()
         .await?
         .error_for_status()?
         .text()
@@ -197,10 +203,11 @@ out.data = svc.status
     let door = format!("http://{}", listed.doors.first().ok_or_else(|| anyhow::anyhow!("the sidecar's door: {listed:?}"))?.address);
 
     // The service dies mid-request, so the call itself fails.
-    anyhow::ensure!(reqwest::get(format!("{door}/crash")).await.is_err(), "the crash answered");
+    let http = weft_core::net::http_client().build()?;
+    anyhow::ensure!(http.get(format!("{door}/crash")).send().await.is_err(), "the crash answered");
     weft_e2e::poll_until("the crashed service to answer again", std::time::Duration::from_secs(120), std::time::Duration::from_secs(1), || {
-        let url = format!("{door}/outputs");
-        async move { Ok(reqwest::get(url).await.ok().filter(|r| r.status().is_success()).map(|_| ())) }
+        let request = http.get(format!("{door}/outputs"));
+        async move { Ok(request.send().await.ok().filter(|r| r.status().is_success()).map(|_| ())) }
     })
     .await?;
     infra::wait_running(&project, "svc").await?;
@@ -214,12 +221,10 @@ out.data = svc.status
 
 /// A node waits on a long job in its own container without holding a
 /// worker: it starts the job, parks on a poll of the job's status route
-/// at the endpoint's worker address, and the listener does the polling.
-/// The container says "running" twice before "done", so the result
-/// reaching Debug proves the listener reached the unit (through the
-/// address weft's own roles use, which on a local install is a loopback
-/// port rather than the Docker name the workers use) and resumed the run
-/// on the answer that passed the filter.
+/// at the endpoint's address, and the listener does the polling. The
+/// container says "running" twice before "done", so the result reaching
+/// Debug proves the listener reached the unit at that address and resumed
+/// the run on the answer that passed the filter.
 #[tokio::test]
 async fn a_node_parks_on_a_long_job_in_its_own_infra() -> anyhow::Result<()> {
     let disp = ensure::up().await?;

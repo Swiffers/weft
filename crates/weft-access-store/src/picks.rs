@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use weft_task_store::db::Client;
+
 use crate::flows::connection_handle;
 use crate::AccessError;
 
@@ -17,26 +19,25 @@ pub struct PickWrite {
 }
 
 /// Keep `writes` and forget `clears` (node, field) for `project_id`, all
-/// or none, on `conn` (the caller's transaction). A pick must name one of
+/// or none, on `db` (the caller's transaction). A pick must name one of
 /// the author's own connections (never an instance's: that would spend its
 /// account on everybody's runs) to the field's service, or the whole
 /// change is refused.
 pub async fn change_install_picks(
-    conn: &mut sqlx::PgConnection,
+    db: &impl Client,
     tenant: &str,
     project_id: uuid::Uuid,
     writes: &[PickWrite],
     clears: &[(String, String)],
 ) -> anyhow::Result<()> {
     for write in writes {
-        let owned: Option<(String,)> = sqlx::query_as(
-            "SELECT service FROM access_grant WHERE id = $1 AND tenant_id = $2 AND instance_id IS NULL",
-        )
-        .bind(write.grant_id)
-        .bind(tenant)
-        .fetch_optional(&mut *conn)
-        .await?;
-        let Some((service,)) = owned else {
+        let owned: Option<String> = db
+            .scalar_opt(
+                "SELECT service FROM access_grant WHERE id = $1 AND tenant_id = $2 AND instance_id IS NULL",
+                &[&write.grant_id, &tenant],
+            )
+            .await?;
+        let Some(service) = owned else {
             return Err(AccessError::Invalid(format!(
                 "connection {} is not one of your connections on this install (`weft connect --list` shows them)",
                 write.grant_id
@@ -52,28 +53,21 @@ pub async fn change_install_picks(
         }
     }
     for write in writes {
-        sqlx::query(
+        db.execute(
             "INSERT INTO install_pick (tenant_id, project_id, node, field, grant_id)
              VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (project_id, node, field) DO UPDATE
                SET grant_id = EXCLUDED.grant_id, tenant_id = EXCLUDED.tenant_id, set_at = now()",
+            &[&tenant, &project_id, &write.node, &write.field, &write.grant_id],
         )
-        .bind(tenant)
-        .bind(project_id)
-        .bind(&write.node)
-        .bind(&write.field)
-        .bind(write.grant_id)
-        .execute(&mut *conn)
         .await?;
     }
     for (node, field) in clears {
-        sqlx::query("DELETE FROM install_pick WHERE tenant_id = $1 AND project_id = $2 AND node = $3 AND field = $4")
-            .bind(tenant)
-            .bind(project_id)
-            .bind(node)
-            .bind(field)
-            .execute(&mut *conn)
-            .await?;
+        db.execute(
+            "DELETE FROM install_pick WHERE tenant_id = $1 AND project_id = $2 AND node = $3 AND field = $4",
+            &[&tenant, &project_id, node, field],
+        )
+        .await?;
     }
     Ok(())
 }
@@ -81,20 +75,15 @@ pub async fn change_install_picks(
 /// Every pick this install keeps for `project_id`, by node and field, each
 /// as the handle a connection field holds (`{id, identity}`), its identity
 /// read from the connection now.
-pub async fn install_picks<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
-    tenant: &str,
-    project_id: uuid::Uuid,
-) -> anyhow::Result<weft_core::picks::Picks> {
-    let rows: Vec<(String, String, uuid::Uuid, Option<String>)> = sqlx::query_as(
-        "SELECT p.node, p.field, p.grant_id, g.identity FROM install_pick p
-         JOIN access_grant g ON g.id = p.grant_id
-         WHERE p.tenant_id = $1 AND p.project_id = $2",
-    )
-    .bind(tenant)
-    .bind(project_id)
-    .fetch_all(executor)
-    .await?;
+pub async fn install_picks(db: &impl Client, tenant: &str, project_id: uuid::Uuid) -> anyhow::Result<weft_core::picks::Picks> {
+    let rows: Vec<(String, String, uuid::Uuid, Option<String>)> = db
+        .all(
+            "SELECT p.node, p.field, p.grant_id, g.identity FROM install_pick p
+             JOIN access_grant g ON g.id = p.grant_id
+             WHERE p.tenant_id = $1 AND p.project_id = $2",
+            &[&tenant, &project_id],
+        )
+        .await?;
     let mut picks = weft_core::picks::Picks::new();
     for (node, field, grant_id, identity) in rows {
         picks.entry(node).or_default().insert(field, connection_handle(grant_id, identity.as_deref()));
@@ -107,24 +96,23 @@ pub async fn install_picks<'e>(
 /// connection with its service. What an activation holds against the
 /// program (`weft_core::picks::activation_picks`) and a move against the
 /// place it leaves (`weft_core::picks::check_move`).
-pub async fn stored_fields<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
+pub async fn stored_fields(
+    db: &impl Client,
     tenant: &str,
     project_id: uuid::Uuid,
 ) -> anyhow::Result<Vec<weft_core::picks::StoredField>> {
-    let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT p.node, p.field, g.service, NULL::TEXT FROM install_pick p
-         JOIN access_grant g ON g.id = p.grant_id
-         WHERE p.tenant_id = $1 AND p.project_id = $2
-         UNION ALL
-         SELECT v.node, v.field, g.service, v.instance_id FROM instance_value v
-         LEFT JOIN access_grant g ON g.id = v.grant_id
-         WHERE v.tenant_id = $1 AND v.project_id = $2",
-    )
-    .bind(tenant)
-    .bind(project_id)
-    .fetch_all(executor)
-    .await?;
+    let rows: Vec<(String, String, Option<String>, Option<String>)> = db
+        .all(
+            "SELECT p.node, p.field, g.service, NULL::TEXT FROM install_pick p
+             JOIN access_grant g ON g.id = p.grant_id
+             WHERE p.tenant_id = $1 AND p.project_id = $2
+             UNION ALL
+             SELECT v.node, v.field, g.service, v.instance_id FROM instance_value v
+             LEFT JOIN access_grant g ON g.id = v.grant_id
+             WHERE v.tenant_id = $1 AND v.project_id = $2",
+            &[&tenant, &project_id],
+        )
+        .await?;
     rows.into_iter()
         .map(|(node, field, service, instance)| {
             let instance = instance
@@ -137,36 +125,28 @@ pub async fn stored_fields<'e>(
 }
 
 /// Carry every pick and every instance's value kept at the place `from`
-/// of `project_id` to the place `to`, on `conn` (the caller's
+/// of `project_id` to the place `to`, on `db` (the caller's
 /// transaction, which checked the move first with
 /// `weft_core::picks::check_move`). Answers how many picks and how many
 /// instance values moved.
 pub async fn move_stored(
-    conn: &mut sqlx::PgConnection,
+    db: &impl Client,
     tenant: &str,
     project_id: uuid::Uuid,
     from: &str,
     to: &str,
 ) -> anyhow::Result<(u64, u64)> {
-    let picks = sqlx::query(
-        "UPDATE install_pick SET node = $4, set_at = now() WHERE tenant_id = $1 AND project_id = $2 AND node = $3",
-    )
-    .bind(tenant)
-    .bind(project_id)
-    .bind(from)
-    .bind(to)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected();
-    let values = sqlx::query(
-        "UPDATE instance_value SET node = $4, set_at = now() WHERE tenant_id = $1 AND project_id = $2 AND node = $3",
-    )
-    .bind(tenant)
-    .bind(project_id)
-    .bind(from)
-    .bind(to)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected();
+    let picks = db
+        .execute(
+            "UPDATE install_pick SET node = $4, set_at = now() WHERE tenant_id = $1 AND project_id = $2 AND node = $3",
+            &[&tenant, &project_id, &from, &to],
+        )
+        .await?;
+    let values = db
+        .execute(
+            "UPDATE instance_value SET node = $4, set_at = now() WHERE tenant_id = $1 AND project_id = $2 AND node = $3",
+            &[&tenant, &project_id, &from, &to],
+        )
+        .await?;
     Ok((picks, values))
 }

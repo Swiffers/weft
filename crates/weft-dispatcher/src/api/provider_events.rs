@@ -29,8 +29,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use serde_json::Value;
-use sqlx::Row;
 use std::collections::BTreeMap;
+use weft_task_store::db::Client as _;
 
 use weft_broker_client::protocol::{EventVerdict, EventVerifyRequest};
 
@@ -163,13 +163,14 @@ async fn match_signals(
     // so a broad push never resumes the wrong wait.
     let rows = match signal_token {
         Some(token) => {
-            sqlx::query(
-                "SELECT token, tenant_id, access_id FROM signal
-                 WHERE token = $1",
-            )
-            .bind(token)
-            .fetch_all(&state.pg_pool)
-            .await?
+            state
+                .pg_pool
+                .query(
+                    "SELECT token, tenant_id, access_id FROM signal
+                     WHERE token = $1",
+                    &[&token],
+                )
+                .await?
         }
         None => {
             let access_ids: Vec<String> =
@@ -177,13 +178,14 @@ async fn match_signals(
             // `access_id` is written on the row at register time from
             // the spec, exactly so this match is one indexed filter
             // instead of a spec-parsing table scan.
-            sqlx::query(
-                "SELECT token, tenant_id, access_id FROM signal
-                 WHERE access_id = ANY($1)",
-            )
-            .bind(&access_ids)
-            .fetch_all(&state.pg_pool)
-            .await?
+            state
+                .pg_pool
+                .query(
+                    "SELECT token, tenant_id, access_id FROM signal
+                     WHERE access_id = ANY($1)",
+                    &[&access_ids],
+                )
+                .await?
         }
     };
 

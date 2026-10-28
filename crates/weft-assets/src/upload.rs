@@ -109,7 +109,7 @@ const UPLOAD_TELL_EVERY: std::time::Duration = std::time::Duration::from_secs(3)
 
 impl<P: UploadPlane> ContentStore<P> {
     pub fn new(plane: P) -> Self {
-        Self { plane, http: reqwest::Client::new(), told: None }
+        Self { plane, http: weft_core::net::http_client().build().expect("reqwest client"), told: None }
     }
 
     /// [`Self::new`], saying on stderr how far its uploads have got.
@@ -322,7 +322,7 @@ impl<P: UploadPlane> ContentStore<P> {
             // Every byte sent was hashed on its way: bytes that are not the
             // content the upload was begun for would be refused by the
             // store's complete, so the upload is ended here instead.
-            let sent = format!("{:x}", std::mem::take(&mut bytes.hasher).finalize());
+            let sent = weft_core::project::hash::hex(&std::mem::take(&mut bytes.hasher).finalize());
             if let Some(hash) = hash.as_deref().filter(|hash| sent != *hash) {
                 changed = true;
                 let said = format!(

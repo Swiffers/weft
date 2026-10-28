@@ -36,10 +36,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 /// gone (its loop only acts on projects it owns), and a lease claimed or
 /// renewed reads the project row it is for (`weft_broker::lifecycle_writes`),
 /// so none can come back once the removal committed.
-pub async fn release_project(conn: &mut sqlx::PgConnection, project_id: uuid::Uuid) -> Result<u64> {
-    let res = sqlx::query("DELETE FROM infra_owner WHERE project_id = $1")
-        .bind(project_id)
-        .execute(conn)
-        .await?;
-    Ok(res.rows_affected())
+pub async fn release_project(db: &impl weft_task_store::db::Client, project_id: uuid::Uuid) -> Result<u64> {
+    Ok(db.execute("DELETE FROM infra_owner WHERE project_id = $1", &[&project_id]).await?)
 }

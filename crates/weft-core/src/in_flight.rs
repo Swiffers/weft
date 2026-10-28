@@ -56,7 +56,7 @@ impl InFlight {
     pub fn end(&self) {
         let before = self
             .count
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| count.checked_sub(1));
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| count.checked_sub(1));
         match before {
             Ok(1) => self.zero.notify_waiters(),
             Ok(_) => {}

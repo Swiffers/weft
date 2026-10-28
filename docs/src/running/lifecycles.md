@@ -156,7 +156,15 @@ address (a webhook, a submitted form, a provider's push), an answer to a run
 waiting on a person, and an event a listener picks up itself (a schedule's tick, a
 message on a connection it holds). Listeners keep listening behind a door that
 holds, so a schedule held for two hours has two hours of ticks waiting when it
-comes back. A caller waiting on a route for its answer cannot be held, so
+comes back. Behind a door that refuses, or once its window ended, the
+listeners stop, and what arrives meanwhile is never caught up. That goes for
+a trigger that keeps its place in what it reads too (a poll's cursor in its
+feed, the files a folder watch last saw): when it listens again, because you
+switched it back on or ran `weft deactivate` on it again with `--door take`
+or `hide`, it starts from its source as it finds it, so nothing that came
+behind the refusing door fires.
+What such a trigger missed while weft itself was down (stopped, the machine
+off, `weft maintenance on`) it catches up from where it left off. A caller waiting on a route for its answer cannot be held, so
 whatever the door, it is answered `503` with a `Retry-After` at once, and a
 client that retries gets through once the trigger is back.
 
@@ -179,7 +187,7 @@ with answers you do not pick, or only some of them:
 |---|---|---|---|
 | `weft rm` | `refuse` | `drop` | `cancel` |
 | The health check, when infra a trigger reads breaks | `take` | `keep` | `cancel`, since those runs cannot go on without the infra |
-| `weft maintenance on`, before an update ([updating weft](cli.md#updating-weft)) | `take` | `keep` | `wait`, or `cancel` with `--running cancel` |
+| `weft maintenance on`, before an update ([updating weft](cli.md#updating-weft)) | `refuse`, so nothing starts on the version being replaced; a trigger that keeps its place in what it reads still catches up from it once `weft maintenance off` brings it back, since the pause was weft's and nobody refused anything | `keep` | `wait`, or `cancel` with `--running cancel` |
 
 ### Bringing them back
 
@@ -278,7 +286,11 @@ If a step fails, the resync tries again 5 seconds later, then 20 seconds after
 that. If steps fail three times during the resync, it stops with the triggers it has not
 brought back still down, and says why: in the answer to `weft resync`, under
 `waiting on weft:` in `weft status`, and as "Resync stopped" on the editor's
-action bar. If it stopped because the infra those triggers read was not
+action bar. If a step fails because the install's database was busy or out
+of reach, it uses none of those three tries: the resync tries it again after
+5, 15, 30 and then 60 seconds, and if the database still cannot take the
+step, the resync stops, then tries again by itself 30 seconds later. If it stopped
+because the infra those triggers read was not
 running, or because an activation of them was still landing, it goes on by
 itself once that infra runs or that activation has landed. Otherwise, once
 you have fixed the cause, `weft resync --resume` (or the bar's Resync button)

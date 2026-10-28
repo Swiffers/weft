@@ -101,10 +101,10 @@ impl KindHandler for TimerHandler {
     /// from when the listener heard of it: the trip from the node
     /// through the dispatcher is not part of the wait. An `at` is its
     /// own moment, or nothing when that moment had passed by then. A
-    /// cron's first is its next occurrence after the asking.
-    // `_prior` is deliberately ignored: reactivate IS a fresh schedule
-    // (an after-timer restarts its countdown from the activation).
-    fn compute_initial_state(&self, spec: &SignalSpec, _prior: Option<&Value>, asked_at_unix_ms: i64, _is_resume: bool) -> Result<Value> {
+    /// cron's first is its next occurrence after the asking. A timer keeps
+    /// no place in a source, so every activation is a fresh schedule (an
+    /// `after` counts down again from it).
+    fn compute_initial_state(&self, spec: &SignalSpec, asked_at_unix_ms: i64, _is_resume: bool) -> Result<Value> {
         let timer: Timer = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed timer spec: {e}"))?;
         let next = match &timer.spec {
@@ -139,8 +139,8 @@ impl KindHandler for TimerHandler {
     async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Option<Woke>> {
         let timer: Timer = serde_json::from_value(spec.config.clone())
             .map_err(|e| super::for_good(anyhow::anyhow!("malformed timer spec: {e}")))?;
-        let unchanged = Woke { state: woken.state.clone(), seq: Some(woken.seq) };
-        let Some(due) = next_of(&woken.state) else { return Ok(Some(unchanged)) };
+        let unchanged = Woke { state: woken.stored.state.clone(), seq: Some(woken.stored.seq) };
+        let Some(due) = next_of(&woken.stored.state) else { return Ok(Some(unchanged)) };
         if due > woken.now_ms.max(woken.aimed_at_ms) {
             return Ok(Some(unchanged));
         }
@@ -174,8 +174,8 @@ impl KindHandler for TimerHandler {
         }
         // Losing the claim means another copy claimed this moment; its
         // tick and ours share one key, and it set the next wake.
-        let claimed = ctx.fire.claim_kind_state(after.clone(), woken.seq).await?;
-        Ok(claimed.then_some(Woke { state: after, seq: Some(woken.seq + 1) }))
+        let claimed = ctx.fire.claim_kind_state(after.clone(), woken.stored.seq).await?;
+        Ok(claimed.then_some(Woke { state: after, seq: Some(woken.stored.seq + 1) }))
     }
 
     fn process_entry(
@@ -241,7 +241,7 @@ mod schedule_tests {
     fn an_after_timer_counts_from_when_it_was_asked_for() {
         let spec = weft_core::signal::to_spec(Timer { spec: TimerSpec::After { duration_ms: 3_000 } });
         let asked = 1_700_000_000_000;
-        let state = TimerHandler.compute_initial_state(&spec, None, asked, false).unwrap();
+        let state = TimerHandler.compute_initial_state(&spec, asked, false).unwrap();
         assert_eq!(state["next_fire_at_unix_ms"], asked + 3_000);
     }
 
@@ -297,7 +297,7 @@ mod tests {
     fn the_first_moment_is_pinned_and_is_the_wake() {
         let asked = 1_700_000_000_000;
         let after = spec(TimerSpec::After { duration_ms: 3_000 });
-        let state = TimerHandler.compute_initial_state(&after, None, asked, false).unwrap();
+        let state = TimerHandler.compute_initial_state(&after, asked, false).unwrap();
         assert_eq!(next_of(&state), Some(asked + 3_000));
         for from in [WakeFrom::Armed, WakeFrom::Woken { aimed_at_ms: asked }] {
             assert_eq!(TimerHandler.next_wake(&after, &state, from, asked + 99).unwrap(), Some(asked + 3_000));
@@ -305,8 +305,8 @@ mod tests {
 
         let when = DateTime::from_timestamp_millis(asked + 60_000).unwrap();
         let at = spec(TimerSpec::At { when });
-        assert_eq!(next_of(&TimerHandler.compute_initial_state(&at, None, asked, false).unwrap()), Some(asked + 60_000));
-        let past = TimerHandler.compute_initial_state(&at, None, asked + 120_000, false).unwrap();
+        assert_eq!(next_of(&TimerHandler.compute_initial_state(&at, asked, false).unwrap()), Some(asked + 60_000));
+        let past = TimerHandler.compute_initial_state(&at, asked + 120_000, false).unwrap();
         assert_eq!(next_of(&past), None, "an `at` already past when armed never fires");
         assert_eq!(TimerHandler.next_wake(&at, &past, WakeFrom::Armed, asked).unwrap(), None);
     }

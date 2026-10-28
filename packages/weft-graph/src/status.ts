@@ -13,6 +13,7 @@ import type {
   BackendSnapshot,
   InstanceHoldings,
   InstanceInfraEntry,
+  LastRestart,
   OwnerTriggers,
   RunPhase,
   ProjectTransition,
@@ -42,6 +43,7 @@ export interface RawStatusPayload {
     progress?: ChangeProgress;
     behind?: boolean;
     takesDown?: OwnerTriggers[];
+    lastRestart?: LastRestart;
   }>;
   instanceInfra?: InstanceInfraEntry[];
   triggers?: TriggerEntry[];
@@ -141,6 +143,7 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
     ...(n.progress !== undefined ? { progress: progressOnLocalClock(n.progress, localNowUnix) } : {}),
     ...(n.behind ? { behind: true } : {}),
     ...(n.takesDown?.length ? { takesDown: n.takesDown } : {}),
+    ...(n.lastRestart !== undefined ? { lastRestart: n.lastRestart } : {}),
   }));
   const instanceInfra = (raw.instanceInfra ?? []).map((copy) =>
     copy.progress !== undefined ? { ...copy, progress: progressOnLocalClock(copy.progress, localNowUnix) } : copy,
@@ -230,6 +233,22 @@ export function backendFromSnapshot(snapshot: ActionAvailability): BackendSnapsh
 export function progressOnLocalClock(progress: ChangeProgress, localNowUnix: number): ChangeProgress {
   const shift = localNowUnix - progress.asOfUnix;
   return { ...progress, sinceUnix: progress.sinceUnix + shift, asOfUnix: localNowUnix };
+}
+
+/** What a person is told about an infra copy's last restart, `node`
+ *  being its place as the program spells it. The time is UTC, so it
+ *  reads the same as `weft status` whatever this machine's clock or zone. */
+// SYNC: describeRestart <-> crates/weft-core/src/infra/status.rs LastRestart::describe
+export function describeRestart(restart: LastRestart, node: string): string {
+  const at = `${new Date(restart.atUnix * 1000).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+  switch (restart.cause.kind) {
+    case 'out_of_memory':
+      return `${node} ran out of memory at ${at}: a process in it was killed because it needs more memory than its container may use; give it more`;
+    case 'exited':
+      return `${node} stopped (exit code ${restart.cause.code}) and was restarted at ${at}`;
+    case 'unknown':
+      return `${node} stopped and was restarted at ${at}, for a reason its host no longer knows`;
+  }
 }
 
 /** How far a change of an infra copy got, as a person reads it: "for

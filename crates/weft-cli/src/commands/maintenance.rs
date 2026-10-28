@@ -12,8 +12,9 @@
 
 use std::time::Duration;
 
-use anyhow::Context;
-use weft_core::maintenance::{LiftAnswer, LiftReport, MaintenanceOn, MaintenanceOnRequest, MaintenanceState};
+use weft_core::builds::VersionBuildState;
+use weft_core::maintenance::{LiftAnswer, LiftDoing, LiftProgress, LiftReport, MaintenanceOn, MaintenanceOnRequest, MaintenanceState, ProjectLifted};
+use weft_core::projects::BuildState;
 use weft_core::take_down::Running;
 
 use super::Ctx;
@@ -30,6 +31,10 @@ pub enum MaintenanceAction {
 /// How long `on` waits between two looks at what is still going down.
 const LOOK_EVERY: Duration = Duration::from_secs(3);
 
+/// How long one look at a lift waits on the install: short, since each
+/// look also reads where it is.
+const LIFT_LOOK: Duration = Duration::from_secs(1);
+
 pub async fn run(ctx: Ctx, action: MaintenanceAction) -> anyhow::Result<()> {
     match action {
         MaintenanceAction::Status => status(&ctx).await,
@@ -40,8 +45,7 @@ pub async fn run(ctx: Ctx, action: MaintenanceAction) -> anyhow::Result<()> {
 }
 
 async fn read_state(client: &crate::client::DispatcherClient) -> anyhow::Result<MaintenanceState> {
-    serde_json::from_value(client.get_json("/install/maintenance").await?)
-        .context("read the install's maintenance (the install and this CLI disagree on its shape; upgrade one of them)")
+    crate::client::read_answer(client.get_json("/install/maintenance").await?, "the install's maintenance")
 }
 
 /// `weft maintenance` / `weft maintenance status`.
@@ -85,8 +89,15 @@ async fn status(ctx: &Ctx) -> anyhow::Result<()> {
 async fn on(ctx: &Ctx, running: Option<Running>) -> anyhow::Result<()> {
     let client = ctx.client()?;
     let request = MaintenanceOnRequest { running };
-    let answer: MaintenanceOn = serde_json::from_value(client.post_json("/install/maintenance", &serde_json::to_value(&request)?).await?)
-        .context("read what `weft maintenance on` did (the install and this CLI disagree on its shape; upgrade one of them)")?;
+    // The install answers once every project is taken down, which can
+    // take a while with infra to stop.
+    let spinner = (!ctx.json()).then(crate::spinner::Spinner::start);
+    if let Some(spinner) = &spinner {
+        spinner.show_one("taking down every trigger and stopping every infra copy", crate::progress::now_unix() as i64);
+    }
+    let answer: MaintenanceOn =
+        crate::client::read_answer(client.post_json("/install/maintenance", &serde_json::to_value(&request)?).await?, "what `weft maintenance on` did")?;
+    drop(spinner);
     if !ctx.json() {
         println!("in maintenance since {}", when(answer.since_unix));
         for project in &answer.projects {
@@ -112,21 +123,25 @@ async fn on(ctx: &Ctx, running: Option<Running>) -> anyhow::Result<()> {
     // waited for, however long it takes: the update needs it over.
     // Ctrl+C stops the waiting, never what it waits for.
     if request.running() == Running::Wait {
-        let mut said = String::new();
+        let spinner = (!ctx.json()).then(crate::spinner::Spinner::start);
+        let since = crate::progress::now_unix() as i64;
+        let mut said = false;
         loop {
             let state = read_state(&client).await?;
             if !state.going.still_going_down() {
                 break;
             }
-            let going = state.going.words();
-            if going != said {
+            if !said {
                 let cancel = if state.going.runs > 0 {
                     format!("; `{}` cancels the runs", ctx.weft("maintenance on --running cancel"))
                 } else {
                     String::new()
                 };
-                eprintln!("waiting for what is still going down: {going} (Ctrl+C stops waiting{cancel})");
-                said = going;
+                eprintln!("waiting for what is still going down (Ctrl+C stops waiting{cancel})");
+                said = true;
+            }
+            if let Some(spinner) = &spinner {
+                spinner.show_one(format!("still going down: {}", state.going.words()), since);
             }
             tokio::time::sleep(LOOK_EVERY).await;
         }
@@ -154,8 +169,8 @@ fn check_left(ctx: &Ctx, answer: &MaintenanceOn) -> anyhow::Result<()> {
 /// `weft maintenance off`.
 async fn off(ctx: &Ctx) -> anyhow::Result<()> {
     let client = ctx.client()?;
-    let answer: LiftAnswer = serde_json::from_value(client.post_json("/install/maintenance/off", &serde_json::json!({})).await?)
-        .context("read the lift's answer (the install and this CLI disagree on its shape; upgrade one of them)")?;
+    let answer: LiftAnswer =
+        crate::client::read_answer(client.post_json("/install/maintenance/off", &serde_json::json!({})).await?, "the lift's answer")?;
     let task = match answer {
         LiftAnswer::NotOn => {
             if !ctx.json_out(&LiftReport { projects: Vec::new() })? {
@@ -165,26 +180,25 @@ async fn off(ctx: &Ctx) -> anyhow::Result<()> {
         }
         LiftAnswer::UnderWay { task } => task,
     };
-    eprintln!("building each project again on this weft, then starting the infra the maintenance stopped, then bringing back its triggers");
     let follow = format!("/install/maintenance/follow/{task}");
-    let report: LiftReport = serde_json::from_value(super::follow::follow_at(&client, &follow, |message| eprintln!("{message}")).await?)
-        .context("read the lift's report (the install and this CLI disagree on its shape; upgrade one of them)")?;
-    if ctx.json_out(&report)? {
+    if ctx.json() {
+        let report: LiftReport =
+            crate::client::read_answer(super::follow::follow_at(&client, &follow, LIFT_LOOK, |_| {}, async |_| Ok(())).await?, "the lift's report")?;
+        ctx.json_out(&report)?;
         return Ok(());
     }
-    let mut down = Vec::new();
-    for project in &report.projects {
-        let (did, failed) = lifted_lines(project);
-        if !did.is_empty() {
-            println!("  {} ({}): {}", project.name, project.id, did.join("; "));
-        }
-        for failed in &failed {
-            eprintln!("  {} ({}): did not come back: {failed}", project.name, project.id);
-        }
-        if !failed.is_empty() {
-            down.push(project.name.as_str());
-        }
+    eprintln!("building each project again on this weft, then starting the infra the maintenance stopped, then bringing back its triggers");
+    let mut view = LiftView { spinner: crate::spinner::Spinner::start(), said: 0, logs_said: Vec::new() };
+    let warn = |message: &str| eprintln!("{message}");
+    let report = super::follow::follow_at(&client, &follow, LIFT_LOOK, warn, async |progress| view.going(&client, progress).await).await?;
+    let report: LiftReport = crate::client::read_answer(report, "the lift's report")?;
+    view.spinner.show(Vec::new());
+    // What the lift finished after the last look.
+    for project in &report.projects[view.said.min(report.projects.len())..] {
+        view.say_lifted(project);
     }
+    drop(view);
+    let down: Vec<&str> = report.projects.iter().filter(|project| !project.failed.is_empty()).map(|project| project.name.as_str()).collect();
     println!("the maintenance is lifted");
     if !down.is_empty() {
         eprintln!(
@@ -196,6 +210,78 @@ async fn off(ctx: &Ctx) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// What `weft maintenance off` shows while the lift goes: each project
+/// once the lift is done with it, the step it is on under a spinner, and
+/// where each image it builds keeps its log.
+struct LiftView {
+    spinner: crate::spinner::Spinner,
+    /// How many of the lift's done projects are said.
+    said: usize,
+    /// The image builds whose log is said.
+    logs_said: Vec<String>,
+}
+
+impl LiftView {
+    async fn going(&mut self, client: &crate::client::DispatcherClient, progress: Option<serde_json::Value>) -> anyhow::Result<()> {
+        let Some(progress) = progress else { return Ok(()) };
+        let progress: LiftProgress = crate::client::read_answer(progress, "where the lift is")?;
+        for project in progress.done.iter().skip(self.said) {
+            self.say_lifted(project);
+        }
+        self.said = self.said.max(progress.done.len());
+        let mut lines = Vec::new();
+        for at in &progress.going {
+            let (label, log) = self.step(client, at).await;
+            lines.push(crate::spinner::Shown { label, since_unix: at.since_unix, log });
+        }
+        self.spinner.show(lines);
+        Ok(())
+    }
+
+    /// How `at` reads on its line, and the log beside it: for a build
+    /// whose images build, which ones (each one's log said once).
+    async fn step(&mut self, client: &crate::client::DispatcherClient, at: &weft_core::maintenance::LiftAt) -> (String, Option<String>) {
+        let words = format!("{}: {}", at.name, at.doing.words());
+        let LiftDoing::Building { build: Some(build) } = &at.doing else { return (words, None) };
+        // A look the install could not answer leaves the line as the
+        // step's words until the next.
+        let answer = client.get_json(&format!("/projects/{}/builds/{build}", at.id)).await.ok();
+        let Some(state) = answer.and_then(|answer| serde_json::from_value::<VersionBuildState>(answer).ok()) else { return (words, None) };
+        let building: Vec<_> = state.images.iter().filter(|image| image.state.state == Some(BuildState::Running)).collect();
+        if building.is_empty() {
+            return (words, None);
+        }
+        for image in &building {
+            if let Some(url) = &image.state.log_url {
+                if !self.logs_said.contains(&image.build.name) {
+                    self.logs_said.push(image.build.name.clone());
+                    self.spinner.say(&format!("  {}: building image {}; its log: {url}", at.name, short_image(&image.build.image)), false);
+                }
+            }
+        }
+        let names: Vec<&str> = building.iter().map(|image| short_image(&image.build.image)).collect();
+        (format!("{}: building image {}", at.name, names.join(", ")), building.iter().find_map(|image| image.state.log_url.clone()))
+    }
+
+    /// The lift is done with `project`: what came back, and what did not.
+    fn say_lifted(&self, project: &ProjectLifted) {
+        let (did, failed) = lifted_lines(project);
+        if !did.is_empty() {
+            self.spinner.say(&format!("  {} ({}): {}", project.name, project.id, did.join("; ")), false);
+        }
+        for failed in &failed {
+            self.spinner.say(&format!("  {} ({}): did not come back: {failed}", project.name, project.id), true);
+        }
+    }
+}
+
+/// An image ref as a person reads it: its name, without where it is
+/// pushed or its tag.
+fn short_image(image: &str) -> &str {
+    let name = image.rsplit('/').next().unwrap_or(image);
+    name.split(':').next().unwrap_or(name)
 }
 
 /// What a lift did in one project, as lines: what came back (and what it
@@ -231,8 +317,7 @@ async fn check(ctx: &Ctx, key_stdin: bool, update: &str) -> anyhow::Result<()> {
     }
     let client = ctx.client_keyed(key_stdin)?;
     let state = match client.get_json("/install/maintenance").await {
-        Ok(state) => serde_json::from_value::<MaintenanceState>(state)
-            .context("read the install's maintenance (the install and this CLI disagree on its shape; upgrade one of them)")?,
+        Ok(state) => crate::client::read_answer::<MaintenanceState>(state, "the install's maintenance")?,
         Err(e) => {
             if let Some(unreachable) = e.chain().find_map(|cause| cause.downcast_ref::<crate::client::InstallUnreachable>()) {
                 println!("{} is not running; nothing to check", unreachable.named());
@@ -304,6 +389,13 @@ mod tests {
     use weft_core::activation::OwnerTriggers;
     use weft_core::infra::wire::CopyRef;
     use weft_core::instance::{InstanceId, Owner};
+
+    #[test]
+    fn an_image_is_said_by_its_name() {
+        assert_eq!(short_image("weft-infra-studio:b0d68f"), "weft-infra-studio");
+        assert_eq!(short_image("us-docker.pkg.dev/x/r/weft-worker:aa"), "weft-worker");
+        assert_eq!(short_image("weft-worker"), "weft-worker");
+    }
 
     #[test]
     fn a_weft_without_the_route_predates_the_maintenance() {

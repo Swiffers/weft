@@ -1,6 +1,7 @@
 //! The weft compiler. Turns a project directory (`weft.toml`,
 //! `src/main.weft`, the nodes under `nodes/` and `src/`) into a flat `ProjectDefinition` and the
-//! docker build contexts of the images that run it.
+//! staged builds of what runs it: its worker (a program compiled on the
+//! machine on a local install, an image on the cloud) and its infra images.
 //!
 //! Pipeline, as the dispatcher drives it when it builds a version
 //! (`weft_dispatcher::build`, from the project files the CLI uploaded):
@@ -31,19 +32,21 @@
 //! 5. The dispatcher resolves file-typed `@asset` markers into stored
 //!    files, then `build_plan::plan_build_from` computes the three hashes
 //!    (binary and infra in `hash`; the definition hash is weft-core's
-//!    `compute_definition_hash`, re-exported there) and stages every
-//!    image: `build::build_project` validates the resolved definition,
+//!    `compute_definition_hash`, re-exported there) and stages what it
+//!    needs: `build::build_project` validates the resolved definition,
 //!    `codegen::emit` writes the worker cargo crate (one crate per
 //!    referenced node package, plus the registry and `main.rs`; the
 //!    definition itself is never baked in, a worker fetches it from the
-//!    broker by `definition_hash`), and `worker_image::emit` writes its
-//!    Dockerfile; `image_set` lists each infra node's own images.
-//! 6. The platform's builder (a local `docker build`, a Cloud Build on
-//!    GCP) builds every planned image not already present. The worker's
-//!    `cargo build` runs inside its docker build, never on the host,
-//!    through `weft-isolate` (`worker_isolate`): a node package that does
-//!    not compile is left out of the worker and named in a record the
-//!    image keeps, instead of failing the image.
+//!    broker by `definition_hash`), staged as a host build for a local
+//!    install or with the Dockerfile `worker_image::emit` writes for the
+//!    cloud; `image_set` lists each infra node's own images.
+//! 6. The platform's builder builds everything planned not already
+//!    present: a local install compiles the worker on the machine and
+//!    builds infra images with `docker build`, GCP runs Cloud Build. The
+//!    worker's `cargo build` runs through `weft-isolate`
+//!    (`worker_isolate`): a node package that does not compile is left
+//!    out of the worker and named in a record kept with it, instead of
+//!    failing the build.
 
 pub mod project;
 pub mod source_name;
@@ -62,17 +65,17 @@ pub mod validate;
 // the workspace walks, and the enriched-project loader) are gated behind
 // `build` INSIDE the module.
 pub mod hash;
-// The image-build path. Gated behind the `build` feature (default on) because it
+// The build path. Gated behind the `build` feature (default on) because it
 // pulls weft-core's runtime types + native filetime; the browser WASM parse
 // build turns it off.
 #[cfg(feature = "build")]
 pub mod codegen;
 #[cfg(feature = "build")]
 pub mod worker_image;
-// The `weft-isolate` program a worker image build runs (codegen emits its
+// The `weft-isolate` program every worker build runs (codegen emits its
 // source as a package of its own). Compiled here for the candidate type
 // codegen writes and for its tests; its `main` and the logic only `main`
-// reaches run in the image, never in this crate.
+// reaches run in the build, never in this crate.
 #[cfg(feature = "build")]
 pub(crate) mod worker_isolate;
 #[cfg(feature = "build")]
@@ -82,8 +85,8 @@ pub mod build;
 #[cfg(feature = "build")]
 pub mod image_set;
 // The shared build-freshness brain: compile -> 3 hashes -> enumerate + stage every
-// image -> mint refs -> report the stale set. One path regardless of build
-// strategy; only the ref/tag naming + existence probe differ.
+// artifact -> mint refs -> report the stale set. One path whatever the
+// platform; only the packaging, the ref naming and the existence probe differ.
 #[cfg(feature = "build")]
 pub mod build_plan;
 pub mod error;

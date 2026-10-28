@@ -15,6 +15,7 @@
 use std::net::{IpAddr, SocketAddr};
 
 use weft_platform_traits::config::PortRange;
+use weft_task_store::db::{self, Client as _};
 
 /// Where the install's project ports come from.
 pub struct ProjectPorts {
@@ -33,21 +34,17 @@ impl ProjectPorts {
     /// address right now: another project's, or held by another program.
     /// `None` when it is free. Asked before anything is activated, so a
     /// refusal changes nothing.
-    pub async fn check_asked(&self, pool: &sqlx::PgPool, project: uuid::Uuid, port: u16) -> anyhow::Result<Option<String>> {
-        let owner: Option<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM project WHERE api_port = $1 AND id <> $2")
-            .bind(i32::from(port))
-            .bind(project)
-            .fetch_optional(pool)
-            .await?;
+    pub async fn check_asked(&self, pool: &db::Pool, project: uuid::Uuid, port: u16) -> anyhow::Result<Option<String>> {
+        let owner: Option<uuid::Uuid> =
+            pool.scalar_opt("SELECT id FROM project WHERE api_port = $1 AND id <> $2", &[&i32::from(port), &project]).await?;
         if let Some(owner) = owner {
             return Ok(Some(format!("port {port} is the own address of project {owner}")));
         }
         // The project's own front, while it is up, holds the port it has;
         // a front that went (its address cleared) holds nothing, and the
         // port is checked like any other.
-        let ours: Option<i32> = sqlx::query_scalar("SELECT api_port FROM project WHERE id = $1 AND api_address IS NOT NULL")
-            .bind(project)
-            .fetch_optional(pool)
+        let ours: Option<i32> = pool
+            .scalar_opt::<Option<i32>>("SELECT api_port FROM project WHERE id = $1 AND api_address IS NOT NULL", &[&project])
             .await?
             .flatten();
         if ours == Some(i32::from(port)) {
@@ -61,17 +58,14 @@ impl ProjectPorts {
 
     /// The port the project's front opens on: `asked` when the person named
     /// one, else the one it has, else a free one, kept on its row.
-    pub async fn port_of(&self, pool: &sqlx::PgPool, project: uuid::Uuid, asked: Option<u16>) -> anyhow::Result<u16> {
+    pub async fn port_of(&self, pool: &db::Pool, project: uuid::Uuid, asked: Option<u16>) -> anyhow::Result<u16> {
         if let Some(port) = asked {
             return match keep(pool, project, port).await? {
                 Kept::Yes => Ok(port),
                 Kept::OtherProjects => anyhow::bail!("port {port} is another project's own address"),
             };
         }
-        let given: Option<Option<i32>> = sqlx::query_scalar("SELECT api_port FROM project WHERE id = $1")
-            .bind(project)
-            .fetch_optional(pool)
-            .await?;
+        let given: Option<Option<i32>> = pool.scalar_opt("SELECT api_port FROM project WHERE id = $1", &[&project]).await?;
         match given.flatten() {
             Some(port) => u16::try_from(port).map_err(|_| anyhow::anyhow!("project {project}'s port {port} is no port")),
             None => self.free_port(pool, project, None).await,
@@ -80,17 +74,14 @@ impl ProjectPorts {
 
     /// A free port for the project in place of `taken`, which another
     /// program holds, kept on its row.
-    pub async fn move_from(&self, pool: &sqlx::PgPool, project: uuid::Uuid, taken: u16) -> anyhow::Result<u16> {
+    pub async fn move_from(&self, pool: &db::Pool, project: uuid::Uuid, taken: u16) -> anyhow::Result<u16> {
         self.free_port(pool, project, Some(taken)).await
     }
 
     /// The first port no project has and no program on the machine holds
     /// right now (`but` aside), kept on the project's row.
-    async fn free_port(&self, pool: &sqlx::PgPool, project: uuid::Uuid, but: Option<u16>) -> anyhow::Result<u16> {
-        let taken: Vec<i32> = sqlx::query_scalar("SELECT api_port FROM project WHERE api_port IS NOT NULL AND id <> $1")
-            .bind(project)
-            .fetch_all(pool)
-            .await?;
+    async fn free_port(&self, pool: &db::Pool, project: uuid::Uuid, but: Option<u16>) -> anyhow::Result<u16> {
+        let taken: Vec<i32> = pool.scalars("SELECT api_port FROM project WHERE api_port IS NOT NULL AND id <> $1", &[&project]).await?;
         // With no block, the machine picks: the port it gives may be one a
         // project keeps while its front is down (its number stays on its
         // row), so it is asked again, at most once per such project.
@@ -127,18 +118,13 @@ enum Kept {
     OtherProjects,
 }
 
-async fn keep(pool: &sqlx::PgPool, project: uuid::Uuid, port: u16) -> anyhow::Result<Kept> {
-    let kept = sqlx::query("UPDATE project SET api_port = $2 WHERE id = $1")
-        .bind(project)
-        .bind(i32::from(port))
-        .execute(pool)
-        .await;
-    match kept {
-        Ok(done) => {
-            anyhow::ensure!(done.rows_affected() == 1, "project {project} is gone");
+async fn keep(pool: &db::Pool, project: uuid::Uuid, port: u16) -> anyhow::Result<Kept> {
+    match pool.execute("UPDATE project SET api_port = $2 WHERE id = $1", &[&project, &i32::from(port)]).await {
+        Ok(touched) => {
+            anyhow::ensure!(touched == 1, "project {project} is gone");
             Ok(Kept::Yes)
         }
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(Kept::OtherProjects),
+        Err(e) if e.code() == Some("23505") => Ok(Kept::OtherProjects),
         Err(e) => Err(e.into()),
     }
 }

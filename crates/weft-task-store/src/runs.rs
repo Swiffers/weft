@@ -49,19 +49,13 @@ macro_rules! in_flight_sql {
 
 /// Whether a worker is driving `run_id` right now
 /// ([`in_flight_sql!`]).
-pub async fn in_flight<'e, E: sqlx::PgExecutor<'e>>(executor: E, run_id: weft_core::RunId) -> anyhow::Result<bool> {
-    Ok(sqlx::query_scalar(concat!("SELECT EXISTS (SELECT 1 FROM run r WHERE r.run_id = $1 AND ", in_flight_sql!("r"), ")"))
-        .bind(run_id)
-        .fetch_one(executor)
-        .await?)
+pub async fn in_flight(db: &impl crate::db::Client, run_id: weft_core::RunId) -> anyhow::Result<bool> {
+    Ok(db.scalar(concat!("SELECT EXISTS (SELECT 1 FROM run r WHERE r.run_id = $1 AND ", in_flight_sql!("r"), ")"), &[&run_id]).await?)
 }
 
 /// Whether `run_id` has ended (or is gone).
-pub async fn ended<'e, E: sqlx::PgExecutor<'e>>(executor: E, run_id: weft_core::RunId) -> anyhow::Result<bool> {
-    Ok(!sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM run WHERE run_id = $1 AND state <> 'ended')")
-        .bind(run_id)
-        .fetch_one(executor)
-        .await?)
+pub async fn ended(db: &impl crate::db::Client, run_id: weft_core::RunId) -> anyhow::Result<bool> {
+    Ok(!db.scalar::<bool>("SELECT EXISTS (SELECT 1 FROM run WHERE run_id = $1 AND state <> 'ended')", &[&run_id]).await?)
 }
 
 /// The channel a run that is queued for a worker is announced on, with its
@@ -92,18 +86,18 @@ pub const EVENTS_CHANNEL: &str = "weft_dispatcher_events";
 /// Postgres NOTIFY refuses a payload past 8000.
 pub const EVENT_MAX_BYTES: usize = 7800;
 
-/// Announce `event` on [`EVENTS_CHANNEL`] through `executor`: inside the
+/// Announce `event` on [`EVENTS_CHANNEL`] through `db`: inside the
 /// caller's transaction it is heard only if that commits. `Err` when the
 /// event weighs more than [`EVENT_MAX_BYTES`] (nobody would hear it, and no
 /// record replays it) or the database refused.
-pub async fn announce_event<'e, E: sqlx::PgExecutor<'e>>(executor: E, event: &weft_core::live_event::LiveEvent) -> anyhow::Result<()> {
+pub async fn announce_event(db: &impl crate::db::Client, event: &weft_core::live_event::LiveEvent) -> anyhow::Result<()> {
     let payload = serde_json::to_string(event)?;
     anyhow::ensure!(
         payload.len() <= EVENT_MAX_BYTES,
         "the event weighs {} bytes, more than the {EVENT_MAX_BYTES} a NOTIFY carries",
         payload.len()
     );
-    sqlx::query("SELECT pg_notify($1, $2)").bind(EVENTS_CHANNEL).bind(&payload).execute(executor).await?;
+    db.execute("SELECT pg_notify($1, $2)", &[&EVENTS_CHANNEL, &payload]).await?;
     Ok(())
 }
 

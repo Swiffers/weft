@@ -140,7 +140,9 @@ pub async fn forward(State(state): State<DispatcherState>, request: Request) -> 
     pass_on(&state.http, target, request).await
 }
 
-/// Pass `request` on to the store at `target`, and its answer back.
+/// Pass `request` on to the store at `target`, and its answer back. No
+/// limit on the call's length: the file streams through it either way, as
+/// fast as the caller sends or reads it.
 async fn pass_on(http: &reqwest::Client, target: &FilesTarget, request: Request) -> Response {
     if !matches!(*request.method(), Method::GET | Method::HEAD | Method::PUT) {
         return (StatusCode::METHOD_NOT_ALLOWED, "a stored file is read (GET, HEAD) or uploaded (PUT) here").into_response();
@@ -200,15 +202,18 @@ pub async fn upload(State(state): State<DispatcherState>, Path(verb): Path<Strin
         return (StatusCode::NOT_FOUND, format!("an upload's verbs are {}", UPLOAD_VERBS.join(", "))).into_response();
     }
     let sent = async {
-        state
+        let mut request = state
             .broker
             .request(reqwest::Method::POST, &format!("/v1/storage/slot/{verb}"))
             .await?
             .header(header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .await
-            .map_err(anyhow::Error::from)
+            .body(body);
+        // Completing assembles the file from its parts, which grows with
+        // its size; every other verb is a fixed amount of work.
+        if verb != "complete" {
+            request = request.timeout(crate::storage::BROKER_STORAGE_CALL_TIMEOUT);
+        }
+        request.send().await.map_err(anyhow::Error::from)
     }
     .await;
     let answer = match sent {
@@ -388,7 +393,7 @@ mod tests {
     #[tokio::test]
     async fn a_read_passes_on_with_its_range_and_the_callers_host() {
         let (target, seen) = fake_store().await;
-        let http = reqwest::Client::new();
+        let http = weft_core::net::http_client().build().unwrap();
         let answer = pass_on(
             &http,
             &target,
@@ -416,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn an_upload_passes_on_whole_and_other_methods_stop_here() {
         let (target, seen) = fake_store().await;
-        let http = reqwest::Client::new();
+        let http = weft_core::net::http_client().build().unwrap();
         pass_on(
             &http,
             &target,
@@ -441,7 +446,7 @@ mod tests {
     async fn an_uploads_etag_comes_back() {
         let (target, _) = fake_store().await;
         let answer = pass_on(
-            &reqwest::Client::new(),
+            &weft_core::net::http_client().build().unwrap(),
             &target,
             request(Method::PUT, "/files/runtime/t/project/p/f?partNumber=1", &[("host", "t.example"), ("content-length", "2")], b"ab"),
         )
@@ -454,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn an_upload_without_a_bounded_length_stops_here() {
         let (target, seen) = fake_store().await;
-        let http = reqwest::Client::new();
+        let http = weft_core::net::http_client().build().unwrap();
         let over = (MAX_PUT_BYTES + 1).to_string();
         for (headers, status) in [
             (vec![("host", "t.example")], StatusCode::LENGTH_REQUIRED),

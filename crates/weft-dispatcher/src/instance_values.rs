@@ -38,8 +38,10 @@ use weft_core::activation::ActivationKey;
 use weft_core::instance::{InstanceId, ValueChanges};
 use weft_core::instance_door::ValuesChanged;
 use weft_core::run_spec::InstanceValueInput;
+use weft_task_store::db::Client as _;
 
 use crate::activation_store::{Activation, ClaimRefused, ProjectStatus};
+use crate::api::access_store_error;
 use crate::state::DispatcherState;
 
 type ApiError = (StatusCode, String);
@@ -52,7 +54,7 @@ pub(crate) async fn owning_tenant(state: &DispatcherState, project_id: uuid::Uui
         .projects
         .tenant_for(project_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project tenant: {e:#}")))?
+        .map_err(|e| crate::api::unavailable_or_internal("read who owns the project", e))?
         .ok_or((StatusCode::NOT_FOUND, format!("project {project_id} not found")))
 }
 
@@ -148,18 +150,18 @@ async fn apply(
         // this pass has decided (and, when nothing live reads the change,
         // stored it). What is stored and what is live are read under it,
         // fresh on every pass.
-        let mut tx = state.pg_pool.begin().await.map_err(|e| access_error(e.into()))?;
-        let locked: Option<(uuid::Uuid,)> = sqlx::query_as("SELECT id FROM project WHERE id = $1 FOR UPDATE")
-            .bind(project_id)
-            .fetch_optional(&mut *tx)
+        let mut conn = state.pg_pool.get().await.map_err(|e| access_store_error(e.into()))?;
+        let tx = conn.transaction().await.map_err(|e| access_store_error(e.into()))?;
+        let locked: Option<uuid::Uuid> = tx
+            .scalar_opt("SELECT id FROM project WHERE id = $1 FOR UPDATE", &[&project_id])
             .await
-            .map_err(|e| access_error(e.into()))?;
+            .map_err(|e| access_store_error(e.into()))?;
         if locked.is_none() {
             return Err((StatusCode::NOT_FOUND, format!("project {project_id} not found")));
         }
-        let stored = weft_access_store::instance_values(&mut *tx, tenant, project_id, instance)
+        let stored = weft_access_store::instance_values(&tx, tenant, project_id, instance)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read instance values: {e:#}")))?;
+            .map_err(access_store_error)?;
         // A forget clears what is stored NOW: the fields the program fills
         // count as a change (a trigger reading one re-arms), and anything
         // left from fields it no longer fills is only deleted.
@@ -173,19 +175,27 @@ async fn apply(
         let Checked { changes, writes, mut cleared } = check(&project, instance, &stored, set, &clear)?;
         cleared.extend(leftovers);
         if changes.is_empty() && cleared.is_empty() {
+            // Already stored: maybe by this same request, sent again after
+            // its commit landed but its answer was lost. The fires waiting
+            // on the instance are routed all the same, so none stays parked
+            // behind a change whose first answer never arrived.
+            drop(tx);
+            drop(conn);
+            route_waiting_fires(state, project_id, instance).await;
             return Ok(ValuesChanged::default());
         }
         let activations = state
             .activations
             .list(project_id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read activations: {e}")))?;
+            .map_err(|e| crate::api::unavailable_or_internal("read the project's triggers", e))?;
         let reading = triggers_reading(&project, &activations, Some(instance), &changes);
         if reading.iter().any(|a| a.lifecycle.status == ProjectStatus::Activating) {
             // One of them is being set up right now (an earlier change of
             // this instance's, an activate): this change re-arms after it,
             // on what it leaves.
             drop(tx);
+            drop(conn);
             wait_for_activations(&mut heard).await?;
             continue;
         }
@@ -195,14 +205,16 @@ async fn apply(
             .map(|a| a.key.clone())
             .collect();
         if live.is_empty() {
-            weft_access_store::change_instance_values(&mut tx, tenant, project_id, instance, &writes, &cleared)
+            weft_access_store::change_instance_values(&tx, tenant, project_id, instance, &writes, &cleared)
                 .await
-                .map_err(access_error)?;
-            tx.commit().await.map_err(|e| access_error(e.into()))?;
+                .map_err(access_store_error)?;
+            tx.commit().await.map_err(|e| access_store_error(e.into()))?;
+            drop(conn);
             route_waiting_fires(state, project_id, instance).await;
             return Ok(ValuesChanged::default());
         }
         drop(tx);
+        drop(conn);
         let keys = live;
         let rearm = crate::api::project::Rearm {
             overlay: Some(&changes),
@@ -344,9 +356,3 @@ pub(crate) async fn wait_for_activations(heard: &mut weft_task_store::pg_signal:
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("wait for the activations to move: {e:#}")))
 }
 
-/// An access-store failure as the API answers it (a refusal the store
-/// names keeps its status; anything else is a 500).
-pub(crate) fn access_error(e: anyhow::Error) -> ApiError {
-    let (status, message) = weft_access_store::client_error(e);
-    (StatusCode::from_u16(status).expect("store status codes are valid"), message)
-}

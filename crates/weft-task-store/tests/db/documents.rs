@@ -5,8 +5,8 @@
 //! moves a value out to a column, and the boot with nothing to do.
 
 use serde_json::{json, Value};
-use sqlx::PgPool;
 use weft_core::stored::{Kind, Op};
+use weft_task_store::db::{Client as _, Pool, Transaction};
 use weft_task_store::documents::{Encoding, Fill, Rederived};
 use weft_task_store::{apply_documents, Document};
 
@@ -17,9 +17,9 @@ const STEPS: &[&[Op]] = &[
     &[Op::AddKey { at: "", key: "c", value: "true" }],
 ];
 
-fn note_rederived(conn: &mut sqlx::PgConnection) -> Rederived<'_> {
+fn note_rederived<'c>(tx: &'c Transaction<'c>) -> Rederived<'c> {
     Box::pin(async move {
-        sqlx::query("INSERT INTO probe_rederived DEFAULT VALUES").execute(&mut *conn).await?;
+        tx.execute("INSERT INTO probe_rederived DEFAULT VALUES", &[]).await?;
         Ok(())
     })
 }
@@ -63,60 +63,49 @@ static EMPTIED_DOC: Document = Document::of(
 
 /// The schema guard's own tables, which the ledger of carried columns is
 /// one of: there on every database the boot has built.
-async fn ledger(pool: &PgPool) {
+async fn ledger(pool: &Pool) {
     weft_task_store::apply_groups(pool, &[]).await.unwrap();
 }
 
 /// A two-column key, so the walk in key order is exercised past one
 /// batch (500 rows).
-async fn tables(pool: &PgPool, rows: i32) {
+async fn tables(pool: &Pool, rows: i32) {
     ledger(pool).await;
-    sqlx::raw_sql(
+    pool.batch_execute(
         "CREATE TABLE probe_doc (owner TEXT NOT NULL, n INTEGER NOT NULL, body JSONB, \
              body_version INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (owner, n));
          CREATE TABLE probe_packed (id BIGINT PRIMARY KEY, body BYTEA NOT NULL, body_version INTEGER NOT NULL DEFAULT 1);
          CREATE TABLE probe_rederived (at TIMESTAMPTZ NOT NULL DEFAULT now())",
     )
-    .execute(pool)
     .await
     .unwrap();
     for n in 0..rows {
-        sqlx::query("INSERT INTO probe_doc (owner, n, body) VALUES ($1, $2, $3)")
-            .bind(if n % 2 == 0 { "even" } else { "odd" })
-            .bind(n)
-            .bind(json!({ "a": n }))
-            .execute(pool)
+        let owner = if n % 2 == 0 { "even" } else { "odd" };
+        pool.execute("INSERT INTO probe_doc (owner, n, body) VALUES ($1, $2, $3)", &[&owner, &n, &json!({ "a": n })])
             .await
             .unwrap();
     }
     // A row whose column is NULL holds no document and is left alone.
-    sqlx::query("INSERT INTO probe_doc (owner, n, body) VALUES ('none', 0, NULL)").execute(pool).await.unwrap();
+    pool.execute("INSERT INTO probe_doc (owner, n, body) VALUES ('none', 0, NULL)", &[]).await.unwrap();
 }
 
-async fn bodies(pool: &PgPool) -> Vec<(Value, i32)> {
-    sqlx::query_as("SELECT body, body_version FROM probe_doc WHERE body IS NOT NULL ORDER BY owner, n")
-        .fetch_all(pool)
-        .await
-        .unwrap()
+async fn bodies(pool: &Pool) -> Vec<(Value, i32)> {
+    pool.all("SELECT body, body_version FROM probe_doc WHERE body IS NOT NULL ORDER BY owner, n", &[]).await.unwrap()
 }
 
-async fn recorded(pool: &PgPool, table: &str) -> i32 {
-    sqlx::query_scalar("SELECT version FROM weft_document_version WHERE table_name = $1")
-        .bind(table)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+async fn recorded(pool: &Pool, table: &str) -> i32 {
+    pool.scalar("SELECT version FROM weft_document_version WHERE table_name = $1", &[&table]).await.unwrap()
 }
 
-async fn rederived(pool: &PgPool) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM probe_rederived").fetch_one(pool).await.unwrap()
+async fn rederived(pool: &Pool) -> i64 {
+    pool.scalar("SELECT count(*) FROM probe_rederived", &[]).await.unwrap()
 }
 
 /// A column with rows and no record was written before it was registered:
 /// every row is at version 1 and takes every step, once, in batches, and
 /// says it is at version 3; what derives from it is derived again once.
-#[sqlx::test]
-async fn rows_from_before_the_column_was_registered_take_every_step_once(pool: PgPool) {
+#[weft_db_macros::test]
+async fn rows_from_before_the_column_was_registered_take_every_step_once(pool: Pool) {
     tables(&pool, 1203).await;
     apply_documents(&pool, &[&JSON_DOC]).await.unwrap();
     let all = bodies(&pool).await;
@@ -129,7 +118,7 @@ async fn rows_from_before_the_column_was_registered_take_every_step_once(pool: P
     assert_eq!(recorded(&pool, "probe_doc").await, 3);
     assert_eq!(rederived(&pool).await, 1);
     let null: (Option<Value>, i32) =
-        sqlx::query_as("SELECT body, body_version FROM probe_doc WHERE owner = 'none'").fetch_one(&pool).await.unwrap();
+        pool.one("SELECT body, body_version FROM probe_doc WHERE owner = 'none'", &[]).await.unwrap();
     assert_eq!(null, (None, 1));
     // At today's version a second boot changes nothing.
     apply_documents(&pool, &[&JSON_DOC]).await.unwrap();
@@ -140,17 +129,13 @@ async fn rows_from_before_the_column_was_registered_take_every_step_once(pool: P
 /// A boot that stopped midway left rows at every version (each batch
 /// committed with its rows' versions): each row takes only the steps after
 /// its own version, and none takes one twice (`AddKey` would refuse it).
-#[sqlx::test]
-async fn rows_at_several_versions_each_take_only_the_steps_after_their_own(pool: PgPool) {
+#[weft_db_macros::test]
+async fn rows_at_several_versions_each_take_only_the_steps_after_their_own(pool: Pool) {
     tables(&pool, 10).await;
-    sqlx::query("UPDATE probe_doc SET body = jsonb_build_object('b', body->'a'), body_version = 2 WHERE n >= 3")
-        .execute(&pool)
+    pool.execute("UPDATE probe_doc SET body = jsonb_build_object('b', body->'a'), body_version = 2 WHERE n >= 3", &[])
         .await
         .unwrap();
-    sqlx::query("UPDATE probe_doc SET body = body || '{\"c\": true}', body_version = 3 WHERE n >= 6")
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute("UPDATE probe_doc SET body = body || '{\"c\": true}', body_version = 3 WHERE n >= 6", &[]).await.unwrap();
     apply_documents(&pool, &[&JSON_DOC]).await.unwrap();
     let all = bodies(&pool).await;
     assert!(all.iter().all(|(b, v)| *v == 3 && b["c"] == json!(true) && b.get("b").is_some()), "{all:?}");
@@ -158,11 +143,11 @@ async fn rows_at_several_versions_each_take_only_the_steps_after_their_own(pool:
 }
 
 /// A column a newer weft carried is refused, naming both versions.
-#[sqlx::test]
-async fn a_column_a_newer_weft_carried_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_column_a_newer_weft_carried_is_refused(pool: Pool) {
     tables(&pool, 1).await;
     apply_documents(&pool, &[&JSON_DOC]).await.unwrap();
-    sqlx::query("UPDATE weft_document_version SET version = 7").execute(&pool).await.unwrap();
+    pool.execute("UPDATE weft_document_version SET version = 7", &[]).await.unwrap();
     let err = format!("{:#}", apply_documents(&pool, &[&JSON_DOC]).await.unwrap_err());
     assert!(
         err.contains("probe_doc.body were carried to version 7 by a newer weft, and this weft reads up to version 3"),
@@ -172,25 +157,22 @@ async fn a_column_a_newer_weft_carried_is_refused(pool: PgPool) {
 
 /// An empty column has nothing to carry: it is recorded at today's
 /// version, and its rows from then on are written in today's shape.
-#[sqlx::test]
-async fn an_empty_column_is_recorded_at_todays_version(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_empty_column_is_recorded_at_todays_version(pool: Pool) {
     tables(&pool, 0).await;
-    sqlx::query("DELETE FROM probe_doc").execute(&pool).await.unwrap();
+    pool.execute("DELETE FROM probe_doc", &[]).await.unwrap();
     apply_documents(&pool, &[&JSON_DOC]).await.unwrap();
     assert_eq!(recorded(&pool, "probe_doc").await, 3);
 }
 
 /// With every column at today's version a boot only reads: it does not
 /// wait on the schema's lock, held here by another session.
-#[sqlx::test]
-async fn a_boot_with_nothing_to_carry_takes_no_lock(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_boot_with_nothing_to_carry_takes_no_lock(pool: Pool) {
     tables(&pool, 3).await;
     apply_documents(&pool, &[&JSON_DOC]).await.unwrap();
-    let mut holder = pool.acquire().await.unwrap();
-    sqlx::query("SELECT pg_advisory_lock(hashtextextended('weft:schema-migrate', 0))")
-        .execute(&mut *holder)
-        .await
-        .unwrap();
+    let holder = pool.get().await.unwrap();
+    holder.execute("SELECT pg_advisory_lock(hashtextextended('weft:schema-migrate', 0))", &[]).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), apply_documents(&pool, &[&JSON_DOC]))
         .await
         .expect("the boot did not wait on the lock")
@@ -198,16 +180,16 @@ async fn a_boot_with_nothing_to_carry_takes_no_lock(pool: PgPool) {
 }
 
 /// A compressed column is read, carried and written back compressed.
-#[sqlx::test]
-async fn a_compressed_column_is_carried_compressed(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_compressed_column_is_carried_compressed(pool: Pool) {
     tables(&pool, 0).await;
     for id in 0..3i64 {
         let packed = zstd::bulk::compress(&serde_json::to_vec(&json!({ "a": id })).unwrap(), 1).unwrap();
-        sqlx::query("INSERT INTO probe_packed (id, body) VALUES ($1, $2)").bind(id).bind(packed).execute(&pool).await.unwrap();
+        pool.execute("INSERT INTO probe_packed (id, body) VALUES ($1, $2)", &[&id, &packed]).await.unwrap();
     }
     apply_documents(&pool, &[&ZSTD_DOC]).await.unwrap();
     let rows: Vec<(Vec<u8>, i32)> =
-        sqlx::query_as("SELECT body, body_version FROM probe_packed ORDER BY id").fetch_all(&pool).await.unwrap();
+        pool.all("SELECT body, body_version FROM probe_packed ORDER BY id", &[]).await.unwrap();
     for (id, (row, version)) in rows.iter().enumerate() {
         let doc: Value = serde_json::from_slice(&zstd::stream::decode_all(&row[..]).unwrap()).unwrap();
         assert_eq!((doc, *version), (json!({ "b": id, "c": true }), 3));
@@ -216,20 +198,19 @@ async fn a_compressed_column_is_carried_compressed(pool: PgPool) {
 
 /// A value a step takes out of the JSON is first written where it lives
 /// now, by the step's fill, from the JSON as it was.
-#[sqlx::test]
-async fn a_fill_moves_a_value_out_before_its_step_drops_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_fill_moves_a_value_out_before_its_step_drops_it(pool: Pool) {
     ledger(&pool).await;
-    sqlx::raw_sql(
+    pool.batch_execute(
         "CREATE TABLE probe_moving (id INTEGER PRIMARY KEY, owner TEXT, body JSONB NOT NULL, \
              body_version INTEGER NOT NULL DEFAULT 1);
          INSERT INTO probe_moving (id, body) VALUES (1, '{\"owner\": \"ann\", \"x\": 1}'), (2, '{\"owner\": \"bob\"}')",
     )
-    .execute(&pool)
     .await
     .unwrap();
     apply_documents(&pool, &[&MOVING_DOC]).await.unwrap();
     let rows: Vec<(Option<String>, Value, i32)> =
-        sqlx::query_as("SELECT owner, body, body_version FROM probe_moving ORDER BY id").fetch_all(&pool).await.unwrap();
+        pool.all("SELECT owner, body, body_version FROM probe_moving ORDER BY id", &[]).await.unwrap();
     assert_eq!(
         rows,
         vec![(Some("ann".into()), json!({ "x": 1 }), 2), (Some("bob".into()), json!({}), 2)]
@@ -238,29 +219,28 @@ async fn a_fill_moves_a_value_out_before_its_step_drops_it(pool: PgPool) {
 
 /// A step whose ops change nothing only moves values out: it is one
 /// statement, so it needs no key to walk the rows by.
-#[sqlx::test]
-async fn a_step_that_only_moves_values_out_needs_no_key(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_step_that_only_moves_values_out_needs_no_key(pool: Pool) {
     ledger(&pool).await;
-    sqlx::raw_sql(
+    pool.batch_execute(
         "CREATE TABLE probe_keyless (name TEXT NOT NULL, body JSONB NOT NULL, body_version INTEGER NOT NULL DEFAULT 1);
          CREATE TABLE probe_moved (name TEXT PRIMARY KEY, n INTEGER NOT NULL);
          INSERT INTO probe_keyless (name, body) VALUES ('a', '{\"n\": 1}'), ('b', '{\"n\": 2}')",
     )
-    .execute(&pool)
     .await
     .unwrap();
     apply_documents(&pool, &[&EMPTIED_DOC]).await.unwrap();
-    let moved: Vec<(String, i32)> = sqlx::query_as("SELECT name, n FROM probe_moved ORDER BY name").fetch_all(&pool).await.unwrap();
+    let moved: Vec<(String, i32)> = pool.all("SELECT name, n FROM probe_moved ORDER BY name", &[]).await.unwrap();
     assert_eq!(moved, vec![("a".into(), 1), ("b".into(), 2)]);
-    let versions: Vec<i32> = sqlx::query_scalar("SELECT body_version FROM probe_keyless").fetch_all(&pool).await.unwrap();
+    let versions: Vec<i32> = pool.scalars("SELECT body_version FROM probe_keyless", &[]).await.unwrap();
     assert_eq!(versions, vec![2, 2]);
 }
 
 /// A column recorded below today is carried from the version it is
 /// recorded at: the steps before it ran, and a fill before them may read
 /// what is gone since.
-#[sqlx::test]
-async fn a_column_recorded_below_today_is_carried_from_there(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_column_recorded_below_today_is_carried_from_there(pool: Pool) {
     /// The fill from version 1 reads a column the table no longer has: run
     /// again, it would fail the boot.
     static RECORDED_AT_TWO: Document = Document::of(
@@ -272,25 +252,21 @@ async fn a_column_recorded_below_today_is_carried_from_there(pool: PgPool) {
         None,
     );
     tables(&pool, 0).await;
-    sqlx::query("INSERT INTO probe_doc (owner, n, body, body_version) VALUES ('two', 1, '{\"b\": 1}', 2)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO weft_document_version (table_name, column_name, version) VALUES ('probe_doc', 'body', 2)")
-        .execute(&pool)
+    pool.execute("INSERT INTO probe_doc (owner, n, body, body_version) VALUES ('two', 1, '{\"b\": 1}', 2)", &[]).await.unwrap();
+    pool.execute("INSERT INTO weft_document_version (table_name, column_name, version) VALUES ('probe_doc', 'body', 2)", &[])
         .await
         .unwrap();
     apply_documents(&pool, &[&RECORDED_AT_TWO]).await.unwrap();
     let rows: Vec<(String, Value, i32)> =
-        sqlx::query_as("SELECT owner, body, body_version FROM probe_doc WHERE body IS NOT NULL ORDER BY owner").fetch_all(&pool).await.unwrap();
+        pool.all("SELECT owner, body, body_version FROM probe_doc WHERE body IS NOT NULL ORDER BY owner", &[]).await.unwrap();
     assert_eq!(rows, vec![("two".into(), json!({ "b": 1, "c": true }), 3)]);
     assert_eq!(recorded(&pool, "probe_doc").await, 3);
 }
 
 /// A column the code reads, missing from its table, is a mistake, said as
 /// one, naming the way to move a column that goes.
-#[sqlx::test]
-async fn a_column_the_table_does_not_have_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_column_the_table_does_not_have_is_refused(pool: Pool) {
     static READ: Document = Document::of(&PROBE, "probe_doc", "units", Encoding::Json, &[], None);
     tables(&pool, 1).await;
     let err = format!("{:#}", apply_documents(&pool, &[&READ]).await.unwrap_err());
@@ -299,8 +275,8 @@ async fn a_column_the_table_does_not_have_is_refused(pool: PgPool) {
 
 /// A version column has no default: a write that forgets it fails on the
 /// NOT NULL instead of being labelled with a version it may not hold.
-#[sqlx::test]
-async fn a_write_naming_no_version_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_write_naming_no_version_is_refused(pool: Pool) {
     static VERSIONED: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         name: "probe_versioned",
         tables: &["probe_versioned"],
@@ -310,9 +286,9 @@ async fn a_write_naming_no_version_is_refused(pool: PgPool) {
     };
     static VERSIONED_DOC: Document = Document::of(&PROBE, "probe_versioned", "body", Encoding::Json, &[], None);
     weft_task_store::apply_schema(&pool, &[&VERSIONED], &[&VERSIONED_DOC]).await.unwrap();
-    let forgot = sqlx::query("INSERT INTO probe_versioned (id, body) VALUES (1, '{}')")
-        .execute(&pool)
+    let forgot = pool
+        .execute("INSERT INTO probe_versioned (id, body) VALUES (1, '{}')", &[])
         .await
         .expect_err("a write naming no version is refused");
-    assert_eq!(forgot.as_database_error().and_then(|e| e.code()).as_deref(), Some("23502"), "{forgot}");
+    assert_eq!(forgot.code(), Some("23502"), "{forgot}");
 }

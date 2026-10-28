@@ -61,6 +61,15 @@ pub fn install_crypto_provider() {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 }
 
+/// A builder for an HTTP client: every client weft builds starts here.
+/// reqwest takes its TLS crypto from the process, so this installs ring
+/// first ([`install_crypto_provider`]); a process that never did (a test)
+/// would otherwise have its first client panic.
+pub fn http_client() -> reqwest::ClientBuilder {
+    install_crypto_provider();
+    reqwest::Client::builder()
+}
+
 /// Dial `host:port` and wrap the pipe in TLS, verifying the peer
 /// against the system's trust roots (SNI from the host part).
 pub async fn tls_connect(address: &str) -> Result<TlsStream<TcpStream>, String> {
@@ -272,6 +281,40 @@ impl EmptyBody for reqwest::RequestBuilder {
     fn empty_body(self) -> Self {
         self.header(reqwest::header::CONTENT_LENGTH, 0)
     }
+}
+
+/// How long a connection weft holds open may sit with nothing on it before
+/// the system checks that the other end is still there, how often after
+/// that, and how many checks may go unanswered before the connection is
+/// given up. A peer that vanished without a word (its machine restarted,
+/// the network to it broke) sends nothing to say so, and the system's own
+/// checks start only after two hours of silence. These are the socket's
+/// settings, kept by the kernel: nothing is sent on the connection, and a
+/// live peer answers them even while it works on a long request, so only
+/// one that stopped answering is given up on, about a minute after it
+/// stopped. Every client weft makes to its own services, its own
+/// connections to the install's database (`weft_task_store::db::config`),
+/// and a database a Postgres node reaches use the same numbers.
+pub const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+pub const KEEPALIVE_RETRIES: u32 = 3;
+/// How long something sent may go unacknowledged before the system closes
+/// the connection (`TCP_USER_TIMEOUT`). A connection with a request in
+/// flight is not quiet, so the checks above never start on it, and the
+/// system would otherwise resend for about fifteen minutes before giving
+/// up. Once it has passed it also ends the checks above, which is what
+/// makes "about a minute" hold.
+pub const UNANSWERED_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `builder`, with every connection its client makes checked for a dead
+/// path once it goes quiet: a call held open on a quiet connection (a CLI
+/// waiting on the install's answer, the install holding a call to a
+/// worker for a run's whole life) keeps its path alive this way, and one
+/// whose path died (a peer gone without a word) fails within a minute or
+/// so instead of waiting for ever. It puts no limit on a call's whole
+/// length: some wait as long as a person's own work runs.
+pub fn notice_dead_connections(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder.tcp_keepalive(KEEPALIVE_IDLE).tcp_keepalive_interval(KEEPALIVE_INTERVAL).tcp_keepalive_retries(KEEPALIVE_RETRIES)
 }
 
 /// The first value of a header a chain of proxies may list comma-separated.
@@ -559,7 +602,7 @@ mod empty_body_tests {
     #[tokio::test]
     async fn a_post_with_nothing_to_send_names_its_length() {
         let url = format!("{}/_weft/tick", length_required_server().await);
-        let http = reqwest::Client::new();
+        let http = super::http_client().build().unwrap();
         assert_eq!(http.post(&url).send().await.unwrap().status(), 411, "the refusal this guards against");
         assert_eq!(http.post(&url).empty_body().send().await.unwrap().status(), 204);
     }

@@ -365,7 +365,7 @@ impl Project {
         Ok(format!("local/{}/{path}", self.id))
     }
 
-    /// Build the project's worker image and register it (the real
+    /// Build the project's worker and register it (the real
     /// compile path), starting nothing. A later run or activate then
     /// finds everything current and does no build of its own. Optional:
     /// a plain run builds on its own.

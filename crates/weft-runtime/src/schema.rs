@@ -136,7 +136,7 @@ static DOCUMENTS: &[Document] = &[
 /// error naming every stale group together. Serialization across racing
 /// boots is the guard's own job. Runs BEFORE any role's state is built; no
 /// role applies schema of its own.
-pub async fn apply(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+pub async fn apply(pool: &weft_task_store::db::Pool) -> anyhow::Result<()> {
     weft_task_store::apply_schema(pool, &groups(), &documents()).await.context("apply the schema")
 }
 

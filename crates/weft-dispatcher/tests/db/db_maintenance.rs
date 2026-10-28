@@ -5,7 +5,6 @@
 //! lift while the install is in maintenance.
 
 use serde_json::json;
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use weft_core::activation::ActivationKey;
@@ -15,11 +14,12 @@ use weft_dispatcher::activation_store::{
     ActivationLifecycle, ActivationStoreOps, Claimant, ClaimRefused, DownCause, Forget, LifecycleWrite, PostgresActivationStore, ProjectStatus,
     SignalsGoing,
 };
-use weft_dispatcher::maintenance::{self, LiftStep};
+use weft_dispatcher::maintenance;
+use weft_task_store::db::{Client as _, Pool};
 
 const TENANT: &str = "tenant-1";
 
-async fn setup(pool: &PgPool) -> (PostgresActivationStore, Uuid) {
+async fn setup(pool: &Pool) -> (PostgresActivationStore, Uuid) {
     weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
     let projects: weft_dispatcher::ProjectStore = std::sync::Arc::new(weft_dispatcher::PostgresProjectStore::new(pool.clone()));
     let id = Uuid::new_v4();
@@ -40,7 +40,7 @@ fn ada() -> Option<InstanceId> {
 }
 
 /// What is on across the rig's tenant.
-async fn going(pool: &PgPool) -> weft_core::maintenance::Going {
+async fn going(pool: &Pool) -> weft_core::maintenance::Going {
     let projects = weft_dispatcher::PostgresProjectStore::new(pool.clone());
     maintenance::going(pool, &projects, TENANT).await.unwrap()
 }
@@ -65,8 +65,8 @@ async fn take_down(activations: &PostgresActivationStore, id: Uuid, keys: &[Acti
 /// `on` marks what it takes down and records the copies it stops; a second
 /// `on` adds what is on by then and keeps the first one's time, marks and
 /// records.
-#[sqlx::test]
-async fn maintenance_on_marks_records_and_accumulates(pool: PgPool) {
+#[weft_db_macros::test]
+async fn maintenance_on_marks_records_and_accumulates(pool: Pool) {
     let (activations, id) = setup(&pool).await;
     turn_on(&activations, id, &[key("feed")], Claimant::Anyone).await;
     assert_eq!(going(&pool).await.triggers_on, 1);
@@ -99,17 +99,17 @@ async fn maintenance_on_marks_records_and_accumulates(pool: PgPool) {
 /// A copy whose stop is asked for and not yet carried out reads as being
 /// stopped, as `weft status` shows it, though its row still says
 /// `running`: what `weft maintenance on` waits for.
-#[sqlx::test]
-async fn a_stop_not_yet_carried_out_counts_as_going_down(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_stop_not_yet_carried_out_counts_as_going_down(pool: Pool) {
     use weft_dispatcher::infra_lifecycle_command::{TakeDownCommands, TakeDownWork, Teardown};
     let (_, id) = setup(&pool).await;
     for node in ["db", "cache"] {
-        sqlx::query("INSERT INTO infra_node (project_id, node_id, copy_id, status, health_rules_json_version) VALUES ($1, $2, $2, 'running', 1)")
-            .bind(id)
-            .bind(node)
-            .execute(&pool)
-            .await
-            .unwrap();
+        pool.execute(
+            "INSERT INTO infra_node (project_id, node_id, copy_id, status, health_rules_json_version) VALUES ($1, $2, $2, 'running', 1)",
+            &[&id, &node],
+        )
+        .await
+        .unwrap();
     }
     assert_eq!((going(&pool).await.copies_up, going(&pool).await.copies_changing), (2, 0));
 
@@ -127,8 +127,8 @@ async fn a_stop_not_yet_carried_out_counts_as_going_down(pool: PgPool) {
 /// A person taking a marked trigger down during the maintenance clears its
 /// mark: it stays off after the lift, and the maintenance can end without
 /// it.
-#[sqlx::test]
-async fn a_persons_deactivate_clears_the_maintenance_mark(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_persons_deactivate_clears_the_maintenance_mark(pool: Pool) {
     let (activations, id) = setup(&pool).await;
     turn_on(&activations, id, &[key("feed")], Claimant::Anyone).await;
     maintenance::begin(&pool, 100).await.unwrap();
@@ -143,10 +143,10 @@ async fn a_persons_deactivate_clears_the_maintenance_mark(pool: PgPool) {
 }
 
 /// The lift reads back only what the maintenance took down (never a
-/// trigger a person or the health check took down), infra first, and the
-/// maintenance ends once each record and mark is gone.
-#[sqlx::test]
-async fn the_lift_brings_back_only_what_was_marked_infra_first(pool: PgPool) {
+/// trigger a person or the health check took down), each owner's apart,
+/// and the maintenance ends once each record and mark is gone.
+#[weft_db_macros::test]
+async fn the_lift_brings_back_only_what_was_marked(pool: Pool) {
     let (activations, id) = setup(&pool).await;
     turn_on(&activations, id, &[key("feed"), key("door"), key("cron")], Claimant::Anyone).await;
     take_down(&activations, id, &[key("door")], DownCause::Person).await;
@@ -160,14 +160,8 @@ async fn the_lift_brings_back_only_what_was_marked_infra_first(pool: PgPool) {
     let left = maintenance::left(&pool).await.unwrap();
     assert_eq!(left.len(), 1);
     let ada = Owner::from_instance(ada());
-    assert_eq!(
-        left[0].steps(),
-        vec![
-            LiftStep::Start { owner: Owner::Shared, nodes: vec!["db".into()] },
-            LiftStep::Start { owner: ada.clone(), nodes: vec!["cache".into()] },
-            LiftStep::BringBack { owner: Owner::Shared, triggers: vec!["feed".into()] },
-        ]
-    );
+    assert_eq!(left[0].copies, std::collections::BTreeMap::from([(Owner::Shared, vec!["db".into()]), (ada.clone(), vec!["cache".into()])]));
+    assert_eq!(left[0].triggers, std::collections::BTreeMap::from([(Owner::Shared, vec!["feed".into()])]));
 
     // What the lift does as each comes back: a started copy is forgotten,
     // and the lift's claim clears the trigger's mark.
@@ -193,8 +187,8 @@ async fn the_lift_brings_back_only_what_was_marked_infra_first(pool: PgPool) {
 
 /// While the install is in maintenance, every claim but the lift's is
 /// refused; once it ends, anyone's goes through again.
-#[sqlx::test]
-async fn while_in_maintenance_activate_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn while_in_maintenance_activate_is_refused(pool: Pool) {
     let (activations, id) = setup(&pool).await;
     maintenance::begin(&pool, 100).await.unwrap();
     let refused = activations.try_begin_activating(id, &[key("feed")], Uuid::new_v4(), None, Claimant::Anyone).await.unwrap();
@@ -210,8 +204,8 @@ async fn while_in_maintenance_activate_is_refused(pool: PgPool) {
 /// new weft) does not hold the install: the maintenance ends, nothing is
 /// refused any more, and what it had taken down stays recorded as that
 /// project's, for its next resync to bring back, which clears the mark.
-#[sqlx::test]
-async fn what_a_project_could_not_bring_back_outlives_the_maintenance(pool: PgPool) {
+#[weft_db_macros::test]
+async fn what_a_project_could_not_bring_back_outlives_the_maintenance(pool: Pool) {
     let (activations, id) = setup(&pool).await;
     turn_on(&activations, id, &[key("feed")], Claimant::Anyone).await;
     maintenance::begin(&pool, 100).await.unwrap();
@@ -222,14 +216,8 @@ async fn what_a_project_could_not_bring_back_outlives_the_maintenance(pool: PgPo
     assert!(!maintenance::is_on(&pool).await.unwrap(), "one project left down never keeps the install in maintenance");
     let left = maintenance::left(&pool).await.unwrap();
     assert_eq!(left.len(), 1);
-    assert_eq!(
-        left[0].steps(),
-        vec![
-            LiftStep::Start { owner: Owner::Shared, nodes: vec!["db".into()] },
-            LiftStep::BringBack { owner: Owner::Shared, triggers: vec!["feed".into()] },
-        ],
-        "still the project's own, to bring back"
-    );
+    assert_eq!(left[0].copies, std::collections::BTreeMap::from([(Owner::Shared, vec!["db".into()])]), "still the project's own, to bring back");
+    assert_eq!(left[0].triggers, std::collections::BTreeMap::from([(Owner::Shared, vec!["feed".into()])]));
     // What the resync's bring-back does: the copy started and forgotten,
     // the trigger claimed and landed on, which clears its mark.
     maintenance::forget_copies(&pool, id, None, &["db".into()]).await.unwrap();
@@ -245,8 +233,8 @@ async fn what_a_project_could_not_bring_back_outlives_the_maintenance(pool: PgPo
 /// registers) keeps that request's name, files and inputs on the project.
 /// A project registered with none (a build an older weft registered) has
 /// nothing to build from, which the lift says.
-#[sqlx::test]
-async fn the_lift_rebuilds_from_the_version_the_running_build_came_from(pool: PgPool) {
+#[weft_db_macros::test]
+async fn the_lift_rebuilds_from_the_version_the_running_build_came_from(pool: Pool) {
     use std::sync::Arc;
     use weft_compiler::build_plan::{ImageKind, PlannedImage};
     use weft_core::builds::{BuildInputs, BuiltProgram, NodeSet, VersionSource};
@@ -268,8 +256,7 @@ async fn the_lift_rebuilds_from_the_version_the_running_build_came_from(pool: Pg
         context_dir: "/tmp/ctx".into(),
         node_id: None,
         image_name: None,
-        uses: Default::default(),
-        result_file: None,
+        recipe: weft_core::builds::BuildRecipe::Dockerfile { result_file: None },
     }];
     let version = Version {
         name: "shop".into(),
@@ -288,16 +275,15 @@ async fn the_lift_rebuilds_from_the_version_the_running_build_came_from(pool: Pg
             worker_image: worker.into(),
             left_out: Vec::new(),
             worker_log: None,
+            node_needs: Default::default(),
         },
         images: vec![worker.into()],
         ask: projects.next_build_ask(id).await.unwrap(),
     };
     let fake = Arc::new(FakeImageBuilder::new());
     let builder = VersionBuilder {
-        bases: weft_compiler::worker_image::BaseImages { builder: "reg:5000/base:1".into(), runtime: "debian:bookworm-slim".into() },
         images: fake.clone(),
         pool: pool.clone(),
-        compile_lanes: 1,
         prunes: Default::default(),
         blobs: weft_dispatcher::build::blob_cache::BlobCache::in_temp_dir(),
     };
@@ -332,8 +318,8 @@ impl weft_dispatcher::build::BuildGate for NoGate {
 /// An activation the lift starts that ends without landing (cancelled,
 /// failed, its driver dead) leaves the trigger marked: the claim keeps the
 /// mark and only landing on clears it, so the next lift brings it back.
-#[sqlx::test]
-async fn a_failed_lift_activation_keeps_the_mark(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_failed_lift_activation_keeps_the_mark(pool: Pool) {
     let (activations, id) = setup(&pool).await;
     turn_on(&activations, id, &[key("feed")], Claimant::Anyone).await;
     maintenance::begin(&pool, 100).await.unwrap();

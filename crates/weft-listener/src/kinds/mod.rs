@@ -39,6 +39,7 @@
 //!     consulted for entry-mode (`is_resume = false`).
 
 pub mod event_source;
+pub mod folder_watch;
 pub mod sse_subscribe;
 pub mod poll_endpoint;
 pub mod provider_events;
@@ -61,8 +62,8 @@ use parking_lot::Mutex;
 
 use crate::config::ListenerConfig;
 use crate::event_context::FireContext;
-use weft_core::signal::listener_protocol::{MatchedPush, ProcessOutcome, ProcessTarget, PushEvent, StartMode};
-use crate::registry::{RegisteredSignal, ServingState, TaskGuard, Transport};
+use weft_core::signal::listener_protocol::{MatchedPush, PriorRow, ProcessOutcome, ProcessTarget, PushEvent, StartMode};
+use crate::registry::{RegisteredSignal, Registrations, ServingState, TaskGuard, Transport};
 
 /// Everything a kind's work on one signal runs with, bundled: the
 /// per-signal identity + fire plumbing (as a ready [`FireContext`],
@@ -85,7 +86,7 @@ pub struct SpawnCtx {
     /// Told each time the serving state changes, so a holder says it
     /// (`crate::hold`): the row is where another process reads it.
     pub said: Arc<tokio::sync::Notify>,
-    /// Where this process connects and as whom, as the broker last said.
+    /// The credentials this process connects with, as the broker last said.
     pub reach: Arc<crate::reach::Reach>,
 }
 
@@ -138,13 +139,20 @@ pub struct Woken {
     /// When it arrived, or its moment when it arrived a little before it
     /// (within what counts as on time).
     pub now_ms: i64,
-    /// The signal's durable state as read just now, and the write-fence
-    /// version it is at.
-    pub state: Value,
-    pub seq: i64,
+    /// The signal's durable state as read just now.
+    pub stored: RowState,
     /// True when the signal is a parked run's wait (`await_signal`)
     /// rather than an entry trigger, read off the row like the state.
     pub is_resume: bool,
+}
+
+/// A signal's durable state as its row holds it, and the write-fence
+/// version it is at: whoever acts on it writes the next version from
+/// `seq` ([`FireContext::claim_kind_state`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowState {
+    pub state: Value,
+    pub seq: i64,
 }
 
 /// What a wake leaves: the state the signal now stands at, and the row
@@ -209,7 +217,7 @@ pub trait KindHandler: Send + Sync {
 
     /// For a `Wakes` kind: handle one wake. A wake may arrive late,
     /// twice, or after the thing it was set for changed, so the kind
-    /// recomputes from `woken.state` whether anything is due, CLAIMS the
+    /// recomputes from `woken.stored` whether anything is due, CLAIMS the
     /// moment through [`FireContext::claim_kind_state`] before acting (so
     /// of two copies woken for it, one acts), fires through `ctx.fire`,
     /// and answers the state it now stands at (for its next wake), or
@@ -247,41 +255,44 @@ pub trait KindHandler: Send + Sync {
         false
     }
 
-    /// Compute the initial opaque state to persist on the signal row
-    /// at register time. Default: empty object. Kinds that need to
-    /// survive a listener restart return values keyed by their own
-    /// schema (Timer: `{"next_fire_at_unix_ms": <abs unix>}` for After,
-    /// `{}` for Cron/At since those are wall-clock-absolute).
+    /// The state a new signal's row starts from when nothing is carried
+    /// over ([`prepare_signal`] decides that). Default: an empty object. A
+    /// kind that keeps something across a listener restart keys it its
+    /// own way (Timer: the next moment it fires, `{"next_fire_at_unix_ms":
+    /// <unix ms>}`, or `{}` once nothing is left to fire).
     ///
-    /// **Persistence policy**: what this returns replaces the stored
-    /// state, and moves the row to a new version, only while the row is
-    /// still at the version `prior` was read at (`signal_insert` is a
-    /// compare-and-set). A wake that claimed a moment in between moved
-    /// the version, so the dispatcher reads the row again and asks
-    /// again; a wake claiming after the registration finds the version
-    /// moved and loses. Either way the registration's state is computed
-    /// from the state it replaces.
-    ///
-    /// `prior` is the previously-persisted state when the reused entry
-    /// token already has a row (None on first registration). Timer
-    /// IGNORES it
-    /// (reactivate is a fresh schedule by design); a kind whose state
-    /// is a feed cursor (poll_endpoint) returns it forward so a
-    /// deactivate/activate cycle never re-primes and silently
-    /// discards what arrived in between.
+    /// What a registration computes replaces the stored state, and moves
+    /// the row to a new version, only while the row is still at the
+    /// version it was read at (`signal_insert` is a compare-and-set). A
+    /// wake that claimed a moment in between moved the version, so the
+    /// dispatcher reads the row again and asks again; a wake claiming
+    /// after the registration finds the version moved and loses.
     ///
     /// `asked_at_unix_ms` is when the registration was asked for (the
     /// node's `await_signal`, or the activation), for a kind whose state
     /// counts from that moment. `is_resume` says which of the two it is,
     /// for a kind that behaves differently while a run waits on it.
-    fn compute_initial_state(
-        &self,
-        _spec: &SignalSpec,
-        _prior: Option<&Value>,
-        _asked_at_unix_ms: i64,
-        _is_resume: bool,
-    ) -> Result<Value> {
+    fn compute_initial_state(&self, _spec: &SignalSpec, _asked_at_unix_ms: i64, _is_resume: bool) -> Result<Value> {
         Ok(Value::Object(serde_json::Map::new()))
+    }
+
+    /// For a kind that keeps its place in what it reads (a feed's cursor,
+    /// what a folder held): what identifies that source in `spec`, so a
+    /// registration again can tell whether it reads the same one. `None`,
+    /// the default, for a kind with no place to keep. A kind with a source
+    /// keeps nothing [`Self::settle`] decides in its state: a door that
+    /// refuses gives it [`Self::compute_initial_state`]'s state, without
+    /// settling again ([`fresh_place`]).
+    fn source(&self, _spec: &SignalSpec) -> Result<Option<Value>> {
+        Ok(None)
+    }
+
+    /// For a kind with a [`Self::source`]: the state a registration again
+    /// starts from when [`prepare_signal`] carries over `prior`, the state
+    /// of the row it replaces. It keeps the place and nothing else (no
+    /// failure count, nothing about how the last registration was served).
+    fn carry(&self, _spec: &SignalSpec, _prior: &Value) -> Result<Value> {
+        anyhow::bail!("the '{}' kind names a source it reads from but says nothing of what it carries over", self.tag())
     }
 
     /// Refuse a spec this kind cannot serve as a parked run's wait
@@ -297,12 +308,13 @@ pub trait KindHandler: Send + Sync {
     /// an unserviceable one) so the start surfaces a 400 and activation
     /// fails loudly instead of minting a dead trigger.
     ///
-    /// `kind_state` is the opaque blob persisted on the row at
-    /// register time (or read back from the row on restore).
+    /// `stored` is the kind's state as the row holds it (written at
+    /// register time, or by the task itself since), and the write-fence
+    /// version it is at.
     async fn spawn_task(
         &self,
         _spec: &SignalSpec,
-        _kind_state: &Value,
+        _stored: RowState,
         _ctx: SpawnCtx,
     ) -> Result<Option<JoinHandle<()>>> {
         Ok(None)
@@ -458,15 +470,14 @@ pub struct Prepared {
 /// dispatcher has committed the row, so whatever it starts (a wake, a
 /// held connection) always finds its row.
 ///
-/// `prior_kind_state` is the state the row already holds when the token
-/// is reused (an entry across reactivates), so a kind whose state is a
-/// feed cursor carries it forward instead of re-priming.
-/// `asked_at_unix_ms` is when the registration was asked for.
+/// `prior` is the row already under the token, when there is one; what
+/// it carries over is decided by [`carried`], the same way for every
+/// kind. `asked_at_unix_ms` is when the registration was asked for.
 pub async fn prepare_signal(
     state: &crate::ListenerState,
     identity: SignalIdentity,
     for_instance: Option<weft_core::instance::InstanceScope>,
-    prior_kind_state: Option<&Value>,
+    prior: Option<&PriorRow>,
     asked_at_unix_ms: i64,
 ) -> Result<Prepared> {
     let SignalIdentity { token, tenant_id, node_id, is_resume, run_id, spec } = identity;
@@ -495,7 +506,10 @@ pub async fn prepare_signal(
         );
     }
     let routing = handler.compute_routing(&spec)?;
-    let computed = handler.compute_initial_state(&spec, prior_kind_state, asked_at_unix_ms, is_resume)?;
+    let computed = match carried(handler, &spec, is_resume, prior)? {
+        Some(prior) => handler.carry(&spec, prior)?,
+        None => handler.compute_initial_state(&spec, asked_at_unix_ms, is_resume)?,
+    };
     // Settling may look at the signal's connection, through the broker,
     // as the signal itself would once up; its slot shows nothing, and it
     // has no registration yet to give up on, nor to keep what it fetched for.
@@ -503,6 +517,7 @@ pub async fn prepare_signal(
     let kind_state = handler.settle(&spec, computed, &ctx).await?;
     let holds = handler.between_fires(&spec, &kind_state)? == BetweenFires::Holds;
     let signal = RegisteredSignal {
+        generation: crate::reach::UNREGISTERED,
         spec,
         node_id,
         tenant_id,
@@ -516,6 +531,43 @@ pub async fn prepare_signal(
     };
     let rendered = handler.render(&token, &signal)?;
     Ok(Prepared { routing, kind_state, rendered, holds })
+}
+
+/// The state of the replaced row `prior` a registration of `spec` carries
+/// over, decided once here for every kind: only an entry's (a run's wait
+/// starts afresh), only when its trigger listened the whole time the row
+/// was not served ([`PriorRow::listened`]), and only for a kind that keeps
+/// its place in a source ([`KindHandler::source`]) when the source is the
+/// one the row read. So what arrived while the trigger listened is caught
+/// up from where it left off, what arrived behind a door that refused
+/// never is, and a trigger pointed at another feed or folder starts there
+/// fresh. `None`: the kind starts fresh ([`KindHandler::compute_initial_state`]).
+fn carried<'a>(handler: &dyn KindHandler, spec: &SignalSpec, is_resume: bool, prior: Option<&'a PriorRow>) -> Result<Option<&'a Value>> {
+    let Some(prior) = prior.filter(|prior| !is_resume && prior.listened && prior.spec.kind == spec.kind) else {
+        return Ok(None);
+    };
+    let Some(source) = handler.source(spec)? else {
+        return Ok(None);
+    };
+    let before = handler.source(&prior.spec).map_err(|e| e.context("reading the source of the row this registration replaces"))?;
+    Ok((before.as_ref() == Some(&source)).then_some(&prior.kind_state))
+}
+
+/// The state an entry signal of `spec` starts from once its place in what
+/// it reads is gone, at `now_unix_ms`: a trigger that stops listening
+/// behind a door that refuses loses it there, so whatever brings the
+/// signal up later starts from its source as it finds it. Only for a kind
+/// that keeps such a place ([`KindHandler::source`]); `None` for any other
+/// kind, whose state stays as it is (a timer keeps its schedule). It is
+/// the state a fresh registration computes
+/// ([`KindHandler::compute_initial_state`]), unsettled (see
+/// [`KindHandler::source`]).
+pub fn fresh_place(spec: &SignalSpec, now_unix_ms: i64) -> Result<Option<Value>> {
+    let handler = handler_or_err(&spec.kind)?;
+    if handler.source(spec)?.is_none() {
+        return Ok(None);
+    }
+    handler.compute_initial_state(spec, now_unix_ms, false).map(Some)
 }
 
 /// Bring a row up: a signal that holds a connection gets its task started
@@ -555,7 +607,6 @@ pub async fn bring_up(state: &crate::ListenerState, row: weft_broker_client::pro
                 generation: Some(row.generation),
                 set_again: 0,
                 row: None,
-                addresses: Default::default(),
                 ended: false,
             };
             match wake(state, woken).await? {
@@ -570,14 +621,18 @@ pub async fn bring_up(state: &crate::ListenerState, row: weft_broker_client::pro
             // BEFORE the new task starts: an outside teardown is keyed by
             // the token (a provider subscription is dropped by it), so run
             // after the new task subscribed it would drop the new one.
-            stop_held(state, &row.token).await;
+            // Only an older registration (or this one) is displaced: a
+            // bring-up of a stale row never gets this far
+            // ([`crate::registry::hold`] leaves a newer one be).
+            stop_held(state, &row.token, Registrations::UpTo(row.generation)).await;
             let serving = Arc::new(Mutex::new(ServingState::default()));
             let mut ctx = spawn_ctx(state, &row.token, row.generation, &row.tenant_id, row.for_instance.clone(), &spec, fresh, serving.clone());
             // Its fires go out under this holder's claim, so a copy that
             // lost the row (to another holder, or to a registration that no
             // longer holds) delivers nothing from then on.
             ctx.fire = ctx.fire.held_by(state.config.replica.clone());
-            let Some(task) = handler.spawn_task(&spec, &row.kind_state, ctx).await? else {
+            let stored = RowState { state: row.kind_state.clone(), seq: row.kind_state_seq };
+            let Some(task) = handler.spawn_task(&spec, stored, ctx).await? else {
                 anyhow::bail!(
                     "the '{}' kind holds a connection but started no task; its `between_fires` \
                      and its `spawn_task` disagree",
@@ -587,6 +642,7 @@ pub async fn bring_up(state: &crate::ListenerState, row: weft_broker_client::pro
             state.registry.insert(
                 row.token,
                 RegisteredSignal {
+                    generation: row.generation,
                     spec,
                     node_id: row.node_id,
                     tenant_id: row.tenant_id,
@@ -610,8 +666,26 @@ pub async fn bring_up(state: &crate::ListenerState, row: weft_broker_client::pro
 /// holds stops through [`forget`]; any other signal tears down from the
 /// removed row the request carries (a subscription it renews on its
 /// wakes), loud in logs on failure, and detached unless the token is
-/// `reused` right after. A connection a holder elsewhere holds stops
-/// there, when its claim goes with the row.
+/// `reused` right after. Which of the two is decided by the removed
+/// registration's own presence here, never by an older one of the token
+/// lingering here (which `forget` stops beside it). A connection a holder
+/// elsewhere holds stops there, when its claim goes with the row.
+///
+/// The removed row is one registration of its token (`req.generation`),
+/// and a token can be registered again (a resume's token is fixed), so
+/// an unregister can arrive after a newer registration of the token came
+/// up here: it then stops nothing and tears nothing down (the teardown is
+/// keyed by the token, so it would undo what the newer one arranged), and
+/// only the removed row's own wakes, named by its generation, are
+/// cancelled. Only a newer registration that RUNS here counts as come
+/// up: one that is counted down or given up on runs nothing, so the
+/// removed row's own entry, which may still be what runs (the newer one
+/// failed before displacing it), is stopped; what is newer is left be,
+/// since [`forget`] covers only the removed registration and older, and
+/// no outside teardown keyed by the token is run beside it. A newer
+/// registration this listener knows nothing of, running on a sibling
+/// listener, is found in the token's row ([`superseded_elsewhere`]) and
+/// keeps every token-keyed teardown off the same way.
 ///
 /// A row this listener cannot tear down is an error, which says whether
 /// trying again can help ([`UnregisterError`]).
@@ -619,60 +693,140 @@ pub async fn unregister(
     state: &crate::ListenerState,
     req: weft_core::signal::listener_protocol::UnregisterRequest,
 ) -> std::result::Result<(), UnregisterError> {
-    state.reach.forget(&req.token);
+    let mine = Registrations::UpTo(req.generation);
     let read = lookup(&req.spec.kind).ok_or_else(|| UnregisterError::UnknownKind(req.spec.kind.clone())).and_then(|handler| {
         let between = handler.between_fires(&req.spec, &req.kind_state).map_err(|e| {
             UnregisterError::Unreadable(e.context(format!("signal {}'s state cannot be read, so what it arranged outside is not torn down", req.token)))
         })?;
         Ok((handler, between))
     });
-    let here = state.registry.get(&req.token).is_some() || state.registry.down_reason(&req.token).is_some();
-    if here {
-        // Counted down here first, so its retry stops before its wakes are
-        // cancelled. One whose kind or state cannot be read never came up,
-        // so it set no wake.
-        let teardown = forget(state, &req.token);
+    if let Some(newer) = state.registry.get(&req.token).map(|s| s.generation).filter(|g| *g > req.generation) {
+        tracing::debug!(
+            target: "weft_listener::kinds",
+            token = %req.token, generation = req.generation, newer,
+            "an unregister of an older registration arrived after a newer one came up; the newer one stays"
+        );
         if let Ok((_, BetweenFires::Wakes)) = &read {
             cancel_wakes_of(state, &req).await?;
         }
-        if req.reused {
-            teardown
-                .await
-                .map_err(|e| UnregisterError::TeardownFailed(anyhow::anyhow!("the teardown of signal {} ended abnormally: {e}", req.token)))?;
-        }
         return Ok(());
     }
-    let (handler, between) = read?;
-    match between {
-        BetweenFires::Holds => return Ok(()),
-        BetweenFires::Wakes => cancel_wakes_of(state, &req).await?,
-        BetweenFires::Called => {}
-    }
-    let sig = RegisteredSignal {
-        spec: req.spec,
-        node_id: String::new(),
-        tenant_id: req.tenant_id,
-        is_resume: false,
-        run_id: None,
-        task: None,
-        kind_state: Some(req.kind_state),
-        routing: SignalRouting {
-            surface: weft_core::primitive::SignalSurface::Internal,
-            auth: weft_core::primitive::SignalAuth::None,
-            auth_config: Value::Null,
-        },
-        serving: Arc::default(),
-        gave_up: None,
+    // Registration `g` itself, when it is here, stops and tears down
+    // through `forget`, and so does anything older still lingering here
+    // (a leftover counted down, a held one whose successor's kind no
+    // longer holds). When `g` never came up here (it wakes or is called
+    // and came up on a sibling listener), `forget` has no entry of it to
+    // tear down, so its outside teardown runs from the removed row the
+    // request carries, beside the leftovers' and not instead of it. A
+    // newer registration counted down or given up on here keeps that
+    // token-keyed teardown off, since it would undo what the newer one
+    // arranges.
+    let present = state.registry.present(&req.token, req.generation);
+    let newer = state.registry.newer_than(&req.token, req.generation).is_some();
+    let superseded = !present && !newer && superseded_elsewhere(state, &req, &read).await?;
+    // Counted down here first, so a retry stops before its wakes are
+    // cancelled. A newer registration running on a sibling listener keeps
+    // every teardown keyed by the token off, the leftovers' included: they
+    // only stop here.
+    let leftovers = match superseded {
+        true => {
+            stop_here_only(state, &req.token, mine);
+            None
+        }
+        false => Some(forget(state, &req.token, mine)),
     };
-    let broker = state.events_broker.clone();
-    let token = req.token.clone();
-    let teardown = tokio::spawn(async move { handler.on_unregister(&req.token, &sig, &broker).await });
+    let from_row = if present || newer || superseded {
+        // One whose kind or state cannot be read never came up, so it set
+        // no wake.
+        if let Ok((_, BetweenFires::Wakes)) = &read {
+            cancel_wakes_of(state, &req).await?;
+        }
+        None
+    } else {
+        let (handler, between) = read?;
+        match between {
+            // A connection held elsewhere stops there, when its claim goes
+            // with the row.
+            BetweenFires::Holds => None,
+            BetweenFires::Wakes => {
+                cancel_wakes_of(state, &req).await?;
+                Some(handler)
+            }
+            BetweenFires::Called => Some(handler),
+        }
+    };
+    let teardown = from_row.map(|handler| {
+        let sig = RegisteredSignal {
+            generation: req.generation,
+            spec: req.spec,
+            node_id: String::new(),
+            tenant_id: req.tenant_id,
+            is_resume: false,
+            run_id: None,
+            task: None,
+            kind_state: Some(req.kind_state),
+            routing: SignalRouting {
+                surface: weft_core::primitive::SignalSurface::Internal,
+                auth: weft_core::primitive::SignalAuth::None,
+                auth_config: Value::Null,
+            },
+            serving: Arc::default(),
+            gave_up: None,
+        };
+        let broker = state.events_broker.clone();
+        let token = req.token.clone();
+        tokio::spawn(async move { handler.on_unregister(&token, &sig, &broker).await })
+    });
     if req.reused {
-        teardown
-            .await
-            .map_err(|e| UnregisterError::TeardownFailed(anyhow::anyhow!("the teardown of signal {token} ended abnormally: {e}")))?;
+        let ended = |e: tokio::task::JoinError| UnregisterError::TeardownFailed(anyhow::anyhow!("the teardown of signal {} ended abnormally: {e}", req.token));
+        if let Some(leftovers) = leftovers {
+            leftovers.await.map_err(ended)?;
+        }
+        if let Some(teardown) = teardown {
+            teardown.await.map_err(ended)?;
+        }
     }
     Ok(())
+}
+
+/// Whether removed registration `req`, which neither it nor anything newer
+/// of its token runs here, has been superseded by a newer registration of
+/// the token that a sibling listener runs: its row now listens at a newer
+/// generation. Then the token-keyed teardown would undo what that newer
+/// one arranged outside (cancel the provider subscription it relies on),
+/// so it is not run. Read through the broker only when that teardown is
+/// about to run (an older entry of the token lingers here, or the removed
+/// row's kind tears down from its row), and never for a `reused` token:
+/// its caller brings the newer one up only after this answers, so what
+/// the row now reads is not running anywhere yet and the removed one's
+/// teardown must run. A row read that fails fails this unregister
+/// ([`UnregisterError::RowUnread`]): tearing down blind could cancel a
+/// live subscription, skipping blind could leave a dead one renewed.
+async fn superseded_elsewhere(
+    state: &crate::ListenerState,
+    req: &weft_core::signal::listener_protocol::UnregisterRequest,
+    read: &std::result::Result<(&'static dyn KindHandler, BetweenFires), UnregisterError>,
+) -> std::result::Result<bool, UnregisterError> {
+    let lingering = state.registry.get(&req.token).is_some();
+    let from_row = matches!(read, Ok((_, BetweenFires::Wakes | BetweenFires::Called)));
+    if req.reused || !(lingering || from_row) {
+        return Ok(false);
+    }
+    let row = state.signals.get_held(&req.token).await.map_err(|e| {
+        UnregisterError::RowUnread(e.context(format!(
+            "signal {}'s row cannot be read, so whether a newer registration of it runs elsewhere is unknown and nothing is torn down",
+            req.token
+        )))
+    })?;
+    let Some(newer) = row.map(|r| r.generation).filter(|g| *g > req.generation) else {
+        return Ok(false);
+    };
+    tracing::debug!(
+        target: "weft_listener::kinds",
+        token = %req.token, generation = req.generation, newer,
+        "an unregister of an older registration arrived after a newer one came up on another listener; what it arranged outside stays"
+    );
+    Ok(true)
 }
 
 /// Cancel the wakes of the removed row `req` names ([`cancel_wakes`]),
@@ -704,20 +858,24 @@ pub enum UnregisterError {
     UnknownKind(String),
     /// The teardown itself ended abnormally.
     TeardownFailed(anyhow::Error),
+    /// Its row could not be read to tell whether a newer registration of
+    /// its token runs on another listener; nothing was touched, and
+    /// trying again can help.
+    RowUnread(anyhow::Error),
 }
 
 impl std::fmt::Display for UnregisterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UnregisterError::Unreadable(e) | UnregisterError::TeardownFailed(e) => write!(f, "{e:#}"),
+            UnregisterError::Unreadable(e) | UnregisterError::TeardownFailed(e) | UnregisterError::RowUnread(e) => write!(f, "{e:#}"),
             UnregisterError::UnknownKind(kind) => write!(f, "the signal is of the kind '{kind}', which this listener does not know"),
         }
     }
 }
 
 /// Stop holding `token`: drop its registry entry (which aborts its task),
-/// stop counting it down or given up here, drop what the process keeps of
-/// where it connects and as whom (`crate::reach`), and have its kind tear down
+/// stop counting it down or given up here, drop the credentials the process
+/// keeps for it (`crate::reach`), and have its kind tear down
 /// what it holds outside this process (a provider-side subscription),
 /// detached and loud in logs on failure. Its wakes are its caller's to
 /// cancel ([`unregister`]). Answers the teardown's task, for a caller
@@ -730,11 +888,14 @@ impl std::fmt::Display for UnregisterError {
 /// subscription. The guard is taken synchronously when free, which is the
 /// case for an unregister; when a bring-up of this token holds it (a row
 /// found gone while it came up), the teardown queues behind that one.
-pub fn forget(state: &crate::ListenerState, token: &str) -> tokio::task::JoinHandle<()> {
-    state.registry.clear_down(token);
-    state.registry.drop_unrecorded(token);
-    state.reach.forget(token);
-    let teardown = stop_held(state, token);
+///
+/// Only the registrations `which` names are stopped: a newer one that
+/// came up under the token since stays, with what it arranged outside.
+pub fn forget(state: &crate::ListenerState, token: &str, which: Registrations) -> tokio::task::JoinHandle<()> {
+    state.registry.clear_down(token, which);
+    state.registry.drop_unrecorded(token, which);
+    state.reach.forget(token, which);
+    let teardown = stop_held(state, token, which);
     let registry = state.registry.clone();
     let token = token.to_string();
     let guard = registry.bring_up_guard(&token);
@@ -751,15 +912,16 @@ pub fn forget(state: &crate::ListenerState, token: &str) -> tokio::task::JoinHan
     })
 }
 
-/// Stop what runs under `token`: its entry leaves the registry at once,
-/// and the returned future aborts its task and has its kind tear down what
-/// it holds outside this process ([`on_unregister`]). Every path that ends
-/// or replaces a held entry goes through here, so no displaced entry skips
-/// its teardown and leaves, say, a provider subscription posting to it.
-pub fn stop_held(state: &crate::ListenerState, token: &str) -> impl std::future::Future<Output = ()> + Send + 'static {
+/// Stop what runs under `token` when it is one of `which`: its entry
+/// leaves the registry at once, and the returned future aborts its task
+/// and has its kind tear down what it holds outside this process
+/// ([`on_unregister`]). Every path that ends or replaces a held entry goes
+/// through here, so no displaced entry skips its teardown and leaves, say,
+/// a provider subscription posting to it.
+pub fn stop_held(state: &crate::ListenerState, token: &str, which: Registrations) -> impl std::future::Future<Output = ()> + Send + 'static {
     // Our handle to the task goes first, so the loop is not left serving
     // while its teardown talks to the provider.
-    let displaced = remove_here(state, token);
+    let displaced = remove_here(state, token, which);
     let broker = state.events_broker.clone();
     let token = token.to_string();
     async move {
@@ -776,16 +938,25 @@ pub fn stop_held(state: &crate::ListenerState, token: &str) -> impl std::future:
 /// (a provider subscription is keyed by the token, so tearing it down
 /// would undo what the next holder arranged).
 pub fn stop_here(state: &crate::ListenerState, token: &str) {
-    state.registry.clear_down(token);
-    state.registry.drop_unrecorded(token);
-    state.reach.forget(token);
-    remove_here(state, token);
+    // Whatever runs under the token is this holder's claim, whichever
+    // registration it is.
+    stop_here_only(state, token, Registrations::All);
 }
 
-/// Take `token`'s entry out of the registry and drop its handle to the
-/// task, which stops the task once no reader still holds a copy.
-fn remove_here(state: &crate::ListenerState, token: &str) -> Option<RegisteredSignal> {
-    let mut sig = state.registry.remove(token)?;
+/// [`stop_here`] for the registrations `which` names: a newer one that
+/// came up here since stays.
+fn stop_here_only(state: &crate::ListenerState, token: &str, which: Registrations) {
+    state.registry.clear_down(token, which);
+    state.registry.drop_unrecorded(token, which);
+    state.reach.forget(token, which);
+    remove_here(state, token, which);
+}
+
+/// Take `token`'s entry out of the registry when it is one of `which`, and
+/// drop its handle to the task, which stops the task once no reader still
+/// holds a copy.
+fn remove_here(state: &crate::ListenerState, token: &str, which: Registrations) -> Option<RegisteredSignal> {
+    let mut sig = state.registry.remove(token, which)?;
     drop(sig.task.take());
     Some(sig)
 }
@@ -851,10 +1022,6 @@ pub struct WakeBody {
     /// reads nothing, and writes only what changed for good.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row: Option<weft_broker_client::protocol::SignalRowWire>,
-    /// With the row, where the signal's addresses are, as the broker said
-    /// (`crate::reach`), by the address given.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub addresses: std::collections::BTreeMap<String, weft_broker_client::protocol::ListenerInfraAddress>,
     /// Set by [`cancel_wakes`] under the name of a wake it cancelled, so a
     /// wake of the same registration being handled right now finds the name
     /// taken when it sets its next one there, and its chain ends. It does
@@ -906,11 +1073,10 @@ pub async fn arm_next_wake(
         generation: Some(row.generation),
         set_again: 0,
         row: None,
-        addresses: Default::default(),
         ended: false,
     };
     if handler.wakes_from_body() && row_is_written {
-        let carried = WakeBody { row: Some(row.clone()), addresses: state.reach.addresses_of(&row.token), ..body.clone() };
+        let carried = WakeBody { row: Some(row.clone()), ..body.clone() };
         if serde_json::to_vec(&carried)?.len() <= state.alarm.largest_body() {
             body = carried;
         }
@@ -948,7 +1114,6 @@ pub async fn cancel_wakes(state: &crate::ListenerState, token: &str, generation:
             generation: Some(generation),
             set_again: 0,
             row: None,
-            addresses: Default::default(),
             ended: true,
         };
         let wake = signal_wake(token, generation, 0, at, serde_json::to_value(ended)?);
@@ -1116,7 +1281,7 @@ pub async fn wake(state: &crate::ListenerState, body: WakeBody) -> Result<Option
     // Set again, it is one that reads its row at its moment: a cancel
     // names only the wakes the row's state names.
     let again = || {
-        let again = WakeBody { set_again: body.set_again + 1, row: None, addresses: Default::default(), ..body.clone() };
+        let again = WakeBody { set_again: body.set_again + 1, row: None, ..body.clone() };
         Ok(signal_wake(&again.token, again.generation.unwrap_or(0), again.set_again, aimed_at_ms, serde_json::to_value(&again)?))
     };
     if let Some(set) = weft_platform_traits::alarm::set_again_if_early(&*state.alarm, aimed_at_ms, again).await {
@@ -1126,16 +1291,13 @@ pub async fn wake(state: &crate::ListenerState, body: WakeBody) -> Result<Option
     // A wake inside the tolerance counts as arriving at its moment, so the
     // next moment its kind picks is after this one.
     let now_ms = now_unix_ms().max(aimed_at_ms);
-    for (authority, answer) in body.addresses {
-        state.reach.keep_address(&body.token, &authority, answer);
-    }
     let row = match body.row {
         Some(row) => row,
         None => match state.signals.get_held(&body.token).await? {
             Some(row) if body.generation.is_none_or(|g| g == row.generation) && row.held_failed.is_none() => row,
             _ => {
                 tracing::debug!(target: "weft_listener::kinds", token = %body.token, "a wake for a signal gone, registered again or given up; nothing to do");
-                state.reach.forget(&body.token);
+                state.reach.forget(&body.token, body.generation.map_or(Registrations::All, Registrations::UpTo));
                 return Ok(None);
             }
         },
@@ -1161,7 +1323,7 @@ pub async fn wake(state: &crate::ListenerState, body: WakeBody) -> Result<Option
     // `bring_up`), so its serving slot lives for this one wake.
     let serving = Arc::new(Mutex::new(ServingState::default()));
     let ctx = spawn_ctx(state, &row.token, row.generation, &row.tenant_id, row.for_instance.clone(), &spec, false, serving);
-    let woken = Woken { aimed_at_ms, now_ms, state: row.kind_state.clone(), seq: row.kind_state_seq, is_resume: row.is_resume };
+    let woken = Woken { aimed_at_ms, now_ms, stored: RowState { state: row.kind_state.clone(), seq: row.kind_state_seq }, is_resume: row.is_resume };
     let after = match handler.on_wake(&spec, woken, ctx).await {
         Ok(Some(after)) => after,
         Ok(None) => return Ok(None),
@@ -1187,7 +1349,7 @@ async fn set_next_after_acting(
     let done_at_ms = now_unix_ms().max(aimed_at_ms);
     if handler.wakes_from_body() && !on_time_or_still_registered(state, handler, spec, row, aimed_at_ms, done_at_ms).await? {
         tracing::info!(target: "weft_listener::kinds", token = %row.token, "a wake whose signal went or was registered again while it was handled; it sets no next one");
-        state.reach.forget(&row.token);
+        state.reach.forget(&row.token, Registrations::UpTo(row.generation));
         return Ok(());
     }
     arm_next_wake(state, handler, spec, row, WakeFrom::Woken { aimed_at_ms }, done_at_ms, written).await
@@ -1350,7 +1512,7 @@ pub fn last_answer(sig: &RegisteredSignal) -> Option<weft_core::signal::listener
 
 /// Send the last call of a wait whose run was cancelled
 /// (`weft_core::signal::cancel_call`), once, as the wait's connection, to
-/// the address the listener reaches it at (an infra endpoint's included).
+/// the address it names.
 /// The wait's row is gone: everything comes with the request, and nothing
 /// fetched for it is kept past the call. An error says why the call did
 /// not go through, a refusal naming the status and what the service said.
@@ -1358,9 +1520,10 @@ pub async fn cancel_call(state: &crate::ListenerState, req: weft_core::signal::l
     let call = req.spec.on_cancel.clone().ok_or_else(|| anyhow::anyhow!("the wait {} carries no last call", req.token))?;
     call.validate().map_err(|e| anyhow::anyhow!(e))?;
     let ctx = spawn_ctx(state, &req.token, crate::reach::UNREGISTERED, &req.tenant_id, req.for_instance.clone(), &req.spec, false, Arc::default());
-    let sent = send_cancel_call(&call, &req.spec.access, &ctx).await;
-    state.reach.forget(&req.token);
-    sent
+    // Nothing it fetched is kept (`UNREGISTERED`), so there is nothing to
+    // forget after it: dropping what is kept under the token would only
+    // drop a newer registration's.
+    send_cancel_call(&call, &req.spec.access, &ctx).await
 }
 
 /// How long a last call may take before it counts as not having gone
@@ -1375,12 +1538,12 @@ async fn send_cancel_call(
     use anyhow::Context;
     use weft_core::signal::CancelMethod;
     let (client, _) = crate::listener_access::client_for(access, ctx).await?;
-    let url = crate::infra_address::for_listener(&call.url, ctx).await?;
+    let url = call.url.as_str();
     let request = match call.method {
-        CancelMethod::Post => client.post(&url),
-        CancelMethod::Put => client.put(&url),
-        CancelMethod::Patch => client.patch(&url),
-        CancelMethod::Delete => client.delete(&url),
+        CancelMethod::Post => client.post(url),
+        CancelMethod::Put => client.put(url),
+        CancelMethod::Patch => client.patch(url),
+        CancelMethod::Delete => client.delete(url),
     };
     let request = match &call.body {
         Some(body) => request.json(body),
@@ -1629,6 +1792,23 @@ mod tests {
         );
     }
 
+    /// A door that refuses takes a poll's cursor and a folder watch's
+    /// snapshot (each then primes silently on its first look), and leaves a
+    /// timer's schedule alone.
+    #[test]
+    fn a_place_in_a_source_goes_and_a_schedule_stays() {
+        use weft_core::signal::{to_spec, PollEndpoint, Timer, TimerSpec};
+        let poll: PollEndpoint = serde_json::from_value(serde_json::json!({
+            "url": "https://feed.test/items", "interval_secs": 60, "delta": { "items": "items", "cursor_field": "id" }
+        }))
+        .unwrap();
+        assert_eq!(fresh_place(&to_spec(poll), 1_000).unwrap(), Some(serde_json::json!({})), "a poll starts unprimed");
+        let watch: weft_core::signal::FolderWatch = serde_json::from_value(serde_json::json!({ "folder": "/srv/inbox" })).unwrap();
+        assert_eq!(fresh_place(&to_spec(watch), 1_000).unwrap(), Some(serde_json::json!({})), "a folder watch has seen nothing");
+        let timer = to_spec(Timer { spec: TimerSpec::After { duration_ms: 60_000 } });
+        assert_eq!(fresh_place(&timer, 1_000).unwrap(), None, "a timer has no place in a source");
+    }
+
     // ----- What a trigger shows -------------------------------------
     //
     // The kind owns its display, so these prove what a public entry
@@ -1640,6 +1820,7 @@ mod tests {
         use weft_core::primitive::SignalAuth;
         let auth = if auth_config.is_null() { SignalAuth::None } else { SignalAuth::Connection };
         RegisteredSignal {
+            generation: 1,
             spec: SignalSpec {
                 kind: "timer".into(),
                 config: Value::Object(Default::default()),
@@ -1866,6 +2047,7 @@ mod tests {
 
     fn registered(kind: &str, config: Value, predicates: Vec<weft_core::signal::Predicate>) -> RegisteredSignal {
         RegisteredSignal {
+            generation: 1,
             spec: SignalSpec {
                 kind: kind.to_string(),
                 config,

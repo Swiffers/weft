@@ -26,9 +26,9 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::Result;
-use sqlx::PgPool;
 use weft_core::install::{Certificate, Domain, DomainServes};
 use weft_platform_traits::DomainHosting;
+use weft_task_store::db::{self, Client as _, Pool};
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn, DB_NOW_MS};
 
 use crate::state::DispatcherState;
@@ -113,7 +113,6 @@ pub struct Stored {
     pub added_unix: i64,
 }
 
-#[derive(sqlx::FromRow)]
 struct Row {
     name: String,
     serves: String,
@@ -122,6 +121,20 @@ struct Row {
     added_unix: i64,
     certificate: String,
     certificate_why: Option<String>,
+}
+
+impl db::FromRow for Row {
+    fn from_row(row: db::Row) -> db::Result<Self> {
+        Ok(Self {
+            name: row.try_get("name")?,
+            serves: row.try_get("serves")?,
+            project_id: row.try_get("project_id")?,
+            upstream: row.try_get("upstream")?,
+            added_unix: row.try_get("added_unix")?,
+            certificate: row.try_get("certificate")?,
+            certificate_why: row.try_get("certificate_why")?,
+        })
+    }
 }
 
 impl Row {
@@ -165,25 +178,20 @@ pub enum Added {
 }
 
 /// Store `domain`.
-pub async fn add(pool: &PgPool, domain: &Domain, now_unix: i64) -> Result<Added> {
+pub async fn add(pool: &Pool, domain: &Domain, now_unix: i64) -> Result<Added> {
     domain.validate().map_err(anyhow::Error::msg)?;
     let (serves, project, upstream) = match &domain.serves {
         DomainServes::Install => ("install", None, None),
         DomainServes::Frontend { project, upstream } => ("frontend", Some(*project), Some(upstream.as_str())),
         DomainServes::Api { project } => ("api", Some(*project), None),
     };
-    let added = sqlx::query(
-        "INSERT INTO install_domain (name, serves, project_id, upstream, added_unix) \
-         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name) DO NOTHING",
-    )
-    .bind(&domain.name)
-    .bind(serves)
-    .bind(project)
-    .bind(upstream)
-    .bind(now_unix)
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let added = pool
+        .execute(
+            "INSERT INTO install_domain (name, serves, project_id, upstream, added_unix) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name) DO NOTHING",
+            &[&domain.name, &serves, &project, &upstream, &now_unix],
+        )
+        .await?;
     if added == 1 {
         return Ok(Added::New);
     }
@@ -194,16 +202,16 @@ pub async fn add(pool: &PgPool, domain: &Domain, now_unix: i64) -> Result<Added>
 }
 
 /// Every stored domain, by name.
-pub async fn list(pool: &PgPool) -> Result<Vec<Domain>> {
+pub async fn list(pool: &Pool) -> Result<Vec<Domain>> {
     Ok(list_stored(pool).await?.into_iter().map(|stored| stored.domain).collect())
 }
 
 /// Every stored domain with its certificate, by name.
-pub async fn list_stored(pool: &PgPool) -> Result<Vec<Stored>> {
-    sqlx::query_as::<_, Row>(
+pub async fn list_stored(pool: &Pool) -> Result<Vec<Stored>> {
+    pool.all::<Row>(
         "SELECT name, serves, project_id, upstream, added_unix, certificate, certificate_why FROM install_domain ORDER BY name",
+        &[],
     )
-    .fetch_all(pool)
     .await?
     .into_iter()
     .map(Row::into_stored)
@@ -212,7 +220,7 @@ pub async fn list_stored(pool: &PgPool) -> Result<Vec<Stored>> {
 
 /// Record where each name's certificate stands. A row whose record says
 /// that already is left alone, so nothing is announced for it.
-async fn record_certificates(pool: &PgPool, certificates: &std::collections::BTreeMap<String, Certificate>) -> Result<()> {
+async fn record_certificates(pool: &Pool, certificates: &std::collections::BTreeMap<String, Certificate>) -> Result<()> {
     let (mut names, mut states, mut whys) = (Vec::new(), Vec::new(), Vec::new());
     for (name, certificate) in certificates {
         let (state, why) = certificate_columns(certificate);
@@ -220,15 +228,12 @@ async fn record_certificates(pool: &PgPool, certificates: &std::collections::BTr
         states.push(state);
         whys.push(why);
     }
-    sqlx::query(
+    pool.execute(
         "UPDATE install_domain d SET certificate = c.state, certificate_why = c.why \
          FROM UNNEST($1::text[], $2::text[], $3::text[]) AS c(name, state, why) \
          WHERE d.name = c.name AND (d.certificate, d.certificate_why) IS DISTINCT FROM (c.state, c.why)",
+        &[&names, &states, &whys],
     )
-    .bind(&names)
-    .bind(&states)
-    .bind(&whys)
-    .execute(pool)
     .await?;
     Ok(())
 }
@@ -237,7 +242,7 @@ async fn record_certificates(pool: &PgPool, certificates: &std::collections::BTr
 /// that `ask` picks, record what it says, and answer `stored` as it
 /// stands now.
 pub async fn check_certificates(
-    pool: &PgPool,
+    pool: &Pool,
     hosting: &dyn DomainHosting,
     mut stored: Vec<Stored>,
     ask: impl Fn(&Stored) -> bool,
@@ -261,8 +266,8 @@ pub async fn check_certificates(
 }
 
 /// Remove `name`. `false` when it was not stored.
-pub async fn remove(pool: &PgPool, name: &str) -> Result<bool> {
-    Ok(sqlx::query("DELETE FROM install_domain WHERE name = $1").bind(name).execute(pool).await?.rows_affected() > 0)
+pub async fn remove(pool: &Pool, name: &str) -> Result<bool> {
+    Ok(pool.execute("DELETE FROM install_domain WHERE name = $1", &[&name]).await? > 0)
 }
 
 /// Why the platform's door could not be put on the stored domains.
@@ -277,7 +282,7 @@ pub enum ServeError {
 /// Put the platform's door on every stored domain, and answer its address
 /// (`None` once no domain is left). Callers hold the domains' lock
 /// (`crate::lease::DOMAINS_DOMAIN`), so the door serves what is stored.
-pub async fn serve_stored(pool: &PgPool, hosting: &dyn DomainHosting) -> Result<Option<IpAddr>, ServeError> {
+pub async fn serve_stored(pool: &Pool, hosting: &dyn DomainHosting) -> Result<Option<IpAddr>, ServeError> {
     let domains = list(pool).await.map_err(ServeError::Store)?;
     serve_domains(pool, hosting, &domains).await
 }
@@ -295,7 +300,7 @@ fn served_as(domain: &Domain) -> String {
 /// person made, and record what it did. The record is a hint the next
 /// pass reads, so failing to write it is logged and changes nothing about
 /// the answer the person gets; [`settle`] writes it strictly.
-async fn serve_domains(pool: &PgPool, hosting: &dyn DomainHosting, domains: &[Domain]) -> Result<Option<IpAddr>, ServeError> {
+async fn serve_domains(pool: &Pool, hosting: &dyn DomainHosting, domains: &[Domain]) -> Result<Option<IpAddr>, ServeError> {
     let served_as: Vec<String> = domains.iter().map(served_as).collect();
     let (served, recorded) = match hosting.serve(domains).await {
         Ok(address) => (Ok(address), record_served(pool, &served_as).await),
@@ -322,12 +327,9 @@ pub struct DoorState {
     pub refusals: i32,
 }
 
-pub async fn door_state(pool: &PgPool) -> Result<DoorState> {
-    let row: Option<(Vec<String>, i64, Option<String>, i32)> = sqlx::query_as(&format!(
-        "SELECT served, {DB_NOW_MS} - served_at_ms, refused, refusals FROM install_domain_door"
-    ))
-    .fetch_optional(pool)
-    .await?;
+pub async fn door_state(pool: &Pool) -> Result<DoorState> {
+    let row: Option<(Vec<String>, i64, Option<String>, i32)> =
+        pool.opt(&format!("SELECT served, {DB_NOW_MS} - served_at_ms, refused, refusals FROM install_domain_door"), &[]).await?;
     Ok(row.map_or_else(DoorState::default, |(served, ago, refused, refusals)| DoorState {
         served: Some((served, ago)),
         refused,
@@ -336,27 +338,27 @@ pub async fn door_state(pool: &PgPool) -> Result<DoorState> {
 }
 
 
-async fn record_served(pool: &PgPool, names: &[String]) -> Result<()> {
-    sqlx::query(&format!(
-        "INSERT INTO install_domain_door (singleton, served, served_at_ms, refused, refusals) VALUES (TRUE, $1, {DB_NOW_MS}, NULL, 0) \
-         ON CONFLICT (singleton) DO UPDATE SET served = EXCLUDED.served, served_at_ms = EXCLUDED.served_at_ms, \
-             refused = NULL, refusals = 0"
-    ))
-    .bind(names)
-    .execute(pool)
+async fn record_served(pool: &Pool, names: &[String]) -> Result<()> {
+    pool.execute(
+        &format!(
+            "INSERT INTO install_domain_door (singleton, served, served_at_ms, refused, refusals) VALUES (TRUE, $1, {DB_NOW_MS}, NULL, 0) \
+             ON CONFLICT (singleton) DO UPDATE SET served = EXCLUDED.served, served_at_ms = EXCLUDED.served_at_ms, \
+                 refused = NULL, refusals = 0"
+        ),
+        &[&names],
+    )
     .await?;
     Ok(())
 }
 
 /// Record a refusal. What the door last accepted stays: it may still
 /// stand.
-async fn record_refused(pool: &PgPool, why: &str) -> Result<()> {
-    sqlx::query(
+async fn record_refused(pool: &Pool, why: &str) -> Result<()> {
+    pool.execute(
         "INSERT INTO install_domain_door (singleton, served, served_at_ms, refused, refusals) VALUES (TRUE, '{}', 0, $1, 1) \
          ON CONFLICT (singleton) DO UPDATE SET refused = EXCLUDED.refused, refusals = install_domain_door.refusals + 1",
+        &[&why],
     )
-    .bind(why)
-    .execute(pool)
     .await?;
     Ok(())
 }
@@ -371,7 +373,7 @@ const SERVED_JUST_NOW: Duration = Duration::from_secs(60);
 /// (`new` when this add stored it). When the door refuses a domain this
 /// add stored, it is forgotten again, and [`drain_loop`] puts the door
 /// back on the domains that remain (taking it down when none does).
-pub async fn serve_added(pool: &PgPool, hosting: &dyn DomainHosting, added: &str, new: bool) -> Result<IpAddr, ServeError> {
+pub async fn serve_added(pool: &Pool, hosting: &dyn DomainHosting, added: &str, new: bool) -> Result<IpAddr, ServeError> {
     let refused = match serve_stored(pool, hosting).await {
         Ok(Some(address)) => return Ok(address),
         Ok(None) => anyhow::anyhow!("the platform answered no door for a stored domain"),
@@ -396,7 +398,7 @@ pub async fn serve_added(pool: &PgPool, hosting: &dyn DomainHosting, added: &str
 /// Stop answering at `name`, one of `stored`, and forget it. The door
 /// goes first: if it refuses, `name` stays stored and removing it again
 /// retries the whole step.
-pub async fn unserve(pool: &PgPool, hosting: &dyn DomainHosting, stored: &[Domain], name: &str) -> Result<(), ServeError> {
+pub async fn unserve(pool: &Pool, hosting: &dyn DomainHosting, stored: &[Domain], name: &str) -> Result<(), ServeError> {
     let rest: Vec<Domain> = stored.iter().filter(|d| d.name != name).cloned().collect();
     serve_domains(pool, hosting, &rest).await?;
     remove(pool, name).await.map_err(ServeError::Store)?;
@@ -444,7 +446,7 @@ pub fn drain_loop(state: &DispatcherState) -> DrainLoop {
 /// One pass of [`drain_loop`], under the domains' lock: put the door on
 /// what is stored unless it serves exactly that already, and answer when
 /// to look again.
-pub async fn settle(pool: &PgPool, hosting: &dyn DomainHosting) -> Result<DrainStep> {
+pub async fn settle(pool: &Pool, hosting: &dyn DomainHosting) -> Result<DrainStep> {
     let domains = list(pool).await?;
     let names: Vec<String> = domains.iter().map(served_as).collect();
     let door = door_state(pool).await?;
@@ -512,7 +514,7 @@ pub fn certificates_loop(state: &DispatcherState) -> DrainLoop {
 /// certificate still looked after, record what the platform says, and
 /// answer when to look again. Asks nothing once no certificate is looked
 /// after, so an idle install is never woken for one.
-pub async fn look_after_certificates(pool: &PgPool, hosting: &dyn DomainHosting, now_unix: i64) -> Result<DrainStep> {
+pub async fn look_after_certificates(pool: &Pool, hosting: &dyn DomainHosting, now_unix: i64) -> Result<DrainStep> {
     let stored = list_stored(pool).await?;
     // Past that time `weft domain list` is what asks, and its waiting line
     // says so: nothing is logged here, since this pass runs again at every

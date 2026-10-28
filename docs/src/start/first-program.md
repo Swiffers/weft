@@ -49,8 +49,12 @@ started run 9b81d0a2-4e17-4a33-bc90-51d8e2f4a7c1 on version a1b2c3d4
 ✓ completed run=9b81d0a2
 ```
 
-The first run of a new project may also print two lines for each image it
-builds, indented under the rest:
+`hello` uses only the standard library's nodes, so on your machine it runs
+the worker program weft ships ready-made (the standard worker), and nothing
+compiles. Once a
+project has nodes of its own, or infrastructure, its build prints two lines
+for each worker it compiles and each infrastructure image it builds,
+indented under the rest:
 
 ```text
   building <image> as <build>; its log: <url>

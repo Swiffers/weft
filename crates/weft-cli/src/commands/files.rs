@@ -152,7 +152,8 @@ const DOWNLOAD_RESUME_ATTEMPTS: u32 = 20;
 /// cast as a value.
 pub(crate) async fn download_bytes(client: &crate::client::DispatcherClient, key: &str) -> anyhow::Result<Vec<u8>> {
     let link = mint_download_url(client, key).await?;
-    let resp = reqwest::Client::new()
+    let resp = weft_core::net::http_client()
+        .build()?
         .get(&link.url)
         .send()
         .await
@@ -179,7 +180,7 @@ pub(crate) async fn download_bytes(client: &crate::client::DispatcherClient, key
 /// it and throws it away.
 pub(crate) async fn download_to(client: &crate::client::DispatcherClient, key: &str, dest: &std::path::Path) -> anyhow::Result<u64> {
     let link = mint_download_url(client, key).await?;
-    download_to_tmp(&reqwest::Client::new(), client, key, &link, dest).await
+    download_to_tmp(&weft_core::net::http_client().build()?, client, key, &link, dest).await
 }
 
 /// Ask the install for a fresh link to one file: it checks the caller,
@@ -198,7 +199,7 @@ async fn mint_download_url(
 
 pub async fn download(ctx: Ctx, key: String, output: Option<String>) -> anyhow::Result<()> {
     let client = ctx.client()?;
-    let http = reqwest::Client::new();
+    let http = weft_core::net::http_client().build()?;
 
     // The first link, with the file's name (the default output path) and
     // its size (the completeness check), which the install knows and the
@@ -592,7 +593,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join("f.txt.partial");
         let first = mint_download_url(&client, "project/p1/f0").await.unwrap();
-        let result = download_to_tmp(&reqwest::Client::new(), &client, "project/p1/f0", &first, &tmp).await;
+        let result = download_to_tmp(&weft_core::net::http_client().build().unwrap(), &client, "project/p1/f0", &first, &tmp).await;
         server.abort();
         (result, std::fs::read(&tmp).unwrap_or_default())
     }

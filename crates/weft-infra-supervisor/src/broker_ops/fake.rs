@@ -41,6 +41,7 @@ fn unit_runtime(
         image_refs: Default::default(),
         not_ready_since_unix: None,
         ready_since_unix: None,
+        last_restart: None,
     }
 }
 
@@ -105,6 +106,7 @@ pub enum BrokerCall {
         status: weft_broker_client::protocol::InfraNodeStatus,
         not_ready_since_unix: Option<i64>,
         ready_since_unix: Option<i64>,
+        restart: Option<weft_core::infra::LastRestart>,
     },
     SetWaiting {
         command_id: i64,
@@ -596,7 +598,6 @@ impl FakeBroker {
                 applied_spec_hash,
                 applied_at_unix: None,
                 addresses: weft_broker_client::protocol::AppliedEndpoints {
-                    install_urls: endpoints.clone(),
                     urls: endpoints,
                     public_paths: BTreeMap::new(),
                     doors: BTreeMap::new(),
@@ -1187,6 +1188,7 @@ impl BrokerSupervisorOps for FakeBroker {
         status: weft_broker_client::protocol::InfraNodeStatus,
         not_ready_since_unix: Option<i64>,
         ready_since_unix: Option<i64>,
+        restart: Option<&weft_core::infra::LastRestart>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetStatusResponse>> {
         let mut inner = self.inner.lock();
         inner.calls.push(BrokerCall::SetUnitHealth {
@@ -1197,10 +1199,18 @@ impl BrokerSupervisorOps for FakeBroker {
             status,
             not_ready_since_unix,
             ready_since_unix,
+            restart: restart.cloned(),
         });
         // The broker's `set_unit_health` stamps through the same write as
-        // `set_status`, with no failure.
-        Ok(inner.stamp(None, project_id, node_id, instance, Some(unit), status, (None, None), not_ready_since_unix, ready_since_unix))
+        // `set_status`, with no failure; a restart it carries lands on the
+        // unit with it.
+        let stamped = inner.stamp(None, project_id, node_id, instance, Some(unit), status, (None, None), not_ready_since_unix, ready_since_unix);
+        if let (Some(restart), weft_broker_client::WriteOutcome::Applied(_)) = (restart, &stamped) {
+            if let Some(ur) = inner.infra_nodes.get_mut(&copy_key(project_id, node_id, instance)).and_then(|row| row.node.units.get_mut(unit)) {
+                ur.last_restart = Some(restart.clone());
+            }
+        }
+        Ok(stamped)
     }
 
     async fn set_waiting(
@@ -1543,6 +1553,7 @@ mod tests {
             weft_broker_client::protocol::InfraNodeStatus::Provisioning,
             Some(10),
             Some(20),
+            None,
         )
         .await
         .unwrap();
@@ -1626,7 +1637,7 @@ mod tests {
         use weft_broker_client::WriteOutcome;
         let b = FakeBroker::new("alice");
         b.add_infra_node(P1, "n1", "inst1", Status::Running);
-        let health = || b.set_unit_health("sup-1", P1, "n1", None, "n1", Status::Flaky, Some(10), None);
+        let health = || b.set_unit_health("sup-1", P1, "n1", None, "n1", Status::Flaky, Some(10), None, None);
         let stamp = |command| b.set_status("sup-1", command, P1, "n1", None, Some("n1"), Status::Stopping, None, None);
         assert!(matches!(stamp(1).await.unwrap(), WriteOutcome::Gone), "a command never issued stamps nothing");
         b.enqueue_command(stop(1, P1));

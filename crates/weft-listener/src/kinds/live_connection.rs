@@ -148,6 +148,7 @@ mod tests {
     #[test]
     fn fire_path_drops_loud() {
         let sig = RegisteredSignal {
+            generation: 1,
             spec: spec("chat", &[], PublicEntryAuth::None),
             node_id: "n".into(),
             tenant_id: "t".into(),

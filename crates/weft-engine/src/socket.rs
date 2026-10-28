@@ -277,15 +277,22 @@ impl MeteredSocket {
 #[async_trait::async_trait]
 impl SocketTransport for MeteredSocket {
     async fn send(&mut self, msg: SocketMessage) -> WeftResult<()> {
-        let frame = match &msg {
-            SocketMessage::Text(s) => Message::Text(s.clone()),
-            SocketMessage::Binary(b) => Message::Binary(b.clone()),
+        // The frame and the tap share the node's bytes (a clone of a
+        // `Bytes` is a count, not a copy).
+        let (frame, sent) = match msg {
+            SocketMessage::Text(text) => {
+                let bytes = text.into_bytes();
+                // SAFETY: a `SocketText`'s bytes are UTF-8.
+                let utf8 = unsafe { tokio_tungstenite::tungstenite::Utf8Bytes::from_bytes_unchecked(bytes.clone()) };
+                (Message::Text(utf8), bytes)
+            }
+            SocketMessage::Binary(bytes) => (Message::Binary(bytes.clone()), bytes),
         };
         // The tap runs only after the write lands: a frame that never
         // reached the provider must not accrue.
         match self.stream.send(frame).await {
             Ok(()) => {
-                self.tap_out(msg.as_bytes());
+                self.tap_out(&sent);
                 Ok(())
             }
             Err(e) => {
@@ -300,7 +307,10 @@ impl SocketTransport for MeteredSocket {
             match self.stream.next().await {
                 Some(Ok(Message::Text(s))) => {
                     self.tap_in(s.as_bytes());
-                    return Ok(Some(SocketMessage::Text(s)));
+                    // SAFETY: tungstenite's `Utf8Bytes` holds UTF-8; moved
+                    // across, not copied nor scanned again.
+                    let text = unsafe { weft_core::access::socket::SocketText::from_utf8_unchecked(s.into()) };
+                    return Ok(Some(SocketMessage::Text(text)));
                 }
                 Some(Ok(Message::Binary(b))) => {
                     self.tap_in(&b);
@@ -529,7 +539,7 @@ mod tests {
             while let Some(Ok(msg)) = ws.next().await {
                 if let Message::Text(t) = msg {
                     seen_srv.lock().unwrap().push(format!("frame={t}"));
-                    ws.send(Message::Text(format!("echo:{t}"))).await.unwrap();
+                    ws.send(Message::Text(format!("echo:{t}").into())).await.unwrap();
                 }
             }
         });

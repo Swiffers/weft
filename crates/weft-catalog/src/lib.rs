@@ -678,8 +678,8 @@ impl FsCatalog {
             error: e,
         })?;
         let parsed: NodeDeps = toml::from_str(&raw).map_err(|e| CatalogError::Parse {
+            error: stale_copy_hint(&deps_path, e.to_string()),
             path: deps_path,
-            error: e.to_string(),
         })?;
         Ok(Some(parsed))
     }
@@ -731,24 +731,17 @@ impl FsCatalog {
 
 /// Shape of a node's `deps.toml`.
 ///
-/// - `[dependencies]` → cargo deps (keys are crate names,
-///   values are whatever cargo accepts).
-/// - `[system]` → OS-level packages to install in the worker
-///   container image. One subkey per package manager
-///   (`apt`/`apk`/`yum`/`brew`). Each manager's value is itself
-///   a table keyed by `<distro>_<major>` (e.g. `debian_12`,
-///   `ubuntu_24_04`, `alpine_3_19`, `rocky_9`) plus a special
-///   `default` fallback for cases where the node doesn't
-///   distinguish versions.
+/// - `[dependencies]`: cargo deps (keys are crate names, values are
+///   whatever cargo accepts).
+/// - `[build-dependencies]`: cargo deps of the package's own `build.rs`.
+/// - `[[needs]]`: what the node needs from the machine its worker runs
+///   on (`weft_core::needs::Need`): checked on a machine before a
+///   program that uses the node starts, installed into an image.
+/// - `[build.env]`: variables the package's compile needs.
 ///
-/// Codegen looks up the project's base-image distro, checks the
-/// matching manager's table for the exact `<distro>_<major>`
-/// key, falls through to `default` otherwise, and errors out
-/// only if NEITHER is present. A node that supports every
-/// distro via one install line just fills `default`; a node
-/// whose package name varies from one distro to the next fills one
-/// key per (distro, version) it verified.
+/// Any other key is refused, naming it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeDeps {
     #[serde(default)]
     pub dependencies: toml::Table,
@@ -758,14 +751,15 @@ pub struct NodeDeps {
     #[serde(default, rename = "build-dependencies")]
     pub build_dependencies: toml::Table,
     #[serde(default)]
-    pub system: SystemPackages,
+    pub needs: Vec<weft_core::needs::Need>,
     #[serde(default)]
     pub build: BuildEnv,
 }
 
 /// Build-environment variables a node needs during `cargo build`.
 /// Merged (union) across every referenced node and emitted as
-/// `ENV` lines in the builder stage of the Dockerfile.
+/// `ENV` lines in the builder stage of the Dockerfile, or as the `[env]`
+/// of a host build's cargo config.
 ///
 /// Keep narrow and declarative. General-purpose build logic
 /// belongs in the node's own `build.rs`, not here.
@@ -782,103 +776,14 @@ pub struct NodeDeps {
 /// resolves to `/weft/project-nodes/nodes/base_catalog/basic/exec_python/foo-config.txt`
 /// if the node lives at `nodes/base_catalog/basic/exec_python/` (the
 /// mount holds every node at its project-relative path, so one beside
-/// the code lands under `/weft/project-nodes/src/...`).
+/// the code lands under `/weft/project-nodes/src/...`). A host build
+/// expands it to the node's folder in its package crate's copy of the
+/// package.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildEnv {
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
-}
-
-/// Per-stage, per-manager system-package tables.
-///
-/// Two stages, two different concerns:
-///
-/// - `build`: packages the BUILDER container needs to COMPILE the
-///   worker binary. `pkg-config`, `libssl-dev`, and so on. These end up in the builder stage and are
-///   discarded before the runtime image is sealed.
-/// - `runtime`: packages the RUNTIME container needs to RUN the
-///   compiled binary. `python3`, `ca-certificates`.
-///
-/// Each stage has the same shape: a `BTreeMap<manager, BTreeMap<
-/// distro_key, Vec<String>>>`. `distro_key` is `<distro>_<major>`
-/// (e.g. `debian_12`, `ubuntu_24_04`, `alpine_3_19`, `rocky_9`)
-/// or the special `default` fallback.
-///
-/// ```toml
-/// [system.build.apt]
-/// default = ["libssl-dev", "pkg-config"]
-///
-/// [system.runtime.apt]
-/// default = ["libssl3"]
-/// debian_11 = ["libssl1.1"]
-/// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SystemPackages {
-    #[serde(default)]
-    pub build: StageSystemPackages,
-    #[serde(default)]
-    pub runtime: StageSystemPackages,
-}
-
-impl SystemPackages {
-    /// True when no stage has any entry on any manager.
-    pub fn is_empty(&self) -> bool {
-        self.build.is_empty() && self.runtime.is_empty()
-    }
-}
-
-/// Per-manager system-package table for a single build stage.
-/// Manager keys are `apt`/`apk`/`yum`/`brew`. Each maps distro
-/// key to the install list for THAT distro.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct StageSystemPackages {
-    #[serde(default)]
-    pub apt: std::collections::BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    pub apk: std::collections::BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    pub yum: std::collections::BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    pub brew: std::collections::BTreeMap<String, Vec<String>>,
-}
-
-impl StageSystemPackages {
-    pub fn is_empty(&self) -> bool {
-        self.apt.is_empty() && self.apk.is_empty() && self.yum.is_empty() && self.brew.is_empty()
-    }
-
-    /// Accessor for a single manager's table. Lets
-    /// worker_image.rs loop over references uniformly.
-    pub fn for_manager(
-        &self,
-        manager: SystemManagerKey,
-    ) -> &std::collections::BTreeMap<String, Vec<String>> {
-        match manager {
-            SystemManagerKey::Apt => &self.apt,
-            SystemManagerKey::Apk => &self.apk,
-            SystemManagerKey::Yum => &self.yum,
-            SystemManagerKey::Brew => &self.brew,
-        }
-    }
-}
-
-/// Abstract name for a package manager, decoupled from
-/// worker_image.rs so weft-catalog doesn't depend on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SystemManagerKey {
-    Apt,
-    Apk,
-    Yum,
-    Brew,
-}
-
-/// Which build stage we're asking about. Used by codegen when
-/// collecting package unions for the builder vs runtime
-/// Dockerfile layers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BuildStage {
-    Build,
-    Runtime,
 }
 
 // ----- Stdlib seed location ------------------------------------------
@@ -1979,11 +1884,11 @@ fn load_node_entry(
     })
 }
 
-/// `error` about the `metadata.json` at `path`, with the one-command
-/// re-sync named when the file sits in a project's copy of the standard
-/// library: a stale `base_catalog` copy is the common way to hold
-/// metadata this weft no longer accepts (a shape serde refuses, a key
-/// dropped or renamed, a setting the language now owns).
+/// `error` about a node's `metadata.json` or `deps.toml` at `path`, with
+/// the one-command re-sync named when the file sits in a project's copy
+/// of the standard library: a stale `base_catalog` copy is the common way
+/// to hold a file this weft no longer accepts (a shape serde refuses, a
+/// key dropped or renamed, a setting the language now owns).
 fn stale_copy_hint(path: &Path, error: String) -> String {
     if path.components().any(|c| c.as_os_str() == "base_catalog") {
         format!("{error} (a stale base_catalog copy? run `weft catalog update` in the project to re-sync it)")
@@ -3148,6 +3053,46 @@ mod tree_tests {
         assert!(err.contains("deps.toml"), "{err}");
         let err = catalog.package_declares_tests(&package).expect_err("a link to nothing").to_string();
         assert!(err.contains("tests.rs"), "{err}");
+    }
+
+    /// A node's `[[needs]]` read through the catalog, each with its stage
+    /// and packages; a `deps.toml` with any other key is refused, naming
+    /// it, never read as a node that needs nothing.
+    #[test]
+    fn a_nodes_needs_read_from_its_deps_toml_and_any_other_key_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node = dir.path().join("nodes/run");
+        fs::create_dir_all(&node).expect("mkdir");
+        fs::write(node.join("metadata.json"), r#"{"type": "Run", "label": "Run", "description": "d", "inputs": [], "outputs": []}"#).expect("write");
+        fs::write(node.join("mod.rs"), "// impl\n").expect("write");
+        fs::write(
+            node.join("deps.toml"),
+            "[[needs]]\nname = \"python3\"\ncheck = [\"python3\", \"--version\"]\n[needs.install.apt]\ndefault = [\"python3\"]\n\n\
+             [[needs]]\nname = \"libvips\"\nstage = \"build\"\ncheck = [\"pkg-config\", \"vips\"]\n[needs.install.apt]\ndefault = [\"libvips-dev\"]\n",
+        )
+        .expect("write");
+        let catalog = FsCatalog::discover(&dir.path().join("nodes")).expect("discover");
+        let needs = catalog.deps("Run").expect("deps read").expect("a deps.toml").needs;
+        assert_eq!(needs.iter().map(|n| (n.name.as_str(), n.stage)).collect::<Vec<_>>(), [
+            ("python3", weft_core::needs::NeedStage::Run),
+            ("libvips", weft_core::needs::NeedStage::Build),
+        ]);
+        assert_eq!(needs[1].packages_for(weft_core::needs::PackageManager::Apt, Some("debian_12")), Some(&["libvips-dev".to_string()][..]));
+
+        fs::write(node.join("deps.toml"), "[system.runtime.apt]\ndefault = [\"python3\"]\n").expect("write");
+        let err = catalog.deps("Run").expect_err("an unknown key").to_string();
+        assert!(err.contains("system"), "{err}");
+        assert!(!err.contains("weft catalog update"), "a project's own node is no stale copy: {err}");
+
+        // The same in a project's copy of the standard library names the re-sync.
+        let copy = dir.path().join("nodes/base_catalog/basic/old");
+        fs::create_dir_all(&copy).expect("mkdir");
+        fs::write(copy.join("metadata.json"), r#"{"type": "Old", "label": "Old", "description": "d", "inputs": [], "outputs": []}"#).expect("write");
+        fs::write(copy.join("mod.rs"), "// impl\n").expect("write");
+        fs::write(copy.join("deps.toml"), "[system.runtime.apt]\ndefault = [\"python3\"]\n").expect("write");
+        let catalog = FsCatalog::discover(&dir.path().join("nodes")).expect("discover");
+        let err = catalog.deps("Old").expect_err("an unknown key").to_string();
+        assert!(err.contains("weft catalog update"), "{err}");
     }
 
     /// A catalog's later reads go to the tree it was discovered from:

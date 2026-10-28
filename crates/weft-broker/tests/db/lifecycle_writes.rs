@@ -5,7 +5,7 @@
 //! supervisor's in-memory fake cannot prove them; these tests drive the
 //! exact statements the handlers serve.
 
-use sqlx::PgPool;
+use weft_task_store::db::{Client as _, Pool};
 
 use weft_broker::lifecycle_writes::{
     cancels_for, claim_next, complete_command, health_state, issue_command, record_event, set_health_state, set_status,
@@ -23,71 +23,60 @@ const NODE: &str = "bridge";
 const OWNER: &str = "supervisor-a";
 const OTHER: &str = "supervisor-b";
 
-async fn schema(pool: &PgPool) {
+async fn schema(pool: &Pool) {
     weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
 }
 
 /// `process` holds the project's `infra_owner` lease for the next hour.
-async fn lease(pool: &PgPool, replica: &str) {
+async fn lease(pool: &Pool, replica: &str) {
     lease_of(pool, PROJECT, replica).await
 }
 
 /// `process` holds `project`'s `infra_owner` lease for the next hour.
-async fn lease_of(pool: &PgPool, project: uuid::Uuid, replica: &str) {
-    sqlx::query(
+async fn lease_of(pool: &Pool, project: uuid::Uuid, replica: &str) {
+    pool.execute(
         "INSERT INTO infra_owner (project_id, supervisor_replica, tenant_id, leased_until_unix) \
          VALUES ($1, $2, $3, EXTRACT(EPOCH FROM NOW())::BIGINT + 3600) \
          ON CONFLICT (project_id) DO UPDATE SET supervisor_replica = EXCLUDED.supervisor_replica, \
          leased_until_unix = EXCLUDED.leased_until_unix",
+        &[&project, &replica, &TENANT],
     )
-    .bind(project)
-    .bind(replica)
-    .bind(TENANT)
-    .execute(pool)
     .await
     .expect("lease");
 }
 
 /// An uncompleted lifecycle command targeting the node; returns its id.
-async fn command(pool: &PgPool) -> i64 {
+async fn command(pool: &Pool) -> i64 {
     command_of(pool, PROJECT).await
 }
 
 /// An uncompleted lifecycle command of `project`; returns its id.
-async fn command_of(pool: &PgPool, project: uuid::Uuid) -> i64 {
+async fn command_of(pool: &Pool, project: uuid::Uuid) -> i64 {
     command_on(pool, project, None).await
 }
 
 /// An uncompleted lifecycle command of `project` on one copy of the node:
 /// the shared one (`None`) or an instance's.
-async fn command_on(pool: &PgPool, project: uuid::Uuid, instance: Option<&str>) -> i64 {
-    let (id,): (i64,) = sqlx::query_as(
+async fn command_on(pool: &Pool, project: uuid::Uuid, instance: Option<&str>) -> i64 {
+    pool.scalar(
         "INSERT INTO infra_lifecycle_command \
          (tenant_id, project_id, node_id, verb, issued_by_replica, issued_at_unix, instance_id) \
          VALUES ($1, $2, $3, 'stop', 'dispatcher', EXTRACT(EPOCH FROM NOW())::BIGINT, $4) \
          RETURNING id",
+        &[&TENANT, &project, &NODE, &instance],
     )
-    .bind(TENANT)
-    .bind(project)
-    .bind(NODE)
-    .bind(instance)
-    .fetch_one(pool)
     .await
-    .expect("command");
-    id
+    .expect("command")
 }
 
 /// A `project` row; `has_infra` false = no supervisor may take it (it
 /// declares no infra and runs none).
-async fn project_row(pool: &PgPool, id: uuid::Uuid, has_infra: bool) {
-    sqlx::query(
+async fn project_row(pool: &Pool, id: uuid::Uuid, has_infra: bool) {
+    pool.execute(
         "INSERT INTO project (id, name, tenant_id, status, project_json, updated_at, has_infra, project_json_version, resync_version, running_build_inputs_version) \
          VALUES ($1, 'p', 'tenant', 'inactive', '{}', 0, $2, $3, 1, 1)",
+        &[&id, &has_infra, &weft_core::ProjectDefinition::STORED.version()],
     )
-    .bind(id)
-    .bind(has_infra)
-    .bind(weft_core::ProjectDefinition::STORED.version())
-    .execute(pool)
     .await
     .expect("project row");
 }
@@ -101,15 +90,12 @@ fn unit(status: &str) -> serde_json::Value {
     })
 }
 
-async fn node_row(pool: &PgPool, status: &str, units: serde_json::Value) {
-    sqlx::query(
+async fn node_row(pool: &Pool, status: &str, units: serde_json::Value) {
+    pool.execute(
         "INSERT INTO infra_node (project_id, node_id, copy_id, status, health_rules_json_version) \
          VALUES ($1, $2, 'inst1', $3, 1)",
+        &[&PROJECT, &NODE, &status],
     )
-    .bind(PROJECT)
-    .bind(NODE)
-    .bind(status)
-    .execute(pool)
     .await
     .expect("node row");
     put_units(pool, None, units).await;
@@ -118,24 +104,25 @@ async fn node_row(pool: &PgPool, status: &str, units: serde_json::Value) {
 /// The units of the copy of `instance` become `units` (unit name to
 /// `UnitRuntime`, as JSON), through the broker's own roster write, as an
 /// apply stamps them.
-async fn put_units(pool: &PgPool, instance: Option<&str>, units: serde_json::Value) {
+async fn put_units(pool: &Pool, instance: Option<&str>, units: serde_json::Value) {
     let units: std::collections::BTreeMap<String, weft_broker_client::protocol::UnitRuntime> =
         serde_json::from_value(units).expect("units as UnitRuntime");
     let instance = instance.map(|m| weft_core::instance::InstanceId::new(m).expect("instance id"));
-    let mut tx = pool.begin().await.expect("begin");
-    write_units(&mut tx, PROJECT, NODE, instance.as_ref(), &units).await.expect("units");
+    let mut conn = pool.get().await.expect("a connection");
+    let tx = conn.transaction().await.expect("begin");
+    write_units(&tx, PROJECT, NODE, instance.as_ref(), &units).await.expect("units");
     tx.commit().await.expect("commit units");
 }
 
 /// The shared copy's status and its units, as the readers see them.
-async fn row(pool: &PgPool) -> (String, serde_json::Value) {
-    sqlx::query_as(&format!(
-        "SELECT n.status, {} FROM infra_node n WHERE n.project_id = $1 AND n.node_id = $2 AND n.instance_id IS NULL",
-        weft_broker_client::protocol::units_of_copy_sql("n")
-    ))
-    .bind(PROJECT)
-    .bind(NODE)
-    .fetch_one(pool)
+async fn row(pool: &Pool) -> (String, serde_json::Value) {
+    pool.one(
+        &format!(
+            "SELECT n.status, {} FROM infra_node n WHERE n.project_id = $1 AND n.node_id = $2 AND n.instance_id IS NULL",
+            weft_broker_client::protocol::units_of_copy_sql("n")
+        ),
+        &[&PROJECT, &NODE],
+    )
     .await
     .expect("row")
 }
@@ -153,6 +140,7 @@ fn stamp(replica: &str, command_id: Option<i64>, unit: Option<&str>, status: Sta
         instance: None,
         not_ready_since_unix: None,
         ready_since_unix: None,
+        restart: None,
     }
 }
 
@@ -174,8 +162,8 @@ fn syncing(replica: &str) -> SupervisorSyncOwnershipRequest {
 /// A per-unit stamp patches that unit and re-rolls the node status
 /// from the UPDATED roster (Flaky outranks Running; the stamped unit's
 /// old status is not what gets rolled up).
-#[sqlx::test]
-async fn per_unit_stamp_patches_the_unit_and_rolls_up_the_new_roster(pool: PgPool) {
+#[weft_db_macros::test]
+async fn per_unit_stamp_patches_the_unit_and_rolls_up_the_new_roster(pool: Pool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     let cmd = command(&pool).await;
@@ -191,10 +179,50 @@ async fn per_unit_stamp_patches_the_unit_and_rolls_up_the_new_roster(pool: PgPoo
     assert_eq!(units["a"]["stop_behavior"]["kind"], "stop");
 }
 
+/// A restart the health check saw lands on its unit with the stamp that
+/// carries it, and stays through every stamp that carries none (a look's
+/// next window, a command's per-unit stamp); the next restart replaces
+/// it, and an apply's roster write that starts the unit again clears it.
+#[weft_db_macros::test]
+async fn a_units_restart_is_written_once_and_kept_until_the_next(pool: Pool) {
+    use weft_core::infra::{LastRestart, RestartCause};
+    schema(&pool).await;
+    lease(&pool, OWNER).await;
+    node_row(&pool, "running", serde_json::json!({ "a": unit("running"), "b": unit("running") })).await;
+    let restart_of = |units: &serde_json::Value, unit: &str| -> Option<LastRestart> {
+        serde_json::from_value(units[unit]["last_restart"].clone()).expect("a restart, or null")
+    };
+
+    let oom = LastRestart { at_unix: 1_000, cause: RestartCause::OutOfMemory };
+    let seen = SupervisorSetStatusRequest { restart: Some(oom.clone()), ..stamp(OWNER, None, Some("a"), Status::Running) };
+    assert_eq!(set_status(&pool, &seen).await.unwrap(), FencedWrite::Applied);
+    let (_, units) = row(&pool).await;
+    assert_eq!(restart_of(&units, "a"), Some(oom.clone()));
+    assert_eq!(restart_of(&units, "b"), None, "only the stamped unit");
+
+    let window = SupervisorSetStatusRequest { not_ready_since_unix: Some(5), ..stamp(OWNER, None, Some("a"), Status::Running) };
+    assert_eq!(set_status(&pool, &window).await.unwrap(), FencedWrite::Applied);
+    let cmd = command(&pool).await;
+    assert_eq!(set_status(&pool, &stamp(OWNER, Some(cmd), Some("a"), Status::Stopping)).await.unwrap(), FencedWrite::Applied);
+    assert_eq!(restart_of(&row(&pool).await.1, "a"), Some(oom), "a stamp with no restart leaves it");
+    complete_command(&pool, &SupervisorCommandCompleteRequest { replica: OWNER.into(), command_id: cmd, error: None, cancelled: false })
+        .await
+        .unwrap();
+
+    let exited = LastRestart { at_unix: 2_000, cause: RestartCause::Exited { code: 3 } };
+    let next = SupervisorSetStatusRequest { restart: Some(exited.clone()), ..stamp(OWNER, None, Some("a"), Status::Running) };
+    assert_eq!(set_status(&pool, &next).await.unwrap(), FencedWrite::Applied);
+    let (_, units) = row(&pool).await;
+    assert_eq!(restart_of(&units, "a"), Some(exited), "the next restart replaces it, its exit code with it");
+
+    put_units(&pool, None, serde_json::json!({ "a": unit("running"), "b": unit("running") })).await;
+    assert_eq!(restart_of(&row(&pool).await.1, "a"), None, "an apply that starts the unit again clears it");
+}
+
 /// Two per-unit stamps of one copy in turn: the second rolls up over the
 /// first's unit, not over the roster as it was before either.
-#[sqlx::test]
-async fn sequential_per_unit_stamps_roll_up_every_unit(pool: PgPool) {
+#[weft_db_macros::test]
+async fn sequential_per_unit_stamps_roll_up_every_unit(pool: Pool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     node_row(&pool, "running", serde_json::json!({ "a": unit("running"), "b": unit("running") })).await;
@@ -214,23 +242,20 @@ async fn sequential_per_unit_stamps_roll_up_every_unit(pool: PgPool) {
 /// fails unit `b` and commits only once the stamp of `a` is blocked
 /// behind it: a rollup read from before the wait would see `b` running
 /// and leave the copy `flaky`.
-#[sqlx::test]
-async fn a_stamp_that_waited_on_the_copy_rolls_up_what_committed_meanwhile(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_stamp_that_waited_on_the_copy_rolls_up_what_committed_meanwhile(pool: Pool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     node_row(&pool, "running", serde_json::json!({ "a": unit("running"), "b": unit("running") })).await;
 
-    let mut other = pool.begin().await.unwrap();
-    sqlx::query("SELECT 1 FROM infra_node WHERE project_id = $1 AND node_id = $2 AND instance_id IS NULL FOR UPDATE")
-        .bind(PROJECT)
-        .bind(NODE)
-        .execute(&mut *other)
+    let mut other_conn = pool.get().await.unwrap();
+    let other = other_conn.transaction().await.unwrap();
+    other
+        .execute("SELECT 1 FROM infra_node WHERE project_id = $1 AND node_id = $2 AND instance_id IS NULL FOR UPDATE", &[&PROJECT, &NODE])
         .await
         .unwrap();
-    sqlx::query("UPDATE infra_unit SET status = 'failed' WHERE project_id = $1 AND node_id = $2 AND unit = 'b'")
-        .bind(PROJECT)
-        .bind(NODE)
-        .execute(&mut *other)
+    other
+        .execute("UPDATE infra_unit SET status = 'failed' WHERE project_id = $1 AND node_id = $2 AND unit = 'b'", &[&PROJECT, &NODE])
         .await
         .unwrap();
 
@@ -242,12 +267,10 @@ async fn a_stamp_that_waited_on_the_copy_rolls_up_what_committed_meanwhile(pool:
     // server reports, so the commit below lands while it waits.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let waiting: i64 = pool
+            .scalar("SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'", &[])
+            .await
+            .unwrap();
         if waiting > 0 {
             break;
         }
@@ -264,8 +287,8 @@ async fn a_stamp_that_waited_on_the_copy_rolls_up_what_committed_meanwhile(pool:
 
 /// A per-unit stamp for a unit the roster does not carry is Gone and
 /// writes NOTHING: no unit, no status change.
-#[sqlx::test]
-async fn per_unit_stamp_on_a_missing_unit_is_gone_and_writes_nothing(pool: PgPool) {
+#[weft_db_macros::test]
+async fn per_unit_stamp_on_a_missing_unit_is_gone_and_writes_nothing(pool: Pool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     let cmd = command(&pool).await;
@@ -285,8 +308,8 @@ async fn per_unit_stamp_on_a_missing_unit_is_gone_and_writes_nothing(pool: PgPoo
 /// A stamp by a process that does not hold the lease is Displaced (not
 /// Gone: the target is there, the writer is not the owner), and the
 /// row is untouched.
-#[sqlx::test]
-async fn stamp_by_a_displaced_replica_is_displaced(pool: PgPool) {
+#[weft_db_macros::test]
+async fn stamp_by_a_displaced_replica_is_displaced(pool: Pool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     let cmd = command(&pool).await;
@@ -305,23 +328,21 @@ async fn stamp_by_a_displaced_replica_is_displaced(pool: PgPool) {
 /// under way, refused (the row untouched) for a process that lost the
 /// project, and cleared, with when it began, once the copy leaves
 /// provisioning.
-#[sqlx::test]
-async fn what_an_apply_waits_on_is_its_own_and_ends_with_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn what_an_apply_waits_on_is_its_own_and_ends_with_it(pool: Pool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     let stop = command(&pool).await;
-    let (cmd,): (i64,) = sqlx::query_as(
-        "INSERT INTO infra_lifecycle_command (tenant_id, project_id, node_id, verb, issued_by_replica, issued_at_unix) \
-         VALUES ($1, $2, $3, 'apply', 'dispatcher', EXTRACT(EPOCH FROM NOW())::BIGINT) RETURNING id",
-    )
-    .bind(TENANT)
-    .bind(PROJECT)
-    .bind(NODE)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let cmd: i64 = pool
+        .scalar(
+            "INSERT INTO infra_lifecycle_command (tenant_id, project_id, node_id, verb, issued_by_replica, issued_at_unix) \
+             VALUES ($1, $2, $3, 'apply', 'dispatcher', EXTRACT(EPOCH FROM NOW())::BIGINT) RETURNING id",
+            &[&TENANT, &PROJECT, &NODE],
+        )
+        .await
+        .unwrap();
     node_row(&pool, "provisioning", serde_json::json!({ "a": unit("provisioning") })).await;
-    sqlx::query("UPDATE infra_node SET provisioning_since_unix = 100 WHERE project_id = $1").bind(PROJECT).execute(&pool).await.unwrap();
+    pool.execute("UPDATE infra_node SET provisioning_since_unix = 100 WHERE project_id = $1", &[&PROJECT]).await.unwrap();
     let waiting = |replica: &str, text: &str| SupervisorSetWaitingRequest {
         replica: replica.into(),
         command_id: cmd,
@@ -331,20 +352,11 @@ async fn what_an_apply_waits_on_is_its_own_and_ends_with_it(pool: PgPool) {
         waiting: text.into(),
     };
     let read = || async {
-        let (w,): (Option<String>,) = sqlx::query_as("SELECT waiting_on FROM infra_node WHERE project_id = $1")
-            .bind(PROJECT)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        w
+        pool.scalar::<Option<String>>("SELECT waiting_on FROM infra_node WHERE project_id = $1", &[&PROJECT]).await.unwrap()
     };
     assert_eq!(set_waiting(&pool, &waiting(OTHER, "theirs")).await.unwrap(), FencedWrite::Displaced);
     assert_eq!(read().await, None);
-    sqlx::query("UPDATE infra_lifecycle_command SET completed_at_unix = 1 WHERE id = $1")
-        .bind(stop)
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute("UPDATE infra_lifecycle_command SET completed_at_unix = 1 WHERE id = $1", &[&stop]).await.unwrap();
     assert_eq!(
         set_waiting(&pool, &SupervisorSetWaitingRequest { command_id: stop, ..waiting(OWNER, "under a done stop") }).await.unwrap(),
         FencedWrite::Gone,
@@ -358,30 +370,22 @@ async fn what_an_apply_waits_on_is_its_own_and_ends_with_it(pool: PgPool) {
     let failed = SupervisorSetStatusRequest { command_id: Some(cmd), ..stamp(OWNER, None, None, Status::Failed) };
     assert_eq!(set_status(&pool, &failed).await.unwrap(), FencedWrite::Applied);
     assert_eq!(read().await, None);
-    let (since,): (Option<i64>,) = sqlx::query_as("SELECT provisioning_since_unix FROM infra_node WHERE project_id = $1")
-        .bind(PROJECT)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let since: Option<i64> =
+        pool.scalar("SELECT provisioning_since_unix FROM infra_node WHERE project_id = $1", &[&PROJECT]).await.unwrap();
     assert_eq!(since, None);
 }
 
 /// What a stop waits on is recorded under the stop, kept while the copy
 /// stays stopping, and cleared once a unit's stop lands and the copy
 /// leaves stopping.
-#[sqlx::test]
-async fn what_a_stop_waits_on_ends_when_the_copy_leaves_stopping(pool: PgPool) {
+#[weft_db_macros::test]
+async fn what_a_stop_waits_on_ends_when_the_copy_leaves_stopping(pool: Pool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     let stop = command(&pool).await;
     node_row(&pool, "running", serde_json::json!({ "a": unit("running"), "b": unit("running") })).await;
     let read = || async {
-        let (w,): (Option<String>,) = sqlx::query_as("SELECT waiting_on FROM infra_node WHERE project_id = $1")
-            .bind(PROJECT)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        w
+        pool.scalar::<Option<String>>("SELECT waiting_on FROM infra_node WHERE project_id = $1", &[&PROJECT]).await.unwrap()
     };
     let waiting = |text: &str| SupervisorSetWaitingRequest {
         replica: OWNER.into(),
@@ -405,8 +409,8 @@ async fn what_a_stop_waits_on_ends_when_the_copy_leaves_stopping(pool: PgPool) {
 
 /// The autonomous (health) stamp is fenced by ownership too: a process that
 /// lost the project cannot stamp it while no command is in flight.
-#[sqlx::test]
-async fn autonomous_stamp_by_a_displaced_replica_is_displaced(pool: PgPool) {
+#[weft_db_macros::test]
+async fn autonomous_stamp_by_a_displaced_replica_is_displaced(pool: Pool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     node_row(&pool, "running", serde_json::json!({ "a": unit("running") })).await;
@@ -423,8 +427,8 @@ async fn autonomous_stamp_by_a_displaced_replica_is_displaced(pool: PgPool) {
 /// A node-wide stamp writes every unit AND the node status directly,
 /// so a unit-less roster still takes it (the rollup would have said
 /// 'stopped'); a completed command no longer fences anything (Gone).
-#[sqlx::test]
-async fn node_wide_stamp_sets_every_unit_and_the_node_even_with_no_units(pool: PgPool) {
+#[weft_db_macros::test]
+async fn node_wide_stamp_sets_every_unit_and_the_node_even_with_no_units(pool: Pool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     let cmd = command(&pool).await;
@@ -463,8 +467,8 @@ async fn node_wide_stamp_sets_every_unit_and_the_node_even_with_no_units(pool: P
 /// The autonomous (health) stamp is fenced by ANY uncompleted command
 /// for the node and answers Gone while one is in flight; it applies
 /// once the command completes.
-#[sqlx::test]
-async fn autonomous_stamp_is_fenced_by_an_in_flight_command(pool: PgPool) {
+#[weft_db_macros::test]
+async fn autonomous_stamp_is_fenced_by_an_in_flight_command(pool: Pool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     node_row(&pool, "running", serde_json::json!({ "a": unit("running") })).await;
@@ -491,8 +495,8 @@ async fn autonomous_stamp_is_fenced_by_an_in_flight_command(pool: PgPool) {
 /// Completing a command is exactly-once by exactly the owner: the
 /// first completion applies and records the outcome, a second is Gone,
 /// a displaced process's is Displaced, and an unknown id is Gone.
-#[sqlx::test]
-async fn command_completion_is_once_and_owner_only(pool: PgPool) {
+#[weft_db_macros::test]
+async fn command_completion_is_once_and_owner_only(pool: Pool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     let cmd = command(&pool).await;
@@ -506,11 +510,7 @@ async fn command_completion_is_once_and_owner_only(pool: PgPool) {
     assert_eq!(complete_command(&pool, &req(OTHER, cmd, None)).await.unwrap(), FencedWrite::Displaced);
     assert_eq!(complete_command(&pool, &req(OWNER, cmd, Some("boom"))).await.unwrap(), FencedWrite::Applied);
     let (outcome, message): (String, Option<String>) =
-        sqlx::query_as("SELECT outcome, outcome_message FROM infra_lifecycle_command WHERE id = $1")
-            .bind(cmd)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        pool.one("SELECT outcome, outcome_message FROM infra_lifecycle_command WHERE id = $1", &[&cmd]).await.unwrap();
     assert_eq!((outcome.as_str(), message.as_deref()), ("failed", Some("boom")));
     assert_eq!(complete_command(&pool, &req(OWNER, cmd, None)).await.unwrap(), FencedWrite::Gone);
     assert_eq!(complete_command(&pool, &req(OWNER, cmd + 1000, None)).await.unwrap(), FencedWrite::Gone);
@@ -519,36 +519,28 @@ async fn command_completion_is_once_and_owner_only(pool: PgPool) {
 /// An apply is issued with the hash of its place in the build its infra
 /// setup runs (the program the run's cut was cut from), and stamps it on
 /// its copy only when it succeeds: a failed one leaves the copy as it was.
-#[sqlx::test]
-async fn an_apply_that_succeeds_stamps_its_copy_with_its_build(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_apply_that_succeeds_stamps_its_copy_with_its_build(pool: Pool) {
     use weft_broker::lifecycle_writes::place_hash_of_run;
     schema(&pool).await;
     lease(&pool, OWNER).await;
     project_row(&pool, PROJECT, true).await;
     node_row(&pool, "running", serde_json::json!({})).await;
     for (hash, places, cut_from) in [("program", Some(serde_json::json!({ NODE: "h-2" })), None), ("cut", None, Some("program"))] {
-        sqlx::query(
+        pool.execute(
             "INSERT INTO project_definition (project_id, definition_hash, project_json, recorded_at_unix, cut_from, infra_places, project_json_version) \
              VALUES ($1, $2, '{}', 0, $3, $4, $5)",
+            &[&PROJECT, &hash, &cut_from, &places, &weft_core::ProjectDefinition::STORED.version()],
         )
-        .bind(PROJECT)
-        .bind(hash)
-        .bind(cut_from)
-        .bind(places)
-        .bind(weft_core::ProjectDefinition::STORED.version())
-        .execute(&pool)
         .await
         .unwrap();
     }
     let run_id = uuid::Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, definition_hash, cut_from, state, last_seq, started_at, spec_version) \
-         VALUES ($1, $2, $3, 'infra_setup', 'project', 'durable', TRUE, 'cut', 'program', 'running', 0, 0, 1)",
+    pool.execute(
+        "INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, definition_hash, binary_hash, cut_from, state, last_seq, started_at, spec_version) \
+         VALUES ($1, $2, $3, 'infra_setup', 'project', 'durable', TRUE, 'cut', 'bin-1', 'program', 'running', 0, 0, 1)",
+        &[&run_id, &PROJECT, &TENANT],
     )
-    .bind(run_id)
-    .bind(PROJECT)
-    .bind(TENANT)
-    .execute(&pool)
     .await
     .unwrap();
     assert_eq!(place_hash_of_run(&pool, PROJECT, run_id, NODE).await.unwrap().as_deref(), Some("h-2"));
@@ -567,10 +559,7 @@ async fn an_apply_that_succeeds_stamps_its_copy_with_its_build(pool: PgPool) {
         issued_by_replica: "worker-1",
     };
     let stamped = || async {
-        sqlx::query_scalar::<_, Option<String>>("SELECT source_hash FROM infra_node WHERE project_id = $1 AND node_id = $2")
-            .bind(PROJECT)
-            .bind(NODE)
-            .fetch_one(&pool)
+        pool.scalar::<Option<String>>("SELECT source_hash FROM infra_node WHERE project_id = $1 AND node_id = $2", &[&PROJECT, &NODE])
             .await
             .unwrap()
     };
@@ -595,8 +584,8 @@ async fn an_apply_that_succeeds_stamps_its_copy_with_its_build(pool: PgPool) {
 /// older one on the same copy is uncompleted, commands on different copies
 /// of one node are handed out side by side, and a project it does not own
 /// is never handed out at all.
-#[sqlx::test]
-async fn next_command_runs_copies_side_by_side_and_one_copy_in_order(pool: PgPool) {
+#[weft_db_macros::test]
+async fn next_command_runs_copies_side_by_side_and_one_copy_in_order(pool: Pool) {
     schema(&pool).await;
     let second = uuid::Uuid::from_u128(2);
     let foreign = uuid::Uuid::from_u128(3);
@@ -641,22 +630,21 @@ async fn next_command_runs_copies_side_by_side_and_one_copy_in_order(pool: PgPoo
 
 /// A command on every copy (the project going) overlaps every copy's
 /// command, so it waits for the older ones and the younger ones wait for it.
-#[sqlx::test]
-async fn a_command_on_every_copy_waits_for_and_holds_up_each_copy(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_command_on_every_copy_waits_for_and_holds_up_each_copy(pool: Pool) {
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
     lease(&pool, OWNER).await;
     let ada = command_on(&pool, PROJECT, Some("ada")).await;
-    let (every,): (i64,) = sqlx::query_as(
-        "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, node_id, verb, issued_by_replica, issued_at_unix, every_copy) \
-         VALUES ($1, $2, NULL, 'terminate', 'dispatcher', EXTRACT(EPOCH FROM NOW())::BIGINT, TRUE) \
-         RETURNING id",
-    )
-    .bind(TENANT)
-    .bind(PROJECT)
-    .fetch_one(&pool)
-    .await
+    let every: i64 = pool
+        .scalar(
+            "INSERT INTO infra_lifecycle_command \
+             (tenant_id, project_id, node_id, verb, issued_by_replica, issued_at_unix, every_copy) \
+             VALUES ($1, $2, NULL, 'terminate', 'dispatcher', EXTRACT(EPOCH FROM NOW())::BIGINT, TRUE) \
+             RETURNING id",
+            &[&TENANT, &PROJECT],
+        )
+        .await
     .expect("every-copy command");
     let bob = command_on(&pool, PROJECT, Some("bob")).await;
 
@@ -682,29 +670,25 @@ async fn a_command_on_every_copy_waits_for_and_holds_up_each_copy(pool: PgPool) 
 
 /// A command nobody holds a lease over is unowned work; once a live
 /// lease covers it, or the command completes, it is not.
-#[sqlx::test]
-async fn unowned_work_is_a_waiting_command_on_an_unleased_project(pool: PgPool) {
+#[weft_db_macros::test]
+async fn unowned_work_is_a_waiting_command_on_an_unleased_project(pool: Pool) {
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
     let cmd = command(&pool).await;
     assert!(unowned_work_waiting(&pool).await.unwrap());
     lease(&pool, OWNER).await;
     assert!(!unowned_work_waiting(&pool).await.unwrap(), "an owned project's command is its owner's");
-    sqlx::query("UPDATE infra_owner SET leased_until_unix = 0").execute(&pool).await.unwrap();
+    pool.execute("UPDATE infra_owner SET leased_until_unix = 0", &[]).await.unwrap();
     assert!(unowned_work_waiting(&pool).await.unwrap(), "an expired lease owns nothing");
-    sqlx::query("UPDATE infra_lifecycle_command SET completed_at_unix = 1 WHERE id = $1")
-        .bind(cmd)
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute("UPDATE infra_lifecycle_command SET completed_at_unix = 1 WHERE id = $1", &[&cmd]).await.unwrap();
     assert!(!unowned_work_waiting(&pool).await.unwrap(), "a completed command waits on nobody");
 }
 
 /// A tick reports the projects it took on: a fresh claim, and the process's
 /// own lease revived after it lapsed. A lease it merely renewed is not
 /// news, and neither is a project another process holds.
-#[sqlx::test]
-async fn a_tick_reports_the_projects_it_took_on(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_tick_reports_the_projects_it_took_on(pool: Pool) {
     schema(&pool).await;
     let foreign = uuid::Uuid::from_u128(3);
     project_row(&pool, PROJECT, true).await;
@@ -717,29 +701,24 @@ async fn a_tick_reports_the_projects_it_took_on(pool: PgPool) {
 
     assert_eq!(claimed().await, vec![PROJECT], "a free project is claimed");
     assert!(claimed().await.is_empty(), "a renewed lease is not news");
-    sqlx::query("UPDATE infra_owner SET leased_until_unix = 0 WHERE project_id = $1")
-        .bind(PROJECT)
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute("UPDATE infra_owner SET leased_until_unix = 0 WHERE project_id = $1", &[&PROJECT]).await.unwrap();
     assert_eq!(claimed().await, vec![PROJECT], "a lapsed lease taken back is news");
 }
 
 /// The database's clock, unix seconds.
-async fn db_now(pool: &PgPool) -> i64 {
-    sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM NOW())::BIGINT").fetch_one(pool).await.unwrap()
+async fn db_now(pool: &Pool) -> i64 {
+    pool.scalar("SELECT EXTRACT(EPOCH FROM NOW())::BIGINT", &[]).await.unwrap()
 }
 
 /// A booking of the supervisor's passes over a fake alarm, and when it is
 /// booked (unix ms).
-fn supervisor_booking(pool: &PgPool) -> (weft_task_store::drain::Booking, std::sync::Arc<weft_platform_traits::alarm::fake::FakeAlarm>) {
+fn supervisor_booking(pool: &Pool) -> (weft_task_store::drain::Booking, std::sync::Arc<weft_platform_traits::alarm::fake::FakeAlarm>) {
     let alarm = std::sync::Arc::new(weft_platform_traits::alarm::fake::FakeAlarm::default());
     (weft_task_store::drain::Booking::new(pool.clone(), weft_platform_traits::CoreRole::Supervisor, alarm.clone()), alarm)
 }
 
-async fn booked_pass(pool: &PgPool) -> Option<i64> {
-    sqlx::query_scalar::<_, Option<i64>>("SELECT due_ms FROM role_loop_due WHERE role = 'supervisor' AND loop_name = 'pass'")
-        .fetch_optional(pool)
+async fn booked_pass(pool: &Pool) -> Option<i64> {
+    pool.scalar_opt::<Option<i64>>("SELECT due_ms FROM role_loop_due WHERE role = 'supervisor' AND loop_name = 'pass'", &[])
         .await
         .unwrap()
         .flatten()
@@ -752,8 +731,8 @@ async fn booked_pass(pool: &PgPool) -> Option<i64> {
 /// project with running infra when it lapses, and now for a command
 /// waiting on a project no lease covers. A sync with nothing to look at
 /// clears the booking and cancels its wake.
-#[sqlx::test]
-async fn sync_ownership_books_the_supervisors_pass_at_next_due_and_clears_it_when_none(pool: PgPool) {
+#[weft_db_macros::test]
+async fn sync_ownership_books_the_supervisors_pass_at_next_due_and_clears_it_when_none(pool: Pool) {
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
     let (booking, alarm) = supervisor_booking(&pool);
@@ -784,12 +763,12 @@ async fn sync_ownership_books_the_supervisors_pass_at_next_due_and_clears_it_whe
     assert!(sibling.owned.is_empty(), "a sibling holds the lease");
     let lapse = sibling.next_due_unix.expect("its lease over running infra may lapse");
     assert!((now + 3600..=now + 3610).contains(&lapse), "looked at once the sibling's lease lapses: {lapse}");
-    sqlx::query("UPDATE infra_node SET status = 'stopped'").execute(&pool).await.unwrap();
+    pool.execute("UPDATE infra_node SET status = 'stopped'", &[]).await.unwrap();
     assert_eq!(sync(OWNER).await.next_due_unix, None, "a stopped copy says nothing to wake for");
 
     // A pass ending claims nothing, so a command on a project nobody
     // leases is still waiting: the next pass is due at once.
-    sqlx::query("DELETE FROM infra_owner").execute(&pool).await.unwrap();
+    pool.execute("DELETE FROM infra_owner", &[]).await.unwrap();
     command(&pool).await;
     let ending = SupervisorSyncOwnershipRequest { ending: true, ..syncing(OWNER) };
     let waiting = sync_ownership(&pool, &ending, Some(&booking)).await.unwrap().next_due_unix.expect("due");
@@ -799,8 +778,8 @@ async fn sync_ownership_books_the_supervisors_pass_at_next_due_and_clears_it_whe
 /// A look whose time already came and failed (the supervisor wrote it
 /// down as given up, at or after that time) is not booked again: a
 /// person's look or the next real event retries it, never a clock.
-#[sqlx::test]
-async fn a_due_time_already_given_up_on_is_not_booked(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_due_time_already_given_up_on_is_not_booked(pool: Pool) {
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
     let (booking, _alarm) = supervisor_booking(&pool);
@@ -819,8 +798,8 @@ async fn a_due_time_already_given_up_on_is_not_booked(pool: PgPool) {
 
 /// A pass that ends gives back every lease, and what it settled is no
 /// longer written down as given up.
-#[sqlx::test]
-async fn an_ending_sync_gives_back_every_lease_and_clears_settled(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_ending_sync_gives_back_every_lease_and_clears_settled(pool: Pool) {
     schema(&pool).await;
     let other = uuid::Uuid::from_u128(2);
     for project in [PROJECT, other] {
@@ -832,17 +811,13 @@ async fn an_ending_sync_gives_back_every_lease_and_clears_settled(pool: PgPool) 
     let ended = sync_ownership(&pool, &ending, None).await.unwrap();
     assert!(ended.owned.is_empty(), "no lease stays");
     assert!(ended.claimed.is_empty(), "an ending sync claims nothing");
-    let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM unanswered_call").fetch_one(&pool).await.unwrap();
+    let written: i64 = pool.scalar("SELECT COUNT(*) FROM unanswered_call", &[]).await.unwrap();
     assert_eq!(written, 0, "the settled project's give-up is cleared");
 }
 
 /// The failure stretch written down for `PROJECT`, if any.
-async fn infra_failure(pool: &PgPool) -> Option<String> {
-    sqlx::query_scalar("SELECT error FROM unanswered_call WHERE callee = $1")
-        .bind(format!("infra:{PROJECT}"))
-        .fetch_optional(pool)
-        .await
-        .unwrap()
+async fn infra_failure(pool: &Pool) -> Option<String> {
+    pool.scalar_opt("SELECT error FROM unanswered_call WHERE callee = $1", &[&format!("infra:{PROJECT}")]).await.unwrap()
 }
 
 /// A pass that failed over a project whose window already ended is
@@ -853,8 +828,8 @@ async fn infra_failure(pool: &PgPool) -> Option<String> {
 /// stops the retries, and a look that fails in nothing ends the count, so
 /// only failures in a row count. A project whose lease moved, or whose
 /// lease of this replica lapsed, writes nothing.
-#[sqlx::test]
-async fn a_failed_pass_is_tried_again_twice_then_given_up(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_failed_pass_is_tried_again_twice_then_given_up(pool: Pool) {
     use weft_broker_client::protocol::ProjectTrouble;
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
@@ -879,9 +854,9 @@ async fn a_failed_pass_is_tried_again_twice_then_given_up(pool: PgPool) {
 
     let taken = sync_ownership(&pool, &syncing(OWNER), Some(&booking)).await.unwrap();
     assert_eq!(taken.owned.len(), 1);
-    sqlx::query("UPDATE infra_health_look SET retry_at_unix = retry_at_unix - 10").execute(&pool).await.unwrap();
+    pool.execute("UPDATE infra_health_look SET retry_at_unix = retry_at_unix - 10", &[]).await.unwrap();
     let retry = || async {
-        sqlx::query_scalar::<_, Option<i64>>("SELECT retry_at_unix FROM infra_health_look").fetch_one(&pool).await.unwrap()
+        pool.scalar::<Option<i64>>("SELECT retry_at_unix FROM infra_health_look", &[]).await.unwrap()
     };
     sync_ownership(&pool, &syncing(OWNER), None).await.unwrap();
     assert!(retry().await.is_some(), "holding the project is not looking at it");
@@ -895,7 +870,7 @@ async fn a_failed_pass_is_tried_again_twice_then_given_up(pool: PgPool) {
     sync_ownership(&pool, &syncing(OWNER), None).await.unwrap();
     let clean = SupervisorSyncOwnershipRequest { looked: vec![PROJECT], settled: vec![PROJECT], ending: true, ..syncing(OWNER) };
     sync_ownership(&pool, &clean, None).await.unwrap();
-    let failures: i32 = sqlx::query_scalar("SELECT failures FROM infra_health_look").fetch_one(&pool).await.unwrap();
+    let failures: i32 = pool.scalar("SELECT failures FROM infra_health_look", &[]).await.unwrap();
     assert_eq!(failures, 0, "a look that fails in nothing ends the count");
     assert_eq!(infra_failure(&pool).await, None);
     pass_fails().await.expect("a failure after one that went through is retried");
@@ -904,12 +879,12 @@ async fn a_failed_pass_is_tried_again_twice_then_given_up(pool: PgPool) {
     sync_ownership(&pool, &syncing(OWNER), None).await.unwrap();
     let unsettled_clean = SupervisorSyncOwnershipRequest { looked: vec![PROJECT], ..syncing(OWNER) };
     sync_ownership(&pool, &unsettled_clean, None).await.unwrap();
-    let failures: i32 = sqlx::query_scalar("SELECT failures FROM infra_health_look").fetch_one(&pool).await.unwrap();
+    let failures: i32 = pool.scalar("SELECT failures FROM infra_health_look", &[]).await.unwrap();
     assert_eq!(failures, 0, "a clean look ends the count even when a protocol keeps it from settling");
     assert_eq!(retry().await, None, "and takes the retry");
 
-    sqlx::query("UPDATE infra_owner SET leased_until_unix = EXTRACT(EPOCH FROM NOW())::BIGINT - 1").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM unanswered_call").execute(&pool).await.unwrap();
+    pool.execute("UPDATE infra_owner SET leased_until_unix = EXTRACT(EPOCH FROM NOW())::BIGINT - 1", &[]).await.unwrap();
+    pool.execute("DELETE FROM unanswered_call", &[]).await.unwrap();
     sync_ownership(&pool, &failing(), Some(&booking)).await.unwrap();
     assert_eq!(infra_failure(&pool).await, None, "a lease of this replica that lapsed judges nothing");
 
@@ -926,16 +901,13 @@ async fn a_failed_pass_is_tried_again_twice_then_given_up(pool: PgPool) {
 /// project ownable clears its retry, its failures and what was written
 /// down of it, so a later pass that cannot list the host charges it
 /// nothing.
-#[sqlx::test]
-async fn a_failed_listing_fails_the_pass_over_a_due_retry_it_could_not_claim(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_failed_listing_fails_the_pass_over_a_due_retry_it_could_not_claim(pool: Pool) {
     schema(&pool).await;
     project_row(&pool, PROJECT, false).await;
     let (booking, _alarm) = supervisor_booking(&pool);
     let now = db_now(&pool).await;
-    sqlx::query("INSERT INTO infra_health_look (project_id, failures, retry_at_unix) VALUES ($1, 1, $2)")
-        .bind(PROJECT)
-        .bind(now - 1)
-        .execute(&pool)
+    pool.execute("INSERT INTO infra_health_look (project_id, failures, retry_at_unix) VALUES ($1, 1, $2)", &[&PROJECT, &(now - 1)])
         .await
         .unwrap();
     let unlisted = || SupervisorSyncOwnershipRequest { held_projects: None, ..syncing(OWNER) };
@@ -951,7 +923,7 @@ async fn a_failed_listing_fails_the_pass_over_a_due_retry_it_could_not_claim(poo
     assert_eq!(listed.next_due_unix, None, "a listing that went through without the project books no retry for it");
     assert_eq!(infra_failure(&pool).await, None, "and clears what was written down of it");
     let look: (i32, Option<i64>) =
-        sqlx::query_as("SELECT failures, retry_at_unix FROM infra_health_look").fetch_one(&pool).await.unwrap();
+        pool.one("SELECT failures, retry_at_unix FROM infra_health_look", &[]).await.unwrap();
     assert_eq!(look, (0, None), "with its retry and its failures in a row");
 
     let later = sync_ownership(&pool, &ending(), Some(&booking)).await.unwrap().next_due_unix;
@@ -963,8 +935,8 @@ async fn a_failed_listing_fails_the_pass_over_a_due_retry_it_could_not_claim(poo
 /// over every project whose lease it holds as it ends, the ones it took
 /// on mid-pass included, once each with its own error joined; a project
 /// another replica holds is left to it.
-#[sqlx::test]
-async fn a_pass_that_failed_whole_fails_over_every_project_it_holds(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_pass_that_failed_whole_fails_over_every_project_it_holds(pool: Pool) {
     use weft_broker_client::protocol::ProjectTrouble;
     schema(&pool).await;
     let (mid_pass, sibling) = (uuid::Uuid::from_u128(2), uuid::Uuid::from_u128(3));
@@ -982,10 +954,7 @@ async fn a_pass_that_failed_whole_fails_over_every_project_it_holds(pool: PgPool
         ..syncing(OWNER)
     };
     sync_ownership(&pool, &ending, Some(&booking)).await.unwrap();
-    let written: Vec<(String, String)> = sqlx::query_as("SELECT callee, error FROM unanswered_call ORDER BY callee")
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+    let written: Vec<(String, String)> = pool.all("SELECT callee, error FROM unanswered_call ORDER BY callee", &[]).await.unwrap();
     assert_eq!(
         written,
         vec![
@@ -998,8 +967,8 @@ async fn a_pass_that_failed_whole_fails_over_every_project_it_holds(pool: PgPool
 /// A claim takes the projects with something due first: a retry due over
 /// a project past the first batch by id is claimed by the first sync, so
 /// the pass it books looks at it instead of booking itself again at once.
-#[sqlx::test]
-async fn a_claim_takes_the_projects_with_something_due_first(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_claim_takes_the_projects_with_something_due_first(pool: Pool) {
     schema(&pool).await;
     let batch = weft_broker_client::lifecycle_command::SUPERVISOR_CLAIM_BATCH as u128;
     let projects: Vec<uuid::Uuid> = (1..=batch + 1).map(|i| uuid::Uuid::from_u128(100 + i)).collect();
@@ -1007,9 +976,7 @@ async fn a_claim_takes_the_projects_with_something_due_first(pool: PgPool) {
         project_row(&pool, *project, true).await;
     }
     let last = *projects.last().unwrap();
-    sqlx::query("INSERT INTO infra_health_look (project_id, failures, retry_at_unix) VALUES ($1, 1, EXTRACT(EPOCH FROM NOW())::BIGINT - 1)")
-        .bind(last)
-        .execute(&pool)
+    pool.execute("INSERT INTO infra_health_look (project_id, failures, retry_at_unix) VALUES ($1, 1, EXTRACT(EPOCH FROM NOW())::BIGINT - 1)", &[&last])
         .await
         .unwrap();
     let claimed = sync_ownership(&pool, &syncing(OWNER), None).await.unwrap().claimed;
@@ -1022,8 +989,8 @@ async fn a_claim_takes_the_projects_with_something_due_first(pool: PgPool) {
 /// the retry, so it would be due again at every pass. The sync that
 /// listed the host and found it not ownable cleared the retry, so the
 /// project ownable again (here through a copy on the host) starts afresh.
-#[sqlx::test]
-async fn a_retry_over_a_project_nobody_can_own_is_cleared(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_retry_over_a_project_nobody_can_own_is_cleared(pool: Pool) {
     use weft_broker_client::protocol::ProjectTrouble;
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
@@ -1038,7 +1005,7 @@ async fn a_retry_over_a_project_nobody_can_own_is_cleared(pool: PgPool) {
     let due = sync_ownership(&pool, &failing, Some(&booking)).await.unwrap().next_due_unix.expect("the retry is due");
     assert!((now + 5..=now + 7).contains(&due), "tried again 5 s later: {due}");
 
-    sqlx::query("UPDATE project SET has_infra = FALSE").execute(&pool).await.unwrap();
+    pool.execute("UPDATE project SET has_infra = FALSE", &[]).await.unwrap();
     let idle = sync_ownership(&pool, &syncing(OWNER), Some(&booking)).await.unwrap();
     assert!(idle.owned.is_empty(), "nothing is left to own");
     assert_eq!(idle.next_due_unix, None, "so its retry books nothing");
@@ -1056,8 +1023,8 @@ async fn a_retry_over_a_project_nobody_can_own_is_cleared(pool: PgPool) {
 /// nothing can own the project, a pass that cannot list the host counting
 /// as its retry), then given up and shown. It stays while a listing still
 /// holds the project, and goes with its count once one does not.
-#[sqlx::test]
-async fn a_removed_projects_leftovers_are_written_down_for_the_install_retried_then_cleared(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_removed_projects_leftovers_are_written_down_for_the_install_retried_then_cleared(pool: Pool) {
     use weft_broker_client::protocol::ProjectTrouble;
     schema(&pool).await;
     let removed = uuid::Uuid::from_u128(9);
@@ -1070,12 +1037,12 @@ async fn a_removed_projects_leftovers_are_written_down_for_the_install_retried_t
         ..holding()
     };
     let written = || async {
-        sqlx::query_as::<_, (String, String)>("SELECT callee, error FROM unanswered_call").fetch_all(&pool).await.unwrap()
+        pool.all::<(String, String)>("SELECT callee, error FROM unanswered_call", &[]).await.unwrap()
     };
     let shift = |secs: i64| {
         let pool = pool.clone();
         async move {
-            sqlx::query("UPDATE infra_health_look SET retry_at_unix = retry_at_unix - $1").bind(secs).execute(&pool).await.unwrap();
+            pool.execute("UPDATE infra_health_look SET retry_at_unix = retry_at_unix - $1", &[&secs]).await.unwrap();
         }
     };
 
@@ -1107,14 +1074,14 @@ async fn a_removed_projects_leftovers_are_written_down_for_the_install_retried_t
     assert_eq!(written().await.len(), 1, "a listing that still holds the project keeps it shown");
     sync_ownership(&pool, &syncing(OWNER), Some(&booking)).await.unwrap();
     assert!(written().await.is_empty(), "a listing that holds none of it clears it");
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM infra_health_look").fetch_one(&pool).await.unwrap();
+    let rows: i64 = pool.scalar("SELECT COUNT(*) FROM infra_health_look", &[]).await.unwrap();
     assert_eq!(rows, 0, "with its count");
 }
 
 /// A health rule that gave up comes back armed once a person asks for a
 /// look after it gave up.
-#[sqlx::test]
-async fn a_persons_look_arms_a_rule_that_gave_up(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_persons_look_arms_a_rule_that_gave_up(pool: Pool) {
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
     lease(&pool, OWNER).await;
@@ -1143,41 +1110,27 @@ async fn a_persons_look_arms_a_rule_that_gave_up(pool: PgPool) {
 /// A claim marks the command as under way: a cancel then flags it rather
 /// than completing it, the held claim of the one running it answers the
 /// cancel, and it completes as cancelled when the supervisor says so.
-#[sqlx::test]
-async fn cancelling_a_claimed_supervisor_command_leaves_it_pending_until_the_supervisor_completes_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn cancelling_a_claimed_supervisor_command_leaves_it_pending_until_the_supervisor_completes_it(pool: Pool) {
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
     lease(&pool, OWNER).await;
     let cmd = command(&pool).await;
     let claimed = claim_next(&pool, OWNER, &[]).await.unwrap().expect("claimed");
     assert!(!claimed.cancel_requested);
-    let by: Option<String> = sqlx::query_scalar("SELECT claimed_by_replica FROM infra_lifecycle_command WHERE id = $1")
-        .bind(cmd)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let by: Option<String> = pool.scalar("SELECT claimed_by_replica FROM infra_lifecycle_command WHERE id = $1", &[&cmd]).await.unwrap();
     assert_eq!(by.as_deref(), Some(OWNER), "the claim marks the row");
     // The dispatcher's cancel: complete the unclaimed, flag the claimed.
-    sqlx::query("UPDATE infra_lifecycle_command SET cancel_requested = TRUE WHERE id = $1 AND claimed_by_replica IS NOT NULL")
-        .bind(cmd)
-        .execute(&pool)
+    pool.execute("UPDATE infra_lifecycle_command SET cancel_requested = TRUE WHERE id = $1 AND claimed_by_replica IS NOT NULL", &[&cmd])
         .await
         .unwrap();
-    let pending: bool = sqlx::query_scalar("SELECT completed_at_unix IS NULL FROM infra_lifecycle_command WHERE id = $1")
-        .bind(cmd)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let pending: bool = pool.scalar("SELECT completed_at_unix IS NULL FROM infra_lifecycle_command WHERE id = $1", &[&cmd]).await.unwrap();
     assert!(pending, "flagged, not completed");
     assert_eq!(cancels_for(&pool, &[cmd], &[]).await.unwrap(), vec![cmd], "the runner's claim hears the cancel");
     assert!(cancels_for(&pool, &[cmd], &[cmd]).await.unwrap().is_empty(), "once");
     let req = SupervisorCommandCompleteRequest { replica: OWNER.into(), command_id: cmd, error: Some("halted".into()), cancelled: true };
     assert_eq!(complete_command(&pool, &req).await.unwrap(), FencedWrite::Applied);
-    let outcome: Option<String> = sqlx::query_scalar("SELECT outcome FROM infra_lifecycle_command WHERE id = $1")
-        .bind(cmd)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let outcome: Option<String> = pool.scalar("SELECT outcome FROM infra_lifecycle_command WHERE id = $1", &[&cmd]).await.unwrap();
     assert_eq!(outcome.as_deref(), Some("cancelled"));
 }
 
@@ -1185,8 +1138,8 @@ async fn cancelling_a_claimed_supervisor_command_leaves_it_pending_until_the_sup
 /// up with an outcome saying so and writes it down for `weft status` as
 /// given up, and hands out the younger command it held back. The ending of that one is
 /// written even with a NUL byte in its error, and clears the record.
-#[sqlx::test]
-async fn a_command_that_never_ends_is_given_up_after_three_runs(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_command_that_never_ends_is_given_up_after_three_runs(pool: Pool) {
     use weft_broker_client::protocol::SUPERVISOR_GIVE_UP_AFTER;
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
@@ -1199,35 +1152,22 @@ async fn a_command_that_never_ends_is_given_up_after_three_runs(pool: PgPool) {
     }
     assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(younger), "no longer held back");
     let (outcome, message): (String, String) =
-        sqlx::query_as("SELECT outcome, outcome_message FROM infra_lifecycle_command WHERE id = $1")
-            .bind(stuck)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        pool.one("SELECT outcome, outcome_message FROM infra_lifecycle_command WHERE id = $1", &[&stuck]).await.unwrap();
     assert_eq!(outcome, "failed");
     assert!(message.contains("took this command up 3 times"), "{message}");
     let shown = || async {
-        sqlx::query_scalar::<_, String>("SELECT error FROM unanswered_call WHERE callee = $1")
-            .bind(format!("commands:{PROJECT}"))
-            .fetch_optional(&pool)
+        pool.scalar_opt::<String>("SELECT error FROM unanswered_call WHERE callee = $1", &[&format!("commands:{PROJECT}")])
             .await
             .unwrap()
     };
     assert!(shown().await.expect("written down").starts_with(&format!("command {stuck}: ")));
-    let alerted: Option<i64> = sqlx::query_scalar("SELECT alerted_ms FROM unanswered_call WHERE callee = $1")
-        .bind(format!("commands:{PROJECT}"))
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let alerted: Option<i64> =
+        pool.scalar("SELECT alerted_ms FROM unanswered_call WHERE callee = $1", &[&format!("commands:{PROJECT}")]).await.unwrap();
     assert!(alerted.is_some(), "written down as given up, which an install that alerts alerts on at once");
 
     let req = SupervisorCommandCompleteRequest { replica: OWNER.into(), command_id: younger, error: Some("bad\0byte".into()), cancelled: false };
     assert_eq!(complete_command(&pool, &req).await.unwrap(), FencedWrite::Applied);
-    let message: String = sqlx::query_scalar("SELECT outcome_message FROM infra_lifecycle_command WHERE id = $1")
-        .bind(younger)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let message: String = pool.scalar("SELECT outcome_message FROM infra_lifecycle_command WHERE id = $1", &[&younger]).await.unwrap();
     assert_eq!(message, "badbyte");
     assert_eq!(shown().await, None, "an ending written clears it");
 }
@@ -1235,8 +1175,8 @@ async fn a_command_that_never_ends_is_given_up_after_three_runs(pool: PgPool) {
 /// A supervisor that does not scale to zero looks again on its own clock:
 /// its failed pass is written down as tried again at its next look, with
 /// nothing counted toward a give-up and no retry set.
-#[sqlx::test]
-async fn an_always_on_supervisors_failure_counts_nothing(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_always_on_supervisors_failure_counts_nothing(pool: Pool) {
     use weft_broker_client::protocol::ProjectTrouble;
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
@@ -1252,15 +1192,15 @@ async fn an_always_on_supervisors_failure_counts_nothing(pool: PgPool) {
         infra_failure(&pool).await.as_deref(),
         Some("the host did not answer (tried again at the supervisor's next look)")
     );
-    let looks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM infra_health_look").fetch_one(&pool).await.unwrap();
+    let looks: i64 = pool.scalar("SELECT COUNT(*) FROM infra_health_look", &[]).await.unwrap();
     assert_eq!(looks, 0, "nothing counted, nothing booked");
 }
 
 /// A command claimed by a replica that lost the project is claimable again
 /// by the new owner; one claimed and held by a live owner is skipped by
 /// anybody else.
-#[sqlx::test]
-async fn a_claim_held_by_a_replica_that_lost_the_project_is_claimable_again(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_claim_held_by_a_replica_that_lost_the_project_is_claimable_again(pool: Pool) {
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
     lease(&pool, OTHER).await;
@@ -1270,19 +1210,14 @@ async fn a_claim_held_by_a_replica_that_lost_the_project_is_claimable_again(pool
     assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(cmd), "OTHER no longer holds the project");
 }
 
-#[sqlx::test]
-async fn a_command_claimed_and_held_is_skipped_by_a_second_claimer(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_command_claimed_and_held_is_skipped_by_a_second_claimer(pool: Pool) {
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
     lease(&pool, OWNER).await;
     let cmd = command(&pool).await;
     assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(cmd));
-    sqlx::query("UPDATE infra_lifecycle_command SET claimed_by_replica = $2 WHERE id = $1")
-        .bind(cmd)
-        .bind("supervisor-c")
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute("UPDATE infra_lifecycle_command SET claimed_by_replica = $2 WHERE id = $1", &[&cmd, &"supervisor-c"]).await.unwrap();
     // supervisor-c holds no lease: its claim does not hold.
     assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(cmd));
     // OWNER runs it now (busy): a pass of the same owner never takes it again.
@@ -1293,8 +1228,8 @@ async fn a_command_claimed_and_held_is_skipped_by_a_second_claimer(pool: PgPool)
 /// command touched the project since, keeping whether it fired. Two
 /// copies' rules of one name, a shared one and an instance's, are kept
 /// apart.
-#[sqlx::test]
-async fn a_given_up_rule_comes_back_armed_after_a_persons_command(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_given_up_rule_comes_back_armed_after_a_persons_command(pool: Pool) {
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
     lease(&pool, OWNER).await;
@@ -1329,7 +1264,7 @@ async fn a_given_up_rule_comes_back_armed_after_a_persons_command(pool: PgPool) 
     assert_eq!(health_state(&pool, PROJECT).await.unwrap().rules, vec![given_up.clone(), ada.clone()], "given up, nothing touched it since");
 
     command(&pool).await;
-    sqlx::query("UPDATE infra_lifecycle_command SET issued_at_unix = $1").bind(now + 10).execute(&pool).await.unwrap();
+    pool.execute("UPDATE infra_lifecycle_command SET issued_at_unix = $1", &[&(now + 10)]).await.unwrap();
     let armed = health_state(&pool, PROJECT).await.unwrap().rules;
     assert_eq!(
         armed,
@@ -1344,22 +1279,21 @@ async fn a_given_up_rule_comes_back_armed_after_a_persons_command(pool: PgPool) 
 /// The command a health rule queued is read back with its rule, how it
 /// ended once it did, and its deadline is booked as the supervisor's next
 /// pass (a command that never ends still gets its look).
-#[sqlx::test]
-async fn a_queued_health_command_is_read_with_how_it_ended_and_its_deadline_is_booked(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_queued_health_command_is_read_with_how_it_ended_and_its_deadline_is_booked(pool: Pool) {
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
     lease(&pool, OWNER).await;
     let (booking, _alarm) = supervisor_booking(&pool);
     let now = db_now(&pool).await;
-    let (command,): (i64,) = sqlx::query_as(
-        "INSERT INTO infra_lifecycle_command (tenant_id, project_id, verb, spec_json, issued_by_replica, issued_at_unix) \
-         VALUES ($1, $2, 'deactivate', '{}', 'supervisor', EXTRACT(EPOCH FROM NOW())::BIGINT) RETURNING id",
-    )
-    .bind(TENANT)
-    .bind(PROJECT)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let command: i64 = pool
+        .scalar(
+            "INSERT INTO infra_lifecycle_command (tenant_id, project_id, verb, spec_json, issued_by_replica, issued_at_unix) \
+             VALUES ($1, $2, 'deactivate', '{}', 'supervisor', EXTRACT(EPOCH FROM NOW())::BIGINT) RETURNING id",
+            &[&TENANT, &PROJECT],
+        )
+        .await
+        .unwrap();
     let queued = HealthRuleState {
         copy: weft_broker_client::protocol::InfraCopy { node_id: "db".into(), instance: None },
         rule: "take-down-while-flaky".into(),
@@ -1380,12 +1314,11 @@ async fn a_queued_health_command_is_read_with_how_it_ended_and_its_deadline_is_b
     let due = sync_ownership(&pool, &syncing(OWNER), Some(&booking)).await.unwrap().next_due_unix;
     assert_eq!(due, Some(now + 100), "the command's deadline is looked at");
 
-    sqlx::query(
+    pool.execute(
         "UPDATE infra_lifecycle_command SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
                 outcome = 'failed', outcome_message = 'the dispatcher could not reach the listener' WHERE id = $1",
+        &[&command],
     )
-    .bind(command)
-    .execute(&pool)
     .await
     .unwrap();
     let read = health_state(&pool, PROJECT).await.unwrap();
@@ -1403,8 +1336,8 @@ async fn a_queued_health_command_is_read_with_how_it_ended_and_its_deadline_is_b
 /// A project with no infra, no row and nothing on the host is owned only
 /// while a supervisor command waits on it: claimed for it, renewed and
 /// reported owned until it completes, then no longer renewed.
-#[sqlx::test]
-async fn a_pending_command_alone_makes_a_project_owned(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_pending_command_alone_makes_a_project_owned(pool: Pool) {
     schema(&pool).await;
     let idle = uuid::Uuid::from_u128(9);
     project_row(&pool, idle, false).await;
@@ -1422,7 +1355,7 @@ async fn a_pending_command_alone_makes_a_project_owned(pool: PgPool) {
     assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(cmd));
 
     // Renewed while pending: expire it, and the tick takes it back.
-    sqlx::query("UPDATE infra_owner SET leased_until_unix = 0").execute(&pool).await.unwrap();
+    pool.execute("UPDATE infra_owner SET leased_until_unix = 0", &[]).await.unwrap();
     assert_eq!(sync().await.claimed, vec![idle], "a pending command's lease is renewed");
 
     complete_command(
@@ -1431,15 +1364,15 @@ async fn a_pending_command_alone_makes_a_project_owned(pool: PgPool) {
     )
     .await
     .unwrap();
-    sqlx::query("UPDATE infra_owner SET leased_until_unix = 0").execute(&pool).await.unwrap();
+    pool.execute("UPDATE infra_owner SET leased_until_unix = 0", &[]).await.unwrap();
     assert!(sync().await.owned.is_empty(), "with the command done, the lease is not renewed");
 }
 
 /// A command or event for a deleted project writes nothing (the caller
 /// was authorized from a cache that can outlive the removal); for a live
 /// project it is written, and a retried apply hands back the same id.
-#[sqlx::test]
-async fn nothing_is_issued_or_recorded_for_a_deleted_project(pool: PgPool) {
+#[weft_db_macros::test]
+async fn nothing_is_issued_or_recorded_for_a_deleted_project(pool: Pool) {
     schema(&pool).await;
     let spec = serde_json::json!({ "units": [] });
     let apply = |project_id: uuid::Uuid| IssuedCommand {
@@ -1474,41 +1407,34 @@ async fn nothing_is_issued_or_recorded_for_a_deleted_project(pool: PgPool) {
 /// An instance's copy is its own row: a stamp naming the instance moves
 /// only that copy, and a command naming copies hands the same copies
 /// back to the supervisor that claims it.
-#[sqlx::test]
-async fn an_instances_copy_is_stamped_and_commanded_on_its_own(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_instances_copy_is_stamped_and_commanded_on_its_own(pool: Pool) {
     use weft_core::instance::{Copies, InstanceId};
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
     lease(&pool, OWNER).await;
     let ada = InstanceId::new("ada").unwrap();
     node_row(&pool, "running", serde_json::json!({ "a": unit("running") })).await;
-    sqlx::query(
+    pool.execute(
         "INSERT INTO infra_node (project_id, node_id, copy_id, status, instance_id, health_rules_json_version) \
          VALUES ($1, $2, 'inst-ada', 'running', 'ada', 1)",
+        &[&PROJECT, &NODE],
     )
-    .bind(PROJECT)
-    .bind(NODE)
-    .execute(&pool)
     .await
     .expect("ada's copy");
     put_units(&pool, Some("ada"), serde_json::json!({ "a": unit("running") })).await;
-    let duplicate = sqlx::query(
-        "INSERT INTO infra_node (project_id, node_id, status, instance_id, health_rules_json_version) VALUES ($1, $2, 'running', 'ada', 1)",
-    )
-    .bind(PROJECT)
-    .bind(NODE)
-    .execute(&pool)
-    .await;
+    let duplicate = pool
+        .execute(
+            "INSERT INTO infra_node (project_id, node_id, status, instance_id, health_rules_json_version) VALUES ($1, $2, 'running', 'ada', 1)",
+            &[&PROJECT, &NODE],
+        )
+        .await;
     assert!(duplicate.is_err(), "one copy per instance");
 
     let stamp_ada = SupervisorSetStatusRequest { instance: Some(ada.clone()), ..stamp(OWNER, None, Some("a"), Status::Flaky) };
     assert_eq!(set_status(&pool, &stamp_ada).await.unwrap(), FencedWrite::Applied);
     let statuses: Vec<(Option<String>, String)> =
-        sqlx::query_as("SELECT instance_id, status FROM infra_node WHERE project_id = $1 ORDER BY instance_id NULLS FIRST")
-            .bind(PROJECT)
-            .fetch_all(&pool)
-            .await
-            .unwrap();
+        pool.all("SELECT instance_id, status FROM infra_node WHERE project_id = $1 ORDER BY instance_id NULLS FIRST", &[&PROJECT]).await.unwrap();
     assert_eq!(statuses, vec![(None, "running".to_string()), (Some("ada".to_string()), "flaky".to_string())]);
     let stamp_bob = SupervisorSetStatusRequest { instance: Some(InstanceId::new("bob").unwrap()), ..stamp_ada.clone() };
     assert_eq!(set_status(&pool, &stamp_bob).await.unwrap(), FencedWrite::Gone, "bob has no copy");
@@ -1535,19 +1461,15 @@ async fn an_instances_copy_is_stamped_and_commanded_on_its_own(pool: PgPool) {
 /// A take-down that waits for its running work first is the dispatcher's
 /// until that work is done: the supervisor is handed it only once the drain hands it
 /// over, and a command on the same copy behind it waits for it.
-#[sqlx::test]
-async fn a_command_still_draining_is_not_handed_to_the_supervisor(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_command_still_draining_is_not_handed_to_the_supervisor(pool: Pool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     let draining = command(&pool).await;
     let behind = command(&pool).await;
-    sqlx::query("UPDATE infra_lifecycle_command SET drains = TRUE WHERE id = $1")
-        .bind(draining)
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute("UPDATE infra_lifecycle_command SET drains = TRUE WHERE id = $1", &[&draining]).await.unwrap();
     assert!(claim_next(&pool, OWNER, &[]).await.unwrap().is_none(), "draining, and the one behind it waits");
-    sqlx::query("UPDATE infra_lifecycle_command SET drains = FALSE WHERE id = $1").bind(draining).execute(&pool).await.unwrap();
+    pool.execute("UPDATE infra_lifecycle_command SET drains = FALSE WHERE id = $1", &[&draining]).await.unwrap();
     assert_eq!(claim_next(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(draining));
     assert_eq!(claim_next(&pool, OWNER, &[draining]).await.unwrap().map(|c| c.id), None, "{behind} waits for it");
 }

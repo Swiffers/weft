@@ -89,6 +89,14 @@ pub struct UnitRuntime {
     /// writes leave this untouched.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub image_refs: std::collections::BTreeSet<String>,
+    /// The latest time one of its containers stopped on its own and its
+    /// host brought it back, since weft last started the unit: written
+    /// once by the health check the first time it sees it
+    /// ([`SupervisorSetStatusRequest::restart`]), kept for a unit an apply
+    /// leaves up, and cleared for one it starts again. `None` when none
+    /// was seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_restart: Option<weft_core::infra::LastRestart>,
 }
 
 /// Lifecycle status of a project row: weft-core's, since the CLI reads it
@@ -112,7 +120,7 @@ wire_enum! {
 /// busy, or the database refusing new ones), so no statement ran and
 /// sending the call again cannot repeat anything. Any other 503 may have
 /// half happened; a write is sent again only on this one.
-// SYNC: NOT_DONE <-> crates/weft-broker/src/handlers.rs (unavailable_or_internal), crates/weft-broker-client/src/client.rs (did_nothing)
+// SYNC: NOT_DONE <-> crates/weft-broker/src/handlers.rs (unavailable_or_internal), crates/weft-broker-client/src/client.rs (turned_away)
 pub const NOT_DONE: &str = "the broker could not get a connection to its database, so nothing was done; send it again";
 
 /// The answer to a call in a shape the broker does not read, and its body
@@ -1240,6 +1248,13 @@ pub struct SupervisorSetStatusRequest {
     pub not_ready_since_unix: Option<i64>,
     #[serde(default)]
     pub ready_since_unix: Option<i64>,
+    /// With `unit`: a restart of the unit the health check saw that the
+    /// unit's row does not hold yet ([`UnitRuntime::last_restart`]),
+    /// written with its status. `None` leaves the row's as it is, which
+    /// is every write but the one that first sees a restart. Ignored
+    /// without `unit`.
+    #[serde(default)]
+    pub restart: Option<weft_core::infra::LastRestart>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1310,14 +1325,11 @@ pub struct SupervisorSetAppliedResponse {}
 /// on its `infra_node` row.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppliedEndpoints {
-    /// Endpoint name to where the project's workers reach it.
+    /// Endpoint name to where the project's workers and weft's own roles
+    /// (the front door passing a `Public` endpoint on, the dispatcher
+    /// reading a unit's `/live`) reach it.
     #[serde(rename = "endpoints")]
     pub urls: std::collections::BTreeMap<String, String>,
-    /// Endpoint name to where weft's own roles reach it (the front door
-    /// passing a `Public` endpoint on, the dispatcher reading a unit's
-    /// `/live`). The same address as the workers' unless the workers sit
-    /// on a network weft's roles are not on (a local install).
-    pub install_urls: std::collections::BTreeMap<String, String>,
     /// Endpoint name to the path it answers at on the front door, for
     /// `Public` endpoints only (`weft_core::infra::public_path`).
     pub public_paths: std::collections::BTreeMap<String, String>,
@@ -1645,7 +1657,11 @@ pub fn units_of_copy_sql(n: &str) -> String {
              'status', u.status, 'stop_behavior', jsonb_build_object('kind', u.stop_behavior), \
              'flaky_after_seconds', u.flaky_after_seconds, 'recovery_after_seconds', u.recovery_after_seconds, \
              'not_ready_since_unix', u.not_ready_since_unix, 'ready_since_unix', u.ready_since_unix, \
-             'image_refs', to_jsonb(u.image_refs))), '{{}}'::jsonb) \
+             'image_refs', to_jsonb(u.image_refs), \
+             'last_restart', CASE WHEN u.last_restart_at_unix IS NOT NULL THEN jsonb_build_object( \
+                 'atUnix', u.last_restart_at_unix, \
+                 'cause', jsonb_strip_nulls(jsonb_build_object('kind', u.last_restart_cause, 'code', u.last_restart_exit_code))) END)), \
+             '{{}}'::jsonb) \
           FROM infra_unit u WHERE u.project_id = {n}.project_id AND u.node_id = {n}.node_id \
             AND u.instance_id IS NOT DISTINCT FROM {n}.instance_id)"
     )
@@ -2067,36 +2083,6 @@ pub struct ListenerResolveRequest {
     /// missing one, rather than dialing forever with a blank address.
     #[serde(default)]
     pub required_values: Vec<String>,
-}
-
-/// Where the listener reaches an address a trigger was given. A trigger
-/// wired from an infra node gets the address the project's WORKERS reach
-/// the endpoint at, and the listener is one of weft's own roles, which
-/// may sit on another network (a local install's runtime runs on the
-/// machine, the workers in Docker's network). The broker answers with the
-/// same endpoint's address for weft's roles, or the address unchanged
-/// when it is no infra endpoint of the signal's project.
-// SYNC: ListenerInfraAddress <-> crates/weft-broker/src/events.rs (listener_infra_address)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListenerInfraAddressRequest {
-    /// The signal the listener is connecting for. The broker reads its
-    /// project off the held row (or, for a cancelled wait whose last call
-    /// is being sent, off that call's task), so the answer looks at that
-    /// project's infra alone, and any other token is refused.
-    pub signal_token: String,
-    /// `host:port`, as the trigger's URL or address names it.
-    pub authority: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ListenerInfraAddress {
-    pub authority: String,
-    /// Whether the address is one of the project's infra endpoints
-    /// (translated for weft's roles). An infra endpoint's address can
-    /// move (a local unit made again on another port), so the listener
-    /// asks again after a connect to it fails; any other address is
-    /// the one given, for good.
-    pub is_infra: bool,
 }
 
 /// Give up on a signal for good (`signal/give_up`): it could not come up
@@ -2752,7 +2738,6 @@ mod supervisor_protocol_tests {
                     "status": "running",
                     "applied_spec_hash": "deadbeef",
                     "endpoints": { "api": "http://x.svc:8080" },
-                    "install_urls": { "api": "http://127.0.0.1:41234" },
                     "public_paths": { "api": "/infra/p/wn-abc-tgi-12/hooks" },
                     "doors": { "sql": "10.0.0.7:5432" },
                     "keep_disks": ["model-cache"],
@@ -2773,7 +2758,6 @@ mod supervisor_protocol_tests {
         let resp: SupervisorInfraNodesResponse = serde_json::from_value(json).unwrap();
         assert_eq!(resp.nodes[0].health_rules.as_ref().unwrap()[0].when.units_named(), vec!["main"]);
         assert_eq!(resp.nodes[0].addresses.urls.get("api").unwrap(), "http://x.svc:8080");
-        assert_eq!(resp.nodes[0].addresses.install_urls.get("api").unwrap(), "http://127.0.0.1:41234");
         assert_eq!(resp.nodes[0].addresses.public_paths.get("api").unwrap(), "/infra/p/wn-abc-tgi-12/hooks");
         assert_eq!(resp.nodes[0].addresses.doors.get("sql").unwrap(), "10.0.0.7:5432");
         assert_eq!(resp.nodes[0].units.get("main").unwrap().status, InfraNodeStatus::Running);
@@ -2814,7 +2798,6 @@ mod supervisor_protocol_tests {
             applied_spec_hash: "deadbeef".into(),
             addresses: AppliedEndpoints {
                 urls: [("api".to_string(), "http://x".to_string())].into(),
-                install_urls: [("api".to_string(), "http://127.0.0.1:40001".to_string())].into(),
                 public_paths: [("api".to_string(), "/infra/p/wn-abc-tgi-12/hooks".to_string())].into(),
                 doors: [("sql".to_string(), "10.0.0.7:5432".to_string())].into(),
             },
@@ -3117,6 +3100,7 @@ mod supervisor_protocol_tests {
             failure_message: None,
             not_ready_since_unix: None,
             ready_since_unix: None,
+            restart: None,
         };
         let v = serde_json::to_value(&r).unwrap();
         let back: SupervisorSetStatusRequest = serde_json::from_value(v).unwrap();
@@ -3138,11 +3122,38 @@ mod supervisor_protocol_tests {
             failure_message: None,
             not_ready_since_unix: None,
             ready_since_unix: None,
+            restart: None,
         };
         let v = serde_json::to_value(&r).unwrap();
         let back: SupervisorSetStatusRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back.command_id, Some(42));
         assert_eq!(back.status, InfraNodeStatus::Stopping);
+    }
+
+    /// A unit's last restart reads from the object `units_of_copy_sql`
+    /// builds out of its columns: `null` when it has none, the cause's
+    /// code only for an exit.
+    #[test]
+    fn a_units_last_restart_reads_as_the_sql_builds_it() {
+        let unit = |last_restart: serde_json::Value| {
+            json!({ "u": {
+                "status": "running", "stop_behavior": { "kind": "stop" }, "flaky_after_seconds": 30,
+                "recovery_after_seconds": 30, "not_ready_since_unix": null, "ready_since_unix": null,
+                "image_refs": [], "last_restart": last_restart,
+            } })
+        };
+        let project = uuid::Uuid::nil();
+        let read = |v| decode_units(v, project, "n").unwrap().remove("u").unwrap().last_restart;
+        assert_eq!(read(unit(serde_json::Value::Null)), None);
+        assert_eq!(
+            read(unit(json!({ "atUnix": 7, "cause": { "kind": "out_of_memory" } }))),
+            Some(weft_core::infra::LastRestart { at_unix: 7, cause: weft_core::infra::RestartCause::OutOfMemory })
+        );
+        assert_eq!(
+            read(unit(json!({ "atUnix": 7, "cause": { "kind": "exited", "code": 3 } }))),
+            Some(weft_core::infra::LastRestart { at_unix: 7, cause: weft_core::infra::RestartCause::Exited { code: 3 } })
+        );
+        assert!(decode_units(unit(json!({ "atUnix": 7, "cause": { "kind": "sleepy" } })), project, "n").is_err());
     }
 
     #[test]

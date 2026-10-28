@@ -43,21 +43,25 @@
 #     target/ (WEFT_TARGET_CAP_GB, default 30G; over it, the incremental
 #     dirs and the superseded executables go, and the tree is never
 #     wiped),
+#   - the daemon start removes the worker containers and images a weft
+#     from before workers ran as processes left for this install (a
+#     local install's workers are programs compiled on this machine),
 #   - after the daemon refresh, `weft clean --images --build-plane`
-#     drops the builder bases and node-test images no install on this
-#     machine still records using, and `weft clean --images --all`
-#     reclaims
-#     every weft image nothing runs any more (unreferenced worker
-#     images, stale weft-infra-* tags, old builder bases and
-#     runtimes, and the worker compile cache this checkout used before
-#     the update, every lane of it). KEEP set = the dispatcher's
-#     referenced set (running projects' worker hashes, live tasks',
-#     every project's infra image tags, every live infra unit's
-#     recorded refs), so a running project's current worker image and
-#     a live project's infra images survive the update untouched; the
-#     user resyncs a project when they want it on the new engine, and
-#     that project's old image goes on a LATER install's reclaim once
-#     nothing points at it.
+#     drops the worker programs no install on this machine still uses
+#     (the standard worker of the weft this update replaced among them),
+#     the shared build crates no build staged for 30 days, and the
+#     builder bases and node-test images an older weft left that no
+#     install records using; and `weft clean --images --all` reclaims
+#     everything of weft's nothing runs any more (unreferenced workers,
+#     stale weft-infra-* tags, old runtimes, and what an older weft left:
+#     standard worker images and BuildKit worker compile caches). KEEP
+#     set = the dispatcher's referenced set (running projects' worker
+#     hashes, live tasks', every project's infra image tags, every live
+#     infra unit's recorded refs), so a running project's current worker
+#     and a live project's infra images survive the update untouched;
+#     the user resyncs a project when they want it on the new engine,
+#     and that project's old worker goes on a LATER install's reclaim
+#     once nothing points at it.
 #
 # Component flags pick a subset (multiple combine):
 #   --cli         build CLI only
@@ -126,9 +130,9 @@
 #   (multiple combine)
 #
 # CLI knobs:
-#   --rebuild     force the shared images (the runtime and the worker
-#                 builder base) to be rebuilt even when nothing they are
-#                 built from has changed. For when an image is corrupt or
+#   --rebuild     rebuild the runtime image and recompile the standard
+#                 worker program even when nothing they are built from
+#                 has changed. For when either is corrupt or
 #                 hand-modified; a plain run already rebuilds whatever
 #                 actually moved.
 #   --debug       build CLI with the debug profile
@@ -172,10 +176,10 @@
 #                 ./setup.sh and your projects + history come back
 #                 instantly.
 #   --purge       TRUE clean slate. Deletes every container weft
-#                 started (workers, infra units, Postgres, the tunnel)
-#                 and their volumes, every weft-built docker image
-#                 (weft-runtime, every weft-worker, every weft infra
-#                 image), the object-store container + data volume +
+#                 started (infra units, Postgres, the tunnel, and an
+#                 older weft's workers) and their volumes, every
+#                 weft-built docker image (weft-runtime, every weft
+#                 infra image, and an older weft's weft-worker images), the object-store container + data volume +
 #                 seaweedfs image, the BuildKit cache, the workspace
 #                 target/ cargo cache, ~/.local/share/weft (THE
 #                 DATABASE'S FILES under postgres-data/, the install's
@@ -193,7 +197,8 @@
 #                   --postgres   remove postgres:18-alpine (and the
 #                                postgres:18 image --migration pulls)
 #                   --kind       remove kindest/node images (an older weft's)
-#                   --debian     remove debian:bookworm-slim
+#                   --debian     remove debian:trixie-slim (and the
+#                                debian:bookworm-slim an older weft used)
 #
 # Examples:
 #   ./setup.sh                          # full install
@@ -406,36 +411,6 @@ remove_dir_reporting() { # path label [ok_note] [fail_note]
   else
     ok "removed ${label}${ok_note}"
   fi
-}
-
-# Drop the node-test cargo cache under target/tmp, which an engine change
-# strands (it bakes the engine crates in). The images an engine change
-# strands (the builder base and the node-test image) are NOT this
-# function's: they are shared by every install on the machine, so only
-# `weft clean --images --build-plane`, which keeps every image any
-# install still records using, removes them (after the daemon refresh,
-# below). Worker images bake the engine too, but a running project keeps
-# using its old-engine image until the user resyncs it, so those go
-# through `weft clean --images --all`, which keeps everything the
-# dispatcher's referenced set still covers.
-#
-# NOT the BuildKit cache. This used to run an unbounded
-# `docker builder prune --force` here, on the theory that every cargo
-# layer bakes the engine and is dead weight after an engine edit. The
-# layers are; the CARGO CACHE MOUNTS are not, and the prune took those
-# with it. A cargo cache holds the crates.io half of the compile,
-# which no engine edit can invalidate, and cargo already refuses to
-# reuse its own stale artifacts by fingerprint. Wiping it meant every
-# install after an engine edit recompiled the dependency tree from
-# cold, in BOTH the runtime-image build and the builder-base build:
-# measured at 336 and 198 crates, 162 of them the same crate twice,
-# and roughly four minutes of an install that has about one minute of
-# real work in it. The 20 GB LRU bound the CLI section applies is what
-# keeps the dead layers from accumulating, and being least recently
-# used is exactly what makes them the ones it drops.
-sweep_stale_node_test_cache() {
-  remove_dir_reporting "${here}/target/tmp" "${C_DIM}target/tmp${C_RESET}" \
-    " ${C_DIM}(node-test sweep cache, engine-keyed)${C_RESET}" "; it goes on a later install"
 }
 
 # One `code` call through a live IPC socket, with a deadline.
@@ -830,6 +805,10 @@ esac
 # The runtime published beside each CLI.
 # SYNC: asset names <-> .github/workflows/release.yml (the runtime binaries)
 runtime_asset="${cli_asset:+${cli_asset/weft-/weft-runtime-}}"
+# The standard worker published beside each CLI: the program a local
+# install's projects run when their nodes are all the standard library's.
+# SYNC: the worker asset name and layout <-> .github/actions/build-binaries, crates/weft-cli/src/host_programs.rs (pack_standard_program)
+worker_asset="${cli_asset:+${cli_asset/weft-/weft-worker-}}"
 # One string value out of the fetched manifest, empty when the key is
 # absent (an asset key missing means "not published; build locally
 # there"). THE one JSON-string extractor, `[^"]*` so no value alphabet
@@ -960,6 +939,51 @@ download_verified() {
   mv -f "${tmp}" "${dest}" || { rm -f "${tmp}"; return 1; }
 }
 
+# The published standard worker, unpacked where the install's workers
+# start from: <data dir>/workers/<its hash>/ (the hash travels inside the
+# asset, the binary hash the CLI computes for this same source). Without
+# it the install's first start compiles the standard worker here, once.
+install_prebuilt_standard_worker() {
+  local want_sha
+  want_sha="$(manifest_value "sha256_${worker_asset}")"
+  if [[ -z "${worker_asset}" || -z "${want_sha}" ]]; then
+    hint "no published standard worker for this commit and machine; the install's first start compiles it here, once"
+    return 0
+  fi
+  local packed="${prebuilt_dir}/${worker_asset}"
+  if ! acquire_prebuilt "${worker_asset}" "${want_sha}" "${packed}"; then
+    warn "the published standard worker could not be downloaded; the install's first start compiles it here, once"
+    return 0
+  fi
+  local hash
+  if ! hash="$(tar -xzOf "${packed}" hash)" || ! [[ "${hash}" =~ ^[0-9a-f]+$ ]]; then
+    warn "the published standard worker names no binary hash; the install's first start compiles it here, once"
+    return 0
+  fi
+  local dest="${weft_state_dir}/workers/${hash}"
+  if [[ -f "${dest}/worker" ]]; then
+    return 0
+  fi
+  local unpacking="${dest}.unpacking.$$"
+  rm -rf "${unpacking}" && mkdir -p "${unpacking}"
+  tar -xzf "${packed}" -C "${unpacking}" worker left-out.json
+  if [[ -e "${dest}" ]]; then
+    # A folder with no program yet (a compile stopped halfway, or one
+    # running now, which then puts the same program over this one): the
+    # record and then the program go into it by rename, the order a
+    # compile places them in. Its holds stay.
+    if ! mv -f "${unpacking}/left-out.json" "${dest}/left-out.json" || ! mv -f "${unpacking}/worker" "${dest}/worker"; then
+      rm -rf "${unpacking}"
+      warn "the published standard worker could not be put in ${dest}; the install's first start compiles it here, once"
+      return 0
+    fi
+    rm -rf "${unpacking}"
+  else
+    mv "${unpacking}" "${dest}"
+  fi
+  ok "standard worker ready ${C_DIM}(${hash:0:12}, from the published build)${C_RESET}"
+}
+
 # Make one prebuilt asset exist at `dest`: a byte-matching copy from an
 # earlier run is reused, anything else is downloaded and verified. One
 # ladder for the CLI and the .vsix, so "already downloaded" can never
@@ -1031,8 +1055,12 @@ if [[ -n "${write_migration}" ]]; then
   if [[ $do_release -eq 1 ]]; then
     release_flag="--release"
   fi
-  # One generator for every table the install's database holds. A
-  # failure leaves this command re-runnable: the generator only deletes
+  # One generator for every table the install's database holds. It
+  # reads the migration history off the disk, so a new group's origin.sql
+  # it freezes is planned from in the same run, and it applies and
+  # records a release itself: the install below only rebuilds weft with
+  # the new files in it. A failure leaves this command re-runnable: the
+  # generator only deletes
   # the drafts after the released file is recorded on the live
   # database, and a released change answers "nothing changed" on the
   # re-run.
@@ -1384,7 +1412,7 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       printf '  %sobject store%s %s(weft-object-store container + data volume)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
-      printf '  %sdocker images%s %s(weft-runtime, weft-worker, weft-infra-*)%s\n' \
+      printf '  %sdocker images%s %s(weft-runtime, weft-infra-*)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       printf '  %sworkspace target/%s %s(cargo cache)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
@@ -1454,14 +1482,15 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
         }
       fi
       if [[ $purge_debian -eq 1 ]]; then
-        remove_docker_object image debian:bookworm-slim " ${C_DIM}(--debian)${C_RESET}"
+        remove_docker_object image debian:trixie-slim " ${C_DIM}(--debian)${C_RESET}"
+        remove_docker_object image debian:bookworm-slim " ${C_DIM}(--debian, an older weft's)${C_RESET}"
       fi
 
       # The object store's image: niche enough that nothing else on the
       # host wants it, so a purge removes it unconditionally.
-      # SYNC: seaweedfs image <-> crates/weft-cli/src/commands/daemon.rs
-      #       (the `docker run` line below OBJECT_STORE_CONTAINER)
-      remove_docker_object image chrislusf/seaweedfs:3.80
+      # SYNC: seaweedfs image <-> crates/weft-cli/src/commands/daemon.rs (OBJECT_STORE_IMAGE)
+      remove_docker_object image chrislusf/seaweedfs:4.51
+      remove_docker_object image chrislusf/seaweedfs:3.80 " ${C_DIM}(an older weft's)${C_RESET}"
 
       if docker buildx prune --force >/dev/null 2>&1; then
         ok "pruned BuildKit cache"
@@ -1471,13 +1500,14 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     fi
 
     # 3. Workspace cargo target/ + the staged builder-base docker context
-    # (both derived artifacts, regenerated on the next build). A failed
-    # removal warns and the purge keeps going: dying here would abandon
-    # every later step over one stubborn directory.
+    # a `weft build-images` run leaves (both derived artifacts,
+    # regenerated on the next build). A failed removal warns and the
+    # purge keeps going: dying here would abandon every later step over
+    # one stubborn directory.
     remove_dir_reporting "${here}/target" "${C_DIM}target/${C_RESET}" \
       "" "; remove it by hand: rm -rf ${here}/target"
     # The staging lock lives BESIDE the dir (see
-    # weft-cli images.rs ensure_worker_builder_base), so it needs its
+    # weft-cli images.rs ensure_builder_base_at), so it needs its
     # own removal or it survives the purge.
     remove_dir_reporting "${here}/.weft-base-context" "${C_DIM}.weft-base-context/${C_RESET}" \
       " ${C_DIM}(builder-base staging context)${C_RESET}" "; remove it by hand: rm -rf ${here}/.weft-base-context"
@@ -1542,9 +1572,11 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       fi
     fi
     if [[ $purge_debian -eq 0 ]]; then
-      if docker image inspect debian:bookworm-slim >/dev/null 2>&1; then
-        skipped_lines+=("debian:bookworm-slim|--debian")
-      fi
+      for debian_image in debian:trixie-slim debian:bookworm-slim; do
+        if docker image inspect "$debian_image" >/dev/null 2>&1; then
+          skipped_lines+=("$debian_image|--debian")
+        fi
+      done
     fi
     if [[ ${#skipped_lines[@]} -gt 0 ]]; then
       printf '\n  %s%sShared base images kept%s %s(reused by other docker projects)%s\n' \
@@ -1652,7 +1684,7 @@ if [[ $build_cli -eq 1 ]]; then
   #   - the cargo target/ dir (incremental artifacts accumulate across
   #     dep bumps and crate renames and are never evicted; once grew to
   #     ~100GB before anyone noticed), and
-  #   - docker's BuildKit layer cache (every worker/infra/test image
+  #   - docker's BuildKit layer cache (every runtime and infra image
   #     build adds entries; nothing prunes them).
   # (The anonymous-volume reap is NOT here: it runs on every install
   # regardless of flags, in its own section above.)
@@ -1791,6 +1823,7 @@ if [[ $build_cli -eq 1 ]]; then
     if [[ $on_default_install -eq 1 ]]; then
       new_cli="${prebuilt_dir}/${cli_asset}"
       new_runtime="${prebuilt_dir}/${runtime_asset}"
+      install_prebuilt_standard_worker
     else
       use_prebuilt_cli=0
       if ! command -v cargo >/dev/null 2>&1; then
@@ -1845,14 +1878,24 @@ if [[ $on_default_install -eq 0 ]]; then
     build_browser=0
   fi
 fi
+# The oldest Node the extension builds run on: vsce, ovsx and wxt need 22,
+# and the Vite both extensions build with needs 22.12 on that line.
+node_floor_major=22
+node_floor_minor=12
+node_floor="${node_floor_major}.${node_floor_minor}"
+node_meets_floor() {
+  local version
+  version="$(node -v 2>/dev/null)" || return 1
+  [[ "$version" =~ ^v([0-9]+)\.([0-9]+) ]] || return 1
+  (( BASH_REMATCH[1] > node_floor_major || (BASH_REMATCH[1] == node_floor_major && BASH_REMATCH[2] >= node_floor_minor) ))
+}
 # What the extension builds need, now that it is known they run.
 missing=()
 install_hints=()
 if [[ $build_vscode -eq 1 && $use_prebuilt_vsix -eq 0 ]]; then
-  node_major="$(node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || echo 0)"
-  if [[ "${node_major}" -lt 20 ]]; then
-    missing+=("node 20+")
-    install_hints+=("  Node:    https://nodejs.org/en/download (or 'nvm install 20')")
+  if ! node_meets_floor; then
+    missing+=("node ${node_floor}+")
+    install_hints+=("  Node:    https://nodejs.org/en/download (or 'nvm install 24')")
   fi
   if ! command -v pnpm >/dev/null 2>&1; then
     missing+=("pnpm")
@@ -1860,9 +1903,9 @@ if [[ $build_vscode -eq 1 && $use_prebuilt_vsix -eq 0 ]]; then
   fi
 fi
 if [[ $build_browser -eq 1 ]]; then
-  if ! command -v node >/dev/null 2>&1; then
-    missing+=("node 20+ (browser extension)")
-    install_hints+=("  Node:    https://nodejs.org/en/download")
+  if ! node_meets_floor; then
+    missing+=("node ${node_floor}+ (browser extension)")
+    install_hints+=("  Node:    https://nodejs.org/en/download (or 'nvm install 24')")
   fi
   if ! command -v pnpm >/dev/null 2>&1; then
     missing+=("pnpm (browser extension)")
@@ -2049,45 +2092,6 @@ if [[ $build_cli -eq 1 ]]; then
   else
     hint "this branch's weft is ${C_BOLD}${installed_bin}${C_RESET}${C_DIM}; inside this checkout, the ${C_RESET}${C_BOLD}weft${C_RESET}${C_DIM} on your PATH hands over to it${C_RESET}"
   fi
-
-  # Engine-change sweep, on either path: the node-test cargo cache under
-  # target/tmp bakes the engine crates in, so an engine change strands
-  # it. (The images an engine change strands are shared by every
-  # install, so `weft clean --images --build-plane` takes those, after
-  # the daemon refresh.) Keyed on the ENGINE'S OWN identity (the
-  # builder-base ref the freshly installed CLI computes from source
-  # content), which is the same on the prebuilt and the compiled path
-  # and does not move when only the binary does (a --debug/--release
-  # switch, a prebuilt/local switch), so those never cost a sweep. The
-  # last one swept for is kept in target/ itself: the cache it guards is
-  # this checkout's, and a wiped target/ has nothing left to sweep.
-  engine_ref_file="${here}/target/weft-engine-ref"
-  # Only the TAG (the content hash) is the identity; the registry
-  # prefix is naming, and keying on it would fire a full sweep on a
-  # WEFT_IMAGE_REGISTRY change with the engine untouched. Streams kept
-  # apart: only STDOUT is grepped for the ref (a diagnostic line on
-  # stderr that happened to mention the base would otherwise feed the
-  # parse a wrong hash), and stderr is kept so the warn below can show
-  # the resolver's own diagnostics (they name the fix), never a bare
-  # "could not compute".
-  new_engine_ref=""
-  engine_err="$(mktemp -t weft-engineref.XXXXXX)"
-  if engine_print_out="$(env WEFT_REPO_ROOT="${here}" WEFT_INSTALL="${install_env}" "${installed_bin}" build-images --print 2>"${engine_err}")"; then
-    new_engine_ref="$(grep -E '(^|/)weft-builder-base:' <<<"${engine_print_out}" || true)"
-    new_engine_ref="${new_engine_ref##*:}"
-  fi
-  if [[ -z "${new_engine_ref}" ]]; then
-    warn "could not compute the engine identity (weft build-images --print); skipping the node-test cache sweep this run"
-    [[ -s "${engine_err}" ]] && cat "${engine_err}" >&2
-  elif [[ "${new_engine_ref}" != "$(cat "${engine_ref_file}" 2>/dev/null || true)" ]]; then
-    sweep_stale_node_test_cache
-    # Braced so a redirect failure is silenced too (a bare 2>/dev/null
-    # does not cover the redirect itself) and only the warn speaks.
-    if ! { mkdir -p "$(dirname "${engine_ref_file}")" && printf '%s' "${new_engine_ref}" > "${engine_ref_file}"; } 2>/dev/null; then
-      warn "could not record the engine identity at ${engine_ref_file}; the sweep re-runs next install"
-    fi
-  fi
-  rm -f "${engine_err}"
 fi
 if [[ $refresh_daemon -eq 0 && -x "${installed_bin}" ]]; then
   record_checkout_install
@@ -2124,19 +2128,24 @@ if [[ $refresh_daemon -eq 1 ]]; then
       ok "the old database of ${install_env} is gone; starting on a fresh one"
     fi
 
-    # In the build slot: a start whose runtime or builder-base image
-    # moved compiles it (cargo, inside docker), as heavy as the CLI build.
+    # In the build slot: a start whose runtime image moved builds it
+    # around the weft-runtime this run installed (a copy, seconds), or,
+    # when this machine's glibc is newer than the image's Debian and the
+    # start says so, compiles it with cargo inside docker; and one whose
+    # standard worker moved compiles that on this machine: as heavy as
+    # the CLI build.
     spin "starting weft (pulls or builds its images the first time)" \
       with_build_slot "${install_env_cmd[@]}" daemon start ${rebuild_flag} ${public_url_flag}
     record_checkout_install
 
-    # Drop the images an engine change strands (the builder base and the
-    # node-test image), now that the start above has recorded which ones
-    # this install uses: the CLI keeps every one that any install on this
-    # machine records, and removes nothing of a kind while an install has
-    # not recorded yet (it names that install). Warn-only: hygiene must
-    # not fail the install.
-    if spin "removing builder images nothing uses any more" \
+    # Drop what an engine change strands (the standard worker program of
+    # the weft this update replaced, and the builder bases and node-test
+    # images an older weft left), now that the start above has recorded
+    # what this install uses: the CLI keeps everything any install on
+    # this machine records, and removes nothing of a kind while an install
+    # has not recorded yet (it names that install). Warn-only: hygiene
+    # must not fail the install.
+    if spin "removing builder files and images nothing uses any more" \
       "${install_env_cmd[@]}" clean --images --build-plane; then
       :
     else
@@ -2146,14 +2155,14 @@ if [[ $refresh_daemon -eq 1 ]]; then
     # Reclaim what the update stranded, now that the refreshed daemon
     # can answer for what is still in use: `weft clean --images --all`
     # keeps exactly the dispatcher's referenced set (running projects'
-    # current worker images, draining workers', live tasks', every
-    # project's infra image tags, every live infra unit's recorded
-    # image refs) and removes everything else of
-    # weft's: unreferenced worker images, stale `weft-infra-*` tags,
-    # old builder bases and runtimes.
+    # current workers, draining workers', live tasks', every project's
+    # infra image tags, every live infra unit's recorded image refs)
+    # and removes everything else of weft's: unreferenced workers,
+    # stale `weft-infra-*` tags, old runtimes, and what an older weft
+    # left.
     # This is the "old version gone, running things untouched" pass:
     # a project the user has not resynced yet KEEPS its old-engine
-    # image (it is still its running pointer) and the reclaim catches
+    # worker (it is still its running pointer) and the reclaim catches
     # it on a later install once the resync moves the pointer.
     # No health re-probe before it: `weft daemon start` returning 0
     # already implies the runtime answered (the CLI waits for it as
@@ -2317,7 +2326,7 @@ if [[ $build_vscode -eq 1 ]]; then
         warn "prebuilt .vsix download failed; building locally instead"
       else
         fail "the prebuilt .vsix could not be downloaded and no Node toolchain is on PATH"
-        hint "install Node 20+ and pnpm, or re-run once the network is back"
+        hint "install Node ${node_floor}+ and pnpm, or re-run once the network is back"
         exit 1
       fi
     fi
@@ -2327,9 +2336,8 @@ if [[ $build_vscode -eq 1 ]]; then
   # above): compile, fingerprint, bump, package. Sets `vsix_path` +
   # `current_ver`; called just below when no prebuilt .vsix landed.
   build_vsix_locally() {
-  node_major="$(node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || echo 0)"
-  if [[ "${node_major}" -lt 20 ]]; then
-    fail "needs Node 20+ (got $(node -v 2>/dev/null || echo 'none'))"
+  if ! node_meets_floor; then
+    fail "needs Node ${node_floor}+ (got $(node -v 2>/dev/null || echo 'none'))"
     hint "try: ${C_BOLD}nvm use 24 && ./setup.sh --vscode${C_RESET}"
     exit 1
   fi

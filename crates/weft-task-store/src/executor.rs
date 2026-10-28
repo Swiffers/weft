@@ -15,9 +15,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::FutureExt;
 use serde_json::Value;
-use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
+use crate::db::Pool;
 use crate::tasks::{claim_duration_secs, claim_heartbeat_interval, Task};
 
 #[async_trait]
@@ -113,7 +113,7 @@ where
 
 /// Run one claimed dispatcher task through its executor, under its lease.
 async fn run_dispatcher_task<Ctx>(
-    pool: PgPool,
+    pool: Pool,
     ctx: Ctx,
     registry: TaskRegistry<Ctx>,
     replica: String,
@@ -172,7 +172,7 @@ tokio::task_local! {
 /// taken back once it ends ([`TaskClaim::resume`]).
 #[derive(Clone)]
 pub struct TaskClaim {
-    pool: PgPool,
+    pool: Pool,
     task_id: uuid::Uuid,
     replica: String,
     /// The heartbeat leaves the claim alone while it rests.
@@ -296,39 +296,90 @@ where
     }
 }
 
-/// Persist the verdict for one task.
+/// What becomes of a task once its executor ended.
+#[derive(Debug)]
+enum Verdict {
+    /// It finished: `tasks::complete`.
+    Complete(Value),
+    /// It failed, with this message: `tasks::fail`.
+    Fail(String),
+    /// It did not fail, but this process could not prove it was entitled
+    /// to run it to the end: `tasks::surrender`, back to `pending` for the
+    /// next claim. A store that did not answer in time must never
+    /// terminalize work that did not fail.
+    Surrender,
+    /// Another claimant owns the row: nothing is written, since any write
+    /// from here would race its run.
+    StandDown,
+}
+
+/// The verdict on one executor run.
 ///
-///   - `Finished(Ok(Ok(value)))`: → `tasks::complete`.
-///   - `Finished(Ok(Err(e)))`: → `tasks::fail` with the error message.
-///   - `Finished(Err(panic))`: → `tasks::fail` with a "panic: ..."
-///     prefix so clients can flag it visibly. Without this
-///     layering, a panicking executor would ride the spawned task's
-///     JoinError up and get discarded by `try_join_next`, and the row
-///     would sit `claimed` until the lease expired.
-///   - `LeaseLost(Unrenewable)`: → `tasks::surrender`
-///     (guarded on our claim, tried until it lands), putting the row back
-///     to `pending` for the next claim. A transient store outage must
-///     never terminalize work that did not fail.
-///   - `LeaseLost(Stolen)`: → nothing. The re-claimer owns the row;
-///     any write from us would race its run.
+///   - `Finished(Ok(Ok(value)))`: complete.
+///   - `Finished(Ok(Err(e)))`: fail with the error's message, unless the
+///     work stopped because a lease it ran under could not be shown held
+///     (`crate::locks::lease_lost`): that is the store not answering in
+///     time, one layer up from the task's own claim, so it gets the same
+///     answer as `LeaseLost(Unrenewable)`: surrender, tried again.
+///   - `Finished(Err(panic))`: fail with a "panic: ..." prefix so clients
+///     can flag it visibly. Without this layering, a panicking executor
+///     would ride the spawned task's JoinError up and get discarded, and
+///     the row would sit `claimed` until the lease expired.
+///   - `LeaseLost(Unrenewable)`: surrender.
+///   - `LeaseLost(Stolen)`: stand down.
+fn verdict(outcome: ExecOutcome, task_id: uuid::Uuid, kind: &str) -> Verdict {
+    match outcome {
+        ExecOutcome::Finished(Ok(Ok(result))) => Verdict::Complete(result),
+        ExecOutcome::Finished(Ok(Err(e))) if crate::locks::lease_lost(&e) => {
+            tracing::warn!(target: "weft_task_store::executor", id = %task_id, kind = %kind, error = %format!("{e:#}"), "a lease the task ran under was lost; giving the task back");
+            Verdict::Surrender
+        }
+        ExecOutcome::Finished(Ok(Err(e))) => Verdict::Fail(format!("{e:#}")),
+        ExecOutcome::Finished(Err(panic)) => {
+            let panic_msg = panic_message(&panic);
+            tracing::error!(target: "weft_task_store::executor", id = %task_id, kind = %kind, panic = %panic_msg, "task panicked; writing tasks::fail");
+            Verdict::Fail(format!("panic: {panic_msg}"))
+        }
+        ExecOutcome::LeaseLost(LeaseLoss::Unrenewable) => Verdict::Surrender,
+        ExecOutcome::LeaseLost(LeaseLoss::Stolen) => Verdict::StandDown,
+    }
+}
+
+/// Persist the verdict for one task ([`verdict`]).
 async fn finalize_task(
-    pool: &PgPool,
+    pool: &Pool,
     task_id: uuid::Uuid,
     replica: &str,
     kind: &str,
     outcome: ExecOutcome,
 ) {
-    let outcome = match outcome {
-        ExecOutcome::Finished(finished) => finished,
-        ExecOutcome::LeaseLost(LeaseLoss::Stolen) => {
+    match verdict(outcome, task_id, kind) {
+        Verdict::Complete(result) => {
+            if let Err(e) = crate::tasks::complete(pool, task_id, replica, result).await {
+                tracing::warn!(
+                    target: "weft_task_store::executor",
+                    id = %task_id, kind = %kind, error = %e,
+                    "complete write failed; row may have been re-claimed"
+                );
+            }
+        }
+        Verdict::Fail(msg) => {
+            if let Err(e) = crate::tasks::fail(pool, task_id, replica, msg).await {
+                tracing::warn!(
+                    target: "weft_task_store::executor",
+                    id = %task_id, kind = %kind, error = %e,
+                    "fail write failed"
+                );
+            }
+        }
+        Verdict::StandDown => {
             tracing::warn!(
                 target: "weft_task_store::executor",
                 id = %task_id, kind = %kind,
                 "lease stolen by another claimant; it owns the task, standing down"
             );
-            return;
         }
-        ExecOutcome::LeaseLost(LeaseLoss::Unrenewable) => {
+        Verdict::Surrender => {
             // Until the surrender lands, this process still holds the task,
             // so nothing else may pick it up: it is tried again for as long
             // as the store does not answer.
@@ -359,44 +410,6 @@ async fn finalize_task(
                         tokio::time::sleep(crate::tasks::claim_heartbeat_interval()).await;
                     }
                 }
-            }
-            return;
-        }
-    };
-    match outcome {
-        Ok(Ok(result)) => {
-            if let Err(e) = crate::tasks::complete(pool, task_id, replica, result).await {
-                tracing::warn!(
-                    target: "weft_task_store::executor",
-                    id = %task_id, kind = %kind, error = %e,
-                    "complete write failed; row may have been re-claimed"
-                );
-            }
-        }
-        Ok(Err(e)) => {
-            let msg = format!("{e:#}");
-            if let Err(e2) = crate::tasks::fail(pool, task_id, replica, msg).await {
-                tracing::warn!(
-                    target: "weft_task_store::executor",
-                    id = %task_id, kind = %kind, error = %e2,
-                    "fail write failed"
-                );
-            }
-        }
-        Err(panic) => {
-            let panic_msg = panic_message(&panic);
-            tracing::error!(
-                target: "weft_task_store::executor",
-                id = %task_id, kind = %kind, panic = %panic_msg,
-                "task panicked; writing tasks::fail"
-            );
-            let msg = format!("panic: {panic_msg}");
-            if let Err(e) = crate::tasks::fail(pool, task_id, replica, msg).await {
-                tracing::warn!(
-                    target: "weft_task_store::executor",
-                    id = %task_id, kind = %kind, error = %e,
-                    "fail write after panic also failed"
-                );
             }
         }
     }
@@ -483,5 +496,25 @@ struct Heartbeat(tokio::task::JoinHandle<()>);
 impl Drop for Heartbeat {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Work stopped because a lease it ran under was lost goes back for the
+    /// next claim, the same answer as a claim that could not be renewed,
+    /// however deep in its error the loss sits; any other error fails it.
+    #[test]
+    fn a_lost_lease_gives_the_task_back_rather_than_failing_it() {
+        let id = uuid::Uuid::nil();
+        let lost = anyhow::Error::new(crate::locks::LeaseLost("stopped work under the lease 'signal_mount/t'".into()))
+            .context("arm signal s");
+        assert!(matches!(verdict(ExecOutcome::Finished(Ok(Err(lost))), id, "register_signal"), Verdict::Surrender));
+        assert!(matches!(verdict(ExecOutcome::LeaseLost(LeaseLoss::Unrenewable), id, "register_signal"), Verdict::Surrender));
+        assert!(matches!(verdict(ExecOutcome::LeaseLost(LeaseLoss::Stolen), id, "register_signal"), Verdict::StandDown));
+        let failed = verdict(ExecOutcome::Finished(Ok(Err(anyhow::anyhow!("no such run")))), id, "register_signal");
+        assert!(matches!(&failed, Verdict::Fail(msg) if msg == "no such run"), "{failed:?}");
     }
 }

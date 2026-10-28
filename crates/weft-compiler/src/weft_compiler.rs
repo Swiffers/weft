@@ -1751,18 +1751,16 @@ fn lower_port_sig(
                     Err(msg) => errors.push(SourceError::at(span, msg)),
                 }
             }
-            rowan::NodeOrToken::Token(t) if t.kind() == K::MARKER => {
-                // @require_one_of(a, b) in an input list.
-                if crate::cst::marker::directive(t.text()) == "require_one_of" {
-                    if direction != "in" {
-                        errors.push(SourceError::at(li.span_of_token(&t), "@require_one_of is only valid in input port lists"));
-                    } else {
-                        // Same validity gate as the body directive: a non-empty
-                        // port list, or a loud error (never a silent drop).
-                        match crate::cst::marker::require_one_of_ports(t.text()) {
-                            Ok(ports) => oor.push(ports),
-                            Err(msg) => errors.push(SourceError::at(li.span_of_token(&t), msg.to_string())),
-                        }
+            // @require_one_of(a, b) in an input list.
+            rowan::NodeOrToken::Token(t) if t.kind() == K::MARKER && crate::cst::marker::directive(t.text()) == "require_one_of" => {
+                if direction != "in" {
+                    errors.push(SourceError::at(li.span_of_token(&t), "@require_one_of is only valid in input port lists"));
+                } else {
+                    // Same validity gate as the body directive: a non-empty
+                    // port list, or a loud error (never a silent drop).
+                    match crate::cst::marker::require_one_of_ports(t.text()) {
+                        Ok(ports) => oor.push(ports),
+                        Err(msg) => errors.push(SourceError::at(li.span_of_token(&t), msg.to_string())),
                     }
                 }
             }

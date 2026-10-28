@@ -11,7 +11,7 @@ use serde_json::Value;
 use weft::node::NodeOutput;
 use weft::{Access, RunContext, Node, NodeManifest, WeftResult};
 
-use super::postgres::{connect, mistake, placeholders, query_json, quote_ident, Statement};
+use super::postgres::{connect, mistake, placeholders, quote_ident, Statement};
 
 /// The UPDATE for a table, its SET columns, and a WHERE condition, plus
 /// the ports the condition reads in the order its `$1..$k` bind them.
@@ -100,8 +100,8 @@ impl Node for PostgresUpdateRowsNode {
             .collect();
         params.extend(obj.values().cloned());
 
-        let client = connect(&ctx, &account).await?;
-        let rows = query_json(&client, &sql, &names, &params).await?;
+        let mut client = connect(&ctx, &account).await?;
+        let rows = client.query_json(&sql, &names, &params).await?;
         // The update has committed by now, so nothing past this point
         // may fail it: `count` is every changed row, and `rows` the
         // leading ones that fit the 100 KB a wire carries, with

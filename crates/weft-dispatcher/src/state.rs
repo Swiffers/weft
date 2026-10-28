@@ -27,7 +27,7 @@ pub struct DispatcherState {
     /// stores) so lease management, EventBus pub/sub, and other
     /// DB-backed primitives can share connections without growing a
     /// store into a kitchen sink.
-    pub pg_pool: sqlx::PgPool,
+    pub pg_pool: weft_task_store::db::Pool,
     /// Connections used ONLY to hold a project's transition lock.
     ///
     /// A Postgres advisory lock lives in a transaction, so holding one
@@ -39,7 +39,7 @@ pub struct DispatcherState {
     /// and then every one of them waited for a connection none of them
     /// would release until it got one. A pool of its own makes holding a
     /// lock cost nothing that doing the work needs.
-    pub lock_pool: sqlx::PgPool,
+    pub lock_pool: weft_task_store::db::Pool,
     /// The process's one Postgres `LISTEN` connection, on (at least)
     /// every channel in [`crate::app::DISPATCHER_CHANNELS`]. Every loop
     /// and request that waits on a row sleeps on it
@@ -52,6 +52,9 @@ pub struct DispatcherState {
     pub displays: Arc<crate::display_feeds::DisplayFeeds>,
     /// Where the project's workers run and how to reach them.
     pub runner: Arc<dyn weft_platform_traits::Runner>,
+    /// What the machine the workers run on lacks of what a program's nodes
+    /// need (`crate::needs`).
+    pub needs: Arc<dyn weft_platform_traits::MachineNeeds>,
     /// Where the projects' infrastructure runs: read here for its logs
     /// (the supervisor is what changes it).
     pub host: Arc<dyn weft_platform_traits::InfraHost>,

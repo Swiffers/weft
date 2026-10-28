@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use lru::LruCache;
-use sqlx::postgres::PgPool;
+use weft_task_store::db::{Client as _, Pool};
 use tokio::sync::Mutex;
 
 use crate::auth::CallerIdentity;
@@ -93,7 +93,7 @@ async fn cache_put<K: std::hash::Hash + Eq, V>(map: &Mutex<LruCache<K, (V, Insta
 /// (never the caller's, which a control-plane caller does not have).
 pub async fn require_project_owned_by(
     cache: &ScopeCache,
-    pool: &PgPool,
+    pool: &Pool,
     caller: &CallerIdentity,
     project_id: uuid::Uuid,
 ) -> Result<String, (StatusCode, String)> {
@@ -136,7 +136,7 @@ impl RunScope {
 /// the broker cannot find is no run of the caller's.
 pub async fn require_run_id_scope(
     cache: &ScopeCache,
-    pool: &PgPool,
+    pool: &Pool,
     caller: &CallerIdentity,
     run_id: weft_core::RunId,
 ) -> Result<RunScope, (StatusCode, String)> {
@@ -153,7 +153,7 @@ pub async fn require_run_id_scope(
 /// FireSignal task.
 pub async fn require_signal_owned_by(
     cache: &ScopeCache,
-    pool: &PgPool,
+    pool: &Pool,
     caller: &CallerIdentity,
     token: &str,
 ) -> Result<String, (StatusCode, String)> {
@@ -215,20 +215,17 @@ fn enforce_scope(
 
 pub(crate) async fn lookup_project_tenant(
     cache: &ScopeCache,
-    pool: &PgPool,
+    pool: &Pool,
     project_id: uuid::Uuid,
 ) -> Result<String, (StatusCode, String)> {
     if let Some(t) = cache_get(&cache.project_to_tenant, &project_id).await {
         return Ok(t);
     }
-    let row: Option<(String,)> = sqlx::query_as("SELECT tenant_id FROM project WHERE id = $1")
-        .bind(project_id)
-        .fetch_optional(pool)
+    let tenant: String = pool
+        .scalar_opt("SELECT tenant_id FROM project WHERE id = $1", &[&project_id])
         .await
-        .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("project lookup")))?;
-    let tenant = row
-        .ok_or((StatusCode::NOT_FOUND, "unknown project".into()))?
-        .0;
+        .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("project lookup")))?
+        .ok_or((StatusCode::NOT_FOUND, "unknown project".into()))?;
     cache_put(
         &cache.project_to_tenant,
         project_id,
@@ -240,16 +237,14 @@ pub(crate) async fn lookup_project_tenant(
 
 pub(crate) async fn lookup_run_id_scope(
     cache: &ScopeCache,
-    pool: &PgPool,
+    pool: &Pool,
     run_id: weft_core::RunId,
 ) -> Result<RunScope, (StatusCode, String)> {
     if let Some(scope) = cache_get(&cache.run_id_to_scope, &run_id).await {
         return Ok(scope);
     }
     let row: Option<(String, uuid::Uuid, Option<String>)> =
-        sqlx::query_as("SELECT tenant_id, project_id, instance_id FROM run WHERE run_id = $1")
-            .bind(run_id)
-            .fetch_optional(pool)
+        pool.opt("SELECT tenant_id, project_id, instance_id FROM run WHERE run_id = $1", &[&run_id])
             .await
             .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("run lookup")))?;
     let (tenant, project, instance) = row.ok_or((StatusCode::NOT_FOUND, "unknown run".into()))?;
@@ -264,19 +259,16 @@ pub(crate) async fn lookup_run_id_scope(
 
 async fn lookup_signal_scope(
     cache: &ScopeCache,
-    pool: &PgPool,
+    pool: &Pool,
     token: &str,
 ) -> Result<ProjectScope, (StatusCode, String)> {
     if let Some(scope) = cache_get(&cache.signal_to_scope, token).await {
         return Ok(scope);
     }
-    let row: Option<(String, uuid::Uuid)> = sqlx::query_as(
-        "SELECT tenant_id, project_id FROM signal WHERE token = $1",
-    )
-    .bind(token)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("signal lookup")))?;
+    let row: Option<(String, uuid::Uuid)> = pool
+        .opt("SELECT tenant_id, project_id FROM signal WHERE token = $1", &[&token])
+        .await
+        .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("signal lookup")))?;
     let (tenant, project) = row.ok_or((StatusCode::NOT_FOUND, "unknown signal token".into()))?;
     let scope = ProjectScope { tenant, project };
     cache_put(&cache.signal_to_scope, token.to_string(), scope.clone()).await;

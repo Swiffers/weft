@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde::Deserialize;
 use weft_platform_traits::{CallerIdentity, IdentityRefused, Principal};
+use weft_task_store::db::{Client as _, Pool};
 
 use crate::names;
 
@@ -33,7 +34,7 @@ const UNKNOWN_KEY_REFETCH: Duration = Duration::from_secs(30);
 
 /// Google's keys as last fetched.
 struct Keys {
-    by_id: HashMap<String, jsonwebtoken::DecodingKey>,
+    by_id: HashMap<String, weft_core::jwt::DecodingKey>,
     fetched: Instant,
     until: Instant,
 }
@@ -80,15 +81,15 @@ pub struct GoogleIdentity {
     core_account: String,
     /// Where a worker's project is looked up; `None` on a process that
     /// only ever takes weft's own calls (a unit's agent).
-    pool: Option<sqlx::PgPool>,
+    pool: Option<Pool>,
     keys: tokio::sync::Mutex<Option<Keys>>,
     workers: parking_lot::Mutex<HashMap<String, Principal>>,
 }
 
 impl GoogleIdentity {
-    pub fn new(gcp_project: String, core_account: String, pool: Option<sqlx::PgPool>) -> Self {
+    pub fn new(gcp_project: String, core_account: String, pool: Option<Pool>) -> Self {
         Self {
-            http: reqwest::Client::builder().timeout(Duration::from_secs(10)).build().expect("reqwest client"),
+            http: weft_core::net::http_client().timeout(Duration::from_secs(10)).build().expect("reqwest client"),
             gcp_project,
             core_account,
             pool,
@@ -97,7 +98,7 @@ impl GoogleIdentity {
         }
     }
 
-    async fn key(&self, kid: &str) -> Result<jsonwebtoken::DecodingKey, IdentityRefused> {
+    async fn key(&self, kid: &str) -> Result<weft_core::jwt::DecodingKey, IdentityRefused> {
         let mut cached = self.keys.lock().await;
         let now = Instant::now();
         if cached.as_ref().is_none_or(|k| k.stale_for(kid, now)) {
@@ -110,7 +111,7 @@ impl GoogleIdentity {
             let set: Set = resp.json().await.map_err(|e| IdentityRefused::Unavailable(e.to_string()))?;
             let mut keys = HashMap::new();
             for k in set.keys {
-                let key = jsonwebtoken::DecodingKey::from_rsa_components(&k.n, &k.e)
+                let key = weft_core::jwt::DecodingKey::from_rsa_components(&k.n, &k.e)
                     .map_err(|e| IdentityRefused::Unavailable(format!("Google published a key weft cannot read: {e}")))?;
                 keys.insert(k.kid, key);
             }
@@ -129,12 +130,10 @@ impl GoogleIdentity {
         let Some(pool) = &self.pool else {
             return Err(IdentityRefused::Stranger(email.to_string()));
         };
-        let rows: Vec<(uuid::Uuid, String)> =
-            sqlx::query_as("SELECT id, tenant_id FROM project WHERE replace(id::text, '-', '') LIKE $1 || '%'")
-                .bind(prefix)
-                .fetch_all(pool)
-                .await
-                .map_err(|e| IdentityRefused::Unavailable(e.to_string()))?;
+        let rows: Vec<(uuid::Uuid, String)> = pool
+            .all("SELECT id, tenant_id FROM project WHERE replace(id::text, '-', '') LIKE $1 || '%'", &[&prefix])
+            .await
+            .map_err(|e| IdentityRefused::Unavailable(e.to_string()))?;
         match rows.as_slice() {
             [(project, tenant)] => {
                 let p = Principal::Worker { tenant: tenant.clone(), project: *project };
@@ -151,9 +150,8 @@ impl GoogleIdentity {
         let (Principal::Worker { tenant, project }, Some(pool)) = (worker, &self.pool) else {
             return Err(IdentityRefused::Stranger(format!("machine {machine}")));
         };
-        let copies: Vec<(String, String)> = sqlx::query_as("SELECT node_id, copy_id FROM infra_node WHERE project_id = $1")
-            .bind(project)
-            .fetch_all(pool)
+        let copies: Vec<(String, String)> = pool
+            .all("SELECT node_id, copy_id FROM infra_node WHERE project_id = $1", &[&project])
             .await
             .map_err(|e| IdentityRefused::Unavailable(e.to_string()))?;
         copy_of_machine(&tenant, project, &copies, machine)
@@ -193,14 +191,14 @@ impl CallerIdentity for GoogleIdentity {
         if bearer.is_empty() {
             return Err(IdentityRefused::Missing);
         }
-        let header = jsonwebtoken::decode_header(bearer).map_err(|e| IdentityRefused::Malformed(e.to_string()))?;
+        let header = weft_core::jwt::decode_header(bearer).map_err(|e| IdentityRefused::Malformed(e.to_string()))?;
         let kid = header.kid.ok_or_else(|| IdentityRefused::Malformed("no key id".into()))?;
         let key = self.key(&kid).await?;
-        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        let mut validation = weft_core::jwt::Validation::new(weft_core::jwt::Algorithm::RS256);
         validation.set_audience(audiences);
         validation.set_issuer(&["https://accounts.google.com", "accounts.google.com"]);
-        let data = jsonwebtoken::decode::<Claims>(bearer, &key, &validation).map_err(|e| {
-            use jsonwebtoken::errors::ErrorKind;
+        let data = weft_core::jwt::decode::<Claims>(bearer, &key, &validation).map_err(|e| {
+            use weft_core::jwt::errors::ErrorKind;
             match e.kind() {
                 ErrorKind::ExpiredSignature => IdentityRefused::Expired,
                 ErrorKind::InvalidSignature => IdentityRefused::BadSignature,

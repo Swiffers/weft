@@ -14,11 +14,22 @@ pub struct ListenerConfig {
     /// (`crate::hold`) and brings such a signal up itself. A listener that
     /// scales to zero does not; the holders do.
     pub holds_here: bool,
-    /// Whether a subscription a provider can push to this install takes
-    /// the push over a connection held open: where holding costs money
-    /// (a cloud's holders run only while something needs one) and the
-    /// install's address is the internet's for good. A local install keeps
-    /// dialing out, since its one process is up anyway and its tunnel's
-    /// address can change.
-    pub prefer_push: bool,
+    /// Where this install's holders run.
+    pub holders: Holders,
+}
+
+/// Where an install's holders run, which decides what a held signal can
+/// reach and what holding it costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Holders {
+    /// On the machine the install runs on, the person's own (a local
+    /// install's one process): a signal can watch a folder there, and a
+    /// subscription a provider could push to keeps dialing out, since the
+    /// process is up anyway and its tunnel's address can change.
+    OnThisMachine,
+    /// On machines of their own that run only while something needs one (a
+    /// cloud's pool), where the person's folders are not: a subscription a
+    /// provider can push takes the push, since holding a connection costs
+    /// money and the install's address is the internet's for good.
+    Pool,
 }

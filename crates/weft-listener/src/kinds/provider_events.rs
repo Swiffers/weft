@@ -42,6 +42,7 @@ use weft_core::access::spec::lookup_path;
 use weft_core::primitive::{AccessRef, SignalAuth, SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{EventScope, ProviderEvents, Signal};
 
+use crate::config::Holders;
 use crate::event_context::FireContext;
 use weft_core::signal::listener_protocol::{ProcessOutcome, ProcessTarget, PushEvent};
 use crate::registry::{RegisteredSignal, ServingState, TaskGuard, Transport};
@@ -116,13 +117,14 @@ impl KindHandler for ProviderEventsHandler {
     /// sets the next wake; a copy whose claim lost ends quietly.
     async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Option<Woke>> {
         let (cfg, access) = parse_spec(spec).map_err(super::for_good)?;
-        let mut settled = Settled::read(&woken.state).map_err(super::for_good)?;
+        let super::RowState { state, seq } = woken.stored;
+        let mut settled = Settled::read(&state).map_err(super::for_good)?;
         let ensured = ensure_via_broker(&ctx, &access, &cfg).await.map_err(crate::listener_access::for_good_when_answered)?;
         let margin_secs = settled.renew_margin_secs.unwrap_or(0);
         settled.renew_at_ms = ensured.expires_at_unix.map(|at| renew_at_ms(&ctx, &cfg, at, margin_secs, woken.now_ms));
         settled.subscribed = true;
-        let after = settled.into_state(woken.state)?;
-        if !ctx.fire.claim_kind_state(after.clone(), woken.seq).await? {
+        let after = settled.into_state(state)?;
+        if !ctx.fire.claim_kind_state(after.clone(), seq).await? {
             tracing::debug!(
                 target: "weft_listener::provider_events",
                 token = %ctx.fire.token(), topic = %cfg.topic,
@@ -130,7 +132,7 @@ impl KindHandler for ProviderEventsHandler {
             );
             return Ok(None);
         }
-        Ok(Some(Woke { state: after, seq: Some(woken.seq + 1) }))
+        Ok(Some(Woke { state: after, seq: Some(seq + 1) }))
     }
 
     fn broad_push_routed(&self) -> bool {
@@ -190,12 +192,12 @@ impl KindHandler for ProviderEventsHandler {
     async fn spawn_task(
         &self,
         spec: &SignalSpec,
-        kind_state: &Value,
+        stored: super::RowState,
         ctx: SpawnCtx,
     ) -> Result<Option<JoinHandle<()>>> {
         let (cfg, access) = parse_spec(spec)?;
         set_status(&ctx, "starting");
-        let settled = Settled::read(kind_state)?.transport.map(|t| match t {
+        let settled = Settled::read(&stored.state)?.transport.map(|t| match t {
             SettledTransport::Socket => Transport::Socket,
             SettledTransport::Webhook => Transport::Webhook,
         });
@@ -282,8 +284,8 @@ fn set_status(ctx: &SpawnCtx, status: impl Into<String>) {
 
 /// Which transport serves a subscription, decided from the recipe,
 /// the subscription's SCOPE, what the connection actually holds, and
-/// whether this install takes a push over a held connection
-/// (`ListenerConfig::prefer_push`). Pure. Dial-in wins there when the
+/// where this install's holders run (`ListenerConfig::holders`): a pool's
+/// takes a push over a held connection. Pure. Dial-in wins there when the
 /// service pushes this topic for one account: it keeps nothing up between
 /// events. Otherwise dial-out
 /// when the connection can run the mint call (it needs no public address
@@ -296,9 +298,9 @@ pub fn decide_transport(
     topic: &EventsSpec,
     scope: EventScope,
     available: &BTreeMap<String, String>,
-    prefer_push: bool,
+    holders: Holders,
 ) -> Transport {
-    if prefer_push && scope == EventScope::Account && topic.webhook.is_some() {
+    if holders == Holders::Pool && scope == EventScope::Account && topic.webhook.is_some() {
         return Transport::Webhook;
     }
     if let Some(socket) = &topic.socket {
@@ -405,7 +407,7 @@ async fn resolve_and_decide(
 ) -> Result<DecidedServing> {
     let resolved = resolve_topic(access, &cfg.topic, ctx).await?;
     let transport =
-        settled.unwrap_or_else(|| decide_transport(&resolved.topic, cfg.scope, &resolved.values, ctx.config.prefer_push));
+        settled.unwrap_or_else(|| decide_transport(&resolved.topic, cfg.scope, &resolved.values, ctx.config.holders));
     Ok(DecidedServing { transport, topic: resolved.topic, provider_account: resolved.provider_account })
 }
 
@@ -494,14 +496,16 @@ struct SocketShare {
     engine: TaskGuard,
     /// The engine resolves as the subscription that started it, so what
     /// the process keeps of the connection is kept under that one's token
-    /// (`crate::reach`) for as long as the share lives, and dropped with it.
+    /// (`crate::reach`) for as long as the share lives, and dropped with it
+    /// (that registration's only: a newer one of the token keeps its own).
     kept_under: String,
+    kept_for: i64,
     reach: Arc<crate::reach::Reach>,
 }
 
 impl Drop for SocketShare {
     fn drop(&mut self) {
-        self.reach.forget(&self.kept_under);
+        self.reach.forget(&self.kept_under, crate::registry::Registrations::UpTo(self.kept_for));
     }
 }
 
@@ -569,6 +573,7 @@ async fn serve_socket(
                 last,
                 engine: TaskGuard::new(engine),
                 kept_under: ctx.fire.token().to_string(),
+                kept_for: ctx.fire.generation(),
                 reach: ctx.reach.clone(),
             }
         });
@@ -933,21 +938,21 @@ mod tests {
         let with_token =
             BTreeMap::from([("appToken".to_string(), "xapp-1".to_string())]);
         assert_eq!(
-            decide_transport(&both, EventScope::Account, &with_token, false),
+            decide_transport(&both, EventScope::Account, &with_token, Holders::OnThisMachine),
             Transport::Socket
         );
         assert_eq!(
-            decide_transport(&both, EventScope::Account, &BTreeMap::new(), false),
+            decide_transport(&both, EventScope::Account, &BTreeMap::new(), Holders::OnThisMachine),
             Transport::Webhook
         );
         // An APP-wide subscription never falls to the push transport
         // (it routes per account, which can never mean "every
         // install"); without the dial-out value it refuses, naming it.
         assert_eq!(
-            decide_transport(&both, EventScope::App, &with_token, false),
+            decide_transport(&both, EventScope::App, &with_token, Holders::OnThisMachine),
             Transport::Socket
         );
-        match decide_transport(&both, EventScope::App, &BTreeMap::new(), false) {
+        match decide_transport(&both, EventScope::App, &BTreeMap::new(), Holders::OnThisMachine) {
             Transport::Unservable(reason) => {
                 assert!(reason.contains("app-wide"), "{reason}");
                 assert!(reason.contains("appToken"), "{reason}");
@@ -967,7 +972,7 @@ mod tests {
                 }
             }
         }));
-        match decide_transport(&socket_only, EventScope::Account, &BTreeMap::new(), false) {
+        match decide_transport(&socket_only, EventScope::Account, &BTreeMap::new(), Holders::OnThisMachine) {
             Transport::Unservable(reason) => {
                 assert!(reason.contains("appToken"), "{reason}")
             }
@@ -975,16 +980,16 @@ mod tests {
         }
     }
 
-    /// On an install that prefers the push, a subscription of one account
-    /// that the service pushes rides it, even when the connection could
-    /// dial out: nothing has to stay up for it. An app-wide one still dials
-    /// out.
+    /// On an install whose holders are a pool, a subscription of one
+    /// account that the service pushes rides the push, even when the
+    /// connection could dial out: nothing has to stay up for it. An
+    /// app-wide one still dials out.
     #[test]
-    fn an_install_that_prefers_the_push_takes_it() {
+    fn an_install_whose_holders_are_a_pool_takes_the_push() {
         let both = slack_topic();
         let with_token = BTreeMap::from([("appToken".to_string(), "xapp-1".to_string())]);
-        assert_eq!(decide_transport(&both, EventScope::Account, &with_token, true), Transport::Webhook);
-        assert_eq!(decide_transport(&both, EventScope::App, &with_token, true), Transport::Socket);
+        assert_eq!(decide_transport(&both, EventScope::Account, &with_token, Holders::Pool), Transport::Webhook);
+        assert_eq!(decide_transport(&both, EventScope::App, &with_token, Holders::Pool), Transport::Socket);
     }
 
     /// A pushed subscription wakes (to subscribe, then to renew) and is

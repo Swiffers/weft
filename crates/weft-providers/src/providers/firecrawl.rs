@@ -388,7 +388,7 @@ mod tests {
     use super::*;
 
     fn follow_up_stub() -> reqwest_middleware::ClientWithMiddleware {
-        reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build()
+        reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build()
     }
 
     /// Route classification is a billing boundary: scrape fixed, crawl
@@ -464,7 +464,7 @@ mod crawl_charge_tests {
     }
 
     fn http() -> reqwest_middleware::ClientWithMiddleware {
-        reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build()
+        reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build()
     }
 
     /// The crawl submit spends, and what it spent is only knowable once

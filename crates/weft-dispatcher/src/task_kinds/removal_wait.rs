@@ -43,7 +43,7 @@ impl TaskExecutor<DispatcherState> for RemovalWaitExecutor {
         // as it lets go.
         if every_run {
             let scope = crate::drain::DrainScope { project_id: id, reaching: crate::drain::Reaching::EveryRun };
-            crate::drain::drain(state, &scope, None).await?;
+            crate::drain::drain(state, &scope, None, None).await?;
         }
         crate::api::project::last_calls_sent(state, id).await?;
         Ok(Value::Null)

@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use weft_task_store::db::{Client as _, Transaction};
 
 use crate::runtime_store::charged_bytes_for;
 
@@ -30,13 +31,8 @@ use crate::runtime_store::charged_bytes_for;
 /// tenants). The task-store also uses `hashtextextended(_, 0)` but over a
 /// different string, so it does NOT contend here (only the hash function is
 /// shared, not the key).
-pub async fn lock_tenant_storage(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    tenant: &str,
-) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(tenant)
-        .execute(&mut **tx)
+pub async fn lock_tenant_storage(tx: &Transaction<'_>, tenant: &str) -> Result<()> {
+    tx.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", &[&tenant])
         .await
         .context("tenant storage lock")?;
     Ok(())
@@ -119,7 +115,7 @@ pub trait EntitlementSource: Send + Sync {
     /// `now` (unix seconds, the store's clock) counts for nothing.
     async fn account_used_bytes(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &Transaction<'_>,
         tenant: &str,
         now: i64,
     ) -> anyhow::Result<u64>;
@@ -159,12 +155,12 @@ impl EntitlementSource for LocalEntitlementSource {
 
     async fn account_used_bytes(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &Transaction<'_>,
         tenant: &str,
         now: i64,
     ) -> anyhow::Result<u64> {
         // One plane here: the runtime-file table's charged bytes ARE the account.
-        charged_bytes_for(&mut **tx, tenant, now).await
+        charged_bytes_for(tx, tenant, now).await
     }
 }
 

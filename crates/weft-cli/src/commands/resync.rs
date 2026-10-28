@@ -19,7 +19,7 @@
 
 use super::Ctx;
 use crate::progress::ActionVerb;
-use weft_core::deactivation::{ResyncAnswer, ResyncResponse};
+use weft_core::deactivation::{ResyncAnswer, ResyncProgress, ResyncResponse};
 use weft_core::TakeDownChoice;
 
 pub async fn run(ctx: Ctx, scope: weft_core::activation::ActivationScope, choice: TakeDownChoice) -> anyhow::Result<()> {
@@ -57,14 +57,27 @@ async fn answer_of(
     project_id: &str,
     answer: serde_json::Value,
 ) -> anyhow::Result<ResyncResponse> {
-    let unreadable = |e: serde_json::Error| {
-        anyhow::anyhow!("resync: the dispatcher's answer does not read as one ({e}); upgrade the dispatcher or this CLI so the versions match")
-    };
-    match serde_json::from_value(answer).map_err(unreadable)? {
+    match crate::client::read_answer(answer, "the resync's answer")? {
         ResyncAnswer::Done(done) => Ok(done),
         ResyncAnswer::UnderWay { task, brought_back } => {
+            // What it waits for, said each time it changes: on the progress
+            // channel, so a CI log shows it line by line and `--json` gets
+            // it as events. It starts as naming none, so a first look that
+            // names none says nothing: the drain-wait line already said what
+            // the resync waits for, and an empty list never means nothing is
+            // left (a run not on record yet is waited for unnamed).
+            let mut said = ResyncProgress::default();
+            let going = async |where_it_is: Option<serde_json::Value>| {
+                let Some(where_it_is) = where_it_is else { return Ok(()) };
+                let now: ResyncProgress = crate::client::read_answer(where_it_is, "where the resync is")?;
+                if said != now {
+                    progress.resync_waits_for(&now);
+                    said = now;
+                }
+                Ok(())
+            };
             let followed: ResyncResponse =
-                serde_json::from_value(super::follow::follow_task(client, progress, project_id, task).await?).map_err(unreadable)?;
+                crate::client::read_answer(super::follow::follow_task(client, progress, project_id, task, going).await?, "the resync's answer")?;
             Ok(ResyncResponse { brought_back, ..followed })
         }
     }

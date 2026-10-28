@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-lru = { version = "0.16", optional = true }
+lru = { workspace = true, optional = true }
 # Re-exported as the `weft_core::NodeManifest` derive: every node picks up
 # its co-located metadata.json through it. Proc-macro crates build for the
 # host, so the WASM parse build is unaffected.
@@ -42,7 +42,7 @@ tokio = { workspace = true, optional = true }
 # storage methods (a core trait), so the alias must live in core.
 futures = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
-cron = { version = "0.12", optional = true }
+cron = { workspace = true, optional = true }
 # The zone a cron timer counts in, validated where the signal is written.
 chrono-tz = { workspace = true, optional = true }
 # Signed socket tickets (`caller_token`): a worker's door signs one for a
@@ -77,6 +77,9 @@ http = { version = "1", optional = true }
 # engine, node code handing a connected stream to a protocol library).
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
+# `jwt`: the token format, with ring as its crypto.
+jsonwebtoken = { workspace = true, optional = true }
+ring = { workspace = true, optional = true }
 # The broker's one reader of the JSON its callers send, as an axum
 # extractor (`wire_shape::Json`): under `server` only.
 axum = { workspace = true, optional = true }
@@ -112,6 +115,9 @@ runtime = [
 ]
 # The broker: the JSON and query extractors of `wire_shape`.
 server = ["runtime", "dep:axum"]
+# Signing and checking JSON Web Tokens (`jwt`), on ring: the services that
+# mint or verify one turn it on, so a worker never builds it.
+jwt = ["runtime", "dep:jsonwebtoken", "dep:ring"]
 # Ships the hand-rolled fakes colocated with their traits (currently
 # `caller::FakeCallerConnection`) so downstream crates can wire them into
 # layer-3 tests. Off by default; consumers enable it in `[dev-dependencies]`.
@@ -119,6 +125,7 @@ test-helpers = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
+toml = { workspace = true }
 
 [lints]
 workspace = true

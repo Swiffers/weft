@@ -2325,6 +2325,7 @@ async fn drive(
                 weft_core::instance::copy_owner(node_def.per_instance, instance).cloned();
             let run_instance = instance.cloned();
             let baked_outputs = node_def.baked_outputs.clone();
+            let failing_type = node_def.node_type.clone();
             // The firing's start goes to the journal in the background
             // (`DriveJournal`): a fast run's body starts now, whatever is
             // still being sent, unless an earlier write already failed. A
@@ -2353,13 +2354,18 @@ async fn drive(
                     let spec = match node_impl.provision_infra(infra_ctx, provision_input).await {
                         Ok(s) => s,
                         Err(e) => {
+                            let (message, catchable) = weft_core::context::node_failure(
+                                &e,
+                                &failing_type,
+                                &loc_task.node_id,
+                                provision_clients.needs_from,
+                            );
                             let _ = tx.send(TaskMsg::Terminal {
                                 loc: loc_task,
                                 run_id: run_id_task,
                                 outcome: NodeTaskOutcome::Failed {
-                                    message: format!("provision: {e}"),
-                                    catchable: weft_core::context::catchable_message(&e)
-                                        .map(|m| format!("provision: {m}")),
+                                    message: format!("provision: {message}"),
+                                    catchable: catchable.map(|m| format!("provision: {m}")),
                                     gave_up_wait: matches!(e, weft_core::error::WeftError::WaitGaveUp(_)),
                                 },
                             });
@@ -2480,11 +2486,15 @@ async fn drive(
                     Err(weft_core::error::WeftError::WaitSkipped(_)) => {
                         NodeTaskOutcome::Skipped(weft_core::run::skip::SkipReason::WaitSkipped)
                     }
-                    Err(e) => NodeTaskOutcome::Failed {
-                        message: runner_for_bake.with_infra_hint(format!("{e}")),
-                        catchable: weft_core::context::catchable_message(&e),
-                        gave_up_wait: matches!(e, weft_core::error::WeftError::WaitGaveUp(_)),
-                    },
+                    Err(e) => {
+                        let (message, catchable) =
+                            weft_core::context::node_failure(&e, &failing_type, &loc_task.node_id, provision_clients.needs_from);
+                        NodeTaskOutcome::Failed {
+                            message: runner_for_bake.with_infra_hint(message),
+                            catchable,
+                            gave_up_wait: matches!(e, weft_core::error::WeftError::WaitGaveUp(_)),
+                        }
+                    }
                 };
                 let _ = tx.send(TaskMsg::Terminal {
                     loc: loc_task,

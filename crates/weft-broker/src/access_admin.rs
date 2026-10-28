@@ -391,10 +391,12 @@ async fn oauth_complete(
     Json(req): Json<weft_access_store::OAuthComplete>,
 ) -> Result<Json<CompletedConnect>, ApiError> {
     control_plane(&state, &headers).await?;
+    // The state is claimed, the connection written and the result parked
+    // one statement at a time.
     weft_access_store::complete_oauth(&state.pool, &req.state, &req.code)
         .await
         .map(Json)
-        .map_err(crate::handlers::store_err)
+        .map_err(crate::handlers::store_err_after_writes)
 }
 
 /// POST /v1/access/admin/lookup: run a `remote_select` list source

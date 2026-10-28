@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   backendFromSnapshot,
   describeProgress,
+  describeRestart,
   emptyActionAvailability,
   parseRunning,
   parseStatusPayload,
@@ -144,5 +145,28 @@ describe('infra progress', () => {
     const progress = snap.infraNodes[0].progress!;
     expect(progress).toEqual({ sinceUnix: 8_970, asOfUnix: 9_000 });
     expect(describeProgress(progress, Date.now() / 1000)).toBe('for 30s');
+  });
+});
+
+describe('infra restarts', () => {
+  // 2026-10-27 14:03:20 UTC; the same words `LastRestart::describe` writes.
+  const atUnix = 1_793_109_800;
+
+  it('says what happened, when, and what to do about it', () => {
+    expect(describeRestart({ atUnix, cause: { kind: 'out_of_memory' } }, 'one.db')).toBe(
+      'one.db ran out of memory at 2026-10-27 14:03 UTC: a process in it was killed because it needs more memory than its container may use; give it more',
+    );
+    expect(describeRestart({ atUnix, cause: { kind: 'exited', code: 137 } }, 'one.db')).toBe(
+      'one.db stopped (exit code 137) and was restarted at 2026-10-27 14:03 UTC',
+    );
+    expect(describeRestart({ atUnix, cause: { kind: 'unknown' } }, 'one.db')).toBe(
+      'one.db stopped and was restarted at 2026-10-27 14:03 UTC, for a reason its host no longer knows',
+    );
+  });
+
+  it('carries a copy\'s last restart from the status answer', () => {
+    const lastRestart = { atUnix, cause: { kind: 'out_of_memory' as const } };
+    const snap = parseStatusPayload({ infra: [{ node: 'db', nodeType: 'pg', status: 'running', lastRestart }] });
+    expect(snap.infraNodes[0].lastRestart).toEqual(lastRestart);
   });
 });

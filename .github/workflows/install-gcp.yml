@@ -149,7 +149,8 @@ jobs:
         run: |
           terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
           terraform apply -input=false -auto-approve \
-            -target=google_project_service.apis -target=google_artifact_registry_repository.images
+            -target=google_project_service.apis -target=google_artifact_registry_repository.images \
+            -target=random_password.install_key
 
       # The CLI weft's release built from this exact source, waited for
       # when that release is still being built; otherwise built here,

@@ -6,6 +6,23 @@ then run `weft maintenance off`.
 
 ## 2026-10-28 (0.2.277)
 
+**If a project has its own nodes, or its own copy of the standard nodes, it
+may not compile after this update.** weft moved to newer versions of the
+libraries a node's code can use, and a node that asks for an older one no
+longer fits. The project then stays down after `weft maintenance off`,
+with the compile error. To bring it back:
+
+- In the project, run `weft catalog update`, which refreshes the copy of
+  the standard nodes under `nodes/base_catalog/` (any edit you made there
+  is overwritten).
+- In each of your own packages, change `reqwest = "0.12"` to `"0.13"`,
+  `reqwest-middleware = "0.4"` to `"0.5"` and `minillmlib = "0.6.0"` to
+  `"0.6.1"` in its `package.toml`, where it asks for them.
+- A node that sends text over a socket writes
+  `SocketMessage::text(value)` where it wrote
+  `SocketMessage::Text(value)`.
+- Then run `weft resync` in the project.
+
 **If your cloud install keeps its database on Cloud SQL, the next run of
 the install workflow restarts that database once.** Until now the workflow
 set its `max_connections` to 250 whatever the tier. Now it leaves Cloud

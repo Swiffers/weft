@@ -32,8 +32,7 @@
 //!   the one running it dies.
 
 use anyhow::Result;
-use weft_task_store::sql;
-use sqlx::postgres::PgPool;
+use weft_task_store::db::{self, Client, Pool, Transaction};
 
 // `InfraLifecycleVerb` is the wire contract for the `verb` column. It
 // lives in `weft-broker-client::protocol` so the supervisor + dispatcher
@@ -324,8 +323,8 @@ impl Teardown {
 /// dispatcher's claimer first waits for the runs reaching its copies to
 /// end (`crate::lifecycle_claimer`); the owning supervisor claims it once
 /// that wait is over, or at once without.
-pub async fn issue_lifecycle<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
+pub async fn issue_lifecycle(
+    db: &impl Client,
     tenant_id: &str,
     project_id: uuid::Uuid,
     node_id: Option<&str>,
@@ -337,27 +336,28 @@ pub async fn issue_lifecycle<'e>(
 ) -> Result<i64> {
     let (instance_id, every_copy) = copies.columns();
     let (force, spec_json) = teardown.columns();
-    let row: (i64,) = sqlx::query_as(
-        "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, node_id, verb, force, spec_json, drains, \
-          issued_by_replica, issued_at_unix, instance_id, every_copy, waits_on_tokens) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, EXTRACT(EPOCH FROM NOW())::BIGINT, $9, $10, $11) \
-         RETURNING id",
-    )
-    .bind(tenant_id)
-    .bind(project_id)
-    .bind(node_id)
-    .bind(teardown.verb().as_str())
-    .bind(force)
-    .bind(spec_json)
-    .bind(waits)
-    .bind(issued_by_replica)
-    .bind(instance_id)
-    .bind(every_copy)
-    .bind(waits_on_tokens)
-    .fetch_one(executor)
-    .await?;
-    Ok(row.0)
+    Ok(db
+        .scalar(
+            "INSERT INTO infra_lifecycle_command \
+             (tenant_id, project_id, node_id, verb, force, spec_json, drains, \
+              issued_by_replica, issued_at_unix, instance_id, every_copy, waits_on_tokens) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, EXTRACT(EPOCH FROM NOW())::BIGINT, $9, $10, $11) \
+             RETURNING id",
+            &[
+                &tenant_id,
+                &project_id,
+                &node_id,
+                &teardown.verb().as_str(),
+                &force,
+                &spec_json,
+                &waits,
+                &issued_by_replica,
+                &instance_id,
+                &every_copy,
+                &waits_on_tokens,
+            ],
+        )
+        .await?)
 }
 
 /// An upgrade's work, carried in its command's `spec_json`; whose
@@ -419,22 +419,16 @@ pub fn upgrade_in_flight_refusal(command: i64) -> (axum::http::StatusCode, Strin
 /// The upgrade of `instance`'s copies (`None`: the shared ones) under
 /// way, if one is: what a second upgrade of the same copies is refused
 /// over, before it takes anything down and again as it is issued.
-pub async fn upgrade_in_flight<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
-    project_id: uuid::Uuid,
-    instance: Option<&str>,
-) -> Result<Option<i64>> {
-    Ok(sqlx::query_scalar(
-        "SELECT id FROM infra_lifecycle_command \
-         WHERE project_id = $1 AND verb = $2 AND instance_id IS NOT DISTINCT FROM $3 \
-           AND completed_at_unix IS NULL \
-         ORDER BY id LIMIT 1",
-    )
-    .bind(project_id)
-    .bind(InfraLifecycleVerb::Upgrade.as_str())
-    .bind(instance)
-    .fetch_optional(executor)
-    .await?)
+pub async fn upgrade_in_flight(db: &impl Client, project_id: uuid::Uuid, instance: Option<&str>) -> Result<Option<i64>> {
+    Ok(db
+        .scalar_opt(
+            "SELECT id FROM infra_lifecycle_command \
+             WHERE project_id = $1 AND verb = $2 AND instance_id IS NOT DISTINCT FROM $3 \
+               AND completed_at_unix IS NULL \
+             ORDER BY id LIMIT 1",
+            &[&project_id, &InfraLifecycleVerb::Upgrade.as_str(), &instance],
+        )
+        .await?)
 }
 
 /// Issue an upgrade of `instance`'s copies (the shared ones for `None`)
@@ -443,7 +437,7 @@ pub async fn upgrade_in_flight<'e>(
 /// the copies, held until that transaction ends, so two requests racing
 /// each other issue one upgrade.
 async fn issue_upgrade_in(
-    conn: &mut sqlx::PgConnection,
+    tx: &Transaction<'_>,
     tenant_id: &str,
     project_id: uuid::Uuid,
     instance: Option<&weft_core::instance::InstanceId>,
@@ -451,30 +445,20 @@ async fn issue_upgrade_in(
     issued_by_replica: &str,
 ) -> Result<Issued> {
     let instance = instance.map(|m| m.as_str());
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(crate::lease::advisory_key(
-            crate::lease::UPGRADE_ISSUE_DOMAIN,
-            &format!("{project_id}/{}", instance.unwrap_or("")),
-        ))
-        .execute(&mut *conn)
-        .await?;
-    if let Some(id) = upgrade_in_flight(&mut *conn, project_id, instance).await? {
+    let key = crate::lease::advisory_key(crate::lease::UPGRADE_ISSUE_DOMAIN, &format!("{project_id}/{}", instance.unwrap_or("")));
+    tx.execute("SELECT pg_advisory_xact_lock($1)", &[&key]).await?;
+    if let Some(id) = upgrade_in_flight(tx, project_id, instance).await? {
         return Ok(Issued::UpgradeInFlight(id));
     }
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, verb, spec_json, issued_by_replica, issued_at_unix, instance_id) \
-         VALUES ($1, $2, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT, $6) \
-         RETURNING id",
-    )
-    .bind(tenant_id)
-    .bind(project_id)
-    .bind(InfraLifecycleVerb::Upgrade.as_str())
-    .bind(sqlx::types::Json(work))
-    .bind(issued_by_replica)
-    .bind(instance)
-    .fetch_one(&mut *conn)
-    .await?;
+    let id: i64 = tx
+        .scalar(
+            "INSERT INTO infra_lifecycle_command \
+             (tenant_id, project_id, verb, spec_json, issued_by_replica, issued_at_unix, instance_id) \
+             VALUES ($1, $2, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT, $6) \
+             RETURNING id",
+            &[&tenant_id, &project_id, &InfraLifecycleVerb::Upgrade.as_str(), &db::Json(work), &issued_by_replica, &instance],
+        )
+        .await?;
     Ok(Issued::Commands(vec![id]))
 }
 
@@ -516,21 +500,21 @@ impl TakeDownCommands {
         )
     }
 
-    /// Issue them on `conn`'s transaction: their ids, first issued first,
+    /// Issue them on `tx`: their ids, first issued first,
     /// or the upgrade of the same copies already in flight. `tokens` are
     /// the entry tokens of the triggers taken down with them, read before
     /// that take-down: what a stop's or terminate's wait counts at the
     /// door for them (`waits_on_tokens`).
-    pub async fn issue_in(&self, conn: &mut sqlx::PgConnection, project_id: uuid::Uuid, tokens: &[String]) -> Result<Issued> {
+    pub async fn issue_in(&self, tx: &Transaction<'_>, project_id: uuid::Uuid, tokens: &[String]) -> Result<Issued> {
         let (tenant, replica) = (self.tenant_id.as_str(), self.issued_by_replica.as_str());
         match &self.work {
             TakeDownWork::Teardown { nodes, copies, teardown, waits } => {
                 let mut ids = Vec::with_capacity(nodes.len().max(1));
                 match nodes.is_empty() {
-                    true => ids.push(issue_lifecycle(&mut *conn, tenant, project_id, None, copies, *teardown, *waits, tokens, replica).await?),
+                    true => ids.push(issue_lifecycle(tx, tenant, project_id, None, copies, *teardown, *waits, tokens, replica).await?),
                     false => {
                         for node in nodes {
-                            ids.push(issue_lifecycle(&mut *conn, tenant, project_id, Some(node), copies, *teardown, *waits, tokens, replica).await?);
+                            ids.push(issue_lifecycle(tx, tenant, project_id, Some(node), copies, *teardown, *waits, tokens, replica).await?);
                         }
                     }
                 }
@@ -538,7 +522,7 @@ impl TakeDownCommands {
             }
             TakeDownWork::Upgrade { instance, work } => {
                 let work = UpgradeWork { waits_on_tokens: tokens.to_vec(), ..work.clone() };
-                issue_upgrade_in(conn, tenant, project_id, instance.as_ref(), &work, replica).await
+                issue_upgrade_in(tx, tenant, project_id, instance.as_ref(), &work, replica).await
             }
         }
     }
@@ -548,16 +532,14 @@ impl TakeDownCommands {
     /// or being removed: the insert holds its row `FOR KEY SHARE`, so a
     /// removal either finds the commands and deletes them or waits for
     /// this and then finds them (`ProjectStore::remove`).
-    pub async fn issue(&self, pool: &PgPool, project_id: uuid::Uuid) -> Result<Option<Issued>> {
-        let mut tx = pool.begin().await?;
-        let live: Option<bool> = sqlx::query_scalar("SELECT TRUE FROM project WHERE id = $1 AND NOT removing FOR KEY SHARE")
-            .bind(project_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    pub async fn issue(&self, pool: &Pool, project_id: uuid::Uuid) -> Result<Option<Issued>> {
+        let mut conn = pool.get().await?;
+        let tx = conn.transaction().await?;
+        let live: Option<bool> = tx.scalar_opt("SELECT TRUE FROM project WHERE id = $1 AND NOT removing FOR KEY SHARE", &[&project_id]).await?;
         if live.is_none() {
             return Ok(None);
         }
-        let issued = self.issue_in(&mut tx, project_id, &[]).await?;
+        let issued = self.issue_in(&tx, project_id, &[]).await?;
         if let Issued::Commands(_) = issued {
             tx.commit().await?;
         }
@@ -568,16 +550,15 @@ impl TakeDownCommands {
 /// Record that upgrade `command_id`'s stop leg landed, while `process`
 /// still holds its claim. `false` when it does not (another process took it
 /// over): the caller stops there.
-pub async fn mark_upgrade_stopped(pool: &PgPool, command_id: i64, replica: &str) -> Result<bool> {
-    let res = sqlx::query(
-        "UPDATE infra_lifecycle_command SET spec_json = jsonb_set(spec_json, '{stopped}', 'true') \
-         WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL",
-    )
-    .bind(command_id)
-    .bind(replica)
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected() > 0)
+pub async fn mark_upgrade_stopped(pool: &Pool, command_id: i64, replica: &str) -> Result<bool> {
+    let res = pool
+        .execute(
+            "UPDATE infra_lifecycle_command SET spec_json = jsonb_set(spec_json, '{stopped}', 'true') \
+             WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL",
+            &[&command_id, &replica],
+        )
+        .await?;
+    Ok(res > 0)
 }
 
 /// The verbs that are a person's infra work, as the SQL list inside
@@ -617,7 +598,7 @@ pub enum WaitOutcome {
 /// Wait for one command to reach a terminal state, or `timeout` to
 /// pass. See [`wait_for_commands`].
 pub async fn wait_for_command(
-    pool: &PgPool,
+    pool: &Pool,
     signals: &weft_task_store::pg_signal::PgSignalWatch,
     command_id: i64,
     timeout: std::time::Duration,
@@ -627,8 +608,7 @@ pub async fn wait_for_command(
 }
 
 /// A completed command row's outcome, or `None` while it is pending.
-fn completed_outcome(command_id: i64, row: &sqlx::postgres::PgRow) -> Result<Option<WaitOutcome>> {
-    use sqlx::Row;
+fn completed_outcome(command_id: i64, row: &db::Row) -> Result<Option<WaitOutcome>> {
     use weft_broker_client::protocol::LifecycleOutcome;
     let done: Option<i64> = row.try_get("completed_at_unix")?;
     if done.is_none() {
@@ -659,7 +639,7 @@ fn completed_outcome(command_id: i64, row: &sqlx::postgres::PgRow) -> Result<Opt
 /// (a NoOp unit staying up means the rollup never reaches "stopped",
 /// so the command outcome is the only honest "is it done" signal).
 pub async fn read_command_outcome(
-    pool: &PgPool,
+    pool: &Pool,
     project_id: uuid::Uuid,
     command_id: i64,
 ) -> Result<Option<WaitOutcome>> {
@@ -669,14 +649,13 @@ pub async fn read_command_outcome(
     // outcome (which carries raw supervisor error strings). A command
     // under a different project returns None, indistinguishable from
     // pending, so no existence leak.
-    let row = sqlx::query(
-        "SELECT completed_at_unix, outcome, outcome_message \
-         FROM infra_lifecycle_command WHERE id = $1 AND project_id = $2",
-    )
-    .bind(command_id)
-    .bind(project_id)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<db::Row> = pool
+        .opt(
+            "SELECT completed_at_unix, outcome, outcome_message \
+             FROM infra_lifecycle_command WHERE id = $1 AND project_id = $2",
+            &[&command_id, &project_id],
+        )
+        .await?;
     match row {
         Some(r) => completed_outcome(command_id, &r),
         None => Ok(None),
@@ -688,7 +667,7 @@ pub async fn read_command_outcome(
 /// its row's own trigger) or the hold runs out. For a client that waits
 /// on one command and asks again after each hold.
 pub async fn held_command_outcome(
-    pool: &PgPool,
+    pool: &Pool,
     signals: &weft_task_store::pg_signal::PgSignalWatch,
     project_id: uuid::Uuid,
     command_id: i64,
@@ -726,7 +705,7 @@ pub async fn held_command_outcome(
 /// a time, so it can leave a breadcrumb), and through
 /// [`wait_for_command`] by every single-command wait.
 pub async fn wait_for_commands(
-    pool: &PgPool,
+    pool: &Pool,
     signals: &weft_task_store::pg_signal::PgSignalWatch,
     command_ids: &[i64],
     timeout: std::time::Duration,
@@ -742,14 +721,13 @@ pub async fn wait_for_commands(
     // a read and the wait still ends the wait.
     let mut heard = signals.subscribe();
     loop {
-        use sqlx::Row;
-        let rows = sqlx::query(
-            "SELECT id, completed_at_unix, outcome, outcome_message \
-             FROM infra_lifecycle_command WHERE id = ANY($1)",
-        )
-        .bind(command_ids)
-        .fetch_all(pool)
-        .await?;
+        let rows = pool
+            .query(
+                "SELECT id, completed_at_unix, outcome, outcome_message \
+                 FROM infra_lifecycle_command WHERE id = ANY($1)",
+                &[&command_ids],
+            )
+            .await?;
         for r in rows {
             let id: i64 = r.try_get("id")?;
             if let Some(outcome) = completed_outcome(id, &r)? {
@@ -794,23 +772,24 @@ pub async fn wait_for_commands(
 /// from keeping a stop's wait for the runs reaching its copies going
 /// (each new one would be waited for too). In-flight work is untouched;
 /// only new launches are gated.
-pub async fn any_in_flight(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool> {
+pub async fn any_in_flight(pool: &Pool, project_id: uuid::Uuid) -> Result<bool> {
     // Only what reaches the shared copies, which the bar starts and stops:
     // one instance's copy booting holds none of the program's own verbs
     // back (a command for every copy names no instance, and counts).
-    let (exists,): (bool,) = sqlx::query_as(sql!(
-        "SELECT EXISTS( \
-             SELECT 1 FROM infra_lifecycle_command \
-             WHERE project_id = $1 \
-               AND completed_at_unix IS NULL \
-               AND instance_id IS NULL \
-               AND verb IN ({INFRA_WORK_VERBS_SQL}) \
-         )",
-    ))
-    .bind(project_id)
-    .fetch_one(pool)
-    .await?;
-    Ok(exists)
+    Ok(pool
+        .scalar(
+            &format!(
+                "SELECT EXISTS( \
+                     SELECT 1 FROM infra_lifecycle_command \
+                     WHERE project_id = $1 \
+                       AND completed_at_unix IS NULL \
+                       AND instance_id IS NULL \
+                       AND verb IN ({INFRA_WORK_VERBS_SQL}) \
+                 )",
+            ),
+            &[&project_id],
+        )
+        .await?)
 }
 
 /// How the commands reaching a trigger's copies stand since the infra
@@ -848,7 +827,7 @@ impl SinceTakeDown {
 /// commands. A command reaches a copy when it names its place or every
 /// place of its owner, and its owner or every copy.
 pub async fn since_take_down(
-    pool: &PgPool,
+    pool: &Pool,
     project_id: uuid::Uuid,
     copies: &[(String, Option<weft_core::instance::InstanceId>)],
     first_command: i64,
@@ -856,30 +835,27 @@ pub async fn since_take_down(
     let places: Vec<&str> = copies.iter().map(|(place, _)| place.as_str()).collect();
     // '' for the shared copy: unnest takes no NULL beside a text array.
     let instances: Vec<&str> = copies.iter().map(|(_, instance)| instance.as_ref().map_or("", |i| i.as_str())).collect();
-    let (under_way, returned): (bool, bool) = sqlx::query_as(
-        "WITH reaching AS ( \
-             SELECT c.id, c.verb, c.completed_at_unix, c.outcome FROM infra_lifecycle_command c \
-             WHERE c.project_id = $1 AND c.verb IN ('apply', 'stop', 'terminate', 'upgrade') \
-               AND EXISTS (SELECT 1 FROM unnest($2::text[], $3::text[]) AS t(place, inst) \
-                           WHERE (c.node_id IS NULL OR c.node_id = t.place) \
-                             AND (c.every_copy OR c.instance_id IS NOT DISTINCT FROM NULLIF(t.inst, ''))) \
-         ), downs AS ( \
-             SELECT id, completed_at_unix, outcome FROM reaching WHERE verb <> 'apply' AND id >= $4 \
-         ), last_done AS ( \
-             SELECT MAX(id) AS id FROM downs WHERE outcome = 'succeeded' \
-         ) \
-         SELECT EXISTS (SELECT 1 FROM reaching WHERE verb <> 'apply' AND completed_at_unix IS NULL), \
-                ((SELECT id FROM last_done) IS NULL \
-                  AND EXISTS (SELECT 1 FROM downs WHERE completed_at_unix IS NOT NULL AND outcome IS DISTINCT FROM 'succeeded')) \
-                OR EXISTS (SELECT 1 FROM reaching WHERE verb = 'apply' AND outcome = 'succeeded' \
-                             AND id > COALESCE((SELECT id FROM last_done), $4))",
-    )
-    .bind(project_id)
-    .bind(&places)
-    .bind(&instances)
-    .bind(first_command)
-    .fetch_one(pool)
-    .await?;
+    let (under_way, returned): (bool, bool) = pool
+        .one(
+            "WITH reaching AS ( \
+                 SELECT c.id, c.verb, c.completed_at_unix, c.outcome FROM infra_lifecycle_command c \
+                 WHERE c.project_id = $1 AND c.verb IN ('apply', 'stop', 'terminate', 'upgrade') \
+                   AND EXISTS (SELECT 1 FROM unnest($2::text[], $3::text[]) AS t(place, inst) \
+                               WHERE (c.node_id IS NULL OR c.node_id = t.place) \
+                                 AND (c.every_copy OR c.instance_id IS NOT DISTINCT FROM NULLIF(t.inst, ''))) \
+             ), downs AS ( \
+                 SELECT id, completed_at_unix, outcome FROM reaching WHERE verb <> 'apply' AND id >= $4 \
+             ), last_done AS ( \
+                 SELECT MAX(id) AS id FROM downs WHERE outcome = 'succeeded' \
+             ) \
+             SELECT EXISTS (SELECT 1 FROM reaching WHERE verb <> 'apply' AND completed_at_unix IS NULL), \
+                    ((SELECT id FROM last_done) IS NULL \
+                      AND EXISTS (SELECT 1 FROM downs WHERE completed_at_unix IS NOT NULL AND outcome IS DISTINCT FROM 'succeeded')) \
+                    OR EXISTS (SELECT 1 FROM reaching WHERE verb = 'apply' AND outcome = 'succeeded' \
+                                 AND id > COALESCE((SELECT id FROM last_done), $4))",
+            &[&project_id, &places, &instances, &first_command],
+        )
+        .await?;
     Ok(SinceTakeDown { under_way, returned })
 }
 
@@ -899,7 +875,7 @@ pub async fn since_take_down(
 /// reactivate) are health's work and never touched. Returns how many
 /// rows were touched.
 pub async fn request_cancel_owner(
-    pool: &PgPool,
+    pool: &Pool,
     project_id: uuid::Uuid,
     instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<u64> {
@@ -909,26 +885,21 @@ pub async fn request_cancel_owner(
          AND verb IN ({INFRA_WORK_VERBS_SQL})",
     );
     let instance = instance.map(|m| m.as_str());
-    let flagged = sqlx::query(sql!(
-        "UPDATE infra_lifecycle_command SET cancel_requested = TRUE WHERE {owner}"
-    ))
-    .bind(project_id)
-    .bind(instance)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    let completed = sqlx::query(sql!(
-        "UPDATE infra_lifecycle_command \
-         SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
-             outcome = 'cancelled', \
-             outcome_message = 'cancelled by user before run' \
-         WHERE {owner} AND claimed_by_replica IS NULL"
-    ))
-    .bind(project_id)
-    .bind(instance)
-    .execute(pool)
-    .await?
-    .rows_affected();
+    let flagged = pool
+        .execute(&format!("UPDATE infra_lifecycle_command SET cancel_requested = TRUE WHERE {owner}"), &[&project_id, &instance])
+        .await?;
+    let completed = pool
+        .execute(
+            &format!(
+                "UPDATE infra_lifecycle_command \
+                 SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
+                     outcome = 'cancelled', \
+                     outcome_message = 'cancelled by user before run' \
+                 WHERE {owner} AND claimed_by_replica IS NULL"
+            ),
+            &[&project_id, &instance],
+        )
+        .await?;
     // `flagged` counted the completed ones too (they were uncompleted
     // at flag time); the touched total is just `flagged`, `completed`
     // is informational.
@@ -951,16 +922,16 @@ pub async fn request_cancel_owner(
 /// counted, no retry booked: the look is the next pass), and the ask is
 /// announced as that commits
 /// (`weft_task_store::infra_command::ask_for_look`).
-pub async fn person_asks_for_look(pool: &PgPool, project_id: uuid::Uuid) -> Result<()> {
-    let mut tx = pool.begin().await?;
-    sqlx::query(
+pub async fn person_asks_for_look(pool: &Pool, project_id: uuid::Uuid) -> Result<()> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    tx.execute(
         "INSERT INTO infra_health_look (project_id, asked_at_unix) VALUES ($1, EXTRACT(EPOCH FROM NOW())::BIGINT) \
          ON CONFLICT (project_id) DO UPDATE SET asked_at_unix = EXCLUDED.asked_at_unix, failures = 0, retry_at_unix = NULL",
+        &[&project_id],
     )
-    .bind(project_id)
-    .execute(&mut *tx)
     .await?;
-    weft_task_store::infra_command::ask_for_look(&mut *tx, project_id).await?;
+    weft_task_store::infra_command::ask_for_look(&tx, project_id).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -968,32 +939,23 @@ pub async fn person_asks_for_look(pool: &PgPool, project_id: uuid::Uuid) -> Resu
 /// Whether a claimed command's cancellation was requested. Read by the
 /// dispatcher's own commands (an upgrade between its stop and its start)
 /// at their steps.
-pub async fn cancel_requested(pool: &PgPool, command_id: i64) -> Result<bool> {
-    let row: Option<(bool,)> = sqlx::query_as(
-        "SELECT cancel_requested FROM infra_lifecycle_command WHERE id = $1",
-    )
-    .bind(command_id)
-    .fetch_optional(pool)
-    .await?;
+pub async fn cancel_requested(pool: &Pool, command_id: i64) -> Result<bool> {
+    let row: Option<bool> = pool.scalar_opt("SELECT cancel_requested FROM infra_lifecycle_command WHERE id = $1", &[&command_id]).await?;
     // A missing row (removed project) reads as cancelled: the executor
     // should stop working on it either way.
-    Ok(row.map(|(c,)| c).unwrap_or(true))
+    Ok(row.unwrap_or(true))
 }
 
 /// Drop every row for a project. Called on `weft rm`.
-pub async fn remove_project<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
-    project_id: uuid::Uuid,
-) -> Result<u64> {
-    let res = sqlx::query(
-        "WITH health AS (DELETE FROM infra_health_rule WHERE project_id = $1), \
-              look AS (DELETE FROM infra_health_look WHERE project_id = $1) \
-         DELETE FROM infra_lifecycle_command WHERE project_id = $1",
-    )
-    .bind(project_id)
-    .execute(executor)
-    .await?;
-    Ok(res.rows_affected())
+pub async fn remove_project(db: &impl Client, project_id: uuid::Uuid) -> Result<u64> {
+    Ok(db
+        .execute(
+            "WITH health AS (DELETE FROM infra_health_rule WHERE project_id = $1), \
+                  look AS (DELETE FROM infra_health_look WHERE project_id = $1) \
+             DELETE FROM infra_lifecycle_command WHERE project_id = $1",
+            &[&project_id],
+        )
+        .await?)
 }
 
 #[cfg(test)]

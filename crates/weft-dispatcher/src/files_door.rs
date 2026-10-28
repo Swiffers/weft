@@ -393,7 +393,7 @@ mod tests {
     #[tokio::test]
     async fn a_read_passes_on_with_its_range_and_the_callers_host() {
         let (target, seen) = fake_store().await;
-        let http = reqwest::Client::new();
+        let http = weft_core::net::http_client().build().unwrap();
         let answer = pass_on(
             &http,
             &target,
@@ -421,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn an_upload_passes_on_whole_and_other_methods_stop_here() {
         let (target, seen) = fake_store().await;
-        let http = reqwest::Client::new();
+        let http = weft_core::net::http_client().build().unwrap();
         pass_on(
             &http,
             &target,
@@ -446,7 +446,7 @@ mod tests {
     async fn an_uploads_etag_comes_back() {
         let (target, _) = fake_store().await;
         let answer = pass_on(
-            &reqwest::Client::new(),
+            &weft_core::net::http_client().build().unwrap(),
             &target,
             request(Method::PUT, "/files/runtime/t/project/p/f?partNumber=1", &[("host", "t.example"), ("content-length", "2")], b"ab"),
         )
@@ -459,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn an_upload_without_a_bounded_length_stops_here() {
         let (target, seen) = fake_store().await;
-        let http = reqwest::Client::new();
+        let http = weft_core::net::http_client().build().unwrap();
         let over = (MAX_PUT_BYTES + 1).to_string();
         for (headers, status) in [
             (vec![("host", "t.example")], StatusCode::LENGTH_REQUIRED),

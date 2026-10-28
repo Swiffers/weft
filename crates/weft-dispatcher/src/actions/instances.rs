@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use weft_core::instance::InstanceId;
 use weft_core::program::instances::InstanceCall;
 use weft_core::program::{ConnectionsForgotten, InstanceHoldings, InstanceTrigger, ProgramCallOutcome, TokensRevoked};
+use weft_task_store::db::Client as _;
 
 use super::{answered, Actor, Refused};
 use crate::api::access_store_error;
@@ -115,13 +116,14 @@ pub(crate) async fn instances(
             ))
         })
         .collect();
-    let last_runs: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT instance_id, MAX(started_at) FROM run WHERE project_id = $1 AND instance_id IS NOT NULL GROUP BY instance_id",
-    )
-    .bind(project_id)
-    .fetch_all(&state.pg_pool)
-    .await
-    .map_err(|e| crate::api::unavailable_or_internal("read the instances' runs", e.into()))?;
+    let last_runs: Vec<(String, i64)> = state
+        .pg_pool
+        .all(
+            "SELECT instance_id, MAX(started_at) FROM run WHERE project_id = $1 AND instance_id IS NOT NULL GROUP BY instance_id",
+            &[&project_id],
+        )
+        .await
+        .map_err(|e| crate::api::unavailable_or_internal("read the instances' runs", e.into()))?;
     let last_runs = last_runs
         .into_iter()
         .map(|(instance, at)| InstanceId::new(instance).map(|instance| (instance, at)))

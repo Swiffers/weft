@@ -291,7 +291,7 @@ mod tests {
     }
 
     fn opened(auth: Vec<AuthStep>, values: &[(&str, &str)]) -> OpenedConnection {
-        let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let client = reqwest_middleware::ClientBuilder::new(crate::net::http_client().build().unwrap()).build();
         OpenedConnection::assemble(
             "svc",
             values.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>(),

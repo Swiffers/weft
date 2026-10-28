@@ -26,7 +26,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-sqlx = { workspace = true, features = ["json", "uuid", "chrono"] }
 lru = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
@@ -44,13 +43,14 @@ weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # The database tests build their tables with `apply_groups`.
-weft-task-store = { workspace = true, features = ["migrate"] }
+weft-task-store = { workspace = true, features = ["migrate", "test-helpers"] }
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 futures = { workspace = true }
 # The access-apps file provider's tests write real files.
 tempfile = { workspace = true }
-# `#[sqlx::test]` provisions a fresh isolated DB per test for the Layer-3 suite.
-sqlx = { workspace = true, features = ["macros", "migrate"] }
+# `#[weft_db_macros::test]` hands each Layer-3 test a fresh database of
+# its own on $DATABASE_URL, dropped after.
+weft-db-macros = { workspace = true }
 # Dev-only, for the provider-declaration resolution suite: the table is
 # written by the dispatcher (`provider_decl::record`, which owns its schema)
 # and read by this crate's `provider_proxy::declared_base_url` as plain SQL

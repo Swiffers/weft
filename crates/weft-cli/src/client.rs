@@ -195,7 +195,7 @@ impl DispatcherClient {
         // A connection whose path died fails within a minute or so
         // (`notice_dead_connections`); a request's whole length has no
         // limit, since some verbs wait as long as the person's own work runs.
-        let http = weft_core::net::notice_dead_connections(reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT))
+        let http = weft_core::net::notice_dead_connections(weft_core::net::http_client().connect_timeout(CONNECT_TIMEOUT))
             .build()
             .expect("an HTTP client with only timeouts set always builds");
         Self { base: base.into(), target: None, bearer: operator_key.map(|key| Arc::new(RwLock::new(key))), http }

@@ -1,5 +1,5 @@
 //! Layer-3 contract tests for the access store: the real store code
-//! against a fresh Postgres (via `#[sqlx::test]`) and a hand-rolled
+//! against a fresh Postgres (via `#[weft_db_macros::test]`) and a hand-rolled
 //! in-process fake provider (token endpoint + API), so every flow runs
 //! end to end without touching a real third party.
 
@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::json;
-use sqlx::PgPool;
+use weft_task_store::db::{self, Client as _, Pool};
 
 use weft_access_store::{
     begin_oauth, complete_oauth, connect_direct, delete_grant, list_grants, lookup,
@@ -253,7 +253,7 @@ fn oauth_spec(base: &str, grants: &str) -> AccessSpec {
 /// Begin one consent for `tenant` through the own door, returning its
 /// state.
 async fn begin_consent(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     spec: &AccessSpec,
     scopes: &[&str],
@@ -280,7 +280,7 @@ async fn begin_consent(
 
 /// Begin + complete one consent for `tenant`, returning the grant id.
 async fn full_consent(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     spec: &AccessSpec,
     scopes: &[&str],
@@ -302,8 +302,8 @@ async fn full_consent(
 /// section): the stored snapshot is the static variant, so the row
 /// resolves like a natively pasted credential and never refreshes
 /// through an app.
-#[sqlx::test]
-async fn paste_connect_on_a_consent_service_stores_the_static_variant(pool: PgPool) {
+#[weft_db_macros::test]
+async fn paste_connect_on_a_consent_service_stores_the_static_variant(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -370,8 +370,8 @@ async fn paste_connect_on_a_consent_service_stores_the_static_variant(pool: PgPo
     assert!(err.to_string().contains("no paste section"), "{err}");
 }
 
-#[sqlx::test]
-async fn static_connect_runs_the_test_call_and_stores_identity(pool: PgPool) {
+#[weft_db_macros::test]
+async fn static_connect_runs_the_test_call_and_stores_identity(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -421,8 +421,8 @@ async fn static_connect_runs_the_test_call_and_stores_identity(pool: PgPool) {
     assert_eq!(list_grants(&pool, TENANT_A, Some("fakestatic"), weft_access_store::GrantOwnerScope::Author).await.unwrap().len(), 1);
 }
 
-#[sqlx::test]
-async fn the_tenant_wall_holds_on_every_surface(pool: PgPool) {
+#[weft_db_macros::test]
+async fn the_tenant_wall_holds_on_every_surface(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -473,8 +473,8 @@ async fn the_tenant_wall_holds_on_every_surface(pool: PgPool) {
 
 /// A poll under a state nothing is live under ends: an unknown state,
 /// and another tenant's open consent, both answer gone.
-#[sqlx::test]
-async fn a_poll_on_a_state_with_nothing_live_answers_gone(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_poll_on_a_state_with_nothing_live_answers_gone(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -504,8 +504,8 @@ async fn a_poll_on_a_state_with_nothing_live_answers_gone(pool: PgPool) {
 /// A permission the service marks `always` rides every consent on top
 /// of what was ticked, is recorded with it, and is held to the
 /// provider's echo like a ticked one.
-#[sqlx::test]
-async fn a_consent_asks_for_what_the_service_always_needs(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_consent_asks_for_what_the_service_always_needs(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -522,8 +522,8 @@ async fn a_consent_asks_for_what_the_service_always_needs(pool: PgPool) {
     assert!(err.to_string().contains("missing 'whoami'"), "{err}");
 }
 
-#[sqlx::test]
-async fn oauth_consent_records_granted_scopes_and_enforces_the_echo(pool: PgPool) {
+#[weft_db_macros::test]
+async fn oauth_consent_records_granted_scopes_and_enforces_the_echo(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -591,8 +591,8 @@ async fn oauth_consent_records_granted_scopes_and_enforces_the_echo(pool: PgPool
     assert!(err.to_string().contains("accessApps"), "{err}");
 }
 
-#[sqlx::test]
-async fn an_exclusive_grant_rotates_in_place_and_upgrades_by_union(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_exclusive_grant_rotates_in_place_and_upgrades_by_union(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -685,8 +685,8 @@ async fn an_exclusive_grant_rotates_in_place_and_upgrades_by_union(pool: PgPool)
     );
 }
 
-#[sqlx::test]
-async fn refresh_is_lazy_single_flight_and_writes_back_rotated_tokens(pool: PgPool) {
+#[weft_db_macros::test]
+async fn refresh_is_lazy_single_flight_and_writes_back_rotated_tokens(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -737,18 +737,13 @@ async fn refresh_is_lazy_single_flight_and_writes_back_rotated_tokens(pool: PgPo
 /// A pool of one connection on `pool`'s database, whose wait for it
 /// gives up after `wait`: what shows a connection held where it must not
 /// be.
-async fn one_connection(pool: &PgPool, wait: std::time::Duration) -> PgPool {
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(wait)
-        .connect_with((*pool.connect_options()).clone())
-        .await
-        .unwrap()
+fn one_connection(pool: &Pool, wait: std::time::Duration) -> Pool {
+    Pool::open(pool.config().clone(), 1, wait, db::Waits::Expected)
 }
 
 /// A consent whose token is due a renewal now, and a provider whose next
 /// answer rotates both tokens: what the renewal tests start from.
-async fn due_for_renewal(pool: &PgPool, fake: &FakeProvider, base: &str) -> GrantSummary {
+async fn due_for_renewal(pool: &Pool, fake: &FakeProvider, base: &str) -> GrantSummary {
     let spec = oauth_spec(base, "coexisting");
     *fake.next_refresh.lock().unwrap() = Some("refresh-1".into());
     *fake.expires_in.lock().unwrap() = Some(1);
@@ -764,14 +759,14 @@ async fn due_for_renewal(pool: &PgPool, fake: &FakeProvider, base: &str) -> Gran
 /// on a pool of one connection, other work goes through while the
 /// renewal waits on the provider, and so do the resolutions waiting on
 /// that same renewal. The provider still sees one renewal.
-#[sqlx::test]
-async fn a_renewal_holds_no_database_connection_while_the_provider_answers(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_renewal_holds_no_database_connection_while_the_provider_answers(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let grant = due_for_renewal(&pool, &fake, &base).await;
     let consent_tokens = fake.token_requests.load(Ordering::SeqCst);
-    let one = one_connection(&pool, std::time::Duration::from_secs(2)).await;
+    let one = one_connection(&pool, std::time::Duration::from_secs(2));
 
     let gate = fake.hold_tokens().await;
     let resolves: Vec<_> = (0..3)
@@ -782,10 +777,8 @@ async fn a_renewal_holds_no_database_connection_while_the_provider_answers(pool:
         })
         .collect();
     fake.token_arrived.acquire().await.unwrap().forget();
-    let (grants,): (i64,) = sqlx::query_as("SELECT count(*) FROM access_grant")
-        .fetch_one(&one)
-        .await
-        .expect("the one connection is free while the provider answers");
+    let grants: i64 =
+        one.scalar("SELECT count(*) FROM access_grant", &[]).await.expect("the one connection is free while the provider answers");
     assert_eq!(grants, 1);
     drop(gate);
 
@@ -800,13 +793,13 @@ async fn a_renewal_holds_no_database_connection_while_the_provider_answers(pool:
 /// had waits for one and writes it: the provider may have retired the
 /// refresh token the row held, so the rotated one is never dropped, and
 /// the next renewal sends it.
-#[sqlx::test]
-async fn a_renewed_token_is_written_once_a_connection_can_be_had(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_renewed_token_is_written_once_a_connection_can_be_had(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let grant = due_for_renewal(&pool, &fake, &base).await;
-    let one = one_connection(&pool, std::time::Duration::from_millis(100)).await;
+    let one = one_connection(&pool, std::time::Duration::from_millis(100));
 
     let gate = fake.hold_tokens().await;
     let resolve = {
@@ -816,7 +809,7 @@ async fn a_renewed_token_is_written_once_a_connection_can_be_had(pool: PgPool) {
     fake.token_arrived.acquire().await.unwrap().forget();
     // The answer arrives while the one connection is taken, for several
     // of the pool's waits.
-    let taken = one.acquire().await.unwrap();
+    let taken = one.get().await.unwrap();
     drop(gate);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     drop(taken);
@@ -832,8 +825,8 @@ async fn a_renewed_token_is_written_once_a_connection_can_be_had(pool: PgPool) {
 /// Two upgrades of one exclusive connection landing at once both keep
 /// the permission each added: the row's permissions are widened in the
 /// statement that writes the sign-in, never from a read before it.
-#[sqlx::test]
-async fn two_upgrades_landing_at_once_both_keep_their_permissions(pool: PgPool) {
+#[weft_db_macros::test]
+async fn two_upgrades_landing_at_once_both_keep_their_permissions(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -871,8 +864,8 @@ async fn two_upgrades_landing_at_once_both_keep_their_permissions(pool: PgPool) 
 /// connection: the second lands on the row the first made, the way a
 /// reconnect does (same id, counted as a reconnect, both permissions
 /// kept), never beside it.
-#[sqlx::test]
-async fn two_first_sign_ins_landing_at_once_make_one_connection(pool: PgPool) {
+#[weft_db_macros::test]
+async fn two_first_sign_ins_landing_at_once_make_one_connection(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -902,7 +895,7 @@ async fn two_first_sign_ins_landing_at_once_make_one_connection(pool: PgPool) {
         assert!(rows[0].scopes.iter().any(|s| s == scope), "{scope} kept: {:?}", rows[0].scopes);
     }
     let reconnects: i64 =
-        sqlx::query_scalar("SELECT reconnects FROM access_grant WHERE id = $1").bind(ids[0]).fetch_one(&pool).await.unwrap();
+        pool.scalar("SELECT reconnects FROM access_grant WHERE id = $1", &[&ids[0]]).await.unwrap();
     assert_eq!(reconnects, 1, "the second sign-in counts as a reconnect of the first");
 }
 
@@ -911,8 +904,8 @@ async fn two_first_sign_ins_landing_at_once_make_one_connection(pool: PgPool) {
 /// renewed through the recipe's own GET (interpolating the current
 /// token and the app's client id), its captures write the fresh
 /// token back, and the answer's expires_in sets the next expiry.
-#[sqlx::test]
-async fn a_declared_renewal_call_replaces_the_standard_refresh(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_declared_renewal_call_replaces_the_standard_refresh(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -967,8 +960,8 @@ async fn a_declared_renewal_call_replaces_the_standard_refresh(pool: PgPool) {
 /// leaves the grant alone and is tried again; one refusing the credential
 /// (401) or the request (400) asks for a reconnect, and the grant still
 /// renews once the provider is back.
-#[sqlx::test]
-async fn a_declared_renewal_the_provider_could_not_answer_is_tried_again_not_a_reconnect(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_declared_renewal_the_provider_could_not_answer_is_tried_again_not_a_reconnect(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1005,8 +998,8 @@ async fn a_declared_renewal_the_provider_could_not_answer_is_tried_again_not_a_r
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-back"));
 }
 
-#[sqlx::test]
-async fn a_revoked_refresh_fails_loud_with_the_reconnect_affordance(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_revoked_refresh_fails_loud_with_the_reconnect_affordance(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1029,8 +1022,8 @@ async fn a_revoked_refresh_fails_loud_with_the_reconnect_affordance(pool: PgPool
 /// A refresh the token endpoint answers busy or down (429, 503) leaves
 /// the grant alone and is tried again; one it refuses (400) asks for a
 /// reconnect, and the grant still renews once the provider is back.
-#[sqlx::test]
-async fn a_refresh_the_provider_could_not_answer_is_tried_again_not_a_reconnect(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_refresh_the_provider_could_not_answer_is_tried_again_not_a_reconnect(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1057,8 +1050,8 @@ async fn a_refresh_the_provider_could_not_answer_is_tried_again_not_a_reconnect(
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-back"));
 }
 
-#[sqlx::test]
-async fn lookups_run_authed_substitute_and_paginate(pool: PgPool) {
+#[weft_db_macros::test]
+async fn lookups_run_authed_substitute_and_paginate(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1139,8 +1132,8 @@ async fn lookups_run_authed_substitute_and_paginate(pool: PgPool) {
 /// nothing pasted, nothing to validate, resolution hands back empty
 /// values (the broker fills them from its credential source) and the
 /// `ours` owner every cost record will carry.
-#[sqlx::test]
-async fn a_shared_key_connect_stores_a_runtime_owned_row(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_shared_key_connect_stores_a_runtime_owned_row(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1198,8 +1191,8 @@ async fn a_shared_key_connect_stores_a_runtime_owned_row(pool: PgPool) {
 /// A CLAIMED (unverified) permission set never blocks resolution: a
 /// pasted credential on a service that reports nothing must resolve
 /// whatever a consumer requires (nobody actually knows what it holds).
-#[sqlx::test]
-async fn a_claimed_shortfall_is_let_through_at_resolution(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_claimed_shortfall_is_let_through_at_resolution(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1238,8 +1231,8 @@ async fn a_claimed_shortfall_is_let_through_at_resolution(pool: PgPool) {
 /// every resolution (tenant wall, service check) and hands out only
 /// the id/label pairs of the named capture, off the FULL stored map
 /// (the worker-handoff filter would drop a captured list).
-#[sqlx::test]
-async fn granted_items_read_the_stored_list_behind_the_wall(pool: PgPool) {
+#[weft_db_macros::test]
+async fn granted_items_read_the_stored_list_behind_the_wall(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1358,8 +1351,8 @@ fn events_spec(base: &str) -> AccessSpec {
 /// account on its indexed column, records the service's recipe for
 /// the receiver, and the inbound-event lookup finds the row ONLY
 /// through the app that made it (the client_id containment pin).
-#[sqlx::test]
-async fn a_connect_records_the_provider_account_for_event_routing(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_connect_records_the_provider_account_for_event_routing(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1408,8 +1401,8 @@ async fn a_connect_records_the_provider_account_for_event_routing(pool: PgPool) 
 /// and a push that verified under one recipe routes ONLY to the
 /// connection whose snapshot declared that exact recipe. A recipe
 /// one spec records can never answer for another spec's connections.
-#[sqlx::test]
-async fn a_push_routes_only_to_connections_carrying_the_verifying_recipe(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_push_routes_only_to_connections_carrying_the_verifying_recipe(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1465,8 +1458,8 @@ async fn a_push_routes_only_to_connections_carrying_the_verifying_recipe(pool: P
 /// address, the row records what the provider answered, a healthy
 /// subscription is NOT re-subscribed, and dropping stops the channel
 /// at the provider and forgets the row.
-#[sqlx::test]
-async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: PgPool) {
+#[weft_db_macros::test]
+async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1516,12 +1509,7 @@ async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: PgPool) {
 
     // The row: findable by the minted id (what a push presents), and
     // carrying the provider's captures.
-    let row = sqlx::query_as::<_, (String,)>(
-        "SELECT id FROM signal_subscription WHERE signal_token = 'sig-1'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let row = pool.one::<(String,)>("SELECT id FROM signal_subscription WHERE signal_token = 'sig-1'", &[]).await.unwrap();
     let sub = weft_access_store::subscription_by_id(&pool, &row.0, "fakeoauth", "things")
         .await
         .unwrap()
@@ -1573,8 +1561,8 @@ async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: PgPool) {
 /// no internet-reachable address, refuses with the teaching error
 /// naming the fix; it never subscribes a channel that could not
 /// deliver.
-#[sqlx::test]
-async fn a_subscribe_topic_without_a_public_address_teaches_the_fix(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_subscribe_topic_without_a_public_address_teaches_the_fix(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1609,8 +1597,8 @@ async fn a_subscribe_topic_without_a_public_address_teaches_the_fix(pool: PgPool
 /// for the listener (a held raw pipe needs only the stored values);
 /// the recipe map simply comes back empty. A subscription needing a
 /// topic is refused by its own topic lookup, not here.
-#[sqlx::test]
-async fn an_eventless_service_resolves_with_an_empty_recipe_map(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_eventless_service_resolves_with_an_empty_recipe_map(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1647,8 +1635,8 @@ async fn an_eventless_service_resolves_with_an_empty_recipe_map(pool: PgPool) {
 /// (that app is the user's). Without this, an app-level token in the
 /// operator's apps file would let any tenant hold the shared app's
 /// APP-WIDE socket and hear every other install's events.
-#[sqlx::test]
-async fn a_shared_door_grant_never_serves_events_with_the_operators_app_values(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_shared_door_grant_never_serves_events_with_the_operators_app_values(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1681,20 +1669,21 @@ async fn a_shared_door_grant_never_serves_events_with_the_operators_app_values(p
 
     // Two grants to the same app snapshot: one through each door.
     for (id, door) in [(uuid::Uuid::new_v4(), "shared"), (uuid::Uuid::new_v4(), "own")] {
-        sqlx::query(
+        pool.execute(
             "INSERT INTO access_grant
                (id, tenant_id, service, registration_sealed, spec_json, values_sealed,
                 granted_scopes, door, identity, spec_json_version)
              VALUES ($1, $2, 'fakeoauth', $3, $4, $5, '[]', $6, 'x', $7)",
+            &[
+                &id,
+                &TENANT_A,
+                &weft_access_store::seal_json(&serde_json::to_value(&registration).unwrap()).unwrap(),
+                &serde_json::to_value(&spec).unwrap(),
+                &weft_access_store::seal_json(&json!({ "token": "tok-1" })).unwrap(),
+                &door,
+                &weft_core::AccessSpec::STORED.version(),
+            ],
         )
-        .bind(id)
-        .bind(TENANT_A)
-        .bind(weft_access_store::seal_json(&serde_json::to_value(&registration).unwrap()).unwrap())
-        .bind(serde_json::to_value(&spec).unwrap())
-        .bind(weft_access_store::seal_json(&json!({ "token": "tok-1" })).unwrap())
-        .bind(door)
-        .bind(weft_core::AccessSpec::STORED.version())
-        .execute(&pool)
         .await
         .unwrap();
         let source =
@@ -1725,8 +1714,8 @@ async fn a_shared_door_grant_never_serves_events_with_the_operators_app_values(p
 ///
 /// Pins the whole chain: what a shared connect stores, what a
 /// resolution hands over, and the door split on app values.
-#[sqlx::test]
-async fn a_shared_app_connection_never_carries_the_operators_app_secret(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_shared_app_connection_never_carries_the_operators_app_secret(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1756,12 +1745,8 @@ async fn a_shared_app_connection_never_carries_the_operators_app_secret(pool: Pg
     // What the row STORES: the provider's answer only. The app's
     // client secret was used to exchange the code and never landed
     // in the connection's values.
-    let (values_sealed,): (String,) =
-        sqlx::query_as("SELECT values_sealed FROM access_grant WHERE id = $1")
-            .bind(done.grant.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let values_sealed: String =
+        pool.scalar("SELECT values_sealed FROM access_grant WHERE id = $1", &[&done.grant.id]).await.unwrap();
     // The at-rest form is ciphertext, not readable JSON.
     assert!(
         serde_json::from_str::<serde_json::Value>(&values_sealed).is_err(),
@@ -1799,8 +1784,8 @@ async fn a_shared_app_connection_never_carries_the_operators_app_secret(pool: Pg
 /// filling one group succeeds, one filling half a group is refused
 /// naming the fix, and a consumer needing the OTHER group's values is
 /// refused at resolution naming the missing value.
-#[sqlx::test]
-async fn optional_field_groups_gate_what_a_connection_can_do(pool: PgPool) {
+#[weft_db_macros::test]
+async fn optional_field_groups_gate_what_a_connection_can_do(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1909,8 +1894,8 @@ async fn optional_field_groups_gate_what_a_connection_can_do(pool: PgPool) {
 /// declared permissions, so they union into `granted_scopes` (no
 /// duplicates) with `permissions_verified` untouched, and the editor's
 /// shortfall check (which reads the summary's scopes) sees them.
-#[sqlx::test]
-async fn a_finished_pick_lands_its_grants_on_the_row(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_finished_pick_lands_its_grants_on_the_row(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1982,8 +1967,8 @@ async fn a_finished_pick_lands_its_grants_on_the_row(pool: PgPool) {
 /// A picker opens only on the caller's own connection: an instance
 /// parking one on the author's connection is refused at begin, so no
 /// pick can ever widen the author's row.
-#[sqlx::test]
-async fn a_instance_cannot_open_a_picker_on_the_authors_connection(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_instance_cannot_open_a_picker_on_the_authors_connection(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -2056,8 +2041,8 @@ fn publish(values: &[(&str, &str)]) -> weft_access_store::PublishAccess {
 /// A node's connection is keyed by the NODE, not the moment: it
 /// publishes once and updates thereafter, so a database that keeps
 /// answering on a new address never leaves a second connection behind.
-#[sqlx::test]
-async fn publishing_twice_updates_one_connection(pool: PgPool) {
+#[weft_db_macros::test]
+async fn publishing_twice_updates_one_connection(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let first = weft_access_store::publish_grant(
         &pool,
@@ -2099,11 +2084,11 @@ async fn publishing_twice_updates_one_connection(pool: PgPool) {
 /// connection announces it. A shared copy's connection is no instance's
 /// own, so any project of the tenant may use it: it is announced for the
 /// tenant.
-#[sqlx::test]
-async fn only_a_publish_that_changes_the_connection_announces_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn only_a_publish_that_changes_the_connection_announces_it(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     static CHANNELS: &[&str] = &["weft_access"];
-    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.unwrap();
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(pool.config(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.unwrap();
     let mut heard = watch.subscribe();
     async fn heard_it(heard: &mut weft_task_store::pg_signal::Subscription) -> bool {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -2119,13 +2104,12 @@ async fn only_a_publish_that_changes_the_connection_announces_it(pool: PgPool) {
     assert!(heard_it(&mut heard).await, "a new password is news");
 
     // A pick is the project's own: announced for the project alone.
-    sqlx::query("INSERT INTO install_pick (tenant_id, project_id, node, field, grant_id) VALUES ($1, $2, 'db', 'access', $3::uuid)")
-        .bind(TENANT_A)
-        .bind(PROJECT_1)
-        .bind(&published.connection_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute(
+        "INSERT INTO install_pick (tenant_id, project_id, node, field, grant_id) VALUES ($1, $2, 'db', 'access', $3::text::uuid)",
+        &[&TENANT_A, &PROJECT_1, &published.connection_id],
+    )
+    .await
+    .unwrap();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     let project = PROJECT_1.to_string();
     assert!(heard.woken_before(deadline, |c, p| c == "weft_access" && p == project).await.unwrap(), "a pick names its project");
@@ -2134,8 +2118,8 @@ async fn only_a_publish_that_changes_the_connection_announces_it(pool: PgPool) {
 /// The shapes a published recipe may not have. Each one would later
 /// have weft act on a third party's behalf for a service that has no
 /// third party, and the values arrive from a worker.
-#[sqlx::test]
-async fn a_published_recipe_describes_something_the_project_runs(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_published_recipe_describes_something_the_project_runs(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let refused = |spec: serde_json::Value| {
         let mut req = publish(&[("host", "db"), ("password", "p")]);
@@ -2224,8 +2208,8 @@ async fn a_published_recipe_describes_something_the_project_runs(pool: PgPool) {
 
 /// Cleanup takes the node's connections and leaves a person's alone,
 /// whether one node goes or the whole project does.
-#[sqlx::test]
-async fn cleanup_removes_what_a_node_published_and_nothing_else(pool: PgPool) {
+#[weft_db_macros::test]
+async fn cleanup_removes_what_a_node_published_and_nothing_else(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     weft_access_store::publish_grant(
         &pool,
@@ -2287,8 +2271,8 @@ async fn cleanup_removes_what_a_node_published_and_nothing_else(pool: PgPool) {
 /// An instance's connection is its own alone: only it sees it, use it as a
 /// value, or forget it, and forgetting it takes the values naming it
 /// along. An instance's values are its own, set together or not at all.
-#[sqlx::test]
-async fn a_instances_connection_and_values_stay_theirs(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_instances_connection_and_values_stay_theirs(pool: Pool) {
     use weft_access_store::{
         change_instance_values, forget_instance_grants, instance_values, ConnectionValue,
         GrantOwnerScope, InstanceValueWrite,
@@ -2338,16 +2322,16 @@ async fn a_instances_connection_and_values_stay_theirs(pool: PgPool) {
         value,
         connection: None,
     };
-    let mut conn = pool.acquire().await.unwrap();
-    let err = change_instance_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[plain("read", serde_json::json!("s-1")), pick("post", bobs.id, "fakestatic")], &[])
+    let conn = pool.get().await.unwrap();
+    let err = change_instance_values(&conn, TENANT_A, PROJECT_1, &ada, &[plain("read", serde_json::json!("s-1")), pick("post", bobs.id, "fakestatic")], &[])
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not one of instance 'ada''s connections"), "{err}");
     assert!(instance_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap().is_empty(), "a refused write stores none of it");
-    let err = change_instance_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[pick("post", adas.id, "slack")], &[]).await.unwrap_err();
+    let err = change_instance_values(&conn, TENANT_A, PROJECT_1, &ada, &[pick("post", adas.id, "slack")], &[]).await.unwrap_err();
     assert!(err.to_string().contains("connects to 'slack'"), "{err}");
     change_instance_values(
-        &mut conn,
+        &conn,
         TENANT_A,
         PROJECT_1,
         &ada,
@@ -2356,7 +2340,7 @@ async fn a_instances_connection_and_values_stay_theirs(pool: PgPool) {
     )
     .await
     .unwrap();
-    change_instance_values(&mut conn, TENANT_A, PROJECT_1, &bob, &[pick("post", bobs.id, "fakestatic")], &[]).await.unwrap();
+    change_instance_values(&conn, TENANT_A, PROJECT_1, &bob, &[pick("post", bobs.id, "fakestatic")], &[]).await.unwrap();
     let nodes = |values: weft_core::instance::InstanceValues| values.into_keys().collect::<Vec<_>>();
     let adas_values = instance_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap();
     assert_eq!(nodes(adas_values.clone()), vec!["post", "read", "reply"]);
@@ -2365,8 +2349,8 @@ async fn a_instances_connection_and_values_stay_theirs(pool: PgPool) {
     assert_eq!(adas_values["read"]["sheet"], serde_json::json!("s-1"));
     assert!(instance_values(&pool, TENANT_B, PROJECT_1, &ada).await.unwrap().is_empty(), "another tenant reads nothing");
     let clear = [("reply".to_string(), "account".to_string())];
-    change_instance_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[], &clear).await.unwrap();
-    change_instance_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[], &clear).await.unwrap();
+    change_instance_values(&conn, TENANT_A, PROJECT_1, &ada, &[], &clear).await.unwrap();
+    change_instance_values(&conn, TENANT_A, PROJECT_1, &ada, &[], &clear).await.unwrap();
     assert_eq!(nodes(instance_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap()), vec!["post", "read"]);
 
     let err = delete_grant(&pool, TENANT_A, adas.id, GrantOwnerScope::Instance { project_id: PROJECT_1, instance: &bob })
@@ -2381,7 +2365,7 @@ async fn a_instances_connection_and_values_stay_theirs(pool: PgPool) {
         "the connection values went with the connection, the plain one stays"
     );
     assert_eq!(nodes(instance_values(&pool, TENANT_A, PROJECT_1, &bob).await.unwrap()), vec!["post"]);
-    change_instance_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[], &[("read".to_string(), "sheet".to_string())])
+    change_instance_values(&conn, TENANT_A, PROJECT_1, &ada, &[], &[("read".to_string(), "sheet".to_string())])
         .await
         .unwrap();
     assert!(instance_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap().is_empty());
@@ -2391,16 +2375,14 @@ async fn a_instances_connection_and_values_stay_theirs(pool: PgPool) {
     let as_bob = GrantOwnerScope::Instance { project_id: PROJECT_1, instance: &bob };
     assert!(list_grants(&pool, TENANT_A, None, as_bob).await.unwrap().is_empty(), "bob's connection is gone");
 
-    let orphan = sqlx::query(
-        "INSERT INTO access_grant (id, tenant_id, service, spec_json, values_sealed, instance_id, spec_json_version) \
-         VALUES ($1, $2, 'fakestatic', '{}', '', 'ada', $3)",
-    )
-    .bind(uuid::Uuid::new_v4())
-    .bind(TENANT_A)
-    .bind(weft_core::AccessSpec::STORED.version())
-    .execute(&pool)
-    .await
-    .unwrap_err();
+    let orphan = pool
+        .execute(
+            "INSERT INTO access_grant (id, tenant_id, service, spec_json, values_sealed, instance_id, spec_json_version) \
+             VALUES ($1, $2, 'fakestatic', '{}', '', 'ada', $3)",
+            &[&uuid::Uuid::new_v4(), &TENANT_A, &weft_core::AccessSpec::STORED.version()],
+        )
+        .await
+        .unwrap_err();
     assert!(orphan.to_string().contains("access_grant_instance_has_project"), "{orphan}");
 }
 
@@ -2408,8 +2390,8 @@ async fn a_instances_connection_and_values_stay_theirs(pool: PgPool) {
 /// project is another person. A consent there never upgrades nor
 /// rotates the first one's grant, and an instance never picks the shared
 /// door, refused before anything is written.
-#[sqlx::test]
-async fn a_instances_consent_stays_in_their_project(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_instances_consent_stays_in_their_project(pool: Pool) {
     use weft_core::instance::InstanceId;
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     const PROJECT_2: uuid::Uuid = uuid::Uuid::from_u128(0xc0df);
@@ -2464,16 +2446,16 @@ async fn a_instances_consent_stays_in_their_project(pool: PgPool) {
     // The shared door is refused before the consent is even parked.
     let err = begin_oauth(&pool, TENANT_A, begin(PROJECT_1, Door::Shared, None)).await.unwrap_err();
     assert!(err.to_string().contains("the shared door is the program author's"), "{err}");
-    let parked: (i64,) = sqlx::query_as("SELECT count(*) FROM access_connect").fetch_one(&pool).await.unwrap();
-    assert_eq!(parked.0, 0, "the refused consent parked nothing");
+    let parked: i64 = pool.scalar("SELECT count(*) FROM access_connect", &[]).await.unwrap();
+    assert_eq!(parked, 0, "the refused consent parked nothing");
 }
 
 /// The install keeps each access node's pick: only one of the author's
 /// own connections, of the field's service, can be picked (never an
 /// instance's), a change is all or none, and forgetting a connection takes
 /// every pick of it along.
-#[sqlx::test]
-async fn the_install_keeps_the_authors_picks(pool: PgPool) {
+#[weft_db_macros::test]
+async fn the_install_keeps_the_authors_picks(pool: Pool) {
     use weft_access_store::{change_install_picks, install_picks, PickWrite};
     use weft_core::instance::InstanceId;
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
@@ -2501,24 +2483,24 @@ async fn the_install_keeps_the_authors_picks(pool: PgPool) {
         grant_id: grant,
         service: service.into(),
     };
-    let mut conn = pool.acquire().await.unwrap();
-    let err = change_install_picks(&mut conn, TENANT_A, PROJECT_1, &[pick("post", mine.id, "fakestatic"), pick("read", adas.id, "fakestatic")], &[])
+    let conn = pool.get().await.unwrap();
+    let err = change_install_picks(&conn, TENANT_A, PROJECT_1, &[pick("post", mine.id, "fakestatic"), pick("read", adas.id, "fakestatic")], &[])
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not one of your connections"), "an instance's is refused: {err}");
     assert!(install_picks(&pool, TENANT_A, PROJECT_1).await.unwrap().is_empty(), "all or none");
-    let err = change_install_picks(&mut conn, TENANT_A, PROJECT_1, &[pick("post", mine.id, "slack")], &[]).await.unwrap_err();
+    let err = change_install_picks(&conn, TENANT_A, PROJECT_1, &[pick("post", mine.id, "slack")], &[]).await.unwrap_err();
     assert!(err.to_string().contains("is a 'fakestatic' one"), "{err}");
-    assert!(change_install_picks(&mut conn, TENANT_B, PROJECT_1, &[pick("post", mine.id, "fakestatic")], &[]).await.is_err(),
+    assert!(change_install_picks(&conn, TENANT_B, PROJECT_1, &[pick("post", mine.id, "fakestatic")], &[]).await.is_err(),
         "another tenant's connection is nobody's to pick");
 
-    change_install_picks(&mut conn, TENANT_A, PROJECT_1, &[pick("post", mine.id, "fakestatic"), pick("one.post", mine.id, "fakestatic")], &[])
+    change_install_picks(&conn, TENANT_A, PROJECT_1, &[pick("post", mine.id, "fakestatic"), pick("one.post", mine.id, "fakestatic")], &[])
         .await
         .unwrap();
     let picks = install_picks(&pool, TENANT_A, PROJECT_1).await.unwrap();
     assert_eq!(picks["post"]["account"]["id"], serde_json::json!(mine.id));
     assert!(picks.contains_key("one.post"), "each place keeps its own pick");
-    change_install_picks(&mut conn, TENANT_A, PROJECT_1, &[], &[("one.post".to_string(), "account".to_string())]).await.unwrap();
+    change_install_picks(&conn, TENANT_A, PROJECT_1, &[], &[("one.post".to_string(), "account".to_string())]).await.unwrap();
     assert!(!install_picks(&pool, TENANT_A, PROJECT_1).await.unwrap().contains_key("one.post"));
 
     delete_grant(&pool, TENANT_A, mine.id, weft_access_store::GrantOwnerScope::Author).await.unwrap();
@@ -2527,8 +2509,8 @@ async fn the_install_keeps_the_authors_picks(pool: PgPool) {
 
 /// A move carries a place's pick and every instance's values to the new
 /// place at once, and reading back shows them there with their services.
-#[sqlx::test]
-async fn a_move_carries_a_places_picks_and_every_instances_values(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_move_carries_a_places_picks_and_every_instances_values(pool: Pool) {
     use weft_access_store::{
         change_install_picks, change_instance_values, move_stored, stored_fields, ConnectionValue, InstanceValueWrite, PickWrite,
     };
@@ -2550,9 +2532,9 @@ async fn a_move_carries_a_places_picks_and_every_instances_values(pool: PgPool) 
     let ada = InstanceId::new("ada").unwrap();
     let mine = connect_direct(&pool, TENANT_A, connect(None, "tok-mine")).await.expect("the author connects").grant;
     let adas = connect_direct(&pool, TENANT_A, connect(Some(ada.clone()), "tok-ada")).await.expect("ada connects").grant;
-    let mut conn = pool.acquire().await.unwrap();
+    let conn = pool.get().await.unwrap();
     change_install_picks(
-        &mut conn,
+        &conn,
         TENANT_A,
         PROJECT_1,
         &[PickWrite { node: "chat.agent".into(), field: "account".into(), grant_id: mine.id, service: "fakestatic".into() }],
@@ -2561,7 +2543,7 @@ async fn a_move_carries_a_places_picks_and_every_instances_values(pool: PgPool) 
     .await
     .unwrap();
     change_instance_values(
-        &mut conn,
+        &conn,
         TENANT_A,
         PROJECT_1,
         &ada,
@@ -2576,7 +2558,7 @@ async fn a_move_carries_a_places_picks_and_every_instances_values(pool: PgPool) 
     .await
     .unwrap();
 
-    let (picks, values) = move_stored(&mut conn, TENANT_A, PROJECT_1, "chat.agent", "studio.chat.agent").await.unwrap();
+    let (picks, values) = move_stored(&conn, TENANT_A, PROJECT_1, "chat.agent", "studio.chat.agent").await.unwrap();
     assert_eq!((picks, values), (1, 1));
     let mut stored = stored_fields(&pool, TENANT_A, PROJECT_1).await.unwrap();
     stored.sort_by(|a, b| a.field.cmp(&b.field));
@@ -2590,8 +2572,8 @@ async fn a_move_carries_a_places_picks_and_every_instances_values(pool: PgPool) 
 /// A picker session lives 15 minutes: one past its life cannot finish (it
 /// would widen the connection's grants long after the person picked), and
 /// the page loading it finds it expired and deletes it.
-#[sqlx::test]
-async fn a_picker_past_its_life_cannot_finish(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_picker_past_its_life_cannot_finish(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -2627,7 +2609,7 @@ async fn a_picker_past_its_life_cannot_finish(pool: PgPool) {
     )
     .await
     .expect("the picker session parks");
-    sqlx::query("UPDATE access_picker SET created_at = now() - interval '16 minutes'").execute(&pool).await.unwrap();
+    pool.execute("UPDATE access_picker SET created_at = now() - interval '16 minutes'", &[]).await.unwrap();
 
     let err = weft_access_store::finish_picker(&pool, &state, json!({ "picked": { "id": "file-1", "label": "File one" } }))
         .await
@@ -2638,14 +2620,14 @@ async fn a_picker_past_its_life_cannot_finish(pool: PgPool) {
     assert!(!row.scopes.contains(&"drive.file".to_string()), "nothing widened: {:?}", row.scopes);
 
     assert!(weft_access_store::load_picker(&pool, &state).await.is_err());
-    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM access_picker").fetch_one(&pool).await.unwrap();
+    let left: i64 = pool.scalar("SELECT COUNT(*) FROM access_picker", &[]).await.unwrap();
     assert_eq!(left, 0, "found expired, deleted");
 }
 
 /// Connect attempts past their life go with no timer: when the next one
 /// of their kind is made, and when a poll finds them gone.
-#[sqlx::test]
-async fn an_abandoned_connect_goes_when_the_next_is_made_or_a_poll_finds_it_gone(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_abandoned_connect_goes_when_the_next_is_made_or_a_poll_finds_it_gone(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -2672,14 +2654,14 @@ async fn an_abandoned_connect_goes_when_the_next_is_made_or_a_poll_finds_it_gone
         }
     };
     let rows = || async {
-        sqlx::query_scalar::<_, String>("SELECT state FROM access_connect ORDER BY state").fetch_all(&pool).await.unwrap()
+        pool.scalars::<String>("SELECT state FROM access_connect ORDER BY state", &[]).await.unwrap()
     };
     begin().await;
-    sqlx::query("UPDATE access_connect SET created_at = now() - interval '16 minutes'").execute(&pool).await.unwrap();
+    pool.execute("UPDATE access_connect SET created_at = now() - interval '16 minutes'", &[]).await.unwrap();
     let new = begin().await;
     assert_eq!(rows().await, vec![new.clone()], "the abandoned one went as the next was made");
 
-    sqlx::query("UPDATE access_connect SET created_at = now() - interval '16 minutes'").execute(&pool).await.unwrap();
+    pool.execute("UPDATE access_connect SET created_at = now() - interval '16 minutes'", &[]).await.unwrap();
     let err = take_connect_result(&pool, TENANT_A, &new).await.unwrap_err();
     assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::Gone(_))), "{err}");
     assert!(rows().await.is_empty(), "the poll that found it gone deleted it");
@@ -2704,8 +2686,8 @@ fn last_call(fake: &FakeProvider, prefix: &str) -> String {
 /// exchange and the refresh, never as `client_id`; the declared extra
 /// params ride every token call, and the consent's own params read the
 /// app's values.
-#[sqlx::test]
-async fn a_provider_naming_the_client_differently_gets_that_name_everywhere(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_provider_naming_the_client_differently_gets_that_name_everywhere(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -2762,8 +2744,8 @@ async fn a_provider_naming_the_client_differently_gets_that_name_everywhere(pool
 /// the token to keep (its answer sets the expiry), and a declared GET
 /// renews that one later. The standard token endpoint only ever sees
 /// the exchange.
-#[sqlx::test]
-async fn a_short_lived_token_is_swapped_after_the_exchange_and_renewed_by_a_get(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_short_lived_token_is_swapped_after_the_exchange_and_renewed_by_a_get(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -2806,8 +2788,8 @@ async fn a_short_lived_token_is_swapped_after_the_exchange_and_renewed_by_a_get(
 /// and absolute expiry are read through the declared paths, on the
 /// exchange AND on the standard refresh, whose captures run too and
 /// keep what a slimmer refresh answer leaves out.
-#[sqlx::test]
-async fn a_nested_answer_is_read_through_its_paths_on_the_exchange_and_the_refresh(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_nested_answer_is_read_through_its_paths_on_the_exchange_and_the_refresh(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -2844,8 +2826,8 @@ async fn a_nested_answer_is_read_through_its_paths_on_the_exchange_and_the_refre
 
 /// A refusal answered with a success status and an error OBJECT (not
 /// an OAuth code string) fails the connect with the provider's words.
-#[sqlx::test]
-async fn a_refusal_answered_200_with_an_error_object_fails_the_connect(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_refusal_answered_200_with_an_error_object_fails_the_connect(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -2863,8 +2845,8 @@ async fn a_refusal_answered_200_with_an_error_object_fails_the_connect(pool: PgP
 /// refused naming the keys that fix the recipe. Declaring the token
 /// never expires connects it with no expiry; a token weft could not
 /// renew anyway connects as it always did.
-#[sqlx::test]
-async fn a_renewable_token_with_no_expiry_is_refused_at_connect(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_renewable_token_with_no_expiry_is_refused_at_connect(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -2893,8 +2875,8 @@ async fn a_renewable_token_with_no_expiry_is_refused_at_connect(pool: PgPool) {
 /// and a lookup's `okPath` refuses the lookup, classified by its code
 /// (`invalid_auth` on a person's own connection asks for a reconnect).
 /// Without the flag declared, `ok` is just data.
-#[sqlx::test]
-async fn a_success_flag_refuses_only_where_the_recipe_declares_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_success_flag_refuses_only_where_the_recipe_declares_it(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -2943,8 +2925,8 @@ async fn a_success_flag_refuses_only_where_the_recipe_declares_it(pool: PgPool) 
 /// THERE: on a refresh, a busy provider is tried again and keeps the
 /// connection, a refused grant asks for a reconnect, whatever the
 /// conventional `error` field says.
-#[sqlx::test]
-async fn a_refusal_at_a_declared_error_path_is_classified_by_its_code(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_refusal_at_a_declared_error_path_is_classified_by_its_code(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -2966,12 +2948,8 @@ async fn a_refusal_at_a_declared_error_path_is_classified_by_its_code(pool: PgPo
 }
 
 /// Make a connection's token due for renewal now, as if its lifetime ran out.
-async fn expire_now(pool: &PgPool, id: uuid::Uuid) {
-    sqlx::query("UPDATE access_grant SET expires_at = now() - interval '1 minute' WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await
-        .unwrap();
+async fn expire_now(pool: &Pool, id: uuid::Uuid) {
+    pool.execute("UPDATE access_grant SET expires_at = now() - interval '1 minute' WHERE id = $1", &[&id]).await.unwrap();
 }
 
 /// A renewal answer naming no expiry lasts as long as the connection's
@@ -2979,8 +2957,8 @@ async fn expire_now(pool: &PgPool, id: uuid::Uuid) {
 /// so the connection is not renewed again on the next open. What a
 /// rotating provider issued is kept: the next renewal sends the NEW
 /// refresh token.
-#[sqlx::test]
-async fn a_renewal_naming_no_expiry_lasts_the_connections_lifetime(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_renewal_naming_no_expiry_lasts_the_connections_lifetime(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -3015,8 +2993,8 @@ async fn a_renewal_naming_no_expiry_lasts_the_connections_lifetime(pool: PgPool)
 /// time to live, keeps what the provider issued and lasts the
 /// connection's known lifetime, so it is never renewed again on every
 /// open.
-#[sqlx::test]
-async fn an_unusable_renewal_expiry_lasts_the_connections_lifetime(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_unusable_renewal_expiry_lasts_the_connections_lifetime(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -3046,8 +3024,8 @@ async fn an_unusable_renewal_expiry_lasts_the_connections_lifetime(pool: PgPool)
 /// the swap's answer carries none the connection has none, and with no
 /// renewal declared and no expiry it connects as a token nothing renews
 /// (it is not judged renewable off the stale refresh token).
-#[sqlx::test]
-async fn after_exchange_drops_the_exchanges_refresh_token(pool: PgPool) {
+#[weft_db_macros::test]
+async fn after_exchange_drops_the_exchanges_refresh_token(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -3075,42 +3053,29 @@ async fn after_exchange_drops_the_exchanges_refresh_token(pool: PgPool) {
 /// a folded row (by a column, or inside its text) names the kept one before
 /// the index is built. The fold run again changes nothing, and once the
 /// index exists a boot no longer runs it.
-#[sqlx::test]
-async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(pool: Pool) {
     const CONTRACT: &str = "20261027T151627_access_grant_whole_identity_one_grant.contract";
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     // The database as it was before the contract part: no index, the
     // contract still to run.
-    sqlx::raw_sql("DROP INDEX access_grant_exclusive").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM weft_migration WHERE group_name = 'access_grant' AND id = $1")
-        .bind(CONTRACT)
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.batch_execute("DROP INDEX access_grant_exclusive").await.unwrap();
+    pool.execute("DELETE FROM weft_migration WHERE group_name = 'access_grant' AND id = $1", &[&CONTRACT]).await.unwrap();
     // The dispatcher's `signal` table, which an install holds beside the
     // access store's: only the columns the fold reads and writes.
-    sqlx::raw_sql("CREATE TABLE signal (token TEXT PRIMARY KEY, access_id TEXT, spec_json TEXT NOT NULL)")
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.batch_execute("CREATE TABLE signal (token TEXT PRIMARY KEY, access_id TEXT, spec_json TEXT NOT NULL)").await.unwrap();
 
     let (oldest, older, newest, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
     let seed = |id: uuid::Uuid, identity: &'static str, project: Option<uuid::Uuid>, scopes: serde_json::Value, age_secs: i64| {
         let pool = pool.clone();
         async move {
-            sqlx::query(
+            pool.execute(
                 "INSERT INTO access_grant (id, tenant_id, service, client_id, project_id, spec_json, spec_json_version, \
                      values_sealed, granted_scopes, identity, updated_at) \
                  VALUES ($1, $2, 'fakeoauth', 'cid', $3, '{\"grants\": \"exclusive\"}', 1, 'sealed', $4, $5, \
                      now() - make_interval(secs => $6))",
+                &[&id, &TENANT_A, &project, &scopes, &identity, &(age_secs as f64)],
             )
-            .bind(id)
-            .bind(TENANT_A)
-            .bind(project)
-            .bind(scopes)
-            .bind(identity)
-            .bind(age_secs as f64)
-            .execute(&pool)
             .await
             .unwrap();
         }
@@ -3122,102 +3087,87 @@ async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(po
     seed(other, "someone-else@example.com", None, json!(["a"]), 100).await;
 
     // Every place that names a connection, each pointing at a row that goes.
-    sqlx::query("INSERT INTO install_pick (tenant_id, project_id, node, field, grant_id) VALUES ($1, $2, 'mail', 'access', $3)")
-        .bind(TENANT_A)
-        .bind(PROJECT_1)
-        .bind(older)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query(
+    pool.execute(
+        "INSERT INTO install_pick (tenant_id, project_id, node, field, grant_id) VALUES ($1, $2, 'mail', 'access', $3)",
+        &[&TENANT_A, &PROJECT_1, &older],
+    )
+    .await
+    .unwrap();
+    pool.execute(
         "INSERT INTO instance_value (tenant_id, project_id, instance_id, node, field, value, grant_id) \
          VALUES ($1, $2, 'alice', 'mail', 'access', $3, $4)",
+        &[&TENANT_A, &PROJECT_1, &json!({"id": oldest.to_string(), "identity": "me@example.com"}), &oldest],
     )
-    .bind(TENANT_A)
-    .bind(PROJECT_1)
-    .bind(json!({"id": oldest.to_string(), "identity": "me@example.com"}))
-    .bind(oldest)
-    .execute(&pool)
     .await
     .unwrap();
-    sqlx::query(
+    pool.execute(
         "INSERT INTO access_connect (state, tenant_id, service, registration_sealed, spec_json, upgrade_grant_id, redirect_uri) \
          VALUES ('connect-1', $1, 'fakeoauth', 'sealed', '{}', $2, 'http://localhost/callback')",
+        &[&TENANT_A, &oldest],
     )
-    .bind(TENANT_A)
-    .bind(oldest)
-    .execute(&pool)
     .await
     .unwrap();
-    sqlx::query(
+    pool.execute(
         "INSERT INTO access_picker (state, tenant_id, access_id, service, script, code) \
          VALUES ('picker-1', $1, $2, 'fakeoauth', 'script', 'code')",
+        &[&TENANT_A, &older],
     )
-    .bind(TENANT_A)
-    .bind(older)
-    .execute(&pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO access_connect_result (state, tenant_id, result_json) VALUES ('result-1', $1, $2)")
-        .bind(TENANT_A)
-        .bind(json!({"grant": {"id": older.to_string(), "service": "fakeoauth"}}))
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query(
+    pool.execute(
+        "INSERT INTO access_connect_result (state, tenant_id, result_json) VALUES ('result-1', $1, $2)",
+        &[&TENANT_A, &json!({"grant": {"id": older.to_string(), "service": "fakeoauth"}})],
+    )
+    .await
+    .unwrap();
+    pool.execute(
         "INSERT INTO signal_subscription (id, tenant_id, service, topic, access_id, signal_token, token_sealed) \
          VALUES ('sub-1', $1, 'fakeoauth', 'mail', $2, 'signal-1', 'sealed')",
+        &[&TENANT_A, &older],
     )
-    .bind(TENANT_A)
-    .bind(older)
-    .execute(&pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO signal (token, access_id, spec_json) VALUES ('signal-1', $1, $2)")
-        .bind(oldest.to_string())
-        .bind(json!({"kind": "mail", "access": {"id": oldest.to_string()}}).to_string())
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute(
+        "INSERT INTO signal (token, access_id, spec_json) VALUES ('signal-1', $1, $2)",
+        &[&oldest.to_string(), &json!({"kind": "mail", "access": {"id": oldest.to_string()}}).to_string()],
+    )
+    .await
+    .unwrap();
 
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.expect("the boot folds, then builds the index");
 
-    let rows: Vec<(uuid::Uuid, Option<uuid::Uuid>, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, project_id, granted_scopes FROM access_grant WHERE identity = 'me@example.com'",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let rows: Vec<(uuid::Uuid, Option<uuid::Uuid>, serde_json::Value)> =
+        pool.all("SELECT id, project_id, granted_scopes FROM access_grant WHERE identity = 'me@example.com'", &[]).await.unwrap();
     assert_eq!(rows, vec![(newest, None, json!(["a", "b", "c", "d"]))], "the newest kept, with every permission");
-    let still: i64 = sqlx::query_scalar("SELECT count(*) FROM access_grant WHERE id = $1").bind(other).fetch_one(&pool).await.unwrap();
+    let still: i64 = pool.scalar("SELECT count(*) FROM access_grant WHERE id = $1", &[&other]).await.unwrap();
     assert_eq!(still, 1, "another account's row is not touched");
-    let pick: uuid::Uuid = sqlx::query_scalar("SELECT grant_id FROM install_pick").fetch_one(&pool).await.unwrap();
+    let pick: uuid::Uuid = pool.scalar("SELECT grant_id FROM install_pick", &[]).await.unwrap();
     assert_eq!(pick, newest);
     let (value_grant, value): (uuid::Uuid, serde_json::Value) =
-        sqlx::query_as("SELECT grant_id, value FROM instance_value").fetch_one(&pool).await.unwrap();
+        pool.one("SELECT grant_id, value FROM instance_value", &[]).await.unwrap();
     assert_eq!((value_grant, value["id"].clone()), (newest, json!(newest.to_string())));
     let upgrading: Option<uuid::Uuid> =
-        sqlx::query_scalar("SELECT upgrade_grant_id FROM access_connect").fetch_one(&pool).await.unwrap();
+        pool.scalar("SELECT upgrade_grant_id FROM access_connect", &[]).await.unwrap();
     assert_eq!(upgrading, Some(newest));
-    let picking: uuid::Uuid = sqlx::query_scalar("SELECT access_id FROM access_picker").fetch_one(&pool).await.unwrap();
+    let picking: uuid::Uuid = pool.scalar("SELECT access_id FROM access_picker", &[]).await.unwrap();
     assert_eq!(picking, newest);
     let parked: serde_json::Value =
-        sqlx::query_scalar("SELECT result_json FROM access_connect_result").fetch_one(&pool).await.unwrap();
+        pool.scalar("SELECT result_json FROM access_connect_result", &[]).await.unwrap();
     assert_eq!(parked, json!({"grant": {"id": newest.to_string(), "service": "fakeoauth"}}));
-    let subscribed: uuid::Uuid = sqlx::query_scalar("SELECT access_id FROM signal_subscription").fetch_one(&pool).await.unwrap();
+    let subscribed: uuid::Uuid = pool.scalar("SELECT access_id FROM signal_subscription", &[]).await.unwrap();
     assert_eq!(subscribed, newest);
     let (signal_access, signal_spec): (Option<String>, String) =
-        sqlx::query_as("SELECT access_id, spec_json FROM signal").fetch_one(&pool).await.unwrap();
+        pool.one("SELECT access_id, spec_json FROM signal", &[]).await.unwrap();
     assert_eq!(signal_access, Some(newest.to_string()));
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&signal_spec).unwrap(),
         json!({"kind": "mail", "access": {"id": newest.to_string()}})
     );
-    let indexed: bool = sqlx::query_scalar("SELECT to_regclass('access_grant_exclusive') IS NOT NULL").fetch_one(&pool).await.unwrap();
+    let indexed: bool = pool.scalar("SELECT to_regclass('access_grant_exclusive') IS NOT NULL", &[]).await.unwrap();
     assert!(indexed, "the contract part built the index once the rows fit it");
 
     // The fold run again finds nothing to do.
-    let everything = |pool: PgPool| async move {
+    let everything = |pool: Pool| async move {
         let mut tables = Vec::new();
         for table in [
             "access_grant",
@@ -3229,17 +3179,15 @@ async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(po
             "signal_subscription",
             "signal",
         ] {
-            let rows: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT string_agg(t::text, E'\\n' ORDER BY t::text) FROM {table} t")))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+            let rows: Option<String> =
+                pool.scalar(&format!("SELECT string_agg(t::text, E'\\n' ORDER BY t::text) FROM {table} t"), &[]).await.unwrap();
             tables.push((table, rows));
         }
         tables
     };
     let before = everything(pool.clone()).await;
     let [fold] = weft_access_store::GROUP.data_steps else { panic!("the access store has one data step, the fold") };
-    sqlx::raw_sql(fold.sql).execute(&pool).await.expect("the fold runs again");
+    pool.batch_execute(fold.sql).await.expect("the fold runs again");
     assert_eq!(everything(pool.clone()).await, before, "a second fold changes nothing");
 
     // With the index built, a boot that has schema work (a stale stamp
@@ -3247,21 +3195,18 @@ async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(po
     // which the fold would make tenant-wide, stays as it is.
     let later = uuid::Uuid::new_v4();
     seed(later, "me@example.com", Some(PROJECT_1), json!(["a"]), 0).await;
-    sqlx::query("UPDATE weft_schema_stamp SET fingerprint = 'stale' WHERE group_name = 'access_grant'")
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute("UPDATE weft_schema_stamp SET fingerprint = 'stale' WHERE group_name = 'access_grant'", &[]).await.unwrap();
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.expect("the boot restamps");
     let project: Option<uuid::Uuid> =
-        sqlx::query_scalar("SELECT project_id FROM access_grant WHERE id = $1").bind(later).fetch_one(&pool).await.unwrap();
+        pool.scalar("SELECT project_id FROM access_grant WHERE id = $1", &[&later]).await.unwrap();
     assert_eq!(project, Some(PROJECT_1), "the fold did not run once the index existed");
 }
 
 /// An upgrade whose consent signs in as an account that already has its
 /// own exclusive connection is refused, naming that connection to
 /// upgrade instead, and leaves both rows as they were.
-#[sqlx::test]
-async fn an_upgrade_signed_in_as_an_account_with_its_own_connection_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_upgrade_signed_in_as_an_account_with_its_own_connection_is_refused(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -3269,7 +3214,7 @@ async fn an_upgrade_signed_in_as_an_account_with_its_own_connection_is_refused(p
     // The fake provider always signs in as 'quentin': the first row is
     // made another account's by hand, so the next sign-in makes quentin's.
     let theirs = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
-    sqlx::query("UPDATE access_grant SET identity = 'someone-else' WHERE id = $1").bind(theirs.id).execute(&pool).await.unwrap();
+    pool.execute("UPDATE access_grant SET identity = 'someone-else' WHERE id = $1", &[&theirs.id]).await.unwrap();
     let quentins = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
     assert_ne!(quentins.id, theirs.id);
 
@@ -3278,6 +3223,6 @@ async fn an_upgrade_signed_in_as_an_account_with_its_own_connection_is_refused(p
     let said = err.to_string();
     assert!(said.contains("quentin") && said.contains(&quentins.id.to_string()), "{said}");
     let identity: Option<String> =
-        sqlx::query_scalar("SELECT identity FROM access_grant WHERE id = $1").bind(theirs.id).fetch_one(&pool).await.unwrap();
+        pool.scalar("SELECT identity FROM access_grant WHERE id = $1", &[&theirs.id]).await.unwrap();
     assert_eq!(identity.as_deref(), Some("someone-else"), "the upgraded row is left as it was");
 }

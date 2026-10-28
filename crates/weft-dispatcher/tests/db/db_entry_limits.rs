@@ -4,13 +4,13 @@
 //! counted at its worker's door; their refusals are read here for
 //! `weft status`.
 //!
-//! Same rig as `db_versions.rs`: `#[sqlx::test]` hands each test a fresh
+//! Same rig as `db_versions.rs`: `#[weft_db_macros::test]` hands each test a fresh
 //! database; the dispatcher's whole schema is applied as a boot does.
 
-use sqlx::PgPool;
 use weft_dispatcher::entry_limits::{self, EdgeConfig, Limited};
+use weft_task_store::db::{Client as _, Pool};
 
-async fn setup(pool: &PgPool) {
+async fn setup(pool: &Pool) {
     weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
 }
 
@@ -23,8 +23,8 @@ fn edge(invalid_tokens_per_minute: Option<u32>) -> EdgeConfig {
 
 /// An address past the bound of refused tokens is blocked for the rest of
 /// the minute; the bound off blocks nobody.
-#[sqlx::test]
-async fn token_guessing_blocks_the_address_for_the_minute(pool: PgPool) {
+#[weft_db_macros::test]
+async fn token_guessing_blocks_the_address_for_the_minute(pool: Pool) {
     setup(&pool).await;
     let edge = edge(Some(3));
     let addr: std::net::IpAddr = "203.0.113.9".parse().unwrap();
@@ -42,21 +42,18 @@ async fn token_guessing_blocks_the_address_for_the_minute(pool: PgPool) {
 /// The refusals the project's workers' doors counted are reported per
 /// entry and limit for two minutes, summed over the copies, and a worker
 /// of another project naming the entry's token counts for nothing.
-#[sqlx::test]
-async fn refusals_are_reported_for_two_minutes(pool: PgPool) {
+#[weft_db_macros::test]
+async fn refusals_are_reported_for_two_minutes(pool: Pool) {
     setup(&pool).await;
     let (project, other) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
     let key = Limited::AtOnce.refusal_key("tok");
     for (window, replica, owner, hits) in [(60, "w1", project, 1), (120, "w1", project, 1), (120, "w2", project, 2), (120, "x", other, 9)] {
-        sqlx::query("INSERT INTO door_count (key, window_start, replica, project_id, hits) VALUES ($1, $2, $3, $4, $5)")
-            .bind(&key)
-            .bind(window)
-            .bind(replica)
-            .bind(owner)
-            .bind(hits as i64)
-            .execute(&pool)
-            .await
-            .unwrap();
+        pool.execute(
+            "INSERT INTO door_count (key, window_start, replica, project_id, hits) VALUES ($1, $2, $3, $4, $5)",
+            &[&key, &(window as i64),&replica, &owner, &(hits as i64)],
+        )
+        .await
+        .unwrap();
     }
     let recent = entry_limits::recent_refusals(&pool, project, "tok", 130).await.unwrap();
     assert_eq!(recent, vec![(Limited::AtOnce, 4)]);
@@ -65,8 +62,8 @@ async fn refusals_are_reported_for_two_minutes(pool: PgPool) {
 
 /// The runs a trigger started, and how many failed, are reported for two
 /// minutes per trigger, summed over the copies, for the project alone.
-#[sqlx::test]
-async fn the_runs_a_trigger_started_are_reported_for_two_minutes(pool: PgPool) {
+#[weft_db_macros::test]
+async fn the_runs_a_trigger_started_are_reported_for_two_minutes(pool: Pool) {
     setup(&pool).await;
     let (project, other) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
     let rows = [
@@ -77,15 +74,12 @@ async fn the_runs_a_trigger_started_are_reported_for_two_minutes(pool: PgPool) {
         (weft_core::signal::limits::ran_key("old"), 0, "w1", project, 5),
     ];
     for (key, window, replica, owner, hits) in rows {
-        sqlx::query("INSERT INTO door_count (key, window_start, replica, project_id, hits) VALUES ($1, $2, $3, $4, $5)")
-            .bind(&key)
-            .bind(window)
-            .bind(replica)
-            .bind(owner)
-            .bind(hits as i64)
-            .execute(&pool)
-            .await
-            .unwrap();
+        pool.execute(
+            "INSERT INTO door_count (key, window_start, replica, project_id, hits) VALUES ($1, $2, $3, $4, $5)",
+            &[&key, &(window as i64),&replica, &owner, &(hits as i64)],
+        )
+        .await
+        .unwrap();
     }
     let runs = entry_limits::recent_runs(&pool, project, 130).await.unwrap();
     assert_eq!(runs.len(), 1, "{runs:?}");
@@ -94,17 +88,17 @@ async fn the_runs_a_trigger_started_are_reported_for_two_minutes(pool: PgPool) {
 
 /// The minutes that no longer count go with the next refused token, so the
 /// counts are kept small by the writes that fill them and no timer looks.
-#[sqlx::test]
-async fn a_refused_token_prunes_the_minutes_that_no_longer_count(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_refused_token_prunes_the_minutes_that_no_longer_count(pool: Pool) {
     setup(&pool).await;
     let edge = edge(Some(3));
     let addr: std::net::IpAddr = "203.0.113.9".parse().unwrap();
     entry_limits::note_invalid_token(&pool, &edge, addr, 120).await.unwrap();
     entry_limits::note_invalid_token(&pool, &edge, addr, 180).await.unwrap();
     entry_limits::note_invalid_token(&pool, &edge, addr, 300).await.unwrap();
-    let minutes: Vec<i64> = sqlx::query_scalar("SELECT window_start FROM entry_rate ORDER BY window_start").fetch_all(&pool).await.unwrap();
+    let minutes: Vec<i64> = pool.scalars("SELECT window_start FROM entry_rate ORDER BY window_start", &[]).await.unwrap();
     assert_eq!(minutes, vec![300], "the minutes before the last two went");
     entry_limits::note_invalid_token(&pool, &edge, addr, 360).await.unwrap();
-    let minutes: Vec<i64> = sqlx::query_scalar("SELECT window_start FROM entry_rate ORDER BY window_start").fetch_all(&pool).await.unwrap();
+    let minutes: Vec<i64> = pool.scalars("SELECT window_start FROM entry_rate ORDER BY window_start", &[]).await.unwrap();
     assert_eq!(minutes, vec![300, 360], "the minute before stays");
 }

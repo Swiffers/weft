@@ -165,14 +165,10 @@ impl DisplayFeeds {
     /// changed. A failed announce leaves each feed to its next tick, at
     /// most [`LOOK_EVERY`] later, so it is logged rather than failing the
     /// press that already happened.
-    pub async fn announce_look_now(pool: &sqlx::PgPool, key: &DisplayKey) {
+    pub async fn announce_look_now(pool: &weft_task_store::db::Pool, key: &DisplayKey) {
+        use weft_task_store::db::Client as _;
         let payload = serde_json::to_string(key).expect("a display key serializes");
-        if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
-            .bind(LOOK_NOW_CHANNEL)
-            .bind(&payload)
-            .execute(pool)
-            .await
-        {
+        if let Err(e) = pool.execute("SELECT pg_notify($1, $2)", &[&LOOK_NOW_CHANNEL, &payload]).await {
             tracing::error!(target: "weft_dispatcher::display_feeds", error = %e, "pg_notify look-now failed");
         }
     }

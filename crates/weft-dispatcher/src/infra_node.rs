@@ -19,11 +19,9 @@
 //! `weft_task_store::PostgresInfraReader` (NOT from this module).
 
 use anyhow::Result;
-use weft_task_store::sql;
 use serde_json::Value;
-use sqlx::postgres::PgPool;
-use sqlx::Row;
 use std::collections::BTreeMap;
+use weft_task_store::db::{self, Client, Pool};
 
 // `InfraNodeStatus` and `FailureStage` are the wire contract for the
 // `status` and `failure_stage` columns of `infra_node`. They live in
@@ -287,21 +285,21 @@ static ROW_COLUMNS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 /// Read one copy's row. Returns None when the row doesn't exist (no
 /// infra was ever applied for this copy).
 pub async fn get(
-    pool: &PgPool,
+    pool: &Pool,
     project_id: uuid::Uuid,
     node_id: &str,
     instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<Option<InfraNodeRow>> {
-    let row = sqlx::query(sql!(
-        "SELECT {} FROM infra_node \
-         WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
-        *ROW_COLUMNS
-    ))
-    .bind(project_id)
-    .bind(node_id)
-    .bind(instance.map(|m| m.as_str()))
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<db::Row> = pool
+        .opt(
+            &format!(
+                "SELECT {} FROM infra_node \
+                 WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
+                *ROW_COLUMNS
+            ),
+            &[&project_id, &node_id, &instance.map(|m| m.as_str())],
+        )
+        .await?;
     match row {
         None => Ok(None),
         Some(r) => Ok(Some(parse_row(r)?)),
@@ -312,49 +310,39 @@ pub use weft_task_store::infra_copies::{statuses, CopyStatus};
 
 /// List every row for a project. Drives the project status response.
 pub async fn list_for_project(
-    pool: &PgPool,
+    pool: &Pool,
     project_id: uuid::Uuid,
 ) -> Result<Vec<InfraNodeRow>> {
-    let rows = sqlx::query(sql!(
-        "SELECT {} FROM infra_node WHERE project_id = $1 ORDER BY node_id, instance_id NULLS FIRST",
-        *ROW_COLUMNS
-    ))
-    .bind(project_id)
-    .fetch_all(pool)
-    .await?;
+    let rows = pool
+        .query(
+            &format!("SELECT {} FROM infra_node WHERE project_id = $1 ORDER BY node_id, instance_id NULLS FIRST", *ROW_COLUMNS),
+            &[&project_id],
+        )
+        .await?;
     rows.into_iter().map(parse_row).collect()
 }
 
 /// Delete one copy's row. Idempotent. Called after a successful
 /// terminate.
 pub async fn remove(
-    pool: &PgPool,
+    pool: &Pool,
     project_id: uuid::Uuid,
     node_id: &str,
     instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<bool> {
-    let res = sqlx::query(
-        "DELETE FROM infra_node WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
-    )
-    .bind(project_id)
-    .bind(node_id)
-    .bind(instance.map(|m| m.as_str()))
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected() > 0)
+    let removed = pool
+        .execute(
+            "DELETE FROM infra_node WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
+            &[&project_id, &node_id, &instance.map(|m| m.as_str())],
+        )
+        .await?;
+    Ok(removed > 0)
 }
 
 /// Drop every row for a project. Called on `weft rm` after the
 /// project's terminate has completed.
-pub async fn remove_project<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
-    project_id: uuid::Uuid,
-) -> Result<u64> {
-    let res = sqlx::query("DELETE FROM infra_node WHERE project_id = $1")
-        .bind(project_id)
-        .execute(executor)
-        .await?;
-    Ok(res.rows_affected())
+pub async fn remove_project(db: &impl Client, project_id: uuid::Uuid) -> Result<u64> {
+    Ok(db.execute("DELETE FROM infra_node WHERE project_id = $1", &[&project_id]).await?)
 }
 
 /// What starts, stops and terminates are under way for a project's copies
@@ -560,7 +548,7 @@ impl ObservedCopies {
 /// Read every copy of `project_id` with what is under way applied: the one
 /// read every status reader goes through.
 pub async fn observe(
-    pool: &PgPool,
+    pool: &Pool,
     project_id: uuid::Uuid,
     project: &weft_core::ProjectDefinition,
 ) -> Result<ObservedCopies> {
@@ -569,11 +557,11 @@ pub async fn observe(
 
 /// [`observe`], with the operations under way it applied.
 pub async fn observe_with(
-    pool: &PgPool,
+    pool: &Pool,
     project_id: uuid::Uuid,
     project: &weft_core::ProjectDefinition,
 ) -> Result<(ObservedCopies, PendingOps)> {
-    let (as_of_unix,): (i64,) = sqlx::query_as("SELECT EXTRACT(EPOCH FROM NOW())::BIGINT").fetch_one(pool).await?;
+    let as_of_unix: i64 = pool.scalar("SELECT EXTRACT(EPOCH FROM NOW())::BIGINT", &[]).await?;
     let mut rows = list_for_project(pool, project_id).await?;
     let pending = pending_ops(pool, project_id, project).await?;
     for row in &mut rows {
@@ -606,21 +594,23 @@ fn read_through(row: &mut InfraNodeRow, status: InfraNodeStatus) {
 /// Read what is under way for `project_id`'s copies (see [`PendingOps`]).
 /// `project` spells the places a setup run brings up.
 pub async fn pending_ops(
-    pool: &PgPool,
+    pool: &Pool,
     project_id: uuid::Uuid,
     project: &weft_core::ProjectDefinition,
 ) -> Result<PendingOps> {
     let mut ops = Vec::new();
     /// id, node_id, verb, instance_id, every_copy, issued_at_unix.
     type CommandRow = (i64, Option<String>, String, Option<String>, bool, i64);
-    let commands: Vec<CommandRow> = sqlx::query_as(sql!(
-        "SELECT id, node_id, verb, instance_id, every_copy, issued_at_unix FROM infra_lifecycle_command \
-         WHERE project_id = $1 AND completed_at_unix IS NULL AND verb IN ({verbs})",
-        verbs = weft_broker_client::lifecycle_command::SUPERVISOR_VERBS_SQL,
-    ))
-    .bind(project_id)
-    .fetch_all(pool)
-    .await?;
+    let commands: Vec<CommandRow> = pool
+        .all(
+            &format!(
+                "SELECT id, node_id, verb, instance_id, every_copy, issued_at_unix FROM infra_lifecycle_command \
+                 WHERE project_id = $1 AND completed_at_unix IS NULL AND verb IN ({verbs})",
+                verbs = weft_broker_client::lifecycle_command::SUPERVISOR_VERBS_SQL,
+            ),
+            &[&project_id],
+        )
+        .await?;
     for (id, node, verb, instance, every, issued_at_unix) in commands {
         let kind = match crate::infra_lifecycle_command::InfraLifecycleVerb::parse(&verb) {
             Some(crate::infra_lifecycle_command::InfraLifecycleVerb::Apply) => PendingKind::Start,
@@ -637,14 +627,14 @@ pub async fn pending_ops(
     let infra = weft_core::project::infra_place_spellings(project);
     /// run_id, instance_id, started_at, the program it runs.
     type SetupRow = (weft_core::RunId, Option<String>, i64, Option<String>, Option<weft_core::stored::Version>);
-    let setups: Vec<SetupRow> = sqlx::query_as(
-        "SELECT r.run_id, r.instance_id, r.started_at, d.project_json, d.project_json_version FROM run r \
-         LEFT JOIN project_definition d ON d.project_id = r.project_id AND d.definition_hash = r.definition_hash \
-         WHERE r.project_id = $1 AND r.phase = 'infra_setup' AND r.state <> 'ended'",
-    )
-    .bind(project_id)
-    .fetch_all(pool)
-    .await?;
+    let setups: Vec<SetupRow> = pool
+        .all(
+            "SELECT r.run_id, r.instance_id, r.started_at, d.project_json, d.project_json_version FROM run r \
+             LEFT JOIN project_definition d ON d.project_id = r.project_id AND d.definition_hash = r.definition_hash \
+             WHERE r.project_id = $1 AND r.phase = 'infra_setup' AND r.state <> 'ended'",
+            &[&project_id],
+        )
+        .await?;
     for (run_id, instance, started_at, program, version) in setups {
         let instance = instance
             .map(weft_core::instance::InstanceId::new)
@@ -679,7 +669,7 @@ pub async fn pending_ops(
 /// JSON column) and propagates as `Err` rather than being coerced
 /// to None / empty (which would let downstream observe a half-valid
 /// row).
-fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
+fn parse_row(row: db::Row) -> anyhow::Result<InfraNodeRow> {
     let project_id: uuid::Uuid = row.try_get("project_id")?;
     let node_id: String = row.try_get("node_id")?;
     let instance: Option<String> = row.try_get("instance_id")?;

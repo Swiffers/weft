@@ -10,7 +10,6 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sqlx = { workspace = true, features = ["json", "uuid", "chrono"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
@@ -40,6 +39,10 @@ p256 = { workspace = true, features = ["ecdh", "getrandom"] }
 weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 
 [dev-dependencies]
+# `#[weft_db_macros::test]` hands each Layer-3 test a fresh database of
+# its own on $DATABASE_URL, dropped after.
+weft-db-macros = { workspace = true }
+weft-task-store = { workspace = true, features = ["migrate", "test-helpers"] }
 weft-core = { workspace = true }
 # The layer-3 tests' fake provider is a tiny in-process HTTP server.
 axum = { workspace = true }

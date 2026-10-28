@@ -38,6 +38,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use weft_task_store::db::Client as _;
 
 use crate::actions::{self, Actor, Refused};
 use crate::api::project::StatusError;
@@ -801,11 +802,13 @@ pub(crate) async fn finish_sync(state: &DispatcherState, begun: BegunSync) -> Re
 /// of them were.
 pub(crate) async fn bring_back_triggers_whose_infra_returned(state: DispatcherState) -> anyhow::Result<weft_task_store::drain::DrainStep> {
     // SYNC: 'infra' <-> weft_broker_client::activation::DownWith::Infra
-    let marked: Vec<uuid::Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT project_id FROM trigger_activation WHERE went_down_with = 'infra' AND status = 'inactive'",
-    )
-    .fetch_all(&state.pg_pool)
-    .await?;
+    let marked: Vec<uuid::Uuid> = state
+        .pg_pool
+        .scalars(
+            "SELECT DISTINCT project_id FROM trigger_activation WHERE went_down_with = 'infra' AND status = 'inactive'",
+            &[],
+        )
+        .await?;
     let mut failed = Vec::new();
     for id in marked {
         if let Err(e) = bring_back_what_went_down_with_infra(&state, id).await {

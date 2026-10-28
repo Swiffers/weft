@@ -4,7 +4,7 @@
 //! its holder without holding a connection while it waits. Each is held
 //! by a transaction, so it is released however the holder ends.
 
-use crate::sql;
+use crate::db::{Client as _, Pool};
 
 /// Derive a stable i64 advisory-lock key from a `(domain, scope)`
 /// pair. The domain string namespaces unrelated coordination
@@ -50,8 +50,8 @@ pub(crate) fn fnv1a_64(bytes: impl IntoIterator<Item = u8>) -> u64 {
 /// would orphan the lock on a recycled connection and wedge every future
 /// acquisition until that physical connection ages out. A
 /// `pg_try_advisory_xact_lock` is held by the transaction and released
-/// the instant the transaction ends, including the ROLLBACK that sqlx's
-/// `Transaction::drop` issues on a panic unwind. So we hold the lock via
+/// the instant the transaction ends, including the ROLLBACK a dropped
+/// transaction issues on a panic unwind. So we hold the lock via
 /// a live `Transaction` (its connection is the lock holder) while `body`
 /// runs its own work on SEPARATE pool connections, then drop the
 /// transaction to release. No `catch_unwind`, no orphaned lock.
@@ -61,7 +61,7 @@ pub(crate) fn fnv1a_64(bytes: impl IntoIterator<Item = u8>) -> u64 {
 /// The lock lives in Postgres, so it serializes across N dispatcher
 /// replicas.
 pub async fn with_advisory_lock<T, F, Fut>(
-    lock_pool: &sqlx::postgres::PgPool,
+    lock_pool: &Pool,
     key: i64,
     body: F,
 ) -> anyhow::Result<Option<T>>
@@ -73,11 +73,9 @@ where
     // transaction is alive. We never write through `tx`; `body` uses the
     // pool. Dropping `tx` (normal end OR panic unwind) rolls back and
     // releases the lock.
-    let mut tx = lock_pool.begin().await?;
-    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-        .bind(key)
-        .fetch_one(&mut *tx)
-        .await?;
+    let mut conn = lock_pool.get().await?;
+    let tx = conn.transaction().await?;
+    let got: bool = tx.scalar("SELECT pg_try_advisory_xact_lock($1)", &[&key]).await?;
     if !got {
         return Ok(None);
     }
@@ -154,7 +152,7 @@ pub enum Leased<T> {
 /// Run `body` holding the lease `name`, or skip it while someone else
 /// holds it ([`Leased::HeldFor`]). A holder that cannot renew its lease
 /// in time stops `body` and fails ([`held`]).
-pub async fn with_lease<T, F, Fut>(pool: &sqlx::postgres::PgPool, name: &str, body: F) -> anyhow::Result<Leased<T>>
+pub async fn with_lease<T, F, Fut>(pool: &Pool, name: &str, body: F) -> anyhow::Result<Leased<T>>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
@@ -175,7 +173,7 @@ where
 /// holder ends, or its lease lapses. A holder that cannot renew its lease
 /// in time stops `body` and fails ([`held`]).
 pub async fn with_lease_waiting<T, F, Fut>(
-    pool: &sqlx::postgres::PgPool,
+    pool: &Pool,
     signals: &crate::pg_signal::PgSignalWatch,
     name: &str,
     waiting_for: &str,
@@ -225,28 +223,28 @@ enum Taken {
     HeldFor(i64),
 }
 
-async fn take(pool: &sqlx::postgres::PgPool, name: &str, holder: uuid::Uuid) -> anyhow::Result<Taken> {
+async fn take(pool: &Pool, name: &str, holder: uuid::Uuid) -> anyhow::Result<Taken> {
     let lease_ms = i64::try_from(LEASE_FOR.as_millis()).expect("seconds fit");
     // The connection first, so the time spent waiting for one is not
     // counted into the lease: it starts when the statement is sent.
-    let mut conn = pool.acquire().await?;
+    let conn = pool.get().await?;
     let sent_at = tokio::time::Instant::now();
     // One statement: take it when free or lapsed, else read how long it
     // is held for still.
-    let (mine, left_ms): (bool, i64) = sqlx::query_as(sql!(
-        "WITH took AS ( \
-           INSERT INTO lease (name, holder, until_ms) VALUES ($1, $2, {now} + $3) \
-           ON CONFLICT (name) DO UPDATE SET holder = EXCLUDED.holder, until_ms = EXCLUDED.until_ms \
-           WHERE lease.until_ms < {now} RETURNING until_ms) \
-         SELECT TRUE, 0::bigint FROM took \
-         UNION ALL SELECT FALSE, until_ms - {now} FROM lease WHERE name = $1 AND NOT EXISTS (SELECT 1 FROM took)",
-        now = crate::drain::DB_NOW_MS
-    ))
-    .bind(name)
-    .bind(holder)
-    .bind(lease_ms)
-    .fetch_optional(&mut *conn)
-    .await?
+    let (mine, left_ms): (bool, i64) = conn
+        .opt(
+            &format!(
+                "WITH took AS ( \
+                   INSERT INTO lease (name, holder, until_ms) VALUES ($1, $2, {now} + $3) \
+                   ON CONFLICT (name) DO UPDATE SET holder = EXCLUDED.holder, until_ms = EXCLUDED.until_ms \
+                   WHERE lease.until_ms < {now} RETURNING until_ms) \
+                 SELECT TRUE, 0::bigint FROM took \
+                 UNION ALL SELECT FALSE, until_ms - {now} FROM lease WHERE name = $1 AND NOT EXISTS (SELECT 1 FROM took)",
+                now = crate::drain::DB_NOW_MS
+            ),
+            &[&name, &holder, &lease_ms],
+        )
+        .await?
     // Someone else's first take of this name committed after this
     // statement's snapshot: its row conflicts with the insert, yet the read
     // cannot see it. Held, for a term this cannot tell, so a waiter looks
@@ -267,7 +265,7 @@ async fn take(pool: &sqlx::postgres::PgPool, name: &str, holder: uuid::Uuid) -> 
 /// work it guarded stops, and is tried again by whoever runs it. Given
 /// back however this ends, dropped by its caller included ([`GiveBack`]).
 async fn held<T, F, Fut>(
-    pool: &sqlx::postgres::PgPool,
+    pool: &Pool,
     name: &str,
     holder: uuid::Uuid,
     held_until: tokio::time::Instant,
@@ -291,7 +289,7 @@ where
 /// in hand, and the database starts the new term when it runs it, so the
 /// lease is surely held for [`LEASE_FOR`] from the sending. A renewal that
 /// fails is tried again, until [`LEASE_STOP_BEFORE`] ahead of that.
-async fn keep_renewed(pool: &sqlx::postgres::PgPool, name: &str, holder: uuid::Uuid, mut held_until: tokio::time::Instant) -> LeaseLost {
+async fn keep_renewed(pool: &Pool, name: &str, holder: uuid::Uuid, mut held_until: tokio::time::Instant) -> LeaseLost {
     let lease_ms = i64::try_from(LEASE_FOR.as_millis()).expect("seconds fit");
     loop {
         tokio::time::sleep_until(held_until - LEASE_FOR + LEASE_RENEW_EVERY).await;
@@ -348,16 +346,16 @@ pub fn lease_lost(e: &anyhow::Error) -> bool {
 
 /// One renewal: when it was sent, or `None` when the lease is no longer
 /// this holder's.
-async fn renew(pool: &sqlx::postgres::PgPool, name: &str, holder: uuid::Uuid, lease_ms: i64) -> anyhow::Result<Option<tokio::time::Instant>> {
-    let mut conn = pool.acquire().await?;
+async fn renew(pool: &Pool, name: &str, holder: uuid::Uuid, lease_ms: i64) -> anyhow::Result<Option<tokio::time::Instant>> {
+    let conn = pool.get().await?;
     let sent_at = tokio::time::Instant::now();
-    let renewed = sqlx::query(sql!("UPDATE lease SET until_ms = {} + $3 WHERE name = $1 AND holder = $2", crate::drain::DB_NOW_MS))
-        .bind(name)
-        .bind(holder)
-        .bind(lease_ms)
-        .execute(&mut *conn)
+    let renewed = conn
+        .execute(
+            &format!("UPDATE lease SET until_ms = {} + $3 WHERE name = $1 AND holder = $2", crate::drain::DB_NOW_MS),
+            &[&name, &holder, &lease_ms],
+        )
         .await?;
-    Ok((renewed.rows_affected() == 1).then_some(sent_at))
+    Ok((renewed == 1).then_some(sent_at))
 }
 
 /// Gives a lease back however its holder ends. Awaited when the work ends
@@ -366,7 +364,7 @@ async fn renew(pool: &sqlx::postgres::PgPool, name: &str, holder: uuid::Uuid, le
 /// request whose client disconnected), the give-back is spawned, so
 /// waiters are not held back until the lease lapses.
 struct GiveBack {
-    pool: sqlx::postgres::PgPool,
+    pool: Pool,
     name: String,
     holder: uuid::Uuid,
     armed: bool,
@@ -397,15 +395,16 @@ impl Drop for GiveBack {
 }
 
 /// Delete the lease if `holder` still has it, and announce it given back.
-async fn give_back(pool: &sqlx::postgres::PgPool, name: &str, holder: uuid::Uuid) {
-    let given_back = sqlx::query(sql!(
-        "WITH gone AS (DELETE FROM lease WHERE name = $1 AND holder = $2 RETURNING name) \
-         SELECT pg_notify('{LEASE_RELEASED_CHANNEL}', name) FROM gone"
-    ))
-    .bind(name)
-    .bind(holder)
-    .execute(pool)
-    .await;
+async fn give_back(pool: &Pool, name: &str, holder: uuid::Uuid) {
+    let given_back = pool
+        .execute(
+            &format!(
+                "WITH gone AS (DELETE FROM lease WHERE name = $1 AND holder = $2 RETURNING name) \
+                 SELECT pg_notify('{LEASE_RELEASED_CHANNEL}', name) FROM gone"
+            ),
+            &[&name, &holder],
+        )
+        .await;
     if let Err(e) = given_back {
         tracing::warn!(target: "weft_task_store::locks", lease = name, error = %e, "could not give a lease back; it lapses on its own");
     }
@@ -440,7 +439,7 @@ const WAITING_BREADCRUMB: std::time::Duration = std::time::Duration::from_secs(2
 /// has no queue, so a waiter is not served in its turn; the backoff stays
 /// short so one that has waited long is never far behind a newcomer.
 pub async fn with_lock_waiting<T, F, Fut>(
-    lock_pool: &sqlx::postgres::PgPool,
+    lock_pool: &Pool,
     key: i64,
     waiting_for: &str,
     body: F,
@@ -452,18 +451,19 @@ where
     let waiting_since = std::time::Instant::now();
     let mut said_at = std::time::Duration::ZERO;
     let mut backoff = std::time::Duration::from_millis(5);
-    // Acquire first, then run the body once: the transaction holding the
-    // lock has to outlive the loop, and the body is `FnOnce`.
-    let tx = loop {
-        match lock_pool.begin().await {
-            Ok(mut tx) => {
-                let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-                    .bind(key)
-                    .fetch_one(&mut *tx)
+    loop {
+        match lock_pool.get().await {
+            Ok(mut conn) => {
+                let tx = conn.transaction().await.map_err(|e| anyhow::Error::from(e).context(format!("wait for {waiting_for}")))?;
+                let got: bool = tx
+                    .scalar("SELECT pg_try_advisory_xact_lock($1)", &[&key])
                     .await
                     .map_err(|e| anyhow::Error::from(e).context(format!("wait for {waiting_for}")))?;
                 if got {
-                    break tx;
+                    let result = body().await;
+                    // The xact lock dies with the transaction, panic or not.
+                    let _ = tx.rollback().await;
+                    return result;
                 }
                 // Rolled back BEFORE the sleep, so the connection goes
                 // back to the pool while this caller waits.
@@ -473,13 +473,8 @@ where
             // holder, each of which ends, so wait for one like for the
             // lock. Otherwise the wait went to opening a connection that
             // never came (the database does not answer), which is no
-            // wait: the error goes back. Read from the connections handed
-            // out, never the pool's size, which also counts a place still
-            // connecting (`crate::db::every_connection_handed_out`); a
-            // holder's connection in the ping sqlx runs on its way back
-            // is not counted, so a wait that ends in that round trip
-            // fails too.
-            Err(sqlx::Error::PoolTimedOut) if crate::db::every_connection_handed_out(lock_pool) => {}
+            // wait: the error goes back.
+            Err(e) if crate::db::busy(&e) => {}
             Err(e) => return Err(anyhow::Error::from(e).context(format!("wait for {waiting_for}"))),
         }
         let waited = waiting_since.elapsed();
@@ -494,11 +489,7 @@ where
         );
         tokio::time::sleep(backoff + jitter).await;
         backoff = (backoff * 2).min(std::time::Duration::from_millis(50));
-    };
-    let result = body().await;
-    // The xact lock dies with the transaction, panic or not.
-    let _ = tx.rollback().await;
-    result
+    }
 }
 
 #[cfg(test)]
@@ -529,10 +520,10 @@ mod tests {
     /// taken by a connection still opening, which is not a holder.
     #[tokio::test]
     async fn a_lock_wait_on_a_database_that_does_not_answer_fails() {
-        // Port 1 on this machine refuses at once; sqlx keeps trying
+        // Port 1 on this machine refuses at once; the pool keeps trying
         // until the wait ends.
-        let refused = crate::db::connect_options("postgres://weft:secret@127.0.0.1:1/weft").unwrap();
-        let lock_pool = crate::db::open(refused, 1, std::time::Duration::from_millis(300), crate::db::Waits::Expected);
+        let refused = crate::db::config("postgres://weft:secret@127.0.0.1:1/weft").unwrap();
+        let lock_pool = Pool::open(refused, 1, std::time::Duration::from_millis(300), crate::db::Waits::Expected);
         let waited = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             with_lock_waiting(&lock_pool, 42, "a lock", || async { anyhow::Ok(()) }),
@@ -540,6 +531,6 @@ mod tests {
         .await
         .expect("the wait gave up rather than looping");
         let e = waited.expect_err("nothing answers on port 1");
-        assert!(matches!(e.downcast_ref::<sqlx::Error>(), Some(sqlx::Error::PoolTimedOut)), "{e:#}");
+        assert_eq!(crate::db::database_no_connection(&e), Some(crate::db::NoConnection::Unreachable), "{e:#}");
     }
 }

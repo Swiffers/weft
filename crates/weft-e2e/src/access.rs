@@ -159,7 +159,7 @@ pub struct SeededGrant {
     /// The seeded row's id.
     grant_id: uuid::Uuid,
     /// The store's Postgres the row was seeded into.
-    pool: sqlx::PgPool,
+    pool: weft_task_store::db::Pool,
     /// Set by `finish` so `Drop` stays silent after a clean delete.
     finished: bool,
 }
@@ -168,7 +168,7 @@ pub struct SeededGrant {
 impl SeededGrant {
     /// Adopt a row the test just INSERTed under `grant_id` into the
     /// install under test's store.
-    pub fn new(pool: sqlx::PgPool, grant_id: uuid::Uuid) -> Result<Self> {
+    pub fn new(pool: weft_task_store::db::Pool, grant_id: uuid::Uuid) -> Result<Self> {
         crate::kept::grant_seeded(&grant_id.to_string())?;
         Ok(Self { grant_id, pool, finished: false })
     }
@@ -176,9 +176,7 @@ impl SeededGrant {
     /// End-of-test teardown for a PASSING test: delete the seeded row,
     /// awaited so a failure surfaces loudly.
     pub async fn finish(mut self) -> Result<()> {
-        sqlx::query("DELETE FROM access_grant WHERE id = $1")
-            .bind(self.grant_id)
-            .execute(&self.pool)
+        weft_task_store::db::Client::execute(&self.pool, "DELETE FROM access_grant WHERE id = $1", &[&self.grant_id])
             .await
             .with_context(|| format!("teardown: delete seeded grant {}", self.grant_id))?;
         crate::kept::grant_gone(&self.grant_id.to_string())?;

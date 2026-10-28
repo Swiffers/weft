@@ -23,13 +23,12 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
-use weft_task_store::sql;
 use weft_core::migrate::{
     Candidate, ConnectionPick, ExportedConnection, ExportedConnections, ImportedConnection, ImportedConnections, Outcome,
     Selection, TransferKey,
 };
 use weft_core::AppRegistration;
+use weft_task_store::db::{self, Client, FromRow, Pool, Row, Transaction};
 
 use crate::flows::{copy_grant, Moved, NewGrant};
 use crate::{door_of, scopes_of, values_of, AccessError};
@@ -40,54 +39,50 @@ const TRANSFER_KEY_TTL: chrono::Duration = chrono::Duration::minutes(15);
 /// Make a key pair for one move to this install, keeping its private half
 /// sealed like every secret the store keeps. Keys past their time go as
 /// the next one is made.
-pub async fn make_transfer_key(pool: &PgPool, tenant: &str) -> anyhow::Result<TransferKey> {
+pub async fn make_transfer_key(pool: &Pool, tenant: &str) -> anyhow::Result<TransferKey> {
     let (secret, public_key) = crate::transfer::key_pair();
     let key_id = uuid::Uuid::new_v4();
-    sqlx::query(sql!(
-        "{} INSERT INTO access_transfer_key (id, tenant_id, secret_sealed) VALUES ($2, $3, $4)",
-        crate::flows::pruning("access_transfer_key", "$1")
-    ))
-    .bind(chrono::Utc::now() - TRANSFER_KEY_TTL)
-    .bind(key_id)
-    .bind(tenant)
-    .bind(crate::seal_str(&BASE64.encode(&secret)))
-    .execute(pool)
+    pool.execute(
+        &format!(
+            "{} INSERT INTO access_transfer_key (id, tenant_id, secret_sealed) VALUES ($2, $3, $4)",
+            crate::flows::pruning("access_transfer_key", "$1")
+        ),
+        &[&(chrono::Utc::now() - TRANSFER_KEY_TTL), &key_id, &tenant, &crate::seal_str(&BASE64.encode(&secret))],
+    )
     .await?;
     Ok(TransferKey { key_id, public_key })
 }
 
 /// A batch opened with this install's transfer key, waiting to be written
-/// ([`begin_import`]). The key is held (locked) by the transaction the
-/// writes go in, and forgotten only when they commit: an import that
+/// ([`begin_import`]). The key is forgotten only when the writes commit,
+/// in the transaction that holds it (locked) for them: an import that
 /// fails part way leaves nothing written and the key still there, so
 /// running it again just works.
 pub struct Import {
-    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    pool: Pool,
     key_id: uuid::Uuid,
     batch: Vec<MovedGrant>,
 }
 
+/// The message for a transfer key that is not there to open a batch.
+const KEY_GONE: &str = "the target install's transfer key is gone (it opens one batch, for 15 minutes); run the migrate again";
+
 /// Open `sealed` with `tenant`'s transfer key `key_id`, still within its
-/// time. A key opens one batch: the next import that names it waits for
-/// this one, and finds it gone once this one commits.
-pub async fn begin_import(pool: &PgPool, tenant: &str, key_id: uuid::Uuid, sealed: &str) -> anyhow::Result<Import> {
-    let mut tx = pool.begin().await?;
-    let kept: Option<String> = sqlx::query_scalar(
-        "SELECT secret_sealed FROM access_transfer_key WHERE id = $1 AND tenant_id = $2 AND created_at >= $3 FOR UPDATE",
-    )
-    .bind(key_id)
-    .bind(tenant)
-    .bind(chrono::Utc::now() - TRANSFER_KEY_TTL)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let kept = kept.ok_or_else(|| {
-        AccessError::Invalid(
-            "the target install's transfer key is gone (it opens one batch, for 15 minutes); run the migrate again".into(),
+/// time. A key opens one batch: [`import`] holds it while it writes, so
+/// the next import that names it waits for that one, and finds it gone
+/// once that one commits. Nothing is held in between: the caller may
+/// take its time over the batch (asking what keys this install holds).
+pub async fn begin_import(pool: &Pool, tenant: &str, key_id: uuid::Uuid, sealed: &str) -> anyhow::Result<Import> {
+    let kept: Option<String> = pool
+        .scalar_opt(
+            "SELECT secret_sealed FROM access_transfer_key WHERE id = $1 AND tenant_id = $2 AND created_at >= $3",
+            &[&key_id, &tenant, &(chrono::Utc::now() - TRANSFER_KEY_TTL)],
         )
-    })?;
+        .await?;
+    let kept = kept.ok_or_else(|| AccessError::Invalid(KEY_GONE.into()))?;
     let secret = BASE64.decode(crate::open_str(&kept)?).map_err(|e| anyhow::anyhow!("the kept transfer key is not base64: {e}"))?;
     let batch = open_batch(&secret, sealed).map_err(|e| AccessError::Invalid(format!("{e:#}")))?;
-    Ok(Import { tx, key_id, batch })
+    Ok(Import { pool: pool.clone(), key_id, batch })
 }
 
 impl Import {
@@ -140,7 +135,6 @@ impl MovedGrant {
 }
 
 /// The `access_grant` columns a move reads.
-#[derive(sqlx::FromRow)]
 struct GrantRow {
     id: uuid::Uuid,
     tenant_id: String,
@@ -161,6 +155,32 @@ struct GrantRow {
     token_lifetime_secs: Option<i64>,
     created_at: chrono::DateTime<chrono::Utc>,
     published_by_node: Option<String>,
+}
+
+impl FromRow for GrantRow {
+    fn from_row(row: Row) -> db::Result<Self> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            tenant_id: row.try_get("tenant_id")?,
+            service: row.try_get("service")?,
+            project_id: row.try_get("project_id")?,
+            instance_id: row.try_get("instance_id")?,
+            spec_json: row.try_get("spec_json")?,
+            spec_json_version: row.try_get("spec_json_version")?,
+            values_sealed: row.try_get("values_sealed")?,
+            registration_sealed: row.try_get("registration_sealed")?,
+            granted_scopes: row.try_get("granted_scopes")?,
+            permissions_verified: row.try_get("permissions_verified")?,
+            owner: row.try_get("owner")?,
+            door: row.try_get("door")?,
+            label: row.try_get("label")?,
+            identity: row.try_get("identity")?,
+            expires_at: row.try_get("expires_at")?,
+            token_lifetime_secs: row.try_get("token_lifetime_secs")?,
+            created_at: row.try_get("created_at")?,
+            published_by_node: row.try_get("published_by_node")?,
+        })
+    }
 }
 
 const GRANT_COLUMNS: &str = "id, tenant_id, service, project_id, instance_id, spec_json, spec_json_version, values_sealed, \
@@ -221,13 +241,10 @@ fn not_copied(row: &GrantRow) -> Option<String> {
 /// `tenant`'s connections `selection` picks, and each copyable one sealed
 /// to `public_key` (none sealed without a key: a dry run), with the
 /// source's picks of them.
-pub async fn export(pool: &PgPool, tenant: &str, selection: &Selection, public_key: Option<&str>) -> anyhow::Result<ExportedConnections> {
+pub async fn export(pool: &Pool, tenant: &str, selection: &Selection, public_key: Option<&str>) -> anyhow::Result<ExportedConnections> {
     selection.validate().map_err(AccessError::Invalid)?;
     let rows: Vec<GrantRow> =
-        sqlx::query_as(sql!("SELECT {GRANT_COLUMNS} FROM access_grant WHERE tenant_id = $1 ORDER BY created_at, id"))
-            .bind(tenant)
-            .fetch_all(pool)
-            .await?;
+        pool.all(&format!("SELECT {GRANT_COLUMNS} FROM access_grant WHERE tenant_id = $1 ORDER BY created_at, id"), &[&tenant]).await?;
     let mut connections = Vec::new();
     let mut moving = Vec::new();
     for row in rows {
@@ -243,14 +260,13 @@ pub async fn export(pool: &PgPool, tenant: &str, selection: &Selection, public_k
         }
     }
     let ids: Vec<uuid::Uuid> = moving.iter().map(|row| row.id).collect();
-    let picks: Vec<(uuid::Uuid, String, String, uuid::Uuid)> = sqlx::query_as(
-        "SELECT project_id, node, field, grant_id FROM install_pick WHERE tenant_id = $1 AND grant_id = ANY($2) \
-         ORDER BY project_id, node, field",
-    )
-    .bind(tenant)
-    .bind(&ids)
-    .fetch_all(pool)
-    .await?;
+    let picks: Vec<(uuid::Uuid, String, String, uuid::Uuid)> = pool
+        .all(
+            "SELECT project_id, node, field, grant_id FROM install_pick WHERE tenant_id = $1 AND grant_id = ANY($2) \
+             ORDER BY project_id, node, field",
+            &[&tenant, &ids],
+        )
+        .await?;
     let picks = picks.into_iter().map(|(project_id, node, field, grant_id)| ConnectionPick { project_id, node, field, grant_id }).collect();
     let sealed = match public_key {
         Some(public_key) if !moving.is_empty() => {
@@ -286,8 +302,10 @@ fn same_connection(a: &MovedGrant, b: &MovedGrant) -> anyhow::Result<bool> {
 }
 
 /// Write each connection of `import`'s batch as `tenant`'s, keeping its
-/// id, in the one transaction its key is held in, and forget the key as
-/// it commits. One already here holding exactly the same is already
+/// id, in one transaction that holds its key (gone already, because
+/// another import of it committed first or its time ran out, and nothing
+/// is written), and forget the
+/// key as it commits. One already here holding exactly the same is already
 /// there; one whose id is here holding anything else is left alone,
 /// naming how to replace it; one whose account this install already has
 /// a connection to (a service with one connection per account) is left
@@ -295,13 +313,26 @@ fn same_connection(a: &MovedGrant, b: &MovedGrant) -> anyhow::Result<bool> {
 /// install holds that key (`shared_keys`, the services it does); one this
 /// weft cannot read is skipped, saying why.
 pub async fn import(import: Import, tenant: &str, shared_keys: &BTreeSet<String>) -> anyhow::Result<ImportedConnections> {
-    let Import { mut tx, key_id, batch } = import;
+    let Import { pool, key_id, batch } = import;
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    // Still within its time as it is held: the batch is written only under
+    // a key that has not expired, however long the caller took over it.
+    let held: Option<uuid::Uuid> = tx
+        .scalar_opt(
+            "SELECT id FROM access_transfer_key WHERE id = $1 AND tenant_id = $2 AND created_at >= $3 FOR UPDATE",
+            &[&key_id, &tenant, &(chrono::Utc::now() - TRANSFER_KEY_TTL)],
+        )
+        .await?;
+    if held.is_none() {
+        return Err(AccessError::Invalid(KEY_GONE.into()).into());
+    }
     let mut connections = Vec::with_capacity(batch.len());
     for grant in batch {
-        let outcome = import_one(&mut tx, tenant, &grant, shared_keys).await?;
+        let outcome = import_one(&tx, tenant, &grant, shared_keys).await?;
         connections.push(ImportedConnection { id: grant.id, service: grant.service, outcome });
     }
-    sqlx::query("DELETE FROM access_transfer_key WHERE id = $1").bind(key_id).execute(&mut *tx).await?;
+    tx.execute("DELETE FROM access_transfer_key WHERE id = $1", &[&key_id]).await?;
     tx.commit().await?;
     Ok(ImportedConnections { connections })
 }
@@ -322,7 +353,7 @@ fn readable(grant: &MovedGrant) -> Result<Readable, String> {
 }
 
 async fn import_one(
-    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    tx: &Transaction<'_>,
     tenant: &str,
     grant: &MovedGrant,
     shared_keys: &BTreeSet<String>,
@@ -331,10 +362,7 @@ async fn import_one(
         Ok(readable) => readable,
         Err(why) => return Ok(Outcome::Skipped { why: format!("it does not read on this install ({why}); the two installs may run different wefts") }),
     };
-    let here: Option<GrantRow> = sqlx::query_as(sql!("SELECT {GRANT_COLUMNS} FROM access_grant WHERE id = $1"))
-        .bind(grant.id)
-        .fetch_optional(&mut **tx)
-        .await?;
+    let here: Option<GrantRow> = tx.opt(&format!("SELECT {GRANT_COLUMNS} FROM access_grant WHERE id = $1"), &[&grant.id]).await?;
     if let Some(row) = here {
         if row.tenant_id != tenant {
             return Ok(Outcome::Skipped { why: format!("another account on this install has a connection {}", grant.id) });
@@ -356,7 +384,7 @@ async fn import_one(
     // other kept a token the provider has revoked.
     if let (weft_core::access::spec::GrantCoexistence::Exclusive, Some(registration)) = (spec.grants, &grant.registration) {
         if let Some(existing) = crate::flows::exclusive_row(
-            &mut **tx,
+            tx,
             tenant,
             &grant.service,
             grant.identity.as_deref(),
@@ -380,9 +408,9 @@ async fn import_one(
             ),
         });
     }
-    crate::resolve::record_events_recipes(&mut **tx, &spec).await?;
+    crate::resolve::record_events_recipes(tx, &spec).await?;
     let copied = copy_grant(
-        &mut **tx,
+        tx,
         tenant,
         Moved { id: grant.id, created_at: grant.created_at, expires_at: grant.expires_at, token_lifetime_secs: grant.token_lifetime_secs },
         NewGrant {

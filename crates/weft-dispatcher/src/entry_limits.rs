@@ -14,7 +14,7 @@
 use std::net::IpAddr;
 
 use anyhow::{Context, Result};
-use sqlx::PgPool;
+use weft_task_store::db::{Client, Pool};
 
 pub use weft_core::signal::limits::{Limited, Refused, WINDOW_SECS};
 use weft_core::signal::limits::window;
@@ -56,14 +56,9 @@ pub use weft_platform_traits::config::EdgeConfig;
 
 /// Count one hit on `key` in the current minute (`weft_rate_hit`): its
 /// hits so far, this one included, and the seconds left in the minute.
-async fn count<'e>(db: impl sqlx::PgExecutor<'e>, key: &str, now: i64) -> Result<(i64, u64)> {
+async fn count(db: &impl Client, key: &str, now: i64) -> Result<(i64, u64)> {
     let (start, left) = window(now);
-    let hits: i32 = sqlx::query_scalar("SELECT weft_rate_hit($1, $2)")
-        .bind(key)
-        .bind(start)
-        .fetch_one(db)
-        .await
-        .context("count a public call")?;
+    let hits: i32 = db.scalar("SELECT weft_rate_hit($1, $2)", &[&key, &start]).await.context("count a public call")?;
     Ok((hits as i64, left))
 }
 
@@ -74,22 +69,20 @@ fn invalid_tokens_key(address: IpAddr) -> String {
 
 /// Whether `address` is blocked for presenting too many refused tokens
 /// this minute. Read-only: [`note_invalid_token`] counts.
-pub async fn token_guessing_blocked(pool: &PgPool, edge: &EdgeConfig, address: IpAddr, now: i64) -> Result<Option<Refused>> {
+pub async fn token_guessing_blocked(pool: &Pool, edge: &EdgeConfig, address: IpAddr, now: i64) -> Result<Option<Refused>> {
     let Some(limit) = edge.invalid_tokens_per_minute else { return Ok(None) };
     let (start, left) = window(now);
-    let hits: Option<(i32,)> = sqlx::query_as("SELECT hits FROM entry_rate WHERE key = $1 AND window_start = $2")
-        .bind(invalid_tokens_key(address))
-        .bind(start)
-        .fetch_optional(pool)
+    let hits: Option<i32> = pool
+        .scalar_opt("SELECT hits FROM entry_rate WHERE key = $1 AND window_start = $2", &[&invalid_tokens_key(address), &start])
         .await
         .context("read refused tokens")?;
     Ok(hits
-        .filter(|(h,)| *h as i64 >= limit as i64)
+        .filter(|h| *h as i64 >= limit as i64)
         .map(|_| Refused { retry_after_secs: left, reason: Limited::InvalidTokens }))
 }
 
 /// Count one refused token from `address`, when the install bounds them.
-pub async fn note_invalid_token(pool: &PgPool, edge: &EdgeConfig, address: IpAddr, now: i64) -> Result<()> {
+pub async fn note_invalid_token(pool: &Pool, edge: &EdgeConfig, address: IpAddr, now: i64) -> Result<()> {
     if edge.invalid_tokens_per_minute.is_some() {
         count(pool, &invalid_tokens_key(address), now).await?;
     }
@@ -101,18 +94,17 @@ pub async fn note_invalid_token(pool: &PgPool, edge: &EdgeConfig, address: IpAdd
 /// them (`door_count`, each copy's total, summed). Read for `project`
 /// only: a worker writes the keys it is handed, and another project's
 /// worker naming this entry's token counts for nothing.
-pub async fn recent_refusals(pool: &PgPool, project: uuid::Uuid, token: &str, now: i64) -> Result<Vec<(Limited, u64)>> {
+pub async fn recent_refusals(pool: &Pool, project: uuid::Uuid, token: &str, now: i64) -> Result<Vec<(Limited, u64)>> {
     let (start, _) = window(now);
     let mut out = Vec::new();
     for reason in Limited::ALL {
-        let (hits,): (Option<i64>,) =
-            sqlx::query_as("SELECT SUM(hits)::BIGINT FROM door_count WHERE key = $1 AND window_start >= $2 AND project_id = $3")
-                .bind(reason.refusal_key(token))
-                .bind(start - WINDOW_SECS)
-                .bind(project)
-                .fetch_one(pool)
-                .await
-                .context("read refusals")?;
+        let hits: Option<i64> = pool
+            .scalar(
+                "SELECT SUM(hits)::BIGINT FROM door_count WHERE key = $1 AND window_start >= $2 AND project_id = $3",
+                &[&reason.refusal_key(token), &(start - WINDOW_SECS), &project],
+            )
+            .await
+            .context("read refusals")?;
         if let Some(hits) = hits.filter(|h| *h > 0) {
             out.push((reason, hits as u64));
         }
@@ -125,18 +117,17 @@ pub async fn recent_refusals(pool: &PgPool, project: uuid::Uuid, token: &str, no
 /// the doors that started them counted (`door_count`). An unrecorded run
 /// leaves no row of its own when it goes well, so this is where it is
 /// seen.
-pub async fn recent_runs(pool: &PgPool, project: uuid::Uuid, now: i64) -> Result<std::collections::HashMap<String, (u64, u64)>> {
+pub async fn recent_runs(pool: &Pool, project: uuid::Uuid, now: i64) -> Result<std::collections::HashMap<String, (u64, u64)>> {
     let (start, _) = window(now);
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT key, SUM(hits)::BIGINT FROM door_count \
-         WHERE project_id = $1 AND window_start >= $2 AND (key LIKE 'ran:%' OR key LIKE 'failed:%') \
-         GROUP BY key",
-    )
-    .bind(project)
-    .bind(start - WINDOW_SECS)
-    .fetch_all(pool)
-    .await
-    .context("read run counts")?;
+    let rows: Vec<(String, i64)> = pool
+        .all(
+            "SELECT key, SUM(hits)::BIGINT FROM door_count \
+             WHERE project_id = $1 AND window_start >= $2 AND (key LIKE 'ran:%' OR key LIKE 'failed:%') \
+             GROUP BY key",
+            &[&project, &(start - WINDOW_SECS)],
+        )
+        .await
+        .context("read run counts")?;
     let mut runs: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
     for (key, hits) in rows {
         let hits = hits.max(0) as u64;

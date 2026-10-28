@@ -63,6 +63,7 @@ use weft_core::storage::{
     UploadResumeResponse, WipePrefixRequest, WipePrefixResponse,
 };
 use weft_platform_traits::PresignAudience;
+use weft_task_store::db::Client as _;
 
 use crate::auth::control_plane;
 use crate::runtime_store::RuntimeStoreError;
@@ -642,9 +643,9 @@ async fn slot_parts_audience(state: &BrokerState, project: &str) -> Result<Presi
 /// The address `project` declared its visitors reach the install at (a
 /// site that passes `/weft/...` on), when it declared one.
 async fn visitor_address(state: &BrokerState, project: uuid::Uuid) -> Result<Option<String>, ApiError> {
-    sqlx::query_scalar("SELECT visitor_address FROM project_frontend WHERE project_id = $1 AND visitor_address IS NOT NULL")
-        .bind(project)
-        .fetch_optional(&state.pool)
+    state
+        .pool
+        .scalar_opt("SELECT visitor_address FROM project_frontend WHERE project_id = $1 AND visitor_address IS NOT NULL", &[&project])
         .await
         // A read, ahead of every write of the call that asks it.
         .map_err(|e| opaque(crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("read the project's visitor address"))).into())
@@ -1359,6 +1360,12 @@ async fn admin_sweep_run(
 #[cfg(test)]
 mod link_route_tests {
     use super::{map_err, route_link, LinkReach, PresignAudience, RuntimeStoreError, StatusCode};
+    use weft_task_store::db;
+
+    /// What a statement that got no connection fails with.
+    fn no_connection() -> db::Error {
+        db::Error::NoConnection { why: db::NoConnection::Busy, refused: None }
+    }
 
     #[test]
     fn unavailable_uploaded_file_explains_expiry_and_how_to_recover() {
@@ -1502,7 +1509,7 @@ mod link_route_tests {
     /// done.
     #[test]
     fn a_store_op_without_a_connection_never_says_nothing_was_done() {
-        let super::ApiError { status, message, .. } = map_err(RuntimeStoreError::Other(sqlx::Error::PoolTimedOut.into()));
+        let super::ApiError { status, message, .. } = map_err(RuntimeStoreError::Other(no_connection().into()));
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_ne!(message, weft_broker_client::protocol::NOT_DONE);
     }
@@ -1512,9 +1519,9 @@ mod link_route_tests {
     /// other failure there keeps the generic body.
     #[test]
     fn a_store_op_without_its_first_connection_says_nothing_was_done() {
-        let super::ApiError { status, message, .. } = map_err(RuntimeStoreError::BeforeWrites(sqlx::Error::PoolTimedOut.into()));
+        let super::ApiError { status, message, .. } = map_err(RuntimeStoreError::BeforeWrites(no_connection().into()));
         assert_eq!((status, message.as_str()), (StatusCode::SERVICE_UNAVAILABLE, weft_broker_client::protocol::NOT_DONE));
-        let super::ApiError { status, message, .. } = map_err(RuntimeStoreError::BeforeWrites(sqlx::Error::RowNotFound.into()));
+        let super::ApiError { status, message, .. } = map_err(RuntimeStoreError::BeforeWrites(db::Error::NoRow.into()));
         assert_eq!((status, message.as_str()), (StatusCode::INTERNAL_SERVER_ERROR, super::INTERNAL_STORAGE_ERROR_BODY));
     }
 }
@@ -1528,9 +1535,7 @@ mod db_tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use sqlx::pool::PoolConnection;
-    use sqlx::postgres::PgPoolOptions;
-    use sqlx::{PgPool, Postgres};
+    use weft_task_store::db::{self, Client as _, Conn, Pool};
     use weft_core::storage::key::{self, CallerAuth};
     use weft_core::storage::StorageScope;
     use weft_platform_traits::clock::FakeClock;
@@ -1547,8 +1552,8 @@ mod db_tests {
     /// database after that bucket call finds no connection. Dumb injection.
     struct TakesTheConnectionOnDelete {
         bucket: FakeObjectStore,
-        pool: PgPool,
-        taken: tokio::sync::Mutex<Option<PoolConnection<Postgres>>>,
+        pool: Pool,
+        taken: tokio::sync::Mutex<Option<Conn>>,
     }
 
     #[async_trait::async_trait]
@@ -1571,7 +1576,7 @@ mod db_tests {
         async fn delete(&self, key: &str) -> anyhow::Result<()> {
             let mut taken = self.taken.lock().await;
             if taken.is_none() {
-                *taken = Some(self.pool.acquire().await.expect("the pool's one connection"));
+                *taken = Some(self.pool.get().await.expect("the pool's one connection"));
             }
             self.bucket.delete(key).await
         }
@@ -1616,20 +1621,15 @@ mod db_tests {
     /// drops the row. When the last step gets no connection, the first two
     /// are done (sending the delete again finds no file), so the answer
     /// asks again without saying nothing was done.
-    #[sqlx::test]
-    async fn a_delete_that_loses_its_connection_after_the_fence_never_says_nothing_was_done(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_delete_that_loses_its_connection_after_the_fence_never_says_nothing_was_done(pool: Pool) {
         weft_task_store::apply_groups(&pool, &[&crate::runtime_store::GROUP, &weft_task_store::unanswered::GROUP])
             .await
             .unwrap();
         weft_task_store::unanswered::judged_run_columns(&pool).await.unwrap();
         // One connection, waited for briefly, so the step after the bucket's
         // delete finds none.
-        let one = PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(Duration::from_secs(1))
-            .connect_with((*pool.connect_options()).clone())
-            .await
-            .unwrap();
+        let one = Pool::open(pool.config().clone(), 1, Duration::from_secs(1), db::Waits::Expected);
         let bucket = Arc::new(TakesTheConnectionOnDelete { bucket: FakeObjectStore::new(), pool: one.clone(), taken: Default::default() });
         let clock = FakeClock::new();
         // The file is stored through the whole pool; only the delete runs
@@ -1659,7 +1659,7 @@ mod db_tests {
         let failed = store.delete(&parsed).await.unwrap_err();
         let RuntimeStoreError::Other(cause) = &failed else { panic!("a database failure, got {failed:?}") };
         assert!(
-            cause.chain().any(|e| matches!(e.downcast_ref::<sqlx::Error>(), Some(sqlx::Error::PoolTimedOut))),
+            db::database_no_connection(cause).is_some(),
             "the last step got no connection: {cause:#}"
         );
         let ApiError { status, message, .. } = map_err(failed);
@@ -1668,7 +1668,7 @@ mod db_tests {
 
         // What committed before the failure: the row is fenced and the
         // object is gone, so the delete sent again finds no file.
-        let status: String = sqlx::query_scalar("SELECT status FROM runtime_file WHERE key = $1").bind(&key).fetch_one(&pool).await.unwrap();
+        let status: String = pool.scalar("SELECT status FROM runtime_file WHERE key = $1", &[&key]).await.unwrap();
         assert_eq!(status, "reaping");
         assert!(bucket.bucket.is_empty(), "the object was removed");
         drop(bucket.taken.lock().await.take());
@@ -1677,18 +1677,13 @@ mod db_tests {
 
     /// A delete that cannot get its first connection has done nothing: it
     /// says so, the caller sends it again, and that one deletes the file.
-    #[sqlx::test]
-    async fn a_delete_with_no_first_connection_says_nothing_was_done(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_delete_with_no_first_connection_says_nothing_was_done(pool: Pool) {
         weft_task_store::apply_groups(&pool, &[&crate::runtime_store::GROUP, &weft_task_store::unanswered::GROUP])
             .await
             .unwrap();
         weft_task_store::unanswered::judged_run_columns(&pool).await.unwrap();
-        let one = PgPoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(Duration::from_secs(1))
-            .connect_with((*pool.connect_options()).clone())
-            .await
-            .unwrap();
+        let one = Pool::open(pool.config().clone(), 1, Duration::from_secs(1), db::Waits::Expected);
         let bucket = Arc::new(FakeObjectStore::new());
         let clock = FakeClock::new();
         let stores = RuntimeStore::new(pool.clone(), bucket.clone(), clock.clone());
@@ -1712,12 +1707,12 @@ mod db_tests {
         stores.complete_upload(&caller, &key).await.unwrap();
         let parsed = key::parse_key(&key).unwrap();
 
-        let taken = one.acquire().await.unwrap();
+        let taken = one.get().await.unwrap();
         let failed = store.delete(&parsed).await.unwrap_err();
         assert!(matches!(failed, RuntimeStoreError::BeforeWrites(_)), "{failed:?}");
         let ApiError { status, message, .. } = map_err(failed);
         assert_eq!((status, message.as_str()), (StatusCode::SERVICE_UNAVAILABLE, weft_broker_client::protocol::NOT_DONE));
-        let status: String = sqlx::query_scalar("SELECT status FROM runtime_file WHERE key = $1").bind(&key).fetch_one(&pool).await.unwrap();
+        let status: String = pool.scalar("SELECT status FROM runtime_file WHERE key = $1", &[&key]).await.unwrap();
         assert_eq!(status, "active", "nothing of the delete ran");
         assert!(!bucket.is_empty(), "the object is still there");
 

@@ -13,6 +13,7 @@
 //! sweep the run's un-kept run files.
 
 use anyhow::{Context, Result};
+use weft_task_store::db::Client as _;
 use weft_task_store::drain::DrainStep;
 
 use weft_core::storage::{
@@ -690,9 +691,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 /// naming the run (the files, if any, remain reclaimable via `weft files`).
 pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
     let rows: Vec<(weft_core::RunId, String)> =
-        sqlx::query_as("SELECT run_id, tenant_id FROM storage_sweep ORDER BY enqueued_at_unix")
-            .fetch_all(&state.pg_pool)
-            .await?;
+        state.pg_pool.all("SELECT run_id, tenant_id FROM storage_sweep ORDER BY enqueued_at_unix", &[]).await?;
     let mut deferred = Vec::new();
     for (run_id, tenant) in rows {
         match sweep_run(&state, &tenant, &run_id.to_string()).await {
@@ -705,10 +704,7 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
                          un-kept run files with the post-run linger expiry"
                     );
                 }
-                sqlx::query("DELETE FROM storage_sweep WHERE run_id = $1")
-                    .bind(run_id)
-                    .execute(&state.pg_pool)
-                    .await?;
+                state.pg_pool.execute("DELETE FROM storage_sweep WHERE run_id = $1", &[&run_id]).await?;
             }
             Err(e) if e.downcast_ref::<StorageNotFound>().is_some() => {
                 // 404 from the broker means there was nothing to sweep for this
@@ -719,10 +715,7 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
                     %run_id, tenant = %tenant,
                     "terminate sweep found nothing to remove; clearing the queue row"
                 );
-                sqlx::query("DELETE FROM storage_sweep WHERE run_id = $1")
-                    .bind(run_id)
-                    .execute(&state.pg_pool)
-                    .await?;
+                state.pg_pool.execute("DELETE FROM storage_sweep WHERE run_id = $1", &[&run_id]).await?;
             }
             Err(e) if e.downcast_ref::<BrokerRejected>().is_some() => {
                 // The broker understood and permanently refuses this request (bad
@@ -737,10 +730,7 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
                      (any remaining files for this run stay listable/deletable via \
                      the storage API)"
                 );
-                sqlx::query("DELETE FROM storage_sweep WHERE run_id = $1")
-                    .bind(run_id)
-                    .execute(&state.pg_pool)
-                    .await?;
+                state.pg_pool.execute("DELETE FROM storage_sweep WHERE run_id = $1", &[&run_id]).await?;
             }
             Err(e) => {
                 // Transient (broker unreachable, apiserver blip surfaced as 401,

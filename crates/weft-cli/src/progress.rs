@@ -808,7 +808,7 @@ mod tests {
         let message = detail["message"].as_str().unwrap();
         assert!(message.starts_with("the weft daemon is not answering. Start it with `weft daemon start`"), "{message}");
 
-        let cause = reqwest::Client::new().get(format!("http://{closed}/")).send().await.unwrap_err();
+        let cause = weft_core::net::http_client().build().unwrap().get(format!("http://{closed}/")).send().await.unwrap_err();
         let remote = crate::client::InstallUnreachable {
             url: "https://weft-prod.example.run.app".into(),
             target: Some("prod".into()),

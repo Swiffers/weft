@@ -233,7 +233,7 @@ impl WorkerStorage {
     /// the worker's identity for it (the broker resolves the tenant and
     /// project from it).
     pub fn new(broker_url: String, token: weft_broker_client::TokenSource) -> Arc<Self> {
-        Arc::new(Self { broker_url, token, http: reqwest::Client::new() })
+        Arc::new(Self { broker_url, token, http: weft_core::net::http_client().build().expect("reqwest client") })
     }
 
     fn url(&self, path: &str) -> String {

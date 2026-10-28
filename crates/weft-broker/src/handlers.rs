@@ -11,14 +11,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use weft_task_store::sql;
-
 use axum::{
     extract::State,
     http::StatusCode,
 };
 use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL, ISSUED_WAKE};
 use weft_broker_client::protocol::*;
+use weft_task_store::db::{self, Client as _, Row};
 use weft_task_store::tasks::DedupOutcome;
 use weft_task_store::TaskKind;
 
@@ -45,10 +44,9 @@ pub(crate) async fn require_worker_drives(
 ) -> Result<scope::RunScope, (StatusCode, String)> {
     let replica = caller.replica.as_deref().ok_or((StatusCode::FORBIDDEN, "a worker names its replica".to_string()))?;
     let scope = scope::require_run_id_scope(&state.scope_cache, &state.pool, caller, run_id).await?;
-    let driven: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM run WHERE run_id = $1 AND owner = $2 AND state = 'running')")
-        .bind(run_id)
-        .bind(replica)
-        .fetch_one(&state.pool)
+    let driven: bool = state
+        .pool
+        .scalar("SELECT EXISTS (SELECT 1 FROM run WHERE run_id = $1 AND owner = $2 AND state = 'running')", &[&run_id, &replica])
         .await
         .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a run's owner")))?;
     if !driven {
@@ -86,8 +84,7 @@ pub async fn run_tag(
     weft_core::tag::validate_tags(&req.tags)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     require_worker_drives(&state, &caller, req.run_id).await?;
-    let mut conn = state.pool.acquire().await.map_err(|e| unavailable_or_internal(e.into()))?;
-    weft_journal::tags::tag_run_in(&mut conn, req.run_id, &req.tags, unix_now_secs())
+    weft_journal::tags::tag_run_in(&state.pool, req.run_id, &req.tags, unix_now_secs())
         .await
         .map_err(|e| unavailable_or_internal(e.into()))?;
     Ok(Json(RunTagResponse {}))
@@ -299,9 +296,9 @@ pub async fn task_enqueue_dedup(
             .map_err(|e| unreadable_payload(&state, &caller, &e))?;
         let t = scope::require_signal_owned_by(&state.scope_cache, &state.pool, &caller, &fire.token).await?;
         merge_anchor_tenant(&mut anchor_tenant, t)?;
-        let wait: Option<(bool, Option<weft_core::RunId>)> = sqlx::query_as("SELECT is_resume, run_id FROM signal WHERE token = $1")
-            .bind(&fire.token)
-            .fetch_optional(&state.pool)
+        let wait: Option<(bool, Option<weft_core::RunId>)> = state
+            .pool
+            .opt("SELECT is_resume, run_id FROM signal WHERE token = $1", &[&fire.token])
             .await
             .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a signal")))?;
         match wait {
@@ -362,12 +359,11 @@ pub async fn task_enqueue_dedup(
         ))?;
         let withdraw: weft_task_store::WithdrawSignalPayload = serde_json::from_value(req.spec.payload.clone())
             .map_err(|e| unreadable_payload(&state, &caller, &e))?;
-        let signal: Option<(bool, Option<weft_core::RunId>)> =
-            sqlx::query_as("SELECT is_resume, run_id FROM signal WHERE token = $1")
-                .bind(&withdraw.token)
-                .fetch_optional(&state.pool)
-                .await
-                .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a signal")))?;
+        let signal: Option<(bool, Option<weft_core::RunId>)> = state
+            .pool
+            .opt("SELECT is_resume, run_id FROM signal WHERE token = $1", &[&withdraw.token])
+            .await
+            .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a signal")))?;
         // A wait already answered or withdrawn has no signal left, and
         // withdrawing it again removes nothing. Anything else the token
         // names (an entry trigger, another run's wait) is refused.
@@ -491,9 +487,9 @@ async fn declared_infra(
     state: &BrokerState,
     project: uuid::Uuid,
 ) -> Result<Option<Arc<weft_core::project::DeclaredInfra>>, (StatusCode, String)> {
-    let digest: Option<String> = sqlx::query_scalar("SELECT md5(project_json) FROM project WHERE id = $1")
-        .bind(project)
-        .fetch_optional(&state.pool)
+    let digest: Option<String> = state
+        .pool
+        .scalar_opt("SELECT md5(project_json) FROM project WHERE id = $1", &[&project])
         .await
         .map_err(definition_unavailable)?;
     match digest {
@@ -515,12 +511,11 @@ async fn declared_infra_under(
     }
     // Read with its own digest, so what is kept is filed under the
     // definition actually parsed, even if it changed since `digest`.
-    let row: Option<(String, weft_core::stored::Version, String)> =
-        sqlx::query_as("SELECT project_json, project_json_version, md5(project_json) FROM project WHERE id = $1")
-            .bind(project)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(definition_unavailable)?;
+    let row: Option<(String, weft_core::stored::Version, String)> = state
+        .pool
+        .opt("SELECT project_json, project_json_version, md5(project_json) FROM project WHERE id = $1", &[&project])
+        .await
+        .map_err(definition_unavailable)?;
     let Some((project_json, version, digest)) = row else { return Ok(None) };
     let definition = weft_core::project::ProjectDefinition::STORED
         .decode(project_json.as_str(), version)
@@ -530,7 +525,7 @@ async fn declared_infra_under(
     Ok(Some(declared))
 }
 
-fn definition_unavailable(e: sqlx::Error) -> (StatusCode, String) {
+fn definition_unavailable(e: db::Error) -> (StatusCode, String) {
     unavailable_or_internal(anyhow::Error::from(e).context("project definition"))
 }
 
@@ -675,23 +670,23 @@ pub async fn infra_bake(
     if req.instance.is_some() && req.instance != run.instance {
         return Err((StatusCode::FORBIDDEN, format!("{}'s copy belongs to another instance than the run saving it", req.place)));
     }
-    let phase: Option<String> = sqlx::query_scalar("SELECT phase FROM run WHERE run_id = $1")
-        .bind(req.run_id)
-        .fetch_optional(&state.pool)
+    let phase: Option<String> = state
+        .pool
+        .scalar_opt("SELECT phase FROM run WHERE run_id = $1", &[&req.run_id])
         .await
         .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read the run's phase")))?;
     if phase.as_deref() != Some(weft_core::context::Phase::InfraSetup.as_str()) {
         return Err((StatusCode::FORBIDDEN, "only an infra setup saves what an infra node bakes".into()));
     }
-    let written = sqlx::query("UPDATE infra_node SET baked_json = baked_json || $4 WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3")
-        .bind(run.project)
-        .bind(&req.place)
-        .bind(req.instance.as_ref().map(|i| i.as_str()))
-        .bind(sqlx::types::Json(&req.values))
-        .execute(&state.pool)
+    let written = state
+        .pool
+        .execute(
+            "UPDATE infra_node SET baked_json = baked_json || $4 WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
+            &[&run.project, &req.place, &req.instance.as_ref().map(|i| i.as_str()), &db::Json(&req.values)],
+        )
         .await
         .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("save what an infra node baked")))?;
-    if written.rows_affected() == 0 {
+    if written == 0 {
         return Err((StatusCode::CONFLICT, format!("{} has no infra copy here to save what it baked with", req.place)));
     }
     Ok(Json(serde_json::json!({})))
@@ -723,15 +718,15 @@ pub async fn project_fetch_definition(
     }
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let row: Option<(String, weft_core::stored::Version)> = sqlx::query_as(
-        "SELECT project_json, project_json_version FROM project_definition \
-         WHERE project_id = $1 AND definition_hash = $2",
-    )
-    .bind(req.project_id)
-    .bind(&req.expected_hash)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a project definition")))?;
+    let row: Option<(String, weft_core::stored::Version)> = state
+        .pool
+        .opt(
+            "SELECT project_json, project_json_version FROM project_definition \
+             WHERE project_id = $1 AND definition_hash = $2",
+            &[&req.project_id, &req.expected_hash],
+        )
+        .await
+        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a project definition")))?;
     let Some((project_json, project_json_version)) = row else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -1055,16 +1050,18 @@ pub async fn supervisor_gone_copies(
             format!("gone_copies of project {}: copy {} belongs to project {}", req.project, stray.copy_id, stray.project),
         ));
     }
-    let err = |e: sqlx::Error| unavailable_or_internal(anyhow::Error::from(e).context("read a project's copies"));
-    let project: Option<(String, bool)> = sqlx::query_as(sql!(
-        "SELECT md5(p.project_json), {owns} FROM project p WHERE p.id = $1",
-        owns = weft_broker_client::lifecycle_command::owns_project_predicate("$2", "p.id"),
-    ))
-    .bind(req.project)
-    .bind(&req.replica)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(err)?;
+    let err = |e: db::Error| unavailable_or_internal(anyhow::Error::from(e).context("read a project's copies"));
+    let project: Option<(String, bool)> = state
+        .pool
+        .opt(
+            &format!(
+                "SELECT md5(p.project_json), {owns} FROM project p WHERE p.id = $1",
+                owns = weft_broker_client::lifecycle_command::owns_project_predicate("$2", "p.id"),
+            ),
+            &[&req.project, &req.replica],
+        )
+        .await
+        .map_err(err)?;
     let gone = match project {
         None => req.copies.iter().map(|c| c.copy_id.clone()).collect(),
         Some((_, false)) => {
@@ -1075,14 +1072,13 @@ pub async fn supervisor_gone_copies(
                 // Removed between the two reads: every copy is gone.
                 return Ok(Json(SupervisorGoneCopiesResponse { gone: req.copies.iter().map(|c| c.copy_id.clone()).collect() }));
             };
-            let rows: std::collections::HashSet<String> =
-                sqlx::query_scalar("SELECT copy_id FROM infra_node WHERE project_id = $1")
-                    .bind(req.project)
-                    .fetch_all(&state.pool)
-                    .await
-                    .map_err(err)?
-                    .into_iter()
-                    .collect();
+            let rows: std::collections::HashSet<String> = state
+                .pool
+                .scalars("SELECT copy_id FROM infra_node WHERE project_id = $1", &[&req.project])
+                .await
+                .map_err(err)?
+                .into_iter()
+                .collect();
             req.copies
                 .iter()
                 .filter(|c| !rows.contains(&c.copy_id) && declared.gone_copy(c))
@@ -1101,18 +1097,20 @@ pub async fn supervisor_infra_nodes(
     require_supervisor(&caller)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    use sqlx::Row;
-    let rows = sqlx::query(sql!(
-        "SELECT node_id, instance_id, copy_id, status, applied_spec_hash, applied_at_unix, \
-                endpoints_json, public_paths_json, doors_json, keep_disks_json, {} AS units, \
-                health_rules_json, health_rules_json_version \
-         FROM infra_node n WHERE project_id = $1 ORDER BY node_id, instance_id NULLS FIRST",
-        weft_broker_client::protocol::units_of_copy_sql("n"),
-    ))
-    .bind(req.project_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a project's infra nodes")))?;
+    let rows = state
+        .pool
+        .query(
+            &format!(
+                "SELECT node_id, instance_id, copy_id, status, applied_spec_hash, applied_at_unix, \
+                        endpoints_json, public_paths_json, doors_json, keep_disks_json, {} AS units, \
+                        health_rules_json, health_rules_json_version \
+                 FROM infra_node n WHERE project_id = $1 ORDER BY node_id, instance_id NULLS FIRST",
+                weft_broker_client::protocol::units_of_copy_sql("n"),
+            ),
+            &[&req.project_id],
+        )
+        .await
+        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a project's infra nodes")))?;
     // Decode every column; row-decode errors mean schema drift and
     // must surface as 500. Empty-string node_ids slipping through
     // would silently corrupt the supervisor's view of the world.
@@ -1141,7 +1139,7 @@ pub async fn supervisor_infra_nodes(
                 ))
             })?;
         let applied_spec_hash: Option<String> = r
-            .try_get::<Option<String>, _>("applied_spec_hash")
+            .try_get::<_, Option<String>>("applied_spec_hash")
             .map_err(|e| internal(anyhow::anyhow!("decode applied_spec_hash: {e}")))?;
         let applied_at_unix: Option<i64> = r
             .try_get("applied_at_unix")
@@ -1149,7 +1147,7 @@ pub async fn supervisor_infra_nodes(
         // A JSON column that must decode as `T`, naming the column when
         // it does not (schema drift surfaces as a 500, never a default).
         fn column<T: serde::de::DeserializeOwned>(
-            r: &sqlx::postgres::PgRow,
+            r: &Row,
             name: &str,
             node_id: &str,
         ) -> Result<T, (StatusCode, String)> {
@@ -1438,10 +1436,11 @@ async fn write_apply_row(
     // the row is ([`crate::lifecycle_writes::write_units`]).
     // One transaction: the row and its units commit together or not at
     // all, and the read after a write that matched nothing wrote nothing.
-    let unreached = |what: &'static str| move |e: sqlx::Error| unavailable_or_internal(anyhow::Error::from(e).context(what));
-    let mut tx = state.pool.begin().await.map_err(unreached("begin the apply row's transaction"))?;
-    let res = sqlx::query(
-        sql!("INSERT INTO infra_node \
+    let unreached = |what: &'static str| move |e: db::Error| unavailable_or_internal(anyhow::Error::from(e).context(what));
+    let mut conn = state.pool.get().await.map_err(unreached("begin the apply row's transaction"))?;
+    let tx = conn.transaction().await.map_err(unreached("begin the apply row's transaction"))?;
+    let sql = format!(
+        "INSERT INTO infra_node \
          (project_id, node_id, instance_id, copy_id, status, \
           failure_stage, failure_message, applied_spec_hash, \
           applied_at_unix, endpoints_json, public_paths_json, doors_json, keep_disks_json, health_rules_json_version, \
@@ -1477,36 +1476,41 @@ async fn write_apply_row(
             waiting_on         = NULL, \
             provisioning_since_unix = EXCLUDED.provisioning_since_unix",
         owns = weft_broker_client::lifecycle_command::owns_project_predicate("$11", "$1"),
-    ),
-    )
-    .bind(project_id)
-    .bind(node_id)
-    .bind(copy_id)
-    .bind(row.status)
-    .bind(&row.applied_spec_hash)
-    .bind(row.stamp_applied_at)
-    .bind(endpoints_json)
-    .bind(keep_disks_json)
-    .bind(weft_core::infra::health::STORED_RULES.version())
-    .bind(command_id)
-    .bind(owner)
-    .bind(public_paths_json)
-    .bind(instance.map(|m| m.as_str()))
-    .bind(doors_json)
-    .bind(notes_json)
-    .bind(health_rules_json)
-    .execute(&mut *tx)
-    .await
-    .map_err(unreached("write the apply row"))?;
-    if res.rows_affected() == 0 {
+    );
+    let written = tx
+        .execute(
+            &sql,
+            &[
+                &project_id,
+                &node_id,
+                &copy_id,
+                &row.status,
+                &row.applied_spec_hash,
+                &row.stamp_applied_at,
+                &endpoints_json,
+                &keep_disks_json,
+                &weft_core::infra::health::STORED_RULES.version(),
+                &command_id,
+                &owner,
+                &public_paths_json,
+                &instance.map(|m| m.as_str()),
+                &doors_json,
+                &notes_json,
+                &health_rules_json,
+            ],
+        )
+        .await
+        .map_err(unreached("write the apply row"))?;
+    if written == 0 {
         drop(tx);
+        drop(conn);
         let outcome = crate::lifecycle_writes::stale_answer(&state.pool, owner, project_id)
             .await
             .map_err(unavailable_or_internal)?;
         fenced_to_http(outcome, || format!("{op}(command id={command_id})"))?;
         return Ok(());
     }
-    crate::lifecycle_writes::write_units(&mut tx, project_id, node_id, instance, units).await.map_err(unavailable_or_internal)?;
+    crate::lifecycle_writes::write_units(&tx, project_id, node_id, instance, units).await.map_err(unavailable_or_internal)?;
     tx.commit().await.map_err(unreached("commit the apply row"))?;
     Ok(())
 }
@@ -1664,10 +1668,9 @@ pub async fn supervisor_project_image_tags(
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
     let id = req.project_id;
-    use sqlx::Row;
-    let row = sqlx::query("SELECT infra_image_tags_json FROM project WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.pool)
+    let row: Option<Row> = state
+        .pool
+        .opt("SELECT infra_image_tags_json FROM project WHERE id = $1", &[&id])
         .await
         .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a project's image tags")))?;
     // No row = project doesn't exist; broker returns empty tags
@@ -1807,15 +1810,15 @@ async fn apply_command_state(
     state: &BrokerState,
     req: &InfraWaitApplyRequest,
 ) -> Result<InfraWaitApplyResponse, (StatusCode, String)> {
-    use sqlx::Row;
-    let row = sqlx::query(
-        "SELECT completed_at_unix, outcome, outcome_message, project_id \
-         FROM infra_lifecycle_command WHERE id = $1",
-    )
-    .bind(req.command_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read an apply command")))?;
+    let row: Option<Row> = state
+        .pool
+        .opt(
+            "SELECT completed_at_unix, outcome, outcome_message, project_id \
+             FROM infra_lifecycle_command WHERE id = $1",
+            &[&req.command_id],
+        )
+        .await
+        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read an apply command")))?;
     let Some(r) = row else {
         return Err((StatusCode::NOT_FOUND, "no such command".into()));
     };
@@ -1827,13 +1830,13 @@ async fn apply_command_state(
         return Err((StatusCode::FORBIDDEN, "command belongs to a different project".into()));
     }
     let done: Option<i64> = r
-        .try_get::<Option<i64>, _>("completed_at_unix")
+        .try_get::<_, Option<i64>>("completed_at_unix")
         .map_err(|e| internal(anyhow::anyhow!("decode completed_at_unix: {e}")))?;
     let outcome_str: Option<String> = r
-        .try_get::<Option<String>, _>("outcome")
+        .try_get::<_, Option<String>>("outcome")
         .map_err(|e| internal(anyhow::anyhow!("decode outcome: {e}")))?;
     let message: Option<String> = r
-        .try_get::<Option<String>, _>("outcome_message")
+        .try_get::<_, Option<String>>("outcome_message")
         .map_err(|e| internal(anyhow::anyhow!("decode outcome_message: {e}")))?;
     // Parse the outcome string into the typed enum. NULL while
     // pending; an unknown string means schema drift and we fail
@@ -1884,17 +1887,16 @@ pub async fn supervisor_remove_node(
     // node_id starts clean: no stale events claiming "flaky" from
     // the prior generation, no pending lifecycle commands from the
     // generation we just terminated.
-    let unreached = |what: &'static str| move |e: sqlx::Error| unavailable_or_internal(anyhow::Error::from(e).context(what));
-    let mut tx = state.pool.begin().await.map_err(unreached("begin remove_node's transaction"))?;
-    let owns: bool = sqlx::query_scalar(sql!(
-        "SELECT {owns}",
-        owns = weft_broker_client::lifecycle_command::owns_project_predicate("$1", "$2"),
-    ))
-    .bind(&req.replica)
-    .bind(req.project_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(unreached("remove_node ownership check"))?;
+    let unreached = |what: &'static str| move |e: db::Error| unavailable_or_internal(anyhow::Error::from(e).context(what));
+    let mut conn = state.pool.get().await.map_err(unreached("begin remove_node's transaction"))?;
+    let tx = conn.transaction().await.map_err(unreached("begin remove_node's transaction"))?;
+    let owns: bool = tx
+        .scalar(
+            &format!("SELECT {owns}", owns = weft_broker_client::lifecycle_command::owns_project_predicate("$1", "$2")),
+            &[&req.replica, &req.project_id],
+        )
+        .await
+        .map_err(unreached("remove_node ownership check"))?;
     if !owns {
         // 410 = displaced (see `fenced_to_http`; here the ownership check
         // is explicit, so no second lookup). A row that is already gone
@@ -1909,24 +1911,19 @@ pub async fn supervisor_remove_node(
         ));
     }
     let instance = req.instance.as_ref().map(|m| m.as_str());
-    let res = sqlx::query(
-        "DELETE FROM infra_node \
-          WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
-    )
-        .bind(req.project_id)
-        .bind(&req.node_id)
-        .bind(instance)
-        .execute(&mut *tx)
+    let removed = tx
+        .execute(
+            "DELETE FROM infra_node \
+              WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
+            &[&req.project_id, &req.node_id, &instance],
+        )
         .await
         .map_err(unreached("delete infra_node"))?;
-    sqlx::query(
+    tx.execute(
         "DELETE FROM infra_event \
           WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
+        &[&req.project_id, &req.node_id, &instance],
     )
-    .bind(req.project_id)
-    .bind(&req.node_id)
-    .bind(instance)
-    .execute(&mut *tx)
     .await
     .map_err(unreached("delete infra_event"))?;
     // Cancel any not-yet-completed lifecycle commands aimed at exactly
@@ -1935,7 +1932,7 @@ pub async fn supervisor_remove_node(
     // Commands for the whole project (`node_id IS NULL`) or for every
     // copy are left in place: they still have other copies to act on.
     use weft_broker_client::protocol::LifecycleOutcome;
-    sqlx::query(
+    tx.execute(
         "UPDATE infra_lifecycle_command \
             SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
                 outcome = $3, \
@@ -1943,13 +1940,8 @@ pub async fn supervisor_remove_node(
           WHERE project_id = $1 AND node_id = $2 \
             AND NOT every_copy AND instance_id IS NOT DISTINCT FROM $4 \
             AND completed_at_unix IS NULL AND id <> $5",
+        &[&req.project_id, &req.node_id, &LifecycleOutcome::Cancelled.as_str(), &instance, &req.command_id],
     )
-    .bind(req.project_id)
-    .bind(&req.node_id)
-    .bind(LifecycleOutcome::Cancelled.as_str())
-    .bind(instance)
-    .bind(req.command_id)
-    .execute(&mut *tx)
     .await
     .map_err(unreached("cancel pending commands"))?;
     // A connection this node published opens the very thing being
@@ -1957,7 +1949,7 @@ pub async fn supervisor_remove_node(
     // name a database that no longer exists, and nothing downstream
     // could use or clean it.
     let published = weft_access_store::delete_published_grants(
-        &mut *tx,
+        &tx,
         &tenant,
         req.project_id,
         Some((&req.node_id, req.instance.as_ref())),
@@ -1977,7 +1969,7 @@ pub async fn supervisor_remove_node(
         );
     }
     Ok(Json(SupervisorRemoveNodeResponse {
-        removed: res.rows_affected() > 0,
+        removed: removed > 0,
     }))
 }
 
@@ -1995,15 +1987,18 @@ pub async fn supervisor_infra_command_in_flight(
     require_supervisor(&caller)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let rows: Vec<(Option<String>, Option<String>, bool)> = sqlx::query_as(sql!(
-        "SELECT node_id, instance_id, every_copy FROM infra_lifecycle_command \
-         WHERE project_id = $1 AND completed_at_unix IS NULL AND verb IN ({verbs})",
-        verbs = weft_broker_client::lifecycle_command::SUPERVISOR_VERBS_SQL,
-    ))
-    .bind(req.project_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read the project's commands in flight")))?;
+    let rows: Vec<(Option<String>, Option<String>, bool)> = state
+        .pool
+        .all(
+            &format!(
+                "SELECT node_id, instance_id, every_copy FROM infra_lifecycle_command \
+                 WHERE project_id = $1 AND completed_at_unix IS NULL AND verb IN ({verbs})",
+                verbs = weft_broker_client::lifecycle_command::SUPERVISOR_VERBS_SQL,
+            ),
+            &[&req.project_id],
+        )
+        .await
+        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read the project's commands in flight")))?;
     let commands = rows
         .into_iter()
         .map(|(node_id, instance, every)| {
@@ -2023,10 +2018,9 @@ pub async fn supervisor_command_complete(
     require_supervisor(&caller)?;
     // The supervisor's own row claim already enforced tenant scope.
     // Re-check: the row we're completing must belong to this caller's tenant.
-    use sqlx::Row;
-    let row = sqlx::query("SELECT tenant_id FROM infra_lifecycle_command WHERE id = $1")
-        .bind(req.command_id)
-        .fetch_optional(&state.pool)
+    let row: Option<Row> = state
+        .pool
+        .opt("SELECT tenant_id FROM infra_lifecycle_command WHERE id = $1", &[&req.command_id])
         .await
         .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a command's tenant")))?;
     let tenant_id: String = match row {
@@ -2115,13 +2109,14 @@ pub async fn signal_fire_target(
     if caller.role != Role::Listener {
         return Err((StatusCode::FORBIDDEN, "listener only".into()));
     }
-    let row: Option<(uuid::Uuid, bool, Option<serde_json::Value>)> = sqlx::query_as(
-        "SELECT s.project_id, s.is_resume, p.api_address FROM signal s LEFT JOIN project p ON p.id = s.project_id WHERE s.token = $1",
-    )
-    .bind(&req.token)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a signal's project")))?;
+    let row: Option<(uuid::Uuid, bool, Option<serde_json::Value>)> = state
+        .pool
+        .opt(
+            "SELECT s.project_id, s.is_resume, p.api_address FROM signal s LEFT JOIN project p ON p.id = s.project_id WHERE s.token = $1",
+            &[&req.token],
+        )
+        .await
+        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a signal's project")))?;
     let Some((project_id, is_resume, address)) = row else { return Ok(Json(None)) };
     // Only an address that serves: one the project's front could not open
     // says why instead.
@@ -2303,14 +2298,12 @@ async fn require_task_owned_by(
     caller: &CallerIdentity,
     task_id: uuid::Uuid,
 ) -> Result<(), (StatusCode, String)> {
-    let row: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT tenant_id FROM task WHERE id = $1",
-    )
-    .bind(task_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("task owner lookup")))?;
-    let owner = row.and_then(|(t,)| t).ok_or((
+    let row: Option<Option<String>> = state
+        .pool
+        .scalar_opt("SELECT tenant_id FROM task WHERE id = $1", &[&task_id])
+        .await
+        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("task owner lookup")))?;
+    let owner = row.flatten().ok_or((
         StatusCode::NOT_FOUND,
         format!("unknown task {task_id}"),
     ))?;
@@ -2346,7 +2339,7 @@ fn store_answer(e: anyhow::Error, written: Written) -> (StatusCode, String) {
 /// cause chain, and answered opaquely.
 ///
 /// Opaque because the callers on this surface include workers, which
-/// run tenant-authored code. A sqlx error's Display names tables and
+/// run tenant-authored code. A database error's Display names tables and
 /// columns, and echoing one hands the untrusted side a description of
 /// our schema. The operator loses nothing: the log has strictly more
 /// than the response ever did.
@@ -2406,8 +2399,7 @@ fn failure_answer(e: anyhow::Error, written: Written) -> (StatusCode, String) {
 /// not be reached, having committed `written` before it; `None` when the
 /// database was reached and `e` is some other failure.
 fn database_unreached(e: &anyhow::Error, written: Written) -> Option<(StatusCode, String)> {
-    let causes = || e.chain().filter_map(|cause| cause.downcast_ref::<sqlx::Error>());
-    if let Some(why) = weft_task_store::db::database_no_connection(e) {
+    if let Some(why) = db::database_no_connection(e) {
         // Said with every other call that got no connection, as what kept
         // it (a busy pool, a database that does not answer), once a minute
         // at most rather than once per call turned away. Either way not
@@ -2417,7 +2409,7 @@ fn database_unreached(e: &anyhow::Error, written: Written) -> Option<(StatusCode
         if written == Written::Nothing {
             return Some((StatusCode::SERVICE_UNAVAILABLE, NOT_DONE.into()));
         }
-    } else if causes().any(weft_task_store::db::unreachable) {
+    } else if db::database_unreachable(e) {
         tracing::warn!(target: "weft_broker", "could not reach the database: {e:#}");
     } else {
         return None;
@@ -2429,11 +2421,16 @@ fn database_unreached(e: &anyhow::Error, written: Written) -> Option<(StatusCode
 mod tests {
     use super::*;
 
+    /// What a statement that got no connection fails with, for `why`.
+    fn no_connection(why: db::NoConnection) -> anyhow::Error {
+        anyhow::Error::from(db::Error::NoConnection { why, refused: None })
+    }
+
     #[test]
     fn only_an_unreachable_database_asks_the_caller_again() {
-        let pool_gone = anyhow::Error::from(sqlx::Error::PoolTimedOut).context("run lookup");
+        let pool_gone = no_connection(db::NoConnection::Busy).context("run lookup");
         assert_eq!(unavailable_or_internal(pool_gone).0, StatusCode::SERVICE_UNAVAILABLE);
-        let bad_row = anyhow::Error::from(sqlx::Error::RowNotFound);
+        let bad_row = anyhow::Error::from(db::Error::NoRow);
         assert_eq!(unavailable_or_internal(bad_row).0, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(unavailable_or_internal(anyhow::anyhow!("undecodable row")).0, StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -2444,15 +2441,15 @@ mod tests {
     /// failure that is not the database's reach stays a 500 either way.
     #[test]
     fn only_a_call_that_wrote_nothing_says_nothing_was_done() {
-        let no_connection = || anyhow::Error::from(sqlx::Error::PoolTimedOut).context("a later step");
-        assert_eq!(failure_answer(no_connection(), Written::Nothing), (StatusCode::SERVICE_UNAVAILABLE, NOT_DONE.to_string()));
-        let (status, body) = failure_answer(no_connection(), Written::Maybe);
+        let busy = || no_connection(db::NoConnection::Busy).context("a later step");
+        assert_eq!(failure_answer(busy(), Written::Nothing), (StatusCode::SERVICE_UNAVAILABLE, NOT_DONE.to_string()));
+        let (status, body) = failure_answer(busy(), Written::Maybe);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_ne!(body, NOT_DONE, "a call that may have committed never promises nothing was done");
-        let (status, body) = failure_answer(anyhow::Error::from(sqlx::Error::PoolClosed), Written::Maybe);
+        let (status, body) = failure_answer(no_connection(db::NoConnection::Closed), Written::Maybe);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_ne!(body, NOT_DONE);
-        assert_eq!(failure_answer(anyhow::Error::from(sqlx::Error::RowNotFound), Written::Maybe).0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(failure_answer(anyhow::Error::from(db::Error::NoRow), Written::Maybe).0, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// A store call that could not get a connection waits like any other
@@ -2460,14 +2457,14 @@ mod tests {
     /// answer, and any other failure stays the store's opaque 500.
     #[test]
     fn a_store_call_without_a_connection_waits_and_its_refusals_keep_their_answer() {
-        let no_connection = || anyhow::Error::from(sqlx::Error::PoolTimedOut).context("resolve a connection");
-        assert_eq!(store_err(no_connection()), (StatusCode::SERVICE_UNAVAILABLE, NOT_DONE.to_string()));
-        let (status, body) = store_err_after_writes(no_connection());
+        let busy = || no_connection(db::NoConnection::Busy).context("resolve a connection");
+        assert_eq!(store_err(busy()), (StatusCode::SERVICE_UNAVAILABLE, NOT_DONE.to_string()));
+        let (status, body) = store_err_after_writes(busy());
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_ne!(body, NOT_DONE, "a store call that may have committed never promises nothing was done");
         assert_eq!(store_err(anyhow::Error::from(weft_access_store::AccessError::NotFound)).0, StatusCode::NOT_FOUND);
         assert_eq!(store_err_after_writes(anyhow::Error::from(weft_access_store::AccessError::NotFound)).0, StatusCode::NOT_FOUND);
-        let (status, body) = store_err(anyhow::Error::from(sqlx::Error::RowNotFound).context("read a grant"));
+        let (status, body) = store_err(anyhow::Error::from(db::Error::NoRow).context("read a grant"));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!body.contains("grant"), "a store failure answers opaquely: {body}");
     }

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde::Deserialize;
 use weft_platform_traits::{CallerIdentity, IdentityRefused, Principal};
+use weft_task_store::db::{Client as _, Pool};
 
 use crate::names;
 
@@ -80,15 +81,15 @@ pub struct GoogleIdentity {
     core_account: String,
     /// Where a worker's project is looked up; `None` on a process that
     /// only ever takes weft's own calls (a unit's agent).
-    pool: Option<sqlx::PgPool>,
+    pool: Option<Pool>,
     keys: tokio::sync::Mutex<Option<Keys>>,
     workers: parking_lot::Mutex<HashMap<String, Principal>>,
 }
 
 impl GoogleIdentity {
-    pub fn new(gcp_project: String, core_account: String, pool: Option<sqlx::PgPool>) -> Self {
+    pub fn new(gcp_project: String, core_account: String, pool: Option<Pool>) -> Self {
         Self {
-            http: reqwest::Client::builder().timeout(Duration::from_secs(10)).build().expect("reqwest client"),
+            http: weft_core::net::http_client().timeout(Duration::from_secs(10)).build().expect("reqwest client"),
             gcp_project,
             core_account,
             pool,
@@ -129,12 +130,10 @@ impl GoogleIdentity {
         let Some(pool) = &self.pool else {
             return Err(IdentityRefused::Stranger(email.to_string()));
         };
-        let rows: Vec<(uuid::Uuid, String)> =
-            sqlx::query_as("SELECT id, tenant_id FROM project WHERE replace(id::text, '-', '') LIKE $1 || '%'")
-                .bind(prefix)
-                .fetch_all(pool)
-                .await
-                .map_err(|e| IdentityRefused::Unavailable(e.to_string()))?;
+        let rows: Vec<(uuid::Uuid, String)> = pool
+            .all("SELECT id, tenant_id FROM project WHERE replace(id::text, '-', '') LIKE $1 || '%'", &[&prefix])
+            .await
+            .map_err(|e| IdentityRefused::Unavailable(e.to_string()))?;
         match rows.as_slice() {
             [(project, tenant)] => {
                 let p = Principal::Worker { tenant: tenant.clone(), project: *project };
@@ -151,9 +150,8 @@ impl GoogleIdentity {
         let (Principal::Worker { tenant, project }, Some(pool)) = (worker, &self.pool) else {
             return Err(IdentityRefused::Stranger(format!("machine {machine}")));
         };
-        let copies: Vec<(String, String)> = sqlx::query_as("SELECT node_id, copy_id FROM infra_node WHERE project_id = $1")
-            .bind(project)
-            .fetch_all(pool)
+        let copies: Vec<(String, String)> = pool
+            .all("SELECT node_id, copy_id FROM infra_node WHERE project_id = $1", &[&project])
             .await
             .map_err(|e| IdentityRefused::Unavailable(e.to_string()))?;
         copy_of_machine(&tenant, project, &copies, machine)

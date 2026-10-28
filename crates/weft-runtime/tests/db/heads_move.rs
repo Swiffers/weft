@@ -6,13 +6,13 @@
 //! had no head gets no copy; a second boot moves nothing.
 
 use serde_json::json;
-use sqlx::PgPool;
+use weft_task_store::db::{Client as _, Pool};
 
 /// The newest migration the weft before working copies shipped.
 const BEFORE_WORKING_COPIES: &str = "20261023T202848_trigger_activation_connect_fixes";
 
-#[sqlx::test]
-async fn a_projects_head_becomes_its_program_copys(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_projects_head_becomes_its_program_copys(pool: Pool) {
     weft_task_store::schema_guard::build_as_of(&pool, &weft_runtime::schema::groups(), |m| m.id <= BEFORE_WORKING_COPIES)
         .await
         .unwrap();
@@ -24,20 +24,13 @@ async fn a_projects_head_becomes_its_program_copys(pool: PgPool) {
     }
     let manifest = json!({ "main.weft": "a".repeat(64) });
     let (version, run) = ("v1".to_string(), uuid::Uuid::new_v4());
-    sqlx::query("INSERT INTO project_version (id, project_id, parent_id, manifest, label, created_at) VALUES ($1, $2, NULL, $3, NULL, 1)")
-        .bind(&version)
-        .bind(with_head)
-        .bind(&manifest)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE project SET head_version = $2, head_run = $3 WHERE id = $1")
-        .bind(with_head)
-        .bind(&version)
-        .bind(run)
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute(
+        "INSERT INTO project_version (id, project_id, parent_id, manifest, label, created_at) VALUES ($1, $2, NULL, $3, NULL, 1)",
+        &[&version, &with_head, &manifest],
+    )
+    .await
+    .unwrap();
+    pool.execute("UPDATE project SET head_version = $2, head_run = $3 WHERE id = $1", &[&with_head, &version, &run]).await.unwrap();
 
     weft_runtime::schema::apply(&pool).await.unwrap();
 
@@ -50,12 +43,10 @@ async fn a_projects_head_becomes_its_program_copys(pool: PgPool) {
     assert_eq!(copy.head, weft_core::working_copy::Head { head_version: Some(version.clone()), head_run: Some(run) });
     assert_eq!(serde_json::to_value(&copy.working).unwrap(), manifest, "the copy holds its head version's files");
     assert!(copies.list(without).await.unwrap().is_empty(), "a project with no head gets no copy");
-    let column: Option<String> = sqlx::query_scalar(
-        "SELECT column_name::text FROM information_schema.columns WHERE table_name = 'project' AND column_name = 'head_version'",
-    )
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
+    let column: Option<String> = pool
+        .scalar_opt("SELECT column_name::text FROM information_schema.columns WHERE table_name = 'project' AND column_name = 'head_version'", &[])
+        .await
+        .unwrap();
     assert_eq!(column, None, "the contract part dropped the column");
 
     weft_runtime::schema::apply(&pool).await.expect("a boot with nothing to do");

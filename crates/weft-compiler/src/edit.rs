@@ -5,12 +5,13 @@
 //! returns the new source plus a byte-exact inverse `TextEdit` for undo.
 //!
 //! How it works: the source is parsed into a lossless concrete syntax tree
-//! (`crate::cst`), cloned mutable, and each op is applied as a STRUCTURAL TREE
-//! MUTATION (`splice_children`/`detach`) resolved against the typed view. The
-//! new source is the tree's `to_string()`, which re-emits only the changed
-//! subtree and leaves every other byte identical (structural sharing). Edits
-//! never compute text offsets: the closing `}` is a real token and a group body
-//! is a real node, so an edit cannot splice in the wrong place.
+//! (`crate::cst`), and each op is applied as STRUCTURAL TREE SPLICES resolved
+//! against the typed view (`crate::cst::tree`: each splice builds a new
+//! immutable version sharing every untouched subtree). The new source is the
+//! last version's `to_string()`, in which only the spliced nodes are new and
+//! every other byte is identical. Edits never compute text offsets: the
+//! closing `}` is a real token and a group body is a real node, so an edit
+//! cannot splice in the wrong place.
 //!
 //! The parse-server wire: `EditOp`s in, `(new_source, inverse TextEdit)` out.
 //! The CST is an internal detail of how an edit produces the new source.
@@ -19,8 +20,8 @@ mod ops;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cst::nodes::WeftFile;
-use crate::cst::parse;
+use crate::cst::tree::Tree;
+use crate::cst::{parse, SyntaxKind};
 
 /// A structured edit intent. `serde` tag `op` matches the parse-server wire.
 // SYNC: EditOp <-> packages/weft-graph/src/protocol.ts EditOp
@@ -215,8 +216,8 @@ pub struct TextEdit {
 
 /// Apply an ordered batch of edits atomically, returning the new source AND the
 /// inverse edit (apply it to the new source to get the original back). The whole
-/// batch runs against ONE mutable CST clone: parse once, mutate op-by-op,
-/// serialize once. On any op failure the whole batch fails and the caller keeps
+/// batch runs against ONE tree under edit: parse once, splice op-by-op,
+/// serialize the last version once. On any op failure the whole batch fails and the caller keeps
 /// the original source. CST editing is purely structural and reads no file:
 /// an `@include` is an opaque marker token, so no filesystem view is taken.
 ///
@@ -245,17 +246,20 @@ fn apply_edits_inner(
     source_id: Option<&str>,
     ops: &[EditOp],
 ) -> Result<(String, TextEdit), EditError> {
-    // Parse to a mutable CST. The root is always a WEFT_FILE (the parser is
-    // total), but guard the cast loudly rather than unwrap.
-    let root = parse(source).clone_for_update();
-    let file = WeftFile::cast(root).ok_or_else(|| EditError::Unparseable("root is not a weft file".into()))?;
-    let view = crate::cst::nodes::FileView::new(&file, source_id);
+    // Parse to a CST. The root is always a WEFT_FILE (the parser is total), but
+    // guard it loudly rather than assume.
+    let root = parse(source);
+    if root.kind() != SyntaxKind::WEFT_FILE {
+        return Err(EditError::Unparseable("root is not a weft file".into()));
+    }
+    let tree = Tree::new(root);
+    let view = crate::cst::nodes::FileView::new(&tree, source_id);
 
     for op in ops {
         ops::apply_op(&view, op)?;
     }
 
-    let new_source = file.syntax().to_string();
+    let new_source = tree.root().to_string();
     let inverse = invert_text_edit(source, &new_source);
     Ok((new_source, inverse))
 }

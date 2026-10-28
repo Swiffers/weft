@@ -64,7 +64,7 @@ pub async fn run_probe(probe: &ProbeKind, timeout: Duration) -> ProbeAnswer {
             Err(_) => failed(format!("port {port}: no answer within {}s", timeout.as_secs())),
         },
         ProbeKind::Http { path, port } => {
-            let client = reqwest::Client::builder()
+            let client = weft_core::net::http_client()
                 .timeout(timeout)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
@@ -123,7 +123,8 @@ const METADATA: &str = "http://metadata.google.internal/computeMetadata/v1/insta
 const HOST_STATE: &str = "/var/lib/weft";
 
 async fn metadata(path: &str) -> anyhow::Result<String> {
-    let resp = reqwest::Client::new()
+    let resp = weft_core::net::http_client()
+        .build()?
         .get(format!("{METADATA}/{path}"))
         .header("Metadata-Flavor", "Google")
         .send()

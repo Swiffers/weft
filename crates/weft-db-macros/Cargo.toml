@@ -1,0 +1,18 @@
+[package]
+name = "weft-db-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["full"] }
+weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
+
+[lints]
+workspace = true

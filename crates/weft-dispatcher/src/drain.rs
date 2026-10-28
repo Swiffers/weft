@@ -26,11 +26,10 @@
 
 use std::time::Duration;
 
-use weft_task_store::sql;
-
 use tokio::time::Instant;
 
 use weft_core::RunId;
+use weft_task_store::db::{self, Client as _};
 use weft_task_store::drain::WakeOn;
 
 use crate::infra_reach::InfraReach;
@@ -157,12 +156,13 @@ pub trait SayWaiting: Send + Sync {
 
 /// The runs among `runs` that are going (queued or driven), oldest first,
 /// each with when it started.
-pub(crate) async fn going_since(pool: &sqlx::PgPool, runs: &[RunId]) -> anyhow::Result<Vec<weft_core::deactivation::RunGoing>> {
-    let rows: Vec<(RunId, i64)> =
-        sqlx::query_as(sql!("SELECT r.run_id, r.started_at FROM run r WHERE r.run_id = ANY($1) AND {GOING} ORDER BY r.started_at, r.run_id"))
-            .bind(runs)
-            .fetch_all(pool)
-            .await?;
+pub(crate) async fn going_since(pool: &db::Pool, runs: &[RunId]) -> anyhow::Result<Vec<weft_core::deactivation::RunGoing>> {
+    let rows: Vec<(RunId, i64)> = pool
+        .all(
+            &format!("SELECT r.run_id, r.started_at FROM run r WHERE r.run_id = ANY($1) AND {GOING} ORDER BY r.started_at, r.run_id"),
+            &[&runs],
+        )
+        .await?;
     Ok(rows.into_iter().map(|(run_id, since_unix)| weft_core::deactivation::RunGoing { run_id, since_unix }).collect())
 }
 
@@ -189,10 +189,12 @@ pub(crate) async fn cancel_reached(
 /// queued or driven: what a resync waits for, or cancels, before its new
 /// version takes over.
 pub(crate) async fn going_on_builds(state: &DispatcherState, project_id: uuid::Uuid, builds: &[String]) -> anyhow::Result<Vec<RunId>> {
-    Ok(sqlx::query_scalar(sql!("SELECT r.run_id FROM run r WHERE r.project_id = $1 AND r.binary_hash = ANY($2) AND {GOING}"))
-        .bind(project_id)
-        .bind(builds)
-        .fetch_all(&state.pg_pool)
+    Ok(state
+        .pg_pool
+        .scalars(
+            &format!("SELECT r.run_id FROM run r WHERE r.project_id = $1 AND r.binary_hash = ANY($2) AND {GOING}"),
+            &[&project_id, &builds],
+        )
         .await?)
 }
 
@@ -286,13 +288,13 @@ impl Reached {
     /// Every run of the project on `builds` that has not ended, and
     /// everything those builds' workers count.
     async fn on_builds(state: &DispatcherState, project_id: uuid::Uuid, builds: &[String]) -> anyhow::Result<Self> {
-        let rows: Vec<(RunId, bool)> = sqlx::query_as(
-            "SELECT run_id, state = 'parked' FROM run WHERE project_id = $1 AND state <> 'ended' AND binary_hash = ANY($2)",
-        )
-        .bind(project_id)
-        .bind(builds)
-        .fetch_all(&state.pg_pool)
-        .await?;
+        let rows: Vec<(RunId, bool)> = state
+            .pg_pool
+            .all(
+                "SELECT run_id, state = 'parked' FROM run WHERE project_id = $1 AND state <> 'ended' AND binary_hash = ANY($2)",
+                &[&project_id, &builds],
+            )
+            .await?;
         let runs = rows.into_iter().map(|(run_id, paused)| crate::infra_reach::RunReached { run_id, paused }).collect();
         Ok(Self { door: AtTheDoor::Builds(builds.to_vec()), runs })
     }
@@ -324,24 +326,22 @@ impl Reached {
 /// doc): what the live workers of `project_id` count at their door for
 /// it (`door`), plus the runs among `runs` on record that are queued or
 /// driven.
-pub async fn going(pool: &sqlx::PgPool, project_id: uuid::Uuid, door: &AtTheDoor, runs: &[RunId]) -> anyhow::Result<i64> {
+pub async fn going(pool: &db::Pool, project_id: uuid::Uuid, door: &AtTheDoor, runs: &[RunId]) -> anyhow::Result<i64> {
     const ALIVE: &str = weft_task_store::worker_alive!("l");
     let (tokens, builds) = door.filters();
-    let counted: i64 = sqlx::query_scalar(sql!(
-        "SELECT COALESCE(SUM(f.n::bigint), 0)::bigint FROM worker_lease l \
-         CROSS JOIN LATERAL jsonb_each_text(l.in_flight) AS f(token, n) \
-         WHERE l.project_id = $1 AND {ALIVE} AND ($2::text[] IS NULL OR f.token = ANY($2)) \
-           AND ($3::text[] IS NULL OR l.binary_hash = ANY($3))"
-    ))
-    .bind(project_id)
-    .bind(tokens)
-    .bind(builds)
-    .fetch_one(pool)
-    .await?;
-    let on_record: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM run r WHERE r.run_id = ANY($1) AND {GOING}"))
-        .bind(runs)
-        .fetch_one(pool)
+    let counted: i64 = pool
+        .scalar(
+            &format!(
+                "SELECT COALESCE(SUM(f.n::bigint), 0)::bigint FROM worker_lease l \
+                 CROSS JOIN LATERAL jsonb_each_text(l.in_flight) AS f(token, n) \
+                 WHERE l.project_id = $1 AND {ALIVE} AND ($2::text[] IS NULL OR f.token = ANY($2)) \
+                   AND ($3::text[] IS NULL OR l.binary_hash = ANY($3))"
+            ),
+            &[&project_id, &tokens, &builds],
+        )
         .await?;
+    let on_record: i64 =
+        pool.scalar(&format!("SELECT COUNT(*) FROM run r WHERE r.run_id = ANY($1) AND {GOING}"), &[&runs]).await?;
     Ok(counted + on_record)
 }
 
@@ -354,14 +354,14 @@ const GOING: &str = concat!("(r.state = 'queued' OR ", weft_task_store::in_fligh
 /// counts again when it ends rather than on a timer, a paused run that
 /// resumed meanwhile included. Marked when a drain looks, never on a run's
 /// own path.
-pub async fn mark_watched(pool: &sqlx::PgPool, project_id: uuid::Uuid, runs: &[RunId]) -> anyhow::Result<()> {
-    sqlx::query(sql!(
-        "UPDATE run r SET watch_end = TRUE \
-         WHERE r.project_id = $1 AND r.run_id = ANY($2) AND NOT r.watch_end AND (r.state = 'parked' OR {GOING})"
-    ))
-    .bind(project_id)
-    .bind(runs)
-    .execute(pool)
+pub async fn mark_watched(pool: &db::Pool, project_id: uuid::Uuid, runs: &[RunId]) -> anyhow::Result<()> {
+    pool.execute(
+        &format!(
+            "UPDATE run r SET watch_end = TRUE \
+             WHERE r.project_id = $1 AND r.run_id = ANY($2) AND NOT r.watch_end AND (r.state = 'parked' OR {GOING})"
+        ),
+        &[&project_id, &runs],
+    )
     .await?;
     Ok(())
 }
@@ -375,25 +375,24 @@ pub async fn mark_watched(pool: &sqlx::PgPool, project_id: uuid::Uuid, runs: &[R
 /// record stops being held by its owner (`weft_task_store::run_held_until_sql!`:
 /// its owner's lease, or the grace of a run just handed to a worker whose
 /// first tick has not landed). The drain counts again then.
-pub async fn workers_look(pool: &sqlx::PgPool, project_id: uuid::Uuid, door: &AtTheDoor, runs: &[RunId]) -> anyhow::Result<Option<i64>> {
+pub async fn workers_look(pool: &db::Pool, project_id: uuid::Uuid, door: &AtTheDoor, runs: &[RunId]) -> anyhow::Result<Option<i64>> {
     const ALIVE: &str = weft_task_store::worker_alive!("l");
     const HELD: &str = weft_task_store::run_held_until_sql!("r");
     let (tokens, builds) = door.filters();
-    Ok(sqlx::query_scalar(sql!(
-        "SELECT MIN(at) FROM ( \
-             SELECT MIN(l.leased_until_unix) AS at FROM worker_lease l \
-             WHERE l.project_id = $1 AND {ALIVE} AND ($4::text[] IS NULL OR l.binary_hash = ANY($4)) \
-               AND EXISTS (SELECT 1 FROM jsonb_each_text(l.in_flight) AS f(token, n) \
-                           WHERE f.n::bigint > 0 AND ($2::text[] IS NULL OR f.token = ANY($2))) \
-             UNION ALL \
-             SELECT MIN({HELD}) FROM run r \
-             WHERE r.run_id = ANY($3) AND r.state = 'running' AND {HELD} >= EXTRACT(EPOCH FROM NOW())::BIGINT \
-         ) looks"
-    ))
-    .bind(project_id)
-    .bind(tokens)
-    .bind(runs)
-    .bind(builds)
-    .fetch_one(pool)
-    .await?)
+    Ok(pool
+        .scalar(
+            &format!(
+                "SELECT MIN(at) FROM ( \
+                     SELECT MIN(l.leased_until_unix) AS at FROM worker_lease l \
+                     WHERE l.project_id = $1 AND {ALIVE} AND ($4::text[] IS NULL OR l.binary_hash = ANY($4)) \
+                       AND EXISTS (SELECT 1 FROM jsonb_each_text(l.in_flight) AS f(token, n) \
+                                   WHERE f.n::bigint > 0 AND ($2::text[] IS NULL OR f.token = ANY($2))) \
+                     UNION ALL \
+                     SELECT MIN({HELD}) FROM run r \
+                     WHERE r.run_id = ANY($3) AND r.state = 'running' AND {HELD} >= EXTRACT(EPOCH FROM NOW())::BIGINT \
+                 ) looks"
+            ),
+            &[&project_id, &tokens, &runs, &builds],
+        )
+        .await?)
 }

@@ -5,7 +5,7 @@
 //! keeps one instance's token id from being taken over, and the project
 //! held to the owner live in one SQL statement.
 
-use sqlx::PgPool;
+use weft_task_store::db::{Client as _, Pool};
 use uuid::Uuid;
 
 use weft_access_store::instance_tokens::{mint, InstanceTokenMint, MintRefused};
@@ -15,16 +15,13 @@ use weft_dispatcher::store::TokenStore;
 
 const TENANT: &str = "t1";
 
-async fn project(pool: &PgPool, tenant: &str) -> Uuid {
+async fn project(pool: &Pool, tenant: &str) -> Uuid {
     let id = Uuid::new_v4();
-    sqlx::query(
+    pool.execute(
         "INSERT INTO project (id, name, tenant_id, status, project_json, updated_at, project_json_version, resync_version, running_build_inputs_version) \
          VALUES ($1, 'p', $2, 'registered', '{}', 0, $3, 1, 1)",
+        &[&id, &tenant, &weft_core::ProjectDefinition::STORED.version()],
     )
-    .bind(id)
-    .bind(tenant)
-    .bind(weft_core::ProjectDefinition::STORED.version())
-    .execute(pool)
     .await
     .expect("project row");
     id
@@ -49,8 +46,8 @@ fn asked<'a>(project: Uuid, instance: &'a InstanceId) -> InstanceTokenMint<'a> {
 /// that token (the old value stops working), an id naming any other token
 /// writes nothing, and a project of another owner is refused as one that
 /// does not exist.
-#[sqlx::test]
-async fn a_replayed_mint_replaces_its_token_and_holds_the_project_to_the_owner(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_replayed_mint_replaces_its_token_and_holds_the_project_to_the_owner(pool: Pool) {
     weft_task_store::apply_groups(&pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
     let store = PostgresStore::from_pool(pool.clone());
     let own = project(&pool, TENANT).await;

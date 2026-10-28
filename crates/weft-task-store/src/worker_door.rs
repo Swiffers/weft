@@ -75,22 +75,19 @@ const PRUNE_BATCH: i64 = 1000;
 /// batch of each, skipping rows a tick holds right now. Both tables are
 /// written by the door tick, so this runs beside the dispatcher's look at
 /// lapsed leases, never on the tick.
-pub async fn prune(pool: &sqlx::PgPool, now: i64) -> anyhow::Result<()> {
-    sqlx::query(
+pub async fn prune(pool: &crate::db::Pool, now: i64) -> anyhow::Result<()> {
+    use crate::db::Client as _;
+    pool.execute(
         "DELETE FROM door_count WHERE ctid IN \
          (SELECT ctid FROM door_count WHERE window_start < $1 LIMIT $2 FOR UPDATE SKIP LOCKED)",
+        &[&(now - COUNTS_KEPT_SECS), &PRUNE_BATCH],
     )
-    .bind(now - COUNTS_KEPT_SECS)
-    .bind(PRUNE_BATCH)
-    .execute(pool)
     .await?;
-    sqlx::query(
+    pool.execute(
         "DELETE FROM worker_lease WHERE replica IN \
          (SELECT replica FROM worker_lease WHERE leased_until_unix < $1 LIMIT $2 FOR UPDATE SKIP LOCKED)",
+        &[&(now - LEASES_KEPT_SECS), &PRUNE_BATCH],
     )
-    .bind(now - LEASES_KEPT_SECS)
-    .bind(PRUNE_BATCH)
-    .execute(pool)
     .await?;
     Ok(())
 }

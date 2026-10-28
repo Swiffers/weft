@@ -13,15 +13,15 @@
 //!
 //! What counts as a wait: a request that got a connection of a work or
 //! record pool only after waiting longer than `crate::db::SLOW_WAIT` while
-//! no connection opened (sqlx measures every acquire and reports the slow
-//! ones, heard by [`slow_acquires`] and told apart by
-//! `crate::db::acquired_slowly`), one that got none within its pool's
-//! whole wait with every connection of a pool handed out
-//! (`crate::db::NoConnection::Busy`), and, in a process that reaches the
-//! database through the broker, a call the broker answered busy
-//! (`weft_broker_client`, log only). A pool in use at its size is not one:
-//! nobody need be waiting (`crate::db::options` says why that is not
-//! counted).
+//! that pool opened no connection (`crate::db::Pool::get` measures every
+//! one), one that got none within its pool's whole wait with every
+//! connection of the pool handed out (`crate::db::NoConnection::Busy`),
+//! and, in a process that reaches the database through the broker, a call
+//! the broker answered busy (`weft_broker_client`, log only). A pool in use
+//! at its size is not one: nobody need be waiting. A pool of one (a cloud
+//! broker copy's record pool) is full every time its one batch runs, and
+//! loops looking in the same instant fill a machine's work pool for a few
+//! milliseconds; neither is the database holding the install back.
 //!
 //! A request that got none because no new connection would open
 //! (`crate::db::NoConnection::Unreachable`) is not a wait for capacity:
@@ -33,11 +33,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use sqlx::postgres::PgPool;
 use weft_core::install::DatabaseHolder;
 
+use crate::db::{Client as _, Pool};
 use crate::drain::DB_NOW_MS;
-use crate::sql;
 
 /// How often a process says it is being held back, at most: once at the
 /// first wait, then once this long after with the waits since.
@@ -115,7 +114,7 @@ static WAITS: Tally = Tally::new();
 static RECORD: OnceLock<Record> = OnceLock::new();
 
 struct Record {
-    pool: PgPool,
+    pool: Pool,
     role: DatabaseHolder,
     max_connections: u32,
     share: u32,
@@ -124,12 +123,12 @@ struct Record {
 /// Write this process's waits into `pool`'s `database_throttle`, under
 /// `role`, with what it read of the database at start. Once per process;
 /// a second call is ignored.
-pub fn record_into(pool: PgPool, role: DatabaseHolder, capacity: &crate::budget::Capacity, share: u32) {
+pub fn record_into(pool: Pool, role: DatabaseHolder, capacity: &crate::budget::Capacity, share: u32) {
     let _ = RECORD.set(Record { pool, role, max_connections: capacity.max_connections, share });
 }
 
 /// A request of this process waited for a database connection to come
-/// free (`crate::db::acquired_slowly`, or [`no_connection`] for one that
+/// free (`crate::db::Pool::get`, or [`no_connection`] for one that
 /// gave up): counted, and said and written when due. Cheap when not
 /// due (a counter and a lock no request holds for longer than a
 /// comparison).
@@ -183,95 +182,27 @@ pub fn no_connection(why: crate::db::NoConnection) {
     }
 }
 
-/// The target sqlx reports how long a pool's acquire took under.
-const SQLX_ACQUIRE: &str = "sqlx::pool::acquire";
-
-/// The field only sqlx's report of a slow acquire carries (its report of
-/// every acquire, off on weft's pools, has none).
-const SLOW_FIELD: &str = "slow_acquire_threshold_secs";
-
-/// The field of sqlx's acquire reports that says how long the acquire
-/// took, in seconds.
-const WAITED_FIELD: &str = "acquired_after_secs";
-
-/// The layer that hears sqlx's reports of a slow acquire (on the pools
-/// whose waits are said, `crate::db::options`) and hands how long each
-/// took to `crate::db::acquired_slowly`, so a wait that got through is counted from
-/// sqlx's own measure, never from reading log text. Install it beside the
-/// process's log, which should leave those reports out: they come one per
-/// slow request, and this module says them once a [`SAY_EVERY`] instead.
-///
-/// It sees only events of sqlx's acquire target (its per-layer filter),
-/// and sqlx sends one only for an acquire past `crate::db::SLOW_WAIT`, so
-/// a request that got its connection at once costs nothing here.
-pub fn slow_acquires<S>() -> impl tracing_subscriber::Layer<S> + Send + Sync
-where
-    S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
-{
-    use tracing_subscriber::Layer as _;
-    SlowAcquires { heard: crate::db::acquired_slowly }.with_filter(only_acquires())
-}
-
-/// sqlx's acquire reports, at the level weft's pools send the slow ones.
-fn only_acquires() -> tracing_subscriber::filter::Targets {
-    tracing_subscriber::filter::Targets::new().with_target(SQLX_ACQUIRE, tracing::Level::WARN)
-}
-
-/// Calls `heard` with how long the acquire took, for each report of a
-/// slow acquire it is given.
-struct SlowAcquires {
-    heard: fn(Duration),
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SlowAcquires {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        if event.metadata().fields().field(SLOW_FIELD).is_none() {
-            return;
-        }
-        let mut waited = Waited(None);
-        event.record(&mut waited);
-        // sqlx-core's `PoolInner::acquire` sends it as an f64 of seconds.
-        // A report without it is a sqlx that changed its report: said,
-        // never guessed at.
-        let Some(waited) = waited.0 else {
-            tracing::error!(target: "weft_task_store::throttle", "sqlx reported a slow acquire without `{WAITED_FIELD}`; it is not counted");
-            return;
-        };
-        (self.heard)(waited);
-    }
-}
-
-/// Reads [`WAITED_FIELD`] off a report.
-struct Waited(Option<Duration>);
-
-impl tracing::field::Visit for Waited {
-    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        if field.name() == WAITED_FIELD {
-            self.0 = Duration::try_from_secs_f64(value).ok();
-        }
-    }
-
-    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
-}
-
 /// Add `waits` to `role`'s stretch, starting a new one after a quiet
 /// longer than [`RECENT`].
-pub async fn write(pool: &PgPool, role: DatabaseHolder, waits: u64, max_connections: u32, share: u32) -> sqlx::Result<()> {
+pub async fn write(pool: &Pool, role: DatabaseHolder, waits: u64, max_connections: u32, share: u32) -> crate::db::Result<()> {
     let recent_ms = i64::try_from(RECENT.as_millis()).expect("minutes fit");
-    sqlx::query(sql!(
-        "INSERT INTO database_throttle AS t (role, since_ms, last_ms, waits, max_connections, share) \
-         VALUES ($1, {DB_NOW_MS}, {DB_NOW_MS}, $2, $3, $4) \
-         ON CONFLICT (role) DO UPDATE SET \
-           since_ms = CASE WHEN t.last_ms < EXCLUDED.last_ms - $5 THEN EXCLUDED.since_ms ELSE t.since_ms END, \
-           waits = CASE WHEN t.last_ms < EXCLUDED.last_ms - $5 THEN EXCLUDED.waits ELSE t.waits + EXCLUDED.waits END, \
-           last_ms = EXCLUDED.last_ms, max_connections = EXCLUDED.max_connections, share = EXCLUDED.share"
-    ))
-    .bind(role.as_str())
-    .bind(i64::try_from(waits).unwrap_or(i64::MAX))
-    .bind(i32::try_from(max_connections).unwrap_or(i32::MAX))
-    .bind(i32::try_from(share).unwrap_or(i32::MAX))
-    .bind(recent_ms)
-    .execute(pool)
+    pool.execute(
+        &format!(
+            "INSERT INTO database_throttle AS t (role, since_ms, last_ms, waits, max_connections, share) \
+             VALUES ($1, {DB_NOW_MS}, {DB_NOW_MS}, $2, $3, $4) \
+             ON CONFLICT (role) DO UPDATE SET \
+               since_ms = CASE WHEN t.last_ms < EXCLUDED.last_ms - $5 THEN EXCLUDED.since_ms ELSE t.since_ms END, \
+               waits = CASE WHEN t.last_ms < EXCLUDED.last_ms - $5 THEN EXCLUDED.waits ELSE t.waits + EXCLUDED.waits END, \
+               last_ms = EXCLUDED.last_ms, max_connections = EXCLUDED.max_connections, share = EXCLUDED.share"
+        ),
+        &[
+            &role.as_str(),
+            &i64::try_from(waits).unwrap_or(i64::MAX),
+            &i32::try_from(max_connections).unwrap_or(i32::MAX),
+            &i32::try_from(share).unwrap_or(i32::MAX),
+            &recent_ms,
+        ],
+    )
     .await?;
     Ok(())
 }
@@ -290,15 +221,17 @@ pub struct Stretch {
 /// The roles whose copies waited for the database within [`RECENT`]. A
 /// row naming no [`DatabaseHolder`] fails the read, naming it: the table's
 /// CHECK holds it to that set, so one would be a database edited by hand.
-pub async fn current(pool: &PgPool) -> anyhow::Result<Vec<Stretch>> {
+pub async fn current(pool: &Pool) -> anyhow::Result<Vec<Stretch>> {
     let recent_ms = i64::try_from(RECENT.as_millis()).expect("minutes fit");
-    let rows: Vec<(String, i64, i64, i64, i32, i32)> = sqlx::query_as(sql!(
-        "SELECT role, since_ms, last_ms, waits, max_connections, share FROM database_throttle \
-         WHERE last_ms >= {DB_NOW_MS} - $1 ORDER BY role"
-    ))
-    .bind(recent_ms)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(String, i64, i64, i64, i32, i32)> = pool
+        .all(
+            &format!(
+                "SELECT role, since_ms, last_ms, waits, max_connections, share FROM database_throttle \
+                 WHERE last_ms >= {DB_NOW_MS} - $1 ORDER BY role"
+            ),
+            &[&recent_ms],
+        )
+        .await?;
     rows.into_iter()
         .map(|(role, since_ms, last_ms, waits, max_connections, share)| {
             let role = DatabaseHolder::parse(&role).ok_or_else(|| {
@@ -333,31 +266,6 @@ mod tests {
         }
         assert_eq!(tally.note(start + SAY_EVERY), Some(60), "a minute on: every wait since, this one with them");
         assert_eq!(tally.note(start + SAY_EVERY + Duration::from_secs(1)), None);
-    }
-
-    static HEARD: Mutex<Vec<Duration>> = Mutex::new(Vec::new());
-
-    fn heard(waited: Duration) {
-        HEARD.lock().unwrap().push(waited);
-    }
-
-    /// Only sqlx's report of a slow acquire is heard, with how long it
-    /// took: not its report of every acquire, not its other warnings, not
-    /// another target's.
-    #[test]
-    fn only_a_slow_acquire_is_heard() {
-        use tracing_subscriber::layer::SubscriberExt as _;
-        use tracing_subscriber::Layer as _;
-        let layer = SlowAcquires { heard }.with_filter(only_acquires());
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
-            tracing::warn!(target: "sqlx::pool::acquire", acquired_after_secs = 2.5, slow_acquire_threshold_secs = 1.0, "acquired connection, but time to acquire exceeded slow threshold");
-            assert_eq!(*HEARD.lock().unwrap(), vec![Duration::from_millis(2500)], "a slow acquire");
-            tracing::warn!(target: "sqlx::pool::acquire", acquired_after_secs = 0.001, "acquired connection");
-            tracing::debug!(target: "sqlx::pool::acquire", acquired_after_secs = 2.5, slow_acquire_threshold_secs = 1.0, "below the level weft's pools send");
-            tracing::warn!(target: "sqlx::query", slow_acquire_threshold_secs = 1.0, "slow statement");
-            tracing::warn!(target: "weft_task_store::db", slow_acquire_threshold_secs = 1.0, "ours");
-            assert_eq!(HEARD.lock().unwrap().len(), 1, "nothing else");
-        });
     }
 
     #[test]

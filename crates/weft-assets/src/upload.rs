@@ -109,7 +109,7 @@ const UPLOAD_TELL_EVERY: std::time::Duration = std::time::Duration::from_secs(3)
 
 impl<P: UploadPlane> ContentStore<P> {
     pub fn new(plane: P) -> Self {
-        Self { plane, http: reqwest::Client::new(), told: None }
+        Self { plane, http: weft_core::net::http_client().build().expect("reqwest client"), told: None }
     }
 
     /// [`Self::new`], saying on stderr how far its uploads have got.

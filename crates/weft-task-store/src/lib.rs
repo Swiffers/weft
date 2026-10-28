@@ -39,6 +39,11 @@
 //! links this crate, must not carry the migration history (see
 //! `schema_group`).
 
+// What `#[weft_db_macros::test]` expands to names this crate by its path,
+// which this crate's own tests reach this way.
+#[cfg(test)]
+extern crate self as weft_task_store;
+
 pub mod alarm;
 pub mod announce;
 pub mod budget;
@@ -69,22 +74,6 @@ pub mod worker_door;
 #[cfg(feature = "migrate")]
 pub use documents::{apply_documents, Document};
 
-#[doc(hidden)]
-pub use sqlx as __sqlx;
-
-/// A statement put together at run time, `format!`'s arguments in, ready
-/// for `sqlx::query` and its kin: `sqlx::query(sql!("SELECT {columns} FROM
-/// run WHERE run_id = $1"))`. sqlx takes a fixed `&'static str` as it is
-/// and anything built only through `AssertSqlSafe`, so that a statement
-/// with something spliced into it says so where it is written. What is
-/// spliced in is weft's own (a column list, a table name, a fragment of
-/// SQL it wrote); a value from outside always goes through `.bind`.
-#[macro_export]
-macro_rules! sql {
-    ($($format:tt)*) => {
-        $crate::__sqlx::AssertSqlSafe(::std::format!($($format)*))
-    };
-}
 pub use schema_group::{DataStep, SchemaGroup, Until};
 #[cfg(feature = "migrate")]
 pub use schema_guard::{apply_groups, apply_schema, Migration, Part};

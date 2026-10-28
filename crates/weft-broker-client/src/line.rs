@@ -308,7 +308,7 @@ struct LinkInner {
 
 impl BrokerLink {
     pub fn new(base_url: impl Into<String>, token: TokenSource) -> Self {
-        let http = reqwest::Client::builder()
+        let http = weft_core::net::http_client()
             .timeout(DEFAULT_CALL_WAIT.to_answer)
             .build()
             .expect("reqwest client builds");

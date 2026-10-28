@@ -259,7 +259,8 @@ mod tests {
     /// runs at boot), and the loops agree with `loop_wakes`.
     #[tokio::test]
     async fn the_brokers_loops_boot_scaled_to_zero() {
-        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://nobody@127.0.0.1:1/none").expect("a lazy pool");
+        let nobody = weft_task_store::db::config("postgres://nobody@127.0.0.1:1/none").expect("a Postgres address");
+        let pool = weft_task_store::db::Pool::open(nobody, 1, std::time::Duration::from_secs(1), weft_task_store::db::Waits::Expected);
         let store = Arc::new(runtime_store::RuntimeStore::new(
             pool,
             Arc::new(weft_platform_traits::object_store::fake::FakeObjectStore::new()),

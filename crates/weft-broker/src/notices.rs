@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sqlx::PgPool;
+use weft_task_store::db::{Client as _, Pool};
 use weft_platform_traits::{Alarm, CoreRole};
 
 /// How long the broker gathers before it speaks.
@@ -52,7 +52,7 @@ impl Notices {
     /// The notices, sent on `pool` by a task of their own. `dispatcher`
     /// is the alarm that calls the dispatcher's tick, when it scales to
     /// zero.
-    pub fn start(pool: PgPool, dispatcher: Option<Arc<dyn Alarm>>) -> Arc<Self> {
+    pub fn start(pool: Pool, dispatcher: Option<Arc<dyn Alarm>>) -> Arc<Self> {
         let notices = Arc::new(Self { pending: Mutex::new(Pending::default()), wake: tokio::sync::Notify::new() });
         tokio::spawn(send_loop(notices.clone(), pool, dispatcher));
         notices
@@ -112,7 +112,7 @@ impl EarliestRung {
     }
 }
 
-async fn send_loop(notices: Arc<Notices>, pool: PgPool, dispatcher: Option<Arc<dyn Alarm>>) {
+async fn send_loop(notices: Arc<Notices>, pool: Pool, dispatcher: Option<Arc<dyn Alarm>>) {
     let mut rung = EarliestRung::default();
     loop {
         notices.wake.notified().await;
@@ -180,14 +180,10 @@ async fn send_loop(notices: Arc<Notices>, pool: PgPool, dispatcher: Option<Arc<d
 }
 
 /// Send the notifications, trying a few times shortly.
-async fn send(pool: &PgPool, channels: &[&str], payloads: &[String]) -> anyhow::Result<()> {
+async fn send(pool: &Pool, channels: &[&str], payloads: &[String]) -> anyhow::Result<()> {
     let mut pauses = RETRY_PAUSES.iter();
     loop {
-        let sent = sqlx::query("SELECT pg_notify(c, p) FROM unnest($1::text[], $2::text[]) AS t(c, p)")
-            .bind(channels)
-            .bind(payloads)
-            .execute(pool)
-            .await;
+        let sent = pool.execute("SELECT pg_notify(c, p) FROM unnest($1::text[], $2::text[]) AS t(c, p)", &[&channels, &payloads]).await;
         match (sent, pauses.next()) {
             (Ok(_), _) => return Ok(()),
             (Err(e), None) => return Err(e.into()),
@@ -220,10 +216,8 @@ mod tests {
     /// unwatched.
     #[tokio::test]
     async fn a_notice_that_cannot_be_sent_is_tried_three_times_then_rung_later() {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .acquire_timeout(Duration::from_millis(100))
-            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
-            .expect("a lazy pool");
+        let nobody = weft_task_store::db::config("postgres://nobody@127.0.0.1:1/none").expect("a Postgres address");
+        let pool = Pool::open(nobody, 1, Duration::from_millis(100), weft_task_store::db::Waits::Expected);
         let alarm = Arc::new(weft_platform_traits::alarm::fake::FakeAlarm::default());
         let notices = Notices::start(pool, Some(alarm.clone()));
         notices.tell([], [weft_core::RunId::from_u128(1)], [], Some("worker-1"));

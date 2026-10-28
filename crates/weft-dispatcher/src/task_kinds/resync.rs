@@ -130,16 +130,22 @@ impl ResyncPlan {
     /// [`Self::row_write`].
     pub const ROW: &'static str = "resync = $2, resync_version = $3, resync_driver = $4";
 
-    /// The write of this plan to project `project`'s row: `sql`, which
-    /// sets [`Self::ROW`] and names the project as `$1` (binds of its own
-    /// follow, from `$5`), with the plan's JSON, its version and its
-    /// drive bound.
-    pub fn row_write<'q>(
-        &'q self,
+    /// Write this plan to project `project`'s row, for how many rows it
+    /// touched: `sql`, which sets [`Self::ROW`] and names the project as
+    /// `$1`, with the plan's JSON, its version and its drive given, and
+    /// `more` as `$5` onward.
+    pub async fn row_write(
+        &self,
+        db: &impl weft_task_store::db::Client,
         project: uuid::Uuid,
-        sql: impl sqlx::SqlSafeStr,
-    ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
-        sqlx::query(sql).bind(project).bind(sqlx::types::Json(self)).bind(Self::STORED.version()).bind(self.driver)
+        sql: &str,
+        more: &[weft_task_store::db::Param<'_>],
+    ) -> weft_task_store::db::Result<u64> {
+        let json = weft_task_store::db::Json(self);
+        let version = Self::STORED.version();
+        let row: [weft_task_store::db::Param<'_>; 4] = [&project, &json, &version, &self.driver];
+        let params: Vec<_> = row.into_iter().chain(more.iter().copied()).collect();
+        db.execute(sql, &params).await
     }
 }
 
@@ -773,13 +779,13 @@ async fn let_the_old_version_finish(state: &DispatcherState, id: uuid::Uuid, pla
 /// shows while it follows and `weft status` shows beside the resync. It
 /// writes only when what it waits for changed since it last said it.
 pub(crate) struct TaskProgress {
-    pool: sqlx::PgPool,
+    pool: weft_task_store::db::Pool,
     task: uuid::Uuid,
     said: tokio::sync::Mutex<Said>,
 }
 
 impl TaskProgress {
-    fn new(pool: sqlx::PgPool, task: uuid::Uuid) -> Self {
+    fn new(pool: weft_task_store::db::Pool, task: uuid::Uuid) -> Self {
         Self { pool, task, said: tokio::sync::Mutex::new(Said::default()) }
     }
 
@@ -1000,6 +1006,12 @@ pub fn left_down(plan: &ResyncPlan, rows: &[crate::activation_store::Activation]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weft_task_store::db;
+
+    /// A call that got no connection, for `why`.
+    fn no_connection(why: db::NoConnection) -> anyhow::Error {
+        db::Error::NoConnection { why, refused: None }.into()
+    }
 
     fn plan() -> ResyncPlan {
         let ada = Owner::Instance(weft_core::instance::InstanceId::new("ada").unwrap());
@@ -1163,13 +1175,13 @@ mod tests {
             Halt::Failed(failure) => failure,
             _ => panic!("a failed read is a failed step"),
         };
-        let busy = failed(Halt::failed("read the resync", anyhow::Error::from(sqlx::Error::PoolTimedOut).context("project 1")));
+        let busy = failed(Halt::failed("read the resync", no_connection(db::NoConnection::Busy).context("project 1")));
         assert_eq!(busy.waits_for, Some(ResyncWait::Database));
         assert_eq!(busy.status, StatusCode::INTERNAL_SERVER_ERROR, "a stop is never a 503: following it asks the same again");
         assert!(busy.error.starts_with("read the resync: the install's database was busy or out of reach"), "{}", busy.error);
-        let gone = failed(failing("end the resync")(anyhow::Error::from(sqlx::Error::PoolClosed)));
+        let gone = failed(failing("end the resync")(no_connection(db::NoConnection::Closed)));
         assert_eq!(gone.waits_for, Some(ResyncWait::Database), "a database out of reach is waited on too");
-        let broken = failed(Halt::failed("read the resync", anyhow::Error::from(sqlx::Error::RowNotFound)));
+        let broken = failed(Halt::failed("read the resync", anyhow::Error::from(db::Error::NoRow)));
         assert_eq!((broken.waits_for, broken.status), (None, StatusCode::INTERNAL_SERVER_ERROR));
 
         let mut tries = Tries::default();
@@ -1246,7 +1258,7 @@ mod tests {
             let attempt = tries.get();
             async move {
                 if attempt < 3 {
-                    return Err(anyhow::Error::from(sqlx::Error::PoolTimedOut).context("book the look"));
+                    return Err(no_connection(db::NoConnection::Busy).context("book the look"));
                 }
                 Ok(())
             }
@@ -1258,7 +1270,7 @@ mod tests {
         let tries = std::cell::Cell::new(0);
         let broken = stop_until_taken(uuid::Uuid::nil(), || {
             tries.set(tries.get() + 1);
-            async { Err(anyhow::Error::from(sqlx::Error::RowNotFound)) }
+            async { Err(anyhow::Error::from(db::Error::NoRow)) }
         })
         .await;
         assert!(broken.is_err());

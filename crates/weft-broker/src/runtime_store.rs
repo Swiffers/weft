@@ -23,8 +23,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use sqlx::PgPool;
-use weft_task_store::sql;
+use weft_task_store::db::{self, Client, FromRow, Pool, Row, Transaction};
 
 use weft_core::storage::key::{CallerAuth, ParsedKey};
 use weft_core::storage::{KeepTtl, PartAsk, PresignedPart, StorageScope, StoredFileMeta};
@@ -186,7 +185,7 @@ const REAP_RETRY_PAUSES: [std::time::Duration; 2] = [std::time::Duration::from_m
 /// nothing else takes it. A marked row holds no claim, and is a rule of
 /// its own ([`MARKED`]).
 fn reap_lapsed(now_param: &str) -> String {
-    format!("(status = 'reaping' AND progressed_at_unix > 0 AND progressed_at_unix < {now_param} - {CLAIM_LEASE_SECS})")
+    format!("(status = 'reaping' AND progressed_at_unix > 0 AND progressed_at_unix < {now_param}::BIGINT - {CLAIM_LEASE_SECS})")
 }
 
 /// SQL condition: the row is marked, a reap the bucket refused that
@@ -231,8 +230,8 @@ const HELD: &str = "(status IN ('pending', 'completing', 'reaping') AND progress
 /// store's clock), where `condition` (more `AND` clauses, or nothing) still
 /// holds. Every flip to 'reaping' goes through here, so every reap holds a
 /// claim ([`reap_lapsed`]).
-fn fence_sql(condition: &str) -> sqlx::AssertSqlSafe<String> {
-    sql!("UPDATE runtime_file SET status = 'reaping', progressed_at_unix = $2 WHERE key = $1 {condition}")
+fn fence_sql(condition: &str) -> String {
+    format!("UPDATE runtime_file SET status = 'reaping', progressed_at_unix = $2 WHERE key = $1 {condition}")
 }
 
 /// SQL condition: the row has not expired by `now_param` (a bind holding
@@ -269,8 +268,8 @@ pub const CLAIM_LEASE_SECS: i64 = 5 * 60;
 /// before can never pass for the content now there.
 /// Answers one row: whether the row deleted carried a failed reap's mark
 /// (`reap_error`).
-fn delete_upload_row(condition: &str) -> sqlx::AssertSqlSafe<String> {
-    sql!(
+fn delete_upload_row(condition: &str) -> String {
+    format!(
         "WITH gone AS (DELETE FROM runtime_file WHERE key = $1 {condition} RETURNING replaces, reap_error), \
          moved AS (UPDATE runtime_file SET version = version + 1 \
                    WHERE key IN (SELECT replaces FROM gone WHERE replaces IS NOT NULL)) \
@@ -830,7 +829,7 @@ fn nothing_uploaded() -> RuntimeStoreError {
 /// for all its copies, so a small copy finished early is never taken for
 /// dead while a big one after it still runs.
 struct CopyClaim<'a> {
-    pool: &'a PgPool,
+    pool: &'a Pool,
     clock: &'a dyn Clock,
     key: &'a str,
     held: &'a [&'a str],
@@ -842,23 +841,22 @@ impl CopyProgress for CopyClaim<'_> {
     /// landed (the copy is whole) needs no claim; a row that went (a reap
     /// ended the upload) stops the copy, which has nothing left to fill.
     async fn copied_piece(&self) -> Result<()> {
-        let renewed: Vec<String> = sqlx::query_scalar(
-            "UPDATE runtime_file SET progressed_at_unix = $2 WHERE key = ANY($1) AND status = 'completing' RETURNING key",
-        )
-        .bind(self.held)
-        .bind(self.clock.now_unix())
-        .fetch_all(self.pool)
-        .await
-        .context("runtime copy: renew the claim")?;
+        let renewed: Vec<String> = self
+            .pool
+            .scalars(
+                "UPDATE runtime_file SET progressed_at_unix = $2 WHERE key = ANY($1) AND status = 'completing' RETURNING key",
+                &[&self.held, &self.clock.now_unix()],
+            )
+            .await
+            .context("runtime copy: renew the claim")?;
         if renewed.iter().any(|key| key == self.key) {
             return Ok(());
         }
-        let landed: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM runtime_file WHERE key = $1 AND status IN ('active', 'uploaded'))")
-                .bind(self.key)
-                .fetch_one(self.pool)
-                .await
-                .context("runtime copy: read what became of the upload")?;
+        let landed: bool = self
+            .pool
+            .scalar("SELECT EXISTS (SELECT 1 FROM runtime_file WHERE key = $1 AND status IN ('active', 'uploaded'))", &[&self.key])
+            .await
+            .context("runtime copy: read what became of the upload")?;
         anyhow::ensure!(landed, "the upload '{}' a copy fills was ended while it copied", self.key);
         Ok(())
     }
@@ -866,7 +864,7 @@ impl CopyProgress for CopyClaim<'_> {
 
 /// The runtime-file store: PG metadata + bucket bytes, one gatekeeper.
 pub struct RuntimeStore {
-    pool: PgPool,
+    pool: Pool,
     bucket: Arc<dyn ObjectStore>,
     clock: Arc<dyn Clock>,
     /// The soonest expiry this copy rang the expiry loop for
@@ -875,7 +873,7 @@ pub struct RuntimeStore {
 }
 
 /// One stored-file metadata row, the in-Rust shape of a `runtime_file` row.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 struct FileRow {
     key: String,
     mime_type: String,
@@ -888,7 +886,28 @@ struct FileRow {
     version: i64,
 }
 
+impl FromRow for FileRow {
+    fn from_row(row: Row) -> db::Result<Self> {
+        Self::read(&row)
+    }
+}
+
 impl FileRow {
+    /// The [`FILE_ROW_COLUMNS`] of `row`.
+    fn read(row: &Row) -> db::Result<Self> {
+        Ok(Self {
+            key: row.try_get("key")?,
+            mime_type: row.try_get("mime_type")?,
+            filename: row.try_get("filename")?,
+            size_bytes: row.try_get("size_bytes")?,
+            keep: row.try_get("keep")?,
+            expires_at_unix: row.try_get("expires_at_unix")?,
+            keep_ttl_secs: row.try_get("keep_ttl_secs")?,
+            created_at_unix: row.try_get("created_at_unix")?,
+            version: row.try_get("version")?,
+        })
+    }
+
     fn to_meta(&self) -> StoredFileMeta {
         StoredFileMeta {
             key: self.key.clone(),
@@ -906,11 +925,16 @@ impl FileRow {
 
 /// A file's row as a link reads it, with the visitor address of the
 /// project the link is for, when it asked for one.
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug)]
 struct LinkedRow {
-    #[sqlx(flatten)]
     file: FileRow,
     visitor_address: Option<String>,
+}
+
+impl FromRow for LinkedRow {
+    fn from_row(row: Row) -> db::Result<Self> {
+        Ok(Self { file: FileRow::read(&row)?, visitor_address: row.try_get("visitor_address")? })
+    }
 }
 
 /// A link [`RuntimeStore::grant_link`] granted and
@@ -925,7 +949,7 @@ pub struct GrantedLink {
 
 /// What a sweep needs to know per row: spare it (kept ACTIVE file) or reap
 /// its bucket state (aborting the in-flight upload of a pending row).
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug)]
 struct SweepEntry {
     key: String,
     kept_active: bool,
@@ -940,7 +964,7 @@ struct SweepEntry {
 /// One in-flight upload's row: the metadata captured at begin plus the
 /// multipart resume state. The in-Rust shape of a 'pending' or
 /// 'completing' `runtime_file` row.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 struct PendingUpload {
     /// 'pending' while parts can still be reserved and reported,
     /// 'completing' once a completion has claimed it.
@@ -964,6 +988,24 @@ struct PendingUpload {
     /// For a run's copy of a slot's upload, the upload it copies
     /// ([`RuntimeStore::claim_uploads`]).
     receives: Option<String>,
+}
+
+impl FromRow for PendingUpload {
+    fn from_row(row: Row) -> db::Result<Self> {
+        Ok(Self {
+            status: row.try_get("status")?,
+            tenant_id: row.try_get("tenant_id")?,
+            keep_ttl_secs: row.try_get("keep_ttl_secs")?,
+            upload_id: row.try_get("upload_id")?,
+            part_size: row.try_get("part_size")?,
+            declared_size: row.try_get("declared_size")?,
+            replaces: row.try_get("replaces")?,
+            mime_type: row.try_get("mime_type")?,
+            filename: row.try_get("filename")?,
+            slot_accepts: row.try_get("slot_accepts")?,
+            receives: row.try_get("receives")?,
+        })
+    }
 }
 
 impl PendingUpload {
@@ -1061,6 +1103,18 @@ enum Removal {
     Free,
 }
 
+impl FromRow for SweepEntry {
+    fn from_row(row: Row) -> db::Result<Self> {
+        Ok(Self {
+            key: row.try_get("key")?,
+            kept_active: row.try_get("kept_active")?,
+            status: row.try_get("status")?,
+            upload_id: row.try_get("upload_id")?,
+            replaces: row.try_get("replaces")?,
+        })
+    }
+}
+
 impl SweepEntry {
     /// A finished file's row as a reap sees it: an object, no upload.
     fn file(key: &str) -> Self {
@@ -1080,7 +1134,7 @@ fn expiry_honoring_links(param: &str) -> String {
 
 
 impl RuntimeStore {
-    pub fn new(pool: PgPool, bucket: Arc<dyn ObjectStore>, clock: Arc<dyn Clock>) -> Self {
+    pub fn new(pool: Pool, bucket: Arc<dyn ObjectStore>, clock: Arc<dyn Clock>) -> Self {
         Self { pool, bucket, clock, rung: Default::default() }
     }
 
@@ -1095,7 +1149,7 @@ impl RuntimeStore {
         if !self.rung.lock().expect("expiry rung").needs(at, self.clock.now_unix()) {
             return;
         }
-        match sqlx::query("SELECT pg_notify($1, '')").bind(FILE_EXPIRY_CHANNEL).execute(&self.pool).await {
+        match self.pool.execute("SELECT pg_notify($1, '')", &[&FILE_EXPIRY_CHANNEL]).await {
             Ok(_) => self.rung.lock().expect("expiry rung").rang(at),
             Err(e) => tracing::error!(
                 target: "weft_broker::runtime_store", error = %e, at,
@@ -1156,14 +1210,17 @@ impl RuntimeStore {
     /// refuses stays marked and ends the pass (a bucket refusing one
     /// removal is all but always refusing the rest). Answers how many went.
     async fn reap_marked(&self, tenant: &str) -> Result<u64> {
-        let entries: Vec<SweepEntry> = sqlx::query_as(sql!(
-            "SELECT key, FALSE AS kept_active, status, upload_id, replaces FROM runtime_file WHERE tenant_id = $1 AND {MARKED} \
-             ORDER BY key"
-        ))
-        .bind(tenant)
-        .fetch_all(&self.pool)
-        .await
-        .context("marked reap scan")?;
+        let entries: Vec<SweepEntry> = self
+            .pool
+            .all(
+                &format!(
+                    "SELECT key, FALSE AS kept_active, status, upload_id, replaces FROM runtime_file WHERE tenant_id = $1 AND {MARKED} \
+                     ORDER BY key"
+                ),
+                &[&tenant],
+            )
+            .await
+            .context("marked reap scan")?;
         let now = self.clock.now_unix();
         let mut record = false;
         let pass = async {
@@ -1216,7 +1273,7 @@ impl RuntimeStore {
     /// bytes, so the check is just `total + incoming > cap`.
     async fn account_would_exceed(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &Transaction<'_>,
         entitlements: &dyn EntitlementSource,
         tenant: &str,
         incoming: u64,
@@ -1231,13 +1288,13 @@ impl RuntimeStore {
     /// tenant lock; a slot's check before a begin runs it without.
     async fn admit_new_file(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &Transaction<'_>,
         entitlements: &dyn EntitlementSource,
         tenant: &str,
         declared_size: Option<u64>,
         now: i64,
     ) -> StoreResult<()> {
-        let count = count_files(&mut **tx, tenant, now)
+        let count = count_files(tx, tenant, now)
             .await
             .context("runtime begin_upload: count tenant files")
             .map_err(RuntimeStoreError::Other)?;
@@ -1271,31 +1328,24 @@ impl RuntimeStore {
     /// when the page states one and weft hashed the upload, so a page that
     /// picked another file is never answered with the first.
     async fn slot_upload_state(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &Transaction<'_>,
         slot: &SlotUpload<'_>,
         filename: &str,
         size: u64,
     ) -> StoreResult<Option<Reserved>> {
-        #[derive(sqlx::FromRow)]
-        struct SlotRow {
-            key: String,
-            status: String,
-            part_size: Option<i64>,
-            filename: String,
-            /// The size declared while it is on its way up, its own once landed.
-            size: i64,
-            content_sha256: Option<String>,
-        }
-        let existing: Option<SlotRow> = sqlx::query_as(
-            "SELECT key, status, part_size, filename, COALESCE(declared_size, size_bytes) AS size, content_sha256 FROM runtime_file \
-             WHERE upload_slot = $1 AND status <> 'reaping'",
-        )
-        .bind(slot.sid)
-        .fetch_optional(&mut **tx)
-        .await
-        .context("runtime begin_upload: look for the slot's upload")
-        .map_err(RuntimeStoreError::Other)?;
-        let Some(SlotRow { key, status, part_size, filename: held, size: held_size, content_sha256 }) = existing else {
+        // key, status, part size, filename, the size declared while it is
+        // on its way up (its own once landed), content sha256
+        type SlotRow = (String, String, Option<i64>, String, i64, Option<String>);
+        let existing: Option<SlotRow> = tx
+            .opt(
+                "SELECT key, status, part_size, filename, COALESCE(declared_size, size_bytes) AS size, content_sha256 FROM runtime_file \
+                 WHERE upload_slot = $1 AND status <> 'reaping'",
+                &[&slot.sid],
+            )
+            .await
+            .context("runtime begin_upload: look for the slot's upload")
+            .map_err(RuntimeStoreError::Other)?;
+        let Some((key, status, part_size, held, held_size, content_sha256)) = existing else {
             return Ok(None);
         };
         let other_hash = matches!((slot.sha256, content_sha256.as_deref()), (Some(stated), Some(hashed)) if stated != hashed);
@@ -1333,11 +1383,12 @@ impl RuntimeStore {
         };
         slot.refuse_too_heavy(size)?;
         self.deciding_with_space(tenant, || async {
-            let mut tx = self.pool.begin().await.context("runtime slot check: begin").map_err(RuntimeStoreError::BeforeWrites)?;
-            if Self::slot_upload_state(&mut tx, &slot, spec.filename, size).await?.is_some() {
+            let mut conn = self.pool.get().await.context("runtime slot check: begin").map_err(RuntimeStoreError::BeforeWrites)?;
+            let tx = conn.transaction().await.context("runtime slot check: begin").map_err(RuntimeStoreError::BeforeWrites)?;
+            if Self::slot_upload_state(&tx, &slot, spec.filename, size).await?.is_some() {
                 return Ok(());
             }
-            self.admit_new_file(&mut tx, entitlements, tenant, spec.declared_size, self.clock.now_unix()).await
+            self.admit_new_file(&tx, entitlements, tenant, spec.declared_size, self.clock.now_unix()).await
         })
         .await
     }
@@ -1503,13 +1554,18 @@ impl RuntimeStore {
                 // to get it: the multipart opened above is aborted below,
                 // and an expired file reaped above was gone either way (the
                 // begin sent again finds nothing to reap).
-                let mut tx = self
+                let mut conn = self
                     .pool
-                    .begin()
+                    .get()
                     .await
                     .context("runtime begin_upload: begin reserve tx")
                     .map_err(RuntimeStoreError::BeforeWrites)?;
-                lock_tenant_storage(&mut tx, &tenant)
+                let tx = conn
+                    .transaction()
+                    .await
+                    .context("runtime begin_upload: begin reserve tx")
+                    .map_err(RuntimeStoreError::BeforeWrites)?;
+                lock_tenant_storage(&tx, &tenant)
                     .await
                     .map_err(RuntimeStoreError::Other)?;
                 // A content-addressed (asset) key can legitimately collide: the
@@ -1519,13 +1575,10 @@ impl RuntimeStore {
                 // mid-flight (a loud conflict; rerun once it settles). Answered
                 // structurally instead of via a raw PK violation.
                 if content_hash.is_some() {
-                    let existing: Option<String> = sqlx::query_scalar(
-                        "SELECT status FROM runtime_file WHERE key = $1",
-                    )
-                    .bind(&key)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .context("runtime begin_upload: check content-addressed key")
+                    let existing: Option<String> = tx
+                        .scalar_opt("SELECT status FROM runtime_file WHERE key = $1", &[&key])
+                        .await
+                        .context("runtime begin_upload: check content-addressed key")
                     .map_err(RuntimeStoreError::Other)?;
                     match existing.as_deref() {
                         Some("active") => return Ok(Reserved::AlreadyActive(key.clone())),
@@ -1534,13 +1587,10 @@ impl RuntimeStore {
                         // has already fenced for reaping ('reaping') is NOT
                         // resumable: its multipart is about to be aborted.
                         Some("pending") => {
-                            let part_size: i64 = sqlx::query_scalar(
-                                "SELECT part_size FROM runtime_file WHERE key = $1",
-                            )
-                            .bind(&key)
-                            .fetch_one(&mut *tx)
-                            .await
-                            .context("runtime begin_upload: read the pending part size")
+                            let part_size: i64 = tx
+                                .scalar("SELECT part_size FROM runtime_file WHERE key = $1", &[&key])
+                                .await
+                                .context("runtime begin_upload: read the pending part size")
                             .map_err(RuntimeStoreError::Other)?;
                             return Ok(Reserved::Pending(key.clone(), part_size as u64));
                         }
@@ -1566,14 +1616,14 @@ impl RuntimeStore {
                 // size) is this begin's answer, one cut off part way up
                 // carries on, anything else under the key is refused.
                 if let Some(imported) = imported {
-                    let existing: Option<(String, i64, i64)> = sqlx::query_as(
-                        "SELECT status, version, CASE WHEN status = 'active' THEN size_bytes ELSE COALESCE(declared_size, -1) END \
-                         FROM runtime_file WHERE key = $1",
-                    )
-                    .bind(&key)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .context("runtime begin_upload: check the copied file's key")
+                    let existing: Option<(String, i64, i64)> = tx
+                        .opt(
+                            "SELECT status, version, CASE WHEN status = 'active' THEN size_bytes ELSE COALESCE(declared_size, -1) END \
+                             FROM runtime_file WHERE key = $1",
+                            &[&key],
+                        )
+                        .await
+                        .context("runtime begin_upload: check the copied file's key")
                     .map_err(RuntimeStoreError::Other)?;
                     let same = |version: i64, size: i64| {
                         u64::try_from(version).ok() == Some(imported.version) && u64::try_from(size).ok() == declared_size
@@ -1583,9 +1633,8 @@ impl RuntimeStore {
                             return Ok(Reserved::AlreadyActive(key.clone()));
                         }
                         Some((status, version, size)) if status == "pending" && same(version, size) => {
-                            let part_size: i64 = sqlx::query_scalar("SELECT part_size FROM runtime_file WHERE key = $1")
-                                .bind(&key)
-                                .fetch_one(&mut *tx)
+                            let part_size: i64 = tx
+                                .scalar("SELECT part_size FROM runtime_file WHERE key = $1", &[&key])
                                 .await
                                 .context("runtime begin_upload: read the pending part size")
                                 .map_err(RuntimeStoreError::Other)?;
@@ -1622,18 +1671,18 @@ impl RuntimeStore {
                 // unique index is built on. A file that expired since it was
                 // reaped above is not this begin's answer: it is on its way out.
                 if let Some(identity) = identity {
-                    let existing: Option<(String, String)> = sqlx::query_as(sql!(
-                        "SELECT key, CASE WHEN status = 'active' AND NOT {live} THEN 'expired' ELSE status END \
-                         FROM runtime_file \
-                         WHERE regexp_replace(key, '/[^/]+$', '') = $1 AND identity = $2",
-                        live = unexpired("$3"),
-                    ))
-                    .bind(scope_prefix(&key))
-                    .bind(identity)
-                    .bind(now)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .context("runtime begin_upload: check identity")
+                    let existing: Option<(String, String)> = tx
+                        .opt(
+                            &format!(
+                                "SELECT key, CASE WHEN status = 'active' AND NOT {live} THEN 'expired' ELSE status END \
+                                 FROM runtime_file \
+                                 WHERE regexp_replace(key, '/[^/]+$', '') = $1 AND identity = $2",
+                                live = unexpired("$3"),
+                            ),
+                            &[&scope_prefix(&key), &identity, &now],
+                        )
+                        .await
+                        .context("runtime begin_upload: check identity")
                     .map_err(RuntimeStoreError::Other)?;
                     match existing {
                         Some((existing_key, status)) if status == "active" => {
@@ -1651,38 +1700,40 @@ impl RuntimeStore {
                 // A slot's one upload: begun again (a page that lost its
                 // place), it carries on where it is.
                 if let (Some(slot), Some(size)) = (slot, declared_size) {
-                    if let Some(reserved) = Self::slot_upload_state(&mut tx, &slot, filename, size).await? {
+                    if let Some(reserved) = Self::slot_upload_state(&tx, &slot, filename, size).await? {
                         return Ok(reserved);
                     }
                 }
-                self.admit_new_file(&mut tx, entitlements, &tenant, declared_size, now).await?;
-                sqlx::query(
+                self.admit_new_file(&tx, entitlements, &tenant, declared_size, now).await?;
+                tx.execute(
                     "INSERT INTO runtime_file \
                      (key, tenant_id, mime_type, filename, size_bytes, status, keep, expires_at_unix, \
                       keep_ttl_secs, created_at_unix, upload_id, part_size, declared_size, \
                       reserved_bytes, progressed_at_unix, identity, upload_slot, slot_accepts, version) \
-                     VALUES ($1, $2, $3, $4, 0, 'pending', $5, $13, $6, COALESCE($16, $7), $8, $9, $10, $11, $7, $12, $14, $15, $17)",
+                     VALUES ($1, $2, $3, $4, 0, 'pending', $5, $13, $6, COALESCE($16::BIGINT, $7), $8, $9, $10, $11, $7, $12, $14, $15, $17)",
+                    &[
+                        &key,
+                        &tenant,
+                        &mime,
+                        &filename,
+                        // The flag is the end-of-run sweep's exemption, which
+                        // only a run file needs; elsewhere a lifetime is just
+                        // a ttl.
+                        &(keep.is_some() && matches!(scope, StorageScope::Run)),
+                        &ttl.map(|s| s as i64),
+                        &now,
+                        &upload_id,
+                        &(part_size as i64),
+                        &declared_size.map(|s| s as i64),
+                        &(declared_size.unwrap_or(0) as i64),
+                        &identity,
+                        &slot.map(|s| s.ends_unix),
+                        &slot.map(|s| s.sid),
+                        &slot.map(|s| s.accepts),
+                        &imported.map(|i| i.created_at_unix),
+                        &(imported.map_or(weft_core::storage::FIRST_FILE_VERSION, |i| i.version) as i64),
+                    ],
                 )
-                .bind(&key)
-                .bind(&tenant)
-                .bind(mime)
-                .bind(filename)
-                // The flag is the end-of-run sweep's exemption, which only a
-                // run file needs; elsewhere a lifetime is just a ttl.
-                .bind(keep.is_some() && matches!(scope, StorageScope::Run))
-                .bind(ttl.map(|s| s as i64))
-                .bind(now)
-                .bind(&upload_id)
-                .bind(part_size as i64)
-                .bind(declared_size.map(|s| s as i64))
-                .bind(declared_size.unwrap_or(0) as i64)
-                .bind(identity)
-                .bind(slot.map(|s| s.ends_unix))
-                .bind(slot.map(|s| s.sid))
-                .bind(slot.map(|s| s.accepts))
-                .bind(imported.map(|i| i.created_at_unix))
-                .bind(imported.map_or(weft_core::storage::FIRST_FILE_VERSION, |i| i.version) as i64)
-                .execute(&mut *tx)
                 .await
                 .context("runtime begin_upload: reserve pending row")
                 .map_err(RuntimeStoreError::Other)?;
@@ -1782,9 +1833,9 @@ impl RuntimeStore {
         let now = self.clock.now_unix();
         // The object keeps the file's type through the swap; a file's
         // type never changes (the locked read below finds it still there).
-        let mime: String = sqlx::query_scalar("SELECT mime_type FROM runtime_file WHERE key = $1 AND status = 'active'")
-            .bind(&replaced)
-            .fetch_optional(&self.pool)
+        let mime: String = self
+            .pool
+            .scalar_opt("SELECT mime_type FROM runtime_file WHERE key = $1 AND status = 'active'", &[&replaced])
             .await
             .context("runtime begin_replace: read the replaced file's type")
             .map_err(RuntimeStoreError::BeforeWrites)?
@@ -1801,33 +1852,37 @@ impl RuntimeStore {
         let reserve = self
             .deciding_with_space(&tenant, || async {
                 // The multipart opened above is aborted below when this fails.
-                let mut tx = self
+                let mut conn = self
                     .pool
-                    .begin()
+                    .get()
                     .await
                     .context("runtime begin_replace: begin reserve tx")
                     .map_err(RuntimeStoreError::BeforeWrites)?;
-                lock_tenant_storage(&mut tx, &tenant).await.map_err(RuntimeStoreError::Other)?;
-                let existing: Option<(String, String, i64)> = sqlx::query_as(sql!(
-                    "SELECT mime_type, filename, version FROM runtime_file WHERE key = $1 AND status = 'active' AND {live}",
-                    live = unexpired("$2"),
-                ))
-                .bind(&replaced)
-                .bind(now)
-                .fetch_optional(&mut *tx)
-                .await
-                .context("runtime begin_replace: read the replaced file")
+                let tx = conn
+                    .transaction()
+                    .await
+                    .context("runtime begin_replace: begin reserve tx")
+                    .map_err(RuntimeStoreError::BeforeWrites)?;
+                lock_tenant_storage(&tx, &tenant).await.map_err(RuntimeStoreError::Other)?;
+                let existing: Option<(String, String, i64)> = tx
+                    .opt(
+                        &format!(
+                            "SELECT mime_type, filename, version FROM runtime_file WHERE key = $1 AND status = 'active' AND {live}",
+                            live = unexpired("$2"),
+                        ),
+                        &[&replaced, &now],
+                    )
+                    .await
+                    .context("runtime begin_replace: read the replaced file")
                 .map_err(RuntimeStoreError::Other)?;
                 let Some((mime, filename, version)) = existing else {
                     return Err(RuntimeStoreError::NotFound(replaced.clone()));
                 };
-                let in_flight: Option<String> =
-                    sqlx::query_scalar("SELECT key FROM runtime_file WHERE replaces = $1")
-                        .bind(&replaced)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .context("runtime begin_replace: look for a replacement in flight")
-                        .map_err(RuntimeStoreError::Other)?;
+                let in_flight: Option<String> = tx
+                    .scalar_opt("SELECT key FROM runtime_file WHERE replaces = $1", &[&replaced])
+                    .await
+                    .context("runtime begin_replace: look for a replacement in flight")
+                    .map_err(RuntimeStoreError::Other)?;
                 if in_flight.is_some() {
                     return Err(RuntimeStoreError::Conflict(format!(
                         "'{replaced}' is being changed by another write; retry once it ends"
@@ -1842,7 +1897,7 @@ impl RuntimeStore {
                     }
                 }
                 if let Some(declared) = declared_size {
-                    if self.account_would_exceed(&mut tx, entitlements, &tenant, declared)
+                    if self.account_would_exceed(&tx, entitlements, &tenant, declared)
                         .await
                         .map_err(RuntimeStoreError::Other)?
                     {
@@ -1858,24 +1913,25 @@ impl RuntimeStore {
                         )));
                     }
                 }
-                sqlx::query(
+                tx.execute(
                     "INSERT INTO runtime_file \
                      (key, tenant_id, mime_type, filename, size_bytes, status, keep, expires_at_unix, \
                       keep_ttl_secs, created_at_unix, upload_id, part_size, declared_size, \
                       reserved_bytes, progressed_at_unix, identity, replaces) \
                      VALUES ($1, $2, $3, $4, 0, 'pending', FALSE, NULL, NULL, $5, $6, $7, $8, $9, $5, NULL, $10)",
+                    &[
+                        &key,
+                        &tenant,
+                        &mime,
+                        &filename,
+                        &now,
+                        &upload_id,
+                        &(part_size as i64),
+                        &declared_size.map(|s| s as i64),
+                        &(declared_size.unwrap_or(0) as i64),
+                        &replaced,
+                    ],
                 )
-                .bind(&key)
-                .bind(&tenant)
-                .bind(&mime)
-                .bind(&filename)
-                .bind(now)
-                .bind(&upload_id)
-                .bind(part_size as i64)
-                .bind(declared_size.map(|s| s as i64))
-                .bind(declared_size.unwrap_or(0) as i64)
-                .bind(&replaced)
-                .execute(&mut *tx)
                 .await
                 .context("runtime begin_replace: reserve pending row")
                 .map_err(RuntimeStoreError::Other)?;
@@ -1952,14 +2008,9 @@ impl RuntimeStore {
         };
         let assembled = async {
             // The multipart handle, committed with the pending row by begin.
-            let mut tx = self
-                .pool
-                .begin()
+            let upload_id = Self::pending_row(&self.pool, &key)
                 .await
                 .context("assemble: read pending row")
-                .map_err(RuntimeStoreError::Other)?;
-            let upload_id = Self::pending_row(&mut tx, &key)
-                .await
                 .map_err(RuntimeStoreError::Other)?
                 .and_then(|p| p.upload_id)
                 .ok_or_else(|| {
@@ -1967,7 +2018,6 @@ impl RuntimeStore {
                         "assemble: begin committed no upload handle for '{key}'"
                     ))
                 })?;
-            drop(tx);
 
             // Concatenate sources into exactly part_size-d parts (only the
             // final one may be smaller; `reserve_parts` validates the
@@ -2131,16 +2181,12 @@ impl RuntimeStore {
             }
         }
         let now = self.clock.now_unix();
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("runtime reserve_parts: begin tx")
-            .map_err(RuntimeStoreError::BeforeWrites)?;
+        let mut conn = self.pool.get().await.context("runtime reserve_parts: begin tx").map_err(RuntimeStoreError::BeforeWrites)?;
+        let tx = conn.transaction().await.context("runtime reserve_parts: begin tx").map_err(RuntimeStoreError::BeforeWrites)?;
         // The row is locked before the tenant: a completion claim (which
         // takes no tenant lock) then waits on this short transaction or
         // this one sees its mark, and no bucket call ever sits under it.
-        let pending = Self::pending_row_locked(&mut tx, key)
+        let pending = Self::pending_row_locked(&tx, key)
             .await
             .map_err(RuntimeStoreError::Other)?
             .ok_or_else(|| {
@@ -2149,7 +2195,7 @@ impl RuntimeStore {
                 ))
             })?;
         pending.refuse_if_completing(key)?;
-        lock_tenant_storage(&mut tx, &pending.tenant_id)
+        lock_tenant_storage(&tx, &pending.tenant_id)
             .await
             .map_err(RuntimeStoreError::Other)?;
         let upload_id = pending.upload_id.clone().ok_or_else(|| {
@@ -2181,13 +2227,10 @@ impl RuntimeStore {
         // stream is charged per part as it goes, and charging a part the
         // caller already paid for would inch the tenant's usage up on every
         // retry.
-        let already: Vec<(i32, i64)> = sqlx::query_as(
-            "SELECT part_number, size_bytes FROM runtime_file_part WHERE key = $1 ORDER BY part_number",
-        )
-        .bind(key)
-        .fetch_all(&mut *tx)
-        .await
-        .context("runtime reserve_parts: read the parts already reserved")
+        let already: Vec<(i32, i64)> = tx
+            .all("SELECT part_number, size_bytes FROM runtime_file_part WHERE key = $1 ORDER BY part_number", &[&key])
+            .await
+            .context("runtime reserve_parts: read the parts already reserved")
         .map_err(RuntimeStoreError::Other)?;
         for ask in asks {
             if let Some((_, size)) = already.iter().find(|(number, _)| *number == ask.part_number) {
@@ -2232,7 +2275,7 @@ impl RuntimeStore {
             // Stream: charge these parts now, under the lock. The account check
             // sums THIS plane's charged bytes (already including this upload's
             // reserved_bytes) plus the other plane's, both read on this tx.
-            if self.account_would_exceed(&mut tx, entitlements, &pending.tenant_id, incoming)
+            if self.account_would_exceed(&tx, entitlements, &pending.tenant_id, incoming)
                 .await
                 .map_err(RuntimeStoreError::Other)?
             {
@@ -2240,9 +2283,7 @@ impl RuntimeStore {
                 // row in-tx so the freed charge is serialized; cascade drops the
                 // parts), then abort the bucket's multipart upload. The caller
                 // gets a loud quota error; nothing is left to clean.
-                sqlx::query(delete_upload_row("AND status = 'pending'"))
-                    .bind(key)
-                    .execute(&mut *tx)
+                tx.execute(&delete_upload_row("AND status = 'pending'"), &[&key])
                     .await
                     .context("runtime reserve_parts: delete over-quota upload")
                     .map_err(RuntimeStoreError::Other)?;
@@ -2250,6 +2291,7 @@ impl RuntimeStore {
                     .await
                     .context("runtime reserve_parts: commit over-quota abort")
                     .map_err(RuntimeStoreError::Other)?;
+                drop(conn);
                 if let Err(abort) =
                     self.bucket.abort_multipart(&pending.object_key(key), &upload_id).await
                 {
@@ -2273,13 +2315,11 @@ impl RuntimeStore {
                     pending.tenant_id
                 )));
             }
-            sqlx::query(
+            tx.execute(
                 "UPDATE runtime_file SET reserved_bytes = reserved_bytes + $2 \
                  WHERE key = $1 AND status = 'pending'",
+                &[&key, &(incoming as i64)],
             )
-            .bind(key)
-            .bind(incoming as i64)
-            .execute(&mut *tx)
             .await
             .context("runtime reserve_parts: charge stream parts")
             .map_err(RuntimeStoreError::Other)?;
@@ -2290,15 +2330,12 @@ impl RuntimeStore {
             // size it was reserved with, and this hands back a fresh URL for
             // it. That is what lets two uploaders of identical content, or
             // one uploader retrying, name the same part and agree.
-            sqlx::query(
+            tx.execute(
                 "INSERT INTO runtime_file_part (key, part_number, size_bytes, etag) \
                  VALUES ($1, $2, $3, NULL) \
                  ON CONFLICT (key, part_number) DO NOTHING",
+                &[&key, &ask.part_number, &(ask.size_bytes as i64)],
             )
-            .bind(key)
-            .bind(ask.part_number)
-            .bind(ask.size_bytes as i64)
-            .execute(&mut *tx)
             .await
             .context("runtime reserve_parts: insert part row")
             .map_err(RuntimeStoreError::Other)?;
@@ -2308,14 +2345,12 @@ impl RuntimeStore {
         // row is locked, so a sweep's fence waits for this commit and its
         // WHERE re-check then sees the bumped clock and spares the row; the
         // gate on 'pending' stays as an assertion of that.
-        let alive = sqlx::query("UPDATE runtime_file SET progressed_at_unix = $2 WHERE key = $1 AND status = 'pending'")
-            .bind(key)
-            .bind(now)
-            .execute(&mut *tx)
+        let alive = tx
+            .execute("UPDATE runtime_file SET progressed_at_unix = $2 WHERE key = $1 AND status = 'pending'", &[&key, &now])
             .await
             .context("runtime reserve_parts: bump progress clock")
             .map_err(RuntimeStoreError::Other)?;
-        if alive.rows_affected() == 0 {
+        if alive == 0 {
             return Err(RuntimeStoreError::Invalid(format!(
                 "upload '{key}' was swept mid-flight (idle past the reserve grace); \
                  begin the upload again"
@@ -2325,6 +2360,7 @@ impl RuntimeStore {
             .await
             .context("runtime reserve_parts: commit reservations")
             .map_err(RuntimeStoreError::Other)?;
+        drop(conn);
 
         // Presign AFTER the commit (no bucket I/O under the tenant lock). If a
         // presign fails here the reservations stand: the caller resumes (which
@@ -2377,13 +2413,9 @@ impl RuntimeStore {
         // Under the upload row's lock: a completion claim reads the etags,
         // so a report must land before it or be refused after it, never
         // change an etag the bucket is being handed.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("runtime record_part: begin tx")
-            .map_err(RuntimeStoreError::BeforeWrites)?;
-        let pending = Self::pending_row_locked(&mut tx, key)
+        let mut conn = self.pool.get().await.context("runtime record_part: begin tx").map_err(RuntimeStoreError::BeforeWrites)?;
+        let tx = conn.transaction().await.context("runtime record_part: begin tx").map_err(RuntimeStoreError::BeforeWrites)?;
+        let pending = Self::pending_row_locked(&tx, key)
             .await
             .map_err(RuntimeStoreError::Other)?
             .ok_or_else(|| {
@@ -2393,26 +2425,18 @@ impl RuntimeStore {
                 ))
             })?;
         pending.refuse_if_completing(key)?;
-        let updated = sqlx::query(
-            "UPDATE runtime_file_part SET etag = $3 WHERE key = $1 AND part_number = $2",
-        )
-        .bind(key)
-        .bind(part_number)
-        .bind(etag)
-        .execute(&mut *tx)
-        .await
-        .context("runtime record_part")
-        .map_err(RuntimeStoreError::Other)?;
-        if updated.rows_affected() == 0 {
+        let updated = tx
+            .execute("UPDATE runtime_file_part SET etag = $3 WHERE key = $1 AND part_number = $2", &[&key, &part_number, &etag])
+            .await
+            .context("runtime record_part")
+            .map_err(RuntimeStoreError::Other)?;
+        if updated == 0 {
             return Err(RuntimeStoreError::Invalid(format!(
                 "part {part_number} of '{key}' was never reserved"
             )));
         }
         // A landed part is progress: refresh the abandoned-pending clock.
-        sqlx::query("UPDATE runtime_file SET progressed_at_unix = $2 WHERE key = $1")
-            .bind(key)
-            .bind(self.clock.now_unix())
-            .execute(&mut *tx)
+        tx.execute("UPDATE runtime_file SET progressed_at_unix = $2 WHERE key = $1", &[&key, &self.clock.now_unix()])
             .await
             .context("runtime record_part: bump progress clock")
             .map_err(RuntimeStoreError::Other)?;
@@ -2478,13 +2502,9 @@ impl RuntimeStore {
     /// cannot cross. A row already 'completing' is left as it is; a key
     /// with no in-flight row is answered by the drive (a retry or unknown).
     async fn claim_completion(&self, key: &str) -> StoreResult<()> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("runtime complete_upload: begin claim")
-            .map_err(RuntimeStoreError::BeforeWrites)?;
-        let Some(pending) = Self::pending_row_locked(&mut tx, key)
+        let mut conn = self.pool.get().await.context("runtime complete_upload: begin claim").map_err(RuntimeStoreError::BeforeWrites)?;
+        let tx = conn.transaction().await.context("runtime complete_upload: begin claim").map_err(RuntimeStoreError::BeforeWrites)?;
+        let Some(pending) = Self::pending_row_locked(&tx, key)
             .await
             .map_err(RuntimeStoreError::Other)?
         else {
@@ -2494,21 +2514,16 @@ impl RuntimeStore {
             return Ok(());
         }
         if let Some(replaced) = &pending.replaces {
-            let status: Option<String> =
-                sqlx::query_scalar("SELECT status FROM runtime_file WHERE key = $1 FOR UPDATE")
-                    .bind(replaced)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .context("runtime complete_upload: lock the replaced file")
+            let status: Option<String> = tx
+                .scalar_opt("SELECT status FROM runtime_file WHERE key = $1 FOR UPDATE", &[replaced])
+                .await
+                .context("runtime complete_upload: lock the replaced file")
                     .map_err(RuntimeStoreError::Other)?;
             if status.as_deref() != Some("active") {
                 // The file was deleted or expired while the new bytes were
                 // on their way: the replacement has nothing left to land
                 // on, so it is ended here like an abort.
-                sqlx::query(fence_sql(""))
-                    .bind(key)
-                    .bind(self.clock.now_unix())
-                    .execute(&mut *tx)
+                tx.execute(&fence_sql(""), &[&key, &self.clock.now_unix()])
                     .await
                     .context("runtime complete_upload: fence an orphaned replacement")
                     .map_err(RuntimeStoreError::Other)?;
@@ -2516,6 +2531,7 @@ impl RuntimeStore {
                     .await
                     .context("runtime complete_upload: commit orphaned replacement fence")
                     .map_err(RuntimeStoreError::Other)?;
+                drop(conn);
                 self.reap_fenced(&pending.sweep_entry(key)).await.map_err(RuntimeStoreError::Other)?;
                 return Err(RuntimeStoreError::NotFound(format!(
                     "'{replaced}' was removed while its replacement '{key}' was uploading; the \
@@ -2523,7 +2539,7 @@ impl RuntimeStore {
                 )));
             }
         }
-        let parts = Self::completion_parts(&mut *tx, key).await?;
+        let parts = Self::completion_parts(&tx, key).await?;
         if parts.is_empty() {
             // A declared NON-zero size with no parts is an incomplete upload,
             // not an empty file.
@@ -2552,13 +2568,11 @@ impl RuntimeStore {
                 }
             }
         }
-        sqlx::query(
+        tx.execute(
             "UPDATE runtime_file SET status = 'completing', progressed_at_unix = $2 \
              WHERE key = $1 AND status = 'pending'",
+            &[&key, &self.clock.now_unix()],
         )
-        .bind(key)
-        .bind(self.clock.now_unix())
-        .execute(&mut *tx)
         .await
         .context("runtime complete_upload: mark completing")
         .map_err(RuntimeStoreError::Other)?;
@@ -2570,16 +2584,12 @@ impl RuntimeStore {
     }
 
     /// An upload's part rows, ascending: (number, etag once landed, size).
-    async fn completion_parts<'e>(
-        executor: impl sqlx::PgExecutor<'e>,
-        key: &str,
-    ) -> StoreResult<Vec<(i32, Option<String>, i64)>> {
-        sqlx::query_as(
+    async fn completion_parts(db: &impl Client, key: &str) -> StoreResult<Vec<(i32, Option<String>, i64)>> {
+        db.all(
             "SELECT part_number, etag, size_bytes FROM runtime_file_part \
              WHERE key = $1 ORDER BY part_number",
+            &[&key],
         )
-        .bind(key)
-        .fetch_all(executor)
         .await
         .context("runtime complete_upload: read parts")
         .map_err(RuntimeStoreError::Other)
@@ -2605,13 +2615,11 @@ impl RuntimeStore {
     /// with the claim that made it ([`Self::claim_uploads`]): a live drive
     /// leaves it, and past its lease that claim died, so the copy goes.
     async fn drive_completion(&self, key: &str, recovering: bool) -> StoreResult<StoredFileMeta> {
-        let row = sqlx::query_as::<_, PendingUpload>(sql!(
-            "{PENDING_ROW_SELECT_ANY} AND status = 'completing'"
-        ))
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await
-        .context("runtime complete_upload: read the completing row")
+        let row: Option<PendingUpload> = self
+            .pool
+            .opt(&format!("{PENDING_ROW_SELECT_ANY} AND status = 'completing'"), &[&key])
+            .await
+            .context("runtime complete_upload: read the completing row")
         .map_err(RuntimeStoreError::Other)?;
         let Some(pending) = row else {
             return Self::completed_meta(&self.pool, key).await?.ok_or_else(|| {
@@ -2834,13 +2842,11 @@ impl RuntimeStore {
                 let overwritten = match &pending.replaces {
                     None => true,
                     Some(replaced) => {
-                        let recorded: Option<i64> = sqlx::query_scalar(
-                            "SELECT size_bytes FROM runtime_file WHERE key = $1",
-                        )
-                        .bind(replaced)
-                        .fetch_optional(&self.pool)
-                        .await
-                        .context("runtime complete_upload: read the replaced file's size")
+                        let recorded: Option<i64> = self
+                            .pool
+                            .scalar_opt("SELECT size_bytes FROM runtime_file WHERE key = $1", &[replaced])
+                            .await
+                            .context("runtime complete_upload: read the replaced file's size")
                         .map_err(RuntimeStoreError::Other)?;
                         recorded.map(|r| r as u64) != other
                     }
@@ -2890,31 +2896,30 @@ impl RuntimeStore {
     /// longer 'completing' was landed or ended by another call meanwhile,
     /// and is left to it.
     async fn end_completion(&self, key: &str, pending: &PendingUpload, overwritten: bool) -> StoreResult<()> {
-        let mut tx = self
+        let mut conn = self
             .pool
-            .begin()
+            .get()
+            .await
+            .context("runtime complete_upload: begin the end of a completion")
+            .map_err(RuntimeStoreError::Other)?;
+        let tx = conn
+            .transaction()
             .await
             .context("runtime complete_upload: begin the end of a completion")
             .map_err(RuntimeStoreError::Other)?;
         let now = self.clock.now_unix();
-        let fenced = sqlx::query(fence_sql("AND status = 'completing'"))
-            .bind(key)
-            .bind(now)
-            .execute(&mut *tx)
+        let fenced = tx
+            .execute(&fence_sql("AND status = 'completing'"), &[&key, &now])
             .await
             .context("runtime complete_upload: fence an ended completion")
             .map_err(RuntimeStoreError::Other)?
-            .rows_affected()
             == 1;
         if !fenced {
             return Ok(());
         }
         let mut doomed = vec![pending.sweep_entry(key)];
         if let (true, Some(replaced)) = (overwritten, &pending.replaces) {
-            sqlx::query(fence_sql(""))
-                .bind(replaced)
-                .bind(now)
-                .execute(&mut *tx)
+            tx.execute(&fence_sql(""), &[replaced, &now])
                 .await
                 .context("runtime complete_upload: fence the file an ended completion overwrote")
                 .map_err(RuntimeStoreError::Other)?;
@@ -2924,6 +2929,7 @@ impl RuntimeStore {
             .await
             .context("runtime complete_upload: commit the end of a completion")
             .map_err(RuntimeStoreError::Other)?;
+        drop(conn);
         // The upload's own row first (it ends the multipart), then the
         // replaced file's (it deletes the object both share).
         for entry in &doomed {
@@ -2959,15 +2965,11 @@ impl RuntimeStore {
         actual: u64,
         mime: &str,
     ) -> StoreResult<StoredFileMeta> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("runtime complete_upload: begin fold")
-            .map_err(RuntimeStoreError::Other)?;
-        let row = Self::pending_row_locked(&mut tx, key).await.map_err(RuntimeStoreError::Other)?;
+        let mut conn = self.pool.get().await.context("runtime complete_upload: begin fold").map_err(RuntimeStoreError::Other)?;
+        let tx = conn.transaction().await.context("runtime complete_upload: begin fold").map_err(RuntimeStoreError::Other)?;
+        let row = Self::pending_row_locked(&tx, key).await.map_err(RuntimeStoreError::Other)?;
         if row.is_none_or(|r| r.status != "completing") {
-            let done = Self::completed_meta(&mut *tx, key).await?;
+            let done = Self::completed_meta(&tx, key).await?;
             return done.ok_or_else(|| {
                 RuntimeStoreError::Other(anyhow::anyhow!(
                     "the bucket completed '{key}' but its row is gone and no file records it; \
@@ -2977,15 +2979,14 @@ impl RuntimeStore {
             });
         }
         if let Some(replaced) = &pending.replaces {
-            sqlx::query("SELECT 1 FROM runtime_file WHERE key = $1 FOR UPDATE")
-                .bind(replaced)
-                .execute(&mut *tx)
+            tx.execute("SELECT 1 FROM runtime_file WHERE key = $1 FOR UPDATE", &[replaced])
                 .await
                 .context("runtime complete_upload: lock the replaced file")
                 .map_err(RuntimeStoreError::Other)?;
         }
         if actual != total {
             drop(tx);
+            drop(conn);
             return self
                 .lose_completion(
                     key,
@@ -3001,13 +3002,14 @@ impl RuntimeStore {
         // look while its replacement completes, so no look may be booked
         // for it.
         let meta = match &pending.replaces {
-            Some(replaced) => Self::fold_replacement(&mut tx, key, replaced, actual, now).await?,
-            None => Self::flip_active(&mut tx, key, pending, actual, mime, now).await?,
+            Some(replaced) => Self::fold_replacement(&tx, key, replaced, actual, now).await?,
+            None => Self::flip_active(&tx, key, pending, actual, mime, now).await?,
         };
         tx.commit()
             .await
             .context("runtime complete_upload: commit fold")
             .map_err(RuntimeStoreError::Other)?;
+        drop(conn);
         self.ring_for(meta.expires_at_unix).await;
         Ok(meta)
     }
@@ -3020,40 +3022,37 @@ impl RuntimeStore {
     /// own row goes, its charge and part rows with it. The replaced file is
     /// active: nothing removes a file whose replacement is completing.
     async fn fold_replacement(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &Transaction<'_>,
         key: &str,
         replaced: &str,
         actual: u64,
         now: i64,
     ) -> StoreResult<StoredFileMeta> {
-        sqlx::query("DELETE FROM runtime_file WHERE key = $1 AND status = 'completing'")
-            .bind(key)
-            .execute(&mut **tx)
+        tx.execute("DELETE FROM runtime_file WHERE key = $1 AND status = 'completing'", &[&key])
             .await
             .context("runtime replace: drop the replacement's row")
             .map_err(RuntimeStoreError::Other)?;
-        let folded: FileRow = sqlx::query_as::<_, FileRow>(sql!(
-            "UPDATE runtime_file SET size_bytes = $2, reserved_bytes = $2, version = version + 1, \
-                 last_replacement = $4, \
-                 expires_at_unix = CASE WHEN keep_ttl_secs IS NULL THEN expires_at_unix ELSE {} END \
-             WHERE key = $1 AND status = 'active' \
-             RETURNING {FILE_ROW_COLUMNS}",
-            expiry_honoring_links("$3 + keep_ttl_secs")
-        ))
-        .bind(replaced)
-        .bind(actual as i64)
-        .bind(now)
-        .bind(key)
-        .fetch_optional(&mut **tx)
-        .await
-        .context("runtime replace: fold the new size into the replaced file")
-        .map_err(RuntimeStoreError::Other)?
-        .ok_or_else(|| {
-            RuntimeStoreError::Other(anyhow::anyhow!(
-                "'{replaced}' is no longer active although its replacement '{key}' was \
-                 completing, which every removal refuses; its object now holds the new bytes"
-            ))
-        })?;
+        let folded: FileRow = tx
+            .opt(
+                &format!(
+                    "UPDATE runtime_file SET size_bytes = $2, reserved_bytes = $2, version = version + 1, \
+                         last_replacement = $4, \
+                         expires_at_unix = CASE WHEN keep_ttl_secs IS NULL THEN expires_at_unix ELSE {} END \
+                     WHERE key = $1 AND status = 'active' \
+                     RETURNING {FILE_ROW_COLUMNS}",
+                    expiry_honoring_links("$3 + keep_ttl_secs")
+                ),
+                &[&replaced, &(actual as i64), &now, &key],
+            )
+            .await
+            .context("runtime replace: fold the new size into the replaced file")
+            .map_err(RuntimeStoreError::Other)?
+            .ok_or_else(|| {
+                RuntimeStoreError::Other(anyhow::anyhow!(
+                    "'{replaced}' is no longer active although its replacement '{key}' was \
+                     completing, which every removal refuses; its object now holds the new bytes"
+                ))
+            })?;
         Ok(folded.to_meta())
     }
 
@@ -3068,7 +3067,7 @@ impl RuntimeStore {
     /// final size so the tenant's charged sum is identical before and after
     /// the flip.
     async fn flip_active(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &Transaction<'_>,
         key: &str,
         pending: &PendingUpload,
         actual: u64,
@@ -3076,25 +3075,22 @@ impl RuntimeStore {
         now: i64,
     ) -> StoreResult<StoredFileMeta> {
         let expires_at = pending.keep_ttl_secs.map(|s| now + s);
-        let flipped: FileRow = sqlx::query_as(sql!(
-            "UPDATE runtime_file SET \
-               size_bytes = $2, status = CASE WHEN upload_slot IS NULL THEN 'active' ELSE 'uploaded' END, \
-               expires_at_unix = COALESCE(expires_at_unix, $3), mime_type = $4, \
-               upload_id = NULL, part_size = NULL, declared_size = NULL, reserved_bytes = $2 \
-             WHERE key = $1 AND status = 'completing' \
-             RETURNING {FILE_ROW_COLUMNS}"
-        ))
-        .bind(key)
-        .bind(actual as i64)
-        .bind(expires_at)
-        .bind(mime)
-        .fetch_one(&mut **tx)
-        .await
+        let flipped: FileRow = tx
+            .one(
+                &format!(
+                    "UPDATE runtime_file SET \
+                       size_bytes = $2, status = CASE WHEN upload_slot IS NULL THEN 'active' ELSE 'uploaded' END, \
+                       expires_at_unix = COALESCE(expires_at_unix, $3), mime_type = $4, \
+                       upload_id = NULL, part_size = NULL, declared_size = NULL, reserved_bytes = $2 \
+                     WHERE key = $1 AND status = 'completing' \
+                     RETURNING {FILE_ROW_COLUMNS}"
+                ),
+                &[&key, &(actual as i64), &expires_at, &mime],
+            )
+            .await
         .context("runtime complete_upload: flip active (the row is locked by this transaction)")
         .map_err(RuntimeStoreError::Other)?;
-        sqlx::query("DELETE FROM runtime_file_part WHERE key = $1")
-            .bind(key)
-            .execute(&mut **tx)
+        tx.execute("DELETE FROM runtime_file_part WHERE key = $1", &[&key])
             .await
             .context("runtime complete_upload: drop part rows")
             .map_err(RuntimeStoreError::Other)?;
@@ -3112,14 +3108,15 @@ impl RuntimeStore {
         key: &str,
         pending: &PendingUpload,
     ) -> anyhow::Result<(std::collections::BTreeMap<i32, u64>, std::collections::BTreeMap<i32, u64>, Vec<(i32, i64)>)> {
-        let rows: Vec<(i32, i64, bool)> = sqlx::query_as(
-            "SELECT part_number, size_bytes, etag IS NULL FROM runtime_file_part \
-             WHERE key = $1 ORDER BY part_number",
-        )
-        .bind(key)
-        .fetch_all(&self.pool)
-        .await
-        .context("runtime part_offsets: read part sizes")?;
+        let rows: Vec<(i32, i64, bool)> = self
+            .pool
+            .all(
+                "SELECT part_number, size_bytes, etag IS NULL FROM runtime_file_part \
+                 WHERE key = $1 ORDER BY part_number",
+                &[&key],
+            )
+            .await
+            .context("runtime part_offsets: read part sizes")?;
         let mut at = 0u64;
         let mut offsets = std::collections::BTreeMap::new();
         let mut sizes = std::collections::BTreeMap::new();
@@ -3148,19 +3145,11 @@ impl RuntimeStore {
         audience: &PresignAudience,
     ) -> StoreResult<(u64, Vec<PresignedPart>, u64)> {
         Self::wall_key(caller, key)?;
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("runtime resume_upload: begin read tx")
-            .map_err(RuntimeStoreError::BeforeWrites)?;
-        let pending = Self::pending_row(&mut tx, key)
+        let conn = self.pool.get().await.context("runtime resume_upload: begin read").map_err(RuntimeStoreError::BeforeWrites)?;
+        let pending = Self::pending_row(&conn, key)
             .await
             .map_err(RuntimeStoreError::Other)?;
-        tx.commit()
-            .await
-            .context("runtime resume_upload: commit read")
-            .map_err(RuntimeStoreError::Other)?;
+        drop(conn);
         if let Some(pending) = &pending {
             pending.refuse_if_completing(key)?;
         }
@@ -3183,14 +3172,13 @@ impl RuntimeStore {
         let part_size = pending.part_size(key).map_err(RuntimeStoreError::Other)?;
         // Signing part links is progress: a PUT may start until they die, so
         // the abandoned-pending clock starts from now ([`abandoned_at`]).
-        let alive = sqlx::query("UPDATE runtime_file SET progressed_at_unix = $2 WHERE key = $1 AND status = 'pending'")
-            .bind(key)
-            .bind(self.clock.now_unix())
-            .execute(&self.pool)
+        let alive = self
+            .pool
+            .execute("UPDATE runtime_file SET progressed_at_unix = $2 WHERE key = $1 AND status = 'pending'", &[&key, &self.clock.now_unix()])
             .await
             .context("runtime resume_upload: bump progress clock")
             .map_err(RuntimeStoreError::BeforeWrites)?;
-        if alive.rows_affected() == 0 {
+        if alive == 0 {
             return Err(RuntimeStoreError::Invalid(format!(
                 "upload '{key}' is no longer pending (a completion claimed it, or it was swept); call complete, \
                  or begin the upload again"
@@ -3265,17 +3253,14 @@ impl RuntimeStore {
     /// bucket that refuses leaves it marked ([`MARKED`]).
     pub async fn abort_upload(&self, caller: &CallerAuth, key: &str) -> StoreResult<()> {
         Self::wall_key(caller, key)?;
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("runtime abort_upload: begin tx")
-            .map_err(RuntimeStoreError::BeforeWrites)?;
-        let pending = Self::pending_row_locked(&mut tx, key)
+        let mut conn = self.pool.get().await.context("runtime abort_upload: begin tx").map_err(RuntimeStoreError::BeforeWrites)?;
+        let tx = conn.transaction().await.context("runtime abort_upload: begin tx").map_err(RuntimeStoreError::BeforeWrites)?;
+        let pending = Self::pending_row_locked(&tx, key)
             .await
             .map_err(RuntimeStoreError::Other)?;
         let Some(pending) = pending else {
             drop(tx);
+            drop(conn);
             return match self.row(key).await.map_err(RuntimeStoreError::Other)? {
                 Some(_) => Err(RuntimeStoreError::Invalid(format!(
                     "'{key}' already completed; delete the file instead of aborting"
@@ -3284,10 +3269,7 @@ impl RuntimeStore {
             };
         };
         pending.refuse_if_completing(key)?;
-        sqlx::query(fence_sql(""))
-            .bind(key)
-            .bind(self.clock.now_unix())
-            .execute(&mut *tx)
+        tx.execute(&fence_sql(""), &[&key, &self.clock.now_unix()])
             .await
             .context("runtime abort_upload: fence the row")
             .map_err(RuntimeStoreError::Other)?;
@@ -3295,6 +3277,7 @@ impl RuntimeStore {
             .await
             .context("runtime abort_upload: commit fence")
             .map_err(RuntimeStoreError::Other)?;
+        drop(conn);
         self.reap_fenced(&pending.sweep_entry(key))
             .await
             .context("runtime abort_upload (the row stays marked in `weft status`; a wipe or the tenant running short of space \
@@ -3339,10 +3322,12 @@ impl RuntimeStore {
             }
             let size = self.copy_into(from, key, pending.declared_size.unwrap_or(0) as u64, &[key]).await?;
             let mime = self.landed_mime(key, &pending, size).await?;
-            let mut tx = self.pool.begin().await.context("runtime copy: begin land").map_err(RuntimeStoreError::Other)?;
-            let row = Self::pending_row_locked(&mut tx, key).await.map_err(RuntimeStoreError::Other)?;
+            let mut conn = self.pool.get().await.context("runtime copy: begin land").map_err(RuntimeStoreError::Other)?;
+            let tx = conn.transaction().await.context("runtime copy: begin land").map_err(RuntimeStoreError::Other)?;
+            let row = Self::pending_row_locked(&tx, key).await.map_err(RuntimeStoreError::Other)?;
             if row.is_none_or(|r| r.status != "completing") {
                 drop(tx);
+                drop(conn);
                 // A drive landed the copy first, and its file is the answer.
                 // Otherwise the row went while the bucket copied, which the
                 // end of the failed copy cleans up after.
@@ -3350,8 +3335,9 @@ impl RuntimeStore {
                     RuntimeStoreError::Other(anyhow::anyhow!("the upload '{key}' a copy fills was ended while it copied"))
                 });
             }
-            let meta = Self::flip_active(&mut tx, key, &pending, size, &mime, self.clock.now_unix()).await?;
+            let meta = Self::flip_active(&tx, key, &pending, size, &mime, self.clock.now_unix()).await?;
             tx.commit().await.context("runtime copy: commit land").map_err(RuntimeStoreError::Other)?;
+            drop(conn);
             self.ring_for(meta.expires_at_unix).await;
             Ok(meta)
         }
@@ -3400,13 +3386,11 @@ impl RuntimeStore {
     /// object the copy made is one no row points at
     /// ([`Self::drop_unrecorded_copy`]).
     async fn end_failed_copy(&self, entry: &SweepEntry) -> Result<()> {
-        let fenced = sqlx::query(fence_sql("AND status = 'completing'"))
-            .bind(&entry.key)
-            .bind(self.clock.now_unix())
-            .execute(&self.pool)
+        let fenced = self
+            .pool
+            .execute(&fence_sql("AND status = 'completing'"), &[&entry.key, &self.clock.now_unix()])
             .await
             .context("runtime copy: fence the failed copy")?
-            .rows_affected()
             == 1;
         match fenced {
             true => self.reap_fenced(entry).await,
@@ -3421,20 +3405,18 @@ impl RuntimeStore {
     /// the copy, the hash is on it. Answers the row as it was, its handle
     /// the multipart the copy aborts.
     async fn claim_for_copy(&self, key: &str, from: &str) -> StoreResult<PendingUpload> {
-        let mut tx = self.pool.begin().await.context("runtime copy: begin claim").map_err(RuntimeStoreError::Other)?;
-        let pending = Self::pending_row_locked(&mut tx, key)
+        let mut conn = self.pool.get().await.context("runtime copy: begin claim").map_err(RuntimeStoreError::Other)?;
+        let tx = conn.transaction().await.context("runtime copy: begin claim").map_err(RuntimeStoreError::Other)?;
+        let pending = Self::pending_row_locked(&tx, key)
             .await
             .map_err(RuntimeStoreError::Other)?
             .filter(|row| row.status == "pending")
             .ok_or_else(|| RuntimeStoreError::Other(anyhow::anyhow!("the upload '{key}' a copy fills is gone")))?;
-        sqlx::query(
+        tx.execute(
             "UPDATE runtime_file SET status = 'completing', progressed_at_unix = $2, upload_id = NULL, \
              content_sha256 = (SELECT content_sha256 FROM runtime_file WHERE key = $3) WHERE key = $1",
+            &[&key, &self.clock.now_unix(), &from],
         )
-        .bind(key)
-        .bind(self.clock.now_unix())
-        .bind(from)
-        .execute(&mut *tx)
         .await
         .context("runtime copy: claim the upload")
         .map_err(RuntimeStoreError::Other)?;
@@ -3514,19 +3496,19 @@ impl RuntimeStore {
             _ => return Err(RuntimeStoreError::Denied("a slot's upload is made for its project".into())),
         };
         let same: Option<String> = match sha256 {
-            Some(hash) => sqlx::query_scalar(sql!(
-                "SELECT key FROM runtime_file WHERE tenant_id = $1 AND content_sha256 = $2 AND size_bytes = $3 \
-                   AND status = 'active' AND {live} LIMIT 1",
-                live = unexpired("$4"),
-            ))
-            .bind(&tenant)
-            .bind(hash)
-            .bind(spec.declared_size.unwrap_or(0) as i64)
-            .bind(self.clock.now_unix())
-            .fetch_optional(&self.pool)
-            .await
-            .context("runtime begin_slot_upload: look for the same content")
-            .map_err(RuntimeStoreError::BeforeWrites)?,
+            Some(hash) => self
+                .pool
+                .scalar_opt(
+                    &format!(
+                        "SELECT key FROM runtime_file WHERE tenant_id = $1 AND content_sha256 = $2 AND size_bytes = $3 \
+                           AND status = 'active' AND {live} LIMIT 1",
+                        live = unexpired("$4"),
+                    ),
+                    &[&tenant, &hash, &(spec.declared_size.unwrap_or(0) as i64), &self.clock.now_unix()],
+                )
+                .await
+                .context("runtime begin_slot_upload: look for the same content")
+                .map_err(RuntimeStoreError::BeforeWrites)?,
             None => None,
         };
         let begun = self.begin_upload(caller, spec, entitlements).await?;
@@ -3539,10 +3521,8 @@ impl RuntimeStore {
     /// page sends through its slot is held to, so a slot reaches its own
     /// upload and nothing else of its project.
     pub async fn is_slot_upload(&self, key: &str, sid: &str) -> StoreResult<bool> {
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM runtime_file WHERE key = $1 AND upload_slot = $2)")
-            .bind(key)
-            .bind(sid)
-            .fetch_one(&self.pool)
+        self.pool
+            .scalar("SELECT EXISTS (SELECT 1 FROM runtime_file WHERE key = $1 AND upload_slot = $2)", &[&key, &sid])
             .await
             .context("runtime slot upload check")
             .map_err(RuntimeStoreError::BeforeWrites)
@@ -3552,19 +3532,16 @@ impl RuntimeStore {
     /// sha256 ([`Self::object_sha256`]): what a later page sending the
     /// same content is matched against ([`Self::begin_slot_upload`]).
     pub async fn hash_upload(&self, key: &str) -> Result<()> {
-        let size: Option<i64> = sqlx::query_scalar("SELECT size_bytes FROM runtime_file WHERE key = $1 AND status = 'uploaded'")
-            .bind(key)
-            .fetch_optional(&self.pool)
+        let size: Option<i64> = self
+            .pool
+            .scalar_opt("SELECT size_bytes FROM runtime_file WHERE key = $1 AND status = 'uploaded'", &[&key])
             .await
             .context("hash_upload: read the upload")?;
         let Some(size) = size else { return Ok(()) };
         let size = size as u64;
         let hash = self.object_sha256(key, &object_key(key), size).await.context("hash_upload")?;
-        sqlx::query("UPDATE runtime_file SET content_sha256 = $2 WHERE key = $1 AND size_bytes = $3")
-            .bind(key)
-            .bind(hash)
-            .bind(size as i64)
-            .execute(&self.pool)
+        self.pool
+            .execute("UPDATE runtime_file SET content_sha256 = $2 WHERE key = $1 AND size_bytes = $3", &[&key, &hash, &(size as i64)])
             .await
             .context("hash_upload: record the hash")?;
         Ok(())
@@ -3750,18 +3727,17 @@ impl RuntimeStore {
     ) -> StoreResult<Option<(Vec<StoredFileMeta>, Vec<String>)>> {
         // Ahead of the commit, a failure leaves nothing of this transaction
         // ([`Self::claim_uploads`] ends the copies made before it).
-        let mut tx = self.pool.begin().await.context("runtime claim: begin").map_err(RuntimeStoreError::BeforeWrites)?;
+        let mut conn = self.pool.get().await.context("runtime claim: begin").map_err(RuntimeStoreError::BeforeWrites)?;
+        let tx = conn.transaction().await.context("runtime claim: begin").map_err(RuntimeStoreError::BeforeWrites)?;
         // Every row the call changes locked up front, in one order, so two
         // calls naming the same slots never wait on each other in a circle.
         let sids: Vec<&str> = slots.iter().map(|slot| slot.claims.sid.as_str()).collect();
         let targets: Vec<&str> = copies.iter().map(|copy| copy.target.as_str()).collect();
-        sqlx::query(
+        tx.execute(
             "SELECT 1 FROM runtime_file WHERE (upload_slot = ANY($1) AND status <> 'reaping') OR key = ANY($2) \
              ORDER BY key FOR UPDATE",
+            &[&sids, &targets],
         )
-        .bind(&sids)
-        .bind(&targets)
-        .execute(&mut *tx)
         .await
         .context("runtime claim: lock the slots' uploads and the run's copies")
         .map_err(RuntimeStoreError::BeforeWrites)?;
@@ -3769,7 +3745,7 @@ impl RuntimeStore {
         let mut moved = Vec::new();
         for (slot, accepts) in slots.iter().zip(accepted) {
             let received =
-                self.receive_slot(&mut tx, run, slot, accepts, copies, &mut moved).await.map_err(|e| of_slot(slot.slot, e))?;
+                self.receive_slot(&tx, run, slot, accepts, copies, &mut moved).await.map_err(|e| of_slot(slot.slot, e))?;
             // Dropped, the transaction rolls back.
             let Some(file) = received else { return Ok(None) };
             files.push(file);
@@ -3787,32 +3763,32 @@ impl RuntimeStore {
     /// expiry loop is rung for the claim's lapse, the time it ends the copy
     /// if this call dies before it does ([`Self::expire`]).
     async fn begin_run_copy(&self, caller: &CallerAuth, run: &str, sid: &str) -> StoreResult<Option<(RunCopy, u64)>> {
-        let waiting: Option<String> =
-            sqlx::query_scalar("SELECT key FROM runtime_file WHERE upload_slot = $1 AND status = 'uploaded'")
-                .bind(sid)
-                .fetch_optional(&self.pool)
-                .await
-                .context("runtime claim: look for the slot's upload")
-                .map_err(RuntimeStoreError::BeforeWrites)?;
+        let waiting: Option<String> = self
+            .pool
+            .scalar_opt("SELECT key FROM runtime_file WHERE upload_slot = $1 AND status = 'uploaded'", &[&sid])
+            .await
+            .context("runtime claim: look for the slot's upload")
+            .map_err(RuntimeStoreError::BeforeWrites)?;
         let Some(upload) = waiting else { return Ok(None) };
         let target = weft_core::storage::key::key_for_put(caller, &StorageScope::Run, &uuid::Uuid::new_v4().to_string())
             .map_err(RuntimeStoreError::Denied)?
             .to_key();
         let now = self.clock.now_unix();
-        let size: Option<i64> = sqlx::query_scalar(
-            "INSERT INTO runtime_file \
-             (key, tenant_id, mime_type, filename, size_bytes, status, created_at_unix, declared_size, reserved_bytes, \
-              progressed_at_unix, slot_received_by, receives, content_sha256) \
-             SELECT $2, tenant_id, mime_type, filename, 0, 'completing', $3, size_bytes, size_bytes, $3, $4, key, content_sha256 \
-             FROM runtime_file WHERE key = $1 AND status = 'uploaded' \
-             RETURNING declared_size",
-        )
-        .bind(&upload)
-        .bind(&target)
-        .bind(now)
-        .bind(run)
-        .fetch_optional(&self.pool)
-        .await
+        // The parameters an INSERT ... SELECT lists take no type from the
+        // columns they fill, so they say theirs.
+        let size: Option<i64> = self
+            .pool
+            .scalar_opt(
+                "INSERT INTO runtime_file \
+                 (key, tenant_id, mime_type, filename, size_bytes, status, created_at_unix, declared_size, reserved_bytes, \
+                  progressed_at_unix, slot_received_by, receives, content_sha256) \
+                 SELECT $2::TEXT, tenant_id, mime_type, filename, 0, 'completing', $3::BIGINT, size_bytes, size_bytes, $3::BIGINT, \
+                        $4::TEXT, key, content_sha256 \
+                 FROM runtime_file WHERE key = $1 AND status = 'uploaded' \
+                 RETURNING declared_size",
+                &[&upload, &target, &now, &run],
+            )
+            .await
         .context("runtime claim: write the run's copy")
         .map_err(RuntimeStoreError::Other)?;
         let Some(size) = size else { return Ok(None) };
@@ -3826,7 +3802,7 @@ impl RuntimeStore {
     /// `moved`; with no copy of it there, the answer is `None`.
     async fn receive_slot(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: &Transaction<'_>,
         run: &str,
         slot: &ClaimedSlot<'_>,
         accepts: &weft_core::weft_type::WeftType,
@@ -3834,12 +3810,12 @@ impl RuntimeStore {
         moved: &mut Vec<String>,
     ) -> StoreResult<Option<StoredFileMeta>> {
         let ClaimedSlot { claims, fits, .. } = *slot;
-        let found: Option<(String, String, Option<String>, String)> = sqlx::query_as(
-            "SELECT key, status, slot_received_by, mime_type FROM runtime_file WHERE upload_slot = $1 AND status <> 'reaping'",
-        )
-        .bind(&claims.sid)
-        .fetch_optional(&mut **tx)
-        .await
+        let found: Option<(String, String, Option<String>, String)> = tx
+            .opt(
+                "SELECT key, status, slot_received_by, mime_type FROM runtime_file WHERE upload_slot = $1 AND status <> 'reaping'",
+                &[&claims.sid],
+            )
+            .await
         .context("runtime claim: read the slot's upload")
         .map_err(RuntimeStoreError::Other)?;
         let Some((key, status, received_by, mime)) = found else { return Err(nothing_uploaded()) };
@@ -3855,7 +3831,7 @@ impl RuntimeStore {
             // A file this run already received is one type: it is handed
             // out again only where it fits as that type.
             "active" => {
-                let meta = Self::completed_meta(&mut **tx, &key).await?.ok_or_else(nothing_uploaded)?;
+                let meta = Self::completed_meta(tx, &key).await?.ok_or_else(nothing_uploaded)?;
                 return weft_core::storage::fits_as_handed_over(&meta.mime_type, fits).map(|()| Some(meta)).map_err(|why| {
                     RuntimeStoreError::Invalid(format!(
                         "the file uploaded for {accepts} this run received does not fit the {fits} it is sent to: {why}"
@@ -3871,17 +3847,15 @@ impl RuntimeStore {
         let now = self.clock.now_unix();
         let ttl = claims.keep.and_then(KeepTtl::secs).map(|s| s as i64);
         if !matches!(claims.scope, StorageScope::Run) {
-            let row: FileRow = sqlx::query_as(sql!(
-                "UPDATE runtime_file SET status = 'active', slot_received_by = $2, mime_type = $5, keep_ttl_secs = $3, \
-                 expires_at_unix = $4 WHERE key = $1 RETURNING {FILE_ROW_COLUMNS}"
-            ))
-            .bind(&key)
-            .bind(run)
-            .bind(ttl)
-            .bind(ttl.map(|t| now + t))
-            .bind(&mime)
-            .fetch_one(&mut **tx)
-            .await
+            let row: FileRow = tx
+                .one(
+                    &format!(
+                        "UPDATE runtime_file SET status = 'active', slot_received_by = $2, mime_type = $5, keep_ttl_secs = $3, \
+                         expires_at_unix = $4 WHERE key = $1 RETURNING {FILE_ROW_COLUMNS}"
+                    ),
+                    &[&key, &run, &ttl, &ttl.map(|t| now + t), &mime],
+                )
+                .await
             .context("runtime claim: receive the upload")
             .map_err(RuntimeStoreError::Other)?;
             return Ok(Some(row.to_meta()));
@@ -3894,28 +3868,20 @@ impl RuntimeStore {
         if let Some(failed) = &copy.failed {
             return Err(RuntimeStoreError::Other(anyhow::anyhow!("runtime claim: copy the upload into the run: {failed}")));
         }
-        sqlx::query(fence_sql(""))
-            .bind(&key)
-            .bind(now)
-            .execute(&mut **tx)
+        tx.execute(&fence_sql(""), &[&key, &now])
             .await
             .context("runtime claim: fence the upload")
             .map_err(RuntimeStoreError::Other)?;
-        let row: Option<FileRow> = sqlx::query_as(sql!(
-            "UPDATE runtime_file SET status = 'active', size_bytes = declared_size, declared_size = NULL, receives = NULL, \
-               upload_slot = $3, mime_type = $4, keep = $5, expires_at_unix = $6, keep_ttl_secs = $7, created_at_unix = $8 \
-             WHERE key = $1 AND status = 'completing' AND receives = $2 RETURNING {FILE_ROW_COLUMNS}"
-        ))
-        .bind(&copy.target)
-        .bind(&key)
-        .bind(&claims.sid)
-        .bind(&mime)
-        .bind(claims.keep.is_some())
-        .bind(ttl.map(|t| now + t))
-        .bind(ttl)
-        .bind(now)
-        .fetch_optional(&mut **tx)
-        .await
+        let row: Option<FileRow> = tx
+            .opt(
+                &format!(
+                    "UPDATE runtime_file SET status = 'active', size_bytes = declared_size, declared_size = NULL, receives = NULL, \
+                       upload_slot = $3, mime_type = $4, keep = $5, expires_at_unix = $6, keep_ttl_secs = $7, created_at_unix = $8 \
+                     WHERE key = $1 AND status = 'completing' AND receives = $2 RETURNING {FILE_ROW_COLUMNS}"
+                ),
+                &[&copy.target, &key, &claims.sid, &mime, &claims.keep.is_some(), &ttl.map(|t| now + t), &ttl, &now],
+            )
+            .await
         .context("runtime claim: receive the run's copy")
         .map_err(RuntimeStoreError::Other)?;
         let row = row.ok_or_else(|| {
@@ -3933,12 +3899,11 @@ impl RuntimeStore {
     /// loop books no look for an upload while a copy of it is made, so
     /// one whose slot ended meanwhile waits for this ring.
     async fn ring_for_received(&self, upload: &str) -> Result<()> {
-        let at: Option<Option<i64>> =
-            sqlx::query_scalar("SELECT expires_at_unix FROM runtime_file WHERE key = $1 AND status = 'uploaded'")
-                .bind(upload)
-                .fetch_optional(&self.pool)
-                .await
-                .context("runtime claim: read when the copied upload ends")?;
+        let at: Option<Option<i64>> = self
+            .pool
+            .scalar_opt("SELECT expires_at_unix FROM runtime_file WHERE key = $1 AND status = 'uploaded'", &[&upload])
+            .await
+            .context("runtime claim: read when the copied upload ends")?;
         self.ring_for(at.flatten()).await;
         Ok(())
     }
@@ -3948,12 +3913,11 @@ impl RuntimeStore {
     /// A row being reaped records nothing: its object may be deleted
     /// already, before the copy landed.
     async fn drop_unrecorded_copy(&self, key: &str) -> Result<()> {
-        let recorded: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM runtime_file WHERE key = $1 AND status <> 'reaping')")
-                .bind(key)
-                .fetch_one(&self.pool)
-                .await
-                .context("runtime copy: look for the copy's row")?;
+        let recorded: bool = self
+            .pool
+            .scalar("SELECT EXISTS (SELECT 1 FROM runtime_file WHERE key = $1 AND status <> 'reaping')", &[&key])
+            .await
+            .context("runtime copy: look for the copy's row")?;
         if !recorded {
             self.bucket
                 .delete(&object_key(key))
@@ -3963,16 +3927,10 @@ impl RuntimeStore {
         Ok(())
     }
 
-    /// The in-flight upload row ('pending' or 'completing') for a key, read
-    /// inside an open transaction. None when the key has none (active,
-    /// being reaped, or unknown).
-    async fn pending_row(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        key: &str,
-    ) -> Result<Option<PendingUpload>> {
-        sqlx::query_as::<_, PendingUpload>(sql!("{PENDING_ROW_SELECT_ANY} AND status IN ('pending', 'completing')"))
-            .bind(key)
-            .fetch_optional(&mut **tx)
+    /// The in-flight upload row ('pending' or 'completing') for a key.
+    /// None when the key has none (active, being reaped, or unknown).
+    async fn pending_row(db: &impl Client, key: &str) -> Result<Option<PendingUpload>> {
+        db.opt(&format!("{PENDING_ROW_SELECT_ANY} AND status IN ('pending', 'completing')"), &[&key])
             .await
             .context("read pending upload row")
     }
@@ -3980,15 +3938,8 @@ impl RuntimeStore {
     /// [`Self::pending_row`], holding the row locked until `tx` ends. Every
     /// transaction that changes an upload's status or parts takes this
     /// lock first, so they apply one after another.
-    async fn pending_row_locked(
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        key: &str,
-    ) -> Result<Option<PendingUpload>> {
-        sqlx::query_as::<_, PendingUpload>(sql!(
-            "{PENDING_ROW_SELECT_ANY} AND status IN ('pending', 'completing') FOR UPDATE"
-        ))
-            .bind(key)
-            .fetch_optional(&mut **tx)
+    async fn pending_row_locked(tx: &Transaction<'_>, key: &str) -> Result<Option<PendingUpload>> {
+        tx.opt(&format!("{PENDING_ROW_SELECT_ANY} AND status IN ('pending', 'completing') FOR UPDATE"), &[&key])
             .await
             .context("lock pending upload row")
     }
@@ -3999,17 +3950,16 @@ impl RuntimeStore {
     /// active file it last folded into. None when the key never completed
     /// (unknown, swept, aborted) or a later replacement of the same file
     /// has folded since.
-    async fn completed_meta<'e>(
-        executor: impl sqlx::PgExecutor<'e>,
-        key: &str,
-    ) -> StoreResult<Option<StoredFileMeta>> {
-        let row: Option<FileRow> = sqlx::query_as(sql!(
-            "SELECT {FILE_ROW_COLUMNS} FROM runtime_file \
-             WHERE (key = $1 OR last_replacement = $1) AND status IN ('active', 'uploaded')"
-        ))
-        .bind(key)
-        .fetch_optional(executor)
-        .await
+    async fn completed_meta(db: &impl Client, key: &str) -> StoreResult<Option<StoredFileMeta>> {
+        let row: Option<FileRow> = db
+            .opt(
+                &format!(
+                    "SELECT {FILE_ROW_COLUMNS} FROM runtime_file \
+                     WHERE (key = $1 OR last_replacement = $1) AND status IN ('active', 'uploaded')"
+                ),
+                &[&key],
+            )
+            .await
         .context("runtime complete_upload: read existing row")
         .map_err(RuntimeStoreError::Other)?;
         Ok(row.as_ref().map(FileRow::to_meta))
@@ -4021,15 +3971,16 @@ impl RuntimeStore {
     /// until it finalizes. Access does NOT bump a kept file's expiry here (a
     /// metadata peek is not an access); the byte `get`/`download_url` bumps it.
     async fn row(&self, key: &str) -> Result<Option<FileRow>> {
-        sqlx::query_as::<_, FileRow>(sql!(
-            "SELECT {FILE_ROW_COLUMNS} FROM runtime_file WHERE key = $1 AND status = 'active' AND {live}",
-            live = unexpired("$2"),
-        ))
-        .bind(key)
-        .bind(self.clock.now_unix())
-        .fetch_optional(&self.pool)
-        .await
-        .context("runtime row")
+        self.pool
+            .opt(
+                &format!(
+                    "SELECT {FILE_ROW_COLUMNS} FROM runtime_file WHERE key = $1 AND status = 'active' AND {live}",
+                    live = unexpired("$2"),
+                ),
+                &[&key, &self.clock.now_unix()],
+            )
+            .await
+            .context("runtime row")
     }
 
     /// The ACTIVE file stored under `identity` in the caller's `scope`,
@@ -4044,16 +3995,17 @@ impl RuntimeStore {
     ) -> StoreResult<Option<StoredFileMeta>> {
         let prefix = weft_core::storage::key::prefix_for_list(caller, scope)
             .map_err(RuntimeStoreError::Denied)?;
-        let row = sqlx::query_as::<_, FileRow>(sql!(
-            "SELECT {FILE_ROW_COLUMNS} FROM runtime_file \
-             WHERE regexp_replace(key, '/[^/]+$', '') = $1 AND identity = $2 AND status = 'active' AND {live}",
-            live = unexpired("$3"),
-        ))
-        .bind(prefix.trim_end_matches('/'))
-        .bind(identity)
-        .bind(self.clock.now_unix())
-        .fetch_optional(&self.pool)
-        .await
+        let row: Option<FileRow> = self
+            .pool
+            .opt(
+                &format!(
+                    "SELECT {FILE_ROW_COLUMNS} FROM runtime_file \
+                     WHERE regexp_replace(key, '/[^/]+$', '') = $1 AND identity = $2 AND status = 'active' AND {live}",
+                    live = unexpired("$3"),
+                ),
+                &[&prefix.trim_end_matches('/'), &identity, &self.clock.now_unix()],
+            )
+            .await
         .context("runtime find_identity")
         .map_err(RuntimeStoreError::BeforeWrites)?;
         Ok(row.as_ref().map(FileRow::to_meta))
@@ -4083,28 +4035,34 @@ impl RuntimeStore {
         // Read the TTL from the locked row, not an earlier metadata read:
         // source publication may have protected or retired this asset since
         // that read. A reaper that already claimed the row wins over access.
-        let visitor_address = match visitors_of {
-            Some(_) => "(SELECT visitor_address FROM project_frontend WHERE project_id = $4 AND visitor_address IS NOT NULL)",
+        let now = self.clock.now_unix();
+        // `$4` only when it is asked about: a statement takes exactly the
+        // parameters it names.
+        let mut params: Vec<db::Param<'_>> = vec![&now, &key, &cover_until];
+        let visitor_address = match &visitors_of {
+            Some(project) => {
+                params.push(project);
+                "(SELECT visitor_address FROM project_frontend WHERE project_id = $4 AND visitor_address IS NOT NULL)"
+            }
             None => "NULL::TEXT",
         };
-        sqlx::query_as::<_, LinkedRow>(sql!(
-            "UPDATE runtime_file SET expires_at_unix = CASE \
-                 WHEN expires_at_unix IS NULL THEN NULL \
-                 WHEN keep_ttl_secs IS NULL THEN GREATEST(expires_at_unix, $3) \
-                 ELSE GREATEST({}, $3) END, \
-               links_until_unix = CASE WHEN $3 > 0 THEN GREATEST(COALESCE(links_until_unix, 0), $3) ELSE links_until_unix END \
-             WHERE key = $2 AND status = 'active' AND {live} \
-             RETURNING {FILE_ROW_COLUMNS}, {visitor_address} AS visitor_address",
-            expiry_honoring_links("$1 + keep_ttl_secs"),
-            live = unexpired("$1"),
-        ))
-        .bind(self.clock.now_unix())
-        .bind(key)
-        .bind(cover_until)
-        .bind(visitors_of)
-        .fetch_optional(&self.pool)
-        .await
-        .context("bump expiry")
+        self.pool
+            .opt(
+                &format!(
+                    "UPDATE runtime_file SET expires_at_unix = CASE \
+                         WHEN expires_at_unix IS NULL THEN NULL \
+                         WHEN keep_ttl_secs IS NULL THEN GREATEST(expires_at_unix, $3) \
+                         ELSE GREATEST({}, $3) END, \
+                       links_until_unix = CASE WHEN $3 > 0 THEN GREATEST(COALESCE(links_until_unix, 0), $3) ELSE links_until_unix END \
+                     WHERE key = $2 AND status = 'active' AND {live} \
+                     RETURNING {FILE_ROW_COLUMNS}, {visitor_address} AS visitor_address",
+                    expiry_honoring_links("$1 + keep_ttl_secs"),
+                    live = unexpired("$1"),
+                ),
+                &params,
+            )
+            .await
+            .context("bump expiry")
     }
 
     /// Delete a file (object + row). A missing row is a not-found so the caller
@@ -4119,33 +4077,28 @@ impl RuntimeStore {
     /// object.
     pub async fn delete(&self, parsed: &ParsedKey) -> StoreResult<()> {
         let key = parsed.to_key();
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("runtime delete: begin tx")
-            .map_err(RuntimeStoreError::BeforeWrites)?;
-        if let Removal::Blocked(blocker) = Self::lock_for_removal(&mut tx, &key).await.map_err(RuntimeStoreError::Other)? {
+        let mut conn = self.pool.get().await.context("runtime delete: begin tx").map_err(RuntimeStoreError::BeforeWrites)?;
+        let tx = conn.transaction().await.context("runtime delete: begin tx").map_err(RuntimeStoreError::BeforeWrites)?;
+        if let Removal::Blocked(blocker) = Self::lock_for_removal(&tx, &key).await.map_err(RuntimeStoreError::Other)? {
             return Err(RuntimeStoreError::Completing(format!(
                 "'{key}' cannot be deleted while {blocker}; delete it once that lands"
             )));
         }
         // A marked row (a reap the bucket refused) is this file being
         // removed already: deleting it again tries its reap again.
-        let fenced = sqlx::query(fence_sql(&format!("AND (status = 'active' OR {MARKED})")))
-            .bind(&key)
-            .bind(self.clock.now_unix())
-            .execute(&mut *tx)
+        let fenced = tx
+            .execute(&fence_sql(&format!("AND (status = 'active' OR {MARKED})")), &[&key, &self.clock.now_unix()])
             .await
             .context("runtime delete: fence the row")
             .map_err(RuntimeStoreError::Other)?;
-        if fenced.rows_affected() == 0 {
+        if fenced == 0 {
             return Err(RuntimeStoreError::NotFound(key));
         }
         tx.commit()
             .await
             .context("runtime delete: commit fence")
             .map_err(RuntimeStoreError::Other)?;
+        drop(conn);
         // A worker reaches this too, so the bucket's own words stay in the
         // log (`mark_reap_failed`) and the answer says what happened.
         let reaped = self.reap_fenced_once(&SweepEntry::file(&key)).await?;
@@ -4169,10 +4122,9 @@ impl RuntimeStore {
     /// as its own statement after the lock, so it sees a claim that
     /// committed while this waited; a claim arriving later locks the same
     /// file and finds it fenced.
-    async fn lock_for_removal(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, key: &str) -> Result<Removal> {
-        let status: Option<String> = sqlx::query_scalar("SELECT status FROM runtime_file WHERE key = $1 FOR UPDATE")
-            .bind(key)
-            .fetch_optional(&mut **tx)
+    async fn lock_for_removal(tx: &Transaction<'_>, key: &str) -> Result<Removal> {
+        let status: Option<String> = tx
+            .scalar_opt("SELECT status FROM runtime_file WHERE key = $1 FOR UPDATE", &[&key])
             .await
             .context("lock a row for removal")?;
         match status.as_deref() {
@@ -4180,13 +4132,13 @@ impl RuntimeStore {
             Some("completing") => return Ok(Removal::Blocked(format!("its upload '{key}' is completing"))),
             Some(_) => {}
         }
-        let landing: Option<(String, bool)> = sqlx::query_as(
-            "SELECT key, replaces IS NOT NULL FROM runtime_file WHERE (replaces = $1 OR receives = $1) AND status = 'completing'",
-        )
-        .bind(key)
-        .fetch_optional(&mut **tx)
-        .await
-        .context("look for a completing replacement or copy")?;
+        let landing: Option<(String, bool)> = tx
+            .opt(
+                "SELECT key, replaces IS NOT NULL FROM runtime_file WHERE (replaces = $1 OR receives = $1) AND status = 'completing'",
+                &[&key],
+            )
+            .await
+            .context("look for a completing replacement or copy")?;
         Ok(match landing {
             Some((r, true)) => Removal::Blocked(format!("its replacement '{r}' is completing")),
             Some((copy, false)) => Removal::Blocked(format!("a run is receiving it as '{copy}'")),
@@ -4199,8 +4151,9 @@ impl RuntimeStore {
     /// else flip it to 'reaping', claimed at `now`, where `condition`
     /// ([`fence_sql`]'s, `$2` being `now`) still holds.
     async fn fence_for_reap(&self, key: &str, condition: &str, now: i64) -> Result<Fence> {
-        let mut tx = self.pool.begin().await.context("fence: begin tx")?;
-        match Self::lock_for_removal(&mut tx, key).await? {
+        let mut conn = self.pool.get().await.context("fence: begin tx")?;
+        let tx = conn.transaction().await.context("fence: begin tx")?;
+        match Self::lock_for_removal(&tx, key).await? {
             Removal::Gone => return Ok(Fence::Gone),
             Removal::Blocked(blocker) => {
                 tracing::info!(target: "weft_broker::runtime_store", key = %key, "not reaped while {blocker}");
@@ -4208,13 +4161,7 @@ impl RuntimeStore {
             }
             Removal::Free => {}
         }
-        let fenced = sqlx::query(fence_sql(condition))
-            .bind(key)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            .context("fence")?
-            .rows_affected();
+        let fenced = tx.execute(&fence_sql(condition), &[&key, &now]).await.context("fence")?;
         tx.commit().await.context("fence: commit")?;
         Ok(if fenced > 0 { Fence::Fenced } else { Fence::Spared })
     }
@@ -4247,19 +4194,22 @@ impl RuntimeStore {
                 ));
             }
         }
-        let mut tx = self.pool.begin().await.context("asset references transaction").map_err(RuntimeStoreError::BeforeWrites)?;
-        lock_tenant_storage(&mut tx, tenant).await?;
-        let before: Vec<String> = sqlx::query_scalar(
-            "SELECT key FROM asset_reference WHERE tenant_id = $1 AND project_id = $2",
-        ).bind(tenant).bind(project).fetch_all(&mut *tx).await.context("read the project's asset references")?;
+        let mut conn = self.pool.get().await.context("asset references transaction").map_err(RuntimeStoreError::BeforeWrites)?;
+        let tx = conn.transaction().await.context("asset references transaction").map_err(RuntimeStoreError::BeforeWrites)?;
+        lock_tenant_storage(&tx, tenant).await?;
+        let before: Vec<String> = tx
+            .scalars("SELECT key FROM asset_reference WHERE tenant_id = $1 AND project_id = $2", &[&tenant, &project])
+            .await
+            .context("read the project's asset references")?;
         // Lock every file this publish touches before checking presence, so
         // expiry cannot remove a referenced file between validation and
         // protection. A reaper that won first makes this update fail without
         // changing any reference.
         let touched: Vec<&String> = keys.iter().chain(kept).chain(&before).collect();
-        let available: Vec<String> = sqlx::query_scalar(
-            "SELECT key FROM runtime_file WHERE key = ANY($1) AND status = 'active' ORDER BY key FOR UPDATE",
-        ).bind(&touched).fetch_all(&mut *tx).await.context("lock the referenced assets")?;
+        let available: Vec<String> = tx
+            .scalars("SELECT key FROM runtime_file WHERE key = ANY($1) AND status = 'active' ORDER BY key FOR UPDATE", &[&touched])
+            .await
+            .context("lock the referenced assets")?;
         let available: std::collections::HashSet<&str> = available.iter().map(String::as_str).collect();
         if let Some(missing) = keys.iter().find(|key| !available.contains(key.as_str())) {
             return Err(RuntimeStoreError::NotFound(missing.clone()));
@@ -4268,32 +4218,42 @@ impl RuntimeStore {
             .partition(|key| available.contains(key.as_str()));
         let referenced: Vec<String> = keys.iter().cloned().chain(kept_present)
             .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-        sqlx::query("DELETE FROM asset_reference WHERE tenant_id = $1 AND project_id = $2")
-            .bind(tenant).bind(project).execute(&mut *tx).await.context("clear the project's asset references")?;
-        sqlx::query(
-            "INSERT INTO asset_reference (tenant_id, project_id, key) SELECT $1, $2, unnest($3::text[])",
-        ).bind(tenant).bind(project).bind(&referenced).execute(&mut *tx).await.context("record the project's asset references")?;
-        sqlx::query(
+        tx.execute("DELETE FROM asset_reference WHERE tenant_id = $1 AND project_id = $2", &[&tenant, &project])
+            .await
+            .context("clear the project's asset references")?;
+        tx.execute(
+            "INSERT INTO asset_reference (tenant_id, project_id, key) SELECT $1::TEXT, $2::TEXT, unnest($3::text[])",
+            &[&tenant, &project, &referenced],
+        )
+        .await
+        .context("record the project's asset references")?;
+        tx.execute(
             "UPDATE runtime_file SET expires_at_unix = NULL, keep_ttl_secs = NULL \
              WHERE key = ANY($1) AND status = 'active'",
-        ).bind(&referenced).execute(&mut *tx).await.context("keep the referenced assets")?;
+            &[&referenced],
+        )
+        .await
+        .context("keep the referenced assets")?;
         // What this project stopped referencing, and no other project
         // references either, starts its countdown.
         let countdown = self.clock.now_unix() + DEFAULT_KEEP_TTL_SECS as i64;
-        let retired = sqlx::query(sql!(
-            "UPDATE runtime_file SET \
-                 expires_at_unix = COALESCE(expires_at_unix, {}), \
-                 keep_ttl_secs = COALESCE(keep_ttl_secs, $3) \
-             WHERE key = ANY($1) AND status = 'active' \
-               AND NOT EXISTS (SELECT 1 FROM asset_reference r WHERE r.key = runtime_file.key)",
-            expiry_honoring_links("$2")
-        ))
-        .bind(&before)
-        .bind(countdown)
-        .bind(DEFAULT_KEEP_TTL_SECS as i64)
-        .execute(&mut *tx).await.context("retire the unreferenced assets")?;
+        let retired = tx
+            .execute(
+                &format!(
+                    "UPDATE runtime_file SET \
+                         expires_at_unix = COALESCE(expires_at_unix, {}), \
+                         keep_ttl_secs = COALESCE(keep_ttl_secs, $3) \
+                     WHERE key = ANY($1) AND status = 'active' \
+                       AND NOT EXISTS (SELECT 1 FROM asset_reference r WHERE r.key = runtime_file.key)",
+                    expiry_honoring_links("$2")
+                ),
+                &[&before, &countdown, &(DEFAULT_KEEP_TTL_SECS as i64)],
+            )
+            .await
+            .context("retire the unreferenced assets")?;
         tx.commit().await.context("commit the project's asset references")?;
-        if retired.rows_affected() > 0 {
+        drop(conn);
+        if retired > 0 {
             self.ring_for(Some(countdown)).await;
         }
         Ok(missing)
@@ -4313,12 +4273,10 @@ impl RuntimeStore {
             wanted.insert(key, hash.clone());
         }
         let keys: Vec<&String> = wanted.keys().collect();
-        let held: Vec<String> = sqlx::query_scalar(
-            "SELECT key FROM runtime_file WHERE key = ANY($1) AND status = 'active'",
-        )
-        .bind(&keys)
-        .fetch_all(&self.pool)
-        .await
+        let held: Vec<String> = self
+            .pool
+            .scalars("SELECT key FROM runtime_file WHERE key = ANY($1) AND status = 'active'", &[&keys])
+            .await
         .context("look up held assets")
         .map_err(RuntimeStoreError::BeforeWrites)?;
         Ok(held.into_iter().map(|key| (wanted[&key].clone(), key)).collect())
@@ -4330,15 +4288,17 @@ impl RuntimeStore {
     /// are not real files a user can see yet; so are expired ones.
     pub async fn list(&self, prefix: &str) -> StoreResult<Vec<StoredFileMeta>> {
         let pattern = like_prefix(prefix);
-        let rows = sqlx::query_as::<_, FileRow>(sql!(
-            "SELECT {FILE_ROW_COLUMNS} FROM runtime_file \
-             WHERE key LIKE $1 ESCAPE '\\' AND status = 'active' AND {live} ORDER BY key",
-            live = unexpired("$2"),
-        ))
-        .bind(&pattern)
-        .bind(self.clock.now_unix())
-        .fetch_all(&self.pool)
-        .await
+        let rows: Vec<FileRow> = self
+            .pool
+            .all(
+                &format!(
+                    "SELECT {FILE_ROW_COLUMNS} FROM runtime_file \
+                     WHERE key LIKE $1 ESCAPE '\\' AND status = 'active' AND {live} ORDER BY key",
+                    live = unexpired("$2"),
+                ),
+                &[&pattern, &self.clock.now_unix()],
+            )
+            .await
         .context("runtime list")
         .map_err(RuntimeStoreError::BeforeWrites)?;
         Ok(rows.iter().map(FileRow::to_meta).collect())
@@ -4352,14 +4312,14 @@ impl RuntimeStore {
     /// too; the bucket never keeps state whose row a sweep removed.
     async fn keys_under(&self, prefix: &str) -> Result<Vec<SweepEntry>> {
         let pattern = like_prefix(prefix);
-        sqlx::query_as::<_, SweepEntry>(
-            "SELECT key, (keep AND status = 'active') AS kept_active, status, upload_id, replaces \
-             FROM runtime_file WHERE key LIKE $1 ESCAPE '\\' ORDER BY key",
-        )
-        .bind(&pattern)
-        .fetch_all(&self.pool)
-        .await
-        .context("runtime keys_under")
+        self.pool
+            .all(
+                "SELECT key, (keep AND status = 'active') AS kept_active, status, upload_id, replaces \
+                 FROM runtime_file WHERE key LIKE $1 ESCAPE '\\' ORDER BY key",
+                &[&pattern],
+            )
+            .await
+            .context("runtime keys_under")
     }
 
     /// Steps 2+3 of a fenced reap (the caller has already flipped the row to
@@ -4404,11 +4364,7 @@ impl RuntimeStore {
                 }
             }
         }
-        let was_marked: bool = sqlx::query_scalar(delete_upload_row(""))
-            .bind(&entry.key)
-            .fetch_one(&self.pool)
-            .await
-            .context("delete reaped row")?;
+        let was_marked: bool = self.pool.scalar(&delete_upload_row(""), &[&entry.key]).await.context("delete reaped row")?;
         Ok(Reaped { refused: None, changes_record: was_marked })
     }
 
@@ -4454,21 +4410,20 @@ impl RuntimeStore {
         // KeepTtl::Never binds NULL (never expires, covers links
         // trivially); a finite deadline never undercuts a live link. A file
         // that already expired stays expired.
-        let row: Option<FileRow> = sqlx::query_as::<_, FileRow>(sql!(
-            "UPDATE runtime_file SET keep = keep OR $4, keep_ttl_secs = $1, \
-                 expires_at_unix = CASE WHEN $2::bigint IS NULL THEN NULL ELSE {} END \
-             WHERE key = $3 AND status <> 'reaping' AND {live} \
-             RETURNING {FILE_ROW_COLUMNS}",
-            expiry_honoring_links("$2"),
-            live = unexpired("$5"),
-        ))
-        .bind(ttl_secs.map(|s| s as i64))
-        .bind(expires_at)
-        .bind(&key)
-        .bind(run_scoped)
-        .bind(now)
-        .fetch_optional(&self.pool)
-        .await
+        let row: Option<FileRow> = self
+            .pool
+            .opt(
+                &format!(
+                    "UPDATE runtime_file SET keep = keep OR $4, keep_ttl_secs = $1, \
+                         expires_at_unix = CASE WHEN $2::bigint IS NULL THEN NULL ELSE {} END \
+                     WHERE key = $3 AND status <> 'reaping' AND {live} \
+                     RETURNING {FILE_ROW_COLUMNS}",
+                    expiry_honoring_links("$2"),
+                    live = unexpired("$5"),
+                ),
+                &[&ttl_secs.map(|s| s as i64), &expires_at, &key, &run_scoped, &now],
+            )
+            .await
         .context("runtime keep")
         .map_err(RuntimeStoreError::BeforeWrites)?;
         let row = row.ok_or_else(|| RuntimeStoreError::NotFound(key))?;
@@ -4605,9 +4560,8 @@ impl RuntimeStore {
         let removed = self.finish_pass(record, pass).await?;
         // A whole-tenant wipe takes the tenant's asset references with its
         // assets; every narrower prefix names no asset, so this matches none.
-        sqlx::query("DELETE FROM asset_reference WHERE key LIKE $1 ESCAPE '\\'")
-            .bind(like_prefix(prefix))
-            .execute(&self.pool)
+        self.pool
+            .execute("DELETE FROM asset_reference WHERE key LIKE $1 ESCAPE '\\'", &[&like_prefix(prefix)])
             .await
             .context("drop the wiped assets' references")?;
         let mut left = Vec::new();
@@ -4695,18 +4649,20 @@ impl RuntimeStore {
                     // deadline out. The deadline honors every link handed out
                     // for the file (`links_until_unix`: a link is a promise the
                     // bytes stay fetchable for its stated lifetime).
-                    let stamped: Option<Option<i64>> = sqlx::query_scalar(sql!(
-                        "UPDATE runtime_file SET expires_at_unix = {} \
-                         WHERE key = $1 AND status IN ('active', 'completing') AND NOT keep \
-                           AND expires_at_unix IS NULL \
-                         RETURNING expires_at_unix",
-                        expiry_honoring_links("$2")
-                    ))
-                    .bind(&entry.key)
-                    .bind(self.clock.now_unix() + RUN_LINGER_TTL_SECS)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .context("linger stamp")?;
+                    let stamped: Option<Option<i64>> = self
+                        .pool
+                        .scalar_opt(
+                            &format!(
+                                "UPDATE runtime_file SET expires_at_unix = {} \
+                                 WHERE key = $1 AND status IN ('active', 'completing') AND NOT keep \
+                                   AND expires_at_unix IS NULL \
+                                 RETURNING expires_at_unix",
+                                expiry_honoring_links("$2")
+                            ),
+                            &[&entry.key, &(self.clock.now_unix() + RUN_LINGER_TTL_SECS)],
+                        )
+                        .await
+                        .context("linger stamp")?;
                     if let Some(at) = stamped {
                         lingering += 1;
                         // The expiry loop must look by the linger's end; one
@@ -4788,14 +4744,14 @@ impl RuntimeStore {
     pub async fn expire(&self) -> Result<weft_task_store::drain::DrainStep> {
         use weft_task_store::drain::DrainStep;
         let now = self.clock.now_unix();
-        let lapsed_completions: Vec<String> = sqlx::query_scalar(sql!(
-            "SELECT key FROM runtime_file WHERE status = 'completing' AND {} ORDER BY receives IS NULL",
-            abandoned("$1")
-        ))
-        .bind(now)
-        .fetch_all(&self.pool)
-        .await
-        .context("lapsed completion scan")?;
+        let lapsed_completions: Vec<String> = self
+            .pool
+            .scalars(
+                &format!("SELECT key FROM runtime_file WHERE status = 'completing' AND {} ORDER BY receives IS NULL", abandoned("$1")),
+                &[&now],
+            )
+            .await
+            .context("lapsed completion scan")?;
         for key in &lapsed_completions {
             // Any answer but a failure with no verdict is the end of it:
             // landed, ended with its verdict, or taken by another call
@@ -4805,10 +4761,8 @@ impl RuntimeStore {
                 target: "weft_broker::runtime_store", key = %key, error = format!("{e:#}"),
                 "a completion whose claim lapsed did not land; the expiry loop tries it again a lease from now"
             );
-            sqlx::query("UPDATE runtime_file SET progressed_at_unix = $2 WHERE key = $1 AND status = 'completing'")
-                .bind(key)
-                .bind(now)
-                .execute(&self.pool)
+            self.pool
+                .execute("UPDATE runtime_file SET progressed_at_unix = $2 WHERE key = $1 AND status = 'completing'", &[key, &now])
                 .await
                 .context("take the claim of a completion that did not land")?;
         }
@@ -4820,14 +4774,14 @@ impl RuntimeStore {
                 abandoned(now)
             )
         };
-        let entries: Vec<SweepEntry> = sqlx::query_as(sql!(
-            "SELECT key, FALSE AS kept_active, status, upload_id, replaces FROM runtime_file WHERE {}",
-            doomed("$1")
-        ))
-        .bind(now)
-        .fetch_all(&self.pool)
-        .await
-        .context("expired file scan")?;
+        let entries: Vec<SweepEntry> = self
+            .pool
+            .all(
+                &format!("SELECT key, FALSE AS kept_active, status, upload_id, replaces FROM runtime_file WHERE {}", doomed("$1")),
+                &[&now],
+            )
+            .await
+            .context("expired file scan")?;
         let mut record = false;
         let pass: Result<u64> = async {
             let mut removed = 0;
@@ -4848,21 +4802,25 @@ impl RuntimeStore {
         if removed > 0 {
             tracing::info!(target: "weft_broker::runtime_store", removed, "expired stored files removed");
         }
-        let next: Option<i64> = sqlx::query_scalar(sql!(
-            "SELECT MIN(at) FROM ( \
-                 SELECT f.expires_at_unix AS at FROM runtime_file f \
-                  WHERE f.status IN ('active', 'uploaded') AND f.expires_at_unix IS NOT NULL \
-                    AND NOT EXISTS (SELECT 1 FROM runtime_file r \
-                                    WHERE (r.replaces = f.key OR r.receives = f.key) AND r.status = 'completing') \
-               UNION ALL \
-                 SELECT {} FROM runtime_file \
-                  WHERE {HELD} \
-             ) due",
-            abandoned_at()
-        ))
-        .fetch_one(&self.pool)
-        .await
-        .context("next file expiry")?;
+        let next: Option<i64> = self
+            .pool
+            .scalar(
+                &format!(
+                    "SELECT MIN(at) FROM ( \
+                         SELECT f.expires_at_unix AS at FROM runtime_file f \
+                          WHERE f.status IN ('active', 'uploaded') AND f.expires_at_unix IS NOT NULL \
+                            AND NOT EXISTS (SELECT 1 FROM runtime_file r \
+                                            WHERE (r.replaces = f.key OR r.receives = f.key) AND r.status = 'completing') \
+                       UNION ALL \
+                         SELECT {} FROM runtime_file \
+                          WHERE {HELD} \
+                     ) due",
+                    abandoned_at()
+                ),
+                &[],
+            )
+            .await
+            .context("next file expiry")?;
         Ok(match next {
             // An expiry and a claim's lapse are a second's mark: the row
             // is doomed once it passed.
@@ -4881,10 +4839,10 @@ impl RuntimeStore {
             "a stored file could not be removed from the bucket; it stays marked until a removal, a wipe, its run's \
              end or its tenant running short of space tries it again"
         );
-        sqlx::query("UPDATE runtime_file SET reap_error = $2, progressed_at_unix = 0 WHERE key = $1 AND status = 'reaping'")
-            .bind(key)
-            .bind(weft_task_store::unanswered::pg_text(&format!("{error:#}")))
-            .execute(&self.pool)
+        let reap_error = format!("{error:#}");
+        let reap_error: &str = &weft_task_store::unanswered::pg_text(&reap_error);
+        self.pool
+            .execute("UPDATE runtime_file SET reap_error = $2, progressed_at_unix = 0 WHERE key = $1 AND status = 'reaping'", &[&key, &reap_error])
             .await
             .context("mark a row whose reap failed")?;
         Ok(())
@@ -4898,22 +4856,23 @@ impl RuntimeStore {
     /// (a transaction lock), so the last one reads every change made
     /// before it and what it writes stands.
     async fn record_reap_failures(&self) -> Result<()> {
-        let mut tx = self.pool.begin().await.context("record failed reaps: begin tx")?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('weft:runtime-file-reaps', 0))")
-            .execute(&mut *tx)
+        let mut conn = self.pool.get().await.context("record failed reaps: begin tx")?;
+        let tx = conn.transaction().await.context("record failed reaps: begin tx")?;
+        tx.execute("SELECT pg_advisory_xact_lock(hashtextextended('weft:runtime-file-reaps', 0))", &[])
             .await
             .context("wait for another record of failed reaps")?;
-        let (failing, shown): (i64, Option<String>) = sqlx::query_as(
-            "SELECT COUNT(*), string_agg(key || ': ' || reap_error, '; ' ORDER BY key) FILTER (WHERE n <= 5) \
-             FROM (SELECT key, reap_error, row_number() OVER (ORDER BY key) AS n FROM runtime_file \
-                   WHERE status = 'reaping' AND reap_error IS NOT NULL) marked",
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .context("read the rows a reap failed on")?;
+        let (failing, shown): (i64, Option<String>) = tx
+            .one(
+                "SELECT COUNT(*), string_agg(key || ': ' || reap_error, '; ' ORDER BY key) FILTER (WHERE n <= 5) \
+                 FROM (SELECT key, reap_error, row_number() OVER (ORDER BY key) AS n FROM runtime_file \
+                       WHERE status = 'reaping' AND reap_error IS NOT NULL) marked",
+                &[],
+            )
+            .await
+            .context("read the rows a reap failed on")?;
         let callee = weft_task_store::unanswered::Callee::Reaps;
         let alerts = if failing == 0 {
-            weft_task_store::unanswered::answered(&mut *tx, callee).await?;
+            weft_task_store::unanswered::answered(&tx, callee).await?;
             weft_task_store::unanswered::Alerts::default()
         } else {
             let error = format!(
@@ -4922,7 +4881,7 @@ impl RuntimeStore {
                 shown.unwrap_or_default(),
                 if failing > 5 { "; ..." } else { "" },
             );
-            weft_task_store::unanswered::failed(&mut *tx, callee, None, &error).await?
+            weft_task_store::unanswered::failed(&tx, callee, None, &error).await?
         };
         tx.commit().await.context("record failed reaps: commit")?;
         alerts.log();
@@ -4937,16 +4896,15 @@ impl RuntimeStore {
     /// and the reap after it are not.
     async fn reap_expired_identity(&self, key: &str, identity: &str) -> StoreResult<()> {
         let now = self.clock.now_unix();
-        let expired: Option<SweepEntry> = sqlx::query_as(
-            "SELECT key, FALSE AS kept_active, status, upload_id, replaces FROM runtime_file \
-             WHERE regexp_replace(key, '/[^/]+$', '') = $1 AND identity = $2 \
-               AND status = 'active' AND expires_at_unix < $3",
-        )
-        .bind(scope_prefix(key))
-        .bind(identity)
-        .bind(now)
-        .fetch_optional(&self.pool)
-        .await
+        let expired: Option<SweepEntry> = self
+            .pool
+            .opt(
+                "SELECT key, FALSE AS kept_active, status, upload_id, replaces FROM runtime_file \
+                 WHERE regexp_replace(key, '/[^/]+$', '') = $1 AND identity = $2 \
+                   AND status = 'active' AND expires_at_unix < $3",
+                &[&scope_prefix(key), &identity, &now],
+            )
+            .await
         .context("look for an expired file under this identity")
         .map_err(RuntimeStoreError::BeforeWrites)?;
         let Some(entry) = expired else { return Ok(()) };
@@ -4964,39 +4922,35 @@ impl RuntimeStore {
 /// store's clock), any other row by its quota-charged reservation. Every
 /// quota check and usage view that needs the runtime-file footprint reads
 /// through here so the numbers can never disagree.
-pub async fn charged_bytes_for<'e, E>(executor: E, tenant: &str, now: i64) -> Result<u64>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let bytes: Option<i64> = sqlx::query_scalar(sql!(
-        "SELECT COALESCE(SUM(CASE WHEN status <> 'active' THEN reserved_bytes \
-                                  WHEN {live} THEN size_bytes ELSE 0 END), 0)::BIGINT \
-         FROM runtime_file WHERE tenant_id = $1",
-        live = unexpired("$2"),
-    ))
-    .bind(tenant)
-    .bind(now)
-    .fetch_one(executor)
-    .await
-    .context("read tenant charged bytes")?;
+pub async fn charged_bytes_for(db: &impl Client, tenant: &str, now: i64) -> Result<u64> {
+    let bytes: Option<i64> = db
+        .scalar(
+            &format!(
+                "SELECT COALESCE(SUM(CASE WHEN status <> 'active' THEN reserved_bytes \
+                                          WHEN {live} THEN size_bytes ELSE 0 END), 0)::BIGINT \
+                 FROM runtime_file WHERE tenant_id = $1",
+                live = unexpired("$2"),
+            ),
+            &[&tenant, &now],
+        )
+        .await
+        .context("read tenant charged bytes")?;
     Ok(bytes.unwrap_or(0) as u64)
 }
 
 /// How many files a tenant holds against its file cap: every row but an
 /// active file expired by `now`.
-async fn count_files<'e, E>(executor: E, tenant: &str, now: i64) -> Result<u64>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    let count: i64 = sqlx::query_scalar(sql!(
-        "SELECT COUNT(*) FROM runtime_file WHERE tenant_id = $1 AND (status <> 'active' OR {live})",
-        live = unexpired("$2"),
-    ))
-    .bind(tenant)
-    .bind(now)
-    .fetch_one(executor)
-    .await
-    .context("count tenant files")?;
+async fn count_files(db: &impl Client, tenant: &str, now: i64) -> Result<u64> {
+    let count: i64 = db
+        .scalar(
+            &format!(
+                "SELECT COUNT(*) FROM runtime_file WHERE tenant_id = $1 AND (status <> 'active' OR {live})",
+                live = unexpired("$2"),
+            ),
+            &[&tenant, &now],
+        )
+        .await
+        .context("count tenant files")?;
     Ok(count as u64)
 }
 

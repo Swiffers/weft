@@ -19,10 +19,8 @@
 
 use std::sync::Arc;
 
-use weft_task_store::sql;
-
 use async_trait::async_trait;
-use sqlx::PgPool;
+use weft_task_store::db::{Client, Pool};
 use weft_core::project::hash::Manifest;
 use weft_core::working_copy::{Head, WorkingChange, WorkingCopy, WorkingCopyId, WorkingCopyKind};
 use weft_core::RunId;
@@ -196,11 +194,11 @@ pub fn adopted_head(copies: &[WorkingCopyRow]) -> Head {
 }
 
 pub struct PostgresWorkingCopyStore {
-    pool: PgPool,
+    pool: Pool,
 }
 
 impl PostgresWorkingCopyStore {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: Pool) -> Self {
         Self { pool }
     }
 }
@@ -241,12 +239,8 @@ fn row_from(row: RowTuple) -> anyhow::Result<WorkingCopyRow> {
     })
 }
 
-async fn notify(conn: &mut sqlx::PgConnection, project: uuid::Uuid, id: WorkingCopyId) -> anyhow::Result<()> {
-    sqlx::query("SELECT pg_notify($1, $2)")
-        .bind(WORKING_COPY_CHANNEL)
-        .bind(format!("{project}/{id}"))
-        .execute(conn)
-        .await?;
+async fn notify(conn: &impl Client, project: uuid::Uuid, id: WorkingCopyId) -> anyhow::Result<()> {
+    conn.execute("SELECT pg_notify($1, $2)", &[&WORKING_COPY_CHANNEL, &format!("{project}/{id}")]).await?;
     Ok(())
 }
 
@@ -264,25 +258,28 @@ impl PostgresWorkingCopyStore {
             WorkingCopyKind::Folder => working.clone(),
             WorkingCopyKind::Program => Manifest::new(),
         };
-        let mut tx = self.pool.begin().await?;
-        let inserted = sqlx::query(
-            "INSERT INTO working_copy (id, project_id, kind, host, path, head_version, head_run, working_manifest, synced, conflicts, revision, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '{}', 0, $10, $10) ON CONFLICT DO NOTHING",
-        )
-        .bind(uuid::Uuid::now_v7())
-        .bind(project)
-        .bind(kind.as_str())
-        .bind(place.map(|(host, _)| host))
-        .bind(place.map(|(_, path)| path))
-        .bind(head.head_version.as_deref())
-        .bind(head.head_run)
-        .bind(serde_json::to_value(working)?)
-        .bind(serde_json::to_value(&synced)?)
-        .bind(now as i64)
-        .execute(&mut *tx)
-        .await?;
-        if inserted.rows_affected() == 1 {
-            sqlx::query("SELECT pg_notify($1, $2)").bind(WORKING_COPY_CHANNEL).bind(format!("{project}/new")).execute(&mut *tx).await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        let inserted = tx
+            .execute(
+                "INSERT INTO working_copy (id, project_id, kind, host, path, head_version, head_run, working_manifest, synced, conflicts, revision, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '{}', 0, $10, $10) ON CONFLICT DO NOTHING",
+                &[
+                    &uuid::Uuid::now_v7(),
+                    &project,
+                    &kind.as_str(),
+                    &place.map(|(host, _)| host),
+                    &place.map(|(_, path)| path),
+                    &head.head_version.as_deref(),
+                    &head.head_run,
+                    &serde_json::to_value(working)?,
+                    &serde_json::to_value(&synced)?,
+                    &(now as i64),
+                ],
+            )
+            .await?;
+        if inserted == 1 {
+            tx.execute("SELECT pg_notify($1, $2)", &[&WORKING_COPY_CHANNEL, &format!("{project}/new")]).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -293,37 +290,28 @@ impl PostgresWorkingCopyStore {
 impl WorkingCopyStoreOps for PostgresWorkingCopyStore {
     async fn list(&self, project: uuid::Uuid) -> anyhow::Result<Vec<WorkingCopyRow>> {
         let rows: Vec<RowTuple> =
-            sqlx::query_as(sql!("SELECT {COLUMNS} FROM working_copy WHERE project_id = $1 ORDER BY created_at, id"))
-                .bind(project)
-                .fetch_all(&self.pool)
-                .await?;
+            self.pool.all(&format!("SELECT {COLUMNS} FROM working_copy WHERE project_id = $1 ORDER BY created_at, id"), &[&project]).await?;
         rows.into_iter().map(row_from).collect()
     }
 
     async fn get(&self, id: WorkingCopyId) -> anyhow::Result<Option<WorkingCopyRow>> {
-        let row: Option<RowTuple> = sqlx::query_as(sql!("SELECT {COLUMNS} FROM working_copy WHERE id = $1"))
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row: Option<RowTuple> = self.pool.opt(&format!("SELECT {COLUMNS} FROM working_copy WHERE id = $1"), &[&id]).await?;
         row.map(row_from).transpose()
     }
 
     async fn folder(&self, project: uuid::Uuid, host: &str, path: &str) -> anyhow::Result<Option<WorkingCopyRow>> {
-        let row: Option<RowTuple> = sqlx::query_as(sql!(
-            "SELECT {COLUMNS} FROM working_copy WHERE project_id = $1 AND kind = 'folder' AND host = $2 AND path = $3"
-        ))
-        .bind(project)
-        .bind(host)
-        .bind(path)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<RowTuple> = self
+            .pool
+            .opt(
+                &format!("SELECT {COLUMNS} FROM working_copy WHERE project_id = $1 AND kind = 'folder' AND host = $2 AND path = $3"),
+                &[&project, &host, &path],
+            )
+            .await?;
         row.map(row_from).transpose()
     }
 
     async fn all_folders(&self) -> anyhow::Result<Vec<WorkingCopyRow>> {
-        let rows: Vec<RowTuple> = sqlx::query_as(sql!("SELECT {COLUMNS} FROM working_copy WHERE kind = 'folder' ORDER BY created_at, id"))
-            .fetch_all(&self.pool)
-            .await?;
+        let rows: Vec<RowTuple> = self.pool.all(&format!("SELECT {COLUMNS} FROM working_copy WHERE kind = 'folder' ORDER BY created_at, id"), &[]).await?;
         rows.into_iter().map(row_from).collect()
     }
 
@@ -343,19 +331,14 @@ impl WorkingCopyStoreOps for PostgresWorkingCopyStore {
     async fn program_copy(&self, project: uuid::Uuid, working: &Manifest, head: &Head, now: u64) -> anyhow::Result<WorkingCopyRow> {
         self.insert(project, WorkingCopyKind::Program, None, working, head, now).await?;
         let row: Option<RowTuple> =
-            sqlx::query_as(sql!("SELECT {COLUMNS} FROM working_copy WHERE project_id = $1 AND kind = 'program'"))
-                .bind(project)
-                .fetch_optional(&self.pool)
-                .await?;
+            self.pool.opt(&format!("SELECT {COLUMNS} FROM working_copy WHERE project_id = $1 AND kind = 'program'"), &[&project]).await?;
         row.map(row_from).transpose()?.ok_or_else(|| anyhow::anyhow!("the program copy of project {project} went as it was made"))
     }
 
     async fn write(&self, id: WorkingCopyId, write: Write<'_>, now: u64) -> anyhow::Result<Written> {
-        let mut tx = self.pool.begin().await?;
-        let row: Option<RowTuple> = sqlx::query_as(sql!("SELECT {COLUMNS} FROM working_copy WHERE id = $1 FOR UPDATE"))
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        let row: Option<RowTuple> = tx.opt(&format!("SELECT {COLUMNS} FROM working_copy WHERE id = $1 FOR UPDATE"), &[&id]).await?;
         let row = row_from(row.ok_or_else(|| anyhow::anyhow!("no working copy {id}"))?)?;
         let working = match weft_core::working_copy::apply_changes(&row.working, write.changes) {
             Ok(working) => working,
@@ -372,20 +355,21 @@ impl WorkingCopyStoreOps for PostgresWorkingCopyStore {
         if !moved && synced == row.synced && conflicts == row.conflicts {
             return Ok(Written::Landed(Box::new(row)));
         }
-        sqlx::query(
+        tx.execute(
             "UPDATE working_copy SET working_manifest = $2, synced = $3, conflicts = $4, revision = $5, \
-             updated_at = CASE WHEN $6 THEN $7 ELSE updated_at END WHERE id = $1",
+             updated_at = CASE WHEN $6::boolean THEN $7::bigint ELSE updated_at END WHERE id = $1",
+            &[
+                &id,
+                &serde_json::to_value(&working)?,
+                &serde_json::to_value(&synced)?,
+                &conflicts,
+                &(revision as i64),
+                &moved,
+                &(now as i64),
+            ],
         )
-        .bind(id)
-        .bind(serde_json::to_value(&working)?)
-        .bind(serde_json::to_value(&synced)?)
-        .bind(&conflicts)
-        .bind(revision as i64)
-        .bind(moved)
-        .bind(now as i64)
-        .execute(&mut *tx)
         .await?;
-        notify(&mut tx, row.project_id, id).await?;
+        notify(&tx, row.project_id, id).await?;
         tx.commit().await?;
         let updated_at = if moved { now } else { row.updated_at };
         Ok(Written::Landed(Box::new(WorkingCopyRow { working, synced, conflicts, revision, updated_at, ..row })))
@@ -399,21 +383,17 @@ impl WorkingCopyStoreOps for PostgresWorkingCopyStore {
         head: &Head,
         now: u64,
     ) -> anyhow::Result<Option<WorkingCopyRow>> {
-        let mut tx = self.pool.begin().await?;
-        let project: Option<uuid::Uuid> = sqlx::query_scalar(
-            "UPDATE working_copy SET working_manifest = $3, head_version = $4, head_run = $5, revision = revision + 1, updated_at = $6 \
-             WHERE id = $1 AND revision = $2 RETURNING project_id",
-        )
-        .bind(id)
-        .bind(revision as i64)
-        .bind(serde_json::to_value(working)?)
-        .bind(head.head_version.as_deref())
-        .bind(head.head_run)
-        .bind(now as i64)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        let project: Option<uuid::Uuid> = tx
+            .scalar_opt(
+                "UPDATE working_copy SET working_manifest = $3, head_version = $4, head_run = $5, revision = revision + 1, updated_at = $6 \
+                 WHERE id = $1 AND revision = $2 RETURNING project_id",
+                &[&id, &(revision as i64), &serde_json::to_value(working)?, &head.head_version.as_deref(), &head.head_run, &(now as i64)],
+            )
+            .await?;
         let Some(project) = project else { return Ok(None) };
-        notify(&mut tx, project, id).await?;
+        notify(&tx, project, id).await?;
         tx.commit().await?;
         self.get(id).await
     }
@@ -422,47 +402,45 @@ impl WorkingCopyStoreOps for PostgresWorkingCopyStore {
         // One statement, so the check and the write cannot be split by a
         // sibling process. `IS NOT DISTINCT FROM` because both columns are
         // nullable and NULL = NULL is not true in SQL.
-        let mut tx = self.pool.begin().await?;
-        let project: Option<uuid::Uuid> = sqlx::query_scalar(
-            "UPDATE working_copy SET head_version = $2, head_run = $3, updated_at = $6 \
-             WHERE id = $1 AND head_version IS NOT DISTINCT FROM $4 AND head_run IS NOT DISTINCT FROM $5 \
-             RETURNING project_id",
-        )
-        .bind(id)
-        .bind(to.head_version.as_deref())
-        .bind(to.head_run)
-        .bind(expected.head_version.as_deref())
-        .bind(expected.head_run)
-        .bind(now as i64)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        let project: Option<uuid::Uuid> = tx
+            .scalar_opt(
+                "UPDATE working_copy SET head_version = $2, head_run = $3, updated_at = $6 \
+                 WHERE id = $1 AND head_version IS NOT DISTINCT FROM $4 AND head_run IS NOT DISTINCT FROM $5 \
+                 RETURNING project_id",
+                &[
+                    &id,
+                    &to.head_version.as_deref(),
+                    &to.head_run,
+                    &expected.head_version.as_deref(),
+                    &expected.head_run,
+                    &(now as i64),
+                ],
+            )
+            .await?;
         if let Some(project) = project {
-            notify(&mut tx, project, id).await?;
+            notify(&tx, project, id).await?;
             tx.commit().await?;
             return Ok(true);
         }
-        let (exists,): (bool,) = sqlx::query_as("SELECT EXISTS(SELECT 1 FROM working_copy WHERE id = $1)")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
+        let exists: bool = tx.scalar("SELECT EXISTS(SELECT 1 FROM working_copy WHERE id = $1)", &[&id]).await?;
         anyhow::ensure!(exists, "no working copy {id}");
         Ok(false)
     }
 
     async fn forget_head_run(&self, run_id: RunId) -> anyhow::Result<()> {
-        sqlx::query("UPDATE working_copy SET head_run = NULL WHERE head_run = $1").bind(run_id).execute(&self.pool).await?;
+        self.pool.execute("UPDATE working_copy SET head_run = NULL WHERE head_run = $1", &[&run_id]).await?;
         Ok(())
     }
 
     async fn remove(&self, id: WorkingCopyId, revision: u64) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        let project: Option<uuid::Uuid> = sqlx::query_scalar("DELETE FROM working_copy WHERE id = $1 AND revision = $2 RETURNING project_id")
-            .bind(id)
-            .bind(revision as i64)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        let project: Option<uuid::Uuid> =
+            tx.scalar_opt("DELETE FROM working_copy WHERE id = $1 AND revision = $2 RETURNING project_id", &[&id, &(revision as i64)]).await?;
         let Some(project) = project else { return Ok(false) };
-        notify(&mut tx, project, id).await?;
+        notify(&tx, project, id).await?;
         tx.commit().await?;
         Ok(true)
     }

@@ -960,7 +960,7 @@ async fn a_cancelled_waits_last_call_goes_once_with_its_verb_and_body() {
     let base = serve(rig.state.clone()).await;
     let mut spec = job_wait(&format!("{target}/status"));
     spec.on_cancel = Some(weft_core::signal::CancelCall::post(format!("{target}/jobs/7/cancel")).with_body(json!({ "reason": "cancelled" })));
-    let resp = reqwest::Client::new().post(format!("{base}/cancel_call")).json(&cancel_request(spec)).send().await.unwrap();
+    let resp = weft_core::net::http_client().build().unwrap().post(format!("{base}/cancel_call")).json(&cancel_request(spec)).send().await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT, "{:?}", resp.text().await);
     assert_eq!(*calls.lock().unwrap(), vec![("POST".to_string(), "/jobs/7/cancel".to_string(), json!({ "reason": "cancelled" }))]);
 }
@@ -1865,7 +1865,7 @@ async fn a_wake_body_that_can_never_be_read_is_dropped_with_a_success_and_logged
 
     let rig = rig(false).await;
     let base = serve(rig.state.clone()).await;
-    let http = reqwest::Client::new();
+    let http = weft_core::net::http_client().build().unwrap();
     for body in ["not json at all", r#"{"at_unix_ms": 1, "body": {"tok": "x"}}"#] {
         let answer = http.post(format!("{base}/wake")).body(body).send().await.unwrap();
         assert_eq!(answer.status(), 200, "{body}");
@@ -1881,7 +1881,9 @@ async fn a_wake_body_that_can_never_be_read_is_dropped_with_a_success_and_logged
 /// Post `call` to the listener's `/wake` at `base` as the alarm's
 /// delivery that had `answered` answered ones before it, and no others.
 async fn post_wake(base: &str, call: &Value, answered: u32) -> reqwest::Response {
-    reqwest::Client::new()
+    weft_core::net::http_client()
+        .build()
+        .unwrap()
         .post(format!("{base}/wake"))
         .header(FakeAlarm::ANSWERED_HEADER, answered)
         .header(FakeAlarm::TRIED_HEADER, answered)
@@ -1913,7 +1915,7 @@ async fn a_readable_wake_that_fails_answers_424_for_a_retry_until_its_last_deliv
     assert_eq!(said["dropped"], true, "{said}");
     assert!(rig.rows.lock().unwrap()["tok"]["held_failed"].is_string(), "the row says why");
 
-    let unsaid = reqwest::Client::new().post(format!("{base}/wake")).json(&call).send().await.unwrap();
+    let unsaid = weft_core::net::http_client().build().unwrap().post(format!("{base}/wake")).json(&call).send().await.unwrap();
     assert_eq!(unsaid.status(), 400);
     assert!(unsaid.text().await.unwrap().contains(FakeAlarm::ANSWERED_HEADER));
 }
@@ -1941,7 +1943,7 @@ async fn a_wake_that_can_never_be_handled_gives_its_signal_up_and_is_dropped() {
     let given_up = rig.rows.lock().unwrap()["poll"]["held_failed"].clone();
     assert!(given_up.as_str().unwrap().contains("poll_endpoint state"), "{given_up}");
     assert!(rig.alarm.wakes_for("signal:poll").is_empty(), "nothing more is set");
-    let live = reqwest::Client::new().post(format!("{base}/live")).json(&json!({ "token": "poll" })).send().await.unwrap();
+    let live = weft_core::net::http_client().build().unwrap().post(format!("{base}/live")).json(&json!({ "token": "poll" })).send().await.unwrap();
     let shown = live.text().await.unwrap();
     assert!(shown.contains("stopped:"), "its node says why: {shown}");
 }
@@ -2077,7 +2079,7 @@ async fn a_poll_registered_again_carries_its_new_spec_and_its_old_wakes_are_canc
     rig.rows.lock().unwrap().insert("poll".into(), again);
     let base = serve(rig.state.clone()).await;
     let start = json!({ "token": "poll", "mode": "new", "replaced": { "spec": old, "kind_state": {}, "generation": 1 } });
-    let answer = reqwest::Client::new().post(format!("{base}/start")).json(&start).send().await.unwrap();
+    let answer = weft_core::net::http_client().build().unwrap().post(format!("{base}/start")).json(&start).send().await.unwrap();
     assert_eq!(answer.status(), 204, "{}", answer.text().await.unwrap());
 
     assert!(rig.alarm.cancelled().iter().any(|w| w.name() == first.name()), "the old registration's wake is cancelled");

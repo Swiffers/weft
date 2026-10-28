@@ -24,6 +24,7 @@ use std::time::Duration;
 use anyhow::Context;
 use weft_core::net::EmptyBody;
 use weft_core::RunId;
+use weft_task_store::db::{self, Client, FromRow, Pool, Row};
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn};
 
 use crate::state::DispatcherState;
@@ -85,7 +86,7 @@ pub const REFUSALS_TO_END: i16 = RETRY_WAITS.len() as i16 + 1;
 pub const UNREACHED_TO_STOP: i16 = RETRY_WAITS.len() as i16 + 1;
 
 /// One queued run taken for delivery.
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug)]
 pub struct Delivery {
     pub run_id: RunId,
     pub project_id: uuid::Uuid,
@@ -93,6 +94,17 @@ pub struct Delivery {
     /// The image it runs on; `None` for a run of no program, which no
     /// worker can claim.
     pub binary_hash: Option<String>,
+}
+
+impl FromRow for Delivery {
+    fn from_row(row: Row) -> db::Result<Self> {
+        Ok(Self {
+            run_id: row.try_get("run_id")?,
+            project_id: row.try_get("project_id")?,
+            tenant_id: row.try_get("tenant_id")?,
+            binary_hash: row.try_get("binary_hash")?,
+        })
+    }
 }
 
 pub fn drain_loop(state: DispatcherState) -> DrainLoop {
@@ -130,35 +142,31 @@ pub fn drain_loop(state: DispatcherState) -> DrainLoop {
 /// `run.waited_on_workers` (its workers failed it) stays until it is
 /// claimed. A delivery that never comes back (its process died) leaves its mark to
 /// run out, and the run is taken again then.
-pub async fn take(pool: &sqlx::PgPool, now: i64, limit: i64) -> anyhow::Result<Vec<Delivery>> {
-    Ok(sqlx::query_as(
-        "UPDATE run SET delivered_until = $1 + $2, waits = FALSE, \
-             unreached = CASE WHEN unreached >= $4 THEN 0 ELSE unreached END, \
-             busy_since = CASE WHEN unreached >= $4 THEN NULL ELSE busy_since END \
-         WHERE run_id IN ( \
-             SELECT r.run_id FROM run r \
-             WHERE r.state = 'queued' \
-               AND ((r.unreached < $4 AND (r.delivered_until IS NULL OR r.delivered_until < $1)) \
-                    OR (r.unreached >= $4 AND EXISTS (SELECT 1 FROM worker_lease l \
-                                                      WHERE l.project_id = r.project_id AND l.alive_since >= r.delivered_until))) \
-             ORDER BY r.started_at LIMIT $3 FOR UPDATE SKIP LOCKED) \
-         RETURNING run_id, project_id, tenant_id, binary_hash",
-    )
-    .bind(now)
-    .bind(delivery_lease_secs())
-    .bind(limit)
-    .bind(UNREACHED_TO_STOP)
-    .fetch_all(pool)
-    .await?)
+pub async fn take(pool: &Pool, now: i64, limit: i64) -> anyhow::Result<Vec<Delivery>> {
+    Ok(pool
+        .all(
+            "UPDATE run SET delivered_until = $1::bigint + $2::bigint, waits = FALSE, \
+                 unreached = CASE WHEN unreached >= $4 THEN 0 ELSE unreached END, \
+                 busy_since = CASE WHEN unreached >= $4 THEN NULL ELSE busy_since END \
+             WHERE run_id IN ( \
+                 SELECT r.run_id FROM run r \
+                 WHERE r.state = 'queued' \
+                   AND ((r.unreached < $4 AND (r.delivered_until IS NULL OR r.delivered_until < $1)) \
+                        OR (r.unreached >= $4 AND EXISTS (SELECT 1 FROM worker_lease l \
+                                                          WHERE l.project_id = r.project_id AND l.alive_since >= r.delivered_until))) \
+                 ORDER BY r.started_at LIMIT $3 FOR UPDATE SKIP LOCKED) \
+             RETURNING run_id, project_id, tenant_id, binary_hash",
+            &[&now, &delivery_lease_secs(), &limit, &UNREACHED_TO_STOP],
+        )
+        .await?)
 }
 
 /// When the earliest queued run still tried is due to be handed out again
 /// (unix seconds): one out with a delivery whose lease runs out, or one
 /// waiting to be tried again. A run whose tries stopped is due on no clock.
-pub async fn next_hand_out(pool: &sqlx::PgPool) -> anyhow::Result<Option<i64>> {
-    Ok(sqlx::query_scalar("SELECT MIN(delivered_until) FROM run WHERE state = 'queued' AND unreached < $1")
-        .bind(UNREACHED_TO_STOP)
-        .fetch_one(pool)
+pub async fn next_hand_out(pool: &Pool) -> anyhow::Result<Option<i64>> {
+    Ok(pool
+        .scalar::<Option<i64>>("SELECT MIN(delivered_until) FROM run WHERE state = 'queued' AND unreached < $1", &[&UNREACHED_TO_STOP])
         .await?)
 }
 
@@ -179,12 +187,12 @@ pub fn busy_wait_cap_secs() -> i64 {
 /// out again once [`starting_wait_secs`] passed, joining the same
 /// bring-up, counting no try. Not announced: the loop looks again when
 /// the earliest such wait runs out.
-pub async fn wait_for_worker(pool: &sqlx::PgPool, run_id: RunId) -> anyhow::Result<()> {
-    sqlx::query("UPDATE run SET delivered_until = $2, waits = TRUE WHERE run_id = $1 AND state = 'queued'")
-        .bind(run_id)
-        .bind(crate::lease::now_unix() + starting_wait_secs())
-        .execute(pool)
-        .await?;
+pub async fn wait_for_worker(pool: &Pool, run_id: RunId) -> anyhow::Result<()> {
+    pool.execute(
+        "UPDATE run SET delivered_until = $2, waits = TRUE WHERE run_id = $1 AND state = 'queued'",
+        &[&run_id, &(crate::lease::now_unix() + starting_wait_secs())],
+    )
+    .await?;
     Ok(())
 }
 
@@ -195,18 +203,15 @@ pub async fn wait_for_worker(pool: &sqlx::PgPool, run_id: RunId) -> anyhow::Resu
 /// [`busy_wait_cap_secs`], and for as long as the workers answer busy: it
 /// is real work waiting for room. Answers how long the stretch has lasted,
 /// in seconds, `None` when it is no longer queued.
-pub async fn busy(pool: &sqlx::PgPool, run_id: RunId) -> anyhow::Result<Option<i64>> {
-    Ok(sqlx::query_scalar(
-        "UPDATE run SET busy_since = COALESCE(busy_since, $2), waits = TRUE, waited_on_workers = TRUE, \
-             delivered_until = $2 + LEAST(GREATEST($2 - COALESCE(busy_since, $2), $3), $4) \
-         WHERE run_id = $1 AND state = 'queued' RETURNING $2 - busy_since",
-    )
-    .bind(run_id)
-    .bind(crate::lease::now_unix())
-    .bind(busy_wait_secs())
-    .bind(busy_wait_cap_secs())
-    .fetch_optional(pool)
-    .await?)
+pub async fn busy(pool: &Pool, run_id: RunId) -> anyhow::Result<Option<i64>> {
+    Ok(pool
+        .scalar_opt(
+            "UPDATE run SET busy_since = COALESCE(busy_since, $2::bigint), waits = TRUE, waited_on_workers = TRUE, \
+                 delivered_until = $2::bigint + LEAST(GREATEST($2::bigint - COALESCE(busy_since, $2::bigint), $3::bigint), $4::bigint) \
+             WHERE run_id = $1 AND state = 'queued' RETURNING $2::bigint - busy_since",
+            &[&run_id, &crate::lease::now_unix(), &busy_wait_secs(), &busy_wait_cap_secs()],
+        )
+        .await?)
 }
 
 /// What `weft status` shows for a project whose workers answered a run
@@ -226,17 +231,15 @@ fn busy_for_words(secs: i64) -> String {
 /// to be tried again after the wait that refusal earns ([`RETRY_WAITS`]).
 /// Answers how many refusals it has now, `None` when it is no longer
 /// queued; the [`REFUSALS_TO_END`]th ends it ([`refused_cause`]).
-pub async fn refused(pool: &sqlx::PgPool, run_id: RunId) -> anyhow::Result<Option<i16>> {
-    Ok(sqlx::query_scalar(
-        "UPDATE run SET refusals = refusals + 1, waits = TRUE, waited_on_workers = TRUE, \
-             delivered_until = $2 + (($3::bigint[])[LEAST(refusals + 1, array_length($3::bigint[], 1))]) \
-         WHERE run_id = $1 AND state = 'queued' RETURNING refusals",
-    )
-    .bind(run_id)
-    .bind(crate::lease::now_unix())
-    .bind(RETRY_WAITS.map(weft_core::time_scale::scaled_secs).to_vec())
-    .fetch_optional(pool)
-    .await?)
+pub async fn refused(pool: &Pool, run_id: RunId) -> anyhow::Result<Option<i16>> {
+    Ok(pool
+        .scalar_opt(
+            "UPDATE run SET refusals = refusals + 1, waits = TRUE, waited_on_workers = TRUE, \
+                 delivered_until = $2::bigint + (($3::bigint[])[LEAST(refusals + 1, array_length($3::bigint[], 1))]) \
+             WHERE run_id = $1 AND state = 'queued' RETURNING refusals",
+            &[&run_id, &crate::lease::now_unix(), &RETRY_WAITS.map(weft_core::time_scale::scaled_secs).to_vec()],
+        )
+        .await?)
 }
 
 /// Count one more hand-off of a queued run that got no answer from its
@@ -248,19 +251,16 @@ pub async fn refused(pool: &sqlx::PgPool, run_id: RunId) -> anyhow::Result<Optio
 /// [`retry_stopped`], `crate::project_store::ProjectStoreOps::set_worker_overrides`).
 /// Answers how many it has now, `None` when it is no longer queued (its
 /// worker claimed it before the call broke).
-pub async fn unreached(pool: &sqlx::PgPool, run_id: RunId) -> anyhow::Result<Option<i16>> {
-    Ok(sqlx::query_scalar(
-        "UPDATE run SET unreached = unreached + 1, waits = TRUE, waited_on_workers = TRUE, \
-             delivered_until = CASE WHEN unreached + 1 >= $3 THEN EXTRACT(EPOCH FROM NOW())::BIGINT \
-                 ELSE $2 + (($4::bigint[])[unreached + 1]) END \
-         WHERE run_id = $1 AND state = 'queued' RETURNING unreached",
-    )
-    .bind(run_id)
-    .bind(crate::lease::now_unix())
-    .bind(UNREACHED_TO_STOP)
-    .bind(RETRY_WAITS.map(weft_core::time_scale::scaled_secs).to_vec())
-    .fetch_optional(pool)
-    .await?)
+pub async fn unreached(pool: &Pool, run_id: RunId) -> anyhow::Result<Option<i16>> {
+    Ok(pool
+        .scalar_opt(
+            "UPDATE run SET unreached = unreached + 1, waits = TRUE, waited_on_workers = TRUE, \
+                 delivered_until = CASE WHEN unreached + 1 >= $3::smallint THEN EXTRACT(EPOCH FROM NOW())::BIGINT \
+                     ELSE $2::bigint + (($4::bigint[])[unreached + 1]) END \
+             WHERE run_id = $1 AND state = 'queued' RETURNING unreached",
+            &[&run_id, &crate::lease::now_unix(), &UNREACHED_TO_STOP, &RETRY_WAITS.map(weft_core::time_scale::scaled_secs).to_vec()],
+        )
+        .await?)
 }
 
 /// Start again the tries of `project_id`'s queued runs that stopped
@@ -269,16 +269,15 @@ pub async fn unreached(pool: &sqlx::PgPool, run_id: RunId) -> anyhow::Result<Opt
 /// queued so the delivery takes them: for a build of the project
 /// registering, which can fix that. `run.waited_on_workers` (their
 /// workers failed them) stays until each is claimed.
-pub async fn retry_stopped(conn: &mut sqlx::PgConnection, project_id: uuid::Uuid) -> anyhow::Result<()> {
-    let retried = sqlx::query(
-        "UPDATE run SET unreached = 0, busy_since = NULL, waits = FALSE, delivered_until = NULL \
-         WHERE project_id = $1 AND state = 'queued' AND unreached >= $2",
-    )
-    .bind(project_id)
-    .bind(UNREACHED_TO_STOP)
-    .execute(&mut *conn)
-    .await?;
-    if retried.rows_affected() > 0 {
+pub async fn retry_stopped(conn: &impl Client, project_id: uuid::Uuid) -> anyhow::Result<()> {
+    let retried = conn
+        .execute(
+            "UPDATE run SET unreached = 0, busy_since = NULL, waits = FALSE, delivered_until = NULL \
+             WHERE project_id = $1 AND state = 'queued' AND unreached >= $2",
+            &[&project_id, &UNREACHED_TO_STOP],
+        )
+        .await?;
+    if retried > 0 {
         weft_journal::record::notify_queued_in(conn, project_id).await?;
     }
     Ok(())
@@ -505,13 +504,13 @@ async fn hand_back(state: &DispatcherState, delivery: &Delivery, e: &anyhow::Err
         GiveBack::WontStart => {
             // Every run queued on that build ends with it: each would bring
             // up the same worker and meet the same answer.
-            let queued: Vec<RunId> = sqlx::query_scalar(
-                "SELECT run_id FROM run WHERE project_id = $1 AND binary_hash IS NOT DISTINCT FROM $2 AND state = 'queued'",
-            )
-            .bind(delivery.project_id)
-            .bind(delivery.binary_hash.as_deref())
-            .fetch_all(&state.pg_pool)
-            .await?;
+            let queued: Vec<RunId> = state
+                .pg_pool
+                .scalars(
+                    "SELECT run_id FROM run WHERE project_id = $1 AND binary_hash IS NOT DISTINCT FROM $2 AND state = 'queued'",
+                    &[&delivery.project_id, &delivery.binary_hash.as_deref()],
+                )
+                .await?;
             tracing::warn!(
                 target: "weft_dispatcher::delivery",
                 %run_id,

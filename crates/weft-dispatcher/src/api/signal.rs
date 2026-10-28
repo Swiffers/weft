@@ -4,7 +4,6 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use weft_task_store::sql;
 use axum::{
     extract::{Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
@@ -12,7 +11,7 @@ use axum::{
     Json,
 };
 use serde_json::Value;
-use sqlx::Row;
+use weft_task_store::db::Client as _;
 
 use weft_core::signal::listener_protocol::ProcessTarget;
 
@@ -40,19 +39,19 @@ pub(crate) enum Landed {
 /// a hand-over that kept failing): how many, and what the one parked or
 /// stopped last waits on.
 pub async fn waiting_fires(
-    pool: &sqlx::PgPool,
+    pool: &weft_task_store::db::Pool,
     project_id: uuid::Uuid,
 ) -> anyhow::Result<std::collections::BTreeMap<weft_core::activation::ActivationKey, weft_core::program::WaitingFires>> {
-    let rows: Vec<(String, Option<String>, i64, String)> = sqlx::query_as(
-        "SELECT s.activation_trigger, s.instance_id, count(*)::bigint, \
-                (array_agg(p.waits_for ORDER BY p.seq DESC))[1] \
-         FROM parked_fire p JOIN signal s ON s.token = p.token \
-         WHERE s.project_id = $1 AND s.activation_trigger IS NOT NULL AND p.waits_for IS NOT NULL \
-         GROUP BY s.activation_trigger, s.instance_id",
-    )
-    .bind(project_id)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(String, Option<String>, i64, String)> = pool
+        .all(
+            "SELECT s.activation_trigger, s.instance_id, count(*)::bigint, \
+                    (array_agg(p.waits_for ORDER BY p.seq DESC))[1] \
+             FROM parked_fire p JOIN signal s ON s.token = p.token \
+             WHERE s.project_id = $1 AND s.activation_trigger IS NOT NULL AND p.waits_for IS NOT NULL \
+             GROUP BY s.activation_trigger, s.instance_id",
+            &[&project_id],
+        )
+        .await?;
     rows.into_iter()
         .map(|(trigger, instance, fires, waits_for)| {
             let instance = instance
@@ -70,22 +69,19 @@ pub async fn waiting_fires(
 /// waiting on that instance's values, and whose activation is Active: what
 /// a change of the instance's values routes again.
 pub async fn instance_waiting_tokens(
-    pool: &sqlx::PgPool,
+    pool: &weft_task_store::db::Pool,
     project_id: uuid::Uuid,
     instance: &weft_core::instance::InstanceId,
 ) -> anyhow::Result<Vec<String>> {
-    Ok(sqlx::query_scalar(sql!(
+    let sql = format!(
         "SELECT s.token FROM signal s {} \
          WHERE s.project_id = $1 AND s.instance_id = $2 \
            AND COALESCE(a.status, 'active') = 'active' \
            AND EXISTS (SELECT 1 FROM parked_fire p WHERE p.token = s.token AND {})",
         weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
         crate::parked_drain::waits_on_sql("p", weft_core::door_fire::UnclockedWait::Instance),
-    ))
-    .bind(project_id)
-    .bind(instance.as_str())
-    .fetch_all(pool)
-    .await?)
+    );
+    Ok(pool.scalars(&sql, &[&project_id, &instance.as_str()]).await?)
 }
 
 /// `POST /signal/{token}`. Dispatcher entry point for every
@@ -390,8 +386,8 @@ impl FireGateInfo {
 /// governs it (`signal.activation_trigger` + `signal.instance_id`, the one
 /// join `SIGNAL_ACTIVATION_JOIN`). No governing activation reads as
 /// live and accepting.
-fn gate_select() -> sqlx::AssertSqlSafe<String> {
-    sql!(
+fn gate_select() -> String {
+    format!(
         "SELECT s.token, s.project_id, s.tenant_id, s.surface_kind, s.auth_kind, \
                 s.is_resume, s.binary_hash, \
                 COALESCE(a.status, 'active') AS status, \
@@ -403,8 +399,10 @@ fn gate_select() -> sqlx::AssertSqlSafe<String> {
     )
 }
 
-fn gate_info(row: &sqlx::postgres::PgRow) -> Result<FireGateInfo, (StatusCode, String)> {
-    let get_err = |e: sqlx::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}"));
+fn gate_info(row: &weft_task_store::db::Row) -> Result<FireGateInfo, (StatusCode, String)> {
+    fn get_err(e: impl std::fmt::Display) -> (StatusCode, String) {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}"))
+    }
     let status_str: String = row.try_get("status").map_err(get_err)?;
     Ok(FireGateInfo {
         project_id: row.try_get("project_id").map_err(get_err)?,
@@ -424,9 +422,9 @@ pub(crate) async fn lookup_signal_routing(
     state: &DispatcherState,
     token: &str,
 ) -> Result<FireGateInfo, (StatusCode, String)> {
-    let row = sqlx::query(gate_select())
-        .bind(token)
-        .fetch_optional(&state.pg_pool)
+    let row = state
+        .pg_pool
+        .opt::<weft_task_store::db::Row>(&gate_select(), &[&token])
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal lookup: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "unknown signal token".into()))?;
@@ -965,7 +963,7 @@ impl TokenScope {
 /// consumers, resume rows only while unanswered. Entry rows first, then
 /// by age.
 pub async fn signals_visible_to(
-    pool: &sqlx::PgPool,
+    pool: &weft_task_store::db::Pool,
     tenant: &str,
     projects: &[uuid::Uuid],
     tags: &[String],
@@ -974,7 +972,7 @@ pub async fn signals_visible_to(
     // One decoder for a signal row, shared with `PostgresStore`
     // (`row_to_signal`): the SELECT differs (a join and the consumer
     // filters), the columns and the decoding must not.
-    let rows = sqlx::query_as::<_, crate::store::postgres::SignalRow>(sql!(
+    let sql = format!(
         concat!("SELECT ", crate::store::postgres::signal_columns!("s."), " \
          FROM signal s {join} \
          WHERE COALESCE(a.fires_visible_to_consumers, TRUE) = TRUE \
@@ -988,14 +986,11 @@ pub async fn signals_visible_to(
            ) \
          ORDER BY s.is_resume ASC, s.created_at ASC"),
         join = weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
-    ))
-    .bind(tenant)
-    .bind(projects)
-    .bind(tags)
-    .bind(instance.map(|m| m.as_str()))
-    .fetch_all(pool)
-    .await
-    .context("signals_visible_to (the consumer listing): read a signal row")?;
+    );
+    let rows: Vec<crate::store::postgres::SignalRow> = pool
+        .all(&sql, &[&tenant, &projects, &tags, &instance.map(|m| m.as_str())])
+        .await
+        .context("signals_visible_to (the consumer listing): read a signal row")?;
     rows.into_iter().map(crate::store::postgres::row_to_signal).collect()
 }
 
@@ -1305,23 +1300,23 @@ async fn fresh_tenant_routes(state: &DispatcherState, tenant: &str) -> Result<Ar
     state.held.routes.load_fresh(tenant.to_string(), || read_tenant_routes(&state.pg_pool, tenant)).await
 }
 
-async fn read_tenant_routes(pool: &sqlx::PgPool, tenant: &str) -> Result<Vec<HeldRoute>, (StatusCode, String)> {
+async fn read_tenant_routes(pool: &weft_task_store::db::Pool, tenant: &str) -> Result<Vec<HeldRoute>, (StatusCode, String)> {
     // token, mount path, methods, project, the program's binary (an entry
     // is armed with its program as it is captured), and the governing
     // activation's standing, read as the fire gate reads it
     // (`gate_select`: no governing activation reads as live and accepting)
     type MountRow = (String, String, Vec<String>, uuid::Uuid, String, String, bool, Option<i64>);
-    let rows: Vec<MountRow> = sqlx::query_as(sql!(
+    let sql = format!(
         "SELECT s.token, s.mount_path, s.mount_methods, s.project_id, s.binary_hash, \
                 COALESCE(a.status, 'active'), COALESCE(a.accepting_fires, TRUE), a.fires_deadline_unix \
          FROM signal s {} \
          WHERE s.tenant_id = $1 AND s.surface_kind = 'public_entry' AND s.mount_path IS NOT NULL",
         weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
-    ))
-    .bind(tenant)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("route lookup: {e}")))?;
+    );
+    let rows: Vec<MountRow> = pool
+        .all(&sql, &[&tenant])
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("route lookup: {e}")))?;
     rows.into_iter()
         .map(|(token, mount_path, mount_methods, project_id, binary_hash, status, accepting_fires, fires_deadline_unix)| {
             let status = crate::activation_store::ProjectStatus::parse(&status)

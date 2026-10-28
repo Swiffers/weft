@@ -167,10 +167,10 @@ pub struct DispatcherSettings<'a> {
     pub config: &'a InstallConfig,
     /// This process's replica id.
     pub replica: String,
-    pub pool: sqlx::PgPool,
+    pub pool: weft_task_store::db::Pool,
     /// A pool of its own for the project transition lock (see
     /// `DispatcherState::lock_pool`).
-    pub lock_pool: sqlx::PgPool,
+    pub lock_pool: weft_task_store::db::Pool,
     /// The process's one `LISTEN` connection, on (at least)
     /// [`DISPATCHER_CHANNELS`].
     pub signals: Arc<weft_task_store::pg_signal::PgSignalWatch>,
@@ -243,7 +243,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
     // wants. Each short internal call bounds itself where it is made
     // (`RequestBuilder::timeout`).
     let http = weft_core::net::notice_dead_connections(
-        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).connect_timeout(PEER_CONNECT_TIMEOUT),
+        weft_core::net::http_client().redirect(reqwest::redirect::Policy::none()).connect_timeout(PEER_CONNECT_TIMEOUT),
     )
     .build()
     .expect("a reqwest client with only a redirect policy and timeouts builds");

@@ -26,7 +26,6 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-sqlx = { workspace = true, features = ["json", "uuid", "tls-rustls"] }
 tokio = { workspace = true, features = ["process"] }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
@@ -44,10 +43,12 @@ weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 # The database tests build their tables with `apply_groups`.
-weft-task-store = { workspace = true, features = ["migrate"] }
+weft-task-store = { workspace = true, features = ["migrate", "test-helpers"] }
 axum = { workspace = true }
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
-sqlx = { workspace = true, features = ["json", "uuid", "macros", "migrate"] }
+# `#[weft_db_macros::test]` hands each Layer-3 test a fresh database of
+# its own on $DATABASE_URL, dropped after.
+weft-db-macros = { workspace = true }
 parking_lot = { workspace = true }
 tempfile = { workspace = true }
 # `weft_core::stress_test!` expands to it.

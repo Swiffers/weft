@@ -72,7 +72,7 @@ pub fn lock_answer(what: &str, e: anyhow::Error) -> (axum::http::StatusCode, Str
 /// `api::versions`, the start of an infra sync in `api::infra`, which
 /// awaits the sync itself outside the lock).
 pub async fn with_project_transition_lock<T, F, Fut>(
-    lock_pool: &sqlx::postgres::PgPool,
+    lock_pool: &weft_task_store::db::Pool,
     project_id: uuid::Uuid,
     body: F,
 ) -> anyhow::Result<T>

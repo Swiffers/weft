@@ -210,7 +210,7 @@ impl LocalRunner {
             folders,
             identity,
             clock,
-            http: reqwest::Client::builder().timeout(Duration::from_secs(5)).build().expect("reqwest client"),
+            http: weft_core::net::http_client().timeout(Duration::from_secs(5)).build().expect("reqwest client"),
             cfg,
             running: parking_lot::Mutex::new(HashMap::new()),
             starting: tokio::sync::Mutex::new(HashMap::new()),

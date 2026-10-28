@@ -54,7 +54,7 @@ pub struct Tick {
     /// process that wrote it answers on its next ring that goes through,
     /// and whose early wake set again is not recorded (a booking that
     /// moves then cancels the wake it was first set as).
-    pub pool: Option<sqlx::PgPool>,
+    pub pool: Option<weft_task_store::db::Pool>,
 }
 
 impl Tick {

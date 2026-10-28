@@ -11,7 +11,7 @@
 #      `/weft/target`.
 #
 # Why precompile the whole stock worker and not just the engine: the
-# package crates pull in dependencies of their own (`sqlx`, `pyo3`,
+# package crates pull in dependencies of their own (`tokio-postgres`, `pyo3`,
 # `tungstenite`, ...) and change how cargo unifies the features of the
 # shared ones, so a base holding only the engine's dependency tree left
 # every first build on a host recompiling the engine, most of that tree

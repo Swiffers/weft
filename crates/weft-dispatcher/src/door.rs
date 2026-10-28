@@ -201,7 +201,8 @@ mod tests {
     #[test]
     fn only_a_database_that_did_not_take_the_read_asks_the_caller_again() {
         let status = |e: anyhow::Error| domains_unread(&e).status();
-        assert_eq!(status(anyhow::Error::from(sqlx::Error::PoolTimedOut).context("list the domains")), StatusCode::SERVICE_UNAVAILABLE);
+        let busy = weft_task_store::db::Error::NoConnection { why: weft_task_store::db::NoConnection::Busy, refused: None };
+        assert_eq!(status(anyhow::Error::from(busy).context("list the domains")), StatusCode::SERVICE_UNAVAILABLE);
         let quota = anyhow::anyhow!("FATAL: the compute time quota of this project is exceeded").context("list the domains");
         assert_eq!(status(quota), StatusCode::INTERNAL_SERVER_ERROR);
     }

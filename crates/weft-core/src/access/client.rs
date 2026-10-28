@@ -35,7 +35,7 @@ use super::spec::{AnswerReader, AuthStep, RefusalPaths, SignKind, Template};
 pub fn base_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        crate::net::http_client()
             .redirect(reqwest::redirect::Policy::limited(10))
             .connect_timeout(std::time::Duration::from_secs(10))
             // Some APIs (GitHub) refuse UA-less requests outright.

@@ -15,6 +15,9 @@ serve = ["dep:axum", "dep:http-body"]
 # database turn it on; a worker never does, so its build neither reads nor
 # hashes `migrations/` (`[package.metadata.weft]` below).
 migrate = []
+# What a database test runs through (`db::testing`), for the crates whose
+# tests need a real Postgres (`#[weft_db_macros::test]`).
+test-helpers = []
 
 [dependencies]
 # Only for stamping a generated migration's file name with the date it was
@@ -30,14 +33,14 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-sqlx = { workspace = true, features = ["json", "uuid", "tls-rustls"] }
+tokio-postgres = { workspace = true }
+deadpool-postgres = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
+rustls = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { version = "0.7" }
 tracing = { workspace = true }
-# Hearing sqlx's reports of a slow acquire (`throttle::slow_acquires`).
-tracing-subscriber = { workspace = true }
-# The level sqlx's pool options take (`db::options`).
-log = "0.4"
 url = { workspace = true }
 uuid = { workspace = true }
 # A column of documents stored compressed (`documents::Encoding::Zstd`).
@@ -52,19 +55,20 @@ weft-workspace-hack = { version = "0.1", path = "../weft-workspace-hack" }
 # the schema, which is behind `migrate`. A dev-dependency on the crate
 # itself turns both on for every test build, so the ordinary run and the
 # database run build the same library.
-weft-task-store = { path = ".", features = ["serve", "migrate"] }
+weft-task-store = { path = ".", features = ["serve", "migrate", "test-helpers"] }
 # Driving `pg_signal::keep_listening` in the database tests (`oneshot`).
 tower = { workspace = true, features = ["util"] }
 # `test-util` enables tokio's paused virtual clock (start_paused +
 # advance) so the timing tests run deterministically without real
 # sleeps.
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
-# `#[sqlx::test]` (macros + migrate features) spins up a fresh isolated
-# Postgres database per test against $DATABASE_URL and drops it after, for
-# the Layer-3 DB-logic tests (claims, reruns, signals, terminal waits,
-# the schema guard). Only nextest's `db` profile runs them
-# (`scripts/run-db-tests.sh`), since without a DATABASE_URL they fail.
-sqlx = { workspace = true, features = ["json", "uuid", "macros", "migrate"] }
+# `#[weft_db_macros::test]` hands each Layer-3 DB-logic test (claims,
+# reruns, signals, terminal waits, the schema guard) a fresh database of
+# its own on $DATABASE_URL, dropped after. Only nextest's `db` profile runs
+# them (`scripts/run-db-tests.sh`), since without a DATABASE_URL they fail.
+weft-db-macros = { workspace = true }
+# Hearing what the code under test logs (`tests/db/unanswered.rs`).
+tracing-subscriber = { workspace = true }
 # The fake alarm the booking tests read the wakes set and cancelled from.
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 

@@ -925,7 +925,7 @@ pub fn stage_builder_base_context(weft_root: &Path) -> BuildResult<PathBuf> {
 /// ```
 ///
 /// The base precompiles the STOCK PROJECT'S WORKER, not a deps-only stand-in:
-/// the package crates pull in dependencies of their own (`sqlx`, `reqwest`,
+/// the package crates pull in dependencies of their own (`tokio-postgres`, `reqwest`,
 /// `tungstenite`, ...) and change how cargo unifies the features of the
 /// shared ones, so a base that had compiled only the engine's dependencies
 /// left every first build on a host recompiling the engine, most of the
@@ -1317,7 +1317,7 @@ pub fn prepare_test_workspace(
 /// One invocation, not one per package, because cargo's v2 resolver
 /// resolves features per invocation: built one at a time, two packages
 /// that share a dependency with different features each get their own
-/// copy of it (that is where ten copies of `sqlx-postgres` came from,
+/// copy of it (that is where ten copies of one database driver came from,
 /// and merging the crates into one workspace did not change it on its
 /// own). Built together, the resolver unifies them and compiles each
 /// dependency once.

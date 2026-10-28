@@ -53,10 +53,8 @@
 //! stretch, and alerts again.
 
 use anyhow::Result;
-use sqlx::postgres::PgPool;
-
+use crate::db::{Client, Json, Pool};
 use crate::drain::DB_NOW_MS;
-use crate::sql;
 
 pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
     name: "unanswered_call",
@@ -339,50 +337,48 @@ pub struct Failing {
 /// every time. On an install that alerts, the first write past its delay
 /// since the stretch began raises the alert: the answer holds it, for the
 /// caller to log once the write commits ([`Alerts`]).
-pub async fn failed<'e>(executor: impl sqlx::PgExecutor<'e>, callee: Callee<'_>, label: Option<&str>, error: &str) -> Result<Alerts> {
-    write(executor, callee, label, error, false, std::time::Duration::ZERO).await
+pub async fn failed(db: &impl Client, callee: Callee<'_>, label: Option<&str>, error: &str) -> Result<Alerts> {
+    write(db, callee, label, error, false, std::time::Duration::ZERO).await
 }
 
 /// [`failed`], for a failure that had already lasted `lasted` when it is
 /// first written: a stretch this write starts begins that long before it,
 /// so the install's delay counts from when the failure began.
-pub async fn failed_for<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
+pub async fn failed_for(
+    db: &impl Client,
     callee: Callee<'_>,
     label: Option<&str>,
     error: &str,
     lasted: std::time::Duration,
 ) -> Result<Alerts> {
-    write(executor, callee, label, error, false, lasted).await
+    write(db, callee, label, error, false, lasted).await
 }
 
 /// [`failed`], for a failure weft stopped retrying on its own: only an
 /// event that can fix it tries it again. On an install that alerts, the
 /// first such write of a stretch raises the alert.
-pub async fn gave_up<'e>(executor: impl sqlx::PgExecutor<'e>, callee: Callee<'_>, label: Option<&str>, error: &str) -> Result<Alerts> {
-    write(executor, callee, label, error, true, std::time::Duration::ZERO).await
+pub async fn gave_up(db: &impl Client, callee: Callee<'_>, label: Option<&str>, error: &str) -> Result<Alerts> {
+    write(db, callee, label, error, true, std::time::Duration::ZERO).await
 }
 
-async fn write<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
+async fn write(
+    db: &impl Client,
     callee: Callee<'_>,
     label: Option<&str>,
     error: &str,
     stopped: bool,
     lasted: std::time::Duration,
 ) -> Result<Alerts> {
-    let alerted: Option<sqlx::types::Json<Vec<Alerted>>> = sqlx::query_scalar(sql!(
-        "WITH written AS ({write}) SELECT {alerted}",
-        write = write_sql("SELECT $1::text AS callee, $2::text AS label, $3::text AS error, $5::bigint AS lasted_ms", "$4::boolean"),
-        alerted = alerted_sql("written"),
-    ))
-    .bind(callee.key())
-    .bind(label)
-    .bind(pg_text(error))
-    .bind(stopped)
-    .bind(i64::try_from(lasted.as_millis()).unwrap_or(i64::MAX))
-    .fetch_one(executor)
-    .await?;
+    let alerted: Option<Json<Vec<Alerted>>> = db
+        .scalar(
+            &format!(
+                "WITH written AS ({write}) SELECT {alerted}",
+                write = write_sql("SELECT $1::text AS callee, $2::text AS label, $3::text AS error, $5::bigint AS lasted_ms", "$4::boolean"),
+                alerted = alerted_sql("written"),
+            ),
+            &[&callee.key(), &label, &pg_text(error).as_ref(), &stopped, &i64::try_from(lasted.as_millis()).unwrap_or(i64::MAX)],
+        )
+        .await?;
     Ok(Alerts::of(alerted))
 }
 
@@ -461,7 +457,7 @@ pub struct Alerts(Vec<Alerted>);
 
 impl Alerts {
     /// The alerts of [`alerted_sql`]'s answer.
-    pub fn of(alerted: Option<sqlx::types::Json<Vec<Alerted>>>) -> Self {
+    pub fn of(alerted: Option<Json<Vec<Alerted>>>) -> Self {
         Self(alerted.map(|json| json.0).unwrap_or_default())
     }
 
@@ -569,12 +565,11 @@ fn workers_through_sql(project_expr: &str, last_ms_expr: &str) -> String {
 // Built in every build, hidden: the database tests of the crates above
 // this one call it too, and a test-only switch here would rebuild them all.
 #[doc(hidden)]
-pub async fn judged_run_columns(pool: &PgPool) -> Result<()> {
-    sqlx::query(
+pub async fn judged_run_columns(pool: &Pool) -> Result<()> {
+    pool.batch_execute(
         "CREATE TABLE run (run_id UUID PRIMARY KEY, project_id UUID NOT NULL, state TEXT NOT NULL, started_at BIGINT NOT NULL, \
          busy_since BIGINT, refusals SMALLINT NOT NULL DEFAULT 0, unreached SMALLINT NOT NULL DEFAULT 0)",
     )
-    .execute(pool)
     .await?;
     Ok(())
 }
@@ -585,11 +580,8 @@ pub async fn judged_run_columns(pool: &PgPool) -> Result<()> {
 /// is no longer shown, unless another queued run of the project still
 /// waits on them ([`delivery_failed_sql`]). Called by whoever took the
 /// run out of the queue, which read the mark off the row it locked.
-pub async fn delivery_waits_ended<'e>(executor: impl sqlx::PgExecutor<'e>, project: uuid::Uuid) -> Result<()> {
-    sqlx::query(sqlx::AssertSqlSafe(delivery_waits_ended_sql("$1", None)))
-        .bind(project)
-        .execute(executor)
-        .await?;
+pub async fn delivery_waits_ended(db: &impl Client, project: uuid::Uuid) -> Result<()> {
+    db.execute(&delivery_waits_ended_sql("$1::uuid", None), &[&project]).await?;
     Ok(())
 }
 
@@ -610,19 +602,18 @@ pub fn delivery_waits_ended_sql(project_expr: &str, leaving_expr: Option<&str>) 
 /// failure weft still retries is current before it counts as stuck, or
 /// stop it alerting (`None`). The process that applies the install's
 /// config writes it at its start.
-pub async fn alert_after(pool: &PgPool, after: Option<std::time::Duration>) -> Result<()> {
+pub async fn alert_after(pool: &Pool, after: Option<std::time::Duration>) -> Result<()> {
     match after {
         Some(after) => {
-            sqlx::query(
+            pool.execute(
                 "INSERT INTO unanswered_alert (one, after_ms) VALUES (TRUE, $1) \
                  ON CONFLICT (one) DO UPDATE SET after_ms = EXCLUDED.after_ms WHERE unanswered_alert.after_ms <> EXCLUDED.after_ms",
+                &[&i64::try_from(after.as_millis()).unwrap_or(i64::MAX)],
             )
-            .bind(i64::try_from(after.as_millis()).unwrap_or(i64::MAX))
-            .execute(pool)
             .await?;
         }
         None => {
-            sqlx::query("DELETE FROM unanswered_alert").execute(pool).await?;
+            pool.execute("DELETE FROM unanswered_alert", &[]).await?;
         }
     }
     Ok(())
@@ -639,30 +630,24 @@ pub fn pg_text(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// What `callee` held up is resolved: it is no longer shown.
-pub async fn answered<'e>(executor: impl sqlx::PgExecutor<'e>, callee: Callee<'_>) -> Result<()> {
-    sqlx::query("DELETE FROM unanswered_call WHERE callee = $1").bind(callee.key()).execute(executor).await?;
+pub async fn answered(db: &impl Client, callee: Callee<'_>) -> Result<()> {
+    db.execute("DELETE FROM unanswered_call WHERE callee = $1", &[&callee.key()]).await?;
     Ok(())
 }
 
 /// `project` is removed: nothing of it waits any more, so nothing written
 /// down of its own work is shown again: every key that holds it up
 /// ([`Callee::project`]).
-pub async fn forget_project<'e>(executor: impl sqlx::PgExecutor<'e>, project: uuid::Uuid) -> Result<()> {
-    sqlx::query(sql!("DELETE FROM unanswered_call WHERE {} = $1::uuid::text", project_part_sql("callee")))
-        .bind(project)
-        .execute(executor)
-        .await?;
+pub async fn forget_project(db: &impl Client, project: uuid::Uuid) -> Result<()> {
+    db.execute(&format!("DELETE FROM unanswered_call WHERE {} = $1::uuid::text", project_part_sql("callee")), &[&project]).await?;
     Ok(())
 }
 
 /// A look over every project found `kind` failing for `failing` only:
 /// what was written down of that kind for the others is no longer shown.
-pub async fn still_failing(pool: &PgPool, kind: PerProject, failing: &[uuid::Uuid]) -> Result<()> {
+pub async fn still_failing(pool: &Pool, kind: PerProject, failing: &[uuid::Uuid]) -> Result<()> {
     let kept: Vec<String> = failing.iter().map(|project| format!("{}{project}", kind.prefix())).collect();
-    sqlx::query("DELETE FROM unanswered_call WHERE starts_with(callee, $1) AND NOT (callee = ANY($2))")
-        .bind(kind.prefix())
-        .bind(&kept)
-        .execute(pool)
+    pool.execute("DELETE FROM unanswered_call WHERE starts_with(callee, $1) AND NOT (callee = ANY($2))", &[&kind.prefix(), &kept])
         .await?;
     Ok(())
 }
@@ -671,10 +656,8 @@ pub async fn still_failing(pool: &PgPool, kind: PerProject, failing: &[uuid::Uui
 /// ago: a process that gave up ringing it (it was stopped) left the row,
 /// and the work the ring was for still waits, so a process that starts
 /// rings these again.
-pub async fn unanswered_roles(pool: &PgPool) -> Result<Vec<String>> {
-    let keys: Vec<String> = sqlx::query_scalar("SELECT callee FROM unanswered_call WHERE callee LIKE 'role:%' ORDER BY callee")
-        .fetch_all(pool)
-        .await?;
+pub async fn unanswered_roles(pool: &Pool) -> Result<Vec<String>> {
+    let keys: Vec<String> = pool.scalars("SELECT callee FROM unanswered_call WHERE callee LIKE 'role:%' ORDER BY callee", &[]).await?;
     Ok(keys.into_iter().filter_map(|key| key.strip_prefix("role:").map(str::to_string)).collect())
 }
 
@@ -685,19 +668,20 @@ pub async fn unanswered_roles(pool: &PgPool) -> Result<Vec<String>> {
 /// and every one that holds up this project ([`Callee::project`]): its
 /// workers while their stretch is not over, its infra, infra commands,
 /// repairs and signals kept past their door's window.
-pub async fn failing_for(pool: &PgPool, project: uuid::Uuid) -> Result<Vec<Failing>> {
-    let rows: Vec<(String, Option<String>, String, i64, i64, i64)> = sqlx::query_as(sql!(
-        "SELECT u.callee, u.label, u.error, u.since_ms, u.last_ms, {DB_NOW_MS} FROM unanswered_call u \
-         WHERE {part} IS NULL \
-            OR ({part} = $2::uuid::text AND (u.callee <> $1 OR NOT {workers_through})) \
-         ORDER BY u.callee",
-        part = project_part_sql("u.callee"),
-        workers_through = workers_through_sql("$2", "u.last_ms"),
-    ))
-    .bind(Callee::Workers(project).key())
-    .bind(project)
-    .fetch_all(pool)
-    .await?;
+pub async fn failing_for(pool: &Pool, project: uuid::Uuid) -> Result<Vec<Failing>> {
+    let rows: Vec<(String, Option<String>, String, i64, i64, i64)> = pool
+        .all(
+            &format!(
+                "SELECT u.callee, u.label, u.error, u.since_ms, u.last_ms, {DB_NOW_MS} FROM unanswered_call u \
+                 WHERE {part} IS NULL \
+                    OR ({part} = $2::uuid::text AND (u.callee <> $1 OR NOT {workers_through})) \
+                 ORDER BY u.callee",
+                part = project_part_sql("u.callee"),
+                workers_through = workers_through_sql("$2", "u.last_ms"),
+            ),
+            &[&Callee::Workers(project).key(), &project],
+        )
+        .await?;
     Ok(rows
         .into_iter()
         .filter_map(|(callee, label, error, since_ms, last_ms, as_of_ms)| {

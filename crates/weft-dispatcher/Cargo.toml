@@ -38,7 +38,6 @@ chrono = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
-sqlx = { workspace = true, features = ["json", "uuid", "chrono"] }
 tokio-tungstenite = { workspace = true }
 sha2 = { workspace = true }
 # The events receiver forwards raw push bodies to the broker base64'd
@@ -61,8 +60,10 @@ weft-dispatcher = { path = ".", features = ["test-helpers"] }
 # worker does in production.
 weft-broker = { path = "../weft-broker" }
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
-# `#[sqlx::test]` (macros + migrate) provisions a fresh isolated DB per test.
-sqlx = { workspace = true, features = ["json", "uuid", "chrono", "macros", "migrate"] }
+# `#[weft_db_macros::test]` hands each Layer-3 test a fresh database of
+# its own on $DATABASE_URL, dropped after.
+weft-db-macros = { workspace = true }
+weft-task-store = { workspace = true, features = ["serve", "migrate", "test-helpers"] }
 # `test-util`: the paused virtual clock the wake-loop tests (`pg_wake`)
 # run on, so their safety ticks pass without real waiting.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

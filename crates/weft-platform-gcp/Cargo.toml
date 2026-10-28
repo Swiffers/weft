@@ -15,7 +15,7 @@ repository.workspace = true
 default = []
 control = [
     "weft-core/jwt",
-    "dep:sqlx",
+    "dep:weft-task-store",
     "dep:tar",
     "dep:flate2",
     "dep:base64",
@@ -39,7 +39,7 @@ url = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
-sqlx = { workspace = true, features = ["uuid"], optional = true }
+weft-task-store = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }

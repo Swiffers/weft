@@ -26,12 +26,11 @@
 //! could lapse, since nothing announces a claimer that died.
 
 use anyhow::Result;
-use weft_task_store::sql;
-use sqlx::PgPool;
 use weft_broker_client::lifecycle_command::ISSUED_WAKE;
+use weft_task_store::db::{self, Client as _, Pool};
+use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn, SAFETY_POLL_INTERVAL};
 
 use crate::infra_lifecycle_command::InfraLifecycleVerb;
-use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn, SAFETY_POLL_INTERVAL};
 use crate::state::DispatcherState;
 
 /// A command being issued, for any project: the claimer serves them all.
@@ -57,16 +56,19 @@ pub fn drain_loop(state: DispatcherState) -> DrainLoop {
 
 /// When the earliest claim this loop makes runs out (unix seconds, on the
 /// database's clock like the claim): what [`claim_one`] then takes over.
-async fn earliest_claim_lapse(pool: &PgPool) -> Result<Option<i64>> {
-    Ok(sqlx::query_scalar(sql!(
-        "SELECT MIN(claimed_at_unix) + {ttl} FROM infra_lifecycle_command \
-         WHERE claimed_by_replica IS NOT NULL AND completed_at_unix IS NULL \
-           AND (verb IN ({verbs}) OR drains)",
-        ttl = weft_broker_client::lifecycle_command::CLAIM_LEASE_TTL.as_secs(),
-        verbs = weft_broker_client::lifecycle_command::DISPATCHER_VERBS_SQL,
-    ))
-    .fetch_one(pool)
-    .await?)
+async fn earliest_claim_lapse(pool: &Pool) -> Result<Option<i64>> {
+    Ok(pool
+        .scalar(
+            &format!(
+                "SELECT MIN(claimed_at_unix) + {ttl} FROM infra_lifecycle_command \
+                 WHERE claimed_by_replica IS NOT NULL AND completed_at_unix IS NULL \
+                   AND (verb IN ({verbs}) OR drains)",
+                ttl = weft_broker_client::lifecycle_command::CLAIM_LEASE_TTL.as_secs(),
+                verbs = weft_broker_client::lifecycle_command::DISPATCHER_VERBS_SQL,
+            ),
+            &[],
+        )
+        .await?)
 }
 
 /// Three terminal outcomes a dispatcher-claimed verb can produce.
@@ -199,16 +201,16 @@ async fn drain_then_hand_over(state: &DispatcherState, row: &ClaimedCommand) {
         }
     };
     let handed = match ended {
-        Ok(()) => sqlx::query(
-            "UPDATE infra_lifecycle_command SET drains = FALSE, claimed_by_replica = NULL, claimed_at_unix = NULL \
-             WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL",
-        )
-        .bind(row.id)
-        .bind(replica)
-        .execute(&state.pg_pool)
-        .await
-        .map(|_| ())
-        .map_err(anyhow::Error::from),
+        Ok(()) => state
+            .pg_pool
+            .execute(
+                "UPDATE infra_lifecycle_command SET drains = FALSE, claimed_by_replica = NULL, claimed_at_unix = NULL \
+                 WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL",
+                &[&row.id, &replica],
+            )
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from),
         Err(e) => Err(e),
     };
     if let Err(e) = handed {
@@ -257,18 +259,16 @@ impl CommandClaim<'_> {
     /// `CLAIM_LEASE_TTL` after `claimed_at_unix`, which is set that far
     /// ahead when the drain's next look is further than one lease away).
     /// `false` when it is no longer this process's.
-    pub async fn keep_until(&self, pool: &PgPool, until_unix: i64) -> Result<bool> {
-        let renewed = sqlx::query(
-            "UPDATE infra_lifecycle_command SET claimed_at_unix = GREATEST(EXTRACT(EPOCH FROM NOW())::BIGINT, $3 - $4) \
-             WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL",
-        )
-        .bind(self.id)
-        .bind(self.replica)
-        .bind(until_unix)
-        .bind(i64::try_from(weft_broker_client::lifecycle_command::CLAIM_LEASE_TTL.as_secs()).unwrap_or(i64::MAX))
-        .execute(pool)
-        .await?;
-        Ok(renewed.rows_affected() == 1)
+    pub async fn keep_until(&self, pool: &Pool, until_unix: i64) -> Result<bool> {
+        let ttl = i64::try_from(weft_broker_client::lifecycle_command::CLAIM_LEASE_TTL.as_secs()).unwrap_or(i64::MAX);
+        let renewed = pool
+            .execute(
+                "UPDATE infra_lifecycle_command SET claimed_at_unix = GREATEST(EXTRACT(EPOCH FROM NOW())::BIGINT, $3::bigint - $4::bigint) \
+                 WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL",
+                &[&self.id, &self.replica, &until_unix, &ttl],
+            )
+            .await?;
+        Ok(renewed == 1)
     }
 }
 
@@ -276,22 +276,21 @@ impl CommandClaim<'_> {
 /// returning only once the claim is no longer this process's. A renewal that
 /// cannot reach the database is retried at the next interval: the lease
 /// outlives several of them.
-async fn hold_claim(pool: &PgPool, id: i64, replica: &str) {
+async fn hold_claim(pool: &Pool, id: i64, replica: &str) {
     let mut every = tokio::time::interval(weft_broker_client::lifecycle_command::CLAIM_RENEW_INTERVAL);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     every.tick().await; // the first tick fires at once: the claim is fresh
     loop {
         every.tick().await;
-        let renewed = sqlx::query(
-            "UPDATE infra_lifecycle_command SET claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
-             WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL",
-        )
-        .bind(id)
-        .bind(replica)
-        .execute(pool)
-        .await;
+        let renewed = pool
+            .execute(
+                "UPDATE infra_lifecycle_command SET claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
+                 WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL",
+                &[&id, &replica],
+            )
+            .await;
         match renewed {
-            Ok(done) if done.rows_affected() == 0 => return,
+            Ok(0) => return,
             Ok(_) => {}
             Err(e) => tracing::warn!(
                 target: "weft_dispatcher::lifecycle_claimer",
@@ -366,8 +365,7 @@ pub struct ClaimedCommand {
 /// write `complete(failed, msg)` BEFORE returning the error. The
 /// caller's contract ("exactly one complete per claim") stays
 /// intact.
-pub async fn claim_one(pool: &PgPool, claimer_replica: &str) -> Result<Option<ClaimedCommand>> {
-    use sqlx::Row;
+pub async fn claim_one(pool: &Pool, claimer_replica: &str) -> Result<Option<ClaimedCommand>> {
     // Claim predicate (shared with the broker's supervisor claim):
     // either no current claimer OR an expired lease. The lease lets
     // a dispatcher that crashed mid-run release the row
@@ -378,7 +376,7 @@ pub async fn claim_one(pool: &PgPool, claimer_replica: &str) -> Result<Option<Cl
     // so without this a take-down and the recovery right after it could
     // run at once and the take-down land last, leaving the triggers down. An
     // upgrade is not held behind them, nor holds them.
-    let sql = sql!(
+    let sql = format!(
         "UPDATE infra_lifecycle_command \
          SET claimed_by_replica = $1, claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
          WHERE id = ( \
@@ -404,10 +402,7 @@ pub async fn claim_one(pool: &PgPool, claimer_replica: &str) -> Result<Option<Cl
             InfraLifecycleVerb::Reactivate.as_str()
         ),
     );
-    let row = sqlx::query(sql)
-        .bind(claimer_replica)
-        .fetch_optional(pool)
-        .await?;
+    let row: Option<db::Row> = pool.opt(&sql, &[&claimer_replica]).await?;
     let Some(r) = row else { return Ok(None) };
     let id: i64 = r.try_get("id")?;
     // Parse every typed column NOW. On error, complete the row
@@ -430,15 +425,13 @@ pub async fn claim_one(pool: &PgPool, claimer_replica: &str) -> Result<Option<Cl
     }
 }
 
-fn decode_row(r: &sqlx::postgres::PgRow) -> Result<ClaimedCommand> {
-    use sqlx::Row;
+fn decode_row(r: &db::Row) -> Result<ClaimedCommand> {
     let id: i64 = r.try_get("id")?;
     let project_id: uuid::Uuid = r.try_get("project_id")?;
     let verb_str: String = r.try_get("verb")?;
     let verb = InfraLifecycleVerb::parse(&verb_str)
         .ok_or_else(|| anyhow::anyhow!("unknown verb '{verb_str}' on id={id}"))?;
-    let spec_json: Option<serde_json::Value> =
-        r.try_get::<Option<serde_json::Value>, _>("spec_json")?;
+    let spec_json: Option<serde_json::Value> = r.try_get("spec_json")?;
     let instance_id: Option<String> = r.try_get("instance_id")?;
     let every_copy: bool = r.try_get("every_copy")?;
     let copies = weft_core::instance::Copies::from_columns(instance_id.clone(), every_copy)
@@ -477,20 +470,16 @@ fn project_outcome(
 /// Record `outcome` on command `id`, only while `process` still holds its
 /// claim: a process whose claim was taken over never answers for the
 /// command, and one already cancelled keeps its cancel.
-async fn complete(pool: &PgPool, id: i64, replica: &str, outcome: &RunOutcome) -> Result<()> {
+async fn complete(pool: &Pool, id: i64, replica: &str, outcome: &RunOutcome) -> Result<()> {
     let (lc_outcome, message) = project_outcome(outcome);
-    sqlx::query(
+    pool.execute(
         "UPDATE infra_lifecycle_command \
          SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
              outcome = $2, \
              outcome_message = $3 \
          WHERE id = $1 AND claimed_by_replica = $4 AND completed_at_unix IS NULL",
+        &[&id, &lc_outcome.as_str(), &message, &replica],
     )
-    .bind(id)
-    .bind(lc_outcome.as_str())
-    .bind(message)
-    .bind(replica)
-    .execute(pool)
     .await?;
     Ok(())
 }

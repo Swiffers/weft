@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::sql;
+use crate::db::{Client, FromRow, Pool, Row};
 
 /// The channel an event parked for a trigger is announced on, with its
 /// project's id, and an answer handed to a run a worker drives, with that
@@ -311,26 +311,25 @@ pub fn waiting_answer(fire_id: uuid::Uuid, answer: weft_core::primitive::WaitAns
 ///   - an event a held connection picked up (`held_by`) is kept only while
 ///     its holder still holds the signal; once kept it is the trigger's;
 ///   - an event already waiting (its `fire_id`) is not kept twice.
-pub async fn park(pool: &sqlx::PgPool, token: &str, waiting: &Waiting, held_by: Option<&str>) -> anyhow::Result<ParkAppend> {
-    let mut tx = pool.begin().await?;
-    let signal: Option<(bool, bool)> = sqlx::query_as(
-        "SELECT is_resume, ($2::text IS NULL OR (holds AND held_by = $2)) FROM signal WHERE token = $1 FOR UPDATE",
-    )
-    .bind(token)
-    .bind(held_by)
-    .fetch_optional(&mut *tx)
-    .await?;
+pub async fn park(pool: &Pool, token: &str, waiting: &Waiting, held_by: Option<&str>) -> anyhow::Result<ParkAppend> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let signal: Option<(bool, bool)> = tx
+        .opt(
+            "SELECT is_resume, ($2::text IS NULL OR (holds AND held_by = $2)) FROM signal WHERE token = $1 FOR UPDATE",
+            &[&token, &held_by],
+        )
+        .await?;
     let Some((is_resume, held)) = signal else { return Ok(ParkAppend::Refused(ParkRefusal::RowGone)) };
     if !held {
         return Ok(ParkAppend::Refused(ParkRefusal::NotHeld));
     }
-    let (queued, already): (i64, bool) = sqlx::query_as(
-        "SELECT count(*), COALESCE(bool_or(fire_id = $2), FALSE) FROM parked_fire WHERE token = $1",
-    )
-    .bind(token)
-    .bind(waiting.fire_id)
-    .fetch_one(&mut *tx)
-    .await?;
+    let (queued, already): (i64, bool) = tx
+        .one(
+            "SELECT count(*), COALESCE(bool_or(fire_id = $2), FALSE) FROM parked_fire WHERE token = $1",
+            &[&token, &waiting.fire_id],
+        )
+        .await?;
     if already {
         return Ok(ParkAppend::Refused(ParkRefusal::AlreadyQueued));
     }
@@ -340,27 +339,29 @@ pub async fn park(pool: &sqlx::PgPool, token: &str, waiting: &Waiting, held_by: 
     if !is_resume && queued >= MAX_PARKED_ENTRY_FIRES {
         return Ok(ParkAppend::Refused(ParkRefusal::QueueFull));
     }
-    let inserted = sqlx::query(
-        "INSERT INTO parked_fire (token, fire_id, payload, caller, attempts, not_before, waits_for, failures, is_resume, skipped) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (fire_id) DO NOTHING",
-    )
-    .bind(token)
-    .bind(waiting.fire_id)
-    .bind(&waiting.payload)
-    .bind(&waiting.caller)
-    .bind(count(waiting.attempts))
-    .bind(waiting.not_before)
-    .bind(waiting.waits_for.clone().map(String::from))
-    .bind(count(waiting.failures))
-    .bind(is_resume)
-    .bind(waiting.skipped)
-    .execute(&mut *tx)
-    .await?;
+    let inserted = tx
+        .execute(
+            "INSERT INTO parked_fire (token, fire_id, payload, caller, attempts, not_before, waits_for, failures, is_resume, skipped) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (fire_id) DO NOTHING",
+            &[
+                &token,
+                &waiting.fire_id,
+                &waiting.payload,
+                &waiting.caller,
+                &count(waiting.attempts),
+                &waiting.not_before,
+                &waiting.waits_for.clone().map(String::from),
+                &count(waiting.failures),
+                &is_resume,
+                &waiting.skipped,
+            ],
+        )
+        .await?;
     tx.commit().await?;
     crate::announce::committed(pool);
     // The id is unique across tokens: an event parked under another token
     // already (it cannot be) would read as queued.
-    Ok(if inserted.rows_affected() == 0 { ParkAppend::Refused(ParkRefusal::AlreadyQueued) } else { ParkAppend::Parked })
+    Ok(if inserted == 0 { ParkAppend::Refused(ParkRefusal::AlreadyQueued) } else { ParkAppend::Parked })
 }
 
 /// Outcome of [`park`].
@@ -413,57 +414,59 @@ const HEAD_COLUMNS: &str = "token, seq, fire_id, payload, caller, attempts, not_
 /// the queue is empty, its head is locked, or its head is not due at `now`
 /// (backing off, or waiting on something no clock brings): one trigger's
 /// events never overtake each other.
-pub async fn take_head(tx: &mut sqlx::PgConnection, token: &str, now: i64) -> anyhow::Result<Option<Head>> {
-    let row: Option<HeadRow> = sqlx::query_as(sql!(
-        "SELECT {HEAD_COLUMNS} FROM parked_fire p \
-         WHERE p.token = $1 AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = $1) \
-           AND p.not_before <= $2 AND p.waits_for IS NULL \
-         FOR UPDATE SKIP LOCKED"
-    ))
-    .bind(token)
-    .bind(now)
-    .fetch_optional(&mut *tx)
-    .await?;
+pub async fn take_head(tx: &impl Client, token: &str, now: i64) -> anyhow::Result<Option<Head>> {
+    let row: Option<HeadRow> = tx
+        .opt(
+            &format!(
+                "SELECT {HEAD_COLUMNS} FROM parked_fire p \
+                 WHERE p.token = $1 AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = $1) \
+                   AND p.not_before <= $2 AND p.waits_for IS NULL \
+                 FOR UPDATE SKIP LOCKED"
+            ),
+            &[&token, &now],
+        )
+        .await?;
     row.map(HeadRow::into_head).transpose()
 }
 
 /// The head of `token`'s queue, whatever its turn says: the same as
 /// [`take_head`] for what something that happened hands over again (an
 /// activation, an instance's values changing, infra coming back).
-pub async fn take_head_now(tx: &mut sqlx::PgConnection, token: &str) -> anyhow::Result<Option<Head>> {
-    let row: Option<HeadRow> = sqlx::query_as(sql!(
-        "SELECT {HEAD_COLUMNS} FROM parked_fire p \
-         WHERE p.token = $1 AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = $1) \
-         FOR UPDATE SKIP LOCKED"
-    ))
-    .bind(token)
-    .fetch_optional(&mut *tx)
-    .await?;
+pub async fn take_head_now(tx: &impl Client, token: &str) -> anyhow::Result<Option<Head>> {
+    let row: Option<HeadRow> = tx
+        .opt(
+            &format!(
+                "SELECT {HEAD_COLUMNS} FROM parked_fire p \
+                 WHERE p.token = $1 AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = $1) \
+                 FOR UPDATE SKIP LOCKED"
+            ),
+            &[&token],
+        )
+        .await?;
     row.map(HeadRow::into_head).transpose()
 }
 
 /// A head handed over: it goes.
-pub async fn remove_in(tx: &mut sqlx::PgConnection, head: &Head) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM parked_fire WHERE token = $1 AND seq = $2")
-        .bind(&head.token)
-        .bind(head.seq)
-        .execute(&mut *tx)
-        .await?;
+pub async fn remove_in(tx: &impl Client, head: &Head) -> anyhow::Result<()> {
+    tx.execute("DELETE FROM parked_fire WHERE token = $1 AND seq = $2", &[&head.token, &head.seq]).await?;
     Ok(())
 }
 
 /// A head that could not be handed over: it stays the head, tried again
 /// as `turn` says.
-pub async fn restamp_in(tx: &mut sqlx::PgConnection, head: &Head, turn: &Turn) -> anyhow::Result<()> {
-    sqlx::query("UPDATE parked_fire SET attempts = $3, not_before = $4, waits_for = $5, failures = $6 WHERE token = $1 AND seq = $2")
-        .bind(&head.token)
-        .bind(head.seq)
-        .bind(count(turn.attempts))
-        .bind(turn.not_before)
-        .bind(turn.waits_for.clone().map(String::from))
-        .bind(count(turn.failures))
-        .execute(&mut *tx)
-        .await?;
+pub async fn restamp_in(tx: &impl Client, head: &Head, turn: &Turn) -> anyhow::Result<()> {
+    tx.execute(
+        "UPDATE parked_fire SET attempts = $3, not_before = $4, waits_for = $5, failures = $6 WHERE token = $1 AND seq = $2",
+        &[
+            &head.token,
+            &head.seq,
+            &count(turn.attempts),
+            &turn.not_before,
+            &turn.waits_for.clone().map(String::from),
+            &count(turn.failures),
+        ],
+    )
+    .await?;
     Ok(())
 }
 
@@ -472,18 +475,13 @@ pub async fn restamp_in(tx: &mut sqlx::PgConnection, head: &Head, turn: &Turn) -
 /// nobody but a run's worker writes the record of a run it drives. The
 /// wait's signal is consumed by the caller in the same transaction, so it
 /// is answered once.
-pub async fn hand_answer_in(tx: &mut sqlx::PgConnection, token: &str, run_id: weft_core::RunId, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<()> {
+pub async fn hand_answer_in(tx: &impl Client, token: &str, run_id: weft_core::RunId, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<()> {
     let (value, skipped) = answer_row(answer);
-    sqlx::query(
+    tx.execute(
         "INSERT INTO parked_fire (token, fire_id, payload, attempts, not_before, is_resume, run_id, skipped) \
          VALUES ($1, $2, $3, 0, 0, TRUE, $4, $5)",
+        &[&token, &uuid::Uuid::new_v4(), &value, &run_id, &skipped],
     )
-    .bind(token)
-    .bind(uuid::Uuid::new_v4())
-    .bind(value)
-    .bind(run_id)
-    .bind(skipped)
-    .execute(&mut *tx)
     .await?;
     Ok(())
 }
@@ -502,16 +500,12 @@ pub fn handed_answers_sql(runs: &str) -> String {
 /// oldest first: what the worker driving the run takes. They go once the
 /// run's record holds them (`weft_record_batch` deletes the answers a
 /// batch resolves).
-pub async fn answers_for<'e, E: sqlx::PgExecutor<'e>>(executor: E, run_id: weft_core::RunId) -> anyhow::Result<Vec<(String, weft_core::primitive::WaitAnswer)>> {
+pub async fn answers_for(db: &impl Client, run_id: weft_core::RunId) -> anyhow::Result<Vec<(String, weft_core::primitive::WaitAnswer)>> {
     let rows: Vec<(weft_core::RunId, String, Value, bool, i64)> =
-        sqlx::query_as(sql!("{} ORDER BY seq", handed_answers_sql("$1")))
-            .bind(run_id)
-            .fetch_all(executor)
-            .await?;
+        db.all(&format!("{} ORDER BY seq", handed_answers_sql("$1")), &[&run_id]).await?;
     Ok(rows.into_iter().map(|(_, token, payload, skipped, _)| (token, stored_answer(payload, skipped))).collect())
 }
 
-#[derive(sqlx::FromRow)]
 struct HeadRow {
     token: String,
     seq: i64,
@@ -524,6 +518,24 @@ struct HeadRow {
     failures: i32,
     is_resume: bool,
     skipped: bool,
+}
+
+impl FromRow for HeadRow {
+    fn from_row(row: Row) -> crate::db::Result<Self> {
+        Ok(Self {
+            token: row.try_get("token")?,
+            seq: row.try_get("seq")?,
+            fire_id: row.try_get("fire_id")?,
+            payload: row.try_get("payload")?,
+            caller: row.try_get("caller")?,
+            attempts: row.try_get("attempts")?,
+            not_before: row.try_get("not_before")?,
+            waits_for: row.try_get("waits_for")?,
+            failures: row.try_get("failures")?,
+            is_resume: row.try_get("is_resume")?,
+            skipped: row.try_get("skipped")?,
+        })
+    }
 }
 
 impl HeadRow {

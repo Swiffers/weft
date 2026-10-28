@@ -22,6 +22,7 @@
 //! takes no calls, and lands here once the route moved (`weft_engine::door`).
 
 use weft_core::projects::ProjectAddress;
+use weft_task_store::db::Client as _;
 
 use crate::state::DispatcherState;
 
@@ -163,7 +164,7 @@ pub(crate) async fn let_go_if_idle(state: &DispatcherState, project: uuid::Uuid)
 /// The project's address, as its front last answered it.
 pub(crate) async fn address(state: &DispatcherState, project: uuid::Uuid) -> anyhow::Result<Option<ProjectAddress>> {
     let kept: Option<serde_json::Value> =
-        sqlx::query_scalar("SELECT api_address FROM project WHERE id = $1").bind(project).fetch_optional(&state.pg_pool).await?.flatten();
+        state.pg_pool.scalar_opt("SELECT api_address FROM project WHERE id = $1", &[&project]).await?.flatten();
     kept.map(|kept| serde_json::from_value(kept).map_err(|e| anyhow::anyhow!("project {project}'s address: {e}"))).transpose()
 }
 
@@ -181,7 +182,7 @@ pub enum Say {
 /// its last process), or, on the reaper's look, a front went down. One
 /// project failing never keeps the others from their look.
 pub async fn serve_all(state: &DispatcherState, say: Say) -> anyhow::Result<()> {
-    let projects: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM project WHERE running_binary_hash IS NOT NULL").fetch_all(&state.pg_pool).await?;
+    let projects: Vec<uuid::Uuid> = state.pg_pool.scalars("SELECT id FROM project WHERE running_binary_hash IS NOT NULL", &[]).await?;
     for project in projects {
         match serve(state, project, None).await {
             Ok(Served { failed: Some(e), changed, .. }) if changed || matches!(say, Say::Every) => {
@@ -223,10 +224,9 @@ where
 /// Keep `address` as the project's; whether it changed.
 async fn keep(state: &DispatcherState, project: uuid::Uuid, address: Option<&ProjectAddress>) -> anyhow::Result<bool> {
     let kept = address.map(serde_json::to_value).transpose()?;
-    let changed = sqlx::query("UPDATE project SET api_address = $2 WHERE id = $1 AND api_address IS DISTINCT FROM $2")
-        .bind(project)
-        .bind(kept)
-        .execute(&state.pg_pool)
+    let changed = state
+        .pg_pool
+        .execute("UPDATE project SET api_address = $2 WHERE id = $1 AND api_address IS DISTINCT FROM $2", &[&project, &kept])
         .await?;
-    Ok(changed.rows_affected() > 0)
+    Ok(changed > 0)
 }

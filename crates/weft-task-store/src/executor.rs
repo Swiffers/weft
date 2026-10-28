@@ -15,9 +15,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::FutureExt;
 use serde_json::Value;
-use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
+use crate::db::Pool;
 use crate::tasks::{claim_duration_secs, claim_heartbeat_interval, Task};
 
 #[async_trait]
@@ -113,7 +113,7 @@ where
 
 /// Run one claimed dispatcher task through its executor, under its lease.
 async fn run_dispatcher_task<Ctx>(
-    pool: PgPool,
+    pool: Pool,
     ctx: Ctx,
     registry: TaskRegistry<Ctx>,
     replica: String,
@@ -172,7 +172,7 @@ tokio::task_local! {
 /// taken back once it ends ([`TaskClaim::resume`]).
 #[derive(Clone)]
 pub struct TaskClaim {
-    pool: PgPool,
+    pool: Pool,
     task_id: uuid::Uuid,
     replica: String,
     /// The heartbeat leaves the claim alone while it rests.
@@ -347,7 +347,7 @@ fn verdict(outcome: ExecOutcome, task_id: uuid::Uuid, kind: &str) -> Verdict {
 
 /// Persist the verdict for one task ([`verdict`]).
 async fn finalize_task(
-    pool: &PgPool,
+    pool: &Pool,
     task_id: uuid::Uuid,
     replica: &str,
     kind: &str,

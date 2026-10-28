@@ -1495,7 +1495,7 @@ fn remove_empty_group_leaves_no_dangling_blank_line() {
     parse_ok(&nested);
 
     // Deleting the only top-level group collapses to the file's trailing newline.
-    // (`detach_with_leading_ws` removes the decl and any leading whitespace; the
+    // (`remove_with_leading_ws` removes the decl and any leading whitespace; the
     // decl's trailing line terminator is a separate root token that stays. A lone
     // newline is a clean empty-ish file, NOT the indented-blank-line corruption
     // the nested case had.)
@@ -2927,9 +2927,9 @@ fn set_loop_config_preserves_nested_closing_brace_indent() {
 
 #[test]
 fn move_container_into_own_descendant_is_rejected_before_mutating() {
-    // Detach-then-resolve would otherwise fail mid-mutation with a
+    // Remove-then-resolve would otherwise fail mid-mutation with a
     // misleading NodeNotFound for a target that exists (it was
-    // detached along with the moved subtree).
+    // removed along with the moved subtree).
     let src = "outer = Group {\n  inner = Group {\n    t = Text {}\n  }\n}\n";
     let err = apply_edits(
         src,

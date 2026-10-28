@@ -201,7 +201,7 @@ impl LocalInfraHost {
     pub fn new(docker: Arc<dyn Docker>, cfg: LocalInfraHostConfig) -> Self {
         Self {
             docker,
-            http: reqwest::Client::builder().build().expect("reqwest client"),
+            http: weft_core::net::http_client().build().expect("reqwest client"),
             cfg,
             kept: parking_lot::Mutex::new(HashMap::new()),
         }

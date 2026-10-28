@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/weft-core",
     "crates/weft-node-derive",
+    "crates/weft-db-macros",
     "crates/weft-compiler",
     "crates/weft-dispatcher",
     "crates/weft-cli",
@@ -89,8 +90,12 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 async-trait = "0.1"
 
-# The install's own database. Each crate adds the features it uses.
-sqlx = { version = "0.9", features = ["runtime-tokio", "postgres"] }
+# The install's own database: the driver, the pool every connection comes
+# from (`weft_task_store::db`), and TLS on rustls with ring.
+tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1", "with-uuid-1", "with-chrono-0_4"] }
+deadpool-postgres = "0.14.2"
+tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Bounded in-memory caches (the broker's key and token caches).
 lru = "0.19"
 cron = "0.17"
@@ -100,11 +105,14 @@ getrandom = "0.4"
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "trace"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# rustls with no crypto library of reqwest's choosing: `weft_core::net`
+# installs ring as the process's provider at startup, and reqwest 0.13's own
+# `rustls` feature would bring aws-lc-rs.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "query", "form", "rustls-no-provider"] }
 # The injectable-client seam for metered paid calls: `ctx.metered_client`
 # returns a `ClientWithMiddleware`, the ecosystem-standard way to hand a
 # library an HTTP client with behavior layered behind it.
-reqwest-middleware = { version = "0.4", features = ["json"] }
+reqwest-middleware = { version = "0.5", features = ["json", "query", "form"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 
 # S3-compatible object storage (the ObjectStore slot: GCS / SeaweedFS / AWS /
@@ -136,10 +144,7 @@ flate2 = "1"
 zstd = "0.14"
 
 # lossless concrete syntax tree (the .weft CST: parse, edit, byte-exact round-trip).
-# Held at 0.16: 0.17 drops the mutable tree (`clone_for_update`,
-# `splice_children`, `detach`) that every edit in `weft_compiler::edit` is
-# built on.
-rowan = "0.16"
+rowan = "0.17"
 
 # cli
 clap = { version = "4", features = ["derive", "env"] }
@@ -209,6 +214,7 @@ weft-engine = { path = "crates/weft-engine" }
 weft-catalog = { path = "crates/weft-catalog" }
 weft-journal = { path = "crates/weft-journal" }
 weft-task-store = { path = "crates/weft-task-store" }
+weft-db-macros = { path = "crates/weft-db-macros" }
 weft-access-store = { path = "crates/weft-access-store" }
 weft-platform-traits = { path = "crates/weft-platform-traits" }
 weft-platform-local = { path = "crates/weft-platform-local" }

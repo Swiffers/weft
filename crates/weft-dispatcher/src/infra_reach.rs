@@ -13,6 +13,7 @@ use std::collections::{BTreeSet, HashMap};
 use weft_core::instance::Copies;
 use weft_core::project::ProjectDefinition;
 use weft_core::RunId;
+use weft_task_store::db::Client as _;
 
 use crate::activation_store::Activation;
 use crate::state::DispatcherState;
@@ -124,13 +125,14 @@ impl Programs<'_> {
 /// of the copies `reach` names, never `except` (the run that asked: its
 /// own `StopSelf` decides its fate).
 pub async fn runs_reached(state: &DispatcherState, project_id: uuid::Uuid, reach: &InfraReach, except: Option<RunId>) -> anyhow::Result<Vec<RunReached>> {
-    let rows: Vec<(RunId, Option<String>, Option<String>, bool)> = sqlx::query_as(
-        "SELECT run_id, instance_id, definition_hash, state = 'parked' FROM run \
-         WHERE project_id = $1 AND state <> 'ended' ORDER BY started_at, run_id",
-    )
-    .bind(project_id)
-    .fetch_all(&state.pg_pool)
-    .await?;
+    let rows: Vec<(RunId, Option<String>, Option<String>, bool)> = state
+        .pg_pool
+        .all(
+            "SELECT run_id, instance_id, definition_hash, state = 'parked' FROM run \
+             WHERE project_id = $1 AND state <> 'ended' ORDER BY started_at, run_id",
+            &[&project_id],
+        )
+        .await?;
     let mut programs = Programs { state, project_id, read: HashMap::new() };
     let mut out = Vec::new();
     for (run_id, instance, definition_hash, paused) in rows {

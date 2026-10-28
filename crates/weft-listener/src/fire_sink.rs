@@ -45,7 +45,7 @@ pub struct HttpWorkerDoors {
 
 impl HttpWorkerDoors {
     pub fn new(secret: Vec<u8>) -> Arc<Self> {
-        Arc::new(Self { http: reqwest::Client::new(), secret })
+        Arc::new(Self { http: weft_core::net::http_client().build().expect("reqwest client"), secret })
     }
 }
 

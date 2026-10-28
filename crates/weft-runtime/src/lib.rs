@@ -213,7 +213,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             // Once per process: the watch holds its channel list for life.
             let channels: &'static [&'static str] = Box::leak(channels.into_boxed_slice());
             let listen_url = optional_secret("WEFT_DATABASE_LISTEN_URL").unwrap_or_else(|| url.clone());
-            let connect = weft_task_store::db::connect_options(&listen_url)
+            let connect = weft_task_store::db::config(&listen_url)
                 .context("WEFT_DATABASE_LISTEN_URL (or WEFT_DATABASE_URL) is not a Postgres address")?;
             let listening = match serverless {
                 true => weft_task_store::pg_signal::Listening::WhileBusy,

@@ -25,7 +25,7 @@
 
 use std::collections::BTreeMap;
 
-use sqlx::Connection;
+use crate::db::{Client, Session};
 use weft_platform_traits::CoreRole;
 
 /// Connections kept back for whoever else opens the database: a person's
@@ -53,25 +53,19 @@ impl Capacity {
     /// A database still starting is waited for, as a pool's first
     /// connection is (`crate::db`).
     pub async fn read(url: &str) -> anyhow::Result<Capacity> {
-        let connect = crate::db::connect_options(url)?;
-        crate::db::reaching(|| async {
-            let mut conn = sqlx::postgres::PgConnection::connect_with(&connect).await?;
-            let read = Self::query(&mut conn).await;
-            let _ = conn.close().await;
-            read
-        })
-        .await
+        let config = crate::db::config(url)?;
+        crate::db::reaching(|| async { Self::query(&Session::connect(&config).await?).await }).await
     }
 
-    async fn query(conn: &mut sqlx::postgres::PgConnection) -> Result<Capacity, sqlx::Error> {
-        let (max_connections, superuser, reserved, role_limit, database_limit): (i32, i32, i32, i32, i32) = sqlx::query_as(
+    async fn query(db: &impl Client) -> crate::db::Result<Capacity> {
+        let (max_connections, superuser, reserved, role_limit, database_limit): (i32, i32, i32, i32, i32) = db.one(
             "SELECT current_setting('max_connections')::int, \
                     current_setting('superuser_reserved_connections')::int, \
                     COALESCE(current_setting('reserved_connections', true), '0')::int, \
                     COALESCE((SELECT rolconnlimit FROM pg_roles WHERE rolname = current_user), -1), \
                     COALESCE((SELECT datconnlimit FROM pg_database WHERE datname = current_database()), -1)",
+            &[],
         )
-        .fetch_one(conn)
         .await?;
         let limit = [role_limit, database_limit].into_iter().filter_map(|l| u32::try_from(l).ok()).min();
         Ok(Capacity {

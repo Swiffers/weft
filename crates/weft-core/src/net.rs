@@ -61,6 +61,15 @@ pub fn install_crypto_provider() {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 }
 
+/// A builder for an HTTP client: every client weft builds starts here.
+/// reqwest takes its TLS crypto from the process, so this installs ring
+/// first ([`install_crypto_provider`]); a process that never did (a test)
+/// would otherwise have its first client panic.
+pub fn http_client() -> reqwest::ClientBuilder {
+    install_crypto_provider();
+    reqwest::Client::builder()
+}
+
 /// Dial `host:port` and wrap the pipe in TLS, verifying the peer
 /// against the system's trust roots (SNI from the host part).
 pub async fn tls_connect(address: &str) -> Result<TlsStream<TcpStream>, String> {
@@ -283,11 +292,9 @@ impl EmptyBody for reqwest::RequestBuilder {
 /// settings, kept by the kernel: nothing is sent on the connection, and a
 /// live peer answers them even while it works on a long request, so only
 /// one that stopped answering is given up on, about a minute after it
-/// stopped. Every client weft makes to its own services, and a database a
-/// Postgres node reaches, use the same numbers. Weft's own connections to
-/// the install's database do not have them yet: sqlx offers no way to set
-/// them, so one whose database went silent is held until the system gives
-/// up on it by itself.
+/// stopped. Every client weft makes to its own services, its own
+/// connections to the install's database (`weft_task_store::db::config`),
+/// and a database a Postgres node reaches use the same numbers.
 pub const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 pub const KEEPALIVE_RETRIES: u32 = 3;
@@ -595,7 +602,7 @@ mod empty_body_tests {
     #[tokio::test]
     async fn a_post_with_nothing_to_send_names_its_length() {
         let url = format!("{}/_weft/tick", length_required_server().await);
-        let http = reqwest::Client::new();
+        let http = super::http_client().build().unwrap();
         assert_eq!(http.post(&url).send().await.unwrap().status(), 411, "the refusal this guards against");
         assert_eq!(http.post(&url).empty_body().send().await.unwrap().status(), 204);
     }

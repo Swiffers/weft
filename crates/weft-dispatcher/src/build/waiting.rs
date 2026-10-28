@@ -27,7 +27,7 @@
 //! transaction that ends the row, whichever way it ends.
 
 use anyhow::{anyhow, Context, Result};
-use sqlx::PgPool;
+use weft_task_store::db::{self, Client, FromRow, Pool};
 use weft_core::builds::{BuiltProgram, ImageBuild, VersionBuildState, VersionBuildStatus};
 
 use crate::project_store::{ProjectStoreOps, ProjectTransition, StoredProjectSummary};
@@ -125,10 +125,8 @@ pub fn same_version(a: &BuiltProgram, b: &BuiltProgram) -> bool {
 
 /// Serialize, for the transaction, every decision about `project`'s
 /// versions: an ask writing one, a registration, a cancel.
-async fn lock_versions(conn: &mut sqlx::PgConnection, project: uuid::Uuid) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('version_build:' || $1::TEXT, 0))")
-        .bind(project)
-        .execute(conn)
+async fn lock_versions(conn: &impl Client, project: uuid::Uuid) -> Result<()> {
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended('version_build:' || $1::uuid::TEXT, 0))", &[&project])
         .await
         .context("lock the project's versions")?;
     Ok(())
@@ -138,40 +136,40 @@ async fn lock_versions(conn: &mut sqlx::PgConnection, project: uuid::Uuid) -> Re
 /// its claim on its images in the same statement. `false` when it no
 /// longer waited.
 async fn end(
-    conn: &mut sqlx::PgConnection,
+    conn: &impl Client,
     id: uuid::Uuid,
     status: VersionBuildStatus,
     reason: Option<&str>,
     registered: Option<&BuiltProgram>,
     now: i64,
 ) -> Result<bool> {
-    let ended: i64 = sqlx::query_scalar(
-        "WITH ended AS (UPDATE version_build SET state = $2, reason = $3, registered = $4, ended_at = $5 \
-                        WHERE id = $1 AND state = 'waiting' RETURNING id), \
-              dropped AS (DELETE FROM image_claim WHERE claim_id IN (SELECT id FROM ended)) \
-         SELECT count(*) FROM (SELECT pg_notify($6, id::TEXT) FROM ended) told",
-    )
-    .bind(id)
-    .bind(status_name(status))
-    .bind(reason)
-    .bind(registered.map(serde_json::to_value).transpose()?)
-    .bind(now)
-    .bind(VERSION_BUILD_ENDED_CHANNEL)
-    .fetch_one(conn)
-    .await
-    .context("end the version build")?;
+    let ended: i64 = conn
+        .scalar(
+            "WITH ended AS (UPDATE version_build SET state = $2, reason = $3, registered = $4, ended_at = $5 \
+                            WHERE id = $1 AND state = 'waiting' RETURNING id), \
+                  dropped AS (DELETE FROM image_claim WHERE claim_id IN (SELECT id FROM ended)) \
+             SELECT count(*) FROM (SELECT pg_notify($6, id::TEXT) FROM ended) told",
+            &[
+                &id,
+                &status_name(status),
+                &reason,
+                &registered.map(serde_json::to_value).transpose()?,
+                &now,
+                &VERSION_BUILD_ENDED_CHANNEL,
+            ],
+        )
+        .await
+        .context("end the version build")?;
     Ok(ended == 1)
 }
 
 /// The project's waiting version (its id, ask and program), read under its
 /// version lock.
-async fn waiting_of(conn: &mut sqlx::PgConnection, project: uuid::Uuid) -> Result<Option<(uuid::Uuid, i64, BuiltProgram)>> {
-    let row: Option<(uuid::Uuid, i64, serde_json::Value)> =
-        sqlx::query_as("SELECT id, ask, program FROM version_build WHERE project_id = $1 AND state = 'waiting'")
-            .bind(project)
-            .fetch_optional(conn)
-            .await
-            .context("read the project's waiting version")?;
+async fn waiting_of(conn: &impl Client, project: uuid::Uuid) -> Result<Option<(uuid::Uuid, i64, BuiltProgram)>> {
+    let row: Option<(uuid::Uuid, i64, serde_json::Value)> = conn
+        .opt("SELECT id, ask, program FROM version_build WHERE project_id = $1 AND state = 'waiting'", &[&project])
+        .await
+        .context("read the project's waiting version")?;
     row.map(|(id, asked_at, program)| {
         Ok((id, asked_at, serde_json::from_value(program).context("a waiting version's program does not read")?))
     })
@@ -180,10 +178,8 @@ async fn waiting_of(conn: &mut sqlx::PgConnection, project: uuid::Uuid) -> Resul
 
 /// The ask of what `project` runs; 0 before its first registration, and
 /// for a project removed meanwhile, which has nothing registered.
-async fn registered_ask(conn: &mut sqlx::PgConnection, project: uuid::Uuid) -> Result<i64> {
-    sqlx::query_scalar("SELECT COALESCE((SELECT registered_ask FROM project WHERE id = $1), 0)")
-        .bind(project)
-        .fetch_one(conn)
+async fn registered_ask(conn: &impl Client, project: uuid::Uuid) -> Result<i64> {
+    conn.scalar("SELECT COALESCE((SELECT registered_ask FROM project WHERE id = $1), 0)", &[&project])
         .await
         .context("read the ask the project runs")
 }
@@ -199,7 +195,7 @@ async fn registered_ask(conn: &mut sqlx::PgConnection, project: uuid::Uuid) -> R
 /// woken as a waiting version commits, so one whose builds already ended
 /// registers at once.
 pub async fn ask(
-    pool: &PgPool,
+    pool: &Pool,
     hold: super::prune::ImageHold,
     project: uuid::Uuid,
     tenant: &str,
@@ -207,16 +203,14 @@ pub async fn ask(
     waits_on: &[ImageBuild],
     now: i64,
 ) -> Result<uuid::Uuid> {
-    let mut tx = pool.begin().await.context("begin writing the waiting version")?;
-    lock_versions(&mut tx, project).await?;
-    super::ledger::refuse_once_cancelled(&mut tx, project).await?;
-    let mut superseded_by = (registered_ask(&mut tx, project).await? >= version.ask).then_some(NEWER_REGISTERED);
-    if let Some((waiting, waiting_ask, program)) = waiting_of(&mut tx, project).await? {
+    let mut conn = pool.get().await.context("begin writing the waiting version")?;
+    let tx = conn.transaction().await.context("begin writing the waiting version")?;
+    lock_versions(&tx, project).await?;
+    super::ledger::refuse_once_cancelled(&tx, project).await?;
+    let mut superseded_by = (registered_ask(&tx, project).await? >= version.ask).then_some(NEWER_REGISTERED);
+    if let Some((waiting, waiting_ask, program)) = waiting_of(&tx, project).await? {
         if same_version(&program, &version.program) {
-            sqlx::query("UPDATE version_build SET ask = GREATEST(ask, $2) WHERE id = $1")
-                .bind(waiting)
-                .bind(version.ask)
-                .execute(&mut *tx)
+            tx.execute("UPDATE version_build SET ask = GREATEST(ask, $2) WHERE id = $1", &[&waiting, &version.ask])
                 .await
                 .context("join the waiting version")?;
             tx.commit().await.context("commit joining the waiting version")?;
@@ -226,7 +220,7 @@ pub async fn ask(
         if waiting_ask > version.ask {
             superseded_by = superseded_by.or(Some("a newer build of this project was asked for"));
         } else if superseded_by.is_none() {
-            end(&mut tx, waiting, VersionBuildStatus::Superseded, Some("a newer build of this project was asked for"), None, now).await?;
+            end(&tx, waiting, VersionBuildStatus::Superseded, Some("a newer build of this project was asked for"), None, now).await?;
         }
     }
     let id = hold.id();
@@ -234,28 +228,29 @@ pub async fn ask(
         Some(_) => (VersionBuildStatus::Superseded, Some(now)),
         None => (VersionBuildStatus::Waiting, None),
     };
-    sqlx::query(
+    tx.execute(
         "INSERT INTO version_build (id, ask, project_id, tenant_id, project_name, manifest, program, images, waits_on, \
                                     state, reason, registered, asked_at, ended_at, inputs) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, $12, $13, $15) \
          RETURNING pg_notify($14, id::TEXT)",
+        &[
+            &id,
+            &version.ask,
+            &project,
+            &tenant,
+            &version.name,
+            &serde_json::to_value(&version.manifest)?,
+            &serde_json::to_value(&version.program)?,
+            &version.images,
+            &serde_json::to_value(waits_on)?,
+            &status_name(state),
+            &superseded_by,
+            &now,
+            &ended_at,
+            &super::follow::BUILD_CLAIMED_CHANNEL,
+            &version.inputs.as_ref().map(serde_json::to_value).transpose()?,
+        ],
     )
-    .bind(id)
-    .bind(version.ask)
-    .bind(project)
-    .bind(tenant)
-    .bind(&version.name)
-    .bind(serde_json::to_value(&version.manifest)?)
-    .bind(serde_json::to_value(&version.program)?)
-    .bind(&version.images)
-    .bind(serde_json::to_value(waits_on)?)
-    .bind(status_name(state))
-    .bind(superseded_by)
-    .bind(now)
-    .bind(ended_at)
-    .bind(super::follow::BUILD_CLAIMED_CHANNEL)
-    .bind(version.inputs.as_ref().map(serde_json::to_value).transpose()?)
-    .execute(&mut *tx)
     .await
     .context("write the waiting version")?;
     tx.commit().await.context("commit the waiting version")?;
@@ -318,15 +313,14 @@ pub enum Settles<'a> {
 /// project's version lock. `false` when the registration must not land:
 /// a newer ask registered already, the version the loop registers no
 /// longer waits, or its project was removed, which ends it.
-pub(crate) async fn settle(conn: &mut sqlx::PgConnection, project: uuid::Uuid, settles: &Settles<'_>, now: i64) -> Result<bool> {
+pub(crate) async fn settle(conn: &impl Client, project: uuid::Uuid, settles: &Settles<'_>, now: i64) -> Result<bool> {
     lock_versions(conn, project).await?;
     // Every registration passes here, under the project row's lock, which
     // a resync takes to begin (`ProjectStoreOps::try_begin_resyncing`): no
     // version registers while a resync holds the project, whose triggers
     // it brings back on the build it named.
-    let row: Option<(i64, String)> = sqlx::query_as("SELECT registered_ask, transition FROM project WHERE id = $1 FOR UPDATE")
-        .bind(project)
-        .fetch_optional(&mut *conn)
+    let row: Option<(i64, String)> = conn
+        .opt("SELECT registered_ask, transition FROM project WHERE id = $1 FOR UPDATE", &[&project])
         .await
         .context("read the ask the project runs")?;
     if row.as_ref().is_some_and(|(_, transition)| transition == ProjectTransition::Resyncing.as_str()) {
@@ -335,13 +329,10 @@ pub(crate) async fn settle(conn: &mut sqlx::PgConnection, project: uuid::Uuid, s
     let running = row.map(|(ask, _)| ask);
     let registers = match settles {
         Settles::Waiting { version, answer } => {
-            let row: Option<(String, i64)> =
-                sqlx::query_as("SELECT state, ask FROM version_build WHERE id = $1 AND project_id = $2")
-                    .bind(version)
-                    .bind(project)
-                    .fetch_optional(&mut *conn)
-                    .await
-                    .context("read the version to register")?;
+            let row: Option<(String, i64)> = conn
+                .opt("SELECT state, ask FROM version_build WHERE id = $1 AND project_id = $2", &[version, &project])
+                .await
+                .context("read the version to register")?;
             let Some((state, ask)) = row else {
                 return Err(anyhow!("no version build {version} of project {project}"));
             };
@@ -378,22 +369,19 @@ pub(crate) async fn settle(conn: &mut sqlx::PgConnection, project: uuid::Uuid, s
             registers
         }
     };
-    sqlx::query("UPDATE project SET registered_ask = $2 WHERE id = $1")
-        .bind(project)
-        .bind(registers)
-        .execute(&mut *conn)
+    conn.execute("UPDATE project SET registered_ask = $2 WHERE id = $1", &[&project, &registers])
         .await
         .context("record the ask the project runs")?;
     // A registered version is runnable at once: the project lands at rest
     // in this same transaction when nothing else holds its build, so
     // whoever hears the version registered (its waiter, woken as this
     // commits) never finds the project still building.
-    sqlx::query_scalar::<_, uuid::Uuid>(crate::project_store::settle_transition_sql())
-        .bind(now - crate::transition::heartbeat_stale_secs())
-        .bind(Some(project))
-        .fetch_all(&mut *conn)
-        .await
-        .context("land the project at rest")?;
+    conn.scalars::<uuid::Uuid>(
+        &crate::project_store::settle_transition_sql(),
+        &[&(now - crate::transition::heartbeat_stale_secs()), &Some(project)],
+    )
+    .await
+    .context("land the project at rest")?;
     Ok(true)
 }
 
@@ -417,7 +405,7 @@ pub enum Registrar {
 /// The database half of [`register`], which a test drives with a store.
 pub async fn register_version(
     projects: &dyn ProjectStoreOps,
-    pool: &PgPool,
+    pool: &Pool,
     project: uuid::Uuid,
     tenant: &str,
     version: &super::Version,
@@ -435,7 +423,7 @@ pub async fn register_version(
     };
     // Let go only now: a prune deciding about one of these images under
     // its lock sees either this claim or the committed reference
-    // (`ledger::begin_reclaim`), never neither.
+    // (`ledger::decide_reclaim`), never neither.
     if let Some(hold) = hold {
         if let Err(released) = hold.release().await {
             if registered.is_ok() {
@@ -588,11 +576,17 @@ pub enum Verdict {
 }
 
 /// One image's row in the ledger, as [`verdict`] reads it.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct ImageRow {
     pub image_ref: String,
     pub status: String,
     pub reason: Option<String>,
+}
+
+impl FromRow for ImageRow {
+    fn from_row(row: db::Row) -> db::Result<Self> {
+        Ok(Self { image_ref: row.try_get("image_ref")?, status: row.try_get("status")?, reason: row.try_get("reason")? })
+    }
 }
 
 /// Where a version waiting on `waits_on` stands, from the ledger's rows
@@ -640,30 +634,26 @@ pub struct Advanced {
 /// would keep the install awake and its project building. One version's
 /// failure never skips the others. The versions ended over
 /// [`ENDED_KEPT_SECS`] ago go first.
-pub async fn advance(pool: &PgPool, projects: &dyn ProjectStoreOps) -> Result<Advanced> {
+pub async fn advance(pool: &Pool, projects: &dyn ProjectStoreOps) -> Result<Advanced> {
     let now = crate::lease::now_unix();
-    sqlx::query("DELETE FROM version_build WHERE state <> 'waiting' AND ended_at < $1")
-        .bind(now - ENDED_KEPT_SECS)
-        .execute(pool)
+    pool.execute("DELETE FROM version_build WHERE state <> 'waiting' AND ended_at < $1", &[&(now - ENDED_KEPT_SECS)])
         .await
         .context("forget the long-ended version builds")?;
-    let rows: Vec<WaitingRow> = sqlx::query_as(
-        "SELECT id, ask, project_id, tenant_id, project_name, manifest, inputs, program, images, waits_on FROM version_build \
-         WHERE state = 'waiting' ORDER BY asked_at",
-    )
-    .fetch_all(pool)
-    .await
-    .context("list the waiting versions")?;
+    let rows: Vec<WaitingRow> = pool
+        .all(
+            "SELECT id, ask, project_id, tenant_id, project_name, manifest, inputs, program, images, waits_on FROM version_build \
+             WHERE state = 'waiting' ORDER BY asked_at",
+            &[],
+        )
+        .await
+        .context("list the waiting versions")?;
     let mut advanced = Advanced::default();
     for row in rows {
         let id = row.id;
         let moved = match advance_one(pool, projects, row).await {
-            Err(e) if !crate::api::database_unreachable(&e) => {
+            Err(e) if !db::database_unreachable(&e) => {
                 let reason = format!("{e:#}");
-                let ended = match pool.acquire().await {
-                    Ok(mut conn) => end(&mut conn, id, VersionBuildStatus::Failed, Some(&reason), None, crate::lease::now_unix()).await,
-                    Err(e) => Err(e.into()),
-                };
+                let ended = end(pool, id, VersionBuildStatus::Failed, Some(&reason), None, crate::lease::now_unix()).await;
                 ended.map(|_| Moved::Ended).map_err(|ending| ending.context(reason))
             }
             moved => moved,
@@ -682,7 +672,6 @@ pub async fn advance(pool: &PgPool, projects: &dyn ProjectStoreOps) -> Result<Ad
 }
 
 /// A waiting version as [`advance`] reads it.
-#[derive(sqlx::FromRow)]
 struct WaitingRow {
     id: uuid::Uuid,
     ask: i64,
@@ -696,6 +685,23 @@ struct WaitingRow {
     waits_on: serde_json::Value,
 }
 
+impl FromRow for WaitingRow {
+    fn from_row(row: db::Row) -> db::Result<Self> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            ask: row.try_get("ask")?,
+            project_id: row.try_get("project_id")?,
+            tenant_id: row.try_get("tenant_id")?,
+            project_name: row.try_get("project_name")?,
+            manifest: row.try_get("manifest")?,
+            inputs: row.try_get("inputs")?,
+            program: row.try_get("program")?,
+            images: row.try_get("images")?,
+            waits_on: row.try_get("waits_on")?,
+        })
+    }
+}
+
 /// What [`advance_one`] did with one waiting version.
 enum Moved {
     Waits,
@@ -706,19 +712,17 @@ enum Moved {
 
 /// Move one waiting version forward. Every failure is answered, for
 /// [`advance`] to end the version with it.
-async fn advance_one(pool: &PgPool, projects: &dyn ProjectStoreOps, row: WaitingRow) -> Result<Moved> {
+async fn advance_one(pool: &Pool, projects: &dyn ProjectStoreOps, row: WaitingRow) -> Result<Moved> {
     let waits_on: Vec<ImageBuild> = serde_json::from_value(row.waits_on).context("the images it waits on do not read")?;
     let refs: Vec<&str> = waits_on.iter().map(|image| image.image.as_str()).collect();
-    let images: Vec<ImageRow> = sqlx::query_as("SELECT image_ref, status, reason FROM image_build WHERE image_ref = ANY($1)")
-        .bind(&refs)
-        .fetch_all(pool)
+    let images: Vec<ImageRow> = pool
+        .all("SELECT image_ref, status, reason FROM image_build WHERE image_ref = ANY($1)", &[&refs])
         .await
         .context("read the builds the version waits on")?;
     match verdict(&waits_on, &images) {
         Verdict::Waits => Ok(Moved::Waits),
         Verdict::Failed(reason) => {
-            let mut conn = pool.acquire().await.context("a connection to end the version")?;
-            end(&mut conn, row.id, VersionBuildStatus::Failed, Some(&reason), None, crate::lease::now_unix()).await?;
+            end(pool, row.id, VersionBuildStatus::Failed, Some(&reason), None, crate::lease::now_unix()).await?;
             Ok(Moved::Ended)
         }
         Verdict::Built => {
@@ -770,13 +774,12 @@ pub async fn wait_ended(state: &DispatcherState, project: uuid::Uuid, id: uuid::
 
 /// Forget every version build of a removed project, letting go of a
 /// waiting one's claim with it.
-pub async fn forget_project(pool: &PgPool, project: uuid::Uuid) -> Result<()> {
-    sqlx::query(
+pub async fn forget_project(pool: &Pool, project: uuid::Uuid) -> Result<()> {
+    pool.execute(
         "WITH gone AS (DELETE FROM version_build WHERE project_id = $1 RETURNING id) \
          DELETE FROM image_claim WHERE claim_id IN (SELECT id FROM gone)",
+        &[&project],
     )
-    .bind(project)
-    .execute(pool)
     .await
     .context("forget the removed project's version builds")?;
     Ok(())
@@ -784,11 +787,12 @@ pub async fn forget_project(pool: &PgPool, project: uuid::Uuid) -> Result<()> {
 
 /// End `project`'s waiting version `cancelled` (the person cancelled its
 /// build), letting go of its claim.
-pub async fn cancel(pool: &PgPool, project: uuid::Uuid) -> Result<()> {
-    let mut tx = pool.begin().await.context("begin cancelling the waiting version")?;
-    lock_versions(&mut tx, project).await?;
-    if let Some((waiting, _, _)) = waiting_of(&mut tx, project).await? {
-        end(&mut tx, waiting, VersionBuildStatus::Cancelled, Some("the build was cancelled"), None, crate::lease::now_unix()).await?;
+pub async fn cancel(pool: &Pool, project: uuid::Uuid) -> Result<()> {
+    let mut conn = pool.get().await.context("begin cancelling the waiting version")?;
+    let tx = conn.transaction().await.context("begin cancelling the waiting version")?;
+    lock_versions(&tx, project).await?;
+    if let Some((waiting, _, _)) = waiting_of(&tx, project).await? {
+        end(&tx, waiting, VersionBuildStatus::Cancelled, Some("the build was cancelled"), None, crate::lease::now_unix()).await?;
     }
     tx.commit().await.context("commit cancelling the waiting version")?;
     Ok(())
@@ -796,14 +800,11 @@ pub async fn cancel(pool: &PgPool, project: uuid::Uuid) -> Result<()> {
 
 /// Where `project`'s version build `id` stands, with each image build it
 /// waits on; `None` when the project has no such version build.
-pub async fn state(pool: &PgPool, project: uuid::Uuid, id: uuid::Uuid) -> Result<Option<VersionBuildState>> {
-    let row: Option<(String, Option<String>, Option<serde_json::Value>, serde_json::Value)> =
-        sqlx::query_as("SELECT state, reason, registered, waits_on FROM version_build WHERE id = $1 AND project_id = $2")
-            .bind(id)
-            .bind(project)
-            .fetch_optional(pool)
-            .await
-            .context("read the version build")?;
+pub async fn state(pool: &Pool, project: uuid::Uuid, id: uuid::Uuid) -> Result<Option<VersionBuildState>> {
+    let row: Option<(String, Option<String>, Option<serde_json::Value>, serde_json::Value)> = pool
+        .opt("SELECT state, reason, registered, waits_on FROM version_build WHERE id = $1 AND project_id = $2", &[&id, &project])
+        .await
+        .context("read the version build")?;
     let Some((state, reason, registered, waits_on)) = row else { return Ok(None) };
     let waits_on: Vec<ImageBuild> = serde_json::from_value(waits_on).context("a version build's images do not read")?;
     Ok(Some(VersionBuildState {

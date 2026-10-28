@@ -13,6 +13,7 @@
 //! releases the connection.
 
 use anyhow::Result;
+use weft_task_store::db::Pool;
 
 /// Who is asking for the runtime's credential, and for which service.
 /// Everything a policy needs to decide: the tenant, the project, the
@@ -88,7 +89,7 @@ pub struct DesignKeyRequest {
 /// repeat harmlessly.
 #[async_trait::async_trait]
 pub trait CredentialSource: Send + Sync {
-    async fn resolve(&self, pool: &sqlx::PgPool, req: &KeyRequest) -> Result<KeyResolution>;
+    async fn resolve(&self, pool: &Pool, req: &KeyRequest) -> Result<KeyResolution>;
 
     /// Design-time twin of [`Self::resolve`]: sign an editor-side
     /// lookup on an ours-owned connection. Required, not defaulted:
@@ -96,7 +97,7 @@ pub trait CredentialSource: Send + Sync {
     /// run is a policy decision every source must make.
     async fn design_resolve(
         &self,
-        pool: &sqlx::PgPool,
+        pool: &Pool,
         req: &DesignKeyRequest,
     ) -> Result<KeyResolution>;
 
@@ -114,7 +115,7 @@ pub trait CredentialSource: Send + Sync {
     /// finished): a source that hands out time-bounded credentials retires
     /// this one now instead of letting it live to its window. The default
     /// hands out the key itself, which is not retirable: nothing to do.
-    async fn close(&self, _pool: &sqlx::PgPool, _credential: &str, _tenant: &str) -> Result<()> {
+    async fn close(&self, _pool: &Pool, _credential: &str, _tenant: &str) -> Result<()> {
         Ok(())
     }
 }
@@ -139,7 +140,7 @@ impl FileCredentialSource {
 
 #[async_trait::async_trait]
 impl CredentialSource for FileCredentialSource {
-    async fn resolve(&self, _pool: &sqlx::PgPool, req: &KeyRequest) -> Result<KeyResolution> {
+    async fn resolve(&self, _pool: &Pool, req: &KeyRequest) -> Result<KeyResolution> {
         match self.provider.api_key(&req.service).await? {
             Some(entry) if !entry.key.is_empty() => {
                 Ok(KeyResolution::Access { credential: entry.key, relay_url: None })
@@ -153,7 +154,7 @@ impl CredentialSource for FileCredentialSource {
     /// a design-time list call may sign with it directly.
     async fn design_resolve(
         &self,
-        _pool: &sqlx::PgPool,
+        _pool: &Pool,
         req: &DesignKeyRequest,
     ) -> Result<KeyResolution> {
         match self.provider.api_key(&req.service).await? {
@@ -200,7 +201,7 @@ pub struct DesignGrant {
 /// value, and answer the URL to call.
 pub async fn design_sign(
     credentials: &dyn CredentialSource,
-    pool: &sqlx::PgPool,
+    pool: &Pool,
     tenant: &str,
     resolved: &mut weft_access_store::ResolvedAccess,
     url: String,
@@ -291,17 +292,17 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl CredentialSource for FakeSource {
-        async fn resolve(&self, _p: &sqlx::PgPool, _r: &KeyRequest) -> Result<KeyResolution> {
+        async fn resolve(&self, _p: &Pool, _r: &KeyRequest) -> Result<KeyResolution> {
             Ok((self.answer)())
         }
         async fn design_resolve(
             &self,
-            _p: &sqlx::PgPool,
+            _p: &Pool,
             _r: &DesignKeyRequest,
         ) -> Result<KeyResolution> {
             Ok((self.answer)())
         }
-        async fn close(&self, _p: &sqlx::PgPool, credential: &str, _t: &str) -> Result<()> {
+        async fn close(&self, _p: &Pool, credential: &str, _t: &str) -> Result<()> {
             self.closed.lock().unwrap().push(credential.to_string());
             Ok(())
         }
@@ -309,10 +310,9 @@ mod tests {
 
     /// A pool that never dials: the fakes ignore it, and building one
     /// lazily keeps these layer-1 tests off the network entirely.
-    fn lazy_pool() -> sqlx::PgPool {
-        sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://unused@localhost/unused")
-            .expect("lazy pool")
+    fn lazy_pool() -> Pool {
+        let unused = weft_task_store::db::config("postgres://unused@localhost/unused").expect("a Postgres address");
+        Pool::open(unused, 1, std::time::Duration::from_secs(1), weft_task_store::db::Waits::Expected)
     }
 
     fn openrouter_resolved() -> weft_access_store::ResolvedAccess {

@@ -128,7 +128,10 @@ out.data = svc.status
     // The door carries the service's own protocol, so the sidecar's own
     // route answers through it. This is the whole promise: a client that
     // is not a weft node talking to the program's infrastructure.
-    let body = reqwest::get(format!("http://{address}/outputs"))
+    let body = weft_core::net::http_client()
+        .build()?
+        .get(format!("http://{address}/outputs"))
+        .send()
         .await?
         .error_for_status()?
         .text()
@@ -170,7 +173,10 @@ out.data = svc.status
         .ok_or_else(|| anyhow::anyhow!("the public endpoint names its address: {status}"))?;
     let path = &address[address.find("/infra/").ok_or_else(|| anyhow::anyhow!("not a door address: {address}"))?..];
     anyhow::ensure!(path.ends_with("/svc"), "the node's own path closes the address: {address}");
-    let body = reqwest::get(format!("{}{path}/outputs", disp.base().trim_end_matches('/')))
+    let body = weft_core::net::http_client()
+        .build()?
+        .get(format!("{}{path}/outputs", disp.base().trim_end_matches('/')))
+        .send()
         .await?
         .error_for_status()?
         .text()
@@ -197,10 +203,11 @@ out.data = svc.status
     let door = format!("http://{}", listed.doors.first().ok_or_else(|| anyhow::anyhow!("the sidecar's door: {listed:?}"))?.address);
 
     // The service dies mid-request, so the call itself fails.
-    anyhow::ensure!(reqwest::get(format!("{door}/crash")).await.is_err(), "the crash answered");
+    let http = weft_core::net::http_client().build()?;
+    anyhow::ensure!(http.get(format!("{door}/crash")).send().await.is_err(), "the crash answered");
     weft_e2e::poll_until("the crashed service to answer again", std::time::Duration::from_secs(120), std::time::Duration::from_secs(1), || {
-        let url = format!("{door}/outputs");
-        async move { Ok(reqwest::get(url).await.ok().filter(|r| r.status().is_success()).map(|_| ())) }
+        let request = http.get(format!("{door}/outputs"));
+        async move { Ok(request.send().await.ok().filter(|r| r.status().is_success()).map(|_| ())) }
     })
     .await?;
     infra::wait_running(&project, "svc").await?;

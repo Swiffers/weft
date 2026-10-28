@@ -72,15 +72,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::sql;
-
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use tokio::time::Instant;
 use weft_platform_traits::roles::TICK_PATH;
 use weft_platform_traits::{Alarm, CoreRole, Wake, WakeQueue};
 
+use crate::db::{Client as _, Pool};
 use crate::pg_signal::{Heard, PgSignalWatch, Subscription};
 use crate::unanswered::{self, Callee};
 
@@ -428,13 +426,13 @@ enum Rule {
 /// the alarm's wakes that go with them.
 #[derive(Clone)]
 pub struct Booking {
-    pool: PgPool,
+    pool: Pool,
     role: CoreRole,
     alarm: Arc<dyn Alarm>,
 }
 
 impl Booking {
-    pub fn new(pool: PgPool, role: CoreRole, alarm: Arc<dyn Alarm>) -> Self {
+    pub fn new(pool: Pool, role: CoreRole, alarm: Arc<dyn Alarm>) -> Self {
         Self { pool, role, alarm }
     }
 
@@ -450,12 +448,10 @@ impl Booking {
     /// another loop must look at by then. Reads the row first, so a look
     /// already booked in time costs no write.
     pub async fn book_sooner(&self, name: &str, at_ms: i64) -> Result<()> {
-        let booked: Option<Option<i64>> =
-            sqlx::query_scalar("SELECT due_ms FROM role_loop_due WHERE role = $1 AND loop_name = $2")
-                .bind(self.role.as_str())
-                .bind(name)
-                .fetch_optional(&self.pool)
-                .await?;
+        let booked: Option<Option<i64>> = self
+            .pool
+            .scalar_opt("SELECT due_ms FROM role_loop_due WHERE role = $1 AND loop_name = $2", &[&self.role.as_str(), &name])
+            .await?;
         if booked.flatten().is_some_and(|due| due <= at_ms) {
             return Ok(());
         }
@@ -464,7 +460,7 @@ impl Booking {
 
     /// [`Self::book_sooner`], `after` from now on the database's clock.
     pub async fn book_sooner_after(&self, name: &str, after: Duration) -> Result<()> {
-        let now: i64 = sqlx::query_scalar(sql!("SELECT {DB_NOW_MS}")).fetch_one(&self.pool).await?;
+        let now: i64 = self.pool.scalar(&format!("SELECT {DB_NOW_MS}"), &[]).await?;
         self.book_sooner(name, now.saturating_add(millis(after))).await
     }
 
@@ -483,23 +479,24 @@ impl Booking {
     /// database could not be written: nothing was written down then.
     async fn rebook(&self, name: &str, label: Option<&str>, step: Step, rule: Rule) -> Result<()> {
         let role = self.role.as_str();
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(sql!(
-            "INSERT INTO role_loop_due (role, loop_name, due_ms, written_ms) VALUES ($1, $2, NULL, {DB_NOW_MS}) \
-             ON CONFLICT (role, loop_name) DO NOTHING"
-        ))
-        .bind(role)
-        .bind(name)
-        .execute(&mut *tx)
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        tx.execute(
+            &format!(
+                "INSERT INTO role_loop_due (role, loop_name, due_ms, written_ms) VALUES ($1, $2, NULL, {DB_NOW_MS}) \
+                 ON CONFLICT (role, loop_name) DO NOTHING"
+            ),
+            &[&role, &name],
+        )
         .await?;
-        let (due, seq, set_again, failures, failure_written, written_ms, now): (Option<i64>, i64, i32, i32, bool, i64, i64) =
-            sqlx::query_as(sql!(
-                "SELECT due_ms, seq, set_again, failures, failure_written, written_ms, {DB_NOW_MS} FROM role_loop_due \
-                 WHERE role = $1 AND loop_name = $2 FOR UPDATE"
-            ))
-            .bind(role)
-            .bind(name)
-            .fetch_one(&mut *tx)
+        let (due, seq, set_again, failures, failure_written, written_ms, now): (Option<i64>, i64, i32, i32, bool, i64, i64) = tx
+            .one(
+                &format!(
+                    "SELECT due_ms, seq, set_again, failures, failure_written, written_ms, {DB_NOW_MS} FROM role_loop_due \
+                     WHERE role = $1 AND loop_name = $2 FOR UPDATE"
+                ),
+                &[&role, &name],
+            )
             .await?;
         let sibling_wrote = matches!(rule, Rule::SinceRead(read_at) if written_ms >= read_at);
         // What a failed drain keeps of the booking: a look still to come
@@ -552,26 +549,29 @@ impl Booking {
         let mut alerts = unanswered::Alerts::default();
         if let Some(error) = &error {
             tracing::error!(target: "weft_task_store::drain", role, subsystem = name, %error, failures = failures_now, "a loop's pass failed and is written down; it runs again when a write that concerns it rings it");
-            alerts = unanswered::gave_up(&mut *tx, callee, label, error).await?;
+            alerts = unanswered::gave_up(&tx, callee, label, error).await?;
         } else if cleared {
-            unanswered::answered(&mut *tx, callee).await?;
+            unanswered::answered(&tx, callee).await?;
         } else if let (Step::Failed { error, .. }, true) = (&step, failure_written) {
             // Retrying, with a failure written down before (a wake that
             // could not be set): what `weft status` shows is what fails now.
-            alerts = unanswered::failed(&mut *tx, callee, label, error).await?;
+            alerts = unanswered::failed(&tx, callee, label, error).await?;
         }
-        sqlx::query(sql!(
-            "UPDATE role_loop_due SET due_ms = $3, seq = $4, set_again = $5, failures = $6, failure_written = $7, written_ms = {DB_NOW_MS} \
-             WHERE role = $1 AND loop_name = $2"
-        ))
-        .bind(role)
-        .bind(name)
-        .bind(next)
-        .bind(next_seq)
-        .bind(if next_seq == seq { set_again } else { 0 })
-        .bind(failures_now)
-        .bind(error.is_some() || (failure_written && !cleared))
-        .execute(&mut *tx)
+        tx.execute(
+            &format!(
+                "UPDATE role_loop_due SET due_ms = $3, seq = $4, set_again = $5, failures = $6, failure_written = $7, written_ms = {DB_NOW_MS} \
+                 WHERE role = $1 AND loop_name = $2"
+            ),
+            &[
+                &role,
+                &name,
+                &next,
+                &next_seq,
+                &if next_seq == seq { set_again } else { 0 },
+                &failures_now,
+                &(error.is_some() || (failure_written && !cleared)),
+            ],
+        )
         .await?;
         tx.commit().await?;
         alerts.log();
@@ -594,14 +594,12 @@ impl Booking {
 /// [`BookedLook::set_again`] counts that set): the row of its loop says
 /// so while that booking is still the current one, so a booking that moves
 /// cancels the wake still waiting rather than the one already delivered.
-pub async fn set_again_recorded(pool: &PgPool, role: CoreRole, booked: &BookedLook) -> Result<()> {
-    sqlx::query("UPDATE role_loop_due SET set_again = GREATEST(set_again, $4) WHERE role = $1 AND loop_name = $2 AND seq = $3")
-        .bind(role.as_str())
-        .bind(&booked.loop_name)
-        .bind(booked.seq)
-        .bind(i32::try_from(booked.set_again).unwrap_or(i32::MAX))
-        .execute(pool)
-        .await?;
+pub async fn set_again_recorded(pool: &Pool, role: CoreRole, booked: &BookedLook) -> Result<()> {
+    pool.execute(
+        "UPDATE role_loop_due SET set_again = GREATEST(set_again, $4) WHERE role = $1 AND loop_name = $2 AND seq = $3",
+        &[&role.as_str(), &booked.loop_name, &booked.seq, &i32::try_from(booked.set_again).unwrap_or(i32::MAX)],
+    )
+    .await?;
     Ok(())
 }
 
@@ -631,20 +629,21 @@ impl std::error::Error for PassFailed {}
 /// changes on a loop's row, its booking kept; a loop with no row gets one
 /// due now, which is what having no row means ([`plan`]), so writing the
 /// failure down never puts a due loop to sleep.
-pub async fn pass_failed(pool: &PgPool, role: CoreRole, failed: &PassFailed) -> Result<()> {
+pub async fn pass_failed(pool: &Pool, role: CoreRole, failed: &PassFailed) -> Result<()> {
     let error = format!("its pass could not write down how it went: {}", failed.error);
-    let mut tx = pool.begin().await?;
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
     let mut alerts = unanswered::Alerts::default();
     for name in &failed.loops {
-        sqlx::query(sql!(
-            "INSERT INTO role_loop_due (role, loop_name, due_ms, written_ms, failure_written) VALUES ($1, $2, {DB_NOW_MS}, {DB_NOW_MS}, TRUE) \
-             ON CONFLICT (role, loop_name) DO UPDATE SET failure_written = TRUE"
-        ))
-        .bind(role.as_str())
-        .bind(name)
-        .execute(&mut *tx)
+        tx.execute(
+            &format!(
+                "INSERT INTO role_loop_due (role, loop_name, due_ms, written_ms, failure_written) VALUES ($1, $2, {DB_NOW_MS}, {DB_NOW_MS}, TRUE) \
+                 ON CONFLICT (role, loop_name) DO UPDATE SET failure_written = TRUE"
+            ),
+            &[&role.as_str(), name],
+        )
         .await?;
-        alerts = alerts.and(unanswered::failed(&mut *tx, Callee::Loop { role: role.as_str(), name }, None, &error).await?);
+        alerts = alerts.and(unanswered::failed(&tx, Callee::Loop { role: role.as_str(), name }, None, &error).await?);
     }
     tx.commit().await?;
     alerts.log();
@@ -736,16 +735,17 @@ struct ReadDue {
 /// role has no row.
 type DueRow = (i64, Option<String>, Option<i64>, Option<i64>, Option<bool>, Option<bool>);
 
-async fn read_due(pool: &PgPool, role: &str) -> Result<ReadDue> {
-    let rows: Vec<DueRow> = sqlx::query_as(sql!(
-        "SELECT c.now_ms, d.loop_name, d.due_ms, d.seq, d.written_ms < c.now_ms - $2, d.failure_written AND d.due_ms IS NULL \
-         FROM (SELECT {DB_NOW_MS} AS now_ms) c \
-         LEFT JOIN role_loop_due d ON d.role = $1"
-    ))
-    .bind(role)
-    .bind(millis(FORGET_AFTER))
-    .fetch_all(pool)
-    .await?;
+async fn read_due(pool: &Pool, role: &str) -> Result<ReadDue> {
+    let rows: Vec<DueRow> = pool
+        .all(
+            &format!(
+                "SELECT c.now_ms, d.loop_name, d.due_ms, d.seq, d.written_ms < c.now_ms - $2::bigint, d.failure_written AND d.due_ms IS NULL \
+                 FROM (SELECT {DB_NOW_MS} AS now_ms) c \
+                 LEFT JOIN role_loop_due d ON d.role = $1"
+            ),
+            &[&role, &millis(FORGET_AFTER)],
+        )
+        .await?;
     let now = rows.first().map(|r| r.0).context("the clock query returned no row")?;
     let mut booked = HashMap::new();
     let mut unbooked = Vec::new();
@@ -871,16 +871,18 @@ async fn forget(booking: &Booking, loops: &[DrainLoop], unbooked: &[String]) {
     if gone.is_empty() {
         return;
     }
-    if let Err(e) = sqlx::query(sql!(
-        "WITH gone AS (DELETE FROM role_loop_due WHERE role = $1 AND loop_name = ANY($2) RETURNING loop_name) \
-         DELETE FROM unanswered_call WHERE callee IN (SELECT {} FROM gone)",
-        unanswered::loop_key_sql("$1", "gone.loop_name")
-    ))
-    .bind(booking.role.as_str())
-    .bind(&gone)
-    .execute(&booking.pool)
-    .await
-    {
+    let forgotten = booking
+        .pool
+        .execute(
+            &format!(
+                "WITH gone AS (DELETE FROM role_loop_due WHERE role = $1 AND loop_name = ANY($2) RETURNING loop_name) \
+                 DELETE FROM unanswered_call WHERE callee IN (SELECT {} FROM gone)",
+                unanswered::loop_key_sql("$1", "gone.loop_name")
+            ),
+            &[&booking.role.as_str(), &gone],
+        )
+        .await;
+    if let Err(e) = forgotten {
         tracing::warn!(target: "weft_task_store::drain", role = booking.role.as_str(), error = %format!("{e:#}"), "could not forget the due times of loops this role no longer has; the next pass tries again");
     }
 }
@@ -1299,12 +1301,12 @@ mod db_tests {
     const WRITES: &[WakeOn] = &[WakeOn::any("chan")];
     const ROLE: CoreRole = CoreRole::Dispatcher;
 
-    async fn schema(pool: &PgPool) {
+    async fn schema(pool: &Pool) {
         crate::apply_groups(pool, &[&GROUP, &crate::unanswered::GROUP]).await.expect("role_loop_due schema");
         crate::unanswered::judged_run_columns(pool).await.expect("the run columns");
     }
 
-    fn booking(pool: &PgPool) -> (Booking, Arc<FakeAlarm>) {
+    fn booking(pool: &Pool) -> (Booking, Arc<FakeAlarm>) {
         let alarm = Arc::new(FakeAlarm::new());
         (Booking::new(pool.clone(), ROLE, alarm.clone()), alarm)
     }
@@ -1329,21 +1331,18 @@ mod db_tests {
         drain_due(booking, loops, &TickBody::default(), Pass::Start, Duration::from_secs(60), None).await
     }
 
-    async fn written(pool: &PgPool) -> Vec<(String, Option<String>, String)> {
-        sqlx::query_as("SELECT callee, label, error FROM unanswered_call ORDER BY callee").fetch_all(pool).await.unwrap()
+    async fn written(pool: &Pool) -> Vec<(String, Option<String>, String)> {
+        pool.all("SELECT callee, label, error FROM unanswered_call ORDER BY callee", &[]).await.unwrap()
     }
 
-    async fn row(pool: &PgPool, name: &str) -> (Option<i64>, i64, i32) {
-        sqlx::query_as("SELECT due_ms, seq, failures FROM role_loop_due WHERE role = $1 AND loop_name = $2")
-            .bind(ROLE.as_str())
-            .bind(name)
-            .fetch_one(pool)
+    async fn row(pool: &Pool, name: &str) -> (Option<i64>, i64, i32) {
+        pool.one("SELECT due_ms, seq, failures FROM role_loop_due WHERE role = $1 AND loop_name = $2", &[&ROLE.as_str(), &name])
             .await
             .unwrap()
     }
 
-    async fn db_now(pool: &PgPool) -> i64 {
-        sqlx::query_scalar(sql!("SELECT {DB_NOW_MS}")).fetch_one(pool).await.unwrap()
+    async fn db_now(pool: &Pool) -> i64 {
+        pool.scalar(&format!("SELECT {DB_NOW_MS}"), &[]).await.unwrap()
     }
 
     fn named(names: &[&str]) -> TickBody {
@@ -1353,8 +1352,8 @@ mod db_tests {
     /// A fresh pass drains every loop; one that asks for a look books it
     /// with one wake for exactly that loop, and one with nothing left
     /// books nothing.
-    #[sqlx::test]
-    async fn a_fresh_pass_drains_every_loop_and_books_only_the_looks_asked_for(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_fresh_pass_drains_every_loop_and_books_only_the_looks_asked_for(pool: Pool) {
         schema(&pool).await;
         let (booking, alarm) = booking(&pool);
         let a_runs = Arc::new(AtomicU32::new(0));
@@ -1378,8 +1377,8 @@ mod db_tests {
 
     /// Moving a booking sets the new wake and cancels the old one; clearing
     /// it cancels it; a booking that does not move touches no wake.
-    #[sqlx::test]
-    async fn a_booking_that_moves_replaces_its_wake_and_one_cleared_cancels_it(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_booking_that_moves_replaces_its_wake_and_one_cleared_cancels_it(pool: Pool) {
         schema(&pool).await;
         let (booking, alarm) = booking(&pool);
         let now = db_now(&pool).await;
@@ -1400,8 +1399,8 @@ mod db_tests {
 
     /// Booking a sooner look never pushes one already booked back, and a
     /// look already booked in time costs no write.
-    #[sqlx::test]
-    async fn a_sooner_look_never_pushes_a_booking_back(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_sooner_look_never_pushes_a_booking_back(pool: Pool) {
         schema(&pool).await;
         let (booking, alarm) = booking(&pool);
         let now = db_now(&pool).await;
@@ -1417,8 +1416,8 @@ mod db_tests {
     /// The wake of a booking still current runs its loop even before the
     /// database's clock reaches it; a wake whose booking moved since runs
     /// nothing; a woken loop runs whatever its booking.
-    #[sqlx::test]
-    async fn a_tick_runs_its_current_booking_and_its_woken_loops_only(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_tick_runs_its_current_booking_and_its_woken_loops_only(pool: Pool) {
         schema(&pool).await;
         let (booking, _) = booking(&pool);
         let (x, x_runs) = counting("x", DrainStep::Done);
@@ -1449,8 +1448,8 @@ mod db_tests {
     /// keeps no look already spent, and is written down for `weft status`.
     /// From then on only a ring runs it, each failure rewriting the error,
     /// and its next success clears what was written.
-    #[sqlx::test]
-    async fn a_failing_loop_retries_then_stops_written_down_until_a_ring_drains_it(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_failing_loop_retries_then_stops_written_down_until_a_ring_drains_it(pool: Pool) {
         schema(&pool).await;
         let (booking, alarm) = booking(&pool);
         let error: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(Some("the database is down")));
@@ -1504,8 +1503,8 @@ mod db_tests {
     /// failures kept) and is written down again, and no tick tries it
     /// after; the next start tries it again, and going through, it clears
     /// what was written. A loop that never gave up is left by a start.
-    #[sqlx::test]
-    async fn a_loop_that_gave_up_is_tried_once_per_start(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_loop_that_gave_up_is_tried_once_per_start(pool: Pool) {
         schema(&pool).await;
         let (booking, alarm) = booking(&pool);
         let error: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(Some("Permission 'cloudtasks.tasks.create' denied")));
@@ -1560,8 +1559,8 @@ mod db_tests {
     /// A loop written down only because its wake could not be set has
     /// spent no retry: the start's try that fails books its first, and
     /// what `weft status` shows is the error that try failed with.
-    #[sqlx::test]
-    async fn a_start_try_of_a_loop_whose_wake_failed_retries_showing_its_error(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_start_try_of_a_loop_whose_wake_failed_retries_showing_its_error(pool: Pool) {
         schema(&pool).await;
         let (booking, alarm) = booking(&pool);
         alarm.fail_sets(true);
@@ -1582,8 +1581,8 @@ mod db_tests {
     /// A booking whose wake cannot be set leaves the booking as it was and
     /// is written down, and the call goes through: a later booking sets the
     /// wake, and the loop's next drain clears what was written.
-    #[sqlx::test]
-    async fn a_wake_that_cannot_be_set_leaves_no_booking_without_one(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_wake_that_cannot_be_set_leaves_no_booking_without_one(pool: Pool) {
         schema(&pool).await;
         let (booking, alarm) = booking(&pool);
         alarm.fail_sets(true);
@@ -1604,8 +1603,8 @@ mod db_tests {
     /// A wake set again by a tick it arrived early at is the one a booking
     /// that moves cancels, once the loop's row knows of it; a wake of a
     /// booking no longer current changes nothing.
-    #[sqlx::test]
-    async fn a_booking_that_moves_cancels_its_wake_as_set_again(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_booking_that_moves_cancels_its_wake_as_set_again(pool: Pool) {
         schema(&pool).await;
         let (booking, alarm) = booking(&pool);
         let now = db_now(&pool).await;
@@ -1624,8 +1623,8 @@ mod db_tests {
     /// the writer whose ring it answered, without changing when any loop
     /// is due: a loop with no row stays due now, one booked keeps its
     /// look. The loop's next drain that goes through clears it.
-    #[sqlx::test]
-    async fn a_failed_pass_written_down_by_its_ringer_is_cleared_by_the_next_drain(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_failed_pass_written_down_by_its_ringer_is_cleared_by_the_next_drain(pool: Pool) {
         schema(&pool).await;
         let (booking, _) = booking(&pool);
         let later = db_now(&pool).await + 3_600_000;
@@ -1648,8 +1647,8 @@ mod db_tests {
     /// A pass whose database stops answering partway names only the loops
     /// it could not write down: one that drained and was booked before is
     /// not among them.
-    #[sqlx::test]
-    async fn a_failed_pass_names_only_the_loops_it_could_not_write_down(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_failed_pass_names_only_the_loops_it_could_not_write_down(pool: Pool) {
         schema(&pool).await;
         let (booking, _) = booking(&pool);
         let (a, _) = counting("a", DrainStep::Done);
@@ -1657,7 +1656,7 @@ mod db_tests {
         let b = DrainLoop::new("b", "break the table", WRITES, Duration::from_secs(30), move || {
             let pool = breaks.clone();
             async move {
-                sqlx::query("ALTER TABLE role_loop_due RENAME TO role_loop_gone").execute(&pool).await?;
+                pool.batch_execute("ALTER TABLE role_loop_due RENAME TO role_loop_gone").await?;
                 Ok(DrainStep::Done)
             }
         });
@@ -1669,11 +1668,11 @@ mod db_tests {
     /// A pass that cannot read when the loops are due runs nothing and
     /// fails, so the queue calls the tick again, naming the loops its call
     /// names, or every loop when it names none.
-    #[sqlx::test]
-    async fn a_pass_that_cannot_read_the_due_times_fails(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_pass_that_cannot_read_the_due_times_fails(pool: Pool) {
         schema(&pool).await;
         let (booking, _) = booking(&pool);
-        sqlx::query("DROP TABLE role_loop_due").execute(&pool).await.unwrap();
+        pool.batch_execute("DROP TABLE role_loop_due").await.unwrap();
         let (x, runs) = counting("x", DrainStep::Done);
         let (y, _) = counting("y", DrainStep::Done);
         let loops = [x, y];
@@ -1684,11 +1683,11 @@ mod db_tests {
 
     /// A loop drains with its process's watch held, and a pass that runs
     /// no loop (a wake whose booking moved since) does not take it.
-    #[sqlx::test]
-    async fn a_pass_holds_the_watch_only_while_a_loop_runs(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_pass_holds_the_watch_only_while_a_loop_runs(pool: Pool) {
         schema(&pool).await;
         let (booking, _) = booking(&pool);
-        let watch = PgSignalWatch::start(&pool.connect_options(), &["chan"], crate::pg_signal::Listening::WhileBusy).await.unwrap();
+        let watch = PgSignalWatch::start(pool.config(), &["chan"], crate::pg_signal::Listening::WhileBusy).await.unwrap();
         let held = Arc::new(Mutex::new(Vec::new()));
         let (seen, looking) = (held.clone(), watch.clone());
         let l = DrainLoop::new("x", "test things", WRITES, Duration::from_secs(30), move || {
@@ -1709,8 +1708,8 @@ mod db_tests {
     /// A pass that drained a loop replaces its booking when nobody wrote
     /// the row since the pass read it, and keeps a sooner look a sibling
     /// booked in between, so the sibling's wake is never pushed back.
-    #[sqlx::test]
-    async fn a_booking_keeps_a_sooner_look_a_sibling_wrote_since_the_read(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_booking_keeps_a_sooner_look_a_sibling_wrote_since_the_read(pool: Pool) {
         schema(&pool).await;
         let (booking, _) = booking(&pool);
         let soon = Duration::from_secs(10);
@@ -1736,10 +1735,10 @@ mod db_tests {
     /// Scaled to zero, a loop run for the life of its process drains only
     /// when a write wakes it (no start drain, no timed look), and keeps no
     /// timer for the look its drain asks for: the tick books it.
-    #[sqlx::test]
-    async fn a_working_process_never_looks_on_a_timer(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_working_process_never_looks_on_a_timer(pool: Pool) {
         schema(&pool).await;
-        let watch = PgSignalWatch::start(&pool.connect_options(), &["chan"], crate::pg_signal::Listening::WhileBusy).await.unwrap();
+        let watch = PgSignalWatch::start(pool.config(), &["chan"], crate::pg_signal::Listening::WhileBusy).await.unwrap();
         let runs = Arc::new(AtomicU32::new(0));
         let counter = runs.clone();
         let l = DrainLoop::new("woken", "test things", WRITES, Duration::from_millis(200), move || {
@@ -1751,25 +1750,23 @@ mod db_tests {
         tokio::spawn(async move { l.run_forever(subscription, looks).await });
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(runs.load(Ordering::SeqCst), 0, "no start drain, no safety look");
-        sqlx::query("SELECT pg_notify('chan', '')").execute(&pool).await.unwrap();
+        pool.execute("SELECT pg_notify('chan', '')", &[]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(runs.load(Ordering::SeqCst), 1, "a write wakes it");
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(runs.load(Ordering::SeqCst), 1, "and nothing after it, not even the look it asked for");
-        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM role_loop_due").fetch_one(&pool).await.unwrap();
+        let rows: i64 = pool.scalar("SELECT count(*) FROM role_loop_due", &[]).await.unwrap();
         assert_eq!(rows, 0, "and it books nothing: the tick rung for the same write does");
     }
 
     /// A row of a loop this role no longer has is forgotten once nobody
     /// booked it for a day; one booked lately is left to the other weft
     /// that may still run it.
-    #[sqlx::test]
-    async fn a_loop_this_role_no_longer_has_is_forgotten(pool: PgPool) {
+    #[weft_db_macros::test]
+    async fn a_loop_this_role_no_longer_has_is_forgotten(pool: Pool) {
         schema(&pool).await;
         let (booking, _) = booking(&pool);
-        sqlx::query("INSERT INTO role_loop_due (role, loop_name, due_ms, written_ms, seq) VALUES ($1, 'renamed', 5, 0, 3)")
-            .bind(ROLE.as_str())
-            .execute(&pool)
+        pool.execute("INSERT INTO role_loop_due (role, loop_name, due_ms, written_ms, seq) VALUES ($1, 'renamed', 5, 0, 3)", &[&ROLE.as_str()])
             .await
             .unwrap();
         let now = db_now(&pool).await;
@@ -1779,7 +1776,7 @@ mod db_tests {
         }
         let (fresh, _) = counting("fresh", DrainStep::Done);
         pass(&booking, &[fresh], &TickBody::default()).await.unwrap();
-        let names: Vec<String> = sqlx::query_scalar("SELECT loop_name FROM role_loop_due ORDER BY loop_name").fetch_all(&pool).await.unwrap();
+        let names: Vec<String> = pool.scalars("SELECT loop_name FROM role_loop_due ORDER BY loop_name", &[]).await.unwrap();
         assert_eq!(names, vec!["another_wefts".to_string(), "fresh".to_string()]);
         let written: Vec<String> = written(&pool).await.into_iter().map(|w| w.0).collect();
         assert_eq!(written, vec!["loop:dispatcher:another_wefts".to_string()], "its failure written down goes with it");

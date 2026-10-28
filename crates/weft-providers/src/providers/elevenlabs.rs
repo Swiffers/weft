@@ -2053,7 +2053,7 @@ mod tests {
         let observed = run(&linked, 200, hour);
         assert!((observed.data["usd"].as_f64().unwrap() - 0.22).abs() < 1e-9, "{observed:?}");
         assert_eq!(observed.data["model"], json!("scribe_v2"));
-        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let follow = FollowUp { http: &http, base_url: NOWHERE, shared: &shared };
         let cost = ELEVENLABS.resolve("speech-to-text", observed, follow).await;
@@ -2091,7 +2091,7 @@ mod tests {
     /// Fold one report into a project charge, with `base` answering any
     /// follow-up the meter makes.
     async fn fold_at(path: &str, observed: crate::ObservedCall, scratch: &mut Value, base: &str) -> Option<MeasuredCost> {
-        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         ELEVENLABS.fold_report(path, observed, scratch, FollowUp { http: &http, base_url: base, shared: &shared }).await
     }
@@ -2204,7 +2204,7 @@ mod tests {
     async fn a_refused_project_create_spends_nothing() {
         let refused = answered("dubbing/project", 422, json!({ "detail": [{ "loc": ["body", "file"], "msg": "Field required" }] }));
         assert_eq!(ELEVENLABS.opens_charge("dubbing/project", &refused), None);
-        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let follow = FollowUp { http: &http, base_url: NOWHERE, shared: &shared };
         let cost = ELEVENLABS.resolve("dubbing/project", refused, follow).await;
@@ -2416,7 +2416,7 @@ mod tests {
         let request = json!({ "model_id": "veo-3.1-generate-001", "prompt": "a corgi", "duration_secs": 5 });
         let refused = generation_answer("flows/video", request, 422, json!({ "detail": "duration_secs must be 4, 6 or 8" }));
         assert_eq!(ELEVENLABS.opens_charge("flows/video", &refused), None);
-        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let follow = FollowUp { http: &http, base_url: NOWHERE, shared: &shared };
         let cost = ELEVENLABS.resolve("flows/video", refused, follow).await;

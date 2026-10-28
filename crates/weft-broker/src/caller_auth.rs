@@ -22,7 +22,7 @@ use axum::routing::post;
 use axum::Router;
 use base64::Engine as _;
 use serde_json::Value;
-use sqlx::PgPool;
+use weft_task_store::db::Pool;
 
 use weft_core::access::events::VerifyKind;
 use weft_core::access::verify::{
@@ -139,7 +139,7 @@ fn names(payload: &str, key: &VerifierKey) -> bool {
 /// Separate from the route so the database tests exercise it directly.
 pub async fn verify_caller(
     verifiers: &HeldVerifiers,
-    pool: &PgPool,
+    pool: &Pool,
     req: &CallerVerifyRequest,
     now_unix: i64,
 ) -> Result<CallerVerified, CallerRefusal> {

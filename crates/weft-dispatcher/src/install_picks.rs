@@ -19,6 +19,7 @@ use weft_core::activation::ActivationKey;
 use weft_core::instance::{Owner, ValueChanges};
 use weft_core::instance_door::ValuesChanged;
 use weft_core::picks::PickInput;
+use weft_task_store::db::Client;
 
 use crate::activation_store::{ClaimRefused, ProjectStatus};
 use crate::api::access_store_error;
@@ -142,11 +143,11 @@ impl Store<'_> {
     /// The fields this write touches, read under the project lock: a
     /// move checks itself against what is stored now and touches every
     /// field it carries to its new place.
-    async fn changes(&self, conn: &mut sqlx::PgConnection, project_id: uuid::Uuid) -> Result<ValueChanges, ApiError> {
+    async fn changes(&self, db: &impl Client, project_id: uuid::Uuid) -> Result<ValueChanges, ApiError> {
         match self {
             Store::Change { changes, .. } => Ok((*changes).clone()),
             Store::Move { tenant, request, project } => {
-                let stored = weft_access_store::stored_fields(&mut *conn, tenant, project_id).await.map_err(access_store_error)?;
+                let stored = weft_access_store::stored_fields(db, tenant, project_id).await.map_err(access_store_error)?;
                 weft_core::picks::check_move(project, &stored, request).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
                 let mut changes = ValueChanges::default();
                 for moved in stored.iter().filter(|s| s.node == request.from) {
@@ -176,10 +177,10 @@ async fn store_then_rearm(
         // Subscribed before looking, so a claim ending between the look
         // and the wait still wakes it.
         let mut heard = state.signals.subscribe();
-        let mut tx = state.pg_pool.begin().await.map_err(|e| access_store_error(e.into()))?;
-        let locked: Option<(uuid::Uuid,)> = sqlx::query_as("SELECT id FROM project WHERE id = $1 FOR UPDATE")
-            .bind(project_id)
-            .fetch_optional(&mut *tx)
+        let mut conn = state.pg_pool.get().await.map_err(|e| access_store_error(e.into()))?;
+        let tx = conn.transaction().await.map_err(|e| access_store_error(e.into()))?;
+        let locked: Option<uuid::Uuid> = tx
+            .scalar_opt("SELECT id FROM project WHERE id = $1 FOR UPDATE", &[&project_id])
             .await
             .map_err(|e| access_store_error(e.into()))?;
         if locked.is_none() {
@@ -190,25 +191,26 @@ async fn store_then_rearm(
             .list(project_id)
             .await
             .map_err(|e| crate::api::unavailable_or_internal("read the project's triggers", e))?;
-        let changes = store.changes(&mut tx, project_id).await?;
+        let changes = store.changes(&tx, project_id).await?;
         let reading = match project {
             Some(project) => triggers_reading(project, &activations, None, &changes),
             None => Vec::new(),
         };
         if reading.iter().any(|a| a.lifecycle.status == ProjectStatus::Activating) {
             drop(tx);
+            drop(conn);
             wait_for_activations(&mut heard).await?;
             continue;
         }
         let moved = match &store {
             Store::Change { tenant, writes, cleared, .. } => {
-                weft_access_store::change_install_picks(&mut tx, tenant, project_id, writes, cleared)
+                weft_access_store::change_install_picks(&tx, tenant, project_id, writes, cleared)
                     .await
                     .map_err(access_store_error)?;
                 (0, 0)
             }
             Store::Move { tenant, request, .. } => {
-                weft_access_store::move_stored(&mut tx, tenant, project_id, &request.from, &request.to)
+                weft_access_store::move_stored(&tx, tenant, project_id, &request.from, &request.to)
                     .await
                     .map_err(access_store_error)?
             }

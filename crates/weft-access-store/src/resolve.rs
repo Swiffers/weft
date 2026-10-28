@@ -6,8 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
-use weft_task_store::sql;
+use weft_task_store::db::{self, Client, FromRow, Pool, Row};
 
 use sha2::Digest;
 
@@ -121,7 +120,6 @@ pub fn value_shortfall<'r>(
 }
 
 /// The `access_grant` columns a walled read selects.
-#[derive(sqlx::FromRow)]
 struct GrantRow {
     tenant_id: String,
     service: String,
@@ -140,6 +138,30 @@ struct GrantRow {
     instance_id: Option<String>,
     project_id: Option<uuid::Uuid>,
     published_by_node: Option<String>,
+}
+
+impl FromRow for GrantRow {
+    fn from_row(row: Row) -> db::Result<Self> {
+        Ok(Self {
+            tenant_id: row.try_get("tenant_id")?,
+            service: row.try_get("service")?,
+            registration_sealed: row.try_get("registration_sealed")?,
+            spec_json: row.try_get("spec_json")?,
+            spec_json_version: row.try_get("spec_json_version")?,
+            values_sealed: row.try_get("values_sealed")?,
+            granted_scopes: row.try_get("granted_scopes")?,
+            permissions_verified: row.try_get("permissions_verified")?,
+            owner: row.try_get("owner")?,
+            door: row.try_get("door")?,
+            identity: row.try_get("identity")?,
+            provider_account: row.try_get("provider_account")?,
+            expires_at: row.try_get("expires_at")?,
+            token_lifetime_secs: row.try_get("token_lifetime_secs")?,
+            instance_id: row.try_get("instance_id")?,
+            project_id: row.try_get("project_id")?,
+            published_by_node: row.try_get("published_by_node")?,
+        })
+    }
 }
 
 /// One connection row, read through the wall and refreshed: what
@@ -250,7 +272,7 @@ struct Due {
 /// again until it is fresh, so the provider sees one renewal however
 /// many resolutions ask at once.
 async fn read_walled_grant(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
@@ -261,10 +283,7 @@ async fn read_walled_grant(
     let open = |row: Option<GrantRow>| open_walled_grant(row, tenant, user, access_id, service, required_permissions);
     let mut look = RENEWAL_LOOK_FIRST;
     loop {
-        let row = sqlx::query_as(sql!("SELECT {WALLED_COLUMNS} FROM access_grant WHERE id = $1"))
-            .bind(access_id)
-            .fetch_optional(pool)
-            .await?;
+        let row = pool.opt(&format!("SELECT {WALLED_COLUMNS} FROM access_grant WHERE id = $1"), &[&access_id]).await?;
         let (grant, due) = open(row)?;
         let Some(due) = due.filter(|_| freshness == Freshness::Refreshed) else {
             return Ok(grant);
@@ -393,28 +412,24 @@ fn open_walled_grant(
 /// it, and the claim, which the renewal's write and its letting go are
 /// keyed on; `None` when the claim was not won.
 async fn claim_renewal(
-    pool: &PgPool,
+    pool: &Pool,
     access_id: uuid::Uuid,
     due: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<Option<(GrantRow, chrono::DateTime<chrono::Utc>)>> {
-    #[derive(sqlx::FromRow)]
-    struct Claimed {
-        #[sqlx(flatten)]
-        row: GrantRow,
-        renewal_claimed_until: chrono::DateTime<chrono::Utc>,
-    }
-    let claimed: Option<Claimed> = sqlx::query_as(sql!(
-        "UPDATE access_grant SET renewal_claimed_until = now() + make_interval(secs => $3)
-         WHERE id = $1 AND expires_at = $2
-           AND (renewal_claimed_until IS NULL OR renewal_claimed_until < now())
-         RETURNING {WALLED_COLUMNS}, renewal_claimed_until"
-    ))
-    .bind(access_id)
-    .bind(due)
-    .bind(RENEWAL_CLAIM.as_secs_f64())
-    .fetch_optional(pool)
-    .await?;
-    Ok(claimed.map(|c| (c.row, c.renewal_claimed_until)))
+    let claimed: Option<Row> = pool
+        .opt(
+            &format!(
+                "UPDATE access_grant SET renewal_claimed_until = now() + make_interval(secs => $3)
+                 WHERE id = $1 AND expires_at = $2
+                   AND (renewal_claimed_until IS NULL OR renewal_claimed_until < now())
+                 RETURNING {WALLED_COLUMNS}, renewal_claimed_until"
+            ),
+            &[&access_id, &due, &RENEWAL_CLAIM.as_secs_f64()],
+        )
+        .await?;
+    let Some(claimed) = claimed else { return Ok(None) };
+    let claim = claimed.try_get("renewal_claimed_until").map_err(db::Error::from)?;
+    Ok(Some((GrantRow::from_row(claimed)?, claim)))
 }
 
 /// Renew a claimed grant's token and write it back: the provider is
@@ -435,7 +450,7 @@ async fn claim_renewal(
 /// same way: it cannot tell a connection made again from a claim taken
 /// over.
 async fn renew(
-    pool: &PgPool,
+    pool: &Pool,
     access_id: uuid::Uuid,
     mut grant: WalledGrant,
     due: Due,
@@ -457,7 +472,7 @@ async fn renew(
     // The provider may have rotated the refresh token, so the old one no
     // longer works: what it answered exists nowhere else, and is written
     // for as long as the database cannot be reached and the claim holds.
-    let last_try = claim_lapses.checked_sub(pool.options().get_acquire_timeout()).unwrap_or(claim_lapses);
+    let last_try = claim_lapses.checked_sub(pool.acquire_timeout()).unwrap_or(claim_lapses);
     let mut wait = RENEWAL_LOOK_FIRST;
     let mut missed = false;
     let written = loop {
@@ -468,22 +483,17 @@ async fn renew(
         // reading the landed write as a claim taken away. The first try
         // can only match on the claim, so the common path is one
         // statement as before.
-        let write = sqlx::query(
-            "UPDATE access_grant
-             SET values_sealed = $3, value_names = $4, expires_at = $5,
-                 token_lifetime_secs = $6, renewal_claimed_until = NULL, updated_at = now()
-             WHERE id = $1 AND (renewal_claimed_until = $2 OR values_sealed = $3)",
-        )
-        .bind(access_id)
-        .bind(claim)
-        .bind(&sealed)
-        .bind(&names)
-        .bind(expires_at)
-        .bind(lifetime)
-        .execute(pool)
-        .await;
+        let write = pool
+            .execute(
+                "UPDATE access_grant
+                 SET values_sealed = $3, value_names = $4, expires_at = $5,
+                     token_lifetime_secs = $6, renewal_claimed_until = NULL, updated_at = now()
+                 WHERE id = $1 AND (renewal_claimed_until = $2 OR values_sealed = $3)",
+                &[&access_id, &claim, &sealed, &names, &expires_at, &lifetime],
+            )
+            .await;
         match write {
-            Ok(done) if done.rows_affected() == 1 => break true,
+            Ok(1) => break true,
             Ok(_) if missed => return Err(unsaved_renewal(access_id, &grant.service, "the renewal's claim on it was gone by the time it could be written")),
             Ok(_) => break false,
             Err(e) if write_again(&e) && std::time::Instant::now() + wait < last_try => {
@@ -511,12 +521,13 @@ async fn renew(
 }
 
 /// Whether a failed write of a renewed token is worth trying again: the
-/// database could not be reached (`weft_task_store::db::unreachable`),
-/// short of a closed pool (this process is going) and of a protocol error
-/// (the conversation with the database went wrong, which sending the same
-/// statement again does not fix).
-fn write_again(e: &sqlx::Error) -> bool {
-    weft_task_store::db::unreachable(e) && !matches!(e, sqlx::Error::PoolClosed | sqlx::Error::Protocol(_))
+/// database could not be reached ([`db::unreachable`]), short of a closed
+/// pool (this process is going). A conversation with the database that
+/// went wrong (a message the driver did not expect) is no failure to
+/// reach it, so it is never tried again: sending the same statement again
+/// does not fix it.
+fn write_again(e: &db::Error) -> bool {
+    db::unreachable(e) && db::no_connection(e) != Some(db::NoConnection::Closed)
 }
 
 /// A renewal the provider made and weft could not keep, for `why`: the
@@ -538,11 +549,9 @@ fn unsaved_renewal(access_id: uuid::Uuid, service: &str, why: &str) -> anyhow::E
 /// Let go of a renewal claim that did not end in a written renewal, so the
 /// next resolution renews at once. A claim not let go (the database could
 /// not be reached) runs out on its own after [`RENEWAL_CLAIM`].
-async fn let_go_of_renewal(pool: &PgPool, access_id: uuid::Uuid, claim: chrono::DateTime<chrono::Utc>) {
-    let let_go = sqlx::query("UPDATE access_grant SET renewal_claimed_until = NULL WHERE id = $1 AND renewal_claimed_until = $2")
-        .bind(access_id)
-        .bind(claim)
-        .execute(pool)
+async fn let_go_of_renewal(pool: &Pool, access_id: uuid::Uuid, claim: chrono::DateTime<chrono::Utc>) {
+    let let_go = pool
+        .execute("UPDATE access_grant SET renewal_claimed_until = NULL WHERE id = $1 AND renewal_claimed_until = $2", &[&access_id, &claim])
         .await;
     if let Err(e) = let_go {
         tracing::warn!(
@@ -561,7 +570,7 @@ async fn let_go_of_renewal(pool: &PgPool, access_id: uuid::Uuid, claim: chrono::
 /// (runtime-supplied credential) skips refresh and hands back empty
 /// values; the caller fills them.
 pub async fn resolve_for_worker(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
@@ -657,7 +666,7 @@ fn worker_handoff(
 /// subscription that needs a topic the map lacks is refused by the
 /// subscription's own handling, naming the topic.
 pub async fn resolve_event_source(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
@@ -712,7 +721,7 @@ pub struct CallerVerifier {
 }
 
 pub async fn caller_verifier(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
@@ -751,20 +760,16 @@ pub fn events_recipe_hash(events: &BTreeMap<String, EventsSpec>) -> Option<Strin
 /// hash, so a push is answered by the recipe the connection itself
 /// declared and recipes recorded by different specs stand side by
 /// side. A spec with no topics records nothing.
-pub async fn record_events_recipes(db: impl sqlx::PgExecutor<'_>, spec: &AccessSpec) -> anyhow::Result<()> {
+pub async fn record_events_recipes(db: &impl Client, spec: &AccessSpec) -> anyhow::Result<()> {
     let Some(hash) = events_recipe_hash(&spec.events) else {
         return Ok(());
     };
-    sqlx::query(
+    db.execute(
         "INSERT INTO service_events_recipe (service, recipe_hash, events_json, events_json_version, updated_at)
          VALUES ($1, $2, $3, $4, now())
          ON CONFLICT (service, recipe_hash) DO UPDATE SET updated_at = now()",
+        &[&spec.service, &hash, &serde_json::to_value(&spec.events)?, &weft_core::access::events::STORED_EVENTS.version()],
     )
-    .bind(&spec.service)
-    .bind(&hash)
-    .bind(serde_json::to_value(&spec.events)?)
-    .bind(weft_core::access::events::STORED_EVENTS.version())
-    .execute(db)
     .await?;
     Ok(())
 }
@@ -781,16 +786,16 @@ pub struct RecordedEventsRecipe {
 /// receiver. Empty = this weft has never seen the service declare
 /// events, so a push for it cannot be verified and is refused.
 pub async fn events_recipes_of(
-    pool: &PgPool,
+    pool: &Pool,
     service: &str,
 ) -> anyhow::Result<Vec<RecordedEventsRecipe>> {
-    let rows: Vec<(String, Value, weft_core::stored::Version)> = sqlx::query_as(
-        "SELECT recipe_hash, events_json, events_json_version FROM service_events_recipe
-         WHERE service = $1 ORDER BY updated_at DESC",
-    )
-    .bind(service)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(String, Value, weft_core::stored::Version)> = pool
+        .all(
+            "SELECT recipe_hash, events_json, events_json_version FROM service_events_recipe
+             WHERE service = $1 ORDER BY updated_at DESC",
+            &[&service],
+        )
+        .await?;
     rows.into_iter()
         .map(|(recipe_hash, v, version)| {
             let events = weft_core::access::events::STORED_EVENTS
@@ -835,23 +840,20 @@ pub struct EventTarget {
 ///    connections (a row with no events block carries NULL and never
 ///    matches).
 pub async fn connections_for_event(
-    pool: &PgPool,
+    pool: &Pool,
     service: &str,
     provider_account: &str,
     allowed_client_ids: &[String],
     recipe_hash: &str,
 ) -> anyhow::Result<Vec<EventTarget>> {
-    let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
-        "SELECT id, tenant_id FROM access_grant
-         WHERE service = $1 AND provider_account = $2
-           AND client_id = ANY($3) AND events_recipe_hash = $4",
-    )
-    .bind(service)
-    .bind(provider_account)
-    .bind(allowed_client_ids)
-    .bind(recipe_hash)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(uuid::Uuid, String)> = pool
+        .all(
+            "SELECT id, tenant_id FROM access_grant
+             WHERE service = $1 AND provider_account = $2
+               AND client_id = ANY($3) AND events_recipe_hash = $4",
+            &[&service, &provider_account, &allowed_client_ids, &recipe_hash],
+        )
+        .await?;
     Ok(rows.into_iter().map(|(id, tenant_id)| EventTarget { id, tenant_id }).collect())
 }
 
@@ -1102,7 +1104,7 @@ pub use weft_core::access::lookup::{GrantedQuery, LookupItem, LookupPage, Lookup
 /// [`Lookup`]). Free: no provider call at all. Only the id/label pairs
 /// leave; the rest of the stored values never do.
 pub async fn granted_items(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
@@ -1273,15 +1275,15 @@ mod tests {
     use super::*;
 
     /// A renewed token's write is tried again only while the database is
-    /// out of reach; a protocol error or a closed pool fails it at once,
-    /// so a write that keeps failing the same way never spins.
+    /// out of reach; a closed pool or a statement that failed fails it at
+    /// once, so a write that keeps failing the same way never spins.
     #[test]
     fn a_renewed_token_is_written_again_only_while_the_database_is_out_of_reach() {
-        assert!(write_again(&sqlx::Error::PoolTimedOut));
-        assert!(write_again(&sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset))));
-        assert!(!write_again(&sqlx::Error::Protocol("unexpected message".into())));
-        assert!(!write_again(&sqlx::Error::PoolClosed));
-        assert!(!write_again(&sqlx::Error::RowNotFound));
+        let no_connection = |why| db::Error::NoConnection { why, refused: None };
+        assert!(write_again(&no_connection(db::NoConnection::Unreachable)));
+        assert!(write_again(&no_connection(db::NoConnection::Busy)));
+        assert!(!write_again(&no_connection(db::NoConnection::Closed)));
+        assert!(!write_again(&db::Error::NoRow));
     }
 
     /// URL templating: `{query}` and `{<parent>}` substitute

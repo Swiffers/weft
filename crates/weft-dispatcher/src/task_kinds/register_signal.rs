@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use weft_core::frames::LoopFrames;
 use weft_core::signal as core_signal;
 use weft_core::signal::listener_protocol::StartMode;
+use weft_task_store::db::Client as _;
 use weft_task_store::executor::TaskExecutor;
 use weft_task_store::tasks::Task;
 use weft_task_store::RegisterSignalPayload;
@@ -804,18 +805,18 @@ async fn refuse_unarmable_route(
     // project's routes are never in play.
     let mount = weft_core::route::SharedMount::new(tenant, project_id);
     let mine = weft_core::route::RoutePattern::parse(path).map_err(anyhow::Error::msg)?;
-    let others: Vec<RegisteredRoute> = sqlx::query_as::<_, (String, Vec<String>, String)>(
-        "SELECT mount_path, mount_methods, node_id \
-         FROM signal \
-         WHERE project_id = $1 AND mount_path IS NOT NULL AND node_id <> $2",
-    )
-    .bind(project_id)
-    .bind(place)
-    .fetch_all(&state.pg_pool)
-    .await?
-    .into_iter()
-    .map(|(mp, ms, node_id)| RegisteredRoute { pattern: mount.pattern_of(&mp), methods: ms, node_id })
-    .collect();
+    let others: Vec<RegisteredRoute> = state
+        .pg_pool
+        .all::<(String, Vec<String>, String)>(
+            "SELECT mount_path, mount_methods, node_id \
+             FROM signal \
+             WHERE project_id = $1 AND mount_path IS NOT NULL AND node_id <> $2",
+            &[&project_id, &place],
+        )
+        .await?
+        .into_iter()
+        .map(|(mp, ms, node_id)| RegisteredRoute { pattern: mount.pattern_of(&mp), methods: ms, node_id })
+        .collect();
     if let Some(taken) = ambiguous_route(&mine, methods, &others) {
         let method_words = |m: &[String]| if m.is_empty() { "any method".to_string() } else { m.join("/") };
         anyhow::bail!(

@@ -652,24 +652,19 @@ pub(crate) fn request_base(headers: &axum::http::HeaderMap) -> Result<String, (a
     })
 }
 
-/// Whether `e` failed because the database is out of reach for now
-/// (`weft_task_store::db::unreachable`), anywhere in its chain.
-pub(crate) fn database_unreachable(e: &anyhow::Error) -> bool {
-    e.chain().filter_map(|cause| cause.downcast_ref::<sqlx::Error>()).any(weft_task_store::db::unreachable)
-}
-
 /// Whether `e` failed because the database did not take the call: too
 /// busy to give it a connection (`weft_task_store::db::busy`), or out of
-/// reach ([`database_unreachable`]), anywhere in its chain. Nothing of the
-/// call itself is to blame, and the same call goes through once the
-/// database answers. A call that got no connection is said as what kept
-/// it (`weft_task_store::throttle::no_connection`: a busy database as
-/// capacity, an unreachable one as unreachable), so every wait on the
-/// database that goes through here is in the log, at most once a minute.
+/// reach (`weft_task_store::db::database_unreachable`), anywhere in its
+/// chain. Nothing of the call itself is to blame, and the same call goes
+/// through once the database answers. A call that got no connection is
+/// said as what kept it (`weft_task_store::throttle::no_connection`: a
+/// busy database as capacity, an unreachable one as unreachable), so
+/// every wait on the database that goes through here is in the log, at
+/// most once a minute.
 /// The one place that decides it, for an answer and for a wait alike.
 // SYNC: database_did_not_take <-> crates/weft-core/src/install.rs (asks_again)
 pub(crate) fn database_did_not_take(e: &anyhow::Error) -> bool {
-    if !(weft_task_store::db::database_busy(e) || database_unreachable(e)) {
+    if !(weft_task_store::db::database_busy(e) || weft_task_store::db::database_unreachable(e)) {
         return false;
     }
     if let Some(why) = weft_task_store::db::database_no_connection(e) {
@@ -738,21 +733,27 @@ fn not_taken(what: &str, e: &anyhow::Error) -> Option<(axum::http::StatusCode, S
 #[cfg(test)]
 mod unavailable_tests {
     use axum::http::StatusCode;
+    use weft_task_store::db;
+
+    /// The call got no connection, for `why`.
+    fn no_connection(why: db::NoConnection) -> anyhow::Error {
+        db::Error::NoConnection { why, refused: None }.into()
+    }
 
     /// A call the database did not take, too busy or out of reach, is a
     /// 503 (nothing ran, ask again); any other failure is a 500.
     #[test]
     fn only_a_database_that_did_not_take_the_call_answers_503() {
         let status = |e: anyhow::Error| super::unavailable_or_internal("read the build", e).0;
-        assert_eq!(status(anyhow::Error::from(sqlx::Error::PoolTimedOut).context("read the build")), StatusCode::SERVICE_UNAVAILABLE);
-        let full = sqlx::Error::Database(Box::new(TooManyConnections));
-        assert!(weft_task_store::db::busy(&full), "53300 is the database too busy");
-        assert_eq!(status(anyhow::Error::from(full).context("read the build")), StatusCode::SERVICE_UNAVAILABLE);
-        let broken = sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
-        assert_eq!(status(anyhow::Error::from(broken)), StatusCode::SERVICE_UNAVAILABLE, "out of reach");
+        // A pool whose every connection was in use for the whole wait, or a
+        // database that refused a new one because it was full (53300).
+        let full = no_connection(db::NoConnection::Busy);
+        assert!(db::database_busy(&full), "a full database is too busy");
+        assert_eq!(status(full.context("read the build")), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status(no_connection(db::NoConnection::Unreachable)), StatusCode::SERVICE_UNAVAILABLE, "out of reach");
         let undecodable = anyhow::anyhow!("a version build state the ledger does not know: 'odd'");
         assert_eq!(status(undecodable), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(status(anyhow::Error::from(sqlx::Error::RowNotFound)), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status(db::Error::NoRow.into()), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// Once part of a request went through, a later step the database did
@@ -760,7 +761,7 @@ mod unavailable_tests {
     /// other answer is kept.
     #[test]
     fn a_503_after_writes_becomes_a_500() {
-        let busy = super::unavailable_or_internal("read the build", anyhow::Error::from(sqlx::Error::PoolTimedOut));
+        let busy = super::unavailable_or_internal("read the build", no_connection(db::NoConnection::Busy));
         assert_eq!(busy.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(super::after_writes(busy).0, StatusCode::INTERNAL_SERVER_ERROR);
         let refused = (StatusCode::CONFLICT, "in flight".to_string());
@@ -773,48 +774,12 @@ mod unavailable_tests {
     #[test]
     fn an_access_store_call_the_database_did_not_take_answers_503() {
         let status = |e: anyhow::Error| super::access_store_error(e).0;
-        assert_eq!(status(anyhow::Error::from(sqlx::Error::PoolTimedOut).context("list grants")), StatusCode::SERVICE_UNAVAILABLE, "busy");
-        let full = sqlx::Error::Database(Box::new(TooManyConnections));
-        assert_eq!(status(anyhow::Error::from(full)), StatusCode::SERVICE_UNAVAILABLE, "full");
-        let broken = sqlx::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
-        assert_eq!(status(anyhow::Error::from(broken)), StatusCode::SERVICE_UNAVAILABLE, "out of reach");
+        assert_eq!(status(no_connection(db::NoConnection::Busy).context("list grants")), StatusCode::SERVICE_UNAVAILABLE, "busy");
+        assert_eq!(status(no_connection(db::NoConnection::Unreachable)), StatusCode::SERVICE_UNAVAILABLE, "out of reach");
         assert_eq!(status(weft_access_store::AccessError::NotFound.into()), StatusCode::NOT_FOUND);
         assert_eq!(status(weft_access_store::AccessError::Gone("expired".into()).into()), StatusCode::GONE);
-        let (code, message) = super::access_store_error(anyhow::Error::from(sqlx::Error::RowNotFound));
+        let (code, message) = super::access_store_error(db::Error::NoRow.into());
         assert_eq!((code, message.as_str()), (StatusCode::INTERNAL_SERVER_ERROR, "access store error"));
-    }
-
-    /// The database refusing a new connection because it is full (SQLSTATE 53300).
-    #[derive(Debug)]
-    struct TooManyConnections;
-
-    impl std::fmt::Display for TooManyConnections {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("sorry, too many clients already")
-        }
-    }
-
-    impl std::error::Error for TooManyConnections {}
-
-    impl sqlx::error::DatabaseError for TooManyConnections {
-        fn message(&self) -> &str {
-            "sorry, too many clients already"
-        }
-        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
-            Some("53300".into())
-        }
-        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
-            self
-        }
-        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
-            self
-        }
-        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
-            self
-        }
-        fn kind(&self) -> sqlx::error::ErrorKind {
-            sqlx::error::ErrorKind::Other
-        }
     }
 }
 

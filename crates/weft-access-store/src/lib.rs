@@ -24,6 +24,9 @@ mod resolve;
 mod subscriptions;
 mod transfer;
 
+use weft_task_store::db::{Client as _, Transaction};
+use weft_task_store::documents::Rederived;
+
 pub use crypt::{open_json, open_str, seal_json, seal_str};
 
 pub use flows::{
@@ -588,20 +591,14 @@ const EXCLUSIVE_FOLD: weft_task_store::DataStep = weft_task_store::DataStep {
 /// keeps matching the recipe [`rekey_events_recipes`] keeps it under.
 /// What `access_grant.spec_json` re-derives once its documents are carried
 /// to today's shape (`weft_runtime::schema::documents`).
-pub fn rehash_grant_recipes(conn: &mut sqlx::PgConnection) -> weft_task_store::documents::Rederived<'_> {
+pub fn rehash_grant_recipes<'c>(tx: &'c Transaction<'c>) -> Rederived<'c> {
     Box::pin(async move {
         let rows: Vec<(uuid::Uuid, serde_json::Value, weft_core::stored::Version, Option<String>)> =
-            sqlx::query_as("SELECT id, spec_json, spec_json_version, events_recipe_hash FROM access_grant")
-                .fetch_all(&mut *conn)
-                .await?;
+            tx.all("SELECT id, spec_json, spec_json_version, events_recipe_hash FROM access_grant", &[]).await?;
         for (id, spec, version, stored) in rows {
             let hash = resolve::events_recipe_hash(&spec_of(format_args!("connection {id}"), spec, version)?.events);
             if hash != stored {
-                sqlx::query("UPDATE access_grant SET events_recipe_hash = $2 WHERE id = $1")
-                    .bind(id)
-                    .bind(hash)
-                    .execute(&mut *conn)
-                    .await?;
+                tx.execute("UPDATE access_grant SET events_recipe_hash = $2 WHERE id = $1", &[&id, &hash]).await?;
             }
         }
         Ok(())
@@ -612,12 +609,10 @@ pub fn rehash_grant_recipes(conn: &mut sqlx::PgConnection) -> weft_task_store::d
 /// once its JSON is in today's shape. Two recipes landing on one hash are
 /// one recipe, kept once. What `service_events_recipe.events_json`
 /// re-derives once its documents are carried to today's shape.
-pub fn rekey_events_recipes(conn: &mut sqlx::PgConnection) -> weft_task_store::documents::Rederived<'_> {
+pub fn rekey_events_recipes<'c>(tx: &'c Transaction<'c>) -> Rederived<'c> {
     Box::pin(async move {
         let rows: Vec<(String, String, serde_json::Value, weft_core::stored::Version)> =
-            sqlx::query_as("SELECT service, recipe_hash, events_json, events_json_version FROM service_events_recipe")
-                .fetch_all(&mut *conn)
-                .await?;
+            tx.all("SELECT service, recipe_hash, events_json, events_json_version FROM service_events_recipe", &[]).await?;
         for (service, stored, events, version) in rows {
             let events = weft_core::access::events::STORED_EVENTS
                 .decode(events, version)
@@ -627,26 +622,17 @@ pub fn rekey_events_recipes(conn: &mut sqlx::PgConnection) -> weft_task_store::d
             if hash == stored {
                 continue;
             }
-            let taken: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM service_events_recipe WHERE service = $1 AND recipe_hash = $2)",
-            )
-            .bind(&service)
-            .bind(&hash)
-            .fetch_one(&mut *conn)
-            .await?;
+            let taken: bool = tx
+                .scalar("SELECT EXISTS (SELECT 1 FROM service_events_recipe WHERE service = $1 AND recipe_hash = $2)", &[&service, &hash])
+                .await?;
             if taken {
-                sqlx::query("DELETE FROM service_events_recipe WHERE service = $1 AND recipe_hash = $2")
-                    .bind(&service)
-                    .bind(&stored)
-                    .execute(&mut *conn)
-                    .await?;
+                tx.execute("DELETE FROM service_events_recipe WHERE service = $1 AND recipe_hash = $2", &[&service, &stored]).await?;
             } else {
-                sqlx::query("UPDATE service_events_recipe SET recipe_hash = $3 WHERE service = $1 AND recipe_hash = $2")
-                    .bind(&service)
-                    .bind(&stored)
-                    .bind(&hash)
-                    .execute(&mut *conn)
-                    .await?;
+                tx.execute(
+                    "UPDATE service_events_recipe SET recipe_hash = $3 WHERE service = $1 AND recipe_hash = $2",
+                    &[&service, &stored, &hash],
+                )
+                .await?;
             }
         }
         Ok(())

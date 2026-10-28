@@ -1356,7 +1356,7 @@ fn tunnel_origin(ports: Ports) -> (String, String) {
 /// now (`/quicktunnel`, the same question the install asks each time it
 /// builds a link on it).
 async fn quick_tunnel_url(container: &str, metrics: &str) -> Result<String> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build()?;
+    let client = weft_core::net::http_client().timeout(Duration::from_secs(3)).build()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     loop {
         // Not answering yet, or answering with no hostname: the tunnel is
@@ -1386,7 +1386,7 @@ struct QuickTunnelAnswer {
 async fn announce_tunnel(install: &Install, Tunnel { url, named, .. }: &Tunnel, ports: Ports) -> Result<()> {
     let named = *named;
     let container = install.tunnel_container();
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let client = weft_core::net::http_client().timeout(Duration::from_secs(10)).build()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
     loop {
         let seen = match client.get(format!("{url}/")).send().await {
@@ -1647,7 +1647,7 @@ async fn stop_runtime(install: &Install) -> Result<()> {
 
 /// Wait until the runtime answers, naming its log when it does not.
 async fn wait_for_runtime(install: &Install, public: u16) -> Result<()> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build()?;
+    let client = weft_core::net::http_client().timeout(Duration::from_secs(3)).build()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(180);
     loop {
         if client.get(format!("http://127.0.0.1:{public}/health")).send().await.is_ok_and(|r| r.status().is_success()) {

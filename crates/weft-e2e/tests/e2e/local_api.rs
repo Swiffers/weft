@@ -11,7 +11,7 @@ use weft_e2e::ensure;
 #[tokio::test]
 async fn the_management_api_wants_the_key_and_answers_no_web_page() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
-    let http = reqwest::Client::new();
+    let http = weft_core::net::http_client().build()?;
     let base = disp.base();
     let key = disp.install().secret(weft_core::signal_token::INSTALL_KEY_SECRET).map_err(anyhow::Error::msg)?;
 

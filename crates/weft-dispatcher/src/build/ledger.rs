@@ -15,8 +15,7 @@
 //! seen through, which a dispatcher that scales to zero could not.
 
 use anyhow::{Context, Result};
-use weft_task_store::sql;
-use sqlx::PgPool;
+use weft_task_store::db::{self, Client, FromRow, Pool, Transaction};
 
 /// What a claim writes into `image_build.held_until`, for a dispatcher of
 /// an older release still up beside this one (a rollout): it ends a start
@@ -158,16 +157,15 @@ impl Claim {
 /// succeeded only after that (a row that turned succeeded, or another
 /// build's name on it) was just built, so its image is there.
 pub async fn claim(
-    pool: &PgPool,
+    pool: &Pool,
     images: &dyn weft_platform_traits::ImageBuilder,
     image_ref: &str,
     project_id: uuid::Uuid,
     tenant: &str,
     now: i64,
 ) -> Result<Claim> {
-    let built_before: Option<(String, String)> = sqlx::query_as("SELECT status, build_name FROM image_build WHERE image_ref = $1")
-        .bind(image_ref)
-        .fetch_optional(pool)
+    let built_before: Option<(String, String)> = pool
+        .opt("SELECT status, build_name FROM image_build WHERE image_ref = $1", &[&image_ref])
         .await
         .context("read how the image's build stands")?;
     // The build the registry was asked about, and whether it still holds
@@ -182,14 +180,12 @@ pub async fn claim(
         )),
         _ => None,
     };
-    let mut tx = pool.begin().await.context("begin the build claim")?;
-    lock_image(&mut tx, image_ref).await?;
-    refuse_once_cancelled(&mut tx, project_id).await?;
+    let mut conn = pool.get().await.context("begin the build claim")?;
+    let tx = conn.transaction().await.context("begin the build claim")?;
+    lock_image(&tx, image_ref).await?;
+    refuse_once_cancelled(&tx, project_id).await?;
     let row: Option<(String, uuid::Uuid, String)> =
-        sqlx::query_as("SELECT status, project_id, build_name FROM image_build WHERE image_ref = $1")
-            .bind(image_ref)
-            .fetch_optional(&mut *tx)
-            .await?;
+        tx.opt("SELECT status, project_id, build_name FROM image_build WHERE image_ref = $1", &[&image_ref]).await?;
     let claim = match row {
         Some((status, _, name)) if status == "succeeded" => {
             let there = match &asked {
@@ -219,7 +215,7 @@ pub async fn claim(
     // starter goes away before it is made on the builder is ended once
     // its project's heartbeat goes stale (`end_lost_starts`), even on an
     // install that was asleep.
-    sqlx::query(
+    tx.execute(
         "INSERT INTO image_build (image_ref, project_id, tenant_id, build_name, builder_id, status, reason, \
                                   held_until, started_at, finished_at, log_url, failing_since) \
          VALUES ($1, $2, $3, $4, NULL, 'running', NULL, $5, $6, NULL, NULL, NULL) \
@@ -228,15 +224,8 @@ pub async fn claim(
              reason = NULL, held_until = EXCLUDED.held_until, started_at = EXCLUDED.started_at, \
              finished_at = NULL, log_url = NULL, failing_since = NULL \
          RETURNING pg_notify($7, image_ref)",
+        &[&image_ref, &project_id, &tenant, &name, &(now + OLDER_READERS_START_HOLD_SECS), &now, &super::follow::BUILD_CLAIMED_CHANNEL],
     )
-    .bind(image_ref)
-    .bind(project_id)
-    .bind(tenant)
-    .bind(&name)
-    .bind(now + OLDER_READERS_START_HOLD_SECS)
-    .bind(now)
-    .bind(super::follow::BUILD_CLAIMED_CHANNEL)
-    .execute(&mut *tx)
     .await
     .context("record the build")?;
     tx.commit().await.context("commit the build claim")?;
@@ -247,10 +236,9 @@ pub async fn claim(
 /// transition is `cancelling_build`). The project's row is read under a
 /// share lock, so a cancel landing meanwhile waits for `tx` to commit and
 /// then finds what it wrote.
-pub(crate) async fn refuse_once_cancelled(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, project: uuid::Uuid) -> Result<()> {
-    let transition: Option<String> = sqlx::query_scalar("SELECT transition FROM project WHERE id = $1 FOR SHARE")
-        .bind(project)
-        .fetch_optional(&mut **tx)
+pub(crate) async fn refuse_once_cancelled(tx: &Transaction<'_>, project: uuid::Uuid) -> Result<()> {
+    let transition: Option<String> = tx
+        .scalar_opt("SELECT transition FROM project WHERE id = $1 FOR SHARE", &[&project])
         .await
         .context("read whether the project's build was cancelled")?;
     if transition.as_deref() == Some(weft_core::projects::ProjectTransition::CancellingBuild.as_str()) {
@@ -264,55 +252,46 @@ pub(crate) async fn refuse_once_cancelled(tx: &mut sqlx::Transaction<'_, sqlx::P
 /// it asks the builder about the right build. `false` when the row is no
 /// longer this running build's (it was cancelled, or given up on, while
 /// it was being made): nobody will ask about it, so the caller frees it.
-pub async fn started(pool: &PgPool, image_ref: &str, name: &str, handle: &weft_platform_traits::BuildHandle) -> Result<bool> {
+pub async fn started(pool: &Pool, image_ref: &str, name: &str, handle: &weft_platform_traits::BuildHandle) -> Result<bool> {
     // The build loop already watches it, woken by its claim.
-    let recorded = sqlx::query(
-        "UPDATE image_build SET builder_id = $3, log_url = $4 \
-         WHERE image_ref = $1 AND build_name = $2 AND status = 'running' AND builder_id IS NULL \
-         RETURNING 1",
-    )
-    .bind(image_ref)
-    .bind(name)
-    .bind(&handle.external_build_id)
-    .bind(&handle.log_url)
-    .fetch_optional(pool)
-    .await
-    .context("record the build's id on its builder")?;
-    Ok(recorded.is_some())
+    let recorded = pool
+        .execute(
+            "UPDATE image_build SET builder_id = $3, log_url = $4 \
+             WHERE image_ref = $1 AND build_name = $2 AND status = 'running' AND builder_id IS NULL",
+            &[&image_ref, &name, &handle.external_build_id, &handle.log_url],
+        )
+        .await
+        .context("record the build's id on its builder")?;
+    Ok(recorded > 0)
 }
 
 /// The builder failed to answer about the build `name` at `now`: since
 /// when it has, every look since.
-pub async fn unanswered(pool: &PgPool, image_ref: &str, name: &str, now: i64) -> Result<i64> {
-    sqlx::query_scalar(
+pub async fn unanswered(pool: &Pool, image_ref: &str, name: &str, now: i64) -> Result<i64> {
+    pool.scalar_opt::<Option<i64>>(
         "UPDATE image_build SET failing_since = COALESCE(failing_since, $3) \
          WHERE image_ref = $1 AND build_name = $2 AND status = 'running' RETURNING failing_since",
+        &[&image_ref, &name, &now],
     )
-    .bind(image_ref)
-    .bind(name)
-    .bind(now)
-    .fetch_optional(pool)
     .await
     .context("record that the builder did not answer")
-    .map(|since| since.unwrap_or(now))
+    .map(|since| since.flatten().unwrap_or(now))
 }
 
 /// The builder answered about the build `name`.
-pub async fn answered(pool: &PgPool, image_ref: &str, name: &str) -> Result<()> {
-    sqlx::query("UPDATE image_build SET failing_since = NULL WHERE image_ref = $1 AND build_name = $2 AND failing_since IS NOT NULL")
-        .bind(image_ref)
-        .bind(name)
-        .execute(pool)
-        .await
-        .context("record that the builder answered")?;
+pub async fn answered(pool: &Pool, image_ref: &str, name: &str) -> Result<()> {
+    pool.execute(
+        "UPDATE image_build SET failing_since = NULL WHERE image_ref = $1 AND build_name = $2 AND failing_since IS NOT NULL",
+        &[&image_ref, &name],
+    )
+    .await
+    .context("record that the builder answered")?;
     Ok(())
 }
 
 /// Serialize every decision about `image_ref`'s row, for the transaction.
-async fn lock_image(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, image_ref: &str) -> Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('image_build:' || $1, 0))")
-        .bind(image_ref)
-        .execute(&mut **tx)
+async fn lock_image(tx: &Transaction<'_>, image_ref: &str) -> Result<()> {
+    tx.execute("SELECT pg_advisory_xact_lock(hashtextextended('image_build:' || $1, 0))", &[&image_ref])
         .await
         .context("lock the image's build row")?;
     Ok(())
@@ -337,34 +316,27 @@ pub enum Outcome {
 /// later build of the same ref, already started, is never overwritten.
 /// `false` when its end was recorded already (by whoever looked first),
 /// so only one of them frees it.
-pub async fn finish(pool: &PgPool, image_ref: &str, name: &str, outcome: Outcome, now: i64) -> Result<bool> {
+pub async fn finish(pool: &Pool, image_ref: &str, name: &str, outcome: Outcome, now: i64) -> Result<bool> {
     let (status, reason, left_out) = match outcome {
         Outcome::Succeeded(left_out) => ("succeeded", None, left_out.map(|record| serde_json::to_string(&record)).transpose()?),
         Outcome::Failed(reason) => ("failed", Some(reason), None),
         Outcome::Cancelled => ("cancelled", None, None),
     };
-    let res = sqlx::query(
-        "UPDATE image_build SET status = $3, reason = $4, finished_at = $5, left_out = $6 \
-         WHERE image_ref = $1 AND build_name = $2 AND status = 'running'",
-    )
-    .bind(image_ref)
-    .bind(name)
-    .bind(status)
-    .bind(reason)
-    .bind(now)
-    .bind(left_out)
-    .execute(pool)
-    .await
-    .context("record how the build ended")?;
-    Ok(res.rows_affected() == 1)
+    let ended = pool
+        .execute(
+            "UPDATE image_build SET status = $3, reason = $4, finished_at = $5, left_out = $6 \
+             WHERE image_ref = $1 AND build_name = $2 AND status = 'running'",
+            &[&image_ref, &name, &status, &reason, &now, &left_out],
+        )
+        .await
+        .context("record how the build ended")?;
+    Ok(ended == 1)
 }
 
 /// Whether a build of `image_ref` succeeded and is on record (with its
 /// result, for an image whose build reports one).
-pub async fn succeeded(pool: &PgPool, image_ref: &str) -> Result<bool> {
-    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM image_build WHERE image_ref = $1 AND status = 'succeeded')")
-        .bind(image_ref)
-        .fetch_one(pool)
+pub async fn succeeded(pool: &Pool, image_ref: &str) -> Result<bool> {
+    pool.scalar("SELECT EXISTS (SELECT 1 FROM image_build WHERE image_ref = $1 AND status = 'succeeded')", &[&image_ref])
         .await
         .context("read whether the image was built")
 }
@@ -378,16 +350,14 @@ pub async fn succeeded(pool: &PgPool, image_ref: &str) -> Result<bool> {
 /// unknown. An empty ref is a version written before records existed,
 /// whose worker could leave nothing out; no record on the row is an image
 /// with nothing to report.
-pub async fn left_out(pool: &PgPool, image_ref: &str) -> Result<(weft_core::builds::LeftOut, Option<String>)> {
+pub async fn left_out(pool: &Pool, image_ref: &str) -> Result<(weft_core::builds::LeftOut, Option<String>)> {
     if image_ref.is_empty() {
         return Ok(Default::default());
     }
-    let row: Option<(Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT left_out, log_url FROM image_build WHERE image_ref = $1 AND status = 'succeeded'")
-            .bind(image_ref)
-            .fetch_optional(pool)
-            .await
-            .context("read what the image left out")?;
+    let row: Option<(Option<String>, Option<String>)> = pool
+        .opt("SELECT left_out, log_url FROM image_build WHERE image_ref = $1 AND status = 'succeeded'", &[&image_ref])
+        .await
+        .context("read what the image left out")?;
     let Some((record, log_url)) = row else {
         anyhow::bail!("no successful build of {image_ref} is on record any more (another build of it may be under way); build again")
     };
@@ -403,21 +373,18 @@ pub async fn left_out(pool: &PgPool, image_ref: &str) -> Result<(weft_core::buil
 /// and the row may run another build since); `Some(None)` when it was not
 /// made on the builder yet, so its starter, finding the row no longer its
 /// build's (`started`), frees it.
-pub async fn cancel(pool: &PgPool, image_ref: &str, name: &str, now: i64) -> Result<Option<Option<String>>> {
-    sqlx::query_scalar(
+pub async fn cancel(pool: &Pool, image_ref: &str, name: &str, now: i64) -> Result<Option<Option<String>>> {
+    pool.scalar_opt(
         "UPDATE image_build SET status = 'cancelled', reason = NULL, finished_at = $3 \
          WHERE image_ref = $1 AND build_name = $2 AND status = 'running' RETURNING builder_id",
+        &[&image_ref, &name, &now],
     )
-    .bind(image_ref)
-    .bind(name)
-    .bind(now)
-    .fetch_optional(pool)
     .await
     .context("record the build as cancelled")
 }
 
 /// One build the ledger says runs.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningBuild {
     pub image_ref: String,
     pub project_id: uuid::Uuid,
@@ -427,6 +394,19 @@ pub struct RunningBuild {
     pub builder_id: Option<String>,
     pub started_at: i64,
     pub log_url: Option<String>,
+}
+
+impl FromRow for RunningBuild {
+    fn from_row(row: db::Row) -> db::Result<Self> {
+        Ok(Self {
+            image_ref: row.try_get("image_ref")?,
+            project_id: row.try_get("project_id")?,
+            build_name: row.try_get("build_name")?,
+            builder_id: row.try_get("builder_id")?,
+            started_at: row.try_get("started_at")?,
+            log_url: row.try_get("log_url")?,
+        })
+    }
 }
 
 const RUNNING_COLUMNS: &str = "image_ref, project_id, build_name, builder_id, started_at, log_url";
@@ -451,28 +431,26 @@ pub enum LostStarts {
 /// End, failed, every build still waiting to be made on the builder whose
 /// starter went away between the claim and recording the builder's id:
 /// nothing will ever make it. Answers how many it ended.
-pub async fn end_lost_starts(conn: &mut sqlx::PgConnection, lost: LostStarts, now: i64) -> Result<u64> {
+pub async fn end_lost_starts(conn: &impl Client, lost: LostStarts, now: i64) -> Result<u64> {
     let (project, stale_before) = match lost {
         LostStarts::Undriven { stale_before } => (None, stale_before),
         LostStarts::Of(project) => (Some(project), 0),
     };
-    let ended = sqlx::query(sql!(
-        "UPDATE image_build b SET status = 'failed', finished_at = $1, \
-             reason = 'the build ' || b.build_name || ' was never made on the builder: the dispatcher starting it went \
-                       away before recording it there. Build again' \
-         WHERE b.status = 'running' AND b.builder_id IS NULL \
-           AND CASE WHEN $2::UUID IS NULL \
-                    THEN NOT EXISTS (SELECT 1 FROM project p WHERE p.id = b.project_id AND {}) \
-                    ELSE b.project_id = $2 END",
-        crate::project_store::build_driven("p", "$3")
-    ))
-    .bind(now)
-    .bind(project)
-    .bind(stale_before)
-    .execute(conn)
+    conn.execute(
+        &format!(
+            "UPDATE image_build b SET status = 'failed', finished_at = $1, \
+                 reason = 'the build ' || b.build_name || ' was never made on the builder: the dispatcher starting it went \
+                           away before recording it there. Build again' \
+             WHERE b.status = 'running' AND b.builder_id IS NULL \
+               AND CASE WHEN $2::UUID IS NULL \
+                        THEN NOT EXISTS (SELECT 1 FROM project p WHERE p.id = b.project_id AND {}) \
+                        ELSE b.project_id = $2 END",
+            crate::project_store::build_driven("p", "$3")
+        ),
+        &[&now, &project, &stale_before],
+    )
     .await
-    .context("end the starts whose starter went away")?;
-    Ok(ended.rows_affected())
+    .context("end the starts whose starter went away")
 }
 
 /// The SQL condition "the claim row `c` still protects its image": its
@@ -504,10 +482,9 @@ pub(crate) fn waited_on_by(project: &str, now: &str) -> String {
 /// build than the one named when the image's build was started again
 /// since. An image with no row (forgotten) has no state.
 pub async fn image_states(
-    pool: &PgPool,
+    pool: &Pool,
     images: &[weft_core::builds::ImageBuild],
 ) -> Result<Vec<weft_core::builds::ImageBuildState>> {
-    #[derive(sqlx::FromRow)]
     struct Row {
         image_ref: String,
         build_name: String,
@@ -517,15 +494,28 @@ pub async fn image_states(
         started_at: i64,
         log_url: Option<String>,
     }
+    impl FromRow for Row {
+        fn from_row(row: db::Row) -> db::Result<Self> {
+            Ok(Self {
+                image_ref: row.try_get("image_ref")?,
+                build_name: row.try_get("build_name")?,
+                status: row.try_get("status")?,
+                reason: row.try_get("reason")?,
+                builder_id: row.try_get("builder_id")?,
+                started_at: row.try_get("started_at")?,
+                log_url: row.try_get("log_url")?,
+            })
+        }
+    }
     let refs: Vec<&str> = images.iter().map(|image| image.image.as_str()).collect();
-    let rows: Vec<Row> = sqlx::query_as(
-        "SELECT image_ref, build_name, status, reason, builder_id, started_at, log_url FROM image_build \
-         WHERE image_ref = ANY($1)",
-    )
-    .bind(&refs)
-    .fetch_all(pool)
-    .await
-    .context("read where the version's image builds are")?;
+    let rows: Vec<Row> = pool
+        .all(
+            "SELECT image_ref, build_name, status, reason, builder_id, started_at, log_url FROM image_build \
+             WHERE image_ref = ANY($1)",
+            &[&refs],
+        )
+        .await
+        .context("read where the version's image builds are")?;
     let mut out = Vec::with_capacity(images.len());
     for image in images {
         let state = match rows.iter().find(|row| row.image_ref == image.image) {
@@ -551,15 +541,15 @@ pub async fn image_states(
 
 /// Every build running, oldest first; when `project` is given, the ones it
 /// waits on ([`waited_on_by`]).
-pub async fn running(pool: &PgPool, project: Option<uuid::Uuid>) -> Result<Vec<RunningBuild>> {
-    sqlx::query_as(sql!(
-        "SELECT {RUNNING_COLUMNS} FROM image_build b WHERE status = 'running' AND ($1::UUID IS NULL OR {}) \
-         ORDER BY started_at, image_ref",
-        waited_on_by("$1", "$2")
-    ))
-    .bind(project)
-    .bind(crate::lease::now_unix())
-    .fetch_all(pool)
+pub async fn running(pool: &Pool, project: Option<uuid::Uuid>) -> Result<Vec<RunningBuild>> {
+    pool.all(
+        &format!(
+            "SELECT {RUNNING_COLUMNS} FROM image_build b WHERE status = 'running' AND ($1::UUID IS NULL OR {}) \
+             ORDER BY started_at, image_ref",
+            waited_on_by("$1", "$2")
+        ),
+        &[&project, &crate::lease::now_unix()],
+    )
     .await
     .context("list the running builds")
 }
@@ -571,15 +561,14 @@ pub async fn running(pool: &PgPool, project: Option<uuid::Uuid>) -> Result<Vec<R
 /// cancelled may still have pushed its image (a step after the push
 /// failed, a cancel that came late), so its row counts too; deleting an
 /// image that was never pushed deletes nothing, and the row is forgotten.
-pub async fn built_images(pool: &PgPool, project: Option<uuid::Uuid>) -> Result<Vec<String>> {
-    sqlx::query_scalar(
+pub async fn built_images(pool: &Pool, project: Option<uuid::Uuid>) -> Result<Vec<String>> {
+    pool.scalars(
         "SELECT b.image_ref FROM image_build b \
          WHERE b.status <> 'running' AND ($1::UUID IS NULL OR b.project_id = $1 \
              OR EXISTS (SELECT 1 FROM image_use u WHERE u.image_ref = b.image_ref AND u.project_id = $1)) \
          ORDER BY b.image_ref",
+        &[&project],
     )
-    .bind(project)
-    .fetch_all(pool)
     .await
     .context("list the built images")
 }
@@ -589,13 +578,13 @@ pub async fn built_images(pool: &PgPool, project: Option<uuid::Uuid>) -> Result<
 /// whose build never registered or failed, the standard worker
 /// (`note_shared`). An image a build in progress relies on is claimed
 /// instead (`claim_images`).
-pub async fn unused_images(pool: &PgPool) -> Result<Vec<String>> {
-    sqlx::query_scalar(
+pub async fn unused_images(pool: &Pool) -> Result<Vec<String>> {
+    pool.scalars(
         "SELECT b.image_ref FROM image_build b \
          WHERE b.status <> 'running' AND NOT EXISTS (SELECT 1 FROM image_use u WHERE u.image_ref = b.image_ref) \
          ORDER BY b.image_ref",
+        &[],
     )
-    .fetch_all(pool)
     .await
     .context("list the images no project uses")
 }
@@ -605,15 +594,12 @@ pub async fn unused_images(pool: &PgPool) -> Result<Vec<String>> {
 /// (`weft_compiler::build::stock_binary_hash`), under the nil project.
 /// Recorded, it is reclaimed like any image once a newer weft names
 /// another standard worker. Recording it twice changes nothing.
-pub async fn note_shared(pool: &PgPool, image_ref: &str, now: i64) -> Result<()> {
-    sqlx::query(
+pub async fn note_shared(pool: &Pool, image_ref: &str, now: i64) -> Result<()> {
+    pool.execute(
         "INSERT INTO image_build (image_ref, project_id, tenant_id, build_name, status, held_until, started_at, finished_at) \
          VALUES ($1, $2, '', 'shared', 'succeeded', 0, $3, $3) ON CONFLICT (image_ref) DO NOTHING",
+        &[&image_ref, &uuid::Uuid::nil(), &now],
     )
-    .bind(image_ref)
-    .bind(uuid::Uuid::nil())
-    .bind(now)
-    .execute(pool)
     .await
     .context("record a shared image")?;
     Ok(())
@@ -621,25 +607,19 @@ pub async fn note_shared(pool: &PgPool, image_ref: &str, now: i64) -> Result<()>
 
 /// Forget an image deleted from the registry, and every project's use of
 /// it, inside the prune's transaction that holds the image's lock.
-pub async fn forget(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, image_ref: &str) -> Result<()> {
-    sqlx::query("DELETE FROM image_build WHERE image_ref = $1 AND status <> 'running'")
-        .bind(image_ref)
-        .execute(&mut **tx)
+pub async fn forget(tx: &Transaction<'_>, image_ref: &str) -> Result<()> {
+    tx.execute("DELETE FROM image_build WHERE image_ref = $1 AND status <> 'running'", &[&image_ref])
         .await
         .context("forget a deleted image")?;
-    sqlx::query("DELETE FROM image_use WHERE image_ref = $1")
-        .bind(image_ref)
-        .execute(&mut **tx)
-        .await
-        .context("forget the uses of a deleted image")?;
+    tx.execute("DELETE FROM image_use WHERE image_ref = $1", &[&image_ref]).await.context("forget the uses of a deleted image")?;
     Ok(())
 }
 
 /// What a prune may do with one image, decided under its lock.
 pub enum Reclaim {
     /// Nothing claims or references it: delete it, then `forget` it inside
-    /// this transaction, which still holds the lock.
-    Free(sqlx::Transaction<'static, sqlx::Postgres>),
+    /// the transaction that decided, which still holds the lock.
+    Free,
     /// A build in progress claims it, or the ledger has a build of it
     /// running (a failed row a new build took over since the prune
     /// listed it).
@@ -649,13 +629,13 @@ pub enum Reclaim {
     Referenced,
 }
 
-/// Decide about one image a prune may delete, holding the image's lock
-/// (the one every build claim takes too) in a transaction: whether a build
-/// in progress still claims it, and whether anything references it right
-/// now. The prune deletes the image and `forget`s it inside this
-/// transaction, so no build can claim the image between this check and
-/// its deletion: a build that claims it afterwards finds it gone and
-/// builds it again.
+/// Decide about one image a prune may delete, taking the image's lock
+/// (the one every build claim takes too) in the prune's transaction `tx`:
+/// whether a build in progress still claims it, and whether anything
+/// references it right now. The prune deletes the image and `forget`s it
+/// inside this transaction, so no build can claim the image between this
+/// check and its deletion: a build that claims it afterwards finds it gone
+/// and builds it again.
 ///
 /// Both checks are needed because a build lets go of its claim only once
 /// its registration commits, or in the same transaction
@@ -664,50 +644,54 @@ pub enum Reclaim {
 /// never neither. The prune's own keep-set was read before its loop and
 /// can predate that registration, so it cannot stand in for the reference
 /// check here.
-pub async fn begin_reclaim(pool: &PgPool, images: &dyn weft_platform_traits::ImageBuilder, image_ref: &str, now: i64) -> Result<Reclaim> {
+pub async fn decide_reclaim(
+    tx: &Transaction<'_>,
+    images: &dyn weft_platform_traits::ImageBuilder,
+    image_ref: &str,
+    now: i64,
+) -> Result<Reclaim> {
     let scope = super::prune::ImageScope::of(image_ref)
         .with_context(|| format!("{image_ref} is not an image a prune may reclaim"))?;
-    let mut tx = pool.begin().await.context("begin reclaiming an image")?;
-    lock_image(&mut tx, image_ref).await?;
-    let claimed: bool = sqlx::query_scalar(sql!(
-        "SELECT EXISTS (SELECT 1 FROM image_claim c WHERE c.image_ref = $1 AND {}) \
-             OR EXISTS (SELECT 1 FROM image_build WHERE image_ref = $1 AND status = 'running')",
-        claim_live("c", "$2")
-    ))
-    .bind(image_ref)
-    .bind(now)
-    .fetch_one(&mut *tx)
-    .await
-    .context("read whether a build claims the image")?;
+    lock_image(tx, image_ref).await?;
+    let claimed: bool = tx
+        .scalar(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM image_claim c WHERE c.image_ref = $1 AND {}) \
+                     OR EXISTS (SELECT 1 FROM image_build WHERE image_ref = $1 AND status = 'running')",
+                claim_live("c", "$2")
+            ),
+            &[&image_ref, &now],
+        )
+        .await
+        .context("read whether a build claims the image")?;
     if claimed {
         return Ok(Reclaim::Claimed);
     }
-    if super::prune::keep_set(&mut tx, scope, images).await?.references(scope) {
+    if super::prune::keep_set(tx, scope, images).await?.references(scope) {
         return Ok(Reclaim::Referenced);
     }
-    Ok(Reclaim::Free(tx))
+    Ok(Reclaim::Free)
 }
 
 /// Claim `images` for the build request holding `claim`, before it looks
 /// for any of them in the registry. Taken under each image's lock, in one
 /// order, so it serializes with a prune deciding about the same image.
-pub async fn claim_images(pool: &PgPool, claim: uuid::Uuid, project: uuid::Uuid, images: &[String], now: i64) -> Result<()> {
+pub async fn claim_images(pool: &Pool, claim: uuid::Uuid, project: uuid::Uuid, images: &[String], now: i64) -> Result<()> {
     let sorted: std::collections::BTreeSet<&String> = images.iter().collect();
-    let mut tx = pool.begin().await.context("begin claiming the build's images")?;
+    let mut conn = pool.get().await.context("begin claiming the build's images")?;
+    let tx = conn.transaction().await.context("begin claiming the build's images")?;
     for image_ref in &sorted {
-        lock_image(&mut tx, image_ref).await?;
+        lock_image(&tx, image_ref).await?;
     }
     let refs: Vec<&String> = sorted.into_iter().collect();
-    sqlx::query(
+    // The values are cast: an INSERT from a SELECT gives them no column
+    // to take their type from.
+    tx.execute(
         "INSERT INTO image_claim (image_ref, claim_id, project_id, holder_until) \
-         SELECT image_ref, $2, $4, $3 FROM UNNEST($1::TEXT[]) AS image_ref \
+         SELECT image_ref, $2::uuid, $4::uuid, $3::bigint FROM UNNEST($1::TEXT[]) AS image_ref \
          ON CONFLICT (image_ref, claim_id) DO UPDATE SET holder_until = EXCLUDED.holder_until",
+        &[&refs, &claim, &(now + CLAIM_LEASE_SECS), &project],
     )
-    .bind(&refs)
-    .bind(claim)
-    .bind(now + CLAIM_LEASE_SECS)
-    .bind(project)
-    .execute(&mut *tx)
     .await
     .context("claim the build's images")?;
     tx.commit().await.context("commit claiming the build's images")?;
@@ -717,22 +701,18 @@ pub async fn claim_images(pool: &PgPool, claim: uuid::Uuid, project: uuid::Uuid,
 /// Extend every live row of `claim`, and answer how many it still holds.
 /// A row that lapsed stays lapsed: a prune may already have taken its
 /// image, so only the holder's own check (`ImageHold::confirm`) decides.
-pub async fn renew_claim(pool: &PgPool, claim: uuid::Uuid, now: i64) -> Result<u64> {
-    let res = sqlx::query("UPDATE image_claim SET holder_until = $3 WHERE claim_id = $1 AND holder_until >= $2")
-        .bind(claim)
-        .bind(now)
-        .bind(now + CLAIM_LEASE_SECS)
-        .execute(pool)
-        .await
-        .context("renew the build's claim on its images")?;
-    Ok(res.rows_affected())
+pub async fn renew_claim(pool: &Pool, claim: uuid::Uuid, now: i64) -> Result<u64> {
+    pool.execute(
+        "UPDATE image_claim SET holder_until = $3 WHERE claim_id = $1 AND holder_until >= $2",
+        &[&claim, &now, &(now + CLAIM_LEASE_SECS)],
+    )
+    .await
+    .context("renew the build's claim on its images")
 }
 
 /// Let go of `claim`: its build registered its images, or ended.
-pub async fn drop_claim(pool: &PgPool, claim: uuid::Uuid) -> Result<()> {
-    sqlx::query("DELETE FROM image_claim WHERE claim_id = $1")
-        .bind(claim)
-        .execute(pool)
+pub async fn drop_claim(pool: &Pool, claim: uuid::Uuid) -> Result<()> {
+    pool.execute("DELETE FROM image_claim WHERE claim_id = $1", &[&claim])
         .await
         .context("let go of the build's claim on its images")?;
     Ok(())
@@ -741,10 +721,8 @@ pub async fn drop_claim(pool: &PgPool, claim: uuid::Uuid) -> Result<()> {
 /// Clear the claims no longer live ([`claim_live`]: their holder stopped
 /// renewing them, its dispatcher gone, and no waiting version keeps them):
 /// they protect nothing any more.
-pub async fn drop_lapsed_claims(pool: &PgPool, now: i64) -> Result<()> {
-    sqlx::query(sql!("DELETE FROM image_claim c WHERE NOT {}", claim_live("c", "$1")))
-        .bind(now)
-        .execute(pool)
+pub async fn drop_lapsed_claims(pool: &Pool, now: i64) -> Result<()> {
+    pool.execute(&format!("DELETE FROM image_claim c WHERE NOT {}", claim_live("c", "$1")), &[&now])
         .await
         .context("clear the lapsed image claims")?;
     Ok(())
@@ -754,16 +732,15 @@ pub async fn drop_lapsed_claims(pool: &PgPool, now: i64) -> Result<()> {
 /// each one's `running_since` moves to `now`, whether this build built it,
 /// found it built by another project, or found it from an earlier build
 /// of its own.
-pub async fn note_running(pool: &PgPool, project_id: uuid::Uuid, images: &[String], now: i64) -> Result<()> {
-    sqlx::query(
+pub async fn note_running(pool: &Pool, project_id: uuid::Uuid, images: &[String], now: i64) -> Result<()> {
+    // The values are cast: an INSERT from a SELECT gives them no column
+    // to take their type from.
+    pool.execute(
         "INSERT INTO image_use (project_id, image_ref, running_since) \
-         SELECT $1, image_ref, $3 FROM UNNEST($2::TEXT[]) AS image_ref \
+         SELECT $1::uuid, image_ref, $3::bigint FROM UNNEST($2::TEXT[]) AS image_ref \
          ON CONFLICT (project_id, image_ref) DO UPDATE SET running_since = EXCLUDED.running_since",
+        &[&project_id, &images, &now],
     )
-    .bind(project_id)
-    .bind(images)
-    .bind(now)
-    .execute(pool)
     .await
     .context("record the images the project runs")?;
     Ok(())
@@ -771,10 +748,8 @@ pub async fn note_running(pool: &PgPool, project_id: uuid::Uuid, images: &[Strin
 
 /// Forget a removed project's uses: its images are then only as recent as
 /// the other projects that use them say.
-pub async fn forget_project(pool: &PgPool, project_id: uuid::Uuid) -> Result<()> {
-    sqlx::query("DELETE FROM image_use WHERE project_id = $1")
-        .bind(project_id)
-        .execute(pool)
+pub async fn forget_project(pool: &Pool, project_id: uuid::Uuid) -> Result<()> {
+    pool.execute("DELETE FROM image_use WHERE project_id = $1", &[&project_id])
         .await
         .context("forget the removed project's images")?;
     Ok(())
@@ -783,21 +758,31 @@ pub async fn forget_project(pool: &PgPool, project_id: uuid::Uuid) -> Result<()>
 /// One project's use of one image: the project's version that runs it
 /// became current at `running_since` (`note_running` stamps every image
 /// of one version with the same instant, so the instant names the build).
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageUse {
     pub project_id: uuid::Uuid,
     pub image_ref: String,
     pub running_since: i64,
 }
 
+impl FromRow for ImageUse {
+    fn from_row(row: db::Row) -> db::Result<Self> {
+        Ok(Self {
+            project_id: row.try_get("project_id")?,
+            image_ref: row.try_get("image_ref")?,
+            running_since: row.try_get("running_since")?,
+        })
+    }
+}
+
 /// Every project's use of every image whose build ended (as
 /// `built_images` counts them).
-pub async fn image_uses(pool: &PgPool) -> Result<Vec<ImageUse>> {
-    sqlx::query_as(
+pub async fn image_uses(pool: &Pool) -> Result<Vec<ImageUse>> {
+    pool.all(
         "SELECT u.project_id, u.image_ref, u.running_since FROM image_use u \
          JOIN image_build b ON b.image_ref = u.image_ref AND b.status <> 'running'",
+        &[],
     )
-    .fetch_all(pool)
     .await
     .context("list the images each project runs")
 }

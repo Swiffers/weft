@@ -18,8 +18,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use sqlx::PgPool;
-use weft_task_store::sql;
+use weft_task_store::db::{self, Client, FromRow, Pool, Transaction};
 use weft_core::frontend::{AddFrontendRequest, AddedFrontend, Frontend, FrontendHost, FrontendWithToken, Repository, VisitorAddressRequest};
 use weft_core::signal_token::MintTokenRequest;
 use weft_platform_traits::FrontendSite;
@@ -67,7 +66,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     data_steps: &[],
 };
 
-#[derive(sqlx::FromRow)]
 struct Row {
     project_id: uuid::Uuid,
     name: String,
@@ -79,6 +77,23 @@ struct Row {
     token_id: Option<uuid::Uuid>,
     pending_token_ids: Vec<uuid::Uuid>,
     visitor_address: Option<String>,
+}
+
+impl FromRow for Row {
+    fn from_row(row: db::Row) -> db::Result<Self> {
+        Ok(Self {
+            project_id: row.try_get("project_id")?,
+            name: row.try_get("name")?,
+            host: row.try_get("host")?,
+            repo: row.try_get("repo")?,
+            repo_id: row.try_get("repo_id")?,
+            service: row.try_get("service")?,
+            url: row.try_get("url")?,
+            token_id: row.try_get("token_id")?,
+            pending_token_ids: row.try_get("pending_token_ids")?,
+            visitor_address: row.try_get("visitor_address")?,
+        })
+    }
 }
 
 impl Row {
@@ -107,21 +122,16 @@ impl Row {
 const COLUMNS: &str = "project_id, name, host, repo, repo_id, service, url, token_id, pending_token_ids, visitor_address";
 
 /// Every frontend of `project`, by name.
-pub async fn list(pool: &PgPool, project: uuid::Uuid) -> anyhow::Result<Vec<Frontend>> {
-    sqlx::query_as::<_, Row>(sql!("SELECT {COLUMNS} FROM project_frontend WHERE project_id = $1 ORDER BY name"))
-        .bind(project)
-        .fetch_all(pool)
+pub async fn list(pool: &Pool, project: uuid::Uuid) -> anyhow::Result<Vec<Frontend>> {
+    pool.all::<Row>(&format!("SELECT {COLUMNS} FROM project_frontend WHERE project_id = $1 ORDER BY name"), &[&project])
         .await?
         .into_iter()
         .map(Row::into_frontend)
         .collect()
 }
 
-async fn get<'e>(executor: impl sqlx::PgExecutor<'e>, project: uuid::Uuid, name: &str) -> anyhow::Result<Option<Frontend>> {
-    sqlx::query_as::<_, Row>(sql!("SELECT {COLUMNS} FROM project_frontend WHERE project_id = $1 AND name = $2"))
-        .bind(project)
-        .bind(name)
-        .fetch_optional(executor)
+async fn get(db: &impl Client, project: uuid::Uuid, name: &str) -> anyhow::Result<Option<Frontend>> {
+    db.opt::<Row>(&format!("SELECT {COLUMNS} FROM project_frontend WHERE project_id = $1 AND name = $2"), &[&project, &name])
         .await?
         .map(Row::into_frontend)
         .transpose()
@@ -129,72 +139,59 @@ async fn get<'e>(executor: impl sqlx::PgExecutor<'e>, project: uuid::Uuid, name:
 
 /// Whether a frontend other than `name` of `project` deploys from `repo`,
 /// in any project: the repository then keeps its right to deploy.
-pub async fn repo_still_used<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
-    repo: &Repository,
-    project: uuid::Uuid,
-    name: &str,
-) -> anyhow::Result<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM project_frontend WHERE repo_id = $1 AND NOT (project_id = $2 AND name = $3))",
-    )
-    .bind(repo.id as i64)
-    .bind(project)
-    .bind(name)
-    .fetch_one(executor)
-    .await?)
+pub async fn repo_still_used(db: &impl Client, repo: &Repository, project: uuid::Uuid, name: &str) -> anyhow::Result<bool> {
+    Ok(db
+        .scalar(
+            "SELECT EXISTS (SELECT 1 FROM project_frontend WHERE repo_id = $1 AND NOT (project_id = $2 AND name = $3))",
+            &[&(repo.id as i64), &project, &name],
+        )
+        .await?)
 }
 
 /// Store `frontend`; `false` when the project has one of that name.
-pub async fn record<'e>(executor: impl sqlx::PgExecutor<'e>, frontend: &Frontend, now_unix: i64) -> anyhow::Result<bool> {
-    Ok(sqlx::query(
-        "INSERT INTO project_frontend (project_id, name, host, repo, repo_id, service, url, token_id, added_unix, visitor_address) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (project_id, name) DO NOTHING",
-    )
-    .bind(frontend.project)
-    .bind(&frontend.name)
-    .bind(frontend.host.as_str())
-    .bind(frontend.repo.as_ref().map(|r| r.name.as_str()))
-    .bind(frontend.repo.as_ref().map(|r| r.id as i64))
-    .bind(&frontend.service)
-    .bind(&frontend.url)
-    .bind(frontend.token_id)
-    .bind(now_unix)
-    .bind(&frontend.visitor_address)
-    .execute(executor)
-    .await?
-    .rows_affected()
+pub async fn record(db: &impl Client, frontend: &Frontend, now_unix: i64) -> anyhow::Result<bool> {
+    Ok(db
+        .execute(
+            "INSERT INTO project_frontend (project_id, name, host, repo, repo_id, service, url, token_id, added_unix, visitor_address) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (project_id, name) DO NOTHING",
+            &[
+                &frontend.project,
+                &frontend.name,
+                &frontend.host.as_str(),
+                &frontend.repo.as_ref().map(|r| r.name.as_str()),
+                &frontend.repo.as_ref().map(|r| r.id as i64),
+                &frontend.service,
+                &frontend.url,
+                &frontend.token_id,
+                &now_unix,
+                &frontend.visitor_address,
+            ],
+        )
+        .await?
         == 1)
 }
 
 /// Forget `name` of `project`.
-pub async fn forget<'e>(executor: impl sqlx::PgExecutor<'e>, project: uuid::Uuid, name: &str) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM project_frontend WHERE project_id = $1 AND name = $2")
-        .bind(project)
-        .bind(name)
-        .execute(executor)
-        .await?;
+pub async fn forget(db: &impl Client, project: uuid::Uuid, name: &str) -> anyhow::Result<()> {
+    db.execute("DELETE FROM project_frontend WHERE project_id = $1 AND name = $2", &[&project, &name]).await?;
     Ok(())
 }
 
 /// Serialize every change to the frontend `name` of `project`, for the
 /// transaction: always taken before the repository's lock, so two changes
 /// never wait on each other's.
-async fn lock_frontend(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, project: uuid::Uuid, name: &str) -> anyhow::Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('frontend:' || $1 || ':' || $2, 0))")
-        .bind(project.to_string())
-        .bind(name)
-        .execute(&mut **tx)
-        .await?;
+async fn lock_frontend(tx: &Transaction<'_>, project: uuid::Uuid, name: &str) -> anyhow::Result<()> {
+    tx.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended('frontend:' || $1::text || ':' || $2::text, 0))",
+        &[&project.to_string(), &name],
+    )
+    .await?;
     Ok(())
 }
 
 /// Serialize every change to what `repo` may do, for the transaction.
-async fn lock_repo(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, repo: &Repository) -> anyhow::Result<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('frontend_repo:' || $1, 0))")
-        .bind(repo.id.to_string())
-        .execute(&mut **tx)
-        .await?;
+async fn lock_repo(tx: &Transaction<'_>, repo: &Repository) -> anyhow::Result<()> {
+    tx.execute("SELECT pg_advisory_xact_lock(hashtextextended('frontend_repo:' || $1::text, 0))", &[&repo.id.to_string()]).await?;
     Ok(())
 }
 
@@ -282,19 +279,20 @@ pub(crate) async fn make(
     // the race never reaches the cloud).
     let mut opened = false;
     let made: anyhow::Result<bool> = async {
-        let mut tx = state.pg_pool.begin().await?;
-        lock_frontend(&mut tx, project, &frontend.name).await?;
-        if get(&mut *tx, project, &frontend.name).await?.is_some() {
+        let mut conn = state.pg_pool.get().await?;
+        let tx = conn.transaction().await?;
+        lock_frontend(&tx, project, &frontend.name).await?;
+        if get(&tx, project, &frontend.name).await?.is_some() {
             return Ok(false);
         }
         if let Some(site) = &site {
-            lock_repo(&mut tx, &site.repo).await?;
+            lock_repo(&tx, &site.repo).await?;
             opened = true;
             let hosted = state.frontends.open(site).await?;
             frontend.service = Some(hosted.service);
             frontend.url = Some(hosted.url);
         }
-        anyhow::ensure!(record(&mut *tx, &frontend, crate::lease::now_unix()).await?, "the frontend's record was not written");
+        anyhow::ensure!(record(&tx, &frontend, crate::lease::now_unix()).await?, "the frontend's record was not written");
         tx.commit().await?;
         Ok(true)
     }
@@ -326,8 +324,8 @@ pub(crate) async fn make(
 /// Whether `e` is the project's one visitor address being taken already.
 fn visitor_address_taken(e: &anyhow::Error) -> bool {
     e.chain()
-        .filter_map(|cause| cause.downcast_ref::<sqlx::Error>())
-        .filter_map(|e| e.as_database_error())
+        .filter_map(|cause| cause.downcast_ref::<db::Error>())
+        .filter_map(db::Error::as_db_error)
         .any(|e| e.constraint() == Some("idx_project_frontend_visitor_address"))
 }
 
@@ -368,14 +366,12 @@ pub(crate) async fn set_visitor(
     req: &VisitorAddressRequest,
 ) -> Result<Frontend, Refused> {
     let address = req.visitor_address.as_deref().map(|a| a.trim_end_matches('/'));
-    let set = sqlx::query("UPDATE project_frontend SET visitor_address = $3 WHERE project_id = $1 AND name = $2")
-        .bind(project)
-        .bind(name)
-        .bind(address)
-        .execute(&state.pg_pool)
+    let set = state
+        .pg_pool
+        .execute("UPDATE project_frontend SET visitor_address = $3 WHERE project_id = $1 AND name = $2", &[&project, &name, &address])
         .await;
     match set {
-        Ok(done) if done.rows_affected() == 0 => return Err(not_found(name)),
+        Ok(0) => return Err(not_found(name)),
         Ok(_) => {}
         Err(e) => {
             let e = anyhow::Error::from(e);
@@ -398,9 +394,10 @@ pub(crate) async fn set_visitor(
 /// this one's right to deploy to it cannot be taken back without taking
 /// the service down, and the error says so.
 async fn take_back_site(state: &DispatcherState, site: &FrontendSite) -> anyhow::Result<()> {
-    let mut tx = state.pg_pool.begin().await?;
-    lock_frontend(&mut tx, site.project, &site.name).await?;
-    if let Some(other) = get(&mut *tx, site.project, &site.name).await?.as_ref().and_then(|f| f.repo.as_ref()) {
+    let mut conn = state.pg_pool.get().await?;
+    let tx = conn.transaction().await?;
+    lock_frontend(&tx, site.project, &site.name).await?;
+    if let Some(other) = get(&tx, site.project, &site.name).await?.as_ref().and_then(|f| f.repo.as_ref()) {
         anyhow::ensure!(
             other.id == site.repo.id,
             "another request added frontend '{}' meanwhile, deploying from {}, so its service stays, and {} may \
@@ -411,8 +408,8 @@ async fn take_back_site(state: &DispatcherState, site: &FrontendSite) -> anyhow:
         );
         return Ok(());
     }
-    lock_repo(&mut tx, &site.repo).await?;
-    let keep_repo = repo_still_used(&mut *tx, &site.repo, site.project, &site.name).await?;
+    lock_repo(&tx, &site.repo).await?;
+    let keep_repo = repo_still_used(&tx, &site.repo, site.project, &site.name).await?;
     state.frontends.close(site, keep_repo).await?;
     tx.commit().await?;
     Ok(())
@@ -452,22 +449,23 @@ pub(crate) async fn renew_token(
     project: uuid::Uuid,
     name: &str,
 ) -> Result<FrontendWithToken, Refused> {
-    let mut tx = state.pg_pool.begin().await.map_err(internal)?;
-    lock_frontend(&mut tx, project, name).await.map_err(internal)?;
-    if get(&mut *tx, project, name).await.map_err(internal)?.is_none() {
+    let mut conn = state.pg_pool.get().await.map_err(internal)?;
+    let tx = conn.transaction().await.map_err(internal)?;
+    lock_frontend(&tx, project, name).await.map_err(internal)?;
+    if get(&tx, project, name).await.map_err(internal)?.is_none() {
         return Err(not_found(name));
     }
     let minted = mint_token(state, owner, project, name).await?;
     let recorded: anyhow::Result<Row> = async {
-        let row = sqlx::query_as::<_, Row>(sql!(
-            "UPDATE project_frontend SET pending_token_ids = array_append(pending_token_ids, $3) \
-             WHERE project_id = $1 AND name = $2 RETURNING {COLUMNS}"
-        ))
-        .bind(project)
-        .bind(name)
-        .bind(minted.id)
-        .fetch_one(&mut *tx)
-        .await?;
+        let row = tx
+            .one::<Row>(
+                &format!(
+                    "UPDATE project_frontend SET pending_token_ids = array_append(pending_token_ids, $3::uuid) \
+                     WHERE project_id = $1 AND name = $2 RETURNING {COLUMNS}"
+                ),
+                &[&project, &name, &minted.id],
+            )
+            .await?;
         tx.commit().await?;
         Ok(row)
     }
@@ -514,16 +512,13 @@ pub(crate) async fn put_token_in_place(
     name: &str,
     token: uuid::Uuid,
 ) -> Result<(), Refused> {
-    let mut tx = state.pg_pool.begin().await.map_err(internal)?;
-    lock_frontend(&mut tx, project, name).await.map_err(internal)?;
-    let row: Option<(Option<uuid::Uuid>, Vec<uuid::Uuid>)> = sqlx::query_as(
-        "SELECT token_id, pending_token_ids FROM project_frontend WHERE project_id = $1 AND name = $2",
-    )
-    .bind(project)
-    .bind(name)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(internal)?;
+    let mut conn = state.pg_pool.get().await.map_err(internal)?;
+    let tx = conn.transaction().await.map_err(internal)?;
+    lock_frontend(&tx, project, name).await.map_err(internal)?;
+    let row: Option<(Option<uuid::Uuid>, Vec<uuid::Uuid>)> = tx
+        .opt("SELECT token_id, pending_token_ids FROM project_frontend WHERE project_id = $1 AND name = $2", &[&project, &name])
+        .await
+        .map_err(internal)?;
     let Some((current, pending)) = row else { return Err(not_found(name)) };
     if current == Some(token) {
         return Ok(());
@@ -531,11 +526,7 @@ pub(crate) async fn put_token_in_place(
     if !pending.contains(&token) {
         return Err((StatusCode::CONFLICT, format!("{token} is not a new token of frontend '{name}'")));
     }
-    sqlx::query("UPDATE project_frontend SET token_id = $3, pending_token_ids = '{}' WHERE project_id = $1 AND name = $2")
-        .bind(project)
-        .bind(name)
-        .bind(token)
-        .execute(&mut *tx)
+    tx.execute("UPDATE project_frontend SET token_id = $3, pending_token_ids = '{}' WHERE project_id = $1 AND name = $2", &[&project, &name, &token])
         .await
         .map_err(internal)?;
     let retired: Vec<uuid::Uuid> = current.into_iter().chain(pending).filter(|t| *t != token).collect();
@@ -565,19 +556,17 @@ pub(crate) async fn drop_new_token(
     name: &str,
     token: uuid::Uuid,
 ) -> Result<(), Refused> {
-    let mut tx = state.pg_pool.begin().await.map_err(internal)?;
-    lock_frontend(&mut tx, project, name).await.map_err(internal)?;
-    let dropped = sqlx::query(
-        "UPDATE project_frontend SET pending_token_ids = array_remove(pending_token_ids, $3) \
-         WHERE project_id = $1 AND name = $2 AND $3 = ANY(pending_token_ids)",
-    )
-    .bind(project)
-    .bind(name)
-    .bind(token)
-    .execute(&mut *tx)
-    .await
-    .map_err(internal)?
-    .rows_affected();
+    let mut conn = state.pg_pool.get().await.map_err(internal)?;
+    let tx = conn.transaction().await.map_err(internal)?;
+    lock_frontend(&tx, project, name).await.map_err(internal)?;
+    let dropped = tx
+        .execute(
+            "UPDATE project_frontend SET pending_token_ids = array_remove(pending_token_ids, $3::uuid) \
+             WHERE project_id = $1 AND name = $2 AND $3::uuid = ANY(pending_token_ids)",
+            &[&project, &name, &token],
+        )
+        .await
+        .map_err(internal)?;
     if dropped == 0 {
         return Err((StatusCode::NOT_FOUND, format!("{token} is not a new token of frontend '{name}'")));
     }
@@ -650,12 +639,13 @@ async fn take_down(
     force: bool,
 ) -> anyhow::Result<Option<Option<String>>> {
     let mut left = None;
-    let mut tx = state.pg_pool.begin().await?;
-    lock_frontend(&mut tx, project, name).await?;
-    let Some(frontend) = get(&mut *tx, project, name).await? else { return Ok(None) };
+    let mut conn = state.pg_pool.get().await?;
+    let tx = conn.transaction().await?;
+    lock_frontend(&tx, project, name).await?;
+    let Some(frontend) = get(&tx, project, name).await? else { return Ok(None) };
     if let Some(site) = site(&frontend) {
-        lock_repo(&mut tx, &site.repo).await?;
-        let keep_repo = repo_still_used(&mut *tx, &site.repo, project, name).await?;
+        lock_repo(&tx, &site.repo).await?;
+        let keep_repo = repo_still_used(&tx, &site.repo, project, name).await?;
         if let Err(e) = state.frontends.close(&site, keep_repo).await {
             if !force {
                 return Err(e.context("take down its service (`--force` forgets the frontend anyway)"));
@@ -669,7 +659,7 @@ async fn take_down(
     }
     let tokens: Vec<uuid::Uuid> = frontend.token_id.into_iter().chain(frontend.pending_token_ids).collect();
     revoke_all(state, owner, &tokens).await?;
-    forget(&mut *tx, project, name).await?;
+    forget(&tx, project, name).await?;
     tx.commit().await?;
     Ok(Some(left))
 }

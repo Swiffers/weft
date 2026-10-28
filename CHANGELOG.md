@@ -4,7 +4,7 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## Unreleased
+## 2026-10-28 (0.2.277)
 
 **If your cloud install keeps its database on Cloud SQL, the next run of
 the install workflow restarts that database once.** Until now the workflow
@@ -30,6 +30,13 @@ requests, runs and resyncs hold back and go on once a connection is free.
 `weft status` says so with a `database: busy` line naming what to raise,
 and the log says it once a minute. When the database cannot be reached
 at all, the log says that rather than that it is busy.
+
+If weft's own database disappears without closing its connections (its
+machine stops, or the network to it breaks), weft now notices within about
+a minute. Requests and runs waiting on it fail as "the database could not
+be reached" and go on once it answers again. Until now a request could
+hang for about fifteen minutes, and the connection that hears the
+database's changes never noticed at all.
 
 A Postgres infra node now sets Postgres up for its `memory` setting and
 keeps the container to it, so a database short of memory has a process

@@ -15,6 +15,7 @@ use weft_core::projects::{
     StatusQuery,
 };
 use weft_core::ProjectDefinition;
+use weft_task_store::db::Client as _;
 
 use super::{answered, Actor, Refused};
 use crate::api::project::{
@@ -620,10 +621,9 @@ pub(crate) async fn follow(
         )),
         weft_core::task::TaskStatus::Complete => Ok(Following::Done(outcome.result.unwrap_or(serde_json::Value::Null))),
         weft_core::task::TaskStatus::Failed => {
-            let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM task WHERE id = $1 AND project_id = $2")
-                .bind(task)
-                .bind(id)
-                .fetch_optional(&state.pg_pool)
+            let kind: Option<String> = state
+                .pg_pool
+                .scalar_opt("SELECT kind FROM task WHERE id = $1 AND project_id = $2", &[&task, &id])
                 .await
                 .map_err(|e| internal("read the task", e.to_string()))?;
             let error = outcome.error.unwrap_or_else(|| "it ended without saying why".into());

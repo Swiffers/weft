@@ -23,6 +23,7 @@ use parking_lot::Mutex;
 use sha2::Sha256;
 use weft_platform_traits::identity::{Principal, REPLICA_HEADER, ROLE_HEADER};
 use weft_platform_traits::CoreRole;
+use weft_task_store::db::Client as _;
 
 use crate::state::BrokerState;
 
@@ -265,13 +266,11 @@ pub async fn resolve_storage_caller(
                         run_id.parse().map_err(|e| (StatusCode::BAD_REQUEST, format!("not a run id: {e}")))?;
                     // The worker writes a run's record before any call that
                     // names it, so the row is there.
-                    let row = sqlx::query_as::<_, (String, uuid::Uuid, Option<String>, Option<String>)>(
-                        "SELECT tenant_id, project_id, owner, instance_id FROM run WHERE run_id = $1 AND state = 'running'",
-                    )
-                    .bind(parsed)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("read a storage caller's run")))?;
+                    let row: Option<(String, uuid::Uuid, Option<String>, Option<String>)> = state
+                        .pool
+                        .opt("SELECT tenant_id, project_id, owner, instance_id FROM run WHERE run_id = $1 AND state = 'running'", &[&parsed])
+                        .await
+                        .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("read a storage caller's run")))?;
                     let Some((run_id_tenant, run_id_project, owner, instance)) = row else {
                         return Err((StatusCode::FORBIDDEN, "no such run is running".into()));
                     };

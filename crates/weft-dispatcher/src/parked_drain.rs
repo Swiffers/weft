@@ -31,10 +31,9 @@
 
 use std::time::Duration;
 
-use weft_task_store::sql;
-
 use axum::http::StatusCode;
 use weft_core::door_fire::{UnclockedWait, WaitsOn};
+use weft_task_store::db::{self, Client as _};
 use weft_task_store::drain::DrainStep;
 use weft_task_store::parked_fires::{take_head, take_head_now, Head, Turn};
 
@@ -74,9 +73,9 @@ pub(crate) async fn drain_activations(
         .into_iter()
         .map(|signal| signal.token)
         .collect();
-    let queued: Vec<String> = sqlx::query_scalar("SELECT DISTINCT token FROM parked_fire WHERE token = ANY($1) AND run_id IS NULL")
-        .bind(&tokens)
-        .fetch_all(&state.pg_pool)
+    let queued: Vec<String> = state
+        .pg_pool
+        .scalars("SELECT DISTINCT token FROM parked_fire WHERE token = ANY($1) AND run_id IS NULL", &[&tokens])
         .await?;
     drain_tokens(state, &queued).await
 }
@@ -92,17 +91,19 @@ pub(crate) async fn drain_waiting_on(state: &DispatcherState, on: UnclockedWait,
 /// The signals of an Active trigger (of `project`, or of every project)
 /// whose queue holds an event waiting on `on`: what [`drain_waiting_on`]
 /// drains.
-pub async fn tokens_waiting_on(pool: &sqlx::PgPool, on: UnclockedWait, project: Option<uuid::Uuid>) -> anyhow::Result<Vec<String>> {
-    Ok(sqlx::query_scalar(sql!(
-        "SELECT s.token FROM signal s {} \
-         WHERE ($1::uuid IS NULL OR s.project_id = $1) AND COALESCE(a.status, 'active') = 'active' \
-           AND EXISTS (SELECT 1 FROM parked_fire p WHERE p.token = s.token AND {})",
-        weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
-        waits_on_sql("p", on),
-    ))
-    .bind(project)
-    .fetch_all(pool)
-    .await?)
+pub async fn tokens_waiting_on(pool: &db::Pool, on: UnclockedWait, project: Option<uuid::Uuid>) -> anyhow::Result<Vec<String>> {
+    Ok(pool
+        .scalars(
+            &format!(
+                "SELECT s.token FROM signal s {} \
+                 WHERE ($1::uuid IS NULL OR s.project_id = $1) AND COALESCE(a.status, 'active') = 'active' \
+                   AND EXISTS (SELECT 1 FROM parked_fire p WHERE p.token = s.token AND {})",
+                weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+                waits_on_sql("p", on),
+            ),
+            &[&project],
+        )
+        .await?)
 }
 
 /// Hand over again the queues of `project` that a failing hand-over
@@ -172,31 +173,36 @@ pub(crate) async fn drain_due(state: &DispatcherState) -> anyhow::Result<DrainSt
 
 /// The heads the sweep would drain: of a trigger that is Active (or that
 /// no activation governs), due at `now`, waiting on no event.
-pub async fn due_tokens(pool: &sqlx::PgPool, now: i64) -> anyhow::Result<Vec<String>> {
-    Ok(sqlx::query_scalar(sql!(
-        "SELECT p.token FROM parked_fire p JOIN signal s ON s.token = p.token {} \
-         WHERE COALESCE(a.status, 'active') = 'active' \
-           AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = p.token) \
-           AND p.waits_for IS NULL AND p.not_before <= $1",
-        weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
-    ))
-    .bind(now)
-    .fetch_all(pool)
-    .await?)
+pub async fn due_tokens(pool: &db::Pool, now: i64) -> anyhow::Result<Vec<String>> {
+    Ok(pool
+        .scalars(
+            &format!(
+                "SELECT p.token FROM parked_fire p JOIN signal s ON s.token = p.token {} \
+                 WHERE COALESCE(a.status, 'active') = 'active' \
+                   AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = p.token) \
+                   AND p.waits_for IS NULL AND p.not_before <= $1",
+                weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+            ),
+            &[&now],
+        )
+        .await?)
 }
 
 /// When the earliest head [`due_tokens`] would drain comes due; `None`
 /// when no head waits on a clock.
-pub async fn next_due(pool: &sqlx::PgPool) -> anyhow::Result<Option<i64>> {
-    Ok(sqlx::query_scalar(sql!(
-        "SELECT MIN(p.not_before) FROM parked_fire p JOIN signal s ON s.token = p.token {} \
-         WHERE COALESCE(a.status, 'active') = 'active' \
-           AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = p.token) \
-           AND p.waits_for IS NULL",
-        weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
-    ))
-    .fetch_one(pool)
-    .await?)
+pub async fn next_due(pool: &db::Pool) -> anyhow::Result<Option<i64>> {
+    Ok(pool
+        .scalar(
+            &format!(
+                "SELECT MIN(p.not_before) FROM parked_fire p JOIN signal s ON s.token = p.token {} \
+                 WHERE COALESCE(a.status, 'active') = 'active' \
+                   AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = p.token) \
+                   AND p.waits_for IS NULL",
+                weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+            ),
+            &[],
+        )
+        .await?)
 }
 
 /// Drain `token`'s queue head by head (see the module doc), until it is
@@ -207,10 +213,11 @@ pub async fn next_due(pool: &sqlx::PgPool) -> anyhow::Result<Option<i64>> {
 /// next turn.
 pub(crate) async fn drain_token(state: &DispatcherState, token: &str, due: Due) -> anyhow::Result<Option<i64>> {
     loop {
-        let mut tx = state.pg_pool.begin().await?;
+        let mut conn = state.pg_pool.get().await?;
+        let tx = conn.transaction().await?;
         let head = match due {
-            Due::WhenDue => take_head(&mut tx, token, crate::lease::now_unix()).await?,
-            Due::Now => take_head_now(&mut tx, token).await?,
+            Due::WhenDue => take_head(&tx, token, crate::lease::now_unix()).await?,
+            Due::Now => take_head_now(&tx, token).await?,
         };
         let Some(head) = head else { return Ok(None) };
         let routing = match crate::api::signal::lookup_signal_routing(state, token).await {
@@ -240,7 +247,7 @@ pub(crate) async fn drain_token(state: &DispatcherState, token: &str, due: Due) 
         let waiting = &head.waiting;
         let turn = match landed {
             Ok(Landed::Done) => {
-                weft_task_store::parked_fires::remove_in(&mut tx, &head).await?;
+                weft_task_store::parked_fires::remove_in(&tx, &head).await?;
                 tx.commit().await?;
                 continue;
             }
@@ -258,7 +265,7 @@ pub(crate) async fn drain_token(state: &DispatcherState, token: &str, due: Due) 
             }
             Err(e) => Turn::next(waiting.attempts, waiting.failures, WaitsOn::Failure, &format!("{e:#}"), now),
         };
-        weft_task_store::parked_fires::restamp_in(&mut tx, &head, &turn).await?;
+        weft_task_store::parked_fires::restamp_in(&tx, &head, &turn).await?;
         tx.commit().await?;
         if let Some(stopped) = turn.waits_for.as_ref().filter(|waits| waits.on == UnclockedWait::Failure) {
             tracing::error!(
@@ -277,7 +284,7 @@ pub(crate) async fn drain_token(state: &DispatcherState, token: &str, due: Due) 
 /// next head.
 async fn hand_answer(
     state: &DispatcherState,
-    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: db::Transaction<'_>,
     head: &Head,
     routing: &crate::api::signal::FireGateInfo,
 ) -> anyhow::Result<bool> {
@@ -288,15 +295,15 @@ async fn hand_answer(
         weft_core::arrival::Arrival::Wait => return Ok(false),
         weft_core::arrival::Arrival::Refused => {
             tracing::info!(target: "weft_dispatcher::parked_drain", token = %head.token, "a queued answer dropped: its trigger takes no work any more");
-            weft_task_store::parked_fires::remove_in(&mut tx, head).await?;
+            weft_task_store::parked_fires::remove_in(&tx, head).await?;
             (None, false)
         }
-        weft_core::arrival::Arrival::Live => match crate::store::postgres::answer_in(&mut tx, &head.token, &head.waiting.answer(), crate::store::postgres::AnswerFrom::Queue).await? {
+        weft_core::arrival::Arrival::Live => match crate::store::postgres::answer_in(&tx, &head.token, &head.waiting.answer(), crate::store::postgres::AnswerFrom::Queue).await? {
             // The wait's signal went, and its queue with it.
             crate::store::Answered::Reached { consumed } => (Some(consumed), true),
             crate::store::Answered::RunEnded { consumed } => (Some(consumed), false),
             crate::store::Answered::Gone => {
-                weft_task_store::parked_fires::remove_in(&mut tx, head).await?;
+                weft_task_store::parked_fires::remove_in(&tx, head).await?;
                 (None, false)
             }
         },

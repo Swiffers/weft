@@ -119,8 +119,8 @@ impl Views {
     async fn paint(&mut self, state: &DispatcherState, run_id: RunId, project_id: uuid::Uuid) -> anyhow::Result<()> {
         let after = self.runs.get(&run_id).map(|live| live.painted);
         let record = {
-            let mut conn = state.pg_pool.acquire().await?;
-            weft_journal::record::read_record(&mut conn, run_id, after).await?
+            let conn = state.pg_pool.get().await?;
+            weft_journal::record::read_record(&conn, run_id, after).await?
         };
         let Some(last) = record.rows.last().map(|row| row.seq) else { return Ok(()) };
         let rows = match record.decode(run_id) {

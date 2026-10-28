@@ -13,8 +13,8 @@
 //! endpoints answer weft's own roles only.
 
 use anyhow::Result;
-use weft_task_store::sql;
 use serde_json::Value;
+use weft_task_store::db::{Client as _, Pool};
 
 use crate::role_client::RoleClient;
 
@@ -288,11 +288,8 @@ impl std::error::Error for ListenerRefused {}
 /// Whether the listener is listening for `project`: it holds every signal
 /// the durable table has, so that is whether the project has an armed
 /// trigger.
-pub async fn project_is_listening(pool: &sqlx::PgPool, project: uuid::Uuid) -> Result<bool> {
-    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM signal WHERE project_id = $1 AND is_resume = FALSE)")
-        .bind(project)
-        .fetch_one(pool)
-        .await?)
+pub async fn project_is_listening(pool: &Pool, project: uuid::Uuid) -> Result<bool> {
+    Ok(pool.scalar("SELECT EXISTS (SELECT 1 FROM signal WHERE project_id = $1 AND is_resume = FALSE)", &[&project]).await?)
 }
 
 /// How long one call to the listener while letting go may take: a
@@ -314,7 +311,7 @@ const LET_GO_AT_ONCE: usize = 16;
 /// token with why, for the caller to write down ([`note_let_go`]); fails
 /// only when the look after could not be made.
 pub async fn let_go_of_stopped(
-    pool: &sqlx::PgPool,
+    pool: &Pool,
     listener: &ListenerClient,
     signals: &[crate::store::SignalRegistration],
 ) -> Result<Vec<(String, String)>> {
@@ -344,14 +341,16 @@ pub async fn let_go_of_stopped(
         .collect()
         .await;
     let tokens: Vec<&str> = signals.iter().map(|s| s.token.as_str()).collect();
-    let listening: Vec<(String, uuid::Uuid)> = sqlx::query_as(sql!(
-        "SELECT s.token, s.project_id FROM signal s {} WHERE s.token = ANY($1) AND {}",
-        weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
-        weft_broker_client::protocol::ACTIVATION_LISTENS,
-    ))
-    .bind(&tokens)
-    .fetch_all(pool)
-    .await?;
+    let listening: Vec<(String, uuid::Uuid)> = pool
+        .all(
+            &format!(
+                "SELECT s.token, s.project_id FROM signal s {} WHERE s.token = ANY($1) AND {}",
+                weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+                weft_broker_client::protocol::ACTIVATION_LISTENS,
+            ),
+            &[&tokens],
+        )
+        .await?;
     // Every one of them is brought up, whatever happens to another: one
     // left torn down would read as listening with nothing behind it, and
     // nothing would look at it again.
@@ -390,21 +389,21 @@ pub async fn let_go_of_stopped(
 /// work, is marked, to be asked again
 /// (`crate::store::postgres::signals_kept_after_let_go` reads them back);
 /// the rest are cleared.
-pub async fn note_let_go(pool: &sqlx::PgPool, signals: &[crate::store::SignalRegistration], kept: &[(String, String)]) -> Result<()> {
+pub async fn note_let_go(pool: &Pool, signals: &[crate::store::SignalRegistration], kept: &[(String, String)]) -> Result<()> {
     let tokens: Vec<&str> = signals.iter().map(|s| s.token.as_str()).collect();
     let why: Vec<Option<&str>> =
         signals.iter().map(|s| kept.iter().find(|(token, _)| token == &s.token).map(|(_, why)| why.as_str())).collect();
-    sqlx::query(sql!(
-        "UPDATE signal SET let_go_failed = t.why \
-         FROM (SELECT s.token, CASE WHEN {listens} THEN NULL ELSE k.why END AS why \
-               FROM unnest($1::text[], $2::text[]) AS k(token, why) JOIN signal s ON s.token = k.token {join}) t \
-         WHERE signal.token = t.token AND signal.let_go_failed IS DISTINCT FROM t.why",
-        listens = weft_broker_client::protocol::ACTIVATION_LISTENS,
-        join = weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
-    ))
-    .bind(&tokens)
-    .bind(&why)
-    .execute(pool)
+    pool.execute(
+        &format!(
+            "UPDATE signal SET let_go_failed = t.why \
+             FROM (SELECT s.token, CASE WHEN {listens} THEN NULL ELSE k.why END AS why \
+                   FROM unnest($1::text[], $2::text[]) AS k(token, why) JOIN signal s ON s.token = k.token {join}) t \
+             WHERE signal.token = t.token AND signal.let_go_failed IS DISTINCT FROM t.why",
+            listens = weft_broker_client::protocol::ACTIVATION_LISTENS,
+            join = weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+        ),
+        &[&tokens, &why],
+    )
     .await?;
     Ok(())
 }

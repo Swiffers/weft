@@ -20,6 +20,7 @@ use weft_core::infra::wire::{INFRA_NOT_STARTED, INFRA_PER_INSTANCE};
 use weft_core::frames::Located;
 use weft_core::infra::run_gate::{copies_read, infra_not_running, missing_and_fix, MissingCopy};
 use weft_core::ProjectDefinition;
+use weft_task_store::db::Client as _;
 
 use crate::actions::{project as project_actions, triggers as trigger_actions, Actor, Refused};
 use crate::authenticator::{authorize_project, CallerTenant};
@@ -65,8 +66,8 @@ pub async fn prune_images(
     // spared inside `prune`, one by one under each image's lock, so this
     // never waits for builds to finish.
     let referenced = {
-        let mut conn = state.pg_pool.acquire().await.map_err(|e| internal("referenced images", e.into()))?;
-        crate::build::prune::keep_set(&mut conn, crate::build::prune::ImageScope::All, state.builder.images.as_ref())
+        let conn = state.pg_pool.get().await.map_err(|e| internal("referenced images", e.into()))?;
+        crate::build::prune::keep_set(&conn, crate::build::prune::ImageScope::All, state.builder.images.as_ref())
             .await
             .map_err(|e| internal("referenced images", e))?
     };
@@ -93,11 +94,11 @@ pub async fn prune_images(
 
 /// The queries behind [`ReferencedImages`], restricted to `scope`: the
 /// whole set for a prune's keep-set, one image's part when a prune
-/// re-checks that image under its lock (`crate::build::ledger::begin_reclaim`).
+/// re-checks that image under its lock (`crate::build::ledger::decide_reclaim`).
 /// One definition for both, so the bulk read and the per-image re-check
 /// can never disagree on what "referenced" means.
 pub async fn referenced_images_query(
-    conn: &mut sqlx::PgConnection,
+    db: &impl weft_task_store::db::Client,
     scope: crate::build::prune::ImageScope<'_>,
 ) -> anyhow::Result<ReferencedImages> {
     // Every image something may still run: each project's current one,
@@ -106,7 +107,7 @@ pub async fn referenced_images_query(
     // was rebuilt since), and each live worker's (it may be driving a run
     // its door just bore, before anything of it is on record). `$1`
     // narrows every arm to one binary hash; NULL keeps them all.
-    let query = weft_task_store::sql!(
+    let query = format!(
         "SELECT DISTINCT running_binary_hash FROM project \
          WHERE running_binary_hash IS NOT NULL AND running_binary_hash <> '' \
            AND ($1::TEXT IS NULL OR running_binary_hash = $1) \
@@ -121,7 +122,7 @@ pub async fn referenced_images_query(
         alive = weft_task_store::worker_alive!("l"),
     );
     let rows: Vec<(String,)> = if scope.covers_workers() {
-        sqlx::query_as(query).bind(scope.worker_hash()).fetch_all(&mut *conn).await?
+        db.all(&query, &[&scope.worker_hash()]).await?
     } else {
         Vec::new()
     };
@@ -140,10 +141,7 @@ pub async fn referenced_images_query(
     // skipped, mirroring the `<> ''` convention of the worker-hash arms
     // (a blank matches no image; keeping it would only launder a
     // buggy-writer blank into the set).
-    let tag_rows: Vec<(uuid::Uuid, serde_json::Value)> =
-        sqlx::query_as("SELECT id, infra_image_tags_json FROM project")
-            .fetch_all(&mut *conn)
-            .await?;
+    let tag_rows: Vec<(uuid::Uuid, serde_json::Value)> = db.all("SELECT id, infra_image_tags_json FROM project", &[]).await?;
     for (project_id, tags) in tag_rows {
         let by_node = weft_broker_client::protocol::decode_infra_image_tags(
             tags,
@@ -165,9 +163,7 @@ pub async fn referenced_images_query(
     // All rows, all units, regardless of status: over-keeping a ref is
     // bounded (rows die with the node on terminate) and the safe
     // direction for a set reclamation deletes against.
-    let unit_refs: Vec<String> = sqlx::query_scalar("SELECT DISTINCT unnest(image_refs) FROM infra_unit")
-        .fetch_all(&mut *conn)
-        .await?;
+    let unit_refs: Vec<String> = db.scalars("SELECT DISTINCT unnest(image_refs) FROM infra_unit", &[]).await?;
     for image_ref in unit_refs {
         if !image_ref.is_empty() && scope.covers_infra_ref(&image_ref) {
             infra_refs.insert(image_ref);
@@ -437,17 +433,16 @@ pub(crate) async fn infra_setup_run_ids(
     // shared copies' setup, `Some(Some(m))` for instance m's.
     owner: Option<Option<&weft_core::instance::InstanceId>>,
 ) -> anyhow::Result<Vec<weft_core::RunId>> {
-    Ok(sqlx::query_scalar(
-        "SELECT run_id FROM run \
-         WHERE project_id = $1 AND phase = 'infra_setup' AND state <> 'ended' \
-           AND ($2 OR instance_id IS NOT DISTINCT FROM $3) \
-         ORDER BY started_at, run_id",
-    )
-    .bind(project_id)
-    .bind(owner.is_none())
-    .bind(owner.flatten().map(|m| m.as_str()))
-    .fetch_all(&state.pg_pool)
-    .await?)
+    Ok(state
+        .pg_pool
+        .scalars(
+            "SELECT run_id FROM run \
+             WHERE project_id = $1 AND phase = 'infra_setup' AND state <> 'ended' \
+               AND ($2 OR instance_id IS NOT DISTINCT FROM $3) \
+             ORDER BY started_at, run_id",
+            &[&project_id, &owner.is_none(), &owner.flatten().map(|m| m.as_str())],
+        )
+        .await?)
 }
 
 /// Whether an infra setup of `owner` (see [`infra_setup_run_ids`])
@@ -979,13 +974,14 @@ pub(crate) async fn await_infra_setup(
 /// The project's entries that refused calls in this minute and the one
 /// before.
 pub(crate) async fn limited_entries(state: &DispatcherState, project_id: uuid::Uuid) -> anyhow::Result<Vec<LimitedEntry>> {
-    let entries: Vec<(String, String)> = sqlx::query_as(
-        "SELECT token, node_id FROM signal \
-         WHERE project_id = $1 AND surface_kind = 'public_entry' AND NOT is_resume",
-    )
-    .bind(project_id)
-    .fetch_all(&state.pg_pool)
-    .await?;
+    let entries: Vec<(String, String)> = state
+        .pg_pool
+        .all(
+            "SELECT token, node_id FROM signal \
+             WHERE project_id = $1 AND surface_kind = 'public_entry' AND NOT is_resume",
+            &[&project_id],
+        )
+        .await?;
     let now = crate::lease::now_unix();
     let mut out = Vec::new();
     for (token, node) in entries {
@@ -1076,10 +1072,8 @@ pub(crate) async fn trigger_runs(state: &DispatcherState, project_id: uuid::Uuid
     if counts.is_empty() {
         return Ok(Vec::new());
     }
-    let triggers: Vec<(String, String)> = sqlx::query_as("SELECT token, node_id FROM signal WHERE project_id = $1 AND NOT is_resume")
-        .bind(project_id)
-        .fetch_all(&state.pg_pool)
-        .await?;
+    let triggers: Vec<(String, String)> =
+        state.pg_pool.all("SELECT token, node_id FROM signal WHERE project_id = $1 AND NOT is_resume", &[&project_id]).await?;
     let mut runs: Vec<weft_core::projects::TriggerRuns> = triggers
         .into_iter()
         .filter_map(|(token, node)| counts.get(&token).map(|&(started, failed)| weft_core::projects::TriggerRuns { node, started, failed }))
@@ -3093,8 +3087,10 @@ async fn drop_orphan_entry_rows(
     orphans: &[String],
     activation: uuid::Uuid,
 ) -> anyhow::Result<()> {
-    let mut tx = activation_write(state, project_id, activation).await?;
-    let removed = crate::store::postgres::remove_signals(&mut *tx, orphans).await?;
+    let mut conn = state.pg_pool.get().await?;
+    let tx = conn.transaction().await?;
+    hold_activation(&tx, project_id, activation).await?;
+    let removed = crate::store::postgres::remove_signals(&tx, orphans).await?;
     tx.commit().await?;
     state.listener.unregister_many(&removed).await;
     Ok(())
@@ -3140,21 +3136,24 @@ async fn take_back_arms(
     }
 }
 
-/// Hold the activation identity while changing its persistent signal
-/// state: the rows it claimed stay Activating under it for the whole
-/// transaction, so a concurrent cancel waits behind this write.
-async fn activation_write(
-    state: &DispatcherState,
+/// Hold the activation identity in `tx` while it changes the activation's
+/// persistent signal state: the rows it claimed stay Activating under it
+/// for the whole transaction, so a concurrent cancel waits behind this
+/// write.
+async fn hold_activation(
+    tx: &weft_task_store::db::Transaction<'_>,
     project_id: uuid::Uuid,
     activation: uuid::Uuid,
-) -> anyhow::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
-    let mut tx = state.pg_pool.begin().await?;
-    let owned: Vec<(String,)> = sqlx::query_as(
-        "SELECT trigger FROM trigger_activation \
-         WHERE project_id = $1 AND status = 'activating' AND activating_run_id = $2 FOR UPDATE",
-    ).bind(project_id).bind(activation).fetch_all(&mut *tx).await?;
+) -> anyhow::Result<()> {
+    let owned: Vec<String> = tx
+        .scalars(
+            "SELECT trigger FROM trigger_activation \
+             WHERE project_id = $1 AND status = 'activating' AND activating_run_id = $2 FOR UPDATE",
+            &[&project_id, &activation],
+        )
+        .await?;
     anyhow::ensure!(!owned.is_empty(), "activation {activation} no longer owns any trigger of project {project_id}");
-    Ok(tx)
+    Ok(())
 }
 
 /// Drop what the activations `keys` held while they were down, when an
@@ -3172,8 +3171,11 @@ async fn drop_held(
 ) -> Result<bool, (StatusCode, String)> {
     let internal = |what: &str, e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
     if held == ReleaseHeld::Drop {
-        let mut tx = activation_write(state, project_id, activation).await.map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
-        crate::store::postgres::drop_held_arrivals(&mut *tx, project_id, keys).await.map_err(|e| internal("drop the held arrivals", e))?;
+        let conflict = |error: String| (StatusCode::CONFLICT, error);
+        let mut conn = state.pg_pool.get().await.map_err(|e| conflict(e.to_string()))?;
+        let tx = conn.transaction().await.map_err(|e| conflict(e.to_string()))?;
+        hold_activation(&tx, project_id, activation).await.map_err(|e| conflict(e.to_string()))?;
+        crate::store::postgres::drop_held_arrivals(&tx, project_id, keys).await.map_err(|e| internal("drop the held arrivals", e))?;
         tx.commit().await.map_err(|e| internal("drop the held arrivals", e.into()))?;
         // A run started by hand and another trigger's runs are not this
         // activation's to touch.
@@ -3578,14 +3580,14 @@ async fn prepare_running_image(
 /// (`weft_listener::kinds::cancel_call`), and how long the queue takes to
 /// reach it is not this call's to cut short.
 pub(crate) async fn last_calls_sent(state: &DispatcherState, id: uuid::Uuid) -> anyhow::Result<()> {
-    let calls: Vec<uuid::Uuid> = sqlx::query_scalar(
-        "SELECT id FROM task WHERE project_id = $1 AND kind = $2 AND status IN ('pending', 'claimed')",
-    )
-    .bind(id)
-    .bind(weft_task_store::TaskKind::CancelCall.as_str())
-    .fetch_all(&state.pg_pool)
-    .await
-    .map_err(|e| anyhow::anyhow!("could not read the project's last calls: {e}"))?;
+    let calls: Vec<uuid::Uuid> = state
+        .pg_pool
+        .scalars(
+            "SELECT id FROM task WHERE project_id = $1 AND kind = $2 AND status IN ('pending', 'claimed')",
+            &[&id, &weft_task_store::TaskKind::CancelCall.as_str()],
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("could not read the project's last calls: {e}"))?;
     for call in calls {
         weft_task_store::terminal::wait_for_terminal_in_project(&state.pg_pool, &state.signals, call, id, std::time::Duration::MAX)
             .await

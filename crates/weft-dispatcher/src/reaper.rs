@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use weft_task_store::db::Client as _;
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn};
 use weft_task_store::locks::Leased;
 
@@ -167,7 +168,7 @@ const CLOSE_ROUNDS: usize = 5;
 /// pass until it lets go (or its trigger takes work again); while any is
 /// marked, its project's `weft status` names it (`Callee::LetGo`). Answers the
 /// projects whose windows ended.
-pub async fn close_door_windows_over(pool: &sqlx::PgPool, listener: &dyn DoorWindowListener) -> anyhow::Result<Vec<uuid::Uuid>> {
+pub async fn close_door_windows_over(pool: &weft_task_store::db::Pool, listener: &dyn DoorWindowListener) -> anyhow::Result<Vec<uuid::Uuid>> {
     use crate::activation_store::WindowsClosed;
     let again = crate::store::postgres::signals_kept_after_let_go(pool).await?;
     if !again.is_empty() {
@@ -220,10 +221,9 @@ pub async fn close_door_windows_over(pool: &sqlx::PgPool, listener: &dyn DoorWin
             ended_in.push(project_id);
         }
     }
-    let kept: Vec<(uuid::Uuid, String, String)> =
-        sqlx::query_as("SELECT project_id, node_id, let_go_failed FROM signal WHERE let_go_failed IS NOT NULL ORDER BY project_id, node_id")
-            .fetch_all(pool)
-            .await?;
+    let kept: Vec<(uuid::Uuid, String, String)> = pool
+        .all("SELECT project_id, node_id, let_go_failed FROM signal WHERE let_go_failed IS NOT NULL ORDER BY project_id, node_id", &[])
+        .await?;
     let mut by_project: std::collections::BTreeMap<uuid::Uuid, Vec<String>> = Default::default();
     for (project, node, why) in kept {
         by_project.entry(project).or_default().push(format!("node {node}: {why}"));

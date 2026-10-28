@@ -7,7 +7,7 @@
 //! schemes are covered whole.
 
 use serde_json::json;
-use sqlx::PgPool;
+use weft_task_store::db::Pool;
 
 use weft_access_store::connect_direct;
 use weft_broker::caller_auth::{verify_caller, CallerRefusal, HeldVerifiers};
@@ -18,7 +18,7 @@ use weft_core::AccessSpec;
 
 const TENANT: &str = "tenant-a";
 
-async fn schema(pool: &PgPool) {
+async fn schema(pool: &Pool) {
     weft_task_store::apply_groups(pool, &[&weft_access_store::GROUP]).await.expect("schema");
 }
 
@@ -42,7 +42,7 @@ fn auth_spec(service: &str, fields: &[&str], verify: serde_json::Value) -> Acces
     .expect("a valid auth recipe")
 }
 
-async fn store(pool: &PgPool, tenant: &str, spec: AccessSpec, values: &[(&str, &str)]) -> String {
+async fn store(pool: &Pool, tenant: &str, spec: AccessSpec, values: &[(&str, &str)]) -> String {
     let done = connect_direct(
         pool,
         tenant,
@@ -95,8 +95,8 @@ fn refused(r: Result<weft_broker_client::protocol::CallerVerified, CallerRefusal
 
 /// A key from the stored list verifies and names its position; the
 /// bearer slot works too; a wrong key and a missing key refuse.
-#[sqlx::test]
-async fn a_stored_key_admits_and_names_which_one(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_stored_key_admits_and_names_which_one(pool: Pool) {
     schema(&pool).await;
     let spec = auth_spec("api_key_auth", &["keys"], json!({ "kind": "api_keys" }));
     let id = store(&pool, TENANT, spec, &[("keys", "first-key\nsecond-key\n")]).await;
@@ -119,8 +119,8 @@ async fn a_stored_key_admits_and_names_which_one(pool: PgPool) {
 
 /// An HMAC over the exact body with the connection's secret verifies
 /// (an anonymous identity); a tampered body refuses.
-#[sqlx::test]
-async fn a_signed_body_admits_with_the_stored_secret(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_signed_body_admits_with_the_stored_secret(pool: Pool) {
     schema(&pool).await;
     let verify = json!({
         "kind": "hmac",
@@ -165,8 +165,8 @@ fn sign(
 /// address the caller was told to call, query included, so the gate
 /// verifies only with the url the door hands it. The vector is Twilio's
 /// own SDK test (twilio-python, tests/unit/test_request_validator.py).
-#[sqlx::test]
-async fn a_route_gated_by_a_url_signing_scheme_verifies_the_address_called(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_route_gated_by_a_url_signing_scheme_verifies_the_address_called(pool: Pool) {
     schema(&pool).await;
     let spec = auth_spec(
         "twilio_auth",
@@ -200,8 +200,8 @@ async fn a_route_gated_by_a_url_signing_scheme_verifies_the_address_called(pool:
 /// reference library's own vector; a signature header sent twice gives
 /// the gate every value, so the right one verifies whichever copy
 /// carries it.
-#[sqlx::test]
-async fn a_standard_webhooks_signature_admits_from_any_header_copy(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_standard_webhooks_signature_admits_from_any_header_copy(pool: Pool) {
     schema(&pool).await;
     let spec = auth_spec(
         "standard_webhook_auth",
@@ -241,8 +241,8 @@ async fn a_standard_webhooks_signature_admits_from_any_header_copy(pool: PgPool)
 
 /// The tenant wall, a wrong service, and a service with no `verify`
 /// block all refuse (a failure of ours is the only non-refusal).
-#[sqlx::test]
-async fn the_wall_the_service_and_a_missing_scheme_all_refuse(pool: PgPool) {
+#[weft_db_macros::test]
+async fn the_wall_the_service_and_a_missing_scheme_all_refuse(pool: Pool) {
     schema(&pool).await;
     let spec = auth_spec("api_key_auth", &["keys"], json!({ "kind": "api_keys" }));
     let id = store(&pool, TENANT, spec, &[("keys", "k")]).await;
@@ -287,8 +287,8 @@ fn jwt_spec() -> AccessSpec {
 /// A JWT gate needs an audience: the issuer signs tokens for every app it
 /// serves, and the audience is the only thing telling this gate's apart.
 /// A connection cannot be saved without one.
-#[sqlx::test]
-async fn a_jwt_gate_connection_cannot_be_saved_without_an_audience(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_jwt_gate_connection_cannot_be_saved_without_an_audience(pool: Pool) {
     schema(&pool).await;
     let unsaved = connect_direct(
         &pool,
@@ -316,8 +316,8 @@ async fn a_jwt_gate_connection_cannot_be_saved_without_an_audience(pool: PgPool)
 /// A JWT gate whose stored key address is plain http is refused before
 /// any key is fetched: keys fetched over http could be swapped by anyone
 /// on the path.
-#[sqlx::test]
-async fn a_jwt_gate_with_an_http_key_address_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_jwt_gate_with_an_http_key_address_is_refused(pool: Pool) {
     schema(&pool).await;
     let values = [("issuer", "https://auth.example"), ("jwksUrl", "http://auth.example/jwks.json"), ("audience", "my-app")];
     let id = store(&pool, TENANT, jwt_spec(), &values).await;

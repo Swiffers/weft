@@ -230,6 +230,8 @@ async fn stored_value(reach: &Reach<'_>, r: &FileRef, hash: &str) -> Result<serd
 /// One GET of a text asset's URL, whole body in memory (a prompt, a JSON
 /// shape: small by contract). A non-2xx answer is the refusal.
 async fn fetch_url(state: &DispatcherState, url: &str) -> Result<Vec<u8>, String> {
+    // No limit beyond the connect one: the address is the person's, part
+    // of a build they wait on and can stop.
     let resp = state.http.get(url).send().await.map_err(|e| format!("GET {url}: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("GET {url} answered {}", resp.status()));

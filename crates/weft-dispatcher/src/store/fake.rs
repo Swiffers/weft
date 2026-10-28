@@ -121,6 +121,16 @@ impl FakeStore {
         self.inner.lock().unwrap().handed.get(&run_id).cloned().unwrap_or_default()
     }
 
+    /// A wake's claim on signal `token`, the way the broker writes one
+    /// (`weft_broker::held_signals`): its kind state, one version past,
+    /// and the same registration.
+    pub fn claim_kind_state(&self, token: &str, kind_state: serde_json::Value) {
+        let mut g = self.inner.lock().unwrap();
+        let row = g.signals.get_mut(token).expect("a signal to claim");
+        row.kind_state = kind_state;
+        row.kind_state_seq += 1;
+    }
+
     /// Let go of `run_id` parked on a wait, the way its worker does.
     pub fn park(&self, run_id: RunId) {
         let mut g = self.inner.lock().unwrap();
@@ -666,16 +676,21 @@ impl SignalStore for FakeStore {
         }
         // Like Postgres's ON CONFLICT refresh, a replaced row keeps its
         // identity and takes only the refreshed columns.
-        match inner.signals.get_mut(&sig.token) {
-            Some(row) => copy_refreshed(row, sig),
+        let generation = match inner.signals.get_mut(&sig.token) {
+            Some(row) => {
+                copy_refreshed(row, sig);
+                row.generation
+            }
             None => {
                 let mut written = sig.clone();
                 written.kind_state_seq += 1;
                 written.generation = next_generation();
+                let generation = written.generation;
                 inner.signals.insert(written.token.clone(), written);
+                generation
             }
-        }
-        Ok(super::SignalWrite::Written)
+        };
+        Ok(super::SignalWrite::Written { generation })
     }
 
     async fn signal_restore(&self, sig: &SignalRegistration) -> anyhow::Result<super::SignalWrite> {
@@ -687,7 +702,7 @@ impl SignalStore for FakeStore {
             return Ok(super::SignalWrite::StateMoved);
         }
         copy_refreshed(row, sig);
-        Ok(super::SignalWrite::Written)
+        Ok(super::SignalWrite::Written { generation: row.generation })
     }
 
     async fn signal_get(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>> {
@@ -730,6 +745,12 @@ impl SignalStore for FakeStore {
             }
         }
         Ok(out)
+    }
+
+    async fn signal_remove_registration(&self, token: &str, generation: i64) -> anyhow::Result<Option<SignalRegistration>> {
+        let mut g = self.inner.lock().unwrap();
+        let still = g.signals.get(token).is_some_and(|s| s.generation == generation);
+        Ok(if still { g.signals.remove(token) } else { None })
     }
 
     async fn signal_list_for_run_id(&self, run_id: RunId) -> anyhow::Result<Vec<SignalRegistration>> {
@@ -934,8 +955,9 @@ pub(crate) mod tests {
         let mut first = registration("tok-1");
         first.kind_state = serde_json::json!({ "cursor": 10 });
         first.kind_state_seq = 0;
-        assert_eq!(j.signal_insert(&first).await.unwrap(), SignalWrite::Written);
-        assert_eq!(j.signal_get("tok-1").await.unwrap().unwrap().kind_state_seq, 1);
+        let SignalWrite::Written { generation } = j.signal_insert(&first).await.unwrap() else { panic!("a new row is written") };
+        let row = j.signal_get("tok-1").await.unwrap().unwrap();
+        assert_eq!((row.kind_state_seq, row.generation), (1, generation), "the write names the registration it made");
 
         // Read at 0, but the row is at 1 now: nothing is written.
         let mut stale = registration("tok-1");
@@ -949,9 +971,10 @@ pub(crate) mod tests {
         let mut current = registration("tok-1");
         current.kind_state = serde_json::json!({ "cursor": 12 });
         current.kind_state_seq = 1;
-        assert_eq!(j.signal_insert(&current).await.unwrap(), SignalWrite::Written);
+        let SignalWrite::Written { generation: rewritten } = j.signal_insert(&current).await.unwrap() else { panic!("it lands") };
         let row = j.signal_get("tok-1").await.unwrap().unwrap();
         assert_eq!((row.kind_state, row.kind_state_seq), (serde_json::json!({ "cursor": 12 }), 2));
+        assert_ne!(rewritten, generation, "a rewrite is another registration");
     }
 
     /// A node test's run is a `node_test` row, and the project-lifecycle

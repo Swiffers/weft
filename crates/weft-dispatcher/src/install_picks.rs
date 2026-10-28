@@ -19,9 +19,11 @@ use weft_core::activation::ActivationKey;
 use weft_core::instance::{Owner, ValueChanges};
 use weft_core::instance_door::ValuesChanged;
 use weft_core::picks::PickInput;
+use weft_task_store::db::Client;
 
 use crate::activation_store::{ClaimRefused, ProjectStatus};
-use crate::instance_values::{access_error, owning_tenant, triggers_reading, wait_for_activations};
+use crate::api::access_store_error;
+use crate::instance_values::{owning_tenant, triggers_reading, wait_for_activations};
 use crate::state::DispatcherState;
 
 type ApiError = (StatusCode, String);
@@ -141,11 +143,11 @@ impl Store<'_> {
     /// The fields this write touches, read under the project lock: a
     /// move checks itself against what is stored now and touches every
     /// field it carries to its new place.
-    async fn changes(&self, conn: &mut sqlx::PgConnection, project_id: uuid::Uuid) -> Result<ValueChanges, ApiError> {
+    async fn changes(&self, db: &impl Client, project_id: uuid::Uuid) -> Result<ValueChanges, ApiError> {
         match self {
             Store::Change { changes, .. } => Ok((*changes).clone()),
             Store::Move { tenant, request, project } => {
-                let stored = weft_access_store::stored_fields(&mut *conn, tenant, project_id).await.map_err(access_error)?;
+                let stored = weft_access_store::stored_fields(db, tenant, project_id).await.map_err(access_store_error)?;
                 weft_core::picks::check_move(project, &stored, request).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
                 let mut changes = ValueChanges::default();
                 for moved in stored.iter().filter(|s| s.node == request.from) {
@@ -175,12 +177,12 @@ async fn store_then_rearm(
         // Subscribed before looking, so a claim ending between the look
         // and the wait still wakes it.
         let mut heard = state.signals.subscribe();
-        let mut tx = state.pg_pool.begin().await.map_err(|e| access_error(e.into()))?;
-        let locked: Option<(uuid::Uuid,)> = sqlx::query_as("SELECT id FROM project WHERE id = $1 FOR UPDATE")
-            .bind(project_id)
-            .fetch_optional(&mut *tx)
+        let mut conn = state.pg_pool.get().await.map_err(|e| access_store_error(e.into()))?;
+        let tx = conn.transaction().await.map_err(|e| access_store_error(e.into()))?;
+        let locked: Option<uuid::Uuid> = tx
+            .scalar_opt("SELECT id FROM project WHERE id = $1 FOR UPDATE", &[&project_id])
             .await
-            .map_err(|e| access_error(e.into()))?;
+            .map_err(|e| access_store_error(e.into()))?;
         if locked.is_none() {
             return Err((StatusCode::NOT_FOUND, format!("project {project_id} not found")));
         }
@@ -188,31 +190,32 @@ async fn store_then_rearm(
             .activations
             .list(project_id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read activations: {e}")))?;
-        let changes = store.changes(&mut tx, project_id).await?;
+            .map_err(|e| crate::api::unavailable_or_internal("read the project's triggers", e))?;
+        let changes = store.changes(&tx, project_id).await?;
         let reading = match project {
             Some(project) => triggers_reading(project, &activations, None, &changes),
             None => Vec::new(),
         };
         if reading.iter().any(|a| a.lifecycle.status == ProjectStatus::Activating) {
             drop(tx);
+            drop(conn);
             wait_for_activations(&mut heard).await?;
             continue;
         }
         let moved = match &store {
             Store::Change { tenant, writes, cleared, .. } => {
-                weft_access_store::change_install_picks(&mut tx, tenant, project_id, writes, cleared)
+                weft_access_store::change_install_picks(&tx, tenant, project_id, writes, cleared)
                     .await
-                    .map_err(access_error)?;
+                    .map_err(access_store_error)?;
                 (0, 0)
             }
             Store::Move { tenant, request, .. } => {
-                weft_access_store::move_stored(&mut tx, tenant, project_id, &request.from, &request.to)
+                weft_access_store::move_stored(&tx, tenant, project_id, &request.from, &request.to)
                     .await
-                    .map_err(access_error)?
+                    .map_err(access_store_error)?
             }
         };
-        tx.commit().await.map_err(|e| access_error(e.into()))?;
+        tx.commit().await.map_err(|e| access_store_error(e.into()))?;
         break (
             moved,
             reading
@@ -251,8 +254,8 @@ pub(crate) async fn require_activation_picks(
 /// every place it stores a pick or an instance's value at.
 pub(crate) async fn kept(state: &DispatcherState, project_id: uuid::Uuid) -> Result<weft_core::picks::Kept, ApiError> {
     let tenant = owning_tenant(state, project_id).await?;
-    let picks = weft_access_store::install_picks(&state.pg_pool, &tenant, project_id).await.map_err(access_error)?;
-    let stored = weft_access_store::stored_fields(&state.pg_pool, &tenant, project_id).await.map_err(access_error)?;
+    let picks = weft_access_store::install_picks(&state.pg_pool, &tenant, project_id).await.map_err(access_store_error)?;
+    let stored = weft_access_store::stored_fields(&state.pg_pool, &tenant, project_id).await.map_err(access_store_error)?;
     Ok(weft_core::picks::Kept { picks, stored })
 }
 
@@ -270,10 +273,13 @@ pub(crate) async fn activation_picks(
 }
 
 /// Set up `live` again on the picks now stored, each owner once. An owner
-/// whose claim is busy is waited for and tried again; one whose triggers
-/// are no longer expected live is done (whatever turned them off read the
-/// stored picks). The triggers of an owner whose setup failed are named in
-/// the answer.
+/// whose claim is busy is waited for and tried again, and so is one whose
+/// setup the database did not take (busy or out of reach): busy means
+/// wait, as the resync waits on it
+/// (`crate::task_kinds::resync::database_wait`), for as long as it lasts.
+/// One whose triggers are no longer expected live is done (whatever turned
+/// them off read the stored picks). The triggers of an owner whose setup
+/// failed are named in the answer.
 async fn rearm(state: &DispatcherState, project_id: uuid::Uuid, live: &[ActivationKey]) -> Result<ValuesChanged, ApiError> {
     let mut owners: Vec<Owner> = Vec::new();
     for key in live {
@@ -287,6 +293,7 @@ async fn rearm(state: &DispatcherState, project_id: uuid::Uuid, live: &[Activati
         let triggers: Vec<String> = live.iter().filter(|k| k.owner == owner).map(|k| k.trigger.clone()).collect();
         // The picks are already stored: the setup reads them there.
         let rearm = crate::api::project::Rearm { overlay: None, store: None };
+        let mut database_waits = 0;
         loop {
             let mut heard = state.signals.subscribe();
             let request = weft_core::activation::ActivateRequest {
@@ -302,6 +309,16 @@ async fn rearm(state: &DispatcherState, project_id: uuid::Uuid, live: &[Activati
                     wait_for_activations(&mut heard).await?;
                 }
                 Err(crate::api::project::ActivateError::Refused(ClaimRefused::NotExpected)) => break,
+                Err(crate::api::project::ActivateError::Database(why)) => {
+                    let wait = crate::task_kinds::resync::database_wait(database_waits);
+                    database_waits += 1;
+                    tracing::warn!(
+                        target: "weft_dispatcher::install_picks",
+                        %project_id, triggers = %triggers.join(", "), wait_secs = wait.as_secs(),
+                        "setting triggers up again on a changed pick waits on the database: {why}"
+                    );
+                    tokio::time::sleep(wait).await;
+                }
                 Err(error @ (crate::api::project::ActivateError::Failed(..)
                 | crate::api::project::ActivateError::Refused(
                     ClaimRefused::Building | ClaimRefused::Resyncing | ClaimRefused::ResyncGone | ClaimRefused::Removing | ClaimRefused::Maintenance,

@@ -22,6 +22,7 @@ use anyhow::Result;
 use serde_json::json;
 
 use weft_e2e::{ensure, infra, project::Project, run, SettledRun};
+use weft_task_store::db::{self, Client as _};
 
 /// The postgres connections belonging to THIS project. The listing is
 /// tenant-wide, and every e2e shares one tenant, so a sibling test's
@@ -211,16 +212,12 @@ async fn a_client_outside_weft_opens_the_database_through_its_door() -> Result<(
             .filter(|v| !v.is_empty())
             .ok_or_else(|| anyhow::anyhow!("the env file does not set {name}"))
     };
-    let options = sqlx::postgres::PgConnectOptions::new()
-        .host(&host)
-        .port(port)
-        .username(&value("PG_USER")?)
-        .password(&value("PG_PASSWORD")?)
-        .database(&value("PG_DB")?);
-    let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(options).await?;
-    let one: i32 = sqlx::query_scalar("SELECT 1").fetch_one(&pool).await?;
+    let mut config = db::Config::new();
+    config.host(&host).port(port).user(value("PG_USER")?).password(value("PG_PASSWORD")?).dbname(value("PG_DB")?);
+    let session = db::Session::connect(&config).await?;
+    let one: i32 = session.scalar("SELECT 1", &[]).await?;
     anyhow::ensure!(one == 1, "the database answered through its door");
-    pool.close().await;
+    drop(session);
 
     round_trip(&mut project).await?;
     infra::terminate_and_wait_gone(&project, "db").await?;

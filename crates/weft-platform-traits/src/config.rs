@@ -46,6 +46,15 @@ pub struct InstallConfig {
     /// pool.
     #[serde(default)]
     pub holders: HolderSettings,
+    /// The most copies the platform runs at once of each role that opens
+    /// the database ([`DATABASE_ROLES`]) placed serverless, one entry
+    /// each: every copy sizes its pools to an equal share of what the
+    /// database takes (`weft_task_store::budget`), so this is how many
+    /// shares there are. Empty on a local install, whose one process takes
+    /// the whole database.
+    // SYNC: maxCopies <-> deploy/terraform/gcp/serverless.tf (local.max_copies)
+    #[serde(default, rename = "maxCopies", skip_serializing_if = "BTreeMap::is_empty")]
+    pub max_copies: BTreeMap<CoreRole, u32>,
     pub edge: EdgeConfig,
     #[serde(rename = "objectStore")]
     pub object_store: ObjectStoreSettings,
@@ -60,6 +69,10 @@ pub struct InstallConfig {
     #[serde(default = "default_alert_after_minutes", rename = "alertAfterMinutes")]
     pub alert_after_minutes: u32,
 }
+
+/// The roles that open the install's database themselves: every other role
+/// reaches it through the broker.
+pub const DATABASE_ROLES: [CoreRole; 2] = [CoreRole::Dispatcher, CoreRole::Broker];
 
 /// [`InstallConfig::alert_after_minutes`] when the config leaves it out.
 pub const DEFAULT_ALERT_AFTER_MINUTES: u32 = 5;
@@ -535,6 +548,20 @@ impl InstallConfig {
                 }
                 _ => {}
             }
+            let shared = DATABASE_ROLES.contains(&role) && placed == Placement::Serverless;
+            match (shared, self.max_copies.get(&role)) {
+                (true, None) => {
+                    return Err(format!(
+                        "roles.{role} is serverless and opens the database, but maxCopies names no ceiling for it: \
+                         each copy sizes its pools to its share of the database, so the number of copies must be known"
+                    ))
+                }
+                (true, Some(0)) => return Err(format!("maxCopies.{role} is 0: no copy of {role} could run; set it to 1 or more")),
+                (false, Some(_)) => {
+                    return Err(format!("maxCopies names {role}, which is not a serverless role that opens the database; remove it"))
+                }
+                _ => {}
+            }
         }
         match &self.platform {
             PlatformConfig::Local(_) => {
@@ -654,6 +681,7 @@ pub(crate) mod tests {
             role_urls: BTreeMap::new(),
             workers: WorkerOverrides::default(),
             holders: HolderSettings::default(),
+            max_copies: BTreeMap::new(),
             edge: EdgeConfig { trusted_proxy_hops: ProxyHops { public: 0, outside: 0, domains: 0 }, invalid_tokens_per_minute: Some(30) },
             object_store: ObjectStoreSettings::S3(S3StoreSettings {
                 endpoint: "http://127.0.0.1:8333".into(),
@@ -704,8 +732,27 @@ pub(crate) mod tests {
             c.role_urls.insert(role, format!("https://{}.run.app/", role.as_str()));
         }
         c.roles.set(CoreRole::Holder, Placement::Pool);
+        c.max_copies = BTreeMap::from([(CoreRole::Dispatcher, 2), (CoreRole::Broker, 4)]);
         c.validate().unwrap();
         c
+    }
+
+    /// Every serverless role that opens the database has a ceiling on its
+    /// copies, and only those roles have one.
+    #[test]
+    fn the_roles_that_open_the_database_name_their_most_copies() {
+        let mut c = gcp();
+        c.max_copies.remove(&CoreRole::Broker);
+        assert!(c.validate().unwrap_err().contains("maxCopies names no ceiling for it"));
+        let mut c = gcp();
+        c.max_copies.insert(CoreRole::Broker, 0);
+        assert!(c.validate().unwrap_err().contains("maxCopies.broker is 0"));
+        let mut c = gcp();
+        c.max_copies.insert(CoreRole::Listener, 3);
+        assert!(c.validate().unwrap_err().contains("maxCopies names listener"));
+        let mut c = local();
+        c.max_copies.insert(CoreRole::Dispatcher, 1);
+        assert!(c.validate().unwrap_err().contains("maxCopies names dispatcher"), "the local process takes the whole database");
     }
 
     #[test]

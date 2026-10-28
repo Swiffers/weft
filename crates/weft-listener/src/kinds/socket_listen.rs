@@ -166,7 +166,8 @@ fn prepare_frame(
     Ok(Some(match frame {
         SocketFrame::Text { body } => Message::Text(
             interpolate_frame(body, values)
-                .map_err(|e| PrepareError::Fatal(anyhow::anyhow!(e)))?,
+                .map_err(|e| PrepareError::Fatal(anyhow::anyhow!(e)))?
+                .into(),
         ),
         SocketFrame::Binary { base64 } => {
             let bytes = base64::engine::general_purpose::STANDARD
@@ -176,7 +177,7 @@ fn prepare_frame(
                         "socket_listen binary frame is not valid base64: {e}"
                     ))
                 })?;
-            Message::Binary(bytes)
+            Message::Binary(bytes.into())
         }
     }))
 }
@@ -229,6 +230,6 @@ mod tests {
             inbound_payload(Message::Text("hello".into())).unwrap(),
             Value::String("hello".into())
         );
-        assert!(inbound_payload(Message::Ping(vec![])).is_none());
+        assert!(inbound_payload(Message::Ping(Default::default())).is_none());
     }
 }

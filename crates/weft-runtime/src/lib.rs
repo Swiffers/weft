@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use axum::Router;
-use weft_platform_traits::config::{InstallConfig, PlatformConfig};
+use weft_platform_traits::config::{InstallConfig, PlatformConfig, DATABASE_ROLES};
 use weft_platform_traits::{CoreRole, Placement, Vantage};
 use weft_task_store::drain::DrainLoop;
 
@@ -45,22 +45,33 @@ const SUPERVISOR_OWNERSHIP_EVERY: Duration = Duration::from_secs(15);
 /// How often the supervisor looks at every owned project's health.
 const SUPERVISOR_HEALTH_EVERY: Duration = Duration::from_secs(30);
 
-/// The work pool's size, and how long a request waits for one of its
-/// connections.
-const WORK_POOL: (u32, Duration) = (16, Duration::from_secs(5));
+// How many connections each pool holds is the process's share of the
+// database (`weft_task_store::budget`); how long a request waits in a
+// pool's line is set here. A request that finds every connection of its
+// pool in use waits for the next one handed back rather than fails: the
+// install is running as fast as its database lets it
+// (`weft_task_store::throttle` says so).
 
-/// The pool a role holds its long locks on (the dispatcher's project
-/// transition lock, the broker's lock on one signal's subscriptions). A
-/// lock is held for the length of an operation and its connection does no
-/// work, so a lock taken from the work pool is a connection the operation
-/// itself then has to wait for (see `weft_dispatcher::lease`).
-const LOCK_POOL: (u32, Duration) = (16, Duration::from_secs(120));
+/// How long a request waits for a connection of the work pool. Long
+/// enough to wait out a busy moment in line; a request still waiting
+/// after it is answered busy (the broker's `NOT_DONE`), and its caller
+/// sends it again.
+const WORK_POOL_WAIT: Duration = Duration::from_secs(30);
 
-/// The pool the broker writes workers' batches of records on
-/// (`weft_broker::records`): a burst of records never starves the
-/// broker's other work of connections, and a batch waits for one rather
-/// than fails (a worker's lane has one batch in flight, so the wait is
-/// how the database slows the workers down).
+/// How long a lock waits for a connection of the pool a role holds its
+/// long locks on (the dispatcher's project transition lock, the broker's
+/// lock on one signal's subscriptions). A lock is held for the length of
+/// an operation and its connection does no work, so a lock taken from the
+/// work pool is a connection the operation itself then has to wait for
+/// (see `weft_dispatcher::lease`). A lock that finds the pool full waits
+/// again (`weft_task_store::locks::with_lock_waiting`).
+const LOCK_POOL_WAIT: Duration = Duration::from_secs(120);
+
+/// How long a batch waits for a connection of the pool the broker writes
+/// workers' batches of records on (`weft_broker::records`): a burst of
+/// records never starves the broker's other work of connections, and a
+/// batch waits for one rather than fails (a worker's lane has one batch in
+/// flight, so the wait is how the database slows the workers down).
 const RECORD_POOL_WAIT: Duration = Duration::from_secs(60);
 
 /// A required secret from the environment (`SECRET_ENV`).
@@ -125,15 +136,43 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     let addresses = config.role_addresses(here);
     // The processes that write: every write is the dispatcher's or the
     // broker's (every other role writes through the broker).
-    let writes = runs(CoreRole::Dispatcher) || runs(CoreRole::Broker);
+    let opens_database: Vec<CoreRole> = DATABASE_ROLES.into_iter().filter(|r| runs(*r)).collect();
+    let writes = !opens_database.is_empty();
 
     // The database: for the roles that reach it, and for a local
-    // install's wakes, which it keeps there.
+    // install's wakes, which it keeps there. Each pool is sized to this
+    // process's share of the connections the database takes.
     let needs_db = writes || matches!(config.platform, PlatformConfig::Local(_));
+    let mut sizes: Option<weft_task_store::budget::Pools> = None;
     let pool = if needs_db {
         let url = secret("WEFT_DATABASE_URL")?;
-        let pool = weft_task_store::db::connect(&url, WORK_POOL.0, WORK_POOL.1).await.context("connect to the database")?;
+        let capacity =
+            weft_task_store::budget::Capacity::read(&url).await.context("ask the database how many connections it takes")?;
+        let sharing = match only {
+            None => weft_task_store::budget::Sharing::OneProcess,
+            Some(_) => weft_task_store::budget::Sharing::Copies(config.max_copies.clone()),
+        };
+        let pools = weft_task_store::budget::pools(&capacity, &sharing, &opens_database)?;
+        tracing::info!(
+            target: "weft_runtime",
+            max_connections = capacity.max_connections, share = pools.share, work = pools.work,
+            dispatcher_locks = ?pools.dispatcher_locks, broker_locks = ?pools.broker_locks, records = ?pools.records,
+            "sized the database pools to this copy's share"
+        );
+        let pool = weft_task_store::db::connect(&url, pools.work, WORK_POOL_WAIT, weft_task_store::db::Waits::Said)
+            .await
+            .context("connect to the database")?;
         schema::apply(&pool).await?;
+        // A process of one role opens the database only for a role that
+        // writes (a local install runs every role in its one process).
+        let holder = match only {
+            None => weft_core::install::DatabaseHolder::Machine,
+            Some(CoreRole::Dispatcher) => weft_core::install::DatabaseHolder::Dispatcher,
+            Some(CoreRole::Broker) => weft_core::install::DatabaseHolder::Broker,
+            Some(other) => anyhow::bail!("{other} opened the database, which only the dispatcher and the broker open"),
+        };
+        weft_task_store::throttle::record_into(pool.clone(), holder, &capacity, pools.share);
+        sizes = Some(pools);
         weft_task_store::unanswered::alert_after(&pool, config.alert_after())
             .await
             .context("write down whether the install alerts on its stuck failures")?;
@@ -174,8 +213,8 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             // Once per process: the watch holds its channel list for life.
             let channels: &'static [&'static str] = Box::leak(channels.into_boxed_slice());
             let listen_url = optional_secret("WEFT_DATABASE_LISTEN_URL").unwrap_or_else(|| url.clone());
-            let connect: sqlx::postgres::PgConnectOptions =
-                listen_url.parse().context("WEFT_DATABASE_LISTEN_URL (or WEFT_DATABASE_URL) is not a Postgres address")?;
+            let connect = weft_task_store::db::config(&listen_url)
+                .context("WEFT_DATABASE_LISTEN_URL (or WEFT_DATABASE_URL) is not a Postgres address")?;
             let listening = match serverless {
                 true => weft_task_store::pg_signal::Listening::WhileBusy,
                 false => weft_task_store::pg_signal::Listening::Always,
@@ -221,8 +260,19 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
 
     if runs(CoreRole::Broker) {
         let (url, pool) = pool.as_ref().expect("the broker's process holds the database");
-        let lock_pool = weft_task_store::db::connect(url, LOCK_POOL.0, LOCK_POOL.1).await.context("connect the broker's lock pool")?;
-        let record_pool = weft_task_store::db::connect_record_pool(url, &replica, RECORD_POOL_WAIT).await.context("connect the broker's record pool")?;
+        let sizes = sizes.expect("a process that holds the database sized its pools");
+        let lock_pool = weft_task_store::db::connect(
+            url,
+            sizes.broker_locks.expect("the broker's share has its locks"),
+            LOCK_POOL_WAIT,
+            weft_task_store::db::Waits::Expected,
+        )
+        .await
+        .context("connect the broker's lock pool")?;
+        let record_pool =
+            weft_task_store::db::connect_record_pool(url, &replica, sizes.records.expect("the broker's share has its records"), RECORD_POOL_WAIT)
+                .await
+                .context("connect the broker's record pool")?;
         let state = weft_broker::BrokerState::new(
             pool.clone(),
             lock_pool,
@@ -262,7 +312,15 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
 
     if runs(CoreRole::Dispatcher) {
         let (url, pool) = pool.as_ref().expect("the dispatcher's process holds the database");
-        let lock_pool = weft_task_store::db::connect(url, LOCK_POOL.0, LOCK_POOL.1).await.context("connect the lock pool")?;
+        let sizes = sizes.expect("a process that holds the database sized its pools");
+        let lock_pool = weft_task_store::db::connect(
+            url,
+            sizes.dispatcher_locks.expect("the dispatcher's share has its locks"),
+            LOCK_POOL_WAIT,
+            weft_task_store::db::Waits::Expected,
+        )
+        .await
+        .context("connect the lock pool")?;
         let state = weft_dispatcher::app::build_state(
             weft_dispatcher::app::DispatcherSettings {
                 config: &config,

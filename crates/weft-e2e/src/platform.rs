@@ -17,10 +17,9 @@
 //! compiled solely under the `e2e` feature, never into anything shipped.
 
 use anyhow::{Context, Result};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
 use std::time::Duration;
 use uuid::Uuid;
+use weft_task_store::db::{self, Client as _, Pool};
 
 use crate::client::{poll_until, Dispatcher};
 
@@ -28,20 +27,19 @@ use crate::client::{poll_until, Dispatcher};
 /// the dispatcher it was made from belongs to (the default one, or a
 /// [`crate::cell::Cell`]).
 pub struct Platform {
-    pool: PgPool,
+    pool: Pool,
     install: weft_core::infra::Install,
 }
 
 /// A pool of at most `max_connections` on the install database at `url`:
 /// what a test that seeds rows directly (a connection, a recipe) writes
 /// through.
-pub async fn database(url: &str, max_connections: u32) -> Result<PgPool> {
-    PgPoolOptions::new()
-        .max_connections(max_connections)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect(url)
-        .await
-        .context("connect to the install's Postgres")
+pub async fn database(url: &str, max_connections: u32) -> Result<Pool> {
+    let pool = Pool::open(db::config(url)?, max_connections, Duration::from_secs(10), db::Waits::Expected);
+    // A first connection now, so an install whose database does not answer
+    // fails here rather than at the test's first read.
+    pool.get().await.context("connect to the install's Postgres")?;
+    Ok(pool)
 }
 
 impl Platform {
@@ -58,9 +56,8 @@ impl Platform {
     /// run, the worker that ended it (`run.owner` is cleared once a run
     /// ends). None for a run nothing wrote yet.
     pub async fn run_writer(&self, run_id: &Uuid) -> Result<Option<String>> {
-        sqlx::query_scalar("SELECT writer FROM run_log WHERE run_id = $1 ORDER BY seq DESC LIMIT 1")
-            .bind(run_id)
-            .fetch_optional(&self.pool)
+        self.pool
+            .scalar_opt("SELECT writer FROM run_log WHERE run_id = $1 ORDER BY seq DESC LIMIT 1", &[run_id])
             .await
             .context("read the writer of a run's record")
     }
@@ -73,9 +70,8 @@ impl Platform {
     /// (and freed its quota reservation).
     pub async fn runtime_pending_uploads_for_run_id(&self, run_id: &Uuid) -> Result<i64> {
         let pattern = format!("%/run/{run_id}/%");
-        sqlx::query_scalar("SELECT COUNT(*) FROM runtime_file WHERE key LIKE $1 AND status = 'pending'")
-            .bind(pattern)
-            .fetch_one(&self.pool)
+        self.pool
+            .scalar("SELECT COUNT(*) FROM runtime_file WHERE key LIKE $1 AND status = 'pending'", &[&pattern])
             .await
             .context("count pending runtime uploads for run")
     }
@@ -85,14 +81,15 @@ impl Platform {
     /// exact number the broker's quota check enforces, so a test can assert an
     /// interrupted upload freed its reservation.
     pub async fn runtime_charged_bytes(&self, tenant: &str) -> Result<i64> {
-        let bytes: Option<i64> = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(CASE WHEN status = 'active' THEN size_bytes ELSE reserved_bytes END), 0)::BIGINT \
-             FROM runtime_file WHERE tenant_id = $1",
-        )
-        .bind(tenant)
-        .fetch_one(&self.pool)
-        .await
-        .context("sum tenant charged runtime bytes")?;
+        let bytes: Option<i64> = self
+            .pool
+            .scalar(
+                "SELECT COALESCE(SUM(CASE WHEN status = 'active' THEN size_bytes ELSE reserved_bytes END), 0)::BIGINT \
+                 FROM runtime_file WHERE tenant_id = $1",
+                &[&tenant],
+            )
+            .await
+            .context("sum tenant charged runtime bytes")?;
         Ok(bytes.unwrap_or(0))
     }
 
@@ -100,9 +97,8 @@ impl Platform {
     /// run stored nothing.
     pub async fn runtime_tenant_for_run_id(&self, run_id: &Uuid) -> Result<Option<String>> {
         let pattern = format!("%/run/{run_id}/%");
-        sqlx::query_scalar("SELECT tenant_id FROM runtime_file WHERE key LIKE $1 LIMIT 1")
-            .bind(pattern)
-            .fetch_optional(&self.pool)
+        self.pool
+            .scalar_opt("SELECT tenant_id FROM runtime_file WHERE key LIKE $1 LIMIT 1", &[&pattern])
             .await
             .context("read tenant for run's runtime files")
     }
@@ -160,11 +156,8 @@ impl Platform {
     /// The build a run runs on: the binary hash of the program its worker
     /// runs.
     pub async fn run_binary_hash(&self, run_id: &Uuid) -> Result<String> {
-        let hash: Option<String> = sqlx::query_scalar("SELECT binary_hash FROM run WHERE run_id = $1")
-            .bind(run_id)
-            .fetch_one(&self.pool)
-            .await
-            .context("read the build a run runs on")?;
+        let hash: Option<String> =
+            self.pool.scalar("SELECT binary_hash FROM run WHERE run_id = $1", &[run_id]).await.context("read the build a run runs on")?;
         hash.ok_or_else(|| anyhow::anyhow!("run {run_id} names no build"))
     }
 

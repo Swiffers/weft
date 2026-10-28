@@ -155,11 +155,11 @@ missing, the package fails to compile and the build leaves it out (see
 On a cloud install the worker is an image, and its build installs the same
 packages: `run` needs into the image the worker runs in, `build` needs into
 the one that compiles it, with the entry for the image's package manager.
-The image starts from `debian:bookworm-slim` unless the project's
+The image starts from `debian:trixie-slim` unless the project's
 `weft.toml` names another in `[build.worker] base_image` (for that setting,
 go and read [the worker](../running/architecture.md#the-worker)), so the
 entry is usually `apt`. If your `apt` entry has keys but neither
-`debian_12` nor `default`, the cloud build fails naming the node. If a need
+`debian_13` nor `default`, the cloud build fails naming the node. If a need
 has no entry for the image's package manager at all, nothing on a cloud
 install can provide it, so a cloud install refuses any program that uses
 that node. The same goes for every `run` need when

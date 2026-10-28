@@ -108,20 +108,29 @@ impl Door {
     async fn domains(&self) -> Result<Arc<Vec<Domain>>, Response> {
         self.state.held.domains.get_or_load((), || crate::domains::list(&self.state.pg_pool)).await.map_err(|e| {
             tracing::warn!(target: "weft_dispatcher::door", error = %format!("{e:#}"), "could not read the install's domains");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                // No promise of a retry: when the database refuses for good
-                // (a plan's quota), its own words are the one thing to fix.
-                format!("the install could not read its domains to route this request: {e:#}"),
-            )
-                .into_response()
+            domains_unread(&e)
         })
     }
 }
 
+/// The door's answer when it could not read the domains (`e`): nothing of
+/// the request ran yet, so when the database only did not take the read
+/// (too busy, or out of reach for now) it is a `503` and a caller sends
+/// the same request again (`weft_core::install::asks_again`). Any other
+/// failure (the database refusing for good, a plan's quota) is a `500`:
+/// its own words are the one thing to fix, and a caller that waited on it
+/// would wait forever.
+fn domains_unread(e: &anyhow::Error) -> Response {
+    let status = match crate::api::database_did_not_take(e) {
+        true => StatusCode::SERVICE_UNAVAILABLE,
+        false => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, format!("the install could not read its domains to route this request: {e:#}")).into_response()
+}
+
 /// `inner` (the public API) behind the door that routes by name.
 pub fn router(state: DispatcherState, inner: Router) -> Router {
-    Router::new().fallback(route).with_state(Door { inner, state })
+    crate::api::marked_as_the_install(Router::new().fallback(route)).with_state(Door { inner, state })
 }
 
 async fn route(State(door): State<Door>, mut request: Request) -> Response {
@@ -184,6 +193,18 @@ mod tests {
             Domain { name: "app.example.com".into(), serves: DomainServes::Frontend { project, upstream: "https://front-x.run.app".into() } },
             Domain { name: "api.example.com".into(), serves: DomainServes::Api { project } },
         ]
+    }
+
+    /// Domains the database did not take the read of answer a 503, which
+    /// a caller asks again on; a database that refused them for good (a
+    /// plan's quota) answers a 500, so no caller waits on it forever.
+    #[test]
+    fn only_a_database_that_did_not_take_the_read_asks_the_caller_again() {
+        let status = |e: anyhow::Error| domains_unread(&e).status();
+        let busy = weft_task_store::db::Error::NoConnection { why: weft_task_store::db::NoConnection::Busy, refused: None };
+        assert_eq!(status(anyhow::Error::from(busy).context("list the domains")), StatusCode::SERVICE_UNAVAILABLE);
+        let quota = anyhow::anyhow!("FATAL: the compute time quota of this project is exceeded").context("list the domains");
+        assert_eq!(status(quota), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

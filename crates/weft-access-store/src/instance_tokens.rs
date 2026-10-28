@@ -10,7 +10,7 @@
 //! never lands in a task row or a journal). The value leaves once, in the
 //! answer; the row keeps only its hash.
 
-use sqlx::PgPool;
+use weft_task_store::db::{Client as _, Pool};
 use weft_core::instance::InstanceId;
 
 /// One instance token to make.
@@ -81,50 +81,53 @@ impl MintRefused {
 /// its project is one of the owner's, in the same statement, so a token
 /// can never outlive a removal it raced (the removal revokes a project's
 /// instance tokens).
-pub async fn mint(pool: &PgPool, mint: &InstanceTokenMint<'_>) -> Result<MintedInstanceToken, MintRefused> {
+pub async fn mint(pool: &Pool, mint: &InstanceTokenMint<'_>) -> Result<MintedInstanceToken, MintRefused> {
     use weft_core::signal_token as names;
     let expires_at = names::expiry_at(mint.now_unix, mint.expires_in_secs).map_err(MintRefused::Expiry)?;
     let token = names::generate_token();
     let recognizer = names::recognizer(&token);
-    let written = sqlx::query(
-        "INSERT INTO signal_token \
-         (id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
-          allowed_displays, all_displays, created_at, instance_id, expires_at) \
-         SELECT $1, $2, $3, $4, $5, ARRAY[$6]::uuid[], $7, $8, $9, $10, $11, $12 \
-         WHERE EXISTS (SELECT 1 FROM project WHERE id = $6 AND tenant_id = $4) \
-         ON CONFLICT (id) DO UPDATE SET \
-             token_hash = EXCLUDED.token_hash, recognizer = EXCLUDED.recognizer, name = EXCLUDED.name, \
-             allowed_tags = EXCLUDED.allowed_tags, allowed_displays = EXCLUDED.allowed_displays, \
-             all_displays = EXCLUDED.all_displays, created_at = EXCLUDED.created_at, \
-             expires_at = EXCLUDED.expires_at \
-         WHERE signal_token.tenant_id = EXCLUDED.tenant_id \
-           AND signal_token.instance_id = EXCLUDED.instance_id \
-           AND signal_token.allowed_projects = EXCLUDED.allowed_projects",
-    )
-    .bind(mint.id)
-    .bind(names::token_hash(&token))
-    .bind(&recognizer)
-    .bind(mint.tenant)
-    .bind(mint.name)
-    .bind(mint.project)
-    .bind(mint.allowed_tags)
-    .bind(mint.allowed_displays)
-    .bind(mint.all_displays)
-    .bind(mint.now_unix as i64)
-    .bind(mint.instance.as_str())
-    .bind(expires_at as i64)
-    .execute(pool)
-    .await
-    .map_err(|e| MintRefused::Store(e.into()))?;
-    if written.rows_affected() == 1 {
+    // Each value is cast: a `$n` in the SELECT list of an INSERT has no
+    // type of its own to be prepared with.
+    let written = pool
+        .execute(
+            "INSERT INTO signal_token \
+             (id, token_hash, recognizer, tenant_id, name, allowed_projects, allowed_tags, \
+              allowed_displays, all_displays, created_at, instance_id, expires_at) \
+             SELECT $1::uuid, $2::text, $3::text, $4::text, $5::text, ARRAY[$6::uuid], $7::text[], $8::text[], $9::boolean, \
+                 $10::bigint, $11::text, $12::bigint \
+             WHERE EXISTS (SELECT 1 FROM project WHERE id = $6 AND tenant_id = $4) \
+             ON CONFLICT (id) DO UPDATE SET \
+                 token_hash = EXCLUDED.token_hash, recognizer = EXCLUDED.recognizer, name = EXCLUDED.name, \
+                 allowed_tags = EXCLUDED.allowed_tags, allowed_displays = EXCLUDED.allowed_displays, \
+                 all_displays = EXCLUDED.all_displays, created_at = EXCLUDED.created_at, \
+                 expires_at = EXCLUDED.expires_at \
+             WHERE signal_token.tenant_id = EXCLUDED.tenant_id \
+               AND signal_token.instance_id = EXCLUDED.instance_id \
+               AND signal_token.allowed_projects = EXCLUDED.allowed_projects",
+            &[
+                &mint.id,
+                &names::token_hash(&token),
+                &recognizer,
+                &mint.tenant,
+                &mint.name,
+                &mint.project,
+                &mint.allowed_tags,
+                &mint.allowed_displays,
+                &mint.all_displays,
+                &(mint.now_unix as i64),
+                &mint.instance.as_str(),
+                &(expires_at as i64),
+            ],
+        )
+        .await
+        .map_err(|e| MintRefused::Store(e.into()))?;
+    if written == 1 {
         return Ok(MintedInstanceToken { token, recognizer, created_at: mint.now_unix, expires_at });
     }
     // Nothing written: the project is not the owner's, or the id is
     // another token's. Told apart only now, off the hot path.
-    let owned: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM project WHERE id = $1 AND tenant_id = $2)")
-        .bind(mint.project)
-        .bind(mint.tenant)
-        .fetch_one(pool)
+    let owned: bool = pool
+        .scalar("SELECT EXISTS (SELECT 1 FROM project WHERE id = $1 AND tenant_id = $2)", &[&mint.project, &mint.tenant])
         .await
         .map_err(|e| MintRefused::Store(e.into()))?;
     Err(if owned { MintRefused::IdTaken(mint.id) } else { MintRefused::NoProject })
@@ -133,45 +136,39 @@ pub async fn mint(pool: &PgPool, mint: &InstanceTokenMint<'_>) -> Result<MintedI
 /// Revoke instance tokens of `instance` in `project_id`: the one `id`, or
 /// every one of them. Answers how many went.
 pub async fn revoke(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     project_id: uuid::Uuid,
     instance: &InstanceId,
     id: Option<uuid::Uuid>,
 ) -> anyhow::Result<u64> {
-    Ok(sqlx::query(
-        "DELETE FROM signal_token \
-         WHERE tenant_id = $1 AND instance_id = $2 AND allowed_projects = ARRAY[$3]::uuid[] \
-           AND ($4::uuid IS NULL OR id = $4)",
-    )
-    .bind(tenant)
-    .bind(instance.as_str())
-    .bind(project_id)
-    .bind(id)
-    .execute(pool)
-    .await?
-    .rows_affected())
+    Ok(pool
+        .execute(
+            "DELETE FROM signal_token \
+             WHERE tenant_id = $1 AND instance_id = $2 AND allowed_projects = ARRAY[$3::uuid] \
+               AND ($4::uuid IS NULL OR id = $4)",
+            &[&tenant, &instance.as_str(), &project_id, &id],
+        )
+        .await?)
 }
 
 /// How many instance tokens of `project_id` still work (not expired at
 /// `now_unix`), per instance, one entry per instance with at least one.
 pub async fn counts(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     project_id: uuid::Uuid,
     now_unix: i64,
 ) -> anyhow::Result<Vec<(InstanceId, u32)>> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT instance_id, count(*)::bigint FROM signal_token \
-         WHERE tenant_id = $1 AND instance_id IS NOT NULL AND allowed_projects = ARRAY[$2]::uuid[] \
-           AND expires_at > $3 \
-         GROUP BY instance_id ORDER BY instance_id",
-    )
-    .bind(tenant)
-    .bind(project_id)
-    .bind(now_unix)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(String, i64)> = pool
+        .all(
+            "SELECT instance_id, count(*)::bigint FROM signal_token \
+             WHERE tenant_id = $1 AND instance_id IS NOT NULL AND allowed_projects = ARRAY[$2::uuid] \
+               AND expires_at > $3 \
+             GROUP BY instance_id ORDER BY instance_id",
+            &[&tenant, &project_id, &now_unix],
+        )
+        .await?;
     rows.into_iter()
         .map(|(instance, n)| {
             let instance = InstanceId::new(instance).map_err(|e| anyhow::anyhow!("signal_token.instance_id: {e}"))?;

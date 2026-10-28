@@ -44,7 +44,7 @@ const IDLE_SWEEP: Duration = Duration::from_secs(30);
 /// (`weft_platform_local::bound_build_cache`).
 const BUILD_CACHE_BOUND: Duration = Duration::from_secs(6 * 3600);
 
-pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyhow::Result<Parts> {
+pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Pool>) -> anyhow::Result<Parts> {
     match &config.platform {
         PlatformConfig::Local(local) => {
             let pool = pool.context("a local install's process runs every role, so it holds the database")?;

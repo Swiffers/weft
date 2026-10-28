@@ -10,7 +10,7 @@ name = "elevenlabs"
 [dependencies]
 async-trait = "0.1"
 # The Image & Video API takes a small file inline, base64 in the JSON.
-base64 = "0.22"
+base64 = "0.23"
 serde_json = "1"
 tokio = "1"
 # The speech routes take their output format in the query string.

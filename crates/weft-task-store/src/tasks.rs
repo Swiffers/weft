@@ -20,9 +20,9 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::postgres::PgPool;
-use sqlx::Row;
 use uuid::Uuid;
+
+use crate::db::{Client, Pool, Row};
 
 /// How long a claim is valid before another process can steal it, at this
 /// install's pace (`weft_core::time_scale`): 60 seconds in real time.
@@ -264,21 +264,22 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
 /// Insert a new task. Returns the minted id, time-ordered (a node test's
 /// run is named after its task). Does NOT enforce dedup even if
 /// `spec.dedup_key` is set; use `enqueue_dedup` for that.
-pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
+pub async fn enqueue(pool: &Pool, spec: NewTask) -> Result<Uuid> {
     let id = Uuid::now_v7();
-    sqlx::query(
+    pool.execute(
         r#"INSERT INTO task (id, kind, status, project_id, dedup_key, run_id, tenant_id, payload, attempts, created_at_unix)
            VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, 0, $8)"#,
+        &[
+            &id,
+            &spec.kind.as_str(),
+            &spec.project_id,
+            &spec.dedup_key.as_deref(),
+            &spec.run_id,
+            &spec.tenant_id.as_str(),
+            &spec.payload,
+            &unix_now(),
+        ],
     )
-    .bind(id)
-    .bind(spec.kind.as_str())
-    .bind(spec.project_id)
-    .bind(spec.dedup_key.as_deref())
-    .bind(spec.run_id)
-    .bind(spec.tenant_id.as_str())
-    .bind(&spec.payload)
-    .bind(unix_now())
-    .execute(pool)
     .await?;
     crate::announce::committed(pool);
     Ok(id)
@@ -296,30 +297,33 @@ pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
 /// a unique-violation on the partial index instead of returning
 /// AlreadyLive. The whole of it is one statement (`weft_enqueue_dedup`),
 /// so on its own it is its own transaction: one round trip.
-pub async fn enqueue_dedup(pool: &PgPool, spec: NewTask) -> Result<DedupOutcome> {
-    let outcome = enqueue_dedup_in(&mut *pool.acquire().await?, spec).await?;
+pub async fn enqueue_dedup(pool: &Pool, spec: NewTask) -> Result<DedupOutcome> {
+    let outcome = enqueue_dedup_in(pool, spec).await?;
     crate::announce::committed(pool);
     Ok(outcome)
 }
 
-/// [`enqueue_dedup`] on a caller-owned connection: inside the caller's
-/// transaction, the insert commits with whatever else it writes, and the
-/// advisory lock lasts until it ends. The caller pokes the announcement
-/// flusher once it commits (`crate::announce::committed`).
-pub async fn enqueue_dedup_in(conn: &mut sqlx::PgConnection, spec: NewTask) -> Result<DedupOutcome> {
+/// [`enqueue_dedup`] through `db`: inside the caller's transaction, the
+/// insert commits with whatever else it writes, and the advisory lock
+/// lasts until it ends. The caller pokes the announcement flusher once it
+/// commits (`crate::announce::committed`).
+pub async fn enqueue_dedup_in(db: &impl Client, spec: NewTask) -> Result<DedupOutcome> {
     let dedup_key = spec.dedup_key.as_deref().ok_or_else(|| anyhow::anyhow!("enqueue_dedup requires dedup_key"))?;
-    let (id, inserted): (Uuid, bool) =
-        sqlx::query_as("SELECT task_id, inserted FROM weft_enqueue_dedup($1, $2, $3, $4, $5, $6, $7, $8)")
-            .bind(Uuid::now_v7())
-            .bind(spec.kind.as_str())
-            .bind(spec.project_id)
-            .bind(dedup_key)
-            .bind(spec.run_id)
-            .bind(spec.tenant_id.as_str())
-            .bind(&spec.payload)
-            .bind(unix_now())
-            .fetch_one(&mut *conn)
-            .await?;
+    let (id, inserted): (Uuid, bool) = db
+        .one(
+            "SELECT task_id, inserted FROM weft_enqueue_dedup($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                &Uuid::now_v7(),
+                &spec.kind.as_str(),
+                &spec.project_id,
+                &dedup_key,
+                &spec.run_id,
+                &spec.tenant_id.as_str(),
+                &spec.payload,
+                &unix_now(),
+            ],
+        )
+        .await?;
     Ok(if inserted { DedupOutcome::Inserted(id) } else { DedupOutcome::AlreadyLive(id) })
 }
 
@@ -344,34 +348,31 @@ pub enum Claim {
 /// same statement, only in that case, reads the earliest lapse of the
 /// claims out (a picker run dry knows when to look again) and prunes the
 /// finished tasks past their retention (`weft_prune_finished_tasks`).
-pub async fn claim_next(pool: &PgPool, replica: &str) -> Result<Claim> {
+pub async fn claim_next(pool: &Pool, replica: &str) -> Result<Claim> {
     let now = unix_now();
     // The lapse and the prune are evaluated only when the CASE reaches
     // them: never when a task was claimed. The prune deletes finished rows
     // only, which the pick never touches.
-    let row = sqlx::query(
-        r#"WITH picked AS (
-               UPDATE task
-               SET status = 'claimed', claimed_by = $1, claimed_until_unix = $3, attempts = attempts + 1
-               WHERE id = (SELECT id FROM task
-                           WHERE status = 'pending' OR (status = 'claimed' AND claimed_until_unix < $2)
-                           ORDER BY created_at_unix ASC
-                           FOR UPDATE SKIP LOCKED
-                           LIMIT 1)
-               RETURNING id, kind, status, project_id, run_id, tenant_id, attempts, payload)
-           SELECT p.*,
-                  CASE WHEN p.id IS NULL
-                       THEN (SELECT MIN(claimed_until_unix) FROM task WHERE status = 'claimed') END AS next_lapse,
-                  CASE WHEN p.id IS NULL THEN weft_prune_finished_tasks($4) END AS pruned
-           FROM (SELECT 1) AS one LEFT JOIN picked p ON TRUE"#,
-    )
-    .bind(replica)
-    .bind(now)
-    .bind(now + claim_duration_secs())
-    .bind(now - TERMINAL_RETENTION_SECS)
-    .fetch_one(pool)
-    .await?;
-    if row.try_get::<Option<Uuid>, _>("id")?.is_none() {
+    let row: Row = pool
+        .one(
+            r#"WITH picked AS (
+                   UPDATE task
+                   SET status = 'claimed', claimed_by = $1, claimed_until_unix = $3, attempts = attempts + 1
+                   WHERE id = (SELECT id FROM task
+                               WHERE status = 'pending' OR (status = 'claimed' AND claimed_until_unix < $2)
+                               ORDER BY created_at_unix ASC
+                               FOR UPDATE SKIP LOCKED
+                               LIMIT 1)
+                   RETURNING id, kind, status, project_id, run_id, tenant_id, attempts, payload)
+               SELECT p.*,
+                      CASE WHEN p.id IS NULL
+                           THEN (SELECT MIN(claimed_until_unix) FROM task WHERE status = 'claimed') END AS next_lapse,
+                      CASE WHEN p.id IS NULL THEN weft_prune_finished_tasks($4) END AS pruned
+               FROM (SELECT 1) AS one LEFT JOIN picked p ON TRUE"#,
+            &[&replica, &now, &(now + claim_duration_secs()), &(now - TERMINAL_RETENTION_SECS)],
+        )
+        .await?;
+    if row.try_get::<_, Option<Uuid>>("id")?.is_none() {
         let pruned: Option<i32> = row.try_get("pruned")?;
         if let Some(pruned) = pruned.filter(|pruned| *pruned > 0) {
             tracing::info!(target: "weft_task_store::tasks", pruned, "pruned finished tasks past their retention");
@@ -385,19 +386,17 @@ pub async fn claim_next(pool: &PgPool, replica: &str) -> Result<Claim> {
 /// belongs to us (lease lost, manually transitioned, deleted).
 /// The caller should abandon work and let the next claim recover. A
 /// claim resting on a run ([`rest_claim`]) stays resting.
-pub async fn heartbeat(pool: &PgPool, task_id: Uuid, replica: &str) -> Result<bool> {
+pub async fn heartbeat(pool: &Pool, task_id: Uuid, replica: &str) -> Result<bool> {
     let claim_until = unix_now() + claim_duration_secs();
-    let rows = sqlx::query(
-        r#"UPDATE task
-           SET claimed_until_unix = CASE WHEN claim_rests_on IS NULL THEN $1 END
-           WHERE id = $2 AND claimed_by = $3 AND status = 'claimed'"#,
-    )
-    .bind(claim_until)
-    .bind(task_id)
-    .bind(replica)
-    .execute(pool)
-    .await?;
-    Ok(rows.rows_affected() > 0)
+    let rows = pool
+        .execute(
+            r#"UPDATE task
+               SET claimed_until_unix = CASE WHEN claim_rests_on IS NULL THEN $1::bigint END
+               WHERE id = $2 AND claimed_by = $3 AND status = 'claimed'"#,
+            &[&claim_until, &task_id, &replica],
+        )
+        .await?;
+    Ok(rows > 0)
 }
 
 /// Let the claim rest on `run`, a run the task waits on that may wait for
@@ -405,33 +404,29 @@ pub async fn heartbeat(pool: &PgPool, task_id: Uuid, replica: &str) -> Result<bo
 /// (`claimed_until_unix` is empty). Whoever watches that run hands the
 /// task back once it ended and nobody resumed the claim
 /// (`weft_dispatcher::lapses`). False when the row is no longer ours.
-pub async fn rest_claim(pool: &PgPool, task_id: Uuid, replica: &str, run: weft_core::RunId) -> Result<bool> {
-    let rows = sqlx::query(
-        r#"UPDATE task SET claimed_until_unix = NULL, claim_rests_on = $3
-           WHERE id = $1 AND claimed_by = $2 AND status = 'claimed'"#,
-    )
-    .bind(task_id)
-    .bind(replica)
-    .bind(run)
-    .execute(pool)
-    .await?;
-    Ok(rows.rows_affected() > 0)
+pub async fn rest_claim(pool: &Pool, task_id: Uuid, replica: &str, run: weft_core::RunId) -> Result<bool> {
+    let rows = pool
+        .execute(
+            r#"UPDATE task SET claimed_until_unix = NULL, claim_rests_on = $3
+               WHERE id = $1 AND claimed_by = $2 AND status = 'claimed'"#,
+            &[&task_id, &replica, &run],
+        )
+        .await?;
+    Ok(rows > 0)
 }
 
 /// Take a resting claim ([`rest_claim`]) back to a lease renewed by its
 /// claimant. False when the row is no longer ours (it was handed back
 /// meanwhile).
-pub async fn resume_claim(pool: &PgPool, task_id: Uuid, replica: &str) -> Result<bool> {
-    let rows = sqlx::query(
-        r#"UPDATE task SET claimed_until_unix = $3, claim_rests_on = NULL
-           WHERE id = $1 AND claimed_by = $2 AND status = 'claimed'"#,
-    )
-    .bind(task_id)
-    .bind(replica)
-    .bind(unix_now() + claim_duration_secs())
-    .execute(pool)
-    .await?;
-    Ok(rows.rows_affected() > 0)
+pub async fn resume_claim(pool: &Pool, task_id: Uuid, replica: &str) -> Result<bool> {
+    let rows = pool
+        .execute(
+            r#"UPDATE task SET claimed_until_unix = $3, claim_rests_on = NULL
+               WHERE id = $1 AND claimed_by = $2 AND status = 'claimed'"#,
+            &[&task_id, &replica, &(unix_now() + claim_duration_secs())],
+        )
+        .await?;
+    Ok(rows > 0)
 }
 
 /// Surrender a claim the process can no longer hold (it cannot renew
@@ -441,17 +436,16 @@ pub async fn resume_claim(pool: &PgPool, task_id: Uuid, replica: &str) -> Result
 /// a thief that already re-claimed the row is never clobbered; answers
 /// false then (the thief owns the task) and true when the surrender
 /// landed.
-pub async fn surrender(pool: &PgPool, task_id: Uuid, replica: &str) -> Result<bool> {
-    let surrendered = sqlx::query(
-        r#"UPDATE task SET status = 'pending', claimed_by = NULL, claimed_until_unix = NULL
-           WHERE id = $1 AND claimed_by = $2 AND status = 'claimed'"#,
-    )
-    .bind(task_id)
-    .bind(replica)
-    .execute(pool)
-    .await?;
+pub async fn surrender(pool: &Pool, task_id: Uuid, replica: &str) -> Result<bool> {
+    let surrendered = pool
+        .execute(
+            r#"UPDATE task SET status = 'pending', claimed_by = NULL, claimed_until_unix = NULL
+               WHERE id = $1 AND claimed_by = $2 AND status = 'claimed'"#,
+            &[&task_id, &replica],
+        )
+        .await?;
     crate::announce::committed(pool);
-    Ok(surrendered.rows_affected() > 0)
+    Ok(surrendered > 0)
 }
 
 /// Record a partial result on a still-claimed row WITHOUT completing
@@ -462,22 +456,20 @@ pub async fn surrender(pool: &PgPool, task_id: Uuid, replica: &str) -> Result<bo
 /// fails loudly so the caller never believes an unrecorded result is
 /// durable.
 pub async fn store_result_partial(
-    pool: &PgPool,
+    pool: &Pool,
     task_id: Uuid,
     replica: &str,
     result: &Value,
 ) -> Result<()> {
-    let updated = sqlx::query(
-        r#"UPDATE task
-           SET result = $1
-           WHERE id = $2 AND claimed_by = $3 AND status = 'claimed'"#,
-    )
-    .bind(result)
-    .bind(task_id)
-    .bind(replica)
-    .execute(pool)
-    .await?;
-    if updated.rows_affected() == 0 {
+    let updated = pool
+        .execute(
+            r#"UPDATE task
+               SET result = $1
+               WHERE id = $2 AND claimed_by = $3 AND status = 'claimed'"#,
+            &[result, &task_id, &replica],
+        )
+        .await?;
+    if updated == 0 {
         anyhow::bail!(
             "store_result_partial: task {task_id} no longer claimed by {replica}; \
              the result was NOT recorded"
@@ -490,13 +482,9 @@ pub async fn store_result_partial(
 /// none. Reads whatever `store_result_partial` or `complete` wrote;
 /// the row outlives claims (only pruning deletes
 /// it), so a re-claim reads a prior claim's recorded outcome here.
-pub async fn stored_result(pool: &PgPool, task_id: Uuid) -> Result<Option<Value>> {
-    let row: Option<(Option<Value>,)> =
-        sqlx::query_as("SELECT result FROM task WHERE id = $1")
-            .bind(task_id)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.and_then(|(r,)| r))
+pub async fn stored_result(pool: &Pool, task_id: Uuid) -> Result<Option<Value>> {
+    let result: Option<Option<Value>> = pool.scalar_opt("SELECT result FROM task WHERE id = $1", &[&task_id]).await?;
+    Ok(result.flatten())
 }
 
 /// `update` (an `UPDATE task ... ` that makes rows terminal) wrapped so
@@ -514,21 +502,20 @@ fn notify_terminal(update: &str) -> String {
 /// Mark a claim complete with a result payload. Bails if the row
 /// no longer belongs to us so callers can react to lost claims.
 pub async fn complete(
-    pool: &PgPool,
+    pool: &Pool,
     task_id: Uuid,
     replica: &str,
     result: Value,
 ) -> Result<()> {
-    let updated = sqlx::query(&notify_terminal(
-        "UPDATE task SET status = 'complete', completed_at_unix = $2, claimed_until_unix = NULL, result = $1 \
-         WHERE id = $3 AND claimed_by = $4 AND status = 'claimed'",
-    ))
-    .bind(&result)
-    .bind(unix_now())
-    .bind(task_id)
-    .bind(replica)
-    .fetch_all(pool)
-    .await?;
+    let updated = pool
+        .query(
+            &notify_terminal(
+                "UPDATE task SET status = 'complete', completed_at_unix = $2, claimed_until_unix = NULL, result = $1 \
+                 WHERE id = $3 AND claimed_by = $4 AND status = 'claimed'",
+            ),
+            &[&result, &unix_now(), &task_id, &replica],
+        )
+        .await?;
     crate::announce::committed(pool);
     if updated.is_empty() {
         anyhow::bail!("complete: task {task_id} no longer claimed by {replica}");
@@ -540,17 +527,17 @@ pub async fn complete(
 /// terminal for work that can no longer run at all. Returns false if the
 /// task moved on (claimed / completed) in the meantime: someone IS
 /// handling it, so the caller backs off.
-pub async fn fail_pending(pool: &PgPool, task_id: Uuid, error: &str) -> Result<bool> {
-    let updated = sqlx::query(&notify_terminal(
-        r#"UPDATE task
-           SET status = 'failed', error = $1, completed_at_unix = $2
-           WHERE id = $3 AND status = 'pending'"#,
-    ))
-    .bind(error)
-    .bind(unix_now())
-    .bind(task_id)
-    .fetch_all(pool)
-    .await?;
+pub async fn fail_pending(pool: &Pool, task_id: Uuid, error: &str) -> Result<bool> {
+    let updated = pool
+        .query(
+            &notify_terminal(
+                r#"UPDATE task
+                   SET status = 'failed', error = $1, completed_at_unix = $2
+                   WHERE id = $3 AND status = 'pending'"#,
+            ),
+            &[&error, &unix_now(), &task_id],
+        )
+        .await?;
     crate::announce::committed(pool);
     Ok(!updated.is_empty())
 }
@@ -559,21 +546,20 @@ pub async fn fail_pending(pool: &PgPool, task_id: Uuid, error: &str) -> Result<b
 /// `complete`. Does not auto-retry; producers re-enqueue with their
 /// own backoff policy.
 pub async fn fail(
-    pool: &PgPool,
+    pool: &Pool,
     task_id: Uuid,
     replica: &str,
     error: String,
 ) -> Result<()> {
-    let updated = sqlx::query(&notify_terminal(
-        "UPDATE task SET status = 'failed', completed_at_unix = $2, claimed_until_unix = NULL, error = $1 \
-         WHERE id = $3 AND claimed_by = $4 AND status = 'claimed'",
-    ))
-    .bind(&error)
-    .bind(unix_now())
-    .bind(task_id)
-    .bind(replica)
-    .fetch_all(pool)
-    .await?;
+    let updated = pool
+        .query(
+            &notify_terminal(
+                "UPDATE task SET status = 'failed', completed_at_unix = $2, claimed_until_unix = NULL, error = $1 \
+                 WHERE id = $3 AND claimed_by = $4 AND status = 'claimed'",
+            ),
+            &[&error, &unix_now(), &task_id, &replica],
+        )
+        .await?;
     crate::announce::committed(pool);
     if updated.is_empty() {
         anyhow::bail!("fail: task {task_id} no longer claimed by {replica}");
@@ -583,14 +569,14 @@ pub async fn fail(
 
 /// Say where task `task_id` is now, for whoever follows it ([`progress`]):
 /// its kind's own shape, replacing what it said before.
-pub async fn set_progress(pool: &PgPool, task_id: Uuid, progress: &Value) -> Result<()> {
-    sqlx::query("UPDATE task SET progress = $1 WHERE id = $2").bind(progress).bind(task_id).execute(pool).await?;
+pub async fn set_progress(pool: &Pool, task_id: Uuid, progress: &Value) -> Result<()> {
+    pool.execute("UPDATE task SET progress = $1 WHERE id = $2", &[progress, &task_id]).await?;
     Ok(())
 }
 
 /// Where task `task_id` last said it is ([`set_progress`]), when it said.
-pub async fn progress(pool: &PgPool, task_id: Uuid) -> Result<Option<Value>> {
-    Ok(sqlx::query_scalar::<_, Option<Value>>("SELECT progress FROM task WHERE id = $1").bind(task_id).fetch_optional(pool).await?.flatten())
+pub async fn progress(pool: &Pool, task_id: Uuid) -> Result<Option<Value>> {
+    Ok(pool.scalar_opt::<Option<Value>>("SELECT progress FROM task WHERE id = $1", &[&task_id]).await?.flatten())
 }
 
 /// Outcome of `wait_for_terminal`. The dispatcher's task executor
@@ -606,7 +592,7 @@ pub struct TaskOutcome {
 /// outcome without leaking another project's tasks (ownership
 /// enforced in the query, not by the caller remembering to check).
 pub async fn peek_for_project(
-    pool: &PgPool,
+    pool: &Pool,
     task_id: Uuid,
     project_id: Uuid,
 ) -> Result<Option<TaskOutcome>> {
@@ -614,35 +600,34 @@ pub async fn peek_for_project(
     // result stored mid-claim (see `store_result_partial`) is an
     // internal re-claim handle, never a public outcome, so a poller
     // can treat "result present" as "done" without checking status.
-    let row = sqlx::query(
-        "SELECT status,
-                CASE WHEN status IN ('complete', 'failed') THEN result END AS result,
-                error
-         FROM task WHERE id = $1 AND project_id = $2",
-    )
-    .bind(task_id)
-    .bind(project_id)
-    .fetch_optional(pool)
-    .await?;
+    let row = pool
+        .opt(
+            "SELECT status,
+                    CASE WHEN status IN ('complete', 'failed') THEN result END AS result,
+                    error
+             FROM task WHERE id = $1 AND project_id = $2",
+            &[&task_id, &project_id],
+        )
+        .await?;
     row.map(row_to_outcome).transpose()
 }
 
-pub(crate) async fn peek(pool: &PgPool, task_id: Uuid) -> Result<Option<TaskOutcome>> {
+pub(crate) async fn peek(pool: &Pool, task_id: Uuid) -> Result<Option<TaskOutcome>> {
     // Same terminal-only `result` rule as `peek_for_project`: a
     // mid-claim partial result never leaves the store as an outcome.
-    let row = sqlx::query(
-        "SELECT status,
-                CASE WHEN status IN ('complete', 'failed') THEN result END AS result,
-                error
-         FROM task WHERE id = $1",
-    )
-    .bind(task_id)
-    .fetch_optional(pool)
-    .await?;
+    let row = pool
+        .opt(
+            "SELECT status,
+                    CASE WHEN status IN ('complete', 'failed') THEN result END AS result,
+                    error
+             FROM task WHERE id = $1",
+            &[&task_id],
+        )
+        .await?;
     row.map(row_to_outcome).transpose()
 }
 
-fn row_to_outcome(row: sqlx::postgres::PgRow) -> Result<TaskOutcome> {
+fn row_to_outcome(row: Row) -> Result<TaskOutcome> {
     let status_str: String = row.try_get("status")?;
     let status = TaskStatus::parse(&status_str).ok_or_else(|| anyhow::anyhow!("bad status {status_str}"))?;
     Ok(TaskOutcome { status, result: row.try_get("result")?, error: row.try_get("error")? })
@@ -654,7 +639,7 @@ fn row_to_outcome(row: sqlx::postgres::PgRow) -> Result<TaskOutcome> {
 /// `project_id`/`tenant_id` (which would misroute work). The
 /// nullable columns are typed `Option<_>`, so a real NULL is `None`
 /// while a type mismatch is an `Err`.
-fn row_to_task(row: sqlx::postgres::PgRow) -> Result<Task> {
+fn row_to_task(row: Row) -> Result<Task> {
     let status_str: String = row.try_get("status")?;
     let status = TaskStatus::parse(&status_str)
         .ok_or_else(|| anyhow::anyhow!("unknown task status '{status_str}'"))?;

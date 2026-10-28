@@ -7,7 +7,7 @@ use crate::support;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use sqlx::PgPool;
+use weft_task_store::db::Pool;
 
 use weft_task_store::tasks;
 use weft_task_store::{PostgresTaskStoreClient, TaskStatus, TaskStoreClient};
@@ -33,8 +33,8 @@ fn task(dedup: &str) -> tasks::NewTask {
 /// notification the wait would run to its 30s timeout. Anything well
 /// short of that (the bound leaves room for a loaded machine) is the
 /// notification waking it.
-#[sqlx::test]
-async fn a_wait_ends_the_moment_the_task_completes(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_wait_ends_the_moment_the_task_completes(pool: Pool) {
     setup(&pool).await;
     let client = PostgresTaskStoreClient::new(pool.clone(), signals(&pool).await).expect("client");
     let id = tasks::enqueue(&pool, task("complete")).await.expect("enqueue");
@@ -59,8 +59,8 @@ async fn a_wait_ends_the_moment_the_task_completes(pool: PgPool) {
 
 /// A failed task wakes its waiter the same way, and so does failing a
 /// task nobody ever claimed.
-#[sqlx::test]
-async fn a_wait_ends_the_moment_the_task_fails(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_wait_ends_the_moment_the_task_fails(pool: Pool) {
     setup(&pool).await;
     let client = PostgresTaskStoreClient::new(pool.clone(), signals(&pool).await).expect("client");
     let claimed = tasks::enqueue(&pool, task("fail")).await.expect("enqueue");
@@ -93,8 +93,8 @@ async fn a_wait_ends_the_moment_the_task_fails(pool: PgPool) {
 
 /// A task that is already done answers at once, and one that never
 /// finishes answers when the timeout passes, with its live status.
-#[sqlx::test]
-async fn a_done_task_answers_at_once_and_an_unfinished_one_at_the_timeout(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_done_task_answers_at_once_and_an_unfinished_one_at_the_timeout(pool: Pool) {
     setup(&pool).await;
     let client = PostgresTaskStoreClient::new(pool.clone(), signals(&pool).await).expect("client");
     let done = tasks::enqueue(&pool, task("done")).await.expect("enqueue");
@@ -112,8 +112,8 @@ async fn a_done_task_answers_at_once_and_an_unfinished_one_at_the_timeout(pool: 
 /// The project-scoped wait reads only its own project's task: another
 /// project's asking finds nothing at once, and the owner's wait ends when
 /// the task does.
-#[sqlx::test]
-async fn a_project_scoped_wait_sees_only_its_own_projects_task(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_project_scoped_wait_sees_only_its_own_projects_task(pool: Pool) {
     use weft_task_store::terminal::wait_for_terminal_in_project;
     setup(&pool).await;
     let watch = signals(&pool).await;

@@ -29,7 +29,9 @@
 //!       implementation (re)compiles the worker.
 //!     - worker build environment: the worker crate closure
 //!       (`codegen::worker_workspace_crates`: the workspace crates a
-//!       worker actually links), `Cargo.toml`, `Cargo.lock`,
+//!       worker actually links, less what a crate leaves out of workers,
+//!       like the database's migration history:
+//!       `build::worker_crate_entries`), `Cargo.toml`, `Cargo.lock`,
 //!       `rust-toolchain.toml`, and for a worker image the builder-base
 //!       Dockerfile and its scripts. Any engine or toolchain change
 //!       invalidates every project's worker, a builder-base change every
@@ -160,9 +162,16 @@ mod fs_hashes {
                     return Ok(hash.clone());
                 }
             }
-            let file = std::fs::File::open(path).with_context(|| format!("read {} for hashing", path.display()))?;
+            let mut file = std::fs::File::open(path).with_context(|| format!("read {} for hashing", path.display()))?;
             let mut hasher = Sha256::new();
-            std::io::copy(&mut std::io::BufReader::new(file), &mut hasher).with_context(|| format!("read {} for hashing", path.display()))?;
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                let read = std::io::Read::read(&mut file, &mut chunk).with_context(|| format!("read {} for hashing", path.display()))?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&chunk[..read]);
+            }
             Ok(hex(&hasher.finalize()))
         }
     }
@@ -199,8 +208,10 @@ mod fs_hashes {
             .map_err(|e| anyhow::anyhow!("worker crate closure: {e}"))?;
         for name in &closure {
             // Same enumerator as the stager (`stage_worker_workspace`):
-            // hashed bytes and staged bytes must stay equal, and the
-            // crate-root `tests/` dir never reaches a worker build.
+            // hashed bytes and staged bytes must stay equal, and neither the
+            // crate-root `tests/` dir nor what a crate lists as left out of
+            // workers (weft-task-store's `migrations/`) reaches a worker
+            // build.
             let entries =
                 crate::build::worker_crate_entries(&weft_root.join("crates").join(name))
                     .map_err(|e| anyhow::anyhow!("enumerate crate {name}: {e}"))?;
@@ -247,7 +258,7 @@ mod fs_hashes {
         // and files the slice copies, and `build::write_once` never rewrites a
         // slice already there, so without the bump every machine keeps the
         // slice the old code wrote.
-        hasher.update(b"weft-worker-workspace-v1\n");
+        hasher.update(b"weft-worker-workspace-v2\n");
         hash_worker_workspace(&mut hasher, weft_root)?;
         Ok(hex(&hasher.finalize()).chars().take(16).collect())
     }
@@ -1013,6 +1024,57 @@ mod fs_hashes {
             assert_ne!(host_stock, image_stock);
             let other_base = weft_core::builds::WorkerPackaging::Image { builder: "elsewhere/weft-builder-base:c".into() };
             assert_eq!(compute_stock_binary_hash(root, &other_base).unwrap(), image_stock, "the base's sources name it, not its ref");
+        }
+
+        /// The database's migration history is no part of a worker: a new
+        /// file under a crate's `left_out_of_workers` folder moves neither the
+        /// worker's name nor what its build is given, while an edit to a
+        /// source file of the same crate moves the name. A listed folder the
+        /// crate does not hold is refused.
+        #[test]
+        fn a_migration_names_no_new_worker_and_a_source_edit_does() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[workspace]\nmembers = []\n\n[workspace.dependencies]\nweft-task-store = { path = \"crates/weft-task-store\" }\n",
+            )
+            .unwrap();
+            std::fs::write(root.join("Cargo.lock"), "version = 4\n").unwrap();
+            for name in ["weft-engine", "weft-core", "weft-broker-client", "weft-task-store"] {
+                let dir = root.join("crates").join(name);
+                std::fs::create_dir_all(dir.join("src")).unwrap();
+                let deps = if name == "weft-engine" { "\n[dependencies]\nweft-task-store = { workspace = true }\n" } else { "" };
+                let metadata = if name == "weft-task-store" {
+                    "\n[package.metadata.weft]\nleft_out_of_workers = [\"migrations\"]\n"
+                } else {
+                    ""
+                };
+                std::fs::write(dir.join("Cargo.toml"), format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n{deps}{metadata}")).unwrap();
+                std::fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+            }
+            let store = root.join("crates/weft-task-store");
+            std::fs::create_dir_all(store.join("migrations/task")).unwrap();
+            std::fs::write(store.join("migrations/task/origin.sql"), "CREATE TABLE task ();\n").unwrap();
+
+            let staged = |at: &str| {
+                let dest = temp.path().join(at);
+                crate::build::stage_worker_workspace(root, &dest).unwrap();
+                dest.join("crates/weft-task-store")
+            };
+            let before = compute_worker_workspace_key(root).unwrap();
+            assert!(!staged("staged-before").join("migrations").exists(), "the history is not given to a worker build");
+
+            std::fs::write(store.join("migrations/task/20990101T000000_task_more.sql"), "ALTER TABLE task ADD x INT;\n").unwrap();
+            assert_eq!(compute_worker_workspace_key(root).unwrap(), before, "a migration names no new worker");
+
+            std::fs::write(store.join("src/lib.rs"), "pub fn f() { let _ = 1; }\n").unwrap();
+            assert_ne!(compute_worker_workspace_key(root).unwrap(), before, "a source edit does");
+            assert!(staged("staged-after").join("src/lib.rs").is_file());
+
+            std::fs::remove_dir_all(store.join("migrations")).unwrap();
+            let refused = compute_worker_workspace_key(root).unwrap_err().to_string();
+            assert!(refused.contains("left_out_of_workers names 'migrations'"), "{refused}");
         }
 
         #[test]

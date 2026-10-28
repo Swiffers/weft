@@ -410,7 +410,7 @@ async fn poll_once(
             // the fire path. A run's wait is answered by the first fire
             // that went out; one that did not keeps it polling.
             let kept = is_resume.then(|| last_answer_of(&body));
-            let answer = super::event_source::coerce_text_payload(body);
+            let answer = super::event_source::coerce_text_payload(&body);
             let carried = weft_core::signal::poll_endpoint::carried(&answer, &poll.carry);
             let outcome = ctx.fire.fire_judged(&answer, carried, "poll_endpoint").await;
             if outcome == crate::event_context::FireOutcome::UnknownSignal {

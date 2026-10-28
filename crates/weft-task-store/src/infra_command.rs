@@ -30,11 +30,7 @@ pub fn look_payload(project: uuid::Uuid) -> String {
 /// Ask the supervisor to look at `project`'s infra: announce it, which
 /// wakes a supervisor that scales to zero. Inside a transaction, the
 /// notice goes out as it commits.
-pub async fn ask_for_look<'e>(executor: impl sqlx::PgExecutor<'e>, project: uuid::Uuid) -> sqlx::Result<()> {
-    sqlx::query("SELECT pg_notify($1, $2)")
-        .bind(INFRA_COMMAND_CHANNEL)
-        .bind(look_payload(project))
-        .execute(executor)
-        .await?;
+pub async fn ask_for_look(db: &impl crate::db::Client, project: uuid::Uuid) -> crate::db::Result<()> {
+    db.execute("SELECT pg_notify($1, $2)", &[&INFRA_COMMAND_CHANNEL, &look_payload(project)]).await?;
     Ok(())
 }

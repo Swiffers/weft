@@ -19,9 +19,9 @@
 
 use std::sync::Arc;
 
-use sqlx::PgPool;
 use weft_platform_traits::config::InternetAddress;
 
+use crate::db::{Client as _, Pool};
 use crate::held_copy::{Changed, HeldCopy};
 use crate::pg_signal::PgSignalWatch;
 
@@ -39,26 +39,26 @@ pub struct InstallAddress {
     internet: InternetAddress,
     /// The install domain whose certificate is issued, as `https://<name>`.
     domain: Arc<HeldCopy<(), Option<String>>>,
-    pool: PgPool,
+    pool: Pool,
     http: reqwest::Client,
 }
 
 impl InstallAddress {
     /// One following the domain rows on `signals`, which must listen on
     /// [`DOMAINS_CHANNEL`].
-    pub fn follow(pool: PgPool, signals: &PgSignalWatch, service: &str, internet: InternetAddress) -> anyhow::Result<Self> {
+    pub fn follow(pool: Pool, signals: &PgSignalWatch, service: &str, internet: InternetAddress) -> anyhow::Result<Self> {
         let domain = HeldCopy::follow(signals, DOMAINS_CHANNEL, 1, |_| Changed::Everything, |_| true)?;
         Ok(Self::with_copy(pool, domain, service, internet))
     }
 
     /// One that reads the rows every time: a process with nothing to tell
     /// it about changes (a test, a tool).
-    pub fn unfollowed(pool: PgPool, service: &str, internet: InternetAddress) -> Self {
+    pub fn unfollowed(pool: Pool, service: &str, internet: InternetAddress) -> Self {
         Self::with_copy(pool, HeldCopy::unfollowed(1, |_| true), service, internet)
     }
 
-    fn with_copy(pool: PgPool, domain: Arc<HeldCopy<(), Option<String>>>, service: &str, internet: InternetAddress) -> Self {
-        Self { service: service.trim_end_matches('/').to_string(), internet, domain, pool, http: reqwest::Client::new() }
+    fn with_copy(pool: Pool, domain: Arc<HeldCopy<(), Option<String>>>, service: &str, internet: InternetAddress) -> Self {
+        Self { service: service.trim_end_matches('/').to_string(), internet, domain, pool, http: weft_core::net::http_client().build().expect("reqwest client") }
     }
 
     /// The platform's own address, which always answers: what the config
@@ -143,12 +143,13 @@ fn host_of(url: &str) -> Option<String> {
 /// The install domain whose certificate is issued, the first added when
 /// there are several.
 // SYNC: the columns <-> crates/weft-dispatcher/src/domains.rs (GROUP's install_domain)
-async fn live_install_domain(pool: &PgPool) -> anyhow::Result<Option<String>> {
-    let name: Option<String> = sqlx::query_scalar(
-        "SELECT name FROM install_domain WHERE serves = 'install' AND certificate = 'issued' ORDER BY added_unix, name LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
+async fn live_install_domain(pool: &Pool) -> anyhow::Result<Option<String>> {
+    let name: Option<String> = pool
+        .scalar_opt(
+            "SELECT name FROM install_domain WHERE serves = 'install' AND certificate = 'issued' ORDER BY added_unix, name LIMIT 1",
+            &[],
+        )
+        .await
     .map_err(|e| anyhow::Error::from(e).context("read the install's domain"))?;
     Ok(name.map(|name| format!("https://{name}")))
 }

@@ -16,6 +16,11 @@
 //!      did, or counts its failure (or its running past the rule's
 //!      timeout) against the rules and tries again.
 //!
+//! A restart of a unit's containers the host reports (one ran out of
+//! memory, or exited, and was brought back) rides along: written onto
+//! the unit's row with its status the first time a look sees it
+//! (`health_engine::restart_to_record`), for `weft status` to tell.
+//!
 //! Everything a look decides lives in the database, never in this
 //! process: a unit's latch and the window it is in on its row
 //! (`UnitRuntime`), whether each rule fired on each copy and how its
@@ -44,7 +49,7 @@ use weft_broker_client::protocol::{
 use weft_core::infra::health::{HealthAction, UnitReading};
 
 use crate::health_engine::{
-    next_fire, observe_unit, rearm, CopyView, NodeEdgeEvent, NodeHealthState, NodeObservation, RuleInputs, RuleOn,
+    next_fire, observe_unit, rearm, restart_to_record, CopyView, NodeEdgeEvent, NodeHealthState, NodeObservation, RuleInputs, RuleOn,
 };
 use crate::SupervisorState;
 
@@ -322,12 +327,12 @@ async fn tick_project(
     // copy, not the node, is the key: a node that exists once
     // per instance runs one copy for each, and one
     // instance's broken copy says nothing about another's.
-    let seen: HashMap<(String, String), weft_platform_traits::UnitRunState> = state
+    let seen: HashMap<(String, String), weft_platform_traits::UnitObservation> = state
         .host
         .observe(&project.tenant_id, project.project_id)
         .await?
         .into_iter()
-        .map(|o| ((o.copy_id, o.unit), o.state))
+        .map(|o| ((o.copy_id.clone(), o.unit.clone()), o))
         .collect();
 
     // ONLY units whose status implies "should be running right now"
@@ -359,8 +364,12 @@ async fn tick_project(
         }
         let mut units: Vec<UnitReading> = Vec::new();
         for (unit, unit_rt) in n.units.iter().filter(|(_, rt)| rt.status.expects_running_units()) {
-            let reading = seen.get(&(n.copy_id.clone(), unit.clone()));
+            let observation = seen.get(&(n.copy_id.clone(), unit.clone()));
+            let reading = observation.map(|o| &o.state);
             let observed = reading.map(|s| NodeObservation { ready: *s == weft_platform_traits::UnitRunState::Ready });
+            // A restart of its containers the row does not hold yet,
+            // written once with the unit (`weft status` tells it).
+            let restart = restart_to_record(observation.and_then(|o| o.restart.as_ref()), unit_rt.last_restart.as_ref());
             let prior = NodeHealthState::of(unit_rt);
             let Some(decision) = observe_unit(
                 prior.clone(),
@@ -398,7 +407,7 @@ async fn tick_project(
                 };
                 state.broker.event_record(project.project_id, Some(&n.node_id), n.instance.as_ref(), infra_event).await?;
             }
-            if unit_rt.status != decision.desired_status || prior != decision.next {
+            if unit_rt.status != decision.desired_status || prior != decision.next || restart.is_some() {
                 // Fenced on ownership, on no command reaching the copy and
                 // on the unit still being in the roster: a stale outcome
                 // means one of those moved since this look read them, and
@@ -414,6 +423,7 @@ async fn tick_project(
                         decision.desired_status,
                         decision.next.not_ready_since_unix,
                         decision.next.ready_since_unix,
+                        restart.as_ref(),
                     )
                     .await?;
                 if !outcome.is_applied() {

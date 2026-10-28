@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use sqlx::PgPool;
+use weft_task_store::db::{Client, Pool};
 use weft_core::run_settings::{KeepFor, Keeping, RunSettings};
 use weft_dispatcher::store::{Lost, RunStore};
 use weft_journal::frame::{Batch, BatchHead, RunHead};
@@ -21,16 +21,13 @@ const TENANT: &str = "t1";
 
 /// The schema, and the project the runs are born in: a birth for a
 /// project that is not there is refused.
-async fn schema(pool: &PgPool) {
+async fn schema(pool: &Pool) {
     weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
-    sqlx::query(
+    pool.execute(
         "INSERT INTO project (id, name, tenant_id, status, project_json, updated_at, project_json_version, resync_version, running_build_inputs_version) \
          VALUES ($1, 'p', $2, 'inactive', '{}', 0, $3, 1, 1)",
+        &[&PROJECT, &TENANT, &weft_core::ProjectDefinition::STORED.version()],
     )
-    .bind(PROJECT)
-    .bind(TENANT)
-    .bind(weft_core::ProjectDefinition::STORED.version())
-    .execute(pool)
     .await
     .expect("project row");
 }
@@ -97,23 +94,23 @@ fn part(run_id: weft_core::RunId, epoch: i32, first_seq: i32, rows: Vec<Vec<RunE
 
 /// Write `parts` as one batch of `writer`'s lane `lane`, the way the broker
 /// writes what a lane sent; each run's fate, in order.
-async fn send(pool: &PgPool, writer: &str, lane: &str, parts: &[Part]) -> Vec<Fate> {
-    let mut conn = pool.acquire().await.unwrap();
-    send_on(&mut conn, writer, lane, parts).await
+async fn send(pool: &Pool, writer: &str, lane: &str, parts: &[Part]) -> Vec<Fate> {
+    let conn = pool.get().await.unwrap();
+    send_on(&conn, writer, lane, parts).await
 }
 
-async fn send_on(conn: &mut sqlx::PgConnection, writer: &str, lane: &str, parts: &[Part]) -> Vec<Fate> {
-    answers_on(conn, writer, lane, parts).await.into_iter().map(|recorded| recorded.fate).collect()
+async fn send_on(db: &impl Client, writer: &str, lane: &str, parts: &[Part]) -> Vec<Fate> {
+    answers_on(db, writer, lane, parts).await.into_iter().map(|recorded| recorded.fate).collect()
 }
 
 /// Write `parts` as [`send_on`] does; each run's whole answer, in order.
-async fn answers_on(conn: &mut sqlx::PgConnection, writer: &str, lane: &str, parts: &[Part]) -> Vec<weft_journal::record::Recorded> {
-    answers_with(conn, writer, lane, parts, Vec::new()).await
+async fn answers_on(db: &impl Client, writer: &str, lane: &str, parts: &[Part]) -> Vec<weft_journal::record::Recorded> {
+    answers_with(db, writer, lane, parts, Vec::new()).await
 }
 
 /// [`answers_on`], the batch also carrying `programs`, the cuts its runs run.
 async fn answers_with(
-    conn: &mut sqlx::PgConnection,
+    db: &impl Client,
     writer: &str,
     lane: &str,
     parts: &[Part],
@@ -141,7 +138,7 @@ async fn answers_with(
         events_version: weft_journal::stored::STORED_EVENTS.version(),
     };
     let batch = Batch { head, rows: encoded.iter().flatten().map(Vec::as_slice).collect() };
-    record_batch(conn, writer, TENANT, lane, &batch).await.unwrap()
+    record_batch(db, writer, TENANT, lane, &batch).await.unwrap()
 }
 
 /// [`birth`] of a run of `program`, a cut of the registered `def-1`, for
@@ -168,9 +165,10 @@ fn cut_of(project: uuid::Uuid) -> weft_journal::record::RunsProgram {
 
 /// What `project_definition` keeps under `hash` for `project`: each row's
 /// program and what it was cut from.
-async fn kept(pool: &PgPool, project: uuid::Uuid, hash: &str) -> Vec<(String, Option<String>)> {
-    sqlx::query_as("SELECT project_json, cut_from FROM project_definition WHERE project_id = $1 AND definition_hash = $2")
-        .bind(project).bind(hash).fetch_all(pool).await.unwrap()
+async fn kept(pool: &Pool, project: uuid::Uuid, hash: &str) -> Vec<(String, Option<String>)> {
+    pool.all("SELECT project_json, cut_from FROM project_definition WHERE project_id = $1 AND definition_hash = $2", &[&project, &hash])
+        .await
+        .unwrap()
 }
 
 /// A run of a cut names the cut by its hash, and the batch that bears it
@@ -178,15 +176,15 @@ async fn kept(pool: &PgPool, project: uuid::Uuid, hash: &str) -> Vec<(String, Op
 /// however often a batch carries it again, marked with what it was cut
 /// from, so the run reads back what it ran and the cut never reads as a
 /// registered version.
-#[sqlx::test]
-async fn a_batch_keeps_the_cut_its_runs_run(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_batch_keeps_the_cut_its_runs_run(pool: Pool) {
     schema(&pool).await;
     let program = cut_of(PROJECT);
     let carried = program.kept().expect("a cut is carried").as_ref().clone();
     for _ in 0..2 {
         let run = weft_core::new_run_id();
-        let mut conn = pool.acquire().await.unwrap();
-        let answers = answers_with(&mut conn, "w1", "w1:0", &[part(run, 1, 0, vec![vec![cut_birth(run, PROJECT, &program)]])], vec![carried.clone()]).await;
+        let conn = pool.get().await.unwrap();
+        let answers = answers_with(&conn, "w1", "w1:0", &[part(run, 1, 0, vec![vec![cut_birth(run, PROJECT, &program)]])], vec![carried.clone()]).await;
         assert_eq!(answers[0].fate, Fate::Accepted);
     }
     let rows = kept(&pool, PROJECT, program.definition_hash()).await;
@@ -199,22 +197,22 @@ async fn a_batch_keeps_the_cut_its_runs_run(pool: PgPool) {
 /// A cut is kept only with a run that went in naming it: a birth refused
 /// (its project is not there) keeps nothing of its cut, and a cut carried
 /// beside a birth that runs the registered program is not kept either.
-#[sqlx::test]
-async fn a_batch_keeps_no_cut_without_a_run_that_went_in(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_batch_keeps_no_cut_without_a_run_that_went_in(pool: Pool) {
     schema(&pool).await;
     let gone = uuid::Uuid::from_u128(2);
     let program = cut_of(gone);
     let run = weft_core::new_run_id();
-    let mut conn = pool.acquire().await.unwrap();
+    let conn = pool.get().await.unwrap();
     let carried = program.kept().expect("a cut is carried").as_ref().clone();
-    let answers = answers_with(&mut conn, "w1", "w1:0", &[part(run, 1, 0, vec![vec![cut_birth(run, gone, &program)]])], vec![carried]).await;
+    let answers = answers_with(&conn, "w1", "w1:0", &[part(run, 1, 0, vec![vec![cut_birth(run, gone, &program)]])], vec![carried]).await;
     assert_eq!(answers[0].fate, Fate::Refused);
     assert!(kept(&pool, gone, program.definition_hash()).await.is_empty(), "a refused birth keeps nothing");
 
     let unnamed = cut_of(PROJECT);
     let run = weft_core::new_run_id();
     let carried = unnamed.kept().expect("a cut is carried").as_ref().clone();
-    let answers = answers_with(&mut conn, "w1", "w1:0", &[part(run, 1, 0, vec![vec![birth(run, Keeping::Fast)]])], vec![carried]).await;
+    let answers = answers_with(&conn, "w1", "w1:0", &[part(run, 1, 0, vec![vec![birth(run, Keeping::Fast)]])], vec![carried]).await;
     assert_eq!(answers[0].fate, Fate::Accepted);
     assert!(kept(&pool, PROJECT, unnamed.definition_hash()).await.is_empty(), "no birth runs it as a cut");
 }
@@ -223,13 +221,13 @@ async fn a_batch_keeps_no_cut_without_a_run_that_went_in(pool: PgPool) {
 /// has not ticked yet) is answered unwatched, so the broker wakes the
 /// look at lapsed holds for it; one born under a live lease, or born
 /// ended, is not. A birth for a project that is not there is refused.
-#[sqlx::test]
-async fn a_run_born_before_its_writers_first_tick_is_answered_unwatched(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_run_born_before_its_writers_first_tick_is_answered_unwatched(pool: Pool) {
     schema(&pool).await;
     let (early, ended) = (weft_core::new_run_id(), weft_core::new_run_id());
-    let mut conn = pool.acquire().await.unwrap();
+    let conn = pool.get().await.unwrap();
     let answers = answers_on(
-        &mut conn,
+        &conn,
         "w1",
         "w1:0",
         &[part(early, 1, 0, vec![vec![birth(early, Keeping::Fast)]]), part(ended, 1, 0, vec![vec![birth(ended, Keeping::Fast), completed(ended)]])],
@@ -237,43 +235,39 @@ async fn a_run_born_before_its_writers_first_tick_is_answered_unwatched(pool: Pg
     .await;
     assert_eq!(answers.iter().map(|a| (a.fate, a.unwatched)).collect::<Vec<_>>(), [(Fate::Accepted, true), (Fate::Accepted, false)]);
 
-    sqlx::query(
+    pool.execute(
         "INSERT INTO worker_lease (replica, project_id, tenant_id, leased_until_unix) \
          VALUES ('w2', $1, $2, EXTRACT(EPOCH FROM NOW())::BIGINT + 60)",
+        &[&PROJECT, &TENANT],
     )
-    .bind(PROJECT)
-    .bind(TENANT)
-    .execute(&pool)
     .await
     .unwrap();
     let watched = weft_core::new_run_id();
-    let answers = answers_on(&mut conn, "w2", "w2:0", &[part(watched, 1, 0, vec![vec![birth(watched, Keeping::Fast)]])]).await;
+    let answers = answers_on(&conn, "w2", "w2:0", &[part(watched, 1, 0, vec![vec![birth(watched, Keeping::Fast)]])]).await;
     assert_eq!(answers.iter().map(|a| (a.fate, a.unwatched)).collect::<Vec<_>>(), [(Fate::Accepted, false)]);
 
-    sqlx::query("DELETE FROM project").execute(&pool).await.unwrap();
+    pool.execute("DELETE FROM project", &[]).await.unwrap();
     let orphan = weft_core::new_run_id();
-    let answers = answers_on(&mut conn, "w1", "w1:0", &[part(orphan, 1, 0, vec![vec![birth(orphan, Keeping::Fast)]])]).await;
+    let answers = answers_on(&conn, "w1", "w1:0", &[part(orphan, 1, 0, vec![vec![birth(orphan, Keeping::Fast)]])]).await;
     assert_eq!(answers.iter().map(|a| (a.fate, a.unwatched)).collect::<Vec<_>>(), [(Fate::Refused, false)]);
 }
 
 /// A run's row as the tests read it: state, owner, epoch, last row, cost.
-async fn row(pool: &PgPool, run_id: weft_core::RunId) -> (String, Option<String>, i32, i32, i64) {
-    sqlx::query_as("SELECT state, owner, epoch, last_seq, cost_micro_usd FROM run WHERE run_id = $1")
-        .bind(run_id)
-        .fetch_one(pool)
+async fn row(pool: &Pool, run_id: weft_core::RunId) -> (String, Option<String>, i32, i32, i64) {
+    pool.one("SELECT state, owner, epoch, last_seq, cost_micro_usd FROM run WHERE run_id = $1", &[&run_id])
         .await
         .expect("the run's row")
 }
 
-async fn rows_of(pool: &PgPool, run_id: weft_core::RunId) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM run_log WHERE run_id = $1").bind(run_id).fetch_one(pool).await.unwrap()
+async fn rows_of(pool: &Pool, run_id: weft_core::RunId) -> i64 {
+    pool.scalar("SELECT COUNT(*) FROM run_log WHERE run_id = $1", &[&run_id]).await.unwrap()
 }
 
 /// A run is born by its first batch, owned by its writer; the next batch
 /// carries it on from its last row; and a run born and ended in one batch
 /// is born ended, its row holding how it ended.
-#[sqlx::test]
-async fn a_run_is_born_carried_on_and_ended_by_its_batches(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_run_is_born_carried_on_and_ended_by_its_batches(pool: Pool) {
     schema(&pool).await;
     let run = weft_core::new_run_id();
     let quick = weft_core::new_run_id();
@@ -287,7 +281,7 @@ async fn a_run_is_born_carried_on_and_ended_by_its_batches(pool: PgPool) {
     assert_eq!(fates, [Fate::Accepted, Fate::Accepted]);
     assert_eq!(row(&pool, run).await, ("running".into(), Some("w1".into()), 1, 0, 0));
     assert_eq!(row(&pool, quick).await, ("ended".into(), None, 1, 0, 0));
-    let outcome: Option<String> = sqlx::query_scalar("SELECT outcome FROM run WHERE run_id = $1").bind(quick).fetch_one(&pool).await.unwrap();
+    let outcome: Option<String> = pool.scalar("SELECT outcome FROM run WHERE run_id = $1", &[&quick]).await.unwrap();
     assert_eq!(outcome.as_deref(), Some("completed"));
 
     let fates = send(&pool, "w1", "w1:0", &[part(run, 1, 1, vec![vec![started(run, "a")], vec![cost(run)]])]).await;
@@ -300,8 +294,8 @@ async fn a_run_is_born_carried_on_and_ended_by_its_batches(pool: PgPool) {
 /// A batch sent again after its answer was lost changes nothing and says
 /// so: a first batch, a continuing batch carrying a cost (counted once),
 /// and an ending.
-#[sqlx::test]
-async fn a_batch_sent_again_changes_nothing(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_batch_sent_again_changes_nothing(pool: Pool) {
     schema(&pool).await;
     let run = weft_core::new_run_id();
     let first = [part(run, 1, 0, vec![vec![birth(run, Keeping::Fast)]])];
@@ -314,15 +308,15 @@ async fn a_batch_sent_again_changes_nothing(pool: PgPool) {
         assert_eq!((row(&pool, run).await, rows_of(&pool, run).await), before, "nothing changed the second time");
     }
     assert_eq!(row(&pool, run).await.4, 250_000, "the cost counted once");
-    let counted: i64 = sqlx::query_scalar("SELECT SUM(runs)::bigint FROM version_runs").fetch_one(&pool).await.unwrap();
+    let counted: i64 = pool.scalar("SELECT SUM(runs)::bigint FROM version_runs", &[]).await.unwrap();
     assert_eq!(counted, 1, "the version counted the run once");
 }
 
 /// Two workers that took one fire both bear its run: the first is the
 /// run's, and the second hears its run was born elsewhere, with nothing of
 /// its own written.
-#[sqlx::test]
-async fn a_run_two_workers_bore_is_the_first_ones(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_run_two_workers_bore_is_the_first_ones(pool: Pool) {
     schema(&pool).await;
     let run = weft_core::new_run_id();
     assert_eq!(send(&pool, "w1", "w1:0", &[part(run, 1, 0, vec![vec![birth(run, Keeping::Fast)]])]).await, [Fate::Accepted]);
@@ -335,8 +329,8 @@ async fn a_run_two_workers_bore_is_the_first_ones(pool: PgPool) {
 /// Rows that do not follow on from the run's record are refused: a gap in
 /// `first_seq`, another writer, an epoch the run has moved past. Nothing
 /// goes in.
-#[sqlx::test]
-async fn a_batch_that_does_not_follow_on_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_batch_that_does_not_follow_on_is_refused(pool: Pool) {
     schema(&pool).await;
     let run = weft_core::new_run_id();
     send(&pool, "w1", "w1:0", &[part(run, 1, 0, vec![vec![birth(run, Keeping::Fast)]])]).await;
@@ -349,12 +343,13 @@ async fn a_batch_that_does_not_follow_on_is_refused(pool: PgPool) {
 
 /// Two lanes of one worker count runs of the same version on rows of
 /// their own: one lane's batch still open never holds the other's up.
-#[sqlx::test]
-async fn two_lanes_counting_one_version_never_block_each_other(pool: PgPool) {
+#[weft_db_macros::test]
+async fn two_lanes_counting_one_version_never_block_each_other(pool: Pool) {
     schema(&pool).await;
     let (a, b) = (weft_core::new_run_id(), weft_core::new_run_id());
-    let mut open = pool.begin().await.unwrap();
-    assert_eq!(send_on(&mut open, "w1", "w1:0", &[part(a, 1, 0, vec![vec![birth(a, Keeping::Fast)]])]).await, [Fate::Accepted]);
+    let mut held = pool.get().await.unwrap();
+    let open = held.transaction().await.unwrap();
+    assert_eq!(send_on(&open, "w1", "w1:0", &[part(a, 1, 0, vec![vec![birth(a, Keeping::Fast)]])]).await, [Fate::Accepted]);
     let other = tokio::time::timeout(
         Duration::from_secs(5),
         send(&pool, "w1", "w1:1", &[part(b, 1, 0, vec![vec![birth(b, Keeping::Fast)]])]),
@@ -363,20 +358,18 @@ async fn two_lanes_counting_one_version_never_block_each_other(pool: PgPool) {
     .expect("the second lane's batch went in while the first one's was still open");
     assert_eq!(other, [Fate::Accepted]);
     open.commit().await.unwrap();
-    let counted: i64 = sqlx::query_scalar("SELECT SUM(runs)::bigint FROM version_runs WHERE source_version = 'v1'").fetch_one(&pool).await.unwrap();
+    let counted: i64 = pool.scalar("SELECT SUM(runs)::bigint FROM version_runs WHERE source_version = 'v1'", &[]).await.unwrap();
     assert_eq!(counted, 2);
 }
 
 /// Claim `run` for `owner` on a lapsed lease, the way a worker that then
 /// died had it.
-async fn driven_by_a_dead_worker(pool: &PgPool, run: weft_core::RunId) {
-    sqlx::query(
+async fn driven_by_a_dead_worker(pool: &Pool, run: weft_core::RunId) {
+    pool.execute(
         "INSERT INTO worker_lease (replica, project_id, tenant_id, leased_until_unix) VALUES ('w1', $1, $2, 0) \
          ON CONFLICT (replica) DO NOTHING",
+        &[&PROJECT, &TENANT],
     )
-    .bind(PROJECT)
-    .bind(TENANT)
-    .execute(pool)
     .await
     .unwrap();
     assert_eq!(send(pool, "w1", "w1:0", &[part(run, 1, 0, vec![vec![birth(run, Keeping::Durable)]])]).await, [Fate::Accepted]);
@@ -384,8 +377,8 @@ async fn driven_by_a_dead_worker(pool: &PgPool, run: weft_core::RunId) {
 
 /// The sweep letting go of a lost run raises its epoch first: a late batch
 /// of the worker it lost is refused, and the run is queued for the next.
-#[sqlx::test]
-async fn a_late_batch_after_the_lost_sweep_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_late_batch_after_the_lost_sweep_is_refused(pool: Pool) {
     schema(&pool).await;
     let store = weft_dispatcher::store::postgres::PostgresStore::from_pool(pool.clone());
     let run = weft_core::new_run_id();
@@ -398,14 +391,15 @@ async fn a_late_batch_after_the_lost_sweep_is_refused(pool: PgPool) {
 /// A late batch that holds the run's row when the sweep comes goes in
 /// first, and the sweep then lets go of the run from where the batch left
 /// it, without either waiting on the other for ever.
-#[sqlx::test]
-async fn a_late_batch_before_the_lost_sweep_goes_in_and_the_sweep_follows(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_late_batch_before_the_lost_sweep_goes_in_and_the_sweep_follows(pool: Pool) {
     schema(&pool).await;
     let store = weft_dispatcher::store::postgres::PostgresStore::from_pool(pool.clone());
     let run = weft_core::new_run_id();
     driven_by_a_dead_worker(&pool, run).await;
-    let mut open = pool.begin().await.unwrap();
-    assert_eq!(send_on(&mut open, "w1", "w1:0", &[part(run, 1, 1, vec![vec![started(run, "late")]])]).await, [Fate::Accepted]);
+    let mut held = pool.get().await.unwrap();
+    let open = held.transaction().await.unwrap();
+    assert_eq!(send_on(&open, "w1", "w1:0", &[part(run, 1, 1, vec![vec![started(run, "late")]])]).await, [Fate::Accepted]);
     let sweep = tokio::spawn(async move { store.let_go_of_lost(run, i64::MAX, None).await.unwrap() });
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!sweep.is_finished(), "the sweep waits for the batch holding the run's row");
@@ -418,8 +412,8 @@ async fn a_late_batch_before_the_lost_sweep_goes_in_and_the_sweep_follows(pool: 
 /// A run whose worker could not write its record, given up with a charge
 /// its record leaves open, ends with that charge booked unknown: one
 /// `CostReported` closing it, before the ending, in the same write.
-#[sqlx::test]
-async fn a_given_up_run_books_its_open_charge_unknown(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_given_up_run_books_its_open_charge_unknown(pool: Pool) {
     schema(&pool).await;
     let run = weft_core::new_run_id();
     let opened = RunEvent::ChargeOpened {
@@ -434,13 +428,14 @@ async fn a_given_up_run_books_its_open_charge_unknown(pool: PgPool) {
     };
     assert_eq!(send(&pool, "w1", "w1:0", &[part(run, 1, 0, vec![vec![birth(run, Keeping::Durable)], vec![opened]])]).await, [Fate::Accepted]);
 
-    let mut tx = pool.begin().await.unwrap();
-    let gave_up = weft_journal::record::give_up_in(&mut tx, run, "w1", "a write failed").await.unwrap();
+    let mut conn = pool.get().await.unwrap();
+    let tx = conn.transaction().await.unwrap();
+    let gave_up = weft_journal::record::give_up_in(&tx, run, "w1", "a write failed").await.unwrap();
     tx.commit().await.unwrap();
+    drop(conn);
     assert_eq!(gave_up, weft_journal::record::GaveUp::Ended(2));
 
-    let mut conn = pool.acquire().await.unwrap();
-    let events = weft_journal::record::read_record(&mut conn, run, None).await.unwrap().events(run).unwrap();
+    let events = weft_journal::record::read_record(&pool, run, None).await.unwrap().events(run).unwrap();
     let costs: Vec<&RunEvent> = events.iter().filter(|event| matches!(event, RunEvent::CostReported { .. })).collect();
     assert_eq!(costs.len(), 1, "{events:?}");
     assert!(

@@ -18,6 +18,31 @@ locals {
   # answered, so their CPU stays on while they are up.
   writers     = ["dispatcher", "broker"]
   holder_pool = "${var.name}-holder"
+  # The roles that open the database themselves (every other role reaches
+  # it through the broker), with the most copies of each Cloud Run may
+  # run. Each copy takes its share of the database's connections from
+  # these numbers, so they are both the services' ceilings and part of
+  # the install config.
+  # SYNC: these roles <-> crates/weft-platform-traits/src/config.rs (InstallConfig::max_copies)
+  max_copies = {
+    dispatcher = var.dispatcher_max_copies
+    broker     = var.broker_max_copies
+  }
+  # How many requests one copy of a role takes at once, where it is not
+  # Cloud Run's default of 80. Every worker, listener and holder process
+  # keeps one line open to the broker (a websocket, which Cloud Run counts
+  # as a request for as long as it is open), and a line is mostly idle, so
+  # at 80 a copy would be full of lines doing nothing while the broker's
+  # copies stay capped (max_copies). 1000 is the most Cloud Run allows. An
+  # idle line costs a copy about 16 KiB of read buffer plus a few KiB of
+  # tasks and channels, so 1000 of them fit well inside a copy's memory;
+  # the broker's CPU, not its lines, is then what makes Cloud Run add a
+  # copy.
+  # SYNC: broker_concurrency <-> crates/weft-broker-client/src/line.rs (LINE_READ_BUFFER)
+  broker_concurrency  = 1000
+  request_concurrency = {
+    broker = local.broker_concurrency
+  }
 
   # SYNC: the install config's shape <-> crates/weft-platform-traits/src/config.rs (InstallConfig)
   install_config = {
@@ -56,6 +81,9 @@ locals {
       { holder = "pool" },
     )
     roleUrls = local.role_urls
+    # How many copies of each database-opening role may run at once: a
+    # copy divides the database's connections by these to size its pools.
+    maxCopies = local.max_copies
     holders = {
       signalsPerCopy = var.signals_per_holder
     }
@@ -162,9 +190,16 @@ resource "google_cloud_run_v2_service" "role" {
     # SYNC: timeout <-> crates/weft-platform-gcp/src/runner.rs (REQUEST_CAP)
     timeout = "3600s"
 
+    # The roles that open the database have a ceiling, since every copy
+    # takes a share of a fixed number of connections and an unbounded
+    # count would run the database out of them. The others reach the
+    # database through the broker, so they scale out with no ceiling
+    # (null leaves the attribute unset).
     scaling {
       min_instance_count = 0
+      max_instance_count = lookup(local.max_copies, each.value, null)
     }
+    max_instance_request_concurrency = lookup(local.request_concurrency, each.value, null)
 
     vpc_access {
       egress = "PRIVATE_RANGES_ONLY"

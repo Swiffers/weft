@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use serde_json::Value;
-use sqlx::postgres::PgPool;
+use weft_task_store::db::{self, Client as _, Pool};
 
 // One source of truth for the `(kind, payload)` wire contract:
 // `weft-broker-client::protocol::{InfraEventKind, InfraEvent}`.
@@ -72,39 +72,31 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 };
 
 pub async fn insert(
-    pool: &PgPool,
+    pool: &Pool,
     tenant_id: &str,
     project_id: uuid::Uuid,
     node_id: Option<&str>,
     event: InfraEvent,
 ) -> Result<i64> {
     let (kind, payload) = event.into_record();
-    let row: (i64,) = sqlx::query_as(
-        "INSERT INTO infra_event \
-         (tenant_id, project_id, node_id, kind, payload, at_unix) \
-         VALUES ($1, $2, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT) \
-         RETURNING id",
-    )
-    .bind(tenant_id)
-    .bind(project_id)
-    .bind(node_id)
-    .bind(kind.as_str())
-    .bind(payload)
-    .fetch_one(pool)
-    .await?;
-    Ok(row.0)
+    Ok(pool
+        .scalar(
+            "INSERT INTO infra_event \
+             (tenant_id, project_id, node_id, kind, payload, at_unix) \
+             VALUES ($1, $2, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT) \
+             RETURNING id",
+            &[&tenant_id, &project_id, &node_id, &kind.as_str(), &payload],
+        )
+        .await?)
 }
 
 /// The row `id`, `None` when it is gone. A row whose kind or payload this
 /// dispatcher cannot read is an error naming it: a newer supervisor wrote
 /// a shape this dispatcher does not know.
-pub async fn read(pool: &PgPool, id: i64) -> Result<Option<InfraEventRow>> {
-    let row: Option<(String, uuid::Uuid, Option<String>, String, Value, i64)> = sqlx::query_as(
-        "SELECT tenant_id, project_id, node_id, kind, payload, at_unix FROM infra_event WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
+pub async fn read(pool: &Pool, id: i64) -> Result<Option<InfraEventRow>> {
+    let row: Option<(String, uuid::Uuid, Option<String>, String, Value, i64)> = pool
+        .opt("SELECT tenant_id, project_id, node_id, kind, payload, at_unix FROM infra_event WHERE id = $1", &[&id])
+        .await?;
     let Some((tenant_id, project_id, node_id, kind_str, payload, at_unix)) = row else { return Ok(None) };
     let kind = InfraEventKind::parse(&kind_str)
         .ok_or_else(|| anyhow::anyhow!("infra_event row id={id} has unknown kind '{kind_str}'. Upgrade the dispatcher."))?;
@@ -114,15 +106,8 @@ pub async fn read(pool: &PgPool, id: i64) -> Result<Option<InfraEventRow>> {
 }
 
 /// Drop every row for a project. Called on `weft rm`.
-pub async fn remove_project<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
-    project_id: uuid::Uuid,
-) -> Result<u64> {
-    let res = sqlx::query("DELETE FROM infra_event WHERE project_id = $1")
-        .bind(project_id)
-        .execute(executor)
-        .await?;
-    Ok(res.rows_affected())
+pub async fn remove_project(db: &impl db::Client, project_id: uuid::Uuid) -> Result<u64> {
+    Ok(db.execute("DELETE FROM infra_event WHERE project_id = $1", &[&project_id]).await?)
 }
 
 #[cfg(test)]

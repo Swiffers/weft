@@ -7,10 +7,10 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
-use sqlx::PgPool;
 use tower::ServiceExt;
 
 use weft_platform_traits::identity::{IdentityRefused, Principal};
+use weft_task_store::db::Pool;
 
 const WORKER_TOKEN: &str = "worker-token";
 const CORE_TOKEN: &str = "core-token";
@@ -29,13 +29,13 @@ impl weft_platform_traits::CallerIdentity for OneWorker {
     }
 }
 
-async fn broker(pool: PgPool) -> axum::Router {
+async fn broker(pool: Pool) -> axum::Router {
     weft_broker::router(broker_state(pool).await)
 }
 
-async fn broker_state(pool: PgPool) -> Arc<weft_broker::BrokerState> {
+async fn broker_state(pool: Pool) -> Arc<weft_broker::BrokerState> {
     let signals = weft_task_store::pg_signal::PgSignalWatch::start(
-        &pool.connect_options(),
+        pool.config(),
         weft_broker::state::BROKER_CHANNELS,
         weft_task_store::pg_signal::Listening::Always,
     )
@@ -95,8 +95,8 @@ async fn answer(router: &axum::Router, request: Request<Body>) -> (StatusCode, S
 
 /// The old shape is answered the one way every endpoint answers it: the
 /// agreed status, the fix, and what did not read.
-#[sqlx::test]
-async fn an_old_shaped_caller_verify_is_answered_naming_the_resync(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_old_shaped_caller_verify_is_answered_naming_the_resync(pool: Pool) {
     let router = broker(pool).await;
     let (status, body) = answer(&router, old_caller_verify(WORKER_TOKEN)).await;
     assert_eq!(status, weft_broker_client::protocol::UNREADABLE_SHAPE);
@@ -106,8 +106,8 @@ async fn an_old_shaped_caller_verify_is_answered_naming_the_resync(pool: PgPool)
 
 /// A caller the broker does not know learns nothing of the shapes: its
 /// token is refused first.
-#[sqlx::test]
-async fn an_old_shaped_call_from_a_stranger_is_refused_as_a_stranger(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_old_shaped_call_from_a_stranger_is_refused_as_a_stranger(pool: Pool) {
     let router = broker(pool).await;
     let (status, _) = answer(&router, old_caller_verify("somebody-else")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -126,8 +126,8 @@ fn caller_verify_with(bearer: &str, body: &'static str) -> Request<Body> {
 /// A body that is not JSON at all is a `400` for a caller the broker
 /// knows, and the identity refusal for one it does not, which so never
 /// learns the endpoint is there and reads JSON.
-#[sqlx::test]
-async fn a_body_that_is_not_json_is_refused_as_a_stranger_before_it_is_read(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_body_that_is_not_json_is_refused_as_a_stranger_before_it_is_read(pool: Pool) {
     let router = broker(pool).await;
     let (status, body) = answer(&router, caller_verify_with(WORKER_TOKEN, "{not json")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -140,8 +140,8 @@ async fn a_body_that_is_not_json_is_refused_as_a_stranger_before_it_is_read(pool
 /// A holder's check in a shape this broker does not read is answered as
 /// every call of another shape is (which the alarm drops as a call that
 /// can never be taken), and one that reads is handled.
-#[sqlx::test]
-async fn a_holders_check_of_another_shape_is_answered_as_unreadable(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_holders_check_of_another_shape_is_answered_as_unreadable(pool: Pool) {
     weft_task_store::apply_groups(&pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
     let router = weft_broker::held_check_route(broker_state(pool).await);
     let check = |body: serde_json::Value| {

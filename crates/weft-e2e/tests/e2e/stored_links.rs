@@ -31,7 +31,7 @@ async fn a_stored_file_is_served_by_link_and_a_page_uploads_through_a_slot() -> 
     let mut project = Project::prepare("stored_links", disp.clone()).await?;
     let base = project.unique_live_path()?;
     project.activate().await?;
-    let http = reqwest::Client::new();
+    let http = weft_core::net::http_client().build()?;
 
     // The same file answered twice: the same link, unless the two calls
     // fell in two windows (a new signing moment, then a new link).

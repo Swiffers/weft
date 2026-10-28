@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 
 use serde_json::json;
-use sqlx::PgPool;
+use weft_task_store::db::{Client as _, Pool};
 
 use weft_access_store::migrate::{begin_import, export, import, make_transfer_key};
 use weft_access_store::{connect_direct, list_grants, resolve_for_worker, GrantOwnerScope, GrantUser};
@@ -31,7 +31,7 @@ fn keyed() -> AccessSpec {
     .unwrap()
 }
 
-async fn connect(pool: &PgPool, door: Door, token: &str, project_id: Option<uuid::Uuid>) -> uuid::Uuid {
+async fn connect(pool: &Pool, door: Door, token: &str, project_id: Option<uuid::Uuid>) -> uuid::Uuid {
     connect_direct(
         pool,
         SOURCE,
@@ -55,7 +55,7 @@ async fn connect(pool: &PgPool, door: Door, token: &str, project_id: Option<uuid
 
 /// A batch `selection` picks on the source, sealed to a fresh key of
 /// `tenant`'s on the target: the key's id and the batch.
-async fn sealed_for(pool: &PgPool, tenant: &str, selection: &Selection) -> (weft_core::migrate::ExportedConnections, uuid::Uuid, String) {
+async fn sealed_for(pool: &Pool, tenant: &str, selection: &Selection) -> (weft_core::migrate::ExportedConnections, uuid::Uuid, String) {
     let key = make_transfer_key(pool, tenant).await.unwrap();
     let exported = export(pool, SOURCE, selection, Some(&key.public_key)).await.unwrap();
     let sealed = exported.sealed.clone().expect("something to copy");
@@ -64,7 +64,7 @@ async fn sealed_for(pool: &PgPool, tenant: &str, selection: &Selection) -> (weft
 
 /// Import a sealed batch as `tenant`, as the broker does.
 async fn import_as(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     (key_id, sealed): &(uuid::Uuid, String),
     shared_keys: &[&str],
@@ -81,19 +81,18 @@ fn outcome(imported: &weft_core::migrate::ImportedConnections, id: uuid::Uuid) -
 /// target's tenant; the same copy again is already there; one changed
 /// since is left alone, naming how to replace it; one spending the
 /// install's own key needs the target to hold it.
-#[sqlx::test]
-async fn a_connection_copies_with_its_id_and_its_secret(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_connection_copies_with_its_id_and_its_secret(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let own = connect(&pool, Door::Own, "tok-1", Some(PROJECT)).await;
     let shared = connect(&pool, Door::Shared, "unused", None).await;
-    let born: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT created_at FROM access_grant WHERE id = $1").bind(own).fetch_one(&pool).await.unwrap();
-    sqlx::query("INSERT INTO install_pick (tenant_id, project_id, node, field, grant_id) VALUES ($1, $2, 'bot', 'access', $3)")
-        .bind(SOURCE)
-        .bind(PROJECT)
-        .bind(own)
-        .execute(&pool)
-        .await
-        .unwrap();
+    let born: chrono::DateTime<chrono::Utc> = pool.scalar("SELECT created_at FROM access_grant WHERE id = $1", &[&own]).await.unwrap();
+    pool.execute(
+        "INSERT INTO install_pick (tenant_id, project_id, node, field, grant_id) VALUES ($1, $2, 'bot', 'access', $3)",
+        &[&SOURCE, &PROJECT, &own],
+    )
+    .await
+    .unwrap();
 
     // One batch per import below, each sealed to a key of its own, made
     // while the source still holds the rows.
@@ -107,7 +106,7 @@ async fn a_connection_copies_with_its_id_and_its_secret(pool: PgPool) {
     assert_eq!(exported.picks[0].grant_id, own);
 
     // The target does not have them yet.
-    sqlx::query("DELETE FROM access_grant").execute(&pool).await.unwrap();
+    pool.execute("DELETE FROM access_grant", &[]).await.unwrap();
     let imported = import_as(&pool, TARGET, &(first_key, first.clone()), &[]).await.unwrap();
     assert_eq!(outcome(&imported, own), Outcome::Copied);
     let Outcome::Skipped { why } = outcome(&imported, shared) else { panic!("a shared-key connection needs the key on the target") };
@@ -117,7 +116,7 @@ async fn a_connection_copies_with_its_id_and_its_secret(pool: PgPool) {
     let resolved = resolve_for_worker(&pool, TARGET, GrantUser::Author, own, "keyed", &[], &[]).await.unwrap();
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-1"), "the secret arrived whole");
     let (tenant, created_at, project): (String, chrono::DateTime<chrono::Utc>, Option<uuid::Uuid>) =
-        sqlx::query_as("SELECT tenant_id, created_at, project_id FROM access_grant WHERE id = $1").bind(own).fetch_one(&pool).await.unwrap();
+        pool.one("SELECT tenant_id, created_at, project_id FROM access_grant WHERE id = $1", &[&own]).await.unwrap();
     assert_eq!((tenant.as_str(), created_at, project), (TARGET, born, Some(PROJECT)));
 
     // The same batch again: already there, and the shared one copies once
@@ -127,7 +126,7 @@ async fn a_connection_copies_with_its_id_and_its_secret(pool: PgPool) {
     assert_eq!(outcome(&imported, shared), Outcome::Copied);
 
     // Changed on the target since: left alone.
-    sqlx::query("UPDATE access_grant SET label = 'renamed' WHERE id = $1").bind(own).execute(&pool).await.unwrap();
+    pool.execute("UPDATE access_grant SET label = 'renamed' WHERE id = $1", &[&own]).await.unwrap();
     let imported = import_as(&pool, TARGET, &third, &["keyed"]).await.unwrap();
     let Outcome::Skipped { why } = outcome(&imported, own) else { panic!("a changed copy is not overwritten") };
     assert!(why.contains(&format!("weft connect --forget {own}")), "{why}");
@@ -141,24 +140,24 @@ async fn a_connection_copies_with_its_id_and_its_secret(pool: PgPool) {
 /// A service with one connection per account keeps one row for it: a
 /// copy of an account the target already holds under another id is left
 /// alone, naming the one it has.
-#[sqlx::test]
-async fn an_account_the_target_has_already_is_not_copied_twice(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_account_the_target_has_already_is_not_copied_twice(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let id = connect(&pool, Door::Own, "tok-1", None).await;
     let app = json!({ "label": "app", "client_id": "cid", "client_secret": "s" });
     let exclusive = json!({ "grants": "exclusive" });
-    sqlx::query("UPDATE access_grant SET client_id = 'cid', registration_sealed = $1, spec_json = spec_json || $2")
-        .bind(weft_access_store::seal_json(&app).unwrap())
-        .bind(exclusive)
-        .execute(&pool)
-        .await
-        .unwrap();
+    pool.execute(
+        "UPDATE access_grant SET client_id = 'cid', registration_sealed = $1, spec_json = spec_json || $2::jsonb",
+        &[&weft_access_store::seal_json(&app).unwrap(), &exclusive],
+    )
+    .await
+    .unwrap();
     let all = Selection { all: true, ..Default::default() };
     let (_, key, sealed) = sealed_for(&pool, TARGET, &all).await;
     // The target holds the same account through the same app, under
     // another id.
     let theirs = uuid::Uuid::new_v4();
-    sqlx::query("UPDATE access_grant SET id = $1, tenant_id = $2").bind(theirs).bind(TARGET).execute(&pool).await.unwrap();
+    pool.execute("UPDATE access_grant SET id = $1, tenant_id = $2", &[&theirs, &TARGET]).await.unwrap();
     let imported = import_as(&pool, TARGET, &(key, sealed), &[]).await.unwrap();
     let Outcome::Skipped { why } = outcome(&imported, id) else { panic!("a second row for one account is refused") };
     assert!(why.contains(&theirs.to_string()), "{why}");
@@ -166,27 +165,27 @@ async fn an_account_the_target_has_already_is_not_copied_twice(pool: PgPool) {
 
 /// A batch that does not open leaves the key, so the import can be run
 /// again; an import that fails part way writes nothing.
-#[sqlx::test]
-async fn a_failed_import_keeps_its_key_and_writes_nothing(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_failed_import_keeps_its_key_and_writes_nothing(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     connect(&pool, Door::Own, "tok-1", None).await;
     let all = Selection { all: true, ..Default::default() };
     let (_, key, sealed) = sealed_for(&pool, TARGET, &all).await;
     let (_, _, sealed_elsewhere) = sealed_for(&pool, TARGET, &all).await;
     assert!(import_as(&pool, TARGET, &(key, sealed_elsewhere), &[]).await.is_err(), "sealed to another key");
-    sqlx::query("DELETE FROM access_grant").execute(&pool).await.unwrap();
+    pool.execute("DELETE FROM access_grant", &[]).await.unwrap();
     let imported = import_as(&pool, TARGET, &(key, sealed), &[]).await.unwrap();
     assert_eq!(imported.connections.len(), 1, "the key was still there");
 }
 
 /// Only what the selection picks travels, a dry run seals nothing, and a
 /// connection a node published stays behind, saying why.
-#[sqlx::test]
-async fn an_export_holds_to_the_selection(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_export_holds_to_the_selection(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let first = connect(&pool, Door::Own, "tok-1", Some(PROJECT)).await;
     let second = connect(&pool, Door::Own, "tok-2", None).await;
-    sqlx::query("UPDATE access_grant SET published_by_node = 'db' WHERE id = $1").bind(second).execute(&pool).await.unwrap();
+    pool.execute("UPDATE access_grant SET published_by_node = 'db' WHERE id = $1", &[&second]).await.unwrap();
 
     let by_project = Selection { projects: vec![PROJECT], ..Default::default() };
     let listed = export(&pool, SOURCE, &by_project, None).await.unwrap();
@@ -206,17 +205,17 @@ async fn an_export_holds_to_the_selection(pool: PgPool) {
 
 /// A transfer key opens a batch only for its tenant, within its time, and
 /// keys past their time go as the next one is made.
-#[sqlx::test]
-async fn a_transfer_key_is_its_tenants_and_expires(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_transfer_key_is_its_tenants_and_expires(pool: Pool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     connect(&pool, Door::Own, "tok-1", None).await;
     let all = Selection { all: true, ..Default::default() };
     let (_, key, sealed) = sealed_for(&pool, TARGET, &all).await;
     let refused = import_as(&pool, "someone-else", &(key, sealed.clone()), &[]).await.unwrap_err().to_string();
     assert!(refused.contains("run the migrate again"), "another tenant's key is no key: {refused}");
-    sqlx::query("UPDATE access_transfer_key SET created_at = now() - interval '1 hour'").execute(&pool).await.unwrap();
+    pool.execute("UPDATE access_transfer_key SET created_at = now() - interval '1 hour'", &[]).await.unwrap();
     assert!(import_as(&pool, TARGET, &(key, sealed), &[]).await.is_err(), "past its time");
     make_transfer_key(&pool, TARGET).await.unwrap();
-    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM access_transfer_key").fetch_one(&pool).await.unwrap();
+    let left: i64 = pool.scalar("SELECT count(*) FROM access_transfer_key", &[]).await.unwrap();
     assert_eq!(left, 1, "a key past its time goes as the next one is made");
 }

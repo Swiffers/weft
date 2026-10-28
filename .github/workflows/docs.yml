@@ -11,6 +11,8 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      # docs/theme/highlight-weft.js is a link to this file.
+      - "packages/weft-syntax/highlight-weft.js"
       - ".github/workflows/docs.yml"
   pull_request:
     # Into main only: `poc` (the retired proof of concept) carries a
@@ -18,6 +20,7 @@ on:
     branches: [main]
     paths:
       - "docs/**"
+      - "packages/weft-syntax/highlight-weft.js"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -36,19 +39,21 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Cache the mdbook binaries
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin
-          key: mdbook-${{ runner.os }}-v1
-
+      # Prebuilt release binaries, a few megabytes each: downloading them
+      # takes as long as restoring a cache would, so nothing is cached and
+      # a version bump here is the whole upgrade. scripts/check-pins.sh
+      # reads both versions from these two lines.
       - name: Install mdbook
+        env:
+          MDBOOK_VERSION: 0.5.4
+          MDBOOK_MERMAID_VERSION: 0.17.1
         run: |
           set -euo pipefail
-          command -v mdbook          >/dev/null || cargo install mdbook --locked
-          command -v mdbook-mermaid  >/dev/null || cargo install mdbook-mermaid --locked
+          bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+          curl -fsSL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar xz -C "$bin"
+          curl -fsSL "https://github.com/badboy/mdbook-mermaid/releases/download/v${MDBOOK_MERMAID_VERSION}/mdbook-mermaid-v${MDBOOK_MERMAID_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar xz -C "$bin"
 
       - name: Build
         run: |
@@ -56,7 +61,7 @@ jobs:
           mdbook-mermaid install .
           mdbook build
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: docs/book
 
@@ -70,4 +75,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

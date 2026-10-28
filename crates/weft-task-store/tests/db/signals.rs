@@ -9,8 +9,7 @@ use crate::support;
 use std::time::Duration;
 
 use serde_json::json;
-use sqlx::PgPool;
-
+use weft_task_store::db::{Client as _, Pool};
 use weft_task_store::pg_signal::{Heard, Subscription};
 use weft_task_store::tasks::{self, TASK_READY_CHANNEL};
 
@@ -50,17 +49,18 @@ fn on(heard: &[Heard], channel: &str) -> Vec<String> {
         .collect()
 }
 
-#[sqlx::test]
-async fn a_committed_notification_is_heard_and_a_rolled_back_one_never_is(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_committed_notification_is_heard_and_a_rolled_back_one_never_is(pool: Pool) {
     setup(&pool).await;
     let watch = signals(&pool).await;
     let mut heard = watch.subscribe();
 
-    let mut tx = pool.begin().await.unwrap();
-    sqlx::query("SELECT pg_notify($1, 'rolled back')").bind(TASK_READY_CHANNEL).execute(&mut *tx).await.unwrap();
+    let mut conn = pool.get().await.unwrap();
+    let tx = conn.transaction().await.unwrap();
+    tx.execute("SELECT pg_notify($1, 'rolled back')", &[&TASK_READY_CHANNEL]).await.unwrap();
     tx.rollback().await.unwrap();
-    let mut tx = pool.begin().await.unwrap();
-    sqlx::query("SELECT pg_notify($1, 'committed')").bind(TASK_READY_CHANNEL).execute(&mut *tx).await.unwrap();
+    let tx = conn.transaction().await.unwrap();
+    tx.execute("SELECT pg_notify($1, 'committed')", &[&TASK_READY_CHANNEL]).await.unwrap();
     tx.commit().await.unwrap();
 
     assert_eq!(on(&drain(&mut heard).await, TASK_READY_CHANNEL), vec!["committed".to_string()]);
@@ -69,19 +69,19 @@ async fn a_committed_notification_is_heard_and_a_rolled_back_one_never_is(pool: 
 /// A dropped listening connection loses whatever was sent meanwhile, so
 /// every waiter is told it is lost, and to look again once it is back;
 /// whether it listens can be read in between.
-#[sqlx::test]
-async fn a_lost_connection_tells_every_waiter_to_recheck(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_lost_connection_tells_every_waiter_to_recheck(pool: Pool) {
     setup(&pool).await;
     let watch = signals(&pool).await;
     let mut heard = watch.subscribe();
-    let killed: Vec<(bool,)> = sqlx::query_as(
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-         WHERE datname = current_database() AND application_name = $1",
-    )
-    .bind(weft_task_store::pg_signal::WATCH_APPLICATION_NAME)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let killed: Vec<bool> = pool
+        .scalars(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = current_database() AND application_name = $1",
+            &[&weft_task_store::pg_signal::WATCH_APPLICATION_NAME],
+        )
+        .await
+        .unwrap();
     assert_eq!(killed.len(), 1, "exactly one listening connection per watch");
     let next = tokio::time::timeout(Duration::from_secs(20), heard.next()).await.expect("heard in time");
     assert_eq!(next.unwrap(), Heard::Lost);
@@ -93,15 +93,15 @@ async fn a_lost_connection_tells_every_waiter_to_recheck(pool: PgPool) {
 
 /// Cut every listening connection of the test database, as a database
 /// going to sleep does.
-async fn cut_the_listener(pool: &PgPool) {
-    let killed: Vec<(bool,)> = sqlx::query_as(
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-         WHERE datname = current_database() AND application_name = $1",
-    )
-    .bind(weft_task_store::pg_signal::WATCH_APPLICATION_NAME)
-    .fetch_all(pool)
-    .await
-    .unwrap();
+async fn cut_the_listener(pool: &Pool) {
+    let killed: Vec<bool> = pool
+        .scalars(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname = current_database() AND application_name = $1",
+            &[&weft_task_store::pg_signal::WATCH_APPLICATION_NAME],
+        )
+        .await
+        .unwrap();
     assert_eq!(killed.len(), 1, "exactly one listening connection per watch");
 }
 
@@ -110,11 +110,11 @@ async fn cut_the_listener(pool: &PgPool) {
 /// sleep) stays down, so listening does not wake the database straight
 /// back up, until work arrives, which waits for it to listen again and is
 /// told it resumed; a drop while something is busy reconnects at once.
-#[sqlx::test]
-async fn a_quiet_watch_listens_again_only_when_work_arrives(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_quiet_watch_listens_again_only_when_work_arrives(pool: Pool) {
     setup(&pool).await;
     let watch = weft_task_store::pg_signal::PgSignalWatch::start(
-        &pool.connect_options(),
+        pool.config(),
         support::CHANNELS,
         weft_task_store::pg_signal::Listening::WhileBusy,
     )
@@ -150,10 +150,14 @@ struct CountingProxy {
     refusing: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-async fn counting_proxy(pool: &PgPool) -> CountingProxy {
+async fn counting_proxy(pool: &Pool) -> CountingProxy {
     use std::sync::atomic::Ordering;
-    let options = pool.connect_options();
-    let target = format!("{}:{}", options.get_host(), options.get_port());
+    let config = pool.config();
+    let host = match config.get_hosts() {
+        [tokio_postgres::config::Host::Tcp(host)] => host.clone(),
+        hosts => panic!("the test database is reached over TCP at one host, not {hosts:?}"),
+    };
+    let target = format!("{host}:{}", config.get_ports().first().copied().unwrap_or(5432));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let proxy = CountingProxy { port, accepted: Default::default(), refusing: Default::default() };
@@ -177,16 +181,28 @@ async fn counting_proxy(pool: &PgPool) -> CountingProxy {
 }
 
 /// A watch listening through `proxy`.
-async fn watch_through(pool: &PgPool, proxy: &CountingProxy) -> std::sync::Arc<weft_task_store::pg_signal::PgSignalWatch> {
-    let options = (*pool.connect_options()).clone().host("127.0.0.1").port(proxy.port);
-    weft_task_store::pg_signal::PgSignalWatch::start(&options, support::CHANNELS, weft_task_store::pg_signal::Listening::WhileBusy).await.unwrap()
+async fn watch_through(pool: &Pool, proxy: &CountingProxy) -> std::sync::Arc<weft_task_store::pg_signal::PgSignalWatch> {
+    // The test database's sign-in, at the proxy's address.
+    let config = pool.config();
+    let mut through = weft_task_store::db::Config::new();
+    through.host("127.0.0.1").port(proxy.port).ssl_mode(config.get_ssl_mode());
+    if let Some(user) = config.get_user() {
+        through.user(user);
+    }
+    if let Some(password) = config.get_password() {
+        through.password(password);
+    }
+    if let Some(dbname) = config.get_dbname() {
+        through.dbname(dbname);
+    }
+    weft_task_store::pg_signal::PgSignalWatch::start(&through, support::CHANNELS, weft_task_store::pg_signal::Listening::WhileBusy).await.unwrap()
 }
 
 /// A connection the database closes while nothing is busy is not made
 /// again behind weft's back: the listener does not reconnect on its own,
 /// so a sleeping database is not woken by it.
-#[sqlx::test]
-async fn a_quiet_watch_opens_no_connection_when_its_own_drops(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_quiet_watch_opens_no_connection_when_its_own_drops(pool: Pool) {
     use std::sync::atomic::Ordering;
     setup(&pool).await;
     let proxy = counting_proxy(&pool).await;
@@ -206,8 +222,8 @@ async fn a_quiet_watch_opens_no_connection_when_its_own_drops(pool: PgPool) {
 /// database is not tried every second for nothing; work arriving later
 /// makes it listen again, and, since the connection was lost while this
 /// process was busy writing, every waiter rechecks.
-#[sqlx::test]
-async fn a_watch_stops_retrying_once_its_work_ends(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_watch_stops_retrying_once_its_work_ends(pool: Pool) {
     use std::sync::atomic::Ordering;
     setup(&pool).await;
     let proxy = counting_proxy(&pool).await;
@@ -234,8 +250,8 @@ async fn a_watch_stops_retrying_once_its_work_ends(pool: PgPool) {
 
 /// Work that went ahead while a quiet watch could not listen again wrote
 /// unheard, so the watch, once it listens, has every waiter recheck.
-#[sqlx::test]
-async fn work_that_went_ahead_unheard_makes_the_watch_recheck(pool: PgPool) {
+#[weft_db_macros::test]
+async fn work_that_went_ahead_unheard_makes_the_watch_recheck(pool: Pool) {
     use std::sync::atomic::Ordering;
     setup(&pool).await;
     let proxy = counting_proxy(&pool).await;
@@ -257,8 +273,8 @@ async fn work_that_went_ahead_unheard_makes_the_watch_recheck(pool: PgPool) {
 /// A task announces itself when it becomes claimable, and only then:
 /// claims, heartbeats and completions are the hot path and stay silent,
 /// while a requeue is loud.
-#[sqlx::test]
-async fn a_task_is_announced_exactly_when_it_becomes_claimable(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_task_is_announced_exactly_when_it_becomes_claimable(pool: Pool) {
     setup(&pool).await;
     let watch = signals(&pool).await;
     let mut heard = watch.subscribe();
@@ -281,35 +297,37 @@ async fn a_task_is_announced_exactly_when_it_becomes_claimable(pool: PgPool) {
 /// What a write leaves in the outbox goes out once it commits and its
 /// writer pokes the flusher, each announcement once however many times it
 /// was left; what a rolled-back write left never does.
-#[sqlx::test]
-async fn an_announcement_goes_out_once_its_write_commits(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_announcement_goes_out_once_its_write_commits(pool: Pool) {
     setup(&pool).await;
     let watch = signals(&pool).await;
     let mut heard = watch.subscribe();
 
-    let mut tx = pool.begin().await.unwrap();
-    sqlx::query("SELECT weft_announce($1, 'rolled back')").bind(TASK_READY_CHANNEL).execute(&mut *tx).await.unwrap();
+    let mut conn = pool.get().await.unwrap();
+    let tx = conn.transaction().await.unwrap();
+    tx.execute("SELECT weft_announce($1, 'rolled back')", &[&TASK_READY_CHANNEL]).await.unwrap();
     tx.rollback().await.unwrap();
-    let mut tx = pool.begin().await.unwrap();
+    let tx = conn.transaction().await.unwrap();
     for _ in 0..3 {
-        sqlx::query("SELECT weft_announce($1, 'committed')").bind(TASK_READY_CHANNEL).execute(&mut *tx).await.unwrap();
+        tx.execute("SELECT weft_announce($1, 'committed')", &[&TASK_READY_CHANNEL]).await.unwrap();
     }
     tx.commit().await.unwrap();
+    drop(conn);
     assert!(on(&drain(&mut heard).await, TASK_READY_CHANNEL).is_empty(), "nothing goes out before the flusher is poked");
     weft_task_store::announce::committed(&pool);
     assert_eq!(on(&drain(&mut heard).await, TASK_READY_CHANNEL), vec!["committed".to_string()]);
-    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM weft_announcement").fetch_one(&pool).await.unwrap();
+    let left: i64 = pool.scalar("SELECT count(*) FROM weft_announcement", &[]).await.unwrap();
     assert_eq!(left, 0, "the outbox is empty once sent");
 }
 
 /// What a process hears another way (the install's news) reaches its
 /// waiters while its watch is quiet and the database asleep, without the
 /// watch listening again.
-#[sqlx::test]
-async fn what_is_told_another_way_reaches_waiters_while_the_watch_is_quiet(pool: PgPool) {
+#[weft_db_macros::test]
+async fn what_is_told_another_way_reaches_waiters_while_the_watch_is_quiet(pool: Pool) {
     setup(&pool).await;
     let watch = weft_task_store::pg_signal::PgSignalWatch::start(
-        &pool.connect_options(),
+        pool.config(),
         support::CHANNELS,
         weft_task_store::pg_signal::Listening::WhileBusy,
     )
@@ -330,15 +348,15 @@ async fn what_is_told_another_way_reaches_waiters_while_the_watch_is_quiet(pool:
 /// A request holds its process's watch busy while it is answered, unless
 /// its handler let go of it: a call that then waits for hours holds
 /// nothing that would keep the database awake.
-#[sqlx::test]
-async fn a_request_that_let_go_of_its_listening_holds_the_watch_no_longer(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_request_that_let_go_of_its_listening_holds_the_watch_no_longer(pool: Pool) {
     use std::sync::Arc;
     use axum::extract::Extension;
     use axum::routing::get;
     use tower::ServiceExt as _;
     use weft_task_store::pg_signal::{keep_listening, PgSignalWatch, RequestListening};
     setup(&pool).await;
-    let watch = PgSignalWatch::start(&pool.connect_options(), support::CHANNELS, weft_task_store::pg_signal::Listening::WhileBusy).await.unwrap();
+    let watch = PgSignalWatch::start(pool.config(), support::CHANNELS, weft_task_store::pg_signal::Listening::WhileBusy).await.unwrap();
     let (waiting, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
     let handler = |lets_go: bool| {
         let (waiting, release) = (waiting.clone(), release.clone());

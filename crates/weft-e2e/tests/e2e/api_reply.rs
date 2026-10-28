@@ -296,14 +296,15 @@ async fn the_project_answers_at_its_own_address() -> anyhow::Result<()> {
     anyhow::ensure!(status["address"]["state"] == "serving", "the project's address: {}", status["address"]);
     let url = status["address"]["url"].as_str().expect("a serving address has a url").to_string();
     let path = base.trim_start_matches(&format!("local/{}/", project.id()));
-    let answered = reqwest::get(format!("{url}/{path}/users/42")).await?;
+    let http = weft_core::net::http_client().build()?;
+    let answered = http.get(format!("{url}/{path}/users/42")).send().await?;
     assert_eq!(answered.status(), 200);
     let body: Value = answered.json().await?;
     assert_eq!(body["name"], "Ada", "{body}");
 
     project.weft(&["deactivate", "--running", "cancel"]).await?;
     status::wait_until_status(&disp, &project.id(), "inactive", status::STATUS_DEADLINE).await?;
-    let refused = reqwest::get(format!("{url}/{path}/users/42")).await?;
+    let refused = http.get(format!("{url}/{path}/users/42")).send().await?;
     assert_eq!(refused.status(), 503);
     assert!(refused.headers().get("retry-after").is_some(), "the caller is told when to try again");
 

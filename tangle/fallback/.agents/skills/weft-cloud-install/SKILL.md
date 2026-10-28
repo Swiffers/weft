@@ -1,6 +1,6 @@
 ---
 name: weft-cloud-install
-description: "Read when the user wants weft itself on their Google Cloud for the first time, or to upgrade or resize the weft already there: getting the user's GitHub and Google Cloud accounts and CLIs ready, the fork, the one-time gcloud block, the database, the fork's variables and secrets, running the install workflow, the first operator key, upgrading, and sizing. Deploying a project to an install that already exists is weft-deploying, not this."
+description: "Read when the user wants weft itself on their Google Cloud for the first time, or to upgrade the weft already there or change the size of its own parts (its Cloud SQL database, how many copies of its dispatcher and broker run, its holders, its build machine): getting the user's GitHub and Google Cloud accounts and CLIs ready, the fork, the one-time gcloud block, the database, the fork's variables and secrets, running the install workflow, the first operator key, upgrading, and sizing. Deploying a project to an install that already exists is weft-deploying, not this."
 ---
 
 # Putting weft on GCP
@@ -184,13 +184,43 @@ from that checkout (it deletes any edits the user made under
 `nodes/base_catalog/`, so check with them first); otherwise fix what the error
 says. Then `weft resync --on prod` in that folder brings back what the upgrade
 took down. Each program on it with
-infrastructure then needs `weft infra upgrade --on prod`, through the
-deployer: the new weft builds each piece's image anew, and `weft status --on
+infrastructure then needs `weft infra upgrade --on prod`, which you run
+yourself: the new weft builds each piece's image anew, and `weft status --on
 prod` marks each infra node `behind the source` until it is done. A program's deploy
 workflow needs nothing: it asks the install which weft it runs on every run.
-Sizing (how many triggers
-one holder takes, a holder's CPU and memory, how many builds run at once,
-the machine builds compile on) is a default in
+If weft's own database is the install's own on Cloud SQL, its size is the
+fork's repository variable `WEFT_CLOUD_SQL_TIER` (`db-g1-small`, a small
+shared machine, when unset; a `db-custom-<cpus>-<MiB>` one for a busier
+program). Editing `deploy/terraform/gcp/variables.tf` does nothing for it,
+because the install workflow always passes the variable. Its companion
+`WEFT_CLOUD_SQL_MAX_CONNECTIONS` is optional: unset, Cloud SQL's own number
+for the tier applies (50 on `db-g1-small`); once set, it stays at that
+number whatever the tier, so raise it together with the tier.
+
+Two more variables cap how many copies of weft's dispatcher and broker
+Cloud Run runs at once: `WEFT_DISPATCHER_MAX_COPIES` (2 when unset) and
+`WEFT_BROKER_MAX_COPIES` (4 when unset). Every copy takes an equal share of
+the database's connections, so more copies means a smaller share each. If
+the user wants more copies running at once, give the database more
+connections first (a bigger tier), then raise a ceiling. If a copy refuses
+to start because its share is too small, raise the tier or lower a ceiling.
+On a database the user brought, more connections means a bigger plan at
+their provider. For how the share is worked out and the least each copy
+needs, go and read the cloud guide's section "How many connections the
+install takes".
+
+Changing the tier, or setting or changing
+`WEFT_CLOUD_SQL_MAX_CONNECTIONS`, restarts weft's database once, and the
+workflow replaces nothing while anything on the install is on, so ask the
+user first, saying both. Then `weft maintenance on --on prod`, `gh variable
+set <name> --body <value> --repo <fork>` for each variable you change, the
+install workflow run again, and `weft maintenance off --on prod`.
+Repository variables live in the fork's GitHub settings, so updating the
+fork keeps them.
+
+The rest of the sizing (how many triggers
+one holder takes, a holder's CPU and memory, the machine builds compile
+on) is a default in
 `deploy/terraform/gcp/variables.tf` in the fork: change it there, commit,
 and run the workflow again. The build machine defaults to the one Cloud
 Build's free minutes cover; a bigger one (`build_machine = "E2_HIGHCPU_8"`)
@@ -227,8 +257,8 @@ Each line says copied, already there, or skipped and why.
 
 Secrets travel sealed to the cloud install and keep their ids. Which
 connection each node uses is picked per install, so the command ends with
-`weft connect --node <node> --grant <id> --on prod` lines: hand those to the
-deployer to run, in the project folder. A connection that spends the
+`weft connect --node <node> --grant <id> --on prod` lines: run those
+yourself, in the project folder. A connection that spends the
 install's own shared key copies only when the cloud install holds that key;
 for one that is skipped, the user connects it there themselves. A run's
 files stay behind unless they were kept. A file keeps its key, version and

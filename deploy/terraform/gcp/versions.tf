@@ -9,13 +9,14 @@ terraform {
   required_providers {
     google = {
       source = "hashicorp/google"
-      # Cloud Run worker pools (the holders) arrived in 7, and
-      # `google_workload_identity_service_agent` (machines.tf) in 7.28.
-      version = "~> 7.28"
+      # The latest minor when last upgraded (October 2026). What this
+      # folder needs is older: Cloud Run worker pools (the holders) since 7,
+      # `google_workload_identity_service_agent` (machines.tf) since 7.28.
+      version = "~> 8.8"
     }
     random = {
       source  = "hashicorp/random"
-      version = "~> 3.6"
+      version = "~> 3.9"
     }
   }
 

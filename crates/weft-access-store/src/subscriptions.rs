@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::Value;
-use sqlx::PgPool;
+use weft_task_store::db::{Client as _, Pool};
 
 use weft_core::access::client::{run_connect_call as core_run_connect_call, ConnectCallError, RefusalKind};
 use weft_core::access::events::{
@@ -98,8 +98,8 @@ pub struct EnsuredSubscription {
 /// internet can reach; a topic that must TELL the provider where to
 /// send then refuses with the teaching error.
 pub async fn ensure_subscription<F, Fut>(
-    pool: &PgPool,
-    locks: &PgPool,
+    pool: &Pool,
+    locks: &Pool,
     req: &EnsureSubscription,
     receiver_url: F,
 ) -> anyhow::Result<EnsuredSubscription>
@@ -182,24 +182,25 @@ where
             .iter()
             .filter_map(|c| values.get(&c.name).map(|v| (c.name.clone(), v.clone())))
             .collect();
-        sqlx::query(
+        pool.execute(
             "INSERT INTO signal_subscription
                (id, tenant_id, service, topic, access_id, signal_token, token_sealed,
                 captures_json, expires_at, project_id, instance_id)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            &[
+                &minted_id,
+                &req.tenant,
+                &req.service,
+                &req.topic,
+                &req.access_id,
+                &req.signal_token,
+                &crate::seal_str(&minted_token),
+                &serde_json::to_value(&captures)?,
+                &expires_at,
+                &req.for_instance.as_ref().map(|m| m.project_id),
+                &req.for_instance.as_ref().map(|m| m.instance.as_str()),
+            ],
         )
-        .bind(&minted_id)
-        .bind(&req.tenant)
-        .bind(&req.service)
-        .bind(&req.topic)
-        .bind(req.access_id)
-        .bind(&req.signal_token)
-        .bind(crate::seal_str(&minted_token))
-        .bind(serde_json::to_value(&captures)?)
-        .bind(expires_at)
-        .bind(req.for_instance.as_ref().map(|m| m.project_id))
-        .bind(req.for_instance.as_ref().map(|m| m.instance.as_str()))
-        .execute(pool)
         .await?;
 
         // Now stop EVERY channel this one replaces: the newest, and any
@@ -233,7 +234,7 @@ where
 /// changes at once would hold every connection and wait for one more. A
 /// waiter holds no connection while it waits
 /// (`weft_task_store::locks::with_lock_waiting`).
-async fn with_signal_locked<T, F, Fut>(locks: &PgPool, tenant: &str, signal_token: &str, body: F) -> anyhow::Result<T>
+async fn with_signal_locked<T, F, Fut>(locks: &Pool, tenant: &str, signal_token: &str, body: F) -> anyhow::Result<T>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
@@ -250,8 +251,8 @@ where
 /// keeping an untracked row would be junk nobody can act on) and is
 /// logged loudly.
 pub async fn drop_subscriptions_for_signal(
-    pool: &PgPool,
-    locks: &PgPool,
+    pool: &Pool,
+    locks: &Pool,
     tenant: &str,
     signal_token: &str,
 ) -> anyhow::Result<u64> {
@@ -296,21 +297,19 @@ pub async fn drop_subscriptions_for_signal(
 /// endpoint's service + topic, so a push replayed at another
 /// service's or topic's endpoint finds nothing and drops.
 pub async fn subscription_by_id(
-    pool: &PgPool,
+    pool: &Pool,
     minted_id: &str,
     service: &str,
     topic: &str,
 ) -> anyhow::Result<Option<Subscription>> {
-    let row: Option<SubscriptionRow> = sqlx::query_as(
-        "SELECT id, tenant_id, service, topic, access_id, signal_token, token_sealed, captures_json,
-                expires_at, project_id, instance_id
-         FROM signal_subscription WHERE id = $1 AND service = $2 AND topic = $3",
-    )
-    .bind(minted_id)
-    .bind(service)
-    .bind(topic)
-    .fetch_optional(pool)
-    .await?;
+    let row: Option<SubscriptionRow> = pool
+        .opt(
+            "SELECT id, tenant_id, service, topic, access_id, signal_token, token_sealed, captures_json,
+                    expires_at, project_id, instance_id
+             FROM signal_subscription WHERE id = $1 AND service = $2 AND topic = $3",
+            &[&minted_id, &service, &topic],
+        )
+        .await?;
     row.map(row_to_subscription).transpose()
 }
 
@@ -319,7 +318,7 @@ pub async fn subscription_by_id(
 /// plus everything the subscribe captured (the resource id the stop
 /// call needs).
 async fn stop_subscription(
-    pool: &PgPool,
+    pool: &Pool,
     source: &crate::resolve::ResolvedEventSource,
     calls: &SubscriptionCalls,
     sub: &Subscription,
@@ -337,11 +336,8 @@ async fn stop_subscription(
     delete_row(pool, &sub.id).await
 }
 
-async fn delete_row(pool: &PgPool, id: &str) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM signal_subscription WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await?;
+async fn delete_row(pool: &Pool, id: &str) -> anyhow::Result<()> {
+    pool.execute("DELETE FROM signal_subscription WHERE id = $1", &[&id]).await?;
     Ok(())
 }
 
@@ -350,20 +346,19 @@ async fn delete_row(pool: &PgPool, id: &str) -> anyhow::Result<()> {
 /// others are strays a crash left behind). The ONE reader for both
 /// the renewal path and the drop path.
 async fn list_for_signal(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     signal_token: &str,
 ) -> anyhow::Result<Vec<Subscription>> {
-    let rows: Vec<SubscriptionRow> = sqlx::query_as(
-        "SELECT id, tenant_id, service, topic, access_id, signal_token, token_sealed, captures_json,
-                expires_at, project_id, instance_id
-         FROM signal_subscription WHERE tenant_id = $1 AND signal_token = $2
-         ORDER BY created_at DESC",
-    )
-    .bind(tenant)
-    .bind(signal_token)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<SubscriptionRow> = pool
+        .all(
+            "SELECT id, tenant_id, service, topic, access_id, signal_token, token_sealed, captures_json,
+                    expires_at, project_id, instance_id
+             FROM signal_subscription WHERE tenant_id = $1 AND signal_token = $2
+             ORDER BY created_at DESC",
+            &[&tenant, &signal_token],
+        )
+        .await?;
     rows.into_iter().map(row_to_subscription).collect()
 }
 

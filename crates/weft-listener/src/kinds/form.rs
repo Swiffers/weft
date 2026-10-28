@@ -150,6 +150,7 @@ mod tests {
 
     fn registered(spec: SignalSpec) -> RegisteredSignal {
         RegisteredSignal {
+            generation: 1,
             spec,
             node_id: "node-7".into(),
             tenant_id: "t".into(),

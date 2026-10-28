@@ -17,7 +17,7 @@ ARG RUNTIME_BINARY=compiled
 # The compiled path uses a plain base + rustup so the toolchain is read
 # from `rust-toolchain.toml` (the single source of truth for the whole
 # system), NOT baked into a `rust:X` image.
-FROM debian:bookworm-slim AS compiled
+FROM debian:trixie-slim AS compiled
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -67,9 +67,9 @@ FROM ${RUNTIME_BINARY} AS binary
 
 # The Docker command line, for the host agent on a cloud machine: it runs
 # the machine's unit on the machine's own Docker through its socket.
-FROM debian:bookworm-slim AS docker-cli
+FROM debian:trixie-slim AS docker-cli
 ARG TARGETARCH
-ARG DOCKER_VERSION=27.3.1
+ARG DOCKER_VERSION=29.9.2
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
@@ -82,7 +82,7 @@ RUN case "${TARGETARCH:-amd64}" in \
        | tar -xz -C /tmp \
     && cp /tmp/docker/docker /usr/local/bin/docker
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

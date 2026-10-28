@@ -74,7 +74,7 @@ async fn spawn_gateway() -> FakeGateway {
                             drop(guard);
                             let Some(frame) = frame else { break };
                             if write
-                                .send(tokio_tungstenite::tungstenite::Message::Text(frame))
+                                .send(tokio_tungstenite::tungstenite::Message::Text(frame.into()))
                                 .await
                                 .is_err()
                             {
@@ -85,7 +85,7 @@ async fn spawn_gateway() -> FakeGateway {
                             drop(guard);
                             match up {
                                 Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
-                                    received.lock().unwrap().push(t);
+                                    received.lock().unwrap().push(t.as_str().to_owned());
                                 }
                                 Some(Ok(_)) => {}
                                 _ => break,
@@ -383,7 +383,7 @@ async fn run_scenario() {
     // Unregistering (registry removal) aborts the per-signal task;
     // its drop guard leaves the socket share, and the LAST subscriber
     // leaving tears the shared engine down.
-    registry.remove(&sig_token);
+    registry.remove(&sig_token, weft_listener::registry::Registrations::All);
 }
 
 // A multi-account socket fails CLOSED: an account-scoped subscriber

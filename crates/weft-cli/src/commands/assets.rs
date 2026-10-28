@@ -72,7 +72,7 @@ async fn resolve_asset_map(
     // is inlined into the build, so no stored copy would be referenced.
     let text_refs = weft_compiler::file_ref::collect_text_refs(target);
     if !text_refs.is_empty() {
-        let http = reqwest::Client::new();
+        let http = weft_core::net::http_client().build()?;
         let mut failed: Vec<String> = Vec::new();
         for r in &text_refs {
             let fetched: Result<Vec<u8>> = if weft_compiler::file_ref::is_url_ref(r) {

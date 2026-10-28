@@ -11,9 +11,9 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use sqlx::postgres::PgPool;
 use uuid::Uuid;
 
+use crate::db::Pool;
 use crate::pg_signal::PgSignalWatch;
 
 /// The channel a terminal task write is announced on, with the task's id
@@ -24,7 +24,7 @@ pub const TERMINAL_CHANNEL: &str = "weft_task_terminal";
 /// Wait for `task_id` to finish, or for `timeout` to pass, and hand back
 /// its outcome either way (a timed-out outcome is not terminal).
 pub async fn wait_for_terminal(
-    pool: &PgPool,
+    pool: &Pool,
     signals: &PgSignalWatch,
     task_id: Uuid,
     timeout: Duration,
@@ -38,7 +38,7 @@ pub async fn wait_for_terminal(
 /// scoped to the project, so `None` when no such task belongs to it (or
 /// it went away while waiting).
 pub async fn wait_for_terminal_in_project(
-    pool: &PgPool,
+    pool: &Pool,
     signals: &PgSignalWatch,
     task_id: Uuid,
     project_id: Uuid,

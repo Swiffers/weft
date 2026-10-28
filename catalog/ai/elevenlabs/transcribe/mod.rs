@@ -520,7 +520,7 @@ impl Node for ElevenLabsTranscribeNode {
                 next = frames.next_bytes("audio") => match next.node_err("reading the audio stream")? {
                     Some((_, audio)) => {
                         let chunk = audio_chunk(&audio, rate, previous_text.take().as_deref(), false);
-                        socket.send(SocketMessage::Text(chunk)).await?;
+                        socket.send(SocketMessage::text(chunk)).await?;
                     }
                     // The audio ended; the drain below takes over.
                     None => break,
@@ -551,7 +551,7 @@ impl Node for ElevenLabsTranscribeNode {
         // close has already been read by this loop. Requiring a goodbye
         // frame here fails real sessions (verified live).
         let flush = audio_chunk(&[], rate, previous_text.take().as_deref(), true);
-        socket.send(SocketMessage::Text(flush)).await?;
+        socket.send(SocketMessage::text(flush)).await?;
         loop {
             tokio::select! {
                 frame = socket.recv() => match frame? {

@@ -30,11 +30,12 @@
 //! layer 1 and the handlers only gather and dispatch.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use weft_task_store::db::{Client, Pool};
 use weft_core::run_spec::RunSpec;
 use weft_core::versions::PrunePlan;
 use weft_core::working_copy::Head;
@@ -230,11 +231,11 @@ pub trait VersionStoreOps: Send + Sync {
 pub type VersionStore = Arc<dyn VersionStoreOps>;
 
 pub struct PostgresVersionStore {
-    pool: PgPool,
+    pool: Pool,
 }
 
 impl PostgresVersionStore {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: Pool) -> Self {
         Self { pool }
     }
 }
@@ -246,29 +247,23 @@ pub const VERSIONS_IN_USE_REFUSAL: &str =
 
 /// Source versions needed by armed settings or runs not yet safely
 /// represented in the tree. Automatic sweeps also retain completed bakes.
-async fn source_versions_in_use(
-    conn: &mut sqlx::PgConnection,
-    project: uuid::Uuid,
-    include_bakes: bool,
-) -> anyhow::Result<BTreeSet<String>> {
-    let versions: Vec<Option<String>> = sqlx::query_scalar(
-        "SELECT source_version FROM signal WHERE project_id = $1 \
-         UNION SELECT r.source_version FROM run r \
-         WHERE r.project_id = $1 \
-           AND (r.state <> 'ended' OR EXISTS (SELECT 1 FROM trigger_setup s WHERE s.run_id = r.run_id)) \
-         UNION SELECT source_version FROM trigger_bake WHERE project_id = $1 AND $2",
-    )
-    .bind(project)
-    .bind(include_bakes)
-    .fetch_all(conn)
-    .await?;
+async fn source_versions_in_use(conn: &impl Client, project: uuid::Uuid, include_bakes: bool) -> anyhow::Result<BTreeSet<String>> {
+    let versions: Vec<Option<String>> = conn
+        .scalars(
+            "SELECT source_version FROM signal WHERE project_id = $1 \
+             UNION SELECT r.source_version FROM run r \
+             WHERE r.project_id = $1 \
+               AND (r.state <> 'ended' OR EXISTS (SELECT 1 FROM trigger_setup s WHERE s.run_id = r.run_id)) \
+             UNION SELECT source_version FROM trigger_bake WHERE project_id = $1 AND $2::boolean",
+            &[&project, &include_bakes],
+        )
+        .await?;
     Ok(versions.into_iter().flatten().collect())
 }
 
-pub(crate) async fn retain_source_version(conn: &mut sqlx::PgConnection, project: uuid::Uuid, version: &str) -> anyhow::Result<()> {
-    let found: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM project_version WHERE project_id = $1 AND id = $2 FOR KEY SHARE"
-    ).bind(project).bind(version).fetch_optional(conn).await?;
+pub(crate) async fn retain_source_version(conn: &impl Client, project: uuid::Uuid, version: &str) -> anyhow::Result<()> {
+    let found: Option<String> =
+        conn.scalar_opt("SELECT id FROM project_version WHERE project_id = $1 AND id = $2 FOR KEY SHARE", &[&project, &version]).await?;
     anyhow::ensure!(found.is_some(), "source version {version} was removed during preparation; run the command again");
     Ok(())
 }
@@ -329,118 +324,96 @@ const IN_TREE: &str = "source_version IS NOT NULL AND definition_hash IS NOT NUL
 #[async_trait]
 impl VersionStoreOps for PostgresVersionStore {
     async fn upsert_version(&self, version: &VersionRow) -> anyhow::Result<bool> {
-        let rows = sqlx::query(
-            "INSERT INTO project_version (id, project_id, parent_id, manifest, label, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (project_id, id) DO NOTHING",
-        )
-        .bind(&version.id)
-        .bind(version.project_id)
-        .bind(&version.parent_id)
-        .bind(serde_json::to_value(&version.manifest)?)
-        .bind(&version.label)
-        .bind(version.created_at as i64)
-        .execute(&self.pool)
-        .await?;
-        Ok(rows.rows_affected() == 1)
+        let rows = self
+            .pool
+            .execute(
+                "INSERT INTO project_version (id, project_id, parent_id, manifest, label, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (project_id, id) DO NOTHING",
+                &[
+                    &version.id,
+                    &version.project_id,
+                    &version.parent_id,
+                    &serde_json::to_value(&version.manifest)?,
+                    &version.label,
+                    &(version.created_at as i64),
+                ],
+            )
+            .await?;
+        Ok(rows == 1)
     }
 
     async fn version(&self, project: uuid::Uuid, id: &str) -> anyhow::Result<Option<VersionRow>> {
-        let row: Option<VersionTuple> = sqlx::query_as(&format!(
-            "SELECT {VERSION_COLUMNS} FROM project_version WHERE project_id = $1 AND id = $2"
-        ))
-        .bind(project)
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<VersionTuple> =
+            self.pool.opt(&format!("SELECT {VERSION_COLUMNS} FROM project_version WHERE project_id = $1 AND id = $2"), &[&project, &id]).await?;
         row.map(version_from).transpose()
     }
 
     async fn versions(&self, project: uuid::Uuid) -> anyhow::Result<Vec<VersionRow>> {
-        let rows: Vec<VersionTuple> = sqlx::query_as(&format!(
-            "SELECT {VERSION_COLUMNS} FROM project_version WHERE project_id = $1 ORDER BY seq ASC"
-        ))
-        .bind(project)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<VersionTuple> =
+            self.pool.all(&format!("SELECT {VERSION_COLUMNS} FROM project_version WHERE project_id = $1 ORDER BY seq ASC"), &[&project]).await?;
         rows.into_iter().map(version_from).collect()
     }
 
     async fn set_label(&self, project: uuid::Uuid, id: &str, label: Option<&str>) -> anyhow::Result<()> {
-        let rows = sqlx::query("UPDATE project_version SET label = $3 WHERE project_id = $1 AND id = $2")
-            .bind(project)
-            .bind(id)
-            .bind(label)
-            .execute(&self.pool)
-            .await?;
-        anyhow::ensure!(rows.rows_affected() == 1, "version {id} not found");
+        let rows = self.pool.execute("UPDATE project_version SET label = $3 WHERE project_id = $1 AND id = $2", &[&project, &id, &label]).await?;
+        anyhow::ensure!(rows == 1, "version {id} not found");
         Ok(())
     }
 
     async fn delete_versions(&self, project: uuid::Uuid, ids: &[String]) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT id FROM project_version WHERE project_id = $1 AND id = ANY($2) ORDER BY id FOR UPDATE")
-            .bind(project).bind(ids).execute(&mut *tx).await?;
-        let protected = source_versions_in_use(&mut tx, project, false).await?;
+        let mut conn = self.pool.get().await?;
+        let tx = conn.transaction().await?;
+        tx.execute("SELECT id FROM project_version WHERE project_id = $1 AND id = ANY($2) ORDER BY id FOR UPDATE", &[&project, &ids]).await?;
+        let protected = source_versions_in_use(&tx, project, false).await?;
         anyhow::ensure!(!ids.iter().any(|id| protected.contains(id)), VERSIONS_IN_USE_REFUSAL);
-        sqlx::query("DELETE FROM trigger_bake WHERE project_id = $1 AND source_version = ANY($2)")
-            .bind(project).bind(ids).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM version_runs WHERE project_id = $1 AND source_version = ANY($2)")
-            .bind(project).bind(ids).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM project_version WHERE project_id = $1 AND id = ANY($2)")
-            .bind(project)
-            .bind(ids)
-            .execute(&mut *tx)
-            .await?;
+        tx.execute("DELETE FROM trigger_bake WHERE project_id = $1 AND source_version = ANY($2)", &[&project, &ids]).await?;
+        tx.execute("DELETE FROM version_runs WHERE project_id = $1 AND source_version = ANY($2)", &[&project, &ids]).await?;
+        tx.execute("DELETE FROM project_version WHERE project_id = $1 AND id = ANY($2)", &[&project, &ids]).await?;
         tx.commit().await?;
         Ok(())
     }
 
     async fn versions_in_use(&self, project: uuid::Uuid, include_bakes: bool) -> anyhow::Result<BTreeSet<String>> {
-        let mut conn = self.pool.acquire().await?;
-        source_versions_in_use(&mut conn, project, include_bakes).await
+        source_versions_in_use(&self.pool, project, include_bakes).await
     }
 
     async fn registered_source(&self, project: uuid::Uuid) -> anyhow::Result<Option<Manifest>> {
         let source: Option<Option<serde_json::Value>> =
-            sqlx::query_scalar("SELECT running_source FROM project WHERE id = $1")
-                .bind(project)
-                .fetch_optional(&self.pool)
-                .await?;
+            self.pool.scalar_opt("SELECT running_source FROM project WHERE id = $1", &[&project]).await?;
         Ok(source.flatten().map(serde_json::from_value).transpose()?)
     }
 
     async fn run(&self, run_id: RunId) -> anyhow::Result<Option<RunRow>> {
-        let row: Option<RunTuple> = sqlx::query_as(&format!(
-            "SELECT {RUN_COLUMNS} FROM run WHERE run_id = $1 AND {IN_TREE}"
-        ))
-        .bind(run_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<RunTuple> = self.pool.opt(&format!("SELECT {RUN_COLUMNS} FROM run WHERE run_id = $1 AND {IN_TREE}"), &[&run_id]).await?;
         row.map(run_from).transpose()
     }
 
     async fn runs(&self, project: uuid::Uuid) -> anyhow::Result<Vec<RunRow>> {
-        let rows: Vec<RunTuple> = sqlx::query_as(&format!(
-            "SELECT {RUN_COLUMNS} FROM run \
-             WHERE project_id = $1 AND spec IS NOT NULL AND {IN_TREE} \
-             ORDER BY started_at ASC, run_id ASC"
-        ))
-        .bind(project)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<RunTuple> = self
+            .pool
+            .all(
+                &format!(
+                    "SELECT {RUN_COLUMNS} FROM run \
+                     WHERE project_id = $1 AND spec IS NOT NULL AND {IN_TREE} \
+                     ORDER BY started_at ASC, run_id ASC"
+                ),
+                &[&project],
+            )
+            .await?;
         rows.into_iter().map(run_from).collect()
     }
 
     async fn trigger_runs(&self, project: uuid::Uuid) -> anyhow::Result<BTreeMap<String, TriggerRuns>> {
-        let rows: Vec<(String, i64, uuid::Uuid)> = sqlx::query_as(
-            // Postgres has no `max(uuid)`; run ids are v7, so the newest one
-            // sorts highest.
-            "SELECT source_version, SUM(runs)::bigint, (ARRAY_AGG(last_run ORDER BY last_run DESC))[1] \
-             FROM version_runs WHERE project_id = $1 GROUP BY source_version",
-        )
-        .bind(project)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<(String, i64, uuid::Uuid)> = self
+            .pool
+            .all(
+                // Postgres has no `max(uuid)`; run ids are v7, so the newest
+                // one sorts highest.
+                "SELECT source_version, SUM(runs)::bigint, (ARRAY_AGG(last_run ORDER BY last_run DESC))[1] \
+                 FROM version_runs WHERE project_id = $1 GROUP BY source_version",
+                &[&project],
+            )
+            .await?;
         Ok(rows.into_iter().map(|(version, runs, last)| (version, TriggerRuns { runs: runs.max(0) as u64, last })).collect())
     }
 
@@ -449,23 +422,20 @@ impl VersionStoreOps for PostgresVersionStore {
         run_id: RunId,
         example: Option<&str>,
     ) -> anyhow::Result<()> {
-        let rows = sqlx::query("UPDATE run SET example = $2 WHERE run_id = $1 AND spec IS NOT NULL")
-            .bind(run_id)
-            .bind(example)
-            .execute(&self.pool)
-            .await?;
-        anyhow::ensure!(rows.rows_affected() == 1, "run {run_id} is not a run started by hand");
+        let rows = self.pool.execute("UPDATE run SET example = $2 WHERE run_id = $1 AND spec IS NOT NULL", &[&run_id, &example]).await?;
+        anyhow::ensure!(rows == 1, "run {run_id} is not a run started by hand");
         Ok(())
     }
 
     async fn activated_versions(&self, project: uuid::Uuid) -> anyhow::Result<Vec<String>> {
-        Ok(sqlx::query_scalar(
-            "SELECT DISTINCT activation_version FROM trigger_activation \
-             WHERE project_id = $1 AND activation_version IS NOT NULL ORDER BY 1",
-        )
-        .bind(project)
-        .fetch_all(&self.pool)
-        .await?)
+        Ok(self
+            .pool
+            .scalars(
+                "SELECT DISTINCT activation_version FROM trigger_activation \
+                 WHERE project_id = $1 AND activation_version IS NOT NULL ORDER BY 1",
+                &[&project],
+            )
+            .await?)
     }
 }
 

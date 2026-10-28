@@ -31,18 +31,11 @@ use weft_core::access::wire::{
 use weft_core::migrate::{ExportConnections, ExportedConnections, ImportConnections, ImportedConnections, TransferKey};
 use weft_core::storage::Tenanted;
 
+use super::access_store_error;
 use crate::authenticator::CallerTenant;
 use crate::state::DispatcherState;
 
 type ApiError = (StatusCode, String);
-
-/// A store error as this surface answers it. The mapping itself lives
-/// in the store (`client_error`), so the dispatcher and the broker
-/// answer identically by construction rather than by copy.
-fn access_err(e: anyhow::Error) -> ApiError {
-    let (status, message) = weft_access_store::client_error(e);
-    (StatusCode::from_u16(status).expect("store status codes are valid"), message)
-}
 
 /// The callback URL a tenant registers at the provider. Shown by the
 /// editor during app registration and used verbatim in the code
@@ -213,7 +206,7 @@ pub async fn list_grants(
         weft_access_store::GrantOwnerScope::Author,
     )
         .await
-        .map_err(access_err)?;
+        .map_err(access_store_error)?;
     // A runtime-owned row is a connection only while the key behind it
     // exists, and only the broker holds the shared-credentials file.
     let services = runtime_owned_services(&grants);
@@ -260,7 +253,7 @@ pub async fn delete_grant(
     weft_access_store::delete_grant(&state.pg_pool, &caller.0 .0, id, weft_access_store::GrantOwnerScope::Author)
         .await
         .map(Json)
-        .map_err(access_err)
+        .map_err(access_store_error)
 }
 
 // ---------- Connect flows ----------
@@ -324,7 +317,7 @@ pub async fn connect_status(
     weft_access_store::take_connect_result(&state.pg_pool, &caller.0 .0, &q.state)
         .await
         .map(Json)
-        .map_err(access_err)
+        .map_err(access_store_error)
 }
 
 // ---------- The OAuth callback door (outside-caller surface) ----------
@@ -435,7 +428,7 @@ pub async fn picker_begin(
     let base = crate::api::request_base(&headers)?;
     let picker_state = weft_access_store::begin_picker(&state.pg_pool, &caller.0 .0, req)
         .await
-        .map_err(access_err)?;
+        .map_err(access_store_error)?;
     // Built from THIS request's own host, like every other link a
     // caller is about to fetch. The editor asks for this address and
     // then opens it in the person's browser, so it has to be the
@@ -461,7 +454,7 @@ pub async fn picker_page(
 ) -> Result<Html<String>, ApiError> {
     let session = weft_access_store::load_picker(&state.pg_pool, &picker_state)
         .await
-        .map_err(access_err)?;
+        .map_err(access_store_error)?;
     // The connection's token, resolved on the broker (a refresh makes
     // an outbound call).
     #[derive(Serialize)]
@@ -604,7 +597,7 @@ pub async fn picker_result(
     };
     weft_access_store::finish_picker(&state.pg_pool, &picker_state, parked)
         .await
-        .map_err(access_err)?;
+        .map_err(access_store_error)?;
     Ok(Json(()))
 }
 

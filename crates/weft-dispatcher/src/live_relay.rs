@@ -54,9 +54,12 @@ pub(crate) async fn to_project(
             tracing::debug!(target: "weft_dispatcher::live_relay", %project, reason = %format!("{e:#}"), "a live caller arrived while the worker starts");
             return (StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}; retry in a moment")).into_response();
         }
+        // Anything else is the platform failing to give a worker, which
+        // may not pass by waiting: a 502, never the 503 that says the same
+        // call goes through later (`weft_core::install::asks_again`).
         Err(e) => {
             tracing::warn!(target: "weft_dispatcher::live_relay", %project, error = %format!("{e:#}"), "no worker for a live caller");
-            return (StatusCode::SERVICE_UNAVAILABLE, format!("no worker of this project could be reached ({e:#}); retry the connection"))
+            return (StatusCode::BAD_GATEWAY, format!("no worker of this project could be reached ({e:#}); retry the connection"))
                 .into_response();
         }
     };

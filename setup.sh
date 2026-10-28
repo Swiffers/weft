@@ -197,7 +197,8 @@
 #                   --postgres   remove postgres:18-alpine (and the
 #                                postgres:18 image --migration pulls)
 #                   --kind       remove kindest/node images (an older weft's)
-#                   --debian     remove debian:bookworm-slim
+#                   --debian     remove debian:trixie-slim (and the
+#                                debian:bookworm-slim an older weft used)
 #
 # Examples:
 #   ./setup.sh                          # full install
@@ -1054,8 +1055,12 @@ if [[ -n "${write_migration}" ]]; then
   if [[ $do_release -eq 1 ]]; then
     release_flag="--release"
   fi
-  # One generator for every table the install's database holds. A
-  # failure leaves this command re-runnable: the generator only deletes
+  # One generator for every table the install's database holds. It
+  # reads the migration history off the disk, so a new group's origin.sql
+  # it freezes is planned from in the same run, and it applies and
+  # records a release itself: the install below only rebuilds weft with
+  # the new files in it. A failure leaves this command re-runnable: the
+  # generator only deletes
   # the drafts after the released file is recorded on the live
   # database, and a released change answers "nothing changed" on the
   # re-run.
@@ -1477,14 +1482,15 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
         }
       fi
       if [[ $purge_debian -eq 1 ]]; then
-        remove_docker_object image debian:bookworm-slim " ${C_DIM}(--debian)${C_RESET}"
+        remove_docker_object image debian:trixie-slim " ${C_DIM}(--debian)${C_RESET}"
+        remove_docker_object image debian:bookworm-slim " ${C_DIM}(--debian, an older weft's)${C_RESET}"
       fi
 
       # The object store's image: niche enough that nothing else on the
       # host wants it, so a purge removes it unconditionally.
-      # SYNC: seaweedfs image <-> crates/weft-cli/src/commands/daemon.rs
-      #       (the `docker run` line below OBJECT_STORE_CONTAINER)
-      remove_docker_object image chrislusf/seaweedfs:3.80
+      # SYNC: seaweedfs image <-> crates/weft-cli/src/commands/daemon.rs (OBJECT_STORE_IMAGE)
+      remove_docker_object image chrislusf/seaweedfs:4.51
+      remove_docker_object image chrislusf/seaweedfs:3.80 " ${C_DIM}(an older weft's)${C_RESET}"
 
       if docker buildx prune --force >/dev/null 2>&1; then
         ok "pruned BuildKit cache"
@@ -1566,9 +1572,11 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       fi
     fi
     if [[ $purge_debian -eq 0 ]]; then
-      if docker image inspect debian:bookworm-slim >/dev/null 2>&1; then
-        skipped_lines+=("debian:bookworm-slim|--debian")
-      fi
+      for debian_image in debian:trixie-slim debian:bookworm-slim; do
+        if docker image inspect "$debian_image" >/dev/null 2>&1; then
+          skipped_lines+=("$debian_image|--debian")
+        fi
+      done
     fi
     if [[ ${#skipped_lines[@]} -gt 0 ]]; then
       printf '\n  %s%sShared base images kept%s %s(reused by other docker projects)%s\n' \
@@ -1870,14 +1878,24 @@ if [[ $on_default_install -eq 0 ]]; then
     build_browser=0
   fi
 fi
+# The oldest Node the extension builds run on: vsce, ovsx and wxt need 22,
+# and the Vite both extensions build with needs 22.12 on that line.
+node_floor_major=22
+node_floor_minor=12
+node_floor="${node_floor_major}.${node_floor_minor}"
+node_meets_floor() {
+  local version
+  version="$(node -v 2>/dev/null)" || return 1
+  [[ "$version" =~ ^v([0-9]+)\.([0-9]+) ]] || return 1
+  (( BASH_REMATCH[1] > node_floor_major || (BASH_REMATCH[1] == node_floor_major && BASH_REMATCH[2] >= node_floor_minor) ))
+}
 # What the extension builds need, now that it is known they run.
 missing=()
 install_hints=()
 if [[ $build_vscode -eq 1 && $use_prebuilt_vsix -eq 0 ]]; then
-  node_major="$(node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || echo 0)"
-  if [[ "${node_major}" -lt 20 ]]; then
-    missing+=("node 20+")
-    install_hints+=("  Node:    https://nodejs.org/en/download (or 'nvm install 20')")
+  if ! node_meets_floor; then
+    missing+=("node ${node_floor}+")
+    install_hints+=("  Node:    https://nodejs.org/en/download (or 'nvm install 24')")
   fi
   if ! command -v pnpm >/dev/null 2>&1; then
     missing+=("pnpm")
@@ -1885,9 +1903,9 @@ if [[ $build_vscode -eq 1 && $use_prebuilt_vsix -eq 0 ]]; then
   fi
 fi
 if [[ $build_browser -eq 1 ]]; then
-  if ! command -v node >/dev/null 2>&1; then
-    missing+=("node 20+ (browser extension)")
-    install_hints+=("  Node:    https://nodejs.org/en/download")
+  if ! node_meets_floor; then
+    missing+=("node ${node_floor}+ (browser extension)")
+    install_hints+=("  Node:    https://nodejs.org/en/download (or 'nvm install 24')")
   fi
   if ! command -v pnpm >/dev/null 2>&1; then
     missing+=("pnpm (browser extension)")
@@ -2110,9 +2128,12 @@ if [[ $refresh_daemon -eq 1 ]]; then
       ok "the old database of ${install_env} is gone; starting on a fresh one"
     fi
 
-    # In the build slot: a start whose runtime image moved compiles it
-    # (cargo, inside docker), and one whose standard worker moved
-    # compiles that on this machine: as heavy as the CLI build.
+    # In the build slot: a start whose runtime image moved builds it
+    # around the weft-runtime this run installed (a copy, seconds), or,
+    # when this machine's glibc is newer than the image's Debian and the
+    # start says so, compiles it with cargo inside docker; and one whose
+    # standard worker moved compiles that on this machine: as heavy as
+    # the CLI build.
     spin "starting weft (pulls or builds its images the first time)" \
       with_build_slot "${install_env_cmd[@]}" daemon start ${rebuild_flag} ${public_url_flag}
     record_checkout_install
@@ -2305,7 +2326,7 @@ if [[ $build_vscode -eq 1 ]]; then
         warn "prebuilt .vsix download failed; building locally instead"
       else
         fail "the prebuilt .vsix could not be downloaded and no Node toolchain is on PATH"
-        hint "install Node 20+ and pnpm, or re-run once the network is back"
+        hint "install Node ${node_floor}+ and pnpm, or re-run once the network is back"
         exit 1
       fi
     fi
@@ -2315,9 +2336,8 @@ if [[ $build_vscode -eq 1 ]]; then
   # above): compile, fingerprint, bump, package. Sets `vsix_path` +
   # `current_ver`; called just below when no prebuilt .vsix landed.
   build_vsix_locally() {
-  node_major="$(node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || echo 0)"
-  if [[ "${node_major}" -lt 20 ]]; then
-    fail "needs Node 20+ (got $(node -v 2>/dev/null || echo 'none'))"
+  if ! node_meets_floor; then
+    fail "needs Node ${node_floor}+ (got $(node -v 2>/dev/null || echo 'none'))"
     hint "try: ${C_BOLD}nvm use 24 && ./setup.sh --vscode${C_RESET}"
     exit 1
   fi

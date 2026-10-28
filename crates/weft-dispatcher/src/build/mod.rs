@@ -216,7 +216,7 @@ pub trait ProjectStorage: Send + Sync {
 #[derive(Clone)]
 pub struct VersionBuilder {
     pub images: Arc<dyn ImageBuilder>,
-    pub pool: sqlx::PgPool,
+    pub pool: weft_task_store::db::Pool,
     /// The reclaims registered builds asked for (`prune::AfterBuildPrunes`).
     pub prunes: Arc<prune::AfterBuildPrunes>,
     /// The version files this replica fetched before (`blob_cache`).

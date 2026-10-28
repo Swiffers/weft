@@ -68,9 +68,10 @@ use std::collections::HashMap;
 
 use anyhow::Context as _;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 
+use crate::db::{Client, Conn, FromRow, Pool, Row, Transaction, Waits};
 use crate::documents::Document;
+use crate::schema_group::{SchemaGroup, Until};
 
 /// One part of one change to one group's tables: the file's SQL, the group
 /// it sits under, the id it is filed by, and which [`Part`] of the change
@@ -80,12 +81,13 @@ use crate::documents::Document;
 /// An id is recorded the moment its SQL runs, so it never runs twice, and its
 /// checksum is recorded with it, so editing a file that has already run
 /// somewhere fails loudly instead of leaving two databases silently apart.
-pub struct Migration {
-    pub group: &'static str,
+#[derive(Clone, Copy)]
+pub struct Migration<'a> {
+    pub group: &'a str,
     /// The file's name without `.sql`: the change's id for its expand
     /// part, and the id followed by [`CONTRACT_SUFFIX`] for its contract
     /// part, so the two are recorded apart.
-    pub id: &'static str,
+    pub id: &'a str,
     pub part: Part,
     /// A draft exists only on the machine that wrote it (its file is
     /// gitignored). It keeps that one database in step with a shape still
@@ -93,7 +95,7 @@ pub struct Migration {
     /// shape settles. Ids start with `draft_`, so drafts sort after every
     /// released file and run last.
     pub draft: bool,
-    pub sql: &'static str,
+    pub sql: &'a str,
 }
 
 /// Which half of a change a migration file holds. The generator splits
@@ -112,85 +114,13 @@ pub enum Part {
     Contract,
 }
 
-/// What ends a contract part's file name before `.sql`, after its
-/// change's id: `20261023T120000_project_resync_drive.contract.sql` beside
-/// the change's `20261023T120000_project_resync_drive.sql`.
-// SYNC: CONTRACT_SUFFIX <-> crates/weft-task-store/build.rs (the part of each file)
-pub const CONTRACT_SUFFIX: &str = ".contract";
+#[path = "migration_files.rs"]
+pub mod migration_files;
+pub use migration_files::CONTRACT_SUFFIX;
 
 // Every file under `migrations/`, gathered at build time. Writing a migration
 // is dropping a file in there; nothing registers it.
 include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
-
-/// One module's schema: the canonical DDL, the tables it creates, and the
-/// changes that carry an older database to it. Declared as a `static` next to
-/// the DDL's owning module.
-pub struct SchemaGroup {
-    /// Short stable slug, usually the main table name. Keys the stored
-    /// fingerprint in `weft_schema_stamp` and the applied ids in
-    /// `weft_migration`.
-    pub name: &'static str,
-    /// Every table the group's ddl creates.
-    pub tables: &'static [&'static str],
-    /// The exact statements the group runs. An entry may hold multiple
-    /// semicolon-separated statements (executed via `raw_sql`).
-    pub ddl: &'static [&'static str],
-    /// Idempotent DML the group needs present (a cursor row, a seed
-    /// record), run after the DDL whenever a boot has work to do. Seeds
-    /// are in the fingerprint, so editing one moves the stamp and the next
-    /// boot runs it; they are outside the migration history, so editing
-    /// one is a non-event rather than a "write the migration" dead end (a
-    /// seed row is invisible to the schema reader, so the shape check
-    /// finds nothing to differ and restamps).
-    pub seed: &'static [&'static str],
-    /// What the rows already there need done before a contract part
-    /// takes away or tightens a column, declared by the group whose
-    /// tables the data lands in: see [`DataStep`].
-    pub data_steps: &'static [DataStep],
-}
-
-/// Work on the rows a database already holds that a contract part needs
-/// done before it runs: a column's content copied to where it lives now
-/// before the column is dropped, or a column the expand part added
-/// filled on the rows already there before it is made NOT NULL. It runs at
-/// the start of the contract transaction ([`apply_schema`]), after the
-/// expand parts made the place it writes to and the documents were
-/// carried, and only while `table.column` is still the way the contract
-/// part has not left it yet ([`Until`]): a fresh database, built from the
-/// DDL, never needs it, and neither does one the contract part ran on.
-/// `table` is locked first, so no write lands between the step and the
-/// contract part.
-///
-/// A [`crate::documents::Fill`] is the other way a value leaves where it
-/// was: it runs before a step of a JSON column that stays, on the rows
-/// still at the step's version. A data step has no version to key on.
-pub struct DataStep {
-    /// The table and the column the step waits on (and locks the table
-    /// of). The table is one of its group's `tables`, which the boot
-    /// checks.
-    pub table: &'static str,
-    pub column: &'static str,
-    /// What the contract part does to the column, which ends the step's work.
-    pub until: Until,
-    /// The statement that does the work. Nothing records that it ran: only
-    /// the column's state stops it, so every boot with schema work to do
-    /// runs it again until a contract part changes the column, and it must
-    /// give the same result run twice (`ON CONFLICT DO NOTHING`, a `SET`
-    /// on the rows still `NULL`).
-    pub sql: &'static str,
-}
-
-/// What a contract part does to a [`DataStep`]'s column, which leaves the
-/// step nothing to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Until {
-    /// It drops the column: the step copies what the column holds to
-    /// where it lives now, while the column is there.
-    Dropped,
-    /// It makes the column NOT NULL: the step fills the column on the rows
-    /// already there, while it may still hold `NULL`.
-    NotNull,
-}
 
 /// Refuse a group declaration the schema work could not run safely. Group
 /// and table names are interpolated into the mismatch error's paste-ready
@@ -225,7 +155,7 @@ fn validate_groups(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
         // every boot, and the contract part would then drop what it
         // was meant to carry.
         for step in group.data_steps {
-            for name in [step.table, step.column] {
+            for name in [step.table, step.until.name()] {
                 anyhow::ensure!(
                     is_identifier(name),
                     "schema group '{}' has a data step on '{name}', which is not a plain SQL identifier ([a-z_][a-z0-9_]*)",
@@ -234,11 +164,10 @@ fn validate_groups(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
             }
             anyhow::ensure!(
                 group.tables.contains(&step.table),
-                "schema group '{}' has a data step on {}.{}, but '{}' is not one of its tables ({}); \
+                "schema group '{}' has a data step on {}, but '{}' is not one of its tables ({}); \
                  declare the step on the group whose tables hold that column",
                 group.name,
-                step.table,
-                step.column,
+                step.target(),
                 step.table,
                 group.tables.join(", ")
             );
@@ -354,7 +283,7 @@ fn bare_name(name: &str) -> &str {
 }
 
 /// This group's migrations, out of every migration there is.
-fn for_group<'a>(migrations: &'a [Migration], group: &str) -> Vec<&'a Migration> {
+fn for_group<'a, 'm>(migrations: &'a [Migration<'m>], group: &str) -> Vec<&'a Migration<'m>> {
     migrations.iter().filter(|m| m.group == group).collect()
 }
 
@@ -405,11 +334,11 @@ fn hex(bytes: &[u8]) -> String {
 /// without a database. Sorting by id here, rather than trusting the order the
 /// group declares them in, is what makes two branches that each add a
 /// migration converge whichever way round they merge.
-fn pending<'a>(
-    declared: &[&'a Migration],
+fn pending<'a, 'm>(
+    declared: &[&'a Migration<'m>],
     applied: &HashMap<String, String>,
-) -> Vec<&'a Migration> {
-    let mut out: Vec<&Migration> =
+) -> Vec<&'a Migration<'m>> {
+    let mut out: Vec<&Migration<'m>> =
         declared.iter().copied().filter(|m| !applied.contains_key(m.id)).collect();
     out.sort_by_key(|m| m.id);
     out
@@ -431,10 +360,10 @@ fn recorded_without_file(declared: &[&Migration], applied: &HashMap<String, Stri
 
 /// A migration file that was edited after it ran somewhere, which would leave
 /// two databases on different shapes with no way to tell.
-fn edited_after_running(
-    declared: &[&Migration],
+fn edited_after_running<'a>(
+    declared: &[&Migration<'a>],
     applied: &HashMap<String, String>,
-) -> Vec<&'static str> {
+) -> Vec<&'a str> {
     declared
         .iter()
         .filter(|m| applied.get(m.id).is_some_and(|stored| *stored != checksum(m.sql)))
@@ -454,15 +383,14 @@ const HISTORY_GROUP: &str = "_history";
 
 /// Record the history's start on a new database, and refuse one that was
 /// built before it.
-async fn refuse_a_database_from_before_the_history(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> anyhow::Result<()> {
-    let (built, current): (bool, bool) = sqlx::query_as(
-        "SELECT EXISTS (SELECT 1 FROM weft_schema_stamp), \
-                EXISTS (SELECT 1 FROM weft_migration WHERE group_name = $1 AND id = $2)",
-    )
-    .bind(HISTORY_GROUP)
-    .bind(HISTORY_EPOCH)
-    .fetch_one(&mut **tx)
-    .await?;
+async fn refuse_a_database_from_before_the_history(tx: &Transaction<'_>) -> anyhow::Result<()> {
+    let (built, current): (bool, bool) = tx
+        .one(
+            "SELECT EXISTS (SELECT 1 FROM weft_schema_stamp), \
+                    EXISTS (SELECT 1 FROM weft_migration WHERE group_name = $1 AND id = $2)",
+            &[&HISTORY_GROUP, &HISTORY_EPOCH],
+        )
+        .await?;
     anyhow::ensure!(
         !built || current,
         "this database was built by an older weft (from before runs were renamed, or before \
@@ -472,11 +400,11 @@ async fn refuse_a_database_from_before_the_history(tx: &mut sqlx::Transaction<'_
          this machine with scripts/scrub-old-install.sh."
     );
     if !built {
-        sqlx::query("INSERT INTO weft_migration (group_name, id, checksum) VALUES ($1, $2, '') ON CONFLICT DO NOTHING")
-            .bind(HISTORY_GROUP)
-            .bind(HISTORY_EPOCH)
-            .execute(&mut **tx)
-            .await?;
+        tx.execute(
+            "INSERT INTO weft_migration (group_name, id, checksum) VALUES ($1, $2, '') ON CONFLICT DO NOTHING",
+            &[&HISTORY_GROUP, &HISTORY_EPOCH],
+        )
+        .await?;
     }
     Ok(())
 }
@@ -498,17 +426,17 @@ async fn refuse_a_database_from_before_the_history(tx: &mut sqlx::Transaction<'_
 /// so concurrent boots serialize and the losers see the tables present,
 /// and because a stamp is then never written for DDL that did not run. A
 /// database that already holds everything takes no lock and runs nothing.
-pub async fn apply_schema(pool: &PgPool, groups: &[&SchemaGroup], documents: &[&Document]) -> anyhow::Result<()> {
+pub async fn apply_schema(pool: &Pool, groups: &[&SchemaGroup], documents: &[&Document]) -> anyhow::Result<()> {
     apply_schema_with(pool, groups, documents, MIGRATIONS).await
 }
 
 /// [`apply_schema`], against a migration set the caller names. The boot
 /// always uses every migration there is; a test names its own.
 pub async fn apply_schema_with(
-    pool: &PgPool,
+    pool: &Pool,
     groups: &[&SchemaGroup],
     documents: &[&Document],
-    migrations: &[Migration],
+    migrations: &[Migration<'static>],
 ) -> anyhow::Result<()> {
     validate_groups(groups)?;
     let holds = holds_everything(pool, groups, migrations).await?;
@@ -524,15 +452,15 @@ pub async fn apply_schema_with(
 
 /// [`apply_schema`] with no stored documents: a group's tables alone, as a
 /// test or a role that keeps no documents builds them.
-pub async fn apply_groups(pool: &PgPool, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
+pub async fn apply_groups(pool: &Pool, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     apply_schema_with(pool, groups, &[], MIGRATIONS).await
 }
 
 /// [`apply_groups`], against a migration set the caller names.
 pub async fn apply_groups_with(
-    pool: &PgPool,
+    pool: &Pool,
     groups: &[&SchemaGroup],
-    migrations: &[Migration],
+    migrations: &[Migration<'static>],
 ) -> anyhow::Result<()> {
     apply_schema_with(pool, groups, &[], migrations).await
 }
@@ -579,9 +507,8 @@ const CONTENDED_FOR: std::time::Duration = std::time::Duration::from_secs(180);
 fn contended(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
         cause
-            .downcast_ref::<sqlx::Error>()
-            .and_then(|e| e.as_database_error())
-            .and_then(|db| db.code())
+            .downcast_ref::<crate::db::Error>()
+            .and_then(|e| e.code())
             .is_some_and(|code| code == "55P03" || code == "40P01")
     })
 }
@@ -593,28 +520,21 @@ fn contended(e: &anyhow::Error) -> bool {
 /// unedited, nothing recorded this build has no file for, the frozen origin
 /// recorded as built). Anything else, including a history this build
 /// refuses, is the locked path's to do or to explain.
-async fn holds_everything(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[Migration]) -> anyhow::Result<bool> {
-    let ledgers: (bool,) = sqlx::query_as(
-        "SELECT to_regclass('weft_schema_stamp') IS NOT NULL AND to_regclass('weft_migration') IS NOT NULL \
-         AND to_regclass('weft_document_version') IS NOT NULL",
-    )
-    .fetch_one(pool)
-    .await?;
-    if !ledgers.0 {
+async fn holds_everything(pool: &Pool, groups: &[&SchemaGroup], migrations: &[Migration<'static>]) -> anyhow::Result<bool> {
+    let ledgers: bool = pool
+        .scalar(
+            "SELECT to_regclass('weft_schema_stamp') IS NOT NULL AND to_regclass('weft_migration') IS NOT NULL \
+             AND to_regclass('weft_document_version') IS NOT NULL",
+            &[],
+        )
+        .await?;
+    if !ledgers {
         return Ok(false);
     }
     let stamps: HashMap<String, String> =
-        sqlx::query_as::<_, (String, String)>("SELECT group_name, fingerprint FROM weft_schema_stamp")
-            .fetch_all(pool)
-            .await?
-            .into_iter()
-            .collect();
+        pool.all::<(String, String)>("SELECT group_name, fingerprint FROM weft_schema_stamp", &[]).await?.into_iter().collect();
     let mut applied: HashMap<String, HashMap<String, String>> = HashMap::new();
-    for (group, id, sum) in
-        sqlx::query_as::<_, (String, String, String)>("SELECT group_name, id, checksum FROM weft_migration")
-            .fetch_all(pool)
-            .await?
-    {
+    for (group, id, sum) in pool.all::<(String, String, String)>("SELECT group_name, id, checksum FROM weft_migration", &[]).await? {
         applied.entry(group).or_default().insert(id, sum);
     }
     if !applied.get(HISTORY_GROUP).is_some_and(|ids| ids.contains_key(HISTORY_EPOCH)) {
@@ -652,15 +572,9 @@ fn reset_sql(group: &SchemaGroup) -> String {
 }
 
 /// The tables `groups` declare that the database does not hold.
-async fn missing_tables<'e>(
-    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
-    groups: &[&SchemaGroup],
-) -> anyhow::Result<Vec<String>> {
+async fn missing_tables(db: &impl Client, groups: &[&SchemaGroup]) -> anyhow::Result<Vec<String>> {
     let tables: Vec<&str> = groups.iter().flat_map(|g| g.tables.iter().copied()).collect();
-    Ok(sqlx::query_scalar("SELECT t FROM unnest($1::text[]) AS t WHERE to_regclass(t) IS NULL")
-        .bind(&tables)
-        .fetch_all(executor)
-        .await?)
+    Ok(db.scalars("SELECT t FROM unnest($1::text[]) AS t WHERE to_regclass(t) IS NULL", &[&tables]).await?)
 }
 
 /// One group as a locked transaction finds it: its stamp, and the
@@ -672,7 +586,7 @@ struct GroupState<'a> {
     applied: HashMap<String, String>,
 }
 
-/// A transaction holding the schema's advisory lock, whose every table
+/// A transaction on `conn` holding the schema's advisory lock, whose every table
 /// lock waits [`LOCK_WAIT`] at most, so the work never sits at the head of
 /// a table's queue holding back the writes behind it ([`while_contended`]
 /// tries again). The schema's work and the documents' carry
@@ -685,35 +599,26 @@ struct GroupState<'a> {
 /// take minutes, which [`CONTENDED_FOR`] would cut short into a failed
 /// boot). Only the table locks taken once it is held are bounded, which is
 /// why `lock_timeout` is set after it.
-pub(crate) async fn locked_tx(pool: &PgPool) -> anyhow::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('weft:schema-migrate', 0))")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(&format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'")).execute(&mut *tx).await?;
+pub(crate) async fn locked_tx(conn: &mut Conn) -> anyhow::Result<Transaction<'_>> {
+    let tx = conn.transaction().await?;
+    tx.execute("SELECT pg_advisory_xact_lock(hashtextextended('weft:schema-migrate', 0))", &[]).await?;
+    tx.batch_execute(&format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'")).await?;
     Ok(tx)
 }
 
 /// Read each group's state and refuse rewritten history, so nothing runs
 /// before every group has been checked.
 async fn group_states<'a>(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &Transaction<'_>,
     groups: &[&'a SchemaGroup],
-    migrations: &[Migration],
+    migrations: &[Migration<'static>],
 ) -> anyhow::Result<Vec<GroupState<'a>>> {
     let mut states: Vec<GroupState> = Vec::new();
     for group in groups {
-        let stored: Option<(String,)> =
-            sqlx::query_as("SELECT fingerprint FROM weft_schema_stamp WHERE group_name = $1")
-                .bind(group.name)
-                .fetch_optional(&mut **tx)
-                .await?;
-        let applied: HashMap<String, String> =
-            sqlx::query_as::<_, (String, String)>(
-                "SELECT id, checksum FROM weft_migration WHERE group_name = $1",
-            )
-            .bind(group.name)
-            .fetch_all(&mut **tx)
+        let stored: Option<String> =
+            tx.scalar_opt("SELECT fingerprint FROM weft_schema_stamp WHERE group_name = $1", &[&group.name]).await?;
+        let applied: HashMap<String, String> = tx
+            .all::<(String, String)>("SELECT id, checksum FROM weft_migration WHERE group_name = $1", &[&group.name])
             .await?
             .into_iter()
             .collect();
@@ -773,7 +678,7 @@ async fn group_states<'a>(
         states.push(GroupState {
             group,
             fp: fingerprint(group),
-            stamped: stored.map(|(fp,)| fp),
+            stamped: stored,
             applied,
         });
     }
@@ -786,12 +691,12 @@ async fn group_states<'a>(
 /// order the agreement test replays, and the order a migration touching
 /// another group's table relies on.
 async fn run_pending(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &Transaction<'_>,
     states: &[GroupState<'_>],
-    migrations: &[Migration],
+    migrations: &[Migration<'static>],
     part: Part,
 ) -> anyhow::Result<()> {
-    let mut todo: Vec<(&SchemaGroup, &Migration)> = Vec::new();
+    let mut todo: Vec<(&SchemaGroup, &Migration<'static>)> = Vec::new();
     for st in states {
         if st.stamped.is_none() {
             continue;
@@ -804,7 +709,7 @@ async fn run_pending(
     }
     todo.sort_by_key(|(_, m)| m.id);
     for (group, m) in todo {
-        sqlx::raw_sql(m.sql).execute(&mut **tx).await.map_err(|e| {
+        tx.batch_execute(m.sql).await.map_err(|e| {
             anyhow::Error::from(e).context(format!("schema group '{}': migration '{}' failed", group.name, m.id))
         })?;
         record_migration(tx, group.name, m.id, m.sql).await?;
@@ -816,30 +721,23 @@ async fn run_pending(
 /// transaction the contract parts then run in: its table is locked first,
 /// as the contract part would lock it, so nothing written to the table
 /// after the step runs is left out of it.
-async fn run_data_steps(tx: &mut sqlx::PgConnection, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
+async fn run_data_steps(tx: &impl Client, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     for group in groups {
         for step in group.data_steps {
-            // `None`: the column is gone; `Some(true)`: it is NOT NULL.
-            let not_null: Option<bool> = sqlx::query_scalar(
-                "SELECT attnotnull FROM pg_attribute \
-                 WHERE attrelid = to_regclass($1) AND attname = $2 AND attnum > 0 AND NOT attisdropped",
-            )
-            .bind(step.table)
-            .bind(step.column)
-            .fetch_optional(&mut *tx)
-            .await?;
             let has_work = match step.until {
-                Until::Dropped => not_null.is_some(),
-                Until::NotNull => not_null == Some(false),
+                Until::Dropped(column) => column_not_null(tx, step.table, column).await?.is_some(),
+                Until::NotNull(column) => column_not_null(tx, step.table, column).await? == Some(false),
+                Until::Indexed(index) => !index_present(tx, index).await?,
             };
             if !has_work {
                 continue;
             }
-            sqlx::raw_sql(&format!("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", step.table)).execute(&mut *tx).await?;
-            sqlx::raw_sql(step.sql).execute(&mut *tx).await.map_err(|e| {
+            tx.batch_execute(&format!("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", step.table)).await?;
+            tx.batch_execute(step.sql).await.map_err(|e| {
                 anyhow::Error::from(e).context(format!(
-                    "schema group '{}': the data step on {}.{} failed",
-                    group.name, step.table, step.column
+                    "schema group '{}': the data step on {} failed",
+                    group.name,
+                    step.target()
                 ))
             })?;
         }
@@ -847,25 +745,41 @@ async fn run_data_steps(tx: &mut sqlx::PgConnection, groups: &[&SchemaGroup]) ->
     Ok(())
 }
 
+/// Whether `table.column` is NOT NULL: `None` when it is gone.
+async fn column_not_null(db: &impl Client, table: &str, column: &str) -> anyhow::Result<Option<bool>> {
+    Ok(db
+        .scalar_opt(
+            "SELECT attnotnull FROM pg_attribute \
+             WHERE attrelid = to_regclass($1) AND attname = $2 AND attnum > 0 AND NOT attisdropped",
+            &[&table, &column],
+        )
+        .await?)
+}
+
+/// Whether an index named `index` exists.
+async fn index_present(db: &impl Client, index: &str) -> anyhow::Result<bool> {
+    Ok(db.scalar("SELECT EXISTS (SELECT 1 FROM pg_class WHERE oid = to_regclass($1) AND relkind = 'i')", &[&index]).await?)
+}
+
 /// Whether `table` holds `column`.
-pub(crate) async fn column_present(conn: &mut sqlx::PgConnection, table: &str, column: &str) -> anyhow::Result<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM pg_attribute \
-         WHERE attrelid = to_regclass($1) AND attname = $2 AND attnum > 0 AND NOT attisdropped)",
-    )
-    .bind(table)
-    .bind(column)
-    .fetch_one(conn)
-    .await?)
+pub(crate) async fn column_present(db: &impl Client, table: &str, column: &str) -> anyhow::Result<bool> {
+    Ok(db
+        .scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_attribute \
+             WHERE attrelid = to_regclass($1) AND attname = $2 AND attnum > 0 AND NOT attisdropped)",
+            &[&table, &column],
+        )
+        .await?)
 }
 
 /// The expand work (see [`apply_schema`]), in one transaction under the
 /// advisory lock.
-async fn expand_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[Migration]) -> anyhow::Result<()> {
-    let mut tx = locked_tx(pool).await?;
-    sqlx::raw_sql(BOOKKEEPING_DDL).execute(&mut *tx).await?;
-    refuse_a_database_from_before_the_history(&mut tx).await?;
-    let states = group_states(&mut tx, groups, migrations).await?;
+async fn expand_under_lock(pool: &Pool, groups: &[&SchemaGroup], migrations: &[Migration<'static>]) -> anyhow::Result<()> {
+    let mut conn = pool.get().await?;
+    let tx = locked_tx(&mut conn).await?;
+    tx.batch_execute(BOOKKEEPING_DDL).await?;
+    refuse_a_database_from_before_the_history(&tx).await?;
+    let states = group_states(&tx, groups, migrations).await?;
 
     // Every group that is new to this database is built from its
     // canonical DDL; its migrations (both parts) and origin are history it
@@ -875,21 +789,17 @@ async fn expand_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations: &
             continue;
         }
         for stmt in st.group.ddl {
-            sqlx::raw_sql(stmt)
-                .execute(&mut *tx)
+            tx.batch_execute(stmt)
                 .await
                 .map_err(|e| anyhow::Error::from(e).context(format!("schema group '{}': DDL failed", st.group.name)))?;
         }
-        sqlx::query("INSERT INTO weft_schema_stamp (group_name, fingerprint) VALUES ($1, $2)")
-            .bind(st.group.name)
-            .bind(&st.fp)
-            .execute(&mut *tx)
+        tx.execute("INSERT INTO weft_schema_stamp (group_name, fingerprint) VALUES ($1, $2)", &[&st.group.name, &st.fp])
             .await?;
         for m in for_group(migrations, st.group.name) {
-            record_migration(&mut tx, st.group.name, m.id, m.sql).await?;
+            record_migration(&tx, st.group.name, m.id, m.sql).await?;
         }
         if let Some(origin) = embedded_origin(st.group.name) {
-            record_migration(&mut tx, st.group.name, ORIGIN_ID, origin).await?;
+            record_migration(&tx, st.group.name, ORIGIN_ID, origin).await?;
         }
     }
 
@@ -905,30 +815,31 @@ async fn expand_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations: &
     for st in &states {
         if st.stamped.as_deref() != Some(st.fp.as_str())
             || !pending(&for_group(migrations, st.group.name), &st.applied).is_empty()
-            || missing_tables(&mut *tx, &[st.group]).await?.is_empty()
+            || missing_tables(&tx, &[st.group]).await?.is_empty()
         {
             continue;
         }
         tracing::warn!(target: "weft_task_store::schema_guard", group = st.group.name, "a table of this group is gone; building it again");
         for stmt in st.group.ddl {
-            sqlx::raw_sql(stmt).execute(&mut *tx).await.map_err(|e| {
+            tx.batch_execute(stmt).await.map_err(|e| {
                 anyhow::Error::from(e).context(format!("schema group '{}': rebuilding a table that is gone failed", st.group.name))
             })?;
         }
     }
 
-    run_pending(&mut tx, &states, migrations, Part::Expand).await?;
+    run_pending(&tx, &states, migrations, Part::Expand).await?;
     tx.commit().await?;
     Ok(())
 }
 
 /// The contract work (see [`apply_schema`]), in one transaction under the
 /// advisory lock, once the stored documents are carried.
-async fn contract_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[Migration]) -> anyhow::Result<()> {
-    let mut tx = locked_tx(pool).await?;
-    let states = group_states(&mut tx, groups, migrations).await?;
-    run_data_steps(&mut tx, groups).await?;
-    run_pending(&mut tx, &states, migrations, Part::Contract).await?;
+async fn contract_under_lock(pool: &Pool, groups: &[&SchemaGroup], migrations: &[Migration<'static>]) -> anyhow::Result<()> {
+    let mut conn = pool.get().await?;
+    let tx = locked_tx(&mut conn).await?;
+    let states = group_states(&tx, groups, migrations).await?;
+    run_data_steps(&tx, groups).await?;
+    run_pending(&tx, &states, migrations, Part::Contract).await?;
 
     // Every moved stamp is verified against the database itself, as it
     // stands once both parts of every pending migration ran: the only
@@ -948,26 +859,25 @@ async fn contract_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations:
         states.iter().filter(|st| st.stamped.as_ref().is_some_and(|stored_fp| *stored_fp != st.fp)).collect();
     let mut mismatched: Vec<(&SchemaGroup, String)> = Vec::new();
     if !moved.is_empty() {
-        sqlx::raw_sql(
+        tx.batch_execute(
             "DROP SCHEMA IF EXISTS weft_shape_check CASCADE; \
              CREATE SCHEMA weft_shape_check; \
              SET LOCAL search_path TO weft_shape_check",
         )
-        .execute(&mut *tx)
         .await?;
         // Every group in the call, so cross-group references (a trigger
         // on another group's table) resolve, in the same dependency
         // order a fresh database builds in.
         for group in groups {
             for stmt in group.ddl {
-                sqlx::raw_sql(stmt).execute(&mut *tx).await.map_err(|e| {
+                tx.batch_execute(stmt).await.map_err(|e| {
                     anyhow::Error::from(e).context(format!("schema group '{}': DDL failed in the shape check", group.name))
                 })?;
             }
         }
-        sqlx::raw_sql("SET LOCAL search_path TO public").execute(&mut *tx).await?;
-        let want = read_things(&mut tx, "weft_shape_check").await?;
-        let live = read_things(&mut tx, "public").await?;
+        tx.batch_execute("SET LOCAL search_path TO public").await?;
+        let want = read_things(&tx, "weft_shape_check").await?;
+        let live = read_things(&tx, "public").await?;
         for st in &moved {
             let want_g: Vec<Thing> =
                 want.iter().filter(|t| owned_by(st.group, t)).cloned().collect();
@@ -976,17 +886,12 @@ async fn contract_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations:
             match diff_things(&want_g, "the code", &live_g, "this database") {
                 Some(diff) => mismatched.push((st.group, diff)),
                 None => {
-                    sqlx::query(
-                        "UPDATE weft_schema_stamp SET fingerprint = $2 WHERE group_name = $1",
-                    )
-                    .bind(st.group.name)
-                    .bind(&st.fp)
-                    .execute(&mut *tx)
-                    .await?;
+                    tx.execute("UPDATE weft_schema_stamp SET fingerprint = $2 WHERE group_name = $1", &[&st.group.name, &st.fp])
+                        .await?;
                 }
             }
         }
-        sqlx::raw_sql("DROP SCHEMA weft_shape_check CASCADE").execute(&mut *tx).await?;
+        tx.batch_execute("DROP SCHEMA weft_shape_check CASCADE").await?;
     }
 
     // The drift bail fires BEFORE the seeds: a seed touching a drifted
@@ -1017,8 +922,7 @@ async fn contract_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations:
     // Seeds, idempotent DML, after every table exists.
     for group in groups {
         for stmt in group.seed {
-            sqlx::raw_sql(stmt)
-                .execute(&mut *tx)
+            tx.batch_execute(stmt)
                 .await
                 .map_err(|e| anyhow::Error::from(e).context(format!("schema group '{}': seed failed", group.name)))?;
         }
@@ -1040,17 +944,127 @@ fn embedded_origin(group: &str) -> Option<&'static str> {
     ORIGINS.iter().find(|(g, _)| *g == group).map(|(_, sql)| *sql)
 }
 
-async fn record_migration(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    group: &str,
-    id: &str,
-    sql: &str,
-) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO weft_migration (group_name, id, checksum) VALUES ($1, $2, $3)")
-        .bind(group)
-        .bind(id)
-        .bind(checksum(sql))
-        .execute(&mut **tx)
+/// A schema history: every group's frozen origin and every migration
+/// file since, drafts included.
+///
+/// Two of them exist. The boot and every test read the one this build
+/// embedded ([`History::embedded`]): the runtime carries its own files
+/// and never reads the disk. The migration generator reads today's
+/// files off the disk ([`HistoryOnDisk`]), so what it writes before
+/// planning (a new group's frozen origin) is part of what it plans
+/// from, in the same run, with no rebuild in between.
+pub struct History<'a> {
+    origins: Vec<(&'a str, &'a str)>,
+    migrations: Vec<Migration<'a>>,
+}
+
+impl History<'static> {
+    /// What the build script embedded from `migrations/`.
+    pub fn embedded() -> Self {
+        History { origins: ORIGINS.to_vec(), migrations: MIGRATIONS.to_vec() }
+    }
+}
+
+impl<'a> History<'a> {
+    /// `group`'s frozen `origin.sql`; `None` for a group that has not
+    /// frozen one yet.
+    fn origin(&self, group: &str) -> Option<&'a str> {
+        self.origins.iter().find(|(g, _)| *g == group).map(|(_, sql)| *sql)
+    }
+
+    pub fn migrations(&self) -> &[Migration<'a>] {
+        &self.migrations
+    }
+
+    /// `group`'s released history: its frozen origin, then every released
+    /// migration.
+    fn released(&self, group: &str) -> Vec<&'a str> {
+        self.origin(group)
+            .into_iter()
+            .chain(self.migrations.iter().filter(|m| m.group == group && !m.draft).map(|m| m.sql))
+            .collect()
+    }
+
+    /// Every table `group`'s released history creates: how a table the
+    /// canonical DDL dropped or renamed is still known to be that group's.
+    fn tables_created(&self, group: &str) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        for sql in self.released(group) {
+            let lower = sql.to_ascii_lowercase();
+            let mut rest = lower.as_str();
+            while let Some(at) = rest.find("create table ") {
+                rest = &rest[at + "create table ".len()..];
+                let name = rest.strip_prefix("if not exists ").unwrap_or(rest);
+                let name: String = name.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                if !name.is_empty() {
+                    out.insert(name);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `group`'s released history creates `table`.
+    fn created(&self, group: &str, table: &str) -> bool {
+        self.tables_created(group).contains(table)
+    }
+
+    /// Every function, type and trigger `group`'s released history
+    /// declares: how an object the canonical DDL dropped is still known
+    /// to be that group's.
+    fn declared_names(&self, group: &str) -> Vec<String> {
+        declared_in(self.released(group).into_iter())
+    }
+
+    /// Whether `group`'s released history declares the function, type or
+    /// trigger `name`.
+    fn declared(&self, group: &str, name: &str) -> bool {
+        self.declared_names(group).iter().any(|n| n == name)
+    }
+}
+
+/// The history as it is on disk right now, read through the same walk
+/// the build script embeds ([`migration_files`]): what the generator
+/// plans from. Owns the files' text; [`HistoryOnDisk::history`] lends it
+/// out as a [`History`].
+pub struct HistoryOnDisk {
+    origins: Vec<(String, String)>,
+    migrations: Vec<(String, String, Part, bool, String)>,
+}
+
+impl HistoryOnDisk {
+    pub fn read(root: &std::path::Path) -> anyhow::Result<Self> {
+        let read = |path: &std::path::Path| {
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
+        };
+        let mut origins = Vec::new();
+        let mut migrations = Vec::new();
+        for group in migration_files::read_groups(root).map_err(anyhow::Error::msg)? {
+            if let Some(origin) = &group.origin {
+                origins.push((group.group.clone(), read(origin)?));
+            }
+            for file in &group.files {
+                let part = if file.contract { Part::Contract } else { Part::Expand };
+                migrations.push((group.group.clone(), file.id.clone(), part, file.draft, read(&file.path)?));
+            }
+        }
+        Ok(HistoryOnDisk { origins, migrations })
+    }
+
+    pub fn history(&self) -> History<'_> {
+        History {
+            origins: self.origins.iter().map(|(g, sql)| (g.as_str(), sql.as_str())).collect(),
+            migrations: self
+                .migrations
+                .iter()
+                .map(|(group, id, part, draft, sql)| Migration { group, id, part: *part, draft: *draft, sql })
+                .collect(),
+        }
+    }
+}
+
+async fn record_migration(tx: &Transaction<'_>, group: &str, id: &str, sql: &str) -> anyhow::Result<()> {
+    tx.execute("INSERT INTO weft_migration (group_name, id, checksum) VALUES ($1, $2, $3)", &[&group, &id, &checksum(sql)])
         .await?;
     Ok(())
 }
@@ -1059,9 +1073,10 @@ async fn record_migration(
 /// directory per group holding `origin.sql` and every migration file since.
 ///
 /// Inside the crate rather than at the repo root so it travels wherever the
-/// crate does. The build script EMBEDS everything in it (`MIGRATIONS`,
-/// `ORIGINS`), so the runtime never reads the disk; only the generator
-/// tooling below writes here.
+/// crate does, except into a worker's build, which leaves it out
+/// (`crate::schema_group`). The build script EMBEDS everything in it
+/// (`MIGRATIONS`, `ORIGINS`), so the runtime never reads the disk; only the
+/// generator below reads it ([`HistoryOnDisk`]) and writes here.
 pub fn migrations_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations")
 }
@@ -1082,7 +1097,7 @@ pub fn write_missing_origins(groups: &[&SchemaGroup]) -> anyhow::Result<Vec<Stri
     let mut written = Vec::new();
     for group in groups {
         let dir = group_dir(group);
-        let path = dir.join("origin.sql");
+        let path = dir.join(format!("{}.sql", migration_files::ORIGIN_STEM));
         if path.exists() {
             continue;
         }
@@ -1108,34 +1123,33 @@ pub fn write_missing_origins(groups: &[&SchemaGroup]) -> anyhow::Result<Vec<Stri
 /// changes in the order they were actually written, which is what an old
 /// database booting today does.
 pub async fn replay_from_origin(
-    pool: &PgPool,
+    pool: &Pool,
+    history: &History<'_>,
     groups: &[&SchemaGroup],
     include_drafts: bool,
 ) -> anyhow::Result<()> {
-    replay_origins(pool, groups).await?;
-    replay_migrations(pool, groups, |m| include_drafts || !m.draft).await
+    replay_origins(pool, history, groups).await?;
+    replay_migrations(pool, history, groups, |m| include_drafts || !m.draft).await
 }
 
 /// Every group's frozen `origin.sql`: the database each group was on the
 /// day it shipped, before any migration ran.
-pub async fn replay_origins(pool: &PgPool, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
+pub async fn replay_origins(pool: &Pool, history: &History<'_>, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     for group in groups {
-        // Embedded at build time, like the migrations: the replay must
-        // start from the SAME frozen text the boot checksums, so an
-        // on-disk edit cannot make the test and the boot disagree.
-        let sql = embedded_origin(group.name).ok_or_else(|| {
+        // A test replays the embedded history, the SAME frozen text the
+        // boot checksums, so an on-disk edit cannot make the test and the
+        // boot disagree. The generator freezes every missing origin
+        // before it reads the disk, so it never lands here.
+        let sql = history.origin(group.name).ok_or_else(|| {
             anyhow::anyhow!(
-                "schema group '{}' has no embedded origin.sql. If the file was just \
-                 written (a new group), rebuild so the build script embeds it, then \
-                 re-run; the file must be committed with the PR that adds the group.",
+                "schema group '{}' has no origin.sql in the history this replays. If the \
+                 file was just written (a new group), the build that embeds it has not run \
+                 yet; the file must be committed with the PR that adds the group.",
                 group.name
             )
         })?;
         if !sql.trim().is_empty() {
-            sqlx::raw_sql(sql)
-                .execute(pool)
-                .await
-                .map_err(|e| anyhow::anyhow!("origin of '{}' failed: {e}", group.name))?;
+            pool.batch_execute(sql).await.map_err(|e| anyhow::anyhow!("origin of '{}' failed: {e}", group.name))?;
         }
     }
     Ok(())
@@ -1147,12 +1161,14 @@ pub async fn replay_origins(pool: &PgPool, groups: &[&SchemaGroup]) -> anyhow::R
 /// write rows the way an older build wrote them) and then plays the rest
 /// picks the two halves by id.
 pub async fn replay_migrations(
-    pool: &PgPool,
+    pool: &Pool,
+    history: &History<'_>,
     groups: &[&SchemaGroup],
     keep: impl Fn(&Migration) -> bool,
 ) -> anyhow::Result<()> {
     let names: std::collections::HashSet<&str> = groups.iter().map(|g| g.name).collect();
-    let mut all: Vec<&Migration> = MIGRATIONS
+    let mut all: Vec<&Migration> = history
+        .migrations()
         .iter()
         .filter(|m| names.contains(m.group) && keep(m))
         .collect();
@@ -1161,10 +1177,7 @@ pub async fn replay_migrations(
     all.sort_by_key(|m| (m.part == Part::Contract, m.id));
     for m in all {
         let group = m.group;
-        sqlx::raw_sql(m.sql)
-            .execute(pool)
-            .await
-            .map_err(|e| anyhow::anyhow!("migration '{}' of '{group}' failed: {e}", m.id))?;
+        pool.batch_execute(m.sql).await.map_err(|e| anyhow::anyhow!("migration '{}' of '{group}' failed: {e}", m.id))?;
     }
     Ok(())
 }
@@ -1176,22 +1189,22 @@ pub async fn replay_migrations(
 /// boot runs what is pending, carries the documents, and proves the
 /// shape). What a test of an upgrade fills, the way that weft wrote its
 /// rows, before booting this one on it.
-pub async fn build_as_of(pool: &PgPool, groups: &[&SchemaGroup], keep: impl Fn(&Migration) -> bool) -> anyhow::Result<()> {
-    replay_origins(pool, groups).await?;
-    replay_migrations(pool, groups, |m| !m.draft && keep(m)).await?;
-    let mut tx = pool.begin().await?;
-    sqlx::raw_sql(BOOKKEEPING_DDL).execute(&mut *tx).await?;
-    refuse_a_database_from_before_the_history(&mut tx).await?;
+pub async fn build_as_of(pool: &Pool, groups: &[&SchemaGroup], keep: impl Fn(&Migration) -> bool) -> anyhow::Result<()> {
+    let history = History::embedded();
+    replay_origins(pool, &history, groups).await?;
+    replay_migrations(pool, &history, groups, |m| !m.draft && keep(m)).await?;
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    tx.batch_execute(BOOKKEEPING_DDL).await?;
+    refuse_a_database_from_before_the_history(&tx).await?;
     for group in groups {
-        sqlx::query("INSERT INTO weft_schema_stamp (group_name, fingerprint) VALUES ($1, 'an older weft')")
-            .bind(group.name)
-            .execute(&mut *tx)
+        tx.execute("INSERT INTO weft_schema_stamp (group_name, fingerprint) VALUES ($1, 'an older weft')", &[&group.name])
             .await?;
-        if let Some(origin) = embedded_origin(group.name) {
-            record_migration(&mut tx, group.name, ORIGIN_ID, origin).await?;
+        if let Some(origin) = history.origin(group.name) {
+            record_migration(&tx, group.name, ORIGIN_ID, origin).await?;
         }
-        for m in MIGRATIONS.iter().filter(|m| m.group == group.name && !m.draft && keep(m)) {
-            record_migration(&mut tx, group.name, m.id, m.sql).await?;
+        for m in history.migrations().iter().filter(|m| m.group == group.name && !m.draft && keep(m)) {
+            record_migration(&tx, group.name, m.id, m.sql).await?;
         }
     }
     tx.commit().await?;
@@ -1202,12 +1215,18 @@ pub async fn build_as_of(pool: &PgPool, groups: &[&SchemaGroup], keep: impl Fn(&
 /// function, an enum type. Keyed so the same thing on two sides compares
 /// equal, and carrying the table it belongs to so a change can be filed
 /// under the right group.
-#[derive(sqlx::FromRow, Clone)]
+#[derive(Clone)]
 pub struct Thing {
     kind: String,
     table: String,
     name: String,
     body: String,
+}
+
+impl FromRow for Thing {
+    fn from_row(row: Row) -> crate::db::Result<Self> {
+        Ok(Self { kind: row.try_get("kind")?, table: row.try_get("table")?, name: row.try_get("name")?, body: row.try_get("body")? })
+    }
 }
 
 impl std::fmt::Display for Thing {
@@ -1219,21 +1238,18 @@ impl std::fmt::Display for Thing {
 /// Everything the database currently holds, ready to compare against the same
 /// reading taken after the schema was built the other way. Generator
 /// tooling only; the boot's shape check reads through [`read_things`].
-pub async fn read_schema(pool: &PgPool) -> anyhow::Result<Vec<Thing>> {
-    let mut conn = pool.acquire().await?;
-    read_things(&mut conn, "public").await
+pub async fn read_schema(pool: &Pool) -> anyhow::Result<Vec<Thing>> {
+    let conn = pool.get().await?;
+    read_things(&conn, "public").await
 }
 
 /// [`read_schema`], on one connection and in one named schema, so the
 /// boot's shape verification can read a scratch schema inside its own
 /// transaction.
-async fn read_things(
-    conn: &mut sqlx::PgConnection,
-    schema: &str,
-) -> anyhow::Result<Vec<Thing>> {
+async fn read_things(db: &impl Client, schema: &str) -> anyhow::Result<Vec<Thing>> {
     let mut out: Vec<Thing> = Vec::new();
     for sql in THING_QUERIES {
-        out.extend(sqlx::query_as::<_, Thing>(sql).bind(schema).fetch_all(&mut *conn).await?);
+        out.extend(db.all::<Thing>(sql, &[&schema]).await?);
     }
     // Postgres prints definitions schema-qualified, and each reading is
     // taken in one schema, so the prefix is noise on both sides.
@@ -2080,51 +2096,6 @@ fn removed(thing: &Thing) -> (Part, String) {
     }
 }
 
-/// `group`'s released history: its frozen origin, then every released
-/// migration.
-fn released_history(group: &str) -> impl Iterator<Item = &'static str> + '_ {
-    embedded_origin(group)
-        .into_iter()
-        .chain(MIGRATIONS.iter().filter(move |m| m.group == group && !m.draft).map(|m| m.sql))
-}
-
-/// Every table `group`'s released history creates: how a table the
-/// canonical DDL dropped or renamed is still known to be that group's.
-fn history_tables(group: &str) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
-    for sql in released_history(group) {
-        let lower = sql.to_ascii_lowercase();
-        let mut rest = lower.as_str();
-        while let Some(at) = rest.find("create table ") {
-            rest = &rest[at + "create table ".len()..];
-            let name = rest.strip_prefix("if not exists ").unwrap_or(rest);
-            let name: String = name.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
-            if !name.is_empty() {
-                out.insert(name);
-            }
-        }
-    }
-    out
-}
-
-/// Whether `group`'s released history creates `table`.
-fn history_created(group: &str, table: &str) -> bool {
-    history_tables(group).contains(table)
-}
-
-/// Every function, type and trigger `group`'s released history declares:
-/// how an object the canonical DDL dropped is still known to be that
-/// group's.
-fn history_declared_names(group: &str) -> Vec<String> {
-    declared_in(released_history(group))
-}
-
-/// Whether `group`'s released history declares the function, type or
-/// trigger `name`.
-fn history_declared(group: &str, name: &str) -> bool {
-    history_declared_names(group).iter().any(|n| n == name)
-}
-
 /// Split a plan into one file per group and part, and say where each
 /// file goes: a group's expand statements in `<id>.sql`, its contract
 /// statements in `<id>.contract.sql` ([`CONTRACT_SUFFIX`]), each written
@@ -2147,6 +2118,7 @@ fn history_declared(group: &str, name: &str) -> bool {
 /// Returns the group, the part, the path to write, and the file's
 /// contents.
 pub fn file_per_group(
+    history: &History<'_>,
     groups: &[&SchemaGroup],
     plan: &[Planned],
     name: &str,
@@ -2162,8 +2134,8 @@ pub fn file_per_group(
                 Owner::Named(name) => declared_names(g).iter().any(|n| n == name),
             })
             .or_else(|| match &planned.owner {
-                Owner::Table(table) => groups.iter().find(|g| history_created(g.name, table)),
-                Owner::Named(name) => groups.iter().find(|g| history_declared(g.name, name)),
+                Owner::Table(table) => groups.iter().find(|g| history.created(g.name, table)),
+                Owner::Named(name) => groups.iter().find(|g| history.declared(g.name, name)),
             })
             .ok_or_else(|| {
                 let what = match &planned.owner {
@@ -2187,14 +2159,14 @@ pub fn file_per_group(
             // let a live upgrade and the agreement replay apply a
             // paired release in opposite orders.
             let id = if draft {
-                format!("draft_{stamp}_{group}_{name}")
+                format!("{}{stamp}_{group}_{name}", migration_files::DRAFT_PREFIX)
             } else {
                 format!("{stamp}_{group}_{name}")
             };
             let id = if contract { format!("{id}{CONTRACT_SUFFIX}") } else { id };
             let dir = migrations_root().join(group);
             let path =
-                if draft { dir.join("drafts") } else { dir }.join(format!("{id}.sql"));
+                if draft { dir.join(migration_files::DRAFTS_DIR) } else { dir }.join(format!("{id}.sql"));
             anyhow::ensure!(
                 !path.exists(),
                 "{} already exists; refusing to overwrite a migration that may have \
@@ -2211,15 +2183,16 @@ pub fn file_per_group(
 /// groups own now or once owned (a table a rename or a drop took away
 /// is still theirs to compare: the shape a release starts from holds it
 /// under its old name); `None` when it holds exactly that shape. Read
-/// through `conn` so a caller mid-transaction sees its own uncommitted
+/// through `db` so a caller mid-transaction sees its own uncommitted
 /// DDL.
 async fn shape_diff(
-    conn: &mut sqlx::PgConnection,
+    history: &History<'_>,
+    db: &impl Client,
     groups: &[&SchemaGroup],
     expected: &[Thing],
 ) -> anyhow::Result<Option<String>> {
     let once: Vec<(std::collections::HashSet<String>, Vec<String>)> =
-        groups.iter().map(|g| (history_tables(g.name), history_declared_names(g.name))).collect();
+        groups.iter().map(|g| (history.tables_created(g.name), history.declared_names(g.name))).collect();
     let ours = |t: &&Thing| {
         groups.iter().zip(&once).any(|(g, (tables, declared))| {
             owned_by(g, t)
@@ -2230,7 +2203,7 @@ async fn shape_diff(
                 }
         })
     };
-    let live_all = read_things(conn, "public").await?;
+    let live_all = read_things(db, "public").await?;
     let live: Vec<Thing> = live_all.iter().filter(|t| ours(t)).cloned().collect();
     let expected: Vec<Thing> = expected.iter().filter(|t| ours(t)).cloned().collect();
     Ok(diff_things(&expected, "the release", &live, "your live database"))
@@ -2241,19 +2214,15 @@ async fn shape_diff(
 /// a group from its canonical DDL. A database from before the stamp
 /// table existed has built nothing this way, so every group is unborn
 /// to it and the boot builds them all.
-pub async fn unborn_groups(
-    conn: &mut sqlx::PgConnection,
-    groups: &[&SchemaGroup],
-) -> anyhow::Result<Vec<&'static str>> {
-    let stamped: Vec<(String,)> =
-        sqlx::query_as("SELECT group_name FROM weft_schema_stamp").fetch_all(&mut *conn).await.or_else(|e| {
-            if e.as_database_error().is_some_and(|d| d.code().as_deref() == Some("42P01")) {
-                Ok(Vec::new())
-            } else {
-                Err(e)
-            }
-        })?;
-    Ok(groups.iter().map(|g| g.name).filter(|name| !stamped.iter().any(|(s,)| s == name)).collect())
+pub async fn unborn_groups(db: &impl Client, groups: &[&SchemaGroup]) -> anyhow::Result<Vec<&'static str>> {
+    let stamped: Vec<String> = db.scalars("SELECT group_name FROM weft_schema_stamp", &[]).await.or_else(|e| {
+        if e.code() == Some("42P01") {
+            Ok(Vec::new())
+        } else {
+            Err(e)
+        }
+    })?;
+    Ok(groups.iter().map(|g| g.name).filter(|name| !stamped.iter().any(|s| s == name)).collect())
 }
 
 /// One part of a released migration as it settles on the live database:
@@ -2287,37 +2256,37 @@ pub struct Settling {
 /// does. A retry is the same transaction on the same database: nothing of
 /// the attempt that gave way was kept.
 pub async fn settle_release(
-    pool: &PgPool,
+    history: &History<'_>,
+    pool: &Pool,
     groups: &[&SchemaGroup],
     documents: &[&Document],
     expected: &[Thing],
     released: &[Settling],
 ) -> anyhow::Result<()> {
     validate_groups(groups)?;
-    while_contended(|| settle_release_once(pool, groups, documents, expected, released)).await
+    while_contended(|| settle_release_once(history, pool, groups, documents, expected, released)).await
 }
 
 /// One attempt of [`settle_release`], in one transaction.
 async fn settle_release_once(
-    pool: &PgPool,
+    history: &History<'_>,
+    pool: &Pool,
     groups: &[&SchemaGroup],
     documents: &[&Document],
     expected: &[Thing],
     released: &[Settling],
 ) -> anyhow::Result<()> {
-    let mut tx = locked_tx(pool).await?;
+    let mut conn = pool.get().await?;
+    let tx = locked_tx(&mut conn).await?;
     for group in groups {
-        sqlx::query("DELETE FROM weft_migration WHERE group_name = $1 AND id LIKE 'draft\\_%'")
-            .bind(group.name)
-            .execute(&mut *tx)
-            .await?;
+        tx.execute("DELETE FROM weft_migration WHERE group_name = $1 AND id LIKE 'draft\\_%'", &[&group.name]).await?;
     }
-    settle_part(&mut tx, released, Part::Expand).await?;
-    crate::documents::apply_documents_within(&mut tx, documents).await.context("carry the stored documents to today's shape")?;
-    run_data_steps(&mut tx, groups).await?;
-    settle_part(&mut tx, released, Part::Contract).await?;
+    settle_part(&tx, released, Part::Expand).await?;
+    crate::documents::apply_documents_within(&tx, documents).await.context("carry the stored documents to today's shape")?;
+    run_data_steps(&tx, groups).await?;
+    settle_part(&tx, released, Part::Contract).await?;
     for group in groups {
-        if let Some(diff) = shape_diff(&mut tx, &[group], expected).await? {
+        if let Some(diff) = shape_diff(history, &tx, &[group], expected).await? {
             anyhow::bail!(
                 "after the release ran, group '{}' on the live database still does not hold \
                  the shape the code declares, so nothing was recorded:\n{diff}",
@@ -2330,28 +2299,20 @@ async fn settle_release_once(
 }
 
 /// Run what `released` has to run of `part`, in id order, and record each.
-async fn settle_part(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, released: &[Settling], part: Part) -> anyhow::Result<()> {
+async fn settle_part(tx: &Transaction<'_>, released: &[Settling], part: Part) -> anyhow::Result<()> {
     let mut mine: Vec<&Settling> = released.iter().filter(|m| m.part == part).collect();
     mine.sort_by(|a, b| a.id.cmp(&b.id));
     for m in mine {
         if m.run {
-            sqlx::raw_sql(&m.sql)
-                .execute(&mut **tx)
-                .await
-                .with_context(|| format!("running released migration '{}' of '{}'", m.id, m.group))?;
+            tx.batch_execute(&m.sql).await.with_context(|| format!("running released migration '{}' of '{}'", m.id, m.group))?;
         }
         // Never overwrite a recorded checksum: that row is what the
         // edited-history guard compares against. A pre-existing row
         // either already matches (a re-run of the same release) or is
         // a genuine id collision, refused loudly.
-        let existing: Option<(String,)> = sqlx::query_as(
-            "SELECT checksum FROM weft_migration WHERE group_name = $1 AND id = $2",
-        )
-        .bind(&m.group)
-        .bind(&m.id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if let Some((stored,)) = existing {
+        let existing: Option<String> =
+            tx.scalar_opt("SELECT checksum FROM weft_migration WHERE group_name = $1 AND id = $2", &[&m.group, &m.id]).await?;
+        if let Some(stored) = existing {
             anyhow::ensure!(
                 stored == checksum(&m.sql),
                 "migration '{}' of '{}' is already recorded with different \
@@ -2434,7 +2395,7 @@ pub fn diff_things(a: &[Thing], only_a: &str, b: &[Thing], only_b: &str) -> Opti
 /// and shipped DDL are still identical by construction. Freezing it any
 /// later would fold newer canonical changes into the "past" and lose
 /// their migration.
-pub async fn assert_schema_agrees(pool: &PgPool, groups: &[&SchemaGroup]) {
+pub async fn assert_schema_agrees(pool: &Pool, groups: &[&SchemaGroup]) {
     let frozen = write_missing_origins(groups).expect("write missing origins");
     assert!(
         frozen.is_empty(),
@@ -2446,14 +2407,11 @@ pub async fn assert_schema_agrees(pool: &PgPool, groups: &[&SchemaGroup]) {
     apply_groups(pool, groups).await.expect("build from canonical DDL");
     let fresh = read_schema(pool).await.expect("read the fresh database");
 
-    sqlx::raw_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
-        .execute(pool)
-        .await
-        .expect("empty the database");
+    pool.batch_execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public").await.expect("empty the database");
 
     // Drafts are deliberately left out of the replay, which is what
     // makes an unreleased draft fail here rather than reaching a PR.
-    replay_from_origin(pool, groups, false).await.expect("replay the history");
+    replay_from_origin(pool, &History::embedded(), groups, false).await.expect("replay the history");
     let upgraded = read_schema(pool).await.expect("read the upgraded database");
 
     if let Some(diff) = diff_things(&fresh, "a fresh install", &upgraded, "an upgraded install") {
@@ -2476,19 +2434,12 @@ pub async fn assert_schema_agrees(pool: &PgPool, groups: &[&SchemaGroup]) {
 /// `schema_agreement` test, so the first place a
 /// non-scratch-buildable statement (a hardcoded `public.`, a reference
 /// outside the group set) surfaces is CI, never a production boot.
-pub async fn assert_shape_check_restamps(pool: &PgPool, groups: &[&SchemaGroup]) {
+pub async fn assert_shape_check_restamps(pool: &Pool, groups: &[&SchemaGroup]) {
     apply_groups(pool, groups).await.expect("build from canonical DDL");
-    sqlx::query("UPDATE weft_schema_stamp SET fingerprint = 'moved'")
-        .execute(pool)
-        .await
-        .expect("move every stamp");
+    pool.execute("UPDATE weft_schema_stamp SET fingerprint = 'moved'", &[]).await.expect("move every stamp");
     apply_groups(pool, groups).await.expect("the shape check verifies and restamps");
-    let stale: Vec<(String,)> = sqlx::query_as(
-        "SELECT group_name FROM weft_schema_stamp WHERE fingerprint = 'moved'",
-    )
-    .fetch_all(pool)
-    .await
-    .expect("read stamps");
+    let stale: Vec<String> =
+        pool.scalars("SELECT group_name FROM weft_schema_stamp WHERE fingerprint = 'moved'", &[]).await.expect("read stamps");
     assert!(
         stale.is_empty(),
         "these groups were not restamped by the shape check: {stale:?}"
@@ -2515,11 +2466,17 @@ fn live_database_url() -> anyhow::Result<(String, String)> {
     Ok((install, url))
 }
 
+/// The most connections the generator's pools hold (the throwaway
+/// database it builds schemas in, and a release's live one), and how long
+/// a statement waits for one, or for the database to answer.
+const GENERATOR_POOL: u32 = 10;
+const GENERATOR_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The whole `--migration` generator, the body of `weft-runtime`'s
 /// `schema_migration` example (over every group the install's database
 /// holds): freeze missing origins, build the schema
 /// the databases out there hold (origins + released migrations + this
-/// machine's drafts), build the schema the code declares, diff them,
+/// machine's drafts, read off the disk: [`HistoryOnDisk`]), build the schema the code declares, diff them,
 /// file the difference (an expand file and a contract file per group,
 /// [`Part`]), and on `--release` collapse the drafts and settle the
 /// released files on the live database as a boot runs them, `documents`
@@ -2553,28 +2510,25 @@ pub async fn write_migration(groups: &[&SchemaGroup], documents: &[&Document]) -
         .context("set DATABASE_URL to a throwaway Postgres this can build schemas in")?;
 
     // A group that has never shipped a change has no history to replay
-    // from yet; freeze its DDL now. The frozen file is embedded by the
-    // NEXT build, so this run cannot continue past it.
-    let frozen = write_missing_origins(groups)?;
-    if !frozen.is_empty() {
-        for path in &frozen {
-            println!("froze {path}");
-        }
-        anyhow::bail!(
-            "origin file(s) were just written; rebuild (re-run the same command) so \
-             they are embedded, and commit them with the group they freeze"
-        );
+    // from yet; freeze its DDL now. The history is then read off the
+    // disk, not out of this binary, so the file just frozen (and every
+    // migration file, whatever this binary was built with) is what the
+    // plan starts from, in this same run.
+    for path in write_missing_origins(groups)? {
+        println!("froze {path}; commit it with the group it freezes");
     }
+    let on_disk = HistoryOnDisk::read(&migrations_root())?;
+    let history = on_disk.history();
 
-    let pool = PgPool::connect(&url).await?;
+    let pool = Pool::open(crate::db::config(&url)?, GENERATOR_POOL, GENERATOR_WAIT, Waits::Expected);
     // Releasing compares against what a database WITHOUT your drafts
     // holds, so the one file it writes carries the whole change rather
     // than the last slice of it.
-    sqlx::raw_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public").execute(&pool).await?;
-    replay_from_origin(&pool, groups, !release).await.context("build what exists")?;
+    pool.batch_execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public").await?;
+    replay_from_origin(&pool, &history, groups, !release).await.context("build what exists")?;
     let before = read_schema(&pool).await?;
 
-    sqlx::raw_sql("DROP SCHEMA public CASCADE; CREATE SCHEMA public").execute(&pool).await?;
+    pool.batch_execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public").await?;
     apply_groups(&pool, groups).await.context("build what the code declares")?;
     let after = read_schema(&pool).await?;
 
@@ -2617,7 +2571,7 @@ pub async fn write_migration(groups: &[&SchemaGroup], documents: &[&Document]) -
         return Ok(());
     }
 
-    let written = file_per_group(groups, &plan, &name, !release)?;
+    let written = file_per_group(&history, groups, &plan, &name, !release)?;
     let released: Vec<(String, String, Part, String)> = written
         .iter()
         .map(|(group, part, path, body)| {
@@ -2646,16 +2600,16 @@ pub async fn write_migration(groups: &[&SchemaGroup], documents: &[&Document]) -
     // leaves a column the code no longer declares, and no file to
     // carry that database anywhere). The running and recording then
     // land in one transaction.
-    let mut settle: Option<(PgPool, Vec<&SchemaGroup>, Vec<Settling>)> = None;
+    let mut settle: Option<(Pool, Vec<&SchemaGroup>, Vec<Settling>)> = None;
     if release {
         let (install, live_url) = live_database_url()?;
-        let live = PgPool::connect(&live_url).await.with_context(|| {
+        let live = Pool::open(crate::db::config(&live_url)?, GENERATOR_POOL, GENERATOR_WAIT, Waits::Expected);
+        let conn = live.get().await.with_context(|| {
             format!(
                 "releasing runs on {install}'s database, and it cannot be reached; start the \
                  install with ./setup.sh --daemon from its checkout and run the same command again"
             )
         })?;
-        let mut conn = live.acquire().await?;
         // A release records itself on the database and THEN puts its
         // files in place; a release cut between the two (Ctrl-C) leaves
         // a recorded id no tree carries, which the boot refuses and
@@ -2666,15 +2620,12 @@ pub async fn write_migration(groups: &[&SchemaGroup], documents: &[&Document]) -
         // that fits: the row goes, and this release records its result
         // under the new id.
         for group in groups {
-            let applied: HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
-                "SELECT id, checksum FROM weft_migration WHERE group_name = $1",
-            )
-            .bind(group.name)
-            .fetch_all(&mut *conn)
-            .await?
-            .into_iter()
-            .collect();
-            let stray = recorded_without_file(&for_group(MIGRATIONS, group.name), &applied);
+            let applied: HashMap<String, String> = conn
+                .all::<(String, String)>("SELECT id, checksum FROM weft_migration WHERE group_name = $1", &[&group.name])
+                .await?
+                .into_iter()
+                .collect();
+            let stray = recorded_without_file(&for_group(history.migrations(), group.name), &applied);
             let waiting: Vec<String> = stray
                 .iter()
                 .map(|id| group_dir(group).join(format!("{id}.sql")))
@@ -2709,7 +2660,7 @@ pub async fn write_migration(groups: &[&SchemaGroup], documents: &[&Document]) -
         // history to bring along; the next boot builds it from its
         // canonical DDL and records its origin, so the release neither
         // checks nor settles it.
-        let unborn = unborn_groups(&mut conn, groups).await?;
+        let unborn = unborn_groups(&conn, groups).await?;
         for name in &unborn {
             println!("group '{name}' is new to the live database; the next boot builds it");
         }
@@ -2721,7 +2672,7 @@ pub async fn write_migration(groups: &[&SchemaGroup], documents: &[&Document]) -
             if released.iter().any(|(g, ..)| g == group.name) {
                 continue;
             }
-            if let Some(diff) = shape_diff(&mut conn, &[group], &after).await? {
+            if let Some(diff) = shape_diff(&history, &conn, &[group], &after).await? {
                 anyhow::bail!(
                     "group '{}' changes nothing in this release, yet the live database does \
                      not hold the shape the code declares for it (a draft whose change was \
@@ -2741,12 +2692,12 @@ pub async fn write_migration(groups: &[&SchemaGroup], documents: &[&Document]) -
                 .iter()
                 .find(|g| g.name == group_name)
                 .expect("a released file belongs to one of the groups it was planned from");
-            let run = if shape_diff(&mut conn, &[group], &after).await?.is_none() {
+            let run = if shape_diff(&history, &conn, &[group], &after).await?.is_none() {
                 false
-            } else if shape_diff(&mut conn, &[group], &before).await?.is_none() {
+            } else if shape_diff(&history, &conn, &[group], &before).await?.is_none() {
                 true
             } else {
-                let diff = shape_diff(&mut conn, &[group], &after)
+                let diff = shape_diff(&history, &conn, &[group], &after)
                     .await?
                     .expect("a database that differs from both shapes differs from this one");
                 anyhow::bail!(
@@ -2767,7 +2718,7 @@ pub async fn write_migration(groups: &[&SchemaGroup], documents: &[&Document]) -
     let files: Vec<(&std::path::Path, &str)> = written.iter().map(|(_, _, path, body)| (path.as_path(), body.as_str())).collect();
     let settled = async {
         let Some((live, groups, settling)) = &settle else { return Ok(()) };
-        settle_release(live, groups, documents, &after, settling).await?;
+        settle_release(&history, live, groups, documents, &after, settling).await?;
         for m in settling {
             println!(
                 "your database {} the released migration '{}' of '{}'",
@@ -3094,7 +3045,10 @@ mod tests {
     // a database still owes.
     use std::collections::HashMap;
 
-    use super::{checksum, edited_after_running, fingerprint_of, pending, recorded_without_file, Migration, Part, ORIGIN_ID};
+    use super::{
+        checksum, edited_after_running, fingerprint_of, migrations_root, pending, recorded_without_file, History, HistoryOnDisk, Migration,
+        Part, ORIGIN_ID,
+    };
 
     static A: Migration = Migration { group: "g", id: "20260101_a", part: Part::Expand, draft: false, sql: "SELECT 1" };
     static B: Migration = Migration { group: "g", id: "20260202_b", part: Part::Expand, draft: false, sql: "SELECT 2" };
@@ -3143,8 +3097,8 @@ mod tests {
     /// arguments or a database): a draft pass as surely as a release.
     #[tokio::test]
     async fn a_migration_refuses_a_bad_data_step_before_planning() {
-        static STEP: &[super::DataStep] =
-            &[super::DataStep { table: "elsewhere", column: "owner", until: super::Until::Dropped, sql: "SELECT 1" }];
+        static STEP: &[crate::DataStep] =
+            &[crate::DataStep { table: "elsewhere", until: super::Until::Dropped("owner"), sql: "SELECT 1" }];
         static BAD: super::SchemaGroup =
             super::SchemaGroup { name: "worker_replica", tables: &["worker_replica"], ddl: &[], seed: &[], data_steps: STEP };
         let err = super::write_migration(&[&BAD], &[]).await.expect_err("refused");
@@ -3222,10 +3176,9 @@ mod tests {
 
     #[test]
     fn a_data_step_on_a_table_outside_its_group_is_refused() {
-        static STEP: &[super::DataStep] = &[super::DataStep {
+        static STEP: &[crate::DataStep] = &[crate::DataStep {
             table: "worker_replicas",
-            column: "owner",
-            until: super::Until::Dropped,
+            until: super::Until::Dropped("owner"),
             sql: "SELECT 1",
         }];
         let typo = super::SchemaGroup {
@@ -3309,9 +3262,78 @@ mod tests {
     /// table no history created is nobody's.
     #[test]
     fn a_table_is_owned_by_the_group_whose_history_created_it() {
-        assert!(super::history_created("access_grant", "access_grant"));
-        assert!(super::history_created("access_grant", "instance_value"));
-        assert!(!super::history_created("project", "instance_value"));
-        assert!(!super::history_created("access_grant", "instance"));
+        let history = History::embedded();
+        assert!(history.created("access_grant", "access_grant"));
+        assert!(history.created("access_grant", "instance_value"));
+        assert!(!history.created("project", "instance_value"));
+        assert!(!history.created("access_grant", "instance"));
+    }
+
+    /// A fresh directory under the system temp dir, its own per test.
+    fn scratch_migrations(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("weft-migrations-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("make the scratch migrations dir");
+        root
+    }
+
+    /// The generator plans from what is on disk NOW: an origin written a
+    /// moment ago (a new group's, frozen in the same run) and a draft are
+    /// both read, each file's part and draft-ness read off its name.
+    #[test]
+    fn the_generator_reads_the_history_off_the_disk() {
+        let root = scratch_migrations("disk");
+        let group = root.join("widget");
+        std::fs::create_dir_all(group.join("drafts")).unwrap();
+        std::fs::write(group.join("origin.sql"), "CREATE TABLE widget (id INT);\n").unwrap();
+        std::fs::write(group.join("20260101T000000_widget_a.sql"), "SELECT 1;\n").unwrap();
+        std::fs::write(group.join("20260101T000000_widget_a.contract.sql"), "SELECT 2;\n").unwrap();
+        std::fs::write(group.join("drafts/draft_20260202T000000_widget_b.sql"), "SELECT 3;\n").unwrap();
+        std::fs::write(group.join("notes.txt"), "not a migration").unwrap();
+
+        let on_disk = HistoryOnDisk::read(&root).unwrap();
+        let history = on_disk.history();
+        assert_eq!(history.origin("widget"), Some("CREATE TABLE widget (id INT);\n"));
+        assert_eq!(history.origin("gadget"), None);
+        let seen: Vec<(&str, &str, Part, bool, &str)> =
+            history.migrations().iter().map(|m| (m.group, m.id, m.part, m.draft, m.sql)).collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("widget", "20260101T000000_widget_a", Part::Expand, false, "SELECT 1;\n"),
+                ("widget", "20260101T000000_widget_a.contract", Part::Contract, false, "SELECT 2;\n"),
+                ("widget", "draft_20260202T000000_widget_b", Part::Expand, true, "SELECT 3;\n"),
+            ]
+        );
+        assert!(history.created("widget", "widget"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A released file and a draft with one id would race at boot, so the
+    /// walk refuses them, naming both, for the generator as for the build.
+    #[test]
+    fn two_files_with_one_id_are_refused() {
+        let root = scratch_migrations("dup");
+        let group = root.join("widget");
+        std::fs::create_dir_all(group.join("drafts")).unwrap();
+        std::fs::write(group.join("draft_x.sql"), "SELECT 1;\n").unwrap();
+        std::fs::write(group.join("drafts/draft_x.sql"), "SELECT 2;\n").unwrap();
+        let err = HistoryOnDisk::read(&root).err().expect("refused").to_string();
+        assert!(err.contains("two files share the id 'draft_x'"), "{err}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The build embeds the very walk the generator reads, so on a tree
+    /// the build has seen, the two histories are the same files.
+    #[test]
+    fn the_embedded_history_is_the_disk_history() {
+        let on_disk = HistoryOnDisk::read(&migrations_root()).unwrap();
+        let disk = on_disk.history();
+        let embedded = History::embedded();
+        let key = |h: &History<'_>| -> Vec<(String, String, bool, String)> {
+            h.migrations().iter().map(|m| (m.group.to_string(), m.id.to_string(), m.draft, m.sql.to_string())).collect()
+        };
+        assert_eq!(key(&disk), key(&embedded));
+        assert_eq!(disk.origins, embedded.origins);
     }
 }

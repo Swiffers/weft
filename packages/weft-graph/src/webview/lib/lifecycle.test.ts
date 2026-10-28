@@ -206,6 +206,16 @@ describe('the badges', () => {
 		).toBe("Taking it down takes down: 'door'; 'inbox' of instance 'ada'.");
 	});
 
+	it('tell an infra node\'s last restart on its pill', () => {
+		const lastRestart = { atUnix: 1_793_109_800, cause: { kind: 'out_of_memory' as const } };
+		expect(infraBadge(place('db', 'running', { lastRestart }), [], 0).detail).toBe(
+			'db ran out of memory at 2026-10-27 14:03 UTC: a process in it was killed because it needs more memory than its container may use; give it more.',
+		);
+		expect(
+			infraBadge(place('box', 'per_instance'), [{ node: 'box', instance: 'ada', status: 'running', lastRestart }], 0).detail,
+		).toBe('ada: running\nbox (instance ada) ran out of memory at 2026-10-27 14:03 UTC: a process in it was killed because it needs more memory than its container may use; give it more.');
+	});
+
 	it('count a per-instance infra node\'s copies that run', () => {
 		const badge = infraBadge(place('box', 'per_instance'), [
 			{ node: 'box', instance: 'ada', status: 'running' },

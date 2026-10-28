@@ -45,7 +45,7 @@ pub struct HttpWorkerDoors {
 
 impl HttpWorkerDoors {
     pub fn new(secret: Vec<u8>) -> Arc<Self> {
-        Arc::new(Self { http: reqwest::Client::new(), secret })
+        Arc::new(Self { http: weft_core::net::http_client().build().expect("reqwest client"), secret })
     }
 }
 
@@ -257,11 +257,14 @@ impl FireSignalSink {
             .signals
             .give_up(&weft_broker_client::protocol::SignalGiveUpRequest { token: token.to_string(), generation, reason: reason.to_string() })
             .await;
-        let was_down_holding = self.registry.clear_down(token) == Some(true);
-        let holding_here = self.registry.remove(token).is_some() || was_down_holding;
-        self.reach.forget(token);
+        // Only this registration (or an older one) stops: a newer one of
+        // the token that came up here since is not what was given up on.
+        let mine = crate::registry::Registrations::UpTo(generation);
+        let was_down_holding = self.registry.clear_down(token, mine) == Some(true);
+        let holding_here = self.registry.remove(token, mine).is_some() || was_down_holding;
+        self.reach.forget(token, mine);
         match &written {
-            Ok(()) => self.registry.drop_unrecorded(token),
+            Ok(()) => self.registry.drop_unrecorded(token, mine),
             Err(_) if holding_here => {
                 self.registry.keep_unrecorded(token, crate::registry::GaveUp { generation, reason: reason.to_string() });
                 self.said.notify_one();

@@ -205,14 +205,17 @@ const TASK_LOOK_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_sec
 
 /// Follow task `task` of project `project_id` (a resync, a deactivate's
 /// wait for its runs) until it ends, and answer what it ended with
-/// ([`follow_at`] on `GET /projects/{id}/follow/{task}`).
+/// ([`follow_at`] on `GET /projects/{id}/follow/{task}`). `going` hears
+/// where the task says it is, in its kind's own shape, which only the
+/// caller knows.
 pub async fn follow_task(
     client: &crate::client::DispatcherClient,
     progress: &crate::progress::Progress,
     project_id: &str,
     task: uuid::Uuid,
+    going: impl AsyncFnMut(Option<Value>) -> anyhow::Result<()>,
 ) -> anyhow::Result<Value> {
-    follow_at(client, &format!("/projects/{project_id}/follow/{task}"), TASK_LOOK, |message| progress.warn(message), async |_| Ok(())).await
+    follow_at(client, &format!("/projects/{project_id}/follow/{task}"), TASK_LOOK, |message| progress.warn(message), going).await
 }
 
 /// How long one look at a task waits on the install when it says nothing
@@ -238,9 +241,7 @@ pub async fn follow_at(
     let path = format!("{follow}?wait_ms={}", look.as_millis());
     loop {
         match client.get_json(&path).await {
-            Ok(answer) => match serde_json::from_value(answer)
-                .context("read the task's state (the install and this CLI disagree on its shape; upgrade one of them)")?
-            {
+            Ok(answer) => match crate::client::read_answer(answer, "the task's state")? {
                 weft_core::deactivation::Following::Going(progress) => going(progress).await?,
                 weft_core::deactivation::Following::Done(value) => return Ok(value),
             },

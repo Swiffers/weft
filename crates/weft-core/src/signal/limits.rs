@@ -236,6 +236,15 @@ impl Refused {
     pub fn answer(&self) -> String {
         format!("too many calls: {} is reached; try again in {}s", self.reason.describe(), self.retry_after_secs)
     }
+
+    /// The whole answer a refused call gets, as a response's status,
+    /// headers and body: a `429`, its `Retry-After`, and [`Self::answer`].
+    /// The one every door that refuses a call past a limit sends (a
+    /// worker's, the install's), so they never drift apart.
+    #[cfg(feature = "runtime")]
+    pub fn too_many_answer(&self) -> (http::StatusCode, [(http::header::HeaderName, String); 1], String) {
+        (http::StatusCode::TOO_MANY_REQUESTS, [(http::header::RETRY_AFTER, self.retry_after_secs.to_string())], self.answer())
+    }
 }
 
 #[cfg(test)]

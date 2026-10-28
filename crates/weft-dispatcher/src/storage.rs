@@ -13,6 +13,7 @@
 //! sweep the run's un-kept run files.
 
 use anyhow::{Context, Result};
+use weft_task_store::db::Client as _;
 use weft_task_store::drain::DrainStep;
 
 use weft_core::storage::{
@@ -25,6 +26,33 @@ use weft_core::storage::{
 };
 
 use crate::state::DispatcherState;
+
+/// How long one storage call to the broker may take when its work does
+/// not grow with what is stored: a row read or written, a link signed,
+/// parts reserved, one tenant's files listed. The broker answers these in
+/// well under a second, and within its database's own wait for a
+/// connection when the database is busy; a broker that took the call and
+/// never answered would otherwise hold it, and whatever waits on it, for
+/// good. The calls whose work grows with the data (a prefix wiped, a run's
+/// files swept, an upload's parts assembled) pass no limit.
+pub(crate) const BROKER_STORAGE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The slowest a read of a stored file on a signed link may go before it
+/// is given up: the store and the install sit in one cloud region (or on
+/// one machine), where a read goes many times faster than this.
+const STORE_READ_FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
+
+/// What a read of a stored file is given on top of its length's time:
+/// the store's first byte, which can take seconds on a cold bucket.
+const STORE_READ_START: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a read of a stored file `size_bytes` long may take
+/// ([`STORE_READ_START`] plus its length at [`STORE_READ_FLOOR_BYTES_PER_SEC`]):
+/// bounded, since nothing the person controls is in it, and sized by the
+/// file, since a large one takes longer.
+fn store_read_timeout(size_bytes: u64) -> std::time::Duration {
+    STORE_READ_START + std::time::Duration::from_secs(size_bytes.div_ceil(STORE_READ_FLOOR_BYTES_PER_SEC))
+}
 
 // ---------- broker admin client ----------
 //
@@ -72,7 +100,8 @@ impl std::fmt::Display for BrokerRejected {
 impl std::error::Error for BrokerRejected {}
 
 /// The broker was out of reach, or said it could not serve right now (a
-/// 502, 503 or 504): a fault that passes, which the person asks again on.
+/// 502, 503 or 504 other than [`StorageBusy`]'s): a fault that passes,
+/// which the person asks again on.
 #[derive(Debug)]
 pub struct StorageUnavailable;
 
@@ -83,6 +112,27 @@ impl std::fmt::Display for StorageUnavailable {
 }
 
 impl std::error::Error for StorageUnavailable {}
+
+/// The broker turned the call away busy with nothing of it run
+/// (`weft_broker_client::client::answered_busy`: its database gave it no
+/// connection, or the platform in front of it handed it to no copy):
+/// the same call goes through once it can.
+#[derive(Debug)]
+pub struct StorageBusy;
+
+impl std::fmt::Display for StorageBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "storage turned the call away busy, and nothing of it ran")
+    }
+}
+
+impl std::error::Error for StorageBusy {}
+
+/// Whether `e` failed because the broker turned it away busy
+/// ([`StorageBusy`]), anywhere in its chain.
+pub fn storage_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| cause.is::<StorageBusy>())
+}
 
 /// Whether `e` failed because storage could not be reached: the broker
 /// answered it was unavailable ([`StorageUnavailable`]), or the request to it
@@ -133,6 +183,11 @@ async fn check(resp: reqwest::Response, what: &str) -> Result<reqwest::Response>
         return Err(anyhow::Error::new(BrokerRejected { status, completing })
             .context(format!("broker storage {what} returned {status}: {body}")));
     }
+    // Checked before the unavailable statuses below: a busy answer is a
+    // 503 too, and only this one says nothing of the call ran.
+    if weft_broker_client::client::answered_busy(status, body.as_bytes()) {
+        return Err(anyhow::Error::new(StorageBusy).context(format!("broker storage {what} returned {status}: {body}")));
+    }
     if matches!(status, StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT) {
         return Err(anyhow::Error::new(StorageUnavailable).context(format!("broker storage {what} returned {status}: {body}")));
     }
@@ -143,21 +198,17 @@ async fn check(resp: reqwest::Response, what: &str) -> Result<reqwest::Response>
 
 /// POST one admin verb to the broker and parse its JSON response. Every
 /// admin-surface call is this exact shape (identity bearer, JSON in, JSON out,
-/// status classified by `check`), so it lives once.
+/// status classified by `check`), so it lives once. `limit` bounds the
+/// whole call ([`BROKER_STORAGE_CALL_TIMEOUT`]); `None` for a verb whose
+/// work grows with the data.
 async fn post_admin<Resp: serde::de::DeserializeOwned>(
     state: &DispatcherState,
     path: &str,
     what: &str,
+    limit: Option<std::time::Duration>,
     body: &impl serde::Serialize,
 ) -> Result<Resp> {
-    let resp = state
-        .broker
-        .request(reqwest::Method::POST, path)
-        .await?
-        .json(body)
-        .send()
-        .await
-        .with_context(|| format!("broker {what}"))?;
+    let resp = admin_call(state, path, what, limit, body).await?;
     check(resp, what).await?.json().await.with_context(|| format!("{what} parse"))
 }
 
@@ -166,18 +217,27 @@ async fn post_admin_unit(
     state: &DispatcherState,
     path: &str,
     what: &str,
+    limit: Option<std::time::Duration>,
     body: &impl serde::Serialize,
 ) -> Result<()> {
-    let resp = state
-        .broker
-        .request(reqwest::Method::POST, path)
-        .await?
-        .json(body)
-        .send()
-        .await
-        .with_context(|| format!("broker {what}"))?;
+    let resp = admin_call(state, path, what, limit, body).await?;
     check(resp, what).await?;
     Ok(())
+}
+
+/// Send one admin verb to the broker, within `limit` when there is one.
+async fn admin_call(
+    state: &DispatcherState,
+    path: &str,
+    what: &str,
+    limit: Option<std::time::Duration>,
+    body: &impl serde::Serialize,
+) -> Result<reqwest::Response> {
+    let mut request = state.broker.request(reqwest::Method::POST, path).await?.json(body);
+    if let Some(limit) = limit {
+        request = request.timeout(limit);
+    }
+    request.send().await.with_context(|| format!("broker {what}"))
 }
 
 /// Read one active file without changing its lifetime or minting a link.
@@ -186,6 +246,7 @@ pub async fn file_meta(state: &DispatcherState, key: &str) -> Result<StoredFileM
         .broker
         .request(reqwest::Method::GET, &format!("/v1/storage/admin/meta/{key}"))
         .await?
+        .timeout(BROKER_STORAGE_CALL_TIMEOUT)
         .send()
         .await
         .context("read stored file metadata")?;
@@ -198,6 +259,7 @@ pub async fn tenant_list(state: &DispatcherState, tenant: &str) -> Result<Vec<St
         state,
         "/v1/storage/admin/tenant-list",
         "tenant-list",
+        Some(BROKER_STORAGE_CALL_TIMEOUT),
         &TenantScopeRequest { tenant: tenant.to_string() },
     )
     .await?;
@@ -210,6 +272,7 @@ pub async fn tenant_usage(state: &DispatcherState, tenant: &str) -> Result<Tenan
         state,
         "/v1/storage/admin/tenant-usage",
         "tenant-usage",
+        Some(BROKER_STORAGE_CALL_TIMEOUT),
         &TenantScopeRequest { tenant: tenant.to_string() },
     )
     .await
@@ -225,6 +288,7 @@ pub async fn set_asset_references(
         state,
         "/v1/storage/admin/asset-references",
         "update asset lifetimes",
+        Some(BROKER_STORAGE_CALL_TIMEOUT),
         &Tenanted { tenant: tenant.into(), inner: references },
     ).await
 }
@@ -235,6 +299,7 @@ pub async fn delete_key(state: &DispatcherState, key: &str) -> Result<()> {
         .broker
         .request(reqwest::Method::DELETE, &format!("/v1/storage/admin/files/{key}"))
         .await?
+        .timeout(BROKER_STORAGE_CALL_TIMEOUT)
         .send()
         .await
         .context("broker delete-key")?;
@@ -257,6 +322,7 @@ pub async fn download_link(
         state,
         "/v1/storage/admin/link",
         "link",
+        Some(BROKER_STORAGE_CALL_TIMEOUT),
         &AdminLinkRequest { key: key.to_string(), ttl_secs, reader },
     )
     .await
@@ -267,7 +333,13 @@ pub async fn download_link(
 /// its files with.
 pub async fn read_file(state: &DispatcherState, key: &str) -> Result<Vec<u8>> {
     let link = download_link(state, key, None, LinkReader::Runtime).await?;
-    let resp = state.http.get(&link.url).send().await.with_context(|| format!("read stored file {key}"))?;
+    let resp = state
+        .http
+        .get(&link.url)
+        .timeout(store_read_timeout(link.size_bytes))
+        .send()
+        .await
+        .with_context(|| format!("read stored file {key}"))?;
     anyhow::ensure!(resp.status().is_success(), "the store answered {} reading stored file {key}", resp.status());
     let bytes = resp.bytes().await.with_context(|| format!("read stored file {key}"))?;
     anyhow::ensure!(
@@ -287,7 +359,13 @@ pub async fn download_file(state: &DispatcherState, key: &str, dest: &std::path:
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
     let link = download_link(state, key, None, LinkReader::Runtime).await?;
-    let resp = state.http.get(&link.url).send().await.with_context(|| format!("read stored file {key}"))?;
+    let resp = state
+        .http
+        .get(&link.url)
+        .timeout(store_read_timeout(link.size_bytes))
+        .send()
+        .await
+        .with_context(|| format!("read stored file {key}"))?;
     anyhow::ensure!(resp.status().is_success(), "the store answered {} reading stored file {key}", resp.status());
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
@@ -342,6 +420,8 @@ pub async fn wipe_prefix(state: &DispatcherState, prefix: &str) -> Result<u64> {
         state,
         "/v1/storage/admin/wipe-prefix",
         "wipe-prefix",
+        // Every file under the prefix is deleted: no limit.
+        None,
         &WipePrefixRequest { prefix: prefix.to_string() },
     )
     .await?;
@@ -355,6 +435,8 @@ async fn sweep_run(state: &DispatcherState, tenant: &str, run_id: &str) -> Resul
         state,
         "/v1/storage/admin/sweep-run",
         "sweep-run",
+        // Every file the run stored is swept: no limit.
+        None,
         &SweepRunRequest { tenant: tenant.to_string(), run_id: run_id.to_string() },
     )
     .await
@@ -380,6 +462,7 @@ pub async fn upload_begin(
         state,
         "/v1/storage/admin/upload/begin",
         "upload-begin",
+        Some(BROKER_STORAGE_CALL_TIMEOUT),
         &Tenanted { tenant: tenant.to_string(), inner: req },
     )
     .await
@@ -391,7 +474,7 @@ pub async fn import_begin(
     tenant: &str,
     req: weft_core::storage::FileImportBeginRequest,
 ) -> Result<UploadBeginResponse> {
-    post_admin(state, "/v1/storage/admin/import/begin", "import-begin", &Tenanted { tenant: tenant.to_string(), inner: req }).await
+    post_admin(state, "/v1/storage/admin/import/begin", "import-begin", Some(BROKER_STORAGE_CALL_TIMEOUT), &Tenanted { tenant: tenant.to_string(), inner: req }).await
 }
 
 /// Which of the named contents `tenant` already stores: a publish's diff.
@@ -404,6 +487,7 @@ pub async fn assets_held(
         state,
         "/v1/storage/admin/assets-held",
         "assets-held",
+        Some(BROKER_STORAGE_CALL_TIMEOUT),
         &Tenanted { tenant: tenant.to_string(), inner: req },
     )
     .await
@@ -419,6 +503,7 @@ pub async fn upload_parts(
         state,
         "/v1/storage/admin/upload/parts",
         "upload-parts",
+        Some(BROKER_STORAGE_CALL_TIMEOUT),
         &Tenanted { tenant: tenant.to_string(), inner: req },
     )
     .await
@@ -434,6 +519,7 @@ pub async fn upload_part_done(
         state,
         "/v1/storage/admin/upload/part-done",
         "upload-part-done",
+        Some(BROKER_STORAGE_CALL_TIMEOUT),
         &Tenanted { tenant: tenant.to_string(), inner: req },
     )
     .await
@@ -449,6 +535,8 @@ pub async fn upload_complete(
         state,
         "/v1/storage/admin/upload/complete",
         "upload-complete",
+        // The store assembles the file from its parts: no limit.
+        None,
         &Tenanted { tenant: tenant.to_string(), inner: req },
     )
     .await
@@ -464,6 +552,7 @@ pub async fn upload_resume(
         state,
         "/v1/storage/admin/upload/resume",
         "upload-resume",
+        Some(BROKER_STORAGE_CALL_TIMEOUT),
         &Tenanted { tenant: tenant.to_string(), inner: req },
     )
     .await
@@ -479,6 +568,7 @@ pub async fn upload_abort(
         state,
         "/v1/storage/admin/upload/abort",
         "upload-abort",
+        Some(BROKER_STORAGE_CALL_TIMEOUT),
         &Tenanted { tenant: tenant.to_string(), inner: req },
     )
     .await
@@ -546,7 +636,7 @@ impl weft_assets::upload::UploadPlane for InstallUploads<'_> {
     }
 
     fn interrupted(&self, error: &anyhow::Error) -> bool {
-        storage_unreachable(error)
+        storage_unreachable(error) || storage_busy(error)
     }
 }
 
@@ -601,9 +691,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 /// naming the run (the files, if any, remain reclaimable via `weft files`).
 pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
     let rows: Vec<(weft_core::RunId, String)> =
-        sqlx::query_as("SELECT run_id, tenant_id FROM storage_sweep ORDER BY enqueued_at_unix")
-            .fetch_all(&state.pg_pool)
-            .await?;
+        state.pg_pool.all("SELECT run_id, tenant_id FROM storage_sweep ORDER BY enqueued_at_unix", &[]).await?;
     let mut deferred = Vec::new();
     for (run_id, tenant) in rows {
         match sweep_run(&state, &tenant, &run_id.to_string()).await {
@@ -616,10 +704,7 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
                          un-kept run files with the post-run linger expiry"
                     );
                 }
-                sqlx::query("DELETE FROM storage_sweep WHERE run_id = $1")
-                    .bind(run_id)
-                    .execute(&state.pg_pool)
-                    .await?;
+                state.pg_pool.execute("DELETE FROM storage_sweep WHERE run_id = $1", &[&run_id]).await?;
             }
             Err(e) if e.downcast_ref::<StorageNotFound>().is_some() => {
                 // 404 from the broker means there was nothing to sweep for this
@@ -630,10 +715,7 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
                     %run_id, tenant = %tenant,
                     "terminate sweep found nothing to remove; clearing the queue row"
                 );
-                sqlx::query("DELETE FROM storage_sweep WHERE run_id = $1")
-                    .bind(run_id)
-                    .execute(&state.pg_pool)
-                    .await?;
+                state.pg_pool.execute("DELETE FROM storage_sweep WHERE run_id = $1", &[&run_id]).await?;
             }
             Err(e) if e.downcast_ref::<BrokerRejected>().is_some() => {
                 // The broker understood and permanently refuses this request (bad
@@ -648,10 +730,7 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
                      (any remaining files for this run stay listable/deletable via \
                      the storage API)"
                 );
-                sqlx::query("DELETE FROM storage_sweep WHERE run_id = $1")
-                    .bind(run_id)
-                    .execute(&state.pg_pool)
-                    .await?;
+                state.pg_pool.execute("DELETE FROM storage_sweep WHERE run_id = $1", &[&run_id]).await?;
             }
             Err(e) => {
                 // Transient (broker unreachable, apiserver blip surfaced as 401,
@@ -672,4 +751,38 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
         deferred.join("; ")
     );
     Ok(DrainStep::Done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stored file's read is given its start, plus a second for every
+    /// started MiB of it.
+    #[test]
+    fn a_store_read_is_given_its_start_and_its_length() {
+        let secs = |size: u64| store_read_timeout(size).as_secs();
+        assert_eq!(secs(0), 30);
+        assert_eq!(secs(1), 31, "a partial MiB counts whole");
+        assert_eq!(secs(1024 * 1024), 31);
+        assert_eq!(secs(1024 * 1024 + 1), 32);
+        assert_eq!(secs(2 * 1024 * 1024 * 1024), 30 + 2048, "a 2 GiB file gets about 34 minutes");
+    }
+
+    /// A broker 503 saying nothing ran (or the platform's 429) is busy,
+    /// which the install answers as its own 503; any other 503 is storage
+    /// out of reach.
+    #[tokio::test]
+    async fn a_busy_broker_is_told_from_storage_out_of_reach() {
+        let answer = |status: u16, body: &str| {
+            reqwest::Response::from(axum::http::Response::builder().status(status).body(body.to_string()).unwrap())
+        };
+        let not_done = weft_broker_client::protocol::NOT_DONE;
+        let busy = check(answer(503, not_done), "wipe").await.unwrap_err();
+        assert!(storage_busy(&busy) && !storage_unreachable(&busy), "{busy:#}");
+        let crowded = check(answer(429, ""), "wipe").await.unwrap_err();
+        assert!(storage_busy(&crowded), "{crowded:#}");
+        let down = check(answer(503, "the object store is down"), "wipe").await.unwrap_err();
+        assert!(storage_unreachable(&down) && !storage_busy(&down), "{down:#}");
+    }
 }

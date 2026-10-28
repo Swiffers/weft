@@ -1084,7 +1084,7 @@ fn parse_manifest(path: &Path) -> BuildResult<toml::Value> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
         BuildError::Build(format!("read manifest {}: {e}", path.display()))
     })?;
-    raw.parse::<toml::Value>()
+    toml::from_str::<toml::Value>(&raw)
         .map_err(|e| BuildError::Build(format!("parse manifest {}: {e}", path.display())))
 }
 
@@ -1545,7 +1545,7 @@ const STANDALONE_WORKSPACE_HEADER: &str = "\
 /// ONE workspace rather than one per package, because cargo resolves
 /// features per workspace: 28 separate workspaces sharing a target dir
 /// meant the same dependency was compiled once per distinct feature
-/// union (ten copies of `sqlx-postgres`, all from one run). Members
+/// union (ten copies of one database driver, all from one run). Members
 /// unify, so each dependency is built once.
 ///
 /// `members` is what THIS run emitted, not every package in the

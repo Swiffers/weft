@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlx::PgPool;
+use weft_task_store::db::Pool;
 use weft_platform_traits::{Alarm, CoreRole, IdentityTokens, RoleAddresses, Wake, WakeCall, WakeRefusal};
 
 /// How long a claimed wake is this loop's before it comes due again (a
@@ -57,12 +57,12 @@ pub const ANSWERED_HEADER: &str = "x-weft-wake-answered";
 pub const TRIED_HEADER: &str = "x-weft-wake-tried";
 
 pub struct LocalAlarm {
-    pool: PgPool,
+    pool: Pool,
     changed: Arc<tokio::sync::Notify>,
 }
 
 impl LocalAlarm {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: Pool) -> Self {
         Self { pool, changed: Arc::new(tokio::sync::Notify::new()) }
     }
 
@@ -242,7 +242,7 @@ pub struct HttpDeliver {
 
 impl HttpDeliver {
     pub fn new(roles: RoleAddresses, tokens: Arc<dyn IdentityTokens>) -> Self {
-        Self { roles, tokens, http: reqwest::Client::new() }
+        Self { roles, tokens, http: weft_core::net::http_client().build().expect("reqwest client") }
     }
 }
 

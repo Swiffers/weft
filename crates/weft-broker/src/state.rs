@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use sqlx::postgres::PgPool;
+use weft_task_store::db::Pool;
 
 use weft_task_store::pg_signal::PgSignalWatch;
 use weft_task_store::{PostgresInfraReader, PostgresTaskStoreClient, TaskStoreClient};
@@ -41,14 +41,14 @@ pub const BROKER_CHANNELS: &[&str] = &[
 ];
 
 pub struct BrokerState {
-    pub pool: PgPool,
+    pub pool: Pool,
     /// A pool for locks held across a slow call (a provider round trip),
     /// whose connections do no work while they hold one.
-    pub lock_pool: PgPool,
+    pub lock_pool: Pool,
     /// The pool workers' batches of records are written on
     /// (`crate::records`): a burst of records never starves the broker's
     /// other work of connections.
-    pub record_pool: PgPool,
+    pub record_pool: Pool,
     /// What the broker tells the dispatcher once a batch commits.
     pub notices: Arc<crate::notices::Notices>,
     /// The process's one Postgres `LISTEN` connection, on (at least)
@@ -166,9 +166,9 @@ impl BrokerState {
     /// The schema (the runtime-file plane's group included) is already
     /// applied: the boot's one pass runs before any role is built.
     pub fn new(
-        pool: PgPool,
-        lock_pool: PgPool,
-        record_pool: PgPool,
+        pool: Pool,
+        lock_pool: Pool,
+        record_pool: Pool,
         signals: Arc<PgSignalWatch>,
         settings: BrokerSettings,
     ) -> anyhow::Result<Arc<Self>> {

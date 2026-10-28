@@ -270,7 +270,7 @@ fn spawn_loop(
                     if !event_filter.is_empty() && msg.event != event_filter {
                         continue;
                     }
-                    let payload = super::event_source::coerce_text_payload(msg.data);
+                    let payload = super::event_source::coerce_text_payload(&msg.data);
                     // An SSE event has no replay cursor; the delivery
                     // outcome is already logged by the fire path.
                     let _ = ctx.fire.fire(payload, "sse_subscribe").await;

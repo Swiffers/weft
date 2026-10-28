@@ -30,7 +30,7 @@ use serde_json::Value;
 
 use weft::{Access, RunContext, Node, NodeManifest, NodeOutput, WeftResult};
 
-use super::postgres::{connect, plan, ports_read, query_json, script_json, steps_json, Plan, Statement};
+use super::postgres::{connect, plan, ports_read, Plan, Statement};
 
 #[derive(NodeManifest)]
 pub struct PostgresExecuteQueryNode;
@@ -80,12 +80,12 @@ impl Node for PostgresExecuteQueryNode {
 
         let mut client = connect(&ctx, &account).await?;
         let rows = match plan {
-            Plan::Query { sql, names } => query_json(&client, &sql, &names, &bind(&names)).await?,
-            Plan::Script { head, last } => script_json(&client, &head, &last).await?,
+            Plan::Query { sql, names } => client.query_json(&sql, &names, &bind(&names)).await?,
+            Plan::Script { head, last } => client.script_json(&head, &last).await?,
             Plan::Steps(steps) => {
                 let bound: Vec<(Statement, Vec<Value>)> =
                     steps.into_iter().map(|s| { let v = bind(&s.names); (s, v) }).collect();
-                steps_json(&mut client, &bound).await?
+                client.steps_json(&bound).await?
             }
         };
         // A wire carries at most 100 KB, and the SQL is where the bound

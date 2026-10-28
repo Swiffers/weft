@@ -61,7 +61,7 @@ impl Dispatcher {
     /// call carrying the install's own key (read from its secrets, the way
     /// the CLI on this machine reads it).
     pub fn for_install(base: &str, install: weft_core::infra::Install) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        let http = weft_core::net::http_client()
             .build()
             .context("build reqwest client")?;
         let key = install.secret(weft_core::signal_token::INSTALL_KEY_SECRET).map_err(anyhow::Error::msg)?;

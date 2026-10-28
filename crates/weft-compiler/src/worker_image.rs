@@ -112,7 +112,8 @@ fn manager_key(manager: PackageManager) -> &'static str {
 /// The image a worker image runs on when its project names no
 /// `[build.worker] base_image`, and the base the builder base's packages
 /// are chosen for.
-pub const DEFAULT_BASE_IMAGE: &str = "debian:bookworm-slim";
+// SYNC: builder base distro <-> deploy/docker/worker-builder-base.Dockerfile (FROM ... AS toolchain)
+pub const DEFAULT_BASE_IMAGE: &str = "debian:trixie-slim";
 
 /// Weft workspace mount point INSIDE the builder container. The
 /// docker build context copies the language-runtime workspace
@@ -195,14 +196,17 @@ pub fn emit(
     })?;
 
     // The pre-built base shortcuts the "install rustup + apt
-    // build-essential" cycle. It only fits a debian-family runtime
-    // base (glibc ABI match: a debian-built worker binary runs in a
-    // debian runtime, not an alpine/musl one) and never applies to a
-    // custom Dockerfile template (the Some arm below), which may not
-    // respect our base layout. Otherwise fall back to the
-    // from-scratch template that installs everything inside the
-    // builder stage.
-    let use_prebuilt_base = base.manager == PackageManager::Apt;
+    // build-essential" cycle. It only fits a runtime base of the very
+    // distro release it was built on ([`DEFAULT_BASE_IMAGE`]'s): a
+    // binary may need any glibc symbol of the release it was built on,
+    // so the loader refuses it on an older glibc (bookworm, Ubuntu
+    // 24.04), it cannot run on musl at all, and the build
+    // packages are named for the runtime base's distro. It never
+    // applies to a custom Dockerfile template (the Some arm below),
+    // which may not respect our base layout. Every other base takes
+    // the from-scratch template, which builds inside the runtime base
+    // itself.
+    let use_prebuilt_base = base.manager == PackageManager::Apt && base.distro_key == default_base_image().distro_key;
     if use_prebuilt_base && build.dockerfile_template.is_none() {
         build_packages.retain(|package| !baked.packages.contains(package));
     }
@@ -523,7 +527,11 @@ pub fn parse_base_image(raw: &str) -> Option<BaseImage> {
     }
 
     if image_lc.starts_with("python") {
-        let distro_key = if tag_lc.contains("bookworm") || tag_lc.contains("slim") {
+        // A tag naming no release (`3.15-slim`) follows whichever Debian
+        // the image's maintainers moved it to, so no distro is guessed.
+        let distro_key = if tag_lc.contains("trixie") {
+            "debian_13".to_string()
+        } else if tag_lc.contains("bookworm") {
             "debian_12".to_string()
         } else if tag_lc.contains("bullseye") {
             "debian_11".to_string()
@@ -573,7 +581,7 @@ pub fn base_image_of(build: &WorkerBuildSection) -> BuildResult<BaseImage> {
 
 fn debian_tag_to_version(tag: &str) -> Option<&'static str> {
     if tag.is_empty() || tag == "latest" {
-        return Some("12");
+        return Some("13");
     }
     for (codename, major) in [
         ("bookworm", "12"),
@@ -1045,6 +1053,8 @@ mod tests {
         let b = parse_base_image("python:3.13-slim-bookworm").unwrap();
         assert_eq!(b.manager, PackageManager::Apt);
         assert_eq!(b.distro_key, "debian_12");
+        let unnamed = parse_base_image("python:3.15-slim").unwrap();
+        assert_eq!((unnamed.manager, unnamed.distro_key.as_str()), (PackageManager::Apt, ""));
     }
 
     /// An image of no family weft knows is refused unless the project
@@ -1176,6 +1186,33 @@ mod tests {
             "fallback template seeds the worker lock from the workspace lock: {}",
             out.body
         );
+    }
+
+    /// An apt runtime of another release than the builder base's (an
+    /// older glibc, which a binary built on the base refuses to start
+    /// on) builds inside that runtime base instead; the default base
+    /// takes the prebuilt one.
+    #[test]
+    fn only_the_builder_bases_own_release_takes_the_prebuilt_base() {
+        let uses_prebuilt = |base: &str| {
+            let build = crate::project::WorkerBuildSection { base_image: Some(base.into()), dockerfile_template: None, package_manager: None };
+            let out = emit(
+                &build,
+                std::path::Path::new("/tmp"),
+                &weft_catalog::FsCatalog::empty(),
+                &std::collections::BTreeSet::new(),
+                &NodeNeeds::new(),
+                "worker_test",
+                "weft-builder-base:irrelevant",
+                &nothing_baked(),
+            )
+            .expect("emit");
+            out.builder_base.is_some()
+        };
+        assert!(uses_prebuilt(DEFAULT_BASE_IMAGE));
+        for other in ["debian:bookworm-slim", "ubuntu:24.04", "python:3.15-slim"] {
+            assert!(!uses_prebuilt(other), "{other} builds from scratch");
+        }
     }
 
     /// A CUSTOM template that references `{{builder_base_image}}`
@@ -1350,12 +1387,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let catalog = crate::codegen::tests::catalog_with_needs(dir.path());
         let referenced: BTreeSet<String> = ["Run".to_string(), "Plain".to_string()].into();
-        let build = WorkerBuildSection { base_image: Some("debian:bookworm-slim".into()), dockerfile_template: None, package_manager: None };
+        let build = WorkerBuildSection { base_image: Some("debian:trixie-slim".into()), dockerfile_template: None, package_manager: None };
         let needs = crate::codegen::node_needs(&referenced, &catalog).unwrap();
         let out = emit(&build, dir.path(), &catalog, &referenced, &needs, "worker_test", "weft-builder-base:x", &nothing_baked()).expect("emit");
         assert_eq!(out.runtime_packages, ["python3"]);
         assert_eq!(out.build_packages, ["libvips-dev"]);
-        let (builder, runtime) = out.body.split_once("\nFROM debian:bookworm-slim\n").expect("two stages");
+        let (builder, runtime) = out.body.split_once("\nFROM debian:trixie-slim\n").expect("two stages");
         assert!(builder.contains("apt-get install -y --no-install-recommends libvips-dev "), "{builder}");
         assert!(runtime.contains("apt-get install -y --no-install-recommends python3 "), "{runtime}");
         assert!(!out.body.contains("ffmpeg") && !out.body.contains(" say"), "{}", out.body);
@@ -1380,10 +1417,10 @@ mod tests {
             let out = emit(build, dir.path(), &catalog, &referenced, &needs, "worker_test", "weft-builder-base:x", &nothing_baked()).expect("emit");
             out.left_to_machine(needs.clone()).values().flatten().map(|need| need.name.clone()).collect()
         };
-        assert_eq!(left(&WorkerBuildSection { base_image: Some("debian:bookworm-slim".into()), dockerfile_template: None, package_manager: None }), ["say"]);
+        assert_eq!(left(&WorkerBuildSection { base_image: Some("debian:trixie-slim".into()), dockerfile_template: None, package_manager: None }), ["say"]);
         assert_eq!(left(&WorkerBuildSection { base_image: Some("rockylinux:9".into()), dockerfile_template: None, package_manager: None }), ["libvips", "say"]);
         std::fs::write(dir.path().join("Dockerfile.custom"), "FROM {{base_image}}\n{{install_runtime_system_packages}}\n").unwrap();
-        let custom = WorkerBuildSection { base_image: Some("debian:bookworm-slim".into()), dockerfile_template: Some("Dockerfile.custom".into()), package_manager: None };
+        let custom = WorkerBuildSection { base_image: Some("debian:trixie-slim".into()), dockerfile_template: Some("Dockerfile.custom".into()), package_manager: None };
         assert_eq!(left(&custom), ["libvips", "say"], "the template installs no build stage");
     }
 
@@ -1405,7 +1442,7 @@ mod tests {
             .err()
             .expect("refused")
             .to_string();
-        assert!(err.contains("'python3'") && err.contains("[needs.install.apt]") && err.contains("debian_12"), "{err}");
+        assert!(err.contains("'python3'") && err.contains("[needs.install.apt]") && err.contains("debian_13"), "{err}");
     }
 
     /// A fake cargo target dir for the sweep: `release/` and the JSON

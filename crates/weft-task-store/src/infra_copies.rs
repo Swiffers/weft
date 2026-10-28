@@ -31,15 +31,14 @@ impl CopyStatus {
 
 /// One `infra_node` row as [`statuses`] reads it: node, instance,
 /// status, last apply, saved bake.
-type CopyRow = (String, Option<String>, String, Option<i64>, sqlx::types::Json<std::collections::BTreeMap<String, serde_json::Value>>);
+type CopyRow = (String, Option<String>, String, Option<i64>, crate::db::Json<std::collections::BTreeMap<String, serde_json::Value>>);
 
 /// Every copy of `project_id`'s infra nodes and its status.
-pub async fn statuses(pool: &sqlx::PgPool, project_id: uuid::Uuid) -> anyhow::Result<Vec<CopyStatus>> {
-    let rows: Vec<CopyRow> =
-        sqlx::query_as("SELECT node_id, instance_id, status, applied_at_unix, baked_json FROM infra_node WHERE project_id = $1")
-            .bind(project_id)
-            .fetch_all(pool)
-            .await?;
+pub async fn statuses(pool: &crate::db::Pool, project_id: uuid::Uuid) -> anyhow::Result<Vec<CopyStatus>> {
+    use crate::db::Client as _;
+    let rows: Vec<CopyRow> = pool
+        .all("SELECT node_id, instance_id, status, applied_at_unix, baked_json FROM infra_node WHERE project_id = $1", &[&project_id])
+        .await?;
     rows.into_iter()
         .map(|(node_id, instance, status, applied_at_unix, baked)| {
             let instance = instance

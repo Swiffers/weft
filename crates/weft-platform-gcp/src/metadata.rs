@@ -39,7 +39,7 @@ impl Default for MetadataTokens {
 impl MetadataTokens {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::builder()
+            http: weft_core::net::http_client()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("a default reqwest client builds"),

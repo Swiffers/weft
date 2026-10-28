@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
+use weft_task_store::db::{self, Client, FromRow, Pool, Row};
 
 use sha2::Digest;
 
@@ -120,7 +120,6 @@ pub fn value_shortfall<'r>(
 }
 
 /// The `access_grant` columns a walled read selects.
-#[derive(sqlx::FromRow)]
 struct GrantRow {
     tenant_id: String,
     service: String,
@@ -139,6 +138,30 @@ struct GrantRow {
     instance_id: Option<String>,
     project_id: Option<uuid::Uuid>,
     published_by_node: Option<String>,
+}
+
+impl FromRow for GrantRow {
+    fn from_row(row: Row) -> db::Result<Self> {
+        Ok(Self {
+            tenant_id: row.try_get("tenant_id")?,
+            service: row.try_get("service")?,
+            registration_sealed: row.try_get("registration_sealed")?,
+            spec_json: row.try_get("spec_json")?,
+            spec_json_version: row.try_get("spec_json_version")?,
+            values_sealed: row.try_get("values_sealed")?,
+            granted_scopes: row.try_get("granted_scopes")?,
+            permissions_verified: row.try_get("permissions_verified")?,
+            owner: row.try_get("owner")?,
+            door: row.try_get("door")?,
+            identity: row.try_get("identity")?,
+            provider_account: row.try_get("provider_account")?,
+            expires_at: row.try_get("expires_at")?,
+            token_lifetime_secs: row.try_get("token_lifetime_secs")?,
+            instance_id: row.try_get("instance_id")?,
+            project_id: row.try_get("project_id")?,
+            published_by_node: row.try_get("published_by_node")?,
+        })
+    }
 }
 
 /// One connection row, read through the wall and refreshed: what
@@ -196,25 +219,60 @@ impl<'a> GrantUser<'a> {
     }
 }
 
-/// Whether a walled read runs the lazy refresh. A `Stored` read is a
-/// pure read (no row lock, no provider call): what an editor lookup
-/// wants, where holding the row's write lock across a provider's HTTP
-/// round-trip would let a dropdown click stall running work on the
-/// same connection.
+/// Whether a walled read renews a token that is due. A `Stored` read
+/// makes no provider call and writes nothing: what a read of a captured
+/// list or of pasted material wants, which never expires.
 #[derive(Clone, Copy, PartialEq)]
 enum Freshness {
     Refreshed,
     Stored,
 }
 
+/// The columns a walled read selects, in [`GrantRow`]'s order: a plain
+/// read and a renewal's claim answer the same row.
+const WALLED_COLUMNS: &str = "tenant_id, service, registration_sealed, spec_json, spec_json_version, \
+                              values_sealed, granted_scopes, permissions_verified, owner, door, \
+                              identity, provider_account, expires_at, token_lifetime_secs, \
+                              instance_id, project_id, published_by_node";
+
+/// How long a renewal may take before it counts as not answered (tried
+/// again later, like a provider that is down), so a claim on a renewal
+/// always ends while its claimant lives.
+const RENEWAL_WAIT: std::time::Duration = weft_core::access::client::CONNECT_CALL_TIMEOUT;
+
+/// How long a claim on a renewal lasts: past [`RENEWAL_WAIT`], so it only
+/// ever runs out on a claimant that died mid-renewal, and then another
+/// resolution takes the renewal over.
+const RENEWAL_CLAIM: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The waits between looks at a connection another resolution is
+/// renewing, and between tries to write a renewed token while the
+/// database cannot be reached: at first, then doubling up to the longest.
+const RENEWAL_LOOK_FIRST: std::time::Duration = std::time::Duration::from_millis(50);
+const RENEWAL_LOOK_LONGEST: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A walled grant whose token is due a renewal: when the row says it
+/// dies, and the lifetime a renewal naming no expiry gets again.
+struct Due {
+    expires_at: chrono::DateTime<chrono::Utc>,
+    lifetime: Option<chrono::Duration>,
+}
+
 /// Read one grant row for a resolution: tenant wall (missing and
 /// cross-tenant answer identically, so the wall leaks no existence),
 /// service check, required-permission drift backstop, sealed open,
 /// spec parse, and (for a `Refreshed` read) the lazy single-flight
-/// refresh with rotated-token write-back. Every read that opens a
+/// renewal with rotated-token write-back. Every read that opens a
 /// row's values goes through here, so none of them can fork the wall.
+///
+/// The read is one plain statement, and no database connection is held
+/// across a provider's answer. A due token is renewed by whichever
+/// resolution claims the renewal on the row (`renewal_claimed_until`,
+/// one statement); the others wait, holding nothing, and read the row
+/// again until it is fresh, so the provider sees one renewal however
+/// many resolutions ask at once.
 async fn read_walled_grant(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
@@ -222,31 +280,51 @@ async fn read_walled_grant(
     required_permissions: &[String],
     freshness: Freshness,
 ) -> anyhow::Result<WalledGrant> {
-    // For a Refreshed read the row lock IS the single-flight: parallel
-    // resolutions of one grant queue here, and whoever wins refreshes
-    // once; the rest see the fresh values. The refresh's HTTP
-    // round-trip runs inside the transaction on purpose (that is the
-    // queueing). A Stored read takes no lock: it writes nothing.
-    const COLUMNS: &str = "SELECT tenant_id, service, registration_sealed, spec_json, spec_json_version, \
-                           values_sealed, granted_scopes, permissions_verified, owner, door, \
-                           identity, provider_account, expires_at, token_lifetime_secs, \
-                           instance_id, project_id, published_by_node \
-                           FROM access_grant WHERE id = $1";
-    let mut tx = None;
-    let row: Option<GrantRow> = match freshness {
-        Freshness::Refreshed => {
-            let mut t = pool.begin().await?;
-            let row = sqlx::query_as(&format!("{COLUMNS} FOR UPDATE"))
-                .bind(access_id)
-                .fetch_optional(&mut *t)
-                .await?;
-            tx = Some(t);
-            row
+    let open = |row: Option<GrantRow>| open_walled_grant(row, tenant, user, access_id, service, required_permissions);
+    let mut look = RENEWAL_LOOK_FIRST;
+    loop {
+        let row = pool.opt(&format!("SELECT {WALLED_COLUMNS} FROM access_grant WHERE id = $1"), &[&access_id]).await?;
+        let (grant, due) = open(row)?;
+        let Some(due) = due.filter(|_| freshness == Freshness::Refreshed) else {
+            return Ok(grant);
+        };
+        // Taken before the claim is asked for, so the claim, which the
+        // database starts later, lapses no sooner than this says.
+        let claim_lapses = std::time::Instant::now() + RENEWAL_CLAIM;
+        if let Some((row, claim)) = claim_renewal(pool, access_id, due.expires_at).await? {
+            // Renewed from the row as the claim found it, which still dies
+            // when `due` says (the claim was won on that).
+            let renewed = match open(Some(row)) {
+                Ok((grant, _)) => renew(pool, access_id, grant, due, claim, claim_lapses).await,
+                Err(e) => Err(e),
+            };
+            if !matches!(renewed, Ok(Some(_))) {
+                let_go_of_renewal(pool, access_id, claim).await;
+            }
+            match renewed? {
+                Some(grant) => return Ok(grant),
+                // The connection was made again while it renewed: read
+                // what that wrote.
+                None => continue,
+            }
         }
-        Freshness::Stored => {
-            sqlx::query_as(COLUMNS).bind(access_id).fetch_optional(pool).await?
-        }
-    };
+        tokio::time::sleep(look).await;
+        look = (look * 2).min(RENEWAL_LOOK_LONGEST);
+    }
+}
+
+/// The wall and the opening of one read row, pure: what every
+/// resolution starts from, and whether its token is due a renewal
+/// (`None` for a runtime-supplied credential, or a token that lives
+/// past [`REFRESH_MARGIN`]).
+fn open_walled_grant(
+    row: Option<GrantRow>,
+    tenant: &str,
+    user: GrantUser<'_>,
+    access_id: uuid::Uuid,
+    service: &str,
+    required_permissions: &[String],
+) -> anyhow::Result<(WalledGrant, Option<Due>)> {
     let Some(GrantRow {
         tenant_id: row_tenant,
         service: row_service,
@@ -305,54 +383,15 @@ async fn read_walled_grant(
         .map(serde_json::from_value::<AppRegistration>)
         .transpose()
         .map_err(|e| anyhow::anyhow!("grant has a malformed app snapshot: {e}"))?;
-    if matches!(spec.acquisition, Acquisition::Runtime {}) {
-        // Nothing stored, nothing to refresh: the caller asks the
-        // runtime's credential source and fills the auth values.
-        if let Some(tx) = tx {
-            tx.commit().await?;
-        }
-        return Ok(WalledGrant {
-            service: row_service,
-            spec,
-            registration,
-            values: BTreeMap::new(),
-            identity,
-            owner,
-            door,
-            provider_account,
-            fresh_until: None,
-            published_by,
-        });
-    }
-    let mut values = values_of(&crate::open_json(&values_sealed)?);
-    let mut expires_at = expires_at;
-    if let Some(mut tx) = tx {
-        let stale = match expires_at {
-            Some(at) => at < chrono::Utc::now() + REFRESH_MARGIN,
-            None => false,
-        };
-        if stale {
-            let lifetime = token_lifetime_secs.map(chrono::Duration::seconds);
-            let life = refresh(&spec, registration.clone(), &mut values, lifetime).await?;
-            let (new_expiry, new_lifetime) = life_columns(life);
-            sqlx::query(
-                "UPDATE access_grant
-                 SET values_sealed = $2, value_names = $3, expires_at = $4,
-                     token_lifetime_secs = $5, updated_at = now()
-                 WHERE id = $1",
-            )
-            .bind(access_id)
-            .bind(crate::seal_json(&serde_json::to_value(&values)?)?)
-            .bind(crate::flows::value_names_of(&values))
-            .bind(new_expiry)
-            .bind(new_lifetime)
-            .execute(&mut *tx)
-            .await?;
-            expires_at = new_expiry;
-        }
-        tx.commit().await?;
-    }
-    Ok(WalledGrant {
+    // A runtime-supplied credential stores nothing and is never renewed
+    // here: the caller asks the runtime's credential source and fills the
+    // auth values.
+    let runtime = matches!(spec.acquisition, Acquisition::Runtime {});
+    let values = if runtime { BTreeMap::new() } else { values_of(&crate::open_json(&values_sealed)?) };
+    let due = expires_at
+        .filter(|at| !runtime && *at < chrono::Utc::now() + REFRESH_MARGIN)
+        .map(|expires_at| Due { expires_at, lifetime: token_lifetime_secs.map(chrono::Duration::seconds) });
+    let grant = WalledGrant {
         service: row_service,
         spec,
         registration,
@@ -361,9 +400,168 @@ async fn read_walled_grant(
         owner,
         door,
         provider_account,
-        fresh_until: expires_at.map(|at| at - REFRESH_MARGIN),
+        fresh_until: if runtime { None } else { expires_at.map(|at| at - REFRESH_MARGIN) },
         published_by,
-    })
+    };
+    Ok((grant, due))
+}
+
+/// Claim the renewal of connection `access_id`, whose token the row said
+/// dies at `due`: won only while the row still says so (nobody renewed it
+/// since) and no live claim is on it. Answers the row as the claim found
+/// it, and the claim, which the renewal's write and its letting go are
+/// keyed on; `None` when the claim was not won.
+async fn claim_renewal(
+    pool: &Pool,
+    access_id: uuid::Uuid,
+    due: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Option<(GrantRow, chrono::DateTime<chrono::Utc>)>> {
+    let claimed: Option<Row> = pool
+        .opt(
+            &format!(
+                "UPDATE access_grant SET renewal_claimed_until = now() + make_interval(secs => $3)
+                 WHERE id = $1 AND expires_at = $2
+                   AND (renewal_claimed_until IS NULL OR renewal_claimed_until < now())
+                 RETURNING {WALLED_COLUMNS}, renewal_claimed_until"
+            ),
+            &[&access_id, &due, &RENEWAL_CLAIM.as_secs_f64()],
+        )
+        .await?;
+    let Some(claimed) = claimed else { return Ok(None) };
+    let claim = claimed.try_get("renewal_claimed_until").map_err(db::Error::from)?;
+    Ok(Some((GrantRow::from_row(claimed)?, claim)))
+}
+
+/// Renew a claimed grant's token and write it back: the provider is
+/// asked with no database connection held, for at most [`RENEWAL_WAIT`].
+/// `None` when the connection was made again while it renewed (the
+/// claim is gone from the row), so what that wrote stands.
+///
+/// The write is tried again while the database cannot be reached, but
+/// only while the claim, lapsing at `claim_lapses`, is still this
+/// renewal's: past it another resolution may claim the renewal and ask
+/// the provider with the token this renewal just retired, and the token
+/// this renewal holds would then match no row. So no try starts once the
+/// claim has less left than the pool's wait for a connection, and the
+/// renewal fails loudly instead, for this one connection, saying the
+/// account must be connected again ([`unsaved_renewal`]). A try whose
+/// reply was lost may have landed: the next one recognises the values it
+/// wrote. One that finds neither the claim nor those values fails the
+/// same way: it cannot tell a connection made again from a claim taken
+/// over.
+async fn renew(
+    pool: &Pool,
+    access_id: uuid::Uuid,
+    mut grant: WalledGrant,
+    due: Due,
+    claim: chrono::DateTime<chrono::Utc>,
+    claim_lapses: std::time::Instant,
+) -> anyhow::Result<Option<WalledGrant>> {
+    let life = tokio::time::timeout(RENEWAL_WAIT, refresh(&grant.spec, grant.registration.clone(), &mut grant.values, due.lifetime))
+        .await
+        .unwrap_or_else(|_| {
+            Err(AccessError::Unreached(format!(
+                "the provider did not answer the renewal within {}s",
+                RENEWAL_WAIT.as_secs()
+            ))
+            .into())
+        })?;
+    let (expires_at, lifetime) = life_columns(life);
+    let sealed = crate::seal_json(&serde_json::to_value(&grant.values)?)?;
+    let names = crate::flows::value_names_of(&grant.values);
+    // The provider may have rotated the refresh token, so the old one no
+    // longer works: what it answered exists nowhere else, and is written
+    // for as long as the database cannot be reached and the claim holds.
+    let last_try = claim_lapses.checked_sub(pool.acquire_timeout()).unwrap_or(claim_lapses);
+    let mut wait = RENEWAL_LOOK_FIRST;
+    let mut missed = false;
+    let written = loop {
+        // A try whose reply was lost may still have landed, clearing the
+        // claim: the row then holds this renewal's own sealed values
+        // (sealing draws a fresh random nonce, so no other write carries
+        // the same text), and the next try matches on them instead of
+        // reading the landed write as a claim taken away. The first try
+        // can only match on the claim, so the common path is one
+        // statement as before.
+        let write = pool
+            .execute(
+                "UPDATE access_grant
+                 SET values_sealed = $3, value_names = $4, expires_at = $5,
+                     token_lifetime_secs = $6, renewal_claimed_until = NULL, updated_at = now()
+                 WHERE id = $1 AND (renewal_claimed_until = $2 OR values_sealed = $3)",
+                &[&access_id, &claim, &sealed, &names, &expires_at, &lifetime],
+            )
+            .await;
+        match write {
+            Ok(1) => break true,
+            Ok(_) if missed => return Err(unsaved_renewal(access_id, &grant.service, "the renewal's claim on it was gone by the time it could be written")),
+            Ok(_) => break false,
+            Err(e) if write_again(&e) && std::time::Instant::now() + wait < last_try => {
+                tracing::warn!(
+                    target: "weft_access_store::resolve",
+                    %access_id,
+                    error = %e,
+                    "a renewed token could not be written yet, and the provider may have retired the one before it; writing it again"
+                );
+                missed = true;
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(RENEWAL_LOOK_LONGEST);
+            }
+            // Not the database's reach, or no time left on the claim:
+            // said as what it is, never as a database that could not be
+            // had, since the renewal happened.
+            Err(e) => return Err(unsaved_renewal(access_id, &grant.service, &format!("the renewed token could not be written ({e})"))),
+        }
+    };
+    if !written {
+        return Ok(None);
+    }
+    grant.fresh_until = expires_at.map(|at| at - REFRESH_MARGIN);
+    Ok(Some(grant))
+}
+
+/// Whether a failed write of a renewed token is worth trying again: the
+/// database could not be reached ([`db::unreachable`]), short of a closed
+/// pool (this process is going). A conversation with the database that
+/// went wrong (a message the driver did not expect) is no failure to
+/// reach it, so it is never tried again: sending the same statement again
+/// does not fix it.
+fn write_again(e: &db::Error) -> bool {
+    db::unreachable(e) && db::no_connection(e) != Some(db::NoConnection::Closed)
+}
+
+/// A renewal the provider made and weft could not keep, for `why`: the
+/// provider may already have retired the token before it, so the
+/// connection cannot be trusted to renew again, and the account is
+/// connected again. Fails this one connection's resolution.
+fn unsaved_renewal(access_id: uuid::Uuid, service: &str, why: &str) -> anyhow::Error {
+    AccessError::NeedsReconnect {
+        service: service.to_string(),
+        reason: format!(
+            "connection {access_id} was renewed at the provider, but weft could not save the renewed key: {why}. The \
+             provider may already have retired the key before it, so connect the account again (Connect on its access \
+             node in the editor, or `weft connect` in the project's folder)"
+        ),
+    }
+    .into()
+}
+
+/// Let go of a renewal claim that did not end in a written renewal, so the
+/// next resolution renews at once. A claim not let go (the database could
+/// not be reached) runs out on its own after [`RENEWAL_CLAIM`].
+async fn let_go_of_renewal(pool: &Pool, access_id: uuid::Uuid, claim: chrono::DateTime<chrono::Utc>) {
+    let let_go = pool
+        .execute("UPDATE access_grant SET renewal_claimed_until = NULL WHERE id = $1 AND renewal_claimed_until = $2", &[&access_id, &claim])
+        .await;
+    if let Err(e) = let_go {
+        tracing::warn!(
+            target: "weft_access_store::resolve",
+            %access_id,
+            error = %e,
+            "could not let go of a renewal that did not land; the next renewal waits until it runs out ({}s)",
+            RENEWAL_CLAIM.as_secs()
+        );
+    }
 }
 
 /// Resolve a connection for a WORKER (or for the store's own
@@ -372,7 +570,7 @@ async fn read_walled_grant(
 /// (runtime-supplied credential) skips refresh and hands back empty
 /// values; the caller fills them.
 pub async fn resolve_for_worker(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
@@ -468,7 +666,7 @@ fn worker_handoff(
 /// subscription that needs a topic the map lacks is refused by the
 /// subscription's own handling, naming the topic.
 pub async fn resolve_event_source(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
@@ -523,7 +721,7 @@ pub struct CallerVerifier {
 }
 
 pub async fn caller_verifier(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
@@ -562,20 +760,16 @@ pub fn events_recipe_hash(events: &BTreeMap<String, EventsSpec>) -> Option<Strin
 /// hash, so a push is answered by the recipe the connection itself
 /// declared and recipes recorded by different specs stand side by
 /// side. A spec with no topics records nothing.
-pub async fn record_events_recipes(db: impl sqlx::PgExecutor<'_>, spec: &AccessSpec) -> anyhow::Result<()> {
+pub async fn record_events_recipes(db: &impl Client, spec: &AccessSpec) -> anyhow::Result<()> {
     let Some(hash) = events_recipe_hash(&spec.events) else {
         return Ok(());
     };
-    sqlx::query(
+    db.execute(
         "INSERT INTO service_events_recipe (service, recipe_hash, events_json, events_json_version, updated_at)
          VALUES ($1, $2, $3, $4, now())
          ON CONFLICT (service, recipe_hash) DO UPDATE SET updated_at = now()",
+        &[&spec.service, &hash, &serde_json::to_value(&spec.events)?, &weft_core::access::events::STORED_EVENTS.version()],
     )
-    .bind(&spec.service)
-    .bind(&hash)
-    .bind(serde_json::to_value(&spec.events)?)
-    .bind(weft_core::access::events::STORED_EVENTS.version())
-    .execute(db)
     .await?;
     Ok(())
 }
@@ -592,16 +786,16 @@ pub struct RecordedEventsRecipe {
 /// receiver. Empty = this weft has never seen the service declare
 /// events, so a push for it cannot be verified and is refused.
 pub async fn events_recipes_of(
-    pool: &PgPool,
+    pool: &Pool,
     service: &str,
 ) -> anyhow::Result<Vec<RecordedEventsRecipe>> {
-    let rows: Vec<(String, Value, weft_core::stored::Version)> = sqlx::query_as(
-        "SELECT recipe_hash, events_json, events_json_version FROM service_events_recipe
-         WHERE service = $1 ORDER BY updated_at DESC",
-    )
-    .bind(service)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(String, Value, weft_core::stored::Version)> = pool
+        .all(
+            "SELECT recipe_hash, events_json, events_json_version FROM service_events_recipe
+             WHERE service = $1 ORDER BY updated_at DESC",
+            &[&service],
+        )
+        .await?;
     rows.into_iter()
         .map(|(recipe_hash, v, version)| {
             let events = weft_core::access::events::STORED_EVENTS
@@ -646,23 +840,20 @@ pub struct EventTarget {
 ///    connections (a row with no events block carries NULL and never
 ///    matches).
 pub async fn connections_for_event(
-    pool: &PgPool,
+    pool: &Pool,
     service: &str,
     provider_account: &str,
     allowed_client_ids: &[String],
     recipe_hash: &str,
 ) -> anyhow::Result<Vec<EventTarget>> {
-    let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
-        "SELECT id, tenant_id FROM access_grant
-         WHERE service = $1 AND provider_account = $2
-           AND client_id = ANY($3) AND events_recipe_hash = $4",
-    )
-    .bind(service)
-    .bind(provider_account)
-    .bind(allowed_client_ids)
-    .bind(recipe_hash)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(uuid::Uuid, String)> = pool
+        .all(
+            "SELECT id, tenant_id FROM access_grant
+             WHERE service = $1 AND provider_account = $2
+               AND client_id = ANY($3) AND events_recipe_hash = $4",
+            &[&service, &provider_account, &allowed_client_ids, &recipe_hash],
+        )
+        .await?;
     Ok(rows.into_iter().map(|(id, tenant_id)| EventTarget { id, tenant_id }).collect())
 }
 
@@ -837,10 +1028,10 @@ pub(crate) async fn mint_and_exchange(
     let private_key = values.get("private_key").ok_or_else(|| {
         AccessError::Invalid("a mint_jwt access stores its key under 'private_key'".into())
     })?;
-    let key = jsonwebtoken::EncodingKey::from_rsa_pem(private_key.as_bytes())
+    let key = weft_core::jwt::EncodingKey::from_rsa_pem(private_key.as_bytes())
         .map_err(|e| AccessError::Invalid(format!("the pasted private key is not RSA PEM: {e}")))?;
-    let jwt = jsonwebtoken::encode(
-        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+    let jwt = weft_core::jwt::encode(
+        &weft_core::jwt::Header::new(weft_core::jwt::Algorithm::RS256),
         &Value::Object(claim_map),
         &key,
     )
@@ -913,7 +1104,7 @@ pub use weft_core::access::lookup::{GrantedQuery, LookupItem, LookupPage, Lookup
 /// [`Lookup`]). Free: no provider call at all. Only the id/label pairs
 /// leave; the rest of the stored values never do.
 pub async fn granted_items(
-    pool: &PgPool,
+    pool: &Pool,
     tenant: &str,
     user: GrantUser<'_>,
     access_id: uuid::Uuid,
@@ -924,10 +1115,8 @@ pub async fn granted_items(
 ) -> anyhow::Result<Vec<LookupItem>> {
     // The same walled read every resolution runs, but the FULL stored
     // map (the worker-handoff filter would drop a captured list) and
-    // STORED freshness: a captured list has no expiry, and an editor
-    // lookup must never hold the row's write lock across a provider
-    // refresh (a dropdown click would stall running work on the same
-    // connection).
+    // STORED freshness: a captured list has no expiry, so reading it
+    // never needs the provider.
     let grant =
         read_walled_grant(pool, tenant, user, access_id, service, &[], Freshness::Stored).await?;
     let Some(raw) = grant.values.get(from) else {
@@ -1084,6 +1273,18 @@ fn display_of(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A renewed token's write is tried again only while the database is
+    /// out of reach; a closed pool or a statement that failed fails it at
+    /// once, so a write that keeps failing the same way never spins.
+    #[test]
+    fn a_renewed_token_is_written_again_only_while_the_database_is_out_of_reach() {
+        let no_connection = |why| db::Error::NoConnection { why, refused: None };
+        assert!(write_again(&no_connection(db::NoConnection::Unreachable)));
+        assert!(write_again(&no_connection(db::NoConnection::Busy)));
+        assert!(!write_again(&no_connection(db::NoConnection::Closed)));
+        assert!(!write_again(&db::Error::NoRow));
+    }
 
     /// URL templating: `{query}` and `{<parent>}` substitute
     /// percent-encoded, unknown placeholders and unclosed braces are

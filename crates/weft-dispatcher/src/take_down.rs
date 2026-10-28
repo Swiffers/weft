@@ -34,6 +34,7 @@ use weft_core::instance::InstanceId;
 use weft_core::projects::HeldWork;
 use weft_core::take_down::{Door, Held, Running, TakeDown};
 use weft_core::RunId;
+use weft_task_store::db::Client as _;
 
 pub use crate::activation_store::DownCause;
 use crate::activation_store::{ActivationLifecycle, Forget, LifecycleWrite, ProjectStatus, SignalsGoing};
@@ -226,13 +227,14 @@ fn listens_again(before: &[&ActivationLifecycle], landing: &ActivationLifecycle,
 /// Every run of the project that has not ended, with what a take-down
 /// needs to know.
 pub(crate) async fn live_runs(state: &DispatcherState, project_id: uuid::Uuid) -> anyhow::Result<Vec<RunFacts>> {
-    let rows: Vec<(RunId, Option<String>, Option<String>, bool)> = sqlx::query_as(
-        "SELECT run_id, instance_id, fired_by, state = 'parked' FROM run \
-         WHERE project_id = $1 AND state <> 'ended' ORDER BY started_at, run_id",
-    )
-    .bind(project_id)
-    .fetch_all(&state.pg_pool)
-    .await?;
+    let rows: Vec<(RunId, Option<String>, Option<String>, bool)> = state
+        .pg_pool
+        .all(
+            "SELECT run_id, instance_id, fired_by, state = 'parked' FROM run \
+             WHERE project_id = $1 AND state <> 'ended' ORDER BY started_at, run_id",
+            &[&project_id],
+        )
+        .await?;
     rows.into_iter()
         .map(|(run_id, instance, fired_by, suspended)| {
             let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("run {run_id} holds a broken instance: {e}"))?;

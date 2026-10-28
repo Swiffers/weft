@@ -210,7 +210,7 @@ impl LocalRunner {
             folders,
             identity,
             clock,
-            http: reqwest::Client::builder().timeout(Duration::from_secs(5)).build().expect("reqwest client"),
+            http: weft_core::net::http_client().timeout(Duration::from_secs(5)).build().expect("reqwest client"),
             cfg,
             running: parking_lot::Mutex::new(HashMap::new()),
             starting: tokio::sync::Mutex::new(HashMap::new()),
@@ -868,7 +868,7 @@ fn now_unix() -> i64 {
 
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    getrandom::getrandom(&mut buf).expect("the OS random source");
+    getrandom::fill(&mut buf).expect("the OS random source");
     hex::encode(buf)
 }
 

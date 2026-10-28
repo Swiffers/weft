@@ -2,5 +2,5 @@
 # the session's settings (model, format, language, ...) ride the
 # session URL's query string.
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 urlencoding = "2"

@@ -350,7 +350,7 @@ impl Ctx {
     /// emitter through helper functions (rather than reaching for
     /// `Ctx`) keeps the verb scope explicit at every call site.
     pub fn progress(&self, verb: crate::progress::ActionVerb) -> crate::progress::Progress {
-        crate::progress::Progress::new(verb, self.json)
+        crate::progress::Progress::new(verb, self.json, self.on.clone())
     }
 
     /// Run a verb body with one shared Progress emitter. The body

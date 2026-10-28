@@ -540,7 +540,7 @@ mod tests {
         let observed = obs.end(false);
 
         let mut scratch = json!({ "model": "fal-ai/flux/dev" });
-        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let http = reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build();
         let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let cost = FAL
             .fold_report(
@@ -594,7 +594,7 @@ mod live_fal {
             http::HeaderValue::from_str(&format!("Key {key}")).unwrap(),
         );
         reqwest_middleware::ClientBuilder::new(
-            reqwest::Client::builder().default_headers(headers).build().unwrap(),
+            weft_core::net::http_client().default_headers(headers).build().unwrap(),
         )
         .build()
     }

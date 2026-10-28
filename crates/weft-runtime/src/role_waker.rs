@@ -114,7 +114,7 @@ pub struct RoleWaker {
     /// Where a ring that did not go through is handed, to call the role later.
     alarm: Arc<dyn Alarm>,
     /// Where a ring that keeps failing is written down.
-    pool: sqlx::PgPool,
+    pool: weft_task_store::db::Pool,
     http: reqwest::Client,
     /// How long a stopping process waits for its rings still out
     /// ([`Self::settle`]): the platform's
@@ -133,7 +133,7 @@ impl RoleWaker {
         addresses: &RoleAddresses,
         tokens: Arc<dyn IdentityTokens>,
         alarm: Arc<dyn Alarm>,
-        pool: sqlx::PgPool,
+        pool: weft_task_store::db::Pool,
     ) -> anyhow::Result<Option<Self>> {
         let mut bells = BTreeMap::new();
         // The listener has no loops to drain, so no tick to ring; the
@@ -151,7 +151,7 @@ impl RoleWaker {
         }
         let limits = crate::platform::serverless_limits(config)
             .ok_or_else(|| anyhow::anyhow!("a role is placed serverless, which this install's platform does not do"))?;
-        Ok(Some(Self { bells, tokens, alarm, pool, http: reqwest::Client::new(), answered: Arc::default(), grace: limits.ring_grace }))
+        Ok(Some(Self { bells, tokens, alarm, pool, http: weft_core::net::http_client().build()?, answered: Arc::default(), grace: limits.ring_grace }))
     }
 
     /// Every channel a sleeping role's loops wait on: what this process's
@@ -368,10 +368,12 @@ mod tests {
             }
         });
         let nobody = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .acquire_timeout(Duration::from_millis(500))
-            .connect_lazy(&format!("postgres://weft@{nobody}/none"))
-            .unwrap();
+        let pool = weft_task_store::db::Pool::open(
+            weft_task_store::db::config(&format!("postgres://weft@{nobody}/none")).unwrap(),
+            1,
+            Duration::from_millis(500),
+            weft_task_store::db::Waits::Expected,
+        );
         let bell = Arc::new(Bell {
             role: CoreRole::Dispatcher,
             url: format!("http://{address}/_weft/tick"),
@@ -383,7 +385,7 @@ mod tests {
             tokens: Arc::new(weft_platform_traits::FixedToken("t".into())),
             alarm: alarm.clone(),
             pool,
-            http: reqwest::Client::new(),
+            http: weft_core::net::http_client().build().expect("reqwest client"),
             answered: Arc::default(),
             grace: Duration::from_secs(10),
         };

@@ -478,6 +478,15 @@ what the first time did. How you write that is the node's business, and the
 node's own description says how; the language's part is only that it will
 happen more than once.
 
+If that setup changes tables in a database people are already using, it also
+has to take no lock on a table when nothing changed: `create table if not
+exists`, `create or replace` rather than a drop and a create. And it starts
+with `SET lock_timeout = '5s';`, so that on a busy table it fails cleanly
+instead of queueing behind the live queries and holding up every one that
+comes after it. It works the same however the script runs its statements,
+and the setting ends with the run. In the example above, that line is the
+first one of `assets/sql/schema.sql`.
+
 The same holds for infrastructure: anything upstream of an infra node is that
 node's setup program and runs when infra starts.
 

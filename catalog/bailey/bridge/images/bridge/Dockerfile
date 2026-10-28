@@ -3,11 +3,11 @@ FROM node:24-alpine
 RUN apk add --no-cache git
 # Node 24 = active LTS in 2026 (Node 22 enters EOL April 2027).
 # Baileys requires Node >= 20 so 24 is well within range. pnpm 11
-# (April 2026) requires Node >= 22 and is the current stable.
+# requires Node >= 22.
 # Both versions pinned: `pnpm@latest` in a Dockerfile is a build-
 # reproducibility bug regardless of which version it points at
 # right now.
-RUN corepack enable && corepack prepare pnpm@11.0.0 --activate
+RUN corepack enable && corepack prepare pnpm@11.28.8 --activate
 
 WORKDIR /app
 

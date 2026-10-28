@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX access_grant_exclusive ON access_grant USING btree (tenant_id, service, identity, client_id, instance_id, project_id) NULLS NOT DISTINCT WHERE ((published_by_node IS NULL) AND (client_id IS NOT NULL) AND ((spec_json ->> 'grants'::text) = 'exclusive'::text));

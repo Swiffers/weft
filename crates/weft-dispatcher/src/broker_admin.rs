@@ -5,6 +5,7 @@
 use axum::http::StatusCode;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use weft_broker_client::client::{turned_away, while_busy};
 
 use crate::state::DispatcherState;
 
@@ -21,8 +22,11 @@ const ADMIN_WAIT: weft_broker_client::line::CallWait = weft_broker_client::line:
 /// POST one admin request and hand back the broker's answer with its
 /// status class INTACT: a 4xx the broker minted for the editor (bad
 /// input, reconnect-needed) must reach the editor as that status and
-/// message, not collapse into a dispatcher 500. Transport faults (the
-/// broker unreachable) are the only 500s minted here.
+/// message, not collapse into a dispatcher 500. A call the broker turns
+/// away busy with nothing of it run is sent again until it is answered
+/// (`weft_broker_client::client::while_busy`), so a busy database is a
+/// wait, never an error the person sees. Transport faults (the broker
+/// unreachable) are the only 500s minted here.
 pub async fn forward_json<Req: Serialize, Resp: DeserializeOwned>(
     state: &DispatcherState,
     path: &str,
@@ -33,7 +37,9 @@ pub async fn forward_json<Req: Serialize, Resp: DeserializeOwned>(
         (StatusCode::INTERNAL_SERVER_ERROR, "broker unreachable".to_string())
     };
     let body = serde_json::to_vec(body).map_err(|e| internal(format!("encode the call: {e}")))?;
-    let answer = state.broker_line.call(path, body, ADMIN_WAIT).await.map_err(|e| internal(format!("{e:#}")))?;
+    let answer = while_busy(path, turned_away, || state.broker_line.call(path, &body, ADMIN_WAIT))
+        .await
+        .map_err(|e| internal(format!("{e:#}")))?;
     if !answer.status.is_success() {
         return Err((answer.status, String::from_utf8_lossy(&answer.body).into_owned()));
     }

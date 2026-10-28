@@ -9,7 +9,7 @@
 //! anything is due.
 
 use anyhow::Result;
-use sqlx::postgres::PgPool;
+use crate::db::{Client as _, FromRow, Pool, Row};
 
 pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
     name: "alarm",
@@ -46,7 +46,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
 };
 
 /// One wake as stored.
-#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AlarmRow {
     pub name: String,
     pub key: String,
@@ -58,9 +58,24 @@ pub struct AlarmRow {
     pub answered: i32,
 }
 
+impl FromRow for AlarmRow {
+    fn from_row(row: Row) -> crate::db::Result<Self> {
+        Ok(Self {
+            name: row.try_get("name")?,
+            key: row.try_get("key")?,
+            set_for_unix_ms: row.try_get("set_for_unix_ms")?,
+            role: row.try_get("role")?,
+            path: row.try_get("path")?,
+            body: row.try_get("body")?,
+            attempts: row.try_get("attempts")?,
+            answered: row.try_get("answered")?,
+        })
+    }
+}
+
 /// Store a wake. Setting one already stored does nothing.
 pub async fn set(
-    pool: &PgPool,
+    pool: &Pool,
     name: &str,
     key: &str,
     at_unix_ms: i64,
@@ -68,58 +83,49 @@ pub async fn set(
     path: &str,
     body: &serde_json::Value,
 ) -> Result<()> {
-    sqlx::query(
+    pool.execute(
         "INSERT INTO alarm (name, key, at_unix_ms, set_for_unix_ms, role, path, body) \
          VALUES ($1, $2, $3, $3, $4, $5, $6) ON CONFLICT (name) DO NOTHING",
+        &[&name, &key, &at_unix_ms, &role, &path, body],
     )
-    .bind(name)
-    .bind(key)
-    .bind(at_unix_ms)
-    .bind(role)
-    .bind(path)
-    .bind(body)
-    .execute(pool)
     .await?;
     Ok(())
 }
 
 /// Claim up to `limit` wakes due at `now_ms`: each one's time moves to
 /// `now_ms + lease_ms`, so it is nobody else's while it is delivered.
-pub async fn claim_due(pool: &PgPool, now_ms: i64, lease_ms: i64, limit: i64) -> Result<Vec<AlarmRow>> {
-    let rows = sqlx::query_as::<_, AlarmRow>(
-        "UPDATE alarm SET at_unix_ms = $1 + $2, attempts = attempts + 1 \
-         WHERE name IN ( \
-             SELECT name FROM alarm WHERE at_unix_ms <= $1 \
-             ORDER BY at_unix_ms LIMIT $3 FOR UPDATE SKIP LOCKED) \
-         RETURNING name, key, set_for_unix_ms, role, path, body, attempts, answered",
-    )
-    .bind(now_ms)
-    .bind(lease_ms)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+pub async fn claim_due(pool: &Pool, now_ms: i64, lease_ms: i64, limit: i64) -> Result<Vec<AlarmRow>> {
+    let rows = pool
+        .all(
+            "UPDATE alarm SET at_unix_ms = $1::bigint + $2::bigint, attempts = attempts + 1 \
+             WHERE name IN ( \
+                 SELECT name FROM alarm WHERE at_unix_ms <= $1 \
+                 ORDER BY at_unix_ms LIMIT $3 FOR UPDATE SKIP LOCKED) \
+             RETURNING name, key, set_for_unix_ms, role, path, body, attempts, answered",
+            &[&now_ms, &lease_ms, &limit],
+        )
+        .await?;
     Ok(rows)
 }
 
 /// A delivered wake is done.
-pub async fn delete(pool: &PgPool, name: &str) -> Result<()> {
-    sqlx::query("DELETE FROM alarm WHERE name = $1").bind(name).execute(pool).await?;
+pub async fn delete(pool: &Pool, name: &str) -> Result<()> {
+    pool.execute("DELETE FROM alarm WHERE name = $1", &[&name]).await?;
     Ok(())
 }
 
 /// A delivery failed: try again at `at_unix_ms`. `answered`: the receiver
 /// answered it, so it counts as one of its tries.
-pub async fn retry_at(pool: &PgPool, name: &str, at_unix_ms: i64, answered: bool) -> Result<()> {
-    sqlx::query("UPDATE alarm SET at_unix_ms = $2, answered = answered + CASE WHEN $3 THEN 1 ELSE 0 END WHERE name = $1")
-        .bind(name)
-        .bind(at_unix_ms)
-        .bind(answered)
-        .execute(pool)
-        .await?;
+pub async fn retry_at(pool: &Pool, name: &str, at_unix_ms: i64, answered: bool) -> Result<()> {
+    pool.execute(
+        "UPDATE alarm SET at_unix_ms = $2, answered = answered + CASE WHEN $3 THEN 1 ELSE 0 END WHERE name = $1",
+        &[&name, &at_unix_ms, &answered],
+    )
+    .await?;
     Ok(())
 }
 
 /// When the next wake comes due, if any is stored.
-pub async fn next_due(pool: &PgPool) -> Result<Option<i64>> {
-    Ok(sqlx::query_scalar::<_, Option<i64>>("SELECT MIN(at_unix_ms) FROM alarm").fetch_one(pool).await?)
+pub async fn next_due(pool: &Pool) -> Result<Option<i64>> {
+    Ok(pool.scalar::<Option<i64>>("SELECT MIN(at_unix_ms) FROM alarm", &[]).await?)
 }

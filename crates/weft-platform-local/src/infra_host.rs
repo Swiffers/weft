@@ -17,7 +17,7 @@
 //! builds it again from its spec (containers are disposable; only disks
 //! carry state), which is also what empties its scratch space.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +29,7 @@ use weft_core::infra::{
 use weft_core::infra::wire::{LogLine, LogMark, LogStream, LogsFrom, Pipe};
 use weft_platform_traits::unit_agent::{ProbeAnswer, ProbeRequest, PROBE_PATH};
 use weft_core::ports::UNIT_AGENT;
-use weft_platform_traits::{EndpointAt, InfraHost, UnitObservation, UnitRunState};
+use weft_platform_traits::{EndpointAt, InfraHost, RestartCause, UnitObservation, UnitRestart, UnitRunState};
 
 use crate::docker::{self, labels, roles, ContainerRow, Docker};
 
@@ -146,8 +146,44 @@ pub struct LocalInfraHost {
     docker: Arc<dyn Docker>,
     http: reqwest::Client,
     cfg: LocalInfraHostConfig,
-    /// Consecutive failed liveness checks, by container name.
-    liveness_failures: parking_lot::Mutex<HashMap<String, u32>>,
+    /// What this host keeps about each app container between looks, by
+    /// container name. An entry goes when a look at its project no longer
+    /// finds its container.
+    kept: parking_lot::Mutex<HashMap<String, Kept>>,
+}
+
+/// What [`LocalInfraHost`] keeps about one app container between looks.
+#[derive(Debug, Clone)]
+struct Kept {
+    /// The project whose looks list it: only a look at that project can
+    /// tell the container is gone.
+    project: uuid::Uuid,
+    /// Consecutive failed liveness checks.
+    liveness_failures: u32,
+    /// Why it last stopped, by when it stopped: read once
+    /// (`docker::stop_cause`, or the container's own state while it waits
+    /// to restart) and kept, since Docker forgets it once the container
+    /// runs again.
+    stop: Option<(chrono::DateTime<chrono::Utc>, RestartCause)>,
+    /// The latest out-of-memory kill of a process inside it while it ran
+    /// on: Docker's `oom` events forget, so it is kept.
+    kill: Option<KillInside>,
+}
+
+impl Kept {
+    fn of(project: uuid::Uuid) -> Self {
+        Self { project, liveness_failures: 0, stop: None, kill: None }
+    }
+}
+
+/// A process inside a container killed for memory while the container
+/// itself ran on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KillInside {
+    /// When the container's run it happened in started: a new run is a
+    /// new count.
+    run_started: chrono::DateTime<chrono::Utc>,
+    at: chrono::DateTime<chrono::Utc>,
 }
 
 impl LocalInfraHost {
@@ -165,9 +201,9 @@ impl LocalInfraHost {
     pub fn new(docker: Arc<dyn Docker>, cfg: LocalInfraHostConfig) -> Self {
         Self {
             docker,
-            http: reqwest::Client::builder().build().expect("reqwest client"),
+            http: weft_core::net::http_client().build().expect("reqwest client"),
             cfg,
-            liveness_failures: parking_lot::Mutex::new(HashMap::new()),
+            kept: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -271,7 +307,10 @@ impl LocalInfraHost {
         for c in &unit.unit.init_containers {
             let env_file = self.env_file(r, name, c)?;
             let args = container_args(node, unit, c, &env_file, ContainerRun::Init, &self.cfg);
-            let out = self.docker.exec(&args).await;
+            let out = match args {
+                Ok(args) => self.docker.exec(&args).await,
+                Err(e) => Err(e),
+            };
             let _ = std::fs::remove_file(&env_file);
             let out = out?;
             if !out.success() {
@@ -287,7 +326,10 @@ impl LocalInfraHost {
         }
         for c in &unit.unit.containers {
             let env_file = self.env_file(r, name, c)?;
-            let started = docker::run(self.docker.as_ref(), container_args(node, unit, c, &env_file, ContainerRun::App, &self.cfg)).await;
+            let started = match container_args(node, unit, c, &env_file, ContainerRun::App, &self.cfg) {
+                Ok(args) => docker::run(self.docker.as_ref(), args).await,
+                Err(e) => Err(e),
+            };
             let _ = std::fs::remove_file(&env_file);
             started.map_err(|e| e.context(format!("start container '{}' of unit '{name}' of '{}'", c.name, r.node)))?;
         }
@@ -365,7 +407,7 @@ impl LocalInfraHost {
 
     /// How one unit is doing; `probes` are its containers' checks, by
     /// container.
-    async fn unit_state(&self, probes: &HashMap<String, Probes>, rows: &[ContainerRow]) -> anyhow::Result<UnitRunState> {
+    async fn unit_state(&self, project: uuid::Uuid, probes: &HashMap<String, Probes>, rows: &[ContainerRow]) -> anyhow::Result<UnitRunState> {
         let agent = rows.iter().find(|c| c.label(PART) == Some(PART_AGENT));
         let apps: Vec<&ContainerRow> = rows.iter().filter(|c| c.label(PART) == Some(PART_APP)).collect();
         let Some(agent) = agent else {
@@ -390,8 +432,8 @@ impl LocalInfraHost {
             if let Some(live) = liveness {
                 let answer = self.probe(&agent_url, &c.name, live).await?;
                 let restart = {
-                    let mut failures = self.liveness_failures.lock();
-                    let n = failures.entry(c.name.clone()).or_insert(0);
+                    let mut kept = self.kept.lock();
+                    let n = &mut kept.entry(c.name.clone()).or_insert_with(|| Kept::of(project)).liveness_failures;
                     *n = if answer.ok { 0 } else { *n + 1 };
                     let due = *n >= live.failure_threshold.max(1);
                     if due {
@@ -409,7 +451,7 @@ impl LocalInfraHost {
                 let answer = self.probe(&agent_url, &c.name, ready).await?;
                 if !answer.ok {
                     let started = docker::started_at(self.docker.as_ref(), &c.name).await?;
-                    let now = daemon_now(self.docker.as_ref()).await?;
+                    let now = docker::daemon_now(self.docker.as_ref()).await?;
                     let why = answer.why.unwrap_or_else(|| "not ready".into());
                     return Ok(readiness_failed(short, &why, now.signed_duration_since(started), ready));
                 }
@@ -445,6 +487,134 @@ fn readiness_failed(short: &str, why: &str, up: chrono::TimeDelta, probe: &weft_
     }
 }
 
+impl LocalInfraHost {
+    /// The latest restart of the unit of `project` whose containers are
+    /// `rows`, from how its app containers last stopped (`stops`, any
+    /// unit's) and from the processes inside them killed for memory while
+    /// they ran on (`kills`, any unit's, see [`Self::kills_inside`]).
+    async fn restart(
+        &self,
+        project: uuid::Uuid,
+        rows: &[ContainerRow],
+        stops: &[docker::ContainerStop],
+        kills: &HashMap<String, chrono::DateTime<chrono::Utc>>,
+    ) -> anyhow::Result<Option<UnitRestart>> {
+        let ours: Vec<(&str, &docker::ContainerStop)> = stops
+            .iter()
+            .filter_map(|s| {
+                let row = rows.iter().find(|r| r.name == s.name && r.label(PART) == Some(PART_APP))?;
+                Some((container_short(row), s))
+            })
+            .collect();
+        let mut latest: Option<(chrono::DateTime<chrono::Utc>, UnitRestart)> = None;
+        if let Some((short, stop, at)) = latest_restart(ours.iter().copied()) {
+            let known = self.kept.lock().get(&stop.name).and_then(|k| k.stop.clone()).filter(|(when, _)| *when == at).map(|(_, cause)| cause);
+            let cause = match (known, cause_in_state(stop)) {
+                (Some(cause), _) | (None, Some(cause)) => cause,
+                (None, None) => docker::stop_cause(self.docker.as_ref(), &stop.name, at).await?,
+            };
+            self.kept.lock().entry(stop.name.clone()).or_insert_with(|| Kept::of(project)).stop = Some((at, cause.clone()));
+            latest = Some((at, UnitRestart { container: short.to_string(), stopped_at_unix: at.timestamp(), cause, count: stop.restart_count }));
+        }
+        // A process inside a container killed for memory while the
+        // container ran on (Postgres restarting its backends in place, every
+        // connection dropped) is a restart too, and the one a capped
+        // container meets most: the kernel kills the largest process, rarely
+        // the container's first.
+        for (short, stop) in ours {
+            let Some(&at) = kills.get(&stop.name) else { continue };
+            if latest.as_ref().is_none_or(|(when, _)| at > *when) {
+                let cause = RestartCause::OutOfMemory;
+                latest = Some((at, UnitRestart { container: short.to_string(), stopped_at_unix: at.timestamp(), cause, count: stop.restart_count }));
+            }
+        }
+        Ok(latest.map(|(_, r)| r))
+    }
+
+    /// For each container of `stops` a process inside which was killed for
+    /// memory while the container ran on, in its current run, when the
+    /// latest such kill happened. Docker's own state says only whether one
+    /// was (its `OOMKilled`, true for the rest of the run after the first
+    /// kill, with no count or time), so a second kill in the same run shows
+    /// only in Docker's events. While any container of the project is so
+    /// flagged, each look therefore costs two more local Docker calls for
+    /// the whole project, however many containers are flagged: one
+    /// `docker info` (the daemon's clock) and one `docker events` read from
+    /// the earliest kill not yet seen. A look at a project none of whose
+    /// containers is flagged makes neither.
+    async fn kills_inside(&self, project: uuid::Uuid, stops: &[docker::ContainerStop]) -> anyhow::Result<HashMap<String, chrono::DateTime<chrono::Utc>>> {
+        let mut flagged = Vec::new();
+        for stop in stops {
+            let Some(run_started) = kill_inside_run(stop)? else { continue };
+            let kept = self.kept.lock().get(&stop.name).and_then(|k| k.kill).filter(|k| k.run_started == run_started);
+            let since = kept.map_or(run_started, |k| k.at + chrono::TimeDelta::nanoseconds(1));
+            flagged.push((stop.name.as_str(), run_started, kept, since));
+        }
+        let Some(since) = flagged.iter().map(|(_, _, _, since)| *since).min() else { return Ok(HashMap::new()) };
+        let now = docker::daemon_now(self.docker.as_ref()).await?;
+        let names: Vec<&str> = flagged.iter().map(|(name, ..)| *name).collect();
+        let found = docker::oom_kills(self.docker.as_ref(), &names, since, now).await?;
+        let mut out = HashMap::with_capacity(flagged.len());
+        for (name, run_started, kept, since) in flagged {
+            // The read began at the earliest container's mark: a kill of
+            // this one before its own mark is one already kept.
+            let latest = found.iter().filter(|(n, at)| n == name && *at >= since).map(|(_, at)| *at).max();
+            // A kill Docker's events no longer hold (it keeps only its
+            // latest, daemon-wide), before this host saw it, is not
+            // reported: named by when the host looked, it would read as a
+            // new kill after every restart of this host.
+            let Some(at) = latest.or(kept.map(|k| k.at)) else { continue };
+            self.kept.lock().entry(name.to_string()).or_insert_with(|| Kept::of(project)).kill = Some(KillInside { run_started, at });
+            out.insert(name.to_string(), at);
+        }
+        Ok(out)
+    }
+
+    /// Forget what is kept about the containers of `project` a look no
+    /// longer lists (`listed`, every container of it the look found).
+    fn forget_gone(&self, project: uuid::Uuid, listed: &HashSet<&str>) {
+        self.kept.lock().retain(|name, k| k.project != project || listed.contains(name.as_str()));
+    }
+}
+
+/// The run `stop`'s container is in when a process inside it was killed
+/// for memory during that run while the container ran on: Docker's
+/// `OOMKilled` on a running container, which a new start clears.
+fn kill_inside_run(stop: &docker::ContainerStop) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+    if stop.status != "running" || !stop.oom_killed {
+        return Ok(None);
+    }
+    stop.started_at
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("`docker inspect` says container '{}' runs but never started", stop.name))
+}
+
+/// Of a unit's app containers (each by its name in the unit), the one
+/// Docker brought back (or is bringing back) whose stop is the latest,
+/// and when it stopped. One that is down and stays down (weft stopped it,
+/// keeping the count Docker had) was not brought back.
+fn latest_restart<'a>(
+    containers: impl Iterator<Item = (&'a str, &'a docker::ContainerStop)>,
+) -> Option<(&'a str, &'a docker::ContainerStop, chrono::DateTime<chrono::Utc>)> {
+    containers
+        .filter(|(_, s)| s.restart_count > 0 && matches!(s.status.as_str(), "running" | "restarting"))
+        .filter_map(|(short, s)| Some((short, s, s.finished_at?)))
+        .max_by_key(|(_, _, at)| *at)
+}
+
+/// Why `stop` happened, while the container's own state still says:
+/// between the stop and the restart. Once it runs again Docker has
+/// cleared it, and only its events tell (`docker::stop_cause`). Killed
+/// for memory only when its main process was killed outright: `OOMKilled`
+/// alone also says a process inside it was killed earlier in the run.
+fn cause_in_state(stop: &docker::ContainerStop) -> Option<RestartCause> {
+    match stop.status.as_str() {
+        "running" => None,
+        _ if stop.oom_killed && stop.exit_code == docker::KILLED => Some(RestartCause::OutOfMemory),
+        _ => Some(RestartCause::Exited { code: stop.exit_code }),
+    }
+}
+
 fn container_short(c: &ContainerRow) -> &str {
     c.label("weft.container").unwrap_or(&c.name)
 }
@@ -467,23 +637,13 @@ fn timestamped_lines(stdout: &str, stderr: &str) -> anyhow::Result<Vec<LogLine>>
     Ok(lines)
 }
 
-/// The Docker daemon's own clock: the one `docker logs` stamps lines
-/// with. A mark for a read that delivers nothing is taken here, never
-/// from this process's clock, so a daemon running behind it (another
-/// machine, a desktop VM) does not put fresh lines before the mark.
-async fn daemon_now(docker: &dyn Docker) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
-    let out = docker::run(docker, vec!["info".into(), "--format".into(), "{{json .SystemTime}}".into()]).await?;
-    let at: String = serde_json::from_str(out.trim())
-        .map_err(|e| anyhow::anyhow!("`docker info` printed no system time ({e}): {}", out.trim()))?;
-    Ok(chrono::DateTime::parse_from_rfc3339(&at)
-        .map_err(|e| anyhow::anyhow!("`docker info` printed a system time that is not RFC 3339 ({e}): {at}"))?
-        .to_utc())
-}
-
 #[async_trait]
 impl InfraHost for LocalInfraHost {
     fn check(&self, node: &ResolvedNode) -> Result<(), String> {
         for u in &node.units {
+            for c in u.unit.init_containers.iter().chain(&u.unit.containers) {
+                memory_cap(c).map_err(|why| format!("unit '{}' of '{}': {why}", u.unit.name, node.node.node))?;
+            }
             if u.unit.machine.gpu.is_some() && self.cfg.gpu == GpuAccess::None {
                 return Err(format!(
                     "unit '{}' of '{}' asks for a GPU, and this machine's Docker has none (no NVIDIA runtime); \
@@ -579,6 +739,12 @@ impl InfraHost for LocalInfraHost {
             let (Some(c), Some(u)) = (r.label(labels::COPY), r.label(labels::UNIT)) else { continue };
             by_unit.entry((c.to_string(), u.to_string())).or_default().push(r);
         }
+        // How every app container last stopped, in one call for the
+        // whole project.
+        let apps: Vec<String> = by_unit.values().flatten().filter(|r| r.label(PART) == Some(PART_APP)).map(|r| r.name.clone()).collect();
+        let stops = docker::container_stops(self.docker.as_ref(), &apps).await?;
+        self.forget_gone(project, &by_unit.values().flatten().map(|r| r.name.as_str()).collect());
+        let kills = self.kills_inside(project, &stops).await?;
         let mut out = Vec::with_capacity(by_unit.len());
         for ((copy_id, unit), rows) in by_unit {
             let hash = rows.iter().find_map(|r| r.label(labels::UNIT_HASH)).unwrap_or_default().to_string();
@@ -588,8 +754,9 @@ impl InfraHost for LocalInfraHost {
                     probes.insert(container_short(r).to_string(), decode_probes(raw)?);
                 }
             }
-            let state = self.unit_state(&probes, &rows).await?;
-            out.push(UnitObservation { copy_id, unit, hash, state });
+            let state = self.unit_state(project, &probes, &rows).await?;
+            let restart = self.restart(project, &rows, &stops, &kills).await?;
+            out.push(UnitObservation { copy_id, unit, hash, state, restart });
         }
         Ok(out)
     }
@@ -671,7 +838,7 @@ impl InfraHost for LocalInfraHost {
             // mark misses none. A marked container resumes from its mark.
             let start = match mark {
                 Some(mark) => mark,
-                None => LogMark::start(daemon_now(self.docker.as_ref()).await?),
+                None => LogMark::start(docker::daemon_now(self.docker.as_ref()).await?),
             };
             let mut args = vec!["logs".to_string(), "--timestamps".into()];
             match (from, &mark) {
@@ -875,7 +1042,7 @@ fn container_args(
     env_file: &std::path::Path,
     run: ContainerRun,
     cfg: &LocalInfraHostConfig,
-) -> Vec<String> {
+) -> anyhow::Result<Vec<String>> {
     let unit_name = &unit.unit.name;
     let mut l = base_labels(&cfg.install, &node.node, unit_name);
     l.insert(labels::UNIT_HASH, unit.hash.clone());
@@ -899,9 +1066,15 @@ fn container_args(
         "--env-file".into(),
         env_file.display().to_string(),
     ]);
-    // No CPU or memory cap: a container's limits and its machine's size
-    // are what a cloud runs it on, and on this machine it takes what it
-    // asks for, like anything else run here.
+    // Its memory limit is a cap, here and on a cloud machine (which runs
+    // its unit through this same code): a container past it is killed
+    // and brought back, and Docker records why, which is what tells
+    // the person to raise it (`restart`). The same for swap, so a
+    // machine that has some does not let it run past its limit slowly
+    // instead. No CPU cap: it would only slow the container down.
+    if let Some(mib) = memory_cap(c).map_err(anyhow::Error::msg)? {
+        args.extend(["--memory".into(), format!("{mib}m"), "--memory-swap".into(), format!("{mib}m")]);
+    }
     if let Some(user) = &c.run_as {
         args.extend(["--user".into(), user.clone()]);
     }
@@ -949,7 +1122,18 @@ fn container_args(
         args.extend(cmd.iter().skip(1).cloned());
     }
     args.extend(c.args.iter().cloned());
-    args
+    Ok(args)
+}
+
+/// The memory cap `docker run` gives `c`: its limit in whole MiB, rounded
+/// down so it never gets more than it asked; `None` when it sets none.
+fn memory_cap(c: &Container) -> Result<Option<u64>, String> {
+    let Some(raw) = &c.limits.memory else { return Ok(None) };
+    match weft_core::infra::memory_mib(raw).map(f64::floor) {
+        Some(mib) if mib >= 1.0 => Ok(Some(mib as u64)),
+        Some(_) => Err(format!("container '{}' limits its memory to '{}', less than 1Mi; raise its limits.memory", c.name, raw.trim())),
+        None => Err(format!("container '{}' limits its memory to '{}', which is not a size; write it like 512Mi or 4Gi", c.name, raw.trim())),
+    }
 }
 
 /// `docker --mount` for one mount: a Docker volume (a sub-directory of it
@@ -1025,7 +1209,7 @@ mod tests {
                     .with_env(vec![EnvEntry::new("POSTGRES_PASSWORD", "s3cret")])
                     .with_ports(vec![ContainerPort { name: "sql".into(), port: 5432, protocol: Protocol::Tcp }])
                     .with_mounts(vec![Mount::new("data", "/var/lib/postgresql")])
-                    .with_readiness(Probe::exec(vec!["pg_isready".into()]))],
+                    .with_readiness(Probe::exec(vec!["pg_isready".into(), "-d".into(), "postgres".into()]))],
                 init_containers: vec![Container::new("init", Image::Upstream { reference: "busybox:1".into() })],
                 machine: MachineShape { memory: Some("1Gi".into()), ..Default::default() },
                 ..Default::default()
@@ -1073,19 +1257,47 @@ mod tests {
     }
 
     #[test]
-    fn a_container_runs_on_its_agents_network_with_its_command_and_disks_and_no_cap() {
+    fn a_container_runs_on_its_agents_network_with_its_command_and_disks_and_no_cap_unless_it_limits_its_memory() {
         let node = resolved();
         let unit = node.unit("main").unwrap();
         let c = &unit.unit.containers[0];
-        let args = container_args(&node, unit, c, std::path::Path::new("/tmp/e.env"), ContainerRun::App, &cfg(GpuAccess::None));
+        let args = container_args(&node, unit, c, std::path::Path::new("/tmp/e.env"), ContainerRun::App, &cfg(GpuAccess::None)).unwrap();
         let agent = agent_name(&node.node, "main");
         assert!(args.windows(2).any(|w| w == ["--network".to_string(), format!("container:{agent}")]));
         assert!(args.windows(2).any(|w| w == ["--entrypoint", "docker-entrypoint.sh"]));
-        assert!(!args.iter().any(|a| a == "--memory" || a == "--cpus"), "a local container is not capped: {args:?}");
+        assert!(!args.iter().any(|a| a == "--memory" || a == "--memory-swap" || a == "--cpus"), "no limit, no cap: {args:?}");
         assert!(args.windows(2).any(|w| w == ["--mount".to_string(), format!("type=volume,source={},target=/var/lib/postgresql", disk_volume(&node.node, "data"))]));
         let at = args.iter().position(|a| a == "postgres:18").unwrap();
         assert_eq!(args[at + 1..], ["postgres", "-c", "fsync=off"], "the command's rest, then the args");
         assert!(!args.iter().any(|a| a.contains("s3cret")), "values stay off the command line");
+    }
+
+    /// A memory limit is a cap in whole MiB, rounded down, on every
+    /// machine; a CPU limit never is; a limit that is not a size is
+    /// refused before anything starts.
+    #[test]
+    fn a_containers_memory_limit_is_its_cap_and_its_cpu_limit_is_not() {
+        let mut s = spec();
+        s.units[0].containers[0].limits = weft_core::infra::Limits { cpu: Some("2".into()), memory: Some("1G".into()) };
+        let node = resolve(&s, &node_ref(), &BTreeMap::new()).unwrap();
+        let unit = node.unit("main").unwrap();
+        let machine = LocalInfraHostConfig { gpu: GpuAccess::CosDriver, disks: DiskBacking::MountedUnder("/mnt/disks".into()), ..cfg(GpuAccess::None) };
+        for on in [cfg(GpuAccess::None), machine] {
+            let args = container_args(&node, unit, &unit.unit.containers[0], std::path::Path::new("/e"), ContainerRun::App, &on).unwrap();
+            // 10^9 bytes is 953.67 MiB.
+            assert!(args.windows(2).any(|w| w == ["--memory", "953m"]), "{args:?}");
+            assert!(args.windows(2).any(|w| w == ["--memory-swap", "953m"]), "no swap past it: {args:?}");
+            assert!(!args.iter().any(|a| a == "--cpus"), "{args:?}");
+        }
+        assert!(host(Arc::new(FakeDocker::new()), false).check(&node).is_ok());
+
+        s.units[0].containers[0].limits.memory = Some("lots".into());
+        let bad = resolve(&s, &node_ref(), &BTreeMap::new()).unwrap();
+        let err = host(Arc::new(FakeDocker::new()), false).check(&bad).unwrap_err();
+        assert!(err.contains("'lots'") && err.contains("512Mi"), "{err}");
+        s.units[0].containers[0].limits.memory = Some("0.5Mi".into());
+        let tiny = resolve(&s, &node_ref(), &BTreeMap::new()).unwrap();
+        assert!(host(Arc::new(FakeDocker::new()), false).check(&tiny).is_err());
     }
 
     #[test]
@@ -1095,10 +1307,10 @@ mod tests {
         let node = resolve(&s, &node_ref(), &BTreeMap::new()).unwrap();
         let unit = node.unit("main").unwrap();
         for (c, run) in [(&unit.unit.containers[0], ContainerRun::App), (&unit.unit.init_containers[0], ContainerRun::Init)] {
-            let args = container_args(&node, unit, c, std::path::Path::new("/e"), run, &cfg(GpuAccess::None));
+            let args = container_args(&node, unit, c, std::path::Path::new("/e"), run, &cfg(GpuAccess::None)).unwrap();
             assert!(args.windows(2).any(|w| w == ["--group-add", "70"]), "{}", c.name);
         }
-        let plain = container_args(&resolved(), resolved().unit("main").unwrap(), &unit.unit.containers[0], std::path::Path::new("/e"), ContainerRun::App, &cfg(GpuAccess::None));
+        let plain = container_args(&resolved(), resolved().unit("main").unwrap(), &unit.unit.containers[0], std::path::Path::new("/e"), ContainerRun::App, &cfg(GpuAccess::None)).unwrap();
         assert!(!plain.iter().any(|a| a == "--group-add"));
     }
 
@@ -1163,7 +1375,7 @@ mod tests {
         let node = resolve(&s, &node_ref(), &BTreeMap::new()).unwrap();
         let unit = node.unit("main").unwrap();
         let machine = LocalInfraHostConfig { gpu: GpuAccess::CosDriver, disks: DiskBacking::MountedUnder("/mnt/disks".into()), ..cfg(GpuAccess::None) };
-        let args = container_args(&node, unit, &unit.unit.containers[0], std::path::Path::new("/e"), ContainerRun::App, &machine);
+        let args = container_args(&node, unit, &unit.unit.containers[0], std::path::Path::new("/e"), ContainerRun::App, &machine).unwrap();
         assert!(args.windows(2).any(|w| w == ["--device", "/dev/nvidia1:/dev/nvidia1"]));
         assert!(!args.windows(2).any(|w| w == ["--device", "/dev/nvidia2:/dev/nvidia2"]));
         assert!(args.windows(2).any(|w| w == ["--volume", "/var/lib/nvidia/lib64:/usr/local/nvidia/lib64"]));
@@ -1242,6 +1454,210 @@ mod tests {
         let again = h.logs(&node_ref(), "main", &LogsFrom::After(marks)).await.unwrap();
         assert_eq!(again[0].mark, streams[0].mark, "nothing new: the mark stays");
         assert_eq!(docker.calls_to("info").len(), before, "a marked read needs no clock");
+    }
+
+    fn stop_line(status: &str, restarts: u32, oom: bool, code: i64, finished: &str) -> String {
+        started_stop_line(status, restarts, oom, code, finished, "2026-10-27T12:00:00Z")
+    }
+
+    fn started_stop_line(status: &str, restarts: u32, oom: bool, code: i64, finished: &str, started: &str) -> String {
+        format!(
+            r#"{{"name":"/c-pg","restartCount":{restarts},"state":{{"Status":"{status}","OOMKilled":{oom},"ExitCode":{code},"StartedAt":"{started}","FinishedAt":"{finished}"}}}}"#
+        )
+    }
+
+    /// The daemon's answers for one unit `main` of `wn-1`: its agent
+    /// running, its app container `pg` in `app_state`, and how `pg` last
+    /// stopped.
+    fn unit_is(docker: &FakeDocker, app_state: &str, stop: &str) {
+        docker.forget(&["ps"]);
+        docker.forget(&["inspect"]);
+        let agent = r#"{"Names":"c-agent","State":"running","Labels":"weft.part=agent,weft.copy=wn-1,weft.unit=main"}"#;
+        let pg = format!(r#"{{"Names":"c-pg","State":"{app_state}","Labels":"weft.part=app,weft.container=pg,weft.copy=wn-1,weft.unit=main"}}"#);
+        docker.answer(&["ps"], &format!("{agent}\n{pg}\n"));
+        docker.answer(&["inspect"], stop);
+    }
+
+    async fn restart_seen(h: &LocalInfraHost) -> Option<UnitRestart> {
+        let seen = h.observe("local", node_ref().project).await.unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        seen[0].restart.clone()
+    }
+
+    /// A container killed for memory reads as such while it waits to
+    /// restart, and still once it runs again and Docker has cleared why;
+    /// a later stop is read from Docker's events, once.
+    #[tokio::test]
+    async fn a_restart_keeps_its_cause_across_looks_and_asks_the_events_once() {
+        let docker = Arc::new(FakeDocker::new());
+        docker.answer(&["port"], "127.0.0.1:40000\n");
+        docker.answer(&["info"], "\"2026-10-27T13:00:00Z\"\n");
+        let h = host(docker.clone(), false);
+
+        unit_is(&docker, "running", &stop_line("running", 0, false, 0, "0001-01-01T00:00:00Z"));
+        assert_eq!(restart_seen(&h).await, None, "never brought back");
+
+        let first = "2026-10-27T12:20:06.351466883Z";
+        let first_unix = chrono::DateTime::parse_from_rfc3339(first).unwrap().timestamp();
+        unit_is(&docker, "restarting", &stop_line("restarting", 1, true, 137, first));
+        let oom = UnitRestart { container: "pg".into(), stopped_at_unix: first_unix, cause: RestartCause::OutOfMemory, count: 1 };
+        assert_eq!(restart_seen(&h).await, Some(oom.clone()));
+
+        unit_is(&docker, "running", &stop_line("running", 1, false, 0, first));
+        assert_eq!(restart_seen(&h).await, Some(oom), "Docker cleared it; the host kept it");
+        assert!(docker.calls_to("events").is_empty(), "the container's own state said why");
+
+        let second = "2026-10-27T12:30:00.5Z";
+        unit_is(&docker, "running", &stop_line("running", 2, false, 0, second));
+        docker.answer(&["events"], "1793104200600000000 die 1\n");
+        let crashed = restart_seen(&h).await.unwrap();
+        assert_eq!((crashed.cause, crashed.count), (RestartCause::Exited { code: 1 }, 2));
+        restart_seen(&h).await.unwrap();
+        assert_eq!(docker.calls_to("events").len(), 1, "read once, then kept");
+    }
+
+    /// The `--since` a look asked Docker's events from.
+    fn events_since(docker: &FakeDocker, nth: usize) -> String {
+        let call = &docker.calls_to("events")[nth];
+        call[call.iter().position(|a| a == "--since").unwrap() + 1].clone()
+    }
+
+    /// A process inside a container killed for memory while the container
+    /// runs on (Postgres restarting its backends in place) is a restart
+    /// for memory, named by when Docker's events say it happened; the next
+    /// look asks only for a later one, and a later one is a new restart.
+    #[tokio::test]
+    async fn a_process_killed_for_memory_inside_a_running_container_is_a_restart() {
+        let docker = Arc::new(FakeDocker::new());
+        docker.answer(&["port"], "127.0.0.1:40000\n");
+        docker.answer(&["info"], "\"2026-10-27T13:00:00Z\"\n");
+        let h = host(docker.clone(), false);
+        let killed = started_stop_line("running", 0, true, 0, "0001-01-01T00:00:00Z", "2026-10-27T12:00:00Z");
+        let oom = |at: i64| UnitRestart { container: "pg".into(), stopped_at_unix: at, cause: RestartCause::OutOfMemory, count: 0 };
+
+        unit_is(&docker, "running", &killed);
+        docker.answer(&["events"], "1793102700500000000 c-pg\n");
+        assert_eq!(restart_seen(&h).await, Some(oom(1793102700)));
+        assert_eq!(events_since(&docker, 0), "1793102400.000000000", "from the run's start");
+        assert_eq!(restart_seen(&h).await, Some(oom(1793102700)), "the same kill");
+        assert_eq!(events_since(&docker, 1), "1793102700.500000001", "only a later one");
+
+        docker.forget(&["events"]);
+        docker.answer(&["events"], "1793102760000000000 c-pg\n");
+        assert_eq!(restart_seen(&h).await, Some(oom(1793102760)), "a new kill");
+
+        // Docker's events forgot it before this host saw it: not reported,
+        // never named by when the host looked.
+        let fresh = host(docker.clone(), false);
+        docker.forget(&["events"]);
+        assert_eq!(restart_seen(&fresh).await, None);
+
+        // A container whose state says no kill asks no events.
+        let before = docker.calls_to("events").len();
+        unit_is(&docker, "running", &stop_line("running", 0, false, 0, "0001-01-01T00:00:00Z"));
+        assert_eq!(restart_seen(&host(docker.clone(), false)).await, None);
+        assert_eq!(docker.calls_to("events").len(), before);
+    }
+
+    /// However many of a project's containers say a process inside them
+    /// was killed for memory, a look reads the daemon's clock and Docker's
+    /// events once, from the earliest kill not yet seen, and each
+    /// container keeps only its own kills.
+    #[tokio::test]
+    async fn kills_inside_every_container_of_a_project_are_one_read_per_look() {
+        let docker = Arc::new(FakeDocker::new());
+        docker.answer(&["port"], "127.0.0.1:40000\n");
+        docker.answer(&["info"], "\"2026-10-27T13:00:00Z\"\n");
+        let h = host(docker.clone(), false);
+        let row = |name: &str, unit: &str, part: &str| {
+            format!(r#"{{"Names":"{name}","State":"running","Labels":"weft.part={part},weft.container={name},weft.copy=wn-1,weft.unit={unit}"}}"#)
+        };
+        let ps = [row("c-agent-a", "a", "agent"), row("c-a", "a", "app"), row("c-agent-b", "b", "agent"), row("c-b", "b", "app")].join("\n");
+        docker.answer(&["ps"], &ps);
+        let killed = |name: &str| {
+            format!(
+                r#"{{"name":"/{name}","restartCount":0,"state":{{"Status":"running","OOMKilled":true,"ExitCode":0,"StartedAt":"2026-10-27T12:00:00Z","FinishedAt":"0001-01-01T00:00:00Z"}}}}"#
+            )
+        };
+        docker.answer(&["inspect"], &format!("{}\n{}\n", killed("c-a"), killed("c-b")));
+        docker.answer(&["events"], "1793102700000000000 c-a\n1793102760000000000 c-b\n");
+
+        let seen = h.observe("local", node_ref().project).await.unwrap();
+        let at = |u: &str| seen.iter().find(|o| o.unit == u).unwrap().restart.as_ref().unwrap().stopped_at_unix;
+        assert_eq!((at("a"), at("b")), (1793102700, 1793102760));
+        assert_eq!((docker.calls_to("info").len(), docker.calls_to("events").len()), (1, 1));
+
+        // The next look reads from the earlier of the two kills kept, and
+        // the later kill of `b` is not taken for a new one of `a`.
+        let seen = h.observe("local", node_ref().project).await.unwrap();
+        let at = |u: &str| seen.iter().find(|o| o.unit == u).unwrap().restart.as_ref().unwrap().stopped_at_unix;
+        assert_eq!((at("a"), at("b")), (1793102700, 1793102760));
+        assert_eq!((docker.calls_to("info").len(), docker.calls_to("events").len()), (2, 2));
+        let call = &docker.calls_to("events")[1];
+        assert_eq!(call[call.iter().position(|a| a == "--since").unwrap() + 1], "1793102700.000000001");
+    }
+
+    /// What the host keeps about a container goes once a look at its
+    /// project no longer finds it; another project's stays.
+    #[tokio::test]
+    async fn what_is_kept_about_a_container_goes_with_it() {
+        let docker = Arc::new(FakeDocker::new());
+        docker.answer(&["port"], "127.0.0.1:40000\n");
+        docker.answer(&["info"], "\"2026-10-27T13:00:00Z\"\n");
+        docker.answer(&["events"], "1793102700500000000 c-pg\n");
+        let h = host(docker.clone(), false);
+        let other = uuid::Uuid::from_u128(7);
+        h.kept.lock().insert("theirs".into(), Kept::of(other));
+        unit_is(&docker, "running", &started_stop_line("running", 0, true, 0, "0001-01-01T00:00:00Z", "2026-10-27T12:00:00Z"));
+        restart_seen(&h).await;
+        assert!(h.kept.lock().contains_key("c-pg"));
+
+        docker.forget(&["ps"]);
+        docker.forget(&["inspect"]);
+        assert!(h.observe("local", node_ref().project).await.unwrap().is_empty());
+        let kept: Vec<String> = h.kept.lock().keys().cloned().collect();
+        assert_eq!(kept, ["theirs"]);
+    }
+
+    #[test]
+    fn the_latest_stop_of_a_container_brought_back_is_the_units_restart() {
+        let stop = |name: &str, restarts: u32, finished: &str| {
+            docker::ContainerStop {
+                name: name.into(),
+                restart_count: restarts,
+                status: "running".into(),
+                oom_killed: false,
+                exit_code: 0,
+                finished_at: Some(chrono::DateTime::parse_from_rfc3339(finished).unwrap().to_utc()),
+                started_at: None,
+            }
+        };
+        let a = stop("a", 1, "2026-01-01T00:00:01Z");
+        let b = stop("b", 2, "2026-01-01T00:00:05Z");
+        // Stopped later, but by hand (a restart count of 0): not a restart.
+        let c = stop("c", 0, "2026-01-01T00:00:09Z");
+        // Stopped by weft after a restart, and down since: its stop is not one.
+        let d = docker::ContainerStop { status: "exited".into(), ..stop("d", 4, "2026-01-01T00:00:12Z") };
+        let picked = latest_restart([("a", &a), ("b", &b), ("c", &c), ("d", &d)].into_iter()).unwrap();
+        assert_eq!(picked.0, "b");
+        assert!(latest_restart([("c", &c), ("d", &d)].into_iter()).is_none());
+    }
+
+    #[test]
+    fn why_a_container_stopped_is_in_its_state_only_until_it_runs_again() {
+        let stop = |status: &str, oom: bool, code: i64| docker::ContainerStop {
+            name: "c".into(),
+            restart_count: 1,
+            status: status.into(),
+            oom_killed: oom,
+            exit_code: code,
+            finished_at: None,
+            started_at: None,
+        };
+        assert_eq!(cause_in_state(&stop("restarting", true, 137)), Some(RestartCause::OutOfMemory));
+        assert_eq!(cause_in_state(&stop("restarting", false, 2)), Some(RestartCause::Exited { code: 2 }));
+        assert_eq!(cause_in_state(&stop("restarting", true, 1)), Some(RestartCause::Exited { code: 1 }), "killed inside earlier, then crashed");
+        assert_eq!(cause_in_state(&stop("running", false, 0)), None);
     }
 
     #[tokio::test]

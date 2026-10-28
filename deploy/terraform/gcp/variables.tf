@@ -1,4 +1,4 @@
-# SYNC: the variables the install workflow sets (project_id, region, zone, database_url, database_listen_url, cloud_sql, cloud_sql_tier, runtime_image, builder_base_image, weft_repository, weft_commit, access_apps_json, alert_email) <-> .github/workflows/install-gcp.yml (the TF_VAR_* names)
+# SYNC: the variables the install workflow sets (project_id, region, zone, database_url, database_listen_url, cloud_sql, cloud_sql_tier, cloud_sql_max_connections, dispatcher_max_copies, broker_max_copies, runtime_image, builder_base_image, weft_repository, weft_commit, access_apps_json, alert_email) <-> .github/workflows/install-gcp.yml (the TF_VAR_* names)
 
 variable "project_id" {
   description = "The GCP project the install lives in."
@@ -43,9 +43,41 @@ variable "cloud_sql_tier" {
 }
 
 variable "cloud_sql_max_connections" {
-  description = "How many connections the install's own Postgres takes at once, when cloud_sql is on. Each role opens its pools straight on it, with no pooler between: one copy of every role holds up to about 110 (crates/weft-runtime/src/lib.rs, the pools), and a busy role runs more than one copy."
+  description = "How many connections the install's own Postgres takes at once, when cloud_sql is on. Unset, Cloud SQL keeps its own number for the tier, which grows with the tier's memory (50 on db-g1-small). weft reads whatever number the database reports and sizes its pools to fit, so raising this (or the tier) is the one knob for more connections. Setting it, changing it, or unsetting it again restarts the instance once, the next time the install runs."
   type        = number
-  default     = 250
+  default     = null
+  nullable    = true
+
+  # Cloud SQL itself accepts 14 and up. Postgres and Cloud SQL keep a few
+  # connections for themselves, so below 25 there is next to nothing left
+  # to share among the copies of the dispatcher and the broker; a value
+  # that low is far more likely a typo than a choice.
+  validation {
+    condition     = coalesce(var.cloud_sql_max_connections, 25) >= 25
+    error_message = "cloud_sql_max_connections is at least 25 when set; leave it unset to keep Cloud SQL's own number for the tier."
+  }
+}
+
+variable "dispatcher_max_copies" {
+  description = "The most copies of the dispatcher Cloud Run runs at once. Every copy takes an equal share of the database's connections, so more copies means a smaller share each, and a copy whose share is too small to work refuses to start, naming this setting and broker_max_copies. If you need more room, give the database more connections first (cloud_sql_max_connections or a larger cloud_sql_tier), then raise this."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.dispatcher_max_copies >= 1
+    error_message = "dispatcher_max_copies is at least 1."
+  }
+}
+
+variable "broker_max_copies" {
+  description = "The most copies of the broker Cloud Run runs at once. Every copy takes an equal share of the database's connections, so more copies means a smaller share each, and a copy whose share is too small to work refuses to start, naming this setting and dispatcher_max_copies. If you need more room, give the database more connections first (cloud_sql_max_connections or a larger cloud_sql_tier), then raise this."
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.broker_max_copies >= 1
+    error_message = "broker_max_copies is at least 1."
+  }
 }
 
 variable "database_listen_url" {

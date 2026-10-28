@@ -34,6 +34,7 @@ fn unit_map(
             image_refs: Default::default(),
             not_ready_since_unix: None,
             ready_since_unix: None,
+            last_restart: None,
         },
     );
     m

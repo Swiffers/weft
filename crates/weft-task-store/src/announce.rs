@@ -84,9 +84,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use sqlx::postgres::PgPool;
 use weft_platform_traits::{News, NewsKind, RunNews};
 
+use crate::db::{Client as _, Pool};
 use crate::unanswered::{self, Callee};
 
 /// Where the writes a run makes leave what they announce.
@@ -200,7 +200,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
 
 /// Tell this process's flusher for `pool`'s database that a write which
 /// may have left announcements just committed.
-pub fn committed(pool: &PgPool) {
+pub fn committed(pool: &Pool) {
     flusher(pool).wanted.notify_one();
 }
 
@@ -210,7 +210,7 @@ pub fn committed(pool: &PgPool) {
 /// its run call it, an answer written into a paused run's record included
 /// (that one leaves no news, and costs one empty look); the run path's
 /// writes never do.
-pub fn news_written(pool: &PgPool) {
+pub fn news_written(pool: &Pool) {
     flusher(pool).news_wanted.notify_one();
 }
 
@@ -218,7 +218,7 @@ pub fn news_written(pool: &PgPool) {
 /// `pool`'s database leave, through `news`, starting with whatever news a
 /// process that stopped left waiting: beside the announcements, never
 /// holding them up.
-pub fn tell_news_through(pool: &PgPool, news: Arc<dyn News>) {
+pub fn tell_news_through(pool: &Pool, news: Arc<dyn News>) {
     let flusher = flusher(pool);
     *flusher.news.lock().expect("announcement flusher news") = Some(news);
     flusher.news_wanted.notify_one();
@@ -230,7 +230,7 @@ pub fn tell_news_through(pool: &PgPool, news: Arc<dyn News>) {
 /// sends the announcements and tells the news, side by side.
 struct Flusher {
     wanted: tokio::sync::Notify,
-    pool: Mutex<PgPool>,
+    pool: Mutex<Pool>,
     /// Told when news may be waiting ([`news_written`], [`tell_news_through`]).
     news_wanted: tokio::sync::Notify,
     /// What tells the install's news, once the process gave it
@@ -249,13 +249,13 @@ fn flushers() -> &'static Flushers {
 
 /// Where `pool` connects: one flusher per database, whatever the number of
 /// pools on it.
-fn database_key(pool: &PgPool) -> String {
-    let options = pool.connect_options();
-    format!("{}:{}/{}", options.get_host(), options.get_port(), options.get_database().unwrap_or(""))
+fn database_key(pool: &Pool) -> String {
+    let config = pool.config();
+    format!("{:?}:{:?}/{}", config.get_hosts(), config.get_ports(), config.get_dbname().unwrap_or(""))
 }
 
 /// The flusher of `pool`'s database, started when there is none.
-fn flusher(pool: &PgPool) -> Arc<Flusher> {
+fn flusher(pool: &Pool) -> Arc<Flusher> {
     let key = database_key(pool);
     let mut flushers = flushers().lock().expect("announcement flushers");
     if let Some(flusher) = flushers.get(&key) {
@@ -341,7 +341,7 @@ where
 /// Send everything waiting, in batches of [`BATCH`]. A flush that fails is
 /// tried again a few times ([`retried`]), then left: the rows stay in the
 /// outbox and go out with the next flush a write asks for.
-async fn flush_waiting(pool: &PgPool) {
+async fn flush_waiting(pool: &Pool) {
     loop {
         match retried("could not send the waiting announcements", || pool.is_closed(), || flush(pool)).await {
             Ok(sent) if sent >= BATCH as usize => {}
@@ -360,8 +360,8 @@ async fn flush_waiting(pool: &PgPool) {
 
 /// Send what waits in the outbox, in one transaction
 /// (`weft_flush_announcements`): how many rows it took.
-async fn flush(pool: &PgPool) -> Result<usize, sqlx::Error> {
-    let taken: i32 = sqlx::query_scalar("SELECT weft_flush_announcements($1)").bind(BATCH).fetch_one(pool).await?;
+async fn flush(pool: &Pool) -> crate::db::Result<usize> {
+    let taken: i32 = pool.scalar("SELECT weft_flush_announcements($1)", &[&BATCH]).await?;
     Ok(taken.max(0) as usize)
 }
 
@@ -384,7 +384,7 @@ async fn tell_when_wanted(flusher: &Flusher) {
 /// bus never refused ([`tell_new`]), then, only when its last read saw
 /// refusals, the news refused before this look ([`tell_refused`]), which
 /// also clears the refusal written down once no refused row is left.
-async fn tell_waiting(pool: &PgPool, news: &dyn News) {
+async fn tell_waiting(pool: &Pool, news: &dyn News) {
     let Some(told) = tell_new(pool, news).await else { return };
     if told.refusals {
         tell_refused(pool, news, &told.refused_now).await;
@@ -405,7 +405,7 @@ struct ToldNew {
 /// to the news after it. `None` when a read or a taking out failed past
 /// its few tries, which ends the look: the news stays in its table until
 /// the next.
-async fn tell_new(pool: &PgPool, news: &dyn News) -> Option<ToldNew> {
+async fn tell_new(pool: &Pool, news: &dyn News) -> Option<ToldNew> {
     let closed = || pool.is_closed();
     // The news this look has read past: everything after it is read next,
     // so a batch whose mark failed is not read again by the same look.
@@ -458,7 +458,7 @@ async fn tell_new(pool: &PgPool, news: &dyn News) -> Option<ToldNew> {
 /// line, and ends the look. With no refused row left, the read clears the
 /// refusal written down (`weft_news_refused`), so it never outlives the
 /// news it was about.
-async fn tell_refused(pool: &PgPool, news: &dyn News, refused_now: &[i64]) {
+async fn tell_refused(pool: &Pool, news: &dyn News, refused_now: &[i64]) {
     let closed = || pool.is_closed();
     loop {
         let refused = match retried("could not read the news the bus refused", closed, || refused_news(pool, refused_now)).await {
@@ -504,12 +504,13 @@ async fn tell_refused(pool: &PgPool, news: &dyn News, refused_now: &[i64]) {
 /// another process told and took out meanwhile leaves nothing written
 /// down. Tried again a few times; past them the news stays as it was
 /// (never refused, it is read with the next look's new news).
-async fn refuse(pool: &PgPool, seqs: &[i64], error: &str) {
+async fn refuse(pool: &Pool, seqs: &[i64], error: &str) {
     let marked = retried("could not mark the news the bus refused", || pool.is_closed(), move || async move {
-        let mut tx = pool.begin().await?;
-        let marked: i64 = sqlx::query_scalar("SELECT weft_news_refuse($1)").bind(seqs).fetch_one(&mut *tx).await?;
+        let mut conn = pool.get().await?;
+        let tx = conn.transaction().await?;
+        let marked: i64 = tx.scalar("SELECT weft_news_refuse($1)", &[&seqs]).await?;
         let alerts = match marked > 0 {
-            true => unanswered::gave_up(&mut *tx, Callee::News, None, error).await?,
+            true => unanswered::gave_up(&tx, Callee::News, None, error).await?,
             false => unanswered::Alerts::default(),
         };
         tx.commit().await?;
@@ -527,9 +528,9 @@ async fn refuse(pool: &PgPool, seqs: &[i64], error: &str) {
 
 /// Take the news `seqs` out of its table, told, trying again a few times;
 /// `None` when it could not, which ends the look.
-async fn take_out_told(pool: &PgPool, seqs: &[i64]) -> Option<()> {
+async fn take_out_told(pool: &Pool, seqs: &[i64]) -> Option<()> {
     let taken_out = retried("could not take the news told out of its table (it would only be told twice)", || pool.is_closed(), move || async move {
-        sqlx::query("DELETE FROM weft_news WHERE seq = ANY($1)").bind(seqs).execute(pool).await
+        pool.execute("DELETE FROM weft_news WHERE seq = ANY($1)", &[&seqs]).await
     })
     .await;
     match taken_out {
@@ -568,20 +569,18 @@ type NewNewsRow = (bool, Option<i64>, Option<uuid::Uuid>, Option<uuid::Uuid>, Op
 /// whose bus never refused anything costs this one read. Read with no
 /// lock: two processes telling the same piece only ring the same doorbell
 /// twice.
-async fn new_news(pool: &PgPool, read_past: i64) -> Result<NewNews, sqlx::Error> {
-    let rows: Vec<NewNewsRow> = sqlx::query_as(
-        "SELECT f.refusals, n.seq, n.project_id, n.run_id, n.kind \
-         FROM (SELECT EXISTS (SELECT 1 FROM weft_news r WHERE r.refused_at IS NOT NULL) \
-                   OR EXISTS (SELECT 1 FROM unanswered_call u WHERE u.callee = $3) AS refusals) f \
-         LEFT JOIN LATERAL (SELECT seq, project_id, run_id, kind FROM weft_news \
-             WHERE refused_at IS NULL AND seq > $2 ORDER BY seq LIMIT $1) n ON TRUE \
-         ORDER BY n.seq",
-    )
-    .bind(NEWS_BATCH)
-    .bind(read_past)
-    .bind(Callee::News.key())
-    .fetch_all(pool)
-    .await?;
+async fn new_news(pool: &Pool, read_past: i64) -> crate::db::Result<NewNews> {
+    let rows: Vec<NewNewsRow> = pool
+        .all(
+            "SELECT f.refusals, n.seq, n.project_id, n.run_id, n.kind \
+             FROM (SELECT EXISTS (SELECT 1 FROM weft_news r WHERE r.refused_at IS NOT NULL) \
+                       OR EXISTS (SELECT 1 FROM unanswered_call u WHERE u.callee = $3) AS refusals) f \
+             LEFT JOIN LATERAL (SELECT seq, project_id, run_id, kind FROM weft_news \
+                 WHERE refused_at IS NULL AND seq > $2 ORDER BY seq LIMIT $1) n ON TRUE \
+             ORDER BY n.seq",
+            &[&NEWS_BATCH, &read_past, &Callee::News.key()],
+        )
+        .await?;
     let refusals = rows.first().is_some_and(|row| row.0);
     let rows = rows
         .into_iter()
@@ -593,12 +592,9 @@ async fn new_news(pool: &PgPool, read_past: i64) -> Result<NewNews, sqlx::Error>
 /// Up to [`NEWS_BATCH`] pieces of news the bus refused, but `skip`,
 /// longest refused first ([`pieces`]); none, with the refusal written down
 /// cleared, when no refused row is left (`weft_news_refused`).
-async fn refused_news(pool: &PgPool, skip: &[i64]) -> Result<Vec<(i64, Option<RunNews>)>, sqlx::Error> {
-    let rows: Vec<NewsRow> = sqlx::query_as("SELECT seq, project_id, run_id, kind FROM weft_news_refused($1, $2, $3)")
-        .bind(NEWS_BATCH)
-        .bind(skip)
-        .bind(Callee::News.key())
-        .fetch_all(pool)
+async fn refused_news(pool: &Pool, skip: &[i64]) -> crate::db::Result<Vec<(i64, Option<RunNews>)>> {
+    let rows: Vec<NewsRow> = pool
+        .all("SELECT seq, project_id, run_id, kind FROM weft_news_refused($1, $2, $3)", &[&NEWS_BATCH, &skip, &Callee::News.key()])
         .await?;
     Ok(pieces(rows))
 }

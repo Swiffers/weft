@@ -105,10 +105,11 @@ impl Reach {
         self.credentials.remove(token);
     }
 
-    /// Signal `token` is no longer served here, or is registered again:
-    /// nothing is kept for it.
-    pub fn forget(&self, token: &str) {
-        self.credentials.remove(token);
+    /// Registrations `which` of signal `token` are no longer served here,
+    /// or the signal is registered again: nothing they fetched is kept.
+    /// What a newer registration fetched stays.
+    pub fn forget(&self, token: &str, which: crate::registry::Registrations) {
+        self.credentials.remove_if(token, |_, kept| which.cover(kept.registration));
     }
 
     /// A connection was made again or removed somewhere: no credential

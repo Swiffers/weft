@@ -50,7 +50,7 @@ use std::collections::BTreeMap;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use sqlx::postgres::PgPool;
+use weft_task_store::db::{Client, Pool};
 
 use weft_core::activation::ActivationKey;
 use weft_core::infra::wire::CopyRef;
@@ -104,13 +104,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 // =================================================================
 
 /// Whether the install is in maintenance.
-pub async fn is_on<'e>(executor: impl sqlx::PgExecutor<'e>) -> anyhow::Result<bool> {
-    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM maintenance)").fetch_one(executor).await?)
+pub async fn is_on(db: &impl Client) -> anyhow::Result<bool> {
+    Ok(db.scalar("SELECT EXISTS (SELECT 1 FROM maintenance)", &[]).await?)
 }
 
 /// Refuse a verb that turns something on while the install is in
 /// maintenance, naming the way out.
-pub(crate) async fn refuse_while_on(pool: &PgPool) -> Result<(), ApiError> {
+pub(crate) async fn refuse_while_on(pool: &Pool) -> Result<(), ApiError> {
     match is_on(pool).await {
         Ok(false) => Ok(()),
         Ok(true) => Err((StatusCode::CONFLICT, weft_core::maintenance::IN_MAINTENANCE.to_string())),
@@ -120,17 +120,14 @@ pub(crate) async fn refuse_while_on(pool: &PgPool) -> Result<(), ApiError> {
 
 /// Record the install as in maintenance from `now_unix`, unless it is
 /// already: answers since when it is, the first record's time.
-pub async fn begin(pool: &PgPool, now_unix: i64) -> anyhow::Result<i64> {
-    sqlx::query("INSERT INTO maintenance (since_unix) VALUES ($1) ON CONFLICT (one) DO NOTHING")
-        .bind(now_unix)
-        .execute(pool)
-        .await?;
+pub async fn begin(pool: &Pool, now_unix: i64) -> anyhow::Result<i64> {
+    pool.execute("INSERT INTO maintenance (since_unix) VALUES ($1) ON CONFLICT (one) DO NOTHING", &[&now_unix]).await?;
     since(pool).await?.ok_or_else(|| anyhow::anyhow!("the maintenance row went as it was written"))
 }
 
 /// Since when the install is in maintenance, if it is.
-pub async fn since(pool: &PgPool) -> anyhow::Result<Option<i64>> {
-    Ok(sqlx::query_scalar("SELECT since_unix FROM maintenance").fetch_optional(pool).await?)
+pub async fn since(pool: &Pool) -> anyhow::Result<Option<i64>> {
+    Ok(pool.scalar_opt("SELECT since_unix FROM maintenance", &[]).await?)
 }
 
 /// One infra copy the maintenance stopped.
@@ -145,47 +142,39 @@ pub struct RecordedCopy {
 /// Record `nodes`, `instance`'s copies of `project_id`, as stopped by the
 /// maintenance. One already recorded stays as it is.
 pub async fn record_copies(
-    pool: &PgPool,
+    pool: &Pool,
     project_id: uuid::Uuid,
     instance: Option<&InstanceId>,
     nodes: &[String],
     now_unix: i64,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    pool.execute(
         "INSERT INTO maintenance_copy (project_id, node_id, instance_id, stopped_unix) \
-         SELECT $1, n, $3, $4 FROM unnest($2::text[]) AS n \
+         SELECT $1::uuid, n, $3::text, $4::bigint FROM unnest($2::text[]) AS n \
          ON CONFLICT (project_id, node_id, instance_id) DO NOTHING",
+        &[&project_id, &nodes, &instance.map(InstanceId::as_str), &now_unix],
     )
-    .bind(project_id)
-    .bind(nodes)
-    .bind(instance.map(InstanceId::as_str))
-    .bind(now_unix)
-    .execute(pool)
     .await?;
     Ok(())
 }
 
 /// Forget `nodes`, `instance`'s copies of `project_id`: they came back, or
 /// there is nothing to bring back.
-pub async fn forget_copies(pool: &PgPool, project_id: uuid::Uuid, instance: Option<&InstanceId>, nodes: &[String]) -> anyhow::Result<()> {
-    sqlx::query(
+pub async fn forget_copies(pool: &Pool, project_id: uuid::Uuid, instance: Option<&InstanceId>, nodes: &[String]) -> anyhow::Result<()> {
+    pool.execute(
         "DELETE FROM maintenance_copy \
          WHERE project_id = $1 AND node_id = ANY($2) AND instance_id IS NOT DISTINCT FROM $3",
+        &[&project_id, &nodes, &instance.map(InstanceId::as_str)],
     )
-    .bind(project_id)
-    .bind(nodes)
-    .bind(instance.map(InstanceId::as_str))
-    .execute(pool)
     .await?;
     Ok(())
 }
 
 /// Every copy the maintenance stopped and the lift has not started yet.
-pub async fn recorded_copies(pool: &PgPool) -> anyhow::Result<Vec<RecordedCopy>> {
-    let rows: Vec<(uuid::Uuid, String, Option<String>)> =
-        sqlx::query_as("SELECT project_id, node_id, instance_id FROM maintenance_copy ORDER BY project_id, node_id, instance_id NULLS FIRST")
-            .fetch_all(pool)
-            .await?;
+pub async fn recorded_copies(pool: &Pool) -> anyhow::Result<Vec<RecordedCopy>> {
+    let rows: Vec<(uuid::Uuid, String, Option<String>)> = pool
+        .all("SELECT project_id, node_id, instance_id FROM maintenance_copy ORDER BY project_id, node_id, instance_id NULLS FIRST", &[])
+        .await?;
     rows.into_iter()
         .map(|(project_id, node, instance)| {
             let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("maintenance_copy.instance_id: {e}"))?;
@@ -197,14 +186,15 @@ pub async fn recorded_copies(pool: &PgPool) -> anyhow::Result<Vec<RecordedCopy>>
 /// Every trigger the maintenance took down that is still down, with its
 /// project. One a person took down since carries no mark any more.
 // SYNC: 'maintenance' <-> weft_core::projects::DownWith::Maintenance
-pub async fn marked_triggers(pool: &PgPool) -> anyhow::Result<Vec<(uuid::Uuid, ActivationKey)>> {
-    let rows: Vec<(uuid::Uuid, String, Option<String>)> = sqlx::query_as(
-        "SELECT project_id, trigger, instance_id FROM trigger_activation \
-         WHERE went_down_with = 'maintenance' AND status = 'inactive' \
-         ORDER BY project_id, trigger, instance_id NULLS FIRST",
-    )
-    .fetch_all(pool)
-    .await?;
+pub async fn marked_triggers(pool: &Pool) -> anyhow::Result<Vec<(uuid::Uuid, ActivationKey)>> {
+    let rows: Vec<(uuid::Uuid, String, Option<String>)> = pool
+        .all(
+            "SELECT project_id, trigger, instance_id FROM trigger_activation \
+             WHERE went_down_with = 'maintenance' AND status = 'inactive' \
+             ORDER BY project_id, trigger, instance_id NULLS FIRST",
+            &[],
+        )
+        .await?;
     rows.into_iter()
         .map(|(project, trigger, instance)| {
             let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("trigger_activation.instance_id: {e}"))?;
@@ -216,8 +206,8 @@ pub async fn marked_triggers(pool: &PgPool) -> anyhow::Result<Vec<(uuid::Uuid, A
 /// End the maintenance: every verb that turns something on goes through
 /// again. What a project could not bring back stays recorded beside it,
 /// for its own next lift.
-pub async fn end(pool: &PgPool) -> anyhow::Result<()> {
-    sqlx::query("DELETE FROM maintenance").execute(pool).await?;
+pub async fn end(pool: &Pool) -> anyhow::Result<()> {
+    pool.execute("DELETE FROM maintenance", &[]).await?;
     Ok(())
 }
 
@@ -226,17 +216,17 @@ pub async fn end(pool: &PgPool) -> anyhow::Result<()> {
 /// a stop the supervisor has not reached yet reads `stopping`, a start
 /// `provisioning`, though the row still says what the copy was.
 // SYNC: the run states <-> crate::store::postgres::GROUP
-pub async fn going(pool: &PgPool, projects: &dyn crate::project_store::ProjectStoreOps, tenant: &str) -> anyhow::Result<Going> {
-    let (triggers_on, runs): (i64, i64) = sqlx::query_as(
-        "SELECT \
-           (SELECT count(*) FROM trigger_activation a JOIN project p ON p.id = a.project_id \
-             WHERE p.tenant_id = $1 AND a.status IN ('active', 'activating')), \
-           (SELECT count(*) FROM run r JOIN project p ON p.id = r.project_id \
-             WHERE p.tenant_id = $1 AND r.state IN ('queued', 'running'))",
-    )
-    .bind(tenant)
-    .fetch_one(pool)
-    .await?;
+pub async fn going(pool: &Pool, projects: &dyn crate::project_store::ProjectStoreOps, tenant: &str) -> anyhow::Result<Going> {
+    let (triggers_on, runs): (i64, i64) = pool
+        .one(
+            "SELECT \
+               (SELECT count(*) FROM trigger_activation a JOIN project p ON p.id = a.project_id \
+                 WHERE p.tenant_id = $1 AND a.status IN ('active', 'activating')), \
+               (SELECT count(*) FROM run r JOIN project p ON p.id = r.project_id \
+                 WHERE p.tenant_id = $1 AND r.state IN ('queued', 'running'))",
+            &[&tenant],
+        )
+        .await?;
     let count = |n: i64| u64::try_from(n).unwrap_or_default();
     let mut going = Going { triggers_on: count(triggers_on), runs: count(runs), ..Going::default() };
     for project in projects.list(tenant).await? {
@@ -266,10 +256,12 @@ fn copies_going(observed: &crate::infra_node::ObservedCopies) -> (u64, u64) {
 }
 
 /// Whether a lift is under way: its task is queued or claimed.
-async fn lift_under_way(pool: &PgPool) -> anyhow::Result<Option<uuid::Uuid>> {
-    Ok(sqlx::query_scalar("SELECT id FROM task WHERE kind = $1 AND status IN ('pending', 'claimed') LIMIT 1")
-        .bind(weft_task_store::TaskKind::MaintenanceLift.as_str())
-        .fetch_optional(pool)
+async fn lift_under_way(pool: &Pool) -> anyhow::Result<Option<uuid::Uuid>> {
+    Ok(pool
+        .scalar_opt(
+            "SELECT id FROM task WHERE kind = $1 AND status IN ('pending', 'claimed') LIMIT 1",
+            &[&weft_task_store::TaskKind::MaintenanceLift.as_str()],
+        )
         .await?)
 }
 
@@ -303,7 +295,7 @@ pub fn plan(copies: Vec<RecordedCopy>, triggers: Vec<(uuid::Uuid, ActivationKey)
 }
 
 /// What the next lift does, as the tables stand.
-pub async fn left(pool: &PgPool) -> anyhow::Result<Vec<ProjectLift>> {
+pub async fn left(pool: &Pool) -> anyhow::Result<Vec<ProjectLift>> {
     Ok(plan(recorded_copies(pool).await?, marked_triggers(pool).await?))
 }
 
@@ -393,9 +385,9 @@ pub async fn follow(
     Path(task): Path<uuid::Uuid>,
     Query(hold): Query<crate::api::HoldQuery>,
 ) -> Result<Json<weft_core::deactivation::Following>, ApiError> {
-    let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM task WHERE id = $1")
-        .bind(task)
-        .fetch_optional(&state.pg_pool)
+    let kind: Option<String> = state
+        .pg_pool
+        .scalar_opt("SELECT kind FROM task WHERE id = $1", &[&task])
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read the task: {e}")))?;
     if kind.as_deref() != Some(weft_task_store::TaskKind::MaintenanceLift.as_str()) {
@@ -476,8 +468,9 @@ async fn take_project_down(state: &DispatcherState, id: uuid::Uuid, name: String
 /// under it. Once both were free, every later one sees the maintenance and
 /// every earlier one is visible (a trigger activating, a setup in flight).
 async fn fence(state: &DispatcherState, id: uuid::Uuid) -> anyhow::Result<()> {
-    let mut tx = state.pg_pool.begin().await?;
-    sqlx::query("SELECT 1 FROM project WHERE id = $1 FOR UPDATE").bind(id).fetch_optional(&mut *tx).await?;
+    let mut conn = state.pg_pool.get().await?;
+    let tx = conn.transaction().await?;
+    tx.query("SELECT 1 FROM project WHERE id = $1 FOR UPDATE", &[&id]).await?;
     tx.commit().await?;
     crate::lease::with_project_transition_lock(&state.lock_pool, id, || async { Ok(()) }).await
 }
@@ -549,6 +542,7 @@ async fn cancel_going(state: &DispatcherState, id: uuid::Uuid) -> anyhow::Result
 pub(crate) async fn lift(state: &DispatcherState, tenant: &str, task: uuid::Uuid) -> anyhow::Result<LiftReport> {
     let names = project_names(state, tenant).await.map_err(|(_, why)| anyhow::anyhow!(why))?;
     let tell = Telling::on(Some(task));
+    let setups = tokio::sync::Semaphore::new(SETUPS_AT_ONCE);
     let lifts = left(&state.pg_pool).await?;
     futures::future::try_join_all(lifts.iter().map(|lift| async {
         let id = lift.project_id;
@@ -556,7 +550,7 @@ pub(crate) async fn lift(state: &DispatcherState, tenant: &str, task: uuid::Uuid
         // A build that failed brings nothing back: what is recorded waits
         // for a build that runs on this weft.
         if rebuild(state, tenant, id, &mut lifted, &tell).await? {
-            run_steps(state, lift, &mut lifted, &tell).await?;
+            run_steps(state, lift, &mut lifted, &tell, &setups).await?;
         }
         tell.done(&state.pg_pool, lifted).await
     }))
@@ -569,6 +563,9 @@ pub(crate) async fn lift(state: &DispatcherState, tenant: &str, task: uuid::Uuid
     // on infra and a resync stopped on either get their look now.
     if let Err(e) = crate::api::infra::bring_back_triggers_whose_infra_returned(state.clone()).await {
         tracing::error!(target: "weft_dispatcher::maintenance", "the maintenance is lifted, but bringing back what went down with its infra failed; the next change of a copy tries again: {e:#}");
+    }
+    if let Err(e) = crate::task_kinds::resync::retry_stopped(state).await {
+        tracing::error!(target: "weft_dispatcher::maintenance", "the maintenance is lifted, but taking up again the resyncs stopped on its infra failed; the next change of a copy tries again: {e:#}");
     }
     Ok(report)
 }
@@ -585,15 +582,53 @@ pub(crate) async fn bring_back_project(state: &DispatcherState, id: uuid::Uuid) 
     let Some(lift) = left(&state.pg_pool).await?.into_iter().find(|lift| lift.project_id == id) else { return Ok(None) };
     let name = state.projects.get(id).await?.map(|project| project.name).unwrap_or_default();
     let mut lifted = ProjectLifted { id, name, ..Default::default() };
-    run_steps(state, &lift, &mut lifted, &Telling::on(None)).await?;
+    run_steps(state, &lift, &mut lifted, &Telling::on(None), &tokio::sync::Semaphore::new(SETUPS_AT_ONCE)).await?;
     Ok(Some(lifted))
+}
+
+/// How many owners' infra starts and trigger setups a lift runs at once,
+/// across every project it lifts side by side (a resync bringing back what
+/// a lift left runs as many for its one project). Each trigger setup run
+/// holds database connections of the dispatcher for its whole window and
+/// calls the listener, which calls the broker, which takes connections of
+/// its own; an infra start's beginning does the same through the
+/// supervisor. A lift that started every owner of every project at once
+/// ran a small database out of connections, and the setups that could not
+/// get one failed. Four keeps a lift well inside the connections of the
+/// smallest database weft runs on, and still brings a project with many
+/// instances back in a fraction of the time one at a time would.
+///
+/// A turn is held only while connections are: an infra start holds one
+/// for its beginning, never while it waits for its apply to land
+/// ([`start_copies`]), since an apply runs the user's infra and has no
+/// deadline, and four slow ones would hold back every other project of
+/// the lift for as long as they take.
+const SETUPS_AT_ONCE: usize = 4;
+
+/// Run every one of `parts`, at most as many at once as `setups` has
+/// permits, answering each one's output in the order given.
+async fn a_few_at_a_time<T>(setups: &tokio::sync::Semaphore, parts: impl IntoIterator<Item = impl std::future::Future<Output = T>>) -> Vec<T> {
+    futures::future::join_all(parts.into_iter().map(|part| async move {
+        let _turn = setups.acquire().await.expect("a lift's semaphore is never closed");
+        part.await
+    }))
+    .await
 }
 
 /// Bring back `lift` on the build its project has registered, saying in
 /// `lifted` what came back and what did not: every recorded copy first,
-/// every owner's at once, since a trigger's setup reads the infra in its
-/// cut; then every marked trigger, every owner's at once.
-async fn run_steps(state: &DispatcherState, lift: &ProjectLift, lifted: &mut ProjectLifted, tell: &Telling) -> anyhow::Result<()> {
+/// every owner's side by side, since a trigger's setup reads the infra in
+/// its cut; then every marked trigger, every owner's side by side. Owners
+/// take their turn from `setups`, which the projects a lift brings back
+/// side by side share ([`SETUPS_AT_ONCE`]): for a trigger setup the whole
+/// of it, for an infra start its beginning alone.
+async fn run_steps(
+    state: &DispatcherState,
+    lift: &ProjectLift,
+    lifted: &mut ProjectLifted,
+    tell: &Telling,
+    setups: &tokio::sync::Semaphore,
+) -> anyhow::Result<()> {
     let id = lift.project_id;
     if !lift.copies.is_empty() {
         let copies = lift
@@ -602,13 +637,17 @@ async fn run_steps(state: &DispatcherState, lift: &ProjectLift, lifted: &mut Pro
             .flat_map(|(owner, nodes)| nodes.iter().map(|node| CopyRef { node: node.clone(), instance: owner.instance().cloned() }))
             .collect();
         tell.at(&state.pg_pool, lifted, LiftDoing::StartingInfra { copies }).await?;
-        let parts = futures::future::try_join_all(lift.copies.iter().map(|(owner, nodes)| async {
+        // Every owner's side by side: each takes a turn of `setups` only
+        // for its start's beginning (`start_copies`).
+        let parts = futures::future::join_all(lift.copies.iter().map(|(owner, nodes)| async {
             let mut part = ProjectLifted::default();
-            start_copies(state, id, owner.instance(), nodes, &mut part).await?;
+            start_copies(state, id, owner.instance(), nodes, setups, &mut part).await?;
             anyhow::Ok(part)
         }))
-        .await?;
-        parts.into_iter().for_each(|part| lifted.absorb(part));
+        .await;
+        for part in parts {
+            lifted.absorb(part?);
+        }
     }
     if !lift.triggers.is_empty() {
         let triggers = lift
@@ -617,11 +656,14 @@ async fn run_steps(state: &DispatcherState, lift: &ProjectLift, lifted: &mut Pro
             .map(|(owner, triggers)| weft_core::activation::OwnerTriggers { owner: owner.clone(), triggers: triggers.clone() })
             .collect();
         tell.at(&state.pg_pool, lifted, LiftDoing::TurningOn { triggers }).await?;
-        let parts = futures::future::join_all(lift.triggers.iter().map(|(owner, triggers)| async {
-            let mut part = ProjectLifted::default();
-            bring_back(state, id, owner, triggers.clone(), &mut part).await;
-            part
-        }))
+        let parts = a_few_at_a_time(
+            setups,
+            lift.triggers.iter().map(|(owner, triggers)| async {
+                let mut part = ProjectLifted::default();
+                bring_back(state, id, owner, triggers.clone(), &mut part).await;
+                part
+            }),
+        )
         .await;
         parts.into_iter().for_each(|part| lifted.absorb(part));
     }
@@ -644,7 +686,7 @@ impl Telling {
     }
 
     /// `lifted`'s project is on step `doing` from now.
-    async fn at(&self, pool: &PgPool, lifted: &ProjectLifted, doing: LiftDoing) -> anyhow::Result<()> {
+    async fn at(&self, pool: &Pool, lifted: &ProjectLifted, doing: LiftDoing) -> anyhow::Result<()> {
         let at = LiftAt { id: lifted.id, name: lifted.name.clone(), since_unix: crate::lease::now_unix(), doing };
         let mut progress = self.progress.lock().await;
         progress.going.retain(|going| going.id != lifted.id);
@@ -654,7 +696,7 @@ impl Telling {
 
     /// `lifted`'s project goes on with its step, as `doing` now (a build
     /// whose images started).
-    async fn still(&self, pool: &PgPool, lifted: &ProjectLifted, doing: LiftDoing) -> anyhow::Result<()> {
+    async fn still(&self, pool: &Pool, lifted: &ProjectLifted, doing: LiftDoing) -> anyhow::Result<()> {
         let mut progress = self.progress.lock().await;
         if let Some(at) = progress.going.iter_mut().find(|going| going.id == lifted.id) {
             at.doing = doing;
@@ -663,7 +705,7 @@ impl Telling {
     }
 
     /// The lift is done with `lifted`'s project.
-    async fn done(&self, pool: &PgPool, lifted: ProjectLifted) -> anyhow::Result<()> {
+    async fn done(&self, pool: &Pool, lifted: ProjectLifted) -> anyhow::Result<()> {
         let mut progress = self.progress.lock().await;
         progress.going.retain(|going| going.id != lifted.id);
         progress.done.push(lifted);
@@ -674,7 +716,7 @@ impl Telling {
         self.progress.into_inner().done
     }
 
-    async fn say(&self, pool: &PgPool, progress: &LiftProgress) -> anyhow::Result<()> {
+    async fn say(&self, pool: &Pool, progress: &LiftProgress) -> anyhow::Result<()> {
         let Some(task) = self.task else { return Ok(()) };
         weft_task_store::tasks::set_progress(pool, task, &serde_json::to_value(progress)?).await
     }
@@ -727,12 +769,14 @@ async fn rebuild(state: &DispatcherState, tenant: &str, id: uuid::Uuid, lifted: 
 /// Start `nodes`, `instance`'s recorded copies of project `id`, on the
 /// registered build (the one [`rebuild`] just registered), and wait until they land. A copy terminated since, or
 /// one the program no longer has, is skipped and forgotten; one that runs
-/// already is forgotten.
+/// already is forgotten. The start's beginning takes a turn of `setups`;
+/// waiting for it to land takes none ([`SETUPS_AT_ONCE`]).
 async fn start_copies(
     state: &DispatcherState,
     id: uuid::Uuid,
     instance: Option<&InstanceId>,
     nodes: &[String],
+    setups: &tokio::sync::Semaphore,
     lifted: &mut ProjectLifted,
 ) -> anyhow::Result<()> {
     let Some(project) = state.projects.project(id).await? else { return Ok(()) };
@@ -770,9 +814,12 @@ async fn start_copies(
         }
     }
     let started = async {
-        let begun = crate::api::infra::begin_sync(state, id, &Default::default(), instance, &to_start, false, crate::api::infra::SyncKind::Lift)
-            .await
-            .map_err(|e| e.into_parts().1)?;
+        let begun = {
+            let _turn = setups.acquire().await.expect("a lift's semaphore is never closed");
+            crate::api::infra::begin_sync(state, id, &Default::default(), instance, &to_start, false, crate::api::infra::SyncKind::Lift)
+                .await
+                .map_err(|e| e.into_parts().1)?
+        };
         if let Some(begun) = begun {
             crate::api::infra::finish_sync(state, begun).await.map_err(|ended| match ended {
                 crate::api::project::SyncNotLanded::Cancelled(why) => format!("its start was cancelled ({why})"),
@@ -887,4 +934,36 @@ mod tests {
     fn nothing_recorded_is_nothing_to_lift() {
         assert!(plan(Vec::new(), Vec::new()).is_empty());
     }
+
+    weft_core::stress_test!(
+        name: setups_go_a_few_at_a_time_across_every_project,
+        runs: 16,
+        worker_threads: 4,
+        async fn body() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            // Two projects lifted side by side, each with many owners,
+            // sharing one lift's turns: never more setups at once than it
+            // allows, and every one of them runs.
+            let setups = tokio::sync::Semaphore::new(SETUPS_AT_ONCE);
+            let (now, most, ran) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+            let setup = |owner: usize| {
+                let (now, most, ran) = (&now, &most, &ran);
+                async move {
+                    let at_once = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(at_once, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    now.fetch_sub(1, Ordering::SeqCst);
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    owner
+                }
+            };
+            let project = |owners: std::ops::Range<usize>| a_few_at_a_time(&setups, owners.map(setup));
+            let (a, b) = tokio::join!(project(0..10), project(10..25));
+            assert_eq!(a, (0..10).collect::<Vec<_>>(), "each owner's answer, in order");
+            assert_eq!(b, (10..25).collect::<Vec<_>>());
+            assert_eq!(ran.load(Ordering::SeqCst), 25);
+            assert_eq!(most.load(Ordering::SeqCst), SETUPS_AT_ONCE, "the bound holds across both projects, and is reached");
+        }
+    );
 }

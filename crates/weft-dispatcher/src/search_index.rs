@@ -27,10 +27,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use sqlx::PgPool;
 use weft_core::project::graph::{GraphView, ProjectGraph};
 use weft_core::{ProjectDefinition, RunId};
 use weft_journal::RunEvent;
+use weft_task_store::db::{self, Client};
 
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "run_search",
@@ -84,21 +84,16 @@ impl Pending {
     /// Up to [`ROUND`] of the runs waiting here, locked on `tx` with `FOR
     /// UPDATE SKIP LOCKED`, so two searches at once never index one run
     /// twice.
-    async fn take(self, tx: &mut sqlx::PgConnection) -> sqlx::Result<Vec<RunId>> {
+    async fn take(self, tx: &db::Transaction<'_>) -> db::Result<Vec<RunId>> {
         match self {
             Pending::Queued => {
-                sqlx::query_scalar("SELECT run_id FROM run_search_queue ORDER BY run_id LIMIT $1 FOR UPDATE SKIP LOCKED")
-                    .bind(ROUND)
-                    .fetch_all(tx)
-                    .await
+                tx.scalars("SELECT run_id FROM run_search_queue ORDER BY run_id LIMIT $1 FOR UPDATE SKIP LOCKED", &[&ROUND]).await
             }
             Pending::Older => {
-                sqlx::query_scalar(
+                tx.scalars(
                     "SELECT run_id FROM run_search WHERE format < $2 ORDER BY run_id LIMIT $1 FOR UPDATE SKIP LOCKED",
+                    &[&ROUND, &FORMAT],
                 )
-                .bind(ROUND)
-                .bind(FORMAT)
-                .fetch_all(tx)
                 .await
             }
         }
@@ -149,7 +144,7 @@ type Programs = HashMap<(uuid::Uuid, String), Option<Arc<ProjectDefinition>>>;
 /// Build the entry of every run queued, then build again every entry at
 /// an older [`FORMAT`], a round of [`ROUND`] at a time, and answer how
 /// many.
-pub async fn index_queued(pool: &PgPool) -> anyhow::Result<usize> {
+pub async fn index_queued(pool: &db::Pool) -> anyhow::Result<usize> {
     let mut programs = Programs::new();
     let mut indexed = 0;
     for pending in Pending::BOTH {
@@ -166,14 +161,15 @@ pub async fn index_queued(pool: &PgPool) -> anyhow::Result<usize> {
 
 /// One round: up to [`ROUND`] runs waiting at `pending` indexed; answers
 /// how many.
-async fn round(pool: &PgPool, programs: &mut Programs, pending: Pending) -> anyhow::Result<usize> {
-    let mut tx = pool.begin().await?;
-    let ids = pending.take(&mut tx).await?;
+async fn round(pool: &db::Pool, programs: &mut Programs, pending: Pending) -> anyhow::Result<usize> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let ids = pending.take(&tx).await?;
     for run_id in &ids {
-        let record = weft_journal::record::read_record(&mut tx, *run_id, None).await?;
+        let record = weft_journal::record::read_record(&tx, *run_id, None).await?;
         let entry = match record.events(*run_id) {
             Ok(events) => {
-                let program = started_on(&mut tx, programs, *run_id, &events).await?;
+                let program = started_on(&tx, programs, *run_id, &events).await?;
                 Entry::of(*run_id, &events, program.as_deref().map(ProjectGraph::new).as_ref())
             }
             Err(e) => {
@@ -181,29 +177,25 @@ async fn round(pool: &PgPool, programs: &mut Programs, pending: Pending) -> anyh
                 Entry::default()
             }
         };
-        sqlx::query(
-            "INSERT INTO run_search (run_id, words, nodes, format) VALUES ($1, to_tsvector('simple', $2), $3, $4) \
+        tx.execute(
+            "INSERT INTO run_search (run_id, words, nodes, format) VALUES ($1, to_tsvector('simple', $2::text), $3, $4) \
              ON CONFLICT (run_id) DO UPDATE SET words = EXCLUDED.words, nodes = EXCLUDED.nodes, format = EXCLUDED.format",
+            &[run_id, &entry.words, &entry.nodes, &FORMAT],
         )
-        .bind(run_id)
-        .bind(&entry.words)
-        .bind(&entry.nodes)
-        .bind(FORMAT)
-        .execute(&mut *tx)
         .await?;
     }
-    sqlx::query("DELETE FROM run_search_queue WHERE run_id = ANY($1)").bind(&ids).execute(&mut *tx).await?;
+    tx.execute("DELETE FROM run_search_queue WHERE run_id = ANY($1)", &[&ids]).await?;
     tx.commit().await?;
     Ok(ids.len())
 }
 
-/// The program `events` (a run's record) was started on, read on `conn`
+/// The program `events` (a run's record) was started on, read on `db`
 /// and kept in `programs`: the registered one its birth names (the
 /// program it was cut from, for a run of a cut, which leaves out what it
 /// reuses). `None` when there is none to spell its nodes by (gone, never
 /// named, or no longer reading), said in the log.
 async fn started_on(
-    conn: &mut sqlx::PgConnection,
+    db: &impl Client,
     programs: &mut Programs,
     run_id: RunId,
     events: &[RunEvent],
@@ -217,7 +209,7 @@ async fn started_on(
     if let Some(program) = programs.get(&key) {
         return Ok(program.clone());
     }
-    let program = match crate::project_store::program_in(conn, *project_id, hash).await {
+    let program = match crate::project_store::program_in(db, *project_id, hash).await {
         Ok(Some(program)) => Some(Arc::new(program)),
         Ok(None) => {
             tracing::warn!(target: "weft_dispatcher::search", %run_id, %hash, "a run's program is gone; its nodes are not searchable");

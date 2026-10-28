@@ -708,12 +708,7 @@ pub(crate) fn not_now() -> Response {
 
 /// The `429` a refused call gets: which limit, and when to come back.
 fn too_many(refused: limits::Refused) -> Response {
-    (
-        StatusCode::TOO_MANY_REQUESTS,
-        [(axum::http::header::RETRY_AFTER, refused.retry_after_secs.to_string())],
-        refused.answer(),
-    )
-        .into_response()
+    refused.too_many_answer().into_response()
 }
 
 fn forwarded_for(headers: &HeaderMap) -> Option<&str> {

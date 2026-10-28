@@ -9,7 +9,7 @@
 //! the thin scope-checked HTTP wrappers around these.
 
 use anyhow::Context as _;
-use sqlx::PgPool;
+use weft_task_store::db::{Client, Param, Pool, Row, Transaction};
 
 use weft_broker_client::lifecycle_command::{
     command_reaches_copy, live_lease_exists, ownable_project, owns_project_predicate, supervisor_work,
@@ -66,14 +66,15 @@ use weft_task_store::unanswered::{infra_key_sql, Alerts};
 /// clock, never the app clock, so a skewed host can't mis-judge lease
 /// expiry.
 pub async fn sync_ownership(
-    pool: &PgPool,
+    pool: &Pool,
     req: &SupervisorSyncOwnershipRequest,
     booking: Option<&weft_task_store::drain::Booking>,
 ) -> anyhow::Result<SupervisorSyncOwnershipResponse> {
     let replica = req.replica.as_str();
     let held_projects: &[uuid::Uuid] = req.held_projects.as_deref().unwrap_or_default();
     let listed = req.held_projects.is_some();
-    let mut tx = pool.begin().await?;
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
     if !req.looked.is_empty() {
         // A look that failed in nothing (no `failed`, no `all_failed`)
         // ends the project's failures in a row.
@@ -81,54 +82,51 @@ pub async fn sync_ownership(
             Some(_) => Vec::new(),
             None => req.looked.iter().copied().filter(|p| !req.failed.iter().any(|t| t.project_id == *p)).collect(),
         };
-        sqlx::query(&format!(
-            "UPDATE infra_health_look l \
-                SET retry_at_unix = NULL, \
-                    failures = CASE WHEN l.project_id = ANY($3) THEN 0 ELSE l.failures END \
-              WHERE l.project_id = ANY($1) \
-                AND (l.retry_at_unix IS NOT NULL OR (l.failures <> 0 AND l.project_id = ANY($3))) \
-                AND {held}",
-            held = owns_project_predicate("$2", "l.project_id"),
-        ))
-        .bind(&req.looked)
-        .bind(replica)
-        .bind(&clean)
-        .execute(&mut *tx)
+        tx.execute(
+            &format!(
+                "UPDATE infra_health_look l \
+                    SET retry_at_unix = NULL, \
+                        failures = CASE WHEN l.project_id = ANY($3) THEN 0 ELSE l.failures END \
+                  WHERE l.project_id = ANY($1) \
+                    AND (l.retry_at_unix IS NOT NULL OR (l.failures <> 0 AND l.project_id = ANY($3))) \
+                    AND {held}",
+                held = owns_project_predicate("$2", "l.project_id"),
+            ),
+            &[&req.looked, &replica, &clean],
+        )
         .await
         .context("take the retries of the projects the supervisor looked at")?;
     }
     if !req.settled.is_empty() {
-        sqlx::query(&format!(
-            "DELETE FROM unanswered_call WHERE callee IN (SELECT {key} FROM unnest($1::uuid[]) AS s)",
-            key = infra_key_sql("s"),
-        ))
-        .bind(&req.settled)
-        .execute(&mut *tx)
+        tx.execute(
+            &format!("DELETE FROM unanswered_call WHERE callee IN (SELECT {key} FROM unnest($1::uuid[]) AS s)", key = infra_key_sql("s")),
+            &[&req.settled],
+        )
         .await
         .context("clear what the supervisor gave up on for settled projects")?;
     }
-    let alerts = record_troubles(&mut tx, req, booking.is_some()).await?;
+    let alerts = record_troubles(&tx, req, booking.is_some()).await?;
     let claimed = match req.ending {
         true => {
-            sqlx::query("DELETE FROM infra_owner WHERE supervisor_replica = $1")
-                .bind(replica)
-                .execute(&mut *tx)
+            tx.execute("DELETE FROM infra_owner WHERE supervisor_replica = $1", &[&replica])
                 .await
                 .context("give back the leases of a pass that ended")?;
             Vec::new()
         }
-        false => renew_and_claim(&mut tx, replica, held_projects, listed).await?,
+        false => renew_and_claim(&tx, replica, held_projects, listed).await?,
     };
     if let Some(listing) = &req.held_projects {
         let failed: Vec<uuid::Uuid> = req.failed.iter().map(|t| t.project_id).collect();
-        clear_what_nothing_owns(&mut tx, listing, &failed).await?;
+        clear_what_nothing_owns(&tx, listing, &failed).await?;
     }
     let next_due_unix = match booking {
-        Some(_) => next_due(&mut *tx, replica, held_projects, listed).await?,
+        Some(_) => next_due(&tx, replica, held_projects, listed).await?,
         None => None,
     };
-    let owned = owned_projects(&mut *tx, replica).await?;
+    let owned = owned_projects(&tx, replica).await?;
     tx.commit().await.context("commit sync_ownership tx")?;
+    // Back to the pool before the booking takes one of its own.
+    drop(conn);
     alerts.log();
     if let Some(booking) = booking {
         let at_ms = next_due_unix.map(|s| s.saturating_mul(1000));
@@ -151,7 +149,7 @@ pub async fn sync_ownership(
 /// `held_projects` is its host's latest listing, `listed` whether one
 /// went through.
 async fn renew_and_claim(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &Transaction<'_>,
     replica: &str,
     held_projects: &[uuid::Uuid],
     listed: bool,
@@ -160,22 +158,22 @@ async fn renew_and_claim(
     // Renew owned leases. A lease that had lapsed comes back as taken on
     // this tick (the self-join reads the row as it was before this
     // statement).
-    let mut claimed: Vec<uuid::Uuid> = sqlx::query_scalar::<_, Option<uuid::Uuid>>(&format!(
-        "UPDATE infra_owner io \
-         SET leased_until_unix = EXTRACT(EPOCH FROM NOW())::BIGINT + $1 \
-         FROM infra_owner prior \
-         WHERE io.supervisor_replica = $2 AND prior.project_id = io.project_id \
-           AND EXISTS (SELECT 1 FROM project p WHERE p.id = io.project_id AND {ownable}) \
-         RETURNING CASE WHEN prior.leased_until_unix < EXTRACT(EPOCH FROM NOW())::BIGINT \
-                        THEN io.project_id END",
-        ownable = ownable_project("p", "$3"),
-    ))
-    .bind(lease_secs)
-    .bind(replica)
-    .bind(held_projects)
-    .fetch_all(&mut **tx)
-    .await
-    .context("renew infra_owner leases")?
+    let mut claimed: Vec<uuid::Uuid> = tx
+        .scalars::<Option<uuid::Uuid>>(
+            &format!(
+                "UPDATE infra_owner io \
+                 SET leased_until_unix = EXTRACT(EPOCH FROM NOW())::BIGINT + $1 \
+                 FROM infra_owner prior \
+                 WHERE io.supervisor_replica = $2 AND prior.project_id = io.project_id \
+                   AND EXISTS (SELECT 1 FROM project p WHERE p.id = io.project_id AND {ownable}) \
+                 RETURNING CASE WHEN prior.leased_until_unix < EXTRACT(EPOCH FROM NOW())::BIGINT \
+                                THEN io.project_id END",
+                ownable = ownable_project("p", "$3"),
+            ),
+            &[&lease_secs, &replica, &held_projects],
+        )
+        .await
+        .context("renew infra_owner leases")?
     .into_iter()
     .flatten()
     .collect();
@@ -218,13 +216,11 @@ async fn renew_and_claim(
         ownable = ownable_project("p", "$4"),
         leased = live_lease_exists(None, "p.id"),
     );
-    let taken: Vec<uuid::Uuid> = sqlx::query_scalar(&sql)
-        .bind(replica)
-        .bind(weft_broker_client::lifecycle_command::SUPERVISOR_CLAIM_BATCH)
-        .bind(lease_secs)
-        .bind(held_projects)
-        .bind(listed)
-        .fetch_all(&mut **tx)
+    let taken: Vec<uuid::Uuid> = tx
+        .scalars(
+            &sql,
+            &[&replica, &weft_broker_client::lifecycle_command::SUPERVISOR_CLAIM_BATCH, &lease_secs, &held_projects, &listed],
+        )
         .await
         .context("claim infra_owner rows")?;
     claimed.extend(taken);
@@ -253,7 +249,7 @@ async fn renew_and_claim(
 /// install-wide failure (`Callee::GoneCopies`), which
 /// [`clear_what_nothing_owns`] clears.
 async fn record_troubles(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &Transaction<'_>,
     req: &SupervisorSyncOwnershipRequest,
     scales_to_zero: bool,
 ) -> anyhow::Result<Alerts> {
@@ -265,17 +261,18 @@ async fn record_troubles(
     let replica = req.replica.as_str();
     let named: Vec<uuid::Uuid> = req.failed.iter().chain(&req.gave_up).map(|t| t.project_id).collect();
     // (project, removed) of every named project still held or removed.
-    let judged: Vec<(uuid::Uuid, bool)> = sqlx::query_as(&format!(
-        "SELECT n.project_id, NOT EXISTS (SELECT 1 FROM project p WHERE p.id = n.project_id) AS removed \
-           FROM unnest($2::uuid[]) AS n(project_id) \
-          WHERE {owns} OR NOT EXISTS (SELECT 1 FROM project p WHERE p.id = n.project_id)",
-        owns = owns_project_predicate("$1", "n.project_id"),
-    ))
-    .bind(replica)
-    .bind(&named)
-    .fetch_all(&mut **tx)
-    .await
-    .context("read which troubled projects the supervisor still holds, or were removed")?;
+    let judged: Vec<(uuid::Uuid, bool)> = tx
+        .all(
+            &format!(
+                "SELECT n.project_id, NOT EXISTS (SELECT 1 FROM project p WHERE p.id = n.project_id) AS removed \
+                   FROM unnest($2::uuid[]) AS n(project_id) \
+                  WHERE {owns} OR NOT EXISTS (SELECT 1 FROM project p WHERE p.id = n.project_id)",
+                owns = owns_project_predicate("$1", "n.project_id"),
+            ),
+            &[&replica, &named],
+        )
+        .await
+        .context("read which troubled projects the supervisor still holds, or were removed")?;
     let mut removed: std::collections::BTreeSet<uuid::Uuid> = judged.iter().filter(|(_, removed)| *removed).map(|(p, _)| *p).collect();
     let held: Vec<uuid::Uuid> = judged.iter().filter(|(_, removed)| !*removed).map(|(p, _)| *p).collect();
     let mut failed: std::collections::BTreeMap<uuid::Uuid, String> = req
@@ -321,7 +318,7 @@ async fn record_troubles(
         if !scales_to_zero {
             let error = format!("{error} (tried again at the supervisor's next look)");
             alerts = alerts.and(
-                write_down(&mut **tx, Callee::Infra(*project), None, &error)
+                write_down(tx, Callee::Infra(*project), None, &error)
                     .await
                     .context("write down the project's failed pass")?,
             );
@@ -330,11 +327,11 @@ async fn record_troubles(
         let written = match count_failure(tx, *project, true).await? {
             (failures, Some(after)) => {
                 let error = format!("{error} (failure {failures} in a row; tried again in {} s)", after.as_secs());
-                write_down(&mut **tx, Callee::Infra(*project), None, &error).await
+                write_down(tx, Callee::Infra(*project), None, &error).await
             }
             (failures, None) => {
                 let error = format!("{error} (failed {failures} times in a row, so the supervisor stopped trying; `weft infra look` tries again)");
-                gave_up(&mut **tx, Callee::Infra(*project), None, &error).await
+                gave_up(tx, Callee::Infra(*project), None, &error).await
             }
         };
         alerts = alerts.and(written.context("write down the project's failed pass")?);
@@ -342,14 +339,14 @@ async fn record_troubles(
     if !removed_failures.is_empty() {
         let error = removed_failures.join("; ");
         let written = match removed_given_up {
-            true => gave_up(&mut **tx, Callee::GoneCopies, None, &error).await,
-            false => write_down(&mut **tx, Callee::GoneCopies, None, &error).await,
+            true => gave_up(tx, Callee::GoneCopies, None, &error).await,
+            false => write_down(tx, Callee::GoneCopies, None, &error).await,
         };
         alerts = alerts.and(written.context("write down what the host still holds of removed projects")?);
     }
     for trouble in req.gave_up.iter().filter(|t| held.contains(&t.project_id) && !failed.contains_key(&t.project_id)) {
         alerts = alerts.and(
-            gave_up(&mut **tx, Callee::Infra(trouble.project_id), None, &trouble.error)
+            gave_up(tx, Callee::Infra(trouble.project_id), None, &trouble.error)
                 .await
                 .context("write down what a health rule gave up on")?,
         );
@@ -363,30 +360,30 @@ async fn record_troubles(
 /// ([`weft_broker_client::protocol::supervisor_retry_after`]): the
 /// failures in a row, and how long until the retry, `None` once it gave up.
 async fn count_failure(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: &Transaction<'_>,
     project: uuid::Uuid,
     retried: bool,
 ) -> anyhow::Result<(u32, Option<std::time::Duration>)> {
-    let failures: i32 = sqlx::query_scalar(
-        "INSERT INTO infra_health_look (project_id, failures) VALUES ($1, 1) \
-         ON CONFLICT (project_id) DO UPDATE SET failures = infra_health_look.failures + 1 \
-         RETURNING failures",
-    )
-    .bind(project)
-    .fetch_one(&mut **tx)
-    .await
-    .context("count the project's failed pass")?;
+    let failures: i32 = tx
+        .scalar(
+            "INSERT INTO infra_health_look (project_id, failures) VALUES ($1, 1) \
+             ON CONFLICT (project_id) DO UPDATE SET failures = infra_health_look.failures + 1 \
+             RETURNING failures",
+            &[&project],
+        )
+        .await
+        .context("count the project's failed pass")?;
     let failures = u32::try_from(failures).with_context(|| format!("infra_health_look.failures is {failures}"))?;
     if !retried {
         return Ok((failures, None));
     }
     let retry_after = weft_broker_client::protocol::supervisor_retry_after(failures);
-    sqlx::query("UPDATE infra_health_look SET retry_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT + $2 WHERE project_id = $1")
-        .bind(project)
-        .bind(retry_after.map(|d| d.as_secs() as i64))
-        .execute(&mut **tx)
-        .await
-        .context("set when the project is tried again")?;
+    tx.execute(
+        "UPDATE infra_health_look SET retry_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT + $2 WHERE project_id = $1",
+        &[&project, &retry_after.map(|d| d.as_secs() as i64)],
+    )
+    .await
+    .context("set when the project is tried again")?;
     Ok((failures, retry_after))
 }
 
@@ -397,24 +394,20 @@ async fn count_failure(
 /// pass's retry is due, that no lease covers, and that only the listing
 /// could make ownable (a removed project's leftovers on the host
 /// included).
-async fn all_failed_over(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    replica: &str,
-    listed: bool,
-) -> anyhow::Result<Vec<(uuid::Uuid, bool)>> {
-    sqlx::query_as(&format!(
-        "SELECT held.project_id, FALSE FROM infra_owner held WHERE {owns} \
-         UNION \
-         SELECT l.project_id, p.id IS NULL FROM infra_health_look l LEFT JOIN project p ON p.id = l.project_id \
-          WHERE NOT $2 AND l.retry_at_unix <= EXTRACT(EPOCH FROM NOW())::BIGINT \
-            AND NOT {leased} AND (p.id IS NULL OR NOT {ownable})",
-        owns = owns_project_predicate("$1", "held.project_id"),
-        leased = live_lease_exists(None, "l.project_id"),
-        ownable = ownable_project("p", "'{}'::uuid[]"),
-    ))
-    .bind(replica)
-    .bind(listed)
-    .fetch_all(&mut **tx)
+async fn all_failed_over(tx: &Transaction<'_>, replica: &str, listed: bool) -> anyhow::Result<Vec<(uuid::Uuid, bool)>> {
+    tx.all(
+        &format!(
+            "SELECT held.project_id, FALSE FROM infra_owner held WHERE {owns} \
+             UNION \
+             SELECT l.project_id, p.id IS NULL FROM infra_health_look l LEFT JOIN project p ON p.id = l.project_id \
+              WHERE NOT $2 AND l.retry_at_unix <= EXTRACT(EPOCH FROM NOW())::BIGINT \
+                AND NOT {leased} AND (p.id IS NULL OR NOT {ownable})",
+            owns = owns_project_predicate("$1", "held.project_id"),
+            leased = live_lease_exists(None, "l.project_id"),
+            ownable = ownable_project("p", "'{}'::uuid[]"),
+        ),
+        &[&replica, &listed],
+    )
     .await
     .context("read which projects a pass that failed as a whole covered")
 }
@@ -429,12 +422,8 @@ async fn all_failed_over(
 ///   sync (`failed`): the host holds nothing of it any more, so its row
 ///   goes, and once no removed project's row is left, the install-wide
 ///   failure of the sweep of removed projects (`Callee::GoneCopies`).
-async fn clear_what_nothing_owns(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    held_projects: &[uuid::Uuid],
-    failed: &[uuid::Uuid],
-) -> anyhow::Result<()> {
-    sqlx::query(&format!(
+async fn clear_what_nothing_owns(tx: &Transaction<'_>, held_projects: &[uuid::Uuid], failed: &[uuid::Uuid]) -> anyhow::Result<()> {
+    let sql = format!(
         "WITH stale AS ( \
              SELECT l.project_id, p.id IS NULL AS removed \
                FROM infra_health_look l LEFT JOIN project p ON p.id = l.project_id \
@@ -457,12 +446,10 @@ async fn clear_what_nothing_owns(
         ownable = ownable_project("p", "$1"),
         infra_key = infra_key_sql("s.project_id"),
         gone_key = weft_task_store::unanswered::gone_copies_key_sql(),
-    ))
-    .bind(held_projects)
-    .bind(failed)
-    .execute(&mut **tx)
-    .await
-    .context("clear the retries and failures of what nothing can own any more")?;
+    );
+    tx.execute(&sql, &[&held_projects, &failed])
+        .await
+        .context("clear the retries and failures of what nothing can own any more")?;
     Ok(())
 }
 
@@ -470,15 +457,8 @@ async fn clear_what_nothing_owns(
 /// announces (unix seconds, database clock), or `None`: the earliest of
 /// [`supervisor_due`], `held_projects` being the projects this replica's
 /// host held at its latest listing, `listed` whether one went through.
-async fn next_due<'e, E>(executor: E, replica: &str, held_projects: &[uuid::Uuid], listed: bool) -> anyhow::Result<Option<i64>>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    sqlx::query_scalar(&format!("SELECT MIN(d.at) FROM ({due}) d", due = supervisor_due("$1", "$2", "$3")))
-        .bind(replica)
-        .bind(held_projects)
-        .bind(listed)
-        .fetch_one(executor)
+async fn next_due(db: &impl Client, replica: &str, held_projects: &[uuid::Uuid], listed: bool) -> anyhow::Result<Option<i64>> {
+    db.scalar(&format!("SELECT MIN(d.at) FROM ({due}) d", due = supervisor_due("$1", "$2", "$3")), &[&replica, &held_projects, &listed])
         .await
         .context("look for when the supervisors next have something to do")
 }
@@ -559,12 +539,8 @@ fn supervisor_due(replica_param: &str, held_param: &str, listed_param: &str) -> 
 
 /// The projects a supervisor owns (every live `infra_owner` lease it
 /// holds, whatever made the project ownable), joined to live project state,
-/// against any executor (a pool or the ownership tick's transaction).
-pub async fn owned_projects<'e, E>(executor: E, replica: &str) -> anyhow::Result<Vec<SupervisorProject>>
-where
-    E: sqlx::PgExecutor<'e>,
-{
-    use sqlx::Row;
+/// on any `Client` (a pool or the ownership tick's transaction).
+pub async fn owned_projects(db: &impl Client, replica: &str) -> anyhow::Result<Vec<SupervisorProject>> {
     // Every activation of the owned projects rides along (a project with
     // none has one row of NULLs from the LEFT JOIN): the health loop reads
     // the project's listening as ONE lifecycle, the aggregate over all its
@@ -581,10 +557,7 @@ where
          ORDER BY p.id",
         owns = owns_project_predicate("$1", "p.id"),
     );
-    let rows = sqlx::query(&sql)
-        .bind(replica)
-        .fetch_all(executor)
-        .await?;
+    let rows = db.query(&sql, &[&replica]).await?;
     let mut projects: Vec<(uuid::Uuid, String, Vec<weft_broker_client::activation::ActivationLifecycle>)> = Vec::new();
     for r in &rows {
         let project_id: uuid::Uuid = r.try_get("project_id").context("decode project_id")?;
@@ -604,8 +577,8 @@ where
             fires_visible_to_consumers: r.try_get("fires_visible_to_consumers").context("decode visibility")?,
             fires_deadline_unix: r.try_get("fires_deadline_unix").context("decode deadline")?,
             went_down: weft_broker_client::activation::WentDown::of_columns(
-                r.try_get::<Option<String>, _>("went_down_with").context("decode went_down_with")?.as_deref(),
-                r.try_get::<Option<i64>, _>("went_down_by_command").context("decode went_down_by_command")?,
+                r.try_get::<_, Option<String>>("went_down_with").context("decode went_down_with")?.as_deref(),
+                r.try_get::<_, Option<i64>>("went_down_by_command").context("decode went_down_by_command")?,
             )
             .map_err(anyhow::Error::msg)?,
             activating_run_id: r.try_get("activating_run_id").context("decode activating_run_id")?,
@@ -669,11 +642,10 @@ where
 /// on, cleared by [`complete_command`]), and the younger commands it held
 /// back are free to go.
 pub async fn claim_next(
-    pool: &PgPool,
+    pool: &Pool,
     claimer_replica: &str,
     busy_commands: &[i64],
 ) -> anyhow::Result<Option<SupervisorCommandRow>> {
-    use sqlx::Row;
     let sql = format!(
         "WITH spent AS ( \
              UPDATE infra_lifecycle_command c \
@@ -725,17 +697,15 @@ pub async fn claim_next(
         ),
         alerted = weft_task_store::unanswered::alerted_sql("gave_up"),
     );
-    let row = sqlx::query(&sql)
-        .bind(claimer_replica)
-        .bind(busy_commands)
-        .bind(SUPERVISOR_GIVE_UP_AFTER as i32)
-        .bind(LifecycleOutcome::Failed.as_str())
-        .bind(gave_up_message())
-        .fetch_one(pool)
+    let row: Row = pool
+        .one(
+            &sql,
+            &[&claimer_replica, &busy_commands, &(SUPERVISOR_GIVE_UP_AFTER as i32), &LifecycleOutcome::Failed.as_str(), &gave_up_message()],
+        )
         .await?;
     // One statement on the pool: committed once it answered.
     Alerts::of(row.try_get("alerted")?).log();
-    match row.try_get::<Option<i64>, _>("id")? {
+    match row.try_get::<_, Option<i64>>("id")? {
         Some(_) => Ok(Some(decode_command(&row)?)),
         None => Ok(None),
     }
@@ -757,34 +727,33 @@ fn gave_up_message() -> String {
 /// cleared (whether it fired, the command it queued and what it took
 /// down are kept), and the supervisor's next write of the state stores
 /// that.
-pub async fn health_state(pool: &PgPool, project_id: uuid::Uuid) -> anyhow::Result<SupervisorHealthStateResponse> {
-    use sqlx::Row;
-    let rows = sqlx::query(
-        "SELECT h.node_id, h.instance_id, h.rule, h.fired, h.consecutive_failures, h.next_retry_at_unix, \
-                h.gave_up_at_unix, h.gave_up_seen, h.last_error, h.queued_command, h.queued_deadline_unix, h.took_down, \
-                (EXISTS (SELECT 1 FROM infra_lifecycle_command c \
-                          WHERE c.project_id = h.project_id AND c.issued_at_unix >= h.gave_up_at_unix \
-                            AND c.verb IN ('apply', 'stop', 'terminate', 'upgrade')) \
-                 OR EXISTS (SELECT 1 FROM infra_health_look l \
-                             WHERE l.project_id = h.project_id AND l.asked_at_unix >= h.gave_up_at_unix)) AS touched \
-         FROM infra_health_rule h WHERE h.project_id = $1 ORDER BY h.node_id, h.instance_id NULLS FIRST, h.rule",
-    )
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .context("read the health rules' state")?;
+pub async fn health_state(pool: &Pool, project_id: uuid::Uuid) -> anyhow::Result<SupervisorHealthStateResponse> {
+    let rows = pool
+        .query(
+            "SELECT h.node_id, h.instance_id, h.rule, h.fired, h.consecutive_failures, h.next_retry_at_unix, \
+                    h.gave_up_at_unix, h.gave_up_seen, h.last_error, h.queued_command, h.queued_deadline_unix, h.took_down, \
+                    (EXISTS (SELECT 1 FROM infra_lifecycle_command c \
+                              WHERE c.project_id = h.project_id AND c.issued_at_unix >= h.gave_up_at_unix \
+                                AND c.verb IN ('apply', 'stop', 'terminate', 'upgrade')) \
+                     OR EXISTS (SELECT 1 FROM infra_health_look l \
+                                 WHERE l.project_id = h.project_id AND l.asked_at_unix >= h.gave_up_at_unix)) AS touched \
+             FROM infra_health_rule h WHERE h.project_id = $1 ORDER BY h.node_id, h.instance_id NULLS FIRST, h.rule",
+            &[&project_id],
+        )
+        .await
+        .context("read the health rules' state")?;
     let rules = rows
         .iter()
         .map(|r| {
             let rule: String = r.try_get("rule")?;
             let node_id: String = r.try_get("node_id")?;
             let instance = r
-                .try_get::<Option<String>, _>("instance_id")?
+                .try_get::<_, Option<String>>("instance_id")?
                 .map(weft_core::instance::InstanceId::new)
                 .transpose()
                 .map_err(|e| anyhow::anyhow!("infra_health_rule.instance_id of '{rule}' on '{node_id}': {e}"))?;
             let copy = weft_broker_client::protocol::InfraCopy { node_id, instance };
-            let queued = match (r.try_get::<Option<i64>, _>("queued_command")?, r.try_get::<Option<i64>, _>("queued_deadline_unix")?) {
+            let queued = match (r.try_get::<_, Option<i64>>("queued_command")?, r.try_get::<_, Option<i64>>("queued_deadline_unix")?) {
                 (Some(command), Some(deadline_unix)) => Some(QueuedHealthCommand { command, deadline_unix }),
                 (None, None) => None,
                 (command, deadline) => anyhow::bail!(
@@ -794,7 +763,7 @@ pub async fn health_state(pool: &PgPool, project_id: uuid::Uuid) -> anyhow::Resu
             };
             let fired: bool = r.try_get("fired")?;
             let took_down: bool = r.try_get("took_down")?;
-            if r.try_get::<bool, _>("touched")? {
+            if r.try_get::<_, bool>("touched")? {
                 return Ok(HealthRuleState {
                     copy,
                     rule,
@@ -827,13 +796,13 @@ pub async fn health_state(pool: &PgPool, project_id: uuid::Uuid) -> anyhow::Resu
     let queued: Vec<i64> = rules.iter().filter_map(|r| r.queued.map(|q| q.command)).collect();
     let ended = match queued.is_empty() {
         true => Vec::new(),
-        false => sqlx::query(
-            "SELECT id, outcome, outcome_message FROM infra_lifecycle_command \
-             WHERE id = ANY($1) AND completed_at_unix IS NOT NULL ORDER BY id",
-        )
-        .bind(&queued)
-        .fetch_all(pool)
-        .await
+        false => pool
+            .query(
+                "SELECT id, outcome, outcome_message FROM infra_lifecycle_command \
+                 WHERE id = ANY($1) AND completed_at_unix IS NOT NULL ORDER BY id",
+                &[&queued],
+            )
+            .await
         .context("read how the health rules' commands ended")?
         .iter()
         .map(|r| {
@@ -855,47 +824,46 @@ pub async fn health_state(pool: &PgPool, project_id: uuid::Uuid) -> anyhow::Resu
 /// The lease row is read `FOR SHARE` first in the same transaction, so a
 /// takeover waits for the write and a displaced supervisor writes
 /// nothing.
-pub async fn set_health_state(pool: &PgPool, req: &SupervisorSetHealthStateRequest) -> anyhow::Result<FencedWrite> {
-    let mut tx = pool.begin().await?;
-    let owns: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM infra_owner WHERE project_id = $1 AND supervisor_replica = $2 \
-                          AND leased_until_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT FOR SHARE)",
-    )
-    .bind(req.project_id)
-    .bind(&req.replica)
-    .fetch_one(&mut *tx)
-    .await
-    .context("read the project's lease")?;
+pub async fn set_health_state(pool: &Pool, req: &SupervisorSetHealthStateRequest) -> anyhow::Result<FencedWrite> {
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let owns: bool = tx
+        .scalar(
+            "SELECT EXISTS (SELECT 1 FROM infra_owner WHERE project_id = $1 AND supervisor_replica = $2 \
+                              AND leased_until_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT FOR SHARE)",
+            &[&req.project_id, &req.replica],
+        )
+        .await
+        .context("read the project's lease")?;
     if !owns {
         return Ok(FencedWrite::Displaced);
     }
-    sqlx::query("DELETE FROM infra_health_rule WHERE project_id = $1")
-        .bind(req.project_id)
-        .execute(&mut *tx)
+    tx.execute("DELETE FROM infra_health_rule WHERE project_id = $1", &[&req.project_id])
         .await
         .context("drop the project's health rules' state before writing it again")?;
     for r in &req.rules {
         let failures = i32::try_from(r.consecutive_failures).context("a rule's failures fit an INTEGER")?;
-        sqlx::query(
+        tx.execute(
             "INSERT INTO infra_health_rule \
                  (project_id, node_id, instance_id, rule, fired, consecutive_failures, next_retry_at_unix, \
                   gave_up_at_unix, gave_up_seen, last_error, queued_command, queued_deadline_unix, took_down) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            &[
+                &req.project_id,
+                &r.copy.node_id,
+                &r.copy.instance.as_ref().map(|i| i.as_str()),
+                &r.rule,
+                &r.fired,
+                &failures,
+                &r.next_retry_at_unix,
+                &r.gave_up_at_unix,
+                &r.gave_up_seen,
+                &r.last_error,
+                &r.queued.map(|q| q.command),
+                &r.queued.map(|q| q.deadline_unix),
+                &r.took_down,
+            ],
         )
-        .bind(req.project_id)
-        .bind(&r.copy.node_id)
-        .bind(r.copy.instance.as_ref().map(|i| i.as_str()))
-        .bind(&r.rule)
-        .bind(r.fired)
-        .bind(failures)
-        .bind(r.next_retry_at_unix)
-        .bind(r.gave_up_at_unix)
-        .bind(&r.gave_up_seen)
-        .bind(&r.last_error)
-        .bind(r.queued.map(|q| q.command))
-        .bind(r.queued.map(|q| q.deadline_unix))
-        .bind(r.took_down)
-        .execute(&mut *tx)
         .await
         .with_context(|| format!("write health rule '{}' on '{}'", r.rule, r.copy.node_id))?;
     }
@@ -905,21 +873,19 @@ pub async fn set_health_state(pool: &PgPool, req: &SupervisorSetHealthStateReque
 
 /// Which of the `busy` commands a person asked to cancel, but the ones
 /// whose cancel the supervisor already heard (`cancelling`).
-pub async fn cancels_for(pool: &PgPool, busy: &[i64], cancelling: &[i64]) -> anyhow::Result<Vec<i64>> {
-    sqlx::query_scalar(
+pub async fn cancels_for(pool: &Pool, busy: &[i64], cancelling: &[i64]) -> anyhow::Result<Vec<i64>> {
+    pool.scalars(
         "SELECT id FROM infra_lifecycle_command \
          WHERE id = ANY($1) AND cancel_requested AND NOT (id = ANY($2)) ORDER BY id",
+        &[&busy, &cancelling],
     )
-    .bind(busy)
-    .bind(cancelling)
-    .fetch_all(pool)
     .await
     .context("read the cancels of the supervisor's busy commands")
 }
 
 /// Whether a supervisor command waits on a project no supervisor holds
 /// a live lease over.
-pub async fn unowned_work_waiting(pool: &PgPool) -> anyhow::Result<bool> {
+pub async fn unowned_work_waiting(pool: &Pool) -> anyhow::Result<bool> {
     let sql = format!(
         "SELECT EXISTS ( \
              SELECT 1 FROM infra_lifecycle_command c \
@@ -928,7 +894,7 @@ pub async fn unowned_work_waiting(pool: &PgPool) -> anyhow::Result<bool> {
         pending = pending_supervisor_command("c"),
         leased = live_lease_exists(None, "c.project_id"),
     );
-    Ok(sqlx::query_scalar(&sql).fetch_one(pool).await?)
+    Ok(pool.scalar(&sql, &[]).await?)
 }
 
 /// A lifecycle command to issue. The tenant is the project's, never
@@ -964,9 +930,9 @@ pub struct IssuedCommand<'a> {
 /// statement (a `DO NOTHING` would return no row and need a second read
 /// that races the row's completion). Other verbs never match that
 /// index's predicate.
-pub async fn issue_command(pool: &PgPool, cmd: &IssuedCommand<'_>) -> anyhow::Result<Option<i64>> {
+pub async fn issue_command(pool: &Pool, cmd: &IssuedCommand<'_>) -> anyhow::Result<Option<i64>> {
     let (instance_id, every_copy) = cmd.copies.columns();
-    sqlx::query_scalar(
+    pool.scalar_opt(
         "INSERT INTO infra_lifecycle_command \
          (tenant_id, project_id, node_id, verb, \
           spec_json, issued_by_replica, issued_at_unix, instance_id, every_copy, source_hash) \
@@ -977,17 +943,18 @@ pub async fn issue_command(pool: &PgPool, cmd: &IssuedCommand<'_>) -> anyhow::Re
            WHERE completed_at_unix IS NULL AND verb = 'apply' \
            DO UPDATE SET issued_at_unix = infra_lifecycle_command.issued_at_unix \
          RETURNING id",
+        &[
+            &cmd.tenant_id,
+            &cmd.project_id,
+            &cmd.node_id,
+            &cmd.verb.as_str(),
+            &cmd.spec_json,
+            &cmd.issued_by_replica,
+            &instance_id,
+            &every_copy,
+            &cmd.source_hash,
+        ],
     )
-    .bind(cmd.tenant_id)
-    .bind(cmd.project_id)
-    .bind(cmd.node_id)
-    .bind(cmd.verb.as_str())
-    .bind(cmd.spec_json)
-    .bind(cmd.issued_by_replica)
-    .bind(instance_id)
-    .bind(every_copy)
-    .bind(cmd.source_hash)
-    .fetch_optional(pool)
     .await
     .context("issue infra_lifecycle_command")
 }
@@ -998,18 +965,16 @@ pub async fn issue_command(pool: &PgPool, cmd: &IssuedCommand<'_>) -> anyhow::Re
 /// copy. `None` when the run runs no registered program (a node test) or
 /// its build named no hash for the place: the copy then reads as behind
 /// until an apply stamps one.
-pub async fn place_hash_of_run(pool: &PgPool, project_id: uuid::Uuid, run_id: weft_core::RunId, place: &str) -> anyhow::Result<Option<String>> {
-    let found: Option<(uuid::Uuid, Option<String>)> = sqlx::query_as(
-        "SELECT r.run_id, p.infra_places ->> $3 FROM run r \
-         LEFT JOIN project_definition p ON p.project_id = r.project_id AND p.definition_hash = COALESCE(r.cut_from, r.definition_hash) \
-         WHERE r.run_id = $1 AND r.project_id = $2",
-    )
-    .bind(run_id)
-    .bind(project_id)
-    .bind(place)
-    .fetch_optional(pool)
-    .await
-    .context("the place hash of an infra setup's build")?;
+pub async fn place_hash_of_run(pool: &Pool, project_id: uuid::Uuid, run_id: weft_core::RunId, place: &str) -> anyhow::Result<Option<String>> {
+    let found: Option<(uuid::Uuid, Option<String>)> = pool
+        .opt(
+            "SELECT r.run_id, p.infra_places ->> $3::text FROM run r \
+             LEFT JOIN project_definition p ON p.project_id = r.project_id AND p.definition_hash = COALESCE(r.cut_from, r.definition_hash) \
+             WHERE r.run_id = $1 AND r.project_id = $2",
+            &[&run_id, &project_id, &place],
+        )
+        .await
+        .context("the place hash of an infra setup's build")?;
     let Some((_, hash)) = found else {
         anyhow::bail!("run {run_id} of project {project_id} applies infra, and no such run is on record");
     };
@@ -1019,7 +984,7 @@ pub async fn place_hash_of_run(pool: &PgPool, project_id: uuid::Uuid, run_id: we
 /// Record one infra event; its id, or `None` when the project row is
 /// gone (read live, for the reason `issue_command` gives).
 pub async fn record_event(
-    pool: &PgPool,
+    pool: &Pool,
     tenant_id: &str,
     project_id: uuid::Uuid,
     node_id: Option<&str>,
@@ -1027,21 +992,15 @@ pub async fn record_event(
     kind: &str,
     payload: &serde_json::Value,
 ) -> anyhow::Result<Option<i64>> {
-    sqlx::query_scalar(
+    pool.scalar_opt(
         "INSERT INTO infra_event \
          (tenant_id, project_id, node_id, kind, payload, at_unix, instance_id) \
          SELECT $1, p.id, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT, $6 \
          FROM project p WHERE p.id = $2 \
          FOR KEY SHARE OF p \
          RETURNING id",
+        &[&tenant_id, &project_id, &node_id, &kind, payload, &instance.map(|i| i.as_str())],
     )
-    .bind(tenant_id)
-    .bind(project_id)
-    .bind(node_id)
-    .bind(kind)
-    .bind(payload)
-    .bind(instance.map(|i| i.as_str()))
-    .fetch_optional(pool)
     .await
     .context("record infra_event")
 }
@@ -1049,16 +1008,15 @@ pub async fn record_event(
 /// Decode one `infra_lifecycle_command` row into the typed
 /// `SupervisorCommandRow` wire shape. EVERY column read propagates
 /// errors; an unknown verb becomes a 500 rather than a silent fallback.
-fn decode_command(r: &sqlx::postgres::PgRow) -> anyhow::Result<SupervisorCommandRow> {
-    use sqlx::Row;
+fn decode_command(r: &Row) -> anyhow::Result<SupervisorCommandRow> {
     let id: i64 = r.try_get("id")?;
     let project_id: uuid::Uuid = r.try_get("project_id")?;
-    let node_id: Option<String> = r.try_get::<Option<String>, _>("node_id")?;
+    let node_id: Option<String> = r.try_get::<_, Option<String>>("node_id")?;
     let verb_str: String = r.try_get("verb")?;
     let verb = InfraLifecycleVerb::parse(&verb_str)
         .ok_or_else(|| anyhow::anyhow!("infra_lifecycle_command.id={id}: unknown verb '{verb_str}'"))?;
     let spec_json: Option<serde_json::Value> =
-        r.try_get::<Option<serde_json::Value>, _>("spec_json")?;
+        r.try_get::<_, Option<serde_json::Value>>("spec_json")?;
     let force: bool = r.try_get("force")?;
     let instance_id: Option<String> = r.try_get("instance_id")?;
     let every_copy: bool = r.try_get("every_copy")?;
@@ -1096,15 +1054,10 @@ pub enum FencedWrite {
 /// SELECT settles which predicate failed (the WHERE that just failed
 /// cannot say). Displaced when `replica` no longer holds the
 /// project's `infra_owner` lease, Gone otherwise.
-pub async fn stale_answer(pool: &PgPool, replica: &str, project_id: uuid::Uuid) -> anyhow::Result<FencedWrite> {
-    let owns: bool = sqlx::query_scalar(&format!(
-        "SELECT {owns}",
-        owns = owns_project_predicate("$1", "$2"),
-    ))
-    .bind(replica)
-    .bind(project_id)
-    .fetch_one(pool)
-    .await?;
+pub async fn stale_answer(pool: &Pool, replica: &str, project_id: uuid::Uuid) -> anyhow::Result<FencedWrite> {
+    let owns: bool = pool
+        .scalar(&format!("SELECT {owns}", owns = owns_project_predicate("$1", "$2")), &[&replica, &project_id])
+        .await?;
     Ok(if owns { FencedWrite::Gone } else { FencedWrite::Displaced })
 }
 
@@ -1124,6 +1077,14 @@ fn rollup_sql(statuses: &str) -> String {
              LIMIT 1), \
             'stopped'))"
     )
+}
+
+/// `value` as the next `$n` of `params`: a statement whose parameters
+/// depend on the request binds each one only where it reads it, since
+/// every parameter a statement takes must appear in it.
+fn bind<'a>(params: &mut Vec<Param<'a>>, value: Param<'a>) -> String {
+    params.push(value);
+    format!("${}", params.len())
 }
 
 /// Stamp a status on an `infra_node` row, per unit or node-wide, under
@@ -1167,7 +1128,7 @@ fn rollup_sql(statuses: &str) -> String {
 /// the status while a user action is in flight, and the EXISTS is
 /// evaluated atomically with the write so a command that appeared after
 /// the supervisor's tick-level gate still blocks here.
-pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyhow::Result<FencedWrite> {
+pub async fn set_status(pool: &Pool, req: &SupervisorSetStatusRequest) -> anyhow::Result<FencedWrite> {
     // What a change waits on belongs to the change the row's status is
     // in (an apply while it provisions, a stop while it stops, a
     // terminate while it terminates): a stamp that changes the status
@@ -1181,93 +1142,117 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
              provisioning_since_unix = CASE WHEN {new_status} = 'provisioning' THEN provisioning_since_unix END"
         )
     };
-    // The first statement's binds: `$1` the unit (unused when unit=None),
-    // `$2` the status, `$3` to `$6` the project, the node, the fence's
-    // replica and the instance, `$7` the command, and `$8`, `$9` the
-    // stamps a unit's health windows run from
-    // (`UnitRuntime::not_ready_since_unix`, `ready_since_unix`). The
-    // second statement's: `$1` to `$3` the copy, `$4` the status (unused
-    // per unit, where the rollup decides), `$5`, `$6` its failure.
+    // The first statement's binds: `$1` the status, `$2` to `$5` the
+    // project, the node, the fence's replica and the instance; then, only
+    // where the statement reads them, the command, and per unit the unit,
+    // the stamps its health windows run from
+    // (`UnitRuntime::not_ready_since_unix`, `ready_since_unix`) and a
+    // restart the health check saw first (`UnitRuntime::last_restart`:
+    // when, why, the exit code), which only a write that carries one
+    // changes (its time NULL leaves the unit's as it is). The second
+    // statement's: `$1` to `$3` the copy, `$4`, `$5` its failure, and
+    // node-wide `$6` the status (per unit, the rollup decides).
     const SAME_COPY: &str = "u.project_id = f.project_id AND u.node_id = f.node_id AND u.instance_id IS NOT DISTINCT FROM f.instance_id";
-    let (unit_fence, units, node_status) = if req.unit.is_some() {
-        (
-            " AND EXISTS (SELECT 1 FROM infra_unit u WHERE u.project_id = n.project_id AND u.node_id = n.node_id \
-              AND u.instance_id IS NOT DISTINCT FROM n.instance_id AND u.unit = $1)",
-            format!(
-                "UPDATE infra_unit u SET status = $2::text, not_ready_since_unix = $8::bigint, \
-                 ready_since_unix = $9::bigint FROM fenced f WHERE {SAME_COPY} AND u.unit = $1"
-            ),
-            rollup_sql(
-                "SELECT u.status FROM infra_unit u WHERE u.project_id = n.project_id AND u.node_id = n.node_id \
-                 AND u.instance_id IS NOT DISTINCT FROM n.instance_id",
-            ),
-        )
-    } else {
+    let status = req.status.as_str();
+    let instance = req.instance.as_ref().map(|m| m.as_str());
+    let restart = req.restart.as_ref();
+    let restart_at = restart.map(|r| r.at_unix);
+    let restart_cause = restart.map(|r| r.cause.as_str());
+    let restart_code = restart.and_then(|r| r.cause.exit_code());
+    let mut fence_params: Vec<Param<'_>> = vec![&status, &req.project_id, &req.node_id, &req.replica, &instance];
+    let (unit_fence, units, node_status) = match &req.unit {
+        Some(unit) => {
+            let unit = bind(&mut fence_params, unit);
+            let not_ready = bind(&mut fence_params, &req.not_ready_since_unix);
+            let ready = bind(&mut fence_params, &req.ready_since_unix);
+            let at = bind(&mut fence_params, &restart_at);
+            let cause = bind(&mut fence_params, &restart_cause);
+            let code = bind(&mut fence_params, &restart_code);
+            (
+                format!(
+                    " AND EXISTS (SELECT 1 FROM infra_unit u WHERE u.project_id = n.project_id AND u.node_id = n.node_id \
+                      AND u.instance_id IS NOT DISTINCT FROM n.instance_id AND u.unit = {unit})"
+                ),
+                format!(
+                    "UPDATE infra_unit u SET status = $1::text, not_ready_since_unix = {not_ready}::bigint, \
+                     ready_since_unix = {ready}::bigint, \
+                     last_restart_at_unix = CASE WHEN {at}::bigint IS NULL THEN u.last_restart_at_unix ELSE {at} END, \
+                     last_restart_cause = CASE WHEN {at}::bigint IS NULL THEN u.last_restart_cause ELSE {cause}::text END, \
+                     last_restart_exit_code = CASE WHEN {at}::bigint IS NULL THEN u.last_restart_exit_code ELSE {code}::bigint END \
+                     FROM fenced f WHERE {SAME_COPY} AND u.unit = {unit}"
+                ),
+                rollup_sql(
+                    "SELECT u.status FROM infra_unit u WHERE u.project_id = n.project_id AND u.node_id = n.node_id \
+                     AND u.instance_id IS NOT DISTINCT FROM n.instance_id",
+                ),
+            )
+        }
         // Node-wide: every unit's status and the node status become
         // the stamp directly. The rollup over all-equal units would be
         // the stamp too, except for a unit-less roster (a spec with only
         // shared resources), where the rollup's empty default is
         // 'stopped' and would turn a Failed / Terminating stamp into a
         // cleanly stopped node.
-        ("", format!("UPDATE infra_unit u SET status = $2::text FROM fenced f WHERE {SAME_COPY}"), "$4::text".to_string())
+        None => (String::new(), format!("UPDATE infra_unit u SET status = $1::text FROM fenced f WHERE {SAME_COPY}"), "$6::text".to_string()),
     };
-    let commands = match req.command_id {
-        Some(_) => "EXISTS ( \
+    let reaches = command_reaches_copy("c", "$3", "$5");
+    let commands = match &req.command_id {
+        Some(command_id) => format!(
+            "EXISTS ( \
                SELECT 1 FROM infra_lifecycle_command c \
-               WHERE c.id = $7 \
-                 AND c.project_id = $3 \
+               WHERE c.id = {command} \
+                 AND c.project_id = $2 \
                  AND {reaches} \
                  AND c.completed_at_unix IS NULL \
              )",
-        None => "NOT EXISTS ( \
+            command = bind(&mut fence_params, command_id),
+        ),
+        None => format!(
+            "NOT EXISTS ( \
                SELECT 1 FROM infra_lifecycle_command c \
-               WHERE c.project_id = $3 \
+               WHERE c.project_id = $2 \
                  AND {reaches} \
                  AND c.completed_at_unix IS NULL \
-             )",
-    }
-    .replace("{reaches}", &command_reaches_copy("c", "$4", "$6"));
-    let unit_key = req.unit.clone().unwrap_or_default();
-    let instance = req.instance.as_ref().map(|m| m.as_str());
-    let mut tx = pool.begin().await?;
-    let fenced: i64 = sqlx::query_scalar(&format!(
-        "WITH fenced AS ( \
-             SELECT n.project_id, n.node_id, n.instance_id FROM infra_node n \
-              WHERE n.project_id = $3 AND n.node_id = $4 \
-                AND n.instance_id IS NOT DISTINCT FROM $6{unit_fence} AND {commands} AND {owns} \
-              FOR UPDATE), \
-              units AS ({units}) \
-         SELECT COUNT(*) FROM fenced",
-        owns = owns_project_predicate("$5", "$3"),
-    ))
-    .bind(&unit_key)
-    .bind(req.status.as_str())
-    .bind(req.project_id)
-    .bind(&req.node_id)
-    .bind(&req.replica)
-    .bind(instance)
-    .bind(req.command_id)
-    .bind(req.not_ready_since_unix)
-    .bind(req.ready_since_unix)
-    .fetch_one(&mut *tx)
-    .await?;
+             )"
+        ),
+    };
+    let mut conn = pool.get().await?;
+    let tx = conn.transaction().await?;
+    let fenced: i64 = tx
+        .scalar(
+            &format!(
+                "WITH fenced AS ( \
+                     SELECT n.project_id, n.node_id, n.instance_id FROM infra_node n \
+                      WHERE n.project_id = $2 AND n.node_id = $3 \
+                        AND n.instance_id IS NOT DISTINCT FROM $5{unit_fence} AND {commands} AND {owns} \
+                      FOR UPDATE), \
+                      units AS ({units}) \
+                 SELECT COUNT(*) FROM fenced",
+                owns = owns_project_predicate("$4", "$2"),
+            ),
+            &fence_params,
+        )
+        .await?;
     if fenced == 0 {
         drop(tx);
+        drop(conn);
         return stale_answer(pool, &req.replica, req.project_id).await;
     }
     // The node row is ours until commit, so this write reaches it.
-    sqlx::query(&format!(
-        "UPDATE infra_node n SET status = {node_status}, failure_stage = $5, failure_message = $6{progress} \
-          WHERE n.project_id = $1 AND n.node_id = $2 AND n.instance_id IS NOT DISTINCT FROM $3",
-        progress = progress(&node_status),
-    ))
-    .bind(req.project_id)
-    .bind(&req.node_id)
-    .bind(instance)
-    .bind(req.status.as_str())
-    .bind(req.failure_stage.map(|s| s.as_str()))
-    .bind(req.failure_message.as_deref())
-    .execute(&mut *tx)
+    let failure_stage = req.failure_stage.map(|s| s.as_str());
+    let failure_message = req.failure_message.as_deref();
+    let mut node_params: Vec<Param<'_>> = vec![&req.project_id, &req.node_id, &instance, &failure_stage, &failure_message];
+    if req.unit.is_none() {
+        node_params.push(&status);
+    }
+    tx.execute(
+        &format!(
+            "UPDATE infra_node n SET status = {node_status}, failure_stage = $4, failure_message = $5{progress} \
+              WHERE n.project_id = $1 AND n.node_id = $2 AND n.instance_id IS NOT DISTINCT FROM $3",
+            progress = progress(&node_status),
+        ),
+        &node_params,
+    )
     .await?;
     tx.commit().await.context("commit set_status tx")?;
     Ok(FencedWrite::Applied)
@@ -1277,40 +1262,71 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
 /// its `infra_unit` rows become exactly `units`.
 // SYNC: write_units <-> weft_broker_client::protocol::UnitRuntime, weft_broker_client::protocol::units_of_copy_sql, crates/weft-dispatcher/src/infra_node.rs (infra_unit, UNITS_MOVE)
 pub async fn write_units(
-    tx: &mut sqlx::PgConnection,
+    db: &impl Client,
     project_id: uuid::Uuid,
     node_id: &str,
     instance: Option<&weft_core::instance::InstanceId>,
     units: &std::collections::BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
 ) -> anyhow::Result<()> {
     let instance = instance.map(|m| m.as_str());
-    sqlx::query("DELETE FROM infra_unit WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3")
-        .bind(project_id)
-        .bind(node_id)
-        .bind(instance)
-        .execute(&mut *tx)
-        .await?;
+    db.execute(
+        "DELETE FROM infra_unit WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
+        &[&project_id, &node_id, &instance],
+    )
+    .await?;
     if units.is_empty() {
         return Ok(());
     }
-    let mut insert = sqlx::QueryBuilder::new(
-        "INSERT INTO infra_unit (project_id, node_id, instance_id, unit, status, stop_behavior, \
-         flaky_after_seconds, recovery_after_seconds, not_ready_since_unix, ready_since_unix, image_refs) ",
-    );
-    insert.push_values(units, |mut row, (unit, runtime)| {
-        row.push_bind(project_id)
-            .push_bind(node_id)
-            .push_bind(instance)
-            .push_bind(unit)
-            .push_bind(runtime.status.as_str())
-            .push_bind(runtime.stop_behavior.kind())
-            .push_bind(i64::from(runtime.flaky_after_seconds))
-            .push_bind(i64::from(runtime.recovery_after_seconds))
-            .push_bind(runtime.not_ready_since_unix)
-            .push_bind(runtime.ready_since_unix)
-            .push_bind(runtime.image_refs.iter().cloned().collect::<Vec<String>>());
-    });
-    insert.build().execute(&mut *tx).await?;
+    type UnitColumns<'a> =
+        (&'a str, &'a str, &'a str, i64, i64, Option<i64>, Option<i64>, Vec<&'a str>, Option<i64>, Option<&'a str>, Option<i64>);
+    let rows: Vec<UnitColumns<'_>> = units
+        .iter()
+        .map(|(unit, runtime)| {
+            let restart = runtime.last_restart.as_ref();
+            (
+                unit.as_str(),
+                runtime.status.as_str(),
+                runtime.stop_behavior.kind(),
+                i64::from(runtime.flaky_after_seconds),
+                i64::from(runtime.recovery_after_seconds),
+                runtime.not_ready_since_unix,
+                runtime.ready_since_unix,
+                runtime.image_refs.iter().map(String::as_str).collect(),
+                restart.map(|r| r.at_unix),
+                restart.map(|r| r.cause.as_str()),
+                restart.and_then(|r| r.cause.exit_code()),
+            )
+        })
+        .collect();
+    // `$1` to `$3` the copy, then each unit's own columns.
+    let mut params: Vec<Param<'_>> = vec![&project_id, &node_id, &instance];
+    let mut values = Vec::with_capacity(rows.len());
+    for (unit, status, stop, flaky, recovery, not_ready, ready, images, restart_at, restart_cause, restart_code) in &rows {
+        let columns = [
+            bind(&mut params, unit),
+            bind(&mut params, status),
+            bind(&mut params, stop),
+            bind(&mut params, flaky),
+            bind(&mut params, recovery),
+            bind(&mut params, not_ready),
+            bind(&mut params, ready),
+            bind(&mut params, images),
+            bind(&mut params, restart_at),
+            bind(&mut params, restart_cause),
+            bind(&mut params, restart_code),
+        ];
+        values.push(format!("($1, $2, $3, {})", columns.join(", ")));
+    }
+    db.execute(
+        &format!(
+            "INSERT INTO infra_unit (project_id, node_id, instance_id, unit, status, stop_behavior, \
+             flaky_after_seconds, recovery_after_seconds, not_ready_since_unix, ready_since_unix, image_refs, \
+             last_restart_at_unix, last_restart_cause, last_restart_exit_code) VALUES {}",
+            values.join(", "),
+        ),
+        &params,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1319,8 +1335,8 @@ pub async fn write_units(
 /// an uncompleted supervisor command that reaches the copy, and `replica`
 /// must still own the project, all in the UPDATE's own WHERE. The next
 /// stamp that changes the row's status clears it ([`set_status`]).
-pub async fn set_waiting(pool: &PgPool, req: &SupervisorSetWaitingRequest) -> anyhow::Result<FencedWrite> {
-    let res = sqlx::query(&format!(
+pub async fn set_waiting(pool: &Pool, req: &SupervisorSetWaitingRequest) -> anyhow::Result<FencedWrite> {
+    let sql = format!(
         "UPDATE infra_node SET waiting_on = $1 \
          WHERE project_id = $2 AND node_id = $3 \
            AND instance_id IS NOT DISTINCT FROM $4 AND EXISTS ( \
@@ -1333,16 +1349,14 @@ pub async fn set_waiting(pool: &PgPool, req: &SupervisorSetWaitingRequest) -> an
         pending = pending_supervisor_command("c"),
         reaches = command_reaches_copy("c", "$3", "$4"),
         owns = owns_project_predicate("$6", "$2"),
-    ))
-    .bind(&req.waiting)
-    .bind(req.project_id)
-    .bind(&req.node_id)
-    .bind(req.instance.as_ref().map(|m| m.as_str()))
-    .bind(req.command_id)
-    .bind(&req.replica)
-    .execute(pool)
-    .await?;
-    if res.rows_affected() > 0 {
+    );
+    let written = pool
+        .execute(
+            &sql,
+            &[&req.waiting, &req.project_id, &req.node_id, &req.instance.as_ref().map(|m| m.as_str()), &req.command_id, &req.replica],
+        )
+        .await?;
+    if written > 0 {
         return Ok(FencedWrite::Applied);
     }
     stale_answer(pool, &req.replica, req.project_id).await
@@ -1364,7 +1378,7 @@ pub async fn set_waiting(pool: &PgPool, req: &SupervisorSetWaitingRequest) -> an
 /// what tells the copy behind the source later. A NUL byte in the error, which a
 /// Postgres text column refuses, is dropped, so the ending is written.
 pub async fn complete_command(
-    pool: &PgPool,
+    pool: &Pool,
     req: &SupervisorCommandCompleteRequest,
 ) -> anyhow::Result<FencedWrite> {
     let outcome = if req.cancelled {
@@ -1375,7 +1389,7 @@ pub async fn complete_command(
             None => LifecycleOutcome::Succeeded,
         }
     };
-    let written: i64 = sqlx::query_scalar(&format!(
+    let sql = format!(
         "WITH done AS ( \
              UPDATE infra_lifecycle_command \
              SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
@@ -1396,23 +1410,16 @@ pub async fn complete_command(
          SELECT COUNT(*) FROM done",
         owns = owns_project_predicate("$4", "project_id"),
         key = weft_task_store::unanswered::commands_key_sql("project_id"),
-    ))
-    .bind(outcome.as_str())
-    .bind(req.error.as_deref().map(weft_task_store::unanswered::pg_text))
-    .bind(req.command_id)
-    .bind(&req.replica)
-    .fetch_one(pool)
-    .await?;
+    );
+    let message = req.error.as_deref().map(weft_task_store::unanswered::pg_text);
+    let written: i64 = pool.scalar(&sql, &[&outcome.as_str(), &message.as_deref(), &req.command_id, &req.replica]).await?;
     if written > 0 {
         return Ok(FencedWrite::Applied);
     }
     // The project id lives on the command row, so the ownership answer
     // comes from there; no command row at all is a gone target.
     let project: Option<uuid::Uuid> =
-        sqlx::query_scalar("SELECT project_id FROM infra_lifecycle_command WHERE id = $1")
-            .bind(req.command_id)
-            .fetch_optional(pool)
-            .await?;
+        pool.scalar_opt("SELECT project_id FROM infra_lifecycle_command WHERE id = $1", &[&req.command_id]).await?;
     match project {
         Some(project_id) => stale_answer(pool, &req.replica, project_id).await,
         None => Ok(FencedWrite::Gone),

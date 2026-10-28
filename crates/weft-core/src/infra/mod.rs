@@ -31,7 +31,7 @@ pub use resolve::{
     public_path, public_url, resolve, resolve_image, unit_image_refs, NodeRef, ResolveError, ResolvedNode,
     ResolvedUnit, VALUES_URL_ENV,
 };
-pub use status::InfraNodeStatus;
+pub use status::{InfraNodeStatus, LastRestart, RestartCause};
 pub use types::*;
 
 /// A string as a resource-name segment may hold it: lowercase letters and

@@ -189,7 +189,7 @@ Checked against the published rules, and all of these are enforced:
 - A licence file must ship. `release.yml` copies the repo `LICENSE`
   into `extension-vscode/` at package time.
 
-`pnpm dlx @vscode/vsce@3.9.2 ls --no-dependencies` lists exactly what
+`pnpm dlx @vscode/vsce@4.0.0 ls --no-dependencies` lists exactly what
 would ship, which is how to catch things like compiled tests riding
 along because `out/` was never cleaned.
 
@@ -234,5 +234,5 @@ reporting a release as broken.
 out ("Every fix and feature ends with setup.sh and the e2e that cover
 it"): the branch you merge has passed them on its final code. Packaging
 the `.vsix`
-(`pnpm run vscode:prepublish && pnpm dlx @vscode/vsce@3.9.2 package --no-dependencies`)
+(`pnpm run vscode:prepublish && pnpm dlx @vscode/vsce@4.0.0 package --no-dependencies`)
 is yours too: it touches nothing outside `extension-vscode/`.

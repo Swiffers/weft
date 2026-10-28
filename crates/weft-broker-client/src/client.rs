@@ -64,12 +64,14 @@ impl HttpCore {
     }
 
     /// Single call core: the body as JSON, sent on the line, the raw
-    /// answer back. Status interpretation lives in the thin wrappers
-    /// (`post` = 2xx-or-error, `post_or_404` = 404 is "no row",
-    /// `post_fenced` = 410 / 409 are the two stale `WriteOutcome`s).
+    /// answer back, sent again for as long as the broker turns it away
+    /// busy with nothing of it run ([`while_busy`]). Status interpretation
+    /// lives in the thin wrappers (`post` = 2xx-or-error, `post_or_404` =
+    /// 404 is "no row", `post_fenced` = 410 / 409 are the two stale
+    /// `WriteOutcome`s).
     async fn post_raw<Req: Serialize>(&self, path: &str, body: &Req, wait: CallWait) -> Result<Answer> {
         let body = serde_json::to_vec(body).with_context(|| format!("serialize {path}"))?;
-        self.link.call(path, body, wait).await.with_context(|| format!("POST {path}"))
+        while_busy(path, turned_away, || self.link.call(path, &body, wait)).await.with_context(|| format!("POST {path}"))
     }
 
     /// Shared 2xx gate + JSON parse for the status-interpreting
@@ -202,15 +204,30 @@ fn wait_ms(wait: Duration) -> u64 {
     u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Whether the broker answered that the call did nothing at all
-/// ([`NOT_DONE`]), so sending it again repeats nothing.
+/// Whether a call was turned away because the broker was busy, with
+/// nothing of it run, so sending it again repeats nothing: the broker
+/// answered that it could not get a database connection for it
+/// ([`NOT_DONE`]), or the line could not open for the call's whole wait
+/// because every copy of the broker the platform may run was busy
+/// (`LineError::NotSent` with `busy`). The predicate [`while_busy`] takes
+/// for any call made on the line.
 // SYNC: NOT_DONE <-> crates/weft-broker/src/handlers.rs unavailable_or_internal
-fn did_nothing(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        cause
-            .downcast_ref::<BrokerRefused>()
-            .is_some_and(|refused| refused.status == reqwest::StatusCode::SERVICE_UNAVAILABLE && refused.body == NOT_DONE)
-    })
+pub fn turned_away(sent: &Result<Answer>) -> bool {
+    match sent {
+        Ok(answer) => answered_busy(answer.status, &answer.body),
+        Err(e) => e.chain().any(|cause| matches!(cause.downcast_ref::<LineError>(), Some(LineError::NotSent { busy: true, .. }))),
+    }
+}
+
+/// Whether a call was turned away busy with nothing of it run: the broker
+/// answered that it could not get a database connection for it
+/// ([`NOT_DONE`]), or the platform in front of it answered 429 because
+/// every copy of the broker it may run was busy and it handed the call to
+/// none (Cloud Run at its most copies). The broker never answers 429
+/// itself, so a 429 is always the platform's.
+// SYNC: NOT_DONE <-> crates/weft-broker/src/handlers.rs unavailable_or_internal
+pub fn answered_busy(status: reqwest::StatusCode, body: &[u8]) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || (status == reqwest::StatusCode::SERVICE_UNAVAILABLE && body == NOT_DONE.as_bytes())
 }
 
 /// The first wait before asking again after the broker could not answer
@@ -264,35 +281,67 @@ where
     }
 }
 
-/// How long a call the broker answered [`NOT_DONE`] is sent again for, at
-/// first and at most between tries, and in all: the broker's database
-/// connections were all busy, which passes in moments, and one busy this
-/// long is a broker in trouble the caller hears about.
-const NOT_DONE_FIRST: Duration = Duration::from_millis(50);
-const NOT_DONE_LONGEST: Duration = Duration::from_secs(2);
-const NOT_DONE_FOR: Duration = Duration::from_secs(20);
+/// How long a call turned away busy waits before it is sent again: at
+/// first, then doubling up to the longest ([`busy_wait`]).
+const BUSY_FIRST: Duration = Duration::from_millis(50);
+const BUSY_LONGEST: Duration = Duration::from_secs(5);
 
-/// Make a call, and send it again for as long as the broker answers that it
-/// did nothing ([`did_nothing`]), within [`NOT_DONE_FOR`]: a claim or a
-/// task's end the broker could not even start is safe to send again, and
-/// failing it instead would fail a caller's run, or leave a finished task
-/// claimed until its lease runs out and it runs again.
-async fn until_done<T, F, Fut>(path: &str, mut call: F) -> Result<T>
+/// The calls this process sent again because the broker was busy, said in
+/// its log at most once a minute (`weft_task_store::throttle::Tally`).
+static BUSY: weft_task_store::throttle::Tally = weft_task_store::throttle::Tally::new();
+
+/// The wait after `last`: doubled, up to [`BUSY_LONGEST`].
+fn busy_wait(last: Duration) -> Duration {
+    (last * 2).min(BUSY_LONGEST)
+}
+
+/// `wait`, with up to half of it again at random, so callers turned away
+/// together do not all come back on the same tick.
+fn jittered(wait: Duration) -> Duration {
+    let half = u64::try_from(wait.as_micros() / 2).unwrap_or(u64::MAX).max(1);
+    wait + Duration::from_micros((uuid::Uuid::new_v4().as_u128() as u64) % half)
+}
+
+/// Count one call (or one try to open the line) the broker turned away
+/// with nothing of it run, at `path`, and say the count in the log when
+/// due: once at first, then once a minute with how many waited
+/// ([`BUSY`]), whichever way they were turned away.
+pub(crate) fn say_turned_away(path: &str) {
+    if let Some(waits) = BUSY.note(std::time::Instant::now()) {
+        tracing::warn!(
+            target: "weft_broker_client",
+            path, waits,
+            "the broker turned calls away with nothing of them run (its database is busy or not answering it, or every \
+             copy of it is in use), so they wait and are sent again. The broker's log says which; `weft status` shows when \
+             the install is short of database connections"
+        );
+    }
+}
+
+/// Make a call, and send it again for as long as `turned_away` says the
+/// broker turned it away with nothing of it run. The predicate is the
+/// caller's; for a call made on the line it is this module's
+/// [`turned_away`]. A turned-away call waits and is sent again, never
+/// failed, however long it lasts: either the install is running as fast
+/// as its database (or the broker's copies) let it, or the broker's
+/// database is not answering it for now, and the broker's own log says
+/// which (`weft_task_store::throttle`). The waits are said in this log,
+/// once at first and then once a minute with how many calls waited. Any
+/// other answer, or failure, is the call's.
+pub async fn while_busy<T, F, Fut>(path: &str, turned_away: impl Fn(&T) -> bool, mut call: F) -> T
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
+    Fut: std::future::Future<Output = T>,
 {
-    let started = tokio::time::Instant::now();
-    let mut wait = NOT_DONE_FIRST;
+    let mut wait = BUSY_FIRST;
     loop {
-        match call().await {
-            Err(e) if did_nothing(&e) && started.elapsed() < NOT_DONE_FOR => {
-                tracing::warn!(target: "weft_broker_client", path, retry_in_ms = wait.as_millis() as u64, "the broker did nothing with a call (its database connections were busy); sending it again");
-                tokio::time::sleep(wait).await;
-                wait = (wait * 2).min(NOT_DONE_LONGEST);
-            }
-            answer => return answer,
+        let sent = call().await;
+        if !turned_away(&sent) {
+            return sent;
         }
+        say_turned_away(path);
+        tokio::time::sleep(jittered(wait)).await;
+        wait = busy_wait(wait);
     }
 }
 
@@ -679,7 +728,7 @@ impl BrokerRunClient {
     pub async fn claim(&self, run_id: RunId) -> Result<Option<weft_journal::record::Claimed>> {
         let path = "/v1/run/claim";
         let req = RunClaimRequest { run_id };
-        let resp: RunClaimResponse = until_done(path, || self.http.post(path, &req)).await?;
+        let resp: RunClaimResponse = self.http.post(path, &req).await?;
         Ok(resp.claimed)
     }
 
@@ -1188,38 +1237,74 @@ mod read_retry_tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
-    /// Only the broker's own "nothing was done" makes a write safe to send
-    /// again: any other 503 may have half happened.
-    #[test]
-    fn only_nothing_done_is_safe_to_send_again() {
-        let not_done: anyhow::Error =
-            BrokerRefused { path: "/v1/task/complete".into(), status: reqwest::StatusCode::SERVICE_UNAVAILABLE, body: NOT_DONE.into() }.into();
-        assert!(did_nothing(&not_done));
-        assert!(!did_nothing(&refused(reqwest::StatusCode::SERVICE_UNAVAILABLE)));
-        assert!(!did_nothing(&refused(reqwest::StatusCode::INTERNAL_SERVER_ERROR)));
+    fn answer(status: reqwest::StatusCode, body: &str) -> Result<Answer> {
+        Ok(Answer { status, body: body.as_bytes().to_vec() })
     }
 
-    /// A call the broker did nothing with is sent again until it is done;
-    /// one that failed otherwise is not.
+    fn not_sent(busy: bool) -> Result<Answer> {
+        Err(anyhow::Error::from(LineError::NotSent { waited: Duration::from_secs(30), why: "429".into(), busy }).context("POST /v1/x"))
+    }
+
+    /// Only a call nothing of which ran is sent again: the broker's own
+    /// "nothing was done", or a line every copy of the broker turned away
+    /// busy. Any other 503 may have half happened; a line down for any
+    /// other reason is the call's failure.
+    #[test]
+    fn only_a_call_turned_away_busy_is_sent_again() {
+        assert!(turned_away(&answer(reqwest::StatusCode::SERVICE_UNAVAILABLE, NOT_DONE)));
+        assert!(turned_away(&not_sent(true)));
+        assert!(turned_away(&answer(reqwest::StatusCode::TOO_MANY_REQUESTS, "Rate exceeded.")), "the platform handed it to no copy");
+        assert!(!turned_away(&answer(reqwest::StatusCode::SERVICE_UNAVAILABLE, "the database connection dropped")));
+        assert!(!turned_away(&answer(reqwest::StatusCode::INTERNAL_SERVER_ERROR, NOT_DONE)));
+        assert!(!turned_away(&answer(reqwest::StatusCode::OK, "{}")));
+        assert!(!turned_away(&not_sent(false)));
+    }
+
+    /// The wait between tries doubles up to its longest, and its jitter
+    /// only ever adds, by less than half.
+    #[test]
+    fn a_busy_wait_doubles_up_to_its_longest() {
+        let mut wait = BUSY_FIRST;
+        let mut waits = vec![wait];
+        while wait < BUSY_LONGEST {
+            wait = busy_wait(wait);
+            waits.push(wait);
+        }
+        assert_eq!(waits.first(), Some(&Duration::from_millis(50)));
+        assert_eq!(busy_wait(BUSY_LONGEST), BUSY_LONGEST, "never past the longest");
+        assert!(waits.windows(2).all(|w| w[1] == (w[0] * 2).min(BUSY_LONGEST)));
+        for _ in 0..100 {
+            let j = jittered(BUSY_FIRST);
+            assert!(j >= BUSY_FIRST && j < BUSY_FIRST + BUSY_FIRST / 2, "{j:?}");
+        }
+    }
+
+    /// A call turned away busy is sent again for as long as it takes, here
+    /// well past the twenty seconds a call used to be given; one that
+    /// failed otherwise is not sent again.
     #[tokio::test(start_paused = true)]
-    async fn a_call_that_did_nothing_is_sent_again() {
+    async fn a_call_turned_away_busy_waits_until_it_goes_through() {
         let calls = AtomicU32::new(0);
-        let answer = until_done("/v1/task/complete", || async {
+        let started = tokio::time::Instant::now();
+        let sent = while_busy("/v1/task/complete", turned_away, || async {
             match calls.fetch_add(1, Ordering::SeqCst) {
-                0 | 1 => Err(BrokerRefused { path: "/v1/task/complete".into(), status: reqwest::StatusCode::SERVICE_UNAVAILABLE, body: NOT_DONE.into() }.into()),
-                _ => Ok(7),
+                0..20 => answer(reqwest::StatusCode::SERVICE_UNAVAILABLE, NOT_DONE),
+                20 => not_sent(true),
+                _ => answer(reqwest::StatusCode::OK, "7"),
             }
         })
         .await
         .unwrap();
-        assert_eq!((answer, calls.load(Ordering::SeqCst)), (7, 3));
+        assert_eq!((sent.body, calls.load(Ordering::SeqCst)), (b"7".to_vec(), 22));
+        assert!(started.elapsed() > Duration::from_secs(60), "it waited as long as the broker was busy");
         let calls = AtomicU32::new(0);
-        let failed: Result<u32> = until_done("/v1/task/complete", || async {
+        let sent = while_busy("/v1/task/complete", turned_away, || async {
             calls.fetch_add(1, Ordering::SeqCst);
-            Err(refused(reqwest::StatusCode::SERVICE_UNAVAILABLE))
+            answer(reqwest::StatusCode::SERVICE_UNAVAILABLE, "the database connection dropped")
         })
-        .await;
-        assert!(failed.is_err());
+        .await
+        .unwrap();
+        assert_eq!(sent.status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "a 503 that may have half happened is not sent again");
     }
 

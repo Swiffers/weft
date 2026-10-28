@@ -6,7 +6,7 @@ use serde_json::json;
 
 use weft::{EndpointMethod, FakeRig, NodeTest, WeftResult};
 
-use super::{PostgresDatabaseNode, CREDENTIAL_PATH, CREDENTIAL_STORED_PATH};
+use super::{memory_mib, PostgresDatabaseNode, Tuning, CREDENTIAL_PATH, CREDENTIAL_STORED_PATH, LEAST_MEMORY_MIB, MOST_AT_ONCE};
 
 /// The service this node declares it publishes, spelled here as the
 /// test's own expectation rather than read from the node, so a change
@@ -20,6 +20,12 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("its_machine_is_what_its_settings_say", sized),
         NodeTest::fake("keeps_the_credential_endpoint_to_the_project", internal),
         NodeTest::fake("waits_for_postgres_to_answer_for_itself", ready),
+        NodeTest::basic("memory_reads_in_every_unit_the_input_takes", memory_units),
+        NodeTest::basic("postgres_is_tuned_to_the_memory_it_has", tuned),
+        NodeTest::basic("a_machine_too_small_for_one_worker_is_refused", too_small),
+        NodeTest::basic("the_least_memory_is_where_one_worker_fits_and_the_input_says_so", least_memory),
+        NodeTest::basic("a_full_database_is_told_by_the_runs_it_holds_back", full_waits),
+        NodeTest::fake("postgres_runs_with_its_tuning_and_its_share_of_memory", runs_tuned),
         NodeTest::fake("the_first_run_reads_the_password_and_retires_it", first_run),
         NodeTest::fake("a_later_run_never_asks_the_database_again", later_run),
         NodeTest::fake("a_replaced_disk_makes_the_node_ask_again", replaced_disk),
@@ -190,6 +196,113 @@ async fn ready(rig: FakeRig) -> WeftResult<()> {
     // socket-only server while it initialises, so a socket check
     // reports ready while the port is still closed.
     assert!(command.iter().any(|a| a == "-h"), "the check must go over TCP: {command:?}");
+    // A database that always exists: without `-d` the check signs in to
+    // one named after the user, and the server logs that it is missing
+    // on every check.
+    assert!(command.windows(2).any(|w| w == ["-d", "postgres"]), "{command:?}");
+    Ok(())
+}
+
+fn memory_units() -> WeftResult<()> {
+    assert_eq!(memory_mib("1Gi")?, 1024);
+    assert_eq!(memory_mib("1.5Gi")?, 1536);
+    assert_eq!(memory_mib("512Mi")?, 512);
+    // A gigabyte is 10^9 bytes, a little under 954 MiB, rounded down so
+    // nothing is planned for memory the machine does not have.
+    assert_eq!(memory_mib("1G")?, 953);
+    assert_eq!(memory_mib("1500M")?, 1430);
+    assert!(memory_mib("1GB").is_err());
+    assert!(memory_mib("Gi").is_err());
+    Ok(())
+}
+
+/// The default machine, worked through by hand from the formula: 1024
+/// MiB less 320 for the rest of the machine leaves 704; a quarter of
+/// that is the shared cache, a sixteenth each cleaner's, and the 396
+/// left over holds 24 connections at 16 MiB each.
+fn tuned() -> WeftResult<()> {
+    assert_eq!(
+        Tuning::for_machine("1Gi")?,
+        Tuning {
+            limit_mib: 704,
+            max_connections: 24,
+            shared_buffers_mib: 176,
+            work_mem_kib: 4352,
+            maintenance_work_mem_mib: 44,
+            effective_cache_size_mib: 528,
+        }
+    );
+    // More memory, more connections, each still given about Postgres's
+    // own 4MB to sort in.
+    let two = Tuning::for_machine("2Gi")?;
+    assert_eq!(two.max_connections, 60);
+    assert!((4096..4400).contains(&two.work_mem_kib), "{two:?}");
+    // Past the most connections Postgres takes, the memory goes to each
+    // connection's sorting instead.
+    let big = Tuning::for_machine("64Gi")?;
+    assert_eq!(big.max_connections, 200);
+    assert_eq!(big.maintenance_work_mem_mib, 1024, "a vacuum uses at most 1GB");
+    assert!(big.work_mem_kib > 100 * 1024, "{big:?}");
+    // Whatever the machine, everything the settings allow at once fits
+    // in Postgres's share.
+    for memory in ["1Gi", "1.5Gi", "2Gi", "4Gi", "8Gi", "16Gi", "64Gi"] {
+        let t = Tuning::for_machine(memory)?;
+        let at_once_kib = t.shared_buffers_mib * 1024
+            + 3 * t.maintenance_work_mem_mib * 1024
+            + t.max_connections * (8 * 1024 + 2 * t.work_mem_kib);
+        assert!(at_once_kib <= t.limit_mib * 1024, "{memory}: {t:?}");
+    }
+    Ok(())
+}
+
+fn too_small() -> WeftResult<()> {
+    let refused = Tuning::for_machine("512Mi").expect_err("512Mi holds fewer connections than one worker opens");
+    let floor = format!("raise `memory` to {LEAST_MEMORY_MIB}Mi or more");
+    assert!(matches!(&refused, weft::WeftError::Input(m) if m.contains(&floor)), "{refused:?}");
+    Ok(())
+}
+
+/// The notice about a full database counts runs, each once however
+/// many times it is refused, says how many wait now, and comes at most
+/// once a minute.
+fn full_waits() -> WeftResult<()> {
+    let t0 = std::time::Instant::now();
+    let mut waits = super::super::postgres::FullWaits::default();
+    waits.begin();
+    waits.begin();
+    let first = waits.notice(t0).expect("the first refusal is told");
+    assert!(first.contains("2 run(s) wait for one now, 2 began waiting"), "{first}");
+    assert_eq!(waits.notice(t0 + std::time::Duration::from_secs(30)), None, "once a minute at most");
+    waits.waiting -= 1;
+    let later = waits.notice(t0 + std::time::Duration::from_secs(61)).expect("a minute later");
+    assert!(later.contains("1 run(s) wait for one now, 0 began waiting"), "{later}");
+    Ok(())
+}
+
+/// The floor the refusal names is the real one (one MiB less is
+/// refused, it is not), and the `memory` input's description states
+/// the same number and connection count.
+fn least_memory() -> WeftResult<()> {
+    assert_eq!(Tuning::for_machine(&format!("{LEAST_MEMORY_MIB}Mi"))?.max_connections, MOST_AT_ONCE as u64);
+    assert!(Tuning::for_machine(&format!("{}Mi", LEAST_MEMORY_MIB - 1)).is_err());
+    let metadata: serde_json::Value = serde_json::from_str(include_str!("metadata.json")).expect("metadata.json reads");
+    let memory = metadata["inputs"]
+        .as_array()
+        .and_then(|inputs| inputs.iter().find(|i| i["name"] == "memory"))
+        .and_then(|i| i["description"].as_str())
+        .expect("a memory input with a description");
+    let says = format!("at least {LEAST_MEMORY_MIB}Mi, the least that holds the {MOST_AT_ONCE} connections");
+    assert!(memory.contains(&says), "the description says '{says}': {memory}");
+    Ok(())
+}
+
+async fn runs_tuned(rig: FakeRig) -> WeftResult<()> {
+    let outcome = rig.run_provision_infra(&PostgresDatabaseNode, config()).await.ok()?;
+    let spec = outcome.infra_spec()?;
+    let postgres = &spec.units[0].containers[0];
+    assert_eq!(postgres.args, Tuning::for_machine("1Gi")?.args());
+    assert!(postgres.args.windows(2).any(|w| w == ["-c", "max_connections=24"]), "{:?}", postgres.args);
+    assert_eq!(postgres.limits.memory.as_deref(), Some("704Mi"));
     Ok(())
 }
 

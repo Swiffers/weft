@@ -229,6 +229,10 @@ pub fn error_detail(e: &anyhow::Error) -> Value {
 pub struct Progress {
     pub json: bool,
     pub verb: ActionVerb,
+    /// The `--on <target>` the command was given, so a line that names a
+    /// command to run names it for the install the person is acting on
+    /// ([`Progress::weft`]).
+    on: Option<String>,
     /// Shared latch tracking whether ANY error event has already been
     /// emitted on this verb. Lets `with_progress` skip the
     /// auto-error trap when the body already emitted a structured
@@ -258,10 +262,11 @@ impl std::error::Error for Reported {
 }
 
 impl Progress {
-    pub fn new(verb: ActionVerb, json: bool) -> Self {
+    pub fn new(verb: ActionVerb, json: bool, on: Option<String>) -> Self {
         Self {
             json,
             verb,
+            on,
             error_emitted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -271,6 +276,12 @@ impl Progress {
     /// when the body already produced a structured error.
     pub fn has_emitted_error(&self) -> bool {
         self.error_emitted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `weft <verb>` as a line of this command names it: with the `--on
+    /// <target>` the command was given (`crate::commands::weft_on`).
+    pub fn weft(&self, verb: &str) -> String {
+        crate::commands::weft_on(self.on.as_deref(), verb)
     }
 
     /// Core emit. Most call sites prefer the typed helpers below
@@ -297,7 +308,7 @@ impl Progress {
             // errors go where a shell expects them, on stderr, so a
             // script capturing stdout gets the result and nothing
             // else; every other line is progress and stays on stdout.
-            if let Some(line) = human_line(&ev) {
+            if let Some(line) = human_line(&ev, &|verb| self.weft(verb)) {
                 match ev.phase {
                     Phase::Warning | Phase::Error => eprintln!("{line}"),
                     _ => println!("{line}"),
@@ -357,6 +368,19 @@ impl Progress {
         if running == weft_core::Running::Wait {
             self.emit(Phase::DrainWait, Some(serde_json::json!({ "on": on.as_str() })));
         }
+    }
+
+    /// The runs on the old version a resync waits for changed (`waits_for`,
+    /// as its task said it): said again with each one's start, and once
+    /// with none when every one named before has ended (a run a worker took
+    /// and has not put on record yet is waited for unnamed, so none named
+    /// is not none left).
+    // SYNC: the drain_wait detail's waitsFor <-> packages/weft-graph/src/protocol.ts CliPhase (drain_wait)
+    pub fn resync_waits_for(&self, waits_for: &weft_core::deactivation::ResyncProgress) {
+        self.emit(
+            Phase::DrainWait,
+            Some(serde_json::json!({ "on": DrainOn::Resync.as_str(), "waitsFor": waits_for.waits_for })),
+        );
     }
 
     pub fn dispatcher_call_start(&self, path: &str) {
@@ -452,6 +476,38 @@ impl Progress {
     }
 }
 
+/// How many of the runs a resync waits for are named on its line; the
+/// rest are counted.
+const RUNS_NAMED: usize = 5;
+
+/// What a resync waits for, at `now_unix`, as one line: the runs going on
+/// the old version (oldest first, each with how long it has been going)
+/// and the ways out, or, once none is named any more, only that: a run a
+/// worker took and has not put on record yet is waited for without being
+/// named (`weft_core::deactivation::ResyncProgress`), so an empty list
+/// never means the old version is done. `weft` spells a command for the
+/// install the person acts on.
+pub(crate) fn resync_wait_line(runs: &[weft_core::deactivation::RunGoing], now_unix: i64, weft: impl Fn(&str) -> String) -> String {
+    if runs.is_empty() {
+        return "the runs named on the old version have ended; the new version takes over once the resync finishes".to_string();
+    }
+    let mut named: Vec<String> = runs
+        .iter()
+        .take(RUNS_NAMED)
+        .map(|run| format!("{} (going {})", run.run_id, elapsed_text(now_unix.saturating_sub(run.since_unix).max(0).unsigned_abs())))
+        .collect();
+    if runs.len() > RUNS_NAMED {
+        named.push(format!("and {} more", runs.len() - RUNS_NAMED));
+    }
+    let counted = if runs.len() == 1 { "1 run on the old one ends".to_string() } else { format!("{} runs on the old one end", runs.len()) };
+    format!(
+        "the new version takes over once {counted}: {}; `{}` ends one now, `{}` gives the resync up",
+        named.join(", "),
+        weft("stop <run>"),
+        weft("cancel-activate")
+    )
+}
+
 /// The build's heartbeat: what is building, what is built, and, between
 /// images, that the next one has not reached the builder yet (the line
 /// never names nothing).
@@ -488,8 +544,9 @@ pub(crate) fn now_unix() -> u64 {
 
 /// Render a human-mode status line. Returns None for phases that
 /// shouldn't surface in plain text mode (paired _done events are
-/// implicit; complete is summary-only).
-fn human_line(ev: &Event<'_>) -> Option<String> {
+/// implicit; complete is summary-only). `weft` spells a command for the
+/// install the person acts on.
+fn human_line(ev: &Event<'_>, weft: &dyn Fn(&str) -> String) -> Option<String> {
     Some(match ev.phase {
         Phase::BuildStart => format!(
             "building {}",
@@ -533,17 +590,31 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
             )
         }
         Phase::InfraProvisionStart => "provisioning infra".to_string(),
+        // What a resync waits for, said again each time it changes.
+        Phase::DrainWait if ev.detail.and_then(|d| d.get("waitsFor")).is_some() => {
+            let runs: Vec<weft_core::deactivation::RunGoing> =
+                ev.detail.and_then(|d| d.get("waitsFor")).and_then(|runs| serde_json::from_value(runs.clone()).ok()).unwrap_or_default();
+            format!("  {}", resync_wait_line(&runs, now_unix() as i64, weft))
+        }
         Phase::DrainWait => match ev.detail.as_ref().and_then(|d| d.get("on")).and_then(Value::as_str) {
-            Some("resync") => "the triggers that are on and behind go down now, and the new version takes over once any run \
-                 still going on the old one ends, however long it takes (`weft stop <run>` ends one now, `weft cancel-activate` \
-                 gives the resync up; Ctrl+C stops following, the resync goes on)"
-                .to_string(),
-            Some("deactivate") => "the triggers go down now; waiting for the runs they fired to end, however long they take \
-                 (`weft stop <run>` ends one now; Ctrl+C stops waiting, the triggers stay down)"
-                .to_string(),
-            _ => "any run reaching the infra it takes down is waited for first, however long it takes \
-                 (`weft stop <run>` ends one now, `weft infra cancel` calls the command off)"
-                .to_string(),
+            Some("resync") => format!(
+                "the triggers that are on and behind go down now, and the new version takes over once any run \
+                 still going on the old one ends, however long it takes (`{}` ends one now, `{}` \
+                 gives the resync up; Ctrl+C stops following, the resync goes on)",
+                weft("stop <run>"),
+                weft("cancel-activate")
+            ),
+            Some("deactivate") => format!(
+                "the triggers go down now; waiting for the runs they fired to end, however long they take \
+                 (`{}` ends one now; Ctrl+C stops waiting, the triggers stay down)",
+                weft("stop <run>")
+            ),
+            _ => format!(
+                "any run reaching the infra it takes down is waited for first, however long it takes \
+                 (`{}` ends one now, `{}` calls the command off)",
+                weft("stop <run>"),
+                weft("infra cancel")
+            ),
         },
         Phase::TriggerRegisterStart => "registering triggers".to_string(),
         Phase::InfraWait => {
@@ -593,6 +664,35 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
     })
 }
 
+/// How often a wait that goes on says it still does: a build, a sync of
+/// the folder, a busy install.
+pub const SAY_AGAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// When a wait that goes on is to say so again: at once when nothing was
+/// said yet, then once every [`SAY_AGAIN_EVERY`]. Times are how long into
+/// the wait, from whatever start the caller measures from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SayAgain {
+    said: Option<std::time::Duration>,
+}
+
+impl SayAgain {
+    /// A wait whose first line was said `at` (its start, announced).
+    pub fn said_at(at: std::time::Duration) -> Self {
+        Self { said: Some(at) }
+    }
+
+    /// Whether a line is due `elapsed` into the wait.
+    pub fn due(&self, elapsed: std::time::Duration) -> bool {
+        self.said.is_none_or(|said| elapsed.saturating_sub(said) >= SAY_AGAIN_EVERY)
+    }
+
+    /// A line was said `elapsed` into the wait.
+    pub fn said(&mut self, elapsed: std::time::Duration) {
+        self.said = Some(elapsed);
+    }
+}
+
 /// `work`'s answer. Every `every` until it comes, `look` runs with how long
 /// it has been, to say what is happening meanwhile: a call that takes
 /// minutes is never silent. The one shape of every such wait (a build, an
@@ -616,7 +716,72 @@ pub async fn while_waiting<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_wait_line, error_detail};
+    use super::{build_wait_line, error_detail, SayAgain, SAY_AGAIN_EVERY};
+
+    /// Every wait for the runs going names its commands for the install
+    /// the command was given (`--on <target>`), never the local one.
+    #[test]
+    fn a_drain_wait_names_its_commands_for_the_install_acted_on() {
+        let progress = super::Progress::new(super::ActionVerb::Resync, false, Some("cloud".into()));
+        let weft = |verb: &str| progress.weft(verb);
+        let line = |detail: serde_json::Value| {
+            let ev = super::Event { ts_unix: 0, verb: None, phase: super::Phase::DrainWait, detail: Some(&detail) };
+            super::human_line(&ev, &weft).expect("a drain wait is said")
+        };
+        for on in ["resync", "deactivate", "infra"] {
+            let said = line(serde_json::json!({ "on": on }));
+            assert!(said.contains("`weft stop <run> --on cloud`"), "{on}: {said}");
+            assert!(!said.contains("`weft stop <run>`"), "{on}: {said}");
+        }
+        assert!(line(serde_json::json!({ "on": "infra" })).contains("`weft infra cancel --on cloud`"));
+        let waits = serde_json::json!({ "on": "resync", "waitsFor": [{ "runId": uuid::Uuid::nil(), "sinceUnix": 0 }] });
+        assert!(line(waits).contains("`weft cancel-activate --on cloud`"));
+    }
+
+    /// What a resync waits for reads as the runs, oldest first with how
+    /// long each has gone, at most a few named, and the ways out; none left
+    /// says only that the named ones ended.
+    #[test]
+    fn a_resync_says_which_runs_it_waits_for() {
+        let run = |n: u128, since_unix| weft_core::deactivation::RunGoing { run_id: uuid::Uuid::from_u128(n), since_unix };
+        let weft = |verb: &str| format!("weft {verb} --on cloud");
+        let line = super::resync_wait_line(&[run(1, 1000), run(2, 1180)], 1200, weft);
+        assert_eq!(
+            line,
+            format!(
+                "the new version takes over once 2 runs on the old one end: {} (going 3m20s), {} (going 20s); \
+                 `weft stop <run> --on cloud` ends one now, `weft cancel-activate --on cloud` gives the resync up",
+                uuid::Uuid::from_u128(1),
+                uuid::Uuid::from_u128(2)
+            )
+        );
+        let many: Vec<_> = (0..8).map(|n| run(n, 1200)).collect();
+        let line = super::resync_wait_line(&many, 1200, weft);
+        assert!(line.starts_with("the new version takes over once 8 runs") && line.contains("(going 0s), and 3 more;"), "{line}");
+        assert_eq!(super::resync_wait_line(&[run(1, 1300)], 1200, weft).matches("going 0s").count(), 1, "a clock behind the install's reads 0s");
+        assert_eq!(
+            super::resync_wait_line(&[], 1200, weft),
+            "the runs named on the old version have ended; the new version takes over once the resync finishes",
+            "an empty list never says the old version is done: a run not on record yet is waited for unnamed"
+        );
+    }
+
+    /// A wait says so at once when nothing was said, then again only once
+    /// a whole beat passed since the last line.
+    #[test]
+    fn a_wait_says_so_at_once_then_once_a_beat() {
+        let secs = std::time::Duration::from_secs;
+        let mut say = SayAgain::default();
+        assert!(say.due(secs(0)), "nothing said yet");
+        say.said(secs(2));
+        assert!(!say.due(secs(2)));
+        assert!(!say.due(secs(2) + SAY_AGAIN_EVERY - secs(1)));
+        assert!(say.due(secs(2) + SAY_AGAIN_EVERY));
+        let announced = SayAgain::said_at(secs(5));
+        assert!(!announced.due(secs(6)), "a wait whose start was announced waits a beat");
+        assert!(announced.due(secs(5) + SAY_AGAIN_EVERY));
+        assert!(!announced.due(secs(1)), "a time before the last line is never due");
+    }
 
     /// The wait line names what it knows in every state, never just the time.
     #[test]
@@ -643,7 +808,7 @@ mod tests {
         let message = detail["message"].as_str().unwrap();
         assert!(message.starts_with("the weft daemon is not answering. Start it with `weft daemon start`"), "{message}");
 
-        let cause = reqwest::Client::new().get(format!("http://{closed}/")).send().await.unwrap_err();
+        let cause = weft_core::net::http_client().build().unwrap().get(format!("http://{closed}/")).send().await.unwrap_err();
         let remote = crate::client::InstallUnreachable {
             url: "https://weft-prod.example.run.app".into(),
             target: Some("prod".into()),

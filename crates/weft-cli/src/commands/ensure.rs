@@ -33,7 +33,7 @@ use weft_core::projects::{BuildState, BuildStateResponse};
 
 use super::Ctx;
 use crate::client::DispatcherClient;
-use crate::progress::Progress;
+use crate::progress::{Progress, SayAgain};
 
 pub struct ProjectHandle {
     pub id: String,
@@ -110,9 +110,6 @@ fn broken_warnings(broken: &[weft_core::project::Broken]) -> Vec<String> {
 /// How often a version build being followed is asked where it is, and
 /// how often an ask the install could not be reached for is sent again.
 const BUILD_LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// How often a build that goes on says so.
-const BUILD_SAY_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The image builds a version build waits on, as this command follows
 /// them: the ones still running, the images that finished, and how the
@@ -223,12 +220,12 @@ async fn follow_version(
     following: &mut Following,
     started: std::time::Instant,
 ) -> Result<BuiltProgram> {
-    let mut said = started.elapsed();
+    let mut say = SayAgain::said_at(started.elapsed());
     let mut out_of_reach = false;
     loop {
         tokio::time::sleep(BUILD_LOOK_EVERY).await;
         let elapsed = started.elapsed();
-        let due = elapsed.saturating_sub(said) >= BUILD_SAY_EVERY;
+        let due = say.due(elapsed);
         let answer = match version_state(client, id, build).await {
             Ok(answer) => answer,
             Err(e) => {
@@ -236,7 +233,7 @@ async fn follow_version(
                 // Said at once when the install goes out of reach, then on
                 // the usual beat while it stays out.
                 if !out_of_reach || due {
-                    said = elapsed;
+                    say.said(elapsed);
                     progress.build_unreachable(elapsed, &why);
                 }
                 out_of_reach = true;
@@ -268,7 +265,7 @@ async fn follow_version(
         // of reach.
         let back = std::mem::take(&mut out_of_reach);
         if back || due {
-            said = elapsed;
+            say.said(elapsed);
             progress.build_wait(elapsed, &following.building(), &following.built);
         }
     }
@@ -277,16 +274,23 @@ async fn follow_version(
 /// A request to the install that failed: `Ok` with why, to say, when the
 /// install is only out of reach for now and the request is to be sent
 /// again: its connection failed on the way
-/// ([`crate::client::connection_failed`]), or the install (or the gateway
-/// in front of it) answered that it cannot serve this right now (a 502,
-/// 503 or 504: down, starting, or unable to read its database). Both
-/// requests this is read on (asking for the build, which joins the one
-/// already asked for, and reading where it is) are safe to send again. The
-/// error itself when anything else answered.
+/// ([`crate::client::connection_failed`]), or the gateway in front of it
+/// answered that it cannot reach it right now (a 502, 503 or 504 the
+/// install did not give itself: down or starting). Every request this is
+/// read on (asking for the build, which joins the one already asked for,
+/// reading where it is, looking at a task) is safe to send again, which
+/// only its caller knows. The client already waits out, for every
+/// request, the answers that are safe to send again whatever the request
+/// ([`crate::client::busy_answer`]: the platform's 429, the install's own
+/// 503), so those never reach here, and this covers the rest. The error
+/// itself when anything else answered, the install's own 500 or 502
+/// included: that one does not lift by waiting (its database refusing for
+/// good, its storage down), and looking again on it would follow forever.
 pub(crate) fn look_again_after(e: anyhow::Error) -> Result<String> {
     use reqwest::StatusCode;
     let busy = crate::client::refusal(&e).is_some_and(|refused| {
-        matches!(refused.status(), StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT)
+        !refused.is_the_installs()
+            && matches!(refused.status(), StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT)
     });
     if busy || crate::client::connection_failed(&e) {
         return Ok(format!("{e:#}"));
@@ -335,7 +339,7 @@ async fn ask_to_build(
     progress: &Progress,
     started: std::time::Instant,
 ) -> Result<Asked> {
-    let mut said: Option<std::time::Duration> = None;
+    let mut say = SayAgain::default();
     let mut sent_again = false;
     loop {
         let asked = client.post_json_success(path, body).await.and_then(|(status, text)| match status {
@@ -349,8 +353,8 @@ async fn ask_to_build(
         let why = ask_again_after(e, sent_again).map_err(|e| e.context("the build failed"))?;
         sent_again = true;
         let elapsed = started.elapsed();
-        if said.is_none_or(|said| elapsed.saturating_sub(said) >= BUILD_SAY_EVERY) {
-            said = Some(elapsed);
+        if say.due(elapsed) {
+            say.said(elapsed);
             progress.build_unreachable(elapsed, &why);
         }
         tokio::time::sleep(BUILD_LOOK_EVERY).await;
@@ -536,8 +540,21 @@ mod tests {
         assert!(look_again_after(reset).is_ok());
         let down = look(install(Then::Answer("HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n")).await).await;
         assert!(look_again_after(down).is_ok());
-        let busy = look(install(Then::Answer("HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n")).await).await;
+        // The gateway's 503 (the install down or starting) to the build ask
+        // (a write this command knows is safe to send again) is read here.
+        let busy = DispatcherClient::new(install(Then::Answer("HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n")).await, None)
+            .post_json_success("/projects/p/builds", &serde_json::json!({}))
+            .await
+            .unwrap_err();
         assert!(look_again_after(busy).is_ok());
+        // The install's own 500 (its database refusing for good) ends the
+        // follow with its words.
+        let for_good = look(
+            install(Then::Answer("HTTP/1.1 500 Internal Server Error\r\nx-weft-install: 1\r\ncontent-length: 14\r\n\r\nquota exceeded"))
+                .await,
+        )
+        .await;
+        assert_eq!(format!("{:#}", look_again_after(for_good).unwrap_err()), "quota exceeded");
     }
 
     /// The project's builds being started right now ends a first ask (it

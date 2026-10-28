@@ -2,14 +2,13 @@
 //! the tree verbs read and write, and the runs it shows, read off the
 //! runs' own rows.
 //!
-//! Same rig as `db_lifecycle.rs`: `#[sqlx::test]` hands each test a fresh
+//! Same rig as `db_lifecycle.rs`: `#[weft_db_macros::test]` hands each test a fresh
 //! database; `setup` applies the dispatcher's whole schema (every group,
 //! the version tables included) exactly as a boot does.
 
 use std::collections::BTreeMap;
 
 use serde_json::json;
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use weft_core::activation::ActivationKey;
@@ -24,10 +23,11 @@ use weft_dispatcher::versions::{version_id, PostgresVersionStore, VersionRow, Ve
 use weft_dispatcher::working_copies::{PostgresWorkingCopyStore, WorkingCopyStoreOps, Write, Written};
 use weft_journal::record::{Queued, Then};
 use weft_journal::RunEvent;
+use weft_task_store::db::{Client as _, Pool};
 
 const TENANT: &str = "tenant-1";
 
-async fn setup(pool: &PgPool) -> (PostgresStore, weft_dispatcher::ProjectStore, PostgresVersionStore) {
+async fn setup(pool: &Pool) -> (PostgresStore, weft_dispatcher::ProjectStore, PostgresVersionStore) {
     weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
     let store = PostgresStore::from_pool(pool.clone());
     let projects: weft_dispatcher::ProjectStore =
@@ -92,8 +92,8 @@ async fn start_run(
 
 /// The same manifest is one row however often it is recorded, and a
 /// second upsert keeps the first parent and label.
-#[sqlx::test]
-async fn identical_code_is_one_version(pool: PgPool) {
+#[weft_db_macros::test]
+async fn identical_code_is_one_version(pool: Pool) {
     let (_, projects, versions) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
@@ -115,8 +115,8 @@ async fn identical_code_is_one_version(pool: PgPool) {
 /// (its spec, its seed, the places it ran again), in the order it was
 /// started, and carries the saved example it is set to. A run nobody
 /// started by hand (a trigger's) is counted on its version, never listed.
-#[sqlx::test]
-async fn runs_round_trip_and_list_in_recording_order(pool: PgPool) {
+#[weft_db_macros::test]
+async fn runs_round_trip_and_list_in_recording_order(pool: Pool) {
     let (store, projects, versions) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
@@ -147,8 +147,8 @@ async fn runs_round_trip_and_list_in_recording_order(pool: PgPool) {
 /// A head lives on a working copy, moved by a stamp, a run and a switch,
 /// compare-and-set. The activated versions are read off the trigger
 /// activations: a build leaves them alone, and a deactivation clears them.
-#[sqlx::test]
-async fn heads_live_on_working_copies_and_activations_name_their_versions(pool: PgPool) {
+#[weft_db_macros::test]
+async fn heads_live_on_working_copies_and_activations_name_their_versions(pool: Pool) {
     let (_, projects, versions) = setup(&pool).await;
     let copies = PostgresWorkingCopyStore::new(pool.clone());
     let project = Uuid::new_v4();
@@ -187,8 +187,8 @@ async fn heads_live_on_working_copies_and_activations_name_their_versions(pool: 
 
 /// `weft clean <run_id>` erases the run, and every head that pointed at
 /// it keeps its version and loses the run pointer.
-#[sqlx::test]
-async fn cleaning_a_run_erases_it_and_clears_head_run(pool: PgPool) {
+#[weft_db_macros::test]
+async fn cleaning_a_run_erases_it_and_clears_head_run(pool: Pool) {
     let (store, projects, versions) = setup(&pool).await;
     let copies = PostgresWorkingCopyStore::new(pool.clone());
     let project = Uuid::new_v4();
@@ -216,8 +216,8 @@ async fn cleaning_a_run_erases_it_and_clears_head_run(pool: PgPool) {
 /// Two writers of one file of a working copy: the one that read the file
 /// before the other wrote is refused whole, nothing of it lands, and the
 /// revision moves only with a change of the files.
-#[sqlx::test]
-async fn a_stale_writer_of_a_working_copy_is_refused(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_stale_writer_of_a_working_copy_is_refused(pool: Pool) {
     let (_, projects, _) = setup(&pool).await;
     let copies = PostgresWorkingCopyStore::new(pool.clone());
     let project = Uuid::new_v4();
@@ -262,8 +262,8 @@ async fn a_stale_writer_of_a_working_copy_is_refused(pool: PgPool) {
 /// (the store deletes it explicitly: a version left behind kept naming
 /// stored files of a project that no longer existed, and the same id
 /// registered again inherited a tree it never made).
-#[sqlx::test]
-async fn deleting_versions_takes_their_runs_out_of_the_tree(pool: PgPool) {
+#[weft_db_macros::test]
+async fn deleting_versions_takes_their_runs_out_of_the_tree(pool: Pool) {
     let (store, projects, versions) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
@@ -288,21 +288,19 @@ async fn deleting_versions_takes_their_runs_out_of_the_tree(pool: PgPool) {
 
 /// A version's trigger count sums every writer's lane and names the
 /// newest run across them.
-#[sqlx::test]
-async fn trigger_runs_sum_the_lanes_and_name_the_newest_run(pool: PgPool) {
+#[weft_db_macros::test]
+async fn trigger_runs_sum_the_lanes_and_name_the_newest_run(pool: Pool) {
     let (_store, _projects, versions) = setup(&pool).await;
     let project = Uuid::new_v4();
     let older = Uuid::now_v7();
     let newer = Uuid::now_v7();
     for (lane, runs, last) in [("a", 2_i64, newer), ("b", 3, older)] {
-        sqlx::query("INSERT INTO version_runs (project_id, source_version, lane, runs, last_run) VALUES ($1, 'v1', $2, $3, $4)")
-            .bind(project)
-            .bind(lane)
-            .bind(runs)
-            .bind(last)
-            .execute(&pool)
-            .await
-            .unwrap();
+        pool.execute(
+            "INSERT INTO version_runs (project_id, source_version, lane, runs, last_run) VALUES ($1, 'v1', $2, $3, $4)",
+            &[&project, &lane, &runs, &last],
+        )
+        .await
+        .unwrap();
     }
     let counted = versions.trigger_runs(project).await.unwrap();
     assert_eq!(counted.len(), 1);

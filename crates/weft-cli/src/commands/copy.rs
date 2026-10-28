@@ -23,7 +23,7 @@ use weft_core::working_copy::{Applied, RegisterFolder, SyncReport, WorkingCopy, 
 
 use super::Ctx;
 use crate::client::DispatcherClient;
-use crate::progress::Progress;
+use crate::progress::{elapsed_text, while_waiting, Progress, SAY_AGAIN_EVERY};
 
 /// This folder's working copy, synced with the folder.
 pub struct FolderCopy {
@@ -43,34 +43,24 @@ impl FolderCopy {
 
 /// Make this folder and its working copy the same (see the module doc),
 /// registering the folder first when the install does not know it yet,
-/// and answer the working copy. What the sync did is said through
-/// `progress` when the command rides it, else printed (and said nowhere
+/// and answer the working copy. That it is syncing is said when it
+/// starts, and again every [`SAY_AGAIN_EVERY`] while it goes on (a busy or
+/// far install can take minutes). What the sync did is said through
+/// `progress` when the command rides it, else printed (and nothing is said
 /// under `--json`, whose one line is the command's answer: the conflict
 /// copies are in the working copy it carries).
 pub async fn this_copy(ctx: &Ctx, progress: Option<&Progress>) -> Result<FolderCopy> {
-    super::ensure::ensure_project_known(ctx).await?;
-    let project = ctx.project()?;
-    let client = ctx.client()?;
-    let project_id = project.id().to_string();
-    let root = project.root.as_path();
-    let path = root
-        .to_str()
-        .with_context(|| format!("the project's folder {} is not a UTF-8 path, which a working copy cannot be named by", root.display()))?
-        .to_string();
-    let host = weft_core::working_copy::this_machine().map_err(anyhow::Error::msg)?;
     let tell = !ctx.json();
-
-    let copy = match find_folder(&client, &project_id, &host, &path).await? {
-        Some(found) => found.copy,
-        None => register(&client, &project_id, root, host, path, tell).await?.copy,
-    };
-    let port = InstallCopy { client: &client, project_id: &project_id, copy: copy.id };
-    let store = if tell { super::assets::DispatcherStore::telling(&client) } else { super::assets::DispatcherStore::new(&client) };
-    let mut cache = HashCache::load(root);
-    let synced = weft_assets::sync::sync_folder(root, &port, &InstallBlobs(&client), &store, &mut cache)
-        .await
-        .with_context(|| format!("sync {} with its working copy", root.display()))?;
-    cache.save(root)?;
+    let human = progress.map_or(tell, |progress| !progress.json);
+    if human {
+        println!("syncing this folder with the install");
+    }
+    let (project_id, client, synced) = while_waiting(sync_folder(ctx, tell), SAY_AGAIN_EVERY, async |elapsed| {
+        if human {
+            println!("  still syncing this folder with the install ({} so far)", elapsed_text(elapsed.as_secs()));
+        }
+    })
+    .await?;
     let (said, conflicts) = sync_lines(&synced, &|verb| ctx.weft(verb));
     match progress {
         Some(progress) => {
@@ -86,6 +76,35 @@ pub async fn this_copy(ctx: &Ctx, progress: Option<&Progress>) -> Result<FolderC
         None => {}
     }
     Ok(FolderCopy { project_id, client, copy: synced.copy })
+}
+
+/// Sync this folder with its working copy (see [`this_copy`]): the
+/// project's id, the client it was synced through, and what the sync did.
+/// `tell` says each file sent, when the command prints.
+async fn sync_folder(ctx: &Ctx, tell: bool) -> Result<(String, DispatcherClient, Synced)> {
+    super::ensure::ensure_project_known(ctx).await?;
+    let project = ctx.project()?;
+    let client = ctx.client()?;
+    let project_id = project.id().to_string();
+    let root = project.root.as_path();
+    let path = root
+        .to_str()
+        .with_context(|| format!("the project's folder {} is not a UTF-8 path, which a working copy cannot be named by", root.display()))?
+        .to_string();
+    let host = weft_core::working_copy::this_machine().map_err(anyhow::Error::msg)?;
+
+    let copy = match find_folder(&client, &project_id, &host, &path).await? {
+        Some(found) => found.copy,
+        None => register(&client, &project_id, root, host, path, tell).await?.copy,
+    };
+    let port = InstallCopy { client: &client, project_id: &project_id, copy: copy.id };
+    let store = if tell { super::assets::DispatcherStore::telling(&client) } else { super::assets::DispatcherStore::new(&client) };
+    let mut cache = HashCache::load(root);
+    let synced = weft_assets::sync::sync_folder(root, &port, &InstallBlobs(&client), &store, &mut cache)
+        .await
+        .with_context(|| format!("sync {} with its working copy", root.display()))?;
+    cache.save(root)?;
+    Ok((project_id, client, synced))
 }
 
 /// The folder's working copy, or `None` when the install does not know

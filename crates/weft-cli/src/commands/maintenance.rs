@@ -12,7 +12,6 @@
 
 use std::time::Duration;
 
-use anyhow::Context;
 use weft_core::builds::VersionBuildState;
 use weft_core::maintenance::{LiftAnswer, LiftDoing, LiftProgress, LiftReport, MaintenanceOn, MaintenanceOnRequest, MaintenanceState, ProjectLifted};
 use weft_core::projects::BuildState;
@@ -46,8 +45,7 @@ pub async fn run(ctx: Ctx, action: MaintenanceAction) -> anyhow::Result<()> {
 }
 
 async fn read_state(client: &crate::client::DispatcherClient) -> anyhow::Result<MaintenanceState> {
-    serde_json::from_value(client.get_json("/install/maintenance").await?)
-        .context("read the install's maintenance (the install and this CLI disagree on its shape; upgrade one of them)")
+    crate::client::read_answer(client.get_json("/install/maintenance").await?, "the install's maintenance")
 }
 
 /// `weft maintenance` / `weft maintenance status`.
@@ -97,8 +95,8 @@ async fn on(ctx: &Ctx, running: Option<Running>) -> anyhow::Result<()> {
     if let Some(spinner) = &spinner {
         spinner.show_one("taking down every trigger and stopping every infra copy", crate::progress::now_unix() as i64);
     }
-    let answer: MaintenanceOn = serde_json::from_value(client.post_json("/install/maintenance", &serde_json::to_value(&request)?).await?)
-        .context("read what `weft maintenance on` did (the install and this CLI disagree on its shape; upgrade one of them)")?;
+    let answer: MaintenanceOn =
+        crate::client::read_answer(client.post_json("/install/maintenance", &serde_json::to_value(&request)?).await?, "what `weft maintenance on` did")?;
     drop(spinner);
     if !ctx.json() {
         println!("in maintenance since {}", when(answer.since_unix));
@@ -171,8 +169,8 @@ fn check_left(ctx: &Ctx, answer: &MaintenanceOn) -> anyhow::Result<()> {
 /// `weft maintenance off`.
 async fn off(ctx: &Ctx) -> anyhow::Result<()> {
     let client = ctx.client()?;
-    let answer: LiftAnswer = serde_json::from_value(client.post_json("/install/maintenance/off", &serde_json::json!({})).await?)
-        .context("read the lift's answer (the install and this CLI disagree on its shape; upgrade one of them)")?;
+    let answer: LiftAnswer =
+        crate::client::read_answer(client.post_json("/install/maintenance/off", &serde_json::json!({})).await?, "the lift's answer")?;
     let task = match answer {
         LiftAnswer::NotOn => {
             if !ctx.json_out(&LiftReport { projects: Vec::new() })? {
@@ -184,8 +182,8 @@ async fn off(ctx: &Ctx) -> anyhow::Result<()> {
     };
     let follow = format!("/install/maintenance/follow/{task}");
     if ctx.json() {
-        let report: LiftReport = serde_json::from_value(super::follow::follow_at(&client, &follow, LIFT_LOOK, |_| {}, async |_| Ok(())).await?)
-            .context("read the lift's report (the install and this CLI disagree on its shape; upgrade one of them)")?;
+        let report: LiftReport =
+            crate::client::read_answer(super::follow::follow_at(&client, &follow, LIFT_LOOK, |_| {}, async |_| Ok(())).await?, "the lift's report")?;
         ctx.json_out(&report)?;
         return Ok(());
     }
@@ -193,8 +191,7 @@ async fn off(ctx: &Ctx) -> anyhow::Result<()> {
     let mut view = LiftView { spinner: crate::spinner::Spinner::start(), said: 0, logs_said: Vec::new() };
     let warn = |message: &str| eprintln!("{message}");
     let report = super::follow::follow_at(&client, &follow, LIFT_LOOK, warn, async |progress| view.going(&client, progress).await).await?;
-    let report: LiftReport =
-        serde_json::from_value(report).context("read the lift's report (the install and this CLI disagree on its shape; upgrade one of them)")?;
+    let report: LiftReport = crate::client::read_answer(report, "the lift's report")?;
     view.spinner.show(Vec::new());
     // What the lift finished after the last look.
     for project in &report.projects[view.said.min(report.projects.len())..] {
@@ -229,8 +226,7 @@ struct LiftView {
 impl LiftView {
     async fn going(&mut self, client: &crate::client::DispatcherClient, progress: Option<serde_json::Value>) -> anyhow::Result<()> {
         let Some(progress) = progress else { return Ok(()) };
-        let progress: LiftProgress =
-            serde_json::from_value(progress).context("read where the lift is (the install and this CLI disagree on its shape; upgrade one of them)")?;
+        let progress: LiftProgress = crate::client::read_answer(progress, "where the lift is")?;
         for project in progress.done.iter().skip(self.said) {
             self.say_lifted(project);
         }
@@ -321,8 +317,7 @@ async fn check(ctx: &Ctx, key_stdin: bool, update: &str) -> anyhow::Result<()> {
     }
     let client = ctx.client_keyed(key_stdin)?;
     let state = match client.get_json("/install/maintenance").await {
-        Ok(state) => serde_json::from_value::<MaintenanceState>(state)
-            .context("read the install's maintenance (the install and this CLI disagree on its shape; upgrade one of them)")?,
+        Ok(state) => crate::client::read_answer::<MaintenanceState>(state, "the install's maintenance")?,
         Err(e) => {
             if let Some(unreachable) = e.chain().find_map(|cause| cause.downcast_ref::<crate::client::InstallUnreachable>()) {
                 println!("{} is not running; nothing to check", unreachable.named());

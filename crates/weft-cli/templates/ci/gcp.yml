@@ -112,7 +112,8 @@ jobs:
       # meanwhile. The resync registers this version and brings onto it
       # only the triggers that are on and behind it: taken down with what
       # arrives meanwhile held, their paused runs moved onto the new
-      # build, and back on once the old version is done. Neither turns
+      # build, and back on once the old version is done (this log names the
+      # runs it waits for meanwhile, each time they change). Neither turns
       # anything on, so on a first deploy they leave the version ready for
       # `weft infra start --on <target>` and `weft activate --on <target>`,
       # run once by hand; a trigger or infra someone took down stays down.

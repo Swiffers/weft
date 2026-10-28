@@ -60,14 +60,17 @@ async fn one_at_a_time<T>(
 /// `GET /install/domains`. A person looking is a reason to ask after the
 /// certificates still pending, so the answer says where each stands now.
 pub async fn list(State(state): State<DispatcherState>, caller: CallerTenant) -> Result<Json<DomainList>, ApiError> {
-    let stored = crate::domains::list_stored(&state.pg_pool).await.map_err(internal)?;
+    let stored = crate::domains::list_stored(&state.pg_pool).await.map_err(|e| crate::api::unavailable_or_internal("read the install's domains", e))?;
     // A certificate that cannot be read is said beside the rest: this is
     // the answer that explains what is wrong, so it never goes missing.
     let (stored, certificates_unread) = match crate::domains::check_certificates(&state.pg_pool, state.domains.as_ref(), stored.clone(), |_| true).await {
         Ok(checked) => (checked, None),
         Err(e) => (stored, Some(format!("{e:#}"))),
     };
-    let door_refused = crate::domains::door_state(&state.pg_pool).await.map_err(internal)?.refused;
+    let door_refused = crate::domains::door_state(&state.pg_pool)
+        .await
+        .map_err(|e| crate::api::unavailable_or_internal("read the domains' door", e))?
+        .refused;
     let live_address = state.address.stable_fresh().await.map_err(internal)?;
     let callback_url = crate::api::access::callback_url(&live_address);
     let callback_services = sign_in_services(&state, &caller.0 .0).await?;
@@ -103,7 +106,7 @@ pub async fn list(State(state): State<DispatcherState>, caller: CallerTenant) ->
 /// `tenant` connected through an app of its own, and the ones the apps
 /// file holds a sign-in app for.
 async fn sign_in_services(state: &DispatcherState, tenant: &str) -> Result<Vec<String>, ApiError> {
-    let mut services = weft_access_store::own_sign_in_services(&state.pg_pool, tenant).await.map_err(internal)?;
+    let mut services = weft_access_store::own_sign_in_services(&state.pg_pool, tenant).await.map_err(crate::api::access_store_error)?;
     let shared: weft_core::access::wire::SignInServices =
         crate::broker_admin::forward_json(state, "/v1/access/admin/sign-in-services", &serde_json::json!({})).await?;
     services.extend(shared.services);

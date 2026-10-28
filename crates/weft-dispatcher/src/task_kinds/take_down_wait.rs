@@ -43,7 +43,7 @@ impl TaskExecutor<DispatcherState> for TakeDownWaitExecutor {
             .flat_map(|owned| owned.triggers.iter().map(|trigger| weft_core::activation::ActivationKey::new(trigger.clone(), owned.owner.clone())))
             .collect();
         let scope = crate::drain::DrainScope { project_id: id, reaching: crate::drain::Reaching::Fired { keys: &keys, tokens: &tokens } };
-        crate::drain::drain(state, &scope, None).await?;
+        crate::drain::drain(state, &scope, None, None).await?;
         Ok(Value::Null)
     }
 }

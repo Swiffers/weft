@@ -5,7 +5,7 @@
 //! status payload as a single JSON line for consumption by the
 //! VS Code extension's action bar.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use weft_core::projects::{ProjectDrift, ProjectStatusResponse, ProjectTransition};
 
 use super::Ctx;
@@ -120,8 +120,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         return Ok(());
     };
 
-    let data: ProjectStatusResponse = serde_json::from_value(data)
-        .context("read the project's status (the dispatcher and this CLI disagree on its shape; upgrade one of them)")?;
+    let data: ProjectStatusResponse = crate::client::read_answer(data, "the project's status")?;
 
     // One JSON object on stdout; the extension reads it.
     if ctx.json_out(&data)? {
@@ -129,8 +128,8 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     }
 
     println!("project: {} ({project_id})", data.name);
-    let (maintenance, address) = tokio::join!(maintenance_line(&ctx), address_line(&ctx));
-    for line in [maintenance, address].into_iter().flatten() {
+    let (maintenance, address, database) = tokio::join!(maintenance_line(&ctx), address_line(&ctx), database_line(&ctx));
+    for line in [maintenance, address, database].into_iter().flatten() {
         println!("  {line}");
     }
     // Half taken down: what follows is what is left.
@@ -146,9 +145,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // The transition axis: only worth a line while in flight.
     match data.transition {
         ProjectTransition::None => {}
-        ProjectTransition::Resyncing => {
-            println!("  resync: under way (`{}` stops it as the triggers come back)", ctx.weft("cancel-activate"))
-        }
+        ProjectTransition::Resyncing => println!("  resync: {}", resync_line(data.resync.as_ref(), crate::progress::now_unix() as i64, |verb| ctx.weft(verb))),
         building => println!("  build: {building} (cancel with `{}`)", ctx.weft("cancel-build")),
     }
     for build in &data.builds {
@@ -194,6 +191,11 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                     if let Some(progress) = &entry.progress {
                         println!("      {}", progress.describe(progress.as_of_unix));
                     }
+                    // One of its containers stopped on its own and was
+                    // brought back: when, why, and what to do about it.
+                    if let Some(restart) = &entry.last_restart {
+                        println!("      {}", restart.describe(node));
+                    }
                 }
             }
             // What stopping it takes down with it: the triggers whose cut
@@ -222,6 +224,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
             println!("    {} (instance {}): {}{behind}", entry.node, entry.instance, entry.status);
             if let Some(progress) = &entry.progress {
                 println!("      {}", progress.describe(progress.as_of_unix));
+            }
+            if let Some(restart) = &entry.last_restart {
+                println!("      {}", restart.describe(&format!("{} (instance {})", entry.node, entry.instance)));
             }
         }
     }
@@ -314,6 +319,50 @@ async fn address_line(ctx: &Ctx) -> Option<String> {
     }
 }
 
+/// The line `weft status` adds while the install's database held it back
+/// lately, read off `GET /install/database`; `None` when it did not. One
+/// that could not be read is said on stderr.
+async fn database_line(ctx: &Ctx) -> Option<String> {
+    let read = async {
+        serde_json::from_value::<weft_core::install::DatabaseLoad>(ctx.client()?.get_json("/install/database").await?).map_err(anyhow::Error::from)
+    };
+    match read.await {
+        Ok(load) => held_back_words(&load),
+        Err(e) => {
+            eprintln!("warning: could not read whether the install's database held it back ({e:#})");
+            None
+        }
+    }
+}
+
+/// [`database_line`]'s words for `load`: who waited, how often, since
+/// when, what the database takes, and what gives the install more.
+fn held_back_words(load: &weft_core::install::DatabaseLoad) -> Option<String> {
+    use weft_core::install::DatabaseHolder;
+    let first = load.held_back.iter().min_by_key(|h| h.since_unix)?;
+    let at = |unix: i64| chrono::DateTime::from_timestamp(unix, 0).map(|at| at.format("%H:%M UTC").to_string()).unwrap_or_else(|| unix.to_string());
+    let waits: u64 = load.held_back.iter().map(|h| h.waits).sum();
+    let last = load.held_back.iter().map(|h| h.last_unix).max().unwrap_or(first.last_unix);
+    let shares: Vec<String> = load
+        .held_back
+        .iter()
+        .map(|h| match h.role {
+            DatabaseHolder::Machine => format!("the install's process holds at most {}", h.share),
+            DatabaseHolder::Dispatcher | DatabaseHolder::Broker => format!("each copy of the {} holds at most {}", h.role, h.share),
+        })
+        .collect();
+    let more = load.more.as_deref().map(|more| format!("; {more}")).unwrap_or_default();
+    Some(format!(
+        "database: busy. Since {}, requests waited {waits} time{} for a database connection, the last at {} \
+         (the database takes {} connections, and {}){more}",
+        at(first.since_unix),
+        if waits == 1 { "" } else { "s" },
+        at(last),
+        first.max_connections,
+        shares.join(", "),
+    ))
+}
+
 fn warn_no_drift(why: &str, e: &anyhow::Error) {
     eprintln!("warning: {why}, so whether the running program is behind the source is not checked ({e:#})");
 }
@@ -400,6 +449,20 @@ fn waiting_words(waiting: &weft_core::program::WaitingFires) -> String {
     format!("; {fires} {until}: {}", waiting.reason)
 }
 
+/// The resync line, at `now_unix` (`weft` spells a command for the install
+/// the person acts on): stopped, with why and what comes next; under way
+/// and waiting for the runs on the old version, naming them; or under way.
+fn resync_line(resync: Option<&weft_core::projects::ResyncStanding>, now_unix: i64, weft: impl Fn(&str) -> String) -> String {
+    let resync = resync.cloned().unwrap_or_default();
+    if let Some(stop) = &resync.stopped {
+        return format!("stopped with triggers it took down still down: {}. Next: {}", stop.error, stop.then);
+    }
+    match resync.progress.waits_for.as_slice() {
+        [] => format!("under way (`{}` stops it as the triggers come back)", weft("cancel-activate")),
+        runs => format!("under way; {}", crate::progress::resync_wait_line(runs, now_unix, weft)),
+    }
+}
+
 /// Every drift bit the dispatcher set, each with the verb that clears
 /// it. Silent when nothing drifted. A trigger behind is listed with the
 /// trigger.
@@ -426,6 +489,28 @@ mod tests {
 
     fn copy(instance: Option<&str>, state: TriggerState, mode: ActivationMode) -> TriggerCopy {
         TriggerCopy { instance: instance.map(|i| InstanceId::new(i).unwrap()), state, mode, down_with: None, held_back: None, held: HeldWork::default(), waiting: None, version: None }
+    }
+
+    /// A resync that stopped says so, why, and what comes next, never
+    /// "under way"; one waiting for runs on the old version names them.
+    #[test]
+    fn a_resync_says_whether_it_stopped_and_what_it_waits_for() {
+        use weft_core::deactivation::{ResyncProgress, RunGoing};
+        use weft_core::projects::{ResyncStanding, ResyncStop};
+        let weft = |verb: &str| format!("weft {verb}");
+        let stopped = ResyncStanding {
+            stopped: Some(ResyncStop { error: "the database was busy".into(), then: "it goes on by itself shortly".into() }),
+            progress: ResyncProgress::default(),
+        };
+        let line = super::resync_line(Some(&stopped), 0, weft);
+        assert_eq!(line, "stopped with triggers it took down still down: the database was busy. Next: it goes on by itself shortly");
+        let waiting = ResyncStanding {
+            stopped: None,
+            progress: ResyncProgress { waits_for: vec![RunGoing { run_id: uuid::Uuid::nil(), since_unix: 40 }] },
+        };
+        let line = super::resync_line(Some(&waiting), 100, weft);
+        assert!(line.starts_with("under way; the new version takes over once 1 run on the old one ends") && line.contains("(going 1m00s)"), "{line}");
+        assert_eq!(super::resync_line(None, 0, weft), "under way (`weft cancel-activate` stops it as the triggers come back)");
     }
 
     /// A shared trigger is one line with what it reads; one that exists
@@ -479,5 +564,27 @@ mod tests {
         held_back.shared.as_mut().unwrap().held_back = Some("triggers on another build. `weft resync --all` moves them".into());
         let lines = super::trigger_lines(&held_back);
         assert!(lines[0].contains("held back: triggers on another build") && lines[0].contains("`weft resync --all`"), "{lines:?}");
+    }
+
+    /// A database that held nobody back adds no line; one that held back
+    /// copies says who waited, how often, what the database takes, each
+    /// role's share, and what gives the install more.
+    #[test]
+    fn a_database_that_held_the_install_back_says_so_and_how_to_give_it_more() {
+        use weft_core::install::{DatabaseHolder, DatabaseLoad, HeldBack};
+        assert_eq!(super::held_back_words(&DatabaseLoad::default()), None);
+        let held = |role, since_unix, waits, share| HeldBack { role, since_unix, last_unix: since_unix + 60, waits, max_connections: 50, share };
+        let load = DatabaseLoad {
+            held_back: vec![held(DatabaseHolder::Broker, 3600, 40, 7), held(DatabaseHolder::Dispatcher, 7200, 2, 7)],
+            more: Some("to give it more, raise WEFT_CLOUD_SQL_TIER".into()),
+        };
+        let line = super::held_back_words(&load).unwrap();
+        assert!(line.starts_with("database: busy. Since 01:00 UTC, requests waited 42 times"), "{line}");
+        assert!(line.contains("the last at 02:01 UTC") && line.contains("takes 50 connections"), "{line}");
+        assert!(line.contains("each copy of the broker holds at most 7, each copy of the dispatcher holds at most 7"), "{line}");
+        assert!(line.ends_with("; to give it more, raise WEFT_CLOUD_SQL_TIER"), "{line}");
+        let local = DatabaseLoad { held_back: vec![held(DatabaseHolder::Machine, 3600, 3, 20)], more: None };
+        let line = super::held_back_words(&local).unwrap();
+        assert!(line.contains("the install's process holds at most 20"), "{line}");
     }
 }

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sqlx::PgPool;
+use weft_task_store::db::{Client as _, Pool};
 use weft_platform_local::{Deliver, EarlierDeliveries, LocalAlarm, NotTaken};
 use weft_platform_traits::{Alarm, CoreRole, Wake, WakeCall, WakeQueue};
 
@@ -35,7 +35,7 @@ impl Deliver for Recorder {
     }
 }
 
-async fn schema(pool: &PgPool) {
+async fn schema(pool: &Pool) {
     weft_task_store::apply_groups(pool, &[&weft_task_store::alarm::GROUP]).await.unwrap();
 }
 
@@ -59,8 +59,8 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
 }
 
-#[sqlx::test]
-async fn a_wake_set_before_a_restart_is_delivered_after_it_once(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_wake_set_before_a_restart_is_delivered_after_it_once(pool: Pool) {
     schema(&pool).await;
     let at = past();
     LocalAlarm::new(pool.clone()).set(wake(at)).await.unwrap();
@@ -79,8 +79,8 @@ async fn a_wake_set_before_a_restart_is_delivered_after_it_once(pool: PgPool) {
     assert_eq!(after_restart.deliver_due(&deliver).await.unwrap(), 0, "delivered wakes are gone");
 }
 
-#[sqlx::test]
-async fn a_refused_wake_comes_back_later(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_refused_wake_comes_back_later(pool: Pool) {
     schema(&pool).await;
     let alarm = LocalAlarm::new(pool.clone());
     alarm.set(wake(past())).await.unwrap();
@@ -89,12 +89,11 @@ async fn a_refused_wake_comes_back_later(pool: PgPool) {
     let deliver: Arc<dyn Deliver> = recorder.clone();
     assert_eq!(alarm.deliver_due(&deliver).await.unwrap(), 1);
     assert_eq!(alarm.deliver_due(&deliver).await.unwrap(), 0, "backing off, not due again at once");
-    let (at, attempts, answered): (i64, i32, i32) =
-        sqlx::query_as("SELECT at_unix_ms, attempts, answered FROM alarm").fetch_one(&pool).await.unwrap();
+    let (at, attempts, answered): (i64, i32, i32) = pool.one("SELECT at_unix_ms, attempts, answered FROM alarm", &[]).await.unwrap();
     assert!(at > now_ms(), "set to try again later");
     assert_eq!((attempts, answered), (1, 1));
 
-    sqlx::query("UPDATE alarm SET at_unix_ms = 0").execute(&pool).await.unwrap();
+    pool.execute("UPDATE alarm SET at_unix_ms = 0", &[]).await.unwrap();
     *recorder.refuse.lock() = None;
     assert_eq!(alarm.deliver_due(&deliver).await.unwrap(), 1);
     assert_eq!(recorder.got.lock().len(), 1, "taken on the retry");
@@ -104,8 +103,8 @@ async fn a_refused_wake_comes_back_later(pool: PgPool) {
 /// A delivery that never reached the receiver backs off like any other,
 /// but spends none of the receiver's tries: after an outage, the first
 /// delivery it gets is still its first.
-#[sqlx::test]
-async fn a_delivery_that_never_reached_the_receiver_is_not_counted(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_delivery_that_never_reached_the_receiver_is_not_counted(pool: Pool) {
     schema(&pool).await;
     let alarm = LocalAlarm::new(pool.clone());
     alarm.set(wake(past())).await.unwrap();
@@ -114,9 +113,9 @@ async fn a_delivery_that_never_reached_the_receiver_is_not_counted(pool: PgPool)
     let deliver: Arc<dyn Deliver> = recorder.clone();
     for _ in 0..3 {
         assert_eq!(alarm.deliver_due(&deliver).await.unwrap(), 1);
-        sqlx::query("UPDATE alarm SET at_unix_ms = 0").execute(&pool).await.unwrap();
+        pool.execute("UPDATE alarm SET at_unix_ms = 0", &[]).await.unwrap();
     }
-    let (attempts, answered): (i32, i32) = sqlx::query_as("SELECT attempts, answered FROM alarm").fetch_one(&pool).await.unwrap();
+    let (attempts, answered): (i32, i32) = pool.one("SELECT attempts, answered FROM alarm", &[]).await.unwrap();
     assert_eq!((attempts, answered), (3, 0), "backs off by every try, counts none");
 
     *recorder.refuse.lock() = None;
@@ -127,14 +126,14 @@ async fn a_delivery_that_never_reached_the_receiver_is_not_counted(pool: PgPool)
 /// A delivery whose process died holding the claim (no answer, no
 /// retry written) comes due again when the lease runs out, and says it
 /// was tried before though none of the receiver's tries is spent.
-#[sqlx::test]
-async fn a_delivery_after_one_whose_process_died_says_it_was_tried_before(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_delivery_after_one_whose_process_died_says_it_was_tried_before(pool: Pool) {
     schema(&pool).await;
     let alarm = LocalAlarm::new(pool.clone());
     alarm.set(wake(past())).await.unwrap();
     let died = weft_task_store::alarm::claim_due(&pool, now_ms(), 60_000, 10).await.unwrap();
     assert_eq!(died.len(), 1, "claimed by a process that then died");
-    sqlx::query("UPDATE alarm SET at_unix_ms = 0").execute(&pool).await.unwrap();
+    pool.execute("UPDATE alarm SET at_unix_ms = 0", &[]).await.unwrap();
 
     let recorder = Arc::new(Recorder::default());
     let deliver: Arc<dyn Deliver> = recorder.clone();
@@ -148,8 +147,8 @@ fn earlier(answered: u32, tried: u32) -> EarlierDeliveries {
 
 /// A cancelled wake is never delivered, and cancelling one already gone
 /// is no failure.
-#[sqlx::test]
-async fn a_cancelled_wake_is_not_delivered(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_cancelled_wake_is_not_delivered(pool: Pool) {
     schema(&pool).await;
     let alarm = LocalAlarm::new(pool.clone());
     let w = wake(past());

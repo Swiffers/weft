@@ -22,6 +22,8 @@ use weft_broker_client::protocol::{
 use weft_journal::frame::BatchAnswer;
 use weft_journal::record::Fate;
 
+use weft_task_store::db::{self, Client as _, Pool};
+
 use crate::auth::{AuthedCaller, CallerIdentity};
 use crate::door::worker;
 use crate::handlers::unavailable_or_internal;
@@ -111,8 +113,8 @@ async fn write_batch(state: &BrokerState, caller: &CallerIdentity, body: &Bytes)
     // (the bench reads it with `weft_broker::batch=debug`).
     tracing::debug!(target: "weft_broker::batch", runs = batch.head.runs.len(), bytes = body.len(), "a batch of records");
     let lane = format!("{replica}/{}", batch.head.lane);
-    let mut conn = state.record_pool.acquire().await.map_err(|e| unavailable_or_internal(e.into()))?;
-    let recorded = weft_journal::record::record_batch(&mut conn, replica, tenant, &lane, &batch)
+    let conn = state.record_pool.get().await.map_err(|e| unavailable_or_internal(e.into()))?;
+    let recorded = weft_journal::record::record_batch(&conn, replica, tenant, &lane, &batch)
         .await
         .map_err(|e| unavailable_or_internal(e.context("write a batch of records")))?;
     drop(conn);
@@ -142,8 +144,7 @@ async fn own_run(state: &BrokerState, caller: &CallerIdentity, run_id: weft_core
 async fn record_of(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, Json(req): Json<RecordOfRequest>) -> Resp<RecordOfResponse> {
     worker(&caller)?;
     own_run(&state, &caller, req.run_id).await?;
-    let mut conn = state.pool.acquire().await.map_err(|e| unavailable_or_internal(e.into()))?;
-    let record = weft_journal::record::read_record(&mut conn, req.run_id, None)
+    let record = weft_journal::record::read_record(&state.pool, req.run_id, None)
         .await
         .map_err(|e| unavailable_or_internal(e.context("read a run's record")))?;
     Ok(Json(RecordOfResponse { record }))
@@ -153,8 +154,8 @@ async fn record_of(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): 
 /// project's own: a run of another project is not queued for this worker.
 async fn run_claim(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, Json(req): Json<RunClaimRequest>) -> Resp<RunClaimResponse> {
     let (_, project, replica) = worker(&caller)?;
-    let mut conn = state.pool.acquire().await.map_err(|e| unavailable_or_internal(e.into()))?;
-    let claimed = weft_journal::record::claim(&mut conn, req.run_id, project, replica)
+    let conn = state.pool.get().await.map_err(|e| unavailable_or_internal(e.into()))?;
+    let claimed = weft_journal::record::claim(&conn, req.run_id, project, replica)
         .await
         .map_err(|e| unavailable_or_internal(e.context("claim a run")))?;
     Ok(Json(RunClaimResponse { claimed }))
@@ -179,8 +180,9 @@ async fn run_answers(State(state): State<Arc<BrokerState>>, AuthedCaller(caller)
 async fn run_give_up(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, Json(req): Json<RunGiveUpRequest>) -> Resp<RunGiveUpResponse> {
     let (_, _, replica) = worker(&caller)?;
     own_run(&state, &caller, req.run_id).await?;
-    let mut tx = state.record_pool.begin().await.map_err(|e| unavailable_or_internal(e.into()))?;
-    let gave_up = weft_journal::record::give_up_in(&mut tx, req.run_id, replica, &req.error)
+    let mut conn = state.record_pool.get().await.map_err(|e| unavailable_or_internal(e.into()))?;
+    let tx = conn.transaction().await.map_err(|e| unavailable_or_internal(e.into()))?;
+    let gave_up = weft_journal::record::give_up_in(&tx, req.run_id, replica, &req.error)
         .await
         .map_err(|e| unavailable_or_internal(e.context("end a run its worker gave up")))?;
     let weft_journal::record::GaveUp::Ended(seq) = gave_up else {
@@ -205,9 +207,9 @@ async fn run_rechecked(State(state): State<Arc<BrokerState>>, AuthedCaller(calle
 /// The cancels and the answers of every run `replica` drives in `project`,
 /// answers oldest first, in one statement. The runs are the worker's own
 /// by the read itself (`owner`), so no run is checked one by one.
-pub async fn rechecked(pool: &sqlx::PgPool, replica: &str, project: uuid::Uuid) -> anyhow::Result<RunRecheckedResponse> {
-    type Row = (weft_core::RunId, Option<sqlx::types::Json<weft_core::run::CancelCause>>, Option<String>, Option<serde_json::Value>, bool);
-    let rows: Vec<Row> = sqlx::query_as(&format!(
+pub async fn rechecked(pool: &Pool, replica: &str, project: uuid::Uuid) -> anyhow::Result<RunRecheckedResponse> {
+    type Row = (weft_core::RunId, Option<db::Json<weft_core::run::CancelCause>>, Option<String>, Option<serde_json::Value>, bool);
+    let sql = format!(
         "WITH mine AS ( \
              SELECT run_id, cancel_requested FROM run \
              WHERE owner = $1 AND project_id = $2 AND state = 'running' \
@@ -219,11 +221,8 @@ pub async fn rechecked(pool: &sqlx::PgPool, replica: &str, project: uuid::Uuid) 
              FROM ({answers}) a \
          ORDER BY seq",
         answers = weft_task_store::parked_fires::handed_answers_sql("SELECT run_id FROM mine"),
-    ))
-    .bind(replica)
-    .bind(project)
-    .fetch_all(pool)
-    .await?;
+    );
+    let rows: Vec<Row> = pool.all(&sql, &[&replica, &project]).await?;
     let mut rechecked = RunRecheckedResponse::default();
     for (run_id, cause, token, payload, skipped) in rows {
         match (cause, token, payload) {
@@ -267,15 +266,14 @@ async fn previous_release_run_cancels(State(state): State<Arc<BrokerState>>, Aut
 
 /// The cancels waiting for every run `replica` drives in `project`, as the
 /// previous release answered them.
-pub async fn previous_release_cancels(pool: &sqlx::PgPool, replica: &str, project: uuid::Uuid) -> anyhow::Result<PreviousReleaseCancels> {
-    let rows: Vec<(weft_core::RunId, sqlx::types::Json<weft_core::run::CancelCause>)> = sqlx::query_as(
-        "SELECT run_id, cancel_requested FROM run \
-         WHERE owner = $1 AND project_id = $2 AND state = 'running' AND cancel_requested IS NOT NULL",
-    )
-    .bind(replica)
-    .bind(project)
-    .fetch_all(pool)
-    .await?;
+pub async fn previous_release_cancels(pool: &Pool, replica: &str, project: uuid::Uuid) -> anyhow::Result<PreviousReleaseCancels> {
+    let rows: Vec<(weft_core::RunId, db::Json<weft_core::run::CancelCause>)> = pool
+        .all(
+            "SELECT run_id, cancel_requested FROM run \
+             WHERE owner = $1 AND project_id = $2 AND state = 'running' AND cancel_requested IS NOT NULL",
+            &[&replica, &project],
+        )
+        .await?;
     Ok(PreviousReleaseCancels { cancels: rows.into_iter().map(|(run_id, cause)| RunCancel { run_id, cause: cause.0 }).collect() })
 }
 

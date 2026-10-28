@@ -758,7 +758,7 @@ modes = ["default", "autoEdit"]
 [[rule]]
 subagent = "deployer"
 toolName = "run_shell_command"
-commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft runs", "weft instances", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft activate", "weft resync", "weft deactivate", "weft cancel-activate", "weft infra start", "weft infra stop", "weft infra upgrade", "weft infra look", "weft infra terminate", "weft infra env", "weft connect", "weft target list", "weft domain", "weft frontend ls"]
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft runs", "weft instances", "weft events", "weft logs", "weft follow", "weft run", "weft wait", "weft stop", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft activate", "weft resync", "weft deactivate", "weft cancel-activate", "weft infra start", "weft infra stop", "weft infra upgrade", "weft infra look", "weft infra terminate", "weft infra env", "weft connect", "weft target list", "weft domain", "weft frontend ls"]
 decision = "allow"
 priority = 800
 modes = ["default", "autoEdit"]

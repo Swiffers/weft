@@ -9,14 +9,14 @@ use std::time::Duration;
 
 use axum::extract::ConnectInfo;
 use axum::routing::get;
-use sqlx::PgPool;
 use tower::ServiceExt as _;
+use weft_task_store::db::Pool;
 use weft_task_store::pg_signal::{keep_listening, Listening, PgSignalWatch};
 
-#[sqlx::test]
-async fn a_request_waiting_on_its_upstream_holds_the_watch_no_longer(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_request_waiting_on_its_upstream_holds_the_watch_no_longer(pool: Pool) {
     static CHANNELS: &[&str] = &["weft_test_proxy"];
-    let watch = PgSignalWatch::start(&pool.connect_options(), CHANNELS, Listening::WhileBusy).await.unwrap();
+    let watch = PgSignalWatch::start(pool.config(), CHANNELS, Listening::WhileBusy).await.unwrap();
     // An upstream that answers once released, as a held route does.
     let (reached, release) = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
     let upstream = axum::Router::new().route(
@@ -37,7 +37,7 @@ async fn a_request_waiting_on_its_upstream_holds_the_watch_no_longer(pool: PgPoo
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
 
-    let http = reqwest::Client::new();
+    let http = weft_core::net::http_client().build().unwrap();
     let door = axum::Router::new()
         .route(
             "/held",

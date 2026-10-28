@@ -137,8 +137,7 @@ pub async fn replay_rows(
         .get_json(&format!("/runs/{run_id}/replay"))
         .await
         .context("read the run")?;
-    serde_json::from_value(rows)
-        .context("read the run's events (the dispatcher and this CLI disagree on their shape; upgrade one of them)")
+    crate::client::read_answer(rows, "the run's events")
 }
 
 /// What every wire of a run carried, with stored media resolved to its

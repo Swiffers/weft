@@ -57,12 +57,17 @@ resource "google_sql_database_instance" "weft" {
       ssl_mode        = "ENCRYPTED_ONLY"
     }
 
-    # Every role opens pools of its own on the database directly (no
-    # pooler in between), more than the smallest tiers allow by default
-    # (var.cloud_sql_max_connections says how many).
-    database_flags {
-      name  = "max_connections"
-      value = tostring(var.cloud_sql_max_connections)
+    # The dispatcher and the broker open their pools on the database
+    # directly, with no pooler in between, and each copy sizes them from
+    # the number the database reports, so Cloud SQL's own number for the
+    # tier works as it is. The flag exists only when
+    # var.cloud_sql_max_connections asks for a different one.
+    dynamic "database_flags" {
+      for_each = var.cloud_sql_max_connections == null ? [] : [var.cloud_sql_max_connections]
+      content {
+        name  = "max_connections"
+        value = tostring(database_flags.value)
+      }
     }
 
     backup_configuration {

@@ -13,8 +13,8 @@
 //! soon as it ran, so none has to stay up for it to finish.
 
 use anyhow::Result;
-use sqlx::PgPool;
 use weft_platform_traits::{BuildHandle, BuildStatus, ImageBuilder};
+use weft_task_store::db::Pool;
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn};
 
 use super::ledger;
@@ -38,14 +38,11 @@ pub(crate) static WAKE_ON: &[WakeOn] = &[WakeOn::any(BUILD_CLAIMED_CHANNEL)];
 /// recorded when it ended. Answers whether any build was running. One
 /// build's failure, or a failed sweep, never skips the others; the
 /// failures are answered together after.
-pub async fn look(pool: &PgPool, images: &dyn ImageBuilder) -> Result<bool> {
+pub async fn look(pool: &Pool, images: &dyn ImageBuilder) -> Result<bool> {
     let now = crate::lease::now_unix();
     let mut failed = Vec::new();
     let stale_before = now - crate::transition::heartbeat_stale_secs();
-    let swept = match pool.acquire().await {
-        Ok(mut conn) => ledger::end_lost_starts(&mut conn, ledger::LostStarts::Undriven { stale_before }, now).await,
-        Err(e) => Err(e.into()),
-    };
+    let swept = ledger::end_lost_starts(pool, ledger::LostStarts::Undriven { stale_before }, now).await;
     if let Err(e) = swept {
         failed.push(format!("ending the starts nobody drives: {e:#}"));
     }
@@ -63,7 +60,7 @@ pub async fn look(pool: &PgPool, images: &dyn ImageBuilder) -> Result<bool> {
 /// only when the ledger cannot be read or written: a builder that does not
 /// answer is looked at again, and given up on (the build ends failed) once
 /// it has not answered for [`ledger::UNANSWERED_GIVE_UP_SECS`].
-async fn advance_build(pool: &PgPool, images: &dyn ImageBuilder, build: &ledger::RunningBuild) -> Result<()> {
+async fn advance_build(pool: &Pool, images: &dyn ImageBuilder, build: &ledger::RunningBuild) -> Result<()> {
     let now = crate::lease::now_unix();
     // Not made on the builder yet: nothing to ask. Its starter still
     // drives it, or `ledger::end_lost_starts` ended it.

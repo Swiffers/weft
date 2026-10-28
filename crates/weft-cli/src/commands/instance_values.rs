@@ -225,9 +225,10 @@ pub async fn run(ctx: Ctx, instance: InstanceId, set: Vec<String>, clear: Vec<St
     let which = instance.clone();
     as_instance(&ctx, &client, &which, |door| async move {
         if !set.is_empty() || !clear.is_empty() {
-            let changed: ValuesChanged =
-                serde_json::from_value(door.put_json("/instance/values", &serde_json::to_value(ValuesRequest { set, clear })?).await?)
-                    .context("read the dispatcher's answer to the change; upgrade the dispatcher or this CLI so the versions match")?;
+            let changed: ValuesChanged = crate::client::read_answer(
+                door.put_json("/instance/values", &serde_json::to_value(ValuesRequest { set, clear })?).await?,
+                "the install's answer to the change",
+            )?;
             let rearmed = changed.rearmed;
             if json {
                 println!("{}", serde_json::json!({ "instance": instance, "rearmed": rearmed }));
@@ -240,8 +241,7 @@ pub async fn run(ctx: Ctx, instance: InstanceId, set: Vec<String>, clear: Vec<St
             return Ok(());
         }
         let answer = door.get_json("/instance/fields").await?;
-        let fields: Vec<InstanceField> = serde_json::from_value(answer.clone())
-            .context("read the instance's fields; upgrade the dispatcher or this CLI so the versions match")?;
+        let fields: Vec<InstanceField> = crate::client::read_answer(answer.clone(), "the instance's fields")?;
         if json {
             println!("{}", serde_json::json!({ "instance": instance, "fields": answer }));
             return Ok(());

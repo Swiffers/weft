@@ -27,9 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
 use tokio::process::Command;
-use weft_platform_local::docker::NETWORK;
 // The object store's key pair goes by these in its `keys.env` and in every
 // install's `secrets.env`: the names the runtime reads it by.
 use weft_platform_traits::object_store::{OBJECT_STORE_ACCESS_KEY_ENV, OBJECT_STORE_SECRET_KEY_ENV};
@@ -57,11 +55,12 @@ const PG_DB: &str = "weft";
 
 /// The object store every local install on this machine shares.
 const OBJECT_STORE_CONTAINER: &str = "weft-object-store";
-const OBJECT_STORE_IMAGE: &str = "chrislusf/seaweedfs:3.80";
+// SYNC: OBJECT_STORE_IMAGE <-> setup.sh (the purge's `remove_docker_object image chrislusf/seaweedfs:...`)
+const OBJECT_STORE_IMAGE: &str = "chrislusf/seaweedfs:4.51";
 
 
 /// The tunnel that brings the open internet to the outside doors.
-const TUNNEL_IMAGE: &str = "cloudflare/cloudflared:2025.8.1";
+const TUNNEL_IMAGE: &str = "cloudflare/cloudflared:2026.10.5";
 
 /// The Kubernetes cluster an older weft ran on this machine.
 const OLD_KIND_CLUSTER: &str = "weft-local";
@@ -592,7 +591,7 @@ fn stale_network(stderr: &str) -> bool {
 /// named volumes and bind-mounted directories are untouched).
 async fn ensure_container(name: &str, args: &[String], stamp_dir: &Path, published: Option<PortUse>) -> Result<()> {
     let stamp = stamp_dir.join(format!("{name}.run.sha256"));
-    let want = format!("{:x}", Sha256::digest(args.join("\u{1f}").as_bytes()));
+    let want = weft_core::project::hash::sha256_hex(args.join("\u{1f}").as_bytes());
     let current = std::fs::read_to_string(&stamp).ok().map(|s| s.trim().to_string()) == Some(want.clone());
     let state = container_state(name).await?;
     // A container of ours at the wanted spec that runs holds the port
@@ -786,12 +785,44 @@ fn object_store_s3_config(access_key: &str, secret_key: &str) -> String {
     .to_string()
 }
 
-/// The object store: SeaweedFS's S3 gateway, one per machine. The runtime
-/// and the workers reach it on loopback, a container by name on weft's
-/// Docker network.
+/// The `docker run` arguments of the object store. Its master, volume and
+/// filer servers answer without any key (the filer serves and takes every
+/// file in the bucket, and its user service makes new S3 identities), so
+/// they listen on the container's own loopback (`-ip=127.0.0.1`), where
+/// only the S3 gateway beside them and `weed shell` under `docker exec`
+/// reach them. The S3 gateway alone listens on the container's address,
+/// for the port published on the machine's loopback: it checks every
+/// request against the keys, and its gRPC port beside it refuses any
+/// caller from outside the container. The container joins no network of
+/// weft's, so an infra container cannot even reach that.
+fn object_store_run_args(port: u16, config_label: &str, cfg_path: &Path) -> Vec<String> {
+    [
+        "run", "-d", "--name", OBJECT_STORE_CONTAINER, "--restart", "unless-stopped",
+        "--label", config_label,
+        "-p", &format!("127.0.0.1:{port}:8333"),
+        "-v", &format!("{OBJECT_STORE_CONTAINER}-data:/data"),
+        "-v", &format!("{}:/etc/seaweedfs/s3.config.json:ro", cfg_path.display()),
+        OBJECT_STORE_IMAGE,
+        "server", "-dir=/data", "-ip=127.0.0.1",
+        "-s3", "-s3.ip.bind=0.0.0.0", "-s3.port=8333", "-s3.config=/etc/seaweedfs/s3.config.json",
+        "-master.volumeSizeLimitMB=1024",
+        // No usage reports leave the machine, and the Iceberg and Lance
+        // servers 4.x starts beside S3 stay off: weft speaks only S3.
+        "-master.telemetry=false", "-s3.port.iceberg=0", "-s3.port.lance=0",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// The object store: SeaweedFS's S3 gateway, one per machine. Only
+/// processes on this machine reach it, at the S3 port published on
+/// loopback: the runtime, the workers, and a caller the dispatcher's
+/// files door passes on.
 /// `-s3.externalUrl` stays unset so the gateway checks each presigned
 /// request against its own Host header, which lets one store take URLs
-/// signed for either address.
+/// signed for loopback and the ones the files door forwards with the
+/// install's public host.
 /// Machine-wide, from reading or making the keys until the store runs on
 /// them, and answers the keys it runs on, which the install's secrets
 /// then carry.
@@ -818,21 +849,8 @@ async fn ensure_object_store(port: u16) -> Result<(String, String)> {
     std::fs::write(&cfg_path, &s3_config)?;
     // The store reads its keys once, at start: a label of their digest makes
     // new keys a new container spec, so the store starts again with them.
-    let config_label = format!("weft.config={:x}", Sha256::digest(s3_config.as_bytes()));
-    let args: Vec<String> = [
-        "run", "-d", "--name", OBJECT_STORE_CONTAINER, "--restart", "unless-stopped",
-        "--network", NETWORK,
-        "--label", &config_label,
-        "-p", &format!("127.0.0.1:{port}:8333"),
-        "-v", &format!("{OBJECT_STORE_CONTAINER}-data:/data"),
-        "-v", &format!("{}:/etc/seaweedfs/s3.config.json:ro", cfg_path.display()),
-        OBJECT_STORE_IMAGE,
-        "server", "-dir=/data", "-s3", "-s3.port=8333", "-s3.config=/etc/seaweedfs/s3.config.json",
-        "-master.volumeSizeLimitMB=1024",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
+    let config_label = format!("weft.config={}", weft_core::project::hash::sha256_hex(s3_config.as_bytes()));
+    let args = object_store_run_args(port, &config_label, &cfg_path);
     // Shared by every install on this machine, so one variable moves it.
     let published = PortUse { addr: ([127, 0, 0, 1], port).into(), what: "its file store", move_it: "WEFT_SEAWEED_PORT=<port> ./setup.sh".into() };
     ensure_container(OBJECT_STORE_CONTAINER, &args, &data_dir(), Some(published)).await?;
@@ -1182,6 +1200,8 @@ fn install_config(
         role_urls: Default::default(),
         workers,
         holders: Default::default(),
+        // The one process takes the whole database.
+        max_copies: Default::default(),
         edge,
         object_store: ObjectStoreSettings::S3(S3StoreSettings {
             endpoint: format!("http://127.0.0.1:{}", object_store_port()?),
@@ -1336,7 +1356,7 @@ fn tunnel_origin(ports: Ports) -> (String, String) {
 /// now (`/quicktunnel`, the same question the install asks each time it
 /// builds a link on it).
 async fn quick_tunnel_url(container: &str, metrics: &str) -> Result<String> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build()?;
+    let client = weft_core::net::http_client().timeout(Duration::from_secs(3)).build()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     loop {
         // Not answering yet, or answering with no hostname: the tunnel is
@@ -1366,7 +1386,7 @@ struct QuickTunnelAnswer {
 async fn announce_tunnel(install: &Install, Tunnel { url, named, .. }: &Tunnel, ports: Ports) -> Result<()> {
     let named = *named;
     let container = install.tunnel_container();
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let client = weft_core::net::http_client().timeout(Duration::from_secs(10)).build()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
     loop {
         let seen = match client.get(format!("{url}/")).send().await {
@@ -1627,7 +1647,7 @@ async fn stop_runtime(install: &Install) -> Result<()> {
 
 /// Wait until the runtime answers, naming its log when it does not.
 async fn wait_for_runtime(install: &Install, public: u16) -> Result<()> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build()?;
+    let client = weft_core::net::http_client().timeout(Duration::from_secs(3)).build()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(180);
     loop {
         if client.get(format!("http://127.0.0.1:{public}/health")).send().await.is_ok_and(|r| r.status().is_success()) {
@@ -1696,8 +1716,10 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
     // while this start makes them too. Its workers are programs compiled
     // on this machine (no builder image, no image compile cache, which the
     // record leaves empty); the runtime runs from its binary, and the
-    // runtime image is what its infra units' agents run.
-    let runtime = images::runtime_image_ref()?;
+    // runtime image is what its infra units' agents run, built around
+    // that same binary whenever it can start there.
+    let runtime_image = images::local_runtime_image(&runtime_binary()?)?;
+    let runtime = runtime_image.image_ref.clone();
     let packaging = weft_platform_local::MachineLayout::here().host_packaging();
     let standard_hash = weft_compiler::build::stock_binary_hash(&packaging)?;
     let standard = weft_compiler::build::worker_image_tag(&standard_hash);
@@ -1708,7 +1730,7 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
         compile_cache_keys: Default::default(),
     }
     .save(&install.dir)?;
-    images::ensure_runtime_image(&runtime, rebuild, None).await?;
+    runtime_image.ensure(rebuild).await?;
     crate::host_programs::ensure_standard_program(&install.id, &standard_hash, rebuild).await?;
     weft_platform_local::docker::ensure_network(&weft_platform_local::DockerCli).await?;
     ensure_postgres(install, ports.postgres).await?;
@@ -1977,6 +1999,20 @@ mod tests {
             "Error response from daemon: failed to set up container networking: network cfc1be309d69 not found"
         ));
         assert!(!stale_network("Error response from daemon: driver failed programming external connectivity: port is already allocated"));
+    }
+
+    /// The object store answers outside its container only through S3:
+    /// it joins no network of weft's (where infra containers run), its
+    /// keyless servers listen on its own loopback, and S3 alone on its
+    /// address, published on the machine's loopback.
+    #[test]
+    fn object_store_answers_outside_only_through_s3() {
+        let args = object_store_run_args(14115, "weft.config=abc", Path::new("/data/object-store/s3.config.json"));
+        assert!(!args.iter().any(|a| a == "--network" || a.starts_with("--network=")), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["-p", "127.0.0.1:14115:8333"]), "{args:?}");
+        assert!(args.iter().any(|a| a == "-ip=127.0.0.1"), "{args:?}");
+        assert!(!args.iter().any(|a| a.starts_with("-ip.bind") || a.starts_with("-master.ip") || a.starts_with("-filer.ip") || a.starts_with("-volume.ip")), "{args:?}");
+        assert!(args.iter().any(|a| a == "-s3.ip.bind=0.0.0.0"), "{args:?}");
     }
 
     fn install(name: Option<&str>) -> Install {

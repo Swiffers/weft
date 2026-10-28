@@ -692,12 +692,21 @@ fn package_root(catalog: &FsCatalog, package_name: &str) -> BuildResult<PathBuf>
 /// (`stage_worker_workspace`) and the hasher (`hash::hash_worker_build_env`)
 /// iterate, so staged and hashed bytes stay equal by construction. Sorted
 /// for deterministic hashing.
+///
+/// A crate also leaves out what its own manifest lists under
+/// `[package.metadata.weft] left_out_of_workers`: data only a feature no
+/// worker turns on reads (weft-task-store's `migrations/`, the database's
+/// history, so a migration names no new worker and asks no project to
+/// resync). Left out of the staged copy as well as the hash, so a worker
+/// build that did reach for it fails on the missing file instead of
+/// compiling bytes its name does not cover.
 pub fn worker_crate_entries(crate_dir: &Path) -> BuildResult<Vec<(String, PathBuf)>> {
+    let mut left_out = left_out_of_workers(crate_dir)?;
     let mut out = Vec::new();
     for entry in std::fs::read_dir(crate_dir).map_err(BuildError::Io)? {
         let entry = entry.map_err(BuildError::Io)?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == "tests" || weft_catalog::is_node_tree_excluded(&name) {
+        if name == "tests" || weft_catalog::is_node_tree_excluded(&name) || left_out.remove(&name) {
             continue;
         }
         // Symlinks are skipped in the workspace-crate slice, by the
@@ -709,8 +718,48 @@ pub fn worker_crate_entries(crate_dir: &Path) -> BuildResult<Vec<(String, PathBu
         }
         out.push((name, entry.path()));
     }
+    // A listed entry the crate no longer holds is a stale declaration:
+    // refuse it, so the list keeps saying what it actually leaves out.
+    if let Some(stale) = left_out.into_iter().next() {
+        return Err(BuildError::Build(format!(
+            "{}: [package.metadata.weft] left_out_of_workers names '{stale}', which is not in the crate; \
+             remove it from the list",
+            crate_dir.join("Cargo.toml").display()
+        )));
+    }
     out.sort();
     Ok(out)
+}
+
+/// The top-level entries a crate's manifest leaves out of a worker's copy
+/// (`[package.metadata.weft] left_out_of_workers`, see
+/// [`worker_crate_entries`]). Empty when it lists none.
+fn left_out_of_workers(crate_dir: &Path) -> BuildResult<BTreeSet<String>> {
+    #[derive(Deserialize)]
+    struct Manifest {
+        package: Package,
+    }
+    #[derive(Deserialize)]
+    struct Package {
+        #[serde(default)]
+        metadata: Metadata,
+    }
+    #[derive(Deserialize, Default)]
+    struct Metadata {
+        #[serde(default)]
+        weft: Weft,
+    }
+    #[derive(Deserialize, Default)]
+    #[serde(deny_unknown_fields)]
+    struct Weft {
+        #[serde(default)]
+        left_out_of_workers: BTreeSet<String>,
+    }
+    let path = crate_dir.join("Cargo.toml");
+    let raw = std::fs::read_to_string(&path).map_err(|e| BuildError::Build(format!("read {}: {e}", path.display())))?;
+    let manifest: Manifest =
+        toml::from_str(&raw).map_err(|e| BuildError::Build(format!("parse {}: {e}", path.display())))?;
+    Ok(manifest.package.metadata.weft.left_out_of_workers)
 }
 
 /// Stage the worker-linked slice of the weft workspace at `dest`:
@@ -787,8 +836,7 @@ fn write_scoped_workspace_manifest(
 ) -> BuildResult<()> {
     let src = weft_root.join("Cargo.toml");
     let raw = std::fs::read_to_string(&src).map_err(BuildError::Io)?;
-    let mut manifest: toml::Value = raw
-        .parse()
+    let mut manifest: toml::Value = toml::from_str(&raw)
         .map_err(|e| BuildError::Build(format!("parse {}: {e}", src.display())))?;
     let workspace = manifest
         .get_mut("workspace")
@@ -877,7 +925,7 @@ pub fn stage_builder_base_context(weft_root: &Path) -> BuildResult<PathBuf> {
 /// ```
 ///
 /// The base precompiles the STOCK PROJECT'S WORKER, not a deps-only stand-in:
-/// the package crates pull in dependencies of their own (`sqlx`, `reqwest`,
+/// the package crates pull in dependencies of their own (`tokio-postgres`, `reqwest`,
 /// `tungstenite`, ...) and change how cargo unifies the features of the
 /// shared ones, so a base that had compiled only the engine's dependencies
 /// left every first build on a host recompiling the engine, most of the
@@ -1269,7 +1317,7 @@ pub fn prepare_test_workspace(
 /// One invocation, not one per package, because cargo's v2 resolver
 /// resolves features per invocation: built one at a time, two packages
 /// that share a dependency with different features each get their own
-/// copy of it (that is where ten copies of `sqlx-postgres` came from,
+/// copy of it (that is where ten copies of one database driver came from,
 /// and merging the crates into one workspace did not change it on its
 /// own). Built together, the resolver unifies them and compiles each
 /// dependency once.

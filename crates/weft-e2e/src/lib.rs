@@ -73,8 +73,8 @@ pub mod kept;
 pub mod live;
 // The platform layer reaches behind the public API (direct Postgres + Docker)
 // to observe and drive what the SYSTEM does underneath a program. It needs the
-// install's Postgres, so it (and its `sqlx` dep) compile ONLY under `e2e`. None
-// of it ships; see the module docs.
+// install's Postgres, so it compiles ONLY under `e2e`. None of it ships; see
+// the module docs.
 #[cfg(feature = "e2e")]
 pub mod platform;
 pub mod project;

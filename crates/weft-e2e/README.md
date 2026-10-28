@@ -281,9 +281,9 @@ recovery) by reaching behind the API the way an operator would: it reads the
 install's Postgres, signals the worker processes the runtime started, found in
 the install's worker registry (`kill_workers`, `stop_workers`), lists infra
 containers with Docker, and reads the runtime's log (`wait_for_runtime_log`).
-**None of it ships**: `platform` + its `sqlx` dep compile only under `e2e`,
-and this crate is never built into anything shipped. Scope is LOCAL
-reliability only (crash and restart on one machine). The API-driving client
+**None of it ships**: `platform` compiles only under `e2e`, and this crate is
+never built into anything shipped. Scope is LOCAL reliability only (crash and
+restart on one machine). The API-driving client
 sends a plain operator key: the install's own for an install on this machine
 (`Dispatcher::for_install`), or one a test holds for another, like a cloud
 install (`Dispatcher::with_key`).

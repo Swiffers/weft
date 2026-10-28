@@ -114,7 +114,7 @@ everything the `weft` command does still works; you just will not see the
 graph.
 
 The installer also needs Rust when it cannot download a prebuilt `weft` for
-your machine, and Node 20 with pnpm when it cannot download a prebuilt editor
+your machine, and Node 22.12 or newer with pnpm when it cannot download a prebuilt editor
 extension. It tells you which, up front, and stops rather than half-installing.
 
 ## Add the browser extension

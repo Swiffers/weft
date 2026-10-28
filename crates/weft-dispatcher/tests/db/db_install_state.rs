@@ -2,15 +2,15 @@
 //! domains it answers at (`weft_dispatcher::domains`), and a project's
 //! frontends (`weft_dispatcher::frontends`).
 //!
-//! Same rig as `db_lifecycle.rs`: `#[sqlx::test]` hands each test a fresh
+//! Same rig as `db_lifecycle.rs`: `#[weft_db_macros::test]` hands each test a fresh
 //! database, and the real boot-time migration path builds the schema.
 
-use sqlx::PgPool;
 use uuid::Uuid;
 use weft_core::install::{Certificate, Domain, DomainServes};
 use weft_dispatcher::ProjectStoreOps as _;
+use weft_task_store::db::{Client as _, Pool};
 
-async fn project(pool: &PgPool) -> Uuid {
+async fn project(pool: &Pool) -> Uuid {
     weft_task_store::apply_groups(pool, weft_dispatcher::app::DISPATCHER_GROUPS).await.expect("core schema");
     let store = weft_dispatcher::PostgresProjectStore::new(pool.clone());
     let id = Uuid::new_v4();
@@ -22,8 +22,8 @@ async fn project(pool: &PgPool) -> Uuid {
     id
 }
 
-#[sqlx::test]
-async fn a_domain_is_stored_once_and_goes_with_its_project(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_domain_is_stored_once_and_goes_with_its_project(pool: Pool) {
     let id = project(&pool).await;
     let install = Domain { name: "weft.example.com".into(), serves: DomainServes::Install };
     let api = Domain { name: "api.example.com".into(), serves: DomainServes::Api { project: id } };
@@ -36,7 +36,7 @@ async fn a_domain_is_stored_once_and_goes_with_its_project(pool: PgPool) {
     assert_eq!(weft_dispatcher::domains::add(&pool, &again, 2).await.unwrap(), Added::TakenForSomethingElse, "a stored name never quietly moves");
     assert_eq!(weft_dispatcher::domains::list(&pool).await.unwrap(), vec![api.clone(), install.clone()]);
 
-    sqlx::query("DELETE FROM project WHERE id = $1").bind(id).execute(&pool).await.unwrap();
+    pool.execute("DELETE FROM project WHERE id = $1", &[&id]).await.unwrap();
     assert_eq!(weft_dispatcher::domains::list(&pool).await.unwrap(), vec![install], "a project's domain goes with it");
     assert!(weft_dispatcher::domains::remove(&pool, "weft.example.com").await.unwrap());
     assert!(!weft_dispatcher::domains::remove(&pool, "weft.example.com").await.unwrap());
@@ -59,8 +59,8 @@ fn frontend(project: Uuid, name: &str, repo: Option<&str>) -> weft_core::fronten
 /// A project's links to its stored files have one way to go: one frontend
 /// at most carries the project's visitor address, and another project's
 /// frontend may carry its own.
-#[sqlx::test]
-async fn a_project_has_one_visitor_address(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_project_has_one_visitor_address(pool: Pool) {
     use weft_dispatcher::frontends::{list, record};
     let id = project(&pool).await;
     let with = |name: &str, address: &str| weft_core::frontend::Frontend { visitor_address: Some(address.into()), ..frontend(id, name, None) };
@@ -74,8 +74,8 @@ async fn a_project_has_one_visitor_address(pool: PgPool) {
 /// A frontend is stored once per name, its repository keeps its right to
 /// deploy while another frontend still deploys from it, and a project's
 /// frontends go with it.
-#[sqlx::test]
-async fn a_frontend_is_kept_once_and_its_repository_while_used(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_frontend_is_kept_once_and_its_repository_while_used(pool: Pool) {
     use weft_dispatcher::frontends::{forget, list, record, repo_still_used};
     let id = project(&pool).await;
     let shop = frontend(id, "shop", Some("me/site"));
@@ -88,15 +88,14 @@ async fn a_frontend_is_kept_once_and_its_repository_while_used(pool: PgPool) {
     assert!(repo_still_used(&pool, &site, id, "shop").await.unwrap(), "admin still deploys from it");
     forget(&pool, id, "admin").await.unwrap();
     assert!(!repo_still_used(&pool, &site, id, "shop").await.unwrap());
-    let hosted_without_repo = sqlx::query(
-        "INSERT INTO project_frontend (project_id, name, host, token_id, added_unix) VALUES ($1, 'x', 'cloud_run', $2, 0)",
-    )
-    .bind(id)
-    .bind(Uuid::new_v4())
-    .execute(&pool)
-    .await;
+    let hosted_without_repo = pool
+        .execute(
+            "INSERT INTO project_frontend (project_id, name, host, token_id, added_unix) VALUES ($1, 'x', 'cloud_run', $2, 0)",
+            &[&id, &Uuid::new_v4()],
+        )
+        .await;
     assert!(hosted_without_repo.is_err(), "a hosted frontend always names the repository that deploys it");
-    sqlx::query("DELETE FROM project WHERE id = $1").bind(id).execute(&pool).await.unwrap();
+    pool.execute("DELETE FROM project WHERE id = $1", &[&id]).await.unwrap();
     assert!(list(&pool, id).await.unwrap().is_empty(), "a project's frontends go with it");
 }
 
@@ -163,8 +162,8 @@ fn names(domains: Vec<Domain>) -> Vec<String> {
 
 /// A removal the door refuses leaves the domain stored, so `weft domain
 /// rm` can run again; one it accepts forgets it.
-#[sqlx::test]
-async fn a_domain_is_forgotten_only_once_the_door_let_it_go(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_domain_is_forgotten_only_once_the_door_let_it_go(pool: Pool) {
     use weft_dispatcher::domains::{add, list, unserve, ServeError};
     project(&pool).await;
     for name in ["a.example.com", "b.example.com"] {
@@ -183,12 +182,12 @@ async fn a_domain_is_forgotten_only_once_the_door_let_it_go(pool: PgPool) {
 /// A new domain the door refuses is forgotten again, and its removal
 /// wakes the loop that puts the door back on what remains, so no door
 /// stands for a domain nobody kept.
-#[sqlx::test]
-async fn a_refused_new_domain_is_forgotten_and_wakes_the_door(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_refused_new_domain_is_forgotten_and_wakes_the_door(pool: Pool) {
     use weft_dispatcher::domains::{add, list, serve_added, Added, ServeError, DOMAINS_CHANNEL};
     project(&pool).await;
     static CHANNELS: &[&str] = &[DOMAINS_CHANNEL];
-    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.unwrap();
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(pool.config(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.unwrap();
     let mut heard = watch.subscribe();
     let domain = Domain { name: "a.example.com".into(), serves: DomainServes::Install };
     let new = add(&pool, &domain, 1).await.unwrap() == Added::New;
@@ -207,8 +206,8 @@ async fn a_refused_new_domain_is_forgotten_and_wakes_the_door(pool: PgPool) {
 
 /// A domain stored before the add that the door refused stays stored:
 /// adding it again retries.
-#[sqlx::test]
-async fn a_refused_add_of_a_stored_domain_keeps_it(pool: PgPool) {
+#[weft_db_macros::test]
+async fn a_refused_add_of_a_stored_domain_keeps_it(pool: Pool) {
     use weft_dispatcher::domains::{add, list, serve_added};
     project(&pool).await;
     let domain = Domain { name: "a.example.com".into(), serves: DomainServes::Install };
@@ -223,8 +222,8 @@ async fn a_refused_add_of_a_stored_domain_keeps_it(pool: PgPool) {
 /// nothing while the door serves exactly them, retries a refusal later
 /// each time while recording why, stops at the third refusal in a row,
 /// and clears the refusal once accepted.
-#[sqlx::test]
-async fn the_door_follows_the_stored_domains_and_backs_off_a_refusal(pool: PgPool) {
+#[weft_db_macros::test]
+async fn the_door_follows_the_stored_domains_and_backs_off_a_refusal(pool: Pool) {
     use weft_dispatcher::domains::{add, door_state, settle};
     use weft_task_store::drain::DrainStep;
     project(&pool).await;
@@ -259,8 +258,8 @@ async fn the_door_follows_the_stored_domains_and_backs_off_a_refusal(pool: PgPoo
 /// the address, and the platform's own address stays until then and after
 /// the domain goes. A push the platform's own address got is verified
 /// against that address.
-#[sqlx::test]
-async fn an_install_domain_becomes_the_address_once_its_certificate_is_issued(pool: PgPool) {
+#[weft_db_macros::test]
+async fn an_install_domain_becomes_the_address_once_its_certificate_is_issued(pool: Pool) {
     use weft_dispatcher::domains::{add, list_stored, look_after_certificates, remove, settle, DOMAINS_CHANNEL};
     use weft_task_store::drain::DrainStep;
     use weft_task_store::install_address::InstallAddress;
@@ -270,7 +269,7 @@ async fn an_install_domain_becomes_the_address_once_its_certificate_is_issued(po
     assert_eq!(address.stable().await.unwrap(), SERVICE);
 
     static CHANNELS: &[&str] = &[DOMAINS_CHANNEL];
-    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.unwrap();
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(pool.config(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.unwrap();
     let mut heard = watch.subscribe();
     let now = weft_dispatcher::lease::now_unix();
     add(&pool, &Domain { name: "w.example.com".into(), serves: DomainServes::Install }, now).await.unwrap();

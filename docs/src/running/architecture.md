@@ -237,7 +237,7 @@ worker, and drops any of them no build has used for 30 days.
 On a cloud install the worker is an image instead, and the `[build.worker]`
 section of `weft.toml` says how that image is built:
 
-- `base_image`: the image it starts from, `debian:bookworm-slim` unless you
+- `base_image`: the image it starts from, `debian:trixie-slim` unless you
   name another.
 - `dockerfile_template`: the path, from the project's folder, to a
   Dockerfile weft uses instead of its own. It has to keep the `{{...}}`

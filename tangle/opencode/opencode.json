@@ -37,6 +37,7 @@
       "weft infra stop*": "allow",
       "weft infra upgrade*": "allow",
       "weft infra status*": "allow",
+      "weft infra logs*": "allow",
       "weft infra look*": "allow",
       "weft infra show*": "allow",
       "weft options*": "allow",

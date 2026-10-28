@@ -76,17 +76,10 @@ impl RequestFingerprint {
         Self {
             method: method.to_ascii_uppercase(),
             path: path.trim_start_matches('/').to_string(),
-            query_sha256: sha256_hex(query.as_bytes()),
-            body_sha256: sha256_hex(body),
+            query_sha256: crate::project::hash::sha256_hex(query.as_bytes()),
+            body_sha256: crate::project::hash::sha256_hex(body),
         }
     }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(bytes);
-    format!("{:x}", h.finalize())
 }
 
 impl SignedClaims for CallerTokenClaims {

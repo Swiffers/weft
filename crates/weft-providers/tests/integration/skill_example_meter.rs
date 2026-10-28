@@ -62,7 +62,7 @@ fn observed(status: u16) -> ObservedCall {
 }
 
 fn follow_up() -> reqwest_middleware::ClientWithMiddleware {
-    reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build()
+    reqwest_middleware::ClientBuilder::new(weft_core::net::http_client().build().unwrap()).build()
 }
 
 #[tokio::test]

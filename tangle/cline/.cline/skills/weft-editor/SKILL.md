@@ -185,8 +185,14 @@ read-only (you can still move, expand, and collapse).".
 - **Read a key off a wire**: right-click a wire whose value is a record and
   pick a field, one level at a time ("Up one level", "Read the whole value"
   to go back). The wire turns dotted with the path at its end; in source it
-  is `t.n = s.out.profile.wpm`. A `JsonDict` or scalar value offers nothing
+  is `t.n = s.out.profile.wpm`. A `JsonDict`, `Json` or scalar value offers nothing
   and says to declare the shape or Cast first.
+- **Metadata ports**: not drawn, and nor are metadata wires: both are
+  written in the code. An input a metadata wire fills shows the value,
+  read-only, with a link to where it comes from; a group's metadata ports
+  show in its Config strip (a fully written value is editable there, a
+  gathered one is read-only with each port it names as a link). The graph
+  only lets a person follow them.
 - **Edit a node's settings**: expand it and edit the fields inline: text,
   selects, checkboxes, code editors, entry lists, file pickers, connection
   pickers. A port-driven field carries a `{ }` / `=` chip toggling whether

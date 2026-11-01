@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use weft_task_store::db::{Client, Pool};
+use weft_task_store::db::{self, Client, Pool};
 use weft_core::run_spec::RunSpec;
 use weft_core::versions::PrunePlan;
 use weft_core::working_copy::Head;
@@ -268,14 +268,14 @@ pub(crate) async fn retain_source_version(conn: &impl Client, project: uuid::Uui
     Ok(())
 }
 
-type VersionTuple = (String, uuid::Uuid, Option<String>, serde_json::Value, Option<String>, i64);
+type VersionTuple = (String, uuid::Uuid, Option<String>, db::Json<serde_json::Value>, Option<String>, i64);
 type RunTuple = (
     uuid::Uuid,
     uuid::Uuid,
     String,
     Option<uuid::Uuid>,
     Vec<String>,
-    Option<serde_json::Value>,
+    Option<String>,
     weft_core::stored::Version,
     String,
     Option<String>,
@@ -283,7 +283,7 @@ type RunTuple = (
 );
 
 fn version_from(row: VersionTuple) -> anyhow::Result<VersionRow> {
-    let (id, project_id, parent_id, manifest, label, created_at) = row;
+    let (id, project_id, parent_id, db::Json(manifest), label, created_at) = row;
     Ok(VersionRow {
         id,
         project_id,
@@ -303,7 +303,7 @@ fn run_from(row: RunTuple) -> anyhow::Result<RunRow> {
         seed_run_id,
         stale,
         spec: spec
-            .map(|spec| RunSpec::STORED.decode(spec, spec_version))
+            .map(|spec| RunSpec::STORED.decode(spec.as_str(), spec_version))
             .transpose()
             .map_err(|e| e.at(format_args!("run {run_id}'s spec")))?,
         definition_hash,
@@ -333,7 +333,7 @@ impl VersionStoreOps for PostgresVersionStore {
                     &version.id,
                     &version.project_id,
                     &version.parent_id,
-                    &serde_json::to_value(&version.manifest)?,
+                    &db::Json(db::WeftMade(&version.manifest)),
                     &version.label,
                     &(version.created_at as i64),
                 ],
@@ -378,9 +378,9 @@ impl VersionStoreOps for PostgresVersionStore {
     }
 
     async fn registered_source(&self, project: uuid::Uuid) -> anyhow::Result<Option<Manifest>> {
-        let source: Option<Option<serde_json::Value>> =
+        let source: Option<Option<db::Json<serde_json::Value>>> =
             self.pool.scalar_opt("SELECT running_source FROM project WHERE id = $1", &[&project]).await?;
-        Ok(source.flatten().map(serde_json::from_value).transpose()?)
+        Ok(source.flatten().map(|source| serde_json::from_value(source.0)).transpose()?)
     }
 
     async fn run(&self, run_id: RunId) -> anyhow::Result<Option<RunRow>> {

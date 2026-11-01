@@ -10,6 +10,8 @@ pub mod completion;
 pub mod emission;
 pub mod firing;
 #[cfg(feature = "runtime")]
+pub mod forget;
+#[cfg(feature = "runtime")]
 pub mod loop_runtime;
 pub mod postprocess;
 pub mod ready;
@@ -22,8 +24,8 @@ pub use cancel::CancelCause;
 pub use completion::check_completion;
 pub use emission::PulseEmission;
 pub use firing::{
-    firing_at, firing_at_mut, NodeFiring, NodeFiringStatus,
-    NodeFiringTable,
+    firing_at, firing_at_mut, set_firing_status, NodeFiring, NodeFiringStatus,
+    NodeFirings, NodeFiringTable,
 };
 pub use postprocess::{close_unmentioned_downstream, postprocess_output, OutputBag};
 pub use ready::{find_ready_nodes, InputBag, ReadyGroup};

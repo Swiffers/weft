@@ -183,22 +183,23 @@ impl StandIn {
     /// answers a caller serves (`RunStarted::stand_in`): its request
     /// is the firing kick's payload. `None` for any other run: a caller on
     /// the line was on the worker that bore its run, and none follows it.
-    fn of(events: &[RunEvent]) -> Result<Option<Self>> {
-        let Some(spec) = events.iter().find_map(|event| match event {
-            RunEvent::RunStarted { stand_in, .. } => stand_in.as_deref().cloned(),
-            _ => None,
-        }) else {
+    /// `birth` is the run's birth, `firing_payload` what its firing kick
+    /// was given (`ClaimedRecord::firing_payload`).
+    fn of(birth: &RunEvent, firing_payload: Option<&serde_json::Value>) -> Result<Option<Self>> {
+        let RunEvent::RunStarted { stand_in: Some(spec), .. } = birth else {
             return Ok(None);
         };
-        let payload = events
-            .iter()
-            .find_map(|event| match event {
-                RunEvent::NodeKicked { firing: true, payload, .. } => Some(payload.clone().unwrap_or_default()),
-                _ => None,
-            })
+        let payload = firing_payload
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("a run started by hand through a caller's trigger has no firing kick to serve"))?;
-        let request = serde_json::from_value(payload).context("the firing kick of a run started by hand through a caller's trigger is not a request")?;
-        Ok(Some(Self { spec, request }))
+        let request: weft_core::caller::LiveRequest =
+            serde_json::from_value(payload).context("the firing kick of a run started by hand through a caller's trigger is not a request")?;
+        // The headers a gate reads were refused at the command, which
+        // reads the gate's connection; this floor holds the rest.
+        if let Some(header) = request.credential_typed_by_hand(&[]) {
+            anyhow::bail!("{}", weft_core::caller::fired_credential(header));
+        }
+        Ok(Some(Self { spec: (**spec).clone(), request }))
     }
 
     /// The exchange its run serves through the stand-in, recorded on the
@@ -342,51 +343,81 @@ impl Worker {
         drive.await.map(Some).context("the drive panicked outside its guard")
     }
 
-    /// Carry on a run this worker just claimed, from its record.
+    /// Carry on a run this worker just claimed, from its record, read a
+    /// page at a time.
     async fn carry_on(
         &self,
         run_id: RunId,
         claimed: weft_journal::record::Claimed,
         registered: Registered,
     ) -> Result<()> {
-        let next_seq = claimed.record.rows.last().map_or(0, |row| row.seq + 1);
-        let first = claimed.record.events(run_id).map_err(anyhow::Error::msg);
-        let settings = first.as_ref().ok().and_then(|events| birth_settings(events)).unwrap_or_default();
+        let record = &**self.clients.writer.record();
         let project = self.plans.project(&self.clients, &claimed.definition_hash).await;
+        // A record this worker cannot read, a program it cannot fetch, or a
+        // stand-in it cannot serve still ends the run: it is this worker's
+        // now.
         let keep_for = project.as_ref().map_or(weft_core::run_settings::KeepFor::WEFT_DEFAULT, |project| project.defaults.keep_for());
+        // A program that cannot be fetched is why the record cannot be read.
+        let read = match project {
+            Ok(project) => {
+                let program = self.plans.program(&project, &claimed.definition_hash);
+                crate::run_driver::ClaimedRecord::read(|run, after| weft_journal::decoded_page(record, run, after), &*self.clients.project, run_id, program.project.clone())
+                    .await
+                    .map(|read| (program, read))
+            }
+            Err(e) => Err(e),
+        };
+        let (settings, next_seq, read) = match read {
+            Ok((program, read)) => (birth_settings(&read.birth), read.last_seq + 1, Ok((program, read))),
+            // The record is read again on this rare path only, in one
+            // pass: where its rows end (the run's ending goes after them)
+            // and the charges it leaves open. When that pass fails too,
+            // the broker ends the run after its last row and books what it
+            // leaves open, as for any run whose ending cannot be written.
+            Err(e) => match Leftovers::of(record, run_id).await {
+                Ok(left) => (None, left.last_seq.map_or(0, |last| last + 1), Err((e, left.charges))),
+                Err(again) => {
+                    let why = format!("{e:#}; and reading its record again to end it failed too: {again:#}");
+                    self.clients.writer.give_up(run_id, &why).await;
+                    return Err(anyhow::anyhow!(why));
+                }
+            },
+        };
+        let settings = settings.unwrap_or_default();
         let journal = self.clients.writer.run(RunSpec {
             run_id,
             settings,
             keep_for: settings.kept_for(keep_for),
             epoch: claimed.epoch,
             next_seq,
-            redaction: Default::default(),
+            secrets: Vec::new(),
             program: None,
         });
-        // A record this worker cannot read, a program it cannot fetch, or a
-        // stand-in it cannot serve still ends the run: it is this worker's
-        // now.
-        let opened = project.and_then(|project| {
-            let events = first?;
-            let exchange = StandIn::of(&events)?.map(|stand_in| stand_in.exchange(run_id, journal.clone(), &self.replica)).transpose()?;
-            let program = self.plans.program(&project, &claimed.definition_hash);
-            Ok((program, events, exchange))
-        });
-        let (program, events, exchange) = match opened {
+        // What fails here still books the charges the record leaves open:
+        // read with it, or in the pass above.
+        let opened = match read {
+            Ok((program, read)) => {
+                let exchange = StandIn::of(&read.birth, read.firing_payload.as_ref()).and_then(|stand_in| {
+                    stand_in.map(|stand_in| stand_in.exchange(run_id, journal.clone(), &self.replica)).transpose()
+                });
+                match exchange {
+                    Ok(exchange) => Ok((program, read, exchange)),
+                    Err(e) => Err((e, read.charges)),
+                }
+            }
+            Err(failed) => Err(failed),
+        };
+        let (program, read, exchange) = match opened {
             Ok(opened) => opened,
-            Err(e) => {
-                // Read again on this rare path only (the drive takes the
-                // events it read); a record that does not decode is the
-                // error itself, and leaves nothing to book.
-                let record = claimed.record.events(run_id).ok();
-                return Err(crate::run_driver::fail_run(&self.clients.writer, &journal, run_id, &self.replica, record.as_deref(), e).await);
+            Err((e, charges)) => {
+                return Err(crate::run_driver::fail_run(&self.clients.writer, &journal, run_id, &self.replica, Some(charges), e).await);
             }
         };
         self.drive(RunStart {
             run_id,
             journal,
             program,
-            starts_from: StartsFrom::Record(events),
+            starts_from: StartsFrom::Record(Box::new(read)),
             exchange,
             registered,
             slot: None,
@@ -461,11 +492,16 @@ impl Worker {
         outcome.map(|_| ())
     }
 
-    /// Let go of a run whose whole record is written, for `why`, asking
-    /// until the broker answers: until then this worker owns the run on
-    /// record, and nothing else may pick it up. An outage is asked about
-    /// again; any other refusal is the broker's answer, and fails the
-    /// drive with it, since asking again would hear the same.
+    /// Let go of a run whose record is written (whole, or for a durable
+    /// run handed back because a write got no answer, the part that
+    /// landed), for `why`, asking until the broker answers: until then this
+    /// worker owns the run on record, and nothing else may pick it up. An
+    /// outage is asked about again. The broker saying the run is not this
+    /// worker's is the let-go done already: an earlier ask whose answer was
+    /// lost, or the run taken from this worker meanwhile (its lease lapsed
+    /// while the broker was out of reach and another worker took it on, or
+    /// it ended). Any other refusal is the broker's answer, and fails the drive
+    /// with it, since asking again would hear the same.
     async fn let_go(&self, run_id: RunId, why: weft_broker_client::protocol::LetGo) -> Result<()> {
         // Whether an earlier ask may have landed with its answer lost.
         let mut maybe_landed = false;
@@ -473,10 +509,12 @@ impl Worker {
         loop {
             match self.clients.runs.let_go(run_id, why).await {
                 Ok(()) => return Ok(()),
-                // The run is another worker's now: the earlier ask landed,
-                // and the worker that took its resume owns it.
-                Err(e) if maybe_landed && broker_conflict(&e) => {
-                    tracing::info!(target: "weft_engine::worker", %run_id, "the run was let go of by an earlier ask whose answer was lost");
+                Err(e) if broker_conflict(&e) => {
+                    if maybe_landed {
+                        tracing::info!(target: "weft_engine::worker", %run_id, "the run was let go of by an earlier ask whose answer was lost");
+                    } else {
+                        tracing::info!(target: "weft_engine::worker", %run_id, ?why, "the run is no longer this worker's to let go of (another worker took it on, or it ended)");
+                    }
                     return Ok(());
                 }
                 Err(e) if broker_outage(&e) => {
@@ -495,12 +533,37 @@ impl Worker {
     }
 }
 
-/// How the run whose record begins with `events` is kept, from its birth.
-fn birth_settings(events: &[RunEvent]) -> Option<weft_core::run_settings::RunSettings> {
-    events.iter().find_map(|event| match event {
+/// How the run born with `birth` is kept.
+fn birth_settings(birth: &RunEvent) -> Option<weft_core::run_settings::RunSettings> {
+    match birth {
         RunEvent::RunStarted { settings, .. } => Some(*settings),
         _ => None,
-    })
+    }
+}
+
+/// What a run's record leaves behind for a worker that cannot carry it
+/// on: where its rows end, and the charges it leaves open.
+struct Leftovers {
+    /// The last row; `None` for a record with none.
+    last_seq: Option<i32>,
+    /// The charges opened in every row that decodes: a row that does not
+    /// (often why the record cannot be carried on) costs only the charges
+    /// it would have opened, never the ones the others did.
+    charges: weft_journal::ChargeBook,
+}
+
+impl Leftovers {
+    /// Run `run_id`'s, read from `record` a page at a time, in one pass.
+    async fn of(record: &dyn weft_journal::RecordClient, run_id: RunId) -> Result<Self> {
+        let start = Self { last_seq: None, charges: Default::default() };
+        weft_journal::record::fold_pages(|after| record.record_of(run_id, after), None, start, move |left: &mut Self, page| {
+            left.last_seq = weft_journal::record::RecordPage::last_seq(&page);
+            let (rows, _) = page.decode_lossy(run_id);
+            rows.iter().for_each(|row| left.charges.apply(&row.event));
+            Ok(())
+        })
+        .await
+    }
 }
 
 impl Worker {
@@ -793,6 +856,9 @@ fn outbound_payload(chunk: &OutboundChunk) -> weft_core::bus::WirePayload {
         OutboundChunk::Bytes(b) => {
             weft_core::bus::WirePayload::Bytes(bytes::Bytes::from(b.clone()))
         }
+        // The record keeps the value with its secrets' markers, never what
+        // the caller received.
+        OutboundChunk::Revealed { kept, .. } => weft_core::bus::WirePayload::Json(kept.clone()),
     }
 }
 
@@ -1112,10 +1178,11 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
     // The door ticks while this worker owns anything on record: a run it
     // drives that does more than wait outside, or a record still on its
     // way. With only waiting runs, it vouches for the worker until the
-    // earliest of their waits gives up, and sleeps.
+    // earliest of their waits gives up, and sleeps. It ticks on the io
+    // runtime, apart from the threads node bodies run on.
     let lease = weft_core::time_scale::scaled_secs(weft_task_store::worker_door::WORKER_LEASE_SECS);
     let under_way = worker.clone();
-    door.start_ticks(Box::new(move || under_way.under_way(lease)));
+    door.start_ticks(&worker.clients.io, Box::new(move || under_way.under_way(lease)));
     // It lives as long as the process.
     spawn_line_watch(worker.line_watch());
     // What the runs share goes once nothing used it for the idle window.
@@ -1176,10 +1243,15 @@ async fn shutdown_signal() {
 
 /// Once the platform told the worker to stop ([`Worker::stopping`], which
 /// hands every recorded run back): wait for the runs it still drives to
-/// end and every record queued to be written. No deadline: what is waited
-/// on is the work already under way, and the platform's kill is the bound.
+/// end, let go of what they shared, and wait for every record queued to
+/// be written. No deadline: what is waited on is the work already under
+/// way, and the platform's kill is the bound.
 async fn wind_down(worker: &Worker) {
     worker.background.wait_zero().await;
+    // No run is left to use them: a pool's connections are given back to
+    // the database now, while the records go out, rather than held until
+    // the process is gone.
+    worker.clients.shared.let_go_all();
     // Every run's rows still queued go out before the process does: a
     // fast run that ended leaves its record trailing behind it.
     worker.clients.writer.written().await;
@@ -1351,9 +1423,9 @@ struct Arriving {
     /// What the trigger wakes with: a caller's opening request, or an
     /// event's payload.
     payload: serde_json::Value,
-    /// The credentials its caller sent: the run reads them in memory, and
-    /// its record holds none of them.
-    redaction: weft_core::caller::Redaction,
+    /// The secrets it is born holding: its caller's credentials
+    /// (`crate::door::Admitted::secrets`).
+    secrets: Vec<weft_journal::frame::KeptSecret>,
     /// Somebody waits to hear the run was born (a fire's firer): a durable
     /// run's birth is on record before that answer leaves.
     acknowledged: bool,
@@ -1393,7 +1465,7 @@ impl Worker {
         triggers_version: u64,
         arriving: Arriving,
     ) -> Result<RunStart, Turned> {
-        let Arriving { registered, payload, redaction, acknowledged } = arriving;
+        let Arriving { registered, payload, secrets, acknowledged } = arriving;
         let run_id = registered.run_id;
         if self.stopping.is_cancelled() {
             return Err(Turned::Stopping);
@@ -1415,7 +1487,7 @@ impl Worker {
             keep_for: plan.keep_for,
             epoch: 1,
             next_seq: 0,
-            redaction,
+            secrets,
             program: startable.runs.kept().cloned(),
         });
         let birth = startable.birth(&plan, run_id, &payload, crate::now_unix());
@@ -1465,7 +1537,7 @@ impl Worker {
         // who leaves at once finds the run to cancel. A fresh id is no
         // other run's.
         let registered = self.cancels.claim(weft_core::new_run_id()).expect("a fresh run id is no other run's");
-        let arriving = Arriving { registered, payload, redaction: admitted.redaction.clone(), acknowledged: false };
+        let arriving = Arriving { registered, payload, secrets: admitted.secrets.clone(), acknowledged: false };
         self.admit(&admitted.trigger, &admitted.entry, admitted.instance.as_ref(), admitted.triggers_version, arriving).await.map_err(|turned| match turned {
             Turned::Unread(e) => {
                 tracing::error!(target: "weft_engine::door", error = %format!("{e:#}"), "a run's facts could not be read");
@@ -1579,7 +1651,7 @@ impl Worker {
         let arriving = Arriving {
             registered,
             payload: fire.payload.clone(),
-            redaction: weft_core::caller::Redaction::default(),
+            secrets: Vec::new(),
             acknowledged: true,
         };
         let born = match self.admit(&trigger, &entry, entry.instance.as_ref(), triggers.version, arriving).await {
@@ -2032,7 +2104,7 @@ mod tests {
     async fn a_run_registered_while_the_door_sleeps_on_waiting_runs_wakes_it() {
         let (worker, broker) = worker_firing(|_, _| {});
         let (cancels, holds) = (worker.cancels.clone(), worker.holds.clone());
-        worker.door.start_ticks(Box::new(move || crate::door::UnderWay::of(true, cancels.count(), holds.quiet(), 15)));
+        worker.door.start_ticks(&tokio::runtime::Handle::current(), Box::new(move || crate::door::UnderWay::of(true, cancels.count(), holds.quiet(), 15)));
         let waiting = worker.cancels.claim(uuid::Uuid::from_u128(1)).expect("a fresh run");
         let quiet = worker.holds.of(uuid::Uuid::from_u128(1), None);
         quiet.quiet(Some(crate::run_holds::Quiet { until: 5_000, can_pause: false }));
@@ -2057,7 +2129,7 @@ mod tests {
     async fn a_stopping_worker_stops_vouching_and_ticks_while_it_lives() {
         let (worker, broker) = worker_firing(|_, _| {});
         let under_way = worker.clone();
-        worker.door.start_ticks(Box::new(move || under_way.under_way(15)));
+        worker.door.start_ticks(&tokio::runtime::Handle::current(), Box::new(move || under_way.under_way(15)));
         let waiting = worker.cancels.claim(uuid::Uuid::from_u128(1)).expect("a fresh run");
         let quiet = worker.holds.of(uuid::Uuid::from_u128(1), None);
         quiet.quiet(Some(crate::run_holds::Quiet { until: 5_000, can_pause: false }));
@@ -2240,8 +2312,11 @@ mod tests {
             self.through.acquire().await.expect("the gate stays").forget();
             self.record.record_batch(batch).await
         }
-        async fn record_of(&self, run_id: RunId) -> anyhow::Result<weft_journal::record::RawRecord> {
-            self.record.record_of(run_id).await
+        async fn record_of(&self, run_id: RunId, after: Option<i32>) -> anyhow::Result<weft_journal::record::RawRecord> {
+            self.record.record_of(run_id, after).await
+        }
+        async fn secret(&self, id: weft_core::secret::SecretId) -> anyhow::Result<Option<serde_json::Value>> {
+            self.record.secret(id).await
         }
         async fn give_up(&self, run_id: RunId, why: String) -> Result<(), weft_journal::BatchError> {
             self.record.give_up(run_id, why).await
@@ -2255,7 +2330,7 @@ mod tests {
     async fn a_worker_stops_once_the_records_of_its_waiting_runs_are_written() {
         let gate = Arc::new(GatedRecord { record: Arc::new(MemJournal::default()), through: tokio::sync::Semaphore::new(0) });
         let mut clients = clients(Arc::new(MemJournal::default()));
-        clients.writer = crate::journal_writer::WorkerJournal::start(gate.clone(), Default::default(), &crate::context::io_runtime().expect("the io runtime starts"));
+        clients.writer = crate::journal_writer::WorkerJournal::start(gate.clone(), Default::default(), &clients.io);
         let line = crate::context::TestLine::new();
         clients.line = line.clone();
         let worker = worker_with(clients);
@@ -2275,7 +2350,7 @@ mod tests {
             keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
             epoch: 1,
             next_seq: 0,
-            redaction: Default::default(),
+            secrets: Vec::new(),
             program: None,
         });
         journal.hand(&RunEvent::RunFailed { run_id, error: "on its way".into(), at_unix: 0 }, None).unwrap();
@@ -2294,6 +2369,25 @@ mod tests {
         assert!(worker.stopping.is_cancelled(), "the records went out: it stops then");
         assert!(waiting.flag.is_cancelled());
         drop((waiting, quiet, journal));
+    }
+
+    /// A stopping worker lets go of what its runs shared once the last one
+    /// ended, and not before: a pool's connections are given back to the
+    /// database then, rather than when the process goes.
+    #[tokio::test]
+    async fn winding_down_lets_go_of_what_the_runs_shared_once_they_ended() {
+        let (worker, _broker) = worker_firing(|_, _| {});
+        drop(worker.clients.shared.named::<usize, _, _>("pool", || async { Ok(1) }).await.unwrap());
+        let run = worker.background.token();
+        let winding = tokio::spawn({
+            let worker = worker.clone();
+            async move { wind_down(&worker).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(worker.clients.shared.len(), 1, "a run still going keeps it");
+        drop(run);
+        tokio::time::timeout(std::time::Duration::from_secs(5), winding).await.expect("wound down").unwrap();
+        assert!(worker.clients.shared.is_empty(), "let go once the runs ended");
     }
 
     /// A line the broker keeps for good never stops the worker.

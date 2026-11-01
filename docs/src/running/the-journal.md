@@ -66,6 +66,23 @@ recomputes everything else with the same functions the live engine ran, so a
 replay rebuilds exactly the picture the live run held. A replay shows the
 times the journal wrote down, so you see when each thing really happened.
 
+weft reads a run back a page of rows at a time. It forgets a node once the
+node has finished (keeping each node's last output, which the run's outputs
+show), and a loop's iteration once nothing in it is still running. So reading
+a run back holds one page of its rows and what is still running, however long
+the run is. The one thing that grows is what a loop gathers: the loop hands
+the whole list on when it ends, so it holds it until then. A run started from
+another one (`weft run --seed`) reads that one the same way, and keeps only
+the nodes it reuses from it.
+
+If you follow a run (the editor, `weft run`, `weft wait`), you get its history
+and then what happens live, on one stream, each event once. If you fall behind
+or lose the connection, you carry on from the last event you got and nothing
+is missed. The events say where in the journal a value is kept instead of
+carrying it, so a value the run passed to ten nodes still travels once: the
+editor reads a node's values when you open its inspector, and `weft events`
+and `weft run` print them written in.
+
 ## When a row cannot be read
 
 A row the fold cannot apply is a hole. It is logged, listed on the run, and the
@@ -115,19 +132,30 @@ nothing is dropped. For what that
 does to new calls, go and read [when a worker is
 full](architecture.md#when-a-worker-is-full).
 
-## Why a failed write stops the run
+## When a write of the record fails
 
-If a write fails (the broker refuses it, or a minute of sending it again gets
-no answer), the runs whose rows were in it end as failed. A write that got no
-answer is safe to send again, because the record takes a batch sent twice only
-once. A journal missing rows the worker thinks it wrote would rebuild a different run:
-a node whose start was lost but whose values landed would run again and spend
-twice.
+If the broker refuses a write, the runs whose rows were in it end as failed.
+
+If a write gets no answer, the worker sends it again for a minute. That is
+safe, because the record takes a batch sent twice only once. After the minute
+it gives up on that write, and then:
+
+- a fast run ends as failed;
+- a durable run is handed back, and another worker carries it on from the rows
+  that did land.
+
+Either way the run writes nothing after the write that failed. A record with a
+hole in it would rebuild a different run: a node whose start was lost but whose
+values landed would run again and spend twice. So what landed is always the
+run's first rows, in order, which is the record a worker that died leaves
+behind, and a durable run carries on from it the same way. A node whose start
+landed and whose end did not is failed rather than run again (for that, go and
+read [when the worker dies mid-run](../nodes/durable-execution.md#when-the-worker-dies-mid-run)).
 
 ## How long a run is kept
 
 An ended run is kept for a week, and then deleted with its record, its logs,
-its search entry and its tags. A run that has not ended (running, parked,
+its costs, its search entry and its tags. A run that has not ended (running, parked,
 waiting for a worker) is never deleted, however old. If you want another
 length:
 

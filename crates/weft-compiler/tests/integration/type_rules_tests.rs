@@ -243,7 +243,7 @@ two = @include("lib/f.weft")
 two.x = a.k
 show = Debug
 show.data = two.r
-g = Group(y?: String) -> (o: String) {
+g = Group(y: String) -> (o: String) {
   self.o = self.y
 }
 g.y = one.r
@@ -262,7 +262,7 @@ fn the_gate_rule_asks_every_site_of_an_included_file() {
     std::fs::create_dir(dir.path().join("lib")).expect("mkdir");
     std::fs::write(
         dir.path().join("lib/step.weft"),
-        "Group(x?: String) -> (r: String) {\n  n = ExecPython(v?: String) -> (r: String) { code: \"return {}\" }\n  n.v = self.x\n  self.r = n.r\n}\n",
+        "Group(x: String) -> (r: String) {\n  n = ExecPython(v?: String) -> (r: String) { code: \"return {}\" }\n  n.v = self.x\n  self.r = n.r\n}\n",
     )
     .expect("write");
     let both = r#"
@@ -461,7 +461,7 @@ fn a_narrowable_output_takes_a_fitting_type_and_a_fixed_one_only_its_own() {
     assert!(enrich_errors.is_empty(), "{enrich_errors:?}");
     assert_eq!(output_type(&project, "r", "body"), ty("{ email: String, .. }"));
 
-    let (_, enrich_errors, _) = check("r = Route -> (body: Number) { path: \"signup\" }\n");
+    let (_, enrich_errors, _) = check("r = Route -> (body: Access) { path: \"signup\" }\n");
     assert!(enrich_errors.iter().any(|e| e.contains("widest type")), "{enrich_errors:?}");
 
     let (_, enrich_errors, _) = check("r = Route -> (path: Number) { path: \"signup\" }\n");
@@ -476,8 +476,13 @@ fn a_route_body_type_must_suit_its_data_type() {
     assert!(message_of(&d, "rule-structural").contains("text body"), "{d:?}");
     let (_, _, d) = check("r = Route -> (body: String) { path: \"say\", method: \"POST\", dataType: \"text\" }\n");
     assert!(!codes(&d).contains(&"rule-structural"), "{d:?}");
-    let (_, _, d) = check("r = Route -> (body: String) { path: \"say\", method: \"POST\" }\n");
+    let (_, _, d) = check("r = Route -> (body: Image) { path: \"say\", method: \"POST\" }\n");
     assert!(message_of(&d, "rule-structural").contains("json body"), "{d:?}");
+    // A json body may be any JSON, a list or a bare value too, once declared so.
+    for body in ["Json", "List[List[Number]]", "String"] {
+        let (_, _, d) = check(&format!("r = Route -> (body: {body}) {{ path: \"say\", method: \"POST\" }}\n"));
+        assert!(!codes(&d).contains(&"rule-structural"), "{body}: {d:?}");
+    }
 }
 
 /// A port added to a route reads the path capture of its name, so one
@@ -627,7 +632,7 @@ params.systemPrompt = a.x
 fn the_gate_rule_reads_the_scope_a_node_sits_in() {
     let gated_group = r#"
 seed = Text { value: "x" }
-g = Group(x?: String) -> (o: String) {
+g = Group(x: String) -> (o: String) {
   i = ExecPython(v?: String) -> (r: String) { code: "return {}" }
   i.v = self.x
   self.o = i.r
@@ -673,7 +678,7 @@ my.items = seed.items
     // Not on the output of the same name: nothing writes it, so nothing
     // arrives on it.
     let out_named_alike = r#"
-h = Group(x?: String) -> (x: String) {
+h = Group(x: String) -> (x: String) {
   i = ExecPython(v?: String) -> (r: String) { code: "return {}" }
   i.v = self.x
 }

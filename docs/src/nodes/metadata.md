@@ -84,6 +84,7 @@ of [CONTRIBUTING](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#
 | `color` | String | none | Hex, a CSS variable, or a palette token |
 | `inputs` | List | `[]` | Everything the node takes, wired data and written settings alike |
 | `outputs` | List | `[]` | The ports it emits on |
+| `metadataPorts` | List | `[]` | Ports whose value you write here, which no run computes. Go and read [metadataPorts](#metadataports) |
 | `requiresInfra` | Boolean | `false` | The node provisions containers and must implement `provision_infra` |
 | `images` | List[String] | `[]` | Directories under the package root, each holding a Dockerfile to build |
 | `publishes` | String | none | The service whose connection this node hands out itself. Needs an `Access` output too |
@@ -133,6 +134,29 @@ and the loader refuses a `metadata.json` that declares it. For what
 comes out on it, go and read [which failures a program can
 handle](values-and-emission.md#which-failures-a-program-can-handle).
 
+## metadataPorts
+
+A metadata port holds a value written here, by hand, and the node never
+computes it. A wire a program draws from it is a metadata wire: before the
+program runs, the compiler writes the value into the input the wire points at.
+For what that is for, go and read [metadata ports](../language/groups.md#metadata-ports).
+
+```json
+"metadataPorts": [
+  { "name": "tool", "type": "{ name: String }", "description": "What this node is, for a model", "value": { "name": "pick" } }
+]
+```
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `name` | String | **required** | The port name. It may not be the name of another of the node's ports: an input, an output, another metadata port, `_error`, `_should_flow` or `_should_not_flow` |
+| `type` | type string | **required** | What the value is. No type variable: nothing a program wires can tell what one would stand for |
+| `description` | String | none | What the port holds, for people and for the AI builder; `weft describe-nodes` shows it |
+| `value` | any | **required** | The value, which has to fit `type` |
+
+If one of these rules is broken, the node fails to load, and the message
+names the port.
+
 ## features
 
 | Key | Type | Default | What it does |
@@ -149,6 +173,8 @@ handle](values-and-emission.md#which-failures-a-program-can-handle).
 | `addedPortsAreDataKeys` | Boolean | `false` | Set it when the ports a program adds are named after data from outside weft: a path's captures, a query's parameters, a template's ids, the keys of a JSON object it builds. The compiler's `not-camel-case` warning then leaves every port a program adds to the node alone, and still checks the name the program gives the node. The nodes that ship with weft and set it are `Route`, `JsonObject`, `ElevenLabsRunTemplate`, `PostgresExecuteQuery`, `PostgresWatchQuery` and `PostgresUpdateRows` |
 | `join` | Boolean | `false` | Set it when the node meets several branches and goes on with whichever arrived, like `FirstInOrder`. The inputs a program adds are optional (a closure on one does not skip the node), it runs once everything it waits on arrived or closed, and when nothing arrived it closes its output itself. The compiler's `run-undecided` check skips it, so it needs no `_should_flow` even when every wired input is optional |
 | `customInputType` | type string | none | The type every added input takes. Naming one variable makes them all one type |
+| `customOutputType` | type string | none | The type every output a program adds takes, when the program does not give it one. If you name a type variable that one of the node's own inputs uses (`T` on `Dispatch`'s `value`), each added output carries whatever that input received: a router's branches carry what it routes. Needs `canAddOutputPorts` |
+| `pairsAddedPorts` | Boolean | `false` | Set it when each input a program adds should come with an output of the same name: the compiler makes that output, so the program does not have to declare it. An added output with no input of its name, an added output nothing reads, and an added input named after one of the node's own outputs are each the `unpaired-port` error. `Dispatch` sets it: `route.search = search.tool` adds a branch, and `route.search` is where it sends what that branch claims. Needs `canAddInputPorts` and `canAddOutputPorts` |
 | `showDebugPreview` | Boolean | `false` | Render the last output as JSON on the node body |
 | `liveEndpoint` | String | none | The declared endpoint the dispatcher proxies `/live` to |
 | `castPorts` | `{input, output}` | none | Declares the node a checked cast between those two ports |
@@ -248,8 +274,8 @@ read [refusals answered with a 200](../connections/declaring-a-service.md#refusa
 
 Each rule is `{ "when": <condition>, "then": <diagnostic> }`.
 
-The diagnostic takes `message` (with `{id}`, `{port}`, `{field}` and
-`{customOutputs}` filled in, plus the three the conditions below name),
+The diagnostic takes `message` (with `{id}`, `{port}` and `{field}` filled
+in, plus the ones the conditions below name),
 `level` (`structural`, the default, or `runtime`), `severity` (`error` by default, or `warning`, `info`, `hint`), and
 optionally `port` or `field` to say what the finding is about.
 
@@ -271,8 +297,10 @@ The conditions are a closed list:
 | `config_equals` | `field`, `equals` | Does it equal this exact value |
 | `config_in_set` | `field`, `values` | Is its string one of these |
 | `config_matches` | `field`, `regex` | Does its string match. False if absent, not a string, or the regex is broken |
-| `custom_outputs_declared` | | Did the source add outputs beyond the metadata's own |
+| `custom_inputs_declared` | | Did the source add inputs beyond the metadata's own. `{customInputs}` in the message names them |
+| `custom_outputs_declared` | | Did the source add outputs beyond the metadata's own. `{customOutputs}` in the message names them |
 | `output_type_fits` | `port`, `within` | Does this output, as the program declared it (or as your metadata types it, if the program declared nothing), fit in the type `within`. Use it when the types that make sense on a narrowable output depend on a setting: a route whose `dataType` is `text` takes only a `String` body. False when the node has no such output |
+| `custom_inputs_fit` | `oneOf` | Does every input the source added beyond the metadata's own fit in one of the types `oneOf` lists. Each input is held to one of them, never to their union, so your node can count on each added input being one of the shapes it handles. Use it when your node sends its added inputs somewhere that takes only some shapes: a model that reads a JSON value or a file lists `["Json", "File | Null"]` (the `Null` lets an input typed `Image | Null` through), and then a record that holds an `Image` fits neither, and neither does `String` or `Image` written as one type. An added input whose type is still open fits, and so does adding none. `{names}` in the message lists the added inputs that do not fit |
 | `run_reaches` | `direction`, `with` | Does this node's run hold a node `with` a feature. `downstream`: every run this node starts holds one. `upstream`: this node is in the run of one |
 | `downstream_of` | `with` | Is a node `with` a feature wired upstream of this one, so it runs first. `{with}` in the message names those nodes |
 | `per_instance` | | Does this node exist once per instance: marked `@per_instance`, with an `@instance_filled` field, or reading one of those (a group that receives a per-instance value on any port counts for everything reading its ports). `{perInstanceReason}` in the message says why, path included: "it reads 'blender'", or "it sits inside group 'work', which receives 'blender'" |

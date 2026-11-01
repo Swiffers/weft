@@ -123,6 +123,17 @@ key.
 `[build.env]` only sets variables. If you need build logic, write a build
 script.
 
+Cargo reads these variables too, so `RUSTFLAGS` works. If you set
+`-C target-cpu=native`, it compiles for the machine doing the build: on a local
+install that is the machine the worker runs on, but a cloud install builds the
+worker on one machine and runs it on another, which may not have every
+instruction the build used.
+
+If a project uses a node that sets `[build.env]`, it compiles in a compile
+cache kept for those nodes and their values, apart from the one every other
+project shares, so its first build compiles more. On a local install,
+`weft clean --images --all` removes those caches.
+
 ## What a node needs from the machine
 
 If your node starts a program (`python3`, `ffmpeg`), or its package needs a

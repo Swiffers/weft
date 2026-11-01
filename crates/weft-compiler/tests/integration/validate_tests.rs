@@ -387,6 +387,7 @@ t = Text
         },
         accepts: weft_core::node::Accepts::both(),
         optional: false,
+        passes_through: false,
         widget: None,
         default: None,
         label: None,
@@ -420,6 +421,7 @@ t = Text { value: "ok" }
         },
         accepts: weft_core::node::Accepts::wire_only(),
         optional: false,
+        passes_through: false,
         widget: None,
         default: None,
         label: None,
@@ -3311,7 +3313,7 @@ out = Debug { data: my.results }
     );
     let d = validate(&typo, &catalog());
     assert!(
-        d.iter().any(|e| e.code.as_deref() == Some("unknown-target-port") && e.message.contains("node 'my'")),
+        d.iter().any(|e| e.code.as_deref() == Some("unknown-target-port") && e.message.contains("loop 'my' has no input 'itmes'")),
         "the typo is refused under the loop's name: {d:?}"
     );
     assert!(
@@ -3350,7 +3352,7 @@ out = Debug { data: my.results }
     // nobody.
     let component = parse_enrich(
         r#"
-Group(raw?: String) -> (cleaned: String) {
+Group(raw: String) -> (cleaned: String) {
     s = Text { value: "x" }
     self.cleaned = s.value
 }
@@ -3359,7 +3361,7 @@ Group(raw?: String) -> (cleaned: String) {
     let d = validate(&component, &catalog());
     assert!(
         !d.iter().any(|e| e.code.as_deref() == Some("run-undecided")),
-        "a component's optional input is the includer's to make required: {d:?}"
+        "a component's input is the includer's to connect: {d:?}"
     );
 }
 
@@ -3917,6 +3919,41 @@ fn a_route_whose_run_answers_nobody_is_flagged_and_a_gated_group_counts() {
 
 fn messages(source: &str) -> Vec<String> {
     validate(&parse_enrich(source), &catalog()).into_iter().map(|d| d.message).collect()
+}
+
+/// `custom_inputs_declared`: a decision node judges only the inputs the
+/// program adds, so one with none is refused when the program is built.
+/// The gate port the language gives every node is not an added input.
+#[test]
+fn a_node_that_needs_added_inputs_is_refused_without_one() {
+    let refused = |source: &str| messages(source).iter().any(|m| m.contains("has nothing to decide about"));
+    assert!(refused("d = DecisionYesNo { instructions: \"Bug?\" }\n"));
+    assert!(refused(
+        "t = Text { value: \"x\" }\nd = DecisionYesNo { instructions: \"Bug?\" }\nd._should_flow = t.value\n"
+    ));
+    assert!(!refused("t = Text { value: \"x\" }\nd = DecisionYesNo(ticket: String) { instructions: \"Bug?\", ticket: t.value }\n"));
+}
+
+/// `custom_inputs_fit`: a decision node takes, on each added input,
+/// exactly one of a value made of JSON, a file or a list of files, so a
+/// file inside a record, a list mixing files with text and a port that is
+/// a value or a file are refused when the program is built, naming the
+/// port.
+#[test]
+fn a_decision_input_holding_a_file_inside_a_value_is_refused() {
+    let unfit = |ports: &str| {
+        messages(&format!("d = DecisionYesNo({ports}) {{ instructions: \"Bug?\" }}\n"))
+            .into_iter()
+            .find(|m| m.contains("these are none of those"))
+    };
+    let refused = unfit("listing: { title: String, photo: Image }, ticket: String").expect("a file inside a record");
+    assert!(refused.contains("'listing'") && !refused.contains("'ticket'"), "{refused}");
+    assert!(unfit("items: List[Image | String]").is_some(), "a list mixing files with text");
+    assert!(unfit("note: String | Image").is_some(), "a value or a file, as one type");
+    assert_eq!(
+        unfit("ticket: String, listing: { title: String }, data: JsonDict, photo: Image, scan?: Image, photos: List[Image], pages: List[File]"),
+        None
+    );
 }
 
 /// `per_instance`: a route that reads an instance's value would need
@@ -5390,4 +5427,170 @@ sink.data = f.file
         assert!(!e.subjects.is_empty(), "an error with no subjects: {e:?}");
         assert!(e.subjects.iter().all(|s| ids.contains(&s.as_str())), "a subject that is no part: {e:?}");
     }
+}
+
+/// A `?` on a container's port that passes through is refused: a group's,
+/// and a loop's that it neither iterates nor carries. On a port the loop
+/// iterates, the `?` keeps its meaning.
+#[test]
+fn a_question_mark_on_a_port_that_passes_through_is_refused() {
+    let project = parse_enrich(
+        r#"
+g = Group(x?: String) {
+  d = Debug {}
+  d.data = self.x
+}
+each = Loop(items?: List[String], prefix?: String) -> (results: List[String | Null]) {
+  over: ["items"]
+  t = Text {}
+  t.value = self.items
+  self.results = t.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let refused: Vec<&str> = d.iter()
+        .filter(|e| e.code.as_deref() == Some("optional-pass-through-port"))
+        .map(|e| e.message.as_str())
+        .collect();
+    assert_eq!(refused.len(), 2, "{d:#?}");
+    assert!(refused.iter().any(|m| m.contains("'x'") && m.contains("group 'g'")), "{refused:#?}");
+    assert!(refused.iter().any(|m| m.contains("'prefix'") && m.contains("loop 'each'")), "{refused:#?}");
+}
+
+/// A loop's output is read from outside the loop, as a group's is: read by
+/// the loop's name from anywhere inside it (a node in its body, a group in
+/// it, a loop nested in it, a carried port), the line is refused once.
+#[test]
+fn a_loops_own_output_is_not_read_from_inside_it() {
+    for (source, port) in [
+        (r#"
+each = Loop(items: List[String]) -> (results: List[String | Null]) {
+  over: ["items"]
+  t = Text { value: self.items }
+  self.results = t.value
+  peek = Debug { data: each.results }
+}
+each.items = ["a"]
+"#, "results"),
+        (r#"
+each = Loop(items: List[String]) -> (results: List[String | Null]) {
+  over: ["items"]
+  self.results = self.items
+  g = Group() {
+    peek = Debug { data: each.results }
+  }
+}
+each.items = ["a"]
+"#, "results"),
+        (r#"
+outer = Loop(items: List[String]) -> (results: List[String | Null]) {
+  over: ["items"]
+  self.results = self.items
+  inner = Loop(xs: List[String]) -> (rs: List[String | Null]) {
+    over: ["xs"]
+    self.rs = self.xs
+    peek = Debug { data: outer.results }
+  }
+  inner.xs = ["a"]
+}
+outer.items = ["a"]
+"#, "results"),
+        (r#"
+each = Loop(items: List[String], acc: String) -> (results: List[String | Null], acc: String) {
+  over: ["items"]
+  carry: ["acc"]
+  t = Text { value: self.items }
+  self.results = t.value
+  self.acc = t.value
+  peek = Debug { data: each.acc }
+}
+each.items = ["a"]
+each.acc = ""
+"#, "acc"),
+    ] {
+        let d = validate(&parse_enrich(source), &catalog());
+        let found: Vec<&str> = errors(&d).iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(found.len(), 1, "{source}\n{d:#?}");
+        assert!(found[0].contains(&format!("'self.{port}' is an output of")), "{source}\n{d:#?}");
+    }
+}
+
+
+// ─── Secret[T] ──────────────────────────────────────────────────────────────
+
+/// A secret stays sealed on its way: wired into a port that takes its
+/// value plain, it is a type mismatch saying the receiving node must take
+/// the secret and reveal it; into a port that takes it, it is clean.
+#[test]
+fn a_secret_wired_into_a_plain_port_says_to_take_it_and_reveal_it() {
+    let refused = parse_enrich(r#"
+s = ExecPython() -> (token: Secret[String]) { code: "x" }
+t = ExecPython(n: String) -> (r: String) { code: "x" }
+t.n = s.token
+"#);
+    let d = validate(&refused, &catalog());
+    let m = d.iter().find(|x| x.code.as_deref() == Some("type-mismatch")).expect("type-mismatch");
+    assert!(m.message.contains("must take Secret[String]") && m.message.contains("reveal it"), "{}", m.message);
+
+    let clean = parse_enrich(r#"
+s = ExecPython() -> (token: Secret[String]) { code: "x" }
+t = ExecPython(n: String | Secret[String]) -> (r: String) { code: "x" }
+t.n = s.token
+"#);
+    assert!(!codes(&validate(&clean, &catalog())).contains(&"type-mismatch"));
+}
+
+/// A wire's key path never steps into a secret: what flows is its marker.
+#[test]
+fn a_path_into_a_secret_is_refused() {
+    let project = parse_enrich(r#"
+s = ExecPython() -> (out: { session: Secret[{ token: String }] }) { code: "x" }
+t = ExecPython(n: String) -> (r: String) { code: "x" }
+t.n = s.out.session.token
+"#);
+    let d = validate(&project, &catalog());
+    let m = d.iter().find(|x| x.code.as_deref() == Some("deref-path")).expect("deref-path");
+    assert!(m.message.contains("stays sealed on its way"), "{}", m.message);
+}
+
+/// Only a node makes a secret: a value written on a secret port, a
+/// secret's marker written anywhere, and a Cast into a secret are each
+/// refused naming who makes one.
+#[test]
+fn a_program_never_writes_a_secret() {
+    let plain = parse_enrich(r#"
+t = ExecPython(n: Secret[String]) -> (r: String) { code: "x", n: "hunter2" }
+"#);
+    let d = validate(&plain, &catalog());
+    assert!(d.iter().any(|x| x.message.contains("ctx.secret")), "{d:?}");
+
+    let marker = parse_enrich(r#"
+t = ExecPython(n: JsonDict) -> (r: String) { code: "x", n: { "__weft_secret__": { "secretId": "00000000-0000-0000-0000-000000000001" } } }
+"#);
+    let d = validate(&marker, &catalog());
+    let m = d.iter().find(|x| x.code.as_deref() == Some("secret-literal")).expect("secret-literal");
+    assert!(m.message.contains("ctx.secret"), "{}", m.message);
+
+    let cast = parse_enrich(r#"
+src = Text { value: "x" }
+c = Cast() -> (value: Secret[String])
+c.value = src.value
+t = ExecPython(n: Secret[String]) -> (r: String) { code: "x" }
+t.n = c.value
+"#);
+    let d = validate(&cast, &catalog());
+    let m = d.iter().find(|x| x.code.as_deref() == Some("cast-not-allowed")).expect("cast-not-allowed");
+    assert!(m.message.contains("ctx.secret"), "{}", m.message);
+}
+
+/// An instance's value comes from outside every run, so a field holding a
+/// secret cannot be `@instance_filled`.
+#[test]
+fn an_instance_filled_secret_is_refused() {
+    let project = parse_enrich(r#"
+t = ExecPython(n: Secret[String]) -> (r: String) { code: "x", n: @instance_filled }
+"#);
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"instance-filled-secret"), "{d:?}");
 }

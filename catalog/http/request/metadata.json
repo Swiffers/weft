@@ -66,11 +66,13 @@
     },
     {
       "name": "body",
-      "type": "JsonDict"
+      "type": "T",
+      "description": "The JSON object sent as the request's body. A secret in it (a token for the API) is revealed into the request where the type of what is wired here declares it, like `{ token: Secret[String] }`, and stays a marker on the run's record; a secret inside a body left as a `JsonDict` fails the node."
     },
     {
       "name": "headers",
-      "type": "Dict[String, String]"
+      "type": "Dict[String, String | Secret[String]]",
+      "description": "Extra request headers. A secret value (a caller's `credentials.authorization`) is revealed into the request it sends, and stays a marker on the run's record."
     },
     {
       "name": "method",
@@ -92,6 +94,9 @@
       "label": "Method"
     }
   ],
+  "typeParams": {
+    "T": "JsonDict"
+  },
   "outputs": [
     {
       "name": "status",
@@ -100,8 +105,8 @@
     {
       "name": "body",
       "type": "JsonDict | String",
-      "narrowable": true,
-      "description": "A text response up to 100 KB: a JSON object as a dict, anything else as its raw text. Absent when the response came out on `file`; with `file` unwired, a bigger text response fails the node instead."
+      "narrowable": "Json",
+      "description": "A text response up to 100 KB, held to the type declared here: a JSON list or object the type takes comes out as itself (an object by default, a list or an object with `-> (body: Json)`), anything else as its raw text while the type takes text, and a type that takes no text (a record, `List[...]`, `Number`) gets the parsed JSON, checked against it. Absent when the response came out on `file`; with `file` unwired, a bigger text response fails the node instead."
     },
     {
       "name": "file",

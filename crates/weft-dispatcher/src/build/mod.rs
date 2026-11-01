@@ -157,7 +157,7 @@ pub struct Version {
 #[async_trait::async_trait]
 pub trait Prepare: Send + Sync {
     /// What each of `definition`'s `@asset`s stands for, by resolution key.
-    async fn assets(&self, storage: &dyn ProjectStorage, tenant: &str, definition: &weft_core::ProjectDefinition) -> Result<BTreeMap<String, serde_json::Value>>;
+    async fn assets(&self, storage: &dyn ProjectStorage, tenant: &str, definition: &weft_core::ProjectDefinition) -> Result<weft_core::project::AssetResolutions>;
     /// Refuse (a [`RunRefused`]) the run this build is for, held to the
     /// compiled program, when it could not start.
     async fn check(&self, definition: &weft_core::ProjectDefinition) -> Result<()>;
@@ -182,11 +182,11 @@ impl std::error::Error for RunRefused {}
 /// rebuilt from what the store records for its key, which must be this
 /// tenant's and of the kind the ref declares; a text resolution is
 /// program data, taken as it is.
-pub struct Kept<'a>(pub &'a BTreeMap<String, serde_json::Value>);
+pub struct Kept<'a>(pub &'a weft_core::project::AssetResolutions);
 
 #[async_trait::async_trait]
 impl Prepare for Kept<'_> {
-    async fn assets(&self, storage: &dyn ProjectStorage, tenant: &str, definition: &weft_core::ProjectDefinition) -> Result<BTreeMap<String, serde_json::Value>> {
+    async fn assets(&self, storage: &dyn ProjectStorage, tenant: &str, definition: &weft_core::ProjectDefinition) -> Result<weft_core::project::AssetResolutions> {
         kept_assets(storage, tenant, definition, self.0).await
     }
 
@@ -248,10 +248,6 @@ impl VersionBuilder {
             .tempdir()
             .context("create the build's working directory")?;
         let root = workdir.path().to_path_buf();
-        // The image contexts are staged under it, and a build started from
-        // one may read it after this request answered: every start keeps a
-        // clone, and the directory goes with the last (`Staging`).
-        let staging = Staging::new(workdir);
         source::materialize(storage.as_ref(), &self.blobs, tenant, &source.manifest, &root).await?;
         let files = Arc::new(source::VersionFiles::new(root.clone(), source.manifest.clone(), storage.clone(), tenant.to_string()));
 
@@ -319,6 +315,12 @@ impl VersionBuilder {
             images,
             ask,
         };
+        // The image contexts are staged under the working directory, and a
+        // build started from one may read it after this request answered:
+        // every start keeps a clone, and the directory goes with the last
+        // (`Staging`), and with it the claim on the shared crates the
+        // worker staged.
+        let staging = Staging::new((workdir, plan.hold.clone()));
         self.start_images(version, &plan.images, &staging, project_id, tenant, gate, hold).await
     }
 
@@ -607,8 +609,8 @@ async fn kept_assets(
     storage: &dyn ProjectStorage,
     tenant: &str,
     definition: &weft_core::ProjectDefinition,
-    sent: &BTreeMap<String, serde_json::Value>,
-) -> Result<BTreeMap<String, serde_json::Value>> {
+    sent: &weft_core::project::AssetResolutions,
+) -> Result<weft_core::project::AssetResolutions> {
     let mut map = BTreeMap::new();
     let mut refused = Vec::new();
     let file_refs = weft_compiler::file_ref::collect_asset_refs(definition)

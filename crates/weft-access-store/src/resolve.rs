@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use weft_task_store::db::{self, Client, FromRow, Pool, Row};
+use weft_task_store::db::{self, Client, FromRow, JsonText, Pool, Row};
 
 use sha2::Digest;
 
@@ -124,8 +124,8 @@ struct GrantRow {
     tenant_id: String,
     service: String,
     registration_sealed: Option<String>,
-    spec_json: Value,
-    spec_json_version: weft_core::stored::Version,
+    spec: Value,
+    spec_version: weft_core::stored::Version,
     values_sealed: String,
     granted_scopes: Value,
     permissions_verified: bool,
@@ -146,10 +146,10 @@ impl FromRow for GrantRow {
             tenant_id: row.try_get("tenant_id")?,
             service: row.try_get("service")?,
             registration_sealed: row.try_get("registration_sealed")?,
-            spec_json: row.try_get("spec_json")?,
-            spec_json_version: row.try_get("spec_json_version")?,
+            spec: row.try_get::<_, JsonText<Value>>("spec")?.0,
+            spec_version: row.try_get("spec_version")?,
             values_sealed: row.try_get("values_sealed")?,
-            granted_scopes: row.try_get("granted_scopes")?,
+            granted_scopes: row.try_get::<_, db::Json<Value>>("granted_scopes")?.0,
             permissions_verified: row.try_get("permissions_verified")?,
             owner: row.try_get("owner")?,
             door: row.try_get("door")?,
@@ -219,6 +219,31 @@ impl<'a> GrantUser<'a> {
     }
 }
 
+/// The wall every read of one connection row passes, pure: somebody
+/// else's connection reads the same as none at all (no existence leak),
+/// and one of another service is refused by name.
+fn walled(
+    row_tenant: &str,
+    row_service: &str,
+    row_project: Option<uuid::Uuid>,
+    row_instance: Option<&str>,
+    tenant: &str,
+    user: GrantUser<'_>,
+    service: &str,
+) -> anyhow::Result<()> {
+    if row_tenant != tenant || !user.may_use(row_project, row_instance) {
+        return Err(AccessError::NotFound.into());
+    }
+    if row_service != service {
+        return Err(AccessError::Invalid(format!(
+            "this connection is a '{row_service}' account, but the node asked for \
+             '{service}'; wire the right service's access node"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// Whether a walled read renews a token that is due. A `Stored` read
 /// makes no provider call and writes nothing: what a read of a captured
 /// list or of pasted material wants, which never expires.
@@ -230,7 +255,7 @@ enum Freshness {
 
 /// The columns a walled read selects, in [`GrantRow`]'s order: a plain
 /// read and a renewal's claim answer the same row.
-const WALLED_COLUMNS: &str = "tenant_id, service, registration_sealed, spec_json, spec_json_version, \
+const WALLED_COLUMNS: &str = "tenant_id, service, registration_sealed, spec, spec_version, \
                               values_sealed, granted_scopes, permissions_verified, owner, door, \
                               identity, provider_account, expires_at, token_lifetime_secs, \
                               instance_id, project_id, published_by_node";
@@ -329,8 +354,8 @@ fn open_walled_grant(
         tenant_id: row_tenant,
         service: row_service,
         registration_sealed,
-        spec_json,
-        spec_json_version,
+        spec: spec_json,
+        spec_version: spec_json_version,
         values_sealed,
         granted_scopes: granted,
         permissions_verified: verified,
@@ -347,17 +372,7 @@ fn open_walled_grant(
     else {
         return Err(AccessError::NotFound.into());
     };
-    // Somebody else's reads the same as none at all: no existence leak.
-    if row_tenant != tenant || !user.may_use(row_project, instance.as_deref()) {
-        return Err(AccessError::NotFound.into());
-    }
-    if row_service != service {
-        return Err(AccessError::Invalid(format!(
-            "this connection is a '{row_service}' account, but the node asked for \
-             '{service}'; wire the right service's access node"
-        ))
-        .into());
-    }
+    walled(&row_tenant, &row_service, row_project, instance.as_deref(), tenant, user, service)?;
     let owner = crate::owner_of(&owner, instance.as_deref())?;
     let door = crate::door_of(&door)?;
     let granted = scopes_of(&granted);
@@ -489,7 +504,7 @@ async fn renew(
                  SET values_sealed = $3, value_names = $4, expires_at = $5,
                      token_lifetime_secs = $6, renewal_claimed_until = NULL, updated_at = now()
                  WHERE id = $1 AND (renewal_claimed_until = $2 OR values_sealed = $3)",
-                &[&access_id, &claim, &sealed, &names, &expires_at, &lifetime],
+                &[&access_id, &claim, &sealed, &db::Json(db::Names(&names)), &expires_at, &lifetime],
             )
             .await;
         match write {
@@ -733,6 +748,63 @@ pub async fn caller_verifier(
     Ok(CallerVerifier { verify: grant.spec.verify.clone(), values })
 }
 
+/// The request headers a route gated by connection `access_id` reads its
+/// caller's credential from (`VerifyKind::credential_headers`): what a run
+/// it admits holds as secrets, so what a request typed by hand for it
+/// (`weft run --fire`) cannot carry. A recipe that declares no `verify`
+/// block gates no route, so it is refused, as the broker refuses every
+/// call through it. Reads the recipe through the wall, never the values.
+pub async fn caller_credential_headers(
+    pool: &Pool,
+    tenant: &str,
+    user: GrantUser<'_>,
+    access_id: uuid::Uuid,
+    service: &str,
+) -> anyhow::Result<Vec<String>> {
+    let row: Option<RecipeRow> = pool
+        .opt(
+            "SELECT tenant_id, service, spec, spec_version, instance_id, project_id FROM access_grant WHERE id = $1",
+            &[&access_id],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Err(AccessError::NotFound.into());
+    };
+    walled(&row.tenant_id, &row.service, row.project_id, row.instance_id.as_deref(), tenant, user, service)?;
+    let spec = spec_of(format_args!("connection {access_id}"), row.spec, row.spec_version)?;
+    match spec.verify {
+        Some(kind) => Ok(kind.credential_headers()),
+        None => Err(AccessError::Invalid(format!(
+            "the '{service}' service declares no `verify` block, so its connections cannot gate a route"
+        ))
+        .into()),
+    }
+}
+
+/// The `access_grant` columns the wall and a connection's recipe need:
+/// nothing sealed.
+struct RecipeRow {
+    tenant_id: String,
+    service: String,
+    spec: Value,
+    spec_version: weft_core::stored::Version,
+    instance_id: Option<String>,
+    project_id: Option<uuid::Uuid>,
+}
+
+impl FromRow for RecipeRow {
+    fn from_row(row: Row) -> db::Result<Self> {
+        Ok(Self {
+            tenant_id: row.try_get("tenant_id")?,
+            service: row.try_get("service")?,
+            spec: row.try_get::<_, JsonText<Value>>("spec")?.0,
+            spec_version: row.try_get("spec_version")?,
+            instance_id: row.try_get("instance_id")?,
+            project_id: row.try_get("project_id")?,
+        })
+    }
+}
+
 /// A stable content hash of an events-recipe map: sha256 hex of its
 /// canonical JSON (BTreeMap keys are ordered, so serialization is
 /// deterministic). `None` for a spec with no topics. What scopes a
@@ -768,7 +840,7 @@ pub async fn record_events_recipes(db: &impl Client, spec: &AccessSpec) -> anyho
         "INSERT INTO service_events_recipe (service, recipe_hash, events_json, events_json_version, updated_at)
          VALUES ($1, $2, $3, $4, now())
          ON CONFLICT (service, recipe_hash) DO UPDATE SET updated_at = now()",
-        &[&spec.service, &hash, &serde_json::to_value(&spec.events)?, &weft_core::access::events::STORED_EVENTS.version()],
+        &[&spec.service, &hash, &JsonText(&spec.events), &weft_core::access::events::STORED_EVENTS.version()],
     )
     .await?;
     Ok(())
@@ -789,7 +861,7 @@ pub async fn events_recipes_of(
     pool: &Pool,
     service: &str,
 ) -> anyhow::Result<Vec<RecordedEventsRecipe>> {
-    let rows: Vec<(String, Value, weft_core::stored::Version)> = pool
+    let rows: Vec<(String, JsonText<Value>, weft_core::stored::Version)> = pool
         .all(
             "SELECT recipe_hash, events_json, events_json_version FROM service_events_recipe
              WHERE service = $1 ORDER BY updated_at DESC",
@@ -797,7 +869,7 @@ pub async fn events_recipes_of(
         )
         .await?;
     rows.into_iter()
-        .map(|(recipe_hash, v, version)| {
+        .map(|(recipe_hash, JsonText(v), version)| {
             let events = weft_core::access::events::STORED_EVENTS
                 .decode(v, version)
                 .map_err(|e| e.at(format_args!("a recorded events recipe of '{service}' ({recipe_hash})")))?;

@@ -510,6 +510,23 @@ mod fs_hashes {
     }
 
     /// The package whose root is `root`, alone, or an error naming it.
+    /// The recipes of the services the package at `root` publishes, as its
+    /// node-test binary bakes them (`codegen::baked_published_services`).
+    /// They may come from another package's metadata, so a change there
+    /// changes what this package's tests are held to. A recipe that cannot
+    /// be resolved is folded as its refusal: the emit refuses it the same.
+    fn hash_published_services(hasher: &mut Sha256, catalog: &FsCatalog, root: &Path) -> Result<()> {
+        let package = catalog
+            .packages()
+            .find(|p| p.root == root)
+            .ok_or_else(|| anyhow::anyhow!("no package of this catalog is at {}", root.display()))?;
+        let baked = crate::codegen::baked_published_services(catalog, &package.node_types).unwrap_or_else(|e| format!("refused: {e}"));
+        hasher.update(b"published_services:\n");
+        hasher.update(baked.as_bytes());
+        hasher.update(b"\n");
+        Ok(())
+    }
+
     fn package_at(catalog: &FsCatalog, root: &Path) -> Result<Packages> {
         let package = catalog
             .packages()
@@ -543,8 +560,8 @@ mod fs_hashes {
     }
 
     /// Content hash of everything that can change a package's node-test
-    /// OUTCOME: the package's own sources plus the catalog's nominal
-    /// type registry (the test binary bakes EVERY package's type
+    /// OUTCOME: the package's own sources, the recipes of the services it
+    /// publishes, plus the catalog's nominal type registry (the test binary bakes EVERY package's type
     /// declarations and resolves this package's port types through
     /// them, so a sibling's type edit changes this package's results).
     /// Excludes the worker build environment on purpose: it rebuilds the
@@ -552,9 +569,10 @@ mod fs_hashes {
     /// real provider money.
     pub fn compute_node_test_outcome_hash(package_root: &Path, catalog: &FsCatalog) -> Result<SourceHash> {
         let mut hasher = Sha256::new();
-        hasher.update(b"weft-node-test-outcome-v2\n");
+        hasher.update(b"weft-node-test-outcome-v3\n");
         hash_packages(&mut hasher, &package_at(catalog, package_root)?, &DISK)?;
         hash_type_registry(&mut hasher, catalog);
+        hash_published_services(&mut hasher, catalog, package_root)?;
         Ok(hex(&hasher.finalize()))
     }
 
@@ -568,16 +586,19 @@ mod fs_hashes {
     /// a compiled server is current.
     pub fn compute_node_test_hash(package_root: &Path, weft_root: &Path, catalog: &FsCatalog) -> Result<SourceHash> {
         let mut hasher = Sha256::new();
-        // v4: a test server is a program compiled on the machine, so no
-        // image recipe or builder base (v3: its package is named by its
+        // v5: it bakes the recipes of the services its package publishes
+        // (v4: a test server is a program compiled on the machine, so no
+        // image recipe or builder base; v3: its package is named by its
         // name, never its path).
-        hasher.update(b"weft-node-test-v4\n");
+        hasher.update(b"weft-node-test-v5\n");
         hash_packages(&mut hasher, &package_at(catalog, package_root)?, &DISK)?;
         // The test crate's main.rs bakes the FULL catalog type
         // registry (see the binary hash's identical step): a type
         // edit in a SIBLING package changes this package's test
         // binary, so it must flip this digest too.
         hash_type_registry(&mut hasher, catalog);
+        // So does a recipe the package publishes, which the binary bakes.
+        hash_published_services(&mut hasher, catalog, package_root)?;
         hash_worker_build_env(&mut hasher, weft_root, false)?;
         Ok(hex(&hasher.finalize()))
     }
@@ -711,8 +732,12 @@ mod fs_hashes {
     /// linked by another). Inside the cache, cargo tells the generated
     /// package crates apart by their content-addressed directory
     /// (`codegen::write_package_crates`) and everything else by
-    /// fingerprint.
-    pub fn compute_worker_cache_key(weft_root: &Path, builder: &str) -> Result<String> {
+    /// fingerprint. And `build_env`, what tells apart the caches of
+    /// projects whose nodes set `[build.env]`
+    /// (`worker_image::NodesBuildEnv::cache_tag`): a project that sets
+    /// none (`None`) keeps the key, and the cache, every such project
+    /// shares.
+    pub fn compute_worker_cache_key(weft_root: &Path, builder: &str, build_env: Option<&str>) -> Result<String> {
         let mut hasher = Sha256::new();
         hasher.update(b"weft-worker-cache-v1\n");
         hasher.update(b"builder:");
@@ -720,6 +745,11 @@ mod fs_hashes {
         hasher.update(b"\n");
         hash_worker_build_env(&mut hasher, weft_root, true)?;
         hash_installed_stdlib_deps(&mut hasher)?;
+        if let Some(tag) = build_env {
+            hasher.update(b"build-env:");
+            hasher.update(tag.as_bytes());
+            hasher.update(b"\n");
+        }
         Ok(hex(&hasher.finalize()).chars().take(16).collect())
     }
 
@@ -1080,14 +1110,43 @@ mod fs_hashes {
         #[test]
         fn worker_cache_key_is_stable_per_builder() {
             let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
-            let prebuilt = compute_worker_cache_key(root, "builder-base").unwrap();
+            let prebuilt = compute_worker_cache_key(root, "builder-base", None).unwrap();
             assert_eq!(prebuilt.len(), 16);
-            assert_eq!(compute_worker_cache_key(root, "builder-base").unwrap(), prebuilt);
+            assert_eq!(compute_worker_cache_key(root, "builder-base", None).unwrap(), prebuilt);
             assert_ne!(
-                compute_worker_cache_key(root, "alpine:3.19").unwrap(),
+                compute_worker_cache_key(root, "alpine:3.19", None).unwrap(),
                 prebuilt,
                 "a from-scratch builder on another distro gets its own cache"
             );
+        }
+
+        /// A project whose nodes set no `[build.env]` keeps the key every
+        /// such project had before the variables counted, so it shares the
+        /// cache it always shared.
+        #[test]
+        fn worker_cache_key_without_build_env_is_the_shared_one() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(b"weft-worker-cache-v1\n");
+            hasher.update(b"builder:");
+            hasher.update(b"builder-base");
+            hasher.update(b"\n");
+            hash_worker_build_env(&mut hasher, root, true).unwrap();
+            hash_installed_stdlib_deps(&mut hasher).unwrap();
+            let shared: String = hex(&hasher.finalize()).chars().take(16).collect();
+            assert_eq!(compute_worker_cache_key(root, "builder-base", None).unwrap(), shared);
+        }
+
+        /// Each `[build.env]` tag gets a cache of its own.
+        #[test]
+        fn worker_cache_key_differs_per_build_env() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+            let key = |tag| compute_worker_cache_key(root, "builder-base", tag).unwrap();
+            let (none, one, other) = (key(None), key(Some("0123456789abcdef")), key(Some("fedcba9876543210")));
+            assert_eq!(key(Some("0123456789abcdef")), one);
+            for (a, b) in [(&none, &one), (&none, &other), (&one, &other)] {
+                assert_ne!(a, b);
+            }
         }
 
         #[test]

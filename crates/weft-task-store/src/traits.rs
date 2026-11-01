@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::db::{Client as _, Json, Pool};
+use crate::db::{Client as _, JsonText, Pool};
 use crate::pg_signal::PgSignalWatch;
 use crate::tasks::{DedupOutcome, NewTask, TaskOutcome};
 
@@ -146,7 +146,7 @@ impl PostgresInfraReader {
         node_id: &str,
         instance: Option<&weft_core::instance::InstanceId>,
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
-        let saved: Option<Json<std::collections::BTreeMap<String, serde_json::Value>>> = self
+        let saved: Option<JsonText<std::collections::BTreeMap<String, serde_json::Value>>> = self
             .pool
             .scalar_opt(
                 "SELECT baked_json FROM infra_node WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
@@ -182,11 +182,11 @@ impl PostgresInfraReader {
         // not available", which would send the node chasing an endpoint
         // that is really there. Only a name the object does not hold is
         // the legitimate `None`.
-        let endpoints: Value = row.try_get("endpoints_json")?;
+        let endpoints = row.try_get::<_, JsonText<Value>>("endpoints_json")?.0;
         let Some(url) = entry_in(&endpoints, "endpoints_json", endpoint_name)? else {
             return Ok(None);
         };
-        let public_paths: Value = row.try_get("public_paths_json")?;
+        let public_paths = row.try_get::<_, JsonText<Value>>("public_paths_json")?.0;
         let public_path = entry_in(&public_paths, "public_paths_json", endpoint_name)?;
         Ok(Some(StoredEndpoint { url, public_path }))
     }

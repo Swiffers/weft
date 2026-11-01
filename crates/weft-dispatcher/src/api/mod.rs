@@ -300,7 +300,11 @@ fn core_routes(state: DispatcherState) -> Router<DispatcherState> {
         // The project's own worker levers.
         .route("/projects/{id}/workers", get(workers::get).put(workers::put))
         .route("/projects/{id}/runs/latest", get(run::latest_for_project))
-        .route("/projects/{id}/activate", post(project::activate))
+        .route("/projects/{id}/activations", post(project::activate))
+        // Where a weft CLI from before activations ran as tasks asked
+        // for one: told to update, never answered in a shape it cannot
+        // read.
+        .route("/projects/{id}/activate", post(project::activate_from_an_older_cli))
         .route("/projects/{id}/bake", post(project::bake))
         // Cancel an in-flight activate (status=Activating). Wipes
         // every signal row registered so far, cancels the
@@ -356,6 +360,9 @@ fn core_routes(state: DispatcherState) -> Router<DispatcherState> {
         // spelled against the program the run ran.
         .route("/runs/{run_id}/events", get(run::events))
         .route("/runs/{run_id}/outputs", get(run::outputs))
+        // The values a run's events name, read back as the editor shows
+        // them (the events carry where the record keeps each).
+        .route("/runs/{run_id}/values", post(run::values))
         .route(
             "/runs/{run_id}",
             get(run::get).delete(run::delete_run),

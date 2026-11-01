@@ -81,6 +81,31 @@ async fn surrender_requeues_only_while_claim_is_ours(pool: Pool) {
     assert_eq!((status.as_str(), claimed_by.as_deref()), ("claimed", Some("disp-2")));
 }
 
+/// A picker whose copy stepped aside claims nothing: the task waiting
+/// stays for a current copy's picker.
+#[weft_db_macros::test]
+async fn a_picker_whose_copy_stepped_aside_claims_nothing(pool: Pool) {
+    use std::sync::Arc;
+    use weft_task_store::drain::DrainStep;
+    setup(&pool).await;
+    let store = Arc::new(weft_task_store::PostgresTaskStoreClient::new(pool.clone(), support::signals(&pool).await).unwrap());
+    struct Unused;
+    #[async_trait::async_trait]
+    impl weft_task_store::TaskExecutor<()> for Unused {
+        async fn execute(&self, _: &(), task: &tasks::Task) -> anyhow::Result<serde_json::Value> {
+            anyhow::bail!("a copy that stepped aside ran {}", task.id)
+        }
+    }
+    let registry = weft_task_store::TaskRegistry::<()>::every_kind(|_| Arc::new(Unused));
+    let aside = weft_task_store::aside::StepAside::new();
+    let picker = weft_task_store::dispatcher_picker_loop(store, (), registry, "disp-old".into(), aside.clone());
+    let waiting = tasks::enqueue(&pool, dispatcher_task("waiting")).await.unwrap();
+    aside.step_aside();
+    assert_eq!((picker.drain)().await.unwrap(), DrainStep::Done);
+    let status: String = pool.scalar("SELECT status FROM task WHERE id = $1", &[&waiting]).await.unwrap();
+    assert_eq!(status, "pending", "left for a current copy");
+}
+
 /// The picker run dry looks again when the earliest claim it may have to
 /// rescue lapses, and sleeps until a task is announced when none is out.
 /// Running dry, it prunes finished tasks older than an hour, and only
@@ -100,7 +125,7 @@ async fn a_dry_picker_prunes_and_looks_at_its_earliest_claim_lapse(pool: Pool) {
         }
     }
     let registry = weft_task_store::TaskRegistry::<()>::every_kind(|_| Arc::new(Unused));
-    let picker = weft_task_store::dispatcher_picker_loop(store, (), registry, "disp-1".into());
+    let picker = weft_task_store::dispatcher_picker_loop(store, (), registry, "disp-1".into(), weft_task_store::aside::StepAside::new());
     assert_eq!((picker.drain)().await.unwrap(), DrainStep::Done, "no claim out");
 
     let old = tasks::enqueue(&pool, dispatcher_task("old")).await.unwrap();
@@ -143,4 +168,27 @@ async fn a_dry_picker_prunes_and_looks_at_its_earliest_claim_lapse(pool: Pool) {
     let DrainStep::RetryIn(_) = (picker.drain)().await.unwrap() else { panic!("a claim is out") };
     let left: Vec<Uuid> = pool.scalars("SELECT id FROM task ORDER BY id", &[]).await.unwrap();
     assert_eq!(left, vec![held, deduped, plain], "the next dry pass prunes what aged since");
+}
+
+/// A task's payload, result and progress hold whatever a node or a
+/// service handed them, NUL characters included, and read back exactly;
+/// its error is written without them rather than refused.
+#[weft_db_macros::test]
+async fn a_task_keeps_nul_characters_exactly_and_drops_them_from_its_error(pool: Pool) {
+    setup(&pool).await;
+    let mut spec = dispatcher_task("t1");
+    spec.payload = json!({ "page": "a\u{0}b" });
+    let task_id = tasks::enqueue(&pool, spec).await.expect("enqueue a payload holding NUL");
+    let claimed = claimed_task(&pool, "disp-1").await.expect("claim").expect("the task");
+    assert_eq!(claimed.payload, json!({ "page": "a\u{0}b" }));
+    tasks::set_progress(&pool, task_id, &json!({ "at": "\u{0}" })).await.expect("say where it is");
+    assert_eq!(tasks::progress(&pool, task_id).await.expect("read"), Some(json!({ "at": "\u{0}" })));
+    tasks::complete(&pool, task_id, "disp-1", json!({ "said": "x\u{0}y" })).await.expect("complete with NUL");
+    assert_eq!(tasks::stored_result(&pool, task_id).await.expect("read"), Some(json!({ "said": "x\u{0}y" })));
+
+    let failing = tasks::enqueue(&pool, dispatcher_task("t2")).await.expect("enqueue");
+    claimed_task(&pool, "disp-1").await.expect("claim").expect("the task");
+    tasks::fail(&pool, failing, "disp-1", "broke\u{0}here".into()).await.expect("fail with NUL");
+    let error: Option<String> = pool.scalar("SELECT error FROM task WHERE id = $1", &[&failing]).await.unwrap();
+    assert_eq!(error.as_deref(), Some("brokehere"));
 }

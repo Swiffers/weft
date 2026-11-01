@@ -674,7 +674,8 @@ async fn require_whole_worker(image: &str) -> Result<()> {
 /// One BuildKit record of a worker image's compile cache mount, as
 /// `docker buildx du --verbose` lists it: what a `weft build-images` run on
 /// this machine, or an older weft's worker image builds, left. There is
-/// one per cache key (build environment and builder), and a key retired by
+/// one per cache key (build environment, builder and the nodes'
+/// `[build.env]`), and a key retired by
 /// a toolchain bump keeps its record, and its bytes, until something
 /// prunes it.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -25,6 +25,9 @@ use weft_catalog::FsCatalog;
 /// hash that NAMES what it builds, so the caller can build it or
 /// recognize it as already present.
 pub struct StagedImageBuild {
+    /// A host build's claim on the shared crates it staged, until it is
+    /// compiled: dropped with the staged build ([`SharedCratesHold`]).
+    pub hold: Option<std::sync::Arc<SharedCratesHold>>,
     /// Absolute path to the build context: the host recipe and the worker
     /// crate for a host build; for an image, the `Dockerfile`, `build/`
     /// (the generated cargo crate), `project-nodes/` and, when the
@@ -196,7 +199,7 @@ pub fn build_project(
         .map_err(|e| BuildError::Build(format!("compute binary hash: {e}")))?;
     let builder = match packaging {
         weft_core::builds::WorkerPackaging::Host { shared_crates } => {
-            let build_context = stage_host_build(
+            let (build_context, hold) = stage_host_build(
                 &project_root.join(".weft").join("target").join("worker-host"),
                 shared_crates,
                 definition,
@@ -204,6 +207,7 @@ pub fn build_project(
                 node_set,
             )?;
             return Ok(StagedImageBuild {
+                hold: Some(std::sync::Arc::new(hold)),
                 build_context,
                 content_hash,
                 recipe: weft_core::builds::BuildRecipe::Host,
@@ -257,6 +261,7 @@ pub fn build_project(
     )?;
 
     Ok(StagedImageBuild {
+        hold: None,
         build_context,
         content_hash,
         recipe: weft_core::builds::BuildRecipe::Dockerfile {
@@ -276,8 +281,7 @@ pub const HOST_CRATE_DIR: &str = "build";
 ///   host-recipe.json      the `weft_core::builds::HostRecipe`
 ///   build/                the worker crate (Cargo.toml, src/,
 ///                         rust-toolchain.toml, isolate.json, left-out.json,
-///                         weft-cache-gc.sh, the weft-isolate helper, and
-///                         `.cargo/config.toml` when a node sets [build.env])
+///                         weft-cache-gc.sh, the weft-isolate helper)
 /// <shared>/               (the machine's, every project's)
 ///   weft-<key>/           the worker-linked slice of this weft's
 ///                         workspace, its empty workspace-hack and lock
@@ -292,18 +296,16 @@ pub const HOST_CRATE_DIR: &str = "build";
 /// project and cargo reuses what it compiled; only the thin worker crate
 /// is the project's own.
 ///
-/// `[build.env]` reaches the compile through the worker crate's
-/// `.cargo/config.toml` (`[env]`, each entry forced over the runtime's
-/// own environment), read by cargo run in the crate's folder,
-/// `{{catalog_path}}` expanded to the node's folder in its package
-/// crate's `source/`.
+/// `[build.env]` reaches the compile through the recipe
+/// (`HostRecipe::build_env`), `{{catalog_path}}` expanded to the node's
+/// folder in its package crate's `source/`.
 pub fn stage_host_build(
     ctx: &Path,
     shared: &Path,
     definition: &weft_core::project::ProjectDefinition,
     catalog: &FsCatalog,
     node_set: weft_core::builds::NodeSet,
-) -> BuildResult<PathBuf> {
+) -> BuildResult<(PathBuf, SharedCratesHold)> {
     stage_host_crate(ctx, shared, catalog, &|crate_root, paths| {
         Ok(HostCrate {
             package_dirs: codegen::emit(definition, crate_root, catalog, WORKER_CRATE_NAME, node_set, paths)?,
@@ -318,7 +320,7 @@ pub fn stage_host_build(
 /// replaced by the package's test crate (`codegen::emit_test_crate`),
 /// whose package crate is the one a worker holding that package compiles
 /// (same folder under `shared`, compiled with its `node-tests` feature).
-pub fn stage_host_test_build(ctx: &Path, shared: &Path, catalog: &FsCatalog, package_name: &str) -> BuildResult<PathBuf> {
+pub fn stage_host_test_build(ctx: &Path, shared: &Path, catalog: &FsCatalog, package_name: &str) -> BuildResult<(PathBuf, SharedCratesHold)> {
     stage_host_crate(ctx, shared, catalog, &|crate_root, paths| {
         let test_crate = codegen::emit_test_crate(crate_root, catalog, package_name, paths)?;
         Ok(HostCrate {
@@ -347,7 +349,8 @@ fn stage_host_crate(
     shared: &Path,
     catalog: &FsCatalog,
     emit: &dyn Fn(&Path, &codegen::EmitPaths) -> BuildResult<HostCrate>,
-) -> BuildResult<PathBuf> {
+) -> BuildResult<(PathBuf, SharedCratesHold)> {
+    let hold = SharedCratesHold::of(shared)?;
     if ctx.exists() {
         std::fs::remove_dir_all(ctx).map_err(BuildError::Io)?;
     }
@@ -362,7 +365,7 @@ fn stage_host_crate(
 
     let crate_root = ctx.join(HOST_CRATE_DIR);
     let emitted = emit(&crate_root, &codegen::EmitPaths::Host { weft: slice.clone(), package_crates: shared.to_path_buf() })?;
-    let env = worker_image::collect_build_env(catalog, &emitted.node_types, &|node_type, source_dir| {
+    let worker_image::NodesBuildEnv { vars: build_env, set_by: build_env_set_by, cache_tag } = worker_image::collect_build_env(catalog, &emitted.node_types, &|node_type, source_dir| {
         let package = catalog
             .package_of(node_type)
             .ok_or_else(|| BuildError::Build(format!("node '{node_type}' has no package")))?;
@@ -371,21 +374,11 @@ fn stage_host_crate(
         })?;
         Ok(emitted.package_dirs[&package.name].join(codegen::HOST_PACKAGE_SOURCE_DIR).join(rel).display().to_string())
     })?;
-    if !env.is_empty() {
-        // `force`: cargo's `[env]` otherwise loses to a variable the
-        // runtime's environment already sets (a machine's own
-        // `PKG_CONFIG_PATH`), where an image's `ENV` always wins.
-        let entry = |value: String| {
-            toml::Value::Table(toml::Table::from_iter([("value".to_string(), toml::Value::String(value)), ("force".to_string(), toml::Value::Boolean(true))]))
-        };
-        let mut config = toml::Table::new();
-        config.insert("env".into(), toml::Value::Table(env.into_iter().map(|(k, v)| (k, entry(v))).collect()));
-        let config = toml::to_string(&config).map_err(|e| BuildError::Build(format!("the build's cargo config: {e}")))?;
-        std::fs::create_dir_all(crate_root.join(".cargo")).map_err(BuildError::Io)?;
-        std::fs::write(crate_root.join(".cargo").join("config.toml"), config).map_err(BuildError::Io)?;
-    }
 
     let recipe = weft_core::builds::HostRecipe {
+        build_env,
+        build_env_set_by,
+        cache_tag,
         isolate_dir: crate_root.join(codegen::isolate_dir_name()),
         isolate_candidates: crate_root.join(codegen::ISOLATE_CANDIDATES_FILE),
         left_out_record: crate_root.join(codegen::LEFT_OUT_RECORD_FILE),
@@ -393,26 +386,35 @@ fn stage_host_crate(
         // image build without a base seeds from (`/weft/Cargo.lock`).
         seed_lock: slice.join("Cargo.lock"),
         binary_name: emitted.binary_name,
-        cache_gc_script: crate_root.join(worker_image::CACHE_GC_SCRIPT_NAME),
-        cache_retention_days: worker_image::WORKER_CACHE_RETENTION_DAYS,
-        cache_versions_kept: worker_image::WORKER_CACHE_VERSIONS_KEPT,
         crate_dir: crate_root,
     };
     let json = serde_json::to_vec_pretty(&recipe).map_err(|e| BuildError::Build(format!("the host recipe: {e}")))?;
     std::fs::write(ctx.join(weft_core::builds::HOST_RECIPE_FILE), json).map_err(BuildError::Io)?;
-    Ok(ctx.to_path_buf())
+    Ok((ctx.to_path_buf(), hold))
+}
+
+/// A build's claim on the crates it staged in the folder every host build
+/// on the machine shares, from before it stages them until it is compiled
+/// (`weft_core::builds::shared_crates_lock`).
+#[derive(Debug)]
+pub struct SharedCratesHold {
+    _lock: std::fs::File,
+}
+
+impl SharedCratesHold {
+    fn of(shared: &Path) -> BuildResult<Self> {
+        Ok(Self { _lock: weft_core::file_lock::hold_shared(&weft_core::builds::shared_crates_lock(shared)).map_err(BuildError::Io)? })
+    }
 }
 
 /// Make `dest` by `write` once and never again: a folder named by its
 /// content is whole as soon as it is there, and another build may be
 /// reading it. `write` fills a fresh folder beside it, which is then
 /// renamed into place, so `dest` is either whole or absent; when another
-/// writer got there first, its copy (the same content) stays. A folder
-/// already there has its time moved to now, which is how
-/// [`reclaim_shared_crates`] tells it is still used.
+/// writer got there first, its copy (the same content) stays.
 pub(crate) fn write_once(dest: &Path, write: &dyn Fn(&Path) -> BuildResult<()>) -> BuildResult<()> {
     if dest.is_dir() {
-        return std::fs::File::open(dest).and_then(|dir| dir.set_modified(std::time::SystemTime::now())).map_err(BuildError::Io);
+        return Ok(());
     }
     let parent = dest.parent().ok_or_else(|| BuildError::Build(format!("{} has no parent folder", dest.display())))?;
     std::fs::create_dir_all(parent).map_err(BuildError::Io)?;
@@ -427,37 +429,6 @@ pub(crate) fn write_once(dest: &Path, write: &dyn Fn(&Path) -> BuildResult<()>) 
         let _ = std::fs::remove_dir_all(&temp);
     }
     written
-}
-
-/// Remove what no build has used for `unused_for` from `shared` (the
-/// folder of crates every host build on the machine shares),
-/// answering the names it removed: a package crate of sources since
-/// edited, the workspace slice of a weft since updated, a half-written
-/// folder a stopped build left. Each is written once and touched by every
-/// build that uses it ([`write_once`]), so what goes is what nothing staged
-/// in that time; a build that wants one again writes it again.
-pub fn reclaim_shared_crates(shared: &Path, unused_for: std::time::Duration) -> BuildResult<Vec<String>> {
-    let entries = match std::fs::read_dir(shared) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(BuildError::Io(e)),
-    };
-    let now = std::time::SystemTime::now();
-    let mut removed = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(BuildError::Io)?;
-        let used = entry.metadata().and_then(|m| m.modified()).map_err(BuildError::Io)?;
-        if now.duration_since(used).is_ok_and(|idle| idle > unused_for) {
-            if entry.file_type().map_err(BuildError::Io)?.is_dir() {
-                std::fs::remove_dir_all(entry.path()).map_err(BuildError::Io)?;
-            } else {
-                std::fs::remove_file(entry.path()).map_err(BuildError::Io)?;
-            }
-            removed.push(entry.file_name().to_string_lossy().into_owned());
-        }
-    }
-    removed.sort();
-    Ok(removed)
 }
 
 /// Copy a package's sources to `dest` as a build compiles them: what
@@ -616,13 +587,14 @@ pub fn build_test_artifact(project: &Project, catalog: &FsCatalog, package_name:
     // servers side by side, so a shared path would have one package's
     // staging clobber another's mid-build.
     let stem = sanitize_crate_name(package_name);
-    let build_context = stage_host_test_build(
+    let (build_context, hold) = stage_host_test_build(
         &project.root.join(".weft").join("target").join("test-host").join(&stem),
         shared_crates,
         catalog,
         package_name,
     )?;
     Ok(StagedImageBuild {
+        hold: Some(std::sync::Arc::new(hold)),
         build_context,
         content_hash: node_test_content_hash(catalog, package_name)?,
         recipe: weft_core::builds::BuildRecipe::Host,
@@ -1219,7 +1191,8 @@ pub struct TestBuildDirs {
     pub crates_root: PathBuf,
     /// Cargo's target dir. Machine-wide, so the engine and every
     /// third-party dependency compiles once per machine rather than
-    /// once per project.
+    /// once per project. Packages whose nodes set `[build.env]` build in
+    /// one beside it per set of values ([`Self::target_dir_for`]).
     pub target_dir: PathBuf,
 }
 
@@ -1240,6 +1213,21 @@ impl TestBuildDirs {
         Self {
             crates_root: cache_root.join("projects").join(project_slug(project_root)),
             target_dir: cache_root.join("target"),
+        }
+    }
+
+    /// The target dir of a build whose nodes' `[build.env]` has the tag
+    /// `cache_tag` (`worker_image::NodesBuildEnv::cache_tag`, which says
+    /// why the values must not share one): [`Self::target_dir`] when they
+    /// set nothing, else a dir of its own beside it, `<target>-<tag>`.
+    pub fn target_dir_for(&self, cache_tag: Option<&str>) -> PathBuf {
+        match cache_tag {
+            None => self.target_dir.clone(),
+            Some(tag) => {
+                let mut name = self.target_dir.file_name().unwrap_or_default().to_os_string();
+                name.push(format!("-{tag}"));
+                self.target_dir.with_file_name(name)
+            }
         }
     }
 }
@@ -1276,6 +1264,10 @@ pub struct TestWorkspace {
     /// The workspace root cargo is invoked from.
     root: PathBuf,
     target_dir: PathBuf,
+    /// What the packages' nodes set in `[build.env]` (`{{catalog_path}}`
+    /// expanded to each node's own folder, which the emission includes
+    /// from), in cargo's environment as a worker's build has it.
+    build_env: BTreeMap<String, String>,
 }
 
 /// Emit every package's node-test crate into `dirs` as members of one
@@ -1304,10 +1296,13 @@ pub fn prepare_test_workspace(
         members.push(member);
     }
     codegen::emit_test_workspace(&dirs.crates_root, &members)?;
+    let node_types: BTreeSet<String> = crates.values().flat_map(|c| c.node_types.iter().cloned()).collect();
+    let build_env = worker_image::collect_build_env(catalog, &node_types, &|_, source_dir| Ok(source_dir.display().to_string()))?;
     Ok(TestWorkspace {
         crates,
         root: dirs.crates_root.clone(),
-        target_dir: dirs.target_dir.clone(),
+        target_dir: dirs.target_dir_for(build_env.cache_tag.as_deref()),
+        build_env: build_env.vars,
     })
 }
 
@@ -1340,6 +1335,7 @@ pub fn build_node_test_binaries(
     let out = std::process::Command::new("cargo")
         .args(["build", "--workspace", "--message-format=json-render-diagnostics"])
         .current_dir(&workspace.root)
+        .envs(&workspace.build_env)
         .env("CARGO_TARGET_DIR", &workspace.target_dir)
         .stderr(std::process::Stdio::inherit())
         .output()
@@ -1454,25 +1450,6 @@ pub fn build_project_catalog(project_root: &Path) -> BuildResult<FsCatalog> {
 mod tests {
     use super::sanitize_crate_name;
 
-    /// A shared crate a build stages again is touched, so a reclaim takes
-    /// only what no build staged for longer than it keeps them.
-    #[test]
-    fn a_reclaim_takes_the_shared_crates_no_build_staged_lately() {
-        let shared = tempfile::tempdir().unwrap();
-        let write = |dir: &std::path::Path| std::fs::create_dir_all(dir).map_err(super::BuildError::Io);
-        for name in ["pkg_a-old", "pkg_a-new", "weft-k"] {
-            super::write_once(&shared.path().join(name), &write).unwrap();
-        }
-        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        for name in ["pkg_a-old", "weft-k"] {
-            std::fs::File::open(shared.path().join(name)).unwrap().set_modified(long_ago).unwrap();
-        }
-        super::write_once(&shared.path().join("weft-k"), &write).unwrap();
-        let removed = super::reclaim_shared_crates(shared.path(), std::time::Duration::from_secs(60)).unwrap();
-        assert_eq!(removed, ["pkg_a-old"]);
-        assert!(shared.path().join("pkg_a-new").is_dir() && shared.path().join("weft-k").is_dir());
-    }
-
     /// Two installs on the same toolchain never share a compile cache, and
     /// each key says whose it is; an install keeps its cache across source
     /// edits and dependency bumps, and moves to a fresh one when its
@@ -1556,17 +1533,16 @@ mod tests {
                 "id": uuid::Uuid::nil(), "nodes": [{"id": "greet", "nodeType": "Run", "config": {}, "position": {"x": 0, "y": 0}}], "edges": []
             }))
             .unwrap();
-            let ctx = super::stage_host_build(&project.join("ctx"), &shared, &definition, &catalog, weft_core::builds::NodeSet::Referenced).expect("stage");
+            let (ctx, _hold) = super::stage_host_build(&project.join("ctx"), &shared, &definition, &catalog, weft_core::builds::NodeSet::Referenced).expect("stage");
             let recipe: weft_core::builds::HostRecipe =
                 serde_json::from_slice(&std::fs::read(ctx.join(weft_core::builds::HOST_RECIPE_FILE)).unwrap()).unwrap();
             assert_eq!(recipe.crate_dir, ctx.join(super::HOST_CRATE_DIR));
-            for file in [&recipe.isolate_candidates, &recipe.left_out_record, &recipe.seed_lock, &recipe.cache_gc_script] {
+            for file in [&recipe.isolate_candidates, &recipe.left_out_record, &recipe.seed_lock] {
                 assert!(file.is_file(), "{}", file.display());
             }
             assert!(recipe.isolate_dir.join("Cargo.toml").is_file());
             assert!(recipe.seed_lock.starts_with(&shared));
             assert_eq!(recipe.binary_name, super::sanitize_crate_name(super::WORKER_CRATE_NAME));
-            assert_eq!(recipe.cache_retention_days, crate::worker_image::WORKER_CACHE_RETENTION_DAYS);
             manifests.push(std::fs::read_to_string(recipe.crate_dir.join("Cargo.toml")).unwrap());
         }
         let package_dep = |manifest: &str| manifest.lines().find(|l| l.starts_with("pkg_run") && l.contains("path =")).expect("the package dep").to_string();
@@ -1598,9 +1574,9 @@ mod tests {
             "id": uuid::Uuid::nil(), "nodes": [{"id": "greet", "nodeType": "Run", "config": {}, "position": {"x": 0, "y": 0}}], "edges": []
         }))
         .unwrap();
-        let worker = super::stage_host_build(&project.join("worker"), &shared, &definition, &catalog, weft_core::builds::NodeSet::Referenced).expect("stage the worker");
+        let (worker, _worker_hold) = super::stage_host_build(&project.join("worker"), &shared, &definition, &catalog, weft_core::builds::NodeSet::Referenced).expect("stage the worker");
         let package = catalog.package_of("Run").unwrap().name.clone();
-        let tests = super::stage_host_test_build(&project.join("tests"), &shared, &catalog, &package).expect("stage the test server");
+        let (tests, _tests_hold) = super::stage_host_test_build(&project.join("tests"), &shared, &catalog, &package).expect("stage the test server");
         let recipe_of = |ctx: &std::path::Path| -> weft_core::builds::HostRecipe {
             serde_json::from_slice(&std::fs::read(ctx.join(weft_core::builds::HOST_RECIPE_FILE)).unwrap()).unwrap()
         };
@@ -1608,7 +1584,7 @@ mod tests {
         assert_eq!(recipe.crate_dir, tests.join(super::HOST_CRATE_DIR));
         assert_eq!(recipe.binary_name, format!("{}_tests", super::sanitize_crate_name(&package)));
         assert_eq!(recipe.seed_lock, recipe_of(&worker).seed_lock, "one workspace slice for both");
-        for file in [&recipe.isolate_candidates, &recipe.left_out_record, &recipe.cache_gc_script] {
+        for file in [&recipe.isolate_candidates, &recipe.left_out_record] {
             assert!(file.is_file(), "{}", file.display());
         }
         let candidates: serde_json::Value = serde_json::from_slice(&std::fs::read(&recipe.isolate_candidates).unwrap()).unwrap();
@@ -1625,31 +1601,63 @@ mod tests {
         assert!(manifest.lines().any(|l| l.starts_with("pkg_run") && l.contains("node-tests")), "{manifest}");
     }
 
-    /// A node's `[build.env]` reaches a host build as a forced `[env]`
-    /// entry of the worker crate's cargo config, so it wins over the same
-    /// variable set on the machine, as an image's `ENV` does.
+    /// A node's `[build.env]` reaches a host build through its recipe, the
+    /// compiler flags as much as any other variable, `{{catalog_path}}`
+    /// expanded to the node's folder where the build compiles it.
     #[test]
-    fn a_host_build_forces_the_nodes_build_env() {
+    fn a_host_build_carries_the_nodes_build_env_in_its_recipe() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         let at = project.join("nodes").join("vips");
         std::fs::create_dir_all(&at).unwrap();
         std::fs::write(at.join("metadata.json"), r#"{"type": "Vips", "label": "Vips", "description": "d", "inputs": [], "outputs": []}"#).unwrap();
         std::fs::write(at.join("mod.rs"), "// impl\n").unwrap();
-        std::fs::write(at.join("deps.toml"), "[build.env]\nPKG_CONFIG_PATH = \"{{catalog_path}}/pkgconfig\"\n").unwrap();
+        std::fs::write(at.join("deps.toml"), "[build.env]\nPKG_CONFIG_PATH = \"{{catalog_path}}/pkgconfig\"\nRUSTFLAGS = \"-C target-cpu=native\"\n").unwrap();
         let catalog = weft_catalog::FsCatalog::discover(&project.join("nodes")).unwrap();
         let definition: weft_core::project::ProjectDefinition = serde_json::from_value(serde_json::json!({
             "id": uuid::Uuid::nil(), "nodes": [{"id": "thumb", "nodeType": "Vips", "config": {}, "position": {"x": 0, "y": 0}}], "edges": []
         }))
         .unwrap();
-        let ctx = super::stage_host_build(&project.join("ctx"), &temp.path().join("shared"), &definition, &catalog, weft_core::builds::NodeSet::Referenced).expect("stage");
-        let config: toml::Table = std::fs::read_to_string(ctx.join(super::HOST_CRATE_DIR).join(".cargo/config.toml")).unwrap().parse().unwrap();
-        let entry = config["env"]["PKG_CONFIG_PATH"].as_table().expect("a table entry");
-        assert_eq!(entry["force"].as_bool(), Some(true));
-        let value = entry["value"].as_str().unwrap();
+        let (ctx, _hold) = super::stage_host_build(&project.join("ctx"), &temp.path().join("shared"), &definition, &catalog, weft_core::builds::NodeSet::Referenced).expect("stage");
+        let recipe: weft_core::builds::HostRecipe = serde_json::from_slice(&std::fs::read(ctx.join(weft_core::builds::HOST_RECIPE_FILE)).unwrap()).unwrap();
+        assert_eq!(recipe.build_env.get("RUSTFLAGS").map(String::as_str), Some("-C target-cpu=native"));
+        assert_eq!(recipe.build_env_set_by.get("RUSTFLAGS"), Some(&["Vips".to_string()].into()), "each variable names the node types that set it");
+        assert!(recipe.cache_tag.is_some(), "the build compiles in caches of its own");
+        let value = &recipe.build_env["PKG_CONFIG_PATH"];
         assert!(
             value.starts_with(&temp.path().join("shared").display().to_string()) && value.contains("/source") && value.ends_with("/pkgconfig"),
             "the node's folder in its package crate: {value}"
+        );
+    }
+
+    /// A node test's build (`weft test-node`) runs cargo with the nodes'
+    /// `[build.env]` as a worker's build does, `{{catalog_path}}` being the
+    /// node's own folder, which that build includes from.
+    #[test]
+    fn a_node_test_build_carries_the_nodes_build_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let at = project.join("nodes").join("vips");
+        std::fs::create_dir_all(&at).unwrap();
+        std::fs::write(at.join("metadata.json"), r#"{"type": "Vips", "label": "Vips", "description": "d", "inputs": [], "outputs": []}"#).unwrap();
+        std::fs::write(at.join("mod.rs"), "// impl\n").unwrap();
+        std::fs::write(at.join("deps.toml"), "[build.env]\nPKG_CONFIG_PATH = \"{{catalog_path}}/pkgconfig\"\nRUSTFLAGS = \"-C target-cpu=native\"\n").unwrap();
+        let catalog = weft_catalog::FsCatalog::discover(&project.join("nodes")).unwrap();
+        let package = catalog.package_of("Vips").unwrap().name.clone();
+        let dirs = super::TestBuildDirs { crates_root: temp.path().join("crates"), target_dir: temp.path().join("target") };
+        let workspace = super::prepare_test_workspace(&catalog, &[package], &dirs).expect("prepare");
+        let target = workspace.target_dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            workspace.target_dir.parent() == Some(temp.path()) && target.starts_with("target-") && target.len() == "target-".len() + 16,
+            "a target dir of its own beside the shared one: {target}"
+        );
+        assert_eq!(dirs.target_dir_for(None), dirs.target_dir, "a build whose nodes set nothing keeps the shared one");
+        assert_eq!(
+            workspace.build_env,
+            std::collections::BTreeMap::from([
+                ("PKG_CONFIG_PATH".to_string(), format!("{}/pkgconfig", catalog.source_dir("Vips").unwrap().display())),
+                ("RUSTFLAGS".to_string(), "-C target-cpu=native".to_string()),
+            ])
         );
     }
 

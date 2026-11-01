@@ -142,6 +142,47 @@ On an opened connection: `client()`, `credential()`, `value(name)`,
 `identity()`, `owner()`. On an endpoint handle: `url()`,
 `host_and_port()`, and `call(method, path, body)`.
 
+## Secrets
+
+If your node hands out a value the run's record must never show, like a
+session key a voice app gets for a few minutes, make it a secret. What flows
+on the wire is a marker naming it. For what the record keeps and for how
+long, go and read [secrets](../language/types.md#secrets).
+
+```rust
+let session = ctx.secret(&key)?;
+ctx.pulse_downstream(NodeOutput::new().set("session", session)).await
+```
+
+Declare that output as `Secret[String]` in your `metadata.json`. A node that
+needs the value declares a `Secret[String]` input and asks for it:
+
+```rust
+let session: weft::secret::Secret = ctx.inputs.get("session")?;
+let key: String = ctx.reveal(&session).await?;
+```
+
+| Call | What you get | It fails when |
+|---|---|---|
+| `secret(&value)` | A `Secret` to put on an output typed `Secret[T]` | The value is not JSON |
+| `reveal::<T>(&secret).await` | The value, as `T` | The record of the run that made it is gone, or the value is not a `T` |
+| `reveal_input(port, value).await` | The value of your input `port` with every secret its declared type says it holds revealed, for handing a whole value outside weft (a script, a request, a caller) | As `reveal_in`, naming the input |
+| `reveal_in(value, &ty).await` | The same for a value of type `ty` that is no input of yours | A secret sits where `ty` declares none, a place `ty` says is a secret holds a plain value, or the record of the run that made one is gone |
+| `secret_in(value, &ty)` | `value` with every plain value at a place `ty` says is a secret made one, for a node whose code hands back plain values | never |
+
+A secret this run made, or revealed already, comes back from the worker's
+memory. Any other comes from its sealed copy, which any run of the same
+project can read: the same run picked up after a pause, a seeded run, a
+marker your program stored somewhere and reads back later. A run with
+`recorded` off writes nothing down, so only that run reveals its secrets.
+
+If a value holds a secret its type does not declare (a token inside a
+`JsonDict`), `reveal_in` and `reveal_input` fail rather than hand it on as
+its marker, saying where the secret is and that the program should declare
+the type, like `{ token: Secret[String] }`. If you emit a revealed value on a
+plain output, the record holds it like any other value. For which types fit a secret, go and read [what fits into
+what](../language/types.md#what-fits-into-what).
+
 ## Sharing something between runs
 
 If your node builds something on every run that is slow to build (a pool of database
@@ -193,7 +234,36 @@ connection changes), so pass the same limit everywhere you call it. The limit co
 past it between them, and so can the old thing and the new one for a moment
 after a connection's values change, while runs still hold handles to the old
 one. The Postgres nodes that query through the
-shared pool ask for 100, Postgres's own default connection limit.
+shared pool ask for 20.
+
+`with_limit` only caps what one worker takes, so that its runs never leave
+its sibling workers without a connection. It cannot keep a database
+under its connection limit, because it cannot see how many workers there are. If your node talks to something that only
+serves so much (a database with a fixed number of connections, an API with a
+rate limit), assume any number of workers run your node at once: Cloud Run
+starts copies up to the project's `--max-instances` (set with `weft workers
+set`), and a change of program
+or worker settings runs the old copies beside the new ones for a while. Two
+things follow:
+
+- **Hold nothing you are not using.** Close an idle connection within
+  seconds, because one a copy keeps between requests is one no other copy can
+  have. On Cloud Run a copy has no CPU between requests (unless the
+  project turned on `weft workers set --cpu-always-allocated true`), so a timer of yours that closes it may not
+  fire for minutes: check how long a connection sat idle when a run takes it,
+  too. The Postgres nodes close a pooled connection after 5 idle seconds and
+  never hand out one idle for longer.
+- **Let the other end do the counting.** It is the one place that sees every
+  copy, so that is where a client past the limit should wait its turn, or be
+  refused with a clear answer. Your node then waits, or fails with a message
+  that says why. A PostgresDatabase does this with a pooler in front of
+  Postgres, where a client that finds every connection busy waits for one,
+  and Postgres closes a session that sat idle for a minute. If your node
+  keeps a connection idle on purpose (one that `LISTEN`s), lift that limit
+  for its own session when it connects, the way PostgresWatchQuery sends
+  `SELECT set_config('idle_session_timeout', '0', false) FROM pg_settings
+  WHERE name = 'idle_session_timeout'` (the `FROM pg_settings` part makes it
+  do nothing on a Postgres that has no such setting, instead of failing).
 
 If a task you spawn needs the thing after your run returns (handing a
 connection back to its pool later), move the handle into the task: it keeps
@@ -207,7 +277,9 @@ By default, weft lets go of a shared thing about five minutes after the last
 run asked for it or dropped its handle, once no handle is left. Your
 thing's `Drop` runs once weft has let go of it and the last handle and `Arc`
 are gone, which is when a pool closes its connections. When the worker
-stops, everything goes with the process.
+stops, it lets go of every shared thing as soon as its last run has ended,
+used recently or not, so a pool's connections go back to the database while
+the worker is still writing its last records.
 
 If you want a quiet stretch not to cost a rebuild, raise the five minutes
 with `weft workers set --shared-idle-seconds <n>` (or lower it to let go
@@ -387,7 +459,7 @@ copy instead of the shared one; `values()`, `connections()` and
 | `values().instance(id).forget().await` | Forgets every value the instance was given |
 | `connections().instance(id).list() / forget()` | Lists an instance's connections, or forgets all of them (the values naming them go too) |
 | `instances().list().await` | Every instance weft holds anything for, one entry each: how many values, connections and live tokens, its infra copies, and its triggers, each with the events waiting on a field not yet filled and why |
-| `costs().instance(id).service(s).since(t).list().await` | The cost records, each saying whose credential paid, narrowed by instance, node, service, run, `paid_by` or `since` (unix seconds) |
+| `costs().instance(id).service(s).since(t).list().await` | The cost records, each saying whose credential paid, narrowed by instance, node, service, run, `paid_by` or `since` (unix seconds). A run's costs are deleted whenever the run is, whether its keep time ran out or something cleaned it (for how long runs are kept, go and read [how long a run is kept](../running/the-journal.md#how-long-a-run-is-kept)) |
 | `runs().instance(id).status(s)?.older_than(d).clean(running, stop_self).await` | Deletes the matching runs and answers how many it deleted, cancelled and left running. If a run is still going, `StillGoing::Leave` leaves it alone and `StillGoing::Cancel` cancels it (its rows go at the next clean). This run is never deleted. If you pass `StopSelf::Include` and this run matches the filters, it is stopped once the rest is cleaned, and the call does not return |
 | `runs()...list(limit).await` / `.count().await` | The newest `limit` matching runs (1 to 200) with how many match in all, or just the count; same filters as `clean` |
 | `tokens().mint_for_instance(id, expires_in).await` | An instance token, value shown once. A replay past this call mints it again under the same id, so the value handed out before the replay stops working |

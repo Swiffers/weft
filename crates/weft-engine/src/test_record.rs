@@ -26,6 +26,30 @@ pub(crate) fn decode_batch(body: &[u8]) -> (BatchHead, Vec<(RunHead, Vec<RunEven
     (batch.head, runs)
 }
 
+/// How many rows a page of an in-memory record holds: a couple, so every
+/// reader of a record in the engine's tests crosses page edges.
+const PAGE: usize = 2;
+
+/// `events`, all of one run, as a record whose every event is a row of its
+/// own, read after row `after` a page at a time, as the broker's record
+/// answers (`weft_journal::record::read_page`).
+pub(crate) fn page_of(events: &[RunEvent], after: Option<i32>) -> RawRecord {
+    let rows = events
+        .iter()
+        .enumerate()
+        .map(|(seq, event)| (seq as i32, event))
+        .filter(|(seq, _)| after.is_none_or(|after| *seq > after))
+        .take(PAGE)
+        .map(|(seq, event)| RunLogRow::of(seq, std::slice::from_ref(event)))
+        .collect();
+    RawRecord { rows }
+}
+
+/// The same page, decoded, as a `weft_journal::JournalClient` answers it.
+pub(crate) fn rows_of(run_id: RunId, events: &[RunEvent], after: Option<i32>) -> Vec<weft_journal::JournalRow> {
+    page_of(events, after).decode(run_id).expect("an in-memory record reads back")
+}
+
 /// What the record keeps of one run.
 #[derive(Debug, Default)]
 struct Run {
@@ -36,6 +60,8 @@ struct Run {
 #[derive(Default)]
 struct State {
     runs: HashMap<RunId, Run>,
+    /// Every secret an accepted run's batch carried, by id.
+    secrets: HashMap<weft_core::secret::SecretId, serde_json::Value>,
     heads: Vec<BatchHead>,
     gave_up: Vec<(RunId, String)>,
     refused: HashSet<RunId>,
@@ -154,6 +180,7 @@ impl RecordClient for FakeRecord {
                 let known = state.runs.entry(id).or_default();
                 known.last_seq = run.first_seq;
                 known.events.extend(events);
+                state.secrets.extend(run.secrets.into_iter().map(|secret| (secret.secret_id, secret.value)));
             }
             fates.push(fate);
         }
@@ -165,9 +192,12 @@ impl RecordClient for FakeRecord {
         Ok(BatchAnswer { fates })
     }
 
-    async fn record_of(&self, run_id: RunId) -> anyhow::Result<RawRecord> {
-        let events = self.events(run_id);
-        Ok(RawRecord { rows: vec![RunLogRow::of(0, &events)] })
+    async fn record_of(&self, run_id: RunId, after: Option<i32>) -> anyhow::Result<RawRecord> {
+        Ok(page_of(&self.events(run_id), after))
+    }
+
+    async fn secret(&self, secret_id: weft_core::secret::SecretId) -> anyhow::Result<Option<serde_json::Value>> {
+        Ok(self.state.lock().unwrap().secrets.get(&secret_id).cloned())
     }
 
     async fn give_up(&self, run_id: RunId, why: String) -> Result<(), BatchError> {

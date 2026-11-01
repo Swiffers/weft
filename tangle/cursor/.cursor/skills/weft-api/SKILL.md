@@ -58,14 +58,21 @@ answer = Reply { status: 201, body: hello.body.name }
 
 A [route]'s fixed output ports carry the request as the gateway saw it: the
 method, the path as called, the query, the headers, and who the [gate] let
-in. Its metadata lists them. A path capture has no fixed port: you declare an
+in. Its metadata lists them. The headers carrying a credential
+(`authorization`, `proxy-authorization`, `cookie`, `weft-instance-token`, and
+the ones the [gate] reads) are never on `headers`: they come out on
+`credentials`, each a `Secret[String]`, which the run's record holds only as a
+marker. Hand them to a node that takes a secret (`HttpRequest`'s `headers`
+sends them revealed, and so does its `body` when what you wire into it declares
+where the secret is, like `{ token: Secret[String] }`); a plain `String` port refuses them at build. A path capture has no fixed port: you declare an
 output of its name (below).
 
 What you declare on `body` depends on the body shape the [route] is set to
 (`dataType` in the source, "Body shape" in the editor):
 
 - an object body (`json`, the default): a record type, or `JsonDict` if you
-  want the object as it came. A record is checked as the request arrives: a
+  want the object as it came (`Json` if the body may be a list or a bare
+  value). A record is checked as the request arrives: a
   body that does not fit it is answered `400` naming the field, and nothing
   downstream runs. A record refuses keys it does not declare, unless you end
   it with `..` (`{ email: String, .. }`), which drops them. A field written
@@ -87,7 +94,7 @@ Every output you add to a `Route` must be a capture of its path, typed
 `String`; the compiler refuses anything else with
 `route-output-not-a-capture`. A capture may not share a name with one of
 `Route`'s own outputs (`body`, `method`, `path`, `query`, `headers`,
-`caller`, `fired`): `cards/{body}` is `route-capture-shadows-output`, asking
+`credentials`, `caller`, `fired`): `cards/{body}` is `route-capture-shadows-output`, asking
 you to rename the capture.
 
 The first thing the program sends commits the status line. A `Reply` on a
@@ -150,7 +157,9 @@ found = Reply { body: lookup.body, status: lookup.status }
 
 A `GET` route has no body: declare nothing on the arrow and read the fixed
 ports. A `text` route: `say = Route -> (body: String) { path: "say", dataType:
-"text" }`, and the `Reply` body must be a `String`.
+"text" }`, and the `Reply` body must be a `String`. A request that carries no
+body closes `body`, whatever the `dataType`, and a json body that is `null` comes out on a `body` whose type takes `Null`
+(`Json` does) and closes it on any other.
 
 If the answer has a different shape from what came in, the [answer] node says
 which with `answerAs`: `json`, `text` or `bytes`, and empty follows the
@@ -570,7 +579,8 @@ graph does instead of a script whose whole body is `return {...}`.
 What a socket adds over a [route] is `inbound`: a `Generator` carrying one
 item per message the caller sends, ended when the caller disconnects. You
 declare its item type on the arrow to match the body shape (a record when
-you will read keys off it, `Generator[String]` for plain text,
+you will read keys off it, `Generator[Json]` for messages of any shape,
+`Generator[String]` for plain text,
 `Generator[File]` for uploads); an undeclared `inbound` wired anywhere is a
 compile error. A `Loop` over it runs
 once per message, in order.
@@ -700,7 +710,8 @@ appears at once at the end and tells you nothing about timing.
 To try a route BEFORE activating (no listeners armed, no URL, no waiting on
 a resync), `--fire` runs the whole thing. Give it the request envelope the
 trigger declares in its `firesWith` metadata (for a Route: `method`,
-`path`, and optionally `params`, `query`, `headers`, `caller`), plus a
+`path`, and optionally `params`, `query`, `headers` (never a credential
+header, nor `credentials`: the fire is refused naming it), `caller`), plus a
 `body` key holding what the caller would have sent. The envelope is checked
 exactly, so a key the trigger does not declare is refused by name, same as a
 missing one.

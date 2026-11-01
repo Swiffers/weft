@@ -71,7 +71,7 @@ use sha2::{Digest, Sha256};
 
 use crate::db::{Client, Conn, FromRow, Pool, Row, Transaction, Waits};
 use crate::documents::Document;
-use crate::schema_group::{SchemaGroup, Until};
+use crate::schema_group::{SchemaGroup, StepWork, Until};
 
 /// One part of one change to one group's tables: the file's SQL, the group
 /// it sits under, the id it is filed by, and which [`Part`] of the change
@@ -377,29 +377,118 @@ fn edited_after_running<'a>(
 /// DDL of that day and the migrations before it were deleted, so no
 /// database built earlier can be carried forward. Every database built
 /// since records this id (under [`HISTORY_GROUP`]) when its first group is
-/// built, and one without it is refused with the way out.
+/// built, and one without it is refused with the way out. When the history
+/// restarts again, this id moves to [`PAST_EPOCHS`] and a new one takes its
+/// place, so the next weft knows this one's databases as older rather than
+/// newer.
+// SYNC: the history's start <-> scripts/lib/weft-cleanup.sh (weft_database_before_runs)
 const HISTORY_EPOCH: &str = "run";
+/// Every id the history started at before [`HISTORY_EPOCH`]: `serverless`,
+/// from the move off Kubernetes. A database built before that first restart
+/// records none at all.
+// SYNC: PAST_EPOCHS <-> scripts/lib/weft-cleanup.sh (weft_database_before_runs)
+const PAST_EPOCHS: &[&str] = &["serverless"];
 const HISTORY_GROUP: &str = "_history";
 
-/// Record the history's start on a new database, and refuse one that was
-/// built before it.
-async fn refuse_a_database_from_before_the_history(tx: &Transaction<'_>) -> anyhow::Result<()> {
-    let (built, current): (bool, bool) = tx
-        .one(
-            "SELECT EXISTS (SELECT 1 FROM weft_schema_stamp), \
-                    EXISTS (SELECT 1 FROM weft_migration WHERE group_name = $1 AND id = $2)",
-            &[&HISTORY_GROUP, &HISTORY_EPOCH],
-        )
-        .await?;
-    anyhow::ensure!(
-        !built || current,
-        "this database was built by an older weft (from before runs were renamed, or before \
-         it moved off Kubernetes), and its tables cannot be carried forward. Run ./setup.sh, \
-         which offers to wipe it (this deletes its projects' run history, versions and stored \
-         connections; your project folders are untouched), or wipe everything weft left on \
-         this machine with scripts/scrub-old-install.sh."
-    );
+/// Where a database stands against this weft's history ([`HISTORY_EPOCH`]),
+/// as its `_history` record says. `weft-runtime database-history` reports
+/// it, and the boot refuses the last two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Epoch {
+    /// Nothing of weft's built in it yet: the boot builds it.
+    Empty,
+    /// Built from this weft's history: the boot carries it forward.
+    Current,
+    /// Built by a weft from before this history started: nothing carries
+    /// it forward, and the one way out deletes what it holds
+    /// ([`rebuild_from_before_the_history`]).
+    Older,
+    /// Built by a weft whose history started after this one's (at
+    /// `epoch`): this weft is the old one, and must never touch it.
+    Newer { epoch: String },
+}
+
+impl std::fmt::Display for Epoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Epoch::Empty => f.write_str("empty"),
+            Epoch::Current => f.write_str("current"),
+            Epoch::Older => f.write_str("older"),
+            Epoch::Newer { .. } => f.write_str("newer"),
+        }
+    }
+}
+
+/// [`Epoch`] from what a database records: whether any group is built in
+/// it (`built`), and every id under [`HISTORY_GROUP`] (`recorded`). An id
+/// this weft does not know can only come from a later history: every
+/// earlier one is in [`PAST_EPOCHS`].
+fn epoch_from(built: bool, recorded: &[String]) -> Epoch {
     if !built {
+        return Epoch::Empty;
+    }
+    if recorded.iter().any(|id| id == HISTORY_EPOCH) {
+        return Epoch::Current;
+    }
+    match recorded.iter().find(|id| !PAST_EPOCHS.contains(&id.as_str())) {
+        Some(later) => Epoch::Newer { epoch: later.clone() },
+        None => Epoch::Older,
+    }
+}
+
+/// The [`Epoch`] of the database `db` is on. Reads only, so it is safe on a
+/// database of any age, one with no weft tables at all included.
+pub async fn epoch(db: &impl Client) -> anyhow::Result<Epoch> {
+    // Two statements: Postgres resolves every table a statement names
+    // before it runs, so whether the ledgers exist is asked first.
+    let ledgers: bool = db
+        .scalar("SELECT to_regclass('weft_schema_stamp') IS NOT NULL AND to_regclass('weft_migration') IS NOT NULL", &[])
+        .await?;
+    if !ledgers {
+        return Ok(Epoch::Empty);
+    }
+    let built: bool = db.scalar("SELECT EXISTS (SELECT 1 FROM weft_schema_stamp)", &[]).await?;
+    let recorded: Vec<String> =
+        db.scalars("SELECT id FROM weft_migration WHERE group_name = $1 ORDER BY id", &[&HISTORY_GROUP]).await?;
+    Ok(epoch_from(built, &recorded))
+}
+
+/// The boot's refusal of a database built before [`HISTORY_EPOCH`]
+/// ([`Epoch::Older`]). A type of its own so the process that knows where
+/// it runs can name the way out that works there: its text here names the
+/// local one, and `weft-runtime` names the cloud's on a cloud install
+/// (`weft_runtime::schema::explain`).
+#[derive(Debug)]
+pub struct BuiltBeforeTheHistory;
+
+impl BuiltBeforeTheHistory {
+    /// What is wrong, without the way out.
+    pub const WHAT: &'static str = "this database was built by an older weft (from before runs were renamed, \
+         or before it moved off Kubernetes), and its tables cannot be carried forward.";
+}
+
+impl std::fmt::Display for BuiltBeforeTheHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} Run ./setup.sh, which offers to wipe it (this deletes its projects' run history, versions \
+             and stored connections; your project folders are untouched), or wipe everything weft left on \
+             this machine with scripts/scrub-old-install.sh.",
+            Self::WHAT
+        )
+    }
+}
+
+impl std::error::Error for BuiltBeforeTheHistory {}
+
+/// Record the history's start on a new database, and refuse one that was
+/// built from any other history.
+async fn refuse_a_database_from_before_the_history(tx: &Transaction<'_>) -> anyhow::Result<()> {
+    let found = epoch(tx).await?;
+    if let Some(refused) = found.refusal() {
+        return Err(refused);
+    }
+    if found == Epoch::Empty {
         tx.execute(
             "INSERT INTO weft_migration (group_name, id, checksum) VALUES ($1, $2, '') ON CONFLICT DO NOTHING",
             &[&HISTORY_GROUP, &HISTORY_EPOCH],
@@ -407,6 +496,78 @@ async fn refuse_a_database_from_before_the_history(tx: &Transaction<'_>) -> anyh
         .await?;
     }
     Ok(())
+}
+
+impl Epoch {
+    /// Why the boot refuses a database at this epoch, or `None` when it
+    /// builds or carries it.
+    pub fn refusal(&self) -> Option<anyhow::Error> {
+        match self {
+            Epoch::Empty | Epoch::Current => None,
+            Epoch::Older => Some(BuiltBeforeTheHistory.into()),
+            Epoch::Newer { epoch } => Some(anyhow::anyhow!(
+                "this database was built by a newer weft (its history starts at '{epoch}', this weft's at \
+                 '{HISTORY_EPOCH}'), which this one cannot read. Run the weft that built it, or a newer one."
+            )),
+        }
+    }
+}
+
+/// Wipe a database built before this weft's history ([`Epoch::Older`])
+/// and build this weft's schema in it, as one boot on an empty database
+/// would: the cloud's way out of [`BuiltBeforeTheHistory`], which
+/// `weft-runtime database-history --wipe-older` runs.
+///
+/// What it wipes is the `public` schema, where weft keeps every table it
+/// has (the boot builds there, and the database it is given is weft's
+/// own): nothing outside it, no other schema, role or database. Every
+/// project's run history, versions and stored connections go with it.
+///
+/// It refuses unless the database really is older, read under the boot's
+/// lock in the same transaction that wipes, so it can never wipe one this
+/// weft or a later one built. And the wipe and the new schema's tables
+/// commit together: an older weft that boots on the database afterwards
+/// finds it built from a history it does not have, and refuses it, rather
+/// than finding it empty and building its own old tables in it again.
+pub async fn rebuild_from_before_the_history(
+    pool: &Pool,
+    groups: &[&SchemaGroup],
+    documents: &[&Document],
+) -> anyhow::Result<()> {
+    validate_groups(groups)?;
+    while_contended(|| wipe_and_expand_under_lock(pool, groups, MIGRATIONS)).await?;
+    apply_schema(pool, groups, documents).await
+}
+
+async fn wipe_and_expand_under_lock(pool: &Pool, groups: &[&SchemaGroup], migrations: &[Migration<'static>]) -> anyhow::Result<()> {
+    let mut conn = pool.get().await?;
+    let tx = locked_tx(&mut conn).await?;
+    let found = epoch(&tx).await?;
+    if let Some(why) = nothing_to_wipe(&found) {
+        anyhow::bail!("{why}");
+    }
+    tx.batch_execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public").await.context("wipe the public schema")?;
+    expand(&tx, groups, migrations).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Why [`rebuild_from_before_the_history`] wipes nothing on a database at
+/// `found`: every epoch but [`Epoch::Older`].
+fn nothing_to_wipe(found: &Epoch) -> Option<String> {
+    let what = match found {
+        Epoch::Older => return None,
+        Epoch::Empty => "it holds nothing of weft's yet, and the boot builds it as it is".to_string(),
+        Epoch::Current => "it was built from this weft's history, and the boot carries it forward as it is".to_string(),
+        Epoch::Newer { epoch } => format!(
+            "it was built by a newer weft (its history starts at '{epoch}', this weft's at '{HISTORY_EPOCH}'), \
+             so this weft is the old one"
+        ),
+    };
+    Some(format!(
+        "nothing was wiped: only a database built before this weft's history ('{HISTORY_EPOCH}') is ever \
+         wiped, and this one is not: {what}."
+    ))
 }
 
 /// Bring `pool`'s schema up to what `groups` describe, and its stored
@@ -721,7 +882,7 @@ async fn run_pending(
 /// transaction the contract parts then run in: its table is locked first,
 /// as the contract part would lock it, so nothing written to the table
 /// after the step runs is left out of it.
-async fn run_data_steps(tx: &impl Client, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
+async fn run_data_steps(tx: &Transaction<'_>, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     for group in groups {
         for step in group.data_steps {
             let has_work = match step.until {
@@ -733,13 +894,11 @@ async fn run_data_steps(tx: &impl Client, groups: &[&SchemaGroup]) -> anyhow::Re
                 continue;
             }
             tx.batch_execute(&format!("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", step.table)).await?;
-            tx.batch_execute(step.sql).await.map_err(|e| {
-                anyhow::Error::from(e).context(format!(
-                    "schema group '{}': the data step on {} failed",
-                    group.name,
-                    step.target()
-                ))
-            })?;
+            let done = match step.work {
+                StepWork::Sql(sql) => tx.batch_execute(sql).await.map_err(anyhow::Error::from),
+                StepWork::Code(code) => code(tx).await,
+            };
+            done.map_err(|e| e.context(format!("schema group '{}': the data step on {} failed", group.name, step.target())))?;
         }
     }
     Ok(())
@@ -777,9 +936,17 @@ pub(crate) async fn column_present(db: &impl Client, table: &str, column: &str) 
 async fn expand_under_lock(pool: &Pool, groups: &[&SchemaGroup], migrations: &[Migration<'static>]) -> anyhow::Result<()> {
     let mut conn = pool.get().await?;
     let tx = locked_tx(&mut conn).await?;
+    expand(&tx, groups, migrations).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The expand work itself, in `tx`, which holds the advisory lock; the
+/// caller commits.
+async fn expand(tx: &Transaction<'_>, groups: &[&SchemaGroup], migrations: &[Migration<'static>]) -> anyhow::Result<()> {
     tx.batch_execute(BOOKKEEPING_DDL).await?;
-    refuse_a_database_from_before_the_history(&tx).await?;
-    let states = group_states(&tx, groups, migrations).await?;
+    refuse_a_database_from_before_the_history(tx).await?;
+    let states = group_states(tx, groups, migrations).await?;
 
     // Every group that is new to this database is built from its
     // canonical DDL; its migrations (both parts) and origin are history it
@@ -796,10 +963,10 @@ async fn expand_under_lock(pool: &Pool, groups: &[&SchemaGroup], migrations: &[M
         tx.execute("INSERT INTO weft_schema_stamp (group_name, fingerprint) VALUES ($1, $2)", &[&st.group.name, &st.fp])
             .await?;
         for m in for_group(migrations, st.group.name) {
-            record_migration(&tx, st.group.name, m.id, m.sql).await?;
+            record_migration(tx, st.group.name, m.id, m.sql).await?;
         }
         if let Some(origin) = embedded_origin(st.group.name) {
-            record_migration(&tx, st.group.name, ORIGIN_ID, origin).await?;
+            record_migration(tx, st.group.name, ORIGIN_ID, origin).await?;
         }
     }
 
@@ -815,7 +982,7 @@ async fn expand_under_lock(pool: &Pool, groups: &[&SchemaGroup], migrations: &[M
     for st in &states {
         if st.stamped.as_deref() != Some(st.fp.as_str())
             || !pending(&for_group(migrations, st.group.name), &st.applied).is_empty()
-            || missing_tables(&tx, &[st.group]).await?.is_empty()
+            || missing_tables(tx, &[st.group]).await?.is_empty()
         {
             continue;
         }
@@ -827,8 +994,7 @@ async fn expand_under_lock(pool: &Pool, groups: &[&SchemaGroup], migrations: &[M
         }
     }
 
-    run_pending(&tx, &states, migrations, Part::Expand).await?;
-    tx.commit().await?;
+    run_pending(tx, &states, migrations, Part::Expand).await?;
     Ok(())
 }
 
@@ -1373,9 +1539,20 @@ fn owner_of(thing: &Thing) -> Owner {
 /// A function whose arguments changed, the one function of its name on each
 /// side, is the same function replaced, in the expand part
 /// ([`replaced_function`]), where an add beside the old one would make
-/// every call ambiguous until the contract part dropped the old. A NOT NULL column with no default in `backfills`
-/// is added holding the value given there on the rows already in its
-/// table, a default the contract part then drops.
+/// every call ambiguous until the contract part dropped the old.
+///
+/// A NOT NULL column with no default in `backfills` is added holding the
+/// value given there on the rows already in its table, a default the
+/// contract part then drops.
+///
+/// Postgres refuses to change the type of a column a trigger holds
+/// (`UPDATE OF` it, or `WHEN` it), so a column whose type changes takes
+/// down every trigger of its table that holds it, in its own statement,
+/// and every one the canonical DDL has holding it is put back where
+/// triggers are planned, after every column and function, filed with the
+/// table so it runs in the same file as the change, and making first a
+/// function the plan makes for it ([`Retyped`]): a trigger added holding
+/// it arrives there, and one removed leaves with the take-down.
 pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfills: &[Backfill]) -> anyhow::Result<Vec<Planned>> {
     let key = |t: &Thing| (t.kind.clone(), t.table.clone(), t.name.clone());
     let (old, mut plan) = apply_renames(old, renames)?;
@@ -1401,6 +1578,7 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
     let old_tables: std::collections::HashSet<&str> =
         old.iter().map(|t| t.table.as_str()).collect();
     let replaced = replaced_functions(old, new);
+    let retyped = Retyped::of(old, new, &old_by);
     // A column's NOT NULL constraint (Postgres names one per NOT NULL
     // column) arrives with the statement that adds the column or makes it
     // NOT NULL: one of its own would be a second, which fails, or a no-op
@@ -1414,7 +1592,10 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
             })
     };
     let mut created: std::collections::HashSet<&str> = Default::default();
-    for thing in new {
+    // Types first: a column or a table may be made of a type added in the
+    // same plan, and things otherwise come in name order of their kind.
+    let types_first = new.iter().filter(|t| t.kind == "type").chain(new.iter().filter(|t| t.kind != "type"));
+    for thing in types_first {
         if backs_constraint(thing) || implied_not_null(thing) {
             continue;
         }
@@ -1443,6 +1624,10 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
             plan.push(Planned { owner: owner_of(thing), part: Part::Expand, stmt: added_whole(thing) });
             continue;
         }
+        if retyped.puts_up(thing) {
+            plan.push(Planned { owner: Owner::Table(thing.table.clone()), part: Part::Expand, stmt: retyped.put_up(thing, new, &old_by) });
+            continue;
+        }
         match old_by.get(&key(thing)) {
             None => match replaced.get(&key(thing)) {
                 Some(was) => plan.push(Planned { owner: owner_of(thing), part: Part::Expand, stmt: replaced_function(was, thing) }),
@@ -1452,7 +1637,7 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
                 }
             },
             Some(was) if was.body != thing.body => {
-                plan.extend(changed(was, thing).into_iter().map(|(part, stmt)| Planned { owner: owner_of(thing), part, stmt }))
+                plan.extend(changed(was, thing, &retyped).into_iter().map(|(part, stmt)| Planned { owner: owner_of(thing), part, stmt }))
             }
             Some(_) => {}
         }
@@ -1486,7 +1671,7 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
             }
             continue;
         }
-        if new_by.contains_key(&key(thing)) || replaced.values().any(|was| key(was) == key(thing)) {
+        if new_by.contains_key(&key(thing)) || replaced.values().any(|was| key(was) == key(thing)) || retyped.holds_retyped(thing) {
             continue;
         }
         // A column's NOT NULL constraint (Postgres names one per NOT NULL
@@ -1515,6 +1700,108 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
     // DROP would then fail on a trigger that is gone.
     plan.extend(dropped_functions);
     Ok(plan)
+}
+
+/// The columns whose type changes, and the triggers taken down before
+/// and put back after ([`plan_migration`]).
+struct Retyped<'t> {
+    /// `(table, column)` of each column whose type changes.
+    columns: std::collections::HashSet<(String, String)>,
+    old: &'t [Thing],
+}
+
+impl<'t> Retyped<'t> {
+    fn of(old: &'t [Thing], new: &[Thing], old_by: &HashMap<(String, String, String), Thing>) -> Self {
+        let columns = new
+            .iter()
+            .filter(|now| now.kind == "column")
+            .filter(|now| {
+                old_by
+                    .get(&(now.kind.clone(), now.table.clone(), now.name.clone()))
+                    .is_some_and(|was| column_parts(&was.body).ty != column_parts(&now.body).ty)
+            })
+            .map(|now| (now.table.clone(), now.name.clone()))
+            .collect();
+        Retyped { columns, old }
+    }
+
+    /// Whether `trigger` holds a column of its table whose type changes.
+    fn holds_retyped(&self, trigger: &Thing) -> bool {
+        trigger.kind == "trigger"
+            && self.columns.iter().any(|(table, column)| *table == trigger.table && mentions(&trigger.body, column))
+    }
+
+    /// The statement putting `trigger` back. It goes in its table's
+    /// group's file, which may run before the file of the group declaring
+    /// the function it calls; so a function made in the same plan (added,
+    /// or made again because its arguments changed) is made here first too.
+    /// Postgres prints a function as `CREATE OR REPLACE`, so its own
+    /// statement making it again, before or after this one, changes nothing.
+    fn put_up(&self, trigger: &Thing, new: &[Thing], old_by: &HashMap<(String, String, String), Thing>) -> String {
+        let made = trigger_function(&trigger.body).and_then(|called| {
+            new.iter().find(|f| {
+                // A trigger function takes no arguments, so its name read
+                // back is `called()`, whatever overloads stand beside it.
+                f.kind == "function" && f.name == format!("{called}()") && !old_by.contains_key(&(f.kind.clone(), f.table.clone(), f.name.clone()))
+            })
+        });
+        let mut lines: Vec<String> = made.map(|f| format!("{};", f.body)).into_iter().collect();
+        lines.push(format!("DROP TRIGGER IF EXISTS {} ON {};\n{};", trigger.name, trigger.table, trigger.body));
+        lines.join("\n")
+    }
+
+    /// Whether `trigger`, as the canonical DDL has it, is put back after a
+    /// retype instead of being planned on its own: it holds a retyped
+    /// column, or a trigger of its name was taken down (so a change of its
+    /// own, which drops it first, would find it gone).
+    fn puts_up(&self, trigger: &Thing) -> bool {
+        self.holds_retyped(trigger)
+            || (trigger.kind == "trigger"
+                && self.old.iter().any(|was| was.table == trigger.table && was.name == trigger.name && self.holds_retyped(was)))
+    }
+
+    /// `alter`, the statement retyping `table.column`, after the drop of
+    /// every trigger holding the column as the database holds it. `IF
+    /// EXISTS`: two columns of one table retyped in one plan take the same
+    /// trigger down each in turn.
+    fn around(&self, table: &str, column: &str, alter: String) -> String {
+        let downs: Vec<String> = self
+            .old
+            .iter()
+            .filter(|t| t.kind == "trigger" && t.table == table && mentions(&t.body, column))
+            .map(|t| format!("DROP TRIGGER IF EXISTS {} ON {};", t.name, t.table))
+            .collect();
+        if downs.is_empty() {
+            return alter;
+        }
+        let mut lines = vec!["-- Postgres changes no type of a column a trigger holds: they come down before it, and go back up once every column and function is in.".to_string()];
+        lines.extend(downs);
+        lines.push(alter);
+        lines.join("\n")
+    }
+}
+
+/// The function a trigger's definition calls, as `pg_get_triggerdef`
+/// prints it (`EXECUTE FUNCTION name(...)`, or `EXECUTE PROCEDURE` from
+/// an older server), unquoted.
+fn trigger_function(body: &str) -> Option<String> {
+    let rest = body.split_once("EXECUTE FUNCTION ").or_else(|| body.split_once("EXECUTE PROCEDURE "))?.1;
+    let name = rest.split('(').next()?.trim();
+    Some(match name.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+        Some(quoted) => quoted.replace("\"\"", "\""),
+        None => name.to_string(),
+    })
+}
+
+/// Whether `body` names `name` as a whole identifier: a trigger holding a
+/// column names it in its `UPDATE OF` list or its `WHEN`. A name that
+/// only happens to match (a column called like the trigger's function)
+/// takes a trigger down and up for nothing, which costs nothing.
+fn mentions(body: &str, name: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    body.match_indices(name).any(|(at, _)| {
+        body[..at].chars().next_back().is_none_or(|c| !is_word(c)) && body[at + name.len()..].chars().next().is_none_or(|c| !is_word(c))
+    })
 }
 
 /// The functions `new` holds under arguments `old` does not, each the one
@@ -1962,7 +2249,7 @@ fn set_not_null(table: &str, column: &str) -> String {
 /// enum label, a trigger, a column's type or default, a dropped NOT NULL)
 /// in the expand part, what tightens (a constraint, a unique index, a new
 /// NOT NULL) in the contract part.
-fn changed(was: &Thing, now: &Thing) -> Vec<(Part, String)> {
+fn changed(was: &Thing, now: &Thing, retyped: &Retyped<'_>) -> Vec<(Part, String)> {
     match now.kind.as_str() {
         // CREATE OR REPLACE cannot change what a function returns nor rename
         // its parameters: one whose signature changed is dropped first (no
@@ -2018,7 +2305,11 @@ fn changed(was: &Thing, now: &Thing) -> Vec<(Part, String)> {
             let (old_ty, old_not_null, old_default) = (was.ty, was.not_null, was.default);
             let (ty, not_null, default) = (now_p.ty, now_p.not_null, now_p.default);
             let mut out = Vec::new();
-            if was.identity != now_p.identity || was.generated != now_p.generated {
+            if was.identity == now_p.identity && was.generated.is_some() && now_p.generated.is_none() {
+                // A generated column made a plain one keeps every value it
+                // holds, which its writers write from now on.
+                out.push((Part::Expand, format!("ALTER TABLE {} ALTER COLUMN {} DROP EXPRESSION;", now.table, now.name)));
+            } else if was.identity != now_p.identity || was.generated != now_p.generated {
                 out.push((Part::Expand, format!(
                     "-- {}.{} changed its identity/generated form; Postgres has no \
                      single ALTER for this.\n-- Write the ALTER TABLE ... ALTER COLUMN \
@@ -2031,12 +2322,13 @@ fn changed(was: &Thing, now: &Thing) -> Vec<(Part, String)> {
                 // real conversion (a date out of a string, a unit change)
                 // wants a different USING, which is why this one is spelled
                 // out rather than hidden.
-                out.push((Part::Expand, format!(
+                let alter = format!(
                     "-- {}.{} was {old_ty}. The cast below is a plain one; if the rows \
                      already there\n-- need converting differently, change the USING.\n\
                      ALTER TABLE {} ALTER COLUMN {} TYPE {ty} USING {}::{ty};",
                     now.table, now.name, now.table, now.name, now.name
-                )));
+                );
+                out.push((Part::Expand, retyped.around(&now.table, &now.name, alter)));
             }
             if old_default != default {
                 out.push((Part::Expand, match &default {
@@ -2856,6 +3148,105 @@ mod tests {
         let plan: Vec<String> = plan_migration(&[was], std::slice::from_ref(&renamed), &[], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         assert_eq!(plan, [format!("DROP FUNCTION f(integer);\n{};", renamed.body)]);
     }
+    /// A column whose type changes takes every trigger of its table that
+    /// holds it down in its own statement, and each trigger the canonical
+    /// DDL has holding it goes back up after every column and function of
+    /// the plan (a column it names may be added in the same plan), filed with
+    /// the table: one kept, one changed to name an added column, one added
+    /// holding it, and one removed (taken down there, never dropped again).
+    /// A trigger that holds another column is left alone.
+    /// A generated column made a plain one keeps its values and drops its
+    /// expression, and a NOT NULL it gains waits for the contract part.
+    #[test]
+    fn a_generated_column_made_plain_drops_its_expression() {
+        use super::{plan_migration, Part, Thing};
+        let column = |body: &str| Thing { kind: "column".into(), table: "t".into(), name: "v".into(), body: body.into() };
+        let old = [column("text null=YES default=- generated=((doc)::jsonb ->> 'v'::text)")];
+        let new = [column("text null=NO default=-")];
+        let plan = plan_migration(&old, &new, &[], &[]).unwrap();
+        let stmts: Vec<(Part, &str)> = plan.iter().map(|p| (p.part, p.stmt.as_str())).collect();
+        assert_eq!(stmts.len(), 2, "{stmts:#?}");
+        assert_eq!(stmts[0], (Part::Expand, "ALTER TABLE t ALTER COLUMN v DROP EXPRESSION;"));
+        assert!(stmts[1].0 == Part::Contract && stmts[1].1.ends_with("ALTER TABLE t ALTER COLUMN v SET NOT NULL;"), "{stmts:#?}");
+    }
+
+    #[test]
+    fn a_retyped_column_takes_the_triggers_holding_it_down_and_up() {
+        use super::{plan_migration, Owner, Part, Thing};
+        let column = |name: &str, ty: &str| Thing { kind: "column".into(), table: "t".into(), name: name.into(), body: format!("{ty} null=YES default=-") };
+        let trigger = |name: &str, body: &str| Thing { kind: "trigger".into(), table: "t".into(), name: name.into(), body: body.into() };
+        let function = Thing { kind: "function".into(), table: String::new(), name: "g()".into(), body: "CREATE OR REPLACE FUNCTION public.g()".into() };
+        let kept = trigger("t_on_doc", "CREATE TRIGGER t_on_doc AFTER UPDATE OF state, doc ON public.t FOR EACH ROW EXECUTE FUNCTION f()");
+        let widened = trigger("t_on_doc", "CREATE TRIGGER t_on_doc AFTER UPDATE OF state, doc, zz ON public.t FOR EACH ROW EXECUTE FUNCTION f()");
+        let gone = trigger("t_when_doc", "CREATE TRIGGER t_when_doc AFTER UPDATE ON public.t FOR EACH ROW WHEN ((new.doc IS DISTINCT FROM old.doc)) EXECUTE FUNCTION f()");
+        let added = trigger("t_doc_again", "CREATE TRIGGER t_doc_again AFTER UPDATE OF doc ON public.t FOR EACH ROW EXECUTE FUNCTION f()");
+        let other = trigger("t_on_docs", "CREATE TRIGGER t_on_docs AFTER UPDATE OF docs ON public.t FOR EACH ROW EXECUTE FUNCTION f()");
+        let old = [column("doc", "jsonb"), kept, gone, other.clone()];
+        let new = [column("doc", "text"), column("zz", "text"), function, widened.clone(), added.clone(), other];
+        let plan = plan_migration(&old, &new, &[], &[]).unwrap();
+        let stmts: Vec<&str> = plan.iter().map(|p| p.stmt.as_str()).collect();
+        assert!(plan.iter().all(|p| p.part == Part::Expand), "{stmts:?}");
+        let at = |what: &str| stmts.iter().position(|s| s.contains(what)).unwrap_or_else(|| panic!("no {what} in {stmts:#?}"));
+        let alter = at("ALTER TABLE t ALTER COLUMN doc TYPE text USING doc::text;");
+        let downs = &stmts[alter];
+        assert!(downs.find("DROP TRIGGER IF EXISTS t_on_doc ON t;") < downs.find("ALTER TABLE t ALTER COLUMN doc"), "{downs}");
+        assert!(downs.find("DROP TRIGGER IF EXISTS t_when_doc ON t;") < downs.find("ALTER TABLE t ALTER COLUMN doc"), "{downs}");
+        let after = at("ADD COLUMN zz").max(at("FUNCTION public.g()"));
+        for up in [&widened.body, &added.body] {
+            let put = at(up);
+            assert!(put > alter && put > after, "{up} goes up after every column and function: {stmts:#?}");
+            assert!(plan[put].owner == Owner::Table("t".into()), "filed with the table");
+            assert_eq!(stmts.iter().filter(|s| s.contains(up.as_str())).count(), 1, "planned once: {stmts:#?}");
+        }
+        assert!(!stmts.iter().any(|s| s.contains("t_on_docs")), "a trigger on another column stays up: {stmts:#?}");
+        assert_eq!(stmts.iter().filter(|s| s.contains("t_when_doc")).count(), 1, "a removed trigger only comes down: {stmts:#?}");
+    }
+
+    /// A trigger put back after a type change makes the function it calls
+    /// first when the plan makes that function (its own file may run
+    /// later); one whose body alone changes is replaced in place and left
+    /// to its own statement.
+    #[test]
+    fn a_retyped_columns_trigger_makes_a_function_made_with_it() {
+        use super::{plan_migration, Thing};
+        let column = |ty: &str| Thing { kind: "column".into(), table: "t".into(), name: "doc".into(), body: format!("{ty} null=YES default=-") };
+        let function = |body: &str| Thing { kind: "function".into(), table: String::new(), name: "f()".into(), body: body.into() };
+        let trigger = |call: &str| Thing {
+            kind: "trigger".into(),
+            table: "t".into(),
+            name: "t_on_doc".into(),
+            body: format!("CREATE TRIGGER t_on_doc AFTER UPDATE OF doc ON t FOR EACH ROW EXECUTE FUNCTION {call}"),
+        };
+        let made = "CREATE OR REPLACE FUNCTION f() two";
+        let put_up = |old: &[Thing], new: &[Thing]| -> String {
+            let plan = plan_migration(old, new, &[], &[]).unwrap();
+            plan.into_iter().map(|p| p.stmt).find(|s| s.contains("CREATE TRIGGER t_on_doc")).expect("the trigger goes back up")
+        };
+        let old = [column("jsonb"), trigger("g()")];
+        for call in ["f()", "\"f\"()"] {
+            let stmt = put_up(&old, &[column("text"), function(made), trigger(call)]);
+            assert!(stmt.find(made) < stmt.find("CREATE TRIGGER"), "the function comes first: {stmt}");
+        }
+        let old = [column("jsonb"), function("CREATE OR REPLACE FUNCTION f() one"), trigger("f()")];
+        let stmt = put_up(&old, &[column("text"), function(made), trigger("f()")]);
+        assert!(!stmt.contains(made), "a body replaced in place is left to its own statement: {stmt}");
+    }
+
+    /// A type added in a plan is made before the columns and tables made
+    /// of it.
+    #[test]
+    fn an_added_type_comes_before_what_is_made_of_it() {
+        use super::{plan_migration, Thing};
+        let mood = Thing { kind: "type".into(), table: String::new(), name: "mood".into(), body: "sad,happy".into() };
+        let column = |table: &str, ty: &str| Thing { kind: "column".into(), table: table.into(), name: "m".into(), body: format!("{ty} null=YES default=-") };
+        let old = [column("t", "text")];
+        let new = [column("t", "mood"), column("fresh", "mood"), mood];
+        let plan: Vec<String> = plan_migration(&old, &new, &[], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
+        let at = |what: &str| plan.iter().position(|s| s.contains(what)).unwrap_or_else(|| panic!("no {what} in {plan:#?}"));
+        let made = at("CREATE TYPE mood");
+        assert!(made < at("ALTER COLUMN m TYPE mood") && made < at("CREATE TABLE fresh"), "{plan:#?}");
+    }
+
     /// A function whose arguments changed, alone under its name on both
     /// sides, is replaced in the expand part; an overload added beside one
     /// the canonical DDL keeps is only added.
@@ -3098,7 +3489,7 @@ mod tests {
     #[tokio::test]
     async fn a_migration_refuses_a_bad_data_step_before_planning() {
         static STEP: &[crate::DataStep] =
-            &[crate::DataStep { table: "elsewhere", until: super::Until::Dropped("owner"), sql: "SELECT 1" }];
+            &[crate::DataStep { table: "elsewhere", until: super::Until::Dropped("owner"), work: crate::StepWork::Sql("SELECT 1") }];
         static BAD: super::SchemaGroup =
             super::SchemaGroup { name: "worker_replica", tables: &["worker_replica"], ddl: &[], seed: &[], data_steps: STEP };
         let err = super::write_migration(&[&BAD], &[]).await.expect_err("refused");
@@ -3179,7 +3570,7 @@ mod tests {
         static STEP: &[crate::DataStep] = &[crate::DataStep {
             table: "worker_replicas",
             until: super::Until::Dropped("owner"),
-            sql: "SELECT 1",
+            work: crate::StepWork::Sql("SELECT 1"),
         }];
         let typo = super::SchemaGroup {
             name: "worker_replica",
@@ -3335,5 +3726,46 @@ mod tests {
         };
         assert_eq!(key(&disk), key(&embedded));
         assert_eq!(disk.origins, embedded.origins);
+    }
+
+    /// A database's place against this weft's history, from what it
+    /// records: nothing built is empty whatever it records, this weft's id
+    /// is current, ids from earlier histories (or none, before the first
+    /// restart) are older, and an id this weft does not know is a later
+    /// history's, never mistaken for an older one (which the wipe would
+    /// then take).
+    #[test]
+    fn a_database_is_placed_against_the_history_by_what_it_records() {
+        use super::{epoch_from, Epoch, HISTORY_EPOCH};
+        let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        assert_eq!(epoch_from(false, &ids(&[])), Epoch::Empty);
+        assert_eq!(epoch_from(false, &ids(&["serverless"])), Epoch::Empty);
+        assert_eq!(epoch_from(true, &ids(&[HISTORY_EPOCH])), Epoch::Current);
+        assert_eq!(epoch_from(true, &ids(&["serverless", HISTORY_EPOCH])), Epoch::Current);
+        assert_eq!(epoch_from(true, &ids(&[])), Epoch::Older);
+        assert_eq!(epoch_from(true, &ids(&["serverless"])), Epoch::Older);
+        assert_eq!(epoch_from(true, &ids(&["later"])), Epoch::Newer { epoch: "later".into() });
+        assert_eq!(epoch_from(true, &ids(&["serverless", "later"])), Epoch::Newer { epoch: "later".into() });
+    }
+
+    /// Only an older database is ever wiped; every other one names why
+    /// nothing was.
+    #[test]
+    fn only_an_older_database_is_wiped() {
+        use super::{nothing_to_wipe, Epoch};
+        assert_eq!(nothing_to_wipe(&Epoch::Older), None);
+        for found in [Epoch::Empty, Epoch::Current, Epoch::Newer { epoch: "later".into() }] {
+            let why = nothing_to_wipe(&found).expect("refused");
+            assert!(why.starts_with("nothing was wiped"), "{why}");
+        }
+        assert!(nothing_to_wipe(&Epoch::Newer { epoch: "later".into() }).unwrap().contains("'later'"));
+    }
+
+    /// The history's current id is never also a past one: a database it
+    /// built would then read as older, and the wipe would take it.
+    #[test]
+    fn the_current_history_is_not_a_past_one() {
+        use super::{HISTORY_EPOCH, PAST_EPOCHS};
+        assert!(!PAST_EPOCHS.contains(&HISTORY_EPOCH));
     }
 }

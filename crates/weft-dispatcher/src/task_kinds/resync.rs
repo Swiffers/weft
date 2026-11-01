@@ -27,10 +27,12 @@
 //! into the plan, so a task run again
 //! (its process died, the claim lapsed and another claimed it) carries on
 //! where the last stopped, and a trigger that was off, or that went down
-//! some other way meanwhile, is never turned on by it. While a
-//! reactivation's setup run waits (on a person, for days), the task's
-//! claim rests on that run (`crate::transition::ActivationHeartbeat`) and
-//! is handed back once it ends (`crate::lapses`).
+//! some other way meanwhile, is never turned on by it; an owner's
+//! reactivation it had claimed and not landed is carried on from its rows
+//! (`crate::api::project::activate_with`). While a reactivation's setup
+//! run waits (on a person, for days), the task's claim rests on that run
+//! (`crate::api::project::run_trigger_setup`) and is handed back once it
+//! ends (`crate::lapses`).
 //!
 //! Every drive of a plan has its own id ([`ResyncPlan::driver`]), carried
 //! by its task, and every write of the plan is fenced on it: a task of an
@@ -114,7 +116,7 @@ impl ResyncPlan {
     /// `version`, and its drive from `resync_driver`.
     pub fn stored(
         project: uuid::Uuid,
-        json: serde_json::Value,
+        json: impl weft_core::stored::Raw,
         version: weft_core::stored::Version,
         driver: Option<uuid::Uuid>,
     ) -> anyhow::Result<ResyncPlan> {
@@ -141,7 +143,7 @@ impl ResyncPlan {
         sql: &str,
         more: &[weft_task_store::db::Param<'_>],
     ) -> weft_task_store::db::Result<u64> {
-        let json = weft_task_store::db::Json(self);
+        let json = weft_task_store::db::JsonText(self);
         let version = Self::STORED.version();
         let row: [weft_task_store::db::Param<'_>; 4] = [&project, &json, &version, &self.driver];
         let params: Vec<_> = row.into_iter().chain(more.iter().copied()).collect();
@@ -1070,6 +1072,8 @@ mod tests {
             lifecycle,
             program: None,
             source_version: None,
+            driver_task: None,
+            activating: None,
             cut: None,
         };
         let rows = [row("feed", ActivationLifecycle::active()), row("door", ActivationLifecycle::holding())];

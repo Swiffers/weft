@@ -23,7 +23,7 @@ export type { NodeFiringStatus };
 export type { NodeFeaturesWire as NodeFeatures } from '../../../protocol';
 // The accepts/widget vocabulary IS the wire type, re-exported for the
 // same one-definition reason.
-import { ACCESS_MARKER_KEY, INFRA_MARKER_KEY, type Accepts, type CodeLanguage, type InputDefinition, type Widget, type WidgetKind } from '../../../protocol';
+import { ACCESS_MARKER_KEY, INFRA_MARKER_KEY, isSecretMarker, type Accepts, type CodeLanguage, type InputDefinition, type Widget, type WidgetKind } from '../../../protocol';
 export type { Accepts, Widget, WidgetKind };
 
 // =============================================================================
@@ -116,11 +116,15 @@ export function extractPrimitives(t: WeftType): WeftPrimitive[] {
 		case 'list': return extractPrimitives(t.inner);
 		case 'dict': return extractPrimitives(t.value);
 		case 'json_dict': return [];
+		case 'json': return [];
 		case 'bus': return [];
 		case 'access': return [];
 		case 'infra': return [];
 		// A stream reads as its element for color/leaf purposes.
 		case 'generator': return extractPrimitives(t.inner);
+		// A secret's port value is its marker, never a leaf of what it
+		// holds (it has its own color).
+		case 'secret': return [];
 		case 'union': return t.types.flatMap(extractPrimitives);
 		case 'record': return t.fields.flatMap(f => extractPrimitives(f.ty));
 		case 'named': return extractPrimitives(t.body);
@@ -155,7 +159,12 @@ export function isCompatible(source: WeftType, target: WeftType): boolean {
 	// JsonDict: compatible with any Dict[String, V] in both directions
 	if (source.kind === 'json_dict' && target.kind === 'json_dict') return true;
 	if (source.kind === 'json_dict' && target.kind === 'dict') return true;
-	if (source.kind === 'dict' && target.kind === 'json_dict') return true;
+	// An unchecked dict could carry a secret on into a port that takes
+	// its value plain, so one holding a secret stays typed.
+	if (source.kind === 'dict' && target.kind === 'json_dict') return !holdsSecret(source.value);
+	// Json takes every JSON-made type, at any depth; Json itself flows
+	// only into Json (and a union or a variable holding it).
+	if (target.kind === 'json') return fitsJson(source);
 	// A bus connects only to a bus; payloads are not type-checked.
 	if (source.kind === 'bus' && target.kind === 'bus') return true;
 	if (source.kind === 'access' && target.kind === 'access') return true;
@@ -165,6 +174,14 @@ export function isCompatible(source: WeftType, target: WeftType): boolean {
 	// SYNC: generator compatibility <-> crates/weft-core/src/weft_type.rs WeftType::is_compatible
 	if (source.kind === 'generator' && target.kind === 'generator') {
 		return isCompatible(source.inner, target.inner) && isCompatible(target.inner, source.inner);
+	}
+	// A secret connects only to a secret of what it holds: a plain `T`
+	// never takes a `Secret[T]` (the value would be a marker its node
+	// cannot read) and a `Secret[T]` never takes a plain `T` (only a node
+	// makes a secret). Every other pairing falls through to false.
+	// SYNC: secret compatibility <-> crates/weft-core/src/weft_type.rs WeftType::is_compatible
+	if (source.kind === 'secret' && target.kind === 'secret') {
+		return isCompatible(source.inner, target.inner);
 	}
 	// No blanket generator rejection here: exactly like the Rust match,
 	// a generator still flows through the named-decay arm below (an
@@ -192,7 +209,8 @@ export function isCompatible(source: WeftType, target: WeftType): boolean {
 	}
 	// A record forgets into the generic-object types; never the reverse
 	// (the deliberate door is the Cast node).
-	if (source.kind === 'record' && target.kind === 'json_dict') return true;
+	// One holding a secret stays typed, for the same reason as a dict.
+	if (source.kind === 'record' && target.kind === 'json_dict') return !holdsSecret(source);
 	// An optional field may hold null, so the dict's value type must
 	// take null too.
 	if (source.kind === 'record' && target.kind === 'dict') {
@@ -222,18 +240,77 @@ export function isCompatible(source: WeftType, target: WeftType): boolean {
 	return false;
 }
 
+/** Is every value of this type made only of JSON, so it fits a `Json`
+ *  port? Text, numbers, booleans and null are; a list, a dict or a
+ *  record is when what it holds is; a union when every member is; a
+ *  declared name when its body is. A stored file, a bus, a stream, an
+ *  access, an infra handle or a secret is not. A type variable answers yes, as it
+ *  does for every compatibility question. */
+// SYNC: fitsJson <-> crates/weft-core/src/weft_type.rs WeftType::fits_json
+function fitsJson(t: WeftType): boolean {
+	switch (t.kind) {
+		case 'primitive':
+			return t.value === 'String' || t.value === 'Number' || t.value === 'Boolean'
+				|| t.value === 'Null' || t.value === 'Empty';
+		case 'list': return fitsJson(t.inner);
+		case 'dict': return fitsJson(t.value);
+		case 'union': return t.types.every(fitsJson);
+		case 'record': return t.fields.every((f) => fitsJson(f.ty));
+		case 'named': return fitsJson(t.body);
+		case 'json_dict':
+		case 'json':
+		case 'typevar':
+			return true;
+		case 'bus':
+		case 'access':
+		case 'infra':
+		case 'generator':
+		case 'secret':
+			return false;
+	}
+}
+
+/** Whether a `Secret` sits anywhere in this type, at any depth (a
+ *  declared name read through its body). */
+// SYNC: holdsSecret <-> crates/weft-core/src/weft_type.rs WeftType::holds_secret
+function holdsSecret(t: WeftType): boolean {
+	switch (t.kind) {
+		case 'secret': return true;
+		case 'list':
+		case 'generator':
+			return holdsSecret(t.inner);
+		case 'dict': return holdsSecret(t.value);
+		case 'union': return t.types.some(holdsSecret);
+		case 'record': return t.fields.some((f) => holdsSecret(f.ty));
+		case 'named': return holdsSecret(t.body);
+		case 'primitive':
+		case 'json_dict':
+		case 'json':
+		case 'bus':
+		case 'access':
+		case 'infra':
+		case 'typevar':
+			return false;
+	}
+}
+
 /** May an author declare `declared` on a port whose type can be at
  *  most `bound`: a narrowable output's call-site type, or a type
  *  parameter's binding against its bound? Every value of `declared`
- *  must be a value of `bound`, which is `isCompatible` with one
- *  difference: a stream narrows ITEM-wise (`Generator[Signup]` fits
+ *  must be a value of `bound`, which is `isCompatible` with two
+ *  differences: a stream narrows ITEM-wise (`Generator[Signup]` fits
  *  `Generator[JsonDict]`), where wiring one stream into another stays
- *  invariant. A named bound stays nominal (only its own name fits it);
+ *  invariant, and a record or dict holding a secret fits a `JsonDict`
+ *  bound, where wiring it into one is refused. A named bound stays nominal (only its own name fits it);
  *  a named declaration is read through its body. */
 // SYNC: fitsWithin <-> crates/weft-core/src/weft_type.rs fits_within
 export function fitsWithin(declared: WeftType, bound: WeftType): boolean {
 	const d = structural(declared);
 	if (d.kind === 'generator' && bound.kind === 'generator') return fitsWithin(d.inner, bound.inner);
+	// Every value of a record or a dict is an object, one holding a secret
+	// included, so declaring one on an output that gives some object says
+	// what it holds (wiring it on into an unchecked dict stays refused).
+	if ((d.kind === 'record' || d.kind === 'dict') && bound.kind === 'json_dict') return true;
 	return isCompatible(declared, bound);
 }
 
@@ -254,6 +331,7 @@ export function substituteTypeVars(t: WeftType, replace: (name: string) => WeftT
 		case 'typevar': return replace(t.name) ?? t;
 		case 'list': return { kind: 'list', inner: substituteTypeVars(t.inner, replace) };
 		case 'generator': return { kind: 'generator', inner: substituteTypeVars(t.inner, replace) };
+		case 'secret': return { kind: 'secret', inner: substituteTypeVars(t.inner, replace) };
 		case 'dict': return { kind: 'dict', value: substituteTypeVars(t.value, replace) };
 		// `T | Null` with `T` a union is one flat union.
 		case 'union': return unionOf(t.types.map((m) => substituteTypeVars(m, replace)));
@@ -274,7 +352,8 @@ export function collectTypeVarBindings(port: WeftType, other: WeftType, out: [st
 	const o = structural(other);
 	if (p.kind === 'typevar') {
 		if (!containsUnresolvedLeaf(other) && o.kind !== 'generator') out.push([p.name, other]);
-	} else if ((p.kind === 'list' && o.kind === 'list') || (p.kind === 'generator' && o.kind === 'generator')) {
+	} else if ((p.kind === 'list' && o.kind === 'list') || (p.kind === 'generator' && o.kind === 'generator')
+		|| (p.kind === 'secret' && o.kind === 'secret')) {
 		collectTypeVarBindings(p.inner, o.inner, out);
 	} else if (p.kind === 'dict' && o.kind === 'dict') {
 		collectTypeVarBindings(p.value, o.value, out);
@@ -377,6 +456,8 @@ export function inferTypeFromValue(value: unknown): WeftType {
 		}
 		if (ACCESS_MARKER_KEY in obj) return { kind: 'access' };
 		if (INFRA_MARKER_KEY in obj) return { kind: 'infra' };
+		// A marker names a secret, never what it holds.
+		if (isSecretMarker(obj)) return { kind: 'secret', inner: { kind: 'typevar', name: 'T' } };
 		const values = Object.values(obj);
 		if (values.length === 0) {
 			return { kind: 'dict', value: { kind: 'primitive', value: 'Empty' } };
@@ -477,7 +558,9 @@ export interface NodeFiring {
 	callbackId?: string;
 	startedAt: number;
 	completedAt?: number;
-	input?: unknown;
+	/// Each input port's value, by where the run's record keeps it: read
+	/// back when shown (`run-values.svelte.ts`).
+	input?: Record<string, import('../../../protocol').ValueRef>;
 	/// Wired input ports that arrived as CLOSURE markers for this
 	/// firing (the upstream frame stack terminated without firing them).
 	/// Disjoint from the keys of `input`; the inspector renders these
@@ -486,7 +569,8 @@ export interface NodeFiring {
 	closedPorts?: string[];
 	/// Why this firing did not run, on a skipped one.
 	skipReason?: import('../../../protocol').SkipReason;
-	output?: unknown;
+	/// Each output port's value, by where the run's record keeps it.
+	output?: Record<string, import('../../../protocol').ValueRef>;
 	costUsd: number;
 	/// Portion of a container's total belonging to reused member firings.
 	inheritedCostUsd?: number;
@@ -560,7 +644,9 @@ export interface RunState {
 	 *  selects on; shown on the run in the inspector. */
 	tags: string[];
 	terminal?: RunTerminal;
-	nodeOutputs: Record<string, unknown>;
+	/// Each node's last output, by port, by where the run's record keeps
+	/// each value (a debug preview reads it back when shown).
+	nodeOutputs: Record<string, Record<string, import('../../../protocol').ValueRef>>;
 	nodeFirings: NodeFiringTable;
 	/** Full bus log per `busId` (in arrival order). The inspector
 	 *  renders one IRC-style panel per bus a node participates in. */
@@ -641,6 +727,8 @@ export interface NodeTemplate {
 	requiresInfra: boolean;
 	defaultInputs: PortDefinition[];
 	defaultOutputs: TemplateOutputPort[];
+	/** The node type's metadata ports, each with its hand-written value. */
+	metadataPorts?: import('../../../protocol').MetadataPort[];
 	/** The bound on each type variable the node type's ports use. */
 	typeParams?: import('../../../protocol').TypeParamWire[];
 	features?: NodeFeatures;
@@ -700,6 +788,15 @@ export interface NodeInstance {
 	parentId?: string;
 	inputs: PortDefinition[];
 	outputs: PortDefinition[];
+	/// The ports whose value is written with the program (the wire's
+	/// `metadataPorts`), declared in code only and never drawn on the
+	/// canvas. A group's carry the value its body writes, shown in its
+	/// config strip.
+	metadataPorts?: import('../../../protocol').MetadataPort[];
+	/// The inputs a metadata wire fills, by input name (`MetadataInput`).
+	/// Kept apart from `portLiterals`, which holds only what the program
+	/// writes on the input itself.
+	metadataInputs?: Record<string, MetadataInput>;
 	features: NodeFeatures;
 	/// The bounds on the node's type variables, each with what it
 	/// resolved to (the wire's `typeParams`). A group carries its
@@ -744,6 +841,19 @@ export interface Edge {
 	path?: string[];
 }
 
+/// A metadata port named from somewhere else: the scoped id of the node
+/// or group it belongs to, the port, and the keys read off its value
+/// (`calls.tools.anthropic`). The same shape a gathered value writes it in.
+export type MetadataRef = Extract<import('../../../protocol').MetadataExpr, { kind: 'port' }>;
+
+/// An input a metadata wire fills: the compiler wrote `value` into it when
+/// the program compiled, from the metadata port `from`. Read-only in the
+/// editor: a person changes it where `from` is written.
+export interface MetadataInput {
+	from: MetadataRef;
+	value: unknown;
+}
+
 export interface ProjectDefinition {
 	id: string;
 	// A project carries no name/description: identity is the manifest file name,
@@ -780,6 +890,10 @@ export interface NodeDataUpdates {
 	portValueForm?: { key: string; form: 'inline' | 'connection' };
 	inputs?: PortDefinition[];
 	outputs?: PortDefinition[];
+	/// A container's metadata port value, written in its body
+	/// (`self.<port> = <value>`); null removes the line. Becomes a
+	/// `set_metadata_value` op, after any header change in the same update.
+	metadataValue?: { port: string; value: unknown };
 	/// Set ONLY when the user dragged the resize handle. The host re-runs ELK on a
 	/// resize (neighbours make room), so this must distinguish a real user resize
 	/// from a programmatic dimension write (min-height auto-enforce, a rebuild after
@@ -807,15 +921,21 @@ export function isContainerNodeType(nodeType: unknown): boolean {
 }
 
 /** True iff an expanded container draws its config strip: a loop always
- *  (its knobs live there), and any container carrying values written on
- *  its interface ports. Both the renderer and the layout engine ask
+ *  (its knobs live there), any container carrying values written on its
+ *  interface ports or brought to them by a metadata wire, and any with a
+ *  metadata port (its value shows there). Both the renderer and the layout engine ask
  *  this, so the strip and the space reserved for it cannot disagree. */
 export function containerHasConfigStrip(
 	nodeType: unknown,
 	portLiterals: Record<string, unknown> | undefined,
+	metadataPorts: readonly unknown[] | undefined,
+	metadataInputs: Record<string, unknown> | undefined,
 ): boolean {
 	if (!isContainerNodeType(nodeType)) return false;
-	return isLoopNodeType(nodeType) || Object.keys(portLiterals ?? {}).length > 0;
+	return isLoopNodeType(nodeType)
+		|| Object.keys(portLiterals ?? {}).length > 0
+		|| Object.keys(metadataInputs ?? {}).length > 0
+		|| (metadataPorts?.length ?? 0) > 0;
 }
 
 /** The written form a port value takes on its FIRST write, when no

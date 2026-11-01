@@ -8,18 +8,11 @@
 // extension, which vite bundles, import the package by name.
 import type { AccessSpecWire, AppRegistration, CredentialOwner } from '../../weft-connect/src/core/wire';
 
-export interface Span {
-  startLine: number;
-  startColumn: number;
-  endLine: number;
-  endColumn: number;
-}
-
 // The input vocabulary (ports, their drivers, the control an input draws)
 // lives in the connect library, whose instance page draws a program's inputs
 // too; the graph protocol names it from there.
-export type { AcceptedForm, Accepts, CodeLanguage, PortDefinition, InputDefinition, Widget } from '../../weft-connect/src/core/wire';
-import type { Accepts, PortDefinition, InputDefinition, Widget } from '../../weft-connect/src/core/wire';
+export type { AcceptedForm, Accepts, CodeLanguage, MetadataExpr, MetadataPort, PortDefinition, InputDefinition, Span, Widget } from '../../weft-connect/src/core/wire';
+import type { Accepts, MetadataPort, PortDefinition, InputDefinition, Span, Widget } from '../../weft-connect/src/core/wire';
 
 /// Source span of one config field plus how it was written. `origin` tells
 /// the editor how to rewrite the field in place: an inline field
@@ -77,7 +70,7 @@ export const ALL_PRIMITIVE_TYPES: WeftPrimitive[] = [
 /** The type names that are not primitives but still mean something to
  *  the type language: no declared type may take one. */
 // SYNC: CONTAINER_AND_SPECIAL_TYPES <-> crates/weft-core/src/weft_type.rs CONTAINER_AND_SPECIAL_TYPES
-const CONTAINER_AND_SPECIAL_TYPES = ['List', 'Dict', 'JsonDict', 'Bus', 'Access', 'Infra', 'Generator'];
+const CONTAINER_AND_SPECIAL_TYPES = ['List', 'Dict', 'JsonDict', 'Json', 'Bus', 'Access', 'Infra', 'Generator', 'Secret'];
 
 // SYNC: NAMED_UNIONS <-> crates/weft-core/src/weft_type.rs WeftType::UNION_ALIASES
 /** Named union aliases. The ONE table both name resolution (parse) and
@@ -111,6 +104,12 @@ export type WeftType =
   // it, and the parser refuses any other key).
   | { kind: 'dict'; value: WeftType }
   | { kind: 'json_dict' }
+  // Any value made only of JSON (text, numbers, booleans, null, and
+  // lists or objects of those at any depth). Not an Any: a file, bus,
+  // stream, access or infra never fits. Every JSON-made type flows in;
+  // a Json value flows out only into Json (narrowing is the Cast node's).
+  // SYNC: json <-> crates/weft-core/src/weft_type.rs WeftType::Json
+  | { kind: 'json' }
   // A message-bus handle: an in-process channel between co-alive nodes.
   // A Bus output connects only to a Bus input; the payloads are not
   // type-checked. Wires only (a live runtime handle takes no literal).
@@ -129,6 +128,14 @@ export type WeftType =
   // of T); exactly one producer feeds exactly one consumer. Wires only.
   // SYNC: generator <-> crates/weft-core/src/weft_type.rs WeftType::Generator
   | { kind: 'generator'; inner: WeftType }
+  // A value its run's record never holds: `Secret[T]`. What flows is a
+  // marker naming a `T` kept sealed beside the record (see
+  // `SECRET_MARKER_KEY`), so the inspector only ever sees the marker.
+  // Strict both ways: a `Secret[T]` fits only a `Secret[U]` whose `T`
+  // fits `U`, never a plain `T`, and nothing plain fits it. Wires only
+  // (a node makes one at run time, never a literal or a Cast).
+  // SYNC: WeftType 'secret' <-> crates/weft-core/src/weft_type.rs WeftType::Secret
+  | { kind: 'secret'; inner: WeftType }
   | { kind: 'union'; types: WeftType[] }
   // Dict with KNOWN field names: `{ role: String, name?: String }`.
   // `open` (written `..` as the last item, `{ role: String, .. }`) takes
@@ -239,6 +246,7 @@ function anyLeaf(t: WeftType, leaf: (kind: WeftType['kind']) => boolean): boolea
   switch (t.kind) {
     case 'list':
     case 'generator':
+    case 'secret':
       return anyLeaf(t.inner, leaf);
     case 'dict':
       return anyLeaf(t.value, leaf);
@@ -365,11 +373,12 @@ function parseSingleType(s: string): WeftType {
     return { kind: 'record', fields, open };
   }
   if (s === 'JsonDict') return { kind: 'json_dict' };
+  if (s === 'Json') return { kind: 'json' };
   if (s === 'Bus') return { kind: 'bus' };
   if (s === 'Access') return { kind: 'access' };
   if (s === 'Infra') return { kind: 'infra' };
 
-  // Parameterized: List[T], Generator[T], Dict[String, V]
+  // Parameterized: List[T], Generator[T], Secret[T], Dict[String, V]
   const bracketPos = s.indexOf('[');
   if (bracketPos !== -1) {
     if (!s.endsWith(']')) refuse(`\`${s}\` opens a \`[\` it never closes at its end`);
@@ -378,6 +387,7 @@ function parseSingleType(s: string): WeftType {
 
     if (name === 'List') return { kind: 'list', inner: parseTypeOrThrow(inner) };
     if (name === 'Generator') return { kind: 'generator', inner: parseTypeOrThrow(inner) };
+    if (name === 'Secret') return { kind: 'secret', inner: parseTypeOrThrow(inner) };
     if (name === 'Dict') {
       const parts = splitTopLevel(inner, ',');
       if (parts.length !== 2) refuse(`\`${s}\`: a dict takes two types, \`Dict[String, V]\``);
@@ -395,7 +405,7 @@ function parseSingleType(s: string): WeftType {
       }
       return { kind: 'dict', value };
     }
-    refuse(`\`${name}[...]\` is not a type; the types that take one are List, Generator and Dict`);
+    refuse(`\`${name}[...]\` is not a type; the types that take one are List, Generator, Secret and Dict`);
   }
 
   // Primitive
@@ -512,12 +522,14 @@ export function weftTypesEqual(a: WeftType, b: WeftType): boolean {
           bf => bf.name === af.name && bf.optional === af.optional && weftTypesEqual(af.ty, bf.ty)));
     case 'generator':
       return b.kind === 'generator' && weftTypesEqual(a.inner, b.inner);
+    case 'secret':
+      return b.kind === 'secret' && weftTypesEqual(a.inner, b.inner);
     case 'named':
       return b.kind === 'named' && a.name === (b as Extract<WeftType, { kind: 'named' }>).name;
     case 'typevar':
       return b.kind === 'typevar' && a.name === (b as Extract<WeftType, { kind: 'typevar' }>).name;
     default:
-      // json_dict / bus / access / infra carry no payload.
+      // json_dict / json / bus / access / infra carry no payload.
       return true;
   }
 }
@@ -565,10 +577,12 @@ function renderType(t: WeftType, wire: boolean): string {
     case 'list': return `List[${renderType(t.inner, wire)}]`;
     case 'dict': return `Dict[String, ${renderType(t.value, wire)}]`;
     case 'json_dict': return 'JsonDict';
+    case 'json': return 'Json';
     case 'bus': return 'Bus';
     case 'access': return 'Access';
     case 'infra': return 'Infra';
     case 'generator': return `Generator[${renderType(t.inner, wire)}]`;
+    case 'secret': return `Secret[${renderType(t.inner, wire)}]`;
     case 'union': return unionAliasName(t.types) ?? t.types.map(m => renderType(m, wire)).join(' | ');
     case 'record': {
       const fields = t.fields.map(f => `${f.name}${f.optional ? '?' : ''}: ${renderType(f.ty, wire)}`);
@@ -617,7 +631,9 @@ function weftTypeReferencesFile(t: WeftType): boolean {
       return weftTypeReferencesFile(t.body);
     // A generator's port value is a live handle; its ITEMS may
     // reference files, but nothing about the port value itself is a
-    // file to cast or pick (mirrors Rust's Generator arm).
+    // file to cast or pick (mirrors Rust's Generator arm). A secret's
+    // port value is its marker, never the file it may hold, so it sits
+    // here too.
     default:
       return false;
   }
@@ -653,6 +669,10 @@ export interface NodeFeaturesWire {
   canAddInputPorts?: boolean;
   canAddOutputPorts?: boolean;
   addedPortsAreDataKeys?: boolean;
+  /// Each added input comes with a same-named output the compiler makes,
+  /// so the node offers no output adder of its own: a person adds the
+  /// input and the output follows.
+  pairsAddedPorts?: boolean;
   isTrigger?: boolean;
   showDebugPreview?: boolean;
   /// Names the endpoint serving the node's `/live` HTTP route the
@@ -698,6 +718,10 @@ export interface NodeDefinition {
   portLiterals?: Record<string, unknown>;
   portLiteralSpans?: Record<string, ConfigFieldSpan>;
   fileRefs?: Record<string, FileRef>;
+  /// The node's metadata ports: its node type's, or on an opaque
+  /// `@include` node, the file's group's. Never drawn on the canvas.
+  // SYNC: NodeDefinition.metadataPorts <-> crates/weft-core/src/project.rs NodeDefinition.metadata_ports
+  metadataPorts?: MetadataPort[];
   /// Set on an opaque `@include` node: the included `.weft` file path. The
   /// editor renders this as an expandable group that navigates into the file.
   includePath?: string;
@@ -832,8 +856,14 @@ export interface GroupDefinition {
   /// segment. The slot exists so a future label syntax needs no wire
   /// change.
   label: string | null;
-  inPorts: PortDefinition[];
+  /// Each as full an input as a node's, the widget for a value written
+  /// on it included (a loop's its `LoopIn`'s).
+  inPorts: InputDefinition[];
   outPorts: PortDefinition[];
+  /// The header's `*name: Type` ports, each with the value the body
+  /// writes (`self.name = ...`).
+  // SYNC: GroupDefinition.metadataPorts <-> crates/weft-core/src/project.rs GroupDefinition.metadata_ports
+  metadataPorts?: MetadataPort[];
   parentGroupId: string | null;
   childGroupIds: string[];
   nodeIds: string[];
@@ -877,6 +907,14 @@ export interface ProjectDefinition {
   // (first plain `# ...` body line). The Rust `ProjectDefinition` mirrors this.
   nodes: NodeDefinition[];
   edges: Edge[];
+  /// The wires that leave a metadata port. The compiler has already
+  /// written each one's value into the input it points at (that input's
+  /// `portLiterals` entry), so none of them runs and the editor draws
+  /// none: it shows each input they fill as filled from that port. Each
+  /// stops where the value lands: a node's input, or a group's port seen
+  /// from outside.
+  // SYNC: ProjectDefinition.metadataWires <-> crates/weft-core/src/project.rs ProjectDefinition.metadata_wires
+  metadataWires?: Edge[];
   groups: GroupDefinition[];
   /// Where a run of a cut is given what it does not compute (the values
   /// are the run's own, never the program's). Absent in a program as
@@ -1026,6 +1064,9 @@ export interface CatalogEntry {
   color?: string;
   inputs: InputSpec[];
   outputs: OutputSpec[];
+  /** The node type's metadata ports, each with its hand-written value. */
+  // SYNC: CatalogEntry.metadataPorts <-> crates/weft-core/src/node.rs NodeMetadata.metadata_ports
+  metadataPorts?: MetadataPort[];
   requiresInfra?: boolean;
   features?: NodeFeaturesWire;
   /** The node's declared inline per-firing display (a media player, a
@@ -1077,6 +1118,29 @@ export { credentialOwnerKind } from '../../weft-connect/src/core/wire';
 /** The on-wire sentinel key tagging an Access value. */
 // SYNC: ACCESS_MARKER_KEY <-> crates/weft-core/src/access/value.rs ACCESS_MARKER_KEY
 export const ACCESS_MARKER_KEY = '__weft_access__';
+
+/** The on-wire sentinel key tagging a Secret's marker:
+ *  `{"__weft_secret__": {"secretId": "<uuid>"}}`. */
+// SYNC: SECRET_MARKER_KEY <-> crates/weft-core/src/secret.rs SECRET_MARKER_KEY
+export const SECRET_MARKER_KEY = '__weft_secret__';
+
+/** Whether `value` is a well-formed secret marker: an object holding
+ *  the sentinel key alone, whose payload holds a `secretId` and nothing
+ *  else. A malformed one is not a secret, just an object. */
+// SYNC: isSecretMarker <-> crates/weft-core/src/secret.rs Secret::from_value
+export function isSecretMarker(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || keys[0] !== SECRET_MARKER_KEY) return false;
+  const payload = (value as Record<string, unknown>)[SECRET_MARKER_KEY];
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return false;
+  const fields = Object.keys(payload);
+  const id = (payload as Record<string, unknown>).secretId;
+  return fields.length === 1 && fields[0] === 'secretId' && typeof id === 'string' && UUID.test(id);
+}
+
+/** A uuid in the hyphenated form the backend writes a `SecretId` in. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** The on-wire sentinel key tagging an Infra handle value. */
 // SYNC: INFRA_MARKER_KEY <-> crates/weft-core/src/infra/handle.rs INFRA_MARKER_KEY
@@ -1541,6 +1605,8 @@ export interface TriggerCopy {
   waiting?: WaitingFires;
   /// The version of the source its fires run, once its setup finished.
   version?: string;
+  /// While it turns on: since when, and what its activation waits on.
+  progress?: ChangeProgress;
 }
 
 /// One trigger place of the program, with its state and each instance's
@@ -1674,6 +1740,40 @@ export interface Seed {
   answers?: string[];
 }
 
+/// Where a run's record keeps a value an event names, and how to read it
+/// back: a value travels once, and the graph reads it when it shows it
+/// (`readValues`). `row`: the value one record row carries (a port's
+/// emission, a wait's answer); `given`: a value the run was given at its
+/// birth; `part`: keys and list items read off another value; `list`: a
+/// list made of other values (what a loop gathered); `written`: a value
+/// kept in no row, written out (a literal, a loop's index).
+// SYNC: ValueRef <-> crates/weft-core/src/record_ref.rs ValueRef
+export type ValueRef =
+  | { from: 'row'; run: string; seq: number; index: number }
+  | { from: 'given'; run: string; place: string; port: string; side: 'input' | 'output' }
+  | { from: 'part'; of: ValueRef; path: Array<string | number> }
+  | { from: 'list'; items: ValueRef[] }
+  | { from: 'written'; value: unknown };
+
+/// One value read back (`readValues`): the value; why the run's record no
+/// longer holds it (`gone`: the run was erased); or why the record and the
+/// reference disagree (`broken`: a bug, shown as an error).
+// SYNC: KeptValue <-> crates/weft-core/src/program.rs KeptValue
+export type KeptValue = { value: unknown } | { gone: string } | { broken: string };
+
+/// `POST /runs/{id}/values`: the values some events of the run name, by
+/// where the record keeps them.
+// SYNC: ValuesRequest <-> crates/weft-core/src/program.rs ValuesRequest
+export interface ValuesRequest {
+  refs: ValueRef[];
+}
+
+/// What each reference of a `ValuesRequest` reads, in its order.
+// SYNC: ValuesAnswer <-> crates/weft-core/src/program.rs ValuesAnswer
+export interface ValuesAnswer {
+  values: KeptValue[];
+}
+
 export interface NodeFiringEvent {
   nodeId: string;
   state: NodeFiringStatus;
@@ -1693,7 +1793,8 @@ export interface NodeFiringEvent {
   /// parallel iterations don't cross-correlate.
   frames: Frame[];
   error?: string;
-  input?: unknown;
+  /// Each input port's value, by where the run's record keeps it.
+  input?: Record<string, ValueRef>;
   /// Wired input ports that arrived as CLOSURE markers for this firing
   /// (the upstream frame stack terminated without firing them). Disjoint from
   /// the keys present in `input`; the inspector renders these as
@@ -1706,7 +1807,8 @@ export interface NodeFiringEvent {
   /// tells a DECISION (`did_not_flow`) from a CONSEQUENCE (an input it
   /// needed closed) with it.
   skipReason?: SkipReason;
-  output?: unknown;
+  /// Each output port's value, by where the run's record keeps it.
+  output?: Record<string, ValueRef>;
   /// The run this firing was taken from when the run was seeded
   /// (`weft run --seed`) and reused it instead of firing the node
   /// again. The graph marks the node inherited. Absent on the run's
@@ -2113,6 +2215,10 @@ export type CliPhase =
   | 'infra_provision_start'
   | 'infra_provision_done'
   | 'trigger_register_start'
+  /// The activation goes on, and what it waits on changed. Detail carries
+  /// `elapsedSeconds` and `waiting` ("its setup run <id>").
+  // SYNC: the trigger_register_wait detail <-> crates/weft-cli/src/progress.rs Progress::trigger_register_wait
+  | 'trigger_register_wait'
   | 'trigger_register_done'
   /// Periodic heartbeat while an infra verb waits on the supervisor
   /// (unbounded: draining runs). Detail carries `elapsedSeconds`.
@@ -2554,7 +2660,16 @@ export type HostMessage =
   /// run is just no longer being followed. Distinct from runTerminal
   /// (which IS the run finishing) and from runReset (a fresh follow).
   | { kind: 'followLost'; runId: string; reason: 'closed' | 'error' }
-  | { kind: 'runReset' }
+  /// The followed run's stream dropped after it had opened, or could not
+  /// be opened again since: the host keeps opening it again past the
+  /// last event painted, for as long as the follow lasts, and says why
+  /// on every failed attempt. `why: null` when that ends (the stream
+  /// opened again, or the follow stopped). The run stays live meanwhile.
+  | { kind: 'followReconnecting'; runId: string; why: string | null }
+  /// A fresh follow of run `runId` starts: the canvas clears and its
+  /// events follow; a value they name is read from this run
+  /// (`readValues`).
+  | { kind: 'runReset'; runId: string }
   /// Pushed from the host whenever the action-bar state machine
   /// transitions. The webview is a pure renderer that reads the
   /// latest state from this message. State transitions come from
@@ -2570,6 +2685,10 @@ export type HostMessage =
   /// dispatcher route's JSON response on success; `error` is the failure
   /// reason (HTTP error body or transport fault) on failure.
   | { kind: 'storageResult'; requestId: number; result?: unknown; error?: string }
+  /// Reply to `readValues`, correlated by requestId: the dispatcher's
+  /// answer (each value, in the order asked), or why it could not be read
+  /// at all.
+  | ({ kind: 'valuesRead'; requestId: number } & (ValuesAnswer | { error: string }))
   /// Reply to `accessCall`, correlated by requestId. `result` is the
   /// dispatcher route's JSON response on success; `error` the failure
   /// reason. Summaries only: no stored value ever rides this channel.
@@ -2748,6 +2867,11 @@ export type WebviewMessage =
   /// correlated `storageResult`. This is the ONE channel for storage control
   /// calls (the inline preview's download link); bytes never ride it.
   | { kind: 'storageCall'; requestId: number; path: string; body: unknown }
+  /// Read back the values some events of run `runId` name (`refs`, as the
+  /// events carry them): the host asks the dispatcher's
+  /// `POST /runs/{runId}/values` and replies with a correlated
+  /// `valuesRead`. What the inspector and a debug preview show a value by.
+  | ({ kind: 'readValues'; requestId: number; runId: string } & ValuesRequest)
   /// Drive one access-store verb through the host: the host sends
   /// `method` to the dispatcher's `/access/<path>` route (stamping the
   /// active project into a POST body) and replies with a correlated
@@ -2945,7 +3069,13 @@ export type EditOp =
   // SYNC: set_value_form.form <-> crates/weft-compiler/src/edit.rs ValueForm, packages/weft-graph/src/webview/lib/types/index.ts portValueForm.form
   | { op: 'set_value_form'; node: string; key: string; form: 'inline' | 'connection' }
   | { op: 'set_loop_config'; loopId: string; key: string; value: string }
-  | { op: 'remove_loop_config'; loopId: string; key: string };
+  | { op: 'remove_loop_config'; loopId: string; key: string }
+  // Write a group's or a loop's metadata port value: the `self.<port> =
+  // <value>` line of its body (`group` is either's id), rewritten in place
+  // when it exists. `value` is weft literal source text, the encoding
+  // `set_config` uses; null removes the line.
+  // SYNC: EditOp set_metadata_value <-> crates/weft-compiler/src/edit.rs EditOp::SetMetadataValue
+  | { op: 'set_metadata_value'; group: string; port: string; value: string | null };
 
 // SYNC: EditPortSig <-> crates/weft-compiler/src/edit.rs PortSig
 // (`rendered` is projection-only and deliberately absent on the Rust side.)
@@ -2963,6 +3093,13 @@ export interface EditPortSig {
    *  must keep showing the rendered type, exactly as a reparse would);
    *  the server ignores it. */
   rendered?: string;
+  /** A metadata port (`*name: Type` in a container's header). Only in a
+   *  container's `outputs`, which carries them after the ordinary ones,
+   *  the order the header writes them in. Required, like `required` and
+   *  `portType`: an omitted flag would turn a metadata port into an
+   *  ordinary output in the author's header, so the server refuses one. */
+  // SYNC: EditPortSig.metadata <-> crates/weft-compiler/src/edit.rs PortSig.metadata
+  metadata: boolean;
 }
 
 /** A port a gesture returned to its provided shape (projection-only,

@@ -1,7 +1,7 @@
 {
   "type": "LlmInferenceJson",
   "label": "LLM (JSON)",
-  "description": "AI language model completion whose answer is JSON: the same call as the LLM node (provider, params, tools, a conversation kept in a file), with the reply repaired, parsed, and held to the type the program declares on `response` (`x = LlmInferenceJson -> (response: Verdict) { ... }` with `Verdict` a record type). A record without `..` refuses keys it does not declare; with `..` (`{ label: String, .. }`) they are dropped. An answer that is not JSON or does not fit fails the node, caught on `_error` when it is wired, with the reason (`the model's answer does not fit Verdict: value: missing required field \"score\"`), and leaves `historyFile` exactly as it came in, so a retry in a Loop sends the model the same conversation with the reason in its prompt. A turn that only calls tools emits `toolCalls` and no `response`; the tool loop is wired as on the LLM node.",
+  "description": "AI language model completion whose answer is JSON: the same call as the LLM node (provider, params, tools, a conversation kept in a file), with the reply repaired, parsed, and held to the type the program declares on `response` (`x = LlmInferenceJson -> (response: Verdict) { ... }` with `Verdict` a record type). If the call only decides something (yes or no, which of several options, a rating), a decision node (Decide: Yes or No, Pick One or Score) is often cheaper and a better fit: it answers with probabilities, so there is no reply to parse. A record without `..` refuses keys it does not declare; with `..` (`{ label: String, .. }`) they are dropped. An answer that is not JSON or does not fit fails the node, caught on `_error` when it is wired, with the reason (`the model's answer does not fit Verdict: value: missing required field \"score\"`), and leaves `historyFile` exactly as it came in, so a retry in a Loop sends the model the same conversation with the reason in its prompt. A turn that only calls tools emits `toolCalls` and no `response`; the tool loop is wired as on the LLM node.",
   "tags": [
     "ai",
     "gpt",
@@ -46,9 +46,8 @@
     },
     {
       "name": "tools",
-      "type": "JsonDict | List[JsonDict]",
-      "accepts": ["wire"],
-      "description": "Tool declarations the model may call: one LLM Tool node's output, or a list of them."
+      "type": "List[LlmTool]",
+      "description": "The tools the model may call, as a List: usually each tool group's `*tool` metadata port wired into it, or an LLM Tool node's `tool`."
     },
     {
       "name": "toolChoice",
@@ -73,8 +72,8 @@
     {
       "name": "response",
       "type": "JsonDict",
-      "narrowable": true,
-      "description": "The answer parsed as JSON, holding the type declared here (`-> (response: Verdict)`), JsonDict when none is. Absent on a turn that only called tools."
+      "narrowable": "Json",
+      "description": "The answer parsed as JSON, holding the type declared here (`-> (response: Verdict)`, `List[String]`, or `Json` for any JSON at all), JsonDict when none is. Absent on a turn that only called tools."
     },
     {
       "name": "historyFile",

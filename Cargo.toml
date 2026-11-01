@@ -92,12 +92,15 @@ async-trait = "0.1"
 
 # The install's own database: the driver, the pool every connection comes
 # from (`weft_task_store::db`), and TLS on rustls with ring.
-tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1", "with-uuid-1", "with-chrono-0_4"] }
+tokio-postgres = { version = "0.7.18", features = ["with-uuid-1", "with-chrono-0_4"] }
 deadpool-postgres = "0.14.2"
 tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Bounded in-memory caches (the broker's key and token caches).
 lru = "0.19"
+# Insertion-ordered maps: a run's firings per node, found by their frames
+# (`weft_core::run::firing`).
+indexmap = "2"
 cron = "0.17"
 getrandom = "0.4"
 

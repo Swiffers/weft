@@ -69,6 +69,12 @@
         pub(super) events: StdMutex<Vec<RunEvent>>,
         /// How many batches the writer sent.
         pub(crate) batches: std::sync::atomic::AtomicUsize,
+        /// While set, a batch reaches nothing and gets no answer: the
+        /// broker is out of reach.
+        pub(crate) out_of_reach: std::sync::atomic::AtomicBool,
+        /// Every secret on record, by id: the ones the batches carried
+        /// and the ones kept straight onto it.
+        pub(crate) secrets: StdMutex<std::collections::HashMap<weft_core::secret::SecretId, serde_json::Value>>,
     }
     impl MemJournal {
         /// Put `events` on record as they are: a run's record (or a seed's)
@@ -90,24 +96,36 @@
             self.seed(std::slice::from_ref(event));
             Ok(())
         }
-        async fn events_for_run_id(&self, run_id: RunId) -> anyhow::Result<Vec<RunEvent>> {
-            Ok(self.events_of(run_id))
+        async fn record_page(&self, run_id: RunId, after: Option<i32>) -> anyhow::Result<Vec<weft_journal::JournalRow>> {
+            Ok(crate::test_record::rows_of(run_id, &self.events_of(run_id), after))
+        }
+        fn keep_secret(&self, value: serde_json::Value) -> weft_core::secret::SecretId {
+            let id = weft_core::secret::SecretId::mint();
+            self.secrets.lock().unwrap().insert(id, value);
+            id
+        }
+        async fn reveal_secret(&self, id: weft_core::secret::SecretId) -> anyhow::Result<serde_json::Value> {
+            self.secrets.lock().unwrap().get(&id).cloned().ok_or_else(|| weft_journal::secret_gone(id))
         }
     }
     #[async_trait]
     impl weft_journal::RecordClient for MemJournal {
         async fn record_batch(&self, batch: Vec<u8>) -> Result<weft_journal::frame::BatchAnswer, weft_journal::BatchError> {
             self.batches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.out_of_reach.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(weft_journal::BatchError::Unanswered(anyhow::anyhow!("the broker is out of reach")));
+            }
             let (_, runs) = crate::test_record::decode_batch(&batch);
             let fates = runs.iter().map(|_| weft_journal::record::Fate::Accepted).collect();
+            self.secrets.lock().unwrap().extend(runs.iter().flat_map(|(head, _)| &head.secrets).map(|secret| (secret.secret_id, secret.value.clone())));
             self.events.lock().unwrap().extend(runs.into_iter().flat_map(|(_, events)| events));
             Ok(weft_journal::frame::BatchAnswer { fates })
         }
-        async fn record_of(&self, run_id: RunId) -> anyhow::Result<weft_journal::record::RawRecord> {
-            let events = self.events_of(run_id);
-            Ok(weft_journal::record::RawRecord {
-                rows: vec![weft_journal::record::RunLogRow::of(0, &events)],
-            })
+        async fn record_of(&self, run_id: RunId, after: Option<i32>) -> anyhow::Result<weft_journal::record::RawRecord> {
+            Ok(crate::test_record::page_of(&self.events_of(run_id), after))
+        }
+        async fn secret(&self, id: weft_core::secret::SecretId) -> anyhow::Result<Option<serde_json::Value>> {
+            Ok(self.secrets.lock().unwrap().get(&id).cloned())
         }
         /// The record writes the ending of a run its worker gave up on.
         async fn give_up(&self, run_id: RunId, why: String) -> Result<(), weft_journal::BatchError> {
@@ -435,15 +453,20 @@
     ///
     /// Cut and seeded runs obey the same equality, including which
     /// given values were used and their original runs.
+    /// `events` as a record whose every event is a row of its own.
+    pub(crate) fn record_rows(events: &[RunEvent]) -> Vec<weft_journal::JournalRow> {
+        events.iter().enumerate().map(|(seq, event)| weft_journal::JournalRow { seq: seq as i32, index: 0, event: event.clone() }).collect()
+    }
+
     pub(super) fn assert_fold_matches_live(
         project: &ProjectDefinition,
         events: &[RunEvent],
-        chain: &weft_journal::SeedChain,
+        sources: Arc<std::collections::BTreeMap<RunId, weft_journal::Fold>>,
         live: &Drove,
     ) {
-        /// One pulse as compared: node, id, status, closed, close
-        /// error, frames, port, value (as its JSON text, so the row
-        /// orders totally).
+        /// One pulse as compared: node, id, status (`absorbed` for a pulse
+        /// taken off its wire), closed, close error, frames, port, value
+        /// (as its JSON text, so the row orders totally).
         type PulseRow = (String, uuid::Uuid, String, bool, Option<weft_core::pulse::Failure>, Vec<u32>, String, String, bool, Option<uuid::Uuid>);
         /// One record as compared: node, frames, status, error,
         /// suspension token, absorbed pulses.
@@ -474,7 +497,16 @@
         type KickRow = (String, Vec<u32>, bool, bool, Option<String>, Option<String>, Option<String>);
         let birth = events.first().expect("journal has rows");
         let run_id = birth.run_id();
-        let snap = weft_journal::fold_seeded(run_id, Arc::new(project.clone()), chain, events).expect("journal folds");
+        let snap = {
+            // The fold a worker drives a run on, which forgets what
+            // ended as the drive does: once the record is read to its
+            // end, both forgot the same.
+            let mut live = weft_journal::LiveFold::from(weft_journal::Fold::new(run_id, Arc::new(project.clone())).driving(), sources);
+            live.apply(&record_rows(events)).expect("journal folds");
+            let mut fold = live.into_fold().expect("the record starts with its birth");
+            fold.read_to_the_end();
+            fold.into_snapshot()
+        };
         assert!(snap.corruptions.is_empty(), "the fold rejected a row the run wrote: {:?}", snap.corruptions);
         let json_pairs = |m: &HashMap<String, Arc<serde_json::Value>>| -> Vec<(String, String)> {
             let mut v: Vec<_> = m.iter().map(|(k, v)| (k.clone(), v.to_string())).collect();
@@ -483,22 +515,23 @@
         };
         let pulses = |table: &PulseTable| -> Vec<PulseRow> {
             let mut v: Vec<_> = table
-                .iter()
-                .flat_map(|(node, bucket)| {
-                    bucket.iter().map(move |p| {
-                        (
-                            node.clone(),
-                            p.id,
-                            format!("{:?}", p.status),
-                            p.closed,
-                            p.failure.clone(),
-                            p.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect::<Vec<_>>(),
-                            p.target_port.clone(),
-                            p.value.to_string(),
-                            p.provided,
-                            p.inherited_from,
-                        )
-                    })
+                .values()
+                .flatten()
+                .map(|p| (p, format!("{:?}", p.status)))
+                .chain(table.all_absorbed().map(|p| (p, "absorbed".to_string())))
+                .map(|(p, status)| {
+                    (
+                        p.target_node.clone(),
+                        p.id,
+                        status,
+                        p.closed,
+                        p.failure.clone(),
+                        p.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect::<Vec<_>>(),
+                        p.target_port.clone(),
+                        p.value.to_string(),
+                        p.provided,
+                        p.inherited_from,
+                    )
                 })
                 .collect();
             v.sort();
@@ -520,7 +553,7 @@
             table
                 .iter()
                 .flat_map(|(node, recs)| {
-                    recs.iter().map(move |r| {
+                    recs.values().map(move |r| {
                         let mut absorbed = r.pulses_absorbed.clone();
                         absorbed.sort();
                         let mut closed_outputs: Vec<_> = r.closed_output_ports.iter().cloned().collect();
@@ -528,7 +561,7 @@
                         (
                             node.clone(),
                             r.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect::<Vec<_>>(),
-                            r.status.clone(),
+                            r.status(),
                             r.error.clone(),
                             r.callback_id.clone(),
                             absorbed,
@@ -554,10 +587,8 @@
                     gathers.sort();
                     let mut gather_ports = inst.gather_ports.clone();
                     gather_ports.sort();
-                    let mut launched = inst.launched.clone();
-                    launched.sort_unstable();
-                    let mut out_fired = inst.out_fired.clone();
-                    out_fired.sort_unstable();
+                    let launched: Vec<u32> = inst.launched.iter().collect();
+                    let out_fired: Vec<u32> = inst.out_fired.iter().collect();
                     (
                         key.group_id.clone(),
                         key.parent_frames.iter().map(|f| f.loop_index().expect("loop frame")).collect(),
@@ -578,14 +609,14 @@
             v
         };
         assert_eq!(loops(&live.loop_runtime), loops(&snap.loop_runtime), "the loop instances differ between the run and the fold");
-        let kicks = |kicked: &HashMap<FiringLocation, weft_core::primitive::KickedNode>| -> Vec<KickRow> {
+        let kicks = |kicked: &weft_core::primitive::KickTable| -> Vec<KickRow> {
             let mut v: Vec<KickRow> = kicked
                 .iter()
                 .map(|(loc, k)| {
                     (
                         loc.node_id.clone(),
                         loc.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect(),
-                        k.dispatched,
+                        k.dispatched(),
                         k.firing,
                         k.payload.as_ref().map(|v| v.to_string()),
                         k.port_snapshot.as_ref().map(|v| v.to_string()),
@@ -679,11 +710,13 @@
     }
 
     /// [`clients`], their writer batching as `settings` say, its lanes on
-    /// the process's own io runtime as a worker's are.
+    /// the process's own io runtime as a worker's are (`EngineClients::io`).
     pub(crate) fn clients_writing(journal: Arc<MemJournal>, settings: crate::journal_writer::WriterSettings) -> EngineClients {
         let answers = Arc::new(Answers::default());
+        let io = crate::context::io_runtime().expect("the io runtime starts");
         EngineClients {
-            writer: crate::journal_writer::WorkerJournal::start(journal, settings, &crate::context::io_runtime().expect("the io runtime starts")),
+            writer: crate::journal_writer::WorkerJournal::start(journal, settings, &io),
+            io,
             told: answers.told.clone(),
             runs: answers,
             tasks: Arc::new(NoopTasks),
@@ -710,7 +743,7 @@
         run_id: RunId,
         events: &[RunEvent],
         next_seq: i32,
-        redaction: weft_core::caller::Redaction,
+        secrets: Vec<weft_journal::frame::KeptSecret>,
     ) -> Arc<crate::journal_writer::DriveJournal> {
         let settings = events
             .iter()
@@ -725,7 +758,7 @@
             keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
             epoch: 1,
             next_seq,
-            redaction,
+            secrets,
             program: None,
         })
     }
@@ -733,7 +766,7 @@
     /// A run born now, the way a worker's door bears one: its handle, its
     /// birth handed to it first.
     pub(crate) async fn born(clients: &EngineClients, run_id: RunId, birth: &[RunEvent]) -> Arc<crate::journal_writer::DriveJournal> {
-        let run = handle(clients, run_id, birth, 0, Default::default());
+        let run = handle(clients, run_id, birth, 0, Vec::new());
         run.record_events(birth, Some("instance-test")).await.expect("a birth is handed");
         run
     }
@@ -781,6 +814,28 @@
         run_on_holding(project, catalog, clients, run_id, journal, first, cancellation, caller, hand_back, &holds).await
     }
 
+    /// What a worker reads after its claim of `run_id`, whose record is
+    /// `first`: the record folded over `project`, a seed's ancestors read
+    /// from `clients`' record.
+    pub(crate) async fn claimed(clients: &EngineClients, run_id: RunId, project: &Arc<ProjectDefinition>, first: &[RunEvent]) -> crate::run_driver::ClaimedRecord {
+        let record = clients.writer.record();
+        crate::run_driver::ClaimedRecord::read(
+            |run, after| -> futures::future::BoxFuture<'_, anyhow::Result<Vec<weft_journal::JournalRow>>> {
+                if run == run_id {
+                    let rows = crate::test_record::rows_of(run, first, after);
+                    Box::pin(async move { Ok(rows) })
+                } else {
+                    Box::pin(weft_journal::decoded_page(&**record, run, after))
+                }
+            },
+            &*clients.project,
+            run_id,
+            project.clone(),
+        )
+        .await
+        .expect("the run's record reads")
+    }
+
     /// [`run_on`], the run's quiet spells counted in `holds`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_on_holding(
@@ -797,7 +852,7 @@
     ) -> anyhow::Result<Drove> {
         // The tables a worker's claim builds for the run's program.
         let program = Arc::new(crate::plan::ProgramTables::new(project));
-        let starts_from = crate::run_driver::StartsFrom::Record(first);
+        let starts_from = crate::run_driver::StartsFrom::Record(Box::new(claimed(clients, run_id, &program.project, &first).await));
         let hold = Some(holds.of(run_id, None));
         let run = RunDrive { run_id, journal, program, starts_from, cancellation, exchange: caller.map(exchange), hand_back, hold };
         tokio::time::timeout(
@@ -827,7 +882,7 @@
         let projects = clients.project.clone();
         // What a worker's claim would hand the drive: the run's record so far.
         let first = journal.events_of(run_id);
-        let run = handle(&clients, run_id, &first, 1, Default::default());
+        let run = handle(&clients, run_id, &first, 1, Vec::new());
         let drove = run_on(project.clone(), catalog, &clients, run_id, run, first, cancellation, caller, None).await;
         // A fast run lets go of its record once its ending is handed over;
         // the checks below read the record whole, as the next reader does.
@@ -836,7 +891,11 @@
         // The run's own rows, folded over what it inherits (the journal
         // may hold the seed's rows under another run).
         let events = journal.events_of(run_id);
-        let chain = weft_journal::seed_chain(&events, |c| { let events = journal.events_of(c); async move { Ok(events) } }, |id, hash| {
+        let page = |c: RunId, after: Option<i32>| {
+            let events = journal.events_of(c);
+            async move { Ok(crate::test_record::rows_of(c, &events, after)) }
+        };
+        let chain = weft_journal::seed_chain(events.first(), &page, |id, hash| {
             let projects = projects.clone();
             async move {
                 projects.fetch_definition(id, &hash).await?.map(Arc::new)
@@ -845,7 +904,8 @@
         })
             .await
             .expect("the seed chain reads");
-        assert_fold_matches_live(&project, &events, &chain, &drove);
+        let sources = chain.materialize(&page).await.expect("the seed chain folds");
+        assert_fold_matches_live(&project, &events, Arc::new(sources), &drove);
         Ok(drove)
     }
 

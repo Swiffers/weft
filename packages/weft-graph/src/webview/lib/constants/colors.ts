@@ -11,10 +11,12 @@ export const PORT_TYPE_COLORS: Record<string, string> = {
 	Blob: '#9e7c5a',     // Warm brown (catch-all stored file)
 	List: '#5a8a8a',     // Monokai teal
 	Dict: '#7c6f9f',     // Monokai purple
+	Json: '#948aad',     // Lighter Dict purple (any JSON value)
 	TypeVar: '#6366f1',  // Indigo
 	Bus: '#d97706',      // Amber-600 (live-channel signal)
 	Access: '#0d9488',   // Teal-600 (credential grant)
 	Infra: '#2563eb',    // Blue-600 (handle on a running service)
+	Secret: '#be123c',   // Rose-700 (a value kept sealed, shown only as its marker)
 };
 
 const FALLBACK_COLOR = '#52525b'; // Dark gray
@@ -37,6 +39,7 @@ function colorForParsed(t: WeftType): string {
 		case 'list': return PORT_TYPE_COLORS.List;
 		case 'dict': return PORT_TYPE_COLORS.Dict;
 		case 'json_dict': return PORT_TYPE_COLORS.Dict;
+		case 'json': return PORT_TYPE_COLORS.Json;
 		case 'union': return colorForParsed(t.types[0]);
 		// A record colors like the generic object types; a named type
 		// colors as its body, so e.g. a media-bodied name reads as media.
@@ -48,6 +51,9 @@ function colorForParsed(t: WeftType): string {
 		case 'infra': return PORT_TYPE_COLORS.Infra;
 		// A stream colors as its element: the wire carries items of T.
 		case 'generator': return colorForParsed(t.inner);
+		// A secret colors as itself, whatever it holds: the wire carries a
+		// marker, never a T, so it must not read like a plain T wire.
+		case 'secret': return PORT_TYPE_COLORS.Secret;
 	}
 }
 

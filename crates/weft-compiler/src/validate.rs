@@ -66,6 +66,8 @@ fn validate_scoped(
     check_type_compat(project, &mut d);
     check_port_coverage(project, catalog, &mut d);
     check_config_derived_ports(project, catalog, &mut d);
+    check_metadata_ports(project, catalog, &mut d);
+    check_pass_through_ports(project, &mut d);
     check_loop_config(project, &mut d);
     check_double_driven_ports(project, &mut d);
     check_two_gates(project, &mut d);
@@ -176,6 +178,13 @@ fn check_instance_filled(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             let (file, span) = cfg_anchor(node, field);
             if node.group_boundary.is_some() {
                 push(d, &[node.part()], file, span, Severity::Error, "instance-filled-boundary", boundary_message(name, field));
+                continue;
+            }
+            // An instance's value comes from outside every run, and a
+            // secret is made by a node inside one.
+            if node.inputs.iter().any(|p| p.name == field && p.port_type.holds_secret()) {
+                push(d, &[node.part()], file, span, Severity::Error, "instance-filled-secret",
+                    format!("'{name}.{field}' is `@instance_filled` and holds a Secret; {}", weft_core::secret::MADE_BY_A_NODE));
                 continue;
             }
             if has_incoming_edge(node, project, field) {
@@ -566,7 +575,7 @@ fn check_named_type_conflicts(project: &ProjectDefinition, d: &mut Vec<Diagnosti
                 out.push((name, body));
                 walk(body, out);
             }
-            WeftType::List(inner) | WeftType::Generator(inner) | WeftType::Dict(inner) => walk(inner, out),
+            WeftType::List(inner) | WeftType::Generator(inner) | WeftType::Secret(inner) | WeftType::Dict(inner) => walk(inner, out),
             WeftType::Union(members) => members.iter().for_each(|m| walk(m, out)),
             WeftType::Record { fields, .. } => fields.iter().for_each(|f| walk(&f.ty, out)),
             _ => {}
@@ -748,8 +757,10 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
     for group in project.groups.iter().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
         let span = group.header_span.or(group.span).unwrap_or_default();
         let file = group.source_file.as_deref();
-        for (side, ports) in [("input", &group.in_ports), ("output", &group.out_ports)] {
-            for port in ports.iter().filter(|p| p.port_type.as_generator().is_some()) {
+        let inputs: Vec<&weft_core::project::PortDefinition> = group.in_ports.iter().map(|p| &p.port).collect();
+        let outputs: Vec<&weft_core::project::PortDefinition> = group.out_ports.iter().collect();
+        for (side, ports) in [("input", inputs), ("output", outputs)] {
+            for port in ports.into_iter().filter(|p| p.port_type.as_generator().is_some()) {
                 let port_name = &port.name;
                 if root_group_ids.contains(group.id.as_str()) {
                     push(d, &[group.id.as_str()], file, span, Severity::Error, "generator-through-group",
@@ -1121,7 +1132,7 @@ fn check_declarative_rules(
     let rules = weft_core::rules::RuleContext::new(project);
     for node in &project.nodes {
         let Some(meta) = catalog.lookup(&node.node_type) else { continue };
-        let custom = node_custom_outputs(node, meta);
+        let custom = weft_core::rules::CustomPorts::of(node, meta);
         for rule in &node_rules(meta, node) {
             // Skip runtime-only rules in structural mode (the build and
             // the Problems panel). Runtime mode runs them: the editor's
@@ -1133,7 +1144,7 @@ fn check_declarative_rules(
                 continue;
             }
             if weft_core::rules::fires(rule, node, &rules, &custom) {
-                emit_rule_diagnostic(node, &rules, meta, rule, out);
+                emit_rule_diagnostic(node, &rules, &custom, rule, out);
             }
         }
     }
@@ -1204,15 +1215,10 @@ fn is_the_connection_rule(meta: &weft_core::node::NodeMetadata, rule: &Validatio
         )
 }
 
-/// The output ports the source added beyond the node type's own.
-pub(crate) fn node_custom_outputs(node: &NodeDefinition, meta: &weft_core::node::NodeMetadata) -> Vec<String> {
-    weft_core::rules::custom_outputs(node, meta.outputs.iter().map(|o| o.name.as_str()))
-}
-
 fn emit_rule_diagnostic(
     node: &NodeDefinition,
     rules: &weft_core::rules::RuleContext,
-    meta: &weft_core::node::NodeMetadata,
+    custom: &weft_core::rules::CustomPorts,
     rule: &ValidationRule,
     out: &mut Vec<Diagnostic>,
 ) {
@@ -1223,7 +1229,7 @@ fn emit_rule_diagnostic(
         RuleSeverity::Info => Severity::Info,
         RuleSeverity::Hint => Severity::Hint,
     };
-    let message = weft_core::rules::message(rule, node, rules, &node_custom_outputs(node, meta));
+    let message = weft_core::rules::message(rule, node, rules, custom);
     let code = match rule.then.level {
         ValidationLevel::Structural => "rule-structural",
         ValidationLevel::Runtime => "rule-runtime",
@@ -1490,6 +1496,19 @@ enum LineEnd {
     Gate { group: String, port: String },
 }
 
+impl LineEnd {
+    /// Whether this end sits inside `group`: a node or a group nested in
+    /// it, or one of its own ports seen from inside.
+    fn lies_in(&self, group: &str) -> bool {
+        let nested = |id: &str| id.starts_with(&format!("{group}."));
+        match self {
+            LineEnd::Node { id, .. } => nested(id),
+            LineEnd::Port { group: at, inner, .. } => nested(at) || (at == group && *inner),
+            LineEnd::Gate { group: at, .. } => nested(at),
+        }
+    }
+}
+
 /// A line a person wrote, read back off the wires that carry it: a wire
 /// through a group's ports is one wire and several lines (`g.x = a.out`
 /// outside, `m.in = self.x` inside), and a line read by several wires is
@@ -1522,7 +1541,7 @@ fn lines(project: &ProjectDefinition) -> Vec<Line> {
         let (mut from, start) = if edge.from_group_port() {
             (exit(&edge.via[0]), 1)
         } else {
-            (LineEnd::Node { id: edge.source.clone(), port: edge.source_port().to_string() }, 0)
+            (node_end(project, &edge.source, edge.source_port(), true), 0)
         };
         for k in start..edge.via.len() {
             let c = &edge.via[k];
@@ -1544,7 +1563,7 @@ fn lines(project: &ProjectDefinition) -> Vec<Line> {
         let to = if project.groups.iter().any(|g| g.id == edge.target) {
             LineEnd::Gate { group: edge.target.clone(), port: edge.target_port().to_string() }
         } else {
-            LineEnd::Node { id: edge.target.clone(), port: edge.target_port().to_string() }
+            node_end(project, &edge.target, edge.target_port(), false)
         };
         add(Line { from, to, span: edge.span.unwrap_or_default(), file: edge.source_file.clone() });
     }
@@ -1552,6 +1571,25 @@ fn lines(project: &ProjectDefinition) -> Vec<Line> {
     // one a later line is told about.
     out.sort_by(|a, b| (&a.file, a.span.start_line, a.span.start_column).cmp(&(&b.file, b.span.start_line, b.span.start_column)));
     out
+}
+
+/// A line's end on node `id`'s `port`, the line leaving it when `leaves`.
+/// A loop's two boundary nodes are how its ports compile, and a line read
+/// back is the loop's port, the way a group's is: `LoopIn` is its inputs
+/// (`self.items` read inside, `each.items` written outside, `each._should_flow`
+/// its gate) and `LoopOut` its outputs (`self.results` written inside,
+/// `each.results` read outside). So every rule about a line holds for a
+/// loop and a group alike.
+fn node_end(project: &ProjectDefinition, id: &str, port: &str, leaves: bool) -> LineEnd {
+    use weft_core::project::{CrossingSide, GroupBoundaryRole};
+    let boundary = project.nodes.iter().find(|n| n.id == id).and_then(|n| n.group_boundary.as_ref());
+    let Some(b) = boundary else { return LineEnd::Node { id: id.to_string(), port: port.to_string() } };
+    let (group, port) = (b.group_id.clone(), port.to_string());
+    match (b.role, leaves) {
+        (GroupBoundaryRole::In, false) if weft_core::run::skip::is_gate_port(&port) => LineEnd::Gate { group, port },
+        (GroupBoundaryRole::In, inner) => LineEnd::Port { group, port, side: CrossingSide::In, inner },
+        (GroupBoundaryRole::Out, leaves) => LineEnd::Port { group, port, side: CrossingSide::Out, inner: !leaves },
+    }
 }
 
 impl LineEnd {
@@ -1643,32 +1681,27 @@ fn check_edge_node_refs(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 /// two nodes of a group, a node and the group's own port seen from
 /// inside (`self.x`), or a node and a child group's port seen from
 /// outside (`child.x`). A line from a node straight to a node of another
-/// scope reaches through a group's wall without its port. A loop's two
-/// boundary nodes stand for its ports on both sides, so a line to one of
-/// them is the loop's own business (`check_loop_config`).
+/// scope reaches through a group's wall without its port. A loop's ports
+/// are read the same way (`node_end`).
 fn check_scope_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
-    let loop_boundary = |end: &LineEnd| matches!(end, LineEnd::Node { id, .. }
-        if project.nodes.iter().any(|n| n.id == *id && weft_core::project::boundary_types::is_boundary(&n.node_type)));
     for line in lines(project) {
-        if loop_boundary(&line.from) || loop_boundary(&line.to) {
+        // A container's own output or metadata port, read by its name from
+        // inside it (`g.out` in `g`): said the way `self.out` is.
+        let read_inside = match &line.from {
+            LineEnd::Port { group, port, side: weft_core::project::CrossingSide::Out, inner: false } if line.to.lies_in(group) => {
+                read_inside_refusal(project, group, port)
+            }
+            _ => None,
+        };
+        if read_inside.is_none() && end_scope(project, &line.from) == end_scope(project, &line.to) {
             continue;
         }
-        if end_scope(project, &line.from) == end_scope(project, &line.to) {
-            continue;
-        }
-        push(
-            d,
-            &line.parts(project),
-            line.file.as_deref(),
-            line.span,
-            Severity::Error,
-            "scope-reachability",
-            format!(
-                "edge '{} -> {}' crosses scope boundaries without a group or loop boundary",
-                end_name(project, &line.from),
-                end_name(project, &line.to),
-            ),
-        );
+        let (code, message) = read_inside.unwrap_or_else(|| ("scope-reachability", format!(
+            "edge '{} -> {}' crosses scope boundaries without a group or loop boundary",
+            end_name(project, &line.from),
+            end_name(project, &line.to),
+        )));
+        push(d, &line.parts(project), line.file.as_deref(), line.span, Severity::Error, code, message);
     }
 }
 
@@ -1696,14 +1729,36 @@ fn enclosing_scope_hint(project: &ProjectDefinition, inner: &str, handle: &str) 
     let inner_short = inner.rsplit('.').next().unwrap_or(inner);
     Some(format!(
         "'{}' has no input '{handle}': inside the {inner_kind} '{}', `self` is the \
-         {inner_kind}'s own inputs, and `{handle}` is an input of the enclosing group \
+         {inner_kind}'s own inputs, and `{handle}` is an input of the enclosing {} \
          '{}'. Declare it on the {inner_kind} (`{inner_short} = {}({handle}: <type>, ...)`) \
          and wire it in from the group (`{inner_short}.{handle} = self.{handle}`).",
         weft_core::project::plain_id(inner),
         weft_core::project::plain_id(inner),
+        outer.kind.noun(),
         weft_core::project::plain_id(&outer.id),
         if inner_kind == "loop" { "Loop" } else { "Group" },
     ))
+}
+
+/// What a line reading `self.{port}` inside `group` is told when the port
+/// is one of the group's own that only the outside reads: a metadata port,
+/// or an output. Both are read from outside, the way a node's output is,
+/// and an output is written inside (`self.out = ...`). The code says which.
+fn read_inside_refusal(project: &ProjectDefinition, group: &str, port: &str) -> Option<(&'static str, String)> {
+    let g = project.groups.iter().find(|g| g.id == group)?;
+    let name = weft_core::project::plain_id(group);
+    let noun = g.kind.noun();
+    if g.metadata_ports.iter().any(|m| m.name == port) {
+        return Some(("metadata-port-read-inside", format!(
+            "'self.{port}' is a metadata port of '{name}', and like an output it is read from outside the {noun} \
+             (`other.input = {name}.{port}`), never from inside it. If a node inside needs the same value, \
+             take it from where '{port}' gets it, or name it in another metadata port's value"
+        )));
+    }
+    g.out_ports.iter().any(|p| p.name == port).then(|| ("unknown-source-port", format!(
+        "'self.{port}' is an output of '{name}': inside the {noun} it is written (`self.{port} = ...`), \
+         and it is read from outside (`other.input = {name}.{port}`)"
+    )))
 }
 
 /// The root anonymous group of a component file (one used through
@@ -1725,6 +1780,27 @@ fn component_root(project: &ProjectDefinition) -> Option<&str> {
     // root holds), so nothing of the program runs outside the component.
     let alone = project.nodes.iter().all(|n| !n.scope.is_empty());
     alone.then_some(root)
+}
+
+/// What a type-mismatch adds when the wire carries a secret where the
+/// target takes it plain: the receiving node has to take the secret and
+/// reveal it, since nothing opens one on a wire.
+fn sealed_hint(source: &weft_core::weft_type::WeftType, target: &weft_core::weft_type::WeftType) -> Option<String> {
+    (source.holds_secret() && !target.holds_secret()).then(|| {
+        format!(
+            "; a {source} stays sealed on its way, so the receiving node must take {source} \
+             and reveal it (ctx.reveal)"
+        )
+    })
+}
+
+/// secret-literal: a value written in the program claims to be a secret
+/// (the marker, at any depth). Only a node makes one at run time, and a
+/// marker written by hand would name a secret of another run.
+fn refuse_written_secret(value: &serde_json::Value, owner: &str, port: &str) -> Option<String> {
+    weft_core::secret::Secret::claimed_in(value).then(|| {
+        format!("'{owner}.{port}' is written as a secret's marker; {}", weft_core::secret::MADE_BY_A_NODE)
+    })
 }
 
 /// Does a written value carry a `@file`/`@asset` marker anywhere (at the
@@ -1766,18 +1842,37 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     use weft_core::project::CrossingSide;
     let by_id: std::collections::HashMap<&str, &weft_core::project::NodeDefinition> =
         project.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
-    let group_ports = |group: &str, side: CrossingSide| -> Option<Vec<&str>> {
+    // The ports a line may name on `group`'s `side`, seen from inside or
+    // from outside. A loop's are its boundary nodes' (`LoopIn` adds `index`
+    // inside, `LoopOut` takes `done` inside), a group's its own.
+    let group_ports = |group: &str, side: CrossingSide, inner: bool| -> Option<Vec<&str>> {
         let g = project.groups.iter().find(|g| g.id == group)?;
-        Some(match side {
-            CrossingSide::In => g.in_ports.iter().map(|p| p.name.as_str()).collect(),
-            CrossingSide::Out => g.out_ports.iter().map(|p| p.name.as_str()).collect(),
-        })
+        let boundary = |role: weft_core::project::GroupBoundaryRole| project.nodes.iter()
+            .find(|n| n.group_boundary.as_ref().is_some_and(|b| b.group_id == group && b.role == role));
+        let mut ports: Vec<&str> = match (side, inner, &g.kind) {
+            (CrossingSide::In, true, weft_core::project::GroupKind::Loop { .. }) => {
+                boundary(weft_core::project::GroupBoundaryRole::In)?.outputs.iter().map(|p| p.name.as_str()).collect()
+            }
+            (CrossingSide::Out, true, weft_core::project::GroupKind::Loop { .. }) => {
+                boundary(weft_core::project::GroupBoundaryRole::Out)?.inputs.iter().map(|p| p.name.as_str()).collect()
+            }
+            (CrossingSide::In, ..) => g.in_ports.iter().map(|p| p.name.as_str()).collect(),
+            (CrossingSide::Out, ..) => g.out_ports.iter().map(|p| p.name.as_str()).collect(),
+        };
+        ports.retain(|p| !weft_core::run::skip::is_gate_port(p));
+        // Read from outside, a metadata port is one of the container's
+        // outputs (a line reading it from inside is refused below).
+        if side == CrossingSide::Out && !inner {
+            ports.extend(g.metadata_ports.iter().map(|m| m.name.as_str()));
+        }
+        Some(ports)
     };
     let unknown_group_port = |group: &str, side: CrossingSide, port: &str, names: &[&str]| {
         let kind = if side == CrossingSide::In { "input" } else { "output" };
+        let noun = project.groups.iter().find(|g| g.id == group).map_or("group", |g| g.kind.noun());
         match did_you_mean(port, names) {
-            Some(s) => format!("group '{}' has no {kind} '{port}'. Did you mean '{s}'?", weft_core::project::plain_id(group)),
-            None => format!("group '{}' has no {kind} '{port}'. Available: [{}]", weft_core::project::plain_id(group), names.join(", ")),
+            Some(s) => format!("{noun} '{}' has no {kind} '{port}'. Did you mean '{s}'?", weft_core::project::plain_id(group)),
+            None => format!("{noun} '{}' has no {kind} '{port}'. Available: [{}]", weft_core::project::plain_id(group), names.join(", ")),
         }
     };
     let lines = lines(project);
@@ -1788,27 +1883,22 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 let Some(src) = by_id.get(id.as_str()) else { continue };
                 if !src.outputs.iter().any(|p| p.name == *port) {
                     let names: Vec<&str> = src.outputs.iter().map(|p| p.name.as_str()).collect();
-                    // A loop's `LoopIn` is its `self` seen from inside.
-                    let hint = src
-                        .group_boundary
-                        .as_ref()
-                        .filter(|b| b.role == weft_core::project::GroupBoundaryRole::In)
-                        .and_then(|b| enclosing_scope_hint(project, &b.group_id, port));
-                    let msg = hint.unwrap_or_else(|| match did_you_mean(port, &names) {
+                    let msg = match did_you_mean(port, &names) {
                         Some(s) => format!("node '{}' has no output port '{port}'. Did you mean '{s}'?", author_name(src)),
                         None => format!("node '{}' has no output port '{port}'. Available: [{}]", author_name(src), names.join(", ")),
-                    });
+                    };
                     push(d, &line.parts(project), file, span, Severity::Error, "unknown-source-port", msg);
                 }
             }
             LineEnd::Port { group, port, side, inner } => {
-                let Some(names) = group_ports(group, *side) else { continue };
+                let Some(names) = group_ports(group, *side, *inner) else { continue };
                 if !names.contains(&port.as_str()) {
                     // `self.x` read inside: the group's own input; `g.y`
                     // read outside: the group's output.
-                    let hint = inner.then(|| enclosing_scope_hint(project, group, port)).flatten();
-                    let msg = hint.unwrap_or_else(|| unknown_group_port(group, *side, port, &names));
-                    push(d, &line.parts(project), file, span, Severity::Error, "unknown-source-port", msg);
+                    let (code, msg) = inner.then(|| read_inside_refusal(project, group, port)).flatten()
+                        .unwrap_or_else(|| ("unknown-source-port", inner.then(|| enclosing_scope_hint(project, group, port)).flatten()
+                            .unwrap_or_else(|| unknown_group_port(group, *side, port, &names))));
+                    push(d, &line.parts(project), file, span, Severity::Error, code, msg);
                 }
             }
             LineEnd::Gate { .. } => {}
@@ -1825,8 +1915,8 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                     push(d, &line.parts(project), file, span, Severity::Error, "unknown-target-port", msg);
                 }
             }
-            LineEnd::Port { group, port, side, .. } => {
-                let Some(names) = group_ports(group, *side) else { continue };
+            LineEnd::Port { group, port, side, inner } => {
+                let Some(names) = group_ports(group, *side, *inner) else { continue };
                 if !names.contains(&port.as_str()) {
                     push(d, &line.parts(project), file, span, Severity::Error, "unknown-target-port", unknown_group_port(group, *side, port, &names));
                 }
@@ -2030,10 +2120,12 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             // When the pair is refused as a wire but the Cast table
             // accepts it (a JsonDict claiming a declared type, text
             // that would parse), name the door.
-            let cast_hint = if weft_core::weft_type::WeftType::cast_allowed(&src_type, tgt_port_type).is_ok() {
-                "; wire it through a Cast node to convert and validate the value"
+            let cast_hint = if let Some(sealed) = sealed_hint(&src_type, tgt_port_type) {
+                sealed
+            } else if weft_core::weft_type::WeftType::cast_allowed(&src_type, tgt_port_type).is_ok() {
+                "; wire it through a Cast node to convert and validate the value".to_string()
             } else {
-                ""
+                String::new()
             };
             push("type-mismatch",
                 format!(
@@ -2070,8 +2162,9 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             return;
         }
         if !weft_core::weft_type::WeftType::is_compatible(&from_type, &to.0) {
+            let hint = sealed_hint(&from_type, &to.0).unwrap_or_default();
             push(d, &stretch, file, span, Severity::Error, "type-mismatch",
-                format!("cannot connect '{}: {from_type}' to '{}: {}'", from.1, to.1, to.0));
+                format!("cannot connect '{}: {from_type}' to '{}: {}'{hint}", from.1, to.1, to.0));
         }
     };
     // Every wire at every place it runs, with the types each place gives
@@ -2118,6 +2211,11 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     // them.
     for group in project.groups.iter().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
         for (key, value) in &group.port_literals {
+            if let Some(why) = refuse_written_secret(value, &weft_core::project::plain_id(&group.id), key) {
+                let (span, file) = group_literal_anchor(group, key);
+                push(d, &[group.id.as_str()], file, span, Severity::Error, "secret-literal", why);
+                continue;
+            }
             if weft_core::run::skip::is_gate_port(key) { continue; }
             let Some(input) = group.in_ports.iter().find(|p| p.name == *key) else { continue };
             if input.port_type.is_unresolved() { continue; }
@@ -2182,6 +2280,14 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 None => value,
             };
             let span_entry = node.port_literal_spans.get(key);
+            if let Some(why) = refuse_written_secret(value, author_name(node), key) {
+                let (file, span) = match span_entry {
+                    Some(s) => (s.source_file.as_deref(), s.span),
+                    None => (node.source_file.as_deref(), node.header_span.unwrap_or_default()),
+                };
+                push(d, &[node.part()], file, span, Severity::Error, "secret-literal", why);
+                continue;
+            }
             let Some(input) = node.inputs.iter().find(|p| p.name == *key) else { continue };
             // A port whose type is still open (an unbound variable) has
             // nothing to check against yet: `unresolved-typevar` owns it, and
@@ -2282,6 +2388,7 @@ fn check_container_inputs(project: &ProjectDefinition, root: Option<&str>, d: &m
         if root == Some(group.id.as_str()) { continue; }
         for input in group.in_ports.iter().filter(|p| !weft_core::run::skip::is_gate_port(&p.name)) {
             if group.port_literals.get(&input.name).is_some_and(|v| !v.is_null()) { continue; }
+            if fed_by_metadata_wire(project, &group.id, &input.name) { continue; }
             let need = project.edges.iter()
                 .filter(|e| e.source == group.id && e.from_group_port() && e.via[0].port == input.name && !e.to_group_port())
                 .filter(|e| project.nodes.iter().any(|n| n.id == e.target))
@@ -2297,6 +2404,7 @@ fn check_container_inputs(project: &ProjectDefinition, root: Option<&str>, d: &m
     // to the members that read it.
     let driven: std::collections::HashSet<(&str, &str)> = project.edges.iter()
         .filter(|e| !e.to_group_port())
+        .chain(&project.metadata_wires)
         .map(|e| (e.target.as_str(), e.target_port())).collect();
     for node in project.nodes.iter().filter(|n| n.node_type == weft_core::project::boundary_types::LOOP_IN) {
         let Some(boundary) = node.group_boundary.as_ref() else { continue };
@@ -2351,7 +2459,10 @@ fn check_group_gates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 /// value.
 fn gets_value(project: &ProjectDefinition, id: &str, port: &str) -> bool {
     let Some(node) = project.nodes.iter().find(|n| n.id == id) else { return false };
-    if literal_fills(node, port) || node.inputs.iter().any(|input| input.name == port && input.default.is_some()) {
+    if literal_fills(node, port)
+        || node.inputs.iter().any(|input| input.name == port && input.default.is_some())
+        || fed_by_metadata_wire(project, id, port)
+    {
         return true;
     }
     project.edges.iter()
@@ -2366,6 +2477,15 @@ fn gets_value(project: &ProjectDefinition, id: &str, port: &str) -> bool {
             });
             followed.is_none() || gets_value(project, &e.source, from)
         })
+}
+
+/// Whether a metadata wire fills input `port` of `id` (a node, a loop's
+/// `LoopIn` or a group): the input is driven, by a value written when the
+/// program compiles. When that value could not be worked out, enrich said
+/// so where it is written, and the input is not reported again as having
+/// no driver.
+fn fed_by_metadata_wire(project: &ProjectDefinition, id: &str, port: &str) -> bool {
+    project.metadata_wires.iter().any(|wire| wire.target == id && wire.target_port() == port)
 }
 
 /// Whether `wire` starts at a constant written on a group's input port
@@ -2394,7 +2514,9 @@ fn check_port_coverage(
     catalog: &dyn MetadataCatalog,
     d: &mut Vec<Diagnostic>,
 ) {
-    // Build "is this (node, port) driven by an edge?" lookup once.
+    // Build "is this (node, port) driven by an edge?" lookup once. A
+    // metadata wire is no edge here: its value is a literal for every rule
+    // (`accepts` above all), and only the missing-driver rule counts it.
     let driven: std::collections::HashSet<(String, String)> = project
         .edges
         .iter()
@@ -2533,7 +2655,9 @@ fn check_port_coverage(
 
             // required + default = satisfiable: the runtime supplies the
             // default when nothing else drives the input.
-            if input.required && !has_edge && !has_literal && input.default.is_none() {
+            if input.required && !has_edge && !has_literal && input.default.is_none()
+                && !fed_by_metadata_wire(project, &node.id, &input.name)
+            {
                 push(
                     d,
                     &[node.part()],
@@ -2763,6 +2887,122 @@ fn check_port_coverage(
     // lowering turns a `node.port = "literal"` line into a config field
     // on the node (not an edge), which the port checks reject when the
     // target port is output-only.
+}
+
+/// What a node's or a group's metadata ports have to be once enrich has
+/// resolved them (`crate::metadata`):
+///  - `duplicate-port`: a metadata port's name is no input's and no
+///    output's of the same owner (`self.x` and `g.x` would mean either);
+///    on a node this is an input the program added under one of its
+///    type's metadata names.
+///  - `config-type-mismatch`: a group's value fits the type its header
+///    declares (a node type's is checked when the catalog loads).
+///  - `unpaired-port`: on a node that pairs its added ports, every added
+///    output has the added input of its name, and something reads it: the
+///    value its input matches would otherwise be dropped.
+// SYNC: duplicate-port (metadata) <-> packages/weft-graph/src/webview/lib/utils/port-specs.ts entryPortCollisions, packages/weft-graph/src/webview/lib/utils/metadata-ports.ts portNameClash
+/// optional-pass-through-port: a `?` on a container's input that passes
+/// through ([`weft_core::project::InputDefinition::passes_through`]). Such
+/// a port holds nothing, so it is never required or optional itself: the
+/// nodes inside that read it decide (`check_container_inputs`), and a `?`
+/// there would claim a choice that does not exist. An include's site is
+/// its file's header, checked on the file's body.
+fn check_pass_through_ports(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    for group in project.groups.iter().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Call { .. })) {
+        let file = group.source_file.as_deref();
+        let span = group.header_span.or(group.span).unwrap_or_default();
+        for input in group.in_ports.iter().filter(|p| p.passes_through && !p.required) {
+            let noun = group.kind.noun();
+            let why = if matches!(group.kind, weft_core::project::GroupKind::Loop { .. }) {
+                "a loop needs only the ports it iterates (`over`) or carries (`carry`) to start, and"
+            } else {
+                "a group needs none of its ports to start, and"
+            };
+            push(d, &[group.id.as_str()], file, span, Severity::Error, "optional-pass-through-port", format!(
+                "'{name}' is written `{port}?` on {noun} '{group_name}', but {why} '{port}' hands what reaches it \
+                 straight to the nodes inside, so it is never required or optional itself: whether it must be \
+                 connected depends on whether a node inside needs it. Remove the `?`",
+                name = input.name,
+                port = input.name,
+                group_name = weft_core::project::plain_id(&group.id),
+            ));
+        }
+    }
+}
+
+fn check_metadata_ports(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, d: &mut Vec<Diagnostic>) {
+    let read: std::collections::HashSet<(&str, &str)> = project.edges.iter()
+        .filter(|edge| !edge.from_group_port())
+        .map(|edge| (edge.source.as_str(), edge.source_port()))
+        .collect();
+    for node in &project.nodes {
+        let file = node.source_file.as_deref();
+        let span = node.header_span_or_default();
+        for port in &node.metadata_ports {
+            if node.inputs.iter().any(|p| p.name == port.name) || node.outputs.iter().any(|p| p.name == port.name) {
+                push(d, &[node.part()], file, span, Severity::Error, "duplicate-port", format!(
+                    "node '{}' has a port named '{}' besides its metadata port of that name; rename the port you added",
+                    author_name(node), port.name,
+                ));
+            }
+        }
+        if !node.features.pairs_added_ports {
+            continue;
+        }
+        let Some(meta) = catalog.lookup(&node.node_type) else { continue };
+        let added = weft_core::rules::CustomPorts::of(node, meta);
+        for input in &added.inputs {
+            if meta.outputs.iter().any(|o| o.name == *input) {
+                let (key_file, key_span) = cfg_anchor(node, input);
+                push(d, &[node.part()], key_file.or(file), key_span, Severity::Error, "unpaired-port", format!(
+                    "node '{}': '{input}' is the name of one of its own outputs, so the input you added cannot have \
+                     an output of its own. Give it another name",
+                    author_name(node),
+                ));
+            }
+        }
+        // The language's `_error` output is the metadata's own, so it is
+        // never an added output.
+        for output in &added.outputs {
+            if !added.inputs.contains(output) {
+                push(d, &[node.part()], file, span, Severity::Error, "unpaired-port", format!(
+                    "node '{}': output '{}' matches no input. Each output of this node is where the input of the same \
+                     name sends what it matches: add that input (`{}.{} = ...`), or remove the output",
+                    author_name(node), output, author_name(node), output,
+                ));
+            } else if !read.contains(&(node.id.as_str(), output.as_str())) {
+                let (key_file, key_span) = cfg_anchor(node, output);
+                push(d, &[node.part()], key_file.or(file), key_span, Severity::Error, "unpaired-port", format!(
+                    "node '{}': nothing reads '{}.{}', so a value that input '{}' matches would be dropped. Wire \
+                     `{}.{}` to what handles it",
+                    author_name(node), author_name(node), output, output, author_name(node), output,
+                ));
+            }
+        }
+    }
+    for group in &project.groups {
+        let file = group.source_file.as_deref();
+        let span = group.header_span.or(group.span).unwrap_or_default();
+        for port in &group.metadata_ports {
+            if group.in_ports.iter().any(|p| p.name == port.name) || group.out_ports.iter().any(|p| p.name == port.name) {
+                push(d, &[group.id.as_str()], file, span, Severity::Error, "duplicate-port", format!(
+                    "{} '{}' has a port named '{}' besides its metadata port of that name: `self.{}` would mean either",
+                    group.kind.noun(), weft_core::project::plain_id(&group.id), port.name, port.name,
+                ));
+            }
+            // An include's site carries its body's value, checked on the body.
+            if matches!(group.kind, weft_core::project::GroupKind::Call { .. }) {
+                continue;
+            }
+            let Some(value) = &port.value else { continue };
+            if let Err(why) = port.port_type.validate_value(value) {
+                push(d, &[group.id.as_str()], file, port.span.unwrap_or(span), Severity::Error, "config-type-mismatch", format!(
+                    "the value of metadata port '{}.{}' does not fit its type '{}': {why}",
+                    weft_core::project::plain_id(&group.id), port.name, port.port_type,
+                ));
+            }
+        }
+    }
 }
 
 /// The entries a node derives its ports from (a form's `fields`, a
@@ -3859,10 +4099,13 @@ fn check_name_casing(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
             continue;
         }
         let mut seen_ports = Vec::new();
-        for port in group.in_ports.iter().chain(&group.out_ports) {
+        for port in group.in_ports.iter().map(|p| &p.port).chain(&group.out_ports) {
             if !port.synthesized_from_carry && !is_gate_port(&port.name) {
                 warn(d, &group.id, file, span, &mut seen_ports, "port", &port.name);
             }
+        }
+        for port in &group.metadata_ports {
+            warn(d, &group.id, file, span, &mut seen_ports, "metadata port", &port.name);
         }
     }
 }

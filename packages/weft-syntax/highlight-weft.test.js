@@ -74,6 +74,27 @@ describe('a weft block', () => {
     );
   });
 
+  it('paints Json and JsonDict each as one whole type word', () => {
+    const painted = paint('n = Exec(a: Json, b: JsonDict) -> (c: List[Json]) {}');
+    expect(painted).toContain('<span class="hljs-type">Json</span>,');
+    expect(painted).toContain('<span class="hljs-type">JsonDict</span>)');
+    expect(painted).toContain('[<span class="hljs-type">Json</span>]');
+  });
+
+  it('paints the metadata-port star in a header output list', () => {
+    expect(paint('s = Group(q: String) -> (results: String, *tool: LlmTool) {}')).toContain(
+      ', <span class="hljs-keyword">*</span><span class="hljs-attr">tool</span>:',
+    );
+    expect(paint('a = Loop(x: String) -> (*meta, y: String) {}')).toContain(
+      '(<span class="hljs-keyword">*</span>meta,',
+    );
+  });
+
+  it('leaves a star in a string or a comment alone', () => {
+    expect(paint('k: "*tool: x"')).not.toContain('<span class="hljs-keyword">*</span>');
+    expect(paint('# *tool: x')).not.toContain('<span class="hljs-keyword">*</span>');
+  });
+
   // The four rules where this grammar and the tmLanguage most easily
   // drift from the lexer. Each case pins the LEXER's answer.
 

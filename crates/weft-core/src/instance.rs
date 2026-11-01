@@ -452,8 +452,9 @@ pub type InstanceValues = std::collections::BTreeMap<String, PlaceValues>;
 /// A change to one instance's values: fields given a value, and fields
 /// cleared (which then fall back as if never given). What a store call
 /// asks for, and what the setup it re-arms runs with before the change is
-/// stored.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// stored. Carried by the task that re-arms them (weft-internal, so its
+/// fields keep Rust's spelling).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ValueChanges {
     pub set: InstanceValues,
     /// `(place, field)` pairs.
@@ -592,7 +593,7 @@ pub fn rule_gaps(
         .rules
         .iter()
         .filter(|rule| rule.then.severity == crate::node::RuleSeverity::Error)
-        .filter(|rule| crate::rules::fires(rule, filled, cx, &rules.custom_outputs))
+        .filter(|rule| crate::rules::fires(rule, filled, cx, &rules.custom))
         .map(|rule| match rule.then.field.as_deref() {
             Some(field)
                 if !filled.port_literals.contains_key(field)
@@ -600,7 +601,7 @@ pub fn rule_gaps(
             {
                 format!("instance '{instance}' has not filled '{place}.{field}'")
             }
-            _ => format!("instance '{instance}' at '{place}': {}", crate::rules::message(rule, filled, cx, &rules.custom_outputs)),
+            _ => format!("instance '{instance}' at '{place}': {}", crate::rules::message(rule, filled, cx, &rules.custom)),
         })
         .collect()
 }
@@ -630,7 +631,7 @@ pub fn instance_field_needed(
             rules.rules.iter().any(|rule| {
                 rule.then.severity == crate::node::RuleSeverity::Error
                     && rule.then.field.as_deref() == Some(field)
-                    && crate::rules::fires(rule, &empty, cx, &rules.custom_outputs)
+                    && crate::rules::fires(rule, &empty, cx, &rules.custom)
             })
         })
 }

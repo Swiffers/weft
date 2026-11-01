@@ -64,7 +64,7 @@ struct SummaryRow {
     ended_at: Option<i64>,
     outcome: Option<String>,
     error: Option<String>,
-    cancel_cause: Option<db::Json<weft_core::run::CancelCause>>,
+    cancel_cause: Option<db::JsonText<weft_core::run::CancelCause>>,
     skipped: i32,
     instance_id: Option<String>,
     tags: Vec<String>,
@@ -217,9 +217,15 @@ async fn cancel_unowned_in(
     program: Option<&weft_core::ProjectDefinition>,
     cause: &weft_core::run::CancelCause,
 ) -> anyhow::Result<usize> {
-    let events = weft_journal::record::read_record(tx, run_id, None).await?.events(run_id).map_err(anyhow::Error::msg)?;
     let now = crate::lease::now_unix() as u64;
-    let writes = crate::api::run::cancel_terminal_events(run_id, &events, program, cause, now)?;
+    let read = crate::api::run::CancelRead::new(run_id, program.cloned().map(std::sync::Arc::new));
+    let read = weft_journal::record::fold_pages(|after| weft_journal::record::read_page(tx, run_id, after), None, read, move |read: &mut crate::api::run::CancelRead, page| {
+        let rows = page.decode(run_id).map_err(anyhow::Error::msg)?;
+        rows.iter().for_each(|row| read.apply(&row.event));
+        Ok(())
+    })
+    .await?;
+    let writes = read.into_events(cause, now);
     let node_cancellations = writes.iter().filter(|write| matches!(write, RunEvent::NodeCancelled { .. })).count();
     match weft_journal::record::append_locked_in(tx, run_id, locked, &writes, weft_journal::record::DISPATCHER, Then::Stays).await? {
         Appended::At(_) => Ok(node_cancellations),
@@ -233,7 +239,7 @@ async fn cancel_unowned_in(
 /// one schema pass, never here.
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "run",
-    tables: &["run", "run_log", "signal_token", "signal", "run_tag", "trigger_setup", "trigger_bake"],
+    tables: &["run", "run_log", "run_cost", "run_secret", "signal_token", "signal", "run_tag", "trigger_setup", "trigger_bake"],
     ddl: &[
         // One row per trigger setup in flight. Several may run at once for
         // one project (each activation claims its own triggers, one instance's
@@ -258,10 +264,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             bake_json TEXT NOT NULL,
             -- The version `bake_json` was written at (`TriggerBake::STORED`).
             bake_json_version INTEGER NOT NULL,
-            -- The source version it baked, which a version's removal
-            -- deletes its bakes by: Postgres copies it out of the bake, so
-            -- it can never disagree with it.
-            source_version TEXT GENERATED ALWAYS AS (bake_json::jsonb ->> 'sourceVersion') STORED
+            -- The source version it baked (the bake's `sourceVersion`),
+            -- which a version's removal deletes its bakes by: written from
+            -- the bake with it. Not copied out by Postgres: reading the
+            -- bake as JSONB refuses one whose captured values hold a NUL.
+            source_version TEXT NOT NULL
         )"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_trigger_bake_key
              ON trigger_bake(project_id, instance_id, program_hash) NULLS NOT DISTINCT"#,
@@ -307,7 +314,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- started by hand. NULL and empty for every other run.
             seed_of UUID,
             stale TEXT[] NOT NULL DEFAULT '{}',
-            spec JSONB,
+            -- As its JSON text (`db::JsonText`), like `cancel_requested` and
+            -- `cancel_cause`: each holds words from the run's nodes or from
+            -- outside, and comes back exactly.
+            spec TEXT,
             -- The version `spec` was written at (`RunSpec::STORED`).
             spec_version INTEGER NOT NULL,
             example TEXT,
@@ -360,7 +370,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- project's worker levers, so only a queued run carries it.
             waited_on_workers BOOLEAN NOT NULL DEFAULT FALSE,
             -- A cancel waiting for its owner to write the run's ending.
-            cancel_requested JSONB,
+            cancel_requested TEXT,
             -- It holds resume signals the dispatcher has to take down now
             -- that it ended (set by its ending, cleared once handled).
             holds_signals BOOLEAN NOT NULL DEFAULT FALSE,
@@ -372,13 +382,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- completed | failed | cancelled
             outcome TEXT,
             error TEXT,
-            cancel_cause JSONB,
+            cancel_cause TEXT,
             -- Node firings it skipped.
             skipped INTEGER NOT NULL DEFAULT 0,
             -- It stored files of its own, which its ending's sweep reclaims.
             wrote_files BOOLEAN NOT NULL DEFAULT FALSE,
-            -- What its metered calls cost, in micro-dollars.
-            cost_micro_usd BIGINT NOT NULL DEFAULT 0,
             -- How long it is kept once it ended, in seconds (NULL: for
             -- ever), and the moment that runs out, set when it ends.
             keep_for BIGINT,
@@ -448,6 +456,90 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         )"#,
         // Already compressed: Postgres compressing it again gains nothing.
         r#"ALTER TABLE run_log ALTER COLUMN events SET STORAGE EXTERNAL"#,
+        // run_cost: one row per cost a run's record reports
+        // (`CostReported`), written with the record's row that carries it,
+        // in the same statement or transaction (`weft_journal::costs`), so
+        // `ctx.costs()` reads one table and no record. Its project and
+        // instance are its run's, copied so the reads that narrow by them
+        // use the index; its `seq` (where the write carrying it starts) and
+        // `idx` (its place among that write's events) are its place in the
+        // record. The node is kept as its id and the call path it ran
+        // under, and spelled as an address on read. Rows go with the run
+        // (`erase_run_ids`).
+        // SYNC: run_cost's columns <-> weft_journal::costs (Cost, CostColumns, list), weft_record_costs
+        r#"CREATE TABLE IF NOT EXISTS run_cost (
+            run_id UUID NOT NULL,
+            cost_id TEXT NOT NULL,
+            project_id UUID NOT NULL,
+            instance_id TEXT,
+            seq INTEGER NOT NULL,
+            idx INTEGER NOT NULL,
+            node_id TEXT NOT NULL,
+            call_path TEXT[] NOT NULL,
+            service TEXT NOT NULL,
+            model TEXT,
+            -- NULL when the service's price could not be measured.
+            amount_usd DOUBLE PRECISION,
+            -- Whose credential the call spent (`PaidBy::as_str`), and the
+            -- instance for an instance's.
+            paid_by TEXT NOT NULL,
+            paid_by_instance TEXT,
+            at_unix BIGINT NOT NULL,
+            PRIMARY KEY (run_id, cost_id),
+            CONSTRAINT run_cost_paid_by
+                CHECK (paid_by IN ('platform', 'author', 'instance') AND (paid_by = 'instance') = (paid_by_instance IS NOT NULL))
+        )"#,
+        // What `ctx.costs()` narrows by: a project's costs, an instance's,
+        // since a moment.
+        r#"CREATE INDEX IF NOT EXISTS run_cost_by_instance ON run_cost (project_id, instance_id, at_unix)"#,
+        // Write costs (`weft_journal::costs::CostColumns`, its arrays
+        // aligned, the call paths flattened by cost ordinal) onto the runs
+        // they name, each once: a cost already there, written by a write
+        // sent again, stays as it is, and a cost whose run is not there (a
+        // run its batch did not take: `weft_record_batch` names it NULL)
+        // goes nowhere.
+        // SYNC: weft_record_costs's parameters <-> weft_journal::costs::CostColumns
+        r#"CREATE OR REPLACE FUNCTION weft_record_costs(
+                p_run UUID[], p_seq INTEGER[], p_cost_id TEXT[], p_idx INTEGER[], p_node TEXT[], p_service TEXT[],
+                p_model TEXT[], p_amount DOUBLE PRECISION[], p_paid_by TEXT[], p_paid_by_instance TEXT[], p_at BIGINT[],
+                p_path_cost INTEGER[], p_path_site TEXT[]
+            ) RETURNS VOID AS $$
+                WITH paths AS (
+                    SELECT s.cost, array_agg(s.site ORDER BY s.n) AS call_path
+                    FROM unnest(p_path_cost, p_path_site) WITH ORDINALITY AS s(cost, site, n)
+                    GROUP BY s.cost
+                )
+                INSERT INTO run_cost (run_id, cost_id, project_id, instance_id, seq, idx, node_id, call_path, service, model,
+                                      amount_usd, paid_by, paid_by_instance, at_unix)
+                SELECT c.run, c.cost_id, r.project_id, r.instance_id, c.seq, c.idx, c.node, COALESCE(p.call_path, '{}'),
+                       c.service, c.model, c.amount, c.paid_by, c.paid_by_instance, c.at
+                FROM unnest(p_run, p_seq, p_cost_id, p_idx, p_node, p_service, p_model, p_amount, p_paid_by,
+                            p_paid_by_instance, p_at)
+                        WITH ORDINALITY AS c(run, seq, cost_id, idx, node, service, model, amount, paid_by,
+                                             paid_by_instance, at, n)
+                    JOIN run r ON r.run_id = c.run
+                    LEFT JOIN paths p ON p.cost = c.n
+                ORDER BY c.run, c.cost_id
+                ON CONFLICT (run_id, cost_id) DO NOTHING
+            $$ LANGUAGE sql"#,
+        // run_secret: the value of each secret a run made
+        // (`weft_core::secret`), whose marker is all its record holds.
+        // Written with the batch that carries the run's rows
+        // (`weft_record_batch`), sealed by the broker before it is bound
+        // (`seal_json`'s base64, under the connection-secret key: text
+        // weft made, never the node's value itself), and read back only by
+        // a worker of the same project revealing it (`project_id` is the
+        // scope). It lives exactly as long as the record of the run that
+        // made it (`erase_run_ids`).
+        // SYNC: run_secret's columns <-> weft_journal::record::record_batch (p_secret_*), weft_broker's reveal (records.rs)
+        r#"CREATE TABLE IF NOT EXISTS run_secret (
+            secret_id UUID PRIMARY KEY,
+            project_id UUID NOT NULL,
+            run_id UUID NOT NULL,
+            sealed TEXT NOT NULL
+        )"#,
+        // What a run's erase deletes by.
+        r#"CREATE INDEX IF NOT EXISTS run_secret_by_run ON run_secret (run_id)"#,
         // signal_token: token-scoped enumeration credential. Allow
         // sets are TEXT[] arrays so parameterized binding gives no
         // SQL-injection surface and the filter SQL is a single `&&`
@@ -533,8 +625,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- for After-style schedules so a listener restart
             -- doesn't reset the clock. Future stateful kinds (e.g.
             -- SSE last-event-id, socket reconnect token) use the
-            -- same column.
-            kind_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+            -- same column. As its JSON text (`db::JsonText`), like
+            -- `port_snapshot` and `auth_config`: a kind keeps what an
+            -- outside service answered in it, and reads it back exactly.
+            kind_state TEXT NOT NULL DEFAULT '{}',
             -- The kind_state write fence: a strictly-increasing
             -- per-signal version stamped by the holder's durable
             -- cursor writes. An update whose seq is not above the
@@ -550,7 +644,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- (entry signals only). Replayed onto the trigger's ports at
             -- every fire: a trigger's inputs are whatever they were at
             -- trigger setup.
-            port_snapshot JSONB,
+            port_snapshot TEXT,
             consumer_payload TEXT,
             surface_kind TEXT NOT NULL DEFAULT 'task_callback',
             -- A public entry's route pattern under its tenant
@@ -573,7 +667,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- started by hand, which no activation governs.
             activation_trigger TEXT,
             auth_kind TEXT NOT NULL DEFAULT 'none',
-            auth_config JSONB,
+            auth_config TEXT,
             -- Whether the signal keeps a connection to the outside open
             -- between fires (its kind's decision for it, from the
             -- listener's `/prepare`): a holder holds it, and the number
@@ -605,8 +699,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             let_go_failed TEXT,
             -- What its holder says the connection is doing
             -- (`{"status", "transport"}`), for the node's display, which
-            -- another process renders. NULL while nobody holds it.
-            serving JSONB,
+            -- another process renders, as its JSON text (`db::JsonText`):
+            -- its status quotes why a connection went down. NULL while
+            -- nobody holds it.
+            serving TEXT,
             -- Its connection (`access_id`) changed or went since this
             -- registration began (`signal_access_stale`): a listener copy
             -- may still keep the old credentials for it, so it is
@@ -668,7 +764,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // held set changes: a held signal comes or goes (so the holders
         // start as the first one is registered and stop with the last),
         // gives up, or loses its holder (a let-go, a rewrite, a dead
-        // holder's check), so another holder takes it.
+        // holder's check), so another holder takes it, or moves from one
+        // holder to another (a hand-over to a spare), so the spare looks
+        // and brings it up.
         // SYNC: 'weft_held_signals' <-> crate::holders::HELD_SIGNALS_CHANNEL
         r#"CREATE OR REPLACE FUNCTION signal_held_notify() RETURNS trigger AS $$
             BEGIN
@@ -698,7 +796,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE TRIGGER signal_held_on_release
             AFTER UPDATE OF held_by ON signal
             FOR EACH ROW
-            WHEN (NEW.holds AND NEW.held_by IS NULL AND OLD.held_by IS NOT NULL)
+            WHEN (NEW.holds AND OLD.held_by IS NOT NULL AND NEW.held_by IS DISTINCT FROM OLD.held_by)
             EXECUTE FUNCTION signal_held_notify()"#,
         // Tell every dispatcher a tenant's routes changed, so its copy of
         // them (`crate::held::Held::routes`) is read again: a public entry
@@ -819,8 +917,12 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // `project_json_version`), both required: a broker of the release
         // before versions is refused by the writer guard before it gets
         // here, and a current broker fills what an older worker left out.
-        // Per run (the `p_ids` arrays, aligned; `p_born` and `p_ended` are
-        // JSON arrays aligned the same way, `null` where it does not apply):
+        // Per run (the `p_ids` arrays, aligned; `p_born` is a JSON array
+        // aligned the same way, `null` where it does not apply, and holds
+        // only words weft makes itself; the ending is four arrays, all
+        // NULL for a run that does not end here, so its error and cause,
+        // which carry text from the run's nodes, are values of their own
+        // and never JSON the database parses):
         //   - a run that starts here (`first_seq = 0`) is inserted, already
         //     ended when it ends in the same batch;
         //   - a run that goes on is applied only when it follows on from its
@@ -834,9 +936,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         //     is "refused", like anything else.
         // Rows are locked in id order, the order every writer of run rows
         // takes them in. Only the runs applied now bring their rows, their
-        // answers taken (`p_resolved_*`, by run ordinal), their version
-        // counts (on this lane's own row), their search queue entry and
-        // their storage sweep. A run born running counts as its writer's
+        // answers taken (`p_resolved_*`, by run ordinal), their costs
+        // (`p_cost_*`, by run ordinal, through `weft_record_costs`), their
+        // secrets (`p_secret_*`, by run ordinal, sealed already, each kept
+        // once), their version counts (on this lane's own row), their search queue entry
+        // and their storage sweep. A run born running counts as its writer's
         // until `p_delivered_until`, before the writer's lease is written.
         // Answers each run's fate, its project, whether it ended now with
         // somebody to tell (`watch_end`, `holds_signals`), for one that
@@ -848,9 +952,14 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         concat!(r#"CREATE OR REPLACE FUNCTION weft_record_batch(
                 p_writer TEXT, p_tenant TEXT, p_lane TEXT, p_now BIGINT, p_delivered_until BIGINT, p_durable BOOLEAN,
                 p_ids UUID[], p_epochs INTEGER[], p_first INTEGER[], p_last INTEGER[],
-                p_costs BIGINT[], p_skipped INTEGER[], p_wrote BOOLEAN[], p_born JSONB, p_ended JSONB,
+                p_skipped INTEGER[], p_wrote BOOLEAN[], p_born JSONB,
+                p_ended_at BIGINT[], p_outcomes TEXT[], p_errors TEXT[], p_cancel_causes TEXT[],
                 p_row_run INTEGER[], p_row_seq INTEGER[], p_row_events BYTEA[],
                 p_resolved_run INTEGER[], p_resolved_token TEXT[],
+                p_cost_run INTEGER[], p_cost_seq INTEGER[], p_cost_id TEXT[], p_cost_idx INTEGER[], p_cost_node TEXT[],
+                p_cost_service TEXT[], p_cost_model TEXT[], p_cost_amount DOUBLE PRECISION[], p_cost_paid_by TEXT[],
+                p_cost_paid_by_instance TEXT[], p_cost_at BIGINT[], p_cost_path_cost INTEGER[], p_cost_path_site TEXT[],
+                p_secret_run INTEGER[], p_secret_id UUID[], p_secret_sealed TEXT[],
                 p_programs JSONB, p_events_version INTEGER
             ) RETURNS TABLE (o_run_id UUID, o_fate TEXT, o_project_id UUID, o_tell_end BOOLEAN, o_keep_until BIGINT,
                              o_unwatched BOOLEAN) AS $$
@@ -876,22 +985,23 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                     INSERT INTO run (run_id, project_id, tenant_id, phase, kind, keeping, recorded, entry_node,
                                      instance_id, fired_by, source_version, definition_hash, cut_from, binary_hash,
                                      seed_of, state, owner, epoch, last_seq, started_at, ended_at, outcome, error,
-                                     cancel_cause, skipped, wrote_files, cost_micro_usd, keep_for, keep_until,
+                                     cancel_cause, skipped, wrote_files, keep_for, keep_until,
                                      delivered_until, spec_version)
                     SELECT v.id, (x.b->>'project_id')::uuid, p_tenant, x.b->>'phase', x.b->>'kind', x.b->>'keeping',
                            (x.b->>'recorded')::boolean, x.b->>'entry_node', x.b->>'instance_id', x.b->>'fired_by',
                            x.b->>'source_version', x.b->>'definition_hash', x.b->>'cut_from', x.b->>'binary_hash',
                            (x.b->>'seed_of')::uuid,
-                           CASE WHEN x.e IS NULL THEN 'running' ELSE 'ended' END,
-                           CASE WHEN x.e IS NULL THEN p_writer END,
-                           v.epoch, v.last_seq, (x.b->>'started_at')::bigint, (x.e->>'at')::bigint, x.e->>'outcome',
-                           x.e->>'error', x.e->'cancel_cause', v.skipped, v.wrote, v.costs, (x.b->>'keep_for')::bigint,
-                           (x.e->>'at')::bigint + (x.b->>'keep_for')::bigint,
-                           CASE WHEN x.e IS NULL THEN p_delivered_until END, (x.b->>'spec_version')::integer
-                    FROM unnest(p_ids, p_epochs, p_last, p_costs, p_skipped, p_wrote, v_fates)
-                            WITH ORDINALITY AS v(id, epoch, last_seq, costs, skipped, wrote, fate, n)
-                        CROSS JOIN LATERAL (SELECT p_born->(v.n::integer - 1) AS b,
-                                                   NULLIF(p_ended->(v.n::integer - 1), 'null'::jsonb) AS e) x
+                           CASE WHEN v.ended_at IS NULL THEN 'running' ELSE 'ended' END,
+                           CASE WHEN v.ended_at IS NULL THEN p_writer END,
+                           v.epoch, v.last_seq, (x.b->>'started_at')::bigint, v.ended_at, v.outcome,
+                           v.error, v.cancel_cause, v.skipped, v.wrote, (x.b->>'keep_for')::bigint,
+                           v.ended_at + (x.b->>'keep_for')::bigint,
+                           CASE WHEN v.ended_at IS NULL THEN p_delivered_until END, (x.b->>'spec_version')::integer
+                    FROM unnest(p_ids, p_epochs, p_last, p_skipped, p_wrote, v_fates,
+                                p_ended_at, p_outcomes, p_errors, p_cancel_causes)
+                            WITH ORDINALITY AS v(id, epoch, last_seq, skipped, wrote, fate,
+                                                 ended_at, outcome, error, cancel_cause, n)
+                        CROSS JOIN LATERAL (SELECT p_born->(v.n::integer - 1) AS b) x
                     WHERE v.fate = 'insert'
                       AND EXISTS (SELECT 1 FROM project p WHERE p.id = (x.b->>'project_id')::uuid AND NOT p.removing)
                     ORDER BY v.id
@@ -928,21 +1038,38 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                     ON CONFLICT (project_id, definition_hash) DO NOTHING;
                 UPDATE run r SET
                         last_seq = v.last_seq,
-                        cost_micro_usd = r.cost_micro_usd + v.costs,
                         skipped = r.skipped + v.skipped,
                         wrote_files = r.wrote_files OR v.wrote,
-                        state = CASE WHEN x.e IS NULL THEN r.state ELSE 'ended' END,
-                        owner = CASE WHEN x.e IS NULL THEN r.owner END,
-                        ended_at = (x.e->>'at')::bigint,
-                        outcome = x.e->>'outcome',
-                        error = x.e->>'error',
-                        cancel_cause = x.e->'cancel_cause',
-                        keep_until = (x.e->>'at')::bigint + r.keep_for,
-                        holds_signals = x.e IS NOT NULL AND EXISTS (SELECT 1 FROM signal s WHERE s.run_id = r.run_id)
-                    FROM unnest(p_ids, p_last, p_costs, p_skipped, p_wrote, v_fates)
-                            WITH ORDINALITY AS v(id, last_seq, costs, skipped, wrote, fate, n)
-                        CROSS JOIN LATERAL (SELECT NULLIF(p_ended->(v.n::integer - 1), 'null'::jsonb) AS e) x
+                        state = CASE WHEN v.ended_at IS NULL THEN r.state ELSE 'ended' END,
+                        owner = CASE WHEN v.ended_at IS NULL THEN r.owner END,
+                        ended_at = v.ended_at,
+                        outcome = v.outcome,
+                        error = v.error,
+                        cancel_cause = v.cancel_cause,
+                        keep_until = v.ended_at + r.keep_for,
+                        holds_signals = v.ended_at IS NOT NULL AND EXISTS (SELECT 1 FROM signal s WHERE s.run_id = r.run_id)
+                    FROM unnest(p_ids, p_last, p_skipped, p_wrote, v_fates,
+                                p_ended_at, p_outcomes, p_errors, p_cancel_causes)
+                            WITH ORDINALITY AS v(id, last_seq, skipped, wrote, fate,
+                                                 ended_at, outcome, error, cancel_cause, n)
                     WHERE v.fate = 'continue' AND r.run_id = v.id;
+                -- Each cost is named by its run's ordinal, which names the
+                -- run only when the run went in now: any other's costs go
+                -- nowhere.
+                PERFORM weft_record_costs(
+                    ARRAY(SELECT CASE WHEN v_fates[c.run] IN ('insert', 'continue') THEN p_ids[c.run] END
+                          FROM unnest(p_cost_run) WITH ORDINALITY AS c(run, n) ORDER BY c.n),
+                    p_cost_seq, p_cost_id, p_cost_idx, p_cost_node, p_cost_service, p_cost_model, p_cost_amount,
+                    p_cost_paid_by, p_cost_paid_by_instance, p_cost_at, p_cost_path_cost, p_cost_path_site);
+                -- A run's secrets go in only when the run did, each once:
+                -- a batch sent again finds them there.
+                INSERT INTO run_secret (secret_id, project_id, run_id, sealed)
+                    SELECT s.id, r.project_id, r.run_id, s.sealed
+                    FROM unnest(p_secret_run, p_secret_id, p_secret_sealed) AS s(run, id, sealed)
+                        JOIN run r ON r.run_id = p_ids[s.run]
+                    WHERE v_fates[s.run] IN ('insert', 'continue')
+                    ORDER BY s.id
+                    ON CONFLICT (secret_id) DO NOTHING;
                 INSERT INTO run_log (run_id, seq, events, events_version, writer, written_at)
                     SELECT p_ids[w.run], w.seq, w.events, p_events_version, p_writer, p_now
                     FROM unnest(p_row_run, p_row_seq, p_row_events) AS w(run, seq, events)
@@ -956,7 +1083,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- has nobody left to take it.
                 DELETE FROM parked_fire pf
                     USING unnest(p_ids, v_fates) WITH ORDINALITY AS v(id, fate, n)
-                    WHERE v.fate IN ('insert', 'continue') AND p_ended->(v.n::integer - 1) <> 'null'::jsonb
+                    WHERE v.fate IN ('insert', 'continue') AND p_ended_at[v.n::integer] IS NOT NULL
                       AND pf.run_id = v.id;
                 INSERT INTO version_runs (project_id, source_version, lane, runs, last_run)
                     SELECT (x.b->>'project_id')::uuid, x.b->>'source_version', p_lane, count(*),
@@ -974,14 +1101,14 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                     SELECT r.run_id
                     FROM unnest(p_ids, v_fates) WITH ORDINALITY AS v(id, fate, n)
                         JOIN run r ON r.run_id = v.id
-                    WHERE v.fate IN ('insert', 'continue') AND p_ended->(v.n::integer - 1) <> 'null'::jsonb
+                    WHERE v.fate IN ('insert', 'continue') AND p_ended_at[v.n::integer] IS NOT NULL
                       AND r.recorded
                     ON CONFLICT (run_id) DO NOTHING;
                 INSERT INTO storage_sweep (run_id, tenant_id, enqueued_at_unix)
                     SELECT r.run_id, r.tenant_id, p_now
                     FROM unnest(p_ids, v_fates) WITH ORDINALITY AS v(id, fate, n)
                         JOIN run r ON r.run_id = v.id
-                    WHERE v.fate IN ('insert', 'continue') AND p_ended->(v.n::integer - 1) <> 'null'::jsonb
+                    WHERE v.fate IN ('insert', 'continue') AND p_ended_at[v.n::integer] IS NOT NULL
                       AND r.wrote_files
                     ON CONFLICT (run_id) DO NOTHING;
                 IF 'insert' = ANY(v_fates) THEN
@@ -994,7 +1121,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                            r.project_id,
                            COALESCE(v.fate IN ('insert', 'continue') AND r.state = 'ended'
                                     AND (r.watch_end OR r.holds_signals), FALSE),
-                           CASE WHEN v.fate IN ('insert', 'continue') AND p_ended->(v.n::integer - 1) <> 'null'::jsonb
+                           CASE WHEN v.fate IN ('insert', 'continue') AND p_ended_at[v.n::integer] IS NOT NULL
                                 THEN r.keep_until END,
                            COALESCE(v.fate = 'insert' AND r.state = 'running' AND NOT v_writer_alive, FALSE)
                     FROM unnest(p_ids, v_fates) WITH ORDINALITY AS v(id, fate, n)
@@ -1004,7 +1131,14 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             $$ LANGUAGE plpgsql"#),
     ],
     seed: &[],
-    data_steps: &[],
+    // A database an older weft kept only each run's total cost in
+    // (`run.cost_micro_usd`) gets every cost its records report as a row
+    // of `run_cost`, read out of the records, before the column goes.
+    data_steps: &[weft_task_store::DataStep {
+        table: "run",
+        until: weft_task_store::Until::Dropped("cost_micro_usd"),
+        work: weft_task_store::StepWork::Code(weft_journal::costs::carry_from_records),
+    }],
 };
 
 #[async_trait]
@@ -1048,9 +1182,11 @@ impl BakeStore for PostgresStore {
                 None => bake.clone(),
             };
             tx.execute(
-                "INSERT INTO trigger_bake (project_id, instance_id, program_hash, bake_json, bake_json_version) VALUES ($1, $2, $3, $4, $5) \
-                 ON CONFLICT (project_id, instance_id, program_hash) DO UPDATE SET bake_json = EXCLUDED.bake_json, bake_json_version = EXCLUDED.bake_json_version",
-                &[&project_id, &instance, &digest, &serde_json::to_string(&merged)?, &super::TriggerBake::STORED.version()],
+                "INSERT INTO trigger_bake (project_id, instance_id, program_hash, bake_json, bake_json_version, source_version) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (project_id, instance_id, program_hash) DO UPDATE SET bake_json = EXCLUDED.bake_json, \
+                     bake_json_version = EXCLUDED.bake_json_version, source_version = EXCLUDED.source_version",
+                &[&project_id, &instance, &digest, &db::JsonText(&merged), &super::TriggerBake::STORED.version(), &merged.source_version],
             )
             .await?;
         }
@@ -1092,14 +1228,20 @@ impl RunStore for PostgresStore {
         Ok(appended)
     }
 
-    async fn events_log_lossy(
-        &self,
-        run_id: RunId,
-    ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<RunEvent>>, Vec<String>)> {
-        let conn = self.pool.get().await?;
-        let record = weft_journal::record::read_record(&conn, run_id, None).await?;
-        let (rows, bad) = record.decode_lossy(run_id);
-        Ok((rows.into_iter().map(|row| crate::events::IdentifiedEvent::recorded(row.seq, row.index, row.event)).collect(), bad))
+    async fn record_page(&self, run_id: RunId, after: Option<i32>) -> anyhow::Result<weft_journal::record::RawRecord> {
+        weft_journal::record::read_page(&self.pool, run_id, after).await
+    }
+
+    async fn written_past(&self, past: &[(RunId, Option<i32>)]) -> anyhow::Result<Vec<RunId>> {
+        weft_journal::record::written_past(&self.pool, past).await
+    }
+
+    async fn record_first_row(&self, run_id: RunId) -> anyhow::Result<Option<weft_journal::record::RunLogRow>> {
+        weft_journal::record::read_first_row(&self.pool, run_id).await
+    }
+
+    async fn record_rows(&self, run_id: RunId, seqs: &[i32]) -> anyhow::Result<weft_journal::record::RawRecord> {
+        weft_journal::record::read_rows(&self.pool, run_id, seqs).await
     }
 
     async fn queue_run(&self, queued: Queued<'_>, for_activation: bool) -> anyhow::Result<bool> {
@@ -1153,7 +1295,7 @@ impl RunStore for PostgresStore {
         match locked {
             Some(locked) if locked.state == "ended" => {}
             Some(locked) if locked.owner.is_some() => {
-                tx.execute("UPDATE run SET cancel_requested = $2 WHERE run_id = $1", &[&run_id, &db::Json(cause)]).await?;
+                tx.execute("UPDATE run SET cancel_requested = $2 WHERE run_id = $1", &[&run_id, &db::JsonText(cause)]).await?;
                 // Announced, and the install's news for the copy holding
                 // the line of the run's worker (`weft_task_store::announce`).
                 // SYNC: 'cancel' <-> weft_task_store::announce::kind_named
@@ -1276,20 +1418,24 @@ impl RunStore for PostgresStore {
         // code the fake runs: lines of parallel firings reach the record
         // in whatever order they ran, so the record's order is not the
         // order they were written in.
-        let conn = self.pool.get().await?;
-        let record = weft_journal::record::read_record(&conn, run_id, None).await?;
-        let written_at: Vec<(i32, i64)> = conn.all("SELECT seq, written_at FROM run_log WHERE run_id = $1", &[&run_id]).await?;
-        let mut entries: Vec<LogEntry> = Vec::new();
-        for row in &record.rows {
-            match weft_journal::stored::decode(run_id, &row.events, row.events_version) {
-                Ok(events) => entries.extend(events.iter().flat_map(LogEntry::from_event)),
-                Err(e) => {
-                    let at = written_at.iter().find(|(seq, _)| *seq == row.seq).map_or(0, |(_, at)| *at);
-                    entries.push(LogEntry::corrupt_row(at as u64, e));
+        // A row that no longer decodes is said with when it was written,
+        // read for those rows alone once the record is read.
+        let (tail, corrupt) = crate::store::fold_record(self, run_id, None, (super::LogTail::new(limit), Vec::new()), move |(tail, corrupt): &mut (super::LogTail, Vec<(i32, String)>), page| {
+            for row in &page.rows {
+                match weft_journal::stored::decode(run_id, &row.events, row.events_version) {
+                    Ok(events) => events.iter().flat_map(LogEntry::from_event).for_each(|entry| tail.push(entry)),
+                    Err(e) => corrupt.push((row.seq, e)),
                 }
             }
+            Ok(())
+        })
+        .await?;
+        let mut tail = tail;
+        for (seq, e) in corrupt {
+            let at: Option<(i64,)> = self.pool.opt("SELECT written_at FROM run_log WHERE run_id = $1 AND seq = $2", &[&run_id, &seq]).await?;
+            tail.push(LogEntry::corrupt_row(at.map_or(0, |(at,)| at) as u64, e));
         }
-        Ok(LogEntry::tail(entries, limit))
+        Ok(tail.into_entries())
     }
 
     async fn list_runs(&self, tenant: &str, query: &RunListQuery) -> anyhow::Result<RunPage> {
@@ -1840,10 +1986,11 @@ async fn erase_run_ids(
         .context("erase runs: read a resume signal row")?;
     let removed = rows.into_iter().map(row_to_signal).collect::<anyhow::Result<Vec<_>>>()?;
     tx.execute("DELETE FROM parked_fire WHERE run_id = ANY($1)", &[&run_ids]).await?;
-    // The queue before the entries: a search building a run's entry holds
-    // its queue row, so the erase waits for it there and then removes the
-    // entry it wrote.
-    for table in ["run_search_queue", "run_search", "run_log", "run"] {
+    // The queue before the entries: a search writes a run's entry in the
+    // one statement that takes its queue row, so it either waits for this
+    // erase and finds the row gone (writing nothing), or wrote first and
+    // its entry goes here.
+    for table in ["run_search_queue", "run_search", "run_cost", "run_secret", "run_log", "run"] {
         tx.execute(&format!("DELETE FROM {table} WHERE run_id = ANY($1)"), &[&run_ids]).await?;
     }
     // A queued run its workers had failed (busy, refused, not reached)
@@ -2045,11 +2192,11 @@ pub(crate) async fn write_fresh_places(db: &impl Client, places: &[crate::store:
     }
     let tokens: Vec<&str> = places.iter().map(|p| p.token.as_str()).collect();
     let seqs: Vec<i64> = places.iter().map(|p| p.kind_state_seq).collect();
-    let states: Vec<&serde_json::Value> = places.iter().map(|p| &p.kind_state).collect();
+    let states: Vec<db::JsonText<&serde_json::Value>> = places.iter().map(|p| db::JsonText(&p.kind_state)).collect();
     let written = db
         .execute(
             "UPDATE signal s SET kind_state = p.kind_state, kind_state_seq = s.kind_state_seq + 1 \
-             FROM unnest($1::text[], $2::bigint[], $3::jsonb[]) AS p(token, seq, kind_state) \
+             FROM unnest($1::text[], $2::bigint[], $3::text[]) AS p(token, seq, kind_state) \
              WHERE s.token = p.token AND s.kind_state_seq = p.seq",
             &[&tokens, &seqs, &states],
         )
@@ -2157,9 +2304,12 @@ const SIGNAL_REFRESHED_COLUMNS: [&str; 18] = [
 struct SignalRefreshed<'s> {
     sig: &'s SignalRegistration,
     spec_json_version: weft_core::stored::Version,
-    program_json: Option<serde_json::Value>,
+    program_json: Option<db::Json<&'s weft_core::project::hash::ProgramIdentity>>,
     program_json_version: weft_core::stored::Version,
     consumer_payload: Option<String>,
+    port_snapshot: Option<db::JsonText<&'s serde_json::Value>>,
+    auth_config: Option<db::JsonText<&'s serde_json::Value>>,
+    kind_state: db::JsonText<&'s serde_json::Value>,
 }
 
 impl<'s> SignalRefreshed<'s> {
@@ -2167,9 +2317,12 @@ impl<'s> SignalRefreshed<'s> {
         Ok(Self {
             sig,
             spec_json_version: weft_core::primitive::SignalSpec::STORED.version(),
-            program_json: sig.program.as_ref().map(serde_json::to_value).transpose()?,
+            program_json: sig.program.as_ref().map(db::Json),
             program_json_version: weft_core::project::hash::ProgramIdentity::STORED.version(),
             consumer_payload: sig.consumer_payload.as_ref().map(serde_json::to_string).transpose()?,
+            port_snapshot: sig.port_snapshot.as_ref().map(db::JsonText),
+            auth_config: sig.auth_config.as_ref().map(db::JsonText),
+            kind_state: db::JsonText(&sig.kind_state),
         })
     }
 
@@ -2186,14 +2339,14 @@ impl<'s> SignalRefreshed<'s> {
             &sig.access_id,
             &sig.consumer_kind,
             &sig.tags,
-            &sig.port_snapshot,
+            &self.port_snapshot,
             &self.consumer_payload,
             &sig.surface_kind,
             &sig.mount_path,
             &sig.mount_methods,
             &sig.auth_kind,
-            &sig.auth_config,
-            &sig.kind_state,
+            &self.auth_config,
+            &self.kind_state,
             &sig.holds,
         ]
     }
@@ -2392,7 +2545,7 @@ impl FromRow for SignalRow {
         Ok(Self {
             setup_run_id: row.try_get("setup_run_id")?,
             source_version: row.try_get("source_version")?,
-            program_json: row.try_get("program_json")?,
+            program_json: row.try_get::<_, Option<db::Json<serde_json::Value>>>("program_json")?.map(|json| json.0),
             program_json_version: row.try_get("program_json_version")?,
             token: row.try_get("token")?,
             tenant_id: row.try_get("tenant_id")?,
@@ -2405,7 +2558,7 @@ impl FromRow for SignalRow {
             access_id: row.try_get("access_id")?,
             consumer_kind: row.try_get("consumer_kind")?,
             tags: row.try_get("tags")?,
-            port_snapshot: row.try_get("port_snapshot")?,
+            port_snapshot: row.try_get::<_, Option<db::JsonText<serde_json::Value>>>("port_snapshot")?.map(|json| json.0),
             consumer_payload: row.try_get("consumer_payload")?,
             surface_kind: row.try_get("surface_kind")?,
             mount_path: row.try_get("mount_path")?,
@@ -2413,8 +2566,8 @@ impl FromRow for SignalRow {
             instance_id: row.try_get("instance_id")?,
             activation_trigger: row.try_get("activation_trigger")?,
             auth_kind: row.try_get("auth_kind")?,
-            auth_config: row.try_get("auth_config")?,
-            kind_state: row.try_get("kind_state")?,
+            auth_config: row.try_get::<_, Option<db::JsonText<serde_json::Value>>>("auth_config")?.map(|json| json.0),
+            kind_state: row.try_get::<_, db::JsonText<serde_json::Value>>("kind_state")?.0,
             kind_state_seq: row.try_get("kind_state_seq")?,
             holds: row.try_get("holds")?,
             generation: row.try_get("generation")?,

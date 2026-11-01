@@ -29,13 +29,37 @@ triggers share, like the schema all their tables live in, is written once and
 wired to each of them; two copies of `create extension if not exists` racing
 each other is how one of them fails on a duplicate key.
 
-So after changing one, `weft resync`. Until then your listener carries on with
+If you want something done once before the triggers listen, like creating the
+table they write to, wire it in front of them. A gate is enough, since any
+value but `false` lets the trigger through:
+
+```weft
+pg = PostgresDatabase {}
+
+schema = PostgresExecuteQuery {
+  account: pg.access
+  query: "create table if not exists cards (id text primary key, title text)"
+}
+
+add = Route { path: "cards", method: "POST" }
+add._should_flow = schema.rows
+
+list = Route { path: "cards", method: "GET" }
+list._should_flow = schema.rows
+```
+
+`schema` runs once, at `weft activate`, before either route listens, and if it
+fails the activation is cancelled. A request never runs it again.
+
+So after changing anything in front of a trigger, `weft resync`. Until then
+`weft status` shows the trigger as behind, and your listener carries on with
 what it registered. weft tells you when a bake is stale:
 
 ```text
 the code changed since trigger 'inbound' was last prepared, so its bake is
-stale. Prepare it again: `weft bake` does it without listening, `weft activate`
-does it and listens
+stale. Prepare it again: `weft bake` does it and changes nothing that listens;
+if the trigger is off, `weft activate` does it and turns it on; if it is on,
+`weft resync` brings it onto the new build and prepares it there
 ```
 
 ## Answering on a URL
@@ -68,7 +92,13 @@ does not fit is answered `400` naming what is wrong, and no node after `post`
 runs. A body carrying a key that `Card` does not declare is answered `400`
 too. If callers may
 send more than you read, end the type with `..`; for what that does, go and
-read [what fits into what](types.md#what-fits-into-what). A request with no body, like a `GET`, closes `body`.
+read [what fits into what](types.md#what-fits-into-what). If callers send JSON
+of any shape, a list or a bare number as well as an object, declare
+`-> (body: Json)`. A request with no body, like a `GET`, closes `body`,
+whatever the route's `dataType`. A json body that is `null` is a value: it
+comes out on a `body` whose type takes `Null` (`Json` does), and closes
+`body` on any other, the way a `null` counts as nothing on a port that does
+not take it.
 
 If you want part of the path as a value, capture it with `{name}` and declare
 an output of the same name:
@@ -83,9 +113,35 @@ card = Route -> (id: String) {
 A call to `cards/42` puts `"42"` on `card.id`. Every other output you add to a
 `Route` has to be a capture of its path, typed `String`, or the build stops
 with `route-output-not-a-capture`. A capture can't share a name with one of
-`Route`'s own outputs (`body`, `method`, `path`, `query`, `headers`, `caller`,
-`fired`), so `cards/{body}` is the `route-capture-shadows-output` error,
+`Route`'s own outputs (`body`, `method`, `path`, `query`, `headers`,
+`credentials`, `caller`, `fired`), so `cards/{body}` is the `route-capture-shadows-output` error,
 asking you to rename the capture.
+
+**A caller's credentials come out on `credentials`, never on `headers`.** The
+headers that carry one (`authorization`, `proxy-authorization`, `cookie`,
+`weft-instance-token`, and any header the route's `auth` reads, like the
+`X-Api-Key` an `ApiKeyAuth` checks) are
+each made a secret the moment the call arrives, before anything of the run is
+written, so the run's record, the inspector, `weft events` and search hold a
+marker in their place and never the value. The value is still there for the
+run, and for the same run picked up after a pause. If you want to pass them
+on, wire them into a port that takes secrets, like an `HttpRequest`'s `headers`, which
+sends them revealed. Here a route hands its caller's credentials on to your
+own backend:
+
+```weft
+me = Route { path: "me", method: "GET" }
+profile = HttpRequest {
+  url: "https://api.internal.example/me"
+  method: "GET"
+}
+profile.headers = me.credentials
+```
+
+A plain `String` port refuses a secret: wired into a `Dict[String, String]`,
+`me.credentials` is a `type-mismatch` telling you the node has to take the
+secret and reveal it. For what a secret is, go and read
+[secrets](types.md#secrets).
 
 **Two routes that one call could reach, where neither is more specific, is an
 error.** `cards/count` beside `cards/{id}` is fine, because the first is more
@@ -230,6 +286,11 @@ and how it ended. Otherwise it leaves nothing. If you want to check that a
 trigger with `recorded` off is being called at all, `weft status` shows how
 many runs each trigger started in the last minute or two, and how many of them
 failed.
+
+If you only want a key kept out of the record, you do not need `recorded`
+off. A value that arrives as a secret (a caller's `credentials`, a node's
+`Secret` output, an `ExecPython` output you declared `Secret[String]`) is
+already kept out. For more, go and read [secrets](types.md#secrets).
 
 An unrecorded run cannot pause, so a timer or a form in it holds
 ([when a run cannot pause](#when-a-run-cannot-pause)). If a node tags it with
@@ -501,6 +562,14 @@ weft run --fire inbound='{"chatId":"123","text":"hello"}'
 
 The payload is checked against what that trigger declared it fires with, both
 ways: a missing field is refused, and so is one you invented.
+
+A route fired this way cannot carry `authorization`, `proxy-authorization`,
+`cookie`, `weft-instance-token`, or a header its `auth` reads a credential
+from (an API key's `X-Api-Key`, a signature's header), nor anything on its
+`credentials` key: a route hands its caller's credentials to the program as
+secrets, which only a real call makes, so the fire is refused, naming the
+header. If you need one, call the route for real (`weft activate`
+prints its URL), or leave the header out.
 
 A run you fire this way follows the trigger's `durable` and `keepRunsFor`, and
 it is always recorded, even when the trigger has `recorded` off, so you can

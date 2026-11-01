@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::json;
-use weft_task_store::db::{self, Client as _, Pool};
+use weft_task_store::db::{self, Client as _, JsonText, Pool};
 
 use weft_access_store::{
     begin_oauth, complete_oauth, connect_direct, delete_grant, list_grants, lookup,
@@ -1671,17 +1671,18 @@ async fn a_shared_door_grant_never_serves_events_with_the_operators_app_values(p
     for (id, door) in [(uuid::Uuid::new_v4(), "shared"), (uuid::Uuid::new_v4(), "own")] {
         pool.execute(
             "INSERT INTO access_grant
-               (id, tenant_id, service, registration_sealed, spec_json, values_sealed,
-                granted_scopes, door, identity, spec_json_version)
-             VALUES ($1, $2, 'fakeoauth', $3, $4, $5, '[]', $6, 'x', $7)",
+               (id, tenant_id, service, registration_sealed, spec, values_sealed,
+                granted_scopes, door, identity, spec_version, exclusive)
+             VALUES ($1, $2, 'fakeoauth', $3, $4, $5, '[]', $6, 'x', $7, $8)",
             &[
                 &id,
                 &TENANT_A,
                 &weft_access_store::seal_json(&serde_json::to_value(&registration).unwrap()).unwrap(),
-                &serde_json::to_value(&spec).unwrap(),
+                &JsonText(&spec),
                 &weft_access_store::seal_json(&json!({ "token": "tok-1" })).unwrap(),
                 &door,
                 &weft_core::AccessSpec::STORED.version(),
+                &(spec.grants == weft_core::access::spec::GrantCoexistence::Exclusive),
             ],
         )
         .await
@@ -2335,7 +2336,8 @@ async fn a_instances_connection_and_values_stay_theirs(pool: Pool) {
         TENANT_A,
         PROJECT_1,
         &ada,
-        &[pick("post", adas.id, "fakestatic"), pick("reply", adas.id, "fakestatic"), plain("read", serde_json::json!("s-1"))],
+        // A plain value keeps what the person typed exactly, a NUL included.
+        &[pick("post", adas.id, "fakestatic"), pick("reply", adas.id, "fakestatic"), plain("read", serde_json::json!("s-\u{0}1"))],
         &[],
     )
     .await
@@ -2346,7 +2348,7 @@ async fn a_instances_connection_and_values_stay_theirs(pool: Pool) {
     assert_eq!(nodes(adas_values.clone()), vec!["post", "read", "reply"]);
     assert_eq!(adas_values["post"]["account"]["id"], serde_json::json!(adas.id));
     assert!(adas_values["post"]["account"].get("identity").is_some(), "a connection value reads back as its handle");
-    assert_eq!(adas_values["read"]["sheet"], serde_json::json!("s-1"));
+    assert_eq!(adas_values["read"]["sheet"], serde_json::json!("s-\u{0}1"));
     assert!(instance_values(&pool, TENANT_B, PROJECT_1, &ada).await.unwrap().is_empty(), "another tenant reads nothing");
     let clear = [("reply".to_string(), "account".to_string())];
     change_instance_values(&conn, TENANT_A, PROJECT_1, &ada, &[], &clear).await.unwrap();
@@ -2377,8 +2379,8 @@ async fn a_instances_connection_and_values_stay_theirs(pool: Pool) {
 
     let orphan = pool
         .execute(
-            "INSERT INTO access_grant (id, tenant_id, service, spec_json, values_sealed, instance_id, spec_json_version) \
-             VALUES ($1, $2, 'fakestatic', '{}', '', 'ada', $3)",
+            "INSERT INTO access_grant (id, tenant_id, service, spec, values_sealed, instance_id, spec_version, exclusive) \
+             VALUES ($1, $2, 'fakestatic', '{}', '', 'ada', $3, FALSE)",
             &[&uuid::Uuid::new_v4(), &TENANT_A, &weft_core::AccessSpec::STORED.version()],
         )
         .await
@@ -3046,8 +3048,8 @@ async fn after_exchange_drops_the_exchanges_refresh_token(pool: Pool) {
     assert_eq!(resolved.values.get("token").map(String::as_str), Some("tok-long"));
 }
 
-/// A database from before `access_grant_exclusive`, where two sign-ins to
-/// one exclusive account raced and left rows (and older code stored the
+/// A database from before `access_grant_one_exclusive`, where two sign-ins
+/// to one exclusive account raced and left rows (and older code stored the
 /// author's row with a project), boots: the rows fold into the one written
 /// last, with every permission any of them held, and everything that named
 /// a folded row (by a column, or inside its text) names the kept one before
@@ -3055,12 +3057,23 @@ async fn after_exchange_drops_the_exchanges_refresh_token(pool: Pool) {
 /// index exists a boot no longer runs it.
 #[weft_db_macros::test]
 async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(pool: Pool) {
-    const CONTRACT: &str = "20261027T151627_access_grant_whole_identity_one_grant.contract";
+    let history = weft_task_store::schema_guard::History::embedded();
+    let contract = history
+        .migrations()
+        .iter()
+        .find(|m| m.group == "access_grant" && m.sql.contains("CREATE UNIQUE INDEX access_grant_one_exclusive"))
+        .expect("a released migration builds access_grant_one_exclusive")
+        .id;
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     // The database as it was before the contract part: no index, the
-    // contract still to run.
-    pool.batch_execute("DROP INDEX access_grant_exclusive").await.unwrap();
-    pool.execute("DELETE FROM weft_migration WHERE group_name = 'access_grant' AND id = $1", &[&CONTRACT]).await.unwrap();
+    // columns it drops still there, the contract still to run.
+    pool.batch_execute(
+        "DROP INDEX access_grant_one_exclusive; \
+         ALTER TABLE access_grant ADD COLUMN spec_json JSONB, ADD COLUMN spec_json_version INTEGER",
+    )
+    .await
+    .unwrap();
+    pool.execute("DELETE FROM weft_migration WHERE group_name = 'access_grant' AND id = $1", &[&contract]).await.unwrap();
     // The dispatcher's `signal` table, which an install holds beside the
     // access store's: only the columns the fold reads and writes.
     pool.batch_execute("CREATE TABLE signal (token TEXT PRIMARY KEY, access_id TEXT, spec_json TEXT NOT NULL)").await.unwrap();
@@ -3070,11 +3083,11 @@ async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(po
         let pool = pool.clone();
         async move {
             pool.execute(
-                "INSERT INTO access_grant (id, tenant_id, service, client_id, project_id, spec_json, spec_json_version, \
+                "INSERT INTO access_grant (id, tenant_id, service, client_id, project_id, spec, spec_version, exclusive, \
                      values_sealed, granted_scopes, identity, updated_at) \
-                 VALUES ($1, $2, 'fakeoauth', 'cid', $3, '{\"grants\": \"exclusive\"}', 1, 'sealed', $4, $5, \
+                 VALUES ($1, $2, 'fakeoauth', 'cid', $3, '{\"grants\": \"exclusive\"}', 1, TRUE, 'sealed', $4::text::jsonb, $5, \
                      now() - make_interval(secs => $6))",
-                &[&id, &TENANT_A, &project, &scopes, &identity, &(age_secs as f64)],
+                &[&id, &TENANT_A, &project, &scopes.to_string(), &identity, &(age_secs as f64)],
             )
             .await
             .unwrap();
@@ -3096,7 +3109,7 @@ async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(po
     pool.execute(
         "INSERT INTO instance_value (tenant_id, project_id, instance_id, node, field, value, grant_id) \
          VALUES ($1, $2, 'alice', 'mail', 'access', $3, $4)",
-        &[&TENANT_A, &PROJECT_1, &json!({"id": oldest.to_string(), "identity": "me@example.com"}), &oldest],
+        &[&TENANT_A, &PROJECT_1, &JsonText(json!({"id": oldest.to_string(), "identity": "me@example.com"})), &oldest],
     )
     .await
     .unwrap();
@@ -3116,7 +3129,7 @@ async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(po
     .unwrap();
     pool.execute(
         "INSERT INTO access_connect_result (state, tenant_id, result_json) VALUES ('result-1', $1, $2)",
-        &[&TENANT_A, &json!({"grant": {"id": older.to_string(), "service": "fakeoauth"}})],
+        &[&TENANT_A, &JsonText(json!({"grant": {"id": older.to_string(), "service": "fakeoauth"}}))],
     )
     .await
     .unwrap();
@@ -3136,14 +3149,14 @@ async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(po
 
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.expect("the boot folds, then builds the index");
 
-    let rows: Vec<(uuid::Uuid, Option<uuid::Uuid>, serde_json::Value)> =
+    let rows: Vec<(uuid::Uuid, Option<uuid::Uuid>, db::Json<serde_json::Value>)> =
         pool.all("SELECT id, project_id, granted_scopes FROM access_grant WHERE identity = 'me@example.com'", &[]).await.unwrap();
-    assert_eq!(rows, vec![(newest, None, json!(["a", "b", "c", "d"]))], "the newest kept, with every permission");
+    assert_eq!(rows, vec![(newest, None, db::Json(json!(["a", "b", "c", "d"])))], "the newest kept, with every permission");
     let still: i64 = pool.scalar("SELECT count(*) FROM access_grant WHERE id = $1", &[&other]).await.unwrap();
     assert_eq!(still, 1, "another account's row is not touched");
     let pick: uuid::Uuid = pool.scalar("SELECT grant_id FROM install_pick", &[]).await.unwrap();
     assert_eq!(pick, newest);
-    let (value_grant, value): (uuid::Uuid, serde_json::Value) =
+    let (value_grant, JsonText(value)): (uuid::Uuid, JsonText<serde_json::Value>) =
         pool.one("SELECT grant_id, value FROM instance_value", &[]).await.unwrap();
     assert_eq!((value_grant, value["id"].clone()), (newest, json!(newest.to_string())));
     let upgrading: Option<uuid::Uuid> =
@@ -3151,7 +3164,7 @@ async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(po
     assert_eq!(upgrading, Some(newest));
     let picking: uuid::Uuid = pool.scalar("SELECT access_id FROM access_picker", &[]).await.unwrap();
     assert_eq!(picking, newest);
-    let parked: serde_json::Value =
+    let JsonText(parked): JsonText<serde_json::Value> =
         pool.scalar("SELECT result_json FROM access_connect_result", &[]).await.unwrap();
     assert_eq!(parked, json!({"grant": {"id": newest.to_string(), "service": "fakeoauth"}}));
     let subscribed: uuid::Uuid = pool.scalar("SELECT access_id FROM signal_subscription", &[]).await.unwrap();
@@ -3163,7 +3176,7 @@ async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(po
         serde_json::from_str::<serde_json::Value>(&signal_spec).unwrap(),
         json!({"kind": "mail", "access": {"id": newest.to_string()}})
     );
-    let indexed: bool = pool.scalar("SELECT to_regclass('access_grant_exclusive') IS NOT NULL", &[]).await.unwrap();
+    let indexed: bool = pool.scalar("SELECT to_regclass('access_grant_one_exclusive') IS NOT NULL", &[]).await.unwrap();
     assert!(indexed, "the contract part built the index once the rows fit it");
 
     // The fold run again finds nothing to do.
@@ -3186,8 +3199,10 @@ async fn a_database_with_duplicate_exclusive_rows_folds_them_before_the_index(po
         tables
     };
     let before = everything(pool.clone()).await;
-    let [fold] = weft_access_store::GROUP.data_steps else { panic!("the access store has one data step, the fold") };
-    pool.batch_execute(fold.sql).await.expect("the fold runs again");
+    let [weft_task_store::DataStep { work: weft_task_store::StepWork::Sql(fold), .. }] = weft_access_store::GROUP.data_steps else {
+        panic!("the access store has one data step, the fold, in SQL")
+    };
+    pool.batch_execute(fold).await.expect("the fold runs again");
     assert_eq!(everything(pool.clone()).await, before, "a second fold changes nothing");
 
     // With the index built, a boot that has schema work (a stale stamp
@@ -3225,4 +3240,95 @@ async fn an_upgrade_signed_in_as_an_account_with_its_own_connection_is_refused(p
     let identity: Option<String> =
         pool.scalar("SELECT identity FROM access_grant WHERE id = $1", &[&theirs.id]).await.unwrap();
     assert_eq!(identity.as_deref(), Some("someone-else"), "the upgraded row is left as it was");
+}
+
+/// A spec a node publishes is kept exactly, a NUL character in it
+/// included: it reads back as published, and publishing it again finds
+/// the row unchanged.
+#[weft_db_macros::test]
+async fn a_published_spec_holding_a_nul_is_kept_exactly(pool: Pool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let mut spec = published_spec();
+    spec.label = Some("self\u{0}run".into());
+    let with_nul = || weft_access_store::PublishAccess { spec: spec.clone(), ..publish(&[("host", "db"), ("password", "p")]) };
+    let first = weft_access_store::publish_grant(&pool, TENANT_A, with_nul()).await.expect("published");
+    let id: uuid::Uuid = first.connection_id.parse().unwrap();
+    let (JsonText(stored), version, exclusive): (JsonText<serde_json::Value>, i32, bool) =
+        pool.one("SELECT spec, spec_version, exclusive FROM access_grant WHERE id = $1", &[&id]).await.unwrap();
+    assert_eq!(AccessSpec::STORED.decode(stored, version).unwrap(), spec);
+    assert!(!exclusive);
+    let written_at = || async {
+        pool.scalar::<chrono::DateTime<chrono::Utc>>("SELECT updated_at FROM access_grant WHERE id = $1", &[&id]).await.unwrap()
+    };
+    let before = written_at().await;
+    let again = weft_access_store::publish_grant(&pool, TENANT_A, with_nul()).await.expect("published again");
+    assert_eq!(again.connection_id, first.connection_id);
+    assert_eq!(written_at().await, before, "it read back equal, so nothing was written");
+}
+
+/// The headers a route gated by a connection reads its caller's
+/// credential from come off the connection's recipe, behind the same wall
+/// as every read: another tenant's connection is not there, and one of
+/// another service is refused by name.
+#[weft_db_macros::test]
+async fn a_gates_credential_headers_come_from_its_recipe(pool: Pool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let spec: AccessSpec = serde_json::from_value(json!({
+        "service": "api_key_auth",
+        "acquisition": { "kind": "static", "fields": [{ "name": "keys" }] },
+        "verify": { "kind": "api_keys", "header": "X-Team-Key" }
+    }))
+    .expect("a valid auth recipe");
+    let done = connect_direct(
+        &pool,
+        TENANT_A,
+        ConnectDirect {
+            paste: false,
+            spec,
+            door: Door::Own,
+            registration: None,
+            values: [("keys".to_string(), "key-1".to_string())].into_iter().collect(),
+            label: None,
+            permissions: Vec::new(),
+            project_id: None,
+            instance: None,
+        },
+    )
+    .await
+    .expect("a pasted verifier connection stores without a test call");
+    let id = done.grant.id;
+
+    let headers = weft_access_store::caller_credential_headers(&pool, TENANT_A, GrantUser::Author, id, "api_key_auth").await.unwrap();
+    assert_eq!(headers, ["X-Team-Key", "authorization"]);
+    let err = weft_access_store::caller_credential_headers(&pool, TENANT_B, GrantUser::Author, id, "api_key_auth").await.unwrap_err();
+    assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NotFound)), "{err}");
+    let err = weft_access_store::caller_credential_headers(&pool, TENANT_A, GrantUser::Author, id, "slack").await.unwrap_err();
+    assert!(err.to_string().contains("wire the right service"), "{err}");
+
+    // A recipe with no `verify` block gates nothing, as a real call
+    // through it is refused.
+    let plain: AccessSpec = serde_json::from_value(json!({
+        "service": "pasted",
+        "acquisition": { "kind": "static", "fields": [{ "name": "token" }] }
+    }))
+    .expect("a valid recipe");
+    let done = connect_direct(
+        &pool,
+        TENANT_A,
+        ConnectDirect {
+            paste: false,
+            spec: plain,
+            door: Door::Own,
+            registration: None,
+            values: [("token".to_string(), "t".to_string())].into_iter().collect(),
+            label: None,
+            permissions: Vec::new(),
+            project_id: None,
+            instance: None,
+        },
+    )
+    .await
+    .expect("a pasted connection stores without a test call");
+    let err = weft_access_store::caller_credential_headers(&pool, TENANT_A, GrantUser::Author, done.grant.id, "pasted").await.unwrap_err();
+    assert!(err.to_string().contains("declares no `verify` block"), "{err}");
 }

@@ -11,6 +11,7 @@ import {
 	fitsWithin,
 	tryParseWeftType,
 	typeVarBoundRefuses,
+	collectTypeVarBindings,
 	type WeftType,
 } from '../types';
 import { portVar } from '../../../protocol';
@@ -84,6 +85,49 @@ describe('parseWeftType', () => {
 		expect(infra.kind).toBe('infra');
 		expect(isCompatible(infra, infra)).toBe(true);
 		expect(isCompatible(parseWeftType('String')!, infra)).toBe(false);
+	});
+
+	it('round-trips Secret[T], alone and inside a dict', () => {
+		for (const spelled of ['Secret[String]', 'Dict[String, String | Secret[String]]']) {
+			const t = parseWeftType(spelled)!;
+			expect(weftTypeToString(t)).toBe(spelled);
+			expect(weftTypeToWireString(t)).toBe(spelled);
+			expect(weftTypesEqual(parseWeftType(weftTypeToWireString(t))!, t)).toBe(true);
+		}
+		expect(parseWeftType('Secret[String]')).toEqual({ kind: 'secret', inner: { kind: 'primitive', value: 'String' } });
+	});
+
+	it('connects a Secret only to a Secret of what it holds', () => {
+		const ok = (s: string, t: string) => isWeftTypeCompatible(s, t);
+		expect(ok('Secret[String]', 'Secret[String]')).toBe(true);
+		expect(ok('Secret[String]', 'String | Secret[String]')).toBe(true);
+		expect(ok('Secret[String]', 'Secret[String | Number]')).toBe(true);
+		expect(ok('Secret[String]', 'String')).toBe(false);
+		expect(ok('String', 'Secret[String]')).toBe(false);
+		expect(ok('Secret[String]', 'Json')).toBe(false);
+		expect(ok('List[Secret[String]]', 'Json')).toBe(false);
+	});
+
+	it('keeps a dict or record holding a Secret out of JsonDict', () => {
+		const ok = (s: string, t: string) => isWeftTypeCompatible(s, t);
+		expect(ok('Dict[String, Secret[String]]', 'JsonDict')).toBe(false);
+		expect(ok('Dict[String, String | Secret[String]]', 'JsonDict')).toBe(false);
+		expect(ok('{ key: Secret[String] }', 'JsonDict')).toBe(false);
+		expect(ok('Dict[String, String]', 'JsonDict')).toBe(true);
+		expect(ok('{ key: String }', 'JsonDict')).toBe(true);
+	});
+
+	it('binds a type variable through a Secret, element-wise', () => {
+		const out: [string, WeftType][] = [];
+		collectTypeVarBindings(parseWeftType('Secret[T]')!, parseWeftType('Secret[String]')!, out);
+		expect(out).toEqual([['T', { kind: 'primitive', value: 'String' }]]);
+	});
+
+	it('infers a secret marker as a Secret, never as a dict', () => {
+		const marker = { __weft_secret__: { secretId: '7c9e6679-7425-40de-944b-e07fc1f90ae7' } };
+		expect(inferTypeFromValue(marker).kind).toBe('secret');
+		// A malformed marker (an extra key) is just an object.
+		expect(inferTypeFromValue({ ...marker, other: 1 }).kind).toBe('dict');
 	});
 
 	it('parses a record with optional fields', () => {
@@ -1078,6 +1122,100 @@ describe('JsonDict', () => {
 		expect(isCompatible(inferTypeFromValue('hello'), jd)).toBe(false);
 		expect(isCompatible(inferTypeFromValue(42), jd)).toBe(false);
 		expect(isCompatible(inferTypeFromValue([1, 2]), jd)).toBe(false);
+	});
+});
+
+// ── Json tests ──────────────────────────────────────────────────────
+
+describe('Json', () => {
+	const T = (s: string) => {
+		const t = parseWeftType(s);
+		if (!t) throw new Error(`${s} did not parse`);
+		return t;
+	};
+
+	it('parses Json, alone and nested', () => {
+		expect(T('Json')).toEqual({ kind: 'json' });
+		expect(T('List[Json]')).toEqual({ kind: 'list', inner: { kind: 'json' } });
+	});
+
+	it('displays and round-trips', () => {
+		for (const s of ['Json', 'List[Json]', 'Dict[String, Json]', '{a: Json, b?: Json}']) {
+			expect(weftTypeToString(T(s)), s).toBe(s);
+			expect(weftTypeToString(T(weftTypeToWireString(T(s)))), s).toBe(s);
+		}
+		// An alias renders under its name only as the whole union, so
+		// `File` beside another member prints as its members (as in Rust).
+		const stream = T('Generator[Json | File]');
+		expect(weftTypeToString(stream)).toBe('Generator[Json | Image | Video | Audio | Blob]');
+		expect(weftTypesEqual(T(weftTypeToWireString(stream)), stream)).toBe(true);
+	});
+
+	it('equals only Json', () => {
+		expect(weftTypesEqual(T('Json'), T('Json'))).toBe(true);
+		expect(weftTypesEqual(T('Json'), T('JsonDict'))).toBe(false);
+		expect(weftTypesEqual(T('JsonDict'), T('Json'))).toBe(false);
+	});
+
+	it('takes every JSON-made type', () => {
+		for (const s of [
+			'String', 'Number', 'Boolean', 'Null', 'JsonDict', 'Json', 'Empty',
+			'Dict[String, Number]', 'Dict[String, List[JsonDict]]',
+			'List[String]', 'List[List[List[Number]]]',
+			'{ a: String, b?: Number }', '{ a: List[Boolean], .. }',
+			'String | Number | Null', 'List[String] | JsonDict',
+			'Profile={ name: String }', 'Score=Number',
+			'T', 'List[T]', '{ a: T }',
+		]) {
+			expect(isWeftTypeCompatible(s, 'Json'), s).toBe(true);
+		}
+		expect(isCompatible(inferTypeFromValue({ a: [1, { b: null }], c: 'x' }), T('Json'))).toBe(true);
+	});
+
+	it('refuses what is not JSON, at any depth', () => {
+		for (const s of [
+			'Bus', 'Access', 'Infra', 'Generator[String]', 'Generator[Json]',
+			'Image', 'Video', 'Audio', 'Blob', 'Media', 'File',
+			'List[Image]', 'Dict[String, Bus]', '{ a: String, b: Audio }', '{ a?: File }',
+			'String | Image', 'List[List[Blob]]', 'Pic=Image', 'Wrapped={ p: Media }',
+		]) {
+			expect(isWeftTypeCompatible(s, 'Json'), s).toBe(false);
+		}
+	});
+
+	it('flows out only into Json, a variable, or a union holding Json', () => {
+		for (const s of ['Json', 'T', 'String | Json', 'Json | Null']) {
+			expect(isWeftTypeCompatible('Json', s), s).toBe(true);
+		}
+		for (const s of [
+			'JsonDict', 'String', 'Number', 'Null', '{ a: String }', '{ a?: String, .. }', 'List[Json]',
+			'Dict[String, Json]', 'String | Number', 'Profile={ name: String }', 'File',
+		]) {
+			expect(isWeftTypeCompatible('Json', s), s).toBe(false);
+		}
+	});
+
+	it('nests like any type inside containers', () => {
+		expect(isWeftTypeCompatible('List[Json]', 'List[Json]')).toBe(true);
+		expect(isWeftTypeCompatible('List[Number]', 'List[Json]')).toBe(true);
+		expect(isWeftTypeCompatible('List[Json]', 'List[Number]')).toBe(false);
+		expect(isWeftTypeCompatible('{ a: Number }', '{ a: Json }')).toBe(true);
+		expect(isWeftTypeCompatible('{ a: Json }', '{ a: Number }')).toBe(false);
+	});
+
+	it('streams narrow item-wise within Generator[Json | File]', () => {
+		const bound = T('Generator[Json | File]');
+		for (const s of ['Generator[JsonDict]', 'Generator[String]', 'Generator[List[List[Number]]]', 'Generator[Image]', 'Generator[Json]']) {
+			expect(fitsWithin(T(s), bound), s).toBe(true);
+		}
+		expect(fitsWithin(T('Generator[Bus]'), bound)).toBe(false);
+		expect(fitsWithin(T('JsonDict'), bound)).toBe(false);
+		// Wiring one stream into another stays invariant.
+		expect(isCompatible(T('Generator[String]'), bound)).toBe(false);
+	});
+
+	it('colors and leaves: no primitive leaf', () => {
+		expect(extractPrimitives(T('Json'))).toEqual([]);
 	});
 });
 

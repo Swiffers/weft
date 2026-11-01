@@ -11,11 +11,12 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse as _, Response};
 use axum::routing::post;
 use axum::Router;
 
 use weft_broker_client::protocol::{
-    RecordOfRequest, RecordOfResponse, RunAnswer, RunAnswerOf, RunAnswersRequest, RunAnswersResponse, RunCancel, RunClaimRequest,
+    RecordOfRequest, RecordOfResponse, RecordSecretRequest, RecordSecretResponse, RunAnswer, RunAnswerOf, RunAnswersRequest, RunAnswersResponse, RunCancel, RunClaimRequest,
     RunClaimResponse, RunGiveUpRequest, RunGiveUpResponse, RunRecheckedRequest, RunRecheckedResponse, JOURNAL_RECORD_BODY_LIMIT,
     BATCH_FATES, BATCH_FATES_HEADER, JOURNAL_RECORD_PATH,
 };
@@ -36,6 +37,7 @@ pub fn routes() -> Router<Arc<BrokerState>> {
     Router::new()
         .route(JOURNAL_RECORD_PATH, post(record_batch).layer(axum::extract::DefaultBodyLimit::max(JOURNAL_RECORD_BODY_LIMIT)))
         .route("/v1/journal/record_of", post(record_of))
+        .route("/v1/journal/secret", post(record_secret))
         .route("/v1/run/claim", post(run_claim))
         .route("/v1/run/answers", post(run_answers))
         .route("/v1/run/rechecked", post(run_rechecked))
@@ -114,7 +116,9 @@ async fn write_batch(state: &BrokerState, caller: &CallerIdentity, body: &Bytes)
     tracing::debug!(target: "weft_broker::batch", runs = batch.head.runs.len(), bytes = body.len(), "a batch of records");
     let lane = format!("{replica}/{}", batch.head.lane);
     let conn = state.record_pool.get().await.map_err(|e| unavailable_or_internal(e.into()))?;
-    let recorded = weft_journal::record::record_batch(&conn, replica, tenant, &lane, &batch)
+    // A secret a run made is sealed here, before it is bound: its value
+    // never reaches the database in the clear.
+    let recorded = weft_journal::record::record_batch(&conn, replica, tenant, &lane, &batch, &weft_access_store::seal_json)
         .await
         .map_err(|e| unavailable_or_internal(e.context("write a batch of records")))?;
     drop(conn);
@@ -140,14 +144,41 @@ async fn own_run(state: &BrokerState, caller: &CallerIdentity, run_id: weft_core
     Ok(())
 }
 
-/// `POST /v1/journal/record_of`: see [`RecordOfRequest`].
-async fn record_of(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, Json(req): Json<RecordOfRequest>) -> Resp<RecordOfResponse> {
+/// `POST /v1/journal/record_of`: see [`RecordOfRequest`]. A page is a few
+/// megabytes at most (`weft_journal::record::PAGE_BYTES`), written on the
+/// blocking pool, never on a thread serving calls.
+async fn record_of(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, Json(req): Json<RecordOfRequest>) -> Result<Response, (StatusCode, String)> {
     worker(&caller)?;
     own_run(&state, &caller, req.run_id).await?;
-    let record = weft_journal::record::read_record(&state.pool, req.run_id, None)
+    let record = weft_journal::record::read_page(&state.pool, req.run_id, req.after)
         .await
         .map_err(|e| unavailable_or_internal(e.context("read a run's record")))?;
-    Ok(Json(RecordOfResponse { record }))
+    let body = weft_journal::on_blocking_pool(move || serde_json::to_vec(&RecordOfResponse { record }))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write the answer: {e}")))?;
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response())
+}
+
+/// `POST /v1/journal/secret`: see [`RecordSecretRequest`]. Any run of the
+/// calling worker's project reveals a secret any run of it made (a run
+/// picked up again, a seeded run, a marker a program kept and reads back
+/// later): the project is the scope, read off the caller.
+async fn record_secret(State(state): State<Arc<BrokerState>>, AuthedCaller(caller): AuthedCaller, Json(req): Json<RecordSecretRequest>) -> Result<Json<RecordSecretResponse>, (StatusCode, String)> {
+    let (_, project, _) = worker(&caller)?;
+    let value = revealed(&state.pool, project, req.secret_id).await.map_err(|e| unavailable_or_internal(e.context("reveal a secret")))?;
+    match value {
+        Some(value) => Ok(Json(RecordSecretResponse { value })),
+        None => Err((StatusCode::NOT_FOUND, format!("no run of this project keeps secret {}", req.secret_id))),
+    }
+}
+
+/// The value of secret `secret_id`, of a run of `project`, opened from its
+/// sealed copy (`run_secret`); `None` when no run of the project keeps it.
+pub async fn revealed(pool: &Pool, project: uuid::Uuid, secret_id: weft_core::secret::SecretId) -> anyhow::Result<Option<serde_json::Value>> {
+    let sealed: Option<String> = pool
+        .scalar_opt("SELECT sealed FROM run_secret WHERE secret_id = $1 AND project_id = $2", &[&secret_id.as_uuid(), &project])
+        .await?;
+    sealed.map(|sealed| weft_access_store::open_json(&sealed)).transpose()
 }
 
 /// `POST /v1/run/claim`: see [`RunClaimRequest`]. The claim is the
@@ -208,13 +239,13 @@ async fn run_rechecked(State(state): State<Arc<BrokerState>>, AuthedCaller(calle
 /// answers oldest first, in one statement. The runs are the worker's own
 /// by the read itself (`owner`), so no run is checked one by one.
 pub async fn rechecked(pool: &Pool, replica: &str, project: uuid::Uuid) -> anyhow::Result<RunRecheckedResponse> {
-    type Row = (weft_core::RunId, Option<db::Json<weft_core::run::CancelCause>>, Option<String>, Option<serde_json::Value>, bool);
+    type Row = (weft_core::RunId, Option<db::JsonText<weft_core::run::CancelCause>>, Option<String>, Option<db::JsonText<serde_json::Value>>, bool);
     let sql = format!(
         "WITH mine AS ( \
              SELECT run_id, cancel_requested FROM run \
              WHERE owner = $1 AND project_id = $2 AND state = 'running' \
          ) \
-         SELECT m.run_id, m.cancel_requested, NULL::text AS token, NULL::jsonb AS payload, FALSE AS skipped, 0::bigint AS seq \
+         SELECT m.run_id, m.cancel_requested, NULL::text AS token, NULL::text AS payload, FALSE AS skipped, 0::bigint AS seq \
              FROM mine m WHERE m.cancel_requested IS NOT NULL \
          UNION ALL \
          SELECT a.run_id, NULL, a.token, a.payload, a.skipped, a.seq \
@@ -230,7 +261,7 @@ pub async fn rechecked(pool: &Pool, replica: &str, project: uuid::Uuid) -> anyho
             (None, Some(token), Some(payload)) => rechecked.answers.push(RunAnswerOf {
                 run_id,
                 token,
-                answer: weft_task_store::parked_fires::stored_answer(payload, skipped),
+                answer: weft_task_store::parked_fires::stored_answer(payload.0, skipped),
             }),
             (cause, token, payload) => {
                 anyhow::bail!("a recheck row of {run_id} is neither a cancel nor an answer: {cause:?} {token:?} {payload:?}")
@@ -267,7 +298,7 @@ async fn previous_release_run_cancels(State(state): State<Arc<BrokerState>>, Aut
 /// The cancels waiting for every run `replica` drives in `project`, as the
 /// previous release answered them.
 pub async fn previous_release_cancels(pool: &Pool, replica: &str, project: uuid::Uuid) -> anyhow::Result<PreviousReleaseCancels> {
-    let rows: Vec<(weft_core::RunId, db::Json<weft_core::run::CancelCause>)> = pool
+    let rows: Vec<(weft_core::RunId, db::JsonText<weft_core::run::CancelCause>)> = pool
         .all(
             "SELECT run_id, cancel_requested FROM run \
              WHERE owner = $1 AND project_id = $2 AND state = 'running' AND cancel_requested IS NOT NULL",

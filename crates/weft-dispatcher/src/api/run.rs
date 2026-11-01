@@ -87,23 +87,53 @@ pub async fn node_state(
     run_admin::node_state(&state, &Actor::operator(caller.0), run_id(&raw)?, &node).await.map(Json)
 }
 
-/// `GET /runs/{id}/replay`.
+/// What a reader of a run's history asks of its values: `with_values=true`
+/// has them written in (`run_admin::Values`).
+#[derive(Debug, Default, Deserialize)]
+pub struct ValuesQuery {
+    pub with_values: Option<bool>,
+}
+
+/// `GET /runs/{id}/replay`: a JSON array of the run's events, written as
+/// its record is read.
 pub async fn replay(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(raw): Path<String>,
-) -> Result<Json<Vec<crate::events::LiveEvent>>, Refused> {
-    run_admin::replay(&state, &Actor::operator(caller.0), run_id(&raw)?).await.map(Json)
+    Query(query): Query<ValuesQuery>,
+) -> Result<axum::response::Response, Refused> {
+    let values = run_admin::Values::asked(query.with_values);
+    run_admin::replay(&state, &Actor::operator(caller.0), run_id(&raw)?, values).await.map(streamed_json)
 }
 
-/// `GET /runs/{id}/events` (`weft events`).
+/// `GET /runs/{id}/events` (`weft events`): the run's events, kept and
+/// spelled, written as its record is read.
 pub async fn events(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(raw): Path<String>,
     Query(request): Query<EventsRequest>,
-) -> Result<Json<weft_core::program::RunEvents>, Refused> {
-    run_admin::events(&state, &Actor::operator(caller.0), run_id(&raw)?, request).await.map(Json)
+) -> Result<axum::response::Response, Refused> {
+    run_admin::events(&state, &Actor::operator(caller.0), run_id(&raw)?, request).await.map(streamed_json)
+}
+
+/// `POST /runs/{id}/values`: the values the run's events name, read back
+/// (`run_admin::values`).
+pub async fn values(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(raw): Path<String>,
+    Json(request): Json<weft_core::program::ValuesRequest>,
+) -> Result<Json<weft_core::program::ValuesAnswer>, Refused> {
+    run_admin::values(&state, &Actor::operator(caller.0), run_id(&raw)?, request.refs).await.map(Json)
+}
+
+/// A JSON answer written as it is read (`run_admin::Streamed`), as the
+/// response that carries it.
+fn streamed_json(chunks: run_admin::Streamed) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let body = futures::stream::unfold(chunks, |mut chunks| async move { chunks.recv().await.map(|chunk| (chunk, chunks)) });
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], axum::body::Body::from_stream(body)).into_response()
 }
 
 /// `POST /runs/{id}/wake/{node}` (`weft wake`): answers how the fire was
@@ -326,60 +356,86 @@ pub fn cancel_terminal_events(
     cause: &CancelCause,
     now: u64,
 ) -> anyhow::Result<Vec<weft_journal::RunEvent>> {
-    use weft_journal::RunEvent;
-    let reason = cause.to_string();
-    let mut writes = Vec::new();
-    match program {
-        Some(program) => {
-            // The runs map says which nodes are still non-terminal.
-            // A row the fold could not apply was logged at `error!`
-            // level and is the inspector's `/replay` to show; the
-            // records that did fold are the ones to flip.
-            let snapshot = weft_journal::fold_to_snapshot(
-                run_id,
-                Arc::new(program.clone()),
-                events,
-            );
-            for (node_id, firings) in &snapshot.firings {
-                for e in firings {
-                    if e.status.is_terminal() {
-                        continue;
-                    }
+    let mut read = CancelRead::new(run_id, program.map(|program| Arc::new(program.clone())));
+    events.iter().for_each(|event| read.apply(event));
+    Ok(read.into_events(cause, now))
+}
+
+/// What a dispatcher-side cancel reads off a run's record, fed its events
+/// in order (a page at a time: it keeps what is open, never the record):
+/// the firings still open, folded over the run's program when it has
+/// one, and the charges left open. [`Self::into_events`] is what
+/// [`cancel_terminal_events`] writes.
+pub struct CancelRead {
+    run_id: RunId,
+    /// `None` without a program: a run that never ran a node body (a
+    /// node self-test), or one whose program is gone or cannot be read,
+    /// still ends, on the terminal alone.
+    fold: Option<weft_journal::Fold>,
+    charges: weft_journal::ChargeBook,
+    started_a_node: bool,
+}
+
+impl CancelRead {
+    pub fn new(run_id: RunId, program: Option<Arc<ProjectDefinition>>) -> Self {
+        Self {
+            run_id,
+            fold: program.map(|program| weft_journal::Fold::new(run_id, program).showing()),
+            charges: weft_journal::ChargeBook::default(),
+            started_a_node: false,
+        }
+    }
+
+    pub fn apply(&mut self, event: &weft_journal::RunEvent) {
+        // A row the fold could not apply was logged at `error!` level and
+        // is the inspector's `/replay` to show; the records that did fold
+        // are the ones to flip.
+        if let Some(fold) = &mut self.fold {
+            fold.apply(event);
+        }
+        self.charges.apply(event);
+        self.started_a_node |= matches!(event, weft_journal::RunEvent::NodeStarted { .. });
+    }
+
+    /// The events that end the run, cancelled for `cause` at `now`.
+    pub fn into_events(self, cause: &CancelCause, now: u64) -> Vec<weft_journal::RunEvent> {
+        use weft_journal::RunEvent;
+        let run_id = self.run_id;
+        let reason = cause.to_string();
+        let mut writes = Vec::new();
+        match &self.fold {
+            Some(fold) => {
+                for e in fold.snapshot().firings.open() {
                     writes.push(RunEvent::NodeCancelled {
                         run_id,
-                        node_id: node_id.clone(),
+                        node_id: e.node_id.clone(),
                         frames: e.frames.clone(),
                         reason: reason.clone(),
                         at_unix: now,
                     });
                 }
             }
-        }
-        // No program: a run that never ran a node body (a node
-        // self-test) has nothing per node to flip. A run whose
-        // program is gone (its project was removed) or cannot be read
-        // still ends, on the terminal alone: the stop must land, and
-        // the run's status is read off the terminal. Its node records
-        // stay as they were (the run view paints them from a
-        // fold this run no longer has), which is what a run without a
-        // program looks like everywhere else.
-        None => {
-            if events.iter().any(|e| matches!(e, RunEvent::NodeStarted { .. })) {
-                tracing::warn!(
-                    target: "weft_dispatcher::cancel",
-                    %run_id,
-                    "cancelling without the run's program: the terminal is written, the \
-                     per-node cancels cannot be derived"
-                );
+            // Its node records stay as they were (the run view paints them
+            // from a fold this run no longer has), which is what a run
+            // without a program looks like everywhere else.
+            None => {
+                if self.started_a_node {
+                    tracing::warn!(
+                        target: "weft_dispatcher::cancel",
+                        %run_id,
+                        "cancelling without the run's program: the terminal is written, the \
+                         per-node cancels cannot be derived"
+                    );
+                }
             }
         }
+        // A charge its record leaves open spent money no drive is left to
+        // price: booked unknown before the ending.
+        let why = format!("the run was cancelled before the job was read back: {reason}");
+        writes.extend(weft_journal::unpriced_charges_closed(run_id, self.charges, &why, now));
+        writes.push(RunEvent::RunCancelled { run_id, reason, cause: Some(cause.clone()), at_unix: now });
+        writes
     }
-    // A charge its record leaves open spent money no drive is left to
-    // price: booked unknown before the ending.
-    let why = format!("the run was cancelled before the job was read back: {reason}");
-    writes.extend(weft_journal::unpriced_charges_closed(run_id, events, &why, now));
-    writes.push(RunEvent::RunCancelled { run_id, reason, cause: Some(cause.clone()), at_unix: now });
-    Ok(writes)
 }
 
 /// The program a cancel folds with to derive its per-node cancels, or
@@ -408,26 +464,69 @@ pub async fn program_for_cancel(
 }
 
 /// The terminal outcome recorded for a run, if any: its run row's
-/// `outcome`, stamped by the write that records its ending. `None` means the run is
-/// still in flight. Used both for cancel-dedup and as the source of
-/// truth when the in-RAM event bus drops events (broadcast `Lagged`).
+/// `outcome`, with the `error` it failed with or the `cancel_cause` it
+/// was cancelled for, all stamped by the write that records its ending.
+/// `None` means the run is still in flight. Used both for cancel-dedup
+/// and as the source of truth when the in-RAM event bus drops events
+/// (broadcast `Lagged`).
 pub(crate) async fn terminal_outcome(
     pool: &weft_task_store::db::Pool,
     run_id: RunId,
 ) -> anyhow::Result<Option<TerminalOutcome>> {
-    let outcome: Option<Option<String>> = pool.scalar_opt("SELECT outcome FROM run WHERE run_id = $1", &[&run_id]).await?;
-    Ok(outcome.flatten().map(|outcome| match outcome.as_str() {
-        "completed" => TerminalOutcome::Completed,
-        "cancelled" => TerminalOutcome::Cancelled,
-        _ => TerminalOutcome::Failed,
+    type Ending = (Option<String>, Option<String>, Option<weft_task_store::db::JsonText<CancelCause>>);
+    let row: Option<Ending> = pool
+        .opt("SELECT outcome, error, cancel_cause FROM run WHERE run_id = $1", &[&run_id])
+        .await?;
+    Ok(row.and_then(|(outcome, error, cause)| {
+        outcome.map(|outcome| TerminalOutcome::of(&outcome, error, cause.map(|cause| cause.0)))
     }))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a run ended, with the reason its row recorded for a failure or a
+/// cancel (`None` when the row holds none).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TerminalOutcome {
     Completed,
-    Failed,
-    Cancelled,
+    Failed(Option<String>),
+    Cancelled(Option<String>),
+}
+
+impl TerminalOutcome {
+    /// The outcome a run row's `outcome`, `error` and `cancel_cause`
+    /// columns say. Any outcome other than `completed` and `cancelled`
+    /// reads as a failure.
+    pub(crate) fn of(outcome: &str, error: Option<String>, cause: Option<CancelCause>) -> Self {
+        match outcome {
+            "completed" => Self::Completed,
+            "cancelled" => Self::Cancelled(cause.map(|cause| cause.to_string())),
+            _ => Self::Failed(error),
+        }
+    }
+
+    /// What a person reads when `what` (a run doing some job, like
+    /// "infra setup") did not complete: `<what> failed: <error>` or
+    /// `<what> cancelled: <cause>`, the bare `<what> failed` or
+    /// `<what> cancelled` when the row recorded no reason. `None` when it
+    /// completed.
+    pub(crate) fn not_landed(&self, what: &str) -> Option<String> {
+        let (ended, reason) = match self {
+            Self::Completed => return None,
+            Self::Failed(error) => ("failed", error),
+            Self::Cancelled(cause) => ("cancelled", cause),
+        };
+        Some(not_landed(what, ended, reason.as_deref()))
+    }
+}
+
+/// What a person reads when `what` (a run doing some job, like "infra
+/// setup") `ended` ("failed", "cancelled") for `reason`, or bare when it
+/// gave none: one wording, whether the ending was heard on the bus or read
+/// from the run's row ([`TerminalOutcome::not_landed`]).
+pub(crate) fn not_landed(what: &str, ended: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!("{what} {ended}: {reason}"),
+        None => format!("{what} {ended}"),
+    }
 }
 
 /// THE reading of a runs listing as a run store query, shared by every
@@ -584,5 +683,32 @@ mod cancel_tests {
         let kinds: Vec<&str> = writes.iter().map(RunEvent::kind_str).collect();
         assert_eq!(kinds, vec!["node_cancelled", "cost_reported", "run_cancelled"]);
         assert!(matches!(&writes[1], RunEvent::CostReported { charge: Some(charge), amount_usd: None, .. } if charge == "job-1"));
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    /// A run row's ending columns read as the outcome they say, and a
+    /// run that did not complete is told with the reason its row kept,
+    /// or bare when it kept none.
+    #[test]
+    fn a_run_row_ending_reads_with_its_reason() {
+        let completed = TerminalOutcome::of("completed", None, None);
+        assert_eq!(completed, TerminalOutcome::Completed);
+        assert_eq!(completed.not_landed("infra setup"), None);
+
+        let failed = TerminalOutcome::of("failed", Some("the extension is missing".into()), None);
+        assert_eq!(failed, TerminalOutcome::Failed(Some("the extension is missing".into())));
+        assert_eq!(failed.not_landed("infra setup").as_deref(), Some("infra setup failed: the extension is missing"));
+        assert_eq!(TerminalOutcome::of("failed", None, None).not_landed("infra setup").as_deref(), Some("infra setup failed"));
+
+        let cancelled = TerminalOutcome::of("cancelled", None, Some(CancelCause::User));
+        assert_eq!(cancelled.not_landed("trigger setup").as_deref(), Some("trigger setup cancelled: Cancelled by user"));
+        assert_eq!(
+            TerminalOutcome::of("cancelled", None, None).not_landed("infra setup").as_deref(),
+            Some("infra setup cancelled")
+        );
     }
 }

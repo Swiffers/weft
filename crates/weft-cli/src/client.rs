@@ -560,7 +560,7 @@ const BUSY_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(4);
 /// caller that knows its request is safe to send again and that the
 /// install may be starting up reads the rest itself
 /// (`crate::commands::ensure::look_again_after`).
-// SYNC: busy_answer <-> crates/weft-core/src/install.rs (asks_again)
+// SYNC: busy_answer <-> crates/weft-core/src/install.rs (asks_again), extension-vscode/src/dispatcher.ts (worthTryingAgain)
 pub(crate) fn busy_answer(status: reqwest::StatusCode, from_install: bool) -> bool {
     match status {
         reqwest::StatusCode::TOO_MANY_REQUESTS => !from_install,
@@ -718,8 +718,19 @@ pub(crate) mod fake {
     }
 
     /// The address of a port nothing listens on: a connection there is refused.
+    ///
+    /// The port stays bound, never listening, for as long as the test
+    /// process runs. Released, it is free for any other process to take,
+    /// and with every test running at once another test's fake install
+    /// did: a test expecting a refusal then spent that install's canned
+    /// answers, and both failed for something neither did.
     pub fn closed() -> String {
-        format!("http://{}", std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap())
+        static HELD: std::sync::Mutex<Vec<tokio::net::TcpSocket>> = std::sync::Mutex::new(Vec::new());
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = format!("http://{}", socket.local_addr().unwrap());
+        HELD.lock().unwrap().push(socket);
+        address
     }
 }
 

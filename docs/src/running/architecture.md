@@ -230,9 +230,13 @@ once, one compiles and the others wait for the lane, then compile only what
 the build before them did not already leave in it. A build of a program
 this machine already has takes no lane at all, and neither does a run, so
 running code is never held up. Two asks for the same build of one project
-are one build, which both wait on. After each build in a lane, weft keeps
-only the three newest compiled versions of each node package and of the
-worker, and drops any of them no build has used for 30 days.
+are one build, which both wait on. Each program weft compiles notes which
+compiled pieces and which source crates its build used, and after each
+build, weft keeps in that lane, in the seed and in the shared source crates
+(`~/.local/share/weft/worker-crates/`) only what some program still on this
+machine was built from. When a program goes (a project removed, a weft
+update replacing the standard worker), what only it used goes at the next
+build.
 
 On a cloud install the worker is an image instead, and the `[build.worker]`
 section of `weft.toml` says how that image is built:
@@ -300,6 +304,25 @@ copies Cloud Run may start (`--max-instances`), or a copy's CPU and memory
 (`--cpu`, `--memory`), `weft workers set` changes them for one project. On
 your machine none of these four does anything: there is no Cloud Run sending
 calls or starting copies, and weft puts no CPU or memory limit on a worker.
+If a node of yours talks to something every copy draws on (a
+database's connections), plan for as many copies as `--max-instances` allows, plus the
+old ones during a change: for what that asks of the node, go and read
+[sharing something between runs](../nodes/ctx.md#sharing-something-between-runs).
+
+New worker settings start a new Cloud Run revision. Once it serves, weft hands
+it the calls the old settings took and deletes the revisions of the
+same program under other settings, so their copies stop and give back what
+they held, and each run still on them is handed back the way it is on any stop
+([what happens when something dies](#what-happens-when-something-dies)). Which
+settings are the new ones is read from what the project has stored, never
+from which revision is newest. A revision of another program stays until weft
+forgets that program's image. If deleting one fails, it takes no calls and its
+copies scale to zero once nothing calls them; the next activation or settings
+change deletes it, and weft logs an error naming the `gcloud run revisions
+delete` command that deletes it now. The one revision Cloud Run never lets
+anyone delete is the service's latest: when a dispatcher copy that still held
+the old settings brought them back up after the change, that revision takes no
+calls and goes once a later settings change or build replaces it.
 
 On a cloud install, if a run keeps working after its caller has gone (a Route
 with `outlivesCaller` that replies and carries on), the nodes it was running
@@ -466,7 +489,24 @@ what it needs between two events, and the listener does exactly that:
   for another holder to take. A holder that cannot move its check in time
   lets go of everything and exits before the check goes off, so its
   triggers are never handed to another holder while it still holds them. A
-  holder that is shut down gives its triggers up at once.
+  holder that is shut down gives its triggers up at once. How many holders
+  run follows how busy they are too. Each holder samples its CPU every ten
+  seconds, averages the last minute, and tells weft that number when it has
+  moved 10 points from the one it said last, plus once more a minute after
+  it took triggers or handed some over, since the old number was measured
+  on what it held before. weft adds up the numbers of the holders that hold
+  triggers (a crashed one counts until its dead man's switch frees them, since that
+  work still needs a holder) and runs as many holders as the sum needs at
+  50% each, never fewer than one per 200 triggers and never more holders than
+  triggers. It stops none while triggers are on their way from one
+  holder to another, or while a holder that took some has not said its new
+  number yet. A holder whose average reaches 70% hands part of its triggers
+  over, keeping as many as should bring it back to about 50%, and takes no
+  new ones until it says less than that. A holder weft started for the load
+  holds nothing at first, so once it has said its number, the first holder
+  over 50% to notice hands it the triggers that bring it nearest 50%, at
+  least one; the broker gives them to that spare alone, so two holders never
+  pile their work onto one spare.
 - **An event subscription** needs a holder only when it dials out to the
   service. On a cloud install, when the service can push the subscribed events
   for one account, weft subscribes with the service instead and renews that
@@ -791,9 +831,10 @@ If you would rather not wait for an old worker to exit, `kill -9 <pid>`
 stops it now, and the runs still on it end as if it had died; the daemon's
 log (`~/.local/share/weft/runtime.log`) names each such worker with its pid.
 
-If a worker cannot get a batch of records written (the broker errors or never
-answers), the runs in that batch end failed (for why, go and read [why a
-failed write stops the run](the-journal.md#why-a-failed-write-stops-the-run)).
+If a worker cannot get a batch of records written, the runs in that batch end
+failed, except a durable run whose batch got no answer at all, which is handed
+back to another worker (for both, go and read [when a write of the record
+fails](the-journal.md#when-a-write-of-the-record-fails)).
 
 If a worker freezes or loses its connection to the broker, it stops reporting,
 and its runs go the way a dead worker's do: about 30 seconds later a durable

@@ -678,15 +678,11 @@ pub async fn infra_bake(
     if phase.as_deref() != Some(weft_core::context::Phase::InfraSetup.as_str()) {
         return Err((StatusCode::FORBIDDEN, "only an infra setup saves what an infra node bakes".into()));
     }
-    let written = state
-        .pool
-        .execute(
-            "UPDATE infra_node SET baked_json = baked_json || $4 WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
-            &[&run.project, &req.place, &req.instance.as_ref().map(|i| i.as_str()), &db::Json(&req.values)],
-        )
+    let instance = req.instance.as_ref().map(|i| i.as_str());
+    let saved = crate::lifecycle_writes::save_baked(&state.pool, run.project, &req.place, instance, &req.values)
         .await
-        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("save what an infra node baked")))?;
-    if written == 0 {
+        .map_err(|e| unavailable_or_internal(e.context("save what an infra node baked")))?;
+    if !saved {
         return Err((StatusCode::CONFLICT, format!("{} has no infra copy here to save what it baked with", req.place)));
     }
     Ok(Json(serde_json::json!({})))
@@ -1151,7 +1147,7 @@ pub async fn supervisor_infra_nodes(
             name: &str,
             node_id: &str,
         ) -> Result<T, (StatusCode, String)> {
-            let v: serde_json::Value = r.try_get(name).map_err(|e| internal(anyhow::anyhow!("decode {name}: {e}")))?;
+            let db::JsonText(v) = r.try_get::<_, db::JsonText<serde_json::Value>>(name).map_err(|e| internal(anyhow::anyhow!("decode {name}: {e}")))?;
             serde_json::from_value(v)
                 .map_err(|e| internal(anyhow::anyhow!("infra_node.{name} for node='{node_id}' does not decode: {e}")))
         }
@@ -1162,9 +1158,10 @@ pub async fn supervisor_infra_nodes(
         };
         let keep_disks: Vec<String> = column(&r, "keep_disks_json", &node_id)?;
         // NULL: the node wrote no rules (it runs the built-in ones).
-        let health_rules: Option<serde_json::Value> = r
-            .try_get("health_rules_json")
-            .map_err(|e| internal(anyhow::anyhow!("decode health_rules_json: {e}")))?;
+        let health_rules = r
+            .try_get::<_, Option<db::JsonText<serde_json::Value>>>("health_rules_json")
+            .map_err(|e| internal(anyhow::anyhow!("decode health_rules_json: {e}")))?
+            .map(|rules| rules.0);
         let health_rules_version: weft_core::stored::Version = r
             .try_get("health_rules_json_version")
             .map_err(|e| internal(anyhow::anyhow!("decode health_rules_json_version: {e}")))?;
@@ -1172,7 +1169,7 @@ pub async fn supervisor_infra_nodes(
             .map(|rules| weft_core::infra::health::STORED_RULES.decode(rules, health_rules_version))
             .transpose()
             .map_err(|e| internal(e.at(format_args!("infra node '{node_id}'"))))?;
-        let units = r.try_get("units").map_err(|e| internal(anyhow::anyhow!("decode units: {e}")))?;
+        let db::Json(units) = r.try_get("units").map_err(|e| internal(anyhow::anyhow!("decode units: {e}")))?;
         let units = weft_broker_client::protocol::decode_units(units, req.project_id, &node_id).map_err(internal)?;
         nodes.push(SupervisorInfraNode {
             node_id,
@@ -1414,15 +1411,14 @@ async fn write_apply_row(
     owner: &str,
     row: ApplyRowState,
 ) -> Result<(), (StatusCode, String)> {
-    let json = |what: &str, v: Result<serde_json::Value, serde_json::Error>| {
-        v.map_err(|e| internal(anyhow::anyhow!("{what} serialize: {e}")))
-    };
-    let keep_disks_json = json("keep_disks", serde_json::to_value(keep_disks))?;
-    let health_rules_json = health_rules.map(|rules| json("health_rules", serde_json::to_value(rules))).transpose()?;
-    let endpoints_json = json("endpoints", serde_json::to_value(&row.addresses.urls))?;
-    let public_paths_json = json("public_paths", serde_json::to_value(&row.addresses.public_paths))?;
-    let doors_json = json("doors", serde_json::to_value(&row.addresses.doors))?;
-    let notes_json = json("notes", serde_json::to_value(&row.notes))?;
+    // Each as its JSON text: the names in them are the ones the node's
+    // spec wrote.
+    let keep_disks_json = db::JsonText(keep_disks);
+    let health_rules_json = health_rules.map(db::JsonText);
+    let endpoints_json = db::JsonText(&row.addresses.urls);
+    let public_paths_json = db::JsonText(&row.addresses.public_paths);
+    let doors_json = db::JsonText(&row.addresses.doors);
+    let notes_json = db::JsonText(&row.notes);
     // The INSERT pulls its values FROM the caller's still-claimed
     // apply command so the ownership check and the write share one
     // row snapshot. Every variable is a bind: no SQL built by string
@@ -1459,7 +1455,7 @@ async fn write_apply_row(
            AND {owns} \
          ON CONFLICT (project_id, node_id, instance_id) DO UPDATE SET \
             baked_json         = CASE WHEN infra_node.status = 'terminating' \
-                                      THEN '{{}}'::jsonb ELSE infra_node.baked_json END, \
+                                      THEN '{{}}' ELSE infra_node.baked_json END, \
             copy_id            = EXCLUDED.copy_id, \
             status             = EXCLUDED.status, \
             failure_stage      = NULL, \
@@ -1683,8 +1679,8 @@ pub async fn supervisor_project_image_tags(
     let tags: std::collections::HashMap<String, String> = match row {
         None => std::collections::HashMap::new(),
         Some(r) => {
-            let value: serde_json::Value = r
-                .try_get("infra_image_tags_json")
+            let db::JsonText(value) = r
+                .try_get::<_, db::JsonText<serde_json::Value>>("infra_image_tags_json")
                 .map_err(|e| internal(anyhow::anyhow!("decode infra_image_tags_json: {e}")))?;
             weft_broker_client::protocol::decode_infra_image_tags(
                 value,
@@ -2109,7 +2105,7 @@ pub async fn signal_fire_target(
     if caller.role != Role::Listener {
         return Err((StatusCode::FORBIDDEN, "listener only".into()));
     }
-    let row: Option<(uuid::Uuid, bool, Option<serde_json::Value>)> = state
+    let row: Option<(uuid::Uuid, bool, Option<String>)> = state
         .pool
         .opt(
             "SELECT s.project_id, s.is_resume, p.api_address FROM signal s LEFT JOIN project p ON p.id = s.project_id WHERE s.token = $1",
@@ -2120,7 +2116,7 @@ pub async fn signal_fire_target(
     let Some((project_id, is_resume, address)) = row else { return Ok(Json(None)) };
     // Only an address that serves: one the project's front could not open
     // says why instead.
-    let address = match address.map(serde_json::from_value::<weft_core::projects::ProjectAddress>).transpose() {
+    let address = match address.as_deref().map(serde_json::from_str::<weft_core::projects::ProjectAddress>).transpose() {
         Ok(Some(weft_core::projects::ProjectAddress::Serving { url })) => Some(url),
         Ok(Some(weft_core::projects::ProjectAddress::Unavailable { .. }) | None) => None,
         Err(e) => {
@@ -2255,6 +2251,42 @@ pub async fn signal_let_go(
     require_replica_matches(&caller, &req.replica)?;
     crate::held_signals::release(&state.pool, &req.replica).await.map_err(unavailable_or_internal)?;
     Ok(Json(serde_json::json!({})))
+}
+
+/// A holder saying its load, letting go of what it hands over (see
+/// `SignalHolderLoadRequest`). Bound to the calling replica, so a holder
+/// only ever speaks for itself.
+pub async fn signal_holder_load(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<SignalHolderLoadRequest>,
+) -> Resp<serde_json::Value> {
+    if caller.role != Role::Listener {
+        return Err((StatusCode::FORBIDDEN, "listener only".into()));
+    }
+    require_replica_matches(&caller, &req.replica)?;
+    use crate::held_signals::{HandTo, Reported};
+    let to = if req.spare_only { HandTo::Spare } else { HandTo::SpareOrAny };
+    match crate::held_signals::report_load(&state.pool, &req.replica, req.cpu_percent, req.room, &req.let_go, to)
+        .await
+        .map_err(unavailable_or_internal)?
+    {
+        Reported::Said { handed, to } => {
+            tracing::info!(
+                target: "weft_broker::held", replica = %req.replica, cpu_percent = req.cpu_percent, room = req.room, handed,
+                spare = ?to, "a holder said its load"
+            );
+            Ok(Json(serde_json::json!({})))
+        }
+        Reported::NothingHeld => Err((
+            StatusCode::CONFLICT,
+            "this holder claims none of the signals it hands over any more; nothing was written, and it looks again before it says its load".into(),
+        )),
+        Reported::NoSpare => Err((
+            StatusCode::CONFLICT,
+            "no spare is free to take what this holder hands over (another holder handed it work first); nothing was written, and it looks again to take its signals back".into(),
+        )),
+    }
 }
 
 // ---------- helpers ----------

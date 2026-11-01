@@ -4,6 +4,461 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-10-31 (0.2.282)
+
+**What breaks after this update:**
+
+**Credentials a caller sends a route moved from `headers` to `credentials`, as
+secrets.** `authorization`, `proxy-authorization`, `cookie`,
+`weft-instance-token`, and any header the route's `auth` reads, now come out
+of a `Route` or a `Socket` on `credentials`, typed
+`Dict[String, Secret[String]]`, and never on `headers`. A program that still
+looks one up on `headers` finds it missing. Hand them to a node that takes a
+secret: an `HttpRequest`'s `headers` does, and sends them revealed. If you
+wire them into a plain `String` port, the build refuses it. Until now those
+values were scrubbed out of the run's record as text, which also meant a run
+that paused and carried on got the scrubbed text back instead of the
+credential. A secret's value is kept sealed beside the run's record and comes
+back after a pause.
+
+**`weft run --fire` refuses a credential header on a `Route`**
+(`authorization`, `proxy-authorization`, `cookie`, `weft-instance-token`, and
+any header the route's `auth` reads a credential from, like `X-Api-Key`),
+naming it: only a real call turns those into secrets. Call the route for real
+(`weft activate` prints its URL), or leave the header out.
+
+**A secret reaches outside weft only where a type declares it.** `HttpRequest`
+sends a secret in its `body` revealed when what you wire into `body` declares
+where it is (`-> (object: { token: Secret[String] })` on the `JsonObject` you
+build it with); a body without a secret builds and runs as before. A secret
+inside a plain `JsonDict` now fails the node that would send it, naming the
+input and where the secret is: `HttpRequest` (`body`, `headers`), `Reply`,
+`Stream`, an `ExecPython` input, and any node of yours that reveals through
+`ctx.reveal_in` or the new `ctx.reveal_input`.
+
+**`MintInstanceToken`'s `token` is a `Secret[String]`.** The run's record and
+search hold its marker, never the token. A `Reply` or a `Stream` sends it to
+the browser revealed if you wired it straight into `body`. If you put it
+inside a `JsonObject`, declare the object's type with the secret in it
+(`-> (object: { token: Secret[String] })`); left as a `JsonDict`, the `Reply`
+or `Stream` fails naming where the secret is, rather than sending the browser
+its marker. A program that wired `token` into a plain `String` port is
+refused when you build.
+
+**Also in this release:**
+
+**New: `Secret[T]`**, for a value a run's record must never show. A node makes
+one with `ctx.secret` and reads one with `ctx.reveal`, and an `ExecPython`
+output declared `Secret[String]` makes one of what its script returns. For
+what fits a secret, go and read the types page.
+
+**A value the HTTP API answers may be a secret's marker**
+(`{"__weft_secret__": {"secretId": "..."}}`): `POST /runs/{id}/values`,
+`GET /runs/{id}/replay` (with or without `?with_values=true`) and the live
+stream show the marker, never the value.
+
+If a project's runs stop being recorded after the update, its worker was
+built by the previous weft: run `weft resync` on it (the broker's log names
+the project).
+
+## 2026-10-31 (dbefc004)
+
+**What you have to change after this update, if you use a PostgresDatabase:**
+
+- **Clients outside the program sign in as `app`, no longer as `weft`.** The
+  password, host and port stay the same; `weft infra env <node> --into .env
+  --set DATABASE_USER=User` writes the user again.
+- **A frontend's pool must expect a connection idle for a minute to close.**
+  The database now closes it. Set the pool's idle timeout under a minute, or
+  have it test a connection before using it.
+- **An extension that needs the superuser goes in the node's new `extensions`
+  setting** (`["pg_trgm", "postgres_fdw"]`). The superuser makes each one on
+  every start, and the program, signed in as `app`, uses it.
+
+**A PostgresDatabase no longer runs out of connections when the program
+scales.** Postgres serves a fixed number of connections, while its clients
+keep changing: workers scale, a change of worker settings runs old and new
+workers side by side, and a frontend connects too. Each worker used to keep up
+to 20 connections open whether it used them or not, so once enough workers ran
+at once, Postgres answered `too many clients` to them and to everything else
+using that database. A PostgresDatabase now runs a pooler in front of Postgres,
+in the same unit. The pooler never opens more connections than Postgres takes,
+and a client that finds them all busy waits for one, so a run waits instead of
+failing. Watching queries (PostgresWatchQuery) get a quarter of the
+connections the pooler opens (what is left after 3 kept for the superuser and
+2 spare), at least one, so a crowd of them never leaves the other queries
+without a connection, or the other way round. If you want to see who holds the
+connections, the node's card now shows them: Postgres's own by user and state,
+each of the pooler's two shares with its clients served and waiting, and the
+clients by address.
+
+Your existing PostgresDatabase nodes get the pooler on their next `weft infra
+upgrade`. When the database starts again it gets a new role, `app`, which
+becomes the owner of everything the superuser owned in it (except objects an
+extension made). After that:
+
+- **Through the pooler a client reaches this one database only**, so a client
+  that also used `postgres` or another database made beside it can no longer
+  reach those. The superuser `weft` can only sign in from inside the unit. An
+  extension listed in `extensions` that this Postgres does not have fails the
+  start, and `weft infra status` names it.
+- **A database whose name the pooler cannot read as written gets a second
+  name for clients.** Your database keeps its name and its data. When the
+  name is letters, digits, `_` and `-` only, at most 57 characters, and none
+  of `pgbouncer`, `all`, `sameuser`, `samerole`, `samegroup` or
+  `replication`, clients use it as before; otherwise they sign in by a name the
+  pooler makes from it (`db_my_app_1a2b3c4d`), which the connection carries
+  and the card shows under Database. A client of yours outside the program
+  takes it from there.
+- **The database closes a connection that sat idle for a minute.** That gives
+  back a connection held by a worker that lost its CPU between requests, or by
+  an old worker a rollout left behind. If a client of yours keeps a connection idle on purpose (one that `LISTEN`s), have it lift that
+  limit for its own session when it connects, the way PostgresWatchQuery does:
+  `SELECT set_config('idle_session_timeout', '0', false) FROM pg_settings
+  WHERE name = 'idle_session_timeout'`.
+- **The least `memory` is 565Mi** (it was 886Mi). At 1Gi Postgres serves 23
+  connections, at 2Gi 59, at 4Gi 131.
+- **A new database needs Postgres 14 or later.** One you already have on an
+  older Postgres keeps running, but it cannot close idle connections, so its
+  card and `weft infra status` warn of it and list the commands that dump it
+  and restore it into a new node on 17.
+
+**Every Postgres node closes a pooled connection that sat idle for 5
+seconds**, and never hands out one idle for longer, whichever database it talks
+to.
+
+**A stopping worker gives back what its runs shared** (`ctx.shared`) as soon
+as its last run has ended, instead of when the process goes, so a pool's
+connections return to the database while the worker writes its last records.
+
+**On Cloud Run, a change of worker settings retires the old workers.** Once
+the new settings serve, weft moves the calls the old ones took to them and
+removes that program's revisions under any other settings, so their copies stop
+instead of running beside the new ones. Which settings are current is decided
+from what the project has stored, so a dispatcher copy that briefly still held
+the old settings and brought them back up never wins: that revision takes no
+calls and scales to zero. It goes at the next settings change or activation,
+unless it is the service's latest, which Cloud Run does not let anyone delete;
+then it goes once a later settings change or build replaces it.
+
+**When an infra node's setup fails, you are told why.** `weft infra start`,
+`weft activate` and the other commands that wait on a setup used to answer
+`infra setup failed` and nothing else; they now give the error the setup run
+failed with (a trigger's setup the same), as `weft runs` shows it.
+
+**A unit that knows why it is not ready says so in `weft infra status`.** When
+a container's health check answers an error with a reason in its body (JSON
+`{"error": "..."}`, or plain text), the status shows that reason after the
+status code.
+
+**A node's fake tests hold a published connection to its service's values.**
+A value the service does not declare, or a required one missing, fails the
+run the way the access store refuses it on an install; before, the fake rig
+stored anything and only a real run found out.
+
+## 2026-10-31 (ed587b61)
+
+**On a cloud install, how many holders run follows how busy they are**, not
+only how many triggers they hold. Each holder averages its CPU over a minute
+and tells weft the number when it has moved 10 points, and weft runs as many
+holders as those numbers added up need at 50% each, never fewer than one per
+200 triggers. A holder that reaches 70% hands part of its triggers over, and a
+holder weft starts for the load gets triggers handed to it by a busy one. A
+load that holds steady writes nothing, so your database still sleeps. The two
+shares are new settings of the install, `holders.highCpuPercent` (70) and
+`holders.targetCpuPercent` (50); on Google Cloud you set them with
+`holder_high_cpu_percent` and `holder_target_cpu_percent` in
+`deploy/terraform/gcp/variables.tf`. The target must stay at least 20 under
+the high mark, and `terraform apply` refuses a pair that is not.
+
+## 2026-10-31 (0.2.281)
+
+**An activation finishes even when the request that asked for it does not.**
+`weft activate` now hands the activation to the install, which carries it out
+on its own and goes on from where it was if the dispatcher copy doing it
+stops; the command follows it to its end, and looks again through a dropped
+connection. Before, a dispatcher copy that went away mid-activation left the
+triggers turning on, holding everything that arrived, until something noticed.
+`weft status` now says how long a trigger has been turning on and what it waits
+on. An activation an older weft had left half done when you update is ended
+the way a stuck one always was. Update your weft CLI with the install
+(`./setup.sh` does both on a machine; for a cloud install, `./setup.sh --cli`
+from the commit it runs): an older CLI's `weft activate` activates nothing and
+answers that it has to be updated.
+
+**On a cloud install, an update's old copies step aside.** A copy of the old
+weft that still had an event stream or a worker's line open used to keep
+taking work beside the new one, sometimes for most of an hour. It now
+finishes what it was answering and stops as soon as Cloud Run sends the
+requests to the new revision, and the editor and the workers reconnect to the
+new one by themselves: you may see the editor's live view reconnect during an
+update. Which revision is current is Cloud Run's answer; if it
+refuses to give it (the roles' service account cannot read its own service),
+nothing steps aside and the install's alert says so.
+
+**A cloud install of any age updates.** The install workflow could not update
+an install last updated before 2026-10-27: Terraform refused its first step
+with "Moved resource instances excluded by targeting". It now goes through
+whatever weft renamed in its Terraform since. Run the workflow as usual.
+
+**A cloud install whose database an older weft built can start fresh.** Before
+it deploys anything, the install workflow now checks the install's database.
+If an older weft built it, from before the database's history last started
+over (when executions were renamed runs), the workflow stops there, leaving
+the install as it was, and names its new `reset_database` input. Run it again
+with that input on to wipe the database and build the new weft's in its place:
+this deletes every project's run history, versions and stored connections, so
+deploy each project again with `weft activate --on prod` and make its
+connections again with `weft connect --on prod`. A role booting on such a
+database now names this way out on the cloud, where it used to name only
+`./setup.sh`.
+
+## 2026-10-31 (0.2.280)
+
+**A project with nodes of its own compiles from a cold cache once** after this
+update: weft no longer builds with `--cfg tokio_unstable`, which changes how
+everything compiles. After that first build it builds incrementally again. The
+stock worker, which every project that uses only weft's own nodes runs, is
+rebuilt once with the new version, as on every update, and those projects
+compile nothing. A worker built by the previous weft is refused when it claims
+a run or reads a run's record, and the broker's log names `weft resync` for its
+project.
+
+**Reading a long run back takes the same memory however long the run is.**
+Opening a run in the editor, `weft events`, `weft logs` and following a run read
+its record a page at a time, and forget a node once it has finished and a
+loop's iteration once nothing in it is still running. The one thing that still
+grows is what a loop gathers, which it hands on whole when it ends. A run
+started with `--seed` reads the runs it reuses the same way, keeping only the
+nodes it takes from each. A worker driving a run forgets the same way, so it
+holds as much on a loop's sixty-thousandth iteration as on its first (what the
+loop gathers aside). It reads a run's record a page at a time too, and when it
+answers a wait it reads only what landed since it last looked.
+
+**A fast run no longer cuts off the people following it.** `weft run`, `weft
+wait` and the editor used to stop with "live updates interrupted" or "Lost the
+live connection" when a run sent a burst of events. A run's follower now gets
+the run's history and then its live events on one stream, each event once; if
+it falls behind, weft catches it up from the record, and if the connection
+drops, it carries on from the last event it got.
+
+**A value travels once.** The editor's live events and a run's replay used to
+carry a copy of every value each time it was shown (a firing's input, the
+output it handed out). They now say where the run's record keeps it, and the
+editor reads a node's values when you open its inspector or a debug preview
+shows them. `weft events`, `weft run` and a program reading a run see the
+values as before.
+
+**weft no longer needs `--cfg tokio_unstable`.** If you build weft yourself, a
+`RUSTFLAGS` of your own works again, and a node can set `RUSTFLAGS` in its
+`deps.toml` `[build.env]` again. On a local install and in `weft test-node`,
+every `[build.env]` variable now reaches the compile: a local build used to drop
+the ones cargo reads for itself (`RUSTFLAGS`), and `weft test-node` dropped
+`[build.env]` entirely. If your custom worker Dockerfile template
+(`[build.worker] dockerfile_template`) has the line
+`ENV RUSTFLAGS="{{worker_rustflags}}"`, delete it: weft refuses a template that
+still has it, and the error names the line. A project whose nodes set `[build.env]` now compiles in a compile cache
+kept for those nodes and their values, so building it no longer makes the next
+build of every other project start from scratch. On a local install,
+`weft clean --images --all` removes those caches.
+
+**A node that does heavy work in one go no longer puts its run at risk**: the
+worker renews its lease from a thread of its own. Such work still slows the
+worker's other calls and runs, so it belongs in `tokio::task::spawn_blocking`;
+for how, go and read "Five things that would have bitten you" in Your first
+node.
+
+**Reading what an instance spent no longer reads every run's record.**
+`ctx.costs()` and the `InstanceCosts` node read a table with one row per cost,
+written together with the run's record, and answer the same records in the
+same order. A run's costs are still deleted with the run (its keep time running
+out, `weft clean`, `weft rm`), so a total only counts the runs weft still
+keeps: a cap over all time needs runs kept `forever`. The update reads every
+stored run's record once to fill the table, so it takes longer on an install
+with a lot of history.
+
+**A NUL character in a node's data no longer fails a write.** A trigger whose
+setup produced a NUL character could never be baked, and an infra spec, its
+health rules or a connection's spec holding one failed to save. These are now
+kept exactly, NUL included.
+
+**If you read weft's HTTP API yourself:** `GET /runs/{id}/replay` and `GET
+/events/run/{id}` now name each value by where the record keeps it (`{"from":
+"row", ...}`); add `?with_values=true` to get the values written in, as before.
+`POST /runs/{id}/values` reads back the values some events name.
+`/events/run/{id}` takes `after=<seq>:<index>:<k>` (the end of an event's
+`eventId`) to start past an event you hold, and sends an SSE event named
+`caught_up` once the history is sent. `GET /runs/{id}/events` writes `total`
+after `events`. Corruption notices (`journal_corruption`) now arrive in order
+with the rows, carrying a `journal:` event id, instead of at the end with an id
+of their own.
+
+## 2026-10-31 (ae995e3a)
+
+**Decision models, as nodes.** A new `decision` package asks OpenRouter's
+decision models a typed question and gets probabilities back, with no reply
+to parse: Decide: Yes or No, Decide: Pick One, Decide: Score and Decide: Find
+in Image, fed by an OpenRouter Decision Model node wired from the OpenRouter
+Access you already have. They are often cheaper than an LLM for routing,
+guardrails and checks around LLM or human steps. What the model judges is the
+inputs you add to the node (`DecisionYesNo(ticket: String, photo: Image)`):
+each is a value made of JSON, a file, or a list of files, and a file inside a
+record is refused when you build, so give each file its own input. Calls on
+weft's own OpenRouter key are measured like any other.
+
+**If you write nodes:** a `validate` rule can now ask about the inputs a
+program added: `custom_inputs_declared` (it added any) and `custom_inputs_fit`
+(each one fits one of the types `oneOf` lists), with `{customInputs}` and
+`{names}` in the message. And `weft test-node` now refuses to run when a node
+of the package it tests failed to load, naming it, instead of reporting the
+rest of the package green.
+
+## 2026-10-30 (671e50f4)
+
+**Long runs open quickly, and weft keeps answering while they do.** Opening a
+long run in the editor, `weft events`, `weft logs` and `weft node-state` took
+longer the longer the run was: a run of 135,000 events took close to a minute,
+and the whole of weft stopped answering meanwhile. The same run now opens in
+about three seconds, and everything else keeps answering. A long loop no
+longer slows down the further it gets either.
+
+**weft gives memory back.** It used to keep the memory of its largest replay
+until it was restarted; it now returns it within seconds.
+
+**A durable run carries on when its worker loses weft's broker.** If a worker
+cannot write a durable run's record for over a minute, the run now moves to
+another worker and carries on from what was recorded, the way it does when a
+worker dies, instead of failing. A fast run still fails.
+
+**Every project's worker compiles from scratch once** after this update.
+
+**If you build weft yourself, or customize how workers build:**
+
+- weft now builds with `--cfg tokio_unstable`, which the checkout's
+  `.cargo/config.toml` sets, so build from the checkout (`./setup.sh` does). A
+  `RUSTFLAGS` of your own replaces that setting: add `--cfg tokio_unstable` to
+  it.
+- A custom worker Dockerfile template (`[build.worker] dockerfile_template`)
+  has to keep the line `ENV RUSTFLAGS="{{worker_rustflags}}"` before its
+  `cargo build`.
+- A node can no longer set `RUSTFLAGS` in its `deps.toml` `[build.env]`: a
+  flag its code needs goes in its build script (`cargo:rustc-cfg=...`).
+
+## 2026-10-30 (0.2.279)
+
+**Run `weft resync` in every project with a trigger on after this update.**
+A trigger now reads as behind when anything in front of it changes (a node
+whose value feeds one of its inputs or its gate), since that runs at its setup
+and a resync is what runs it again. Before, only an edit to what its fires
+run did. Every trigger that is on reads as behind once after the update,
+because its fingerprint is now worked out over both.
+
+**A new type, `Json`, holds any JSON value**: text, a number, a boolean, null,
+or a list or object of those at any depth. Every type made of JSON fits into
+it (`List[List[Number]]` does); a file, a stream or a connection never does,
+and a `Json` value goes into anything narrower only through a `Cast`. A
+`Route`'s `body` and a `Socket`'s `inbound` items can now be declared `Json`
+(or `List[...]`) to take a body or a message that is a list or a bare value;
+the default stays `JsonDict`. A request with no body (a `GET`, or a fire with
+no `body`) now closes `body` on a `text` or `bytes` route too, where it used to
+arrive as an empty text or an empty file, and a json body that is `null` is now
+a value: it comes out on a `body` declared `Json` (or `... | Null`), and
+closes `body` otherwise. A json route now refuses a body that does not fit
+with the type's own message (`body does not fit JsonDict: ...`), and a fired
+run's string body on a json route is a JSON string, held to the type like any
+other. `LlmInferenceJson`'s `response` can be declared any JSON-made type, and
+`HttpRequest`'s `body` too: declared `Json`, a JSON list comes out as the
+list, and declared a type that takes no text (a record, `List[...]`), the
+response is parsed and a wrong shape fails naming the field. `HttpRequest`
+now refuses a response carrying a stored-file object.
+
+**A `Cast` into `String` turns a list or an object into its JSON text.** The
+build allowed it before, but the run then failed.
+
+**An install remembers its named tunnel.** A `weft daemon start` or `restart`
+from a shell without `WEFT_PUBLIC_TUNNEL_TOKEN` and
+`WEFT_PUBLIC_TUNNEL_HOSTNAME` used to replace your stable address with a quick
+tunnel; it now opens the named tunnel the install last ran. If a start says
+the install's record has no hostname (one an older weft wrote), run
+`./setup.sh --public-url` once from the checkout whose `.env.local` names the
+tunnel. To go back to a quick tunnel, run `./setup.sh --no-public-url`, then
+`./setup.sh --public-url`. Each named tunnel's container is made again once,
+on the first start after the update.
+
+## 2026-10-30 (7a1dcb43)
+
+**A NUL character in a run no longer breaks search, or the runs beside it.**
+Text a node picks up from a scraped page or a PDF can hold the invisible NUL
+character, which Postgres refuses. One run carrying it made every later
+`weft runs --search` and `--through` fail with `invalid byte sequence for
+encoding "UTF8": 0x00`, and if it ended on an error holding one, the other
+runs ending in the same batch were stopped with it. Now an error, a reason or
+a search entry is written without the character, and a value that has to come
+back exactly (a payload, an answer, a run's starting values, a trigger's
+state) keeps it. An install that is already stuck searches again after
+`./setup.sh`.
+
+**The Postgres nodes read and write pgvector columns.** A `vector` or
+`halfvec` column reads back as a list of numbers, and a list of numbers
+writes into one. PostgresInsertRow and PostgresUpdateRows check that they can
+read every column of the table back before they write, so a column they
+cannot read (a `sparsevec`, for example) refuses the write instead of storing
+the row and then failing. A `real` column now reads as `0.1` instead of
+`0.10000000149011612`.
+
+## 2026-10-29 (0.2.278)
+
+**If a program hands tools to an LLM node, it may not compile after this
+update.** The `tools` input of `LlmInference`, `LlmInferenceJson` and
+`LlmStream` now takes a `List[LlmTool]`, and the `LlmTool` node hands out
+that type. Three shapes need a change:
+
+- A group that takes the tools as `tools: List[JsonDict]` gets a type
+  mismatch: declare it `tools: List[LlmTool]`.
+- One `LlmTool` wired straight into `tools` now goes through a `List`
+  (`tools = List`, `tools.dog = dog.tool`, then `ask.tools = tools.list`).
+- `ComputerTools` is gone: each computer action node now describes its own
+  tools, and the premade computer agent gathers them itself. Drop the
+  `tools = ComputerTools` and `agent.tools = tools.tools` lines; the agent
+  offers Anthropic's names, and `calls.tools.openai` in a copy of
+  `agent.weft` offers OpenAI's.
+
+Then run `weft resync` in the project.
+
+**A `?` on a group's input no longer compiles.** A group input passes what
+reaches it straight to the nodes inside, so it was never optional itself, and
+the `?` did nothing. The build now refuses it with
+`optional-pass-through-port`: remove the `?` from the group's header (an
+included file's too, and a loop's on any port the loop neither iterates nor
+carries), and if a node inside should run without the value, put the `?` on
+that node's input.
+
+**A group can now describe itself on a metadata port.** Write `*tool:
+LlmTool` in a group's or a loop's outputs and its value in the body
+(`self.tool = { "name": "search", ... }`), or gather it from other metadata
+ports (`self.tools = [...search.tools, fetch.tool]`). A wire from that port is
+written into the input it points at before anything runs, so it may point
+back up the graph without making a cycle. The new `Dispatch` node sends a
+value to the branch that claims it: wire each tool group's `*tool` into a
+`List` for the model's `tools` and into a `Dispatch` inside the loop over
+the model's calls, and each call reaches the group that performs it. For
+the whole picture, go and read [metadata
+ports](https://weavemindai.github.io/weft/language/groups.html#metadata-ports).
+
+## 2026-10-28 (341192de)
+
+**The folders weft compiles in stop growing with every update.** Each
+program weft compiles for a project now notes which compiled pieces and
+source crates it used, and after every build weft keeps in its compile
+folders (`~/.local/share/weft/worker-target/` and
+`~/.local/share/weft/worker-crates/`) only what a program still on the
+machine was built from. Before, every update left a full copy of weft's
+libraries behind in each of them. The first project build after you update
+clears out what older versions left, which can free tens of gigabytes. If
+you build weft from source, `./setup.sh` now also removes from the
+checkout's `target/` every compiled piece a newer build of it replaced, and
+`WEFT_TARGET_CAP_GB` is gone.
+
 ## 2026-10-28 (0.2.277)
 
 **If a project has its own nodes, or its own copy of the standard nodes, it

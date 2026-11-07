@@ -282,6 +282,18 @@ resource "google_cloud_run_v2_service" "role" {
       image = var.runtime_image
       args  = ["serve", "--role", each.value]
 
+      # A new weft carries the stored documents forward before it listens,
+      # which on a large install takes far longer than Cloud Run's default
+      # four minutes. Up to forty minutes here; each try keeps its progress.
+      startup_probe {
+        tcp_socket {
+          port = 8080
+        }
+        period_seconds    = 240
+        timeout_seconds   = 240
+        failure_threshold = 10
+      }
+
       resources {
         # A writer wakes the roles its writes concern once the request
         # that wrote has answered, which needs its CPU then. Billed while
